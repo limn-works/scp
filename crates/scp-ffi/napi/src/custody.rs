@@ -24,8 +24,7 @@ use napi_derive::napi;
 use scp_ffi_common::callback_custody::{self as flow, CallbackKeyRegistry, HostPublicKey, KeyRole};
 use scp_platform::error::PlatformError;
 use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
 
 #[cfg(feature = "testing")]
@@ -56,17 +55,30 @@ use crate::identity::OpaqueInMemoryKeyCustody;
 /// `Promise`) — keystore reads are fast and the bridge awaits the dispatch via
 /// [`call_host`]. Private key material never crosses into
 /// Rust ownership (ADR-006): the consumer owns the secrets and returns only
-/// public bytes / opaque key-id strings.
+/// public bytes and key-id strings.
+///
+/// Every key id the host returns is the canonical decimal form of a `u64`, as
+/// `String(n)` writes it for a `bigint` `n`: ASCII digits only, with no sign,
+/// no leading zero (`"0"` itself is allowed) and no whitespace
+/// ([`parse_handle`](scp_ffi_common::custody_parse::parse_handle)). Any other
+/// id is rejected with the custody error `SCP-CRYPTO-4060`.
+///
+/// A pseudonym has no private key (§9.10.4): `derivePseudonym` and
+/// `deriveRotatablePseudonym` return only the 33-byte compressed P-256 point,
+/// and the bridge fails the derivation with `SCP-IDENT-1055` when the bytes
+/// are not a valid point (ADR-021 2026-09-29 amendment). `sign`,
+/// `getPublicKey` and `destroyKey` never receive a pseudonym.
 #[napi(object, object_to_js = false)]
 pub struct NapiKeyCustodyProvider {
     /// `(keyType: string, role: string) => string` — generate a keypair,
-    /// return its id. `keyType` is `"ed25519"`, `"x25519"`, `"p256"` or
+    /// return its id, a canonical decimal `u64` string (`SCP-CRYPTO-4060`
+    /// otherwise). `keyType` is `"ed25519"`, `"x25519"`, `"p256"` or
     /// `"hpke-p256"`; `role` is `"identity"` (the only pseudonym-derivation
     /// source) or `"operational"`. The host records `role` and reports it from
     /// `getPublicKey` for the key's lifetime; the bridge refuses and destroys
     /// a key whose reported role differs. The host never reuses a key id: an
-    /// id it returns here, or from a pseudonym derivation, names no other key
-    /// for the host's lifetime, even after that key is destroyed.
+    /// id it returns here names no other key for the host's lifetime, even
+    /// after that key is destroyed.
     #[napi(
         ts_type = "(args: [string, string]) => { ok: boolean; value?: string; code?: string; message?: string }"
     )]
@@ -81,19 +93,18 @@ pub struct NapiKeyCustodyProvider {
         ts_type = "(args: [string, number[]]) => { ok: boolean; value?: number[]; code?: string; message?: string }"
     )]
     pub sign: Function<'static, (String, Vec<u8>), HostBytesResult>,
-    /// `(keyId: string) => { keyType, publicKey }` — the key's type
+    /// `(keyId: string) => { keyType, publicKey, role }` — the key's type
     /// (`"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`) and its public
     /// key: exactly 32 bytes (Ed25519 / X25519), the 33-byte compressed SEC1
     /// point (`"p256"`) or the 65-byte uncompressed SEC1 point
     /// (`"hpke-p256"`). The bridge types the key from `keyType`, never from
     /// the length, and refuses any other length. A key id the host does not
     /// hold is a failure whose `code` is `"SCP-CRYPTO-4006"`. `role` is the
-    /// role `generateKeypair` minted the key in, reported across sessions; a
-    /// pseudonym key is `"operational"`. A key id the bridge has not seen
-    /// binds as an identity only when `role` is `"identity"`. The bridge
-    /// cannot check the host's word: a host that reports `"identity"` for a
-    /// key it minted as `"operational"` lets that key derive pseudonyms,
-    /// which is outside Rust's control.
+    /// role `generateKeypair` minted the key in, reported across sessions. A
+    /// key id the bridge has not seen binds as an identity only when `role`
+    /// is `"identity"`. The bridge cannot check the host's word: a host that
+    /// reports `"identity"` for a key it minted as `"operational"` lets that
+    /// key derive pseudonyms, which is outside Rust's control.
     #[napi(
         ts_type = "(keyId: string) => { ok: boolean; value?: { keyType: string; publicKey: number[]; role: string }; code?: string; message?: string }"
     )]
@@ -110,26 +121,37 @@ pub struct NapiKeyCustodyProvider {
         ts_type = "(args: [string, number[]]) => { ok: boolean; value?: number[]; code?: string; message?: string }"
     )]
     pub dh_agree: Function<'static, (String, Vec<u8>), HostBytesResult>,
-    /// `(keyId: string, contextId: Uint8Array) => { publicKey, keyId }` —
-    /// the §9.10.4 v1 pseudonym: `publicKey` is the 33-byte compressed P-256
-    /// point and `keyId` the numeric handle of the pseudonym key. The bridge
-    /// requires `getPublicKey(keyId)` to return the same 33 bytes. The same
-    /// (`keyId`, `contextId`) MUST return the same pseudonym `keyId` on every
-    /// call, so re-deriving names one key rather than minting another.
+    /// `(keyId: string, contextId: Uint8Array) => Uint8Array` — the §9.10.4
+    /// v1 pseudonym: the 33-byte compressed P-256 point. The bridge rejects
+    /// any other bytes with `SCP-IDENT-1055`; a host `SCP-CRYPTO-4006` means
+    /// the identity key is not found.
+    ///
+    /// Canonical recipe (§9.10.4, §9.10.4.A; `ikm` is the identity private key
+    /// material, the 32-byte Ed25519 seed until the identity key
+    /// moves to P-256 (SCP-315)):
+    ///   1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
+    ///   2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
+    ///   3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; return the
+    ///      compressed point `d·G`. `d` is discarded, never stored.
+    ///
+    /// The HMAC key is the 32-byte `pseudonym_secret`, never the public key:
+    /// public key bytes would be a membership-enumeration oracle (§9.10.4.A).
     #[napi(
-        ts_type = "(args: [string, number[]]) => { ok: boolean; value?: { publicKey: number[]; keyId: string }; code?: string; message?: string }"
+        ts_type = "(args: [string, number[]]) => { ok: boolean; value?: number[]; code?: string; message?: string }"
     )]
-    pub derive_pseudonym: Function<'static, (String, Vec<u8>), HostPseudonymResult>,
-    /// `(keyId: string, contextId: Uint8Array, pseudonymEpoch: bigint) => { publicKey, keyId }`
-    /// — the §9.10.4 rotatable v2 pseudonym, same return shape as
-    /// `derivePseudonym`; the same (`keyId`, `contextId`, `pseudonymEpoch`)
-    /// MUST return the same pseudonym `keyId`. The provider performs the canonical derivation
-    /// (HMAC key is the private-derived `pseudonym_secret`, domain
-    /// `"scp-pseudonym-v2"`); the bridge does NOT synthesize the preimage.
+    pub derive_pseudonym: Function<'static, (String, Vec<u8>), HostBytesResult>,
+    /// `(keyId: string, contextId: Uint8Array, pseudonymEpoch: bigint) => Uint8Array`
+    /// — the §9.10.4.1 rotatable v2 pseudonym, same return shape and checks
+    /// as `derivePseudonym`. The provider performs the canonical derivation,
+    /// steps 1 and 3 of `derivePseudonym` with step 2 replaced by
+    ///   `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonymEpoch) || "scp-pseudonym-v2")`
+    /// where `BE64` is the 8-byte big-endian epoch; the HMAC key is the
+    /// `pseudonym_secret`, never the public key. The bridge does NOT
+    /// synthesize the preimage.
     #[napi(
-        ts_type = "(args: [string, number[], bigint]) => { ok: boolean; value?: { publicKey: number[]; keyId: string }; code?: string; message?: string }"
+        ts_type = "(args: [string, number[], bigint]) => { ok: boolean; value?: number[]; code?: string; message?: string }"
     )]
-    pub derive_rotatable_pseudonym: Function<'static, (String, Vec<u8>, u64), HostPseudonymResult>,
+    pub derive_rotatable_pseudonym: Function<'static, (String, Vec<u8>, u64), HostBytesResult>,
     /// `(keyId: string) => Uint8Array` — 32 raw private-seed bytes.
     #[napi(
         ts_type = "(keyId: string) => { ok: boolean; value?: number[]; code?: string; message?: string }"
@@ -152,17 +174,6 @@ pub struct NapiCustodyPublicKey {
     /// `"identity"` or `"operational"`: the role the key was minted in.
     pub role: String,
 }
-
-/// A host pseudonym derivation result: the 33-byte compressed P-256 point and
-/// the key id of the pseudonym key, as separate fields (§9.10.4).
-#[napi(object)]
-pub struct NapiPseudonymResult {
-    /// 33-byte SEC1 compressed P-256 public key.
-    pub public_key: Vec<u8>,
-    /// Numeric key id of the pseudonym key, as a decimal string.
-    pub key_id: String,
-}
-
 /// A host callback outcome carrying a string (`generateKeypair`, `custodyType`).
 #[napi(object, object_to_js = false)]
 pub struct HostStringResult {
@@ -177,7 +188,7 @@ pub struct HostStringResult {
 }
 
 /// A host callback outcome carrying bytes (`sign`, `getPublicKey`, `dhAgree`,
-/// `exportSigningKeyBytes`).
+/// `derivePseudonym`, `deriveRotatablePseudonym`, `exportSigningKeyBytes`).
 #[napi(object, object_to_js = false)]
 pub struct HostBytesResult {
     /// `true` when the host call succeeded and `value` holds its result.
@@ -215,24 +226,10 @@ pub struct HostUnitResult {
     pub message: Option<String>,
 }
 
-/// A host callback outcome carrying a pseudonym (`derivePseudonym`,
-/// `deriveRotatablePseudonym`).
-#[napi(object, object_to_js = false)]
-pub struct HostPseudonymResult {
-    /// `true` when the host call succeeded and `value` holds its result.
-    pub ok: bool,
-    /// The host's result when `ok`.
-    pub value: Option<NapiPseudonymResult>,
-    /// The failure's `SCP-` code when the host error carried one.
-    pub code: Option<String>,
-    /// The host error's message when not `ok`.
-    pub message: Option<String>,
-}
-
 /// A host failure's `SCP-` code and message.
 type HostFailure = (Option<String>, Option<String>);
 
-/// One accessor over the four host outcome shapes, so every custody method
+/// One accessor over the three host outcome shapes, so every custody method
 /// maps a host failure the same way.
 trait HostOutcome {
     type Value;
@@ -257,7 +254,6 @@ macro_rules! host_outcome_with_value {
 
 host_outcome_with_value!(HostStringResult, String);
 host_outcome_with_value!(HostBytesResult, Vec<u8>);
-host_outcome_with_value!(HostPseudonymResult, NapiPseudonymResult);
 host_outcome_with_value!(HostPublicKeyResult, NapiCustodyPublicKey);
 
 impl HostOutcome for HostUnitResult {
@@ -412,14 +408,14 @@ pub(crate) struct CallbackTsfns {
     >,
     derive_pseudonym: ThreadsafeFunction<
         (String, Vec<u8>),
-        HostPseudonymResult,
+        HostBytesResult,
         (String, Vec<u8>),
         napi::Status,
         false,
     >,
     derive_rotatable_pseudonym: ThreadsafeFunction<
         (String, Vec<u8>, u64),
-        HostPseudonymResult,
+        HostBytesResult,
         (String, Vec<u8>, u64),
         napi::Status,
         false,
@@ -459,13 +455,13 @@ pub(crate) trait JsCustodyHost: Send + Sync {
         &self,
         key_id: String,
         context_id: Vec<u8>,
-    ) -> impl Future<Output = Result<(Vec<u8>, String), PlatformError>> + Send;
+    ) -> impl Future<Output = Result<Vec<u8>, PlatformError>> + Send;
     fn derive_rotatable_pseudonym(
         &self,
         key_id: String,
         context_id: Vec<u8>,
         epoch: u64,
-    ) -> impl Future<Output = Result<(Vec<u8>, String), PlatformError>> + Send;
+    ) -> impl Future<Output = Result<Vec<u8>, PlatformError>> + Send;
     fn export_signing_key_bytes(
         &self,
         key_id: String,
@@ -508,14 +504,13 @@ impl JsCustodyHost for CallbackTsfns {
         &self,
         key_id: String,
         context_id: Vec<u8>,
-    ) -> Result<(Vec<u8>, String), PlatformError> {
+    ) -> Result<Vec<u8>, PlatformError> {
         call_host(
             "derive_pseudonym",
             &self.derive_pseudonym,
             (key_id, context_id),
         )
         .await
-        .map(|r| (r.public_key, r.key_id))
     }
 
     async fn derive_rotatable_pseudonym(
@@ -523,14 +518,13 @@ impl JsCustodyHost for CallbackTsfns {
         key_id: String,
         context_id: Vec<u8>,
         epoch: u64,
-    ) -> Result<(Vec<u8>, String), PlatformError> {
+    ) -> Result<Vec<u8>, PlatformError> {
         call_host(
             "derive_rotatable_pseudonym",
             &self.derive_rotatable_pseudonym,
             (key_id, context_id, epoch),
         )
         .await
-        .map(|r| (r.public_key, r.key_id))
     }
 
     async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, PlatformError> {
@@ -739,16 +733,14 @@ impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
         &self,
         key: &KeyHandle,
         context_id: &[u8],
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         let h = &self.host;
         flow::derive_pseudonym(
             &self.registry,
             key,
-            context_id,
             None,
             |key_id| h.derive_pseudonym(key_id, context_id.to_vec()),
             |key_id| h.get_public_key(key_id),
-            |key_id| h.destroy_key(key_id),
         )
         .await
     }
@@ -758,7 +750,7 @@ impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
         key: &KeyHandle,
         context_id: &[u8],
         pseudonym_epoch: u64,
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         // Canonical v2 recipe (spec §9.10.4.A / §9.10.4.1): the provider performs
         // the rotatable derivation itself — seed = HMAC-SHA256(pseudonym_secret,
         // context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2"); d =
@@ -772,11 +764,9 @@ impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
         flow::derive_pseudonym(
             &self.registry,
             key,
-            context_id,
             Some(pseudonym_epoch),
             |key_id| h.derive_rotatable_pseudonym(key_id, context_id.to_vec(), pseudonym_epoch),
             |key_id| h.get_public_key(key_id),
-            |key_id| h.destroy_key(key_id),
         )
         .await
     }
@@ -972,7 +962,7 @@ impl KeyCustody for NapiKeyCustody {
         &self,
         key: &KeyHandle,
         context_id: &[u8],
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.derive_pseudonym(key, context_id).await,
@@ -985,7 +975,7 @@ impl KeyCustody for NapiKeyCustody {
         key: &KeyHandle,
         context_id: &[u8],
         pseudonym_epoch: u64,
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => {
@@ -1112,7 +1102,7 @@ mod adapter_tests {
     use std::sync::Arc;
 
     use scp_crypto::p256::{
-        P256PublicKey, P256SigningKey, ecdh_p256, normalize_low_s, verify_prehash_strict,
+        P256PublicKey, P256SecretKey, ecdh_p256, normalize_low_s, verify_prehash_strict,
     };
     use scp_ffi_common::callback_custody::fake_host::FakeHost;
 
@@ -1155,7 +1145,7 @@ mod adapter_tests {
             &self,
             key_id: String,
             context_id: Vec<u8>,
-        ) -> Result<(Vec<u8>, String), PlatformError> {
+        ) -> Result<Vec<u8>, PlatformError> {
             self.host.derive_pseudonym(&key_id, &context_id, None)
         }
 
@@ -1164,7 +1154,7 @@ mod adapter_tests {
             key_id: String,
             context_id: Vec<u8>,
             epoch: u64,
-        ) -> Result<(Vec<u8>, String), PlatformError> {
+        ) -> Result<Vec<u8>, PlatformError> {
             self.host
                 .derive_pseudonym(&key_id, &context_id, Some(epoch))
         }
@@ -1183,7 +1173,7 @@ mod adapter_tests {
         })
     }
 
-    /// A13: P-256 sign and HPKE `dh_agree` through the adapter. The host
+    /// P-256 sign and HPKE `dh_agree` through the adapter. The host
     /// signs with a high `s` in DER; the adapter returns the raw low-`s`
     /// signature that strictly verifies. The host receives the peer as the
     /// 65-byte uncompressed point, and a compressed peer never reaches it.
@@ -1229,7 +1219,7 @@ mod adapter_tests {
                 .as_bytes(),
         )
         .expect("a valid point");
-        let peer = P256SigningKey::from_scalar_bytes(&[0x33; 32]).expect("scalar");
+        let peer = P256SecretKey::from_scalar_bytes(&[0x33; 32]).expect("scalar");
         let peer_point = peer.public_key().to_uncompressed();
         let shared = custody
             .dh_agree(&hpke, &peer_point)
@@ -1264,7 +1254,7 @@ mod adapter_tests {
         );
     }
 
-    /// F7: each derivation reaches its own callback. Wiring
+    /// Each derivation reaches its own callback. Wiring
     /// `derive_rotatable_pseudonym` to the plain callback (or the reverse)
     /// changes the call counts and the derived point.
     #[tokio::test]
@@ -1283,12 +1273,7 @@ mod adapter_tests {
             )
             .expect("32 bytes"),
         );
-        let expected = |epoch| {
-            scp_crypto::pseudonym::derive_pseudonym_keypair(&seed, b"ctx", epoch)
-                .expect("derive")
-                .public_key()
-                .to_compressed()
-        };
+        let expected = |version| scp_crypto::pseudonym::derive_pseudonym(&seed, b"ctx", version);
 
         let rotatable = custody
             .derive_rotatable_pseudonym(&identity, b"ctx", 3)
@@ -1297,8 +1282,8 @@ mod adapter_tests {
         assert_eq!(host.calls("derive_rotatable_pseudonym"), 1);
         assert_eq!(host.calls("derive_pseudonym"), 0);
         assert_eq!(
-            rotatable.public_key().as_bytes(),
-            expected(Some(3)).as_slice()
+            rotatable.public_key(),
+            &expected(scp_crypto::pseudonym::PseudonymVersion::Rotatable { epoch: 3 })
         );
 
         let plain = custody
@@ -1307,7 +1292,10 @@ mod adapter_tests {
             .expect("plain derive");
         assert_eq!(host.calls("derive_pseudonym"), 1);
         assert_eq!(host.calls("derive_rotatable_pseudonym"), 1);
-        assert_eq!(plain.public_key().as_bytes(), expected(None).as_slice());
+        assert_eq!(
+            plain.public_key(),
+            &expected(scp_crypto::pseudonym::PseudonymVersion::Static)
+        );
 
         // An operational key is not a derive source (§9.10.4.A interim).
         let operational = custody
@@ -1321,7 +1309,7 @@ mod adapter_tests {
         assert_eq!(host.calls("derive_pseudonym"), 1);
     }
 
-    /// D2: a host failure whose `code` is `SCP-CRYPTO-4006` is the typed
+    /// A host failure whose `code` is `SCP-CRYPTO-4006` is the typed
     /// not-found, and any other failure, or a success with no value, a
     /// custody error; through `sign`, a host not-found reaches the caller as
     /// `KeyNotFound` and a transport error as `CustodyError`.
@@ -1396,7 +1384,7 @@ mod adapter_tests {
         assert_eq!(host.calls("sign"), 2);
     }
 
-    /// F2: `export_ed25519_signing_key` and `ed25519_to_x25519_agree` refuse a
+    /// `export_ed25519_signing_key` and `ed25519_to_x25519_agree` refuse a
     /// P-256 handle, minted or resolved, with `WrongKeyType` before any host
     /// export or agreement call.
     #[tokio::test]

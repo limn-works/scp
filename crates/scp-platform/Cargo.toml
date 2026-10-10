@@ -42,13 +42,52 @@ in-memory-push = ["dep:uuid"]
 testing = ["software_platform", "in-memory-storage", "in-memory-push"]
 # Apple storage adapter with SQLCipher encryption (spec section 17.6).
 # Same engine as `sqlite` but encryption key provided by caller (Apple Keychain).
-apple = ["dep:rusqlite", "dep:hex", "dep:fs2"]
+apple = ["dep:rusqlite", "dep:scp-sqlite-pools", "dep:hex", "dep:fs2"]
 # SQLite storage adapter with SQLCipher encryption (spec section 17.6).
 # `argon2` + `rand` back the passphrase key-derivation mode (§17.6) and its
 # per-database salt generation; the shared `kdf` module is the single source
 # of the Argon2id parameterization. `fs2` provides advisory file locking for
 # the per-database salt sidecar (fail-closed on lock contention).
-sqlite = ["dep:rusqlite", "dep:hex", "dep:argon2", "dep:rand", "dep:fs2"]
+# `dep:libsqlite3-sys` names, on a non-Apple target only, the package rusqlite
+# already compiles, so that `vendored-openssl` below has an edge to set a
+# feature on; it adds no package to the build.
+sqlite = ["dep:rusqlite", "dep:scp-sqlite-pools", "dep:hex", "dep:argon2", "dep:rand", "dep:fs2", "dep:libsqlite3-sys"]
+# On a non-Apple target, compile OpenSSL from source into SQLCipher instead of
+# linking the build host's libcrypto (see the `rusqlite` comment in the workspace
+# Cargo.toml for what each host supplies). On an Apple target this feature
+# changes nothing: `libsqlite3-sys` below is declared for non-Apple targets only,
+# so an Apple host building an Apple target leaves SQLCipher on CommonCrypto from
+# the Security framework, which ships with the OS and takes its patches from OS
+# updates, unless the build environment sets OPENSSL_DIR (or both OPENSSL_LIB_DIR
+# and OPENSSL_INCLUDE_DIR), bare or prefixed with the target triple as in
+# AARCH64_APPLE_DARWIN_OPENSSL_DIR. libsqlite3-sys 0.30.1 takes its CommonCrypto
+# branch only when both host and target are Apple, so a non-Apple host building
+# an Apple target links `crypto` as a Linux build does.
+# The feature cannot name `rusqlite/bundled-sqlcipher-vendored-openssl`
+# directly: a Cargo feature carries no target condition, and libsqlite3-sys 0.30.1's build script
+# checks that feature before its Apple branch, so an Apple build would drop
+# CommonCrypto for the OpenSSL that `Cargo.lock` pins.
+#
+# Exactly one shipped configuration selects this: the one
+# `bindings/python/pyproject.toml` declares, whose `[tool.maturin] features` list
+# names `vendored-openssl`, the `scp-ffi` feature that forwards to this one. The
+# PyPI wheel and the PyPI sdist both build from that table, the sdist on the
+# installing machine. A Linux or Windows wheel installs onto a machine whose
+# OpenSSL this build never saw, and a `pip install` of it runs no linker.
+#
+# No other shipped artifact selects it. `openssl-sys/vendored` statically links
+# the OpenSSL that `Cargo.lock` pins, so the crypto inside a binary that selects
+# it changes only when someone bumps that lockfile. The `scp-relay` and
+# `scp-node` binaries leave it off and link `libcrypto.so.3` dynamically, and
+# `Dockerfile` installs `libssl3` in their runtime image for that reason. The
+# napi addon and the uniffi library also compile SQLCipher and also leave this
+# feature off. No decision states why any of these four leaves it off; this
+# comment claims none.
+#
+# `libsqlite3-sys?/` rather than `libsqlite3-sys/`: this feature adds a build mode
+# to a SQLCipher that `sqlite` already asked for, and never pulls SQLCipher into a
+# build that did not enable `sqlite`.
+vendored-openssl = ["libsqlite3-sys?/bundled-sqlcipher-vendored-openssl"]
 # Encrypted file-backed key custody (Argon2id + AES-256-GCM).
 # Universal fallback for non-HSM platforms. See GitHub issue #391.
 file = ["software_platform", "dep:aes-gcm", "dep:argon2", "dep:hkdf"]
@@ -63,7 +102,7 @@ sync = []
 
 [dependencies]
 # P-256 point validation and the pseudonym routing id (§9.10.4) back the
-# `PseudonymKeypair` constructor, which every build (not only
+# `Pseudonym` constructors, which every build (not only
 # `software_platform`) exposes; the software backends also derive pseudonyms
 # through it (ADR-057 Option A). `scp-crypto` is a pure, wasm-safe leaf.
 scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
@@ -94,12 +133,24 @@ uuid = { workspace = true, optional = true }
 
 # sqlite dependencies, gated behind the `sqlite` feature flag.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"], optional = true }
+# Opens this crate's SQLCipher connections with SQLite's lookaside pool and page-cache
+# bulk block off (spec section 17.6).
+scp-sqlite-pools = { path = "../scp-sqlite-pools", version = "=0.1.0-beta.2", optional = true }
 hex = { workspace = true, optional = true }
 # fs2 provides advisory POSIX / Windows file locking — used by SqliteStorage
 # to refuse a second process/instance trying to open the same database
 # directory concurrently (SQLite journal/WAL corruption guard, red-hat
 # RED-1002). Tiny dep (flock/LockFileEx wrappers).
 fs2 = { version = "0.4", optional = true }
+
+# The package rusqlite 0.32 compiles SQLCipher in, named directly so that the
+# `vendored-openssl` feature can set its `bundled-sqlcipher-vendored-openssl`
+# feature. Declared for non-Apple targets only, which confines that feature to
+# them: resolver 2 activates no feature of a dependency declared for a target the
+# build does not compile for. The version requirement matches rusqlite 0.32.1's,
+# so Cargo resolves it to the same package.
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+libsqlite3-sys = { version = "0.30.1", optional = true }
 
 [dev-dependencies]
 # Test-only: raw (un-normalised) RFC 6979 ECDSA, to pin a digest whose raw `s`

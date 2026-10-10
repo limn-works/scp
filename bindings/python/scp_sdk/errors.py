@@ -235,12 +235,12 @@ class EconomyError(ScpError):
 
 
 class SagaAbortedError(OutletError):
-    """A §6.2.4 saga aborted at a Prepare phase (authorization, freshness,
-    rate limit, co-residency, or a transiently-unavailable participant actor).
+    """A §6.2.4 saga that ended in an ``Aborted`` terminal, with the code
+    ``decompose_saga_error`` (crates/scp-ffi/common/src/saga_errors.rs) gives it.
 
     An ``Aborted`` terminal may be a PERMANENT rejection the caller must not
     blindly retry, OR a RETRYABLE transient (rate limit / participant-actor
-    unavailable); the two are distinguished by the ``SCP-SAGA-*`` code.
+    unavailable).
 
     Attributes:
         retry_after_ms: Rate-limit back-off hint in milliseconds when the
@@ -311,7 +311,7 @@ def _saga_terminal_from_bridge(exc: BaseException) -> ScpError | None:
     Dispatches on the bridge exception's class *name* (so a mocked bridge
     works without the native extension) and reads the structured terminal
     datum positionally from ``exc.args`` — ``args[0]`` is the message,
-    ``args[1]`` the ``SCP-SAGA-13xxx`` code, and ``args[2]`` the typed
+    ``args[1]`` the code, and ``args[2]`` the typed
     datum (``retry_after_ms`` / ``saga_id`` / ``contended_context``). The
     datum is read STRUCTURALLY, never parsed from the message string.
 

@@ -20,6 +20,7 @@
 
 use async_trait::async_trait;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+use scp_ffi_common::bridge_instance::StreamRegistry;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so the
 // `napi_check_handle!` macro can refer to it as `$crate::runtime::CoreFields`
 // without each caller importing the full `scp_ffi_common` path.
@@ -27,7 +28,7 @@ pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_ffi_common::bridge_runtime::EventLogInMemoryStorageHandle;
 use scp_ffi_common::credentials::FfiCredentialStore;
 use scp_ffi_common::error_codes as codes;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
@@ -35,7 +36,7 @@ use scp_clock::SystemClock;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::outlets::{OutletRegistry, SessionStore};
 use scp_core::context::persistence::ContextPersistence;
-use scp_core::context::roles::{ContextRoleState, default_ceiling};
+use scp_core::context::roles::ContextRoleState;
 use scp_core::context::state::ContextSnapshot;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
@@ -144,6 +145,41 @@ pub enum StorageInitError {
         /// The underlying `scp-platform` error rendered via `Display`.
         message: String,
     },
+    /// Another store holds the directory's advisory lock, in this process or
+    /// another (`PlatformError::StorageLockHeld`; spec §17.6 "One Opener per
+    /// Durable Directory").
+    LockHeld {
+        /// The directory path the caller asked for (for the error message).
+        path: String,
+        /// The underlying `scp-platform` error rendered via `Display`.
+        message: String,
+    },
+}
+
+impl StorageInitError {
+    /// Builds the variant for a failed `SqliteStorage` open: the typed
+    /// lock-still-held condition keeps its own variant, every other open
+    /// failure is [`Self::SqliteOpen`].
+    #[must_use]
+    pub fn from_open_failure(path: String, err: &scp_platform::PlatformError) -> Self {
+        let message = err.to_string();
+        if matches!(err, scp_platform::PlatformError::StorageLockHeld { .. }) {
+            Self::LockHeld { path, message }
+        } else {
+            Self::SqliteOpen { path, message }
+        }
+    }
+
+    /// The registered `SCP-STORAGE-` code for this failure
+    /// (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes):
+    /// `8005` for a held lock, `8004` for every other open failure.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::SqliteOpen { .. } => scp_ffi_common::error_codes::STORAGE_8004,
+            Self::LockHeld { .. } => scp_ffi_common::error_codes::STORAGE_8005,
+        }
+    }
 }
 
 impl std::fmt::Display for StorageInitError {
@@ -151,6 +187,12 @@ impl std::fmt::Display for StorageInitError {
         match self {
             Self::SqliteOpen { path, message } => {
                 write!(f, "failed to open SQLCipher storage at {path}: {message}")
+            }
+            Self::LockHeld { path, message } => {
+                write!(
+                    f,
+                    "SQLCipher storage at {path} is held by another store: {message}"
+                )
             }
         }
     }
@@ -186,12 +228,25 @@ pub struct NapiBridgeInstance {
     pub(crate) core: CoreFields,
 
     /// Per-context UCAN validation state (revocation lists, nonce trackers,
-    /// role state, outlet registries, outlet handlers, session stores).
+    /// outlet registries, outlet handlers, session stores).
     ///
     /// Previously stored type-erased in `CoreFields::ucan_registry`. Post
     /// PR 1, the registry lives here as a typed field and is cleared by
     /// [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) ucan_registry: Arc<DashMap<String, UcanContextState>>,
+
+    /// Release marks, keyed by the context id whose `ucan_registry` entry a
+    /// release removed.
+    ///
+    /// [`ensure_registered`] refuses to rebuild an entry for a marked id.
+    pub(crate) released_contexts: std::sync::Mutex<HashMap<String, ReleaseMark>>,
+
+    /// Generation the next newly created release mark receives.
+    pub(crate) next_release_generation: std::sync::atomic::AtomicU64,
+
+    /// The number of live [`NapiContextHandle`]s this instance minted, per
+    /// context id.
+    pub(crate) context_handles: Arc<DashMap<String, usize>>,
 
     /// Retained identity state for registered DIDs.
     ///
@@ -320,10 +375,10 @@ pub struct NapiBridgeInstance {
     /// control-plane handle + detached chunk receiver. Per-instance (never a
     /// `static` — `check-no-bridge-globals.sh` / `check-handle-affinity.sh`): a
     /// stream opened on one instance is invisible to another, and instance
-    /// shutdown drops every live stream with the `Arc`. Cleared by
-    /// [`BridgeInstanceCore::bridge_specific_shutdown`]. Mirrors the `PyO3`
+    /// shutdown drops every live stream with the `Arc`. Mirrors the `PyO3`
     /// reference bridge's `PyBridgeInstance::outlet_stream_registry`.
-    pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
+    pub(crate) outlet_stream_registry:
+        Arc<StreamRegistry<String, crate::outlet_stream::StreamEntry>>,
 
     /// Per-instance §5.4.5 / §6.2.4 cross-context STREAMING-saga registry
     /// (SCP-OUT-047, pass 3a).
@@ -335,11 +390,10 @@ pub struct NapiBridgeInstance {
     /// invoker DID, and `request_id`. Per-instance (never a `static` —
     /// `check-no-bridge-globals.sh` / `check-handle-affinity.sh`): a saga opened
     /// on one instance is invisible to another, and instance shutdown drops every
-    /// live saga stream with the `Arc`. Cleared by
-    /// [`BridgeInstanceCore::bridge_specific_shutdown`]. Mirrors the `PyO3`
+    /// live saga stream with the `Arc`. Mirrors the `PyO3`
     /// reference bridge's `PyBridgeInstance::outlet_streaming_saga_registry`.
     pub(crate) outlet_streaming_saga_registry:
-        Arc<DashMap<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+        Arc<StreamRegistry<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
 }
 
 /// Permit cap for [`NapiBridgeInstance::recovery_semaphore`].
@@ -385,9 +439,15 @@ impl NapiBridgeInstance {
         // the handle is moved into `durable_providers_from_handle`.
         let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
+        let core = CoreFields::new();
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::new(),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: std::sync::Mutex::new(HashMap::new()),
+            next_release_generation: std::sync::atomic::AtomicU64::new(0),
+            context_handles: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             durable_providers: Some(durable_providers),
@@ -397,8 +457,8 @@ impl NapiBridgeInstance {
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -418,9 +478,15 @@ impl NapiBridgeInstance {
         // selected before the handle is moved into the durable providers.
         let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
+        let core = CoreFields::with_persistence(persistence);
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::with_persistence(persistence),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: std::sync::Mutex::new(HashMap::new()),
+            next_release_generation: std::sync::atomic::AtomicU64::new(0),
+            context_handles: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             durable_providers: Some(durable_providers),
@@ -430,8 +496,8 @@ impl NapiBridgeInstance {
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -455,8 +521,10 @@ impl NapiBridgeInstance {
     ///
     /// Returns [`StorageInitError::SqliteOpen`] if the `SQLCipher` database
     /// cannot be opened (bad key/passphrase, permission denied, corrupt file,
-    /// or a salt-sidecar fail-closed condition). FAIL CLOSED (spec §17.6): the
-    /// bridge does NOT silently degrade to in-memory or no-storage on a failed
+    /// or a salt-sidecar fail-closed condition), and
+    /// [`StorageInitError::LockHeld`] if another store holds the directory's
+    /// advisory lock. FAIL CLOSED (spec §17.6): the bridge does NOT silently
+    /// degrade to in-memory or no-storage on a failed
     /// durable-backend open. The error is surfaced to the `SCP.withStorage`
     /// factory and thrown as a JS `ValidationError`.
     pub fn with_storage_napi(config: StorageConfig) -> Result<Self, StorageInitError> {
@@ -486,10 +554,7 @@ impl NapiBridgeInstance {
                         path = %path.display(),
                         "with_storage_napi: SQLCipher open failed — failing closed, no in-memory fallback"
                     );
-                    StorageInitError::SqliteOpen {
-                        path: path.display().to_string(),
-                        message: e.to_string(),
-                    }
+                    StorageInitError::from_open_failure(path.display().to_string(), &e)
                 })?;
 
                 let arc_storage = Arc::new(storage);
@@ -549,9 +614,15 @@ impl NapiBridgeInstance {
         durable_providers: scp_core::context::supervisor::DurableProviders,
         credential_store: FfiCredentialStore,
     ) -> Self {
+        let core = CoreFields::with_persistence_arc(persistence);
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::with_persistence_arc(persistence),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: std::sync::Mutex::new(HashMap::new()),
+            next_release_generation: std::sync::atomic::AtomicU64::new(0),
+            context_handles: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository,
             durable_providers: Some(durable_providers),
@@ -561,8 +632,8 @@ impl NapiBridgeInstance {
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -658,10 +729,28 @@ impl BridgeInstanceCore for NapiBridgeInstance {
     // gate `scripts/check-bridge-instance-lifecycle.py`.
 
     // `shutdown` inherits the `BridgeInstanceCore` default (ADR-049 §11,
-    // landed in commit 6): `core.shutdown_core_async(timeout).await +
-    // bridge_specific_shutdown()`. Overriding here would diverge from
+    // landed in commit 6). Overriding here would diverge from
     // the shared contract and be caught by the cross-bridge consistency
     // gate `scripts/check-bridge-instance-lifecycle.py`.
+
+    fn durable_store_closer(&self) -> Option<scp_ffi_common::bridge_instance::DurableStoreCloser> {
+        // The `Sqlite` variant's advisory lock on `{dir}/scp.db.lock` is
+        // released after the Supervisor drain, so a later
+        // `new SCP({ storage: { type: 'sqlite', path, key } })` against the
+        // same directory succeeds once a shutdown finished in time.
+        self.protocol_repository.durable_store_closer()
+    }
+
+    fn release_streams(&self) {
+        // Drop every live §5.4.5 stream on this instance — dropping the
+        // `StreamEntry` `Arc`s releases the control handle + chunk receiver
+        // (SCP-OUT-037, C8a).
+        self.outlet_stream_registry.clear();
+        // Drop every live §5.4.5 / §6.2.4 cross-context streaming saga on this
+        // instance — dropping the `StreamingSagaEntry` `Arc`s releases each
+        // saga's chunk receiver (SCP-OUT-047).
+        self.outlet_streaming_saga_registry.clear();
+    }
 
     fn bridge_specific_shutdown(&self) {
         // Clear typed registries. Dropping the `Arc<NapiKeyCustody>` values
@@ -670,30 +759,15 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         // the custody provider's `Drop` impl (matching the behavior of the
         // previous `clear_fn` closures).
         self.ucan_registry.clear();
+        lock_release_marks(self).clear();
+        self.context_handles.clear();
         self.identity_registry.clear();
-        // Release the SQLite advisory lock on `{dir}/scp.db.lock` for the
-        // `Sqlite` variant. Other `Arc<SqliteStorage>` holders
-        // (`CoreFields::persistence`, `ContextManager`) keep the storage
-        // struct alive until the `NapiBridgeInstance` drops, but the
-        // advisory lock must be released now so that a subsequent
-        // `new SCP({ storage: { type: 'sqlite', path, key } })` against
-        // the same directory does not fail with "already open by another
-        // SCP instance". The `InMemory` variant's `close()` is a no-op.
-        self.protocol_repository.close();
         // Clear MCP registries so server shutdown senders and client
         // connections drop, allowing background tasks to terminate cleanly.
         // Migrated off `crate::mcp::clear_registries` (called by a
         // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
-        // Drop every live §5.4.5 stream on this instance — dropping the
-        // `StreamEntry` `Arc`s releases the control handle + chunk receiver, so
-        // any parked pump task winds down (SCP-OUT-037, C8a).
-        self.outlet_stream_registry.clear();
-        // Drop every live §5.4.5 / §6.2.4 cross-context streaming saga on this
-        // instance — dropping the `StreamingSagaEntry` `Arc`s releases each
-        // saga's chunk receiver (SCP-OUT-047).
-        self.outlet_streaming_saga_registry.clear();
         // Reset the full-stack test network slot. Best-effort: on lock
         // poisoning we leave the slot alone — a poisoned mutex means
         // another thread panicked while holding it, which is a larger
@@ -856,26 +930,35 @@ fn document_vm_key_resolver(
 pub fn supervisor(
     bi: &NapiBridgeInstance,
 ) -> napi::Result<&Arc<scp_core::context::supervisor::Supervisor>> {
+    typed_supervisor(bi).map_err(napi::Error::from)
+}
+
+/// [`supervisor`] with the refusal kept as the typed [`ScpNapiError`], so a
+/// caller that returns `ScpNapiError` passes the `SCP-CTX-2000` refusal on
+/// as built instead of re-wrapping the rendered `napi::Error` text.
+fn typed_supervisor(
+    bi: &NapiBridgeInstance,
+) -> Result<&Arc<scp_core::context::supervisor::Supervisor>, ScpNapiError> {
     // Suspended: return error (recoverable — caller should resume()).
     // AlreadyShutDown: warn only — shutdown already destroyed state,
     // operations will fail naturally at MLS/transport layer.
     if bi.core.is_suspended() {
-        return Err(napi::Error::from(ScpNapiError::Context {
+        return Err(ScpNapiError::Context {
             message: "bridge is suspended — call resume() before performing operations".to_owned(),
             code: codes::CTX_2000.to_owned(),
-        }));
+        });
     }
     if bi.core.is_shutdown() {
         tracing::warn!("supervisor() called after shutdown — operations may fail");
     }
-    bi.core.try_supervisor().ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Context {
+    bi.core
+        .try_supervisor()
+        .ok_or_else(|| ScpNapiError::Context {
             message: "Supervisor not yet attached — call context_create, \
-                      context_join, context_import, or init_supervisor first"
+                  context_import, reserve_key_package, or context_join_from_welcome first"
                 .to_owned(),
             code: codes::CTX_2000.to_owned(),
         })
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,9 +1227,9 @@ fn persistence_box_for_init(bi: &NapiBridgeInstance) -> Box<dyn ContextPersisten
 /// `LocalTransportProvider` (silently succeeds on all send/publish calls)
 /// instead of `NotConfiguredTransportProvider` (rejects everything).
 ///
-/// **Must be called before any `context_create` / `context_join` /
-/// `context_import`** — those functions call `init_supervisor` which
-/// will win the `OnceLock` race if called first.
+/// **Must be called before any `context_create` / `context_import` /
+/// `reserve_key_package` / `context_join_from_welcome`** — those functions
+/// call `init_supervisor`, which wins the `OnceLock` race if called first.
 ///
 /// Exposed to JS/TS via `crate::transport::configure_local_transport` so
 /// that E2E tests can exercise `contextSend` and `broadcastPublish` without
@@ -1198,9 +1281,9 @@ pub fn init_supervisor_with_local_transport(bi: &NapiBridgeInstance, local_did: 
 /// the given relay URL. This allows the supervisor's send pipeline (and
 /// thus `contextSend`) to publish encrypted payloads through the relay.
 ///
-/// **Must be called before any `context_create` / `context_join` /
-/// `context_import`** — those functions call `init_supervisor` which
-/// will win the `OnceLock` race if called first.
+/// **Must be called before any `context_create` / `context_import` /
+/// `reserve_key_package` / `context_join_from_welcome`** — those functions
+/// call `init_supervisor`, which wins the `OnceLock` race if called first.
 ///
 /// Exposed to JS/TS via `crate::transport::configure_relay_transport` so
 /// that E2E tests can exercise the full send → relay → subscribe → receive
@@ -1596,14 +1679,10 @@ where
 /// Per-context UCAN validation state (NAPI bridge).
 ///
 /// Wraps [`scp_ffi_common::bridge_runtime::UcanContextStateCore`] with
-/// NAPI-specific fields for outlet management and role state. The core
-/// fields (revocation list, nonce tracker, ceiling, creator DID, event log)
-/// are shared with the `UniFFI` bridge (#1447).
+/// NAPI-specific fields for outlet management.
 pub struct UcanContextState {
     /// Core UCAN validation state shared with `UniFFI` bridge.
     pub core: scp_ffi_common::bridge_runtime::UcanContextStateCore,
-    /// Role state for capability checking (outlet registration, invocation).
-    pub role_state: ContextRoleState,
     /// Outlet registry for this context (cross-context + session support).
     pub outlet_registry: OutletRegistry,
     /// Registered outlet handlers keyed by outlet ID.
@@ -1624,94 +1703,61 @@ pub(crate) fn ucan_registry(bi: &NapiBridgeInstance) -> &DashMap<String, UcanCon
     bi.ucan_registry.as_ref()
 }
 
-/// Builds a fresh [`UcanContextState`] for a context, validating the caller's
-/// ceiling entries (§5.3.1.1) before normalizing them into the UCAN ceiling
-/// string set.
+/// Builds a fresh [`UcanContextState`] for a context after rejecting a caller
+/// ceiling entry that violates the §5.3.1.1 grammar.
 ///
 /// Shared by [`ensure_registered`] (lazy, idempotent — the UCAN-op path) and
 /// [`register_ffi_state`] (eager, fail-closed — the Welcome-join path) so the
-/// two cannot drift in how they construct per-context FFI state. Mirrors the
-/// `PyO3` reference bridge's `register_ffi_state` state-building: the role state
-/// is seeded from `default_ceiling()` with `creator_did` as admin, and the
-/// caller ceiling drives only the UCAN `ceiling_strings`.
+/// two cannot drift in how they construct per-context FFI state.
+///
+/// `user_ceiling` reaches this function for that grammar check alone. The state
+/// this function builds stores no role state, no ceiling, and no creator DID.
 ///
 /// # Errors
 ///
 /// Returns `ScpNapiError::Validation` if a ceiling entry violates the §5.3.1.1
-/// grammar, or `ScpNapiError::Context` if role-state construction fails.
+/// grammar.
 fn build_ucan_context_state(
     context_id: &str,
-    creator_did: &str,
     user_ceiling: &[String],
 ) -> Result<UcanContextState, ScpNapiError> {
-    let ceiling_strings = if user_ceiling.is_empty() {
-        scp_core::context::roles::default_ceiling()
-            .iter()
-            .map(scp_core::context::roles::Capability::ucan_capability_name)
-            .collect::<HashSet<String>>()
-    } else {
-        // Ceiling-entry grammar enforcement (spec §5.3.1.1) on each user entry
-        // BEFORE it is normalized into the UCAN ceiling string set. Validate the
-        // PARSED enum (`Capability::new(entry).validate_as_ceiling_entry()`) — NOT
-        // the raw string — so the validation checks EXACTLY the capability that
-        // gets enforced. `Capability::new` strips a `custom:` prefix: the raw
-        // string `"custom:payments"` has one colon (would pass a raw-string check)
-        // but parses to `Custom("payments")`, whose enforced form
-        // (`ucan_capability_name` → `payments:payments`) corresponds to a no-colon
-        // custom that `validate_as_ceiling_entry` REJECTS. Routing through the
-        // parsed enum keeps the raw-string validation and the enforced parse in
-        // agreement on one canonical form (BLACK-003), and still rejects a
-        // no-colon `payments` that would otherwise be widened to `payments:*`.
-        for entry in user_ceiling {
-            // Fail-closed: a malformed capability string (deleted legacy
-            // outlet-invoke / pre-rename outlet-invoke stems, invalid §5.4.2.1
-            // outlet suffix) parses to `None` and is rejected at the FFI
-            // boundary rather than silently dropped.
-            let cap = scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
-                ScpNapiError::Validation {
-                    message: format!(
-                        "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
-                    ),
-                    code: codes::VALID_7000.to_owned(),
-                }
+    // Ceiling-entry grammar enforcement (spec §5.3.1.1) on each user entry.
+    // Validate the PARSED enum (`Capability::new(entry).validate_as_ceiling_entry()`)
+    // — NOT the raw string — so the validation checks EXACTLY the capability that
+    // gets enforced. `Capability::new` strips a `custom:` prefix: the raw
+    // string `"custom:payments"` has one colon (would pass a raw-string check)
+    // but parses to `Custom("payments")`, whose enforced form
+    // (`ucan_capability_name` → `payments:payments`) corresponds to a no-colon
+    // custom that `validate_as_ceiling_entry` REJECTS. Routing through the
+    // parsed enum keeps the raw-string validation and the enforced parse in
+    // agreement on one canonical form (BLACK-003), and still rejects a
+    // no-colon `payments` that would otherwise be widened to `payments:*`.
+    for entry in user_ceiling {
+        // Fail-closed: a malformed capability string (deleted legacy
+        // outlet-invoke / pre-rename outlet-invoke stems, invalid §5.4.2.1
+        // outlet suffix) parses to `None` and is rejected at the FFI
+        // boundary rather than silently dropped.
+        let cap = scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
+            ScpNapiError::Validation {
+                message: format!(
+                    "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                ),
+                code: codes::VALID_7000.to_owned(),
+            }
+        })?;
+        cap.validate_as_ceiling_entry()
+            .map_err(|e| ScpNapiError::Validation {
+                message: e.to_string(),
+                code: codes::VALID_7000.to_owned(),
             })?;
-            cap.validate_as_ceiling_entry()
-                .map_err(|e| ScpNapiError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7000.to_owned(),
-                })?;
-        }
-        user_ceiling
-            .iter()
-            .filter_map(|s| {
-                scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name())
-            })
-            .collect::<HashSet<String>>()
-    };
-
-    // Default ceiling + no custom roles cannot fail validation in practice; the
-    // fallible path is preserved for parity with the shared constructor.
-    let role_state = ContextRoleState::new(
-        context_id,
-        creator_did,
-        default_ceiling(),
-        Vec::new(),
-        &SystemClock,
-    )
-    .map_err(|e| ScpNapiError::Context {
-        message: format!("failed to create role state: {e}"),
-        code: codes::CTX_2023.to_owned(),
-    })?;
+    }
 
     Ok(UcanContextState {
         core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
             revocation_list: RevocationList::new(context_id.to_owned()),
             nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-            ceiling_strings,
-            creator_did: creator_did.to_owned(),
             event_log: EventLog::new(context_id.to_owned()),
         },
-        role_state,
         outlet_registry: OutletRegistry::new(),
         outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),
@@ -1730,9 +1776,13 @@ fn build_ucan_context_state(
 /// consumed — and leaves the pre-existing entry untouched (the bridge must
 /// never roll back state it did not create).
 ///
-/// `creator_did` becomes the role-state admin; the joiner is inserted as a
-/// member by the caller via [`with_context`] immediately after, so a
-/// member-insert failure can roll this back.
+/// The registered state holds no role state, membership, capability ceiling,
+/// or creator DID.
+///
+/// `user_ceiling` is validated against the ceiling-entry grammar (spec
+/// §5.3.1.1) by [`build_ucan_context_state`] and then discarded; no ceiling is
+/// stored. The Welcome-join path passes an empty slice, because the ceiling
+/// the creator signed reaches the actor through `spawn_actor_from_welcome`.
 ///
 /// # Errors
 ///
@@ -1741,7 +1791,6 @@ fn build_ucan_context_state(
 pub fn register_ffi_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
-    creator_did: &str,
     user_ceiling: &[String],
 ) -> Result<(), ScpNapiError> {
     use dashmap::mapref::entry::Entry;
@@ -1752,7 +1801,8 @@ pub fn register_ffi_state(
             code: codes::CTX_2023.to_owned(),
         }),
         Entry::Vacant(vacant) => {
-            let state = build_ucan_context_state(context_id, creator_did, user_ceiling)?;
+            // This insert leaves the release mark in place.
+            let state = build_ucan_context_state(context_id, user_ceiling)?;
             vacant.insert(state);
             Ok(())
         }
@@ -1764,25 +1814,287 @@ pub fn register_ffi_state(
 ///
 /// If the context is already registered, this is a no-op. Otherwise, creates
 /// UCAN state from the `NapiContextHandle` metadata via
-/// [`build_ucan_context_state`].
+/// [`build_ucan_context_state`], unless [`release_context`] released the id.
+///
+/// The released-id check and the insert run under the registry entry's shard
+/// lock, so a mark that lands before this call takes the lock refuses the
+/// rebuild, and a mark that lands after it finds the entry this call built.
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Context` if the context state cannot be determined.
+/// Returns `ScpNapiError::Context` (`SCP-CTX-2023`) when a release marked the
+/// context's id on this bridge instance and the registry holds no state for
+/// it, and the errors of
+/// [`build_ucan_context_state`].
 pub fn ensure_registered(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> Result<(), ScpNapiError> {
+    use dashmap::mapref::entry::Entry;
+
     let context_id = handle.context_id();
-    let map = ucan_registry(bi);
-
-    if map.contains_key(&context_id) {
-        return Ok(());
+    if let Entry::Vacant(vacant) = ucan_registry(bi).entry(context_id) {
+        if lock_release_marks(bi).contains_key(vacant.key()) {
+            // The refusal withholds the lifecycle state: this call authorizes
+            // no one, so its answer must not say whether the context closed.
+            return Err(ScpNapiError::Context {
+                message: format!(
+                    "cannot use context: {}",
+                    scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+                ),
+                code: codes::CTX_2023.to_owned(),
+            });
+        }
+        let state = build_ucan_context_state(vacant.key(), &handle.ceiling())?;
+        vacant.insert(state);
     }
-
-    let state = build_ucan_context_state(&context_id, &handle.creator_did(), &handle.ceiling())?;
-    map.entry(context_id).or_insert(state);
     Ok(())
+}
+
+/// One release mark: the number of closes that set it and have not yet
+/// settled, and the generation it took when it was created.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReleaseMark {
+    pub(crate) in_flight: usize,
+    pub(crate) generation: u64,
+}
+
+/// One close's claim on a release mark: the context id and the mark
+/// generation the close set or joined.
+#[derive(Debug)]
+pub(crate) struct ReleaseTicket {
+    context_id: String,
+    generation: u64,
+}
+
+/// Locks `bi`'s release marks.
+pub(crate) fn lock_release_marks(
+    bi: &NapiBridgeInstance,
+) -> std::sync::MutexGuard<'_, HashMap<String, ReleaseMark>> {
+    bi.released_contexts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Sets the release mark on `context_id`, adds `in_flight` to its count of
+/// unsettled closes, and returns the mark's generation. A mark created by this
+/// call takes a generation no earlier mark of this instance took; a mark that
+/// already stands keeps its generation.
+fn set_release_mark(
+    marks: &mut HashMap<String, ReleaseMark>,
+    next_generation: &std::sync::atomic::AtomicU64,
+    context_id: &str,
+    in_flight: usize,
+) -> u64 {
+    let mark = marks
+        .entry(context_id.to_owned())
+        .or_insert_with(|| ReleaseMark {
+            in_flight: 0,
+            generation: next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        });
+    mark.in_flight = mark.in_flight.saturating_add(in_flight);
+    mark.generation
+}
+
+/// Returns the mark on `ticket`'s context id when it stands under `ticket`'s
+/// generation.
+fn ticketed_mark<'m>(
+    marks: &'m mut HashMap<String, ReleaseMark>,
+    ticket: &ReleaseTicket,
+) -> Option<&'m mut ReleaseMark> {
+    marks
+        .get_mut(&ticket.context_id)
+        .filter(|mark| mark.generation == ticket.generation)
+}
+
+/// Removes the UCAN state `entry` holds, if any, and releases the registry
+/// shard lock `entry` holds.
+fn remove_registry_entry(entry: dashmap::mapref::entry::Entry<'_, String, UcanContextState>) {
+    if let dashmap::mapref::entry::Entry::Occupied(occupied) = entry {
+        occupied.remove();
+    }
+}
+
+/// Releases a closed context's [`UcanContextState`] and marks the id so
+/// [`ensure_registered`] does not rebuild it.
+///
+/// The mark, both removals, and the handle-count check run while this call
+/// holds the registry entry for `context_id` and then the release-mark lock,
+/// the order [`ensure_registered`] takes them in. When no live
+/// [`NapiContextHandle`] for the id remains, this call drops the mark again.
+pub fn release_context(bi: &NapiBridgeInstance, context_id: &str) {
+    let entry = ucan_registry(bi).entry(context_id.to_owned());
+    let mut marks = lock_release_marks(bi);
+    set_release_mark(&mut marks, &bi.next_release_generation, context_id, 0);
+    bi.core.remove_known_context(context_id);
+    remove_registry_entry(entry);
+    prune_marked(bi, &mut marks, context_id);
+    drop(marks);
+}
+
+/// Marks `context_id` released with one unsettled close, and returns the
+/// ticket that names the mark generation this close set or joined.
+pub(crate) fn mark_released(bi: &NapiBridgeInstance, context_id: &str) -> ReleaseTicket {
+    let generation = set_release_mark(
+        &mut lock_release_marks(bi),
+        &bi.next_release_generation,
+        context_id,
+        1,
+    );
+    ReleaseTicket {
+        context_id: context_id.to_owned(),
+        generation,
+    }
+}
+
+/// Removes `ticket`'s context id's [`UcanContextState`] and known-context
+/// entry and runs `teardown`, only while the release mark stands under
+/// `ticket`'s generation, and returns whether it stood. When it stood, settles
+/// `ticket`'s close on it.
+///
+/// The mark check, both removals, and `teardown` run while this call holds the
+/// release-mark lock, which [`readmit_context`] also takes, so a readmit that
+/// clears the mark first leaves the readmitted context's state in place and
+/// `teardown` unrun, and a readmit that comes second waits for `teardown` to
+/// finish. No registry guard is held while `teardown` runs.
+pub(crate) fn remove_context_while_released(
+    bi: &NapiBridgeInstance,
+    ticket: ReleaseTicket,
+    teardown: impl FnOnce(),
+) -> bool {
+    let entry = ucan_registry(bi).entry(ticket.context_id.clone());
+    let mut marks = lock_release_marks(bi);
+    let Some(mark) = ticketed_mark(&mut marks, &ticket) else {
+        return false;
+    };
+    mark.in_flight = mark.in_flight.saturating_sub(1);
+    bi.core.remove_known_context(&ticket.context_id);
+    remove_registry_entry(entry);
+    teardown();
+    drop(marks);
+    true
+}
+
+/// Clears the release mark on `context_id`.
+///
+/// It clears the mark while holding the release-mark lock.
+pub fn readmit_context(bi: &NapiBridgeInstance, context_id: &str) {
+    lock_release_marks(bi).remove(context_id);
+}
+
+/// Settles `ticket`'s close and clears its context id's release mark when no
+/// unsettled close remains on it, if the mark stands under `ticket`'s
+/// generation.
+fn readmit_ticketed(bi: &NapiBridgeInstance, ticket: &ReleaseTicket) {
+    let mut marks = lock_release_marks(bi);
+    if let Some(mark) = ticketed_mark(&mut marks, ticket) {
+        mark.in_flight = mark.in_flight.saturating_sub(1);
+        if mark.in_flight == 0 {
+            marks.remove(&ticket.context_id);
+        }
+    }
+}
+
+/// Marks `context_id` released, re-reads the supervisor, and removes the
+/// context's bridge state and runs `teardown` only when the re-read does not
+/// report `Active`.
+///
+/// A close decides from a lifecycle read taken before it releases, so the id
+/// can return to `Active`, and be readmitted, in between. When the re-read,
+/// taken after the mark went in, reports `Active`, this removes nothing, runs
+/// nothing, returns `false`, and settles this call's close, clearing the mark
+/// once no unsettled close remains on it, so the readmitted context keeps its
+/// revocation list, nonce tracker, outlets, and sessions. On any other
+/// answer, a failed read included, it runs [`remove_context_while_released`]
+/// with `teardown` and returns its result: `true` when the mark stood under
+/// the generation this call set or joined, so the state was removed and
+/// `teardown` ran, and `false` otherwise.
+pub async fn release_context_unless_readmitted(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    teardown: impl FnOnce(),
+) -> bool {
+    let ticket = mark_released(bi, context_id);
+    if matches!(
+        read_live_context_state(bi, context_id).await,
+        Ok(Some(scp_core::context::ContextState::Active))
+    ) {
+        readmit_ticketed(bi, &ticket);
+        return false;
+    }
+    if !remove_context_while_released(bi, ticket, teardown) {
+        return false;
+    }
+    prune_release_mark(bi, context_id);
+    true
+}
+
+/// Counts one more live [`NapiContextHandle`] for `context_id` on this
+/// instance.
+///
+/// [`untrack_context_handle`] undoes one call.
+pub(crate) fn track_context_handle(bi: &NapiBridgeInstance, context_id: &str) {
+    *bi.context_handles.entry(context_id.to_owned()).or_insert(0) += 1;
+}
+
+/// Counts one fewer live [`NapiContextHandle`] for `context_id`, and drops the
+/// id's release mark when the count reaches zero and no close on the id is
+/// unsettled.
+///
+/// Dropping it keeps `released_contexts` from holding a mark for every closed
+/// context whose handles are gone. A count this instance does not hold (after a
+/// shutdown cleared the counts) changes nothing.
+pub(crate) fn untrack_context_handle(bi: &NapiBridgeInstance, context_id: &str) {
+    use dashmap::mapref::entry::Entry;
+
+    let last = match bi.context_handles.entry(context_id.to_owned()) {
+        Entry::Occupied(mut occupied) => {
+            let remaining = occupied.get().saturating_sub(1);
+            if remaining == 0 {
+                occupied.remove();
+                true
+            } else {
+                *occupied.get_mut() = remaining;
+                false
+            }
+        }
+        Entry::Vacant(_) => false,
+    };
+    if last {
+        prune_release_mark(bi, context_id);
+    }
+}
+
+/// Returns whether `context_id` holds a release mark on `bi`.
+#[cfg(test)]
+pub(crate) fn has_release_mark(bi: &NapiBridgeInstance, context_id: &str) -> bool {
+    lock_release_marks(bi).contains_key(context_id)
+}
+
+/// Drops `context_id`'s release mark when no live [`NapiContextHandle`] for
+/// the id remains and no close on it is unsettled.
+///
+/// The handle-count check and the removal run under the registry entry's
+/// shard lock and then the release-mark lock, the order [`ensure_registered`]
+/// takes them in while it reads the mark.
+fn prune_release_mark(bi: &NapiBridgeInstance, context_id: &str) {
+    let _shard = ucan_registry(bi).entry(context_id.to_owned());
+    prune_marked(bi, &mut lock_release_marks(bi), context_id);
+}
+
+/// The body of [`prune_release_mark`], for a caller that already holds the
+/// release-mark lock.
+fn prune_marked(
+    bi: &NapiBridgeInstance,
+    marks: &mut HashMap<String, ReleaseMark>,
+    context_id: &str,
+) {
+    if bi.context_handles.contains_key(context_id)
+        || marks.get(context_id).is_some_and(|mark| mark.in_flight > 0)
+    {
+        return;
+    }
+    marks.remove(context_id);
 }
 
 /// Executes a closure with mutable access to a context's UCAN state on the
@@ -1816,101 +2128,323 @@ where
 
 /// Removes UCAN state for a context on the given bridge instance.
 ///
-/// Called when a context is closed. Idempotent.
+/// Idempotent.
 pub fn remove_context(bi: &NapiBridgeInstance, context_id: &str) {
     ucan_registry(bi).remove(context_id);
     // Clean up known-context discovery entry on the same instance.
     bi.core.remove_known_context(context_id);
 }
 
-/// Re-syncs the `UcanContextState.role_state` for a context from the shared
-/// `ContextManager`.
+/// Reads a context's lifecycle state from that context's supervisor actor.
 ///
-/// Must be called after any governance action that modifies role state
-/// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that
-/// the NAPI-side copy used by UCAN/outlet capability checks stays current.
+/// A context with no registered actor reads as `None` instead of as an error,
+/// unless the supervisor holds a poison flag or a recovery in progress for it:
+/// an absent actor the crash watchdog poisoned reads as `Some(Poisoned)`,
+/// because the supervisor keeps that flag outside the actor (ADR-049 §10), and
+/// an absent actor the supervisor is still recovering reads as an error (see
+/// `# Errors`). A crash-window record that is neither poisoned, respawning, nor
+/// marked failed does not change the answer: that context reads as `None`.
+///
+/// [`require_active_context`] is the gate form: it turns `None` into an error so
+/// a gate never admits an operation on an absent answer.
+///
+/// An actor the supervisor still holds but this call got no answer from — a
+/// mailbox send that failed or timed out (a saturated mailbox, or a closed one
+/// because the actor task has terminated and the watchdog has not yet
+/// despawned it), a reply channel the actor dropped, or a reply that missed
+/// the reply timeout — reads as an error, never as `Ok(None)`.
+/// `Supervisor::read_context_state` folds that outcome into `None`; this
+/// function calls `Supervisor::read_context_state_checked`, which
+/// keeps the two outcomes apart.
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError` if the context is not registered in either the
-/// manager or the UCAN state registry.
-pub async fn sync_role_state_from_manager(
+/// Returns [`ScpNapiError::Context`] with:
+///
+/// - `SCP-CTX-2000` when this instance holds no supervisor, or when the bridge
+///   is suspended (the supervisor stays attached; call `resume()` and retry);
+/// - `SCP-CTX-2130` when an actor serves `context_id` but the mailbox send
+///   failed or timed out, or the actor dropped its reply to the state read or
+///   missed the reply timeout;
+/// - `SCP-CTX-2135` when no actor is registered for `context_id` because the
+///   crash watchdog despawned it and has not finished the respawn, because an
+///   operator's `clear_poison` cleared its poison flag and has not yet
+///   respawned it, because an import despawned it and has not yet registered
+///   the imported actor, or because its last respawn failed and the context is
+///   not yet poisoned (ADR-049 §10).
+///
+/// It also returns whatever error the actor's `ReadContextState` handler
+/// returned, translated by `From<ContextError>`. The state read reports a
+/// context the supervisor neither serves nor is recovering as `Ok(None)`, so
+/// a caller distinguishes "no actor serves this context" from "this bridge
+/// could not get an answer".
+pub async fn read_live_context_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
-) -> Result<(), ScpNapiError> {
-    use scp_core::context::actor::commands::QueriesCommand;
-    let sup = supervisor(bi).map_err(|e| ScpNapiError::Context {
-        message: e.to_string(),
-        code: codes::CTX_2000.to_owned(),
-    })?;
-    let sup = Arc::clone(sup);
-    // Route through the ADR-049 query shim. The handler returns
-    // `Ok(None)` when the context is unknown, matching the legacy
-    // `ContextManager::get_role_state` `Option` contract.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let cmd = QueriesCommand::GetRoleState {
-        context_id: context_id.to_owned(),
-        reply: tx,
-    };
-    sup.dispatch_query(cmd)
+) -> Result<Option<scp_core::context::ContextState>, ScpNapiError> {
+    let sup = Arc::clone(typed_supervisor(bi)?);
+    sup.read_context_state_checked(context_id)
         .await
-        .map_err(|e| ScpNapiError::Context {
-            message: format!("supervisor dispatch_query failed: {e}"),
-            code: codes::CTX_2000.to_owned(),
-        })?;
-    let new_role_state = rx
-        .await
-        .map_err(|e| ScpNapiError::Context {
-            message: format!("query shim reply dropped: {e}"),
-            code: codes::CTX_2000.to_owned(),
-        })?
-        .map_err(|e| ScpNapiError::Context {
-            message: e.to_string(),
-            code: codes::CTX_2000.to_owned(),
-        })?
-        .ok_or_else(|| ScpNapiError::Context {
-            message: format!("context '{context_id}' not registered with Supervisor"),
-            code: codes::CTX_2023.to_owned(),
-        })?;
-
-    with_context(bi, context_id, |st| {
-        st.role_state = new_role_state;
-        Ok(())
-    })
+        .map_err(ScpNapiError::from)
 }
 
-/// Re-syncs the `UcanContextState.core.ceiling_strings` for a context from the
-/// AUTHENTICATED context params carried by a joined
-/// [`ContextHandle`](scp_core::context::ContextHandle).
+/// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`.
 ///
-/// Peer of [`sync_role_state_from_manager`] (which syncs role state); this syncs
-/// the UCAN/outlet capability-check ceiling string set. Used by
-/// [`crate::context::context_join_from_welcome_on`]: the joiner no longer
-/// supplies a ceiling, so the FFI state is registered with the DEFAULT ceiling as
-/// a reversible precheck, then this overwrites it with the ceiling AUTHENTICATED
-/// by the joined MLS group's signed context binding. The ceiling entries are
-/// normalized to their enforced UCAN capability-name form (`{resource}:{action}`),
-/// matching the set [`build_ucan_context_state`] builds on the create path.
-/// Mirrors the `PyO3` reference bridge's `sync_ceiling_from_params`.
+/// The lifecycle gate reads the supervisor actor, never the `state` string
+/// [`NapiContextHandle`](crate::context::NapiContextHandle) caches. That string
+/// records only the transitions THIS bridge observed, so a TTL expiry the
+/// supervisor applied on its own timer, a close another member initiated, a
+/// migration that tombstoned the context, and an actor the watchdog poisoned
+/// all leave it reading `"active"`. A gate reading that string admits an
+/// operation into a context the supervisor stopped serving.
+///
+/// Fails closed: a context no actor serves refuses the operation. `mk_err`
+/// wraps the refusal message in the error variant and the error code the
+/// calling operation reports, so a lifecycle refusal keeps whichever
+/// [`ScpNapiError`] variant that operation already returned. A poisoned
+/// context is the exception: it refuses with `ContextPoisoned`
+/// (`SCP-CTX-2134`), the code ADR-049 §10 names as the consumer's signal to
+/// start operator recovery.
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Context` if the context's FFI state is not registered
-/// (unreachable on the join success path — the state was just registered and not
-/// removed).
-pub fn sync_ceiling_from_params(
+/// Returns [`ScpNapiError::Context`] with `SCP-CTX-2134` when the supervisor
+/// reports `Poisoned`; whatever `mk_err` builds when it reports any other state
+/// than `Active` and when no actor serves `context_id`; and the supervisor's
+/// own error (`SCP-CTX-2130` busy, `SCP-CTX-2135` crashed or mid-respawn) when
+/// the supervisor query itself fails, or `SCP-CTX-2000` when this bridge has no
+/// supervisor or is suspended (call `resume()` and retry).
+pub async fn require_active_context<F>(
     bi: &NapiBridgeInstance,
     context_id: &str,
-    ceiling: &[scp_core::context::roles::Capability],
-) -> Result<(), ScpNapiError> {
-    let ceiling_strings: HashSet<String> = ceiling
-        .iter()
-        .map(scp_core::context::roles::Capability::ucan_capability_name)
-        .collect();
-    with_context(bi, context_id, |st| {
-        st.core.ceiling_strings = ceiling_strings;
-        Ok(())
-    })
+    verb: &str,
+    mk_err: F,
+) -> Result<(), ScpNapiError>
+where
+    F: FnOnce(String) -> ScpNapiError,
+{
+    match read_live_context_state(bi, context_id).await? {
+        Some(scp_core::context::ContextState::Active) => Ok(()),
+        // ADR-049 §10: a caller detects a poisoned context by the
+        // `SCP-CTX-2134` code on its next per-context operation, not by
+        // polling `state()`, so the gate surfaces `ContextPoisoned` rather
+        // than the operation's own non-active code.
+        Some(scp_core::context::ContextState::Poisoned) => Err(ScpNapiError::from(
+            scp_core::context::ContextError::ContextPoisoned(context_id.to_owned()),
+        )),
+        Some(other) => Err(mk_err(format!(
+            "cannot {verb} in '{}' state -- context must be active",
+            context_state_str(&other)
+        ))),
+        None => Err(mk_err(format!(
+            "context '{context_id}' has no live supervisor state -- refusing to run a \
+             lifecycle-gated operation against a context no actor serves"
+        ))),
+    }
+}
+
+/// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`, and
+/// withholds the lifecycle state from the refusal.
+///
+/// The outlet PRD's SCP-OUT-031 PR-2a note records the rule this form keeps: the raw lifecycle state never reaches an
+/// FFI caller before authorization. The refusal therefore reads the same for
+/// every non-`Active` state, for a context no actor serves, and for a state
+/// read that failed: a closing or closed context, a context mid-respawn or
+/// past a failed respawn (`ActorCrashed`), a poisoned context, and an actor
+/// that did not answer (`ActorBusy`) refuse with the same text and the
+/// caller's code, and the text never names the context.
+///
+/// `mk_err` wraps the refusal message in the error variant and the error code
+/// the calling entry point reports.
+///
+/// # Errors
+///
+/// Returns whatever `mk_err` builds when the supervisor reports any state other
+/// than `Active`, when no actor serves `context_id`, and when the state read
+/// fails. Returns [`ScpNapiError::Context`] with `SCP-CTX-2000` when this
+/// bridge has no supervisor or is suspended (call `resume()` and retry); that
+/// refusal describes this bridge's own state, not the context, so it passes
+/// through unchanged.
+pub async fn require_active_context_before_authz<F>(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    verb: &str,
+    mk_err: F,
+) -> Result<(), ScpNapiError>
+where
+    F: FnOnce(String) -> ScpNapiError,
+{
+    let sup = Arc::clone(typed_supervisor(bi)?);
+    let state = sup
+        .read_context_state_checked(context_id)
+        .await
+        .map_err(ScpNapiError::from);
+    if let Err(ref e) = state {
+        tracing::debug!(
+            context_id,
+            error = %e,
+            "pre-authorization lifecycle read failed; withholding the cause from the caller"
+        );
+    }
+    match state {
+        Ok(Some(scp_core::context::ContextState::Active)) => Ok(()),
+        Ok(Some(_) | None) | Err(_) => Err(mk_err(withheld_refusal(verb))),
+    }
+}
+
+/// Reads `context_id`'s role state for an authorization decision after its
+/// supervisor actor reports `Active`, and withholds the lifecycle state from
+/// the refusal.
+///
+/// The function resolves the bridge's supervisor once and hands it to
+/// `active_role_state_on`, which runs both reads and takes no
+/// `&NapiBridgeInstance`, so neither read can resolve the supervisor again. The
+/// two reads are two mailbox round trips, and a close, a crash, or a saturated
+/// mailbox can land between them. The outlet PRD's SCP-OUT-031 PR-2a note
+/// records the rule this function keeps: the raw lifecycle state never reaches
+/// an FFI caller before authorization. The refusal therefore reads the same
+/// for every non-`Active` state, for a context no actor serves, for an actor
+/// fault either read meets (`ActorBusy`, `ActorCrashed`, `ContextPoisoned`),
+/// and for an actor that returned no role state: each refuses with the same
+/// text and the caller's code, and the text never names the context. The
+/// cause goes to the `debug` log, where an operator can still read it.
+///
+/// `mk_err` wraps the refusal message in the error variant and the error code
+/// the calling entry point reports.
+///
+/// # Errors
+///
+/// Returns whatever `mk_err` builds when the supervisor reports any state other
+/// than `Active`, when no actor serves `context_id`, when either read fails,
+/// and when the supervisor holds no role state for `context_id`. Returns
+/// [`ScpNapiError::Context`] with `SCP-CTX-2000` when this bridge has no
+/// supervisor or is suspended (call `resume()` and retry); that refusal
+/// describes this bridge's own state, not the context, so it passes through
+/// unchanged.
+pub async fn active_role_state_before_authz<F>(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    verb: &str,
+    mk_err: F,
+) -> Result<ContextRoleState, ScpNapiError>
+where
+    F: FnOnce(String) -> ScpNapiError,
+{
+    active_role_state_on(Arc::clone(typed_supervisor(bi)?), context_id, verb, mk_err).await
+}
+
+/// Runs both [`active_role_state_before_authz`] reads, the lifecycle state
+/// read and then the role-state read, on `sup`, the supervisor that function
+/// resolved.
+async fn active_role_state_on<F>(
+    sup: Arc<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+    verb: &str,
+    mk_err: F,
+) -> Result<ContextRoleState, ScpNapiError>
+where
+    F: FnOnce(String) -> ScpNapiError,
+{
+    let state = sup
+        .read_context_state_checked(context_id)
+        .await
+        .map_err(ScpNapiError::from);
+    withhold_before_authz(
+        context_id,
+        state,
+        || async move {
+            sup.get_role_state_checked(context_id)
+                .await
+                .map_err(ScpNapiError::from)
+        },
+        verb,
+        mk_err,
+    )
+    .await
+}
+
+/// Applies the [`active_role_state_before_authz`] refusal rule to a lifecycle
+/// state answer and a role-state read: `read_role_state` runs only after
+/// `state` reads `Active`. Every outcome other than an `Active` state followed
+/// by a present role state becomes the one withheld refusal `mk_err` builds,
+/// and its cause goes to the `debug` log.
+async fn withhold_before_authz<F, R, Fut>(
+    context_id: &str,
+    state: Result<Option<scp_core::context::ContextState>, ScpNapiError>,
+    read_role_state: R,
+    verb: &str,
+    mk_err: F,
+) -> Result<ContextRoleState, ScpNapiError>
+where
+    F: FnOnce(String) -> ScpNapiError,
+    R: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<ContextRoleState>, ScpNapiError>>,
+{
+    let cause = match state {
+        Ok(Some(scp_core::context::ContextState::Active)) => match read_role_state().await {
+            Ok(Some(role_state)) => return Ok(role_state),
+            Ok(None) => "the supervisor holds no role state".to_owned(),
+            Err(e) => format!("role-state read failed: {e}"),
+        },
+        Ok(Some(other)) => format!("lifecycle state is {}", context_state_str(&other)),
+        Ok(None) => "no actor serves the context".to_owned(),
+        Err(e) => format!("lifecycle read failed: {e}"),
+    };
+    tracing::debug!(
+        context_id,
+        cause = %cause,
+        "pre-authorization gate refused; withholding the cause from the caller"
+    );
+    Err(mk_err(withheld_refusal(verb)))
+}
+
+/// The refusal text both pre-authorization forms report: `verb` plus the
+/// shared withheld message, with no lifecycle state and no context id.
+fn withheld_refusal(verb: &str) -> String {
+    format!(
+        "cannot {verb}: {}",
+        scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+    )
+}
+
+/// Reads a context's role state from that context's supervisor actor.
+///
+/// Reports each failure as itself.
+///
+/// Fails closed. A context whose actor returns no role state yields
+/// [`ScpNapiError::Context`] with `SCP-CTX-2023`; no caller receives a
+/// permissive default.
+///
+/// # Errors
+///
+/// Returns [`ScpNapiError::Context`] with `SCP-CTX-2000` when this instance
+/// holds no supervisor or is suspended, and with `SCP-CTX-2023` when the
+/// supervisor holds no role state for `context_id`. Returns the converted
+/// `ActorBusy` (`SCP-CTX-2130`), `ActorCrashed` (`SCP-CTX-2135`), or
+/// `ContextPoisoned` (`SCP-CTX-2134`) error when the context's actor is
+/// saturated, wedged, mid-respawn, or poisoned, so a caller never reads an
+/// actor that did not answer as an absent context.
+pub async fn live_role_state(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<ContextRoleState, ScpNapiError> {
+    let sup = Arc::clone(typed_supervisor(bi)?);
+    sup.get_role_state_checked(context_id)
+        .await?
+        .ok_or_else(|| ScpNapiError::Context {
+            message: format!(
+                "context '{context_id}' has no live supervisor role state -- refusing to \
+                 authorize against an absent membership record"
+            ),
+            code: codes::CTX_2023.to_owned(),
+        })
+}
+
+/// Renders a [`ContextState`](scp_core::context::ContextState) as the lowercase
+/// name a lifecycle-gate error reports.
+#[must_use]
+pub const fn context_state_str(state: &scp_core::context::ContextState) -> &'static str {
+    scp_ffi_common::context_state_str(state)
 }
 
 /// Registers an outlet handler for an outlet in a context.
@@ -1975,46 +2509,125 @@ pub fn query_trust_event_counts(
 // `bi.core.with_rate_limit_tracker(identity_did, f)` directly.
 
 /// Registers a test context in the UCAN state registry.
-///
-/// # Panics
-///
-/// Panics if `ContextRoleState::new` fails with default ceiling and no
-/// custom roles, which should be infallible.
 #[cfg(test)]
-#[allow(clippy::expect_used)]
-pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_did: &str) {
+pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str) {
     let map = ucan_registry(bi);
-
-    let ceiling_strings = scp_core::context::roles::default_ceiling()
-        .iter()
-        .map(scp_core::context::roles::Capability::ucan_capability_name)
-        .collect::<HashSet<String>>();
-
-    // Default ceiling + no custom roles: infallible in practice.
-    let role_state = ContextRoleState::new(
-        context_id,
-        creator_did,
-        default_ceiling(),
-        Vec::new(),
-        &SystemClock,
-    )
-    .expect("ContextRoleState::new with default ceiling and no custom roles cannot fail");
 
     let state = UcanContextState {
         core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
             event_log: EventLog::new(context_id.to_owned()),
             revocation_list: RevocationList::new(context_id.to_owned()),
             nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-            ceiling_strings,
-            creator_did: creator_did.to_owned(),
         },
-        role_state,
         outlet_registry: OutletRegistry::new(),
         outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),
     };
 
     map.entry(context_id.to_owned()).or_insert(state);
+}
+
+/// Attaches a supervisor to `bi` if none is attached, then creates `context_id`
+/// inside it under `creator_did` with `default_ceiling()` as the capability
+/// ceiling.
+///
+/// [`register_test_context`] alone registers the bridge's UCAN state; it does
+/// NOT create the context inside a supervisor, so every lifecycle gate refuses
+/// a context a test only registered. Tests call this to give the context the
+/// actor a real `context_create` would have spawned.
+///
+/// Gated on `testing` as well as `test`: its only callers are `testing`-gated
+/// tests, and the production test lane (`--features server`) must compile it
+/// out rather than warn that it is unused.
+///
+/// # Errors
+///
+/// Returns the bridge error when no supervisor is attached or when
+/// `create_context` rejects the request. The calling test fails on either,
+/// because both are a broken fixture rather than a condition under test.
+#[cfg(all(test, feature = "testing"))]
+pub(crate) async fn create_supervisor_context_for_test(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    creator_did: &str,
+) -> napi::Result<()> {
+    let ceiling: Vec<scp_core::context::roles::Capability> =
+        scp_core::context::roles::default_ceiling()
+            .iter()
+            .cloned()
+            .collect();
+    create_supervisor_context_with_capabilities(bi, context_id, creator_did, ceiling).await
+}
+
+/// [`create_supervisor_context_for_test`] with `ceiling` as the context's
+/// capability ceiling instead of `default_ceiling()`.
+///
+/// A test that gives the supervisor a ceiling different from the handle's
+/// (`NapiContextHandle::test_active_on` writes an empty `ceiling`) proves an
+/// entry point read the supervisor: the handle would answer differently.
+/// `ceiling` entries take the colon form the TypeScript surface accepts
+/// (`"messages:read"`, `"outlet:call:*"`).
+///
+/// # Errors
+///
+/// Returns a validation error when a `ceiling` entry fails the capability
+/// parser, and the bridge error when no supervisor is attached or when
+/// `create_context` rejects the request. The calling test fails on each,
+/// because each is a broken fixture rather than a condition under test.
+#[cfg(all(test, feature = "testing"))]
+pub(crate) async fn create_supervisor_context_with_ceiling_for_test(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    creator_did: &str,
+    ceiling: &[&str],
+) -> napi::Result<()> {
+    let ceiling = ceiling
+        .iter()
+        .map(|entry| {
+            scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
+                napi::Error::from(ScpNapiError::Validation {
+                    message: format!("test ceiling entry {entry:?} does not parse"),
+                    code: codes::VALID_7004.to_owned(),
+                })
+            })
+        })
+        .collect::<napi::Result<Vec<_>>>()?;
+    create_supervisor_context_with_capabilities(bi, context_id, creator_did, ceiling).await
+}
+
+/// A creator DID that no identity and no supervisor context carries. Tests
+/// name it in a [`crate::context::NapiContextHandle`], so an entry point that
+/// took the creator from the handle instead of the supervisor fails to resolve
+/// that creator's signing key.
+#[cfg(all(
+    test,
+    any(feature = "testing", feature = "outlet-capability-test-grant")
+))]
+pub(crate) const KEYLESS_HANDLE_CREATOR: &str = "did:dht:z6MkNapiKeylessHandleCreator";
+
+/// The shared body of the two supervisor-context test fixtures.
+#[cfg(all(test, feature = "testing"))]
+async fn create_supervisor_context_with_capabilities(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    creator_did: &str,
+    ceiling: Vec<scp_core::context::roles::Capability>,
+) -> napi::Result<()> {
+    init_supervisor_for_test_on(bi);
+    let params = scp_core::context::ContextParams {
+        ceiling,
+        ..scp_core::context::ContextParams::default()
+    };
+    let sup = Arc::clone(supervisor(bi)?);
+    sup.create_context(
+        context_id.to_owned(),
+        params,
+        scp_did::DID(creator_did.to_owned()),
+        None,
+    )
+    .await
+    .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2160,6 +2773,36 @@ impl ContextPersistence for ArcContextPersistence {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use scp_core::context::roles::default_ceiling;
+
+    /// The stream registries this bridge builds share its core's shutdown
+    /// gate: a streaming-saga entry registers before shutdown begins and is
+    /// refused after `stop_borrowers`.
+    #[test]
+    fn stream_registries_refuse_inserts_once_shutdown_begins() {
+        fn entry(saga_id: &str) -> scp_ffi_common::streaming_saga::StreamingSagaEntry {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            scp_ffi_common::streaming_saga::StreamingSagaEntry {
+                receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+                saga_id: scp_core::context::supervisor::SagaId(saga_id.to_owned()),
+                target_context_id: "ctx".to_owned(),
+                invoker_did: "invoker".to_owned(),
+                request_id: [0u8; 16],
+            }
+        }
+        let bi = NapiBridgeInstance::new_napi();
+        assert!(
+            bi.outlet_streaming_saga_registry
+                .insert("early".to_owned(), entry("early"))
+        );
+        bi.core.stop_borrowers();
+        assert!(
+            !bi.outlet_streaming_saga_registry
+                .insert("late".to_owned(), entry("late"))
+        );
+        assert!(!bi.outlet_streaming_saga_registry.contains_key("late"));
+        assert!(bi.outlet_streaming_saga_registry.contains_key("early"));
+    }
 
     // -----------------------------------------------------------------------
     // BridgeInstance tests (#1549)
@@ -2180,6 +2823,49 @@ mod tests {
             Arc::ptr_eq(sup, bi.core.try_supervisor().unwrap()),
             "supervisor(&bi) must match bi.core.try_supervisor()"
         );
+    }
+
+    /// `read_live_context_state` passes the `SCP-CTX-2000` refusal on as
+    /// `supervisor` built it: one code, and no rendered `napi::Error` status
+    /// inside the message. Covers a bridge with no supervisor, a suspended
+    /// one, and an attached one that answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_live_context_state_keeps_the_ctx_2000_refusal_as_built() {
+        let assert_refusal = |err: ScpNapiError, expected: &str| {
+            let rendered = err.to_string();
+            assert!(
+                matches!(&err, ScpNapiError::Context { code, .. } if code == codes::CTX_2000),
+                "expected an SCP-CTX-2000 context error, got {err:?}"
+            );
+            assert!(
+                rendered.starts_with(&format!("[{}] context error: {expected}", codes::CTX_2000)),
+                "rendered: {rendered}"
+            );
+            assert_eq!(
+                rendered.matches(codes::CTX_2000).count(),
+                1,
+                "the code appears once: {rendered}"
+            );
+            assert!(
+                !rendered.contains("GenericFailure"),
+                "the message re-wraps a rendered napi::Error: {rendered}"
+            );
+        };
+
+        let bi = NapiBridgeInstance::new_napi();
+        let err = read_live_context_state(&bi, "ctx-none").await.unwrap_err();
+        assert_refusal(err, "Supervisor not yet attached");
+
+        init_supervisor_for_test_on(&bi);
+        assert_eq!(
+            read_live_context_state(&bi, "ctx-none").await.unwrap(),
+            None,
+            "an attached supervisor answers for a context it does not serve"
+        );
+
+        bi.core.suspend().expect("suspend");
+        let err = read_live_context_state(&bi, "ctx-none").await.unwrap_err();
+        assert_refusal(err, "bridge is suspended");
     }
 
     #[test]
@@ -2276,6 +2962,72 @@ mod tests {
             bi.durable_providers_ref().is_some(),
             "in-memory dev path must populate the durable providers"
         );
+    }
+
+    /// `from_open_failure` keeps the lock-still-held condition apart from
+    /// every other open failure, and `code()` names each one's registered
+    /// code (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes).
+    #[test]
+    fn open_failure_classification_carries_registered_codes() {
+        let held = StorageInitError::from_open_failure(
+            "/tmp/scp".to_owned(),
+            &scp_platform::PlatformError::StorageLockHeld {
+                dir: "/tmp/scp".to_owned(),
+                lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+            },
+        );
+        assert!(
+            matches!(held, StorageInitError::LockHeld { .. }),
+            "{held:?}"
+        );
+        assert_eq!(held.code(), scp_ffi_common::error_codes::STORAGE_8005);
+        let other = StorageInitError::from_open_failure(
+            "/tmp/scp".to_owned(),
+            &scp_platform::PlatformError::StorageError("bad key".to_owned()),
+        );
+        assert!(
+            matches!(other, StorageInitError::SqliteOpen { .. }),
+            "{other:?}"
+        );
+        assert_eq!(other.code(), scp_ffi_common::error_codes::STORAGE_8004);
+    }
+
+    /// Spec §17.6 "One Opener per Durable Directory": a second open of a
+    /// directory whose store is live fails with `LockHeld`, and a shutdown
+    /// that finished in time closes the store (through the bridge's
+    /// `durable_store_closer`) before it returns, so a reopen succeeds on its
+    /// first attempt even while the shut-down instance is still alive.
+    #[test]
+    fn sqlite_shutdown_releases_the_lock_before_returning() {
+        use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bi = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+            path: tmp.path().to_path_buf(),
+            key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x33u8; 32])),
+        })
+        .expect("first open");
+        let second = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+            path: tmp.path().to_path_buf(),
+            key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x33u8; 32])),
+        });
+        assert!(
+            matches!(second, Err(StorageInitError::LockHeld { .. })),
+            "a second open of a live store's directory must fail with LockHeld"
+        );
+        let outcome = crate::runtime().block_on(bi.shutdown(std::time::Duration::from_secs(10)));
+        assert!(
+            matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
+            "{outcome:?}"
+        );
+        let reopened = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+            path: tmp.path().to_path_buf(),
+            key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x33u8; 32])),
+        });
+        assert!(
+            reopened.is_ok(),
+            "a reopen after a shutdown that finished in time must succeed on its first attempt"
+        );
+        drop(bi);
     }
 
     #[test]
@@ -2425,4 +3177,344 @@ mod tests {
     // legacy default bridge no longer exists. Each caller owns its own
     // `NapiBridgeInstance` and `Scp::new()` verifies uniqueness via
     // `test_napi_bridge_instance_unique_ids` above.
+
+    // -----------------------------------------------------------------------
+    // The UCAN pre-authorization gate and the live role-state reads
+    // -----------------------------------------------------------------------
+
+    /// The refusal a test caller builds, with a code no UCAN entry point uses,
+    /// so an assertion on it proves the gate kept the caller's code.
+    fn caller_refusal(message: String) -> ScpNapiError {
+        ScpNapiError::Validation {
+            message,
+            code: codes::VALID_7004.to_owned(),
+        }
+    }
+
+    /// The pre-authorization gate refuses a context no actor serves, a
+    /// poisoned context, a context mid-respawn or past a failed respawn, and an
+    /// actor that does not answer, with the withheld text and the caller's
+    /// code, and admits an Active context.
+    ///
+    /// `read_live_context_state` reports the poisoned context as
+    /// `Some(Poisoned)`, the crashed ones as `ActorCrashed` (`SCP-CTX-2135`),
+    /// and the unreachable mailbox as `ActorBusy` (`SCP-CTX-2130`). A gate
+    /// that passed any of those through told a caller it had not yet
+    /// authorized that the context exists and is faulted, which the outlet
+    /// PRD's SCP-OUT-031 PR-2a note forbids.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pre_authz_gate_withholds_absent_poisoned_crashed_and_busy_states() {
+        let bi = NapiBridgeInstance::new_napi();
+        init_supervisor_for_test_on(&bi);
+        let creator = "did:key:z6MkNapiPreAuthzGate";
+        let sup = Arc::clone(supervisor(&bi).expect("supervisor"));
+
+        let active = format!("napi-preauthz-active-{}", uuid::Uuid::new_v4());
+        create_supervisor_context_for_test(&bi, &active, creator)
+            .await
+            .expect("test supervisor context creation must succeed");
+        require_active_context_before_authz(&bi, &active, "probe", caller_refusal)
+            .await
+            .expect("the gate must admit an Active context");
+        let role_state = active_role_state_before_authz(&bi, &active, "probe", caller_refusal)
+            .await
+            .expect("the gate-and-read must admit an Active context");
+        assert_eq!(role_state.creator_did, creator);
+
+        for fault in [
+            "absent",
+            "poisoned",
+            "mid_respawn",
+            "respawn_failed",
+            "unreachable",
+        ] {
+            let ctx_id = format!("napi-preauthz-{fault}-{}", uuid::Uuid::new_v4());
+            if fault != "absent" {
+                create_supervisor_context_for_test(&bi, &ctx_id, creator)
+                    .await
+                    .expect("test supervisor context creation must succeed");
+            }
+            match fault {
+                "poisoned" => sup.test_poison_context(&ctx_id).await,
+                "mid_respawn" => sup.test_hold_context_mid_respawn(&ctx_id).await,
+                "respawn_failed" => sup.test_fail_context_respawn(&ctx_id).await,
+                "unreachable" => sup.test_make_actor_unreachable(&ctx_id),
+                _ => {}
+            }
+
+            let gate_err =
+                require_active_context_before_authz(&bi, &ctx_id, "probe", caller_refusal)
+                    .await
+                    .expect_err("the gate must refuse a context that is not Active");
+            let read_err = active_role_state_before_authz(&bi, &ctx_id, "probe", caller_refusal)
+                .await
+                .expect_err("the gate-and-read must refuse a context that is not Active");
+            for (form, err) in [("gate", gate_err), ("gate-and-read", read_err)] {
+                let text = err.to_string();
+                assert!(
+                    text.contains(&format!(
+                        "cannot probe: {}",
+                        scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+                    )) && text.contains(codes::VALID_7004),
+                    "the {form} refusal must carry the withheld text and the caller's code \
+                     ({fault}): {text}"
+                );
+                for leaked in [
+                    ctx_id.as_str(),
+                    codes::CTX_2130,
+                    codes::CTX_2134,
+                    codes::CTX_2135,
+                ] {
+                    assert!(
+                        !text.contains(leaked),
+                        "the {form} refusal must not disclose {leaked:?} ({fault}): {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The pre-authorization gate passes the `SCP-CTX-2000` refusal through
+    /// for a bridge with no supervisor and for a suspended bridge, so the
+    /// caller reads "call `resume()`" rather than "context is not active", and
+    /// admits the same Active context once the bridge resumes.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pre_authz_gate_passes_the_bridge_local_ctx_2000_refusal_through() {
+        let bi = NapiBridgeInstance::new_napi();
+        let err = require_active_context_before_authz(&bi, "ctx-none", "probe", caller_refusal)
+            .await
+            .expect_err("a bridge with no supervisor must refuse");
+        assert!(
+            matches!(&err, ScpNapiError::Context { code, message }
+                if code == codes::CTX_2000 && message.contains("Supervisor not yet attached")),
+            "expected the no-supervisor SCP-CTX-2000 refusal, got {err:?}"
+        );
+
+        init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-preauthz-suspended-{}", uuid::Uuid::new_v4());
+        create_supervisor_context_for_test(&bi, &ctx_id, "did:key:z6MkNapiPreAuthzSuspend")
+            .await
+            .expect("test supervisor context creation must succeed");
+        bi.core.suspend().expect("suspend");
+        let err = require_active_context_before_authz(&bi, &ctx_id, "probe", caller_refusal)
+            .await
+            .expect_err("a suspended bridge must refuse");
+        assert!(
+            matches!(&err, ScpNapiError::Context { code, message }
+                if code == codes::CTX_2000 && message.contains("bridge is suspended")),
+            "expected the suspended SCP-CTX-2000 refusal, got {err:?}"
+        );
+        assert!(
+            !err.to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "a suspended bridge must not report the context as not active: {err}"
+        );
+
+        bi.core.resume().await.expect("resume");
+        require_active_context_before_authz(&bi, &ctx_id, "probe", caller_refusal)
+            .await
+            .expect("the gate must admit the Active context after resume");
+    }
+
+    /// A role-state read that fails after the lifecycle state read `Active`
+    /// becomes the same withheld refusal, a read that finds no role state does
+    /// too, and a read that succeeds passes through unchanged.
+    ///
+    /// Each input carries what a raw failure would hand an unauthorized
+    /// caller: the context id the absent-role-state refusal names, or an actor
+    /// fault code.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_that_fails_after_the_gate_is_withheld() {
+        let ctx_id = "ctx-withheld-after-gate";
+        let active = || Ok(Some(scp_core::context::ContextState::Active));
+        for raw in [
+            ScpNapiError::Context {
+                message: format!("context '{ctx_id}' has no live supervisor role state"),
+                code: codes::CTX_2023.to_owned(),
+            },
+            ScpNapiError::from(scp_core::context::ContextError::ActorBusy(format!(
+                "actor for '{ctx_id}' did not answer"
+            ))),
+            ScpNapiError::from(scp_core::context::ContextError::ActorCrashed(
+                ctx_id.to_owned(),
+            )),
+            ScpNapiError::from(scp_core::context::ContextError::ContextPoisoned(
+                ctx_id.to_owned(),
+            )),
+        ] {
+            let raw_text = raw.to_string();
+            let err = withhold_before_authz(
+                ctx_id,
+                active(),
+                || async { Err(raw) },
+                "probe",
+                caller_refusal,
+            )
+            .await
+            .expect_err("a failed read must stay a refusal");
+            let text = err.to_string();
+            assert!(
+                text.contains(&format!(
+                    "cannot probe: {}",
+                    scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+                )) && text.contains(codes::VALID_7004),
+                "the refusal must be the withheld one with the caller's code: {text}"
+            );
+            assert!(
+                !text.contains(ctx_id),
+                "the refusal must not echo the context id that {raw_text:?} carried: {text}"
+            );
+        }
+
+        let err = withhold_before_authz(
+            ctx_id,
+            active(),
+            || async { Ok(None) },
+            "probe",
+            caller_refusal,
+        )
+        .await
+        .expect_err("an absent role state must stay a refusal");
+        assert!(
+            err.to_string().contains(&format!(
+                "cannot probe: {}",
+                scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+            )) && !err.to_string().contains(ctx_id),
+            "an absent role state must be the withheld refusal: {err}"
+        );
+
+        let creator = "did:key:z6MkNapiWithholdPassThrough";
+        let role_state =
+            ContextRoleState::new(ctx_id, creator, default_ceiling(), Vec::new(), &SystemClock)
+                .expect("default role state");
+        let passed = withhold_before_authz(
+            ctx_id,
+            active(),
+            || async { Ok(Some(role_state)) },
+            "probe",
+            caller_refusal,
+        )
+        .await
+        .expect("a successful read passes through");
+        assert_eq!(passed.creator_did, creator);
+    }
+
+    /// The gate-and-read keeps the bridge-local `SCP-CTX-2000` refusal on a
+    /// bridge with no supervisor and on a suspended bridge, so the caller reads
+    /// "call `resume()`" rather than "context is not active". Once the bridge
+    /// resumes, a context with no role state is withheld again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_that_fails_on_a_suspended_bridge_keeps_the_ctx_2000_refusal() {
+        let ctx_id = "ctx-suspended-after-gate";
+
+        let bare = NapiBridgeInstance::new_napi();
+        let err = active_role_state_before_authz(&bare, ctx_id, "probe", caller_refusal)
+            .await
+            .expect_err("a bridge with no supervisor must refuse");
+        assert!(
+            matches!(&err, ScpNapiError::Context { code, message }
+                if code == codes::CTX_2000 && message.contains("Supervisor not yet attached")),
+            "expected the no-supervisor SCP-CTX-2000 refusal, got {err:?}"
+        );
+
+        let bi = NapiBridgeInstance::new_napi();
+        init_supervisor_for_test_on(&bi);
+        bi.core.suspend().expect("suspend");
+        let err = active_role_state_before_authz(&bi, ctx_id, "probe", caller_refusal)
+            .await
+            .expect_err("a suspended bridge must refuse");
+        assert!(
+            matches!(&err, ScpNapiError::Context { code, message }
+                if code == codes::CTX_2000 && message.contains("bridge is suspended")),
+            "expected the suspended SCP-CTX-2000 refusal, got {err:?}"
+        );
+        assert!(
+            !err.to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "a suspended bridge must not report the context as not active: {err}"
+        );
+
+        bi.core.resume().await.expect("resume");
+        let err = active_role_state_before_authz(&bi, ctx_id, "probe", caller_refusal)
+            .await
+            .expect_err("a context no actor serves must stay a refusal");
+        assert!(
+            err.to_string().contains(&format!(
+                "cannot probe: {}",
+                scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+            )) && err.to_string().contains(codes::VALID_7004),
+            "after resume the refusal must be withheld again: {err}"
+        );
+    }
+
+    /// `live_role_state` reports an actor that does not answer as busy
+    /// (`SCP-CTX-2130`), a poisoned context as `SCP-CTX-2134`, and a context
+    /// the supervisor never held as absent (`SCP-CTX-2023`), and returns the
+    /// role state of an Active context with the creator and ceiling the
+    /// supervisor holds.
+    ///
+    /// A read that folded a busy actor into "absent" told its caller the
+    /// context does not exist when the caller should retry.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_role_state_reports_busy_poisoned_and_absent_apart() {
+        let bi = NapiBridgeInstance::new_napi();
+        init_supervisor_for_test_on(&bi);
+        let creator = "did:key:z6MkNapiLiveRoleState";
+        let sup = Arc::clone(supervisor(&bi).expect("supervisor"));
+
+        let active = format!("napi-live-role-active-{}", uuid::Uuid::new_v4());
+        create_supervisor_context_with_ceiling_for_test(&bi, &active, creator, &["messages:read"])
+            .await
+            .expect("test supervisor context creation must succeed");
+        let role_state = live_role_state(&bi, &active)
+            .await
+            .expect("an Active context answers");
+        assert_eq!(role_state.creator_did, creator);
+        assert_eq!(
+            role_state.ceiling().to_ucan_string_set(),
+            std::collections::HashSet::from(["messages:read".to_owned()]),
+        );
+
+        for (fault, expected) in [
+            ("unreachable", codes::CTX_2130),
+            ("poisoned", codes::CTX_2134),
+            ("absent", codes::CTX_2023),
+        ] {
+            let ctx_id = format!("napi-live-role-{fault}-{}", uuid::Uuid::new_v4());
+            if fault != "absent" {
+                create_supervisor_context_for_test(&bi, &ctx_id, creator)
+                    .await
+                    .expect("test supervisor context creation must succeed");
+            }
+            match fault {
+                "unreachable" => sup.test_make_actor_unreachable(&ctx_id),
+                "poisoned" => sup.test_poison_context(&ctx_id).await,
+                _ => {}
+            }
+            let err = live_role_state(&bi, &ctx_id)
+                .await
+                .expect_err("a context that does not answer has no role state to return");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected} ({fault}), got: {err}"
+            );
+        }
+    }
+
+    /// `live_role_state` refuses with `SCP-CTX-2000` on a bridge instance with
+    /// no supervisor, rather than answering with a default role state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_role_state_fails_closed_without_a_supervisor() {
+        let bi = NapiBridgeInstance::new_napi();
+        let err = live_role_state(&bi, "ctx-no-supervisor")
+            .await
+            .expect_err("no supervisor, no role state");
+        assert!(
+            err.to_string().contains(codes::CTX_2000),
+            "expected SCP-CTX-2000, got: {err}"
+        );
+    }
 }

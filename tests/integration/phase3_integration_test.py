@@ -23,7 +23,9 @@ the authoritative 13-step specification.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -33,18 +35,38 @@ import pytest
 # Bridge availability check
 # ---------------------------------------------------------------------------
 
+# The absence check lives in the Python SDK's test conftest, which pytest does
+# not load for a file under the repository-root ``tests/`` directory, so this
+# module loads it by path. It skips only when no extension file is installed
+# (SCP-VALID-7081) and raises for a present extension that failed to load
+# (SCP-VALID-7082). maturin installs the extension as ``scp_sdk._scp_core``.
+#
+# Status: this module fails at import on every machine, because the
+# ``from scp_sdk import (... ToolDefinition ...)`` below names an export
+# ``scp_sdk`` does not define, so pytest collects and runs no test
+# here, and no CI step runs the module. Its tests also patch
+# ``sys.modules["_scp_core"]``, a name no SDK code reads. The guard below is
+# inert until the suite is rewritten.
+_CONFTEST_SPEC = importlib.util.spec_from_file_location(
+    "_scp_python_tests_conftest",
+    Path(__file__).resolve().parents[2] / "bindings" / "python" / "tests" / "conftest.py",
+)
+assert _CONFTEST_SPEC is not None and _CONFTEST_SPEC.loader is not None
+_conftest = importlib.util.module_from_spec(_CONFTEST_SPEC)
+_CONFTEST_SPEC.loader.exec_module(_conftest)
+skip_reason_if_extension_absent = _conftest.skip_reason_if_extension_absent
+
+_NATIVE_SKIP_REASON: str | None
 try:
-    import _scp_core  # type: ignore[import-not-found]
+    from scp_sdk import _scp_core  # noqa: F401  (installed as scp_sdk._scp_core)
 
-    _BRIDGE_AVAILABLE = True
-except ImportError:
-    _BRIDGE_AVAILABLE = False
+    _NATIVE_SKIP_REASON = None
+except Exception as _exc:
+    _NATIVE_SKIP_REASON = skip_reason_if_extension_absent(_exc)
 
-# Skip the entire module if the compiled bridge is unavailable.
-# When the bridge IS available, every test runs against the real Rust stack.
 requires_bridge = pytest.mark.skipif(
-    not _BRIDGE_AVAILABLE,
-    reason="_scp_core PyO3 bridge not compiled -- skipping integration tests",
+    _NATIVE_SKIP_REASON is not None,
+    reason=_NATIVE_SKIP_REASON or "",
 )
 
 # ---------------------------------------------------------------------------

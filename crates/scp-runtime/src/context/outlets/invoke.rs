@@ -244,6 +244,64 @@ pub enum InvocationError {
     },
 }
 
+/// Why an outlet stream open failed.
+///
+/// The Supervisor refused it because `shutdown_all_contexts` has begun, or the
+/// open itself failed.
+#[derive(Debug, thiserror::Error)]
+pub enum OutletOpenError {
+    /// The Supervisor refused the open because shutdown has begun.
+    ///
+    /// Error code: `SCP-CTX-2138`.
+    #[error("SCP-CTX-2138: {message}")]
+    SupervisorShutDown {
+        /// The refusal detail carried by `ContextError::SupervisorShutDown`.
+        message: String,
+    },
+    /// The open failed for an outlet reason.
+    #[error(transparent)]
+    Invocation(#[from] InvocationError),
+}
+
+/// Why [`Supervisor::open_outlet_stream`](crate::context::supervisor::Supervisor::open_outlet_stream)
+/// failed.
+///
+/// The Supervisor refused the open because `shutdown_all_contexts` has begun,
+/// or the open was rejected for a reason in the open-time taxonomy.
+#[derive(Debug)]
+pub enum OutletStreamOpenError {
+    /// The Supervisor refused the open because shutdown has begun (ADR-049
+    /// Decision 16 item 2).
+    ///
+    /// Error code: `SCP-CTX-2138`, the code of
+    /// `ContextError::SupervisorShutDown`.
+    SupervisorShutDown {
+        /// The refusal detail carried by `ContextError::SupervisorShutDown`.
+        message: String,
+    },
+    /// The open was rejected for a reason in the open-time taxonomy.
+    Rejected(crate::context::outlets::dispatch::OpenStreamRejection),
+}
+
+impl From<crate::context::outlets::dispatch::OpenStreamRejection> for OutletStreamOpenError {
+    fn from(rejection: crate::context::outlets::dispatch::OpenStreamRejection) -> Self {
+        Self::Rejected(rejection)
+    }
+}
+
+impl From<OutletStreamOpenError> for OutletOpenError {
+    /// Keeps a shutdown refusal typed; routes a rejection through
+    /// [`OpenStreamRejection::to_open_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_open_error).
+    fn from(err: OutletStreamOpenError) -> Self {
+        match err {
+            OutletStreamOpenError::SupervisorShutDown { message } => {
+                Self::SupervisorShutDown { message }
+            }
+            OutletStreamOpenError::Rejected(rejection) => rejection.to_open_error(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Economy context for outlet invocation
 // ---------------------------------------------------------------------------
@@ -1762,9 +1820,7 @@ pub struct EconomicPolicySnapshot {
 /// The dispatch pump fires this from inside its spawned `tokio` task at the
 /// settlement block (gated by the `pump_exited` flag so it fires at most
 /// once). Because it runs ON the pump's tokio task, the implementation MUST
-/// NOT `block_on` — the production native-bridge impls hold a
-/// [`tokio::runtime::Handle`] and `Handle::spawn` the async
-/// `ContextManager::outlet_stream_settle`. The trait is `Send + Sync` so it
+/// NOT `block_on`. The trait is `Send + Sync` so it
 /// can be shared into the spawned pump task without an extra mutex.
 ///
 /// `None` (no sink wired) disables settlement — the legacy / test open
@@ -1772,8 +1828,7 @@ pub struct EconomicPolicySnapshot {
 /// `(billed, refund)` are still surfaced via the `StreamCloseSummary` for
 /// those callers.
 pub trait StreamSettlementSink: Send + Sync {
-    /// Settles the stream's economics exactly once. MUST NOT block — spawn
-    /// the async settlement onto a runtime handle.
+    /// Settles the stream's economics exactly once. MUST NOT block.
     fn settle(&self, settlement: StreamSettlement);
 
     /// Fix-D — durably persist the crash-recovery
@@ -2629,7 +2684,7 @@ pub const fn accrue_data_chunk_if_billable(
 ///
 /// Decrements the per-invoker and per-outlet counters on the per-context
 /// `admission` tracker AND the per-origin-invoker counter on the
-/// operator-scoped `origin_admission` tracker (§05-contexts.md:448),
+/// operator-scoped `origin_admission` tracker (§5.4.5),
 /// under both trackers' critical sections. Idempotent on a
 /// never-admitted triple (matches
 /// [`super::stream::StreamAdmissionTracker::release`] semantics). The
@@ -3618,8 +3673,8 @@ pub type CaveatPostInputCheck<'a> = Box<
 /// Returns a `mpsc::Receiver<OutletStreamChunk>` that yields the chunks
 /// produced by the executor (`Data` / `Progress`), terminated by a
 /// single terminal chunk (`End` on success, `Error { terminal: true }`
-/// on failure). The framework spawns a tokio task that drives the
-/// executor and pumps chunks into the channel.
+/// on failure). The framework starts a task through `spawn_task` that drives
+/// the executor and pumps chunks into the channel.
 ///
 /// This is the streaming counterpart of the unary
 /// [`invoke_outlet_aggregating`] (best-effort *outlet stream* mode per
@@ -3681,6 +3736,9 @@ pub async fn invoke_outlet<E>(
     // the per-chunk-signature preimage. `[0u8; 32]` for legacy / test
     // callers; production paths supply the real binding.
     caveats_binding: [u8; 32],
+    // Starts the streaming executor task. The Supervisor's open paths spawn it
+    // onto the Supervisor's task tracker (ADR-049 Decision 16).
+    spawn_task: &(dyn Fn(super::dispatch::StreamTask) + Send + Sync),
 ) -> Result<mpsc::Receiver<OutletStreamChunk>, InvocationError>
 where
     E: OutletExecutor + ?Sized + 'static,
@@ -3772,7 +3830,7 @@ where
         signing_ctx,
         memory_scope,
     };
-    tokio::spawn(run_streaming_executor_task(task_inputs));
+    spawn_task(Box::pin(run_streaming_executor_task(task_inputs)));
 
     Ok(chunk_rx)
 }
@@ -5162,9 +5220,9 @@ pub(crate) async fn run_cross_context_bridge(
 /// On a successful seal the open-failure `escrow_ticket` is `consume`d (its hold
 /// stays reserved through the pump per AC3; the durable ledger owns the billed /
 /// refund split the seal recorded) and the saga journal is resolved to
-/// `Committed`. On a seal FAILURE the ticket is dropped so its `Drop` reverses
-/// the open-time hold, and the journal is LEFT at `Committing` for the
-/// autonomous crash-recovery sweep (SCP-OUT-046 #136).
+/// `Committed`. On a seal FAILURE the ticket is dropped, and the journal is
+/// LEFT at `Committing` for the autonomous crash-recovery sweep (SCP-OUT-046
+/// #136).
 ///
 /// The receiving-context A-side `CrossContextOutletInvoked` dual-log leaf
 /// (SCP-OUT-046 #135) is recorded from the SEALED `outcome` (the signed receipt +
@@ -5174,9 +5232,14 @@ pub(crate) async fn run_cross_context_bridge(
 /// a synthesized terminal) while B's DURABLE manifest is the `SagaId`-keyed
 /// frontier folded via `StreamCaptureAppend`. This task never re-signs a chunk and
 /// never re-invokes the outlet.
+///
+/// The task runs on the Supervisor's task tracker and holds only a
+/// `Weak<Supervisor>` (ADR-049 Decision 16), upgraded per operation. A failed
+/// upgrade takes the same path as a vanished target actor: the journal stays
+/// `Committing` for crash recovery.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn run_streaming_saga_seal_task(
-    supervisor: std::sync::Arc<crate::context::supervisor::Supervisor>,
+    supervisor: std::sync::Weak<crate::context::supervisor::Supervisor>,
     target_context_hex: String,
     saga_id: crate::context::supervisor::saga_journal::SagaId,
     target_signing_key: crate::context::actor::commands::SigningKeyBytes,
@@ -5307,7 +5370,10 @@ pub(crate) async fn run_streaming_saga_seal_task(
         // actor is unreachable), NOT A closing its channel — the post-loop
         // terminal-guarantee synthesis must still fire so A never truncates after
         // a non-terminal `Data` (crypto review: preserve the terminal guarantee).
-        let Some(actor) = supervisor.lookup(&target_context_hex) else {
+        let Some(actor) = supervisor
+            .upgrade()
+            .and_then(|sup| sup.lookup(&target_context_hex))
+        else {
             capture_broke = true;
             break;
         };
@@ -5405,7 +5471,10 @@ pub(crate) async fn run_streaming_saga_seal_task(
     // control plane), NOT here — see SCP-OUT-047's live-cancel control-plane
     // action item.
     let terminal_status = terminal.terminal_status.clone();
-    let seal_result = match supervisor.lookup(&target_context_hex) {
+    let seal_result = match supervisor
+        .upgrade()
+        .and_then(|sup| sup.lookup(&target_context_hex))
+    {
         Some(actor) => {
             let settle_saga_id = saga_id.clone();
             actor
@@ -5475,14 +5544,22 @@ pub(crate) async fn run_streaming_saga_seal_task(
             let settlement_applied = match outcome.settlement {
                 None => true,
                 Some(settlement) => {
-                    match supervisor
-                        .settle_outlet_stream_via_actor(
-                            *settlement,
-                            outcome.generation,
-                            Some(saga_id.clone()),
-                        )
-                        .await
-                    {
+                    let settled = match supervisor.upgrade() {
+                        Some(sup) => {
+                            sup.settle_outlet_stream_via_actor(
+                                *settlement,
+                                outcome.generation,
+                                Some(saga_id.clone()),
+                            )
+                            .await
+                        }
+                        None => Err(scp_protocol::context::ContextError::SupervisorShutDown(
+                            "streaming-saga seal task: supervisor dropped before the close-time \
+                             settlement"
+                                .to_owned(),
+                        )),
+                    };
+                    match settled {
                         Ok(application) => application.applied,
                         Err(err) => {
                             tracing::error!(
@@ -5502,7 +5579,15 @@ pub(crate) async fn run_streaming_saga_seal_task(
                 // Resolve the journal to `Committed` so crash recovery does not
                 // redrive a completed saga. Non-secret (the streaming saga journals
                 // public metadata only).
-                if let Err(err) = supervisor.resolve_saga_committed(&saga_id).await {
+                let resolved = match supervisor.upgrade() {
+                    Some(sup) => sup.resolve_saga_committed(&saga_id).await,
+                    None => Err(scp_protocol::context::ContextError::SupervisorShutDown(
+                        "streaming-saga seal task: supervisor dropped before the journal \
+                         resolve"
+                            .to_owned(),
+                    )),
+                };
+                if let Err(err) = resolved {
                     tracing::error!(
                         saga_id = %saga_id.0,
                         %err,
@@ -5519,8 +5604,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
             }
         }
         Err(err) => {
-            // The seal did not commit. Drop the ticket so its `Drop` reverses the
-            // open-time hold (the sole refund path when no seal ran). Leave the
+            // The seal did not commit. Drop the ticket. Leave the
             // journal at `Committing` — the autonomous crash-recovery sweep
             // (SCP-OUT-046 #136) resolves it (witness present → Committed; absent
             // → the key-bearing truncated close, or an honest NeedsRepair).
@@ -5544,8 +5628,8 @@ pub(crate) async fn run_streaming_saga_seal_task(
             tracing::error!(
                 saga_id = %saga_id.0,
                 %err,
-                "streaming-saga seal task: CommitBStreamSettle failed — open-time escrow hold \
-                 reversed, journal left Committing for crash recovery"
+                "streaming-saga seal task: CommitBStreamSettle failed — journal left Committing \
+                 for crash recovery"
             );
         }
     }
@@ -5687,14 +5771,18 @@ pub(crate) async fn record_streaming_saga_a_event(
 ///
 /// # Errors
 ///
-/// Returns [`InvocationError`]:
-/// - [`OutletNotFound`](InvocationError::OutletNotFound) — the outlet is not in
+/// Returns [`OutletOpenError`]:
+/// - [`SupervisorShutDown`](OutletOpenError::SupervisorShutDown) — shutdown
+///   has begun: the Supervisor's tracker refused the spawner, or the B-side
+///   reserve was refused.
+/// - [`Invocation`](OutletOpenError::Invocation) wrapping
+///   [`OutletNotFound`](InvocationError::OutletNotFound) — the outlet is not in
 ///   B's registry.
 /// - [`CrossContextPaidActionUnsupported`](InvocationError::CrossContextPaidActionUnsupported)
 ///   — a paid Action outlet OR a positive billed `cost_per_chunk` (zero-escrow
 ///   rejection on the value actually billed).
 /// - the mapped B-side open rejection
-///   ([`OpenStreamRejection::to_invocation_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_invocation_error)),
+///   ([`From<OutletStreamOpenError>`](OutletStreamOpenError)),
 ///   including a §7.3.8 counter-CAS rejection when `caveat_binding`'s cap is
 ///   exhausted.
 #[allow(clippy::too_many_arguments)]
@@ -5717,10 +5805,19 @@ pub(crate) async fn invoke_outlet_cross_context<E>(
     // `[u8; 32]` chunk-signature binding.
     caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
     params: crate::context::outlets::dispatch::OpenStreamParams,
-) -> Result<mpsc::Receiver<OutletStreamChunk>, InvocationError>
+) -> Result<mpsc::Receiver<OutletStreamChunk>, OutletOpenError>
 where
     E: OutletExecutor + ?Sized + 'static,
 {
+    let spawner = supervisor
+        .tracked_spawner("open cross-context outlet stream")
+        .map_err(|refused| OutletOpenError::SupervisorShutDown {
+            message: match refused {
+                scp_protocol::context::ContextError::SupervisorShutDown(message) => message,
+                other => other.to_string(),
+            },
+        })?;
+
     // Look up the registration in B's registry: the economy gate reads its
     // `cost`, and the pinned verification descriptor + schemas are sourced from
     // it BEFORE the stream opens (never from delivery-time chunk input).
@@ -5765,7 +5862,8 @@ where
     // caller log, §6.2.4). Compute the input hash before `input` is moved.
     let input_hash = sha256_json(&input);
 
-    // Open the B-side stream. `open_outlet_stream` reserves escrow (zero for
+    // Open the B-side stream through the spawner taken above, so this open has
+    // one shutdown refusal point. `open_outlet_stream_with_spawner` reserves escrow (zero for
     // Query / zero-cost), sources admission caps + timing policy from B's
     // `ContextParams`, wires B's durable `OutletInvoked` sink internally, and
     // spawns the off-mailbox pump. A best-effort open passes `None` for the
@@ -5777,7 +5875,8 @@ where
     // per-stream chunk ceiling; the value-caveat gate runs iff `caveat_binding`
     // is `Some` (supplied by the FFI caller / SCP-OUT-047).
     let mut handle = supervisor
-        .open_outlet_stream(
+        .open_outlet_stream_with_spawner(
+            &spawner,
             operating_context_id,
             registry,
             outlet_id,
@@ -5791,8 +5890,7 @@ where
             caveat_binding,
             params,
         )
-        .await
-        .map_err(|rejection| rejection.to_invocation_error())?;
+        .await?;
 
     // Take B's plaintext operator-signed chunk receiver.
     let inner_rx = handle
@@ -5817,7 +5915,10 @@ where
 
     // Spawn the OFF-MAILBOX bridge task owning the inner receiver, the outer
     // sender, the PINNED descriptor, the schemas, and A's event-log provider.
-    tokio::spawn(run_cross_context_bridge(
+    // The task holds no Supervisor reference, but it writes A's event log, so it
+    // spawns on the Supervisor's tracker and shutdown waits for that write
+    // before the owner closes storage (ADR-049 Decision 16, step 5).
+    let bridge = run_cross_context_bridge(
         inner_rx,
         outer_tx,
         descriptor,
@@ -5833,7 +5934,8 @@ where
         timestamp_secs,
         MAX_CROSS_CONTEXT_STREAM_CHUNKS,
         None,
-    ));
+    );
+    spawner.spawn(bridge);
 
     Ok(outer_rx)
 }
@@ -7234,6 +7336,7 @@ mod tests {
             None,
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -7275,6 +7378,72 @@ mod tests {
         }
     }
 
+    /// `invoke_outlet` starts its executor only through `spawn_task`: while the
+    /// caller holds the task unstarted, the stream yields no chunk, and once the
+    /// caller runs the task the stream completes.
+    #[tokio::test]
+    async fn invoke_outlet_runs_its_executor_only_through_spawn_task() {
+        struct EchoExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for EchoExecutor {
+            async fn exec_action(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                input: serde_json::Value,
+            ) -> Result<serde_json::Value, super::OutletExecutorError> {
+                Ok(input)
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
+        let context = active_context();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: std::sync::Arc<dyn super::OutletExecutor> = std::sync::Arc::new(EchoExecutor);
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            test_signer(),
+            [0u8; 32],
+            &move |task| task_tx.send(task).expect("the test holds the receiver"),
+        )
+        .await
+        .expect("invoke_outlet should accept a well-formed open");
+
+        let task = task_rx
+            .try_recv()
+            .expect("invoke_outlet handed its executor task to spawn_task");
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "no chunk arrives while the executor task is not started"
+        );
+        tokio::spawn(task);
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+        assert!(
+            matches!(
+                chunks.last().map(|c| &c.payload),
+                Some(ChunkPayload::End { .. })
+            ),
+            "the started task completes the stream, got {chunks:?}"
+        );
+    }
+
     /// Item 4 (fail-closed provenance): the terminal `End` chunk's provenance
     /// MUST carry the hosting context's REAL `memory_scope`, not a hardcoded
     /// `Full`. The prior `placeholder_data_provenance` stamped `Full`
@@ -7310,6 +7479,7 @@ mod tests {
                 None,
                 test_signer(),
                 [0u8; 32],
+                &|task| drop(tokio::spawn(task)),
             )
             .await
             .expect("invoke_outlet should accept a well-formed open");
@@ -7430,6 +7600,7 @@ mod tests {
             None,
             failing_signer,
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("open succeeds; the signing failure surfaces during the pump");
@@ -7559,6 +7730,7 @@ mod tests {
             None,
             signer,
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("open succeeds; the terminal signing failure surfaces during the pump");
@@ -7641,6 +7813,7 @@ mod tests {
             None,
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -7721,6 +7894,7 @@ mod tests {
             None,
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -7788,6 +7962,7 @@ mod tests {
             None,
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("synchronous validation must pass before the panic fires");
@@ -7914,6 +8089,7 @@ mod tests {
             None,
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -7991,6 +8167,7 @@ mod tests {
             Some(sink),
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -8060,6 +8237,7 @@ mod tests {
             Some(sink),
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -8135,6 +8313,7 @@ mod tests {
             Some(sink),
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -8209,6 +8388,7 @@ mod tests {
             Some(sink),
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -8472,7 +8652,7 @@ mod tests {
             incoming_open: &OutletStreamOpen,
             params: crate::context::outlets::dispatch::OpenStreamParams,
         ) {
-            let out: Result<mpsc::Receiver<OutletStreamChunk>, InvocationError> =
+            let out: Result<mpsc::Receiver<OutletStreamChunk>, OutletOpenError> =
                 invoke_outlet_cross_context::<NoopExecutor>(
                     supervisor,
                     a_event_log,
@@ -8800,6 +8980,7 @@ mod tests {
                 Some(b_sink),
                 signer,
                 CB,
+                &|task| drop(tokio::spawn(task)),
             )
             .await
             .expect("B open");
@@ -9035,6 +9216,133 @@ mod tests {
             )
             .await;
             assert_terminal_error(received.last().unwrap(), CODE_AUTHORIZATION_DENIED);
+        }
+
+        // ---- ADR-049 Decision 16, item 2: a shutdown refusal is typed.
+
+        /// Builds the `OpenStreamParams` + incoming open for a cross-context
+        /// call that the gate tests below refuse before any stream opens.
+        fn shutdown_gate_inputs() -> (
+            crate::context::outlets::dispatch::OpenStreamParams,
+            OutletStreamOpen,
+        ) {
+            let operator = operator_key();
+            let params = crate::context::outlets::dispatch::OpenStreamParams {
+                identity: crate::context::outlets::stream::StreamIdentity {
+                    context_id: B_CTX.to_owned(),
+                    outlet_id: OUTLET.to_owned(),
+                    stream_epoch: 1,
+                    caveats_binding: CB,
+                },
+                caps: crate::context::outlets::stream::AdmissionCaps {
+                    per_invoker: 10,
+                    per_origin_invoker: 10,
+                    per_outlet: 10,
+                },
+                invoker_did: INVOKER.to_owned(),
+                origin_invoker_did: INVOKER.to_owned(),
+                cost_per_chunk: scp_protocol::economy::types::Amount::new(0),
+                available_balance: scp_protocol::economy::types::Amount::new(0),
+                reserved_escrow: scp_protocol::economy::types::Amount::new(0),
+                declared_estimated_chunk_count: Some(1),
+                credit_window: 8,
+                caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
+                invoker_pk: operator.verifying_key(),
+                operator_signer: Arc::new(InProcessStreamSigner::new(operator)),
+                stream_credit_stall_secs: 999,
+                stream_cancel_ack_secs: 999,
+                stream_ucan_recheck_secs: 999,
+                ucan_cid: "bafy-shutdown-gate".to_owned(),
+                request_id: RID,
+                revocation_checker: Arc::new(
+                    scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
+                ),
+                economic_policy_snapshot: None,
+            };
+            let incoming = OutletStreamOpen {
+                request_id: RID,
+                outlet_id: OUTLET.to_owned(),
+                input: serde_json::json!({}),
+                invoker_did: DID::from(INVOKER),
+                ucan: vec![0x01],
+                caveats_binding: CB,
+                chain_depth: 1,
+                credit_window: 8,
+                estimated_chunk_count: 1,
+                session_id: None,
+                timeout_ms: 1000,
+            };
+            (params, incoming)
+        }
+
+        /// Runs `invoke_outlet_cross_context` against an EMPTY registry, with
+        /// the Supervisor's spawn gate closed or open.
+        async fn cross_context_with_gate(
+            gate_closed: bool,
+        ) -> Result<mpsc::Receiver<OutletStreamChunk>, OutletOpenError> {
+            let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+                INVOKER.to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ));
+            let supervisor = crate::context::test_supervisor(
+                crypto,
+                Box::new(crate::context::builder::NotConfiguredTransportProvider),
+                Box::new(MerkleEventLogProvider::new()),
+                Arc::new(|_, _| None),
+            );
+            if gate_closed {
+                supervisor.close_spawn_gate();
+            }
+            let (a_log, _a_bytes) = fresh_a_log().await;
+            let (params, incoming) = shutdown_gate_inputs();
+            invoke_outlet_cross_context::<NoopExecutor>(
+                &supervisor,
+                a_log,
+                A_CTX,
+                B_CTX,
+                &OutletRegistry::new(),
+                &OUTLET.to_owned(),
+                serde_json::json!({}),
+                &DID::from(INVOKER),
+                None,
+                Arc::new(NoopExecutor),
+                &incoming,
+                None,
+                params,
+            )
+            .await
+        }
+
+        /// Once shutdown has begun, a cross-context open is refused before the
+        /// registry lookup with `SupervisorShutDown` (`SCP-CTX-2138`), never
+        /// `ContextNotActive` or `ExecutionFailed` (the handler-panic surface).
+        #[tokio::test]
+        async fn closed_spawn_gate_refuses_cross_context_open_as_supervisor_shut_down() {
+            let result = cross_context_with_gate(true).await;
+            match result {
+                Err(err @ OutletOpenError::SupervisorShutDown { .. }) => {
+                    let text = err.to_string();
+                    assert!(text.starts_with("SCP-CTX-2138: "), "got {text}");
+                    assert_eq!(text.matches("SCP-CTX-2138").count(), 1, "got {text}");
+                }
+                other => panic!("expected SupervisorShutDown, got {other:?}"),
+            }
+        }
+
+        /// With the spawn gate open the shutdown check passes, and the same
+        /// call reaches the registry lookup, which rejects the unknown outlet.
+        #[tokio::test]
+        async fn open_spawn_gate_passes_shutdown_check_to_registry_lookup() {
+            let result = cross_context_with_gate(false).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(OutletOpenError::Invocation(
+                        InvocationError::OutletNotFound { .. }
+                    ))
+                ),
+                "an open gate must not refuse the open; got {result:?}"
+            );
         }
 
         // ---- AC12: zero-escrow economy gate.
@@ -9346,6 +9654,7 @@ mod tests {
                     None,
                     test_signer(),
                     [0u8; 32],
+                    &|task| drop(tokio::spawn(task)),
                 )
                 .await;
             drop(out);
@@ -9419,6 +9728,74 @@ mod tests {
                 "a lossless contiguous stream is forwarded verbatim, with no synthesized error \
                  terminal"
             );
+        }
+
+        /// Counts the refunds the escrow ticket's `Drop` requests for `B_CTX`.
+        #[derive(Default)]
+        struct RecordingRefundSink {
+            calls: AtomicU64,
+            amount: AtomicU64,
+        }
+
+        impl crate::context::outlets::dispatch::StreamEscrowRefundSink for RecordingRefundSink {
+            fn refund(
+                &self,
+                context_id: &str,
+                _member_did: &DID,
+                amount: scp_protocol::economy::types::Amount,
+            ) {
+                assert_eq!(context_id, B_CTX, "the refund targets the ticket's context");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.amount.fetch_add(amount.value(), Ordering::SeqCst);
+            }
+        }
+
+        /// ADR-049 Decision 16: a streaming-saga seal task whose Supervisor has
+        /// dropped sends no `CommitBStreamSettle`, drops the escrow ticket
+        /// (whose `Drop` asks its sink for the refund), and returns.
+        #[tokio::test]
+        async fn seal_task_with_dropped_supervisor_drops_the_ticket_and_returns() {
+            let (a_log, _) = fresh_a_log().await;
+            let sink = Arc::new(RecordingRefundSink::default());
+            let ticket = crate::context::outlets::dispatch::StreamEscrowTicket::new(
+                Arc::clone(&sink)
+                    as Arc<dyn crate::context::outlets::dispatch::StreamEscrowRefundSink>,
+                B_CTX.to_owned(),
+                DID(INVOKER.to_owned()),
+                scp_protocol::economy::types::Amount::new(40),
+            );
+            let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(1);
+            drop(inner_tx);
+            let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(4);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                run_streaming_saga_seal_task(
+                    std::sync::Weak::new(),
+                    B_CTX.to_owned(),
+                    crate::context::supervisor::saga_journal::SagaId("saga-dropped-sup".to_owned()),
+                    crate::context::actor::commands::SigningKeyBytes::from_signing_key(
+                        &operator_key(),
+                    ),
+                    inner_rx,
+                    outer_tx,
+                    ticket,
+                    pinned_descriptor(&operator_key()),
+                    permissive_schema(),
+                    None,
+                    a_log as Arc<dyn ContextEventLogProvider>,
+                ),
+            )
+            .await
+            .expect("the seal task returns when the Supervisor has dropped");
+            assert_eq!(
+                (
+                    sink.calls.load(Ordering::SeqCst),
+                    sink.amount.load(Ordering::SeqCst)
+                ),
+                (1, 40),
+                "the unsealed ticket is dropped unconsumed, so its sink is asked once"
+            );
+            while outer_rx.recv().await.is_some() {}
         }
     }
 
@@ -9533,17 +9910,13 @@ mod tests {
                 DID::from("did:dht:z6MkOutsiderOutsiderOutsiderOutsiderOut".to_owned()),
             );
             assert!(
-                outsider_a
-                    .open(&scp_clock::SystemClock, a_ctx_str, &sealed_for_outsider)
-                    .is_err(),
+                outsider_a.open(a_ctx_str, &sealed_for_outsider).is_err(),
                 "a non-A-member holding no A group key must not decrypt the sealed chunk"
             );
 
             // (b) An A member decrypts and recovers the chunk with B's operator
             // signature intact and verifying against B's PINNED context_id.
-            let opened = bob_a
-                .open(&scp_clock::SystemClock, a_ctx_str, &sealed_for_member)
-                .unwrap();
+            let opened = bob_a.open(a_ctx_str, &sealed_for_member).unwrap();
             let recovered_bytes = match opened {
                 OpenResult::Application(env) => env.inner.payload,
                 other => panic!("expected Application, got {other:?}"),

@@ -845,8 +845,8 @@ async fn pseudonym_unlinkability() {
         .unwrap();
 
     assert_ne!(
-        p1.public_key().as_bytes(),
-        p2.public_key().as_bytes(),
+        p1.public_key().to_compressed(),
+        p2.public_key().to_compressed(),
         "pseudonyms derived for different contexts must be unlinkable"
     );
     assert_ne!(
@@ -854,10 +854,6 @@ async fn pseudonym_unlinkability() {
         p2.routing_id(),
         "routing ids derived for different contexts must be unlinkable"
     );
-
-    // §9.10.4: the pseudonym is a 33-byte compressed P-256 point.
-    assert_eq!(p1.public_key().as_bytes().len(), 33);
-    assert_eq!(p2.public_key().as_bytes().len(), 33);
 }
 
 // ===========================================================================

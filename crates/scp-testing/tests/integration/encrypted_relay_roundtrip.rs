@@ -50,8 +50,7 @@ use scp_identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::error::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
 use scp_transport::native::adapter::NativeRelayAdapter;
 use scp_transport::native::server::{RelayConfig, RelayServer};
@@ -127,7 +126,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         &self,
         _key: &KeyHandle,
         _context_id: &[u8],
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
 
@@ -136,7 +135,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         _key: &KeyHandle,
         _context_id: &[u8],
         _pseudonym_epoch: u64,
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
 
@@ -273,7 +272,13 @@ async fn alice_bob_encrypted_message_via_relay() {
     let add_result = add_member(&mut alice_group, bob_kp_in, &scp_clock::SystemClock).unwrap();
 
     // Bob joins the group via the Welcome message.
-    let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+    let mut bob_group = join_group(
+        &add_result.welcome,
+        bob_provider,
+        bob_signer,
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
 
     // Both should see 2 members at epoch 1.
     assert_eq!(alice_group.members().unwrap().len(), 2);

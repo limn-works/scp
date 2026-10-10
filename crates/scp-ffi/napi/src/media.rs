@@ -673,7 +673,7 @@ mod tests {
         // event log when activate_session transitions the session to Active.
         let ctx = "ctx-media-activate-001";
         let bi = test_bi();
-        crate::runtime::register_test_context(&bi, ctx, ALICE_DID);
+        crate::runtime::register_test_context(&bi, ctx);
 
         let initial_count = crate::runtime::with_context(&bi, ctx, |st| {
             Ok(scp_event_log::tree::event_count(&st.core.event_log))
@@ -715,7 +715,7 @@ mod tests {
         // well-formed JSON directly.
         let ctx = "ctx-media-end-001";
         let bi = test_bi();
-        crate::runtime::register_test_context(&bi, ctx, ALICE_DID);
+        crate::runtime::register_test_context(&bi, ctx);
 
         // First: append the Started event so the tree is non-empty.
         media_activate_session_on(&bi, initiating_session_json(ctx)).unwrap();

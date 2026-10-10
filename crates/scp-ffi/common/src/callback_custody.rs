@@ -31,9 +31,10 @@
 //! - Every host signature is verified: an Ed25519 signature strictly over the
 //!   data under the registered verifying key, a P-256 signature through
 //!   [`p256_host_signature`].
-//! - Pseudonym derivation requires an [`KeyRole::Identity`] source, and binds
-//!   the result as a [`KeyRole::Pseudonym`] tied to its source, context and
-//!   epoch.
+//! - Pseudonym derivation requires an [`KeyRole::Identity`] source. A
+//!   pseudonym has no private key (§9.10.4): the host returns only the
+//!   33-byte compressed point, which becomes a [`Pseudonym`], and the
+//!   registry records nothing for it.
 //!
 //! See ADR-006 and the per-bridge `CallbackKeyCustody` adapters.
 
@@ -46,9 +47,7 @@ use scp_crypto::p256::{
     normalize_low_s, verify_prehash_strict,
 };
 use scp_platform::error::PlatformError;
-use scp_platform::traits::{
-    KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret, Signature,
-};
+use scp_platform::traits::{KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature};
 
 /// The host-protocol string for a key type: the argument of the provider's
 /// `generate_keypair` and the `key_type` of its `get_public_key` answer.
@@ -80,8 +79,8 @@ pub fn parse_key_type(key_type: &str) -> Option<KeyType> {
 ///
 /// The host records the role `generate_keypair` named and reports it for
 /// the key's lifetime, across adapter instances, so a new adapter resolves
-/// an identity key from an earlier session as an identity. A pseudonym key a
-/// derivation minted is `"operational"`. Rust cannot check the host's word:
+/// an identity key from an earlier session as an identity. Rust cannot check
+/// the host's word:
 /// a host that reports `"identity"` for a key it minted as operational lets
 /// that key derive pseudonyms, and that is outside the bridge's control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +88,7 @@ pub enum HostRole {
     /// `"identity"`: minted by `generate_identity_keypair`, the only role a
     /// pseudonym may be derived from.
     Identity,
-    /// `"operational"`: every other key, pseudonym keys included.
+    /// `"operational"`: every other key.
     Operational,
 }
 
@@ -113,13 +112,12 @@ impl HostRole {
         }
     }
 
-    /// The host role a registry role is minted or reported as: `Identity`
-    /// for [`KeyRole::Identity`], `Operational` for every other role.
+    /// The host role a registry role is minted or reported as.
     #[must_use]
-    pub const fn of(role: &KeyRole) -> Self {
+    pub const fn of(role: KeyRole) -> Self {
         match role {
             KeyRole::Identity => Self::Identity,
-            KeyRole::Pseudonym { .. } | KeyRole::Operational => Self::Operational,
+            KeyRole::Operational => Self::Operational,
         }
     }
 }
@@ -188,36 +186,15 @@ impl RegisteredKey {
 }
 
 /// What a key is for, which decides what may be derived from it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyRole {
     /// An identity key (`#0`), minted by `generate_identity_keypair` or
     /// resolved from a host that reports `"identity"`: the only role a
     /// pseudonym may be derived from.
     Identity,
-    /// A pseudonym derived from identity key `source` for `context_id` at
-    /// `epoch` (`None` for the v1 derivation).
-    Pseudonym {
-        /// The id of the identity key it was derived from.
-        source: u64,
-        /// The context it is scoped to.
-        context_id: Vec<u8>,
-        /// The rotation epoch, `None` for the v1 derivation.
-        epoch: Option<u64>,
-    },
     /// Any other key: minted by `generate_keypair`, or a host key resolved
     /// through `get_public_key` whose host role is `"operational"`.
     Operational,
-}
-
-/// How an entry reached the registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Origin {
-    /// Minted by this adapter (`generate_keypair`).
-    Minted,
-    /// Resolved from the host's `get_public_key`.
-    Resolved,
-    /// Bound by a pseudonym derivation.
-    Derived,
 }
 
 /// A live registry entry.
@@ -227,18 +204,13 @@ pub struct RegisteredEntry {
     pub key: RegisteredKey,
     /// What it is for.
     pub role: KeyRole,
-    origin: Origin,
 }
 
 impl RegisteredEntry {
     /// An entry for a key this adapter minted.
     #[must_use]
     pub const fn minted(key: RegisteredKey, role: KeyRole) -> Self {
-        Self {
-            key,
-            role,
-            origin: Origin::Minted,
-        }
+        Self { key, role }
     }
 }
 
@@ -256,26 +228,13 @@ enum Slot {
         abandoned: bool,
     },
     /// The caller dropped a destroy before the host answered, so the host
-    /// may or may not hold the key. Every lookup fails as for `Destroyed`,
-    /// and a pseudonym of an abandoned identity is retired; a new
-    /// `destroy_key` retries the host destroy.
+    /// may or may not hold the key. Every lookup fails as for `Destroyed`; a
+    /// new `destroy_key` retries the host destroy.
     Abandoned {
         prior: Option<RegisteredEntry>,
     },
     /// Destroyed in this session.
     Destroyed,
-}
-
-impl Slot {
-    /// Whether this slot held an identity when a destroy, in flight or
-    /// abandoned, began.
-    fn identity_mid_destroy(&self) -> bool {
-        matches!(
-            self,
-            Self::Destroying { prior: Some(e), .. } | Self::Abandoned { prior: Some(e) }
-                if e.role == KeyRole::Identity
-        )
-    }
 }
 
 #[derive(Debug, Default)]
@@ -301,16 +260,6 @@ impl Slots {
                 Some(Slot::Live(_) | Slot::Destroying { .. })
             )
         })
-    }
-
-    /// Whether slot `id` is a live identity holding `key`: the source a
-    /// pseudonym derivation resolved, not yet destroyed and not handed to
-    /// another key.
-    fn is_live_identity(&self, id: u64, key: &RegisteredKey) -> bool {
-        matches!(
-            self.map.get(&id),
-            Some(Slot::Live(identity)) if identity.role == KeyRole::Identity && identity.key == *key
-        )
     }
 }
 
@@ -340,11 +289,7 @@ impl CallbackKeyRegistry {
     /// Records a key `generate_keypair` minted. The host contract forbids
     /// handing a freed id to a new key; a host that breaks it may name a
     /// `Destroying`, `Abandoned` or `Destroyed` slot, which this replaces,
-    /// and the destroy in flight then leaves the new entry alone. When the
-    /// replaced slot is an identity mid-destroy, its
-    /// pseudonyms are retired first (§9.15), because the destroy that would
-    /// retire them no longer owns the slot and the new key must own none of
-    /// them.
+    /// and the destroy in flight then leaves the new entry alone.
     ///
     /// # Errors
     ///
@@ -357,13 +302,6 @@ impl CallbackKeyRegistry {
                 "KeyCustodyProvider.generate_keypair returned key_id {} that is already live",
                 handle.id()
             )));
-        }
-        if slots
-            .map
-            .get(&handle.id())
-            .is_some_and(Slot::identity_mid_destroy)
-        {
-            retire_pseudonyms_of(&mut slots.map, handle.id());
         }
         slots.map.insert(handle.id(), Slot::Live(entry));
         drop(slots);
@@ -404,7 +342,6 @@ impl CallbackKeyRegistry {
                         HostRole::Identity => KeyRole::Identity,
                         HostRole::Operational => KeyRole::Operational,
                     },
-                    origin: Origin::Resolved,
                 };
                 slots.map.insert(handle.id(), Slot::Live(entry.clone()));
                 Ok(entry)
@@ -412,72 +349,6 @@ impl CallbackKeyRegistry {
         };
         drop(slots);
         bound
-    }
-
-    /// Binds a derived pseudonym. A repeat derivation may return the same id,
-    /// so an id already bound to the same key for the same `role` (source,
-    /// context and epoch) is accepted; so is an id this adapter resolved as
-    /// an operational key with the same public key, which the derivation now
-    /// identifies, and a `Destroyed` id, which a host breaking the no-reuse
-    /// contract has handed to the new pseudonym (tolerated as
-    /// [`Self::register`] tolerates it for a minted key). Any
-    /// other occupant is rejected: a minted key, an identity, another key, or
-    /// the same key for another source, context or epoch.
-    ///
-    /// The source slot must still be a live identity holding `source_key`,
-    /// the key the derive resolved, under the same lock: a derive whose host
-    /// call raced the identity's destroy binds nothing, and neither does one
-    /// whose source id the host meanwhile handed to another identity key.
-    ///
-    /// # Errors
-    ///
-    /// [`PlatformError::KeyNotFound`] if the id is being destroyed, or the
-    /// source is not a live identity holding `source_key`;
-    /// [`PlatformError::PseudonymRejected`] for any rejected occupant;
-    /// [`PlatformError::CustodyError`] for a poisoned registry lock.
-    pub fn bind_pseudonym(
-        &self,
-        method: &str,
-        handle: KeyHandle,
-        key: RegisteredKey,
-        role: KeyRole,
-        source_key: &RegisteredKey,
-    ) -> Result<(), PlatformError> {
-        let mut slots = self.lock()?;
-        if let KeyRole::Pseudonym { source, .. } = &role
-            && !slots.is_live_identity(*source, source_key)
-        {
-            return Err(PlatformError::KeyNotFound);
-        }
-        match slots.map.get(&handle.id()) {
-            Some(Slot::Live(existing)) if existing.key == key && existing.role == role => {
-                return Ok(());
-            }
-            // A host key resolved earlier as operational, now identified.
-            Some(Slot::Live(existing))
-                if existing.key == key
-                    && existing.origin == Origin::Resolved
-                    && existing.role == KeyRole::Operational => {}
-            Some(Slot::Live(_)) => {
-                return Err(PlatformError::PseudonymRejected(format!(
-                    "KeyCustodyProvider.{method}: key_id {} is already bound to another key \
-                     or derivation",
-                    handle.id()
-                )));
-            }
-            Some(Slot::Destroying { .. }) => return Err(PlatformError::KeyNotFound),
-            Some(Slot::Abandoned { .. } | Slot::Destroyed) | None => {}
-        }
-        slots.map.insert(
-            handle.id(),
-            Slot::Live(RegisteredEntry {
-                key,
-                role,
-                origin: Origin::Derived,
-            }),
-        );
-        drop(slots);
-        Ok(())
     }
 
     /// The live entry for a handle, or `None` if this adapter has not seen it.
@@ -547,12 +418,6 @@ impl CallbackKeyRegistry {
     /// call may have destroyed the key. A slot a generation took over in the
     /// meantime is left alone.
     ///
-    /// Destroying an [`KeyRole::Identity`] key destroys every pseudonym
-    /// derived from it (§9.15): in the same critical section, each slot whose
-    /// entry, live or mid-destroy, is a [`KeyRole::Pseudonym`] of that
-    /// identity becomes `Destroyed`, and a destroy in flight on one of them
-    /// then finds its slot taken over and leaves it alone.
-    ///
     /// # Errors
     ///
     /// [`PlatformError::CustodyError`] if the registry lock is poisoned.
@@ -575,11 +440,8 @@ impl CallbackKeyRegistry {
             return Ok(());
         }
         match (destroyed, prior.clone(), *abandoned) {
-            (true, prior, _) => {
+            (true, _, _) => {
                 slots.map.insert(handle.id(), Slot::Destroyed);
-                if prior.is_some_and(|entry| entry.role == KeyRole::Identity) {
-                    retire_pseudonyms_of(&mut slots.map, handle.id());
-                }
             }
             (false, prior, true) => {
                 slots.map.insert(handle.id(), Slot::Abandoned { prior });
@@ -596,9 +458,9 @@ impl CallbackKeyRegistry {
     }
 
     /// Records that the destroy `token` began was dropped before the host
-    /// answered: the slot becomes `Abandoned`, and an identity's pseudonyms
-    /// are retired (§9.15), since the host may already have destroyed it. A
-    /// slot a generation took over in the meantime is left alone.
+    /// answered: the slot becomes `Abandoned`, since the host may already
+    /// have destroyed the key. A slot a generation took over in the meantime
+    /// is left alone.
     ///
     /// It cannot fail, because [`DestroyGuard`] calls it from `Drop`, which
     /// has no caller to report to. On a poisoned lock it still records the
@@ -618,13 +480,7 @@ impl CallbackKeyRegistry {
             }) if *owner == token => prior.clone(),
             _ => return,
         };
-        let identity = prior
-            .as_ref()
-            .is_some_and(|entry| entry.role == KeyRole::Identity);
         slots.map.insert(handle.id(), Slot::Abandoned { prior });
-        if identity {
-            retire_pseudonyms_of(&mut slots.map, handle.id());
-        }
         drop(slots);
     }
 
@@ -675,17 +531,6 @@ impl CallbackKeyRegistry {
         Ok(self.lock()?.names_held_key(key_id))
     }
 
-    /// Whether slot `id` is a live identity holding `key`, read under the
-    /// registry lock ([`CallbackKeyRegistry::bind_pseudonym`] applies the
-    /// same test to a pseudonym's source).
-    ///
-    /// # Errors
-    ///
-    /// [`PlatformError::CustodyError`] if the registry lock is poisoned.
-    fn is_live_identity(&self, id: u64, key: &RegisteredKey) -> Result<bool, PlatformError> {
-        Ok(self.lock()?.is_live_identity(id, key))
-    }
-
     /// The host key ids queued for [`sweep_orphans`].
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
@@ -731,27 +576,6 @@ impl Drop for DestroyGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.registry.abandon_destroy(self.handle, self.token);
-        }
-    }
-}
-
-/// Marks `Destroyed` every slot whose entry (live, or the prior of a destroy
-/// in flight or abandoned) is a pseudonym derived from identity `source`.
-fn retire_pseudonyms_of(map: &mut HashMap<u64, Slot>, source: u64) {
-    let derived_from = |entry: &RegisteredEntry| matches!(&entry.role, KeyRole::Pseudonym { source: s, .. } if *s == source);
-    for slot in map.values_mut() {
-        let owned = match slot {
-            Slot::Live(entry)
-            | Slot::Destroying {
-                prior: Some(entry), ..
-            }
-            | Slot::Abandoned { prior: Some(entry) } => derived_from(entry),
-            Slot::Destroying { prior: None, .. }
-            | Slot::Abandoned { prior: None }
-            | Slot::Destroyed => false,
-        };
-        if owned {
-            *slot = Slot::Destroyed;
         }
     }
 }
@@ -1024,7 +848,7 @@ where
     DF: Future<Output = Result<(), PlatformError>>,
 {
     sweep_orphans(registry, &host_destroy).await?;
-    let host_role_wanted = HostRole::of(&role);
+    let host_role_wanted = HostRole::of(role);
     let key_id = host_generate(key_type_str(key_type), host_role_wanted.as_str()).await?;
     let mut orphan = OrphanGuard {
         registry,
@@ -1208,7 +1032,7 @@ where
 
 /// `KeyCustody::sign` over a host provider.
 ///
-/// A P-256 signing key (generated, resolved or a pseudonym) signs a 32-byte
+/// A P-256 signing key (generated or resolved) signs a 32-byte
 /// digest and its host result passes [`p256_host_signature`]. An Ed25519 key
 /// signs `data` and its host result passes [`ed25519_host_signature`]. A
 /// key-agreement key is [`PlatformError::WrongKeyType`] without a host sign
@@ -1269,7 +1093,7 @@ where
     if !asked {
         let answer = host_get_public_key(key.id().to_string()).await?;
         let current = registered_key("get_public_key", &answer)?;
-        if host_role("get_public_key", &answer)? != HostRole::of(&entry.role) {
+        if host_role("get_public_key", &answer)? != HostRole::of(entry.role) {
             return Err(PlatformError::CustodyError(
                 "KeyCustodyProvider.get_public_key reports another role than the one \
                  registered for this key_id"
@@ -1291,8 +1115,7 @@ where
 ///
 /// An HPKE P-256 key requires a valid 65-byte uncompressed peer point, an
 /// X25519 key a 32-byte peer, both checked before the host call. A signing
-/// key (a pseudonym included) is [`PlatformError::WrongKeyType`] without a
-/// host call. The host must return exactly 32 bytes, which are zeroized once
+/// key is [`PlatformError::WrongKeyType`] without a host call. The host must return exactly 32 bytes, which are zeroized once
 /// copied.
 ///
 /// # Errors
@@ -1331,7 +1154,7 @@ where
 /// tombstone; a host failure restores the prior entry (or clears the marker
 /// for a handle that was unknown) and returns the host error. When the
 /// caller drops this future before the host answers, the slot becomes
-/// `Abandoned` and an identity's pseudonyms are retired; a later
+/// `Abandoned`; a later
 /// `destroy_key` on the handle retries the host destroy, and a failed retry
 /// leaves it `Abandoned`.
 ///
@@ -1387,51 +1210,32 @@ where
 /// `KeyCustody::derive_pseudonym` (`epoch` `None`) and
 /// `derive_rotatable_pseudonym` over a host provider.
 ///
-/// `key` must be an [`KeyRole::Identity`] key: an operational key, a
-/// resolved host key or a pseudonym is [`PlatformError::WrongKeyType`], with
-/// no derive call. The host returns the pseudonym as separate
-/// `(public_key, key_id)` fields; the point must be a 33-byte compressed
-/// P-256 point, the key id numeric, and the host's own
-/// `get_public_key(key_id)` must answer `"p256"` with the same point in the
-/// `"operational"` role. The
-/// handle is then bound as a [`KeyRole::Pseudonym`] of `(key, context_id,
-/// epoch)` ([`CallbackKeyRegistry::bind_pseudonym`]).
+/// `key` must be a live [`KeyRole::Identity`] key: an operational key or a
+/// resolved operational host key is [`PlatformError::WrongKeyType`], and a
+/// handle being or already destroyed is [`PlatformError::KeyNotFound`], each
+/// with no derive call (§9.10.4.A). A pseudonym has no private key, so the
+/// host returns only the point; [`parse_pseudonym`] requires a 33-byte
+/// compressed P-256 point, and nothing is registered.
 ///
-/// A derivation in flight when its identity is destroyed fails with
-/// key-not-found and stores nothing (§9.10.4.A), on the host included: when
-/// the `get_public_key(key_id)` confirmation fails or the bind runs and the
-/// source is no longer a live identity holding the key the derive resolved,
-/// the adapter destroys the derived host key through `host_destroy`
-/// ([`destroy_refused_key`]: never an id the registry holds, and queued for
-/// [`sweep_orphans`] if the destroy fails or is dropped) before it returns
-/// [`PlatformError::KeyNotFound`]. A failed confirmation while the source
-/// is still that live identity refuses the pseudonym (ADR-021).
+/// [`parse_pseudonym`]: crate::custody_parse::parse_pseudonym
 ///
 /// # Errors
 ///
 /// [`PlatformError::WrongKeyType`] for `key`, or as in [`resolve`]; any
-/// `host_derive` error; [`PlatformError::KeyNotFound`] for a derive that
-/// raced its identity's destroy; [`PlatformError::PseudonymRejected`]
-/// (reported as `SCP-IDENT-1055`) for a malformed pseudonym, a failed or
-/// malformed `get_public_key(key_id)` answer, a point or role that answer
-/// does not confirm, or a refused bind; [`PlatformError::CustodyError`] if
-/// the registry lock is poisoned.
-pub async fn derive_pseudonym<H, HF, P, PF, D, DF>(
+/// `host_derive` error; [`PlatformError::PseudonymRejected`] (reported as
+/// `SCP-IDENT-1055`) for bytes that are not a compressed P-256 point.
+pub async fn derive_pseudonym<H, HF, P, PF>(
     registry: &CallbackKeyRegistry,
     key: &KeyHandle,
-    context_id: &[u8],
     epoch: Option<u64>,
     host_derive: H,
     host_get_public_key: P,
-    host_destroy: D,
-) -> Result<PseudonymKeypair, PlatformError>
+) -> Result<Pseudonym, PlatformError>
 where
     H: FnOnce(String) -> HF,
-    HF: Future<Output = Result<(Vec<u8>, String), PlatformError>>,
+    HF: Future<Output = Result<Vec<u8>, PlatformError>>,
     P: Fn(String) -> PF + Sync,
     PF: Future<Output = Result<HostPublicKey, PlatformError>>,
-    D: Fn(String) -> DF + Sync,
-    DF: Future<Output = Result<(), PlatformError>>,
 {
     let method = if epoch.is_some() {
         "derive_rotatable_pseudonym"
@@ -1439,98 +1243,14 @@ where
         "derive_pseudonym"
     };
     let source = resolve(registry, key, &host_get_public_key).await?.0;
-    let source_key = source.key.clone();
-    if source.role != KeyRole::Identity {
+    // Until the identity key moves to P-256 (SCP-315; §9.10.4.A native
+    // interim), the host derives from an Ed25519 identity seed, so the source
+    // must be an Ed25519 identity.
+    if source.role != KeyRole::Identity || !matches!(source.key, RegisteredKey::Ed25519(_)) {
         return Err(source.key.wrong_type(KeyType::Ed25519));
     }
-    // Until S12 (§9.10.4.A native interim): the host derives from an Ed25519
-    // identity seed, so the source must also be an Ed25519 key.
-    if !matches!(source.key, RegisteredKey::Ed25519(_)) {
-        return Err(source.key.wrong_type(KeyType::Ed25519));
-    }
-    let (public_key, key_id) = host_derive(key.id().to_string()).await?;
-    let pseudonym = crate::custody_parse::parse_pseudonym(method, &public_key, &key_id)?;
-    let derived =
-        RegisteredKey::P256Signing(P256PublicKey::from_sec1(&public_key).map_err(|e| {
-            PlatformError::PseudonymRejected(format!("KeyCustodyProvider.{method}: {e}"))
-        })?);
-    let answer = match host_get_public_key(key_id).await {
-        Ok(answer) => answer,
-        // A failed confirmation refuses the pseudonym (ADR-021), unless the
-        // identity was destroyed while the host derived (§9.10.4.A).
-        Err(e) => {
-            return Err(if registry.is_live_identity(key.id(), &source_key)? {
-                PlatformError::PseudonymRejected(format!(
-                    "KeyCustodyProvider.{method}: get_public_key(key_id) failed: {e}"
-                ))
-            } else {
-                refuse_raced_derive(registry, &pseudonym, &host_destroy).await
-            });
-        }
-    };
-    // A malformed answer about the pseudonym key refuses the pseudonym.
-    let rejected = |e| match e {
-        PlatformError::CustodyError(msg) => PlatformError::PseudonymRejected(msg),
-        other => other,
-    };
-    let confirmed = registered_key("get_public_key", &answer).map_err(rejected)?;
-    if host_role("get_public_key", &answer).map_err(rejected)? != HostRole::Operational {
-        return Err(PlatformError::PseudonymRejected(format!(
-            "KeyCustodyProvider.{method}: get_public_key(key_id) reports the pseudonym key as \
-             an identity"
-        )));
-    }
-    if confirmed != derived {
-        return Err(PlatformError::PseudonymRejected(format!(
-            "KeyCustodyProvider.{method}: get_public_key(key_id) does not match the derived \
-             pseudonym point"
-        )));
-    }
-    match registry.bind_pseudonym(
-        method,
-        *pseudonym.key_handle(),
-        derived,
-        KeyRole::Pseudonym {
-            source: key.id(),
-            context_id: context_id.to_vec(),
-            epoch,
-        },
-        &source_key,
-    ) {
-        Ok(()) => Ok(pseudonym),
-        // The source identity was destroyed (or its id handed to another
-        // key) while the host derived, or the derived id is mid-destroy. A
-        // held id is left alone; any other is the host key this derive made.
-        Err(PlatformError::KeyNotFound) => {
-            Err(refuse_raced_derive(registry, &pseudonym, &host_destroy).await)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// The error a derivation that raced its identity's destroy returns, after
-/// destroying the host key it derived ([`destroy_refused_key`]): key-not-found
-/// (§9.10.4.A), also when the destroy failed and left the key queued for the
-/// sweep; the poisoned-lock error if the registry lock is poisoned.
-async fn refuse_raced_derive<D, DF>(
-    registry: &CallbackKeyRegistry,
-    pseudonym: &PseudonymKeypair,
-    host_destroy: &D,
-) -> PlatformError
-where
-    D: Fn(String) -> DF + Sync,
-    DF: Future<Output = Result<(), PlatformError>>,
-{
-    match destroy_refused_key(
-        registry,
-        pseudonym.key_handle().id().to_string(),
-        host_destroy,
-    )
-    .await
-    {
-        Ok(()) | Err(RefusedKeyQueued::DestroyFailed(_)) => PlatformError::KeyNotFound,
-        Err(RefusedKeyQueued::RegistryPoisoned(poisoned)) => poisoned,
-    }
+    let point = host_derive(key.id().to_string()).await?;
+    crate::custody_parse::parse_pseudonym(method, &point)
 }
 
 /// A software host for bridge tests: Ed25519, P-256 signing and HPKE P-256
@@ -1548,7 +1268,8 @@ pub mod fake_host {
     use std::sync::{Mutex, MutexGuard};
 
     use ed25519_dalek::Signer;
-    use scp_crypto::p256::{P256PublicKey, P256SigningKey, ecdh_p256, sign_prehash_rfc6979};
+    use scp_crypto::p256::{P256PublicKey, P256SecretKey, ecdh_p256, sign_prehash_rfc6979};
+    use scp_crypto::pseudonym::{PseudonymVersion, derive_pseudonym};
     use scp_platform::error::PlatformError;
 
     use super::{HostPublicKey, HostRole};
@@ -1617,26 +1338,22 @@ pub mod fake_host {
     /// A key the host holds, with the role it was minted in.
     enum HostKey {
         Ed25519(ed25519_dalek::SigningKey),
-        P256(P256SigningKey),
-        HpkeP256(P256SigningKey),
+        P256(P256SecretKey),
+        HpkeP256(P256SecretKey),
     }
 
-    fn p256_copy(key: &P256SigningKey) -> Result<P256SigningKey, PlatformError> {
-        P256SigningKey::from_scalar_bytes(&key.to_scalar_bytes())
+    fn p256_copy(key: &P256SecretKey) -> Result<P256SecretKey, PlatformError> {
+        P256SecretKey::from_scalar_bytes(&key.to_scalar_bytes())
             .map_err(|e| PlatformError::CustodyError(e.to_string()))
     }
 
-    /// A derivation's source key id, context id and epoch.
-    type Derivation = (String, Vec<u8>, Option<u64>);
-
-    /// Host state: every key by id, pseudonym ids by derivation, call counts,
-    /// and the last peer it was sent.
+    /// Host state: every key by id, call counts, and the last peer it was
+    /// sent.
     #[derive(Default)]
     pub struct FakeHost {
         keys: Mutex<HashMap<String, HostKey>>,
-        /// The role each key id was minted in; a pseudonym is operational.
+        /// The role each key id was minted in.
         roles: Mutex<HashMap<String, HostRole>>,
-        derived: Mutex<HashMap<Derivation, String>>,
         next: AtomicUsize,
         calls: Mutex<HashMap<&'static str, usize>>,
         /// The peer bytes of the most recent `dh_agree` call.
@@ -1644,12 +1361,12 @@ pub mod fake_host {
     }
 
     impl FakeHost {
-        /// How many calls to `method` reached the host.
         /// Whether the host still holds `key_id`.
         pub fn holds(&self, key_id: &str) -> bool {
             locked(&self.keys).is_ok_and(|keys| keys.contains_key(key_id))
         }
 
+        /// How many calls to `method` reached the host.
         pub fn calls(&self, method: &str) -> usize {
             locked(&self.calls).map_or(0, |calls| calls.get(method).copied().unwrap_or(0))
         }
@@ -1690,7 +1407,7 @@ pub mod fake_host {
             let id = self.next_id();
             let scalar = [u8::try_from(id % 64).unwrap_or(0) + 0x40; 32];
             let p256 = || {
-                P256SigningKey::from_scalar_bytes(&scalar)
+                P256SecretKey::from_scalar_bytes(&scalar)
                     .map_err(|e| PlatformError::CustodyError(e.to_string()))
             };
             let key = match key_type {
@@ -1790,8 +1507,8 @@ pub mod fake_host {
         }
 
         /// `derive_pseudonym` / `derive_rotatable_pseudonym`: the §9.10.4.A
-        /// P-256 pseudonym of an Ed25519 key's seed, registered as a `p256`
-        /// key. A repeated derivation returns the same key id.
+        /// compressed P-256 pseudonym point of an Ed25519 key's seed. The
+        /// host stores nothing for it.
         ///
         /// # Errors
         ///
@@ -1801,7 +1518,7 @@ pub mod fake_host {
             key_id: &str,
             context_id: &[u8],
             epoch: Option<u64>,
-        ) -> Result<(Vec<u8>, String), PlatformError> {
+        ) -> Result<Vec<u8>, PlatformError> {
             self.count(if epoch.is_some() {
                 "derive_rotatable_pseudonym"
             } else {
@@ -1813,22 +1530,12 @@ pub mod fake_host {
                     "a pseudonym derives from an Ed25519 key".into(),
                 )),
             })?;
-            let pseudonym =
-                scp_crypto::pseudonym::derive_pseudonym_keypair(&seed, context_id, epoch)
-                    .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
-            let point = pseudonym.public_key().to_compressed().to_vec();
-            let tuple = (key_id.to_owned(), context_id.to_vec(), epoch);
-            let mut derived = locked(&self.derived)?;
-            if let Some(id) = derived.get(&tuple) {
-                return Ok((point, id.clone()));
-            }
-            let id = self.next_id().to_string();
-            // A pseudonym key is operational (the host contract's `role`).
-            locked(&self.roles)?.insert(id.clone(), HostRole::Operational);
-            locked(&self.keys)?.insert(id.clone(), HostKey::P256(pseudonym));
-            derived.insert(tuple, id.clone());
-            drop(derived);
-            Ok((point, id))
+            let version = epoch.map_or(PseudonymVersion::Static, |epoch| {
+                PseudonymVersion::Rotatable { epoch }
+            });
+            Ok(derive_pseudonym(&seed, context_id, version)
+                .to_compressed()
+                .to_vec())
         }
 
         /// `export_signing_key_bytes`: an Ed25519 key's 32-byte seed.
@@ -1870,17 +1577,17 @@ mod tests {
     use super::fake_host::{der, negate};
     use super::*;
     use ed25519_dalek::Signer;
-    use scp_crypto::p256::{P256SigningKey, sign_prehash_rfc6979};
+    use scp_crypto::p256::{P256SecretKey, sign_prehash_rfc6979};
 
-    fn key_and_sig() -> (P256SigningKey, [u8; 32], [u8; 64]) {
-        let key = P256SigningKey::from_scalar_bytes(&[0x11u8; 32]).unwrap();
+    fn key_and_sig() -> (P256SecretKey, [u8; 32], [u8; 64]) {
+        let key = P256SecretKey::from_scalar_bytes(&[0x11u8; 32]).unwrap();
         let digest = [0x22u8; 32];
         let sig = sign_prehash_rfc6979(&key, &digest).unwrap();
         (key, digest, sig)
     }
 
-    fn p256(seed: u8) -> P256SigningKey {
-        P256SigningKey::from_scalar_bytes(&[seed; 32]).unwrap()
+    fn p256(seed: u8) -> P256SecretKey {
+        P256SecretKey::from_scalar_bytes(&[seed; 32]).unwrap()
     }
 
     fn ed(seed: u8) -> ed25519_dalek::SigningKey {
@@ -1904,11 +1611,11 @@ mod tests {
         answer("ed25519", &key.verifying_key().to_bytes())
     }
 
-    fn p256_answer(key: &P256SigningKey) -> HostPublicKey {
+    fn p256_answer(key: &P256SecretKey) -> HostPublicKey {
         answer("p256", &key.public_key().to_compressed())
     }
 
-    fn hpke_answer(key: &P256SigningKey) -> HostPublicKey {
+    fn hpke_answer(key: &P256SecretKey) -> HostPublicKey {
         answer("hpke-p256", &key.public_key().to_uncompressed())
     }
 
@@ -2030,7 +1737,7 @@ mod tests {
         assert!(p256_public_key("m", KeyType::HpkeP256, &off).is_err());
     }
 
-    /// A1/F3: the host's stated type decides the key, and the key must have
+    /// The host's stated type decides the key, and the key must have
     /// exactly that type's length and be valid. Every other answer is a
     /// custody error: a length that fits another type, an unknown type
     /// string, an invalid or weak Ed25519 point, an off-curve P-256 point.
@@ -2081,7 +1788,7 @@ mod tests {
         }
     }
 
-    /// A3: an Ed25519 host signature is accepted only when it verifies
+    /// An Ed25519 host signature is accepted only when it verifies
     /// strictly over the data; 64 junk bytes, a signature over other data and
     /// a wrong length are refused.
     #[test]
@@ -2126,7 +1833,7 @@ mod tests {
         assert!(x25519_peer(&[0u8; 65]).is_err());
     }
 
-    /// A3: an Ed25519 handle, minted or resolved, rejects a host that returns
+    /// An Ed25519 handle, minted or resolved, rejects a host that returns
     /// 64 junk bytes, and accepts its real signature.
     #[tokio::test]
     async fn ed25519_sign_rejects_junk_from_the_host() {
@@ -2180,12 +1887,11 @@ mod tests {
         );
     }
 
-    /// A registry holding identity key 1 (Ed25519) and pseudonym 7 of
-    /// (1, "ctx", None), derived through the shared flow from a host whose
-    /// pseudonym key is `key`.
-    async fn registry_with_pseudonym(
+    /// A registry holding identity key 1 (Ed25519) and operational P-256
+    /// signing key 7 (`key`).
+    fn registry_with_p256(
         identity: &ed25519_dalek::SigningKey,
-        key: &P256SigningKey,
+        key: &P256SecretKey,
     ) -> CallbackKeyRegistry {
         let registry = CallbackKeyRegistry::new();
         live(
@@ -2194,54 +1900,26 @@ mod tests {
             RegisteredKey::Ed25519(identity.verifying_key()),
             KeyRole::Identity,
         );
-        let point = key.public_key().to_compressed().to_vec();
-        let confirm = p256_answer(key);
-        let derived = derive_pseudonym(
+        live(
             &registry,
-            &KeyHandle::new(1),
-            b"ctx",
-            None,
-            |id| async move {
-                assert_eq!(id, "1");
-                Ok((point, "7".to_owned()))
-            },
-            move |id| {
-                let confirm = confirm.clone();
-                async move {
-                    assert_eq!(id, "7");
-                    Ok(confirm)
-                }
-            },
-            no_destroy,
-        )
-        .await
-        .unwrap();
-        assert_eq!(derived.key_handle().id(), 7);
+            7,
+            RegisteredKey::P256Signing(key.public_key()),
+            KeyRole::Operational,
+        );
         registry
     }
 
-    fn pseudonym_role(source: u64, context: &[u8], epoch: Option<u64>) -> KeyRole {
-        KeyRole::Pseudonym {
-            source,
-            context_id: context.to_vec(),
-            epoch,
-        }
-    }
-
-    /// A pseudonym handle is a registered P-256 signing key. Its host's DER
-    /// high-s signature comes out raw low-s and strictly verifies; a junk
-    /// 64-byte signature is refused; `dh_agree` is `WrongKeyType`; a
-    /// registered handle never asks the host for its public key to sign.
+    /// A registered P-256 signing key. Its host's DER high-s signature comes
+    /// out raw low-s and strictly verifies; a junk 64-byte signature is
+    /// refused; a non-digest input never reaches the host; `dh_agree` is
+    /// `WrongKeyType`; a registered handle never asks the host for its public
+    /// key to sign.
     #[tokio::test]
-    async fn pseudonym_handles_use_the_registry_path() {
+    async fn p256_signing_handles_use_the_registry_path() {
         let key = p256(0x21);
-        let registry = registry_with_pseudonym(&ed(0x61), &key).await;
+        let registry = registry_with_p256(&ed(0x61), &key);
         let handle = KeyHandle::new(7);
         let digest = [0x5au8; 32];
-        assert_eq!(
-            registry.get(&handle).unwrap().unwrap().role,
-            pseudonym_role(1, b"ctx", None)
-        );
 
         let raw = sign_prehash_rfc6979(&key, &digest).unwrap();
         let high_der = der(&raw[..32], &negate(&raw[32..]));
@@ -2305,7 +1983,7 @@ mod tests {
         );
     }
 
-    /// A2: every entry point resolves an unregistered handle the same way,
+    /// Every entry point resolves an unregistered handle the same way,
     /// with one host lookup, and binds the same operational entry, whichever
     /// runs first. Before this, `dh_agree` and the Ed25519-only operations
     /// returned `KeyNotFound` for a handle `sign` would have resolved.
@@ -2400,7 +2078,7 @@ mod tests {
         }
     }
 
-    /// A2: a host without the key answers its not-found to every entry
+    /// A host without the key answers its not-found to every entry
     /// point, with no other host call and nothing bound.
     #[tokio::test]
     async fn every_entry_point_reports_a_key_the_host_lacks() {
@@ -2441,7 +2119,7 @@ mod tests {
         assert!(registry.get(&h).unwrap().is_none());
     }
 
-    /// F3: a resolution whose answer has the wrong length for its stated
+    /// A resolution whose answer has the wrong length for its stated
     /// type, or an unknown type, is a custody error and binds nothing, with
     /// no host sign call.
     #[tokio::test]
@@ -2474,7 +2152,7 @@ mod tests {
         }
     }
 
-    /// F6: two resolutions of one handle that both asked the host (the
+    /// Two resolutions of one handle that both asked the host (the
     /// second completes inside the first's host call) both succeed and bind
     /// one entry; a handle already bound resolves to its entry, role kept.
     #[tokio::test]
@@ -2510,22 +2188,16 @@ mod tests {
         assert_eq!(slot_count(), 1);
 
         // Resolving again asks nothing and writes nothing: the one slot holds
-        // the same entry. A bound pseudonym keeps its role.
+        // the same entry.
         assert_eq!(
             resolve(&registry, &h, &no_lookup).await.unwrap(),
             (entry.clone(), false)
         );
         assert_eq!(slot_count(), 1);
         assert_eq!(registry.get(&h).unwrap(), Some(entry));
-        let pseudo = registry_with_pseudonym(&ed(0x92), &p).await;
-        let (entry, asked) = resolve(&pseudo, &KeyHandle::new(7), &no_lookup)
-            .await
-            .unwrap();
-        assert!(!asked);
-        assert_eq!(entry.role, pseudonym_role(1, b"ctx", None));
     }
 
-    /// F2: `require_ed25519` refuses a P-256, an HPKE and an X25519 entry
+    /// `require_ed25519` refuses a P-256, an HPKE and an X25519 entry
     /// with `WrongKeyType`, and accepts an Ed25519 one.
     #[tokio::test]
     async fn require_ed25519_refuses_every_other_type() {
@@ -2571,7 +2243,7 @@ mod tests {
             .unwrap();
     }
 
-    /// F4: a registered HPKE key whose host point changes after generation
+    /// A registered HPKE key whose host point changes after generation
     /// is a custody error from `public_key`; so is one whose host now states
     /// another type for the same bytes.
     #[tokio::test]
@@ -2616,7 +2288,7 @@ mod tests {
         );
     }
 
-    /// F5: an X25519 handle given a 33-byte peer is a custody error with no
+    /// An X25519 handle given a 33-byte peer is a custody error with no
     /// host call; a 32-byte peer reaches the host.
     #[tokio::test]
     async fn x25519_agree_checks_the_peer_before_the_host() {
@@ -2649,45 +2321,35 @@ mod tests {
     }
 
     /// Runs `derive_pseudonym` from `source` with a host that returns
-    /// `(point, id)` and confirms `confirm`, counting derive calls.
+    /// `point`, counting derive calls.
     async fn derive_from(
         registry: &CallbackKeyRegistry,
         source: u64,
-        context: &[u8],
         epoch: Option<u64>,
-        returned: (Vec<u8>, &str),
-        confirm: HostPublicKey,
+        point: Vec<u8>,
         derives: &AtomicUsize,
-    ) -> Result<PseudonymKeypair, PlatformError> {
-        let (point, id) = (returned.0, returned.1.to_owned());
+    ) -> Result<Pseudonym, PlatformError> {
         derive_pseudonym(
             registry,
             &KeyHandle::new(source),
-            context,
             epoch,
             |_| {
                 derives.fetch_add(1, Ordering::Relaxed);
-                async move { Ok((point, id)) }
+                async move { Ok(point) }
             },
-            move |_| {
-                let confirm = confirm.clone();
-                async move { Ok(confirm) }
-            },
-            no_destroy,
+            no_lookup,
         )
         .await
     }
 
-    /// C2: a derive source must be an identity key. An operational Ed25519
-    /// key (minted by `generate_keypair`, or resolved), and an Ed25519 key in
-    /// the pseudonym role, are refused because of their role: they are
-    /// Ed25519, so the curve check alone would pass them. A P-256 identity
-    /// key is refused by the interim curve check. None reaches the host's
-    /// derive.
+    /// A derive source must be an identity key. An operational Ed25519 key
+    /// (minted by `generate_keypair`, or resolved) is refused because of its
+    /// role: it is Ed25519, so the curve check alone would pass it. A P-256
+    /// identity key is refused by the interim curve check. None reaches the
+    /// host's derive, and a derive registers nothing.
     #[tokio::test]
     async fn derivation_needs_an_identity_source() {
-        let pseudo = p256(0xC1);
-        let point = pseudo.public_key().to_compressed().to_vec();
+        let point = p256(0xC1).public_key().to_compressed().to_vec();
         let registry = CallbackKeyRegistry::new();
         let e = ed(0xC2).verifying_key();
         live(&registry, 1, RegisteredKey::Ed25519(e), KeyRole::Identity);
@@ -2699,28 +2361,14 @@ mod tests {
         );
         live(
             &registry,
-            3,
-            RegisteredKey::Ed25519(e),
-            pseudonym_role(1, b"ctx", None),
-        );
-        live(
-            &registry,
             4,
-            RegisteredKey::P256Signing(pseudo.public_key()),
+            RegisteredKey::P256Signing(p256(0xC1).public_key()),
             KeyRole::Identity,
         );
-        let derives = AtomicUsize::new(0);
-        for source in [2, 3, 4] {
-            let result = derive_from(
-                &registry,
-                source,
-                b"ctx",
-                Some(0),
-                (point.clone(), "20"),
-                p256_answer(&pseudo),
-                &derives,
-            )
-            .await;
+        let host_derives = AtomicUsize::new(0);
+        for source in [2, 4] {
+            let result =
+                derive_from(&registry, source, Some(0), point.clone(), &host_derives).await;
             assert!(
                 matches!(
                     result,
@@ -2737,11 +2385,9 @@ mod tests {
         let resolved = derive_pseudonym(
             &registry,
             &KeyHandle::new(5),
-            b"ctx",
             None,
             |_| async { panic!("no derivation from a resolved key") },
             lookup(&answer("ed25519", &e.to_bytes()), &calls),
-            no_destroy,
         )
         .await;
         assert!(matches!(
@@ -2751,368 +2397,78 @@ mod tests {
                 actual: KeyType::Ed25519
             })
         ));
-        assert_eq!(derives.load(Ordering::Relaxed), 0);
-        assert!(registry.get(&KeyHandle::new(20)).unwrap().is_none());
+        assert_eq!(host_derives.load(Ordering::Relaxed), 0);
 
-        derive_from(
-            &registry,
-            1,
-            b"ctx",
-            Some(0),
-            (point, "20"),
-            p256_answer(&pseudo),
-            &derives,
-        )
-        .await
-        .expect("an identity source derives");
-        assert_eq!(
-            registry.get(&KeyHandle::new(20)).unwrap().unwrap().role,
-            pseudonym_role(1, b"ctx", Some(0))
-        );
-    }
-
-    /// C3: the same pseudonym id is accepted again only for the same key
-    /// and the same (source, context, epoch). An id that collides with a
-    /// minted key or an identity, an id returned for another derivation, a
-    /// point the host's `get_public_key` does not confirm, and a 32-byte
-    /// pseudonym are refused, and each leaves the registry as it was.
-    #[tokio::test]
-    async fn pseudonym_rebinding_rules() {
-        let pseudo = p256(0xD1);
-        let other = p256(0xD2);
-        let point = pseudo.public_key().to_compressed().to_vec();
-        let registry = CallbackKeyRegistry::new();
-        let e = ed(0xD3).verifying_key();
-        live(&registry, 1, RegisteredKey::Ed25519(e), KeyRole::Identity);
-        live(
-            &registry,
-            2,
-            RegisteredKey::Ed25519(ed(0xD4).verifying_key()),
-            KeyRole::Identity,
-        );
-        live(
-            &registry,
-            30,
-            RegisteredKey::P256Signing(pseudo.public_key()),
-            KeyRole::Operational,
-        );
-        let derives = AtomicUsize::new(0);
-        let d = |source: u64,
-                 context: &'static [u8],
-                 epoch: Option<u64>,
-                 ret: (Vec<u8>, &'static str),
-                 confirm: HostPublicKey| {
-            derive_from(&registry, source, context, epoch, ret, confirm, &derives)
-        };
-
-        d(
-            1,
-            b"ctx",
-            Some(3),
-            (point.clone(), "20"),
-            p256_answer(&pseudo),
-        )
-        .await
-        .unwrap();
-        let bound = registry.get(&KeyHandle::new(20)).unwrap();
-        // A repeat derivation: accepted.
-        d(
-            1,
-            b"ctx",
-            Some(3),
-            (point.clone(), "20"),
-            p256_answer(&pseudo),
-        )
-        .await
-        .unwrap();
-        assert_eq!(registry.get(&KeyHandle::new(20)).unwrap(), bound);
-
-        // The same id for another context, epoch or source, or another
-        // point: refused, and entry 20 is unchanged.
-        for (source, context, epoch, key) in [
-            (1, &b"other"[..], Some(3), &pseudo),
-            (1, &b"ctx"[..], Some(4), &pseudo),
-            (1, &b"ctx"[..], None, &pseudo),
-            (2, &b"ctx"[..], Some(3), &pseudo),
-            (1, &b"ctx"[..], Some(3), &other),
-        ] {
-            let ret = (key.public_key().to_compressed().to_vec(), "20");
-            let result = d(source, context, epoch, ret, p256_answer(key)).await;
-            assert!(
-                matches!(result, Err(PlatformError::PseudonymRejected(_))),
-                "{result:?}"
-            );
-            assert_eq!(registry.get(&KeyHandle::new(20)).unwrap(), bound);
-        }
-        // An id held by a minted operational key or by an identity: refused,
-        // the occupant unchanged.
-        for id in ["30", "1"] {
-            let before = registry.get(&KeyHandle::new(id.parse().unwrap())).unwrap();
-            let result = d(1, b"x", None, (point.clone(), id), p256_answer(&pseudo)).await;
-            assert!(
-                matches!(result, Err(PlatformError::PseudonymRejected(_))),
-                "{id}: {result:?}"
-            );
-            assert_eq!(
-                registry.get(&KeyHandle::new(id.parse().unwrap())).unwrap(),
-                before
-            );
-        }
-        // The host's own public key disagrees, or states another type:
-        // nothing is bound.
-        for confirm in [
-            p256_answer(&other),
-            hpke_answer(&pseudo),
-            answer("p256", &[0u8; 33]),
-        ] {
-            let result = d(1, b"y", None, (point.clone(), "21"), confirm).await;
-            assert!(
-                matches!(result, Err(PlatformError::PseudonymRejected(_))),
-                "{result:?}"
-            );
-            assert!(registry.get(&KeyHandle::new(21)).unwrap().is_none());
-        }
-        // A 32-byte (Ed25519-era) pseudonym.
-        let result = d(
-            1,
-            b"y",
-            None,
-            (vec![2u8; 32], "21"),
-            answer("p256", &[2u8; 32]),
-        )
-        .await;
-        assert!(matches!(result, Err(PlatformError::PseudonymRejected(_))));
-        assert!(registry.get(&KeyHandle::new(21)).unwrap().is_none());
-    }
-
-    /// C3: a host key resolved earlier as operational is identified by the
-    /// derivation of its own point. Once destroyed, its id stays unusable
-    /// until a derivation the host answers with that id binds it afresh, as
-    /// a host with deterministic pseudonym ids does on a re-derive.
-    #[tokio::test]
-    async fn a_resolved_key_is_identified_by_its_derivation() {
-        let other = p256(0xD2);
-        let registry = CallbackKeyRegistry::new();
-        live(
-            &registry,
-            1,
-            RegisteredKey::Ed25519(ed(0xD3).verifying_key()),
-            KeyRole::Identity,
-        );
-        let derives = AtomicUsize::new(0);
-        let d = |source: u64,
-                 context: &'static [u8],
-                 epoch: Option<u64>,
-                 ret: (Vec<u8>, &'static str),
-                 confirm: HostPublicKey| {
-            derive_from(&registry, source, context, epoch, ret, confirm, &derives)
-        };
-        let calls = AtomicUsize::new(0);
-        resolve(
-            &registry,
-            &KeyHandle::new(22),
-            &lookup(&p256_answer(&other), &calls),
-        )
-        .await
-        .unwrap();
-        d(
-            1,
-            b"z",
-            None,
-            (other.public_key().to_compressed().to_vec(), "22"),
-            p256_answer(&other),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            registry.get(&KeyHandle::new(22)).unwrap().unwrap().role,
-            pseudonym_role(1, b"z", None)
-        );
-        destroy_key(&registry, &KeyHandle::new(22), |_| async { Ok(()) })
+        let slots = || registry.slots.lock().expect("registry lock").map.len();
+        let before = slots();
+        let derived = derive_from(&registry, 1, Some(0), point.clone(), &host_derives)
             .await
-            .unwrap();
-        assert!(matches!(
-            registry.get(&KeyHandle::new(22)),
-            Err(PlatformError::KeyNotFound)
-        ));
-        d(
-            1,
-            b"z",
-            None,
-            (other.public_key().to_compressed().to_vec(), "22"),
-            p256_answer(&other),
-        )
-        .await
-        .unwrap();
+            .expect("an identity source derives");
         assert_eq!(
-            registry.get(&KeyHandle::new(22)).unwrap().unwrap().role,
-            pseudonym_role(1, b"z", None)
+            derived.public_key().to_compressed().as_slice(),
+            point.as_slice()
         );
+        assert_eq!(host_derives.load(Ordering::Relaxed), 1);
+        assert_eq!(slots(), before, "a pseudonym registers nothing");
     }
 
-    /// §9.15: destroying an identity destroys every pseudonym derived from
-    /// it, live or mid-destroy, in the same step, and no other key. A host
-    /// that then reuses a retired id binds it afresh: as a minted key (an
-    /// operational entry, with no pseudonym's digest-only signing) or as
-    /// another identity's pseudonym.
+    /// The host's derive answer must be a 33-byte compressed P-256 point: an
+    /// uncompressed point, a 32-byte (Ed25519-era) value and an off-curve
+    /// prefix are each `PseudonymRejected`.
     #[tokio::test]
-    async fn identity_destroy_retires_its_pseudonyms() {
+    async fn a_derive_answer_must_be_a_compressed_point() {
         let registry = CallbackKeyRegistry::new();
         live(
             &registry,
             1,
-            RegisteredKey::Ed25519(ed(0xE1).verifying_key()),
+            RegisteredKey::Ed25519(ed(0xC3).verifying_key()),
             KeyRole::Identity,
         );
-        live(
-            &registry,
-            2,
-            RegisteredKey::Ed25519(ed(0xE2).verifying_key()),
-            KeyRole::Identity,
-        );
+        let key = p256(0xC4).public_key();
+        let mut bad_prefix = key.to_compressed().to_vec();
+        bad_prefix[0] = 0x05;
         let derives = AtomicUsize::new(0);
-        let (a, b, c) = (p256(0xE3), p256(0xE4), p256(0xE5));
-        for (source, epoch, key, id) in [
-            (1, None, &a, "10"),
-            (1, Some(3), &b, "11"),
-            (2, None, &c, "12"),
-        ] {
-            derive_from(
+        for point in [key.to_uncompressed().to_vec(), vec![2u8; 32], bad_prefix] {
+            let result = derive_from(&registry, 1, None, point, &derives).await;
+            assert!(
+                matches!(result, Err(PlatformError::PseudonymRejected(_))),
+                "{result:?}"
+            );
+        }
+    }
+
+    /// A destroyed identity, or one whose destroy is in flight or was
+    /// abandoned, derives nothing: `KeyNotFound` with no host derive call.
+    #[tokio::test]
+    async fn a_destroyed_identity_derives_nothing() {
+        let registry = CallbackKeyRegistry::new();
+        for id in [1, 2, 3] {
+            live(
                 &registry,
-                source,
-                b"ctx",
-                epoch,
-                (key.public_key().to_compressed().to_vec(), id),
-                p256_answer(key),
-                &derives,
-            )
-            .await
-            .unwrap();
+                id,
+                RegisteredKey::Ed25519(ed(0xC5).verifying_key()),
+                KeyRole::Identity,
+            );
         }
-        // A destroy of pseudonym 11 is in flight when its identity goes.
-        let in_flight = registry.begin_destroy(&KeyHandle::new(11)).unwrap();
-
         destroy_key(&registry, &KeyHandle::new(1), |_| async { Ok(()) })
             .await
             .unwrap();
-        for id in [1, 10, 11] {
+        let _in_flight = registry.begin_destroy(&KeyHandle::new(2)).unwrap();
+        let token = registry.begin_destroy(&KeyHandle::new(3)).unwrap();
+        registry.abandon_destroy(KeyHandle::new(3), token);
+        let point = p256(0xC6).public_key().to_compressed().to_vec();
+        let derives = AtomicUsize::new(0);
+        for id in [1, 2, 3] {
+            let result = derive_from(&registry, id, None, point.clone(), &derives).await;
             assert!(
-                matches!(
-                    registry.get(&KeyHandle::new(id)),
-                    Err(PlatformError::KeyNotFound)
-                ),
-                "handle {id} must be retired with its identity"
+                matches!(result, Err(PlatformError::KeyNotFound)),
+                "handle {id}: {result:?}"
             );
         }
-        assert_eq!(
-            registry.get(&KeyHandle::new(12)).unwrap().unwrap().role,
-            pseudonym_role(2, b"ctx", None)
-        );
-        // The in-flight destroy failing does not bring pseudonym 11 back.
-        registry
-            .end_destroy(&KeyHandle::new(11), in_flight, false)
-            .unwrap();
-        assert!(matches!(
-            registry.get(&KeyHandle::new(11)),
-            Err(PlatformError::KeyNotFound)
-        ));
-        // A derive from the destroyed identity binds nothing.
-        assert!(matches!(
-            derive_from(
-                &registry,
-                1,
-                b"ctx",
-                None,
-                (a.public_key().to_compressed().to_vec(), "10"),
-                p256_answer(&a),
-                &derives,
-            )
-            .await,
-            Err(PlatformError::KeyNotFound)
-        ));
-
-        // The host reuses id 10 for a minted key and id 11 for another
-        // identity's pseudonym.
-        let minted = RegisteredKey::P256Signing(p256(0xE6).public_key());
-        registry
-            .register(
-                KeyHandle::new(10),
-                RegisteredEntry::minted(minted.clone(), KeyRole::Operational),
-            )
-            .unwrap();
-        let entry = registry.get(&KeyHandle::new(10)).unwrap().unwrap();
-        assert_eq!((entry.key, entry.role), (minted, KeyRole::Operational));
-        let d = p256(0xE7);
-        derive_from(
-            &registry,
-            2,
-            b"other",
-            None,
-            (d.public_key().to_compressed().to_vec(), "11"),
-            p256_answer(&d),
-            &derives,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            registry.get(&KeyHandle::new(11)).unwrap().unwrap().role,
-            pseudonym_role(2, b"other", None)
-        );
-    }
-
-    /// A derive whose host call returns after its identity was destroyed
-    /// binds nothing (the source check is repeated under the bind's lock)
-    /// and destroys the host key it derived. Dropping that destroy fails the
-    /// host-destroy assertion.
-    #[tokio::test]
-    async fn a_derive_racing_its_identity_destroy_binds_nothing() {
-        let registry = CallbackKeyRegistry::new();
-        live(
-            &registry,
-            1,
-            RegisteredKey::Ed25519(ed(0xE8).verifying_key()),
-            KeyRole::Identity,
-        );
-        let key = p256(0xE9);
-        let point = key.public_key().to_compressed().to_vec();
-        let destroyed = Log::default();
-        let destroyed = &destroyed;
-        let result = derive_pseudonym(
-            &registry,
-            &KeyHandle::new(1),
-            b"ctx",
-            None,
-            |_| {
-                let token = registry.begin_destroy(&KeyHandle::new(1));
-                let ended = token.and_then(|t| registry.end_destroy(&KeyHandle::new(1), t, true));
-                async move {
-                    ended?;
-                    Ok((point, "20".to_owned()))
-                }
-            },
-            |_| {
-                let answer = p256_answer(&key);
-                async move { Ok(answer) }
-            },
-            |id| async move {
-                destroyed.lock().unwrap().push(id);
-                Ok(())
-            },
-        )
-        .await;
-        assert!(matches!(result, Err(PlatformError::KeyNotFound)));
-        assert!(registry.get(&KeyHandle::new(20)).unwrap().is_none());
-        // §9.10.4.A: the derive stores nothing, on the host included.
-        assert_eq!(*destroyed.lock().unwrap(), vec!["20".to_owned()]);
-        assert!(registry.orphans().is_empty());
+        assert_eq!(derives.load(Ordering::Relaxed), 0);
     }
 
     type Log = std::sync::Mutex<Vec<String>>;
-
-    /// A host destroy a test expects never to be called.
-    fn no_destroy(_: String) -> std::future::Ready<Result<(), PlatformError>> {
-        panic!("unexpected host destroy")
-    }
 
     async fn generate_with(
         registry: &CallbackKeyRegistry,
@@ -3139,7 +2495,7 @@ mod tests {
     /// Every generation the adapter refuses destroys the host key it was
     /// handed, and a destroyed key leaves no orphan queued: a non-numeric id,
     /// a malformed public key, a failing fetch, an answer stating another
-    /// type (F3) or role (M2).
+    /// type or role.
     #[tokio::test]
     async fn refused_generation_destroys_the_host_key() {
         type Case = (KeyType, &'static str, Result<HostPublicKey, PlatformError>);
@@ -3178,7 +2534,7 @@ mod tests {
                 Ok(answer("x25519", &e.verifying_key().to_bytes())),
             ),
             (KeyType::X25519, "17", Ok(ed_answer(&e))),
-            // M2: the host reports another role than the one requested, or
+            // The host reports another role than the one requested, or
             // no known role.
             (KeyType::Ed25519, "18", Ok(as_identity(ed_answer(&e)))),
             (
@@ -3207,7 +2563,7 @@ mod tests {
         }
     }
 
-    /// (B2) A generation handed an id the registry holds live is refused,
+    /// A generation handed an id the registry holds live is refused,
     /// and nothing is destroyed or queued, because the id names the held key;
     /// an accepted key is not destroyed, and may take over a destroyed id.
     #[tokio::test]
@@ -3228,7 +2584,7 @@ mod tests {
         assert_eq!(handle.id(), 21);
         assert!(destroyed.lock().unwrap().is_empty());
 
-        // B2: a live id is refused, and the held key is not destroyed.
+        // A live id is refused, and the held key is not destroyed.
         let again = generate_with(
             &registry,
             KeyType::Ed25519,
@@ -3264,7 +2620,7 @@ mod tests {
         );
     }
 
-    /// B1/B2: the slot life cycle. A destroyed handle is `KeyNotFound` for
+    /// The slot life cycle. A destroyed handle is `KeyNotFound` for
     /// every lookup and for a second destroy, with no host call; a generation
     /// may take over a destroyed or destroying id, and the destroy in flight
     /// then leaves that new entry alone, whether it succeeds or fails.
@@ -3327,7 +2683,7 @@ mod tests {
         }
     }
 
-    /// B3: the host destroy closure calls `public_key` on the same handle
+    /// The host destroy closure calls `public_key` on the same handle
     /// before it returns. The handle is `KeyNotFound` with no host lookup,
     /// and nothing is written back; afterwards a failed destroy restores the
     /// entry (or clears the marker of an unknown handle) and a successful one
@@ -3373,8 +2729,8 @@ mod tests {
         }
     }
 
-    /// G1: a `destroy_key` future dropped while the host destroy is pending
-    /// leaves the pseudonym handle `Abandoned`. A later `sign` is
+    /// A `destroy_key` future dropped while the host destroy is pending
+    /// leaves the P-256 signing handle `Abandoned`. A later `sign` is
     /// `KeyNotFound` without calling the host, so no unverified host
     /// signature can pass through an unbound handle. A retry whose host
     /// destroy fails leaves it `Abandoned`, not live, because the cancelled
@@ -3382,7 +2738,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_destroy_leaves_the_handle_fail_closed() {
         let p = p256(0xF2);
-        let registry = registry_with_pseudonym(&ed(0xF3), &p).await;
+        let registry = registry_with_p256(&ed(0xF3), &p);
         let h = KeyHandle::new(7);
         let polled = AtomicUsize::new(0);
         {
@@ -3428,138 +2784,6 @@ mod tests {
         assert!(matches!(registry.get(&h), Err(PlatformError::KeyNotFound)));
     }
 
-    /// J1: a cancelled identity destroy retires the identity and every
-    /// pseudonym derived from it through the adapter, with no host call, and
-    /// a retried destroy calls the host exactly once and completes.
-    #[tokio::test]
-    async fn cancelled_identity_destroy_retires_its_pseudonyms() {
-        let p = p256(0xF4);
-        let registry = registry_with_pseudonym(&ed(0xF5), &p).await;
-        let identity = KeyHandle::new(1);
-        {
-            let destroy = destroy_key(&registry, &identity, |_| {
-                std::future::pending::<Result<(), PlatformError>>()
-            });
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(10), destroy)
-                    .await
-                    .is_err(),
-                "the host destroy never returns"
-            );
-        }
-        let no_sign = |_: String, _: Vec<u8>| async { panic!("no host sign call") };
-        for (id, data) in [(1, &b"message"[..]), (7, &[0x11u8; 32][..])] {
-            assert!(
-                matches!(
-                    sign(&registry, &KeyHandle::new(id), data, no_sign, no_lookup).await,
-                    Err(PlatformError::KeyNotFound)
-                ),
-                "handle {id} must fail after the cancelled identity destroy"
-            );
-            assert!(matches!(
-                public_key(&registry, &KeyHandle::new(id), no_lookup).await,
-                Err(PlatformError::KeyNotFound)
-            ));
-        }
-
-        let host_destroys = AtomicUsize::new(0);
-        destroy_key(&registry, &identity, |id| {
-            assert_eq!(id, "1");
-            host_destroys.fetch_add(1, Ordering::Relaxed);
-            async { Ok(()) }
-        })
-        .await
-        .unwrap();
-        assert_eq!(host_destroys.load(Ordering::Relaxed), 1);
-        assert!(matches!(slot(&registry, 1), Some(Slot::Destroyed)));
-        assert!(matches!(slot(&registry, 7), Some(Slot::Destroyed)));
-    }
-
-    /// J2: the host reuses an identity's id for a new identity key while
-    /// that identity's destroy is in flight. The old identity's pseudonym is
-    /// retired, the new key owns none, and the new key stays live.
-    #[tokio::test]
-    async fn register_over_a_destroying_identity_retires_its_pseudonyms() {
-        let p = p256(0xF6);
-        let registry = registry_with_pseudonym(&ed(0xF7), &p).await;
-        let identity = KeyHandle::new(1);
-        let replacement = RegisteredKey::Ed25519(ed(0xF8).verifying_key());
-        destroy_key(&registry, &identity, |_| {
-            registry
-                .register(
-                    identity,
-                    RegisteredEntry::minted(replacement.clone(), KeyRole::Identity),
-                )
-                .unwrap();
-            async { Ok(()) }
-        })
-        .await
-        .unwrap();
-        assert!(
-            matches!(
-                registry.get(&KeyHandle::new(7)),
-                Err(PlatformError::KeyNotFound)
-            ),
-            "the old identity's pseudonym must be retired"
-        );
-        let entry = registry.get(&identity).unwrap().unwrap();
-        assert_eq!((entry.key, entry.role), (replacement, KeyRole::Identity));
-    }
-
-    /// J3: a derive from identity 1 (key A) whose host call returns after id
-    /// 1 was destroyed and handed to identity key B fails with
-    /// `KeyNotFound`, the id it returned is not bound, and the host key
-    /// behind that id is destroyed.
-    #[tokio::test]
-    async fn a_derive_racing_an_identity_id_reuse_binds_nothing() {
-        let registry = CallbackKeyRegistry::new();
-        let identity = KeyHandle::new(1);
-        live(
-            &registry,
-            1,
-            RegisteredKey::Ed25519(ed(0xF9).verifying_key()),
-            KeyRole::Identity,
-        );
-        let replacement = RegisteredKey::Ed25519(ed(0xFA).verifying_key());
-        let key = p256(0xFB);
-        let point = key.public_key().to_compressed().to_vec();
-        let destroyed = Log::default();
-        let destroyed = &destroyed;
-        let result = derive_pseudonym(
-            &registry,
-            &identity,
-            b"ctx",
-            None,
-            |_| {
-                let (registry, replacement) = (&registry, replacement.clone());
-                async move {
-                    destroy_key(registry, &identity, |_| async { Ok(()) }).await?;
-                    registry.register(
-                        identity,
-                        RegisteredEntry::minted(replacement, KeyRole::Identity),
-                    )?;
-                    Ok((point, "20".to_owned()))
-                }
-            },
-            |_| {
-                let answer = p256_answer(&key);
-                async move { Ok(answer) }
-            },
-            |id| async move {
-                destroyed.lock().unwrap().push(id);
-                Ok(())
-            },
-        )
-        .await;
-        assert!(
-            matches!(result, Err(PlatformError::KeyNotFound)),
-            "{result:?}"
-        );
-        assert!(registry.get(&KeyHandle::new(20)).unwrap().is_none());
-        assert_eq!(registry.get(&identity).unwrap().unwrap().key, replacement);
-        assert_eq!(*destroyed.lock().unwrap(), vec!["20".to_owned()]);
-    }
-
     /// The software host through the flows: every type generates with the
     /// host's stated type, an Ed25519 identity derives a pseudonym whose
     /// signatures verify, and a destroyed key is gone on both sides.
@@ -3592,29 +2816,26 @@ mod tests {
         let pseudonym = derive_pseudonym(
             &registry,
             &identity,
-            b"ctx",
             Some(2),
             |id| async move { host.derive_pseudonym(&id, b"ctx", Some(2)) },
             gpk,
-            no_destroy,
         )
         .await
         .unwrap();
-        let digest = [9u8; 32];
-        let psig: [u8; 64] = sign(
-            &registry,
-            pseudonym.key_handle(),
-            &digest,
-            |id, data| async move { host.sign(&id, &data) },
-            gpk,
-        )
-        .await
-        .unwrap()
-        .as_bytes()
-        .try_into()
-        .unwrap();
-        let point = P256PublicKey::from_sec1(pseudonym.public_key().as_bytes()).unwrap();
-        verify_prehash_strict(&point, &digest, &psig).unwrap();
+        let seed: [u8; 32] = host
+            .export_signing_key_bytes(&identity.id().to_string())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            pseudonym.public_key(),
+            &scp_crypto::pseudonym::derive_pseudonym(
+                &seed,
+                b"ctx",
+                scp_crypto::pseudonym::PseudonymVersion::Rotatable { epoch: 2 }
+            ),
+            "the host's point is the §9.10.4.A derivation"
+        );
         assert_eq!(host.calls("derive_rotatable_pseudonym"), 1);
         assert_eq!(host.calls("derive_pseudonym"), 0);
 
@@ -3659,24 +2880,18 @@ mod tests {
 
         let registry = CallbackKeyRegistry::new();
         let gpk = |id: String| async move { host.get_public_key(&id) };
-        let pseudonym = derive_pseudonym(
+        derive_pseudonym(
             &registry,
             &identity,
-            b"ctx",
             None,
             |id| async move { host.derive_pseudonym(&id, b"ctx", None) },
             gpk,
-            no_destroy,
         )
         .await
         .unwrap();
         assert_eq!(
             registry.get(&identity).unwrap().unwrap().role,
             KeyRole::Identity
-        );
-        assert_eq!(
-            registry.get(pseudonym.key_handle()).unwrap().unwrap().role,
-            pseudonym_role(identity.id(), b"ctx", None)
         );
         assert_eq!(host.calls("derive_pseudonym"), 1);
     }
@@ -3694,11 +2909,9 @@ mod tests {
         let result = derive_pseudonym(
             &registry,
             &operational,
-            b"ctx",
             None,
             |id| async move { host.derive_pseudonym(&id, b"ctx", None) },
             |id: String| async move { host.get_public_key(&id) },
-            no_destroy,
         )
         .await;
         assert!(
@@ -3710,58 +2923,6 @@ mod tests {
             KeyRole::Operational
         );
         assert_eq!(host.calls("derive_pseudonym"), 0);
-    }
-
-    /// A host whose answer changes a registered key's role, or reports a
-    /// derived pseudonym as an identity, is refused.
-    #[tokio::test]
-    async fn a_changed_or_identity_pseudonym_role_is_refused() {
-        let host = fake_host::FakeHost::default();
-        let host = &host;
-        let registry = CallbackKeyRegistry::new();
-        let identity = generate_keypair(
-            &registry,
-            KeyType::Ed25519,
-            KeyRole::Identity,
-            |t, r| async move { host.generate_keypair(t, r) },
-            |id: String| async move { host.get_public_key(&id) },
-            |id| async move { host.destroy_key(&id) },
-        )
-        .await
-        .unwrap();
-        let demoted = |id: String| async move {
-            host.get_public_key(&id).map(|a| HostPublicKey {
-                role: "operational".to_owned(),
-                ..a
-            })
-        };
-        assert!(matches!(
-            public_key(&registry, &identity, demoted).await,
-            Err(PlatformError::CustodyError(_))
-        ));
-
-        let identity_id = identity.id().to_string();
-        let promoting = |id: String| {
-            let promote = id != identity_id;
-            async move {
-                host.get_public_key(&id)
-                    .map(|a| if promote { as_identity(a) } else { a })
-            }
-        };
-        let result = derive_pseudonym(
-            &registry,
-            &identity,
-            b"ctx",
-            None,
-            |id| async move { host.derive_pseudonym(&id, b"ctx", None) },
-            promoting,
-            no_destroy,
-        )
-        .await;
-        assert!(
-            matches!(result, Err(PlatformError::PseudonymRejected(_))),
-            "{result:?}"
-        );
     }
 
     /// A caller that drops `generate_keypair` between the host's mint
@@ -3835,10 +2996,10 @@ mod tests {
     }
 
     /// A destroy dropped after a panic poisoned the registry lock still
-    /// abandons its slot and retires the identity's pseudonyms.
+    /// abandons its slot, and leaves every other slot as it was.
     #[tokio::test]
     async fn a_poisoned_registry_still_abandons_a_dropped_destroy() {
-        let registry = registry_with_pseudonym(&ed(0xF6), &p256(0xF7)).await;
+        let registry = registry_with_p256(&ed(0xF6), &p256(0xF7));
         let identity = KeyHandle::new(1);
         let token = registry.begin_destroy(&identity).unwrap();
         let poisoner = std::thread::scope(|s| {
@@ -3855,9 +3016,9 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(matches!(slots.map.get(&1), Some(Slot::Abandoned { .. })));
-        assert!(matches!(slots.map.get(&7), Some(Slot::Destroyed)));
+        assert!(matches!(slots.map.get(&7), Some(Slot::Live(_))));
         drop(slots);
-        assert!(!registry.is_live(&KeyHandle::new(7)));
+        assert!(registry.is_live(&KeyHandle::new(7)));
     }
 
     /// A sweep whose host destroy fails keeps the orphan queued and
@@ -4087,243 +3248,5 @@ mod tests {
         assert_eq!(*destroyed.lock().unwrap(), vec!["07".to_owned()]);
         assert!(registry.orphans().is_empty());
         assert!(registry.is_live(&KeyHandle::new(7)));
-    }
-
-    /// A derive racing its identity's destroy, through the software host,
-    /// which keeps every key it is not told to destroy: the identity destroy
-    /// completes while the derive is inside the host's derive call. The
-    /// derive is key-not-found, the host received a destroy for the derived
-    /// id and no longer holds it, and a sign on that id is key-not-found.
-    /// Dropping the adapter's destroy leaves the host key, which a later
-    /// sign resolves and uses; this fails.
-    #[tokio::test]
-    async fn a_derive_racing_its_identity_destroy_leaves_no_host_key() {
-        let host = fake_host::FakeHost::default();
-        let host = &host;
-        let registry = CallbackKeyRegistry::new();
-        let registry = &registry;
-        let gpk = |id: String| async move { host.get_public_key(&id) };
-        let host_destroy = |id: String| async move { host.destroy_key(&id) };
-        let identity = generate_keypair(
-            registry,
-            KeyType::Ed25519,
-            KeyRole::Identity,
-            |t, r| async move { host.generate_keypair(t, r) },
-            gpk,
-            host_destroy,
-        )
-        .await
-        .unwrap();
-        let derived_id = std::sync::Mutex::new(None::<String>);
-        let derived_id = &derived_id;
-        let result = derive_pseudonym(
-            registry,
-            &identity,
-            b"ctx",
-            None,
-            |id| async move {
-                let derived = host.derive_pseudonym(&id, b"ctx", None)?;
-                *derived_id.lock().unwrap() = Some(derived.1.clone());
-                destroy_key(registry, &identity, host_destroy).await?;
-                Ok(derived)
-            },
-            gpk,
-            host_destroy,
-        )
-        .await;
-        assert!(
-            matches!(result, Err(PlatformError::KeyNotFound)),
-            "{result:?}"
-        );
-        let derived_id = derived_id.lock().unwrap().clone().unwrap();
-        assert_eq!(
-            host.calls("destroy_key"),
-            2,
-            "the identity and the derived key"
-        );
-        assert!(
-            !host.holds(&derived_id),
-            "the derived host key is destroyed"
-        );
-        assert!(registry.orphans().is_empty());
-        let signed = sign(
-            registry,
-            &KeyHandle::new(derived_id.parse().unwrap()),
-            &[0x42; 32],
-            |id, data| async move { host.sign(&id, &data) },
-            gpk,
-        )
-        .await;
-        assert!(
-            matches!(signed, Err(PlatformError::KeyNotFound)),
-            "{signed:?}"
-        );
-    }
-
-    /// A derive racing its identity's destroy whose host destroy of the
-    /// derived key fails is still key-not-found, and the key is queued for
-    /// the sweep.
-    #[tokio::test]
-    async fn a_raced_derive_whose_destroy_fails_queues_the_key() {
-        let registry = CallbackKeyRegistry::new();
-        live(
-            &registry,
-            1,
-            RegisteredKey::Ed25519(ed(0xE8).verifying_key()),
-            KeyRole::Identity,
-        );
-        let key = p256(0xE9);
-        let point = key.public_key().to_compressed().to_vec();
-        let result = derive_pseudonym(
-            &registry,
-            &KeyHandle::new(1),
-            b"ctx",
-            None,
-            |_| {
-                let token = registry.begin_destroy(&KeyHandle::new(1));
-                let ended = token.and_then(|t| registry.end_destroy(&KeyHandle::new(1), t, true));
-                async move {
-                    ended?;
-                    Ok((point, "20".to_owned()))
-                }
-            },
-            |_| {
-                let answer = p256_answer(&key);
-                async move { Ok(answer) }
-            },
-            |_| async { Err(PlatformError::CustodyError("host busy".into())) },
-        )
-        .await;
-        assert!(
-            matches!(result, Err(PlatformError::KeyNotFound)),
-            "{result:?}"
-        );
-        assert_eq!(registry.orphans(), vec!["20".to_owned()]);
-    }
-
-    /// A raced derive whose returned id names a key the registry holds live
-    /// destroys nothing: the held key is not the raced derive's to destroy.
-    #[tokio::test]
-    async fn a_raced_derive_never_destroys_a_held_id() {
-        let registry = CallbackKeyRegistry::new();
-        live(
-            &registry,
-            1,
-            RegisteredKey::Ed25519(ed(0xE8).verifying_key()),
-            KeyRole::Identity,
-        );
-        let held = p256(0xEA);
-        live(
-            &registry,
-            20,
-            RegisteredKey::P256Signing(held.public_key()),
-            KeyRole::Operational,
-        );
-        let key = p256(0xE9);
-        let point = key.public_key().to_compressed().to_vec();
-        let result = derive_pseudonym(
-            &registry,
-            &KeyHandle::new(1),
-            b"ctx",
-            None,
-            |_| {
-                let token = registry.begin_destroy(&KeyHandle::new(1));
-                let ended = token.and_then(|t| registry.end_destroy(&KeyHandle::new(1), t, true));
-                async move {
-                    ended?;
-                    Ok((point, "20".to_owned()))
-                }
-            },
-            |_| {
-                let answer = p256_answer(&key);
-                async move { Ok(answer) }
-            },
-            no_destroy,
-        )
-        .await;
-        assert!(
-            matches!(result, Err(PlatformError::KeyNotFound)),
-            "{result:?}"
-        );
-        assert!(registry.orphans().is_empty());
-        assert!(registry.is_live(&KeyHandle::new(20)));
-    }
-
-    /// A failed `get_public_key(key_id)` confirmation while the source is
-    /// still the live identity refuses the pseudonym (ADR-021) with the
-    /// host's message, binds nothing, and destroys nothing. Passing the host
-    /// error through fails this.
-    #[tokio::test]
-    async fn a_failed_confirmation_refuses_the_pseudonym() {
-        let registry = CallbackKeyRegistry::new();
-        live(
-            &registry,
-            1,
-            RegisteredKey::Ed25519(ed(0xE8).verifying_key()),
-            KeyRole::Identity,
-        );
-        let point = p256(0xE9).public_key().to_compressed().to_vec();
-        let result = derive_pseudonym(
-            &registry,
-            &KeyHandle::new(1),
-            b"ctx",
-            None,
-            |_| async move { Ok((point, "20".to_owned())) },
-            |_| async { Err(PlatformError::CustodyError("keystore locked".into())) },
-            no_destroy,
-        )
-        .await;
-        assert!(
-            matches!(&result, Err(PlatformError::PseudonymRejected(msg)) if msg.contains("keystore locked")),
-            "{result:?}"
-        );
-        assert!(!registry.is_live(&KeyHandle::new(20)));
-        assert!(registry.orphans().is_empty());
-    }
-
-    /// A failed `get_public_key(key_id)` confirmation after the source
-    /// identity was destroyed while the host answered is key-not-found
-    /// (§9.10.4.A), and the adapter destroys the derived host key. Refusing
-    /// every failed confirmation as a rejected pseudonym fails this.
-    #[tokio::test]
-    async fn a_failed_confirmation_after_the_identity_destroy_is_key_not_found() {
-        let registry = CallbackKeyRegistry::new();
-        let registry = &registry;
-        live(
-            registry,
-            1,
-            RegisteredKey::Ed25519(ed(0xE8).verifying_key()),
-            KeyRole::Identity,
-        );
-        let point = p256(0xE9).public_key().to_compressed().to_vec();
-        let destroyed = Log::default();
-        let destroyed = &destroyed;
-        let result = derive_pseudonym(
-            registry,
-            &KeyHandle::new(1),
-            b"ctx",
-            None,
-            |_| async move { Ok((point, "20".to_owned())) },
-            |_| {
-                let token = registry.begin_destroy(&KeyHandle::new(1));
-                let ended = token.and_then(|t| registry.end_destroy(&KeyHandle::new(1), t, true));
-                async move {
-                    ended?;
-                    Err(PlatformError::CustodyError("keystore locked".into()))
-                }
-            },
-            |id: String| async move {
-                destroyed.lock().unwrap().push(id);
-                Ok(())
-            },
-        )
-        .await;
-        assert!(
-            matches!(result, Err(PlatformError::KeyNotFound)),
-            "{result:?}"
-        );
-        assert_eq!(*destroyed.lock().unwrap(), vec!["20".to_owned()]);
-        assert!(registry.orphans().is_empty());
-        assert!(!registry.is_live(&KeyHandle::new(20)));
     }
 }

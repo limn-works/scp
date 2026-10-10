@@ -1,23 +1,19 @@
 /**
- * The napi callback-custody adapter's pseudonym checks (§9.5, §9.10.4),
- * driven through the SDK's production custody record
- * (`toNativeCustodyProvider`) and the napi `TestingCallbackCustody` hook.
+ * The napi callback-custody adapter (§9.10.4), driven through the SDK's
+ * production custody record (`toNativeCustodyProvider`) and the napi
+ * `TestingCallbackCustody` hook, whose derivations return the 32-byte routing
+ * id the bridge computes from the host's point.
  *
- * Each test fails if the check it names is removed from the adapter
- * (`crates/scp-ffi/napi/src/custody.rs` over `CallbackKeyRegistry` in
- * `crates/scp-ffi/common/src/callback_custody.rs`):
- *   - `p256_digest`: a pseudonym key signs only a 32-byte digest, and a
- *     shorter input never reaches the host;
- *   - `p256_host_signature`: a high-s host signature comes out as the low-s
- *     form;
- *   - `begin_destroy` and `end_destroy`: the id is no longer live when the
- *     host's `destroyKey` runs, and a host that breaks the no-reuse contract
- *     by giving a destroyed id a new point has that point bound;
- *   - `retire_pseudonyms_of`: destroying an identity retires its pseudonyms,
- *     so they sign nothing, and a host that breaks the no-reuse contract by
- *     handing their ids to new pseudonyms has those bound afresh;
- *   - `derive_pseudonym`: a derive racing its identity's destroy is
- *     key-not-found and destroys the host key it derived (§9.10.4.A).
+ * The forwarding test fails if `derive_pseudonym` or
+ * `derive_rotatable_pseudonym` in `crates/scp-ffi/napi/src/custody.rs`, or
+ * `derivePseudonym` or `deriveRotatablePseudonym` in
+ * `src/internal/custody-adapter.ts`, hands the host anything but the caller's
+ * context bytes and epoch, routes v2 to the v1 callback, or computes any
+ * routing id but §25.19 Vector 30's from the host's point.
+ *
+ * The derivation-failure tests fail if the bridge accepts host bytes that are
+ * not a compressed P-256 point (`SCP-IDENT-1055`) or reports a host
+ * key-not-found as anything but `SCP-CRYPTO-4006`.
  *
  * The host-failure tests fail if `hostCall` in
  * `src/internal/custody-adapter.ts` stops turning a host failure into a typed
@@ -28,32 +24,34 @@
  * and never reach the process as an uncaught exception or an unhandled
  * rejection.
  *
- * It also runs the §25.19 Vector 30 and 31 identity scalars through the
- * bridge's production pseudonym derivation and compares each v1 routing id to
- * the spec.
+ * The secret-wipe tests fail if `dhAgree` or `exportSigningKeyBytes` in
+ * `src/internal/custody-adapter.ts` stops zero-filling the adapter's copy of
+ * the host secret once napi-rs has read it, wipes it before the bridge reads
+ * it (the bridge would then return zeros), or writes to the host's buffer.
  */
 
 import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 
-import { CryptoError, mapBridgeError } from "../src/errors";
+import { CryptoError, IdentityError, mapBridgeError } from "../src/errors";
 import { toNativeCustodyProvider } from "../src/internal/custody-adapter";
 import { loadNativeAddon } from "../src/internal/native";
-import type { CustodyPublicKey, KeyCustodyProvider, PseudonymResult } from "../src/scp";
-import {
-  bigIntTo32,
-  bytesToBigInt,
-  P256_N,
-  p256Compressed,
-  p256SignPrehash,
-  pseudonymScalar,
-  pseudonymSeedV1,
-} from "./pseudonym-recipe";
+import type { CustodyPublicKey, KeyCustodyProvider } from "../src/scp";
+import { p256SoftwarePseudonymPoint } from "../src/scp";
 
 interface TestingCustody {
   generateKeypair(): Promise<string>;
-  derivePseudonym(identityKeyId: string, contextId: string): Promise<PseudonymResult>;
+  /** Returns the 32-byte routing id of the host's v1 point. */
+  derivePseudonym(identityKeyId: string, contextId: string): Promise<Buffer>;
+  /** Returns the 32-byte routing id of the host's v2 point. */
+  deriveRotatablePseudonym(
+    identityKeyId: string,
+    contextId: string,
+    epoch: bigint,
+  ): Promise<Buffer>;
   sign(keyId: string, data: Buffer): Promise<Buffer>;
+  /** Returns the 32-byte shared secret the bridge read from the host. */
+  dhAgree(keyId: string, peerPublic: Buffer): Promise<Buffer>;
   destroyKey(keyId: string): Promise<void>;
 }
 
@@ -72,116 +70,74 @@ try {
   skipReason = `native addon not available: ${e instanceof Error ? e.message : String(e)}`;
 }
 
-/** A host fault the store injects into pseudonym signing or key ids. */
-type Fault = "highS" | "fixedId" | "signThrows" | "sign4001";
+/** A host fault the keychain injects into signing or derivation. */
+type Fault = "signThrows" | "sign4001" | "legacy32";
 
-/** The host's key store, with a count of `sign` calls that reach it. */
-class Store {
+/** A host keychain of Ed25519 identity seeds; it stores no pseudonym. */
+class StoreKeychain implements KeyCustodyProvider {
   seeds = new Map<string, Uint8Array>();
-  pseudonyms = new Map<string, bigint>();
-  /** Pseudonym key id -> the identity key id it was derived from. */
-  pseudonymOwner = new Map<string, string>();
   /** Key id -> the role `generateKeypair` minted it in. */
   roles = new Map<string, string>();
   next = 1;
-  signCalls = 0;
-  /** Called with the key id at the start of the host's `destroyKey`. */
-  destroyProbe?: (keyId: string) => void;
-  /** Every key id the host's `destroyKey` received, in order. */
-  destroyed: string[] = [];
-  /**
-   * Whether destroying an identity also drops its pseudonyms. A host that
-   * keeps every key it is not told to destroy sets this false.
-   */
-  cascadeDestroy = true;
-  /**
-   * Called with (identity key id, derived key id) inside the host's
-   * `derivePseudonym`, after the host holds the derived key.
-   */
-  deriveProbe?: (sourceKeyId: string, derivedKeyId: string) => void;
-}
 
-class StoreKeychain implements KeyCustodyProvider {
-  constructor(
-    readonly store: Store,
-    readonly fault?: Fault,
-  ) {}
+  constructor(readonly fault?: Fault) {}
 
   generateKeypair(_keyType: string, role: string): string {
-    const kid = String(this.store.next++);
-    this.store.seeds.set(kid, new Uint8Array(crypto.randomBytes(32)));
-    this.store.roles.set(kid, role);
+    const kid = String(this.next++);
+    this.seeds.set(kid, new Uint8Array(crypto.randomBytes(32)));
+    this.roles.set(kid, role);
     return kid;
   }
 
+  #seed(keyId: string): Uint8Array {
+    const seed = this.seeds.get(keyId);
+    // The contract's key-not-found signal (`KeyCustodyProvider` in `src/scp.ts`).
+    if (seed === undefined) throw new CryptoError(`key not found: ${keyId}`, "SCP-CRYPTO-4006");
+    return seed;
+  }
+
+  #privateKey(keyId: string): crypto.KeyObject {
+    const der = Buffer.concat([
+      Buffer.from("302e020100300506032b657004220420", "hex"),
+      Buffer.from(this.#seed(keyId)),
+    ]);
+    return crypto.createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+  }
+
   sign(keyId: string, message: Uint8Array): Uint8Array {
-    this.store.signCalls++;
     if (this.fault === "signThrows") throw new Error("keystore offline");
     if (this.fault === "sign4001") throw new CryptoError("hsm offline", "SCP-CRYPTO-4001");
-    const d = this.store.pseudonyms.get(keyId);
-    // The contract's key-not-found signal (`KeyCustodyProvider` in `src/scp.ts`).
-    if (d === undefined) throw new CryptoError(`key not found: ${keyId}`, "SCP-CRYPTO-4006");
-    const sig = p256SignPrehash(d, message);
-    if (this.fault !== "highS") return sig;
-    const s = bytesToBigInt(sig.subarray(32));
-    return new Uint8Array(
-      Buffer.concat([Buffer.from(sig.subarray(0, 32)), bigIntTo32(P256_N - s)]),
-    );
+    return new Uint8Array(crypto.sign(null, Buffer.from(message), this.#privateKey(keyId)));
   }
 
   getPublicKey(keyId: string): CustodyPublicKey {
-    const d = this.store.pseudonyms.get(keyId);
-    if (d !== undefined) {
-      return { keyType: "p256", publicKey: p256Compressed(d), role: "operational" };
-    }
-    const seed = this.store.seeds.get(keyId);
-    if (seed !== undefined) {
-      return {
-        keyType: "ed25519",
-        publicKey: ed25519Public(seed),
-        role: this.store.roles.get(keyId) ?? "missing",
-      };
-    }
-    // The contract's key-not-found signal.
-    throw new CryptoError(`unknown key id: ${keyId}`, "SCP-CRYPTO-4006");
+    const spki = crypto
+      .createPublicKey(this.#privateKey(keyId))
+      .export({ format: "der", type: "spki" });
+    return {
+      keyType: "ed25519",
+      publicKey: new Uint8Array(spki.subarray(spki.length - 32)),
+      role: this.roles.get(keyId) ?? "missing",
+    };
   }
 
   destroyKey(keyId: string): void {
-    this.store.destroyProbe?.(keyId);
-    this.store.destroyed.push(keyId);
-    this.store.seeds.delete(keyId);
-    this.store.roles.delete(keyId);
-    this.store.pseudonyms.delete(keyId);
-    this.store.pseudonymOwner.delete(keyId);
-    if (!this.store.cascadeDestroy) return;
-    // A pseudonym dies with its identity (§9.10.4.A).
-    for (const [kid, owner] of [...this.store.pseudonymOwner]) {
-      if (owner !== keyId) continue;
-      this.store.pseudonyms.delete(kid);
-      this.store.pseudonymOwner.delete(kid);
-    }
+    this.seeds.delete(keyId);
+    this.roles.delete(keyId);
   }
 
   dhAgree(_keyId: string, _peerPublic: Uint8Array): Uint8Array {
     throw new Error("unused");
   }
 
-  derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult {
-    const seed = this.store.seeds.get(keyId);
-    if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
-    const d = pseudonymScalar(pseudonymSeedV1(seed, contextId));
-    // Deterministic per (identity, context), as the provider contract requires;
-    // `fixedId` names every pseudonym "777" to reuse one id across contexts.
-    const h = crypto.createHash("sha256").update(`${keyId}|`).update(contextId).digest();
-    const pseudonymId =
-      this.fault === "fixedId" ? "777" : (h.readBigUInt64BE(0) | (1n << 63n)).toString();
-    this.store.pseudonyms.set(pseudonymId, d);
-    this.store.pseudonymOwner.set(pseudonymId, keyId);
-    this.store.deriveProbe?.(keyId, pseudonymId);
-    return { publicKey: p256Compressed(d), keyId: pseudonymId };
+  derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array {
+    // The SDK's software helper derives the point; the host stores nothing.
+    const point = p256SoftwarePseudonymPoint(this.#seed(keyId), contextId);
+    // A host still on the retired 32-byte Ed25519 pseudonym shape.
+    return this.fault === "legacy32" ? point.subarray(1) : point;
   }
 
-  deriveRotatablePseudonym(): PseudonymResult {
+  deriveRotatablePseudonym(): Uint8Array {
     throw new Error("unused");
   }
 
@@ -194,30 +150,22 @@ class StoreKeychain implements KeyCustodyProvider {
   }
 }
 
-/** The Ed25519 public key of a 32-byte seed, through a PKCS#8 import. */
-function ed25519Public(seed: Uint8Array): Uint8Array {
-  const pkcs8 = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]);
-  const key = crypto.createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
-  const spki = crypto.createPublicKey(key).export({ format: "der", type: "spki" });
-  return new Uint8Array(spki.subarray(spki.length - 32));
-}
-
-function adapter(store: Store, fault?: Fault): TestingCustody {
+function adapter(host: StoreKeychain): TestingCustody {
   const Ctor = native.TestingCallbackCustody as TestingCustodyCtor;
-  return new Ctor(toNativeCustodyProvider(new StoreKeychain(store, fault)));
+  return new Ctor(toNativeCustodyProvider(host));
 }
 
 /**
- * A provider over `store` whose `overrides` replace some methods, typed
- * loosely so a test can return what a misbehaving host returns.
+ * A provider whose `overrides` replace some methods, typed loosely so a test
+ * can return what a misbehaving host returns.
  */
-function adapterWith(store: Store, overrides: Record<string, () => unknown>): TestingCustody {
+function adapterWith(overrides: Record<string, (...args: unknown[]) => unknown>): TestingCustody {
   const Ctor = native.TestingCallbackCustody as TestingCustodyCtor;
-  const provider = Object.assign(new StoreKeychain(store), overrides) as KeyCustodyProvider;
+  const provider = Object.assign(new StoreKeychain(), overrides) as KeyCustodyProvider;
   return new Ctor(toNativeCustodyProvider(provider));
 }
 
-const DIGEST = crypto.createHash("sha256").update("custody-bridge-checks").digest();
+const MESSAGE = Buffer.from("custody-bridge-checks");
 
 /**
  * Runs `body` and returns every error that reached the process as an uncaught
@@ -254,73 +202,70 @@ async function rejectionOf(call: () => Promise<unknown>): Promise<Error & { code
   return mapBridgeError(err);
 }
 
-describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () => {
-  test("a pseudonym key signs a 32-byte digest and nothing shorter reaches the host", async () => {
-    const store = new Store();
-    const custody = adapter(store);
-    const identity = await custody.generateKeypair();
-    const pseudonym = await custody.derivePseudonym(identity, "ctx");
-    expect((await custody.sign(pseudonym.keyId, DIGEST)).length).toBe(64);
-    const calls = store.signCalls;
-    const err = await custody.sign(pseudonym.keyId, Buffer.alloc(12)).catch((e: unknown) => e);
-    expect(mapBridgeError(err).code).toBe("SCP-CRYPTO-4060");
-    expect(store.signCalls).toBe(calls);
-  });
-
-  test("a high-s host signature comes out as the low-s form", async () => {
-    const store = new Store();
-    const custody = adapter(store, "highS");
-    const identity = await custody.generateKeypair();
-    const pseudonym = await custody.derivePseudonym(identity, "ctx");
-    const sig = await custody.sign(pseudonym.keyId, DIGEST);
-    expect(sig.length).toBe(64);
-    expect(bytesToBigInt(sig.subarray(32)) <= P256_N / 2n).toBe(true);
-    const d = store.pseudonyms.get(pseudonym.keyId);
-    if (d === undefined) throw new Error("pseudonym missing from the store");
-    expect(Buffer.from(sig).equals(Buffer.from(p256SignPrehash(d, DIGEST)))).toBe(true);
-  });
-
-  test("destroying a pseudonym unbinds its id", async () => {
-    const store = new Store();
-    const custody = adapter(store, "fixedId");
-    const identity = await custody.generateKeypair();
-    const alpha = await custody.derivePseudonym(identity, "alpha");
-    await custody.destroyKey(alpha.keyId);
-    // "777" now carries a different point; a stale binding would reject it.
-    const beta = await custody.derivePseudonym(identity, "beta");
-    expect(beta.keyId).toBe(alpha.keyId);
-    expect(Buffer.from(beta.publicKey).equals(Buffer.from(alpha.publicKey))).toBe(false);
-    expect((await custody.sign(beta.keyId, DIGEST)).length).toBe(64);
-  });
-
-  test("a destroyed identity's pseudonym rejects sign with key-not-found (§9.10.4.A)", async () => {
-    const store = new Store();
-    const custody = adapter(store);
-    const identity = await custody.generateKeypair();
-    const other = await custody.generateKeypair();
-    const pseudonym = await custody.derivePseudonym(identity, "ctx");
-    const kept = await custody.derivePseudonym(other, "ctx");
-    expect((await custody.sign(pseudonym.keyId, DIGEST)).length).toBe(64);
-    await custody.destroyKey(identity);
-    let err: unknown;
-    const uncaught = await uncaughtDuring(async () => {
-      err = await custody.sign(pseudonym.keyId, DIGEST).catch((e: unknown) => e);
+describe.skipIf(skipReason !== "")("napi callback custody", () => {
+  test("the host receives the caller's context and epoch unchanged and the bridge returns the §25.19 Vector 30 routing ids", async () => {
+    // §25.19 Vector 30 (`context_id` = "context-alpha", epoch 1): the points
+    // and routing ids, copied verbatim from the spec.
+    const V1 = "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72";
+    const V2 = "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479";
+    const V1_ROUTING = "b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307";
+    const V2_ROUTING = "b19754a5e88c993683f99e48646ba518cba80dec0693f920c5671263650b6ae9";
+    const received: unknown[][] = [];
+    const custody = adapterWith({
+      derivePseudonym: (...args: unknown[]) => {
+        received.push(["v1", ...args]);
+        return new Uint8Array(Buffer.from(V1, "hex"));
+      },
+      deriveRotatablePseudonym: (...args: unknown[]) => {
+        received.push(["v2", ...args]);
+        return new Uint8Array(Buffer.from(V2, "hex"));
+      },
     });
-    expect(uncaught).toEqual([]);
-    const mapped = mapBridgeError(err);
+    const identity = await custody.generateKeypair();
+    const v1 = await custody.derivePseudonym(identity, "context-alpha");
+    const v2 = await custody.deriveRotatablePseudonym(identity, "context-alpha", 1n);
+    const context = new Uint8Array(Buffer.from("context-alpha"));
+    expect(received).toEqual([
+      ["v1", identity, context],
+      ["v2", identity, context, 1n],
+    ]);
+    expect(Buffer.from(v1).toString("hex")).toBe(V1_ROUTING);
+    expect(Buffer.from(v2).toString("hex")).toBe(V2_ROUTING);
+  });
+
+  test("host pseudonym bytes that are not a compressed P-256 point reject with SCP-IDENT-1055", async () => {
+    const custody = adapter(new StoreKeychain("legacy32"));
+    const identity = await custody.generateKeypair();
+    const mapped = await rejectionOf(() => custody.derivePseudonym(identity, "ctx"));
+    expect(mapped).toBeInstanceOf(IdentityError);
+    expect(mapped.code).toBe("SCP-IDENT-1055");
+    expect(mapped.message).toContain("got 32 bytes");
+  });
+
+  test("deriving under a destroyed identity rejects with CryptoError SCP-CRYPTO-4006", async () => {
+    const custody = adapter(new StoreKeychain());
+    const identity = await custody.generateKeypair();
+    await custody.derivePseudonym(identity, "ctx");
+    await custody.destroyKey(identity);
+    const mapped = await rejectionOf(() => custody.derivePseudonym(identity, "ctx"));
     expect(mapped).toBeInstanceOf(CryptoError);
     expect(mapped.code).toBe("SCP-CRYPTO-4006");
-    expect((await custody.sign(kept.keyId, DIGEST)).length).toBe(64);
+  });
+
+  test("a non-canonical key id from generateKeypair is SCP-CRYPTO-4060", async () => {
+    const generated = adapterWith({ generateKeypair: () => "007" });
+    const onGenerate = await rejectionOf(() => generated.generateKeypair());
+    expect(onGenerate).toBeInstanceOf(CryptoError);
+    expect(onGenerate.code).toBe("SCP-CRYPTO-4060");
+    expect(onGenerate.message).toContain("non-canonical key_id");
   });
 
   test("a host method that throws another error rejects with a custody error", async () => {
-    const store = new Store();
-    const custody = adapter(store, "signThrows");
+    const custody = adapter(new StoreKeychain("signThrows"));
     const identity = await custody.generateKeypair();
-    const pseudonym = await custody.derivePseudonym(identity, "ctx");
     let err: unknown;
     const uncaught = await uncaughtDuring(async () => {
-      err = await custody.sign(pseudonym.keyId, DIGEST).catch((e: unknown) => e);
+      err = await custody.sign(identity, MESSAGE).catch((e: unknown) => e);
     });
     expect(uncaught).toEqual([]);
     const mapped = mapBridgeError(err);
@@ -329,11 +274,9 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
   });
 
   test("a host error carrying the generic SCP-CRYPTO-4001 is a custody error, not key-not-found", async () => {
-    const store = new Store();
-    const custody = adapter(store, "sign4001");
+    const custody = adapter(new StoreKeychain("sign4001"));
     const identity = await custody.generateKeypair();
-    const pseudonym = await custody.derivePseudonym(identity, "ctx");
-    const err = await custody.sign(pseudonym.keyId, DIGEST).catch((e: unknown) => e);
+    const err = await custody.sign(identity, MESSAGE).catch((e: unknown) => e);
     const mapped = mapBridgeError(err);
     expect(mapped.code).toBe("SCP-CRYPTO-4060");
     expect(mapped.message).toContain("SCP-CRYPTO-4001");
@@ -341,30 +284,28 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
   });
 
   test("an async host method's rejection is a custody error, never an unhandled rejection", async () => {
-    const store = new Store();
-    const custody = adapterWith(store, {
+    const custody = adapterWith({
       sign: () => Promise.reject(new Error("async keystore offline")),
     });
     const identity = await custody.generateKeypair();
-    const pseudonym = await custody.derivePseudonym(identity, "ctx");
-    const mapped = await rejectionOf(() => custody.sign(pseudonym.keyId, DIGEST));
+    const mapped = await rejectionOf(() => custody.sign(identity, MESSAGE));
     expect(mapped).toBeInstanceOf(CryptoError);
     expect(mapped.code).toBe("SCP-CRYPTO-4060");
     expect(mapped.message).toContain("Promise");
   });
 
   test("a wrongly typed or asynchronous host return is a custody error", async () => {
-    const wrongType = adapterWith(new Store(), { generateKeypair: () => 42 });
+    const wrongType = adapterWith({ generateKeypair: () => 42 });
     const mapped = await rejectionOf(() => wrongType.generateKeypair());
     expect(mapped).toBeInstanceOf(CryptoError);
     expect(mapped.code).toBe("SCP-CRYPTO-4060");
     expect(mapped.message).toContain("not a string");
 
-    const asyncKeypair = adapterWith(new Store(), { generateKeypair: () => Promise.resolve("1") });
+    const asyncKeypair = adapterWith({ generateKeypair: () => Promise.resolve("1") });
     expect((await rejectionOf(() => asyncKeypair.generateKeypair())).code).toBe("SCP-CRYPTO-4060");
 
     // A thenable whose `then` rejects is settled against a no-op handler.
-    const thenable = adapterWith(new Store(), {
+    const thenable = adapterWith({
       generateKeypair: () => ({
         // biome-ignore lint/suspicious/noThenProperty: a host-returned thenable is the case under test
         then: (_: unknown, reject: (e: unknown) => void) => reject(new Error("late")),
@@ -377,136 +318,55 @@ describe.skipIf(skipReason !== "")("napi callback custody pseudonym checks", () 
     const { proxy, revoke } = Proxy.revocable({}, {});
     revoke();
     for (const thrown of [Object.create(null), proxy, Object.assign(new Error(), { message: 7 })]) {
-      const store = new Store();
-      const custody = adapterWith(store, {
+      const custody = adapterWith({
         sign: () => {
           throw thrown;
         },
       });
       const identity = await custody.generateKeypair();
-      const pseudonym = await custody.derivePseudonym(identity, "ctx");
-      const mapped = await rejectionOf(() => custody.sign(pseudonym.keyId, DIGEST));
+      const mapped = await rejectionOf(() => custody.sign(identity, MESSAGE));
       expect(mapped).toBeInstanceOf(CryptoError);
       expect(mapped.code).toBe("SCP-CRYPTO-4060");
     }
   });
 
-  test("the adapter retires a pseudonym before the host's destroyKey runs", async () => {
-    // Observed through behaviour: a sign issued while the host's destroyKey
-    // runs finds the handle retired (Destroying) and fails key-not-found
-    // (SCP-CRYPTO-4006) without reaching the host's `sign`. The testing `sign`
-    // polls the adapter once on the JS thread before it returns, and that
-    // poll reads the registry, so a `sign` issued inside the host's
-    // `destroyKey` sees the registry as it stands during that host call.
-    const store = new Store();
-    const custody = adapter(store);
+  test("the bridge reads the host's shared secret intact, then the adapter's copy is zeroed", async () => {
+    // A secret no wipe or truncation produces: 32 distinct non-zero bytes.
+    const secret = Uint8Array.from({ length: 32 }, (_, i) => 0xa0 + i);
+    const peer = Buffer.alloc(32, 0x5c);
+    const seen: unknown[][] = [];
+    const custody = adapterWith({
+      dhAgree: (...args: unknown[]) => {
+        seen.push(args);
+        return secret;
+      },
+    });
     const identity = await custody.generateKeypair();
-    const pseudonym = await custody.derivePseudonym(identity, "ctx");
-    expect((await custody.sign(pseudonym.keyId, DIGEST)).length).toBe(64);
-    const signsBefore = store.signCalls;
-
-    let duringHostDestroy: Promise<unknown> | undefined;
-    store.destroyProbe = (keyId) => {
-      // Settle the result into a value at once, so a rejection is never
-      // unhandled; the promise below never rejects.
-      duringHostDestroy = custody.sign(keyId, DIGEST).then(
-        () => undefined,
-        (e: unknown) => e,
-      );
-    };
-    await custody.destroyKey(pseudonym.keyId);
-    expect(duringHostDestroy).toBeDefined();
-    const err = await (duringHostDestroy as Promise<unknown>);
-    expect(mapBridgeError(err).code).toBe("SCP-CRYPTO-4006");
-    expect(store.signCalls).toBe(signsBefore);
+    const shared = await custody.dhAgree(identity, peer);
+    expect(Buffer.from(shared).toString("hex")).toBe(Buffer.from(secret).toString("hex"));
+    expect(seen).toEqual([[identity, new Uint8Array(peer)]]);
+    // The host's own buffer is the host's to wipe.
+    expect(secret.every((b, i) => b === 0xa0 + i)).toBe(true);
   });
 
-  test("a derive racing its identity's destroy leaves no host key", async () => {
-    // §9.10.4.A: a derivation in flight when its identity is destroyed is
-    // key-not-found and stores nothing, on the host included. The identity
-    // destroy starts inside the host's derivePseudonym; the testing
-    // `destroyKey` retires the identity on the JS thread before it returns,
-    // so the adapter's bind finds the identity gone. The host keeps every key
-    // it is not told to destroy, so without the adapter's destroy of the
-    // derived id the host keeps it, and the sign below resolves and uses it.
-    const store = new Store();
-    store.cascadeDestroy = false;
-    const custody = adapter(store);
-    const identity = await custody.generateKeypair();
-    let derivedId: string | undefined;
-    let identityDestroy: Promise<unknown> | undefined;
-    store.deriveProbe = (_source, id) => {
-      derivedId = id;
-      // Settle the result into a value at once, so a rejection is never
-      // unhandled; the promise below never rejects.
-      identityDestroy = custody.destroyKey(identity).then(
-        () => undefined,
-        (e: unknown) => e,
-      );
-    };
-    const err = await custody.derivePseudonym(identity, "ctx").then(
-      () => undefined,
-      (e: unknown) => e,
-    );
-    expect(mapBridgeError(err).code).toBe("SCP-CRYPTO-4006");
-    expect(await identityDestroy).toBeUndefined();
-    expect(derivedId).toBeDefined();
-    const id = derivedId as string;
-    expect(store.destroyed).toContain(id);
-    expect(store.pseudonyms.has(id)).toBe(false);
-    const signed = await custody.sign(id, DIGEST).then(
-      () => undefined,
-      (e: unknown) => e,
-    );
-    expect(mapBridgeError(signed).code).toBe("SCP-CRYPTO-4006");
-  });
-
-  test("destroying an identity retires its pseudonyms", async () => {
-    const store = new Store();
-    const custody = adapter(store, "fixedId");
-    const first = await custody.generateKeypair();
-    const alpha = await custody.derivePseudonym(first, "alpha");
-    // Bound: the adapter rejects a 5-byte input before calling the host.
-    const whileBound = await rejectionOf(() => custody.sign(alpha.keyId, Buffer.alloc(5)));
-    expect(whileBound.code).toBe("SCP-CRYPTO-4060");
-    expect(store.signCalls).toBe(0);
-    await custody.destroyKey(first);
-    // The host still holds the pseudonym key; the adapter must not reach it.
-    // The pseudonym died with its identity (§9.10.4.A), so it is key-not-found.
-    const calls = store.signCalls;
-    const err = await custody.sign(alpha.keyId, DIGEST).catch((e: unknown) => e);
-    expect(mapBridgeError(err).code).toBe("SCP-CRYPTO-4006");
-    expect(store.signCalls).toBe(calls);
-    // A new identity's pseudonym reuses id "777" with a different point.
-    const second = await custody.generateKeypair();
-    const beta = await custody.derivePseudonym(second, "beta");
-    expect(beta.keyId).toBe(alpha.keyId);
-    expect(Buffer.from(beta.publicKey).equals(Buffer.from(alpha.publicKey))).toBe(false);
-    expect((await custody.sign(beta.keyId, DIGEST)).length).toBe(64);
-  });
-
-  // §25.19 Vectors 30 and 31: each identity scalar, installed as the native
-  // custody's Ed25519 seed (the §9.10.4.A native interim ikm), then derived on
-  // "context-alpha" by the production pseudonym path. No bridge path derives a
-  // v2 pseudonym in production; scp-crypto's §25.19 KAT covers v2.
-  const SPEC_25_19_V1 = [
-    {
-      name: "Vector 30",
-      scalar: "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
-      routingId: "b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307",
-    },
-    {
-      name: "Vector 31",
-      scalar: "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
-      routingId: "cab5ff45d21b6d0425fa7657e89fc68514965cbb4ca2b9549f4ccf430d581e7c",
-    },
-  ];
-  for (const vector of SPEC_25_19_V1) {
-    test(`§25.19 ${vector.name} v1 routing id through the bridge's pseudonym derivation`, async () => {
-      const routingId = await (
-        native.testingPseudonymRoutingIdFromSeed as (s: Buffer, c: string) => Promise<Buffer>
-      )(Buffer.from(vector.scalar, "hex"), "context-alpha");
-      expect(Buffer.from(routingId).toString("hex")).toBe(vector.routingId);
+  for (const method of ["dhAgree", "exportSigningKeyBytes"] as const) {
+    test(`${method}: the adapter's copy of the host secret is zero after the bridge's synchronous read`, async () => {
+      const secret = Uint8Array.from({ length: 32 }, (_, i) => 0x40 + i);
+      const provider = Object.assign(new StoreKeychain(), {
+        [method]: () => secret,
+      }) as KeyCustodyProvider;
+      const record = toNativeCustodyProvider(provider);
+      const result =
+        method === "dhAgree"
+          ? record.dhAgree(["1", Array.from(Buffer.alloc(32, 1))])
+          : record.exportSigningKeyBytes("1");
+      if (!result.ok) throw new Error(`host call failed: ${result.message}`);
+      const copy = result.value;
+      // What napi-rs copies into Rust as the callback returns.
+      expect(copy).toEqual(Array.from(secret));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(copy).toEqual(new Array(32).fill(0));
+      expect(secret.every((b, i) => b === 0x40 + i)).toBe(true);
     });
   }
 });

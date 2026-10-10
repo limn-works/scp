@@ -66,7 +66,9 @@ const RESET_BLOB_TTL_SECS: u32 = 3600;
 ///
 /// Wrapped in [`Zeroizing`](zeroize::Zeroizing) so the 32-byte private seed
 /// is zeroed when the driver (and every clone threaded into the per-tier
-/// engines) drops, rather than lingering in freed heap/stack memory.
+/// engines) drops, on the stack as well as the heap; the wiping global
+/// allocator of security model spec §9.15 (freed heap memory) reaches freed
+/// heap blocks only.
 type SigningKeyBytes = zeroize::Zeroizing<[u8; 32]>;
 
 /// Relay-backed driver for the ADR-029 reconnection protocol.

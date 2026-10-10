@@ -5,7 +5,8 @@
 # `rust-toolchain.toml` is the one place this repository names a stable Rust version, and
 # `fuzz/rust-toolchain.toml` the one place it names a nightly. Every consumer derives the
 # version from one of those two files, so no two consumers can disagree. This gate checks
-# the four things a derivation cannot establish on its own.
+# the four things a derivation cannot establish on its own, and check 5 checks the two mise
+# settings every checkout of this repository needs.
 #
 # ── CHECK 1: every container build proves which compiler it resolved ─────────────────
 #
@@ -104,10 +105,11 @@
 # against the repository rather than against a list of paths someone remembered to add.
 #
 #   2a/2b — THE PIN, ROUTED BY CONSTRUCTION. `rust-toolchain.toml` selects the compiler
-#   for every lane, not only the Rust lane: `python-test` runs `maturin develop`,
-#   `typescript-check` runs `cargo build -p scp-ffi-napi`, `typescript-wasm-check` and
-#   `scaffold-typescript-web-check` run `wasm-pack build`, `kotlin-test` runs
-#   `cargo build -p scp-ffi-uniffi`, `swift-build-test` runs `build-xcframework.sh`, and
+#   for every lane, not only the Rust lane: `pyo3-module` and `pyo3-module-macos` run
+#   `maturin develop`, `napi-addon` runs `cargo build -p scp-ffi-napi`, and `xcframework`
+#   runs `build-xcframework.sh`, and the jobs that need those artifacts download them;
+#   `typescript-wasm-check` and `scaffold-typescript-web-check` run `wasm-pack build`,
+#   `kotlin-test` runs `cargo build -p scp-ffi-uniffi`, and
 #   `docs.yml`'s `rust-docs` runs `cargo doc`. Listing the pin in each of those filters is
 #   a list that grows with the lanes. Instead each workflow declares one `toolchain`
 #   filter holding the pin, and every output of its `changes` job ORs that filter in. The
@@ -232,6 +234,34 @@
 # this gate too, before it pushes. Placing the comparison only in CI is what made an earlier
 # revision of it report success forever, and this gate is not that placement: the same
 # command an agent runs locally fails there.
+#
+# ── CHECK 5: mise refuses to run below 2026.9.15, and installs npm tools through bun ───
+#
+# THE CRITERION: every mise that runs in this repository is 2026.9.15 or newer, and every
+# `npm:` tool `.mise.toml` names installs through bun. mise 2026.2.22 resolved the
+# `"npm:@napi-rs/cli" = "latest"` entry by running `npm view @napi-rs/cli dist-tags
+# --json`. `npm` is itself a mise shim, so each such call started mise again, which
+# started `npm view` again, until about 10,000 processes filled a developer's process
+# table. mise 2026.9.15 answers `mise ls-remote npm:@napi-rs/cli` without starting
+# `npm view`. The root `AGENTS.md` forbids npm and names bun as this repository's package
+# manager, and a setting in one developer's `~/.config/mise/config.toml` reaches no other
+# checkout.
+#
+# HOW THE GATE ASKS. It parses `.mise.toml` with the TOML parser check 3 uses and reads two
+# keys:
+#
+#   * `min_version` at the top level. mise treats a string value as a hard floor and exits
+#     with an error when its own version is older, and treats `{ hard = "..." }` the same
+#     way. `{ soft = "..." }` alone only prints a warning, so the gate rejects a table
+#     without a `hard` key. The gate compares the floor's dot-separated integers against
+#     2026.9.15 and fails when the floor is absent, soft, lower, or not dot-separated
+#     integers.
+#   * `package_manager` in the `settings.npm` table. The gate fails unless it reads "bun".
+#
+# Check 5 reads a file, so it establishes what that file demands and nothing about the
+# mise installed in the shell running it. mise itself enforces the floor at run time, and
+# the first mise call in `scripts/setup-toolchain.sh` loads `.mise.toml`, so an older mise
+# stops that script with mise's own error.
 #
 # The gate FAILS CLOSED: a missing workflow, a missing filter, a filter with no path
 # entries, a `changes` job with no outputs, an empty root-file listing, an undiscoverable
@@ -722,11 +752,76 @@ else
     fi
 fi
 
+# ── Check 5 ──────────────────────────────────────────────────────────────────────────
+
+MISE_MIN_VERSION_FLOOR="2026.9.15"
+
+# The program that reads the two mise settings check 5 requires. It prints one finding per
+# line and nothing when both settings hold. A document no TOML parser accepts exits 2 with
+# the parser's message.
+read -r -d '' MISE_POLICY_PROGRAM <<'PYTHON' || true
+import sys
+import tomllib
+
+path, floor_text = sys.argv[1], sys.argv[2]
+try:
+    with open(path, "rb") as handle:
+        document = tomllib.load(handle)
+except (OSError, tomllib.TOMLDecodeError) as error:
+    print(error, file=sys.stderr)
+    sys.exit(2)
+
+
+def parse(text):
+    parts = text.split(".")
+    if not all(part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
+floor = parse(floor_text)
+declared = document.get("min_version")
+hard = None
+if declared is None:
+    print(f"{path} declares no top-level min_version, so a mise older than {floor_text} runs in this repository. mise 2026.2.22 resolves the 'npm:@napi-rs/cli = latest' entry by running 'npm view', which re-enters mise through the npm shim until the process table fills. Add 'min_version = \"{floor_text}\"'.")
+elif isinstance(declared, str):
+    hard = declared
+elif isinstance(declared, dict) and isinstance(declared.get("hard"), str):
+    hard = declared["hard"]
+else:
+    print(f"{path} sets min_version to {declared!r}, which gives mise no hard floor: mise only warns on a soft floor and keeps running. Write 'min_version = \"{floor_text}\"'.")
+if hard is not None:
+    parsed = parse(hard)
+    if parsed is None:
+        print(f"{path} sets the min_version hard floor to {hard!r}, which is not dot-separated integers, so the gate cannot compare it against {floor_text}.")
+    elif parsed < floor:
+        print(f"{path} sets the min_version hard floor to {hard}, which is lower than {floor_text}. mise 2026.2.22 resolves the 'npm:@napi-rs/cli = latest' entry by running 'npm view', which re-enters mise through the npm shim until the process table fills. Raise the floor to {floor_text} or later.")
+
+settings = document.get("settings")
+npm = settings.get("npm") if isinstance(settings, dict) else None
+manager = npm.get("package_manager") if isinstance(npm, dict) else None
+if manager != "bun":
+    print(f"{path} sets settings.npm.package_manager to {manager!r}, not 'bun', so mise installs npm-backend tools through whatever a developer's own configuration or mise's default selects. This repository uses bun and never npm. Add '[settings.npm]' with 'package_manager = \"bun\"'.")
+PYTHON
+
+if [[ ! -f $MISE_CONFIG ]]; then
+    report "$MISE_CONFIG does not exist, so the gate cannot check that mise refuses to run below $MISE_MIN_VERSION_FLOOR and installs npm tools through bun"
+elif [[ -z $toml_reader ]]; then
+    report "no python3.12, python3, or python on PATH imports tomllib, so the gate cannot parse $MISE_CONFIG to check its mise version floor and npm package manager"
+elif mise_policy_findings=$("$toml_reader" -c "$MISE_POLICY_PROGRAM" "$MISE_CONFIG" "$MISE_MIN_VERSION_FLOOR" 2>&1); then
+    while IFS= read -r mise_policy_line; do
+        if [[ -n $mise_policy_line ]]; then report "$mise_policy_line"; fi
+    done <<< "$mise_policy_findings"
+else
+    report "$MISE_CONFIG is not a TOML document tomllib accepts, so the gate cannot check its mise version floor and npm package manager: $mise_policy_findings"
+fi
+
 if [[ $fail -eq 0 ]]; then
     printf 'OK: every container build asserts it resolved the compiler %s names\n' "$PIN"
     printf 'OK: every lane of every paths-filtered workflow routes a %s change and a change to its own workflow file, and every root-level file and cargo configuration file is routed or declared unread\n' "$PIN"
     printf 'OK: %s names no Rust version source, so rustup resolves each directory from its own toolchain file\n' "$MISE_CONFIG"
     printf 'OK: %s\n' "$resolved_rustc_report"
+    printf 'OK: %s requires mise %s or newer and installs npm-backend tools through bun\n' "$MISE_CONFIG" "$MISE_MIN_VERSION_FLOOR"
     exit 0
 fi
 exit 1

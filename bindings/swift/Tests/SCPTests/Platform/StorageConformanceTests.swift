@@ -9,7 +9,8 @@
 // The in-memory backend uses the identical SQL schema and query
 // patterns as ``AppleStorage``, and it binds every parameter through
 // ``AppleStorage/bindText(_:to:at:)`` and
-// ``AppleStorage/bindBlob(_:to:at:)`` rather than through a second
+// ``AppleStorage/bindBlob(_:to:at:)``, and its `listKeys` reads rows
+// through ``AppleStorage/readKeys(from:)``, rather than through a second
 // copy of that code. A copy would let one of the two spellings carry a
 // defect the other had fixed.
 // Three differences remain: this backend applies no SQLCipher encryption
@@ -164,13 +165,7 @@
                     try AppleStorage.bindText(prefix, to: stmt, at: 1)
                 }
 
-                var keys: [String] = []
-                while sqlite3_step(stmt) == SQLITE_ROW {
-                    if let cStr = sqlite3_column_text(stmt, 0) {
-                        keys.append(String(cString: cStr))
-                    }
-                }
-                return keys
+                return try AppleStorage.readKeys(from: stmt)
             }
         }
 

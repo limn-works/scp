@@ -66,7 +66,17 @@ def _cargo_target_dir() -> Path:
     `~/.cargo/config.toml` points every worktree at one shared directory builds
     the cdylib outside this checkout. `cargo metadata --no-deps` reads the
     manifests and compiles nothing.
+
+    A set `CARGO_TARGET_DIR` is read directly instead. Cargo resolves a relative
+    value of that variable against the directory it runs in, which for the
+    `cargo metadata` call below is the repository root. Job
+    `bridge-parity-kotlin` in `.github/workflows/ci.yml` sets it because that job
+    installs no Rust toolchain, and a `cargo metadata` there would make rustup
+    install the pinned channel.
     """
+    env_target_dir = os.environ.get("CARGO_TARGET_DIR", "")
+    if env_target_dir:
+        return _REPO_ROOT / env_target_dir
     out = subprocess.run(
         ["cargo", "metadata", "--format-version", "1", "--no-deps"],
         cwd=_REPO_ROOT,
@@ -323,14 +333,15 @@ def kotlin_runner() -> Iterator[RunnerClient]:
 
     JNA loads the UniFFI cdylib via the JVM library path. CI exports
     `LD_LIBRARY_PATH` pointing at the Rust target directory; locally,
-    run `./gradlew -p . installDist` with the same env set before
-    starting the tests.
+    run `./gradlew -p . installDist -Pscp.uniffi.cargoFeatures=testing`
+    with the same env set before starting the tests.
     """
     binary = _kotlin_runner_binary()
     if binary is None:
         pytest.skip(
             "Kotlin parity runner not built. Set SCP_PARITY_KOTLIN_RUNNER "
-            "or run installDist under helpers/kotlin_bridge_runner/."
+            "or run installDist -Pscp.uniffi.cargoFeatures=testing under "
+            "helpers/kotlin_bridge_runner/."
         )
 
     # JNA needs a path to the UniFFI cdylib. On macOS, DYLD_* env vars

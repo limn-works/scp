@@ -448,7 +448,7 @@ pub mod test_helpers {
         own_public: &[u8],
     ) -> Result<(Vec<u8>, [u8; 32]), scp_crypto::p256::P256Error> {
         let own = scp_crypto::p256::P256PublicKey::from_sec1(own_public)?;
-        let peer = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&[0x2Au8; 32])?;
+        let peer = scp_crypto::p256::P256SecretKey::from_scalar_bytes(&[0x2Au8; 32])?;
         let shared = scp_crypto::p256::ecdh_p256(&peer, &own);
         Ok((peer.public_key().to_uncompressed().to_vec(), *shared))
     }
@@ -479,7 +479,7 @@ pub mod test_helpers {
     pub fn off_curve_p256_point() -> Result<[u8; 65], scp_crypto::p256::P256Error> {
         let mut one = [0u8; 32];
         one[31] = 1;
-        let generator = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&one)?;
+        let generator = scp_crypto::p256::P256SecretKey::from_scalar_bytes(&one)?;
         let mut point = generator.public_key().to_uncompressed();
         point[64] ^= 1;
         assert!(

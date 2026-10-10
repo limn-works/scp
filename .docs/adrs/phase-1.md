@@ -203,12 +203,12 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
 
 ### Acceptance Criteria
 
-1. **`derive_pseudonym(key_custody, identity_key_handle, context_id) -> PseudonymKeypair`**
+1. **`derive_pseudonym(key_custody, identity_key_handle, context_id) -> Pseudonym`**
    - Delegates to `key_custody.derive_pseudonym(identity_key_handle, context_id)`.
-   - Deterministic: same identity key + same context_id always produces the same pseudonym keypair.
+   - Deterministic: same identity key + same context_id always produces the same pseudonym.
    - Different `context_id` produces a different, unlinkable pseudonym.
-   - Uses `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")` then `P256_keygen(seed_to_scalar(seed[0..32]))`, where the seed-to-scalar step is the one §9.10.4 of the security-model spec fixes. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key (using the public key would be a membership-enumeration oracle — see §9.10.4.A and ADR-027). For software custody, `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic. For hardware custody (Android Keystore TEE, Secure Enclave) the `pseudonym_secret` is a device-local value computed inside the secure boundary (the private key is non-exportable), so hardware pseudonyms are device-local by design. The resulting PseudonymKeypair is software-managed.
-   - The pseudonym keypair's public key is the routing identifier used in outer envelopes.
+   - Uses `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")` then the point `seed_to_scalar(seed)·G`, where the seed-to-scalar step is the one §9.10.4 of the security-model spec fixes. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key (using the public key would be a membership-enumeration oracle — see §9.10.4.A and ADR-027). For software custody, `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic. For hardware custody (Android Keystore TEE, Secure Enclave) the `pseudonym_secret` is a device-local value computed inside the secure boundary (the private key is non-exportable), so hardware pseudonyms are device-local by design. The result is the 33-byte pseudonym point and its routing id; no private key is returned or stored (amended 2026-09-29, SCP-307).
+   - Outer envelopes carry the pseudonym's routing id, `SHA-256("scp-pseudonym-routing-v1:" || point)`, never the point (§9.10.4).
 
 2. **`create_inner_envelope(context_id, sender_did, epoch, generation, sequence, timestamp, payload, provenance, signing_key, signing_key_id) -> InnerEnvelope`**
    - The `signing_key_id` parameter names the operational role that is signing, `"#active"`. Stored on the `InnerEnvelope` for verifier key resolution.
@@ -866,11 +866,13 @@ pub enum TransportEvent {
 
 ## ADR-006: Platform Abstraction (In-Memory Testing Adapter)
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-09-27 (SCP-307, the Android hardware pseudonym secret).
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling) and 2026-09-29 (SCP-307, a pseudonym has no private key, and the typed custody failure; `InMemoryPush` returns a fixed wake signal and copies no payload byte into it; acceptance criterion 3; the `Push` trait's `handle_notification` returns one fixed wake signal; `WakeSignal`'s `&'static` bytes rule out returning the borrowed payload or a temporary copy of it, and `check_fixed_wake_signal` checks that the signal does not vary across the payloads it sends; `push_conformance!()` requires a fixed wake signal of every adapter, in the testing harness paragraph).
 
 **Amendment (2026-09-10 — the `KeyCustody` key types are both P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `KeyType` enum this ADR defines named one variant per curve and now names both by purpose: `P256Signing` and `P256Agreement`. Every method contract below reads the same way afterwards — `sign` rejects an agreement-only handle, `dh_agree` rejects a signing-only handle — because the split was always a purpose split and the curve names hid that. The pseudonym derivation gains the seed-to-scalar step of §9.10.4 of the security-model spec, because P-256 has no analogue of the seed expansion RFC 8032 fixed for the superseded curve. This ADR's adapter is the in-memory testing one, so no custody claim changes.
 
-**Amendment (2026-09-27 — SCP-307, the Android hardware pseudonym secret).** On Android hardware custody (Keystore, API 33 and above), `pseudonym_secret` is a 256-bit Keystore HMAC-SHA256 key that `generate_keypair` creates beside the identity key. The HMAC that yields the §9.10.4 context seed runs inside Keystore, so the secret never leaves it. Nothing is derived from a signature: the example `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))` in acceptance criterion 1 below is withdrawn, because a hardware signer draws its own nonce and would yield a different secret on every call (§9.10.4.A). A Keystore identity key generated before this secret existed has none, and deriving a pseudonym from it fails with `SCP-CRYPTO-4006`.
+**Amendment (2026-09-29 — SCP-307, a pseudonym has no private key).** `derive_pseudonym` and `derive_rotatable_pseudonym` return a `Pseudonym`: the 33-byte SEC1 compressed P-256 point and its 32-byte routing id (§9.10.4 of the security-model spec). No custody stores a pseudonym key, returns a handle to one, or signs with one, because no protocol message is signed by a pseudonym. Destroying the identity destroys its `pseudonym_secret`, and a derivation from a destroyed identity fails with `SCP-CRYPTO-4006` (§9.10.4.A). On Android hardware custody, `pseudonym_secret` is a 256-bit Keystore HMAC-SHA256 key that `generate_keypair` creates beside the identity key, and the HMAC that yields the context seed runs inside Keystore. Nothing is derived from a signature, because a hardware signer draws its own nonce (§9.10.4.A). Under the §9.10.4.A native interim, while the identity key is Ed25519, Keystore holds this secret only at API 33 and above, where it holds the identity key; after the identity key moves to P-256 (SCP-315) it holds the secret at every API level the SDK supports. A Keystore identity key generated before the secret existed fails pseudonym derivation with `SCP-CRYPTO-4006`.
+
+**Amendment (2026-09-29 — SCP-307, a failed custody call keeps its kind across every layer).** A `PlatformError` reaches a bridge through error types in crates below `scp-platform` that cannot hold it, so each of them carries a `CustodyFailure` from `scp-crypto` whose kind is key-not-found, a rejected host pseudonym, a closed store, a store whose directory lock is still held, or any other failure: `EnvelopeError`, `ContextError`, `SenderKeyError`, `AccessKeyError`, `UcanError` and `EventLogError` each have a `Custody` variant. Every native bridge (PyO3, napi-rs, UniFFI) reports `PlatformError::KeyNotFound` as `SCP-CRYPTO-4006`, `PlatformError::PseudonymRejected` as `SCP-IDENT-1055`, `PlatformError::StorageClosed` as `SCP-STORAGE-8006`, `PlatformError::StorageLockHeld` as `SCP-STORAGE-8005` (§17.6 of the persistence spec, "One Opener per Durable Directory"), and every other `PlatformError` as `SCP-CRYPTO-4060`, whether the error arrives as a `PlatformError` or as a `CustodyFailure`. A host custody callback signals key-not-found by failing with `SCP-CRYPTO-4006`, and the bridge reports a host failure with any other code as `SCP-CRYPTO-4060`. `.docs/standards/sdk-common.md` registers the five codes.
 
 ### Context
 
@@ -905,7 +907,7 @@ None. This is foundational. The traits it implements are defined in `scp-platfor
    - `public_key(key_handle) -> PublicKey`: Returns the public key for a handle (signing or agreement).
    - `destroy_key(key_handle) -> ()`: Removes the private key from the internal map. Subsequent operations with this handle fail.
    - `dh_agree(key_handle, peer_public) -> SharedSecret`: Performs P-256 ECDH. Returns error for signing-only handles.
-   - `derive_pseudonym(key_handle, context_id) -> PseudonymKeypair`: Computes `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`, derives a P-256 keypair from the first 32 bytes of the HMAC output through the seed-to-scalar step §9.10.4 of the security-model spec fixes — HKDF-Expand-SHA256 to 48 bytes, reduced modulo `n − 1`, plus one — because P-256 has no RFC-8032 seed expansion. Returns error for agreement-only handles. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — using public key bytes would be a membership-enumeration oracle (§9.10.4.A). For software custody (InMemory, Apple software, Android software) `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic and pinned by §25.19 vectors. For hardware custody (Apple Secure Enclave, Android Keystore TEE API 33+) the private key is non-exportable, so `pseudonym_secret` is a device-local value computed inside the secure boundary (e.g. Android uses `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))`); hardware pseudonyms are device-local by design. See §9.10.4.A of `.docs/specs/09-security-model.md`.
+   - `derive_pseudonym(key_handle, context_id) -> Pseudonym`: Computes `HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`, derives the P-256 point from the first 32 bytes of the HMAC output through the seed-to-scalar step §9.10.4 of the security-model spec fixes — HKDF-Expand-SHA256 to 48 bytes, reduced modulo `n − 1`, plus one — because P-256 has no RFC-8032 seed expansion. Returns error for agreement-only handles. The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — using public key bytes would be a membership-enumeration oracle (§9.10.4.A). For software custody (InMemory, Apple software, Android software) `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1")`, which is cross-platform deterministic and pinned by §25.19 vectors. For hardware custody (Apple Secure Enclave, Android Keystore TEE API 33+) the private key is non-exportable, so `pseudonym_secret` is a device-local value computed inside the secure boundary (Android: a Keystore HMAC-SHA256 key; amended 2026-09-29, SCP-307); hardware pseudonyms are device-local by design. See §9.10.4.A of `.docs/specs/09-security-model.md`.
    - `custody_type(key_handle) -> CustodyType::InMemory`.
    - Optionally accepts a seed for deterministic key generation in tests.
 
@@ -916,7 +918,7 @@ None. This is foundational. The traits it implements are defined in `scp-platfor
 
 3. **`InMemoryPush`**
    - `register() -> PushToken`: Returns a synthetic push token (UUID).
-   - `handle_notification(payload) -> WakeSignal`: Passes through the payload as a wake signal.
+   - `handle_notification(payload) -> WakeSignal`: Returns the fixed wake signal `{"aps":{"content-available":1}}` (UTF-8 bytes) for every payload and copies no byte of the payload into it. `10-infrastructure-and-self-hosting.md` §10.7 states: "Push payloads MUST contain a wake signal and nothing else. No context ID, no sender identifier, no message preview, no metadata of any kind." A wake signal built from the received bytes would hand the caller whatever metadata a relay put there. The bytes are the APNs payload ADR-025 criterion 4 (`.docs/adrs/phase-5.md`) names. (Amended 2026-09-29; this bullet previously read "`handle_notification(payload) -> WakeSignal`: Passes through the payload as a wake signal.")
    - For Phase 1 testing, push is not exercised (two processes use direct relay subscriptions). This adapter exists to satisfy the trait requirements.
 
 4. **`InMemoryStorage`**
@@ -933,7 +935,7 @@ None. This is foundational. The traits it implements are defined in `scp-platfor
 /// The type of cryptographic key managed by this handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyType {
-    /// P-256 signing key (identity key, pseudonym keys).
+    /// P-256 signing key (identity key).
     P256Signing,
     /// P-256 key agreement key (HPKE wrapping keys).
     P256Agreement,
@@ -961,11 +963,11 @@ pub trait KeyCustody: Send + Sync {
     /// Returns an error if the key handle refers to a signing-only key.
     async fn dh_agree(&self, key: &KeyHandle, peer_public: &[u8; 32]) -> Result<SharedSecret, PlatformError>;
 
-    /// Derive a deterministic, context-scoped pseudonym keypair.
+    /// Derive a deterministic, context-scoped pseudonym: a P-256 point and its routing id.
     ///
     /// Algorithm:
     ///   1. seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
-    ///   2. pseudonym_keypair = P256_keygen(seed_to_scalar(seed[0..32]))  // §9.10.4
+    ///   2. point = seed_to_scalar(seed)·G  // §9.10.4; the scalar is discarded
     ///
     /// The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — using
     /// public key bytes would be a membership-enumeration oracle (§9.10.4.A).
@@ -979,9 +981,9 @@ pub trait KeyCustody: Send + Sync {
     /// device-local BY DESIGN, not cross-platform identical.
     /// See §9.10.4.A of .docs/specs/09-security-model.md.
     ///
-    /// The returned PseudonymKeypair is always software-managed (derived output).
+    /// No private key is returned or stored.
     /// Returns an error if the key handle refers to an agreement-only key.
-    async fn derive_pseudonym(&self, key: &KeyHandle, context_id: &[u8]) -> Result<PseudonymKeypair, PlatformError>;
+    async fn derive_pseudonym(&self, key: &KeyHandle, context_id: &[u8]) -> Result<Pseudonym, PlatformError>;
 
     /// The custody type for a given key handle.
     fn custody_type(&self, key: &KeyHandle) -> CustodyType;
@@ -996,6 +998,15 @@ pub trait DeviceAttestation: Send + Sync {
 
 pub trait Push: Send + Sync {
     async fn register(&self) -> Result<PushToken, PlatformError>;
+    /// Amended 2026-09-29: returns one fixed WakeSignal for every payload it accepts, and
+    /// may reject a payload instead. §10.7 of 10-infrastructure-and-self-hosting.md states:
+    /// "Push payloads MUST contain a wake signal and nothing else. No context ID, no sender
+    /// identifier, no message preview, no metadata of any kind." The signal must therefore
+    /// not vary with the payload. WakeSignal
+    /// holds &'static bytes, so an implementation cannot return the borrowed payload or a
+    /// temporary copy of it; the type does not stop a signal chosen by payload content, and
+    /// the conformance check check_fixed_wake_signal rejects a signal that varies across the
+    /// payloads it sends.
     async fn handle_notification(&self, payload: &[u8]) -> Result<WakeSignal, PlatformError>;
 }
 
@@ -1026,7 +1037,7 @@ pub trait Storage: Send + Sync {
 
 **Estimated functions:** ~4-5 per trait implementation, ~15-20 total.
 
-**Testing harness.** These in-memory adapters are consumed by the `scp-testing` crate (§16), which composes them into a full network simulation harness: `SimulatedIdentity` wraps a real `Identity` with `InMemoryKeyCustody` + `InMemoryStorage` + `InMemoryTransport` instances. Trait conformance macros (`key_custody_conformance!()`, `storage_conformance!()`, `attestation_conformance!()`, `push_conformance!()`) verify that every adapter implementation — in-memory and production — satisfies the same contract.
+**Testing harness.** These in-memory adapters are consumed by the `scp-testing` crate (§16), which composes them into a full network simulation harness: `SimulatedIdentity` wraps a real `Identity` with `InMemoryKeyCustody` + `InMemoryStorage` + `InMemoryTransport` instances. Trait conformance macros (`key_custody_conformance!()`, `storage_conformance!()`, `attestation_conformance!()`, `push_conformance!()`) verify that every adapter implementation — in-memory and production — satisfies the same contract. `push_conformance!()` requires each adapter to accept at least one permitted wake payload and to return a non-empty wake signal for it, and to return a byte-identical signal for every other payload it accepts among the fixed set the check sends (the other permitted payloads, those payloads with trailing whitespace, and payloads carrying a context ID or sender), as `16-test-infrastructure.md` §16.12.5 states; the adapter may reject any of them instead. The check samples that set; it does not exercise payloads outside it. (Amended 2026-09-29; the macro previously required only that a wake signal be returned.)
 
 ---
 

@@ -68,8 +68,14 @@
 //! store, not merely a confidential one). Confidentiality keeps the keys secret;
 //! authentication is what actually prevents a blob-rollback from lowering an
 //! anti-replay floor on restore (the checkpoint above does not cover those
-//! fields). This is §17.5 and the ADR-057 tab custody/plaintext boundary. The
-//! snapshot's key-bearing fields are zeroized after serialization/reconstruction.
+//! fields). This is §17.5 and the ADR-057 tab custody/plaintext boundary. Every
+//! field holding key material or decrypted plaintext has a type that wipes on
+//! drop (`Zeroizing`, or `SenderKey`'s `ZeroizeOnDrop`), so a snapshot wipes
+//! those fields when it drops. Buffers that serde and `rmp_serde` allocate and
+//! free while decoding a snapshot are wiped as they are freed by the wiping
+//! global allocator every shipped artifact installs (security model spec §9.15,
+//! freed heap memory), and by nothing in an application that links this crate
+//! without `scp-alloc`.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -118,16 +124,17 @@ pub const SNAPSHOT_FORMAT_VERSION: u16 = 4;
 
 /// A buffered, decrypted-but-undrained context event, in serializable form.
 ///
-/// The participant driver buffers two variants of local message history for
+/// The participant driver buffers three variants of local history for
 /// [`crate::ScpClient::drain_events`]: a sender's own `MessageSent` (recorded on
-/// [`crate::ScpClient::send_message`]) and a receiver's `MessageReceived`
-/// (recorded on [`crate::ScpClient::receive_message`]). Neither is a convergent
-/// event-log leaf (ADR-011 exclusion taxonomy §2), so both live only in this
-/// buffer; persisting them keeps the persisted `recv_sequence_tracker` / MLS
-/// ratchet consistent with what the tab had decrypted/sent before a
-/// crash-before-drain. Both carry decrypted plaintext, so both depend on the
-/// backend's encryption at rest (see the module security note) and are zeroized.
-#[derive(Serialize, Deserialize)]
+/// [`crate::ScpClient::send_message`]), a receiver's `MessageReceived`
+/// (recorded on [`crate::ScpClient::receive_message`]), and a peer's
+/// `PseudonymAnnounced`. None is a convergent event-log leaf (ADR-011 exclusion
+/// taxonomy §2), so all three live only in this buffer; persisting them keeps
+/// the persisted `recv_sequence_tracker` / MLS ratchet consistent with what the
+/// tab had decrypted/sent before a crash-before-drain. The two message variants
+/// carry decrypted plaintext, so they depend on the backend's encryption at
+/// rest (see the module security note); all three are wiped on drop.
+#[derive(Serialize, Deserialize, Zeroize)]
 enum BufferedEvent {
     /// A message this participant sent (its own local `MessageSent` history).
     Sent {
@@ -159,6 +166,40 @@ enum BufferedEvent {
     },
 }
 
+impl BufferedEvent {
+    /// The [`ContextEvent`] this buffered event restores to, moving its
+    /// payload without a copy. A method rather than inline in
+    /// [`ContextSnapshot::restore`], which would exceed clippy's
+    /// `too_many_lines` limit.
+    fn into_context_event(self) -> ContextEvent {
+        match self {
+            Self::Sent {
+                sender_did,
+                sequence_number,
+                payload,
+            } => ContextEvent::MessageSent {
+                sender_did: sender_did.into(),
+                sequence_number,
+                payload,
+            },
+            Self::Received {
+                sender_did,
+                payload,
+            } => ContextEvent::MessageReceived {
+                sender_did: sender_did.into(),
+                payload,
+            },
+            Self::Announced {
+                member_did,
+                pseudonym,
+            } => ContextEvent::PseudonymAnnounced {
+                member_did: member_did.into(),
+                pseudonym,
+            },
+        }
+    }
+}
+
 /// A serializable snapshot of one context's participant state.
 ///
 /// Round-trips through [`Self::capture`] / [`Self::restore`] and
@@ -176,14 +217,18 @@ pub struct ContextSnapshot {
     /// identity and must not be adopted under another.
     owner_did: String,
     /// The MLS crypto state, serialized by
-    /// [`ScpMlsGroup::serialize_state`](scp_mls::ScpMlsGroup::serialize_state).
-    mls_state: Vec<u8>,
+    /// [`ScpMlsGroup::serialize_state`](scp_mls::ScpMlsGroup::serialize_state),
+    /// in the wiping buffer that call returns. `Zeroizing`'s serde impls
+    /// delegate to the inner value, so it encodes as a plain byte vector.
+    mls_state: Zeroizing<Vec<u8>>,
     /// This participant's own §9.16 sender key.
     local_sender_key: SenderKey,
     /// This participant's monotonic sender-key epoch (§9.16.5).
     sender_key_epoch: u64,
     /// Other members' sender keys for this context: `(sender_did, key)` pairs.
-    sender_key_entries: Vec<(String, SenderKey)>,
+    /// The `Zeroizing` vector wipes its whole buffer on drop, including the
+    /// slots restore drains keys out of.
+    sender_key_entries: Zeroizing<Vec<(String, SenderKey)>>,
     /// Per-sender epoch high-water floors for this context: `(sender_did, epoch)`
     /// pairs. Persisted so the sender-key rollback-protection floor survives a
     /// restart (mirrors the native runtime crypto snapshot, §17.9.1).
@@ -202,17 +247,19 @@ pub struct ContextSnapshot {
     /// relay re-delivery — decrypting it already advanced and persisted the MLS
     /// forward-secrecy ratchet). This is decrypted plaintext, so it depends on the
     /// backend's encryption at rest (see the module security note). The driver
-    /// buffers `MessageSent` (a sender's own history) and `MessageReceived`, so
-    /// [`BufferedEvent`]'s two variants are its complete representation.
-    buffered_events: Vec<BufferedEvent>,
+    /// buffers `MessageSent` (a sender's own history), `MessageReceived`, and
+    /// `PseudonymAnnounced`, so [`BufferedEvent`]'s three variants are its
+    /// complete representation.
+    /// Wiped on drop, payloads included.
+    buffered_events: Zeroizing<Vec<BufferedEvent>>,
     /// This participant's §9.16.1 stable wrapping public key (X25519). Persisted
     /// so a reopened tab republishes/uses the same key peers seal to.
     wrapping_public: [u8; 32],
     /// This participant's §9.16.1 stable wrapping secret key (X25519). Persisted
     /// so a reopened tab can HPKE-open the next distribution sealed to it.
-    /// Zeroized after reconstruction. Depends on the backend's authenticated
-    /// encryption at rest (see the module security note).
-    wrapping_secret: [u8; 32],
+    /// Wiped on drop. Depends on the backend's authenticated encryption at rest
+    /// (see the module security note).
+    wrapping_secret: Zeroizing<[u8; 32]>,
     /// The member-wrapping-key **directory**: `(did, scp_wrapping_key)` pairs. This
     /// IS the membership set (ADR-057 sender-key distribution INVARIANT 1) — it
     /// replaced the bare `members` DID list — so a reopened tab can seal sender
@@ -233,6 +280,21 @@ pub struct ContextSnapshot {
     /// the module security note); it is a consistency guard, not authentication.
     event_log_root: [u8; 32],
 }
+
+impl Drop for ContextSnapshot {
+    fn drop(&mut self) {
+        // Exists only as a move guard: `local_sender_key` and `wrapping_secret`
+        // are inline, so restore must take them with `mem::replace` and
+        // `mem::take`, which zero their slots, and a partial move out is a
+        // compile error (E0509). Every field wipes itself through its type.
+    }
+}
+
+#[expect(drop_bounds, reason = "asserts the E0509 move guard")]
+const _: fn() = || {
+    const fn guard<T: Drop>() {}
+    guard::<ContextSnapshot>();
+};
 
 // SECURITY: manual `Debug` redacts key material and the (potentially sensitive)
 // event payloads. `Clone` is intentionally NOT derived — the snapshot holds raw
@@ -289,22 +351,25 @@ impl ContextSnapshot {
     ///
     /// Returns [`ClientError::Mls`] if the MLS group state cannot be serialized
     /// (destroyed group, poisoned provider lock), or [`ClientError::Driver`] if
-    /// the receive buffer holds an event other than `MessageSent` or
-    /// `MessageReceived` (an internal invariant violation — the driver only ever
-    /// buffers those two variants).
+    /// the receive buffer holds an event other than `MessageSent`,
+    /// `MessageReceived`, or `PseudonymAnnounced` (an internal invariant
+    /// violation — the driver only ever buffers those three variants).
     pub fn capture(
         context_id: &str,
         owner_did: &str,
         state: &PerContextState,
     ) -> Result<Self, ClientError> {
         let crypto: &ContextCryptoState = &state.crypto;
+        // Stays in its wiping buffer, which moves (no copy) into `Self`.
         let mls_state = crypto.mls_group.serialize_state()?;
 
-        let sender_key_entries: Vec<(String, SenderKey)> = crypto
-            .sender_key_store
-            .get_all(&crypto.context_id)
-            .into_iter()
-            .collect();
+        let sender_key_entries: Zeroizing<Vec<(String, SenderKey)>> = Zeroizing::new(
+            crypto
+                .sender_key_store
+                .get_all(&crypto.context_id)
+                .into_iter()
+                .collect(),
+        );
         let sender_key_epochs = crypto
             .sender_key_store
             .epochs_for_context(&crypto.context_id);
@@ -333,7 +398,7 @@ impl ContextSnapshot {
         // sender's own history) and `MessageReceived`; any other variant is an
         // internal invariant violation and fails closed rather than being silently
         // dropped (the payload is never logged).
-        let mut buffered_events = Vec::with_capacity(state.event_buffer.len());
+        let mut buffered_events = Zeroizing::new(Vec::with_capacity(state.event_buffer.len()));
         for event in &state.event_buffer {
             match event {
                 ContextEvent::MessageSent {
@@ -382,7 +447,7 @@ impl ContextSnapshot {
             events: state.events(),
             buffered_events,
             wrapping_public: crypto.wrapping_public,
-            wrapping_secret: *crypto.wrapping_secret,
+            wrapping_secret: crypto.wrapping_secret.clone(),
             member_wrapping_keys: crypto.wrapping_keys_snapshot(),
             member_sequence_numbers,
             peer_pseudonyms,
@@ -432,7 +497,7 @@ impl ContextSnapshot {
         for (did, epoch) in std::mem::take(&mut self.sender_key_epochs) {
             sender_key_store.restore_epoch_high_water(&self.context_id, &did, epoch);
         }
-        for (did, key) in std::mem::take(&mut self.sender_key_entries) {
+        for (did, key) in self.sender_key_entries.drain(..) {
             sender_key_store.set_unchecked(&self.context_id, &did, key);
         }
 
@@ -443,7 +508,8 @@ impl ContextSnapshot {
                 .collect();
 
         // Move the local sender key out, leaving a zeroed placeholder that is
-        // wiped when the snapshot drops.
+        // wiped when the snapshot drops. Stack copies the move makes are not
+        // wiped.
         let local_sender_key =
             std::mem::replace(&mut self.local_sender_key, SenderKey::from_bytes([0u8; 32]));
 
@@ -468,7 +534,7 @@ impl ContextSnapshot {
             // context starts with an empty announcement floor — see `RecvChannel`.
             recv_announcement_tracker: HashMap::new(),
             wrapping_public: self.wrapping_public,
-            wrapping_secret: Zeroizing::new(wrapping_secret),
+            wrapping_secret,
             member_wrapping_keys,
         };
 
@@ -480,7 +546,7 @@ impl ContextSnapshot {
         }
         let recomputed = root(&event_log);
         if recomputed != self.event_log_root {
-            // `self` (and its key material) is zeroized by `Drop` on return.
+            // The key material is wiped as `crypto` and `self` drop.
             return Err(ClientError::StorageCorrupt(format!(
                 "checkpoint mismatch for context '{}': recomputed event-log root {} \
                  does not match the recorded root {} (torn/corrupt/truncated snapshot)",
@@ -508,34 +574,12 @@ impl ContextSnapshot {
         // FIFO order, so a message sent or decrypted before the tab closed is
         // delivered exactly once after restore (a received message cannot be
         // recovered by relay re-delivery — the MLS ratchet that decrypted it is
-        // persisted and advanced).
-        let event_buffer: VecDeque<ContextEvent> = std::mem::take(&mut self.buffered_events)
-            .into_iter()
-            .map(|event| match event {
-                BufferedEvent::Sent {
-                    sender_did,
-                    sequence_number,
-                    payload,
-                } => ContextEvent::MessageSent {
-                    sender_did: sender_did.into(),
-                    sequence_number,
-                    payload,
-                },
-                BufferedEvent::Received {
-                    sender_did,
-                    payload,
-                } => ContextEvent::MessageReceived {
-                    sender_did: sender_did.into(),
-                    payload,
-                },
-                BufferedEvent::Announced {
-                    member_did,
-                    pseudonym,
-                } => ContextEvent::PseudonymAnnounced {
-                    member_did: member_did.into(),
-                    pseudonym,
-                },
-            })
+        // persisted and advanced). The drained `Zeroizing` vector wipes its
+        // buffer when the snapshot drops.
+        let event_buffer: VecDeque<ContextEvent> = self
+            .buffered_events
+            .drain(..)
+            .map(BufferedEvent::into_context_event)
             .collect();
 
         let state = PerContextState {
@@ -552,18 +596,21 @@ impl ContextSnapshot {
             poisoned: false,
         };
 
-        // `self` (and any residual key material) is zeroized by `Drop` on return.
         Ok(state)
     }
 
     /// Serializes this snapshot to a `MessagePack` blob for storage.
     ///
+    /// The blob carries the MLS signer and group secrets, so it is returned in
+    /// a buffer wiped on drop (security model spec §9.15 step 2).
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError::StorageCorrupt`] if the snapshot cannot be
     /// serialized into a durable blob (unreachable for a well-formed snapshot).
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ClientError> {
+    pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>, ClientError> {
         rmp_serde::to_vec_named(self)
+            .map(Zeroizing::new)
             .map_err(|e| ClientError::StorageCorrupt(format!("serializing context snapshot: {e}")))
     }
 
@@ -591,41 +638,6 @@ impl ContextSnapshot {
     #[must_use]
     pub fn context_id(&self) -> &str {
         &self.context_id
-    }
-
-    /// Zeroizes the secret-bearing fields (`mls_state`, sender keys, and the
-    /// buffered decrypted plaintext). `SenderKey` already zeroizes on drop; this
-    /// clears the MLS blob, the sender-key entry copies, and the buffered
-    /// plaintext explicitly so they do not linger (the tab is the plaintext
-    /// boundary — ADR-057).
-    fn zeroize_secrets(&mut self) {
-        self.mls_state.zeroize();
-        self.local_sender_key.zeroize();
-        self.wrapping_secret.zeroize();
-        for (_, key) in &mut self.sender_key_entries {
-            key.zeroize();
-        }
-        for event in &mut self.buffered_events {
-            match event {
-                BufferedEvent::Sent { payload, .. } | BufferedEvent::Received { payload, .. } => {
-                    payload.zeroize();
-                }
-                // A pseudonym announcement carries no secret material (a DID + a
-                // public routing id), so there is nothing to zeroize.
-                BufferedEvent::Announced { .. } => {}
-            }
-        }
-    }
-}
-
-// SECURITY: the snapshot carries the MLS signer/epoch secrets (inside
-// `mls_state`) and sender keys. `SenderKey` already zeroizes on drop, but the
-// `mls_state` blob does not — zeroize every key-bearing field when the snapshot
-// is dropped so private material never lingers in freed memory, on any path
-// (capture, restore, error).
-impl Drop for ContextSnapshot {
-    fn drop(&mut self) {
-        self.zeroize_secrets();
     }
 }
 
@@ -771,6 +783,66 @@ mod tests {
             Err(other) => panic!("expected a StorageCorrupt checkpoint error, got {other:?}"),
             Ok(_) => panic!("expected the corrupted checkpoint to be rejected"),
         }
+    }
+
+    /// `ContextSnapshot`'s `Zeroizing` fields encode exactly as the plain
+    /// fields they replaced: the blob decodes into the plain-field layout and
+    /// re-encodes to the same bytes, and those bytes decode back into the
+    /// wiping type and restore.
+    #[test]
+    fn context_snapshot_encodes_like_plain_fields() {
+        #[derive(Serialize, Deserialize)]
+        struct Plain {
+            format_version: u16,
+            context_id: String,
+            owner_did: String,
+            mls_state: Vec<u8>,
+            local_sender_key: SenderKey,
+            sender_key_epoch: u64,
+            sender_key_entries: Vec<(String, SenderKey)>,
+            sender_key_epochs: Vec<(String, u64)>,
+            recv_sequence_tracker: Vec<(String, u64, u64)>,
+            events: Vec<Event>,
+            buffered_events: Vec<BufferedEvent>,
+            wrapping_public: [u8; 32],
+            wrapping_secret: [u8; 32],
+            member_wrapping_keys: Vec<(String, [u8; 32])>,
+            member_sequence_numbers: Vec<(String, u64)>,
+            peer_pseudonyms: Vec<(String, [u8; 32])>,
+            event_log_root: [u8; 32],
+        }
+        let mut state = fresh_state();
+        state.event_buffer.push_back(ContextEvent::MessageReceived {
+            sender_did: "did:dht:z6MkPeer".into(),
+            payload: vec![0x42; 24],
+        });
+        let snapshot = ContextSnapshot::capture(CTX, CREATOR, &state).unwrap();
+        let blob = snapshot.to_bytes().unwrap();
+
+        let plain: Plain = rmp_serde::from_slice(&blob).unwrap();
+        assert!(!plain.mls_state.is_empty());
+        assert_eq!(plain.buffered_events.len(), 1);
+        assert_eq!(plain.wrapping_secret, *state.crypto.wrapping_secret);
+        assert_eq!(
+            plain.local_sender_key.as_bytes(),
+            state.crypto.local_sender_key.as_bytes()
+        );
+        let plain_bytes = rmp_serde::to_vec_named(&plain).unwrap();
+        assert_eq!(*blob, plain_bytes);
+
+        let restored = ContextSnapshot::from_bytes(&plain_bytes)
+            .unwrap()
+            .restore(CREATOR)
+            .unwrap();
+        assert_eq!(
+            *restored.crypto.wrapping_secret,
+            *state.crypto.wrapping_secret
+        );
+        assert_eq!(
+            restored.crypto.local_sender_key.as_bytes(),
+            state.crypto.local_sender_key.as_bytes()
+        );
+        assert_eq!(restored.event_buffer.len(), 1);
     }
 
     #[test]

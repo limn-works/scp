@@ -281,30 +281,25 @@ impl ProtocolRepoVariant {
         }
     }
 
-    /// Releases persistent resources held by the variant.
+    /// Returns the closer for the variant's durable store, or `None` for
+    /// [`ProtocolRepoVariant::InMemory`], which holds no advisory lock.
     ///
-    /// For [`ProtocolRepoVariant::Sqlite`] this walks the
-    /// `Arc<ProtocolRepository<Arc<SqliteStorage>>>` chain to reach
-    /// the `SqliteStorage` and calls
-    /// [`scp_platform::sqlite::SqliteStorage::close`] — releasing the
-    /// advisory lock on `{dir}/scp.db.lock` even when other `Arc`
-    /// holders (`CoreFields::persistence`, `ContextManager`) keep the
-    /// storage struct alive until the bridge instance drops.
-    /// [`ProtocolRepoVariant::InMemory`] has no persistent resources
-    /// and the call is a no-op.
-    ///
-    /// Called from `bridge_specific_shutdown` on the NAPI + `UniFFI`
-    /// bridges so that `SCP.shutdown()` at the SDK surface releases
-    /// the lock without requiring the caller to drop the `SCP` handle
-    /// itself.
-    pub fn close(&self) {
+    /// For [`ProtocolRepoVariant::Sqlite`] the closer owns a clone of the
+    /// `Arc<SqliteStorage>` and calls
+    /// [`scp_platform::sqlite::SqliteStorage::close`], which closes the
+    /// connection and releases the advisory lock on `{dir}/scp.db.lock` even
+    /// while other `Arc` holders (`CoreFields::persistence`, the Supervisor)
+    /// keep the storage struct alive; their later operations fail with the
+    /// closed-store error. The NAPI and `UniFFI` bridges return it from
+    /// `BridgeInstanceCore::durable_store_closer`, so `SCP.shutdown()` closes
+    /// the store after the Supervisor drain (ADR-049 Decision 16).
+    #[must_use]
+    pub fn durable_store_closer(&self) -> Option<crate::bridge_instance::DurableStoreCloser> {
         match self {
-            Self::InMemory(_) => {}
+            Self::InMemory(_) => None,
             Self::Sqlite(repo) => {
-                // `ProtocolRepository<S>::storage()` returns `&S` — here
-                // `&Arc<SqliteStorage>` — and `SqliteStorage::close()` is
-                // `&self`, so the `Arc` deref gives us the call we need.
-                repo.storage().close();
+                let storage = Arc::clone(repo.storage());
+                Some(Box::new(move || storage.close()))
             }
         }
     }
@@ -357,25 +352,22 @@ impl ProtocolRepoVariant {
 // Shared UCAN validation state
 // ---------------------------------------------------------------------------
 
-/// Core per-context UCAN validation state shared by all FFI bridges.
+/// Core per-context UCAN validation state.
 ///
 /// Retains the `RevocationList` and `NonceTracker` needed by the UCAN
 /// validation pipeline (ADR-016). These are NOT duplicates of `ContextManager`
 /// state — the manager does not track UCAN revocation or nonces.
 ///
-/// The NAPI bridge extends this with bridge-specific fields (`role_state`,
-/// `outlet_registry`, `outlet_handlers`, `session_store`). The `UniFFI` bridge
+/// The NAPI bridge extends this with bridge-specific fields
+/// (`outlet_registry`, `outlet_handlers`, `session_store`). The `UniFFI` bridge
 /// uses this as-is (type alias `UcanContextState = UcanContextStateCore`).
+///
+/// This struct holds no capability ceiling and no context creator DID.
 pub struct UcanContextStateCore {
     /// UCAN revocation list for this context.
     pub revocation_list: scp_core::crypto::ucan::revoke::RevocationList,
     /// UCAN nonce tracker for replay prevention (ADR-016 step 9).
     pub nonce_tracker: scp_core::crypto::ucan::nonce::NonceTracker<scp_clock::SystemClock>,
-    /// Capability ceiling as a set of `{resource}:{action}` strings for
-    /// UCAN validation (ADR-016 step 8).
-    pub ceiling_strings: std::collections::HashSet<String>,
-    /// The DID of the context creator.
-    pub creator_did: String,
     /// Event log (Merkle tree) for this context.
     pub event_log: scp_event_log::EventLog,
 }

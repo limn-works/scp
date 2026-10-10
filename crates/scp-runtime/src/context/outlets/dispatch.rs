@@ -45,7 +45,7 @@
 //!    - calls [`StreamAdmissionTracker::release`] to decrement all three
 //!      cap counters — the per-invoker + per-outlet counters on the
 //!      per-context tracker and the per-origin-invoker counter on the
-//!      operator-scoped [`OriginAdmissionTracker`] (§05-contexts.md:448),
+//!      operator-scoped [`OriginAdmissionTracker`] (§5.4.5),
 //!      both under the sanctioned lock order,
 //!    - publishes the frontier-derived `chunks_billed` value into the
 //!      `OutletInvokedEvent` field; the event-local wire-invariant
@@ -96,7 +96,7 @@ use tokio::sync::{Notify, mpsc};
 use crate::context::ContextHandle;
 
 use super::invoke::{
-    HandlerPanicSink, InvocationError, OutletExecutor, OutletInvokedEventSink,
+    HandlerPanicSink, InvocationError, OutletExecutor, OutletInvokedEventSink, OutletOpenError,
     QueryMisdeclarationSink, StreamGateOutcome, StreamSettlement, StreamSettlementSink,
     accrue_data_chunk_if_billable, apply_stream_chunk_gate, ingest_stream_chunk, invoke_outlet,
     release_stream_admission,
@@ -122,9 +122,7 @@ use scp_protocol::context::roles::ContextRoleState;
 /// `MemberBudgetTracker` but never settled.
 ///
 /// `reverse_spend` is async (it takes the per-context lock), and a `Drop`
-/// impl cannot `.await`, so the production sink the native bridges supply
-/// holds a [`tokio::runtime::Handle`] and `Handle::spawn`s the async
-/// `ContextManager::outlet_stream_reverse_spend`. The trait is the seam
+/// impl cannot `.await`. The trait is the seam
 /// that lets `dispatch.rs` (below the `ContextManager` in the dependency
 /// graph) refund a hold without depending on the manager type.
 ///
@@ -237,11 +235,6 @@ impl Drop for StreamEscrowTicket {
 /// Distinct from [`InvocationError`] because the OUT-034 admission /
 /// escrow gates run BEFORE the stream is opened — a synchronous failure
 /// at this point produces a terminal envelope, not a chunk receiver.
-/// Each variant maps to a §5.4.4 slug + class + retry policy via
-/// [`OpenStreamRejection::slug`] and
-/// [`OpenStreamRejection::error_code`] so the FFI / SDK layer can shape
-/// the error envelope identically to the in-stream terminal `Error`
-/// chunks the pump emits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenStreamRejection {
     /// `StreamAdmissionTracker` rejected the open at one of the three
@@ -393,12 +386,12 @@ impl OpenStreamRejection {
         }
     }
 
-    /// Routes this rejection into an [`InvocationError`] envelope so
-    /// existing `invocation_error_to_context` translation surfaces it
-    /// identically to other open-time validation failures.
+    /// Routes this rejection into an [`OutletOpenError`] so the existing
+    /// `invocation_error_to_context` translation surfaces it identically to
+    /// other open-time failures.
     #[must_use]
-    pub fn to_invocation_error(&self) -> InvocationError {
-        match self {
+    pub fn to_open_error(&self) -> OutletOpenError {
+        let invocation = match self {
             // #2196 — round-trip as the canonical `InvocationError::ContextNotActive`
             // rather than a misleading `CaveatViolation`, preserving the state
             // string so the wire terminal-chunk message names the actual
@@ -413,7 +406,8 @@ impl OpenStreamRejection {
                 slug: self.slug().to_owned(),
                 message: format!("stream open rejected: {}", self.slug()),
             },
-        }
+        };
+        OutletOpenError::Invocation(invocation)
     }
 }
 
@@ -618,7 +612,7 @@ pub(crate) struct SharedSessionState {
     /// releases the per-invoker + per-outlet counters here at
     /// terminal-chunk emission.
     pub admission: Arc<RwLock<StreamAdmissionTracker>>,
-    /// Operator-scoped origin admission tracker (§05-contexts.md:448):
+    /// Operator-scoped origin admission tracker (§5.4.5):
     /// a SINGLE instance shared across every context the operator hosts.
     /// The pump releases the per-origin-invoker counter here at
     /// terminal-chunk emission, in lock-step with `admission`.
@@ -1364,7 +1358,7 @@ fn run_admission_gate(
     params: &OpenStreamParams,
 ) -> Result<(), OpenStreamRejection> {
     let admission_outcome = {
-        // LOCK ORDER (§05-contexts.md:448 split): the per-context
+        // LOCK ORDER (§5.4.5 split): the per-context
         // `admission` lock is ALWAYS acquired before the operator-scoped
         // `origin_admission` lock. `origin_admission` is a single leaf
         // lock always taken innermost, so no acquisition cycle is
@@ -2059,10 +2053,12 @@ fn spawn_pump_task(
     // it drops when the task body returns (normal/terminal/cancel-ack) or
     // when the task panics and its stack unwinds.
     pump_permit: tokio::sync::OwnedSemaphorePermit,
+    spawn_pump: &(dyn Fn(StreamTask) + Send + Sync),
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     let stream_credit_stall = Duration::from_secs(u64::from(stream_credit_stall_secs));
     let stream_cancel_ack = Duration::from_secs(u64::from(stream_cancel_ack_secs));
-    tokio::spawn(async move {
+    spawn_pump(Box::pin(async move {
         // Bind the permit for the whole task body so it drops on every
         // exit path (return, terminal-break, or panic-unwind).
         let _pump_permit = pump_permit;
@@ -2090,6 +2086,7 @@ fn spawn_pump_task(
             stream_cancel_ack,
             request_id,
             event_inputs,
+            shutdown,
         ));
         if futures::future::FutureExt::catch_unwind(pump)
             .await
@@ -2101,8 +2098,14 @@ fn spawn_pump_task(
                  stream closed"
             );
         }
-    });
+    }));
 }
+
+/// A streaming task handed to the spawner of [`open_stream_session`].
+///
+/// The Supervisor's open paths spawn it onto the Supervisor's task tracker,
+/// so shutdown waits for it (ADR-049 Decision 16).
+pub type StreamTask = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
 
 /// Maps a synchronous [`invoke_outlet`] open failure to its correct
 /// [`OpenStreamRejection`] class (#2196 error-masking fix).
@@ -2163,7 +2166,7 @@ fn invocation_error_to_open_rejection(err: &InvocationError) -> OpenStreamReject
 /// the underlying [`invoke_outlet`] (context not active, capability
 /// denial, schema) are translated into the open-time rejection
 /// envelope by the caller via
-/// [`OpenStreamRejection::to_invocation_error`].
+/// [`OpenStreamRejection::to_open_error`].
 ///
 /// # Panics
 ///
@@ -2190,7 +2193,7 @@ pub async fn open_stream_session<E>(
     settlement_sink: Option<Arc<dyn StreamSettlementSink>>,
     params: OpenStreamParams,
     admission: Arc<RwLock<StreamAdmissionTracker>>,
-    // §05-contexts.md:448: the operator-scoped origin admission tracker,
+    // §5.4.5: the operator-scoped origin admission tracker,
     // a SINGLE instance the supervisor owns and shares across every
     // context it hosts. Carries the per-origin-invoker dimension so a
     // caller cannot fan out across N of the operator's contexts to open
@@ -2229,6 +2232,12 @@ pub async fn open_stream_session<E>(
     // close-time release. A failure here rolls back admission + drops the
     // pump permit so no capacity is stranded by a rejected open.
     counter_reservation: Option<StreamCounterReservation>,
+    // Starts the pump task. The Supervisor's open paths spawn it onto the
+    // Supervisor's task tracker (ADR-049 Decision 16).
+    spawn_pump: &(dyn Fn(StreamTask) + Send + Sync),
+    // Cancelled when Supervisor shutdown begins; the pump then arms
+    // `ContextClosedMidStream` and closes (ADR-049 Decision 16).
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<StreamSessionHandle, OpenStreamRejection>
 where
     E: OutletExecutor + ?Sized + 'static,
@@ -2382,6 +2391,7 @@ where
         // with the signer in `SharedSessionState::operator_signer`.
         Arc::clone(&params.operator_signer),
         params.identity.caveats_binding,
+        spawn_pump,
     )
     .await
     .map_err(|err| {
@@ -2539,6 +2549,8 @@ where
             counter_reserve: counter_reserve.clone(),
         },
         pump_permit,
+        spawn_pump,
+        shutdown,
     );
 
     Ok(StreamSessionHandle {
@@ -2772,6 +2784,23 @@ async fn try_arm_context_closed_mid_stream(
     true
 }
 
+/// Arms [`TerminateReason::ContextClosedMidStream`] once Supervisor shutdown
+/// has begun (ADR-049 Decision 16): the shutdown tears down the stream's
+/// context, so the pump emits its terminal chunk and settles instead of
+/// holding the drain while it waits on a credit grant or on the executor. A
+/// prior arm wins.
+fn arm_shutdown_terminate(state: &Arc<RwLock<SharedSessionState>>) {
+    let mut guard = state
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.pending_terminate.is_none() {
+        guard.pending_terminate = Some(PendingTerminate {
+            reason: TerminateReason::ContextClosedMidStream,
+            message_override: None,
+        });
+    }
+}
+
 /// Runs one §5.4.5 round-8 re-check tick: consults context teardown FIRST
 /// (Protocol-class precedence), then — only if the context is still live —
 /// the UCAN revocation checker. When either arms `pending_terminate`, wakes
@@ -2824,6 +2853,7 @@ async fn run_stream_pump_v2(
     stream_cancel_ack: Duration,
     request_id: RequestId,
     event_inputs: PumpEventEmissionInputs,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     // §5.4.5 / ADR-061: fold each emitted (renumbered, re-signed) chunk
     // into the O(log n) RFC-6962 Merkle frontier + O(1) terminal summary
@@ -3035,6 +3065,10 @@ async fn run_stream_pump_v2(
                     // path re-engages.
                     continue;
                 }
+                () = shutdown.cancelled() => {
+                    arm_shutdown_terminate(&state);
+                    continue;
+                }
                 _ = recheck_interval.tick() => {
                     // §5.4.5 round-8 re-check (runtime-authoritative).
                     // Context teardown takes PRECEDENCE over revocation:
@@ -3093,6 +3127,10 @@ async fn run_stream_pump_v2(
                     // Loop back so the eager `pending_terminate`
                     // check at the top emits the synthetic terminal
                     // and breaks.
+                    continue;
+                }
+                () = shutdown.cancelled() => {
+                    arm_shutdown_terminate(&state);
                     continue;
                 }
                 _ = recheck_interval.tick() => {
@@ -3318,7 +3356,7 @@ async fn run_stream_pump_v2(
         // through the invoke.rs public helper (which lifts the type
         // reference into invoke.rs for grep enforcement). The
         // operator-scoped `origin_admission` MUST be decremented here too
-        // (§05-contexts.md:448) — else the origin's operator-wide count
+        // (§5.4.5) — else the origin's operator-wide count
         // leaks and permanently caps the origin.
         let admission_arc = Arc::clone(&guard.admission);
         let origin_admission_arc = Arc::clone(&guard.origin_admission);
@@ -3585,8 +3623,8 @@ mod tests {
             Some(RetryPolicy::Never),
             "a context-not-active open failure must be non-retryable"
         );
-        match rej.to_invocation_error() {
-            InvocationError::ContextNotActive { current_state } => {
+        match rej.to_open_error() {
+            OutletOpenError::Invocation(InvocationError::ContextNotActive { current_state }) => {
                 assert_eq!(current_state, "Closing", "state string round-trips");
             }
             other => panic!("expected ContextNotActive round-trip, got {other:?}"),
@@ -3992,6 +4030,8 @@ mod tests {
                 counter_reserve: CounterReserveSettlement::zero(),
             },
             permit,
+            &|task| drop(tokio::spawn(task)),
+            tokio_util::sync::CancellationToken::new(),
         );
 
         // Send one Data chunk — the pump's signing path will panic.
@@ -4052,6 +4092,70 @@ mod tests {
         );
     }
 
+    /// ADR-049 Decision 16: an idle pump stays open while the Supervisor's
+    /// shutdown token is live, and closes with a terminal
+    /// `ContextClosedMidStream` chunk once the token is cancelled, so it
+    /// does not hold the shutdown drain.
+    #[tokio::test]
+    async fn shutdown_token_closes_an_idle_pump() {
+        let state = build_test_state();
+        let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (summary_tx, _summary_rx) = tokio::sync::oneshot::channel();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let pump = tokio::spawn(run_stream_pump_v2(
+            Arc::clone(&state),
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+            inner_rx,
+            outer_tx,
+            summary_tx,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+            [0x7a; 16],
+            PumpEventEmissionInputs {
+                sink: None,
+                settlement_sink: None,
+                context_id: "ctx-test".to_owned(),
+                outlet_id: "outlet-test".to_owned(),
+                invoker_did: scp_did::DID("did:dht:invoker".to_owned()),
+                input_hash: "0".repeat(64),
+                start: Instant::now(),
+                economic_policy_snapshot: None,
+                counter_reserve: CounterReserveSettlement::zero(),
+            },
+            shutdown.clone(),
+        ));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), outer_rx.recv())
+                .await
+                .is_err(),
+            "a live token leaves the idle pump open"
+        );
+        assert!(
+            !pump.is_finished(),
+            "a live token leaves the idle pump open"
+        );
+
+        shutdown.cancel();
+        let chunk = tokio::time::timeout(Duration::from_secs(2), outer_rx.recv())
+            .await
+            .expect("the cancelled token closes the pump within 2s")
+            .expect("the pump emits a terminal chunk");
+        let ChunkPayload::Error { code, terminal, .. } = chunk.payload else {
+            panic!("expected a terminal Error chunk");
+        };
+        assert_eq!(code, TerminateReason::ContextClosedMidStream.code());
+        assert!(terminal);
+        tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("the pump exits after its terminal chunk")
+            .expect("the pump does not panic");
+        drop(inner_tx);
+    }
+
     /// §5.4.5 receiver-side revocation re-check: `terminate_with_error`
     /// arms `pending_terminate` and the pump emits a synthetic terminal
     /// `Error{terminal:true}` chunk on its next iteration with the
@@ -4094,6 +4198,7 @@ mod tests {
                     economic_policy_snapshot: None,
                     counter_reserve: CounterReserveSettlement::zero(),
                 },
+                tokio_util::sync::CancellationToken::new(),
             )
             .await;
         });
@@ -4225,6 +4330,7 @@ mod tests {
                     economic_policy_snapshot: None,
                     counter_reserve: CounterReserveSettlement::zero(),
                 },
+                tokio_util::sync::CancellationToken::new(),
             )
             .await;
         });
@@ -4346,6 +4452,7 @@ mod tests {
                         economic_policy_snapshot: None,
                         counter_reserve: CounterReserveSettlement::zero(),
                     },
+                    tokio_util::sync::CancellationToken::new(),
                 )
                 .await;
             });
@@ -4473,6 +4580,7 @@ mod tests {
                     economic_policy_snapshot: None,
                     counter_reserve: CounterReserveSettlement::zero(),
                 },
+                tokio_util::sync::CancellationToken::new(),
             )
             .await;
         });
@@ -5070,6 +5178,7 @@ mod tests {
                         cost_per_chunk: Amount::new(cost_per_chunk),
                     },
                 },
+                tokio_util::sync::CancellationToken::new(),
             )
             .await;
         });

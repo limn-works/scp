@@ -1241,9 +1241,21 @@ macro_rules! push_conformance {
             }
 
             #[tokio::test]
-            async fn handle_notification_returns_wake() {
-                // Register, handle_notification with test payload,
-                // verify WakeSignal is returned.
+            async fn handle_notification_returns_fixed_wake() {
+                // Calls check_fixed_wake_signal, a public function of
+                // this module, which asserts the contract below.
+                // The adapter accepts at least one permitted wake payload:
+                // the APNs payload {"aps":{"content-available":1}}
+                // (ADR-025 criterion 4), the FCM payload
+                // {"data": {"scp": "1"}} (ADR-027), or the relay payload
+                // { "scp": 1 } (§10.7.1 step 5). It returns a non-empty
+                // WakeSignal for it. Every other payload the adapter
+                // accepts (another permitted payload, a permitted payload
+                // with trailing whitespace, or a payload carrying a context
+                // ID or sender) yields a byte-identical WakeSignal; the
+                // adapter may reject any of them instead. A signal that
+                // varied with the payload would hand the caller whatever
+                // a relay put in it, which §10.7 forbids.
             }
         }
     };
@@ -1478,14 +1490,9 @@ Tests that verify the protocol layer's typed domain methods (§17.4) correctly p
 | `key_state_cache_roundtrip` | Cache key state, load, verify matches |
 | `relay_score_list` | Store scores for 3 relays, list all, verify all returned |
 
-### 16.13.8 MlsStorageBridge Correctness
+### 16.13.8 (Removed) MlsStorageBridge Correctness
 
-Tests that verify OpenMLS group state persists correctly through the `MlsStorageBridge` → `ProtocolRepository` → `Storage` chain (§17.9). These confirm that the bridge's key prefix mapping and serialization produce correct roundtrips for MLS-internal state.
-
-| Test | Verifies |
-|------|----------|
-| `mls_group_state_roundtrip` | Create MLS group, persist via bridge, reload, verify group state matches |
-| `mls_state_isolated_per_context` | Two contexts with MLS groups, verify state does not leak between them |
+SCP deleted the MLS storage bridge and its two tests, because §17.9.1 persists MLS crypto state as one snapshot blob and no live provider used the bridge.
 
 ### 16.13.9 Assertion Library Meta-Tests
 
@@ -1551,7 +1558,6 @@ Every simulation component maps to a specific protocol mechanism or threat:
 | `blob_store_conformance!()` | §17.11 | BlobStorage contract (5 methods, TTL, concurrent access) |
 | `payment_adapter_conformance!()` | §19.2, §19.2.6 | PaymentAdapter contract (authorize/capture/void/verify/refund, error conditions) |
 | ProtocolRepository integration tests | §17.4, §17.13 | Protocol-layer persistence correctness |
-| MlsStorageBridge tests | §17.9 | OpenMLS state persistence through ProtocolRepository |
 | Assertion library meta-tests | §16.10, §16.13.9 | Assertion functions detect violations correctly |
 | Preset scenario meta-tests | §16.11, §16.13.10 | Preset factories produce valid, deterministic simulators |
 
@@ -1571,7 +1577,7 @@ No §16.13 meta-tests run at this tier — they exercise the simulation harness 
 
 ### 16.15.2 Tier 2 — Merge Gate
 
-**Trigger:** Merge queue entry or push to `main`.
+**Trigger:** Merge queue entry.
 **Target:** < 10 minutes.
 **Purpose:** Required to merge. Exercises the harness and protocol integration.
 
@@ -1588,7 +1594,6 @@ Tier 2 includes all Tier 1 checks plus the `scp-testing` harness meta-tests and 
 | §16.13.5 | ScenarioBuilder correctness (6 tests) | Validates builder produces valid simulators |
 | §16.13.6 | Determinism (3 tests) | Validates seed-based reproducibility |
 | §16.13.7 | ProtocolRepository correctness (9 tests) | Validates protocol-layer persistence against InMemoryStorage |
-| §16.13.8 | MlsStorageBridge correctness (2 tests) | Validates OpenMLS state persistence chain |
 | §16.13.9 | Assertion library meta-tests (15 tests) | Validates assertion functions before trusting them |
 | §16.13.10 | Preset scenario meta-tests (5 tests) | Validates preset factories |
 
@@ -1659,7 +1664,6 @@ Every §16.13 subsection is assigned to exactly one tier. No test is unassigned.
 | §16.13.5 ScenarioBuilder | 2 | `ci-tier2` |
 | §16.13.6 Determinism | 2 | `ci-tier2` |
 | §16.13.7 ProtocolRepository | 2 | `ci-tier2` |
-| §16.13.8 MlsStorageBridge | 2 | `ci-tier2` |
 | §16.13.9 Assertion library | 2 | `ci-tier2` |
 | §16.13.10 Preset scenarios | 2 | `ci-tier2` |
 | Preset scenarios × 10 seeds | 3 | `ci-tier3` |

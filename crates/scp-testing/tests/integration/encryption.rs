@@ -13,6 +13,7 @@
 //! (inner to seal to open), pseudonym derivation, bucket padding, and chunking.
 
 use openmls::prelude::*;
+use scp_clock::SystemClock;
 use scp_core::crypto::mls::credential::ScpCredential;
 use scp_core::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
 use scp_core::crypto::mls::group::{
@@ -45,7 +46,7 @@ async fn mls_create_group() {
     )
     .unwrap();
 
-    let group = create_group(&cred, &scp_clock::SystemClock).unwrap();
+    let group = create_group(&cred, &SystemClock).unwrap();
     assert_eq!(group.epoch().unwrap(), 0);
     assert_eq!(group.members().unwrap().len(), 1);
 }
@@ -63,7 +64,7 @@ async fn mls_add_member() {
     )
     .unwrap();
 
-    let mut group = create_group(&creator_cred, &scp_clock::SystemClock).unwrap();
+    let mut group = create_group(&creator_cred, &SystemClock).unwrap();
     let initial_epoch = group.epoch().unwrap();
     assert_eq!(initial_epoch, 0);
 
@@ -75,7 +76,7 @@ async fn mls_add_member() {
     )
     .unwrap();
     let (key_package_bundle, _signer, _provider) =
-        generate_key_package(&member_cred, &scp_clock::SystemClock).unwrap();
+        generate_key_package(&member_cred, &SystemClock).unwrap();
 
     // Convert KeyPackageBundle to KeyPackageIn for add_member.
     let kp_bytes = key_package_bundle
@@ -84,7 +85,7 @@ async fn mls_add_member() {
         .unwrap();
     let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
 
-    let result = add_member(&mut group, kp_in, &scp_clock::SystemClock).unwrap();
+    let result = add_member(&mut group, kp_in, &SystemClock).unwrap();
     assert!(group.epoch().unwrap() > initial_epoch);
     assert_eq!(group.members().unwrap().len(), 2);
 
@@ -106,7 +107,7 @@ async fn mls_join_group() {
     )
     .unwrap();
 
-    let mut group = create_group(&creator_cred, &scp_clock::SystemClock).unwrap();
+    let mut group = create_group(&creator_cred, &SystemClock).unwrap();
 
     let member_cred = ScpCredential::new(
         "did:dht:z6MkMemberJoin".to_owned(),
@@ -115,7 +116,7 @@ async fn mls_join_group() {
     )
     .unwrap();
     let (key_package_bundle, signer, provider) =
-        generate_key_package(&member_cred, &scp_clock::SystemClock).unwrap();
+        generate_key_package(&member_cred, &SystemClock).unwrap();
 
     let kp_bytes = key_package_bundle
         .key_package()
@@ -123,10 +124,10 @@ async fn mls_join_group() {
         .unwrap();
     let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
 
-    let add_result = add_member(&mut group, kp_in, &scp_clock::SystemClock).unwrap();
+    let add_result = add_member(&mut group, kp_in, &SystemClock).unwrap();
 
     // Join the group from the new member's side using the Welcome.
-    let joined_group = join_group(&add_result.welcome, provider, signer).unwrap();
+    let joined_group = join_group(&add_result.welcome, provider, signer, &SystemClock).unwrap();
 
     // Both sides should be at the same epoch.
     assert_eq!(group.epoch().unwrap(), joined_group.epoch().unwrap());
@@ -145,7 +146,7 @@ async fn mls_remove_member() {
     )
     .unwrap();
 
-    let mut group = create_group(&creator_cred, &scp_clock::SystemClock).unwrap();
+    let mut group = create_group(&creator_cred, &SystemClock).unwrap();
 
     let member_cred = ScpCredential::new(
         "did:dht:z6MkMemberRm".to_owned(),
@@ -154,7 +155,7 @@ async fn mls_remove_member() {
     )
     .unwrap();
     let (key_package_bundle, _signer, _provider) =
-        generate_key_package(&member_cred, &scp_clock::SystemClock).unwrap();
+        generate_key_package(&member_cred, &SystemClock).unwrap();
 
     let kp_bytes = key_package_bundle
         .key_package()
@@ -162,7 +163,7 @@ async fn mls_remove_member() {
         .unwrap();
     let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
 
-    add_member(&mut group, kp_in, &scp_clock::SystemClock).unwrap();
+    add_member(&mut group, kp_in, &SystemClock).unwrap();
     assert_eq!(group.members().unwrap().len(), 2);
 
     let epoch_after_add = group.epoch().unwrap();
@@ -194,7 +195,7 @@ async fn mls_destroy_group() {
     )
     .unwrap();
 
-    let mut group = create_group(&cred, &scp_clock::SystemClock).unwrap();
+    let mut group = create_group(&cred, &SystemClock).unwrap();
     assert!(group.epoch().is_ok());
 
     destroy_group(&mut group).unwrap();
@@ -213,8 +214,8 @@ async fn mls_destroy_group() {
 
 #[tokio::test]
 async fn mls_forward_secrecy() {
-    use scp_core::crypto::mls::epoch_grace::EpochGraceStore;
-    use scp_core::crypto::mls::ratchet::{process_commit, serialize_mls_message};
+    use scp_core::crypto::mls::encrypt::decrypt_with_sender_did;
+    use scp_core::crypto::mls::ratchet::serialize_mls_message;
 
     // Forward secrecy: ciphertext from epoch N must be undecryptable after
     // max_past_epochs+1 epoch advances discard the key material.
@@ -226,13 +227,14 @@ async fn mls_forward_secrecy() {
     let bob_cred =
         ScpCredential::new("did:dht:z6MkBobFS".to_owned(), None, SigningKeyId::Active).unwrap();
 
-    let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).unwrap();
+    let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
     let (bob_kpb, bob_signer, bob_provider) =
-        generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
+        generate_key_package(&bob_cred, &SystemClock).unwrap();
     let bob_kp_bytes = bob_kpb.key_package().tls_serialize_detached().unwrap();
     let bob_kp_in = KeyPackageIn::tls_deserialize(&mut bob_kp_bytes.as_slice()).unwrap();
-    let add_result = add_member(&mut alice_group, bob_kp_in, &scp_clock::SystemClock).unwrap();
-    let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+    let add_result = add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
+    let mut bob_group =
+        join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
     assert_eq!(alice_group.epoch().unwrap(), 1);
     assert_eq!(bob_group.epoch().unwrap(), 1);
 
@@ -245,20 +247,19 @@ async fn mls_forward_secrecy() {
 
     // Step 3: Advance BOTH groups past max_past_epochs (2) via add_member.
     // Each add_member on Alice produces a Commit; Bob processes it to stay in sync.
-    let mut bob_grace = EpochGraceStore::new();
     for i in 0..3 {
         let temp_cred =
             ScpCredential::new(format!("did:dht:z6MkTempFS{i}"), None, SigningKeyId::Active)
                 .unwrap();
         let (temp_kpb, _signer, _provider) =
-            generate_key_package(&temp_cred, &scp_clock::SystemClock).unwrap();
+            generate_key_package(&temp_cred, &SystemClock).unwrap();
         let kp_bytes = temp_kpb.key_package().tls_serialize_detached().unwrap();
         let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
-        let result = add_member(&mut alice_group, kp_in, &scp_clock::SystemClock).unwrap();
+        let result = add_member(&mut alice_group, kp_in, &SystemClock).unwrap();
 
         // Bob processes Alice's Commit to advance his epoch too.
         let commit_bytes = serialize_mls_message(&result.commit).unwrap();
-        process_commit(&mut bob_group, &commit_bytes, &mut bob_grace).unwrap();
+        decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap();
     }
 
     // Both groups are now at epoch 4. With max_past_epochs=2, epoch 1 material
@@ -554,7 +555,7 @@ async fn double_encryption_roundtrip() {
     )
     .unwrap();
 
-    let mut creator_group = create_group(&creator_cred, &scp_clock::SystemClock).unwrap();
+    let mut creator_group = create_group(&creator_cred, &SystemClock).unwrap();
     let sender_key = generate_sender_key();
 
     let payload = b"secret payload for double encryption test";
@@ -634,7 +635,7 @@ async fn double_encryption_roundtrip() {
     )
     .unwrap();
     let (joiner_kp_bundle, joiner_signer, joiner_provider) =
-        generate_key_package(&joiner_cred, &scp_clock::SystemClock).unwrap();
+        generate_key_package(&joiner_cred, &SystemClock).unwrap();
     let kp_bytes = joiner_kp_bundle
         .key_package()
         .tls_serialize_detached()
@@ -642,10 +643,10 @@ async fn double_encryption_roundtrip() {
     let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
 
     // Create a fresh group for the MLS layer test.
-    let mut mls_sender_group = create_group(&creator_cred, &scp_clock::SystemClock).unwrap();
-    let add_result = add_member(&mut mls_sender_group, kp_in, &scp_clock::SystemClock).unwrap();
+    let mut mls_sender_group = create_group(&creator_cred, &SystemClock).unwrap();
+    let add = add_member(&mut mls_sender_group, kp_in, &SystemClock).unwrap();
     let mut mls_receiver_group =
-        join_group(&add_result.welcome, joiner_provider, joiner_signer).unwrap();
+        join_group(&add.welcome, joiner_provider, joiner_signer, &SystemClock).unwrap();
 
     let mls_msg = encrypt(&mut mls_sender_group, &inner_bytes).unwrap();
     let mls_serialized = serialize_ciphertext(&mls_msg).unwrap();
@@ -752,17 +753,23 @@ async fn mls_application_message_roundtrip() {
     )
     .unwrap();
 
-    let mut creator_group = create_group(&creator_cred, &scp_clock::SystemClock).unwrap();
+    let mut creator_group = create_group(&creator_cred, &SystemClock).unwrap();
 
     // Add joiner to group.
     let (joiner_kpb, joiner_signer, joiner_provider) =
-        generate_key_package(&joiner_cred, &scp_clock::SystemClock).unwrap();
+        generate_key_package(&joiner_cred, &SystemClock).unwrap();
 
     let kp_bytes = joiner_kpb.key_package().tls_serialize_detached().unwrap();
     let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
 
-    let add_result = add_member(&mut creator_group, kp_in, &scp_clock::SystemClock).unwrap();
-    let mut joiner_group = join_group(&add_result.welcome, joiner_provider, joiner_signer).unwrap();
+    let add_result = add_member(&mut creator_group, kp_in, &SystemClock).unwrap();
+    let mut joiner_group = join_group(
+        &add_result.welcome,
+        joiner_provider,
+        joiner_signer,
+        &SystemClock,
+    )
+    .unwrap();
 
     // Creator encrypts a message.
     let plaintext = b"application-level message for MLS encrypt/decrypt test";

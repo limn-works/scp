@@ -37,10 +37,9 @@ pub mod crypto {
             InMemoryMlsProvider, credential, encrypt, epoch_grace, error, group, key_package,
             ratchet, wrapping_extension,
         };
-        // Node-only async durable-storage bridge from scp-runtime.
+        // Node-only async MLS backend and provider from scp-runtime.
         pub use scp_runtime::crypto::mls::{
-            MlsStorageBridge, MlsStorageBridgeError, NodeMlsFactory, ScpMlsProvider, backend,
-            production_backend, provider, storage, storage_adapter,
+            NodeMlsFactory, backend, production_backend, provider, storage_adapter,
         };
     }
     pub mod sender_keys {

@@ -20,15 +20,9 @@ import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 
 import { CryptoError, KeyNotFoundError, ScpError } from "../src/errors";
-import type { CustodyPublicKey, KeyCustodyProvider, PseudonymResult } from "../src/scp";
-import { SCP } from "../src/scp";
-import {
-  p256Compressed,
-  p256SignPrehash,
-  pseudonymScalar,
-  pseudonymSeedV1,
-  pseudonymSeedV2,
-} from "./pseudonym-recipe";
+import type { CustodyPublicKey, KeyCustodyProvider } from "../src/scp";
+import { p256SoftwarePseudonymPoint, SCP } from "../src/scp";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Probe: is the NAPI-backed SCP class available in this environment?
@@ -41,7 +35,7 @@ try {
   scpAvailable = true;
   probe.shutdown(1).catch(() => {});
 } catch (e: unknown) {
-  skipReason = `NAPI SCP class not available: ${e instanceof Error ? e.message : String(e)}`;
+  skipReason = skipReasonIfAddonAbsent(e);
 }
 
 // ---------------------------------------------------------------------------
@@ -49,15 +43,10 @@ try {
 // ---------------------------------------------------------------------------
 
 /** A host fault the fixture can inject into its pseudonym results. */
-type PseudonymFault = "legacy32" | "wrongPublicKey" | "deriveKeyNotFound";
+type PseudonymFault = "legacy32" | "deriveKeyNotFound";
 
 class CryptoKeychain implements KeyCustodyProvider {
   #seeds = new Map<string, Uint8Array>();
-  // Pseudonym key ids → P-256 private scalar (§9.10.4.A).
-  #pseudonyms = new Map<string, bigint>();
-  // Pseudonym key id -> the identity key id it was derived from, so destroying
-  // the identity destroys its pseudonyms (§9.10.4.A).
-  #pseudonymOwner = new Map<string, string>();
   // Key id -> the role generateKeypair minted it in.
   #roles = new Map<string, string>();
   #next = 1;
@@ -95,19 +84,10 @@ class CryptoKeychain implements KeyCustodyProvider {
   }
 
   sign(keyId: string, message: Uint8Array): Uint8Array {
-    const d = this.#pseudonyms.get(keyId);
-    if (d !== undefined) return p256SignPrehash(d, message);
     return new Uint8Array(crypto.sign(null, Buffer.from(message), this.#keyObject(keyId)));
   }
 
   getPublicKey(keyId: string): CustodyPublicKey {
-    const d = this.#pseudonyms.get(keyId);
-    if (d !== undefined) {
-      const point = p256Compressed(d);
-      // A host whose handle answers with a different point than its derivation.
-      if (this.#fault === "wrongPublicKey") point[0] = point[0] === 0x02 ? 0x03 : 0x02;
-      return { keyType: "p256", publicKey: point, role: "operational" };
-    }
     const pub = crypto.createPublicKey(this.#keyObject(keyId));
     const jwk = pub.export({ format: "jwk" }) as { x: string };
     return {
@@ -120,14 +100,6 @@ class CryptoKeychain implements KeyCustodyProvider {
   destroyKey(keyId: string): void {
     this.#seeds.delete(keyId);
     this.#roles.delete(keyId);
-    this.#pseudonyms.delete(keyId);
-    this.#pseudonymOwner.delete(keyId);
-    // A pseudonym dies with its identity (§9.10.4.A).
-    for (const [kid, owner] of [...this.#pseudonymOwner]) {
-      if (owner !== keyId) continue;
-      this.#pseudonyms.delete(kid);
-      this.#pseudonymOwner.delete(kid);
-    }
   }
 
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array {
@@ -146,58 +118,29 @@ class CryptoKeychain implements KeyCustodyProvider {
     return seed;
   }
 
-  // The pseudonym key id for (identity, context, epoch): the provider contract
-  // requires the same inputs to name the same key. The top bit keeps it clear
-  // of the small sequential identity ids.
-  static #pseudonymKeyId(identity: string, contextId: Uint8Array, epoch?: bigint): string {
-    const h = crypto.createHash("sha256");
-    const identityBytes = Buffer.from(identity, "utf8");
-    const lengths = Buffer.alloc(8);
-    lengths.writeUInt32BE(identityBytes.length, 0);
-    lengths.writeUInt32BE(contextId.length, 4);
-    h.update("fake-keychain-pseudonym-id").update(lengths).update(identityBytes).update(contextId);
-    if (epoch !== undefined) {
-      const be = Buffer.alloc(8);
-      be.writeBigUInt64BE(epoch);
-      h.update(be);
-    }
-    return (h.digest().readBigUInt64BE(0) | (1n << 63n)).toString();
-  }
-
-  // Register the §9.10.4.A P-256 pseudonym of a context seed under `keyId`.
-  // Native software custody keys the recipe on the Ed25519 identity seed.
-  #registerPseudonym(owner: string, contextSeed: Uint8Array, keyId: string): PseudonymResult {
-    const d = pseudonymScalar(contextSeed);
-    this.#pseudonyms.set(keyId, d);
-    this.#pseudonymOwner.set(keyId, owner);
-    const point = p256Compressed(d);
+  // The §9.10.4.A P-256 pseudonym point. Native software custody keys the
+  // recipe on the Ed25519 identity seed; the SDK's software helper derives the
+  // point and nothing is stored.
+  #pseudonymPoint(keyId: string, contextId: Uint8Array, epoch?: bigint): Uint8Array {
+    const point = p256SoftwarePseudonymPoint(this.#identitySeed(keyId), contextId, epoch);
     // A host still on the retired 32-byte Ed25519 pseudonym shape.
-    const publicKey = this.#fault === "legacy32" ? point.subarray(1) : point;
-    return { publicKey, keyId };
+    return this.#fault === "legacy32" ? point.subarray(1) : point;
   }
 
-  derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult {
+  derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array {
     // A host whose key is gone reports the contract's key-not-found code.
     if (this.#fault === "deriveKeyNotFound") {
       throw new CryptoError(`key not found: ${keyId}`, "SCP-CRYPTO-4006");
     }
-    return this.#registerPseudonym(
-      keyId,
-      pseudonymSeedV1(this.#identitySeed(keyId), contextId),
-      CryptoKeychain.#pseudonymKeyId(keyId, contextId),
-    );
+    return this.#pseudonymPoint(keyId, contextId);
   }
 
   deriveRotatablePseudonym(
     keyId: string,
     contextId: Uint8Array,
     pseudonymEpoch: bigint,
-  ): PseudonymResult {
-    return this.#registerPseudonym(
-      keyId,
-      pseudonymSeedV2(this.#identitySeed(keyId), contextId, pseudonymEpoch),
-      CryptoKeychain.#pseudonymKeyId(keyId, contextId, pseudonymEpoch),
-    );
+  ): Uint8Array {
+    return this.#pseudonymPoint(keyId, contextId, pseudonymEpoch);
   }
 
   exportSigningKeyBytes(keyId: string): Uint8Array {
@@ -224,29 +167,6 @@ class SignOnlyKeychain extends CryptoKeychain {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-describe("CryptoKeychain pseudonym lifecycle", () => {
-  test("destroying an identity destroys its v1 and v2 pseudonyms (§9.10.4.A)", () => {
-    const keychain = new CryptoKeychain();
-    const identity = keychain.generateKeypair("ed25519", "identity");
-    const other = keychain.generateKeypair("ed25519", "identity");
-    const ctx = new TextEncoder().encode("ctx");
-    const v1 = keychain.derivePseudonym(identity, ctx).keyId;
-    const v2 = keychain.deriveRotatablePseudonym(identity, ctx, 3n).keyId;
-    const kept = keychain.derivePseudonym(other, ctx).keyId;
-    const digest = new Uint8Array(crypto.createHash("sha256").update("message").digest());
-    expect(keychain.sign(v1, digest).length).toBe(64);
-    expect(keychain.sign(v2, digest).length).toBe(64);
-
-    keychain.destroyKey(identity);
-
-    for (const kid of [v1, v2]) {
-      expect(() => keychain.sign(kid, digest)).toThrow();
-      expect(() => keychain.getPublicKey(kid)).toThrow();
-    }
-    expect(keychain.sign(kept, digest).length).toBe(64);
-  });
-});
 
 if (!scpAvailable) {
   describe("identityCreateWithCustody (SKIPPED)", () => {
@@ -290,30 +210,28 @@ if (!scpAvailable) {
       }
     });
 
-    // §9.10.4: the bridge fails closed on a host pseudonym it cannot trust —
-    // a retired 32-byte key, or a key id whose getPublicKey disagrees with the
-    // point the derivation returned — with SCP-IDENT-1055.
-    for (const fault of ["legacy32", "wrongPublicKey"] as const) {
-      test(`an encrypted context create fails with SCP-IDENT-1055 on host fault ${fault}`, async () => {
-        const scp = new SCP({ storage: { type: "in_memory" } });
+    // §9.10.4: the bridge fails closed with SCP-IDENT-1055 on host pseudonym
+    // bytes that are not a compressed P-256 point, such as a retired 32-byte key.
+    test("an encrypted context create fails with SCP-IDENT-1055 on a 32-byte host pseudonym", async () => {
+      const scp = new SCP({ storage: { type: "in_memory" } });
+      try {
+        const identity = await scp.identityCreateWithCustody(new CryptoKeychain("legacy32"));
+        let caught: unknown;
         try {
-          const identity = await scp.identityCreateWithCustody(new CryptoKeychain(fault));
-          let caught: unknown;
-          try {
-            await scp.contextCreate(
-              identity,
-              JSON.stringify({ ceiling: ["messages:read"], memoryScope: "ephemeral" }),
-            );
-          } catch (err) {
-            caught = err;
-          }
-          expect(caught).toBeInstanceOf(ScpError);
-          expect((caught as ScpError).code).toBe("SCP-IDENT-1055");
-        } finally {
-          await scp.shutdown(1000).catch(() => {});
+          await scp.contextCreate(
+            identity,
+            JSON.stringify({ ceiling: ["messages:read"], memoryScope: "ephemeral" }),
+          );
+        } catch (err) {
+          caught = err;
         }
-      });
-    }
+        expect(caught).toBeInstanceOf(ScpError);
+        expect((caught as ScpError).code).toBe("SCP-IDENT-1055");
+        expect((caught as ScpError).message).toContain("got 32 bytes");
+      } finally {
+        await scp.shutdown(1000).catch(() => {});
+      }
+    });
 
     test("rejects a provider missing required methods", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });

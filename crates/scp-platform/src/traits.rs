@@ -35,7 +35,7 @@ pub enum KeyType {
     X25519,
     /// P-256 ECDSA signing key. Signs a 32-byte digest (prehash) and returns
     /// the 64-byte low-`s` `r ‖ s`; its public key is the 33-byte compressed
-    /// SEC1 point. Pseudonym handles are this type.
+    /// SEC1 point.
     P256Signing,
     /// P-256 key-agreement key (HPKE `DHKEM(P-256, HKDF-SHA256)`). Its public
     /// key is the 65-byte uncompressed SEC1 point; it only performs ECDH.
@@ -155,8 +155,7 @@ impl PublicKey {
 
 /// A signature produced by [`KeyCustody::sign`].
 ///
-/// Contains the raw 64-byte signature: Ed25519 `R ‖ S` for an Ed25519 key, or
-/// the low-`s` P-256 `r ‖ s` for a pseudonym key.
+/// Contains the raw 64-byte Ed25519 signature `R ‖ S`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature(Vec<u8>);
 
@@ -208,48 +207,50 @@ impl SharedSecret {
 /// A per-context pseudonym derived via [`KeyCustody::derive_pseudonym`] or
 /// [`KeyCustody::derive_rotatable_pseudonym`] (§9.10.4).
 ///
-/// The pseudonym is a P-256 key: `public_key` is its 33-byte SEC1 compressed
-/// point, and `routing_id` is
-/// `SHA-256("scp-pseudonym-routing-v1:" || public_key)`, the 32-byte value
-/// every routing field carries. The only constructor,
-/// [`PseudonymKeypair::new`], validates the point (§9.5) and computes the
-/// routing id, so a held value is always well-formed, whichever custody
-/// backend or host adapter produced it.
-#[derive(Debug, Clone)]
-pub struct PseudonymKeypair {
-    public_key: PublicKey,
+/// A pseudonym is a P-256 point with no private key: no protocol message is
+/// signed under it, so no custody stores one. `routing_id` is
+/// `SHA-256("scp-pseudonym-routing-v1:" || compressed point)`, the 32-byte
+/// value every routing field carries. Both constructors take a validated point
+/// (§9.5) and compute the routing id, so a held value is always well-formed,
+/// whichever custody backend or host adapter produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pseudonym {
+    public_key: scp_crypto::p256::P256PublicKey,
     routing_id: [u8; 32],
-    key_handle: KeyHandle,
 }
 
-impl PseudonymKeypair {
-    /// Validates a pseudonym public key and binds it to its custody handle.
+impl Pseudonym {
+    /// The pseudonym whose point is `public_key`.
+    #[must_use]
+    pub fn new(public_key: scp_crypto::p256::P256PublicKey) -> Self {
+        Self {
+            routing_id: scp_crypto::pseudonym::pseudonym_routing_id(&public_key),
+            public_key,
+        }
+    }
+
+    /// Validates a pseudonym point a custody returned.
     ///
     /// # Errors
     ///
-    /// [`PlatformError::CustodyError`] when `public_key` is not a 33-byte SEC1
-    /// compressed P-256 point on the curve.
-    pub fn new(public_key: &[u8], key_handle: KeyHandle) -> Result<Self, PlatformError> {
+    /// [`PlatformError::PseudonymRejected`] when `point` is not a 33-byte SEC1
+    /// compressed P-256 point on the curve; the message names which.
+    pub fn from_point(point: &[u8]) -> Result<Self, PlatformError> {
         use scp_crypto::p256::{COMPRESSED_POINT_LEN, P256PublicKey};
-        let compressed: [u8; COMPRESSED_POINT_LEN] = public_key.try_into().map_err(|_| {
-            PlatformError::CustodyError(format!(
-                "pseudonym public key must be a {COMPRESSED_POINT_LEN}-byte compressed P-256 point, got {} bytes",
-                public_key.len()
-            ))
-        })?;
-        P256PublicKey::from_sec1(&compressed).map_err(|e| {
-            PlatformError::CustodyError(format!("invalid pseudonym public key: {e}"))
-        })?;
-        Ok(Self {
-            public_key: PublicKey::new(compressed.to_vec()),
-            routing_id: scp_crypto::pseudonym::pseudonym_routing_id(&compressed),
-            key_handle,
-        })
+        if point.len() != COMPRESSED_POINT_LEN {
+            return Err(PlatformError::PseudonymRejected(format!(
+                "pseudonym point must be a {COMPRESSED_POINT_LEN}-byte compressed P-256 point, got {} bytes",
+                point.len()
+            )));
+        }
+        P256PublicKey::from_sec1(point)
+            .map(Self::new)
+            .map_err(|e| PlatformError::PseudonymRejected(format!("invalid pseudonym point: {e}")))
     }
 
-    /// The 33-byte SEC1 compressed P-256 pseudonym public key.
+    /// The P-256 pseudonym point.
     #[must_use]
-    pub const fn public_key(&self) -> &PublicKey {
+    pub const fn public_key(&self) -> &scp_crypto::p256::P256PublicKey {
         &self.public_key
     }
 
@@ -257,12 +258,6 @@ impl PseudonymKeypair {
     #[must_use]
     pub const fn routing_id(&self) -> &[u8; 32] {
         &self.routing_id
-    }
-
-    /// The custody handle of the pseudonym's private key.
-    #[must_use]
-    pub const fn key_handle(&self) -> &KeyHandle {
-        &self.key_handle
     }
 }
 
@@ -340,19 +335,64 @@ impl PushToken {
 /// A wake signal produced by [`Push::handle_notification`].
 ///
 /// Indicates that the application should wake up and process pending messages.
-/// The payload carries transport-specific context (e.g., which context has new
-/// messages). See ADR-006.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// §10.7 of the infrastructure spec states: "Push payloads MUST contain a wake
+/// signal and nothing else. No context ID, no sender identifier, no message
+/// preview, no metadata of any kind." A wake signal must therefore not vary
+/// with the payload it was produced from. `WakeSignal` holds `&'static` bytes,
+/// so returning the borrowed payload or a temporary copy of it does not
+/// compile (the two examples below). The type does not stop a signal that
+/// varies with the payload: an implementation can leak payload bytes with
+/// `Vec::leak`, pick one of several `'static` constants by payload content, or
+/// slice a `static` table at an index read from the payload. The conformance
+/// check `scp_testing::conformance::push::check_fixed_wake_signal` is what
+/// rejects an adapter whose signal differs across the payloads it sends,
+/// however the signal was built. `InMemoryPush`, the durability-only adapter behind the
+/// `in-memory-push` feature (ADR-062 §0), returns the fixed bytes
+/// `{"aps":{"content-available":1}}` for every payload. See ADR-006.
+///
+/// ```
+/// use scp_platform::WakeSignal;
+///
+/// const WAKE: &[u8] = br#"{"aps":{"content-available":1}}"#;
+/// assert_eq!(WakeSignal::new(WAKE).payload(), WAKE);
+/// ```
+///
+/// Bytes borrowed from a notification payload do not compile:
+///
+/// ```compile_fail,E0521
+/// use scp_platform::WakeSignal;
+///
+/// fn from_payload(payload: &[u8]) -> WakeSignal {
+///     WakeSignal::new(payload)
+/// }
+/// ```
+///
+/// Nor does a copy of them:
+///
+/// ```compile_fail,E0716
+/// use scp_platform::WakeSignal;
+///
+/// fn from_payload(payload: &[u8]) -> WakeSignal {
+///     WakeSignal::new(&payload.to_vec())
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WakeSignal {
-    /// The raw notification payload that triggered this wake signal.
-    pub payload: Vec<u8>,
+    payload: &'static [u8],
 }
 
 impl WakeSignal {
-    /// Creates a new wake signal from a notification payload.
+    /// Creates a wake signal holding `payload`, a constant the [`Push`]
+    /// implementation returns for every notification it accepts (§10.7).
     #[must_use]
-    pub const fn new(payload: Vec<u8>) -> Self {
+    pub const fn new(payload: &'static [u8]) -> Self {
         Self { payload }
+    }
+
+    /// Returns the wake signal bytes.
+    #[must_use]
+    pub const fn payload(&self) -> &'static [u8] {
+        self.payload
     }
 }
 
@@ -393,8 +433,7 @@ pub trait KeyCustody: Send + Sync {
     /// key may be the source of [`derive_pseudonym`](Self::derive_pseudonym)
     /// and [`derive_rotatable_pseudonym`](Self::derive_rotatable_pseudonym)
     /// (§9.10.4.A). A key from [`generate_keypair`](Self::generate_keypair)
-    /// is operational, and a derived pseudonym key is a pseudonym; neither
-    /// ever derives. [`import_ed25519_signing_key`](Self::import_ed25519_signing_key)
+    /// is operational and never derives. [`import_ed25519_signing_key`](Self::import_ed25519_signing_key)
     /// installs the new identity key of a migrated identity, so it also
     /// holds its key in the identity role.
     ///
@@ -411,8 +450,7 @@ pub trait KeyCustody: Send + Sync {
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send;
 
     /// Sign data with an Ed25519 key, or a 32-byte digest with a
-    /// [`KeyType::P256Signing`] key (including a pseudonym handle,
-    /// [`PseudonymKeypair::key_handle`]).
+    /// [`KeyType::P256Signing`] key.
     ///
     /// For a P-256 key, `data` is the digest itself (prehash, §9.5.1) and the
     /// result is the 64-byte low-`s` `r ‖ s`. Software backends use RFC 6979
@@ -435,7 +473,7 @@ pub trait KeyCustody: Send + Sync {
     /// Return the public key for a handle.
     ///
     /// Ed25519 and X25519 handles return 32 bytes, [`KeyType::P256Signing`]
-    /// handles (pseudonyms included) the 33-byte compressed SEC1 point, and
+    /// handles the 33-byte compressed SEC1 point, and
     /// [`KeyType::HpkeP256`] handles the 65-byte uncompressed SEC1 point.
     ///
     /// # Errors
@@ -451,10 +489,9 @@ pub trait KeyCustody: Send + Sync {
     /// After this call, all subsequent operations with the same handle will
     /// return [`PlatformError::KeyNotFound`].
     ///
-    /// Destroying an identity destroys every v1 and v2 pseudonym key derived
-    /// from it, and a derivation still in flight when its identity is destroyed
-    /// fails with key-not-found (`SCP-CRYPTO-4006`) and stores nothing
-    /// (`09-security-model.md` §9.10.4.A).
+    /// No pseudonym key exists to destroy: a pseudonym has no private key, and
+    /// a derivation from a destroyed identity fails with key-not-found
+    /// (`SCP-CRYPTO-4006`, `09-security-model.md` §9.10.4.A).
     ///
     /// # Errors
     ///
@@ -489,12 +526,12 @@ pub trait KeyCustody: Send + Sync {
         peer_public: &[u8],
     ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send;
 
-    /// Derive a deterministic, context-scoped pseudonym keypair (v1, non-rotatable).
+    /// Derive a deterministic, context-scoped pseudonym (v1, non-rotatable).
     ///
     /// Algorithm:
     ///   1. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
     ///   2. `d = (int(HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48)) mod (n − 1)) + 1`
-    ///      (FIPS 186-5 A.2.1), and the pseudonym is the P-256 key `d`
+    ///      (FIPS 186-5 A.2.1), and the pseudonym is the point `d·G`; `d` is discarded
     ///
     /// The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key (public
     /// key bytes would be a membership-enumeration oracle, §9.10.4.A). For SOFTWARE
@@ -504,20 +541,17 @@ pub trait KeyCustody: Send + Sync {
     /// `pseudonym_secret` is a device-local value computed inside the boundary;
     /// hardware pseudonyms are therefore device-local BY DESIGN, not cross-platform
     /// identical. The Rust software backends share this derivation via
-    /// [`scp_crypto::pseudonym::derive_pseudonym_keypair`].
+    /// [`scp_crypto::pseudonym::derive_pseudonym`].
     ///
-    /// The returned [`PseudonymKeypair`] is always software-managed (derived
-    /// output). Its handle signs only a 32-byte digest, returning a 64-byte
-    /// low-`s` P-256 `r ‖ s` signature ([`KeyCustody::sign`]); every other
-    /// operation on it fails with a typed [`PlatformError`].
+    /// The returned [`Pseudonym`] is the point and its routing id; the custody
+    /// stores nothing for it.
     ///
     /// For contexts that support pseudonym rotation (BLACK-001 mitigation),
     /// use [`derive_rotatable_pseudonym`](KeyCustody::derive_rotatable_pseudonym) instead.
     ///
     /// The pseudonym dies with its identity (`09-security-model.md` §9.10.4.A):
-    /// destroying the identity destroys every v1 and v2 pseudonym key derived
-    /// from it, and a derivation still in flight when its identity is destroyed
-    /// fails with key-not-found (`SCP-CRYPTO-4006`) and stores nothing.
+    /// once the identity is destroyed, deriving from it fails with
+    /// key-not-found (`SCP-CRYPTO-4006`).
     ///
     /// # Errors
     ///
@@ -525,16 +559,15 @@ pub trait KeyCustody: Send + Sync {
     /// Returns [`PlatformError::WrongKeyType`] (with `expected`
     /// [`KeyType::Ed25519`]) if the handle is not an identity key
     /// ([`generate_identity_keypair`](Self::generate_identity_keypair)): an
-    /// operational or pseudonym key of any type, Ed25519 included, and every
-    /// non-Ed25519 key. Until S12 (§9.10.4.A native interim) the identity key
-    /// is Ed25519.
+    /// operational key of any type, Ed25519 included, and every non-Ed25519
+    /// key. The identity key is Ed25519 (§9.10.4.A).
     fn derive_pseudonym(
         &self,
         key: &KeyHandle,
         context_id: &[u8],
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send;
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send;
 
-    /// Derive a rotatable, epoch-scoped pseudonym keypair (v2).
+    /// Derive a rotatable, epoch-scoped pseudonym (v2).
     ///
     /// Mitigates relay-side pseudonym correlation (BLACK-001) by including a
     /// rotation epoch in the HMAC derivation, producing a different pseudonym
@@ -542,7 +575,7 @@ pub trait KeyCustody: Send + Sync {
     ///
     /// Algorithm:
     ///   1. `seed = HMAC-SHA256(pseudonym_secret, context_id || epoch_BE || "scp-pseudonym-v2")`
-    ///   2. the P-256 key `d` from `seed` exactly as in v1
+    ///   2. the point `d·G` from `seed` exactly as in v1
     ///
     /// where `epoch_BE` is the `pseudonym_epoch` as an 8-byte big-endian u64. As in
     /// v1, the HMAC key is the `pseudonym_secret` (NEVER the public key, §9.10.4.A):
@@ -555,9 +588,8 @@ pub trait KeyCustody: Send + Sync {
     /// domain confusion.
     ///
     /// The pseudonym dies with its identity (`09-security-model.md` §9.10.4.A):
-    /// destroying the identity destroys every v1 and v2 pseudonym key derived
-    /// from it, and a derivation still in flight when its identity is destroyed
-    /// fails with key-not-found (`SCP-CRYPTO-4006`) and stores nothing.
+    /// once the identity is destroyed, deriving from it fails with
+    /// key-not-found (`SCP-CRYPTO-4006`).
     ///
     /// # Errors
     ///
@@ -565,15 +597,14 @@ pub trait KeyCustody: Send + Sync {
     /// Returns [`PlatformError::WrongKeyType`] (with `expected`
     /// [`KeyType::Ed25519`]) if the handle is not an identity key
     /// ([`generate_identity_keypair`](Self::generate_identity_keypair)): an
-    /// operational or pseudonym key of any type, Ed25519 included, and every
-    /// non-Ed25519 key. Until S12 (§9.10.4.A native interim) the identity key
-    /// is Ed25519.
+    /// operational key of any type, Ed25519 included, and every non-Ed25519
+    /// key. The identity key is Ed25519 (§9.10.4.A).
     fn derive_rotatable_pseudonym(
         &self,
         key: &KeyHandle,
         context_id: &[u8],
         pseudonym_epoch: u64,
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send;
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send;
 
     /// Performs X25519 key agreement using an Ed25519 key via birational conversion.
     ///
@@ -930,8 +961,30 @@ pub trait PreRotationCustody: Send + Sync {
 /// Device attestation trait.
 ///
 /// Abstracts platform-specific device attestation (Apple App Attest, Android
-/// `SafetyNet` / Play Integrity). The testing implementation returns synthetic
-/// attestation tokens that always verify. See ADR-006.
+/// `SafetyNet` / Play Integrity). ADR-006, the platform abstraction, in
+/// `.docs/adrs/phase-1.md` defines this trait signature.
+///
+/// `InMemoryDeviceAttestation`, the `testing`-gated implementation in
+/// `crate::testing`, mints tokens carrying the byte prefix
+/// `scp-test-attestation-v1:` followed by a sequence number. Its
+/// [`verify`](DeviceAttestation::verify) returns `true` for a token carrying
+/// that prefix and `false` for every token that does not. Two unit tests in
+/// that module, `verify_foreign_token_returns_false` and
+/// `verify_empty_token_returns_false`, pin the rejecting branch.
+///
+/// Neither platform adapter implements this trait. The Swift
+/// `AppleDeviceAttestation` adapter conforms to the `UniFFI`
+/// `DeviceAttestationProvider` callback interface in
+/// `crates/scp-ffi/uniffi/src/lib.rs`, which has declared no verifier since
+/// ADR-021 defined it. That adapter carries no verifier either, because the
+/// maintainer ruled on 2026-09-26 that reading-side verification belongs to
+/// the keri workstream (ADR-025, the Apple platform adapter, in
+/// `.docs/adrs/phase-5.md`). §9.3.1 of `.docs/specs/09-security-model.md`
+/// states how a reader verifies an Apple App Attest attestation object, and
+/// story SCP-316, still pending, specifies that reader; no code verifies a
+/// device attestation yet. OQ-22 of
+/// `.docs/specs/27-attestations.md` keeps open which of the two traits is
+/// normative.
 pub trait DeviceAttestation: Send + Sync {
     /// Generate a device attestation token.
     ///
@@ -958,8 +1011,8 @@ pub trait DeviceAttestation: Send + Sync {
 /// Push notification trait.
 ///
 /// Abstracts platform-specific push notification registration and handling
-/// (APNs, FCM). The testing implementation returns synthetic tokens and passes
-/// payloads through as wake signals. See ADR-006.
+/// (APNs, FCM). The in-memory implementation returns synthetic tokens and one
+/// fixed wake signal for every payload. See ADR-006.
 pub trait Push: Send + Sync {
     /// Register for push notifications and return a platform-specific token.
     ///
@@ -969,6 +1022,14 @@ pub trait Push: Send + Sync {
     fn register(&self) -> impl Future<Output = Result<PushToken, PlatformError>> + Send;
 
     /// Handle an incoming push notification payload and produce a wake signal.
+    ///
+    /// Returns one fixed [`WakeSignal`] for every payload the implementation
+    /// accepts, and may reject a payload instead. §10.7 of the infrastructure
+    /// spec states: "Push payloads MUST contain a wake signal and nothing else.
+    /// No context ID, no sender identifier, no message preview, no metadata of
+    /// any kind." The signal must therefore not vary with `payload`: a signal
+    /// that did would hand the caller whatever a relay put there. Spec
+    /// §16.12.5 and ADR-006 state this contract for every implementation.
     ///
     /// # Errors
     ///
@@ -1115,7 +1176,7 @@ impl<T: Storage> Storage for std::sync::Arc<T> {
 
 /// Signs a 32-byte digest with a software P-256 key: the shared
 /// [`KeyCustody::sign`] path of every software backend for
-/// [`KeyType::P256Signing`] handles, pseudonyms included.
+/// [`KeyType::P256Signing`] handles.
 ///
 /// # Errors
 ///
@@ -1126,7 +1187,7 @@ impl<T: Storage> Storage for std::sync::Arc<T> {
     any(feature = "file", feature = "sqlite", feature = "testing")
 ))]
 pub(crate) fn sign_p256_digest(
-    key: &scp_crypto::p256::P256SigningKey,
+    key: &scp_crypto::p256::P256SecretKey,
     data: &[u8],
 ) -> Result<Signature, PlatformError> {
     let digest: &[u8; 32] = data.try_into().map_err(|_| {
@@ -1178,7 +1239,7 @@ pub fn hpke_p256_peer(
     any(feature = "file", feature = "sqlite", feature = "testing")
 ))]
 pub(crate) fn p256_dh_agree(
-    key: &scp_crypto::p256::P256SigningKey,
+    key: &scp_crypto::p256::P256SecretKey,
     peer_public: &[u8],
 ) -> Result<SharedSecret, PlatformError> {
     let peer = hpke_p256_peer(peer_public)?;
@@ -1218,8 +1279,8 @@ pub(crate) fn x25519_peer(peer_public: &[u8]) -> Result<[u8; 32], PlatformError>
 ))]
 pub(crate) fn p256_key_from_stored(
     scalar: &[u8; 32],
-) -> Result<scp_crypto::p256::P256SigningKey, PlatformError> {
-    scp_crypto::p256::P256SigningKey::from_scalar_bytes(scalar).map_err(|e| {
+) -> Result<scp_crypto::p256::P256SecretKey, PlatformError> {
+    scp_crypto::p256::P256SecretKey::from_scalar_bytes(scalar).map_err(|e| {
         PlatformError::StorageError(format!("stored P-256 scalar is not a valid key: {e}"))
     })
 }
@@ -1235,12 +1296,12 @@ pub(crate) fn p256_key_from_stored(
     feature = "software_platform",
     any(feature = "file", feature = "sqlite")
 ))]
-pub(crate) fn generate_p256_os_rng() -> Result<scp_crypto::p256::P256SigningKey, PlatformError> {
+pub(crate) fn generate_p256_os_rng() -> Result<scp_crypto::p256::P256SecretKey, PlatformError> {
     use rand::RngCore as _;
     for _ in 0..8 {
         let mut scalar = zeroize::Zeroizing::new([0u8; 32]);
         rand::rngs::OsRng.fill_bytes(scalar.as_mut());
-        if let Ok(key) = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&scalar) {
+        if let Ok(key) = scp_crypto::p256::P256SecretKey::from_scalar_bytes(&scalar) {
             return Ok(key);
         }
     }
@@ -1251,8 +1312,8 @@ pub(crate) fn generate_p256_os_rng() -> Result<scp_crypto::p256::P256SigningKey,
 
 /// The pseudonym-derivation source check shared by the software backends:
 /// the source must be an identity key
-/// ([`KeyCustody::generate_identity_keypair`]), and until S12 (§9.10.4.A
-/// native interim) an Ed25519 one.
+/// ([`KeyCustody::generate_identity_keypair`]), and an Ed25519 one
+/// (§9.10.4.A).
 ///
 /// # Errors
 ///
@@ -1273,7 +1334,7 @@ pub(crate) const fn require_derive_source(
             actual: key_type,
         });
     }
-    // Until S12 (§9.10.4.A native interim): the identity key is Ed25519.
+    // §9.10.4.A: the identity key is Ed25519.
     if !matches!(key_type, KeyType::Ed25519) {
         return Err(PlatformError::WrongKeyType {
             expected: KeyType::Ed25519,

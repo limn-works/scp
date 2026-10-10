@@ -40,7 +40,6 @@ export const Capabilities = {
   CONTEXT_CLOSE: "context:close",
   CHILD_CONTEXT_CREATE: "context:child:create",
   OUTLET_INTERFACE: "outlet:interface",
-  BRIDGING: "bridging",
   MEDIA_VOICE: "media:voice",
   MEDIA_VIDEO: "media:video",
   MEDIA_SCREEN_SHARE: "media:screen_share",
@@ -76,7 +75,14 @@ export function outletCall(outletId: string): string {
 
 /** Parameters for creating a new SCP context. */
 export interface ContextParams {
-  /** Capability ceiling — maximum capabilities available in this context. */
+  /**
+   * Capability ceiling — maximum capabilities available in this context.
+   *
+   * Required and non-empty. `contextCreate` rejects params JSON whose
+   * `ceiling` is absent or `null` with `SCP-VALID-7004` and one whose
+   * `ceiling` is an empty array with `SCP-VALID-7005`; no default ceiling is
+   * substituted.
+   */
   readonly ceiling: readonly string[];
   /** Outlet definitions to register at context creation. */
   readonly outlets?: readonly OutletDefinition[];
@@ -181,7 +187,6 @@ export type UnitCapability =
   | "ContextClose"
   | "ChildContextCreate"
   | "OutletInterface"
-  | "Bridging"
   | "MediaVoice"
   | "MediaVideo"
   | "MediaScreenShare"

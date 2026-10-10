@@ -126,6 +126,7 @@ pub(crate) fn outcome_error_sketch(err: &ContextError) -> ContextError {
             message: message.clone(),
             retry_after_ms: *retry_after_ms,
         },
+        ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
     }
 }
@@ -204,5 +205,21 @@ mod tests {
             ERR_MUT.result,
             Err(ContextError::ContextNotActive)
         ));
+    }
+}
+
+#[cfg(test)]
+mod outcome_sketch_tests {
+    use super::{ContextError, outcome_error_sketch};
+
+    /// The Outcome sketch keeps a Supervisor shutdown typed rather than
+    /// recording it as a crypto failure.
+    #[test]
+    fn sketch_keeps_supervisor_shut_down_typed() {
+        let sketch = outcome_error_sketch(&ContextError::SupervisorShutDown("gone".to_owned()));
+        assert!(
+            matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
+            "got {sketch:?}"
+        );
     }
 }

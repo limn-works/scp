@@ -494,6 +494,30 @@ describe("mapSagaError", () => {
     expect((err as SagaBusyError).contendedContext).toBe("ctxABC");
   });
 
+  it("maps a Supervisor-shutdown saga refusal (SCP-CTX-2138) to SagaAbortedError", () => {
+    // The PyO3 and UniFFI bridges raise SagaAborted for this refusal; the
+    // class follows the `saga aborted:` phrase, not the code prefix.
+    const err = mapSagaError(
+      new Error(
+        "[SCP-CTX-2138] saga aborted: start cross-context streaming saga (retry_after_ms=null)",
+      ),
+    );
+    expect(err).toBeInstanceOf(SagaAbortedError);
+    expect(err.code).toBe("SCP-CTX-2138");
+    expect((err as SagaAbortedError).retryAfterMs).toBeNull();
+  });
+
+  it("delegates an SCP-CTX-2139 context error without a saga phrase to mapBridgeError", () => {
+    const err = mapSagaError(
+      new Error(
+        "[SCP-CTX-2139] context error: streaming saga s1 started, then its receiver was dropped unregistered: bridge shutdown began before the bridge registered it",
+      ),
+    );
+    expect(err).toBeInstanceOf(ContextError);
+    expect(err).not.toBeInstanceOf(SagaAbortedError);
+    expect(err.code).toBe("SCP-CTX-2139");
+  });
+
   it("delegates a non-saga error to mapBridgeError", () => {
     const err = mapSagaError(new Error("[SCP-OUTLET-6011] outlet error: target not active"));
     expect(err).toBeInstanceOf(OutletError);

@@ -659,9 +659,8 @@ pub async fn close_context_with_key(
     // combinator (replacing the former inline `persist_state_fail_closed`).
     // KEEP-direction: a close that did not durably land is NOT rolled back in
     // memory — silently re-opening a closed context is the unsafe direction; the
-    // persist error is surfaced instead. These mutations are all synchronous (the
-    // self-deadlock-avoiding gauge refresh is a detached `tokio::spawn` that
-    // borrows only `deps`), so they fit the sync `_keep` closure.
+    // persist error is surfaced instead. These mutations are all synchronous,
+    // so they fit the sync `_keep` closure.
     cell.commit_class_s_keep(deps, &context_id, |mut view| {
         let state = view.rest_mut();
 
@@ -751,10 +750,26 @@ pub async fn close_context_with_key(
         // budget`). Detach it: the close handler returns, this actor's command loop
         // frees, and the refresh then observes up-to-date state. Gauges are
         // eventually-consistent metrics, so fire-and-forget is the correct coupling.
+        // The task captures the handle, so it spawns on the Supervisor's tracker
+        // (ADR-049 Decision 16) and shutdown waits for it. A refusal means
+        // shutdown has begun or the Supervisor dropped, so the refresh is
+        // skipped and logged.
         let supervisor = deps.supervisor.clone();
-        tokio::spawn(async move {
-            supervisor.update_context_gauges().await;
-        });
+        let refresh = async move {
+            if let Err(e) = supervisor.update_context_gauges().await {
+                tracing::debug!(error = %e, "context gauge refresh skipped: supervisor gone");
+            }
+        };
+        if let Err(e) = deps
+            .supervisor
+            .spawn_tracked("refresh context gauges after close", refresh)
+        {
+            tracing::debug!(
+                context_id = %context_id,
+                error = %e,
+                "context gauge refresh not spawned: supervisor shutting down"
+            );
+        }
 
         Ok(())
     })
@@ -1558,9 +1573,21 @@ fn rollback_join_economy_ticket(
 ///
 /// # Errors
 ///
-/// - [`ContextCreationError::CreationFailed`] for version
-///   incompatibility, governance / consequence-rule / economic-policy
-///   validation failures, or supervisor registration failures.
+/// - [`ContextCreationError::StateTransition`] wrapping
+///   [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)
+///   with [`CeilingDeclaration::Empty`](scp_protocol::context::CeilingDeclaration::Empty)
+///   when `params.ceiling` is empty, before any context state exists.
+/// - [`ContextCreationError::StateTransition`] wrapping
+///   [`ContextError::VersionIncompatible`](scp_protocol::context::ContextError::VersionIncompatible)
+///   when the running SDK does not satisfy `params.min_protocol_version`.
+/// - [`ContextCreationError::InvalidCeilingCategory`] when a ceiling entry
+///   breaks the ceiling-entry grammar (spec §5.3.1.1).
+/// - [`ContextCreationError::StateTransition`] wrapping
+///   [`ContextError::SupervisorShutDown`] when the actor spawn is refused
+///   because shutdown has begun or the Supervisor dropped (ADR-049 Decision 16).
+/// - [`ContextCreationError::CreationFailed`] for governance /
+///   consequence-rule / economic-policy validation failures, or supervisor
+///   registration failures.
 /// - Crypto / transport / event-log failures during the initial MLS
 ///   group setup.
 #[allow(clippy::too_many_lines)]
@@ -1576,6 +1603,21 @@ pub async fn create_context(
     creator_did: DID,
     local_pseudonym: Option<[u8; 32]>,
 ) -> Result<ContextHandle, ContextCreationError> {
+    // The ceiling must be non-empty (construction.md M2, Alec's ruling of
+    // 2026-09-30): an empty ceiling describes a context no member can use.
+    // Every create path (`Supervisor::create`, `Supervisor::create_context`,
+    // the `CreateContext` lifecycle command, the standing-pair recreate, and
+    // the governance migration) reaches this function. The rejection runs
+    // here, before any context state exists; `builder::create_context`, which
+    // builds the MLS group, repeats it in its Phase 1 validation so the rule
+    // holds for every in-crate caller.
+    if params.ceiling.is_empty() {
+        return Err(ContextCreationError::StateTransition(
+            scp_protocol::context::ContextError::CeilingRequired(
+                scp_protocol::context::CeilingDeclaration::Empty,
+            ),
+        ));
+    }
     // Defense-in-depth: verify creator's SDK version satisfies
     // min_protocol_version.
     params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
@@ -1653,7 +1695,7 @@ pub async fn create_context(
     // ADR-049 PR-4 §5: create-seed the supervisor floor registry so a
     // default-empty entry exists from creation (it then grows via
     // mirror-forward). Insert-if-absent — never resets an advanced entry.
-    deps.supervisor.seed_context_floors(&context_id_bytes);
+    deps.supervisor.seed_context_floors(&context_id_bytes)?;
     let actor_members: HashSet<DID> = initial_members.clone();
     let create_is_broadcast = broadcast_context.is_some();
     let mode = if create_is_broadcast {
@@ -1807,9 +1849,12 @@ pub async fn create_context(
     deps.supervisor
         .spawn_actor_with_state(per_context, owned_deps, None)
         .await
-        .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+        .map_err(|e| match e {
+            ContextError::SupervisorShutDown(_) => ContextCreationError::StateTransition(e),
+            other => ContextCreationError::CreationFailed(other.to_string()),
+        })?;
 
-    finalize_create(deps, &context_id, params.ttl, &handle).await;
+    finalize_create(deps, &context_id, params.ttl, &handle).await?;
     Ok(handle)
 }
 
@@ -1833,13 +1878,18 @@ pub async fn create_context(
 /// governance-timeout interval task, persistence/broadcast, and the TTL
 /// timer all reach the freshly-spawned actor through the supervisor
 /// registry, never the `DashMap`.
+///
+/// # Errors
+///
+/// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped
+/// (ADR-049 Decision 16).
 pub async fn finalize_create(
     deps: &ActorDeps,
     context_id: &str,
     ttl_duration: Option<std::time::Duration>,
     handle: &ContextHandle,
-) {
-    deps.supervisor.update_context_gauges().await;
+) -> Result<(), ContextError> {
+    deps.supervisor.update_context_gauges().await?;
     // The governance-timeout interval is ACTOR-OWNED (ADR-049 Decision-1 /
     // finding A3): the freshly-spawned actor's `reconcile_timers` arms a
     // 60 s interval while the context is `Active` — no bootstrap mailbox
@@ -1856,8 +1906,9 @@ pub async fn finalize_create(
             // Create path: no explicit deadline — the actor handler derives the
             // convergent `creation_timestamp_secs + params.ttl` deadline.
             .dispatch_start_ttl_timer(context_id, handle.params().clone(), None)
-            .await;
+            .await?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1934,7 +1985,7 @@ fn generate_initial_access_key_store(
 /// replay-protection rejection the registry's `validate_and_merge_*` sink
 /// returns) if a per-sender floor regresses (import path) or overshoots (both
 /// paths); the just-built owned crypto is dropped on rejection (the `SenderKey`
-/// zeroizes; the `ScpMlsGroup` / Ed25519 signer is freed, not zeroized - #82) and
+/// and the `ScpMlsGroup`'s Ed25519 signer zeroize on drop) and
 /// the registry is left unchanged (atomic).
 pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     deps: &ActorDeps,
@@ -2001,22 +2052,20 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     // rejection to `ContextError::CryptoFailed`.
     //
     // Rollback: on rejection the just-built `owned` material is dropped at the `?`
-    // return (the `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not
-    // zeroized - #82) so no floor-regressed / half-restored state persists (BUG-1
+    // return (the `SenderKey` and the `ScpMlsGroup`'s signer zeroize on drop) so
+    // no floor-regressed / half-restored state persists (BUG-1
     // atomicity). The registry itself is left UNCHANGED (validate-before-apply,
     // across both axes). Fail-closed by construction: a rejected restore is never
     // seeded onto an actor and writes no durable snapshot, so it cannot resurrect a
     // divergent second group for this id (there is no provider `taken_context_ids`
     // marker; #2148 deleted it, and `build_restored_owned` sets none).
-    deps.supervisor
-        .validate_and_merge_all_floors(
-            ctx_id_bytes,
-            restored.sender_epochs,
-            restored.recv_sequence,
-            scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-            policy,
-        )
-        .map_err(ContextError::from)?;
+    deps.supervisor.validate_and_merge_all_floors(
+        ctx_id_bytes,
+        restored.sender_epochs,
+        restored.recv_sequence,
+        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+        policy,
+    )?;
 
     Ok(owned)
 }
@@ -2288,7 +2337,7 @@ pub async fn import_context(
     // gate provided. On success the prior actor claims itself terminal
     // and exits; we deterministically despawn its dead handle before the
     // fresh spawn below.
-    if deps.supervisor.lookup(&context_id).is_some() {
+    if deps.supervisor.lookup(&context_id)?.is_some() {
         // Crypto state is read from the SIGNED snapshot field (ADR-050: all
         // importer-restored state lives in the signed preimage), never from an
         // unsigned envelope blob. Validated by `validate_export_for_import` above.
@@ -2301,7 +2350,7 @@ pub async fn import_context(
         // onto the fresh `PerContextState`.
         match deps
             .supervisor
-            .dispatch_prepare_for_replace(&context_id, export.snapshot.mls_crypto_state.clone())
+            .dispatch_prepare_for_replace(&context_id, export.snapshot.mls_crypto_state.0.clone())
             .await
         {
             Ok(()) => {
@@ -2309,7 +2358,7 @@ pub async fn import_context(
                 // remove its dead handle so the respawn slot is vacant. The
                 // replace-gap marker makes a lifecycle-state read during the
                 // gap report `ActorCrashed`, not an absent context.
-                let _ = deps.supervisor.despawn_for_replace(&context_id).await;
+                let _: bool = deps.supervisor.despawn_for_replace(&context_id).await?;
             }
             // ONLY a stale/unreachable handle routes to recovery. The prior
             // actor exited (or dropped its reply) before we reached it. ALL
@@ -2320,7 +2369,7 @@ pub async fn import_context(
             // recovery branch below would re-restore the replayed snapshot and
             // silently bypass the replay guard.
             Err(ContextError::ContextNotRegistered(_)) => {
-                if deps.supervisor.lookup(&context_id).is_some() {
+                if deps.supervisor.lookup(&context_id)?.is_some() {
                     // A concurrent operation already owns the slot — refuse to
                     // overwrite it.
                     return Err(ContextError::MembershipFailed(format!(
@@ -2359,8 +2408,8 @@ pub async fn import_context(
     // `context_params` field against the MLS group embedded in `mls_crypto_state`;
     // this closes that gap. A group with no `0xFF02` (not an SCP context) or any
     // rule 2-6 mismatch is rejected as a forged/corrupt import; the owned material
-    // is dropped (the `SenderKey` zeroizes; the group / signer is freed, not
-    // zeroized - #82) so no forged crypto is ever seeded (mirrors the
+    // is dropped (the `SenderKey` and the group's signer zeroize on drop) so no
+    // forged crypto is ever seeded (mirrors the
     // restore path's own rejection and the Welcome-join pre-install rejection). A
     // keyless (needs-reconnect) snapshot has `None` owned material and no group to
     // bind, so it is skipped — its group arrives later via a reconnect Welcome,
@@ -2378,8 +2427,8 @@ pub async fn import_context(
         )
     {
         // On rejection the `imported_owned` material is dropped here (the
-        // `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not zeroized -
-        // #82) so no forged crypto is seeded; fail-closed by construction - the
+        // `SenderKey` and the `ScpMlsGroup`'s signer zeroize on drop) so no forged
+        // crypto is seeded; fail-closed by construction - the
         // rejected crypto is never seeded onto the actor and no durable snapshot is
         // written (there is no longer a provider `taken_context_ids` marker; #2148
         // deleted it). Read the extension from the OWNED group (ADR-049 PR-7 C3 - no
@@ -2767,9 +2816,12 @@ pub async fn import_context(
     deps.supervisor
         .spawn_actor_with_state(per_context, owned_deps, None)
         .await
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        .map_err(|e| match e {
+            ContextError::SupervisorShutDown(_) => e,
+            other => ContextError::MembershipFailed(other.to_string()),
+        })?;
 
-    deps.supervisor.update_context_gauges().await;
+    deps.supervisor.update_context_gauges().await?;
 
     // Governance timeouts (ADR-031 §5) are ACTOR-OWNED (ADR-049
     // Decision-1 / finding A3): the spawned actor's `reconcile_timers`
@@ -2814,7 +2866,7 @@ pub async fn import_context(
     ) {
         deps.supervisor
             .dispatch_start_ttl_timer(&context_id, handle.params().clone(), Some(deadline))
-            .await;
+            .await?;
     }
 
     Ok(handle)
@@ -3069,20 +3121,18 @@ pub async fn restore_context(
         // routes the cold-restart (empty-registry) floors through the SAME sink,
         // closing the D2 replay window on first boot. FAIL-CLOSED via
         // `.map_err(..)?`. On rejection the just-built `owned` material is dropped
-        // here (the `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not
-        // zeroized - #82); fail-closed by construction - a rejected restore is never
+        // here (the `SenderKey` and the `ScpMlsGroup`'s signer zeroize on drop);
+        // fail-closed by construction - a rejected restore is never
         // seeded and writes no durable snapshot, so the id cannot resurrect a
         // divergent second group. #2148 deleted the provider `taken_context_ids`
         // marker this comment referenced, and `build_restored_owned` sets none.
-        deps.supervisor
-            .validate_and_merge_all_floors(
-                &ctx_id_bytes,
-                restored_floors.sender_epochs,
-                restored_floors.recv_sequence,
-                scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-                scp_protocol::crypto::sender_keys::MergePolicy::MaxMergeTrustedLocal,
-            )
-            .map_err(ContextError::from)?;
+        deps.supervisor.validate_and_merge_all_floors(
+            &ctx_id_bytes,
+            restored_floors.sender_epochs,
+            restored_floors.recv_sequence,
+            scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+            scp_protocol::crypto::sender_keys::MergePolicy::MaxMergeTrustedLocal,
+        )?;
 
         // §5.13.3 rule 1 (FFI-02, load-time binding). Verify the rehydrated
         // group's committed `scp_context_params` (`0xFF02`) extension binds the
@@ -3095,7 +3145,7 @@ pub async fn restore_context(
         // context, or whose committed params diverge, is a corrupt snapshot and
         // is rejected. Read the extension from the OWNED group (it is no longer
         // provider-resident). On rejection the `owned` material is dropped (the
-        // `SenderKey` zeroizes; the group / signer is freed, not zeroized - #82);
+        // `SenderKey` and the group's signer zeroize on drop);
         // fail-closed by construction - the rejected crypto is never seeded, so no
         // divergent crypto persists (no provider taken-marker exists post-#2148).
         if let Err(reason) = verify_scp_context_binding(
@@ -3435,7 +3485,10 @@ pub async fn restore_context(
     deps.supervisor
         .spawn_actor_with_state(per_context, owned_deps, None)
         .await
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        .map_err(|e| match e {
+            ContextError::SupervisorShutDown(_) => e,
+            other => ContextError::MembershipFailed(other.to_string()),
+        })?;
 
     // Fix-D — restore-time streaming crash-recovery sweep. The actor is now
     // resident with its Class-S state rehydrated (including any
@@ -3491,7 +3544,7 @@ pub async fn restore_context(
     if let Some(deadline) = restore_ttl_deadline {
         deps.supervisor
             .dispatch_start_ttl_timer(context_id, handle.params().clone(), Some(deadline))
-            .await;
+            .await?;
     }
 
     Ok(())
@@ -3663,51 +3716,103 @@ pub fn flush_all_contexts_sync(supervisor: &crate::context::supervisor::Supervis
 /// Sweep entry point: shut down every actor (best-effort, local
 /// cleanup only).
 ///
-/// Destroys per-context sender keys + MLS groups + event logs in that
-/// order (zeroize secrets before tearing down structure) by dispatching
-/// [`LifecycleCommand::ShutdownSelf`](crate::context::actor::commands::LifecycleCommand::ShutdownSelf)
-/// to each actor (each actor owns its `PerContextState` and drops it when
-/// its task exits — no `DashMap` cleanup needed), then clears
-/// supervisor-level state (standing contexts, local DIDs, wrapping keys,
-/// task set).
+/// Shuts down every context and drains the supervisor's tracked tasks
+/// (ADR-049 Decision 16, supervisor task drain).
 ///
-/// Relocates the legacy `shutdown_all_contexts_legacy` off the
-/// `Supervisor::contexts` `DashMap` iteration (the legacy body is now
-/// deleted). Used by
+/// Steps, in order:
+/// 1. Set the closed flag.
+/// 2. Snapshot the actor registry under the write lock. A spawner that
+///    passed the closed-flag check registers under the same lock, so the
+///    snapshot holds every actor that can still be spawned.
+/// 3. Send each actor
+///    [`LifecycleCommand::ShutdownSelf`](crate::context::actor::commands::LifecycleCommand::ShutdownSelf),
+///    which destroys sender keys, the MLS group, and the event log in that
+///    order (zeroize secrets before tearing down structure), then despawn the
+///    actor whether or not the send succeeded and whether or not the actor
+///    replied within [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT):
+///    the despawn drops the last
+///    mailbox sender, the actor's `run()` loop exits on the closed inbox, and
+///    its task releases its `PerContextState`.
+/// 4. Stop every key-package actor and clear `key_package_stores`.
+/// 5. Clear the standing-context index, the local-DID registry, and the
+///    per-identity wrapping keys.
+/// 6. Close the task tracker and await it.
+/// 7. Drop each swept context's floor-registry entry. A despawned actor whose
+///    `ShutdownSelf` was not delivered or not answered keeps running its
+///    mailbox backlog until step 6 has awaited it, and each persist it makes
+///    reads its floors from this registry.
+///
+/// Used by
 /// [`Supervisor::shutdown_all_contexts`](crate::context::supervisor::Supervisor::shutdown_all_contexts)
-/// (and its sync wrapper) for process exit / test teardown. Does NOT
+/// (and its sync wrapper) for process exit and test teardown. Does NOT
 /// send leave messages or notify remote peers.
 pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supervisor) {
+    let context_ids = shutdown_sweep(supervisor).await;
+    supervisor.await_tracked_tasks().await;
+    let removed_count = reap_swept_floors(supervisor, &context_ids);
+    tracing::info!(
+        removed_count,
+        "shutdown: removed all contexts, stopped key-package actors, and drained every \
+         supervisor task"
+    );
+}
+
+/// Steps 1 to 5 of [`shutdown_all_contexts`]; returns the ids of the context
+/// actors the sweep despawned.
+async fn shutdown_sweep(supervisor: &crate::context::supervisor::Supervisor) -> Vec<String> {
     use std::collections::{HashMap, HashSet};
 
     use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
 
-    let context_ids = supervisor.actor_ids();
+    supervisor.close_spawn_gate();
+    let context_ids = {
+        let _guard = supervisor.write_lock.lock().await;
+        supervisor.actor_ids()
+    };
     for ctx_id in &context_ids {
-        let Some(actor) = supervisor.lookup(ctx_id) else {
-            continue;
-        };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply: tx });
-        if actor
-            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
-            .await
-            .is_err()
-        {
-            continue;
+        if let Some(actor) = supervisor.lookup(ctx_id) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply: tx });
+            match actor
+                .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+                .await
+            {
+                Ok(()) => match crate::context::actor::bounded_reply_await(rx).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(
+                        context_id = %ctx_id,
+                        error = %e,
+                        "shutdown: actor reported a ShutdownSelf teardown failure; despawning"
+                    ),
+                    Err(crate::context::actor::BoundedReplyError::Dropped) => tracing::warn!(
+                        context_id = %ctx_id,
+                        "shutdown: actor exited before replying to ShutdownSelf; despawning"
+                    ),
+                    Err(crate::context::actor::BoundedReplyError::Elapsed) => tracing::warn!(
+                        context_id = %ctx_id,
+                        "shutdown: actor did not reply to ShutdownSelf within REPLY_TIMEOUT; \
+                         despawning"
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    context_id = %ctx_id,
+                    error = %e,
+                    "shutdown: ShutdownSelf not delivered; despawning, which closes the \
+                     actor's inbox and drops its state"
+                ),
+            }
         }
-        let _ = rx.await;
         // `ShutdownSelf` tears down the per-context resources (sender
         // keys, MLS group, event log, timers) but does NOT break the
         // actor's `run()` loop — only `LifecycleControlCommand::Shutdown`
         // and a claimed `PrepareForReplace` do, and neither is sent here.
-        // We must explicitly despawn the actor: `despawn_actor` removes
-        // the handle from `actors` under the write lock, dropping the
-        // last `mpsc::Sender`. That closes the inbox, so the actor's
-        // `run()` loop exits on its inbox-closed (`None`) arm and the
-        // spawned task releases its `PerContextState`. Without this the
-        // handle leaks (context stays discoverable via `lookup` /
-        // `actor_ids` after "shutdown") and the task never exits.
+        // Despawning removes the handle from `actors` under the write lock,
+        // dropping the last `mpsc::Sender`. That closes the inbox, so the
+        // actor's `run()` loop exits on its inbox-closed (`None`) arm and the
+        // spawned task releases its `PerContextState`. The despawn runs
+        // even when the send failed or the reply did not arrive within
+        // `REPLY_TIMEOUT`, so a full mailbox or a wedged actor cannot keep an
+        // actor registered past shutdown.
         supervisor.despawn_actor(ctx_id).await;
         // Clean shutdown: reap the (non-poison) crash-window entry so it does
         // not leak past teardown (ADR-049 §10). A poisoned entry is preserved
@@ -3715,20 +3820,13 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
         // lookup still reports the poison until an operator clears it or the
         // process restarts.
         supervisor.reap_crash_window(ctx_id);
-        // Drop the authoritative Class-M floor registry entry on the same
-        // teardown sweep (ADR-049) — the floor-registry twin of the crash-window
-        // reap above. Harmless-but-tidy here (the whole Supervisor is about to be
-        // dropped), but it keeps the registry floors' lifecycle aligned 1:1 with
-        // crash_windows and leaves no per-context registry entry behind after a
-        // shutdown sweep.
-        let ctx_id_bytes = crate::context::state::context_id_to_bytes(ctx_id);
-        supervisor.remove_context_floors(&ctx_id_bytes);
+        // The floor-registry entry is dropped in step 7, after the drain.
         // Drop the per-context stream admission-tracker registry entry on the
-        // same teardown sweep (spec §5.4.5) — the streaming twin of the
-        // crash-window / floor-registry reaps above, keeping the admission
-        // registry from leaking past a shutdown.
+        // same teardown sweep (spec §5.4.5).
         supervisor.reap_stream_admission(ctx_id);
     }
+
+    supervisor.stop_key_package_actors().await;
 
     // Supervisor-level state clear. Acquired under the write_lock once
     // for the standing_contexts + local_dids stores so a concurrent
@@ -3746,16 +3844,31 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
 
     supervisor.clear_wrapping_keys();
 
-    // No supervisor timer JoinSet to abort: TTL / governance timers are
-    // ACTOR-OWNED arms (ADR-049 finding A3). Despawning each actor above
-    // drops its inbox sender, so its `run()` loop exits and its owned timer
-    // arms are dropped with the task — no separate teardown needed.
-
-    tracing::info!(
-        removed_count = context_ids.len(),
-        "shutdown: removed all contexts via actor mailbox and cleared identity registries"
-    );
+    // TTL / governance timers are ACTOR-OWNED arms (ADR-049 finding A3) and
+    // end with their actor's task. Every other supervisor-held task (actor
+    // watchdogs, the context-gauge refresh, the streaming saga seal task,
+    // the streaming settlement tasks) is on the tracker, which step 6 awaits.
+    context_ids
 }
+
+/// Step 7 of [`shutdown_all_contexts`]: drops the floor-registry entry of each
+/// swept context and returns how many contexts were swept. Runs only after the
+/// tracker drain has finished, so no actor task is left to persist a snapshot
+/// that would export the absent entry as empty floors.
+fn reap_swept_floors(
+    supervisor: &crate::context::supervisor::Supervisor,
+    context_ids: &[String],
+) -> usize {
+    for ctx_id in context_ids {
+        supervisor.remove_context_floors(&crate::context::state::context_id_to_bytes(ctx_id));
+    }
+    context_ids.len()
+}
+
+/// How long [`shutdown_all_contexts_sync`] waits for the tracker drain (step 6
+/// of [`shutdown_all_contexts`]) before it abandons the drain and returns an
+/// error. The sweep before the drain runs to completion either way.
+const SYNC_SHUTDOWN_DRAIN_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Sync wrapper for [`shutdown_all_contexts`].
 ///
@@ -3763,21 +3876,271 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
 /// instance's blocking-shutdown path) that cannot `.await`. Per
 /// ADR-049 §7 allowlist for the FFI shutdown path — uses
 /// [`tokio::runtime::Handle::try_current`] +
-/// [`tokio::task::block_in_place`] to bridge sync → async; no-op
-/// (with warning) when called outside a runtime.
-pub fn shutdown_all_contexts_sync(supervisor: &crate::context::supervisor::Supervisor) {
+/// [`tokio::task::block_in_place`] to bridge sync → async.
+///
+/// # Errors
+///
+/// [`ContextError::InvalidState`](scp_protocol::context::ContextError::InvalidState)
+/// when called outside a tokio runtime: nothing was shut down and nothing was
+/// drained, so the caller must not close the storage backend. The same error
+/// when the tracker drain has not finished within
+/// [`SYNC_SHUTDOWN_DRAIN_BOUND`]: every actor was still despawned, but
+/// supervisor tasks may still hold storage, so the caller must not close the
+/// storage backend.
+pub fn shutdown_all_contexts_sync(
+    supervisor: &crate::context::supervisor::Supervisor,
+) -> Result<(), scp_protocol::context::ContextError> {
+    shutdown_all_contexts_sync_within(supervisor, SYNC_SHUTDOWN_DRAIN_BOUND)
+}
+
+/// [`shutdown_all_contexts_sync`] with the drain bound as a parameter.
+fn shutdown_all_contexts_sync_within(
+    supervisor: &crate::context::supervisor::Supervisor,
+    bound: std::time::Duration,
+) -> Result<(), scp_protocol::context::ContextError> {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown allowlist — the bridge's blocking shutdown path cannot .await.
-            tokio::task::block_in_place(|| handle.block_on(shutdown_all_contexts(supervisor))); // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "shutdown_all_contexts_sync called outside tokio runtime; \
-                 skipping shutdown — per-actor resources will leak"
+            let shutdown = async {
+                let context_ids = shutdown_sweep(supervisor).await;
+                let drained = tokio::time::timeout(bound, supervisor.await_tracked_tasks()).await;
+                (context_ids, drained)
+            };
+            let (context_ids, drained) = tokio::task::block_in_place(|| handle.block_on(shutdown)); // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown
+            drained.map_err(|_elapsed| {
+                scp_protocol::context::ContextError::InvalidState(format!(
+                    "shutdown_all_contexts_sync: the drain did not finish within {bound:?}; \
+                     tracked tasks still run, so the storage backend must stay open"
+                ))
+            })?;
+            let removed_count = reap_swept_floors(supervisor, &context_ids);
+            tracing::info!(
+                removed_count,
+                "shutdown: removed all contexts, stopped key-package actors, and drained every \
+                 supervisor task"
             );
+            Ok(())
         }
+        Err(e) => Err(scp_protocol::context::ContextError::InvalidState(format!(
+            "shutdown_all_contexts_sync called outside a tokio runtime ({e}); nothing was \
+             shut down or drained, so the storage backend must stay open"
+        ))),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod shutdown_sweep_tests {
+    //! ADR-049 Decision 16: the shutdown sweep despawns an actor that never
+    //! replies to `ShutdownSelf`, and the sync wrapper abandons a drain that
+    //! does not finish within its bound.
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use scp_protocol::context::ContextError;
+
+    use super::{
+        shutdown_all_contexts, shutdown_all_contexts_sync, shutdown_all_contexts_sync_within,
+    };
+    use crate::context::actor::{ContextActorHandle, ContextCommand, REPLY_TIMEOUT};
+    use crate::context::supervisor::Supervisor;
+
+    fn supervisor() -> Arc<Supervisor> {
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+            "did:dht:z6MkShutdownSweep".to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        ));
+        crate::context::test_supervisor(
+            crypto,
+            Box::new(crate::context::builder::NotConfiguredTransportProvider),
+            Box::new(crate::context::providers::MerkleEventLogProvider::new()),
+            Arc::new(|_, _| None),
+        )
+    }
+
+    /// Two actors accept `ShutdownSelf` into a free mailbox slot and never
+    /// reply. The sweep waits `REPLY_TIMEOUT` for each, then despawns both, so
+    /// neither stays registered and the sweep reaches its end.
+    #[tokio::test(start_paused = true)]
+    async fn sweep_despawns_actors_that_never_reply_to_shutdown_self() {
+        let sup = supervisor();
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        sup.register_actor_handle_for_test("ctx-wedged-a", ContextActorHandle::from_sender(tx_a));
+        sup.register_actor_handle_for_test("ctx-wedged-b", ContextActorHandle::from_sender(tx_b));
+
+        let start = tokio::time::Instant::now();
+        shutdown_all_contexts(&sup).await;
+        assert!(
+            start.elapsed() >= REPLY_TIMEOUT * 2,
+            "the sweep waits REPLY_TIMEOUT for each unanswered ShutdownSelf"
+        );
+        assert!(
+            sup.actor_ids().is_empty(),
+            "an actor that never replies to ShutdownSelf is despawned, got {:?}",
+            sup.actor_ids()
+        );
+        // Each mailbox received the one ShutdownSelf, and the despawn dropped
+        // the last sender, so the inbox reads closed after it.
+        for rx in [&mut rx_a, &mut rx_b] {
+            assert!(rx.recv().await.is_some(), "ShutdownSelf was delivered");
+            assert!(rx.recv().await.is_none(), "the despawn closed the inbox");
+        }
+    }
+
+    /// An actor that never answers `ShutdownSelf` keeps running until the drain
+    /// awaits it. A persist it makes on its way out still reads the context's
+    /// floors from the registry, and only after the drain does the shutdown
+    /// drop the registry entry.
+    #[tokio::test(start_paused = true)]
+    async fn floors_outlive_an_unanswering_actor_until_the_drain_ends() {
+        use crate::context::actor::commands::LifecycleCommand;
+
+        let sup = supervisor();
+        let ctx_id = "ab".repeat(32);
+        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_id);
+        sup.check_and_advance_sender_epoch(&ctx_bytes, "floor-sender", 7, u64::MAX)
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        sup.register_actor_handle_for_test(&ctx_id, ContextActorHandle::from_sender(tx));
+        let actor_sup = Arc::clone(&sup);
+        let actor = sup
+            .spawn_tracked("unanswering actor", async move {
+                let mut held_replies = Vec::new();
+                while let Some(cmd) = rx.recv().await {
+                    if let ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply }) = cmd
+                    {
+                        held_replies.push(reply);
+                    }
+                }
+                // The inbox closed on the despawn: model the persist of a
+                // command the actor was still running.
+                (actor_sup.export_sender_key_epochs(&ctx_bytes), held_replies)
+            })
+            .expect("spawn before shutdown");
+
+        shutdown_all_contexts(&sup).await;
+
+        assert!(actor.is_finished(), "the drain awaited the actor task");
+        let (seen, held_replies) = actor.await.expect("the actor task does not panic");
+        assert_eq!(
+            held_replies.len(),
+            1,
+            "the actor held the one ShutdownSelf unanswered"
+        );
+        assert_eq!(
+            seen,
+            vec![("floor-sender".to_owned(), 7)],
+            "the actor's last persist read the advanced floor, not an empty export"
+        );
+        assert!(
+            sup.export_sender_key_epochs(&ctx_bytes).is_empty(),
+            "the shutdown dropped the floor entry after the drain"
+        );
+    }
+
+    /// A sync shutdown whose drain times out leaves the floor entry in place,
+    /// because the tracked tasks it abandoned may still persist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_shutdown_keeps_floors_when_the_drain_stalls() {
+        let sup = supervisor();
+        let ctx_id = "cd".repeat(32);
+        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_id);
+        sup.check_and_advance_sender_epoch(&ctx_bytes, "floor-sender", 3, u64::MAX)
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        drop(rx);
+        sup.register_actor_handle_for_test(&ctx_id, ContextActorHandle::from_sender(tx));
+        sup.spawn_tracked("never-exiting probe", std::future::pending::<()>())
+            .expect("spawn before shutdown");
+
+        let result = shutdown_all_contexts_sync_within(&sup, Duration::from_millis(200));
+        assert!(
+            result.is_err(),
+            "the stalled drain is abandoned, got {result:?}"
+        );
+        assert_eq!(
+            sup.export_sender_key_epochs(&ctx_bytes),
+            vec![("floor-sender".to_owned(), 3)],
+            "the floor entry survives an abandoned drain"
+        );
+    }
+
+    /// The sync wrapper's deadline bounds only the tracker drain: an actor
+    /// that replies to `ShutdownSelf` after the deadline has passed still
+    /// gets its reply awaited, and both registered actors are despawned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_shutdown_finishes_the_sweep_past_the_drain_deadline() {
+        use crate::context::actor::commands::LifecycleCommand;
+
+        let sup = supervisor();
+        let (tx_slow, mut rx_slow) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        // A closed inbox fails the send at once, so this actor adds no wait.
+        let (tx_next, rx_next) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        drop(rx_next);
+        sup.register_actor_handle_for_test("ctx-slow", ContextActorHandle::from_sender(tx_slow));
+        sup.register_actor_handle_for_test("ctx-next", ContextActorHandle::from_sender(tx_next));
+        let slow_actor = tokio::spawn(async move {
+            while let Some(cmd) = rx_slow.recv().await {
+                if let ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply }) = cmd {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        });
+
+        let result = shutdown_all_contexts_sync_within(&sup, Duration::from_millis(100));
+        assert!(
+            result.is_ok(),
+            "an empty tracker drains within the deadline, got {result:?}"
+        );
+        assert!(
+            sup.actor_ids().is_empty(),
+            "the sweep despawned every actor although it ran past the deadline, got {:?}",
+            sup.actor_ids()
+        );
+        slow_actor
+            .await
+            .expect("the slow actor's inbox closed after the despawn");
+    }
+
+    /// Outside a tokio runtime the sync wrapper shuts nothing down and says so.
+    #[test]
+    fn sync_shutdown_outside_a_runtime_is_an_error() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let sup = rt.block_on(async { supervisor() });
+        let result = shutdown_all_contexts_sync(&sup);
+        assert!(
+            matches!(&result, Err(ContextError::InvalidState(m)) if m.contains("outside a tokio runtime")),
+            "got {result:?}"
+        );
+    }
+
+    /// An idle supervisor drains within the bound; a tracked task that never
+    /// exits makes the wrapper abandon the drain and return an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_shutdown_returns_ok_when_drained_and_err_when_the_drain_stalls() {
+        let idle = supervisor();
+        assert!(
+            shutdown_all_contexts_sync_within(&idle, Duration::from_secs(5)).is_ok(),
+            "an idle supervisor drains within the bound"
+        );
+
+        let stalled = supervisor();
+        stalled
+            .spawn_tracked("never-exiting probe", std::future::pending::<()>())
+            .expect("spawn before shutdown");
+        let start = std::time::Instant::now();
+        let result = shutdown_all_contexts_sync_within(&stalled, Duration::from_millis(200));
+        assert!(
+            matches!(&result, Err(ContextError::InvalidState(m)) if m.contains("did not finish within")),
+            "a stalled drain is abandoned with an error, got {result:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the wrapper returns at the bound, not after the stalled task"
+        );
     }
 }
 
@@ -4022,11 +4385,13 @@ mod restore_reconcile_tests {
                 mode: ContextMode::Broadcast,
                 // Broadcast contexts only support `MemoryScope::Full`.
                 memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
                 ..ContextParams::default()
             }
         } else {
             ContextParams {
                 mode: ContextMode::Encrypted,
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
                 ..ContextParams::default()
             }
         };
@@ -4077,6 +4442,169 @@ mod restore_reconcile_tests {
             .expect("build_actor_deps");
         let handle = ContextHandle::new(restore_ctx_id.to_owned(), ContextParams::default());
         lifecycle_helpers::restore_context(&deps, restore_ctx_id, &handle, None).await
+    }
+
+    /// ADR-049 Decision 16: a create or a restore that reaches the actor spawn
+    /// after shutdown has begun returns the typed `SupervisorShutDown`
+    /// (SCP-CTX-2138), not a flattened `CreationFailed` / `MembershipFailed`.
+    /// The same calls on a live Supervisor succeed.
+    #[tokio::test]
+    async fn create_and_restore_after_shutdown_keep_supervisor_shut_down() {
+        let params = || ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..ContextParams::default()
+        };
+        let creator = || DID("did:dht:z6MkShutdownCreate".to_owned());
+
+        // The deps are built before shutdown, as a create already past
+        // `build_actor_deps` holds them when shutdown begins.
+        let create_on = |closed: bool, ctx_id: &'static str| async move {
+            let supervisor = build_supervisor(Box::new(SharedCapture(Arc::new(
+                CapturingPersistence::default(),
+            ))));
+            let deps = supervisor
+                .build_actor_deps(&creator())
+                .await
+                .expect("build_actor_deps");
+            if closed {
+                supervisor.shutdown_all_contexts().await;
+            }
+            lifecycle_helpers::create_context(
+                &deps,
+                ctx_id.to_owned(),
+                params(),
+                creator(),
+                Some([7u8; 32]),
+            )
+            .await
+        };
+        create_on(false, "create-live")
+            .await
+            .expect("create on a live supervisor succeeds");
+        let created = create_on(true, "create-closed").await;
+        assert!(
+            matches!(
+                created,
+                Err(ContextCreationError::StateTransition(
+                    ContextError::SupervisorShutDown(_)
+                ))
+            ),
+            "create after shutdown must keep SupervisorShutDown; got {created:?}"
+        );
+
+        let ctx_id = "restore-after-shutdown";
+        let (snapshot, _) = harvest_snapshot(ctx_id, false).await;
+        let serving = build_supervisor(Box::new(ServingPersistence {
+            snapshot: snapshot.clone(),
+        }));
+        let deps = serving
+            .build_actor_deps(&DID("did:dht:z6MkRestoreShutdown".to_owned()))
+            .await
+            .expect("build_actor_deps");
+        let handle = ContextHandle::new(ctx_id.to_owned(), ContextParams::default());
+        serving.shutdown_all_contexts().await;
+        let restored = lifecycle_helpers::restore_context(&deps, ctx_id, &handle, None).await;
+        assert!(
+            matches!(restored, Err(ContextError::SupervisorShutDown(_))),
+            "restore after shutdown must keep SupervisorShutDown; got {restored:?}"
+        );
+    }
+
+    /// ADR-049 Decision 16: an import that reaches the actor spawn after
+    /// shutdown has begun returns the typed `SupervisorShutDown`
+    /// (SCP-CTX-2138), not a flattened `MembershipFailed`. The same import on a
+    /// live Supervisor succeeds.
+    #[tokio::test]
+    async fn import_after_shutdown_keeps_supervisor_shut_down() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let import_on = |closed: bool, ctx_id: &'static str| async move {
+            let (mut snapshot, _) = harvest_snapshot(ctx_id, false).await;
+            // The export carries no event log, which recomputes to the zero
+            // root; the signed snapshot field must match it.
+            snapshot.event_log_merkle_root = [0u8; 32];
+            let creator = DID("did:dht:z6MkHarvestCreator".to_owned());
+            let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+            let export = crate::context::export_import::create_export(
+                snapshot,
+                Vec::new(),
+                creator.clone(),
+                crate::context::export_import::ExportScope::Full,
+                &scp_clock::SystemClock,
+                |hash: &[u8; 32]| {
+                    Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
+                },
+            )
+            .expect("build a signed export");
+            let supervisor = build_supervisor(Box::new(SharedCapture(Arc::new(
+                CapturingPersistence::default(),
+            ))));
+            // The deps are built before shutdown, as an import already past
+            // `build_actor_deps` holds them when shutdown begins.
+            let deps = supervisor
+                .build_actor_deps(&creator)
+                .await
+                .expect("build_actor_deps");
+            if closed {
+                supervisor.shutdown_all_contexts().await;
+            }
+            lifecycle_helpers::import_context(
+                &deps,
+                export,
+                &signing_key.verifying_key(),
+                Some([7u8; 32]),
+            )
+            .await
+        };
+        import_on(false, "import-live")
+            .await
+            .expect("import on a live supervisor succeeds");
+        let imported = import_on(true, "import-closed").await;
+        assert!(
+            matches!(imported, Err(ContextError::SupervisorShutDown(_))),
+            "import after shutdown must keep SupervisorShutDown; got {imported:?}"
+        );
+    }
+
+    /// A duplicate id is an actor-spawn failure other than shutdown: create
+    /// still flattens it to `CreationFailed`.
+    #[tokio::test]
+    async fn create_duplicate_id_still_flattens_to_creation_failed() {
+        let supervisor = build_supervisor(Box::new(SharedCapture(Arc::new(
+            CapturingPersistence::default(),
+        ))));
+        let params = || ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..ContextParams::default()
+        };
+        let creator = || DID("did:dht:z6MkDuplicateCreate".to_owned());
+        let deps = supervisor
+            .build_actor_deps(&creator())
+            .await
+            .expect("build_actor_deps");
+        lifecycle_helpers::create_context(
+            &deps,
+            "create-dup".to_owned(),
+            params(),
+            creator(),
+            Some([7u8; 32]),
+        )
+        .await
+        .expect("first create succeeds");
+        let second = lifecycle_helpers::create_context(
+            &deps,
+            "create-dup".to_owned(),
+            params(),
+            creator(),
+            Some([8u8; 32]),
+        )
+        .await;
+        assert!(
+            matches!(second, Err(ContextCreationError::CreationFailed(_))),
+            "a duplicate id must still flatten to CreationFailed; got {second:?}"
+        );
     }
 
     /// Case 1: reconstructed mode ENCRYPTED (no broadcast state) but the

@@ -62,6 +62,10 @@
 // The uniffi::include_scaffolding! macro expands unsafe extern "C" declarations.
 #![allow(unsafe_code)]
 
+// Links the one `#[global_allocator]`, which wipes every heap block before
+// freeing it (09-security-model.md §9.15, freed heap memory).
+use scp_alloc as _;
+
 use scp_ffi_common::error_codes as codes;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -315,17 +319,6 @@ pub trait MessageListener: Send + Sync {
     fn on_complete(&self);
 }
 
-/// A host-derived §9.10.4 pseudonym, returned by
-/// [`KeyCustodyProvider::derive_pseudonym`] and
-/// [`KeyCustodyProvider::derive_rotatable_pseudonym`].
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct PseudonymResult {
-    /// The 33-byte SEC1 compressed P-256 pseudonym public key.
-    pub public_key: Vec<u8>,
-    /// The key id of the pseudonym's signing key in the host's custody.
-    pub key_id: String,
-}
-
 /// A host key's stated type and public key, returned by
 /// [`KeyCustodyProvider::get_public_key`].
 #[derive(Debug, Clone, uniffi::Record)]
@@ -337,8 +330,7 @@ pub struct CustodyPublicKey {
     /// uncompressed SEC1 point (`"hpke-p256"`).
     pub public_key: Vec<u8>,
     /// `"identity"` or `"operational"`: the role
-    /// [`KeyCustodyProvider::generate_keypair`] minted the key in. A pseudonym
-    /// key is `"operational"`.
+    /// [`KeyCustodyProvider::generate_keypair`] minted the key in.
     pub role: String,
 }
 
@@ -346,8 +338,7 @@ pub struct CustodyPublicKey {
 ///
 /// Implemented by host code and injected into the Rust engine. No in-tree
 /// Swift or Kotlin host implements this protocol yet: `AppleKeyCustody` and
-/// `AndroidKeyCustody` implement their SDKs' own custody interfaces (UUID or
-/// hex key ids, no [`PseudonymResult`]), and S0 PR8 conforms them to it.
+/// `AndroidKeyCustody` implement their SDKs' own custody interfaces.
 ///
 /// A method reports failure by returning an [`ScpError`]. Return one whose
 /// code is `SCP-CRYPTO-4006` (key not found) for a key id that was destroyed or
@@ -357,10 +348,21 @@ pub struct CustodyPublicKey {
 /// reports these two codes, including the pseudonym derivation inside
 /// `context_create` and the identity key reads and signatures of identity
 /// operations. There are two exceptions: `SCP-IDENT-1055`, reported when the
-/// bridge rejects the pseudonym a `derive_pseudonym` call returned, and
-/// `SCP-IDENT-1037`, which `scpid_sign` reports for any custody failure (spec
-/// §3.11.4). Throw only
+/// bytes a `derive_pseudonym` or `derive_rotatable_pseudonym` call returned
+/// are not a compressed P-256 point, and `SCP-IDENT-1037`, which `scpid_sign`
+/// reports for any custody failure (spec §3.11.4). Throw only
 /// [`ScpError`]: `UniFFI` 0.29 panics on any other error a callback throws.
+///
+/// Every key id the host returns is the canonical decimal form of a `u64`, as
+/// `String(n)` (Swift, `UInt64`) or `n.toString()` (Kotlin, `ULong`) writes it:
+/// ASCII digits only, with no sign, no leading zero (`"0"` itself is allowed)
+/// and no whitespace. The bridge rejects any other id (`"007"`, `"+7"`,
+/// `" 7"`, a UUID) from `generate_keypair` with the custody error
+/// `SCP-CRYPTO-4060`.
+///
+/// A pseudonym has no private key (`09-security-model.md` §9.10.4): a host
+/// stores no pseudonym key and signs with none, so `sign`, `get_public_key`
+/// and `destroy_key` never receive a pseudonym.
 ///
 /// # SAFETY: Thread execution context
 ///
@@ -379,9 +381,8 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// Sign `message` bytes with the key identified by `key_id`.
     ///
     /// For an Ed25519 key, returns the raw 64-byte signature. For a `"p256"`
-    /// key or a pseudonym key id from `derive_pseudonym`, `message` is a
-    /// 32-byte prehash (§9.5.1, no second hash) and the result is raw
-    /// `r || s` (64 bytes) or DER (`SecKeyCreateSignature` /
+    /// key, `message` is a 32-byte prehash (§9.5.1, no second hash) and the
+    /// result is raw `r || s` (64 bytes) or DER (`SecKeyCreateSignature` /
     /// `java.security.Signature` output); the bridge normalises it to low-s
     /// and verifies it strictly against the key's registered public key, and
     /// any mismatch is an error. A software host MUST derive the ECDSA nonce
@@ -393,28 +394,25 @@ pub trait KeyCustodyProvider: Send + Sync {
     ///
     /// The bridge types the key by `key_type` alone and requires exactly that
     /// type's length: 32 bytes (`"ed25519"`, `"x25519"`), the 33-byte
-    /// compressed SEC1 point (`"p256"`, and a pseudonym key id, whose point is
-    /// byte-identical to the one `derive_pseudonym` returned), or the 65-byte
-    /// uncompressed SEC1 point (`"hpke-p256"`). An unknown type, a length that
-    /// does not match the stated type, or an invalid point is an error, and
-    /// the bridge binds nothing. The bridge asks this for every key id it has
-    /// not yet registered, whichever operation names it first.
+    /// compressed SEC1 point (`"p256"`), or the 65-byte uncompressed SEC1
+    /// point (`"hpke-p256"`). An unknown type, a length that does not match
+    /// the stated type, or an invalid point is an error, and the bridge binds
+    /// nothing. The bridge asks this for every key id it has not yet
+    /// registered, whichever operation names it first.
     ///
     /// `role` is the role `generate_keypair` minted the key in, recorded by
-    /// the host for the key's lifetime and reported across sessions; a
-    /// pseudonym key is `"operational"`. A key id the bridge has not seen
-    /// binds as an identity only when `role` is `"identity"`, so an identity
-    /// from an earlier session can still derive pseudonyms. Any other role
-    /// string is an error. The bridge cannot check the host's word: a host
-    /// that reports `"identity"` for a key it minted as `"operational"` lets
-    /// that key derive pseudonyms, which is outside Rust's control.
+    /// the host for the key's lifetime and reported across sessions. A key id
+    /// the bridge has not seen binds as an identity only when `role` is
+    /// `"identity"`, so an identity from an earlier session can still derive
+    /// pseudonyms. Any other role string is an error. The bridge cannot check
+    /// the host's word: a host that reports `"identity"` for a key it minted
+    /// as `"operational"` lets that key derive pseudonyms, which is outside
+    /// Rust's control.
     async fn get_public_key(&self, key_id: String) -> Result<CustodyPublicKey, ScpError>;
 
-    /// Destroy key material for `key_id`. Subsequent operations must fail.
-    ///
-    /// Destroying an identity key also destroys its `pseudonym_secret` and
-    /// every v1 and v2 pseudonym key derived from it, so each such pseudonym
-    /// key id then fails too (`09-security-model.md` §9.10.4.A).
+    /// Destroy key material for `key_id`. Subsequent operations must fail,
+    /// including pseudonym derivation under a destroyed identity key, which
+    /// returns `SCP-CRYPTO-4006` (`09-security-model.md` §9.10.4.A).
     async fn destroy_key(&self, key_id: String) -> Result<(), ScpError>;
 
     /// Generate a new keypair. `key_type` is `"ed25519"`, `"x25519"`,
@@ -424,10 +422,11 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// from [`Self::get_public_key`] for the key's lifetime; the bridge
     /// refuses and destroys a key whose reported role differs.
     ///
-    /// Returns an opaque key identifier string. A host never reuses a key
-    /// id: the id returned here, or by a pseudonym derivation, names no other
-    /// key on the host for the host's lifetime, even after that key is
-    /// destroyed.
+    /// Returns the new key's id, a canonical decimal `u64` string (see
+    /// [`KeyCustodyProvider`]); the bridge rejects any other id with
+    /// `SCP-CRYPTO-4060`. A host never reuses a key id: the id returned here
+    /// names no other key on the host for the host's lifetime, even after
+    /// that key is destroyed.
     async fn generate_keypair(&self, key_type: String, role: String) -> Result<String, ScpError>;
 
     /// Perform Diffie-Hellman key agreement.
@@ -441,57 +440,41 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// custody boundary.
     async fn dh_agree(&self, key_id: String, peer_public: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
-    /// Derive a deterministic, context-scoped P-256 pseudonym keypair (§9.10.4).
+    /// Derive the deterministic, context-scoped P-256 pseudonym point (§9.10.4).
     ///
-    /// The derivation runs inside the host's custody. Algorithm:
+    /// The derivation runs inside the host's custody. Canonical recipe
+    /// (§9.10.4, §9.10.4.A; every software host MUST produce identical bytes;
+    /// `ikm` is the identity private key material, the 32-byte Ed25519 seed
+    /// until the identity key moves to P-256 (SCP-315)):
     ///   1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
     ///   2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
-    ///   3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; the public key
-    ///      is the 33-byte SEC1 compressed point `d·G`.
+    ///   3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; return the
+    ///      33-byte SEC1 compressed point `d·G`. `d` is discarded, never stored.
     ///
     /// The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key —
-    /// public key bytes would be a membership-enumeration oracle (§9.10.4).
+    /// public key bytes would be a membership-enumeration oracle (§9.10.4.A).
     /// Routing fields carry `SHA-256("scp-pseudonym-routing-v1:" || point)`,
     /// which the Rust side computes from the returned point.
     ///
-    /// Returns the pseudonym's 33-byte compressed point and the key id of its
-    /// signing key as a [`PseudonymResult`]. The bridge rejects (fail closed,
-    /// `SCP-IDENT-1055`) a point that is not a valid compressed P-256 point, a
-    /// non-numeric key id, and a key id whose `get_public_key` does not return
-    /// the same 33 bytes. `sign` on that key id receives a 32-byte digest and
-    /// must return a 64-byte low-`s` `r || s` that verifies under the point.
-    /// A host maps the seed with [`crate::p256_host::p256_seed_to_scalar`]
-    /// rather than reducing it itself.
-    ///
-    /// The pseudonym dies with its identity (`09-security-model.md`
-    /// §9.10.4.A): `destroy_key` on `key_id` destroys it, and a derivation
-    /// still in flight when `key_id` is destroyed fails with key-not-found
-    /// (`SCP-CRYPTO-4006`) and stores nothing.
-    ///
-    /// The same (`key_id`, `context_id`) MUST return the same pseudonym key id
-    /// on every call, so re-deriving names one key rather than minting another;
-    /// the bridge's per-key-id point bindings grow with the distinct ids a
-    /// host returns.
+    /// Returns the 33-byte compressed point and nothing else. The bridge
+    /// fails the derivation with `SCP-IDENT-1055` when the bytes are not a
+    /// valid compressed P-256 point. A host returns `SCP-CRYPTO-4006` when
+    /// `key_id` was destroyed or never existed, and the caller receives
+    /// key-not-found.
     async fn derive_pseudonym(
         &self,
         key_id: String,
         context_id: Vec<u8>,
-    ) -> Result<PseudonymResult, ScpError>;
+    ) -> Result<Vec<u8>, ScpError>;
 
-    /// Derive a rotatable (epoch-versioned) per-context pseudonym keypair.
+    /// Derive a rotatable (epoch-versioned) per-context pseudonym point.
     ///
-    /// Canonical recipe (spec §9.10.4.A / §9.10.4.1): the HMAC key is the
-    /// private-derived `pseudonym_secret` (HKDF over the identity private seed),
-    /// NEVER the public key.
-    /// `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`;
-    /// `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`. Returns a
-    /// [`PseudonymResult`], checked exactly as for `derive_pseudonym`.
-    ///
-    /// The same (`key_id`, `context_id`, `pseudonym_epoch`) MUST return the
-    /// same pseudonym key id on every call, as for `derive_pseudonym`.
-    /// Destroying `key_id` destroys this pseudonym, and an in-flight
-    /// derivation fails and stores nothing, as for `derive_pseudonym`
-    /// (`09-security-model.md` §9.10.4.A).
+    /// Canonical recipe (§9.10.4.1): steps 1 and 3 of `derive_pseudonym`, with
+    /// step 2 replaced by
+    ///   `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`
+    /// where `BE64` is the 8-byte big-endian epoch. The HMAC key is the
+    /// `pseudonym_secret`, NEVER the public key. Returns the 33-byte
+    /// compressed point, checked exactly as for `derive_pseudonym`.
     ///
     /// The `pseudonym_epoch` is passed through to the provider so it performs
     /// the canonical v2 derivation itself. Bridges MUST NOT synthesize a
@@ -503,8 +486,7 @@ pub trait KeyCustodyProvider: Send + Sync {
     ///
     /// Rust-side providers that do not rotate return `ScpError::Context`
     /// (SCP-CTX-2050) indicating the method is not implemented. A host that
-    /// rotates overrides it; no in-tree Swift or Kotlin host implements this
-    /// protocol yet (S0 PR8).
+    /// rotates overrides it.
     ///
     /// **Note:** `UniFFI` callback interfaces require foreign implementations to
     /// define all methods. The generated Swift protocol / Kotlin interface will
@@ -512,14 +494,18 @@ pub trait KeyCustodyProvider: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns `ScpError` if the key is not found, is not an Ed25519 key, or the
-    /// provider does not support rotatable pseudonyms.
+    /// The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
+    /// destroyed or never existed, and the caller receives key-not-found
+    /// (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
+    /// `SCP-CTX-2050`, reaches the caller as the custody error `SCP-CRYPTO-4060`
+    /// carrying the host's code and message. A returned result the bridge
+    /// rejects is `SCP-IDENT-1055`, as for `derive_pseudonym`.
     async fn derive_rotatable_pseudonym(
         &self,
         key_id: String,
         context_id: Vec<u8>,
         pseudonym_epoch: u64,
-    ) -> Result<PseudonymResult, ScpError> {
+    ) -> Result<Vec<u8>, ScpError> {
         let _ = (key_id, context_id, pseudonym_epoch);
         Err(ScpError::Context {
             msg: "derive_rotatable_pseudonym not implemented by this KeyCustodyProvider".to_owned(),
@@ -529,15 +515,20 @@ pub trait KeyCustodyProvider: Send + Sync {
 
     /// Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
     ///
-    /// Required for governance vote signing, which uses `ed25519_dalek::SigningKey`
-    /// directly. Platform implementations using software-backed Ed25519 storage
-    /// (e.g., Keychain, Android Keystore with `PURPOSE_SIGN`) MUST support this.
+    /// The bridge's signing paths that sign with an `ed25519_dalek::SigningKey`,
+    /// governance vote signing among them, build that key from the returned
+    /// bytes. A key held in hardware or in Android Keystore does not export its
+    /// bytes, and ADR-063 requires every key-export accessor, this callback
+    /// included, to leave the custody adapters and all three bridges, because
+    /// hardware custody on the governance path is impossible until then.
     ///
     /// # Default
     ///
     /// Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-    /// implemented. A host that needs it overrides it (no in-tree Swift or
-    /// Kotlin host implements this protocol yet, S0 PR8). Third-party
+    /// implemented. A host that needs it overrides it. No Kotlin class
+    /// implements this callback: the Kotlin `AndroidKeyCustody` implements the
+    /// Kotlin SDK's own `KeyCustodyProvider` interface, and no code passes it
+    /// to the Rust engine. Third-party
     /// `KeyCustodyProvider` implementations that do not need governance vote
     /// signing may rely on the default until they add support.
     ///
@@ -547,8 +538,12 @@ pub trait KeyCustodyProvider: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns `ScpError` if the key is not found, not exportable, or not
-    /// an Ed25519 key.
+    /// The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
+    /// destroyed or never existed, and the caller receives key-not-found
+    /// (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
+    /// `SCP-CTX-2050` and a key that is not exportable or not Ed25519, reaches
+    /// the caller as the custody error `SCP-CRYPTO-4060` carrying the host's
+    /// code and message.
     async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, ScpError> {
         let _ = key_id;
         Err(ScpError::Context {
@@ -631,7 +626,12 @@ pub trait PushProvider: Send + Sync {
 
     /// Handle an incoming push notification `payload`.
     ///
-    /// Returns wake signal bytes indicating which context has new messages.
+    /// An implementation returns fixed wake signal bytes that do not depend on
+    /// `payload` and copy no byte of it. §10.7 of the infrastructure spec
+    /// states: "Push payloads MUST contain a wake signal and nothing else. No
+    /// context ID, no sender identifier, no message preview, no metadata of any
+    /// kind." A wake signal built from the received bytes would hand the caller
+    /// whatever a relay put in them. No Rust code calls this method yet.
     async fn handle_notification(&self, payload: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 }
 
@@ -640,7 +640,9 @@ pub trait PushProvider: Send + Sync {
 /// Swift SDK: `DCAppAttestService` (App Attest on iOS 14+ / macOS 11+).
 /// Kotlin SDK: Play Integrity API on Android.
 ///
-/// Implemented by Swift/Kotlin code and injected into the Rust engine.
+/// The Swift SDK's `AppleDeviceAttestation` conforms to this callback
+/// interface. No Rust code holds or calls it yet, so nothing injects an
+/// implementation into the Rust engine.
 ///
 /// # SAFETY: Thread execution context
 ///
@@ -656,12 +658,20 @@ pub trait PushProvider: Send + Sync {
 pub trait DeviceAttestationProvider: Send + Sync {
     /// Generate a cryptographic attestation for this device.
     ///
-    /// `challenge` — server-provided challenge bytes (SHA-256 digested with
-    ///   `device_id` before submission to the platform attestation service).
-    /// `device_id` — stable identifier for this device instance.
+    /// `challenge` — Apple: the 32-byte binding digest `D` of
+    ///   `09-security-model.md` §9.3.1, which the Swift adapter hands App
+    ///   Attest as `clientDataHash` unchanged. When App Attest is supported,
+    ///   the adapter rejects a `challenge` that is not 32 bytes with
+    ///   `SCP-ATTEST-9026` (ADR-025 acceptance criterion 3); when it is not
+    ///   supported, the adapter throws `SCP-ATTEST-9019` before it reads the
+    ///   length. Android: ADR-027, the Android platform adapter, states
+    ///   what it binds.
+    /// `device_id` — stable identifier for this device instance. The Swift
+    ///   adapter does not read it.
     ///
-    /// Returns the platform attestation object bytes (Apple: CBOR-encoded
-    /// attestation; Android: Play Integrity token bytes).
+    /// Returns the platform attestation bytes. Apple: the raw CBOR attestation
+    /// object Apple signed (ADR-025 acceptance criterion 3). Android: the Play
+    /// Integrity token bytes.
     async fn attest(&self, challenge: Vec<u8>, device_id: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
     /// Generate a per-request assertion proving key possession.
@@ -670,7 +680,12 @@ pub trait DeviceAttestationProvider: Send + Sync {
     ///   `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` of
     ///   `09-security-model.md` §9.3.1 over the caller's request bytes `m`,
     ///   never `SHA-256(m)` and never `m` itself. The domain separator keeps
-    ///   every `A` distinct from every attestation binding digest `D`.
+    ///   every `A` distinct from every attestation binding digest `D`. The
+    ///   Swift adapter hands `A` to App Attest as `clientDataHash` unchanged.
+    ///   When App Attest is supported, the adapter rejects an `A` that is not
+    ///   32 bytes with `SCP-ATTEST-9026` (ADR-025 acceptance criterion 3);
+    ///   when it is not supported, the adapter throws `SCP-ATTEST-9019`
+    ///   before it reads the length.
     ///
     /// Returns the platform assertion object bytes (Apple: CBOR assertion;
     /// Android: integrity verdict).
@@ -885,7 +900,7 @@ mod tests {
 
         let params = bridge::ContextParams {
             mode: bridge::ContextMode::Encrypted,
-            ceiling: Vec::new(),
+            ceiling: vec!["messages:read".to_owned()],
             ceiling_policy: bridge::CeilingPolicy::Immutable,
             governance: bridge::GovernanceModel::SingleAdmin,
             memory_scope: bridge::MemoryScope::Ephemeral,
@@ -948,7 +963,7 @@ mod tests {
 
         let params = bridge::ContextParams {
             mode: bridge::ContextMode::Encrypted,
-            ceiling: Vec::new(),
+            ceiling: vec!["messages:read".to_owned()],
             ceiling_policy: bridge::CeilingPolicy::Immutable,
             governance: bridge::GovernanceModel::SingleAdmin,
             memory_scope: bridge::MemoryScope::Ephemeral,

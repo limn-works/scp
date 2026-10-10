@@ -10,17 +10,12 @@ cargo-fuzz = true
 [workspace]
 
 # ── Release profile ─────────────────────────────────────────────────────────
-# CRITICAL for `fuzz_mls_decrypt` (ADR-057 §Prereq-4). cargo-fuzz builds the
-# `release` profile but, unless `-O`/`--release` is passed, ALSO injects
-# `-Cdebug-assertions` — which would make openmls's decrypt `debug_assert!`
-# ("Ciphertext decryption failed") fire on EVERY tampered ciphertext and report
-# a false crash. `fuzz_mls_decrypt` must validate the SHIPPED release path
-# (debug_assert compiled out → typed `Err`), so it MUST be run with
-# `cd fuzz && cargo fuzz run fuzz_mls_decrypt -O ...` (release, debug-assertions
-# off). This explicit profile line keeps debug-assertions off in the profile
-# itself (the release default) so the two agree; the `-O` flag is the operative
-# switch that stops cargo-fuzz re-enabling them. See the dedicated
-# `fuzz-mls-decrypt` job in `.github/workflows/fuzz.yml`.
+# cargo-fuzz builds the `release` profile but, unless `-O`/`--release` is passed,
+# also injects `-Cdebug-assertions` and `-Coverflow-checks`. CI runs every target
+# that way, `fuzz_mls_decrypt` included, so the fuzzed build carries every
+# debug-only panic site the shipped browser `--release` build drops (ADR-057
+# §Prereq-4). This line keeps the profile's own setting at the release default,
+# which a local `-O` run uses.
 [profile.release]
 debug-assertions = false
 
@@ -48,6 +43,7 @@ scp-event-log = { path = "../crates/scp-event-log" }
 scp-clock = { path = "../crates/scp-clock" }
 scp-did = { path = "../crates/scp-did" }
 scp-mls = { path = "../crates/scp-mls" }
+zeroize = "1"
 
 # Tier 1 — Wire Format Parsers
 [[bin]]
@@ -210,9 +206,9 @@ path = "fuzz_targets/fuzz_epoch_monotonicity.rs"
 test = false
 doc = false
 
-# Tier 4 — MLS decrypt-path panic safety (ADR-057 §Prereq-4, #1444).
-# MUST be run with `-O` (release, debug-assertions OFF) — see the
-# `[profile.release]` note above and `.github/workflows/fuzz.yml`.
+# Tier 4 — MLS decrypt-path panic safety (ADR-057 §Prereq-4).
+# CI runs it without `-O`, like every target; see the `[profile.release]` note
+# above and `.github/workflows/fuzz.yml`.
 [[bin]]
 name = "fuzz_mls_decrypt"
 path = "fuzz_targets/fuzz_mls_decrypt.rs"

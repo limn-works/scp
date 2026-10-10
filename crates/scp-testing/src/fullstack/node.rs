@@ -213,6 +213,9 @@ impl ContextEventLogProvider for ArcEventLogProvider {
     fn event_log_merkle_root(&self, id: &[u8; 32]) -> Result<[u8; 32], ContextError> {
         self.0.event_log_merkle_root(id)
     }
+    fn event_log_summary(&self, id: &[u8; 32]) -> Result<(usize, [u8; 32]), ContextError> {
+        self.0.event_log_summary(id)
+    }
     async fn restore_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.restore_event_log(id).await
     }
@@ -586,10 +589,11 @@ impl FullStackNode {
         //    (§9.16.2), the canonical new-member mechanism. Neither `invite_member`
         //    nor the Welcome carries the joiner's sender key to the incumbents, so
         //    without this a B→A send fails at the receiver with `sender key lookup
-        //    failed`. The joiner CANNOT proactively PUSH its key: a push seals to
-        //    each incumbent's STABLE `0xFF01` wrapping key, and openmls 0.8.1
-        //    exposes no way to read a remote member's LeafNode extension from a
-        //    joined group (ADR-057) — a joiner's `member_wrapping_keys` is empty.
+        //    failed`. The joiner does not proactively PUSH its key: a push seals
+        //    to each incumbent's STABLE `0xFF01` wrapping key, and a joiner's
+        //    `member_wrapping_keys` is empty:
+        //    [`scp_mls::extract_member_wrapping_key`] returns only the local
+        //    member's key; its rustdoc says why.
         //    Instead each incumbent PULLS the joiner's key (see the helper).
         self.incumbents_pull_joiner_sender_key(context_id, &handle)
             .await?;

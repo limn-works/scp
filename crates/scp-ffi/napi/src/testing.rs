@@ -456,58 +456,20 @@ pub(crate) fn fullstack_seed_peer_pseudonym_on(
 // Pseudonym custody test hooks (§9.10.4)
 // ---------------------------------------------------------------------------
 
-/// Test-only: the §9.10.4 routing id the bridge derives for a software-custody
-/// identity whose Ed25519 seed is `seed`, in `context_id`.
-///
-/// Imports `seed` into an in-memory custody as the identity key and runs the
-/// bridge's own pseudonym derivation (`derive_pseudonym_bytes`, the path the
-/// create / join / import flows use), so a TypeScript KAT can compare the
-/// production bridge output against a §25.19 routing id.
-///
-/// # Errors
-///
-/// `SCP-VALID-7005` when `seed` is not 32 bytes; the custody code of a failed
-/// derivation (`SCP-CRYPTO-4006`, `SCP-CRYPTO-4060` or `SCP-IDENT-1055`).
-#[napi(js_name = "testingPseudonymRoutingIdFromSeed")]
-pub async fn testing_pseudonym_routing_id_from_seed(
-    seed: Buffer,
-    context_id: String,
-) -> napi::Result<Buffer> {
-    let seed: zeroize::Zeroizing<[u8; 32]> =
-        zeroize::Zeroizing::new(seed.as_ref().try_into().map_err(|_| {
-            napi::Error::from(ScpNapiError::Validation {
-                message: format!("seed must be 32 bytes, got {}", seed.len()),
-                code: codes::VALID_7005.to_owned(),
-            })
-        })?);
-    use scp_platform::KeyCustody;
-    let in_memory = scp_platform::testing::InMemoryKeyCustody::new();
-    // The identity role (§9.10.4.A): only an identity key derives.
-    let identity_key = in_memory
-        .import_ed25519_signing_key(&seed)
-        .await
-        .map_err(custody_err)?;
-    let custody = crate::custody::NapiKeyCustody::InMemory(Box::new(
-        crate::identity::OpaqueInMemoryKeyCustody(in_memory),
-    ));
-    let routing_id =
-        crate::context::derive_pseudonym_bytes(&custody, &identity_key, &context_id).await?;
-    Ok(Buffer::from(routing_id.to_vec()))
-}
-
 /// Test-only handle over one callback custody adapter built from a JS provider.
 ///
-/// TypeScript tests reach the adapter's pseudonym checks through it:
-/// `get_public_key` binding, 32-byte digest input, strict low-`s` signature
-/// verification, and destroy-time unbinding.
+/// TypeScript tests reach the adapter through it: the context and epoch it
+/// forwards to the host, the routing id it computes from the host's pseudonym
+/// point, the `SCP-IDENT-1055` rejection of a bad point, and the mapping of
+/// each host failure to a typed error.
 #[napi]
 pub struct TestingCallbackCustody {
     inner: std::sync::Arc<crate::custody::NapiCallbackKeyCustody>,
 }
 
 /// The error production reports for a custody failure outside derivation:
-/// the bridge's `From<PlatformError>` (`SCP-CRYPTO-4006` for key-not-found,
-/// `SCP-CRYPTO-4060` for a custody error).
+/// the bridge's `From<PlatformError>`, which codes it with
+/// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code).
 fn custody_err(e: scp_platform::PlatformError) -> napi::Error {
     napi::Error::from(ScpNapiError::from(e))
 }
@@ -536,8 +498,8 @@ impl TestingCallbackCustody {
     ///
     /// # Errors
     ///
-    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` for any other
-    /// custody error, as production reports them.
+    /// The code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+    /// assigns to the custody error, as production reports it.
     #[napi(js_name = "generateKeypair")]
     pub async fn generate_keypair(&self) -> napi::Result<String> {
         use scp_platform::KeyCustody;
@@ -548,19 +510,20 @@ impl TestingCallbackCustody {
             .map_err(custody_err)
     }
 
-    /// Derives and binds the v1 pseudonym of `identity_key_id` in `context_id`.
+    /// Derives the v1 pseudonym of `identity_key_id` in `context_id` and
+    /// returns its 32-byte routing id, the value production puts on the
+    /// routing axis (§9.10.4).
     ///
     /// # Errors
     ///
-    /// The adapter's custody error coded as production derivation reports it:
-    /// `SCP-CRYPTO-4006` for key-not-found, `SCP-IDENT-1055` for a host
-    /// pseudonym the bridge cannot bind, `SCP-CRYPTO-4060` otherwise.
+    /// The adapter's custody error coded as production derivation reports it,
+    /// by [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code).
     #[napi(js_name = "derivePseudonym")]
     pub async fn derive_pseudonym(
         &self,
         identity_key_id: String,
         context_id: String,
-    ) -> napi::Result<crate::custody::NapiPseudonymResult> {
+    ) -> napi::Result<Buffer> {
         use scp_platform::KeyCustody;
         let identity = testing_handle(&identity_key_id)?;
         let pseudonym = self
@@ -568,87 +531,87 @@ impl TestingCallbackCustody {
             .derive_pseudonym(&identity, context_id.as_bytes())
             .await
             .map_err(|e| napi::Error::from(crate::context::pseudonym_derivation_failed(&e)))?;
-        Ok(crate::custody::NapiPseudonymResult {
-            public_key: pseudonym.public_key().as_bytes().to_vec(),
-            key_id: pseudonym.key_handle().id().to_string(),
-        })
+        Ok(Buffer::from(pseudonym.routing_id().to_vec()))
     }
 
-    /// Signs `data` with `key_id` through the adapter's checked `sign`.
-    ///
-    /// The adapter's `sign` future is polled once on the calling JS thread
-    /// before the returned promise is spawned, so its input check (which reads
-    /// the pseudonym binding table) completes before this call returns. A test
-    /// that calls `sign` from inside a host callback therefore reads the table
-    /// as it stands while that host callback runs, with no timing window.
+    /// Derives the v2 (rotatable) pseudonym of `identity_key_id` in
+    /// `context_id` at `epoch` (§9.10.4.1) and returns its 32-byte routing id.
     ///
     /// # Errors
     ///
-    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` for any other
-    /// custody error, as production reports them.
-    #[napi(ts_return_type = "Promise<Buffer>")]
-    pub fn sign<'env>(
+    /// `SCP-VALID-7001` for an `epoch` that is negative or does not fit in a
+    /// `u64`; otherwise the adapter's custody error coded as production
+    /// derivation reports it (as for `derivePseudonym`).
+    #[napi(js_name = "deriveRotatablePseudonym")]
+    pub async fn derive_rotatable_pseudonym(
         &self,
-        env: &'env napi::Env,
-        key_id: String,
-        data: Buffer,
-    ) -> napi::Result<napi::bindgen_prelude::PromiseRaw<'env, Buffer>> {
+        identity_key_id: String,
+        context_id: String,
+        epoch: napi::bindgen_prelude::BigInt,
+    ) -> napi::Result<Buffer> {
         use scp_platform::KeyCustody;
-        use std::future::Future;
-        let key = testing_handle(&key_id)?;
-        let inner = std::sync::Arc::clone(&self.inner);
-        let data = data.to_vec();
-        let mut signing = Box::pin(async move {
-            inner
-                .sign(&key, &data)
-                .await
-                .map(|signature| Buffer::from(signature.as_bytes().to_vec()))
-                .map_err(custody_err)
-        });
-        let first = signing
-            .as_mut()
-            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
-        env.spawn_future(async move {
-            match first {
-                std::task::Poll::Ready(result) => result,
-                std::task::Poll::Pending => signing.await,
-            }
-        })
+        let identity = testing_handle(&identity_key_id)?;
+        let epoch = crate::economy::amount_u64_from_bigint(&epoch, "epoch")?;
+        let pseudonym = self
+            .inner
+            .derive_rotatable_pseudonym(&identity, context_id.as_bytes(), epoch)
+            .await
+            .map_err(|e| napi::Error::from(crate::context::pseudonym_derivation_failed(&e)))?;
+        Ok(Buffer::from(pseudonym.routing_id().to_vec()))
     }
 
-    /// Destroys `key_id` through the adapter, which retires the handle before
-    /// the host call.
-    ///
-    /// The adapter's `destroy_key` future is polled once on the calling JS
-    /// thread before the returned promise is spawned, so the handle is
-    /// retired before this call returns. A test that calls `destroyKey` from
-    /// inside a host callback therefore retires the handle while that host
-    /// callback runs, with no timing window.
+    /// Signs `data` with `key_id` through the adapter's `sign`.
     ///
     /// # Errors
     ///
-    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` for any other
-    /// custody error, as production reports them.
-    #[napi(js_name = "destroyKey", ts_return_type = "Promise<void>")]
-    pub fn destroy_key<'env>(
-        &self,
-        env: &'env napi::Env,
-        key_id: String,
-    ) -> napi::Result<napi::bindgen_prelude::PromiseRaw<'env, ()>> {
+    /// The code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+    /// assigns to the custody error, as production reports it.
+    #[napi]
+    pub async fn sign(&self, key_id: String, data: Buffer) -> napi::Result<Buffer> {
         use scp_platform::KeyCustody;
-        use std::future::Future;
         let key = testing_handle(&key_id)?;
-        let inner = std::sync::Arc::clone(&self.inner);
-        let mut destroying =
-            Box::pin(async move { inner.destroy_key(&key).await.map_err(custody_err) });
-        let first = destroying
-            .as_mut()
-            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
-        env.spawn_future(async move {
-            match first {
-                std::task::Poll::Ready(result) => result,
-                std::task::Poll::Pending => destroying.await,
-            }
-        })
+        self.inner
+            .sign(&key, &data)
+            .await
+            .map(|signature| Buffer::from(signature.as_bytes().to_vec()))
+            .map_err(custody_err)
+    }
+
+    /// Runs the adapter's `dh_agree` for `key_id` against `peer_public` and
+    /// returns the 32-byte shared secret the bridge read from the host.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-VALID-7005` when `peer_public` is not 32 bytes; otherwise the code
+    /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+    /// assigns to the custody error, as production reports it.
+    #[napi(js_name = "dhAgree")]
+    pub async fn dh_agree(&self, key_id: String, peer_public: Buffer) -> napi::Result<Buffer> {
+        use scp_platform::KeyCustody;
+        let key = testing_handle(&key_id)?;
+        let peer: [u8; 32] = peer_public.as_ref().try_into().map_err(|_| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("peer_public must be 32 bytes, got {}", peer_public.len()),
+                code: codes::VALID_7005.to_owned(),
+            })
+        })?;
+        self.inner
+            .dh_agree(&key, &peer)
+            .await
+            .map(|shared| Buffer::from(shared.as_bytes().to_vec()))
+            .map_err(custody_err)
+    }
+
+    /// Destroys `key_id` through the adapter.
+    ///
+    /// # Errors
+    ///
+    /// The code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+    /// assigns to the custody error, as production reports it.
+    #[napi(js_name = "destroyKey")]
+    pub async fn destroy_key(&self, key_id: String) -> napi::Result<()> {
+        use scp_platform::KeyCustody;
+        let key = testing_handle(&key_id)?;
+        self.inner.destroy_key(&key).await.map_err(custody_err)
     }
 }

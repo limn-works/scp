@@ -60,7 +60,7 @@
       "id": "gate-3",
       "name": "Phase 3: Python SDK + MCP",
       "priority": "P0",
-      "status": "done",
+      "status": "in-progress",
       "stories": [
         "SCP-036",
         "SCP-037",
@@ -146,15 +146,10 @@
     },
     {
       "id": "gate-5",
-      "name": "Phase 5: Platform Adapters + Swift + Bridges + Media",
+      "name": "Phase 5: Platform Adapters + Swift + Media",
       "priority": "P1",
       "status": "done",
       "stories": [
-        "SCP-084",
-        "SCP-085",
-        "SCP-086",
-        "SCP-087",
-        "SCP-088",
         "SCP-089",
         "SCP-090",
         "SCP-091",
@@ -395,7 +390,7 @@
         "InMemoryDeviceAttestation.attest() returns a synthetic attestation (always valid)",
         "InMemoryDeviceAttestation.verify(attestation) always returns true for attestations produced by this adapter",
         "InMemoryPush.register() returns a synthetic push token (UUID)",
-        "InMemoryPush.handle_notification(payload) passes through the payload as a wake signal",
+        "InMemoryPush.handle_notification(payload) returns the fixed wake signal {\"aps\":{\"content-available\":1}} for every payload and copies no byte of the payload into it (ADR-006, amended 2026-09-29; spec §10.7 opacity)",
         "InMemoryStorage.store(key, data) stores bytes in internal HashMap<String, Vec<u8>>",
         "InMemoryStorage.retrieve(key) returns stored data or None",
         "InMemoryStorage.delete(key) removes data from the map",
@@ -2831,7 +2826,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/python/scp_sdk/event_log.py",
         "bindings/python/scp_sdk/transport.py",
@@ -2867,7 +2862,7 @@
       "details": {
         "event_log_api": "class EventLog:\n    async def query(self, filter=None, since=None, actor=None, event_type=None) -> list[Event]: ...\n    async def verify(self, claim: dict) -> Proof: ...\n    async def checkpoint(self) -> Checkpoint: ..."
       },
-      "result": "Implemented in iteration 3"
+      "result": "Seven of eight acceptance criteria met in iteration 3. Unmet: Rust `tracing` output is not forwarded to Python logging, because no crate installs a pyo3 log bridge. The SDK formerly probed for an `init_pyo3_log` export that no crate defines, a no-op that has been removed."
     },
     {
       "id": "SCP-046",
@@ -2890,7 +2885,7 @@
         "`py.typed` PEP 561 marker file exists.",
         "`pyproject.toml` declares package metadata, version, Python >=3.10 constraint, optional dependencies `[langchain]` and `[mcp]`.",
         "maturin builds the `_scp_core` extension into the `scp_sdk` package directory.",
-        "Users install with `pip install scp-python` — no Rust toolchain required.",
+        "Users on a platform and CPython minor a wheel covers (the release wheels cover CPython 3.10-3.13; 3.10 is the supported floor) install with `pip install scp-python` — no Rust toolchain required.",
         "Full PEP 484 type hints throughout all modules."
       ],
       "actionItems": [
@@ -2968,7 +2963,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-mcp/server.rs"
       ],
@@ -2985,7 +2980,7 @@
         "Provenance is attached to the result.",
         "The JSON-RPC response contains the outlet output as content.",
         "Errors are returned as JSON-RPC error responses with descriptive messages.",
-        "`resources/list` returns SCP context event streams as MCP resources: `scp://context_a/events`, `scp://context_a/members`, `scp://context_a/tools`.",
+        "`resources/list` returns the context event streams the agent may read as MCP resources, out of `scp://context_a/events`, `scp://context_a/members`, `scp://context_a/tools`.",
         "`resources/read` returns the current state of a resource (e.g., member list, recent events).",
         "Resource subscriptions (`resources/subscribe`) map to SCP context event streams.",
         "Handles MCP lifecycle: `initialize`, `initialized`, `ping`.",
@@ -3014,9 +3009,17 @@
         }
       ],
       "details": {
-        "tool_call_example": "{\n    \"jsonrpc\": \"2.0\",\n    \"method\": \"tools/call\",\n    \"params\": {\n        \"name\": \"context_a/guide_assistant\",\n        \"arguments\": { \"query\": \"butter substitute\" }\n    },\n    \"id\": 1\n}"
+        "tool_call_example": "{\n    \"jsonrpc\": \"2.0\",\n    \"method\": \"tools/call\",\n    \"params\": {\n        \"name\": \"context_a/guide_assistant\",\n        \"arguments\": { \"query\": \"butter substitute\" }\n    },\n    \"id\": 1\n}",
+        "audit_note": "Downgraded from done (audit): the NAPI MCP provider in crates/scp-ffi/napi/src/mcp.rs does not implement ContextProvider::invoke_outlet, so its validate_capability refuses every tool, tools/list is empty and tools/call is refused. The tool-invocation criterion is unmet on NAPI. The PyO3 provider runs an outlet from tools/call at most once per server: the server holds the one agent UCAN it was created with, the first tools/call whose Invoke check reaches ADR-016 Step 9 records that token's nonce, whether or not the check then passes and the outlet runs, and every later check of the token fails as a replay, so tools/list then omits every outlet and tools/call refuses it; the token's nonce also fails the freshness check five minutes after it was minted. The UniFFI provider runs no outlet from tools/call: no production code in the UniFFI crate registers an outlet handler. On both the PyO3 and UniFFI providers, tools/list lists an outlet only when the server holds an agent UCAN, the agent's role state grants the outlet's invocation capability, and the UCAN check passes; that check runs the nonce freshness check on every tools/list probe, so five minutes after the server's one agent token was minted tools/list omits every outlet on UniFFI as it does on PyO3. The one-token replay above applies to UniFFI as well once a caller can register a handler. The tool-invocation criterion is unmet on PyO3 until a server can present a fresh token per call, and on UniFFI until a caller can register an outlet handler and a server can present a fresh token per call. The dynamic-update criterion is unmet on every bridge: registering, updating or removing an outlet sends no `notifications/tools/list_changed`, because the event pump runs only on a ContextEvent, no ContextEvent variant reports an outlet change, and every bridge discards the registry event that register_outlet returns. The built-in-tools criterion is unmet on every bridge: `{context}/send_message`, `{context}/read_messages` and `{context}/list_members` are listed only when the provider grants the built-in's name, the PyO3 and UniFFI providers grant a name only for an outlet registered under it in the context's outlet registry, and no code registers an outlet under any of the three names, so tools/list omits them and tools/call refuses them from the first request; the NAPI provider refuses them as it refuses every tool. `resources/list` returns only the resources the agent may read: `events` and `members` require `messages:read` (contexts spec §5.5.1, Default Role Set) and `tools` requires membership, so a member without `messages:read` sees only `scp://{context}/tools` (ADR-015 criterion 3). A server created while the instance is suspended or has no supervisor has no event source for its whole life: it advertises `resources.subscribe`, `resources.listChanged` and `tools.listChanged` as false and answers `resources/subscribe` and `resources/unsubscribe` with METHOD_NOT_FOUND, so the subscription criterion holds only on a server created with a supervisor while the instance is not suspended."
       },
-      "result": "MCP server with ContextProvider trait, capability filtering, tool namespacing. 42 tests."
+      "result": "MCP server with ContextProvider trait, capability filtering, tool namespacing. 42 tests.",
+      "blockedByIssues": [
+        2506,
+        2512,
+        2513,
+        2561,
+        2582
+      ]
     },
     {
       "id": "SCP-049",
@@ -3024,7 +3027,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-mcp/stdio.rs",
         "crates/scp-mcp/sse.rs"
@@ -3038,7 +3041,11 @@
         "SSE transport: HTTP server (configurable host:port) serves SSE endpoint for server-to-client messages.",
         "SSE transport: POST endpoint accepts client-to-server JSON-RPC requests.",
         "SSE transport: handles connection lifecycle, reconnection, keep-alive.",
-        "SSE transport: suitable for web-based MCP clients and remote integrations."
+        "SSE transport: suitable for web-based MCP clients and remote integrations.",
+        "SSE transport: every SDK's SSE client sends a bearer token over plain HTTP only to a loopback address: given a token, it refuses, before it opens a connection, a URL whose host resolves to any other address.",
+        "SSE transport: every request to the SSE and POST endpoints presents an `Authorization: Bearer <token>` header, and the server answers any other request with HTTP 401. `SseConfig::new` fills the token with 256 bits from the operating system's random number generator, and every SDK's SSE client takes the token and sends it on the `GET` and on every POST.",
+        "SSE transport: one server serves one MCP session at a time. A new `GET /sse` that passes the bearer check ends the live session's stream and takes its place; the server answers that `GET /sse` with HTTP 409 when the ended session still holds the slot 5 seconds later, when a newer `GET /sse` arrives while it waits, or when the server shuts down while it waits, and it answers a POST that names any other session with HTTP 409.",
+        "SSE transport: reconnection starts a new session. The server clears the ended session's handshake, client capabilities and subscriptions before it admits the next client, and it ignores the `Last-Event-ID` header."
       ],
       "actionItems": [
         "Create `crates/scp-mcp/stdio.rs` with stdio transport: tokio stdin/stdout reader/writer, line-delimited JSON parsing, JSON-RPC request dispatch to server handler, response writing.",
@@ -3060,8 +3067,15 @@
           "tokio (async I/O)",
           "axum (HTTP/SSE)",
           "serde_json (JSON-RPC serialization)"
-        ]
-      }
+        ],
+        "audit_note": "Downgraded from done (audit): two SSE criteria are unmet, 'suitable for web-based MCP clients and remote integrations' and 'HTTP server (configurable host:port) serves SSE endpoint for server-to-client messages'. The criterion 'suitable for web-based MCP clients and remote integrations' is unmet in both halves. Web-based clients: a browser's EventSource cannot set the Authorization header, so the server answers its GET /sse with HTTP 401, and the server answers a CORS preflight with HTTP 401 and no Access-Control-Allow-* header, so the browser blocks a fetch() that sets the header. Remote integrations: neither the SSE server nor the SDK SSE client has TLS, the client refuses to send a bearer token to a host that is not loopback, and the server answers every tokenless request with HTTP 401, so no SDK client can reach an SSE server on another host. The criterion 'HTTP server (configurable host:port) serves SSE endpoint for server-to-client messages' is unmet on every bridge: the PyO3, UniFFI and NAPI bridges each bind the SSE server to 127.0.0.1 port 0, so a caller cannot choose the host or the port, and no bridge returns the port it bound or the bearer token SseConfig::new drew, so a caller cannot connect any client to an SSE server a bridge starts."
+      },
+      "blockedByIssues": [
+        2311,
+        2551,
+        2557,
+        2583
+      ]
     },
     {
       "id": "SCP-050",
@@ -3108,7 +3122,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/python/scp_sdk/mcp.py"
       ],
@@ -3144,9 +3158,16 @@
       ],
       "details": {
         "python_usage": "from scp_sdk.mcp import serve_mcp\n\nserver = await serve_mcp(\n    identity=my_identity,\n    contexts=[context_a, context_b],\n    transport=\"stdio\",\n)",
-        "cli_usage": "scp-mcp serve --identity <did> --relay <relay_url> --transport stdio"
+        "cli_usage": "scp-mcp serve --identity <did> --relay <relay_url> --transport stdio",
+        "audit_note": "Downgraded from done (audit): five criteria are unmet. The criterion '`serve_mcp(identity, contexts, transport)` starts an MCP server that dynamically exposes outlets from the agent's active SCP contexts' is unmet. The Python SDK starts a server through `SCP.mcp_serve(did, context_ids, transport)`, and the PyO3 server it starts holds the one agent UCAN it was created with, so tools/list omits every outlet after the first tools/call whose Invoke check reaches ADR-016 Step 9, and five minutes after that token was minted (SCP-048 audit note). That server also sends no `notifications/tools/list_changed` when an outlet is registered, updated or removed, so a connected client sees a new outlet only when it calls tools/list again (SCP-048 audit note). The criterion 'Transport parameter accepts `\"stdio\"` or `\"sse\"`' is unmet for `\"sse\"`: the PyO3 bridge binds the SSE server to 127.0.0.1 port 0 and returns neither the port nor the bearer token, so no client can connect to a server started with `\"sse\"` (SCP-049 audit note). The criteria 'CLI entry point: `scp-mcp serve --identity <did> --relay <relay_url> --transport stdio` starts an MCP server for a given SCP identity' and 'CLI connects to specified relays, loads active contexts, and serves tools' are unmet. `_cli_serve` in `bindings/python/scp_sdk/mcp.py` opens `SCP(storage={\"type\": \"in_memory\"})` and then calls `identity_load` on that store, which the same process created empty, so every run fails with 'identity not found in storage' before any server starts. Past that step, `mcp_load_contexts` ignores its relay URL and reads contexts only from the same empty instance, so it would return none. The criterion 'Suitable for integration with MCP hosts that launch servers as subprocesses' is unmet for the same reason, because `scp-mcp serve` is the entry point such a host launches. `blockedByIssues` lists the issue that tracks the CLI."
       },
-      "result": "Created bindings/python/scp_sdk/mcp.py with serve_mcp(), McpClient, and CLI entry point. All Python SDK patterns followed."
+      "result": "Created bindings/python/scp_sdk/mcp.py with serve_mcp(), McpClient, and CLI entry point. All Python SDK patterns followed.",
+      "blockedByIssues": [
+        2311,
+        2512,
+        2513,
+        2584
+      ]
     },
     {
       "id": "SCP-052",
@@ -3435,13 +3456,13 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "tests/integration/phase3_integration_test.py"
       ],
-      "description": "The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with the Phase 1 and Phase 2 Rust stacks. Two Python agents on different machines exchange encrypted messages, invoke outlets, and expose SCP contexts as MCP tools. This test proves: pip install works without Rust, the 20-line agent works, async Python wraps Rust correctly, UCAN enforces on every action, MCP exposes SCP outlets to any model, the event log is queryable from Python, and the full Phase 1 + Phase 2 Rust stack is accessible through a Pythonic API.",
+      "description": "The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with the Phase 1 and Phase 2 Rust stacks. Two Python agents on different machines exchange encrypted messages, invoke outlets, and expose SCP contexts as MCP tools. This test proves: pip install works without Rust on a platform and CPython minor a wheel covers, the 20-line agent works, async Python wraps Rust correctly, UCAN enforces on every action, MCP exposes SCP outlets to any model, the event log is queryable from Python, and the full Phase 1 + Phase 2 Rust stack is accessible through a Pythonic API.",
       "acceptanceCriteria": [
-        "Install the SDK: `pip install scp-python` in a clean Python venv. No Rust toolchain. Zero compilation. Binary wheel installs in seconds.",
+        "Install the SDK: `pip install scp-python` in a clean Python venv on a platform and CPython minor a wheel covers. No Rust toolchain. Zero compilation. Binary wheel installs in seconds.",
         "Alice creates an identity in Python: `alice = await scp.Identity.create(custody=\"in_memory\")`. Calls through: Python wrapper (ADR-014) -> PyO3 bridge (ADR-013) -> scp-core Identity::create.",
         "Alice creates a context with outlets: `ctx = await scp.Context.create(creator=alice, ceiling=[\"messaging\", \"outlet_call\"], outlets=[scp.OutletDefinition(name=\"calculator\", ...)])`. Context creation mints admin UCAN tokens for Alice (ADR-016). UCAN nonce is generated and tracked. Capability ceiling is set and immutable.",
         "Bob creates an identity and joins the context: `bob = await scp.Identity.create(custody=\"in_memory\")`, `membership = await ctx.join(bob)`. Bob receives member-role UCAN tokens (ADR-016). Tokens are scoped to messages:read, messages:write, outlet_query_all, outlet_call_all. UCAN signature chain traces to Alice (context creator) as root authority.",
@@ -3457,7 +3478,7 @@
       ],
       "actionItems": [
         "Create `tests/integration/phase3_integration_test.py` with the 13-step end-to-end test.",
-        "Set up clean Python venv and verify `pip install scp-python` works without Rust toolchain.",
+        "Set up clean Python venv and verify `pip install scp-python` works without Rust toolchain on a platform and CPython minor a wheel covers.",
         "Test identity creation via Python SDK -> PyO3 bridge -> scp-core.",
         "Test context creation with outlets, UCAN minting, and ceiling enforcement.",
         "Test member join with role-scoped UCAN token delegation.",
@@ -3501,8 +3522,15 @@
           "section": "## Phase 3 Integration Test"
         }
       ],
-      "details": {},
-      "result": "Phase 3 end-to-end Python SDK integration test created at tests/integration/phase3_integration_test.py. Exercises Identity, Context, Outlets, UCAN, MCP, and EventLog across PyO3 bridge."
+      "details": {
+        "audit_note": "Downgraded from done (audit): the two MCP criteria are unmet, and the story's test proves no criterion. The MCP server criterion is unmet because the Python SDK defines no `scp.mcp.serve_mcp`, the entry point the criterion names. The Python SDK starts a server through `SCP.mcp_serve` instead, and the PyO3 server it starts omits every outlet from tools/list after the first tools/call whose Invoke check reaches ADR-016 Step 9, and five minutes after its agent UCAN was minted (SCP-048 audit note). In the MCP tool-invocation criterion, a PyO3 server runs an outlet from tools/call at most once, and none five minutes after its agent UCAN was minted, because it presents that one token for every call (SCP-048 audit note). `tests/integration/phase3_integration_test.py` imports `serve_mcp` from `scp_sdk.mcp`, which the Python SDK no longer defines, so the module fails at import. The test also replaces the PyO3 bridge with a `MagicMock` fixture, so even a passing run would show no call crossing the bridge, and no CI workflow or script runs the test. `blockedByIssues` lists the issue that tracks the test."
+      },
+      "result": "Phase 3 end-to-end Python SDK integration test created at tests/integration/phase3_integration_test.py. Exercises Identity, Context, Outlets, UCAN, MCP, and EventLog across PyO3 bridge.",
+      "blockedByIssues": [
+        2512,
+        2545,
+        2561
+      ]
     },
     {
       "id": "SCP-059",
@@ -4627,7 +4655,7 @@
       "status": "done",
       "files": [
         "bindings/typescript/src/index.ts",
-        "bindings/typescript/src/bridge.ts",
+        "bindings/typescript/src/internal/bridge.ts",
         "bindings/typescript/package.json",
         "bindings/typescript/tsup.config.ts"
       ],
@@ -4645,7 +4673,7 @@
       "actionItems": [
         "Create bindings/typescript/package.json with @limn-works/scp-ts package configuration",
         "Create bindings/typescript/tsup.config.ts for dual ESM/CJS output",
-        "Create bindings/typescript/src/bridge.ts exposing the napi backend",
+        "Create bindings/typescript/src/internal/bridge.ts exposing the napi backend",
         "Create bindings/typescript/src/index.ts with public API re-exports",
         "Implement Identity module wrapping bridge calls",
         "Implement Context module wrapping bridge calls",
@@ -4793,278 +4821,6 @@
       },
       "result": "ADR-026 completed in .docs/adrs/phase-5.md: Swift SDK actor isolation, AsyncStream<Message>, @Observable, SPM Package.swift structure, deinit+close() resource management.",
       "completedAt": "2026-02-27T02:55:57Z"
-    },
-    {
-      "id": "SCP-084",
-      "title": "Define bridge core types and module structure",
-      "gate": "gate-5",
-      "priority": "P1",
-      "severity": "critical",
-      "status": "done",
-      "files": [
-        "crates/scp-core/src/bridge/mod.rs"
-      ],
-      "description": "Create the `scp-core/bridge/` module root with all bridge protocol types from ADR-023. Bridge connector as registered protocol entity with accountable operator identifier. Shadow identities as restricted participants (observer default). Four operating modes (Relay, Puppet, Api, Cooperative). All bridged content carries full provenance chain.\n\nKey types:\n\n```rust\npub struct BridgeConnector {\n    pub bridge_id: String,\n    pub operator_did: DID,\n    pub platform: String,\n    pub mode: BridgeMode,\n    pub status: BridgeStatus,\n    pub registration_context: ContextId,\n    pub registered_at: u64,\n}\n\npub enum BridgeMode {\n    Relay,        // Read-only mirroring from external platform\n    Puppet,       // Bridge acts on behalf of external users\n    Api,          // Platform API integration\n    Cooperative,  // Native SCP support on external platform\n}\n\npub enum BridgeStatus {\n    Active,\n    Suspended,\n    Revoked,\n}\n\npub struct ShadowIdentity {\n    pub shadow_id: String,\n    pub platform_handle: String,\n    pub bridge_id: String,\n    pub attributed_role: String,     // Default: \"observer\"\n    pub provenance_status: ShadowProvenanceStatus,\n    pub created_at: u64,\n}\n\npub enum ShadowProvenanceStatus {\n    Shadow,   // Unclaimed — attributed via bridge\n    Claimed,  // Bound to an identifier via identity attestation\n}\n```\n\nModule declares `pub mod registration; pub mod shadow; pub mod claiming; pub mod provenance;` and re-exports all public types.",
-      "acceptanceCriteria": [
-        "`cargo build -p scp-core` succeeds with zero warnings",
-        "BridgeConnector struct has fields: bridge_id (String), operator_did (DID), platform (String), mode (BridgeMode), status (BridgeStatus), registration_context (ContextId), registered_at (u64)",
-        "BridgeMode enum has variants: Relay, Puppet, Api, Cooperative",
-        "BridgeStatus enum has variants: Active, Suspended, Revoked",
-        "ShadowIdentity struct has fields: shadow_id (String), platform_handle (String), bridge_id (String), attributed_role (String), provenance_status (ShadowProvenanceStatus), created_at (u64)",
-        "ShadowProvenanceStatus enum has variants: Shadow, Claimed",
-        "mod.rs declares pub mod for registration, shadow, claiming, provenance",
-        "All public items have /// doc comments",
-        "All types derive Debug, Clone, serde::Serialize, serde::Deserialize"
-      ],
-      "actionItems": [
-        "Create crates/scp-core/src/bridge/mod.rs with BridgeConnector, BridgeMode, BridgeStatus, ShadowIdentity, ShadowProvenanceStatus",
-        "Add pub mod declarations for registration, shadow, claiming, provenance sub-modules (empty stubs)",
-        "Add re-exports for all public types",
-        "Add pub mod bridge to scp-core/src/lib.rs",
-        "Verify cargo build and clippy pass"
-      ],
-      "blockedBy": [],
-      "sources": [
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-023: Bridge Connector Protocol"
-        }
-      ],
-      "details": {
-        "adr": "ADR-023",
-        "protocolSection": "§12",
-        "keyTypes": {
-          "BridgeConnector": "bridge_id, operator_did, platform, mode, status, registration_context, registered_at",
-          "BridgeMode": "Relay | Puppet | Api | Cooperative",
-          "BridgeStatus": "Active | Suspended | Revoked",
-          "ShadowIdentity": "shadow_id, platform_handle, bridge_id, attributed_role, provenance_status, created_at",
-          "ShadowProvenanceStatus": "Shadow | Claimed"
-        }
-      },
-      "result": "BridgeConnector, BridgeMode, BridgeStatus, ShadowIdentity, ShadowProvenanceStatus. Stub submodules. 12 tests."
-    },
-    {
-      "id": "SCP-085",
-      "title": "Implement bridge registration with governance approval",
-      "gate": "gate-5",
-      "priority": "P1",
-      "severity": "critical",
-      "status": "done",
-      "files": [
-        "crates/scp-core/src/bridge/registration.rs"
-      ],
-      "description": "Implement bridge registration in `scp-core/bridge/registration.rs`. Operator identifier presents registration request to context governance. Context governance approves or rejects. Registered bridge visible in context metadata (visible before opt-in, per legibility tenet). Registration is a context event in the Merkle log.\n\nBridge revocation: context governance removes bridge at any time. Severing bridge disconnects all shadow identities from external platform. Shadows retain their attributed actions but can no longer receive/send.\n\nContext isolation: bridge in Context A has zero access to Context B. Same platform bridged into two contexts = two separate bridge instances with separate registrations.\n\nSelf-hosted bridges: protocol treats self-hosted and managed identically. Self-hosted eliminates third-party credential delegation (puppet mode).",
-      "acceptanceCriteria": [
-        "Operator identifier presents registration request to context governance",
-        "Context governance approves or rejects registration",
-        "Registered bridge visible in context metadata (visible before opt-in, per legibility tenet)",
-        "Registration is a context event in the Merkle log",
-        "Context governance removes bridge at any time (revocation)",
-        "Severing bridge disconnects all shadow identities from external platform",
-        "Shadows retain their attributed actions but can no longer receive/send after revocation",
-        "Bridge in Context A has zero access to Context B (context isolation)",
-        "Same platform bridged into two contexts = two separate bridge instances with separate registrations",
-        "Protocol treats self-hosted and managed bridges identically",
-        "Self-hosted eliminates third-party credential delegation (puppet mode)",
-        "`cargo test -p scp-core` passes all bridge registration tests"
-      ],
-      "actionItems": [
-        "Implement register_bridge(operator_did, platform, mode, context) -> Result<BridgeConnector, BridgeError>",
-        "Implement approve_registration(bridge_id, governance_decision) -> Result<BridgeConnector, BridgeError>",
-        "Implement revoke_bridge(bridge_id, governance_action) -> Result<(), BridgeError>",
-        "Implement list_bridges(context_id) -> Vec<BridgeConnector> for context metadata visibility",
-        "Emit context events for registration and revocation into event log",
-        "Enforce context isolation — bridge instance scoped to single context",
-        "Write unit tests for registration, approval, rejection, revocation, context isolation"
-      ],
-      "blockedBy": [
-        "SCP-084",
-        "SCP-018",
-        "SCP-030"
-      ],
-      "sources": [
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "### Acceptance Criteria"
-        }
-      ],
-      "details": {
-        "adr": "ADR-023",
-        "acceptanceCriteriaRefs": [
-          "2. Bridge registration",
-          "9. Bridge revocation",
-          "10. Context isolation",
-          "11. Self-hosted bridges"
-        ],
-        "dependencies": {
-          "ADR-008": "Bridge registration requires context governance approval. Bridge revocation is a governance action.",
-          "ADR-011": "Bridge registration, shadow creation, and claiming are context events."
-        }
-      },
-      "result": "Bridge registration with governance approval/revocation, context isolation. 44 tests."
-    },
-    {
-      "id": "SCP-086",
-      "title": "Implement shadow identity creation and role management",
-      "gate": "gate-5",
-      "priority": "P1",
-      "severity": "critical",
-      "status": "done",
-      "files": [
-        "crates/scp-core/src/bridge/shadow.rs"
-      ],
-      "description": "Implement shadow identity creation and role management in `scp-core/bridge/shadow.rs`. Bridge creates protocol entity per external platform participant. Shadow carries platform handle, bridge reference, and operating mode.\n\nShadow default role: observer-equivalent with restricted capabilities. Cannot exercise capabilities requiring verified identity. Specific role upgradeable by context governance.\n\nShadow creation is a context event in the Merkle log.",
-      "acceptanceCriteria": [
-        "Bridge creates protocol entity per external platform participant",
-        "Shadow carries platform handle, bridge reference, and operating mode",
-        "Shadow default role is observer-equivalent with restricted capabilities",
-        "Shadows cannot exercise capabilities requiring verified identity",
-        "Specific role upgradeable by context governance",
-        "Shadow creation is a context event in the Merkle log",
-        "`cargo test -p scp-core` passes all shadow identity tests"
-      ],
-      "actionItems": [
-        "Implement create_shadow(bridge_id, platform_handle) -> Result<ShadowIdentity, BridgeError>",
-        "Enforce observer default role on shadow creation",
-        "Implement upgrade_shadow_role(shadow_id, new_role, governance_action) -> Result<(), BridgeError>",
-        "Implement list_shadows(bridge_id) -> Vec<ShadowIdentity>",
-        "Emit shadow creation event to context event log",
-        "Write unit tests for shadow creation, default role enforcement, role upgrade"
-      ],
-      "blockedBy": [
-        "SCP-084",
-        "SCP-023",
-        "SCP-030"
-      ],
-      "sources": [
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "### Acceptance Criteria"
-        }
-      ],
-      "details": {
-        "adr": "ADR-023",
-        "acceptanceCriteriaRefs": [
-          "3. Shadow identity creation",
-          "4. Shadow default role"
-        ],
-        "dependencies": {
-          "ADR-011": "Shadow creation is a context event.",
-          "ADR-009": "Role management uses context governance roles."
-        }
-      },
-      "result": "Already implemented in prior iteration. ShadowRegistry with create_shadow, role management, collision guard, 62 shadow-specific tests."
-    },
-    {
-      "id": "SCP-087",
-      "title": "Implement BridgeProvenance for bridged content attribution",
-      "gate": "gate-5",
-      "priority": "P1",
-      "severity": "critical",
-      "status": "done",
-      "files": [
-        "crates/scp-core/src/bridge/provenance.rs"
-      ],
-      "description": "Implement BridgeProvenance and provenance marking for all bridged content in `scp-core/bridge/provenance.rs`.\n\nAll actions/content attributed to shadow identities carry `BridgeProvenance`. `BridgeProvenance` includes: originating platform, bridge connector ID, operator identifier, operating mode, shadow/claimed status. No shadow action mistakable for native SCP action.\n\nTrust hierarchy (two axes per §12.5):\n- Native identity + native transport (strongest).\n- Native identity + bridged transport.\n- Claimed shadow + historical bridged.\n- Shadow + bridged (weakest).\n- Both identity confidence and transport confidence factor into evaluation.\n\nKey type:\n\n```rust\n/// Extension of DataProvenance for bridged content.\npub struct BridgeProvenance {\n    pub base: DataProvenance,\n    pub originating_platform: String,\n    pub bridge_connector_id: String,\n    pub operator_did: DID,\n    pub bridge_mode: BridgeMode,\n    pub shadow_status: ShadowProvenanceStatus,\n}\n```",
-      "acceptanceCriteria": [
-        "BridgeProvenance struct extends DataProvenance with fields: originating_platform, bridge_connector_id, operator_did, bridge_mode, shadow_status",
-        "All actions/content attributed to shadow identities carry BridgeProvenance",
-        "BridgeProvenance includes: originating platform, bridge connector ID, operator identifier, operating mode, shadow/claimed status",
-        "No shadow action mistakable for native SCP action",
-        "Trust hierarchy implements four levels: native+native (strongest), native+bridged, claimed+bridged, shadow+bridged (weakest)",
-        "Both identity confidence and transport confidence factor into trust evaluation",
-        "`cargo test -p scp-core` passes all bridge provenance tests"
-      ],
-      "actionItems": [
-        "Implement BridgeProvenance struct extending DataProvenance",
-        "Implement mark_bridge_provenance(action, bridge, shadow) -> BridgeProvenance",
-        "Implement trust_level(provenance) -> TrustLevel with four-tier hierarchy",
-        "Implement is_native_action(provenance) -> bool to distinguish native from bridged",
-        "Write unit tests for provenance marking, trust hierarchy ordering, native vs bridged distinction"
-      ],
-      "blockedBy": [
-        "SCP-084"
-      ],
-      "sources": [
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "### Acceptance Criteria"
-        }
-      ],
-      "details": {
-        "adr": "ADR-023",
-        "acceptanceCriteriaRefs": [
-          "5. Provenance marking",
-          "6. Trust hierarchy"
-        ],
-        "dependencies": {
-          "ADR-019": "All bridged content carries BridgeProvenance extending DataProvenance."
-        },
-        "trustHierarchy": [
-          "Native identity + native transport (strongest)",
-          "Native identity + bridged transport",
-          "Claimed shadow + historical bridged",
-          "Shadow + bridged (weakest)"
-        ]
-      },
-      "result": "Bridge provenance with 4-tier trust hierarchy. 34 new tests."
-    },
-    {
-      "id": "SCP-088",
-      "title": "Implement shadow claiming with identity attestation",
-      "gate": "gate-5",
-      "priority": "P1",
-      "severity": "critical",
-      "status": "done",
-      "files": [
-        "crates/scp-core/src/bridge/claiming.rs"
-      ],
-      "description": "Implement shadow claiming via identity attestation in `scp-core/bridge/claiming.rs`. Shadow claiming via identity attestation (§3.5) is one-way and irreversible.\n\nClaimant publishes identity attestation (§3.5) binding external handle to identifier. Protocol verifies attestation matches shadow's platform handle. Shadow retired, historical actions retroattributed to claimant identifier.\n\nClaiming is one-way and irreversible: claimed shadow cannot be unclaimed. Claimed shadow cannot be re-assigned to a different identifier.\n\nClaiming is a context event in the Merkle log.\n\nKey types:\n\n```rust\npub struct ClaimRequest {\n    pub shadow_id: String,\n    pub claimant_did: DID,\n    pub platform_handle: String,\n    pub identity_attestation: Attestation,  // §3.5 attestation binding handle to identifier\n    pub timestamp: u64,\n    pub signature: Ed25519Signature,\n}\n\n// claim_shadow returns Result<ShadowClaimEvent, ClaimError>\n\npub enum ClaimError {\n    HandleMismatch,\n    AttestationInvalid,\n    AlreadyClaimed,\n    ShadowNotFound,\n}\n```",
-      "acceptanceCriteria": [
-        "ClaimRequest struct has fields: shadow_id, claimant_did, platform_handle, identity_attestation (Attestation per §3.5), timestamp, signature (Ed25519Signature)",
-        "claim_shadow returns Result<ShadowClaimEvent, ClaimError>",
-        "ClaimError enum has variants: HandleMismatch, AttestationInvalid, AlreadyClaimed, ShadowNotFound",
-        "Claimant publishes identity attestation (§3.5) binding external handle to identifier",
-        "Protocol verifies attestation matches shadow's platform handle",
-        "Shadow retired, historical actions retroattributed to claimant identifier",
-        "Claimed shadow cannot be unclaimed (one-way)",
-        "Claimed shadow cannot be re-assigned to a different identifier (irreversible)",
-        "Claiming is a context event in the Merkle log",
-        "`cargo test -p scp-core` passes all shadow claiming tests"
-      ],
-      "actionItems": [
-        "Implement ClaimRequest, ClaimError types",
-        "Implement claim_shadow(registry, request: ClaimRequest) -> Result<ShadowClaimEvent, ClaimError>",
-        "Verify attestation matches shadow's platform handle",
-        "Implement retroattribute_actions(shadow_id, claimant_did) to retroattribute historical actions",
-        "Enforce one-way irreversibility: reject unclaim and re-assignment attempts",
-        "Emit claiming event to context event log",
-        "Write unit tests for successful claim, handle mismatch, invalid attestation, already-claimed rejection, shadow-not-found"
-      ],
-      "blockedBy": [
-        "SCP-084",
-        "SCP-086",
-        "SCP-006",
-        "SCP-030"
-      ],
-      "sources": [
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "### Acceptance Criteria"
-        }
-      ],
-      "details": {
-        "adr": "ADR-023",
-        "acceptanceCriteriaRefs": [
-          "7. Shadow claiming",
-          "8. Claiming is one-way and irreversible"
-        ],
-        "dependencies": {
-          "ADR-003": "Shadow claiming uses identity attestation (§3.5) to bind external handle to identifier.",
-          "ADR-011": "Claiming is a context event."
-        }
-      },
-      "result": "Created crates/scp-core/src/bridge/claiming.rs with ClaimRequest, ClaimError types and claim_shadow() function. One-way irreversible claiming with attestation verification."
     },
     {
       "id": "SCP-089",
@@ -5401,14 +5157,14 @@
       "severity": "major",
       "status": "in-progress",
       "files": [
-        "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift"
+        "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift",
+        "bindings/swift/Tests/SCPTests/Platform/AppleDeviceAttestationTests.swift"
       ],
-      "description": "Implement Apple App Attest device attestation adapter in `scp-platform/apple/app_attest.rs`. Implements the `DeviceAttestation` trait for Apple platforms.\n\nApp Attest integration: attestation flow, server-side verification, fraud metric handling. App Attest provides hardware-backed device attestation that can be verified server-side.\n\nPer §9.15 key destruction verification: hardware-attested is the strongest trust level. App Attest provides the attestation primitive for this.\n\nThis is a stub ADR (ADR-025) — implementation details will be refined when the full ADR is written.\n\nStatus reopened 2026-09-27: ADR-025's amendment of that date replaces the `clientDataJSON` binding with the binding digest `D` of `09-security-model.md` §9.3.1 and withdraws the synthetic software-only token. The shipped adapter mints the JSON binding, returns the synthetic token when App Attest is unsupported, and no code verifies an attestation against Apple's root, so the criterion \"Server-side verification validates attestation against Apple's attestation root\" is unmet. SCP-316 implements the reader; this story keeps the minting side.",
+      "description": "Implement the Apple App Attest device attestation adapter as the Swift class `AppleDeviceAttestation` in `bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift`. ADR-025, the Apple platform adapter, decides that the Apple adapter is a set of Swift classes conforming to the UniFFI callback interfaces, so no Rust file holds the App Attest calls. A Rust `DeviceAttestation` implementation that calls the adapter through the UniFFI `DeviceAttestationProvider` callback is still missing, and criterion 1 waits on it; GitHub issue #2515, \"Implement DeviceAttestation in Rust over the UniFFI DeviceAttestationProvider callback (SCP-095 criterion 1)\", tracks it. An earlier revision of this description named `scp-platform/apple/app_attest.rs`; that file never existed, and ADR-025 places the adapter in Swift.\n\nApp Attest integration: attestation flow, key binding, and App Attest error handling. App Attest provides hardware-backed device attestation. Under `09-security-model.md` §9.3.1 a peer runs every App Attest check offline; SCP-316, the device-attestation reader story, specifies that reader, and no code implements it yet.\n\nPer §9.15 key destruction verification: hardware-attested is the strongest trust level. App Attest provides the attestation primitive for this.\n\nStatus reopened 2026-09-27: ADR-025's amendment of that date replaces the `clientDataJSON` binding with the binding digest `D` of `09-security-model.md` §9.3.1 and withdraws the synthetic software-only token. The shipped adapter hands App Attest the 32-byte `challenge` it receives unchanged and throws on an unsupported device instead of returning the synthetic token. On the minting side no Rust code meets the requirements of ADR-025 acceptance criterion 3 that fall outside the adapter, because no Rust code yet holds or calls the `DeviceAttestationProvider` callback: nothing computes `D`, passes `D` to `attest`, publishes the attestation object, strips `attStmt.receipt` from it, re-attests before the credential certificate's `notBefore` plus the context's `device_attestation_max_age_secs`, computes the assertion digest `A`, or passes `A` to `assertRequest`. No code verifies an attestation against Apple's root, so the criterion \"A reader verifies the attestation offline against Apple's App Attestation Root CA\" is unmet. SCP-316, still pending, specifies the reader, and no code verifies a device attestation yet; this story keeps the minting side.\n\nRevision on 2026-10-04: this revision deleted acceptance criterion 4 and its action item, which required the adapter to read Apple's risk metric, because `09-security-model.md` §9.3.1 states that no peer can use the App Attest receipt. The same revision deleted this description's claim that a server verifies the attestation, because §9.3.1 has each reader verify it offline, and deleted the sentence that called ADR-025 a stub, because ADR-025 is decided. `details.criteriaStatus` names the evidence for each of the five remaining criteria.",
       "acceptanceCriteria": [
         "Implements DeviceAttestation trait for Apple platforms",
         "Attestation request generates App Attest attestation object",
         "A reader verifies the attestation offline against Apple's App Attestation Root CA under `09-security-model.md` §9.3.1 (SCP-316)",
-        "Fraud metric handling integrated (risk metric from Apple)",
         "Attestation bound to specific key material",
         "Tests pass with App Attest sandbox environment"
       ],
@@ -5416,7 +5172,6 @@
         "Implement DeviceAttestation::attest() using App Attest API (DCAppAttestService)",
         "Leave verification to the reader of `09-security-model.md` §9.3.1, a pure function in `scp-protocol` (SCP-316); the adapter implements no verify method",
         "Handle attestation key generation and binding to SCP identity",
-        "Implement fraud metric extraction and reporting",
         "Handle App Attest error cases (unsupported device, service unavailable)",
         "Write integration tests using App Attest sandbox"
       ],
@@ -5435,13 +5190,41 @@
         }
       ],
       "details": {
-        "stubADR": true,
+        "stubADR": false,
         "adr": "ADR-025",
         "protocolSections": [
           "§9.15"
         ],
         "expectedDecisions": {
-          "appAttest": "Attestation flow, server-side verification, fraud metric handling"
+          "appAttest": "Attestation flow, offline verification by every reader under `09-security-model.md` §9.3.1, no receipt exchange with Apple"
+        },
+        "criteriaStatus": {
+          "assessedOn": "2026-10-04",
+          "assessedAgainst": "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift and bindings/swift/Tests/SCPTests/Platform/AppleDeviceAttestationTests.swift, after the change that generates and attests a replacement key when the stored key carries an attestation record",
+          "met": [
+            {
+              "criterion": "Attestation request generates App Attest attestation object",
+              "evidence": "`AppleDeviceAttestation.attest(challenge:deviceId:)` checks that `challenge` is 32 bytes, calls `DCAppAttestService.attestKey(_:clientDataHash:)` with `challenge` as `clientDataHash` unchanged, and returns the raw CBOR attestation object Apple signed. `attestForwardsChallenge` pins the unchanged `clientDataHash` under two different `deviceId` values and the raw return value; `attestRejectsWrongLengthChallenge` pins `SCP-ATTEST-9026` for a 0-, 31- and 33-byte `challenge`, with no key generated and no App Attest call. `AppleDeviceAttestation` is the only adapter that implements this criterion: `AndroidDeviceAttestation`, the other class conforming to a `DeviceAttestationProvider` interface, requests a Play Integrity token under SCP-111, the Play Integrity adapter story."
+            }
+          ],
+          "unmet": [
+            {
+              "criterion": "Attestation bound to specific key material",
+              "evidence": "`AppleDeviceAttestation.attest(challenge:deviceId:)` attests the App Attest key Apple generated. No code binds the attestation to an SCP identity key."
+            },
+            {
+              "criterion": "Implements DeviceAttestation trait for Apple platforms",
+              "evidence": "No Rust code implements the `DeviceAttestation` trait over the Apple adapter. `DeviceAttestation` in `crates/scp-platform/src/traits.rs` declares `attest(&self)`, which takes no argument and returns a `DeviceAttestationToken`, and `verify(&self, token)`. `DeviceAttestationProvider` in `crates/scp-ffi/uniffi/src/lib.rs`, the UniFFI callback interface `AppleDeviceAttestation` conforms to, declares `attest(challenge, device_id)` returning bytes and `assert_request(request_hash)`, so its method set differs from the trait's. The only implementation of `DeviceAttestation` under `crates/` is the `testing`-gated `InMemoryDeviceAttestation` in `crates/scp-platform/src/testing/attestation.rs`. No Rust code holds or calls a `DeviceAttestationProvider`, and no Swift code under `bindings/swift/Sources` constructs or calls `AppleDeviceAttestation`: outside `AppleDeviceAttestation.swift`, the name appears under `bindings/swift/Sources` only in a doc comment in `AppleKeyCustody.swift` and a doc comment in the generated `Internal/ScpBindings.swift`, so no production path reaches `attest(challenge:deviceId:)` or `assertRequest(requestHash:)`. GitHub issue #2515, \"Implement DeviceAttestation in Rust over the UniFFI DeviceAttestationProvider callback (SCP-095 criterion 1)\", tracks that implementation."
+            },
+            {
+              "criterion": "A reader verifies the attestation offline against Apple's App Attestation Root CA under `09-security-model.md` §9.3.1 (SCP-316)",
+              "evidence": "`AppleDeviceAttestation` carries no verifier, because the maintainer ruled on 2026-09-26 that reading-side verification belongs to the keri workstream. `09-security-model.md` §9.3.1 states how a reader verifies an App Attest attestation. SCP-316, still pending, specifies that reader, and no file under `crates/` or `bindings/` implements it."
+            },
+            {
+              "criterion": "Tests pass with App Attest sandbox environment",
+              "evidence": "`AppleDeviceAttestationTests.swift` drives the adapter with `ScriptedAppAttestService`, `CountingAppAttestService`, `OverlapDetectingAppAttestService` and `RecordingAppAttestService`, `DCAppAttestService` subclasses that override `isSupported` and the App Attest methods each one scripts. No test contacts Apple's App Attest sandbox, and no test runs on a physical device."
+            }
+          ]
         }
       }
     },
@@ -5951,7 +5734,7 @@
     },
     {
       "id": "SCP-104",
-      "title": "Phase 5 end-to-end integration test across all four ADRs",
+      "title": "Phase 5 end-to-end integration test across all three ADRs",
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
@@ -5959,13 +5742,11 @@
       "files": [
         "tests/phase5_integration.rs"
       ],
-      "description": "Phase 5 end-to-end integration test validating all four ADRs work together. Tests the full bridge-to-media-to-platform-to-SDK pipeline:\n\n1. **Bridge (ADR-023):** Register bridge, create shadow identity, bridge message with provenance, claim shadow, verify retroattribution.\n2. **Media (ADR-024):** Initiate media session with capability ceiling check, export MLS keys, exchange signaling messages, end session, verify event log.\n3. **Apple Platform (ADR-025):** Key custody operations through Secure Enclave/Keychain adapters, App Attest attestation, APNs push registration.\n4. **Swift SDK (ADR-026):** Identity create/load, context create/join/send/receive/leave, outlet invocation, UCAN validation — all through Swift wrapper layer.\n\nThis test validates that Phase 5 components integrate with Phase 1-4 foundation (MLS, envelope, identifier, context, UCAN, transport, event log, provenance, UniFFI).",
+      "description": "Phase 5 end-to-end integration test validating all three ADRs work together. Tests the full media-to-platform-to-SDK pipeline:\n\n1. **Media (ADR-024):** Initiate media session with capability ceiling check, export MLS keys, exchange signaling messages, end session, verify event log.\n2. **Apple Platform (ADR-025):** Key custody operations through Secure Enclave/Keychain adapters, App Attest attestation, APNs push registration.\n3. **Swift SDK (ADR-026):** Identity create/load, context create/join/send/receive/leave, outlet invocation, UCAN validation — all through Swift wrapper layer.\n\nThis test validates that Phase 5 components integrate with Phase 1-4 foundation (MLS, envelope, identifier, context, UCAN, transport, event log, provenance, UniFFI).",
       "acceptanceCriteria": [
-        "Bridge registration, shadow creation, provenance marking, and claiming all succeed end-to-end",
         "Media session initiation with ceiling check, MLS key export, signaling exchange, and teardown all succeed end-to-end",
         "Apple platform adapters (Secure Enclave, Keychain, App Attest, APNs) pass integration tests on macOS",
         "Swift SDK identity, context, outlets, UCAN, transport, event log wrappers pass end-to-end through UniFFI bridge",
-        "Bridged content carries correct BridgeProvenance through entire pipeline",
         "Media session keys are correctly derived from MLS group state",
         "All operations recorded in context event log",
         "`cargo test --test phase5_integration` passes",
@@ -5973,19 +5754,12 @@
       ],
       "actionItems": [
         "Create tests/phase5_integration.rs with end-to-end test scenario",
-        "Test bridge lifecycle: register -> shadow -> message -> claim -> retroattribute",
         "Test media lifecycle: ceiling check -> initiate -> MLS key export -> signaling -> end",
         "Test Apple platform: SE key generate/sign, Keychain store/retrieve, App Attest, APNs register",
         "Test Swift SDK: Identity.create -> Context.create -> send -> receive -> leave through UniFFI",
-        "Verify cross-ADR integration: bridged media session, platform-backed identity in bridge claim",
         "Ensure all context events logged correctly"
       ],
       "blockedBy": [
-        "SCP-084",
-        "SCP-085",
-        "SCP-086",
-        "SCP-087",
-        "SCP-088",
         "SCP-089",
         "SCP-090",
         "SCP-091",
@@ -6005,12 +5779,11 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "# Phase 5 Architecture Decision Records — Bridges, Media, Apple Platform, Swift SDK"
+          "section": "# Phase 5 Architecture Decision Records — Media, Apple Platform, Swift SDK"
         }
       ],
       "details": {
         "adrs": [
-          "ADR-023",
           "ADR-024",
           "ADR-025",
           "ADR-026"
@@ -6022,7 +5795,7 @@
           "Phase 4 (UniFFI)"
         ]
       },
-      "result": "Phase 5 integration test created at crates/scp-core/tests/phase5_integration.rs with 11 tests covering bridge lifecycle (ADR-023), media lifecycle (ADR-024), platform adapters (ADR-025), and cross-ADR integration. All tests pass. Swift SDK tests (ACs 4, 9) deferred to XCFramework build (SCP-103)."
+      "result": "Phase 5 integration test created at crates/scp-core/tests/phase5_integration.rs with 8 tests covering media lifecycle (ADR-024), platform adapters (ADR-025), and cross-ADR integration. All tests pass. Swift SDK tests (ACs 3, 7) deferred to XCFramework build (SCP-103)."
     },
     {
       "id": "SCP-105",
@@ -6258,15 +6031,21 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidKeyCustody.kt"
       ],
-      "description": "Implement the KeyCustody platform trait for Android Keystore. Android Keystore provides TEE-backed key custody; Ed25519 support requires API 33+ (Android 13+). StrongBox is available but dramatically slower than TEE-backed operations. Must decide minimum API level (API 33+ for Ed25519 Keystore, or software fallback for older devices) and TEE vs StrongBox policy (performance vs security tradeoff). Mirrors the Apple adapter structure from ADR-025. Emulator Keystore behavior differs from hardware — test on physical devices.",
+      "description": "Implement the KeyCustody platform trait for Android Keystore. ADR-027, the Android platform adapter, as amended on 2026-09-10, sets the API levels and curve: the SDK minimum is API 26, every signing key the adapter generates is an EC P-256 key in Android Keystore at every supported API level, and P-256 key agreement uses Keystore from API 31 and a Bouncy Castle software key below API 31. ADR-027 also excludes StrongBox with no opt-in, because StrongBox operations run 10-100x slower than TEE-backed operations and SCP signs frequently, and this story follows ADR-027. Spec 17, persistence and storage, makes StrongBox opt-in in two tables: the platform-encryption table in §17.5, Serialization (\"StrongBox opt-in only\"), and the key custody table in §17.8, Platform-Specific Key Custody (\"StrongBox is available, dramatically slower, and opt-in\"). ADR-027 and spec 17 cannot both hold, so the open question \"StrongBox opt-in on Android\" in `.docs/specs/00-open-questions.md` puts that conflict to a human. Mirrors the Apple adapter structure from ADR-025. Emulator Keystore behavior differs from hardware — test on physical devices.\n\nStatus reopened 2026-09-28: ADR-027, as amended on 2026-09-10, requires an EC P-256 signing key in Keystore at every supported API level, P-256 key agreement in Keystore from API 31 with a Bouncy Castle software P-256 agreement key below it, and (acceptance criterion 6) a hardware `pseudonym_secret` that is a 32-byte symmetric key generated inside the TEE, never `SHA-256` over a signature. The shipped adapter generates Ed25519 and X25519 keys, derives Ed25519 pseudonym keypairs, and derives the hardware pseudonym secret from a signature. It reports every Keystore key as `CustodyType.HARDWARE` without reading the key's `KeyInfo` security level. `AndroidKeyCustody` implements the Kotlin `KeyCustodyProvider` interface of `Types.kt`, not the UniFFI `KeyCustodyProvider` callback interface that ADR-027 requires, and no code injects it into the Rust engine, so \"KeyCustody trait implemented for Android Keystore matching the same platform trait signatures as ADR-025\" is unmet. Key destruction deletes the Keystore entry and checks that the alias is gone; it requests no Keystore attestation, so \"Key destruction verification via Android Keystore attestation per §9.15\" is unmet.",
       "acceptanceCriteria": [
         "KeyCustody trait implemented for Android Keystore matching the same platform trait signatures as ADR-025",
-        "Ed25519 key generation uses Android Keystore on API 33+ devices",
-        "Software fallback path exists for devices below API 33",
+        "`generateKeypair` generates every P-256 signing key in `AndroidKeyStore` with `ECGenParameterSpec(\"secp256r1\")` at every supported API level (API 26+) and returns `CustodyType.HARDWARE` (ADR-027 acceptance criterion 1)",
+        "`generateKeypair` generates a P-256 agreement key in `AndroidKeyStore` with `KeyProperties.PURPOSE_AGREE_KEY` on API 31+ and returns `CustodyType.HARDWARE`; on API 26-30 it generates a Bouncy Castle software key, stores it in `EncryptedSharedPreferences`, and returns `CustodyType.SOFTWARE` (ADR-027 acceptance criterion 1)",
+        "`generateKeypair` generates no key for the root member: `09-security-model.md` §9.7.4.1 item 4 places the root in the platform credential provider as a passkey (ADR-027 acceptance criterion 1)",
+        "`sign` signs with `SHA256withECDSA` under the handle's P-256 key, returns the 64-byte raw `r || s` form of §9.5 with `s` normalized into the low half of the group order, rejects an agreement-only handle with `PlatformError.wrongKeyType`, and throws `ScpException` with code `SCP-CRYPTO-4001` for a handle it does not hold (ADR-027 acceptance criterion 2)",
+        "`publicKey` returns the 33-byte SEC1 compressed encoding of the P-256 public point (§9.5, ADR-027 acceptance criterion 3)",
+        "`dhAgree` performs P-256 ECDH in `AndroidKeyStore` on API 31+ and through Bouncy Castle below API 31, returns the 32-byte x-coordinate of the agreed point, and rejects a signing-only handle with `PlatformError.wrongKeyType` (ADR-027 acceptance criterion 5)",
+        "`derivePseudonym` computes `HMAC-SHA256(pseudonym_secret, contextId || \"scp-pseudonym\")`, derives a P-256 keypair from the first 32 bytes through the seed-to-scalar step of §9.10.4, and returns a `PseudonymKeyHandle` with `custodyType = CustodyType.SOFTWARE`, for a hardware identity key too (ADR-027 acceptance criterion 6)",
+        "A hardware key's `pseudonym_secret` is a 32-byte symmetric key generated inside the TEE at `generateKeypair`, never `SHA-256` over a signature; a software key's `pseudonym_secret` is `HKDF-SHA256(p256_private_scalar, salt=\"scp-pseudonym-secret-v1\", info=\"\", len=32)` and matches the §25.19 vectors (ADR-027 acceptance criterion 6)",
         "TEE-backed key operations used exclusively; StrongBox is not offered due to prohibitive latency for SCP's frequent signing operations (ADR-027)",
         "Key destruction verification via Android Keystore attestation per §9.15",
         "Compromise recovery follows same 6 steps from §9.12 with Android-specific key rotation",
@@ -6274,10 +6053,12 @@
       ],
       "actionItems": [
         "Define Android-specific KeyCustody implementation struct",
-        "Implement Ed25519 key generation via Android Keystore (API 33+)",
-        "Implement software fallback key generation for API < 33",
+        "Implement P-256 signing key generation in Android Keystore at every supported API level",
+        "Implement P-256 agreement key generation: Android Keystore on API 31+, Bouncy Castle software keys on API 26-30",
+        "Generate the hardware `pseudonym_secret` as a 32-byte symmetric key inside the TEE at key generation",
+        "Derive each pseudonym keypair on P-256 through the §9.10.4 seed-to-scalar step",
         "Implement TEE-backed signing and verification operations",
-        "Add StrongBox policy configuration (opt-in, document performance tradeoff)",
+        "Request no StrongBox key and offer no StrongBox opt-in (ADR-027)",
         "Implement key destruction with attestation per §9.15",
         "Implement compromise recovery key rotation per §9.12",
         "Test on physical Android device — emulator Keystore behavior differs from hardware"
@@ -6295,20 +6076,21 @@
         }
       ],
       "details": {
-        "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
+        "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
-          "minimumApiLevel": "API 33+ for Ed25519 Keystore, or software fallback for older devices",
-          "teeVsStrongBox": "StrongBox excluded — 10-100x latency penalty is incompatible with SCP's per-message signing. TEE is the only option (ADR-027)"
+          "minimumApiLevel": "Decided by ADR-027 as amended on 2026-09-10: API 26 SDK minimum, P-256 signing in Keystore at every supported API level, Keystore P-256 key agreement from API 31",
+          "teeVsStrongBox": "StrongBox excluded: its 10-100x latency penalty is incompatible with SCP's per-message signing, so TEE is the only option (ADR-027). Spec 17 §17.5 and §17.8 make StrongBox opt-in, and the open question \"StrongBox opt-in on Android\" in `.docs/specs/00-open-questions.md` records that conflict"
         },
         "references": [
-          "§17.8 — Android Keystore: TEE-backed, API 33+ for Ed25519",
+          "§17.5 — Serialization: the platform-encryption table's Android row makes StrongBox opt-in for the SQLCipher key",
+          "§17.8 — Platform-specific key custody: the Android row",
+          "§9.7.4.1 — Pre-rotation key custody: item 4",
           "§9.12 — Compromise recovery",
           "§9.15 — Key destruction verification",
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidKeyCustody.kt + Types.kt implemented. TEE-backed Ed25519 on API 33+, Bouncy Castle fallback for API 26-32, software X25519. 32 JVM unit tests. Commits: 77f48a0, 87fc586."
+      "result": "AndroidKeyCustody.kt and Types.kt implemented. Ed25519 keys are held by Android Keystore on API 33+ and reported as `CustodyType.HARDWARE` without a `KeyInfo.securityLevel` check, so the adapter does not know whether a key sits in the TEE or in software; API 26-32 falls back to Bouncy Castle software keys, and X25519 keys are software keys. ADR-027 requires P-256."
     },
     {
       "id": "SCP-111",
@@ -6320,18 +6102,21 @@
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidDeviceAttestation.kt"
       ],
-      "description": "Implement the DeviceAttestation platform trait for Android using Play Integrity API. Must decide integration level: standard requests vs classic attestation. Mirrors the Apple adapter structure from ADR-025. Play Integrity API integration pattern must be determined (standard vs classic).\n\nStatus reopened 2026-09-27: ADR-027's amendment of that date sets the Standard request's `requestHash` to the hexadecimal binding digest `D` of `09-security-model.md` §9.3.1 and names a verifier whose signed verdict a reader checks. The shipped adapter calls the Classic API's `setNonce` with a `clientDataJSON` digest, and no component validates a token, so the criterion \"Attestation tokens validated server-side\" is unmet. SCP-316 implements the reader; this story keeps the minting side.",
+      "description": "Implement the DeviceAttestation platform trait for Android using Play Integrity API. ADR-027 sets the integration level: Standard integrity requests, and no Classic attestation. Mirrors the Apple adapter structure from ADR-025.\n\nStatus reopened 2026-09-27: ADR-027's amendment of that date sets the Standard request's `requestHash` to the hexadecimal binding digest `D` of `09-security-model.md` §9.3.1 and names a verifier whose signed verdict a reader checks. The shipped adapter calls the Classic API's `setNonce` with a `clientDataJSON` digest, and no component validates a token, so the criterion \"Attestation tokens validated server-side\" is unmet. The adapter prepares no token with a `cloudProjectNumber`, accepts a `challenge` of any length, and reads `deviceId`. It routes `assertRequest` through `attest`. ADR-027 acceptance criteria 7 and 8 forbid each of these, and this story's acceptance criteria state each rule. `AndroidDeviceAttestation` implements the Kotlin `DeviceAttestationProvider` interface of `Types.kt`, not the UniFFI `DeviceAttestationProvider` callback interface that ADR-027 requires, and no code injects it into the Rust engine, so \"DeviceAttestation trait implemented for Android using Play Integrity API matching ADR-025 trait signatures\" is unmet. SCP-316, still pending, specifies the reader, and no code verifies a device attestation yet; this story keeps the minting side.",
       "acceptanceCriteria": [
         "DeviceAttestation trait implemented for Android using Play Integrity API matching ADR-025 trait signatures",
-        "Standard Play Integrity request flow implemented",
-        "Classic attestation flow available as alternative (if decided)",
+        "`attest` calls `IntegrityManagerFactory.createStandard(context)`, `prepareIntegrityToken` with the `cloudProjectNumber` of the package verifier's `PlayIntegrityVerifier` entry, and `StandardIntegrityTokenProvider.request` with `requestHash` set to the lowercase hexadecimal form of the binding digest `D` of §9.3.1 (ADR-027 acceptance criterion 7)",
+        "The adapter makes no Classic Play Integrity request: it never calls `IntegrityManagerFactory.create` or builds an `IntegrityTokenRequest` (ADR-027)",
+        "`attest` rejects a `challenge` that is not 32 bytes and does not read `deviceId` (ADR-027 acceptance criterion 7)",
+        "Every `attest` failure, a missing Google Play services installation and a `challenge` of the wrong size included, throws `ScpException` with code `SCP-ATTEST-9001` (ADR-027 acceptance criterion 7)",
+        "`assertRequest` issues a fresh Standard integrity token whose `requestHash` is the lowercase hexadecimal form of the assertion digest `A` of §9.3.1, and does not route through `attest` (ADR-027 acceptance criterion 8)",
         "Attestation tokens validated server-side",
         "Integration tests verify attestation flow end-to-end on physical device"
       ],
       "actionItems": [
         "Define Android-specific DeviceAttestation implementation struct",
         "Implement Play Integrity standard request flow",
-        "Evaluate and optionally implement classic attestation flow",
+        "Implement no Classic attestation flow: ADR-027 decides against it",
         "Wire attestation into SCP identity verification pipeline",
         "Test on physical Android device"
       ],
@@ -6352,16 +6137,15 @@
         }
       ],
       "details": {
-        "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
+        "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
-          "playIntegrityLevel": "Standard requests vs classic attestation"
+          "playIntegrityLevel": "Decided by ADR-027: Standard integrity requests; Classic attestation is not used"
         },
         "references": [
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidDeviceAttestation.kt implemented. Play Integrity Standard API, SHA-256 nonce, JWT token return. 14 JVM unit tests. Commits: bd4e2f7, 87fc586."
+      "result": "AndroidDeviceAttestation.kt implemented. The adapter requests a Classic Play Integrity token through `IntegrityTokenRequest.builder().setNonce(nonce)` with a SHA-256 nonce and returns the token bytes; ADR-027 requires a Standard request, which this story still has to deliver."
     },
     {
       "id": "SCP-112",
@@ -6369,11 +6153,11 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidPushProvider.kt"
       ],
-      "description": "Implement the PushProvider platform trait for Android using Firebase Cloud Messaging (FCM). FCM payload format must parallel the APNs opacity decision in ADR-025 — payloads must be opaque to the push infrastructure. FCM payload constraints and opacity requirements must be respected.",
+      "description": "Implement the PushProvider platform trait for Android using Firebase Cloud Messaging (FCM). FCM payload format must parallel the APNs opacity decision in ADR-025 — payloads must be opaque to the push infrastructure. FCM payload constraints and opacity requirements must be respected.\n\nStatus reopened 2026-09-28: No sender in the repository emits the §10.7.1 step 5 payload `{ \"scp\": 1 }`, so the criterion \"FCM payload format is opaque\" is unmet: opacity is an obligation on the sender, and FCM carries every field of a payload before `handleNotification` runs. `handleNotification` checks only the `scp` field and accepts extra fields. No SDK code wakes the app, connects to a relay, or pulls envelopes on a push, so \"Push notification delivery triggers SCP message fetch\" is unmet, and no integration test exists, so \"Integration tests verify push delivery flow\" is unmet. The Kotlin `PushProvider` interface matches neither the Rust `Push` trait nor the UniFFI `PushProvider` callback interface, so \"PushProvider trait implemented for Android using FCM matching ADR-025 trait signatures\" is unmet. `register` only returns the FCM token: no SDK code builds or sends the §10.7.1 `PushRegistration` to a relay or sends a new one when the token changes, so \"FCM token registration and refresh handled\" is unmet.",
       "acceptanceCriteria": [
         "PushProvider trait implemented for Android using FCM matching ADR-025 trait signatures",
         "FCM payload format is opaque — no plaintext protocol data exposed to push infrastructure",
@@ -6401,8 +6185,7 @@
         }
       ],
       "details": {
-        "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
+        "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
           "fcmPayloadFormat": "Parallel to APNs opacity decision in ADR-025"
         },
@@ -6410,7 +6193,7 @@
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidPushProvider.kt implemented. FCM data-only opaque payload, SCP-PUSH-5001/5002 error codes. 10 JVM unit tests. Commits: b37d2f0, 87fc586."
+      "result": "AndroidPushProvider.kt implemented. `register` returns the FCM token, and `handleNotification` checks only the `scp` field of a data-only payload, throwing `SCP-TRANS-5001` when the field is missing and `SCP-TRANS-5002` when it is not `\"1\"`. It accepts extra fields. No sender in the repository emits the §10.7.1 step 5 payload, so no code meets §10.7 opacity, which binds the sender."
     },
     {
       "id": "SCP-113",
@@ -6418,11 +6201,11 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidStorage.kt"
       ],
-      "description": "Implement the Storage platform trait for Android with TEE-backed key derivation for SQLCipher database encryption. The database encryption key must be derived using TEE-backed key derivation, not stored in plaintext. Mirrors ADR-025 Apple adapter storage structure.",
+      "description": "Implement the Storage platform trait for Android with TEE-backed key derivation for SQLCipher database encryption. The database encryption key must be derived using TEE-backed key derivation, not stored in plaintext. Mirrors ADR-025 Apple adapter storage structure.\n\nStatus reopened 2026-09-28: the shipped adapter derives the SQLCipher passphrase from a Keystore AES-256 key but never reads that key's `KeyInfo` security level, so it does not show that the key is TEE-backed, and no unit test opens a SQLCipher database. Each test in `AndroidStorageTest.kt` runs against the test-only `InMemoryStorageProvider` or checks `AndroidStorage` constants, type or error codes. `StorageConformanceTest.kt` runs its conformance tests against `InMemoryStorageProvider` and against an unencrypted JVM SQLite provider that runs hand-copied versions of `AndroidStorage`'s schema and SQL statements, which no test compares with `AndroidStorage`, plus SQL-specific tests against that SQLite provider; none of them opens SQLCipher. The criteria \"SQLCipher database encryption key derived via TEE-backed key derivation\" and \"Unit tests verify encrypted storage round-trip\" are unmet. `AndroidStorage` implements the Kotlin `StorageProvider` interface of `Types.kt`, which declares the method names of the UniFFI `StorageProvider` callback interface but is not that interface, and no code injects it into the Rust engine as ADR-027 requires, so the criterion \"Storage trait implemented for Android matching ADR-025 trait signatures\" is unmet as well.",
       "acceptanceCriteria": [
         "Storage trait implemented for Android matching ADR-025 trait signatures",
         "SQLCipher database encryption key derived via TEE-backed key derivation",
@@ -6451,8 +6234,7 @@
         }
       ],
       "details": {
-        "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
+        "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
           "sqlCipherKeyDerivation": "TEE-backed key derivation for database encryption key"
         },
@@ -6461,7 +6243,7 @@
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidStorage.kt implemented with TEE-backed AES-256 key derivation via Android Keystore. InMemoryStorageProvider for testing. 548-line test suite. Commit 775403b."
+      "result": "AndroidStorage.kt implemented. The SQLCipher passphrase is derived from an AES-256 key held by Android Keystore, and SQLCipher derives the database key from that passphrase; the adapter does not read `KeyInfo.securityLevel`, so it does not know whether the AES key sits in the TEE or in software. Each JVM unit test in `AndroidStorageTest.kt` runs against the test-only `InMemoryStorageProvider`, asserts an `AndroidStorage` constant, or checks `AndroidStorage`'s type and constructor by reflection or builds an `ScpException` from its error-code constants. None opens a SQLCipher database."
     },
     {
       "id": "SCP-114",
@@ -6473,7 +6255,7 @@
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/PlatformAdapter.kt"
       ],
-      "description": "Create the scp-platform/android/ module root in mod.rs. Declares and re-exports all Android platform adapter modules: key_custody, device_attestation, push_provider, storage. Platform adapters implement traits defined in scp-platform/ (KeyCustody, PushProvider, DeviceAttestation, Storage). Android module is conditionally compiled for Android targets only. Mirrors Apple platform module root SCP-097 (gate-5).",
+      "description": "Create the scp-platform/android/ module root in mod.rs. Declares and re-exports all Android platform adapter modules: key_custody, device_attestation, push_provider, storage. Android module is conditionally compiled for Android targets only. Mirrors Apple platform module root SCP-097 (gate-5).",
       "acceptanceCriteria": [
         "mod.rs declares pub mod for key_custody, device_attestation, push_provider, storage",
         "All Android adapter types re-exported from mod.rs",
@@ -9379,7 +9161,7 @@
         "`crates/scp-ffi/src/event_log.rs` delegates to real `scp-core` event log query, proof, and checkpoint functions (no `Err(\"not implemented\")`)",
         "All 9 MCP bridge functions (`py_mcp_serve`, `py_mcp_client_connect_stdio`, etc.) are registered in the `#[pymodule]` in `lib.rs`",
         "`crates/scp-ffi/src/mcp.rs` exists and delegates to real `scp-mcp` crate functions",
-        "`python -c \"from _scp_core import py_mcp_serve\"` does not raise `ImportError`",
+        "`python -c \"from scp_sdk._scp_core import SCP; SCP.py_mcp_serve\"` does not raise",
         "Phase 3 integration test (`tests/integration/phase3_integration_test.py`) passes without `MagicMock` for the bridge layer — real bridge calls succeed for all 16 test methods",
         "No `\"not implemented\"` strings remain in any `crates/scp-ffi/src/*.rs` file"
       ],
@@ -9589,7 +9371,7 @@
       ],
       "description": "Scaffold the Kotlin SDK Gradle build infrastructure. Multi-module project with scp-kt (core JVM) and scp-kt-android (Android platform adapter). Must match ADR-028 layout conventions.",
       "acceptanceCriteria": [
-        "gradle build succeeds from bindings/kotlin/",
+        "gradle build -Pscp.uniffi.cargoFeatures=testing succeeds from bindings/kotlin/",
         "Multi-module structure matches ADR-028 layout (scp-kt + scp-kt-android)",
         "UniFFI-generated NativeLib.kt integration configured",
         "Android dependencies declared: Bouncy Castle, Play Integrity, FCM, SQLCipher, AndroidX Security",
@@ -9716,7 +9498,7 @@
         "crates/scp-ffi/src/runtime.rs",
         ".docs/specs/09-security-model.md"
       ],
-      "description": "Wire platform-injected KeyCustodyProvider callbacks through all three FFI bridges (PyO3, UniFFI, NAPI) into scp-core crypto operations. Currently, all bridges use InMemoryKeyCustody unconditionally — platform custody (Secure Enclave, Android Keystore) is implemented (SCP-093, SCP-110) but unreachable from Rust. KeyHandle references are not retained across FFI boundaries, making all cryptographic operations impossible with real key material.\n\nWithout this wiring, 14 scp-core public functions that take &impl KeyCustody are unreachable from production FFI code:\n- Identity: the identity-creation path that signs and publishes an inception event, and the rotation path that appends a `KeyState` event under the standing root (`09-security-model.md` §9.7.4.2 R2, R3)\n- Envelope: create_inner_envelope (message signing), derive_pseudonym (routing IDs)\n- Event log: CheckpointManager::maybe_create_checkpoint, CheckpointManager::force_create_checkpoint, generate_checkpoint (checkpoint signing)\n- UCAN: mint_ucan (token signing — py_ucan_mint is a stub that doesn't call scp-core yet), delegate_ucan (delegation chain signing — no FFI bridge function exists)\n- Sender keys: publish_sender_key_epoch_advance, request_sender_key, open_sender_key_response, send_block_notification, rotate_sender_key_for_block\n\nAdditionally, 4 internal functions (the signing-closure builder, rotate_active_key, create_new_identity_keys, and generate_checkpoint_at) take KeyCustody but are called by the above — they don't need separate FFI wiring. There is no migration function to wire: the identifier is the inception event's digest and never changes (`09-security-model.md` §9.7.4.2 R13), so SCP-008 implements rotation and the two reveal-authorized recovery kinds and no migration.\n\nseal_envelope takes a pre-computed routing_id: &[u8] parameter, so it does not take KeyCustody directly — but its two inputs (routing_id from derive_pseudonym and InnerEnvelope from create_inner_envelope) both require KeyCustody upstream. The entire message send path is blocked.\n\nAdditionally, the InMemoryKeyCustody implementation must use the HKDF-derived pseudonym_secret (crate::pseudonym::derive_pseudonym_secret, HKDF-SHA256 over the P-256 private scalar) as the HMAC key for derive_pseudonym, per §9.10.4.A. The HMAC key is the private-derived pseudonym_secret, never the public key — public-key-keyed derivation is rejected as a membership-enumeration oracle. The golden vector test must assert this private-seed-HKDF derivation.\n\nThis is a P0 blocker because:\n1. Routing IDs use a stub HMAC derivation (context.rs) instead of KeyCustody::derive_pseudonym — relay probes never match real envelopes\n2. InMemoryKeyCustody stores private keys in unprotected heap memory on mobile devices — the entire TEE/Secure Enclave security model is dead code\n3. Key rotation always errors (\"requires wired KeyCustodyProvider\")\n4. UniFFI KeyCustodyProvider callback interface is incomplete — missing derive_pseudonym and dh_agree methods vs the full KeyCustody trait (7 methods)\n5. Inner envelope signing, UCAN minting/delegation, checkpoint signing, and all sender key protocol operations are unreachable with platform key material\n6. py_ucan_mint (ucan.rs:320) is a stub that builds a local PyUcanToken without calling scp-core::mint_ucan — no real signing occurs\n7. No py_ucan_delegate bridge function exists despite the scp-core implementation being complete (SCP-056)\n8. InMemoryKeyCustody::derive_pseudonym must key the HMAC with the private-derived pseudonym_secret (HKDF-SHA256 over the P-256 private scalar) per §9.10.4.A, never the public key — public-key-keyed derivation is a rejected membership-enumeration oracle\n\nThe architecture is fully specified in ADR-006, ADR-021, ADR-022, ADR-025, ADR-027. Platform adapters are implemented. Only the wiring is missing.",
+      "description": "Wire platform-injected KeyCustodyProvider callbacks through all three FFI bridges (PyO3, UniFFI, NAPI) into scp-core crypto operations. Currently, all bridges use InMemoryKeyCustody unconditionally — platform custody adapters exist (`AppleKeyCustody` under SCP-093, which holds Ed25519 and X25519 keys in the Keychain where ADR-025 as amended on 2026-09-10 requires P-256 keys in the Secure Enclave; Android Keystore under SCP-110, which is in progress because the Android adapter holds Ed25519 keys where ADR-027 requires P-256) but Rust cannot reach them. KeyHandle references are not retained across FFI boundaries, making all cryptographic operations impossible with real key material.\n\nWithout this wiring, 14 scp-core public functions that take &impl KeyCustody are unreachable from production FFI code:\n- Identity: the identity-creation path that signs and publishes an inception event, and the rotation path that appends a `KeyState` event under the standing root (`09-security-model.md` §9.7.4.2 R2, R3)\n- Envelope: create_inner_envelope (message signing), derive_pseudonym (routing IDs)\n- Event log: CheckpointManager::maybe_create_checkpoint, CheckpointManager::force_create_checkpoint, generate_checkpoint (checkpoint signing)\n- UCAN: mint_ucan (token signing — py_ucan_mint is a stub that doesn't call scp-core yet), delegate_ucan (delegation chain signing — no FFI bridge function exists)\n- Sender keys: publish_sender_key_epoch_advance, request_sender_key, open_sender_key_response, send_block_notification, rotate_sender_key_for_block\n\nAdditionally, 4 internal functions (the signing-closure builder, rotate_active_key, create_new_identity_keys, and generate_checkpoint_at) take KeyCustody but are called by the above — they don't need separate FFI wiring. There is no migration function to wire: the identifier is the inception event's digest and never changes (`09-security-model.md` §9.7.4.2 R13), so SCP-008 implements rotation and the two reveal-authorized recovery kinds and no migration.\n\nseal_envelope takes a pre-computed routing_id: &[u8] parameter, so it does not take KeyCustody directly — but its two inputs (routing_id from derive_pseudonym and InnerEnvelope from create_inner_envelope) both require KeyCustody upstream. The entire message send path is blocked.\n\nAdditionally, the InMemoryKeyCustody implementation must use the HKDF-derived pseudonym_secret (crate::pseudonym::derive_pseudonym_secret, HKDF-SHA256 over the P-256 private scalar) as the HMAC key for derive_pseudonym, per §9.10.4.A. The HMAC key is the private-derived pseudonym_secret, never the public key — public-key-keyed derivation is rejected as a membership-enumeration oracle. The golden vector test must assert this private-seed-HKDF derivation.\n\nThis is a P0 blocker because:\n1. Routing IDs use a stub HMAC derivation (context.rs) instead of KeyCustody::derive_pseudonym — relay probes never match real envelopes\n2. InMemoryKeyCustody stores private keys in unprotected heap memory on mobile devices — the entire TEE/Secure Enclave security model is dead code\n3. Key rotation always errors (\"requires wired KeyCustodyProvider\")\n4. UniFFI KeyCustodyProvider callback interface is incomplete — missing derive_pseudonym and dh_agree methods vs the full KeyCustody trait (7 methods)\n5. Inner envelope signing, UCAN minting/delegation, checkpoint signing, and all sender key protocol operations are unreachable with platform key material\n6. py_ucan_mint (ucan.rs:320) is a stub that builds a local PyUcanToken without calling scp-core::mint_ucan — no real signing occurs\n7. No py_ucan_delegate bridge function exists despite the scp-core implementation being complete (SCP-056)\n8. InMemoryKeyCustody::derive_pseudonym must key the HMAC with the private-derived pseudonym_secret (HKDF-SHA256 over the P-256 private scalar) per §9.10.4.A, never the public key — public-key-keyed derivation is a rejected membership-enumeration oracle\n\nThe architecture is fully specified in ADR-006, ADR-021, ADR-022, ADR-025, ADR-027. Neither platform custody adapter holds the P-256 keys its ADR requires, and SCP-110 tracks the Android adapter's remaining gaps. This story adds the wiring from each bridge to the platform adapter.",
       "acceptanceCriteria": [
         "UniFFI KeyCustodyProvider callback interface includes all 7 KeyCustody trait methods: generate_keypair, sign, get_public_key, destroy_key, dh_agree, derive_pseudonym, custody_type",
         "UniFFI identity_create with CustodyMethod::Platform accepts an injected KeyCustodyProvider and creates the identity using it, signing and publishing the inception event through that provider",
@@ -9889,7 +9671,7 @@
         ".docs/adrs/phase-3.md",
         ".docs/sketch.md"
       ],
-      "description": "The Python receive() iterator (py_context_receive / PyMessageReceiver.__anext__) has placeholder semantics that conflate empty and closed channels. The __anext__ method uses sync try_recv() and maps both TryRecvError::Empty and TryRecvError::Disconnected to StopAsyncIteration. The sender _tx is dropped immediately after channel creation, meaning the channel is always disconnected.\n\nNo spec, ADR, or PRD story captures the intended lifecycle semantics. ADR-014 has only a function signature (line 291-293). By contrast, TypeScript (ADR-019 phase-4.md) specifies full onMessage/onError/onComplete callbacks, Swift (ADR-023 phase-5.md) specifies AsyncStream with continuation.yield/finish, and Kotlin (ADR-027 phase-6.md) specifies callbackFlow/awaitClose. sketch.md (lines 371-389) specifies AsyncStream<ContextEvent>, 1000-event buffer, oldest-drop overflow, and BufferOverflow warning event.\n\nThis story adds the missing lifecycle specification to ADR-014 and implements it.",
+      "description": "The Python receive() iterator (py_context_receive / PyMessageReceiver.__anext__) has placeholder semantics that conflate empty and closed channels. The __anext__ method uses sync try_recv() and maps both TryRecvError::Empty and TryRecvError::Disconnected to StopAsyncIteration. The sender _tx is dropped immediately after channel creation, meaning the channel is always disconnected.\n\nNo spec, ADR, or PRD story captures the intended lifecycle semantics. ADR-014 has only a function signature (line 291-293). By contrast, TypeScript (ADR-022 phase-4.md) specifies full onMessage/onError/onComplete callbacks, Swift (ADR-026 phase-5.md) specifies AsyncStream with continuation.yield/finish, and Kotlin (ADR-028 phase-6.md) specifies callbackFlow/awaitClose. sketch.md (lines 371-389) specifies AsyncStream<ContextEvent>, 1000-event buffer, oldest-drop overflow, and BufferOverflow warning event.\n\nThis story adds the missing lifecycle specification to ADR-014 and implements it.",
       "acceptanceCriteria": [
         "ADR-014 specifies receive() lifecycle: async channel receive (not sync try_recv), empty vs closed distinction, transport wiring, buffer overflow, shutdown triggers",
         "__anext__ uses async recv() and distinguishes empty channel (await more) from closed channel (StopAsyncIteration)",
@@ -9924,10 +9706,6 @@
           "section": "## ADR-019: Data Provenance"
         },
         {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-023: Bridge Connector Protocol"
-        },
-        {
           "file": ".docs/adrs/phase-6.md",
           "section": "## ADR-027: Android Platform Adapter"
         }
@@ -9949,7 +9727,7 @@
         "crates/scp-ffi/src/runtime.rs",
         "crates/scp-ffi/src/lib.rs"
       ],
-      "description": "py_identity_load (identity.rs:278) is a stub that reconstructs a PyIdentity from the identifier with in_memory custody instead of loading from persistent storage. The inline comment says \"full storage integration is a future story\" but no story was ever created.\n\nSCP-038 acceptance criterion 2 requires: \"py_identity_load(did) -> loads an existing identity from storage.\" This criterion is unmet. The Storage trait (scp-platform) and ProtocolRepository (scp-core/store) exist, and platform implementations are done (SCP-113 Android, SCP-093 Apple). What is missing is:\n\n1. A StorageProvider injection point in the Python FFI bridge (analogous to SCP-214 for KeyCustody)\n2. py_identity_load calling ProtocolRepository to retrieve persisted identity state\n3. py_identity_create persisting identity state after creation\n\nThis is the Storage counterpart to SCP-214 (KeyCustody wiring). Both are required for a functional production FFI bridge.",
+      "description": "py_identity_load (identity.rs:278) is a stub that reconstructs a PyIdentity from the identifier with in_memory custody instead of loading from persistent storage. The inline comment says \"full storage integration is a future story\" but no story was ever created.\n\nSCP-038 acceptance criterion 2 requires: \"py_identity_load(did) -> loads an existing identity from storage.\" This criterion is unmet. The Storage trait (scp-platform) and ProtocolRepository (scp-core/store) exist, and platform storage adapters exist: `AppleStorage` under SCP-094, and `AndroidStorage` under SCP-113, which is in progress because the adapter does not check that its SQLCipher key is TEE-backed and no unit test opens a SQLCipher database. What is missing is:\n\n1. A StorageProvider injection point in the Python FFI bridge (analogous to SCP-214 for KeyCustody)\n2. py_identity_load calling ProtocolRepository to retrieve persisted identity state\n3. py_identity_create persisting identity state after creation\n\nThis is the Storage counterpart to SCP-214 (KeyCustody wiring). Both are required for a functional production FFI bridge.",
       "acceptanceCriteria": [
         "Python FFI bridge accepts a StorageProvider at initialization (analogous to KeyCustody injection in SCP-214)",
         "py_identity_create persists identity state (DID, custody type, key handles) via StorageProvider after successful creation",
@@ -10437,13 +10215,13 @@
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt",
         "bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/TrustTest.kt"
       ],
-      "description": "ADR-059 and §7.2.4 decide that capability/trust validation crosses the FFI as a typed structured record (CapabilityValidation: six per-stage booleans) and that SDKs MUST consume that result — never reverse-engineer which check failed by parsing human-readable error prose. The structured bridge op (ucan_evaluate / evaluate_ucan returning CapabilityValidation) already exists at the Rust core and all three FFI bridges; only the SDK consumers are wrong. A first-principles audit of the trust/capability SDK surface found the Python SDK string-matching error prose in trust.py to reconstruct the per-check breakdown, an antipattern that is brittle by construction and that masked a multi-attestation nonce bug (mocks emitted prose without modeling nonce state). This story is the C3c SDK rebuild: delete the Python prose-classification apparatus and consume the structured ucan_evaluate op; add the TypeScript public evaluateTrust wrapper over a ucanEvaluate bridge call plumbed through all TS bridge layers, exposing a CapabilityValidation interface, with all bridge-error typing routed through a single mapping chokepoint keyed on the [SCP-CAT-NNNN] error-code taxonomy rather than per-call prose classification; and rebuild the test mocks to model nonce state so the masked-bug class is surfaced. Per ADR-059 §Decision-5 and the per-SDK-idiom lesson, ALL FOUR bindings expose an idiomatic wrapper over the structured result: the per-SDK-idiom lesson governs HOW each binding surfaces the op (language-native naming/types), never WHETHER it does. The UniFFI bridge already exports CapabilityValidationRecord, so the Swift and Kotlin SDKs add the idiomatic sugar (SCP.ucanEvaluate / evaluateTrust plus a CapabilityValidation type) on top of it, at parity with Python and TypeScript. This story also lands the bundled SDK-parity wrappers the same audit identified as missing on the affected SDKs (per the UCAN.evaluate / Trust.evaluate_trust / Bridge.* / Identity.* / Discovery.discover / Economy.verify_payment_receipts capability-matrix exemptions that name \"the C3c SDK-parity follow-up\"). Per-SDK idiom is preserved throughout; the structured-result field set is identical across bindings (snake_case in Python, camelCase in TypeScript), only the wrappers are language-idiomatic.",
+      "description": "ADR-059 and §7.2.4 decide that capability/trust validation crosses the FFI as a typed structured record (CapabilityValidation: six per-stage booleans) and that SDKs MUST consume that result — never reverse-engineer which check failed by parsing human-readable error prose. The structured bridge op (ucan_evaluate / evaluate_ucan returning CapabilityValidation) already exists at the Rust core and all three FFI bridges; only the SDK consumers are wrong. A first-principles audit of the trust/capability SDK surface found the Python SDK string-matching error prose in trust.py to reconstruct the per-check breakdown, an antipattern that is brittle by construction and that masked a multi-attestation nonce bug (mocks emitted prose without modeling nonce state). This story is the C3c SDK rebuild: delete the Python prose-classification apparatus and consume the structured ucan_evaluate op; add the TypeScript public evaluateTrust wrapper over a ucanEvaluate bridge call plumbed through all TS bridge layers, exposing a CapabilityValidation interface, with all bridge-error typing routed through a single mapping chokepoint keyed on the [SCP-CAT-NNNN] error-code taxonomy rather than per-call prose classification; and rebuild the test mocks to model nonce state so the masked-bug class is surfaced. Per ADR-059 §Decision-5 and the per-SDK-idiom lesson, ALL FOUR bindings expose an idiomatic wrapper over the structured result: the per-SDK-idiom lesson governs HOW each binding surfaces the op (language-native naming/types), never WHETHER it does. The UniFFI bridge already exports CapabilityValidationRecord, so the Swift and Kotlin SDKs add the idiomatic sugar (SCP.ucanEvaluate / evaluateTrust plus a CapabilityValidation type) on top of it, at parity with Python and TypeScript. This story also lands the bundled SDK-parity wrappers the same audit identified as missing on the affected SDKs (per the UCAN.evaluate / Trust.evaluate_trust / Identity.* / Discovery.discover / Economy.verify_payment_receipts capability-matrix exemptions that name \"the C3c SDK-parity follow-up\"). Per-SDK idiom is preserved throughout; the structured-result field set is identical across bindings (snake_case in Python, camelCase in TypeScript), only the wrappers are language-idiomatic.",
       "acceptanceCriteria": [
         "bindings/python/scp_sdk/trust.py contains zero occurrences of _classify_ucan_error, _extract_core_error, _PASSED_BEFORE, _TOKEN_PARSE_PREFIXES, _SIGNATURE_CHAIN_PREFIXES, _CAPABILITY_CEILING_PREFIXES, _NONCE_PREFIXES, _REVOCATION_PREFIXES, and _EXPIRY_PREFIXES (grep -c each returns 0), and evaluate_trust calls the structured ucan_evaluate bridge op per token and AND-combines the six CapabilityValidation booleans across the token set instead of catching and string-classifying error prose",
         "TypeScript exposes the structured op end-to-end: a ucanEvaluate signature is declared in bindings/typescript/src/internal/bridge.ts and implemented in bindings/typescript/src/internal/native.ts and surfaced via bindings/typescript/src/scp.ts; a CapabilityValidation interface with the six camelCase booleans (tokensValid, signaturesValid, withinCeiling, nonceValid, notRevoked, timeBoundsValid) is defined in bindings/typescript/src/types.ts and re-exported from bindings/typescript/src/index.ts; and a public method named exactly evaluateTrust consuming the structured CapabilityValidation result exists on the SCP class in bindings/typescript/src/scp.ts",
         "TypeScript trust/capability error typing flows through a single mapping function keyed on the [SCP-CAT-NNNN] error code: one mapBridgeError function (bindings/typescript/src/errors.ts) is applied at one site per dispatch surface — the wrapBridgeErrors Proxy (bindings/typescript/src/internal/bridge.ts) over the native bridge factory, plus the SCP-class methods in bindings/typescript/src/scp.ts that dispatch through the raw addon directly (e.g. evaluateTrust's event-log query); mapBridgeError passes already-typed ScpError instances through untouched (no downgrade to SCP-UNKNOWN-0000); and grep finds zero error.message / .message prose-branching (e.g. .includes(, .startsWith(, .match() on a message string) in the TypeScript trust-signal code paths",
-        "The bundled SDK-parity wrappers land on the SDKs the audit flagged: TypeScript public Identity wrappers identityRotateKey, identityAddAgentKey, identityRotateAgentKey, identityRemoveAgentKey, and identityMigrate exist on the SCP class (the bare rotateKey/addAgentKey/rotateAgentKey/removeAgentKey/migrate names are the underlying Identity-handle methods, not the SCP-class wrappers); a TypeScript public bridgeRegister wrapper exists as a module-level export in bindings/typescript/src/bridge.ts re-exported from bindings/typescript/src/index.ts (the TS free-function idiom — NOT a method on the SCP class); a Python public discover() method exists in bindings/python/scp_sdk/discovery.py; and a Python public verify_payment_receipts() method exists in bindings/python/scp_sdk/economy.py",
-        "The capability matrix .docs/standards/sdk-capability-matrix.json flips these cells true and removes the now-stale C3c-follow-up exemption for each flipped cell: UCAN.evaluate (python, typescript, kotlin, and swift all true, with the kotlin and swift C3c-follow-up exemptions removed), Trust.evaluate_trust (typescript true), Bridge.evaluate_trust (typescript true), Identity.rotate_key / Identity.add_agent_key / Identity.rotate_agent_key / Identity.remove_agent_key / Identity.migrate (typescript true), Bridge.register (typescript true), Discovery.discover (python true), and Economy.verify_payment_receipts (python true); the (\"UCAN\", \"evaluate\") alias in the ALIASES table of scripts/check-sdk-coverage.py lists all four bindings (python: ucan_evaluate/evaluate_trust, typescript: ucanEvaluate/evaluateTrust, kotlin: ucanEvaluate/evaluateTrust, swift: ucanEvaluate/evaluateTrust); and python3.12 scripts/check-sdk-coverage.py exits 0",
+        "The bundled SDK-parity wrappers land on the SDKs the audit flagged: TypeScript public Identity wrappers identityRotateKey, identityAddAgentKey, identityRotateAgentKey, identityRemoveAgentKey, and identityMigrate exist on the SCP class (the bare rotateKey/addAgentKey/rotateAgentKey/removeAgentKey/migrate names are the underlying Identity-handle methods, not the SCP-class wrappers); a Python public discover() method exists in bindings/python/scp_sdk/discovery.py; and a Python public verify_payment_receipts() method exists in bindings/python/scp_sdk/economy.py",
+        "The capability matrix .docs/standards/sdk-capability-matrix.json flips these cells true and removes the now-stale C3c-follow-up exemption for each flipped cell: UCAN.evaluate (python, typescript, kotlin, and swift all true, with the kotlin and swift C3c-follow-up exemptions removed), Trust.evaluate_trust (typescript true), Identity.rotate_key / Identity.add_agent_key / Identity.rotate_agent_key / Identity.remove_agent_key / Identity.migrate (typescript true), Discovery.discover (python true), and Economy.verify_payment_receipts (python true); the (\"UCAN\", \"evaluate\") alias in the ALIASES table of scripts/check-sdk-coverage.py lists all four bindings (python: ucan_evaluate/evaluate_trust, typescript: ucanEvaluate/evaluateTrust, kotlin: ucanEvaluate/evaluateTrust, swift: ucanEvaluate/evaluateTrust); and python3.12 scripts/check-sdk-coverage.py exits 0",
         "Tests model nonce state instead of emitting prose: TypeScript bun-addon-backed tests and Python pytest mocks for ucan_evaluate distinguish that the read-only diagnostic records NO nonce while the throwing gate (ucan_validate) DOES record it, a multi-token AND test asserts evaluate_trust is false when any single token fails a stage, and real-addon evaluate assertions run unskipped (the real-napi evaluate test cases are not gated out)",
         "All gates pass on the changed surfaces: in bindings/typescript with the .node addon built, bun run check && bun run lint && bun test succeed; in bindings/python, python3.12 -m ruff check . && python3.12 -m ruff format --check . && python3.12 -m pytest tests/ succeed (with DYLD_LIBRARY_PATH set); python3.12 scripts/validate-prd.py exits 0; and the Rust workspace build and clippy are unchanged and green",
         "The narrow optional-challenge core+bridge change lands and is fail-closed: the read-only diagnostic crates/scp-protocol/src/crypto/ucan/validate.rs fn evaluate_ucan takes required_capability: Option<&CapabilityUri> (grep finds the Option signature), while the enforcement gate fn validate_ucan keeps required_capability: &CapabilityUri (mandatory, not Option); and all three bridges accept an optional capability on ucan_evaluate (crates/scp-ffi/src/ucan.rs capability: Option<&str>; crates/scp-ffi/napi/src/ucan.rs and crates/scp-ffi/uniffi/src/bridge.rs capability: Option<String>), coercing an empty/whitespace capability to no-challenge (capability.filter(|c| !c.trim().is_empty()) appears in each of the three bridge files); the Rust workspace build and clippy stay green",
@@ -10463,7 +10241,7 @@
         "Delete the prose-classification apparatus from bindings/python/scp_sdk/trust.py (_classify_ucan_error, _extract_core_error, _PASSED_BEFORE, and the six *_PREFIXES tuples) and rewrite evaluate_trust to call the structured ucan_evaluate bridge op per token and AND-combine the six CapabilityValidation booleans across the token set",
         "Add ucanEvaluate to bindings/typescript/src/internal/bridge.ts and implement it in internal/native.ts; define the CapabilityValidation interface (six camelCase booleans) in types.ts and re-export from index.ts; add the public evaluateTrust method on the SCP class in scp.ts consuming the structured result",
         "Route TypeScript bridge-error typing through one mapBridgeError function (bindings/typescript/src/errors.ts) applied per dispatch surface — the wrapBridgeErrors Proxy over the native bridge factory plus the SCP-class methods that dispatch through the raw addon directly; remove any per-call message-string branching from TS trust-signal code",
-        "Add the bundled SDK-parity wrappers: TS SCP-class Identity wrappers identityRotateKey/identityAddAgentKey/identityRotateAgentKey/identityRemoveAgentKey/identityMigrate; the module-level bridgeRegister free-function export (bindings/typescript/src/bridge.ts, re-exported from index.ts — NOT an SCP-class method); Python discover() in discovery.py and verify_payment_receipts() in economy.py",
+        "Add the bundled SDK-parity wrappers: TS SCP-class Identity wrappers identityRotateKey/identityAddAgentKey/identityRotateAgentKey/identityRemoveAgentKey/identityMigrate; Python discover() in discovery.py and verify_payment_receipts() in economy.py",
         "Flip the capability-matrix cells listed in the acceptance criteria, remove each now-stale C3c-follow-up exemption, and add the (\"UCAN\", \"evaluate\") alias to scripts/check-sdk-coverage.py",
         "Rebuild the test mocks to model nonce state (diagnostic records no nonce, gate records it), add a multi-token AND test, and ensure the real-napi evaluate assertions run unskipped",
         "Run all local gates (bun check/lint/test with the addon built, ruff + pytest with DYLD, check-sdk-coverage.py, validate-prd.py, Rust build + clippy) and confirm green before opening the PR"
@@ -10770,135 +10548,155 @@
       "severity": "critical",
       "status": "in-progress",
       "files": [
-        "crates/scp-crypto/src/p256.rs",
-        "crates/scp-crypto/src/kdf.rs",
-        "crates/scp-crypto/src/pseudonym.rs",
-        "crates/scp-crypto/src/lib.rs",
-        "crates/scp-platform/src/traits.rs",
-        "crates/scp-ffi/common/src/custody_parse.rs",
-        "crates/scp-ffi/uniffi/src/bridge.rs",
-        "crates/scp-ffi/uniffi/src/p256_host.rs",
-        "crates/scp-ffi/src/custody.rs",
-        "crates/scp-ffi/napi/src/custody.rs",
-        "bindings/typescript/src/internal/custody-adapter.ts",
-        "bindings/python/scp_sdk/scp.py",
-        "bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift",
-        "bindings/swift/Sources/SCP/Platform/P256Pseudonym.swift",
-        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidKeyCustody.kt",
-        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/P256Pseudonym.kt",
-        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/PseudonymSecret.kt",
-        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/Types.kt",
         ".docs/adrs/phase-1.md",
         ".docs/adrs/phase-4.md",
         ".docs/adrs/phase-5.md",
         ".docs/adrs/phase-6.md",
+        ".docs/architecture.md",
+        ".docs/prds/main.json",
         ".docs/specs/09-security-model.md",
         ".docs/specs/25-test-vectors.md",
+        ".docs/standards/sdk-capability-matrix.json",
+        ".docs/standards/sdk-common.md",
         "Cargo.lock",
         "Cargo.toml",
         "bindings/kotlin/scp-kt-android/build.gradle.kts",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidKeyCustody.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/P256Pseudonym.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/PseudonymSecret.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/Types.kt",
         "bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/platform/AndroidKeyCustodyPseudonymLifecycleTest.kt",
         "bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/platform/AndroidKeyCustodyTest.kt",
+        "bindings/python/scp_sdk/__init__.py",
         "bindings/python/scp_sdk/_scp_core.pyi",
+        "bindings/python/scp_sdk/scp.py",
         "bindings/python/tests/pseudonym_recipe.py",
         "bindings/python/tests/test_identity_create_with_custody.py",
+        "bindings/python/tests/test_p256_host_helpers.py",
         "bindings/python/tests/test_pseudonym_kat.py",
         "bindings/swift/Sources/SCP/Internal/ScpBindings.swift",
+        "bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift",
         "bindings/swift/Tests/SCPTests/Platform/AppleKeyCustodyTests.swift",
         "bindings/typescript/src/index.ts",
+        "bindings/typescript/src/internal/custody-adapter.ts",
         "bindings/typescript/src/scp.ts",
         "bindings/typescript/tests/custody-bridge-checks.test.ts",
         "bindings/typescript/tests/identity-create-with-custody.test.ts",
+        "bindings/typescript/tests/p256-host-helpers.test.ts",
         "bindings/typescript/tests/pseudonym-kat.test.ts",
-        "bindings/typescript/tests/pseudonym-recipe.ts",
         "crates/scp-client-wasm/tests/cross_target_determinism_kat.rs",
         "crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs",
         "crates/scp-crypto/Cargo.toml",
+        "crates/scp-crypto/README.md",
+        "crates/scp-crypto/src/custody.rs",
+        "crates/scp-crypto/src/lib.rs",
+        "crates/scp-crypto/src/p256.rs",
+        "crates/scp-crypto/src/pseudonym.rs",
         "crates/scp-crypto/src/signer.rs",
         "crates/scp-crypto/tests/wycheproof.rs",
         "crates/scp-crypto/tests/wycheproof/ecdh_secp256r1_ecpoint_test.json",
         "crates/scp-crypto/tests/wycheproof/ecdsa_secp256r1_sha256_p1363_test.json",
         "crates/scp-crypto/tests/wycheproof/ecdsa_secp256r1_sha256_test.json",
-        "crates/scp-ffi/Cargo.toml",
-        "crates/scp-ffi/common/Cargo.toml",
-        "crates/scp-ffi/common/src/error_codes.rs",
-        "crates/scp-ffi/napi/Cargo.toml",
-        "crates/scp-ffi/napi/src/context.rs",
-        "crates/scp-ffi/napi/src/testing.rs",
-        "crates/scp-ffi/napi/src/identity.rs",
-        "crates/scp-ffi/napi/src/scp.rs",
-        "crates/scp-ffi/napi/src/ucan.rs",
-        "crates/scp-ffi/src/context.rs",
-        "crates/scp-ffi/src/testing.rs",
-        "crates/scp-ffi/uniffi/Cargo.toml",
-        "crates/scp-ffi/uniffi/src/lib.rs",
-        "crates/scp-mls/Cargo.toml",
-        "crates/scp-mls/src/group.rs",
-        "crates/scp-platform/Cargo.toml",
-        "crates/scp-platform/src/file.rs",
-        "crates/scp-platform/src/lib.rs",
-        "crates/scp-platform/src/pseudonym_keys.rs",
-        "crates/scp-platform/src/sqlite/key_custody.rs",
-        "crates/scp-platform/src/testing/key_custody.rs",
-        "crates/scp-runtime/src/envelope/pseudonym.rs",
-        "crates/scp-testing/tests/integration/attacks.rs",
-        "crates/scp-testing/tests/integration/encrypted_relay_roundtrip.rs",
-        "crates/scp-testing/tests/integration/encryption.rs",
-        "crates/scp-testing/tests/integration/network_simulation.rs",
-        "scripts/ffi-export-allowlist.json",
-        "scripts/gen-test-vectors-p256.py",
-        ".docs/standards/sdk-common.md",
-        "crates/scp-ffi/napi/src/error.rs",
-        "crates/scp-ffi/napi/src/outlet_stream.rs",
-        "crates/scp-ffi/src/error.rs",
-        "crates/scp-ffi/src/identity.rs",
-        "crates/scp-ffi/src/outlet_stream.rs",
-        "crates/scp-ffi/uniffi/src/outlet_stream.rs",
-        "crates/scp-platform/src/error.rs",
-        "crates/scp-runtime/src/context/outlets/signer.rs",
         "crates/scp-event-log/src/checkpoint.rs",
         "crates/scp-event-log/src/lib.rs",
         "crates/scp-event-log/src/test_helpers.rs",
         "crates/scp-event-log/tests/test_vectors.rs",
+        "crates/scp-ffi/Cargo.toml",
+        "crates/scp-ffi/common/Cargo.toml",
+        "crates/scp-ffi/common/src/custody_parse.rs",
+        "crates/scp-ffi/common/src/error_codes.rs",
+        "crates/scp-ffi/common/src/lib.rs",
+        "crates/scp-ffi/common/src/p256_host.rs",
         "crates/scp-ffi/common/src/ucan_errors.rs",
+        "crates/scp-ffi/napi/Cargo.toml",
+        "crates/scp-ffi/napi/src/context.rs",
+        "crates/scp-ffi/napi/src/custody.rs",
+        "crates/scp-ffi/napi/src/error.rs",
         "crates/scp-ffi/napi/src/event_log.rs",
+        "crates/scp-ffi/napi/src/identity.rs",
+        "crates/scp-ffi/napi/src/lib.rs",
+        "crates/scp-ffi/napi/src/outlet_stream.rs",
+        "crates/scp-ffi/napi/src/outlet_stream/tests.rs",
+        "crates/scp-ffi/napi/src/p256_host.rs",
+        "crates/scp-ffi/napi/src/scp.rs",
+        "crates/scp-ffi/napi/src/testing.rs",
+        "crates/scp-ffi/napi/src/ucan.rs",
+        "crates/scp-ffi/src/context.rs",
+        "crates/scp-ffi/src/custody.rs",
+        "crates/scp-ffi/src/error.rs",
         "crates/scp-ffi/src/event_log.rs",
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/src/lib.rs",
+        "crates/scp-ffi/src/outlet_stream.rs",
+        "crates/scp-ffi/src/p256_host.rs",
+        "crates/scp-ffi/uniffi/Cargo.toml",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-ffi/uniffi/src/lib.rs",
+        "crates/scp-ffi/uniffi/src/outlet_stream.rs",
+        "crates/scp-ffi/uniffi/src/outlet_stream/tests.rs",
+        "crates/scp-ffi/uniffi/src/p256_host.rs",
+        "crates/scp-mls/Cargo.toml",
+        "crates/scp-mls/src/group.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-platform/Cargo.toml",
+        "crates/scp-platform/src/error.rs",
+        "crates/scp-platform/src/file.rs",
+        "crates/scp-platform/src/lib.rs",
+        "crates/scp-platform/src/pseudonym_checks.rs",
+        "crates/scp-platform/src/sqlite/key_custody.rs",
+        "crates/scp-platform/src/testing/key_custody.rs",
+        "crates/scp-platform/src/traits.rs",
         "crates/scp-protocol/src/context/mod.rs",
         "crates/scp-protocol/src/crypto/access_keys/mod.rs",
         "crates/scp-protocol/src/crypto/sender_keys/mod.rs",
         "crates/scp-protocol/src/crypto/ucan/mod.rs",
         "crates/scp-protocol/src/envelope/mod.rs",
         "crates/scp-runtime/src/context/export_import.rs",
+        "crates/scp-runtime/src/context/outlets/signer.rs",
         "crates/scp-runtime/src/context/outlets/stream.rs",
         "crates/scp-runtime/src/context/supervisor/spawn_from_welcome_tests.rs",
         "crates/scp-runtime/src/context/supervisor/supervisor.rs",
         "crates/scp-runtime/src/crypto/access_keys/wire.rs",
+        "crates/scp-runtime/src/crypto/key_loss_custody.rs",
+        "crates/scp-runtime/src/crypto/mod.rs",
         "crates/scp-runtime/src/crypto/sender_keys/key_protocol.rs",
         "crates/scp-runtime/src/crypto/ucan/mint.rs",
         "crates/scp-runtime/src/envelope/inner/sign.rs",
+        "crates/scp-runtime/src/envelope/pseudonym.rs",
         "crates/scp-runtime/src/event_log/mod.rs",
-        "crates/scp-crypto/src/custody.rs"
+        "crates/scp-runtime/tests/governance_integration.rs",
+        "crates/scp-testing/tests/integration/attacks.rs",
+        "crates/scp-testing/tests/integration/encrypted_relay_roundtrip.rs",
+        "crates/scp-testing/tests/integration/encryption.rs",
+        "crates/scp-testing/tests/integration/ffi_conformance.rs",
+        "crates/scp-testing/tests/integration/network_simulation.rs",
+        "scripts/bridge-aliases.json",
+        "scripts/check-sdk-coverage.py",
+        "scripts/ffi-export-allowlist.json",
+        "scripts/gen-test-vectors-p256.py"
       ],
-      "description": "Architecture slice S0 of the key-event-log identity substrate. ADR-063 moves every SCP key to ECDSA over NIST P-256 with SHA-256, and `09-security-model.md` §9.5 states the encoding and verification rules. This story adds P-256 to the wasm-safe `scp-crypto` crate and to `KeyCustody`, moves MLS to RFC 9420 ciphersuite 2 and HPKE to DHKEM(P-256), and adds the JOSE ES256 codec. S12 (SCP-315) wires that codec to UCAN. The key-event preimage types are SCP-308.",
+      "description": "The first architecture slice of the key-event-log identity substrate. ADR-063 moves every SCP key to ECDSA over NIST P-256 with SHA-256, and `09-security-model.md` §9.5 states the encoding and verification rules. This story adds P-256 to the wasm-safe `scp-crypto` crate and to `KeyCustody`, moves MLS to RFC 9420 ciphersuite 2 and HPKE to DHKEM(P-256), and adds the JOSE ES256 codec. SCP-315 wires that codec to UCAN. The key-event preimage types are SCP-308.",
       "acceptanceCriteria": [
         "`scp-crypto` verifies an ECDSA P-256/SHA-256 signature carried as 64 bytes of raw `r‖s`, each a 32-byte big-endian integer, and rejects any other length (`09-security-model.md` §9.5)",
         "`scp-crypto` rejects a signature whose `s` exceeds half the group order: a test flips a valid signature to `(r, n − s)` and asserts rejection (`09-security-model.md` §9.5)",
         "`scp-crypto` rejects a public key that is not a point on P-256, and rejects the point at infinity: one test per case (`09-security-model.md` §9.5)",
         "`scp-crypto` converts a DER-encoded ECDSA signature to the 64-byte raw form and rejects DER that is not canonical: a test per case",
         "Signing derives the per-signature nonce under RFC 6979 with SHA-256: a known-answer test reproduces the P-256 signatures Vectors 41 and 42 of `25-test-vectors.md` §25.26 carry (`09-security-model.md` §9.5)",
-        "`KeyCustody` generates, holds and signs with P-256 keys beside the Ed25519 keys the S12 cut-over deletes",
+        "`KeyCustody` generates, holds and signs with P-256 keys beside the Ed25519 keys the SCP-315 cut-over deletes",
         "MLS groups use RFC 9420 ciphersuite 2, HPKE uses DHKEM(P-256) under RFC 9180 Base mode, and the JOSE ES256 codec round-trips: one round-trip test per protocol (`09-security-model.md` §9.5)",
         "`cargo check -p scp-crypto --target wasm32-unknown-unknown` exits 0",
-        "A host `KeyCustodyProvider.derive_pseudonym` and `derive_rotatable_pseudonym` return a structured result carrying the 33-byte SEC1 compressed P-256 pseudonym point and the pseudonym's key id, in the UniFFI, PyO3 and napi bridges (`09-security-model.md` §9.10.4)",
-        "Each bridge binds a host pseudonym only when `get_public_key(key_id)` returns the same 33 bytes, and fails with `SCP-IDENT-1055` otherwise: a test per bridge",
-        "A pseudonym key signs only a 32-byte digest, and each bridge verifies the host's 64-byte `r‖s` strictly and rejects a high-`s` signature, for a pseudonym key this adapter derived and still holds bound; PR #2514 covers handles the adapter did not bind: a test per bridge (`09-security-model.md` §9.5)",
-        "The §25.19 Vector 30 and 31 points reproduce in Swift and Kotlin custody, and the v1 routing ids reproduce through the Rust, TypeScript and Python bridges. No bridge derives a v2 pseudonym on a production path, so scp-crypto's §25.19 KAT covers the v2 routing ids (`25-test-vectors.md` §25.19)",
-        "No unwrap() or expect() in library code"
+        "A host `KeyCustodyProvider.derive_pseudonym` and `derive_rotatable_pseudonym` return the 33-byte SEC1 compressed P-256 pseudonym point and nothing else, in the UniFFI, PyO3 and napi bridges, and each bridge computes the routing id from it (`09-security-model.md` §9.10.4)",
+        "Each bridge fails a host pseudonym derivation with `SCP-IDENT-1055` when the returned bytes are not a valid 33-byte compressed P-256 point, and reports a host `SCP-CRYPTO-4006` as key-not-found: a test per bridge",
+        "Each bridge exports `p256_pseudonym_point` and `p256_software_pseudonym_point` from one Rust implementation, and neither returns a private scalar: a test per bridge reproduces the §25.19 Vector 30 and 31 points (`09-security-model.md` §9.10.4.A)",
+        "The §25.19 Vector 30 and 31 points reproduce in Rust, Swift and Kotlin custody and through the TypeScript and Python software-host export; the Vector 30 v1 routing id reproduces through each bridge's callback adapter, for PyO3 and UniFFI in the Rust test `callback_pseudonym_routing_id_is_spec_25_19_vector_30` (`crates/scp-ffi/src/custody.rs`, `crates/scp-ffi/uniffi/src/bridge.rs`) and for napi in the TypeScript test \"the host receives the caller's context and epoch unchanged and the bridge returns the §25.19 Vector 30 routing ids\" (`bindings/typescript/tests/custody-bridge-checks.test.ts`), which runs through the addon's `TestingCallbackCustody` because a napi Rust unit test cannot host a JavaScript callback; scp-crypto's §25.19 KAT covers every routing id (`25-test-vectors.md` §25.19)",
+        "No unwrap() or expect() in library code",
+        "No custody stores a pseudonym key. After an identity is destroyed, deriving its v1 or v2 pseudonym fails with `SCP-CRYPTO-4006`, while another identity's pseudonyms still derive, in the file, SQLite, test, Apple and Android custodies. On Android hardware custody, a destroy that fails part-way leaves the identity destroyable, and a retry deletes the pseudonym secret: a test per custody (`09-security-model.md` §9.10.4.A)",
+        "A failed `KeyCustody` call keeps its kind across every layer: `EnvelopeError`, `ContextError`, `SenderKeyError`, `AccessKeyError`, `UcanError` and `EventLogError` carry it as a typed `CustodyFailure`, and the PyO3, napi and UniFFI bridges report key-not-found as `SCP-CRYPTO-4006`, a rejected host pseudonym as `SCP-IDENT-1055` and every other custody failure as `SCP-CRYPTO-4060`, whether it arrives as a `PlatformError` or as a `CustodyFailure`: one table test per bridge (ADR-006 2026-09-29 amendment, `sdk-common.md`)"
       ],
       "actionItems": [
         "Add P-256 verification, low-s, point validation, DER-to-raw conversion and SHA-256 to `scp-crypto`.",
-        "Add P-256 key generation, holding and signing to `KeyCustody` in every backend, beside the Ed25519 keys the S12 cut-over (SCP-315) deletes.",
-        "Move MLS and HPKE to their P-256 suites, and add the JOSE ES256 codec that S12 (SCP-315) wires to UCAN.",
+        "Add P-256 key generation, holding and signing to `KeyCustody` in every backend, beside the Ed25519 keys the SCP-315 cut-over deletes.",
+        "Move MLS and HPKE to their P-256 suites, and add the JOSE ES256 codec that SCP-315 wires to UCAN.",
         "Write the known-answer and negative tests the acceptance criteria name."
       ],
       "blockedBy": [],

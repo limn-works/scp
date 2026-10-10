@@ -64,7 +64,7 @@ SCP.Identity.recover(
 
 ### Identity Attestations (§3.5)
 
-Cryptographic proofs binding external platform identities to your identifier. Makes bridging trustworthy and social graph import possible.
+Cryptographic proofs binding external platform identities to your identifier. Makes social graph import possible.
 
 ```
 // Create an attestation linking your X handle to your identifier
@@ -317,7 +317,6 @@ SCP.Context.inspect(
   memoryScope: MemoryScope,        // ephemeral, summary, or full (§5.11)
   outlets: [OutletMetadata],      // name, description, input/output schema
   outletInterfaceCount: { inbound: Int, outbound: Int },  // active cross-context interfaces (§6.2)
-  bridges: [BridgeInfo]?,         // active bridge connectors, if any
   // For child contexts (§5.13):
   parents: [{
     contextID: contextID,
@@ -908,8 +907,6 @@ SCP.Governance.propose(
         | .addRole(name, [Capability])
         | .removeMember(Identifier)
         | .changeGovernance(GovernanceModel)
-        | .addBridge(BridgeDefinition)
-        | .removeBridge(bridgeID)
         | .modifyConsequenceRules([ConsequenceRule])
         | .modifyAdmissionRequirements(AdmissionRequirements)
 ) → Proposal { proposalID, requiredApprovals, deadline }
@@ -925,68 +922,6 @@ SCP.Governance.reject(proposalID, by: agentID) → ProposalStatus
 Resolution depends on governance model: single admin auto-approves, multi-sig waits for threshold, consensus waits for all members.
 
 The three-method interface (propose, approve, reject) is the mandatory protocol contract. All governance models must implement it. Single-admin auto-approves; multi-sig waits for threshold; consensus waits for all members. Custom governance models are pluggable within this interface.
-
----
-
-## 7. Bridge Connectors (§12)
-
-### Register Bridge
-
-Bring external platform participants into an SCP context.
-
-```
-SCP.Bridge.register(
-  context: contextID,
-  operator: Identifier,                   // accountable identity running the bridge
-  platform: "x" | "facebook" | "whatsapp" | "discord" | ...,
-  mode: .relay | .puppet | .api | .cooperative
-) → BridgeInstance { bridgeID, contextID, operator, platform, mode }
-```
-
-### Shadow Identities
-
-External platform users represented in SCP contexts.
-
-```
-// Bridge creates a shadow identity for an external user
-SCP.Bridge.createShadow(
-  bridge: bridgeID,
-  externalIdentity: { platform: "x", handle: "@dave" },
-  attributedBy: bridgeOperatorIdentifier
-) → ShadowIdentity {
-  shadowID, platform, handle, bridgeID,
-  role: "observer",               // restricted by default
-  provenance: .bridged(mode, operator)
-}
-
-// External user later claims their shadow with an identity attestation
-SCP.Bridge.claimShadow(
-  shadowID: shadowID,
-  claimant: Identifier,
-  attestation: Attestation        // identity_link matching the shadow's platform handle
-) → Result<ShadowClaimEvent, ClaimError>
-// On success: shadow retired, history attributed to the claimant's identifier
-// On error: ClaimError (HandleMismatch, AttestationInvalid, AlreadyClaimed, ShadowNotFound)
-```
-
-### Bridge Content Provenance
-
-All bridged content carries provenance automatically.
-
-```
-// Bridged message carries:
-BridgedMessage {
-  content: ...,
-  provenance: {
-    source: .bridge(bridgeID),
-    platform: "x",
-    operator: Identifier,
-    mode: .relay,
-    attribution: .shadow(shadowID) | .claimed(Identifier),
-    trustLevel: .native | .nativeBridged | .claimedShadow | .unclaimedShadow
-  }
-}
-```
 
 ---
 
@@ -1174,34 +1109,6 @@ let app = try await SCP.App.declare(
 // Protocol validates against ceiling + role, grants interfaces
 // Generated app uses app.interfaces.messaging and app.interfaces.outlets
 // Everything else (identity, encryption, trust) is invisible
-```
-
-### Bridging: X Users Participate in a Quest Community
-
-```swift
-// 1. Alice registers an X bridge in her quest context
-let bridge = try await SCP.Bridge.register(
-  context: quest.contextID,
-  operator: alice.identifier,           // Alice runs the bridge
-  platform: "x",
-  mode: .relay
-)
-
-// 2. Bridge creates shadow identities for X participants
-let daveShadow = try await SCP.Bridge.createShadow(
-  bridge: bridge.bridgeID,
-  externalIdentity: { platform: "x", handle: "@dave_cooks" },
-  attributedBy: alice.identifier
-)
-// Dave appears in context as observer, bridged provenance
-
-// 3. Dave later joins SCP and claims his shadow
-let claimResult = try await SCP.Bridge.claimShadow(
-  shadowID: daveShadow.shadowID,
-  claimant: dave.identifier,
-  attestation: daveXAttestation  // proves @dave_cooks is dave.identifier
-)
-// Shadow retired. Dave's historical bridged messages now attributed to his identifier.
 ```
 
 ### Blocking: Cryptographic, Identity-Level
@@ -1415,9 +1322,6 @@ No sender identifier. No context ID. No timestamp. No signature. The relay is a 
   },
   "consequence_rules": [
     { "trigger": "message_velocity > 50/min", "action": "capability_suspension", "duration": "1h" }
-  ],
-  "bridges": [
-    { "platform": "x", "mode": "relay", "operator": "<scp-identifier:operator>", "shadows": 12 }
   ],
   "ttl": null,
   "memory_scope": "full",

@@ -115,9 +115,8 @@ semantics".
 ### 3. `shutdown` takes a timeout and is async (#1549 PR 1)
 
 `BridgeInstance::shutdown` accepts a `timeout: Duration` and is async
-internally. Outstanding work gets the full timeout to drain; anything
-still running at the deadline is forcibly cancelled via
-`tokio_util::sync::CancellationToken`.
+internally. Outstanding work gets the full timeout to drain; ADR-048
+§5 states what the bridge aborts at the deadline.
 
 - **Python** — `scp.shutdown(5.0)` (seconds as `float`; the SDK wrapper
   converts to milliseconds and clamps to `u64::MAX`). Also runs

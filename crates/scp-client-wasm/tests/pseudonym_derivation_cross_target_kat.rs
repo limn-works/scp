@@ -3,8 +3,8 @@
 //!
 //! The software-custody pseudonym derivation — `derive_pseudonym_secret`
 //! (HKDF-SHA-256 over the 32-byte private key material) and
-//! `derive_pseudonym_keypair` (HMAC-SHA-256 context seed, then the FIPS 186-5
-//! A.2.1 seed-to-scalar step onto P-256) — lives in the wasm-safe
+//! `derive_pseudonym` (HMAC-SHA-256 context seed, then the FIPS 186-5 A.2.1
+//! seed-to-scalar step onto P-256, then the point) — lives in the wasm-safe
 //! `scp-crypto::pseudonym` module so the in-browser client derives its own
 //! per-context pseudonym in Rust over the wasm-held key WITHOUT forking the
 //! native `scp-platform` copy. This file is the guard that the shared
@@ -18,9 +18,9 @@
 // KATs assert on fixed vectors; `expect`/`unwrap`/`panic` keep failures legible.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use scp_crypto::p256::P256SigningKey;
+use scp_crypto::p256::{P256SecretKey, SeedLabel};
 use scp_crypto::pseudonym::{
-    derive_pseudonym_keypair, derive_pseudonym_secret, pseudonym_routing_id,
+    PseudonymVersion, derive_pseudonym, derive_pseudonym_secret, pseudonym_routing_id,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -33,10 +33,6 @@ use wasm_bindgen_test::wasm_bindgen_test;
 
 /// `context_id` used by both §25.19 derivation vectors.
 const KAT_CONTEXT_ID: &[u8] = b"context-alpha";
-
-/// The §25.2 seed-to-scalar label that maps a vector's identity seed to its
-/// identity P-256 scalar (the derivation's ikm).
-const IDENTITY_LABEL: &[u8] = b"SCP-TEST-VECTOR-KEY-V1";
 
 /// One §25.19 derivation vector, as hex: identity seed → identity scalar →
 /// `pseudonym_secret` → v1 pubkey and v2 pubkey at epoch 1 (33-byte
@@ -96,7 +92,7 @@ fn seed32(hex: &str) -> [u8; 32] {
 fn assert_pseudonym_derivation_cross_target_vectors() {
     for vector in [&VECTOR_30, &VECTOR_31] {
         // (1) identity seed → identity scalar (FIPS 186-5 A.2.1, §25.2 label).
-        let identity = P256SigningKey::from_seed(IDENTITY_LABEL, &seed32(vector.seed)).unwrap();
+        let identity = P256SecretKey::from_seed(SeedLabel::TestVectorKey, &seed32(vector.seed));
         let ikm = identity.to_scalar_bytes();
         assert_eq!(
             to_hex(ikm.as_ref()),
@@ -114,12 +110,9 @@ fn assert_pseudonym_derivation_cross_target_vectors() {
         );
 
         // (3) v1 (static) pseudonym public key matches the golden.
-        let v1 = derive_pseudonym_keypair(&ikm, KAT_CONTEXT_ID, None)
-            .unwrap()
-            .public_key()
-            .to_compressed();
+        let v1 = derive_pseudonym(&ikm, KAT_CONTEXT_ID, PseudonymVersion::Static);
         assert_eq!(
-            to_hex(&v1),
+            to_hex(&v1.to_compressed()),
             vector.v1_pub,
             "v1 pseudonym public key diverged from the §25.19 golden vector"
         );
@@ -130,12 +123,13 @@ fn assert_pseudonym_derivation_cross_target_vectors() {
         );
 
         // (4) v2 (rotatable, epoch = 1) pseudonym public key matches the golden.
-        let v2 = derive_pseudonym_keypair(&ikm, KAT_CONTEXT_ID, Some(1))
-            .unwrap()
-            .public_key()
-            .to_compressed();
+        let v2 = derive_pseudonym(
+            &ikm,
+            KAT_CONTEXT_ID,
+            PseudonymVersion::Rotatable { epoch: 1 },
+        );
         assert_eq!(
-            to_hex(&v2),
+            to_hex(&v2.to_compressed()),
             vector.v2_pub,
             "v2 (epoch=1) pseudonym public key diverged from the §25.19 golden vector"
         );
@@ -163,9 +157,9 @@ fn pseudonym_derivation_matches_golden_vectors() {
 
 // ---------------------------------------------------------------------------
 // C2 — the FULL `ScpMlsGroup::derive_pseudonym` serde-extraction path, driven on
-// BOTH native and wasm32. The KAT above pins the raw `derive_pseudonym_keypair`
+// BOTH native and wasm32. The KAT above pins the raw `derive_pseudonym`
 // recipe; this exercises the driver's actual reach into the openmls
-// `SignatureKeyPair` (recovering the 32-byte Ed25519 seed, the S0 ikm, through the type's serde
+// `SignatureKeyPair` (recovering the 32-byte Ed25519 seed, the interim ikm, through the type's serde
 // form — the step whose wasm32 32-bit-`usize` behavior the byte-parity claim
 // depends on). The MLS key is random, so this is not a fixed-byte golden; instead
 // it pins determinism + context-separation + restore-stability of the serde path

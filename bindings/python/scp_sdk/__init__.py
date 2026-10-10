@@ -28,29 +28,34 @@ handle.
 
 from __future__ import annotations
 
-import sys
+from scp_sdk._extension import reject_load_failure as _reject_load_failure
 
-# Register the native extension under its bare name so that function-scoped
-# ``import _scp_core`` (used throughout the SDK) resolves correctly.  Maturin
-# installs the extension as ``scp_sdk._scp_core`` (see pyproject.toml
-# module-name), but every call-site does a bare ``import _scp_core``.
+# Import the native extension while the package loads, so that a broken build
+# fails here. Maturin installs the extension as ``scp_sdk._scp_core`` (see
+# pyproject.toml module-name), and every SDK accessor reaches it by that name
+# through ``scp_sdk._extension.native_module``. The package registers no
+# bare-name ``_scp_core`` alias in ``sys.modules``, because no code in this
+# repository imports the bare name:
+# ``test_no_sdk_or_test_file_imports_the_extension_by_its_bare_name`` in
+# ``bindings/python/tests/test_extension_loading.py`` scans ``scp_sdk/``, the
+# SDK's ``tests/``, and the repository-root ``tests/`` for one.
+#
+# An absent extension is swallowed, so a pure-Python or mocked environment
+# still imports the package. A present extension that failed to load raises
+# ``SCP-VALID-7082`` from here, because ``ImportError`` carries both causes
+# and reporting a load failure as absence lets every
+# ``except ImportError: pytest.skip(...)`` guard under ``bindings/python/tests``
+# skip the whole real-FFI suite over a broken artifact. The error raised is a
+# ``ValidationError``, not an ``ImportError``, so no such guard catches it.
 try:
-    from scp_sdk import _scp_core
-
-    sys.modules["_scp_core"] = _scp_core
-except ImportError:
-    pass  # Native extension not available (pure-Python / mocked tests)
+    from scp_sdk import _scp_core  # noqa: F401
+except ImportError as _exc:
+    _reject_load_failure(_exc)
 
 from scp_sdk.auth import (
     ScpIdAuthentication,
     ScpIdChallenge,
     ScpIdResponse,
-)
-from scp_sdk.bridge import (
-    bridge_provenance_tier,
-)
-from scp_sdk.bridge import (
-    register as bridge_register,
 )
 from scp_sdk.context import (
     AssetEntry,
@@ -165,12 +170,15 @@ from scp_sdk.scp import (
     SCP,
     InMemoryStorage,
     InviteMemberOutcome,
+    KeyCustodyProvider,
     McpAllowlistState,
     Sealed,
     SealedInvitation,
     SqlitePassphraseStorage,
     SqliteStorage,
     StorageConfig,
+    p256_pseudonym_point,
+    p256_software_pseudonym_point,
 )
 from scp_sdk.server import Node, Relay
 from scp_sdk.sync import classify_offline, get_policy, run_sync
@@ -207,7 +215,6 @@ from scp_sdk.trust import (
     verify_participation_requirements,
 )
 from scp_sdk.types import (
-    BridgeMode,
     Capability,
     CeilingPolicy,
     ContextMode,
@@ -219,7 +226,6 @@ from scp_sdk.types import (
     PromotionPolicy,
     Provenance,
     ProvenanceQuality,
-    ShadowStatus,
     SourceType,
 )
 from scp_sdk.ucan import UcanToken
@@ -239,7 +245,6 @@ __all__ = [
     "AttestorInfo",
     "BatchPublishResult",
     "BehavioralRecord",
-    "BridgeMode",
     "CachedAttestation",
     "CachedAttestationEnvelope",
     "Capability",
@@ -272,6 +277,7 @@ __all__ = [
     "InvalidGrant",
     "InviteMemberOutcome",
     "InvocationHandle",
+    "KeyCustodyProvider",
     "KeyNotFoundError",
     "McpAllowlistState",
     "McpClient",
@@ -315,7 +321,6 @@ __all__ = [
     "ScpIdResponse",
     "Sealed",
     "SealedInvitation",
-    "ShadowStatus",
     "SignedCheckpoint",
     "SiteConfig",
     "SourceType",
@@ -338,8 +343,6 @@ __all__ = [
     "VerificationLevel",
     "__version__",
     "auto_accept_blocked",
-    "bridge_provenance_tier",
-    "bridge_register",
     "check_capability_requirements",
     "check_media_capability",
     "check_policy_lock",
@@ -363,6 +366,8 @@ __all__ = [
     "media_send_signaling",
     "media_verify_sender_attribution",
     "normalize_address",
+    "p256_pseudonym_point",
+    "p256_software_pseudonym_point",
     "parse_address",
     "policy_requires_payment",
     "run_sync",
