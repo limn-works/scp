@@ -897,7 +897,7 @@ The Python SDK is the most critical binding. The agent ecosystem is Python. If t
 **Design principles:**
 - Pythonic. async/await. Type hints. No Rust concepts leaking through.
 - `pip install scp-python` installs a wheel with the Rust binary embedded (via maturin/PyO3).
-- Zero Rust toolchain required for users.
+- Users on a platform and CPython minor a wheel covers need no Rust toolchain. The supported floor is CPython 3.10, and the release wheels cover CPython 3.10-3.13 (ADR-013, the PyO3 bridge layer, in `.docs/adrs/phase-3.md`; the Python row of `.docs/standards/python.md` §Toolchain).
 
 **The 20-line agent:**
 

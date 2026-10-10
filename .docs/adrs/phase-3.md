@@ -37,7 +37,7 @@ Build order: ADR-013 (depends on all Phase 1 + Phase 2 Rust crates) --> ADR-014 
 
 The Python SDK is the most critical language binding for SCP. The agent ecosystem — LangChain, CrewAI, AutoGen, custom agents — is overwhelmingly Python (architecture.md section 3.1). If agents cannot `import scp`, the protocol does not exist to them. The bridge layer is the boundary between the Rust protocol engine (scp-core, scp-transport, scp-platform) and the Python world. It must expose core SCP types and operations to Python without leaking Rust concepts, while bridging async runtimes (tokio on the Rust side, asyncio on the Python side).
 
-PyO3 is the established Rust-Python FFI framework, and maturin is the standard build tool for PyO3 projects. Together they produce Python wheels with the compiled Rust binary embedded — users run `pip install scp-python` and get a working binary extension with zero Rust toolchain requirement (architecture.md section 3.1).
+PyO3 is the established Rust-Python FFI framework, and maturin is the standard build tool for PyO3 projects. Together they produce Python wheels with the compiled Rust binary embedded — users on a platform and CPython minor a wheel covers run `pip install scp-python` and get a working binary extension with no Rust toolchain (architecture.md section 3.1).
 
 ### Decision
 
@@ -162,7 +162,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
     - `maturin build --release` produces optimized wheels.
     - `maturin publish` uploads to PyPI.
     - CI builds wheels for Linux (manylinux2014 x86_64 + aarch64), macOS (universal2), Windows (x86_64).
-    - Users install with `pip install scp-python` — no Rust toolchain required.
+    - Users on a platform and CPython minor a wheel covers (the release wheels cover CPython 3.10-3.13; 3.10 is the supported floor) install with `pip install scp-python` — no Rust toolchain required.
 
 ### Scope
 
@@ -912,7 +912,7 @@ Build order:
 The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with the Phase 1 and Phase 2 Rust stacks:
 
 ```
-1. Install the SDK: `pip install scp-python` in a clean Python venv. No Rust toolchain.
+1. Install the SDK: `pip install scp-python` in a clean Python venv on a platform and CPython minor a wheel covers. No Rust toolchain.
    Zero compilation. Binary wheel installs in seconds.
 
 2. Alice creates an identity in Python:
@@ -994,7 +994,7 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
     full PEP 484 hints. IDE autocompletion works.
 ```
 
-This test proves: pip install works without Rust, the 20-line agent works, async Python wraps Rust correctly, UCAN enforces on every action, MCP exposes SCP outlets to any model, the event log is queryable from Python, and the full Phase 1 + Phase 2 Rust stack is accessible through a Pythonic API.
+This test proves: pip install works without Rust on a platform and CPython minor a wheel covers, the 20-line agent works, async Python wraps Rust correctly, UCAN enforces on every action, MCP exposes SCP outlets to any model, the event log is queryable from Python, and the full Phase 1 + Phase 2 Rust stack is accessible through a Pythonic API.
 
 ---
 
