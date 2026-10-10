@@ -55,7 +55,8 @@ from typing import (
     runtime_checkable,
 )
 
-from scp_sdk.errors import ScpError, _coded_bridge_error
+from scp_sdk._extension import EXTENSION_LOAD_FAILED_CODE, native_module
+from scp_sdk.errors import ScpError, ValidationError, _coded_bridge_error
 from scp_sdk.types import CustodyType
 
 if TYPE_CHECKING:
@@ -368,20 +369,12 @@ def _native_mod() -> Any:
     Raised at call time (not import time) so that pure-Python environments
     — where the native extension isn't available — can still ``import
     scp_sdk`` without an ImportError. The caller sees a meaningful
-    :class:`ScpError` the first time they actually use the bridge.
+    :class:`~scp_sdk.errors.ValidationError` the first time they actually use the bridge.
 
     Used by SDK wrappers that route to module-level free functions per
     ADR-048 §1 (pure helpers exposed as ``_scp_core.<name>``).
     """
-    try:
-        import _scp_core  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise ScpError(
-            "The _scp_core extension module is not installed. "
-            "Install scp-python with: pip install scp-python",
-            code="SCP-UNKNOWN-0001",
-        ) from exc
-    return _scp_core
+    return native_module()
 
 
 def p256_pseudonym_point(context_seed: bytes | bytearray) -> bytes:
@@ -432,16 +425,21 @@ def _native_cls() -> Any:
     Raised at call time (not import time) so that pure-Python environments
     — where the native extension isn't available — can still ``import
     scp_sdk`` without an ImportError. The caller sees a meaningful
-    :class:`ScpError` the first time they actually construct an instance.
+    :class:`~scp_sdk.errors.ValidationError` the first time they actually construct an instance.
     """
     mod = _native_mod()
     cls = getattr(mod, "SCP", None)
     if cls is None:
-        raise ScpError(
-            "_scp_core does not export the SCP class — rebuild the native "
-            "extension with `maturin develop --release` from the Phase 4 "
-            "PR 1 codebase.",
-            code="SCP-UNKNOWN-0001",
+        # The module loaded, so the extension is installed and this is a wrong
+        # or partial build. ``EXTENSION_LOAD_FAILED_CODE`` says so, and the
+        # ``scp`` fixture in bindings/python/tests/conftest.py fails on that
+        # code instead of skipping, which ``EXTENSION_ABSENT_CODE`` would have
+        # done.
+        raise ValidationError(
+            "_scp_core loaded but does not export the SCP class — rebuild the "
+            "native extension with `maturin develop --release` from "
+            "bindings/python.",
+            code=EXTENSION_LOAD_FAILED_CODE,
         )
     return cls
 
@@ -654,9 +652,7 @@ class SCP:
         """Shut down this instance with a graceful deadline.
 
         Drains in-flight tasks within ``timeout`` seconds, aborts any
-        stragglers, then runs typed-field cleanup. A second call is a
-        no-op (the underlying :class:`ShutdownError::AlreadyShutDown` is
-        swallowed at the SDK surface).
+        stragglers, then runs typed-field cleanup.
 
         ``timeout`` is clamped defensively: ``NaN`` and negative values
         map to ``0`` (abort immediately); ``math.inf`` or values that
@@ -678,10 +674,14 @@ class SCP:
         :param timeout: Maximum seconds to wait for in-flight tasks
             (float — fractional seconds are preserved to millisecond
             resolution before crossing the FFI boundary).
-        :raises ContextError: If the tokio runtime is unavailable.
+        :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
+            store still holds its advisory lock after the call.
         """
         millis = self._shutdown_millis(timeout)
-        await asyncio.to_thread(self._native.shutdown, millis)
+        try:
+            await asyncio.to_thread(self._native.shutdown, millis)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     def __enter__(self) -> SCP:
         """Enter the synchronous context-manager scope — returns ``self``."""
@@ -698,9 +698,20 @@ class SCP:
         Calls ``_native.shutdown`` directly — the PyO3 bridge already
         runs ``block_on`` internally, so the sync path is correct here.
         Async callers should use :meth:`__aexit__` / ``async with``.
+
+        :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
+            store still holds its advisory lock after the call and the
+            ``with`` body raised nothing. When the body raised, the
+            shutdown error is logged and the body's exception propagates.
         """
-        del exc_type, exc, tb
-        self._native.shutdown(self._shutdown_millis(5.0))
+        del exc_type, tb
+        try:
+            self._native.shutdown(self._shutdown_millis(5.0))
+        except Exception as shutdown_exc:
+            coded = _coded_bridge_error(shutdown_exc)
+            if exc is None:
+                raise coded from shutdown_exc
+            logger.warning("SCP shutdown on with-scope exit failed: %s", coded)
 
     async def __aenter__(self) -> SCP:
         """Enter the asynchronous context-manager scope — returns ``self``."""
@@ -716,9 +727,19 @@ class SCP:
 
         Awaits :meth:`shutdown` so the event loop keeps running while
         the tokio runtime drains in-flight tasks.
+
+        :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
+            store still holds its advisory lock after the call and the
+            ``async with`` body raised nothing. When the body raised, the
+            shutdown error is logged and the body's exception propagates.
         """
-        del exc_type, exc, tb
-        await self.shutdown()
+        del exc_type, tb
+        try:
+            await self.shutdown()
+        except ScpError as shutdown_exc:
+            if exc is None:
+                raise
+            logger.warning("SCP shutdown on async-with exit failed: %s", shutdown_exc)
 
     # ------------------------------------------------------------------
     # Operation methods — 159 bridge delegators (PyO3 → asyncio.to_thread)
@@ -1372,10 +1393,10 @@ class SCP:
         (governed-context invitations are not yet implemented).
 
         The invite routes through the actor governance gate, which requires the
-        inviter to hold the ``governance:propose`` capability. A normally-created
-        ``SingleAdmin`` context grants its admin that capability at genesis, so it
-        works out of the box; a context with a custom ceiling must grant
-        ``governance:propose`` to the inviter.
+        inviter to hold the ``governance:propose`` capability. The creator of a
+        ``SingleAdmin`` context holds the admin role, which grants every
+        capability in the context's declared ceiling, so the creator can invite
+        only when that ceiling includes ``governance:propose``.
 
         Example::
 
@@ -1555,17 +1576,24 @@ class SCP:
         parent_token: str,
         capabilities: list[str],
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.ucan_delegate`` (returns :class:`UcanToken`)."""
+        """Delegate to ``_scp_core.SCP.ucan_delegate`` (returns :class:`UcanToken`).
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
+        """
         from scp_sdk.ucan import UcanToken
 
-        raw = await asyncio.to_thread(
-            self._native.ucan_delegate,
-            context_id,
-            delegator_did,
-            delegatee_did,
-            parent_token,
-            capabilities,
-        )
+        try:
+            raw = await asyncio.to_thread(
+                self._native.ucan_delegate,
+                context_id,
+                delegator_did,
+                delegatee_did,
+                parent_token,
+                capabilities,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return UcanToken._from_bridge(raw)
 
     async def ucan_mint(
@@ -1575,17 +1603,31 @@ class SCP:
         capabilities: list[str],
         proofs: list[str] | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.ucan_mint`` (returns :class:`UcanToken`)."""
+        """Delegate to ``_scp_core.SCP.ucan_mint`` (returns :class:`UcanToken`).
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
+        """
         from scp_sdk.ucan import UcanToken
 
-        raw = await asyncio.to_thread(
-            self._native.ucan_mint, context_id, member_did, capabilities, proofs
-        )
+        try:
+            raw = await asyncio.to_thread(
+                self._native.ucan_mint, context_id, member_did, capabilities, proofs
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return UcanToken._from_bridge(raw)
 
     async def ucan_revoke(self, context_id: str, token: str, revoker_did: str) -> Any:
-        """Delegate to ``_scp_core.SCP.ucan_revoke``."""
-        return await asyncio.to_thread(self._native.ucan_revoke, context_id, token, revoker_did)
+        """Delegate to ``_scp_core.SCP.ucan_revoke``.
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
+        """
+        try:
+            return await asyncio.to_thread(self._native.ucan_revoke, context_id, token, revoker_did)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def ucan_validate(
         self,
@@ -1602,6 +1644,9 @@ class SCP:
         presenting agent to the token's own ``aud`` (which would make the
         step-5 audience check the tautology ``aud == aud`` and inflate trust).
         Pass the DID the token must be addressed to.
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
         """
 
         try:
@@ -1657,21 +1702,27 @@ class SCP:
         capability URI to additionally require the token grants it. (The
         enforcing :meth:`ucan_validate` gate keeps a mandatory capability.)
 
-        Raises ``ValidationError`` only for malformed FFI input
+        Raises ``ValidationError`` for malformed FFI input
         (e.g. an invalid ``context_id`` / ``token`` / ``capability`` /
         ``did``); capability/signature/expiry outcomes are reported via the
         returned booleans, never as exceptions.
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
         """
         from scp_sdk.trust import structured_to_capability_validation
 
-        raw = await asyncio.to_thread(
-            self._native.ucan_evaluate,
-            context_id,
-            token,
-            capability,
-            presenting_agent_did,
-            proof_tokens,
-        )
+        try:
+            raw = await asyncio.to_thread(
+                self._native.ucan_evaluate,
+                context_id,
+                token,
+                capability,
+                presenting_agent_did,
+                proof_tokens,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         # Shared six-field projection — pins the canonical CapabilityValidation
         # shape in one place (the same helper Layer 1 of ``evaluate_trust`` uses).
         return structured_to_capability_validation(raw)
@@ -1933,12 +1984,18 @@ class SCP:
 
     # region MCP
 
-    async def mcp_client_connect_sse(self, url: str) -> Any:
-        """Connect an MCP client via SSE transport (returns :class:`McpClient`)."""
+    async def mcp_client_connect_sse(self, url: str, auth_token: str | None) -> Any:
+        """Connect an MCP client via SSE transport (returns :class:`McpClient`).
+
+        *auth_token* is the bearer token sent in an ``Authorization`` header
+        on every request, or ``None`` for a server that runs no bearer check.
+        An SCP SSE server always runs one (ADR-015). The transport has no
+        TLS, so a token is sent only to a loopback host.
+        """
         from scp_sdk.mcp import McpClient, validate_client_connect
 
         validate_client_connect("sse", url=url)
-        raw = await asyncio.to_thread(self._native.py_mcp_client_connect_sse, url)
+        raw = await asyncio.to_thread(self._native.py_mcp_client_connect_sse, url, auth_token)
         return McpClient(raw)
 
     async def mcp_client_connect_stdio(self, command: list[str]) -> Any:
@@ -2759,11 +2816,9 @@ class SCP:
         receipt and captured output bytes — or reaches a typed terminal,
         which is re-raised as one of the SDK saga exceptions:
 
-        - :class:`~scp_sdk.errors.SagaAbortedError` — a Prepare-phase abort:
-          a PERMANENT rejection OR a RETRYABLE transient (rate limit /
-          participant actor unavailable), distinguished by the
-          ``SCP-SAGA-*`` code; carries ``retry_after_ms`` (``None``, never
-          ``0``, when no precise back-off exists).
+        - :class:`~scp_sdk.errors.SagaAbortedError` — the code tells its
+          causes apart; carries ``retry_after_ms`` (``None``, never ``0``,
+          when no precise back-off exists).
         - :class:`~scp_sdk.errors.SagaNeedsRepairError` — Commit retries
           exhausted; carries the durable ``saga_id`` repair handle.
         - :class:`~scp_sdk.errors.SagaBusyError` — the participant context

@@ -259,6 +259,8 @@ constant).
 | `SCP-CTX-2085` | `scp-client-wasm` (browser participant) | Driver invariant violation / malformed driver argument (`ClientError::Driver`) |
 | `SCP-CTX-2086` | `scp-client-wasm` (browser participant) | No retained pending join material — join must reconstruct from the durable snapshot (`ClientError::NoPendingJoinMaterial`). (Sits at 2086 because 2080/2081 are taken by the Kotlin SDK.) |
 | `SCP-CTX-2095` | native FFI-common registry + Swift + Kotlin + ts-native + `scp-client-wasm` (**shared meaning, all surfaces**) | Pseudonym registry empty — peers have not announced routing IDs (§9.10.4); native `ContextError::PseudonymRegistryEmpty`, browser `ClientError::PseudonymRegistryEmpty` |
+| `SCP-CTX-2138` | native FFI-common registry | Operation refused because the owning Supervisor began shutdown or dropped (`ContextError::SupervisorShutDown`, ADR-049 Decision 16 items 2 and 4) — NOT emitted by `scp-client-wasm` |
+| `SCP-CTX-2139` | native FFI-common registry | Outlet stream or streaming saga that the Supervisor had opened, dropped unregistered because bridge shutdown began; the operation had started (ADR-049 Decision 16 item 2) — NOT emitted by `scp-client-wasm` |
 | `SCP-CRYPTO-4006` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`), the ts-native, Python and `UniFFI` host custody contracts, and the Kotlin SDK key custody interface | Key not found: the key handle is unknown or its key was destroyed (`PlatformError::KeyNotFound`). A host custody callback signals key-not-found with this code, and the bridge maps a host failure with any other code to `SCP-CRYPTO-4060`. ADR-006's 2026-09-29 amendment fixes this mapping. The Kotlin SDK key custody interface (`AndroidKeyCustody`) throws this code for every key-not-found |
 | `SCP-CRYPTO-4010` | native FFI-common registry (also Kotlin SDK) | MLS group create error — native meaning; NOT emitted by `scp-client-wasm` |
 | `SCP-CRYPTO-4020` | `scp-client-wasm` (browser participant) | Sender-key (§9.16) layer failure (`ClientError::SenderKey`) |
@@ -274,6 +276,8 @@ constant).
 | `SCP-VALID-7029` | `scp-client-wasm` (browser participant) | Frame content type did not match its relay channel — §9.10.4 mis-routed frame, defense-in-depth (`ClientError::ChannelContentMismatch`) |
 | `SCP-VALID-7025` | `@limn-works/scp-ts-wasm` (browser SDK wrapper) | wasm module not initialized — `initScp()` (or `ScpBrowserClient.connect`) must be awaited before constructing/using a client |
 | `SCP-VALID-7026` | `@limn-works/scp-ts-wasm` (browser SDK wrapper) | `WebSocketRelaySocket` (the managed transport) passed to `create()` instead of `ScpBrowserClient.connect()` — it would be left unattached |
+| `SCP-VALID-7081` | SDK-wrapper native-loader guard (**one meaning in every SDK that loads a native bridge**; never minted by a bridge). ts-native SDK: `src/internal/native.ts`. Python SDK: `scp_sdk/_extension.py` | No native bridge is installed for the platform; in the ts-native SDK, no napi addon package resolves; in the Python SDK, no `scp_sdk._scp_core` extension file is present. The only native-load failure a test skip guard may treat as absence |
+| `SCP-VALID-7082` | SDK-wrapper native-loader guard (**one meaning in every SDK that loads a native bridge**; never minted by a bridge). ts-native SDK: `src/internal/native.ts`, `src/scp.ts`. Python SDK: `scp_sdk/__init__.py`, `scp_sdk/_extension.py`, `scp_sdk/scp.py` | A native bridge is installed and failed to load (`dlopen` error, ABI or architecture mismatch, missing shared library), or it loaded without an export the SDK calls. A test skip guard fails on it |
 
 The browser participant reuses **only** `SCP-CTX-2095` from the shared band —
 its condition is semantically identical on all five surfaces. Every other
@@ -302,6 +306,8 @@ enforcement mechanism.)
 | `SCP-STORAGE-8002` | `scp-kt-android` `AndroidStorage` | Storage operation failed |
 | `SCP-STORAGE-8003` | `scp-kt-android` `AndroidStorage` | Key derivation failed |
 | `SCP-STORAGE-8004` | selection layer (all bridges) | Selected durable storage backend failed to open |
+| `SCP-STORAGE-8005` | selection layer, SDK `shutdown`, and `From<PlatformError>` translation (all bridges) | Durable storage directory's advisory lock is still held: at open, by another store; at shutdown, by the instance's own store (§17.6 "One Opener per Durable Directory") |
+| `SCP-STORAGE-8006` | `From<PlatformError>` translation (all bridges) | `PlatformError::StorageClosed` (§17.6 "One Opener per Durable Directory") |
 | `SCP-STORAGE-8010` | `scp-client-wasm` (browser participant) | Injected `Storage` backend I/O fault (`get`/`put`/`delete`/`list_keys`) |
 | `SCP-STORAGE-8011` | `scp-client-wasm` (browser participant) | Corrupt snapshot — bad decode / unknown version / context-id-vs-key mismatch / §9.9.3 checkpoint mismatch |
 | `SCP-STORAGE-8012` | `scp-client-wasm` (browser participant) | Snapshot / pending-join blob belongs to a different identity (owner-identifier mismatch) |
@@ -310,12 +316,19 @@ enforcement mechanism.)
 The browser participant codes (`8010-8013`) start at `8010` specifically to avoid
 colliding with the Android backend's `8001-8003`, which were allocated first.
 
-The selection layer owns `8000` and `8004`. `8000` reports that the caller named
-no storage backend; `8004` reports that the backend the caller did name failed to
-open — a wrong `SQLCipher` key or passphrase, an unwritable directory, a corrupt
-file, a salt-sidecar fail-closed condition, or a database another `SCP` instance
-already holds an advisory lock on. The `PyO3`, NAPI and `UniFFI` bridges all
-raise `8004` for that one condition. The second selection-layer code took `8004`
+The selection layer owns `8000` and `8004`, and shares `8005` with each bridge's SDK `shutdown` and its `From<PlatformError>` translation of `PlatformError::StorageLockHeld`. `8000` reports that the caller
+named no storage backend; `8004` reports that the backend the caller did name
+failed to open — a wrong `SQLCipher` key or passphrase, an unwritable directory, a
+corrupt file, or a salt-sidecar fail-closed condition. At open, `8005` reports that another
+store, in this process or another, holds the directory's advisory lock. An SDK `shutdown` raises `8005` when it
+leaves the instance's own store holding its lock: the Supervisor drain did not finish
+(`ShutdownOutcome::TimedOut` with `drain` set to `DrainState::Running` and `durable_store_open`),
+the drain task panicked or was cancelled (`ShutdownOutcome::TimedOut` with `drain` set to
+`DrainState::Panicked` or `DrainState::Cancelled`, and `durable_store_open`), the store refused to close
+(`ShutdownError::DurableStoreClose`), or an earlier shutdown had not closed it by the
+time this call's timeout passed (`ShutdownError::AlreadyShutDown` with
+`durable_store_open`) (ADR-048 §5, amendment 2026-10-04). The `PyO3`, NAPI and `UniFFI` bridges all raise
+the same code for each of these conditions. The second selection-layer code took `8004`
 rather than `8001` because the Android backend already owns `8001-8003`: an
 Android app links `AndroidStorage` and the `UniFFI` bridge into one process, so
 reusing `8001` would make one code string mean both "storage key not found" and
@@ -325,7 +338,7 @@ reusing `8001` would make one code string mean both "storage key not found" and
 
 | Code | Description |
 |------|-------------|
-| `SCP-ATTEST-9001` | Device attestation provider call failed: a Play Integrity token request failed, or Apple's App Attest service answered with an error no narrower code names |
+| `SCP-ATTEST-9001` | Device attestation provider call failed: a Play Integrity token request failed, Apple's App Attest service answered with an error no narrower code names, or the caller's task was cancelled while its App Attest call was queued or waiting for Apple |
 | `SCP-ATTEST-9006` | Attestation verification requires raw JSON, which is absent |
 | `SCP-ATTEST-9010` | Identity link attestation create bridge function not yet exported |
 | `SCP-ATTEST-9011` | Identity link attestation list bridge function not yet exported |
@@ -338,7 +351,13 @@ reusing `8001` would make one code string mean both "storage key not found" and
 | `SCP-ATTEST-9018` | Cryptographic-class attestation not verifiable via browser fetch |
 | `SCP-ATTEST-9019` | Apple App Attest is unsupported on this device: `DCAppAttestService.isSupported` is `false`, or an App Attest call answered with `DCError.featureUnsupported` |
 | `SCP-ATTEST-9020` | No App Attest key ID is stored, so no assertion is possible |
+| `SCP-ATTEST-9021` | Apple already attested this App Attest key |
+| `SCP-ATTEST-9022` | Apple refused an `assertRequest` assertion with a stored App Attest key that carries no attestation record |
+| `SCP-ATTEST-9023` | Apple's App Attest service rejected this device's key |
+| `SCP-ATTEST-9024` | Apple App Attest `attestKey` or `generateAssertion` answered with `DCError.serverUnavailable`; the Apple adapter keeps the key for a retry |
 | `SCP-ATTEST-9025` | The App Attest adapter reached a state no caller input produces: Apple's service answered a completion handler with neither a value nor an error |
+| `SCP-ATTEST-9026` | The attestation challenge or the assertion request hash is not 32 bytes |
+| `SCP-ATTEST-9027` | Apple App Attest did not answer one serialized call (one `attest` or one `assertRequest`) within 25 seconds of the call's start; the adapter runs the next queued call and discards any later answer |
 
 ### SCP-IDENT-1017 and its cross-bridge contract
 
@@ -430,10 +449,18 @@ SCP objects hold crypto state (MLS groups, key material, WebSocket connections) 
 | Python | `async with` (context manager) | `Context`, `Identity`, transport connections |
 | TypeScript | `using` / `Symbol.dispose` (Explicit Resource Management) | `Context`, `Identity` |
 | Swift | `deinit` + explicit `close()` | `Context`, `Identity` |
-| Kotlin | `use { }` / `Closeable` | `Context`, `Identity` |
+| Kotlin | one `suspend` teardown function, and no `Closeable` — see below | `SCP`, `Relay`, `Node`, `ScpHotStreams` (`scp-kt-android`) |
 | Go | `defer ctx.Close()` / `io.Closer` | `Context`, `Identity` |
 | C# | `await using` / `IAsyncDisposable` | `Context`, `Identity` |
 | Java | `try-with-resources` / `AutoCloseable` | `Context`, `Identity` |
+
+### Kotlin: why no `Closeable`
+
+`AutoCloseable.close()` is synchronous, and `use { }` treats its return as the end of the teardown, so a `close()` whose teardown suspends on an injected dispatcher can keep that promise only by blocking its calling thread. That fails in two ways: a caller injecting a `StandardTestDispatcher` parks the one thread that advances that dispatcher's scheduler, so the teardown never runs and `close()` never returns, which this repository observed as a hang in `ScpViewModel.onCleared()`'s tests; and an Android caller blocks a main thread, which risks an ANR. A bounded wait still blocks, so it trades a deadlock for an ANR rather than removing a blocking wait.
+
+`SCP`, `Relay`, `Node`, and `ScpHotStreams` (`scp-kt-android`) therefore each expose their teardown as one `suspend` function — `SCP.shutdown(bridge, timeout)`, `Relay.shutdown()`, `Node.shutdown()`, `ScpHotStreams.close()` — implement no `AutoCloseable`, and a caller invokes the teardown from a coroutine. The classes UniFFI generates, such as `Scp`, keep the synchronous `close()` UniFFI gives them. `SCP.shutdown` reaches the Rust engine through the UniFFI-generated `Scp` object. No production class implements the `ServerBindings` interface that `Relay` and `Node` call (`.docs/standards/sdk-capability-matrix.json` marks every Server operation `"kotlin": false`) or the `EventContextBindings` interface that `ScpHotStreams` releases through, so today those three teardowns reach only a test source set's stub; they suspend so that a production implementation inherits a suspending teardown. ADR-028 in `.docs/adrs/phase-6.md` carries this amendment; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records the observed deadlock and the ANR risk. Every other language in the table above keeps its idiomatic pattern, because none of them must satisfy a synchronous, `Unit`-returning interface method over a suspending call.
+
+Each of the three `shutdown` functions sets its shutdown flag inside its bridge call, once its teardown call returns, so a teardown call that throws leaves the object reading as live, while a cancellation the bridge raises after a finished teardown still finds the flag set. One exception applies: the UniFFI-generated `Scp.shutdown` raises `SCP-STORAGE-8005` only after the teardown ran, so `SCP.shutdown` sets its flag before it rethrows that error. A caller that tears down from a `finally` block runs the call as `withContext(NonCancellable) { scp.shutdown(bridge) }`: `finally` usually runs because its coroutine was cancelled, and in a cancelled coroutine the bridge's `withContext(ioDispatcher)` throws `CancellationException` before the FFI call starts, so a bare `scp.shutdown(bridge)` there tears nothing down.
 
 ### Lifecycle invariant
 
@@ -655,7 +682,7 @@ Every push to a PR branch. Target: < 3 minutes. Must pass before review.
 
 ### Tier 2 — Merge Gate
 
-Merge queue entry or push to `main`. Target: < 10 minutes. Required to merge.
+Merge queue entry. Target: < 10 minutes. Required to merge.
 
 | Check | All SDKs |
 |-------|----------|

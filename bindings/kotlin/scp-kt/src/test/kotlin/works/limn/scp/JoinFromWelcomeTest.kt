@@ -26,8 +26,9 @@
 // These mirror the Python reference (tests/test_join_from_welcome.py) and the
 // TypeScript SDK (tests/context-join-from-welcome.test.ts).
 //
-// All tests require the compiled UniFFI cdylib; without a loadable native
-// library the suite skips via JUnit 5 assumptions, matching ScpClassTest.
+// All tests require the compiled UniFFI cdylib. A cdylib that is absent or fails
+// to load throws `UnsatisfiedLinkError` from the first native call and fails the
+// test.
 //
 // Provenance: ADR-049 Phase 2J; FFI-02 Option A. Kotlin SDK slice.
 
@@ -36,8 +37,6 @@ package works.limn.scp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
-import org.junit.jupiter.api.Assumptions.assumeTrue
-import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
 import uniffi.scp.CeilingPolicy
 import uniffi.scp.ContextMode
@@ -58,33 +57,14 @@ import kotlin.time.Duration.Companion.seconds
 @OptIn(ExperimentalCoroutinesApi::class)
 class JoinFromWelcomeTest {
     companion object {
-        private var nativeAvailable = false
-        private var skipReason = ""
-
-        @JvmStatic
-        @BeforeAll
-        fun probeNativeLibrary() {
-            try {
-                Class.forName("uniffi.scp.ScpKt")
-                Class.forName("uniffi.scp.Scp\$Companion")
-                nativeAvailable = true
-            } catch (e: ClassNotFoundException) {
-                skipReason = "UniFFI bindings not available: ${e.message}"
-            } catch (e: UnsatisfiedLinkError) {
-                skipReason = "Native library link error: ${e.message}"
-            } catch (e: ExceptionInInitializerError) {
-                skipReason = "Native library init error: ${e.cause?.message ?: e.message}"
-            } catch (e: NoClassDefFoundError) {
-                skipReason = "Native library class not found: ${e.message}"
-            }
-        }
-
         /** Canonical missing-key-material code (spec §17, ADR-048). */
         private const val MISSING_KEY_MATERIAL_CODE = "SCP-IDENT-1054"
 
         /**
          * Length in bytes of an RFC 9180 HPKE encapsulated key under DHKEM
-         * X25519-HKDF-SHA256 — the KEM the sealed invitation uses.
+         * X25519-HKDF-SHA256 — the KEM the sealed invitation uses. A join
+         * boundary validates `SealedInvitation.enc` against exactly this many
+         * bytes.
          */
         private const val HPKE_ENCAPSULATED_KEY_BYTES = 32
 
@@ -105,9 +85,9 @@ class JoinFromWelcomeTest {
     // Encrypted SingleAdmin params. inviteMember routes the add through the
     // actor's governance gate, which enforces ONLY the proposer's
     // `governance:propose` capability before auto-executing the unilateral
-    // SingleAdmin add (a normally-created SingleAdmin context grants its admin
-    // that capability at genesis). The ceiling below simply keeps the default
-    // SingleAdmin capability set (mirrors the PyO3 reference
+    // SingleAdmin add. The SingleAdmin creator holds every capability in the
+    // declared ceiling, so the ceiling below declares `governance:propose`; a
+    // ceiling without it cannot invite (mirrors the PyO3 reference
     // `test_invite_member_seals_for_single_admin_context`).
     private fun makeInviteParams(): ContextParams =
         ContextParams(
@@ -141,7 +121,6 @@ class JoinFromWelcomeTest {
 
     @Test
     fun `reserveKeyPackage returns a reservation and non-empty public bytes`() {
-        assumeTrue(nativeAvailable, skipReason)
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {
@@ -166,7 +145,6 @@ class JoinFromWelcomeTest {
 
     @Test
     fun `reserveKeyPackage rejects a DID-only non-custodied identity`() {
-        assumeTrue(nativeAvailable, skipReason)
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {
@@ -196,7 +174,6 @@ class JoinFromWelcomeTest {
 
     @Test
     fun `inviteMember seals a real bundle for a reserved invitee KeyPackage`() {
-        assumeTrue(nativeAvailable, skipReason)
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {
@@ -257,6 +234,8 @@ class JoinFromWelcomeTest {
                     sealed.enc.size,
                     "the HPKE encapsulated key must be 32 bytes (RFC 9180 DHKEM X25519)",
                 )
+                // `ct = ciphertext || tag`, so real sealing never yields an
+                // empty ciphertext.
                 assertTrue(
                     sealed.ciphertext.isNotEmpty(),
                     "the sealed Welcome ciphertext must be non-empty",
@@ -276,7 +255,6 @@ class JoinFromWelcomeTest {
 
     @Test
     fun `inviteMember rejects a non-custodied inviter DID`() {
-        assumeTrue(nativeAvailable, skipReason)
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {
@@ -317,7 +295,6 @@ class JoinFromWelcomeTest {
 
     @Test
     fun `contextJoinFromWelcome rejects a DID-only joiner before consuming the KeyPackage`() {
-        assumeTrue(nativeAvailable, skipReason)
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {

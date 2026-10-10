@@ -24,19 +24,20 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use openmls::ciphersuite::hash_ref::make_key_package_ref;
 use openmls::prelude::*;
+use openmls::treesync::errors::LifetimeError;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
+use openmls_traits::storage::StorageProvider as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
-use zeroize::Zeroizing;
 
 use super::backend::{
     AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
     ValidatedKeyPackage,
 };
-use super::storage::new_provider;
 use super::storage_adapter::OpenMlsStorageAdapter;
 use scp_clock::Clock;
 use scp_mls::InMemoryMlsProvider;
@@ -44,7 +45,7 @@ use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::{DecryptedContent, decrypt_with_sender_did};
 use scp_mls::error::MlsError;
 use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
-use scp_mls::validate_key_package_lifetime;
+use scp_mls::{validate_key_package_lifetime, validate_key_package_lifetime_for_add};
 
 /// Durable-store key namespace for the consumed-init-key set (A2 crypto-layer
 /// single-use backstop). Value at `scp-kp-consumed-initkey/{hex(SHA-256(init_key))}`
@@ -103,8 +104,12 @@ const CONSUMED_INIT_KEY_PREFIX: &str = "scp-kp-consumed-initkey";
 /// spawn-from-Welcome entrypoint) and deliberately NOT implemented now.
 pub struct ProductionMlsBackend {
     /// Injected hardened [`Clock`] used to stamp `KeyPackage` / group-leaf
-    /// `Lifetime`s on generation and to re-validate accepted `Lifetime`s on the
-    /// receive/add paths (ADR-057 §Prereq-1). In production this is the SAME
+    /// `Lifetime`s on generation, to check a `KeyPackage` an adder adds
+    /// (current, with the add-side minimum remaining lifetime and minimum
+    /// `not_before` age), and to check
+    /// the joiner's own `KeyPackage` on a Welcome join (ADR-057 §Prereq-1). A
+    /// received Add and another member's Welcome tree leaf are checked for
+    /// range only and read no clock. In production this is the SAME
     /// `Arc` the owning `NodeMlsFactory` and the actor-deps clock share, so
     /// there is one hardened clock per node — never openmls's internal one.
     clock: Arc<dyn Clock>,
@@ -180,27 +185,117 @@ impl ProductionMlsBackend {
     ///
     /// Returns [`MlsError::WelcomeProcessingFailed`] if the public bytes do
     /// not deserialize / validate as an SCP `KeyPackage`.
-    fn consumed_init_key_key(key_package_public_bytes: &[u8]) -> Result<String, MlsError> {
+    pub(crate) fn consumed_init_key_key(
+        key_package_public_bytes: &[u8],
+    ) -> Result<String, MlsError> {
+        Self::init_key_marker(key_package_public_bytes, |e| {
+            MlsError::WelcomeProcessingFailed(format!("validating key package for init-key: {e}"))
+        })
+    }
+
+    /// [`Self::consumed_init_key_key`] for the signer state's own
+    /// `KeyPackage` bytes in `join_from_welcome`: openmls's internal-clock
+    /// rejection in `KeyPackageIn::validate` is reported as
+    /// [`MlsError::KeyPackageLifetimeInvalid`] with `own_lifetime`'s bounds and
+    /// the `now` openmls read, the shape of an injected-clock rejection
+    /// (ADR-057 §Prereq-1 residual). `own_lifetime` is the `Lifetime` of the
+    /// signer state's own `KeyPackageBundle`, read from the same bytes, so the
+    /// bounds always belong to the `KeyPackage` openmls rejected. Only those
+    /// bytes may be passed here; the caller-supplied bytes go through the
+    /// unmapped [`Self::consumed_init_key_key`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::consumed_init_key_key`], except for the `Lifetime` rejection.
+    fn own_consumed_init_key_key(
+        key_package_public_bytes: &[u8],
+        own_lifetime: &Lifetime,
+    ) -> Result<String, MlsError> {
+        Self::init_key_marker(key_package_public_bytes, |e| {
+            MlsError::KeyPackageLifetimeInvalid {
+                not_before: own_lifetime.not_before(),
+                not_after: own_lifetime.not_after(),
+                now: match e {
+                    LifetimeError::Expired { now, .. } | LifetimeError::NotValidYet { now, .. } => {
+                        *now
+                    }
+                    LifetimeError::SystemTimeBeforeUnixEpoch => 0,
+                },
+            }
+        })
+    }
+
+    /// Shared body of [`Self::consumed_init_key_key`] and
+    /// [`Self::own_consumed_init_key_key`]; `on_lifetime` maps openmls's
+    /// `LifetimeError` from `KeyPackageIn::validate`.
+    fn init_key_marker(
+        key_package_public_bytes: &[u8],
+        on_lifetime: impl FnOnce(&LifetimeError) -> MlsError,
+    ) -> Result<String, MlsError> {
         let kp_in =
             KeyPackageIn::tls_deserialize(&mut &*key_package_public_bytes).map_err(|e| {
                 MlsError::WelcomeProcessingFailed(format!(
                     "deserializing key package for init-key: {e}"
                 ))
             })?;
-        let provider = new_provider();
+        let provider = InMemoryMlsProvider::default();
         let validated = kp_in
             .validate(provider.crypto(), ProtocolVersion::Mls10)
-            .map_err(|e| {
-                MlsError::WelcomeProcessingFailed(format!(
-                    "validating key package for init-key: {e}"
-                ))
+            .map_err(|e| match e {
+                KeyPackageVerifyError::LifetimeError(lifetime_error) => {
+                    on_lifetime(&lifetime_error)
+                }
+                other => MlsError::WelcomeProcessingFailed(format!(
+                    "validating key package for init-key: {other}"
+                )),
             })?;
-        let init_key = validated.hpke_init_key().as_slice();
-        let digest = Sha256::digest(init_key);
-        Ok(format!(
-            "{CONSUMED_INIT_KEY_PREFIX}/{}",
-            hex::encode(digest)
+        Ok(Self::consumed_init_key_marker(
+            validated.hpke_init_key().as_slice(),
         ))
+    }
+
+    /// The consumed-init-key set key for an HPKE init key:
+    /// `scp-kp-consumed-initkey/{hex(SHA-256(init_key))}`.
+    fn consumed_init_key_marker(init_key: &[u8]) -> String {
+        let digest = Sha256::digest(init_key);
+        format!("{CONSUMED_INIT_KEY_PREFIX}/{}", hex::encode(digest))
+    }
+
+    /// Read the signer state's own `KeyPackage` from the `KeyPackageBundle`
+    /// that `generate_key_package` stored in the signer state's provider
+    /// (ADR-057 §Prereq-1).
+    ///
+    /// The bundle is SCP's own locally generated record, keyed by the
+    /// `KeyPackageRef` of `own_key_package_bytes` (the public bytes the signer
+    /// state carries), so its `Lifetime` and HPKE init key are read without
+    /// parsing an unverified `KeyPackage`. `KeyPackage::life_time` cannot fail
+    /// on a bundle's `KeyPackage`, whose leaf openmls builds KeyPackage-sourced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::StorageError`] if the provider storage cannot be
+    /// read, and [`MlsError::WelcomeProcessingFailed`] if the reference cannot
+    /// be computed or the signer state holds no bundle for its own
+    /// `KeyPackage`.
+    fn own_key_package(
+        provider: &InMemoryMlsProvider,
+        own_key_package_bytes: &[u8],
+    ) -> Result<KeyPackage, MlsError> {
+        let kp_ref =
+            make_key_package_ref(own_key_package_bytes, SCP_CIPHERSUITE, provider.crypto())
+                .map_err(|e| {
+                    MlsError::WelcomeProcessingFailed(format!("own key package reference: {e}"))
+                })?;
+        let bundle: KeyPackageBundle = provider
+            .storage()
+            .key_package(&kp_ref)
+            .map_err(|e| MlsError::StorageError(format!("reading own key package bundle: {e}")))?
+            .ok_or_else(|| {
+                MlsError::WelcomeProcessingFailed(
+                    "signer state holds no key package bundle for its own key package".to_owned(),
+                )
+            })?;
+        Ok(bundle.key_package().clone())
     }
 }
 
@@ -211,21 +306,21 @@ impl ProductionMlsBackend {
 /// Opaque byte layout behind [`SignerState`]. Private to this module.
 ///
 /// `signer_bytes` and `mls_storage_entries` hold private signing key and HPKE
-/// decryption-key material. A transient `SerializedSigner` (the wrapper built to
-/// serialize a signer-state in `serialize_signer_state`, or parsed back out of
-/// one via `parse_signer_state` during a join) would otherwise drop those
-/// private `Vec`s un-zeroed. The hand-written [`Drop`] zeroes them on every drop
-/// while leaving the on-disk serde format (plain `Vec<u8>` / tuple-vec fields)
-/// unchanged. `key_package_public_bytes` is the publishable KP and is not zeroed.
+/// decryption-key material, so both are `Zeroizing`: a transient
+/// `SerializedSigner` (the wrapper built to serialize a signer-state in
+/// `serialize_signer_state`, or parsed back out of one via `parse_signer_state`
+/// during a join) wipes them on every drop. `Zeroizing`'s serde impls delegate
+/// to the inner value, so the encoding is that of plain `Vec<u8>` / tuple-vec
+/// fields. `key_package_public_bytes` is the publishable KP and is not zeroed.
 #[derive(Serialize, Deserialize)]
 struct SerializedSigner {
     /// MessagePack-serialized [`SignatureKeyPair`] bytes. Zeroed on drop.
-    signer_bytes: Vec<u8>,
+    signer_bytes: zeroize::Zeroizing<Vec<u8>>,
     /// Raw MLS storage entries from the `InMemoryMlsProvider` generated
     /// alongside the `KeyPackage`. Needed to process a Welcome addressed to
     /// the KP (`OpenMLS` reads the private HPKE decryption key out of
     /// storage when decrypting the Welcome). Zeroed on drop.
-    mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    mls_storage_entries: scp_mls::snapshot::ProviderStorageEntries,
     /// TLS-serialized PUBLIC `KeyPackage` bytes this signer-state was
     /// generated for. Carried so [`MlsBackend::join_from_welcome`] can derive
     /// the consumed-init-key marker from the signer-state's OWN KP and bind it
@@ -235,49 +330,34 @@ struct SerializedSigner {
     key_package_public_bytes: Vec<u8>,
 }
 
-impl Drop for SerializedSigner {
-    fn drop(&mut self) {
-        // Zero the private signing-key + HPKE-key material on drop;
-        // `key_package_public_bytes` is publishable.
-        zeroize::Zeroize::zeroize(&mut self.signer_bytes);
-        for (k, v) in &mut self.mls_storage_entries {
-            zeroize::Zeroize::zeroize(k);
-            zeroize::Zeroize::zeroize(v);
-        }
-    }
-}
-
 fn serialize_signer_state(
     signer: &SignatureKeyPair,
     provider: &InMemoryMlsProvider,
     key_package_public_bytes: &[u8],
 ) -> Result<SignerState, MlsError> {
-    let signer_bytes = Zeroizing::new(
-        rmp_serde::to_vec_named(signer)
-            .map_err(|e| MlsError::StorageError(format!("signer serialization: {e}")))?,
-    );
-
-    let mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)> = {
-        let values = provider
-            .storage()
-            .values
-            .read()
-            .map_err(|e| MlsError::StorageError(format!("provider lock poisoned: {e}")))?;
-        values.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-    };
-
-    let wrapper = SerializedSigner {
-        signer_bytes: signer_bytes.to_vec(),
-        mls_storage_entries,
-        key_package_public_bytes: key_package_public_bytes.to_vec(),
-    };
-
-    let bytes = Zeroizing::new(
-        rmp_serde::to_vec_named(&wrapper)
-            .map_err(|e| MlsError::StorageError(format!("signer-state serialization: {e}")))?,
-    );
+    let wrapper = serialized_signer(signer, provider, key_package_public_bytes)?;
+    let bytes = rmp_serde::to_vec_named(&wrapper)
+        .map(zeroize::Zeroizing::new)
+        .map_err(|e| MlsError::StorageError(format!("signer-state serialization: {e}")))?;
 
     Ok(SignerState { bytes })
+}
+
+/// Captures the [`SerializedSigner`] wrapper [`serialize_signer_state`]
+/// encodes: the signer bytes, the provider's storage entries, and the public
+/// `KeyPackage` bytes.
+fn serialized_signer(
+    signer: &SignatureKeyPair,
+    provider: &InMemoryMlsProvider,
+    key_package_public_bytes: &[u8],
+) -> Result<SerializedSigner, MlsError> {
+    let (signer_bytes, mls_storage_entries) =
+        scp_mls::snapshot::capture_signer_and_storage(provider, signer)?;
+    Ok(SerializedSigner {
+        signer_bytes,
+        mls_storage_entries,
+        key_package_public_bytes: key_package_public_bytes.to_vec(),
+    })
 }
 
 /// Parse the opaque [`SignerState`] blob into its [`SerializedSigner`] wrapper
@@ -298,28 +378,15 @@ fn signer_and_provider_from_wrapper(
     let signer: SignatureKeyPair = rmp_serde::from_slice(&wrapper.signer_bytes)
         .map_err(|e| MlsError::StorageError(format!("signer deserialization: {e}")))?;
 
-    let provider = new_provider();
-    {
-        let mut values = provider
-            .storage()
-            .values
-            .write()
-            .map_err(|e| MlsError::StorageError(format!("provider lock poisoned: {e}")))?;
-        // `SerializedSigner` has a `Drop` that zeroes its private fields, so
-        // the entries cannot be moved out by value; take them out via
-        // `mem::take` (leaving an empty Vec the Drop harmlessly zeroes) so the
-        // private bytes move into the provider without an extra copy.
-        for (k, v) in std::mem::take(&mut wrapper.mls_storage_entries) {
-            values.insert(k, v);
-        }
-    }
+    // The entries move into the provider without a copy, and the `Drop` of
+    // the provider's storage wipes them. A signer-labelled entry is refused before any
+    // entry moves (persistence spec §17.9.1); the `Zeroizing` vector wipes
+    // whatever it still holds when `wrapper` drops.
+    let provider = InMemoryMlsProvider::from_storage_entries(&mut wrapper.mls_storage_entries)?;
 
-    // Re-store the signer in the provider's key store so OpenMLS can resolve
-    // it during Welcome processing.
-    signer
-        .store(provider.storage())
-        .map_err(|e| MlsError::StorageError(format!("signer store failed: {e}")))?;
-
+    // The signer is not written into the provider's storage: every openmls
+    // operation that signs takes it as an argument, and openmls never reads a
+    // stored `SignatureKeyPair` back.
     Ok((signer, provider))
 }
 
@@ -418,27 +485,7 @@ impl MlsBackend for ProductionMlsBackend {
         group: &mut ScpMlsGroup,
         ciphertext: &[u8],
     ) -> Result<DecryptedContent, MlsError> {
-        decrypt_with_sender_did(group, ciphertext, self.clock.as_ref())
-    }
-
-    async fn process_commit(
-        &self,
-        group: &mut ScpMlsGroup,
-        commit_bytes: &[u8],
-    ) -> Result<(), MlsError> {
-        // Parse the incoming Commit bytes and process via `decrypt_with_sender_did`
-        // path, but only accept Commit outcomes. This reuses the existing
-        // `process_message` + `merge_staged_commit` sequence verbatim.
-        let content = decrypt_with_sender_did(group, commit_bytes, self.clock.as_ref())?;
-        match content {
-            DecryptedContent::Commit { .. } => Ok(()),
-            DecryptedContent::Application { .. } => Err(MlsError::CommitProcessingFailed(
-                "expected Commit, got Application message".to_string(),
-            )),
-            DecryptedContent::Proposal { .. } => Err(MlsError::CommitProcessingFailed(
-                "expected Commit, got Proposal message".to_string(),
-            )),
-        }
+        decrypt_with_sender_did(group, ciphertext)
     }
 
     async fn advance_epoch(
@@ -467,19 +514,21 @@ impl MlsBackend for ProductionMlsBackend {
         let kp_in = KeyPackageIn::tls_deserialize(&mut &*key_package_bytes)
             .map_err(|e| MlsError::AddMemberFailed(format!("deserializing key package: {e}")))?;
 
-        let provider = new_provider();
+        let provider = InMemoryMlsProvider::default();
         let validated = kp_in
             .validate(provider.crypto(), ProtocolVersion::Mls10)
             .map_err(|e| MlsError::AddMemberFailed(format!("key package validation: {e}")))?;
 
         // SECURITY (ADR-057 §Prereq-1): openmls's `validate` above runs its own
-        // internal `Lifetime::is_valid` against openmls's (wasm: unhardened)
+        // internal `Lifetime::validate` against openmls's (wasm: unhardened)
         // clock. Re-validate the accepted `Lifetime` against the injected
         // hardened clock (threaded in as `clock`, not read from backend state —
         // SCP-CRYPTOMOVE-000c) and enforce the RFC 9420 max-range bound
         // openmls's `validate` never applies. Additive hardening; never
-        // replaces openmls.
-        validate_key_package_lifetime(validated.life_time(), clock)?;
+        // replaces openmls. Every caller is an add path, so the add-side
+        // minimum remaining lifetime and minimum `not_before` age apply too
+        // (security-model spec §9.7.1, the adder).
+        validate_key_package_lifetime_for_add(validated.life_time(), clock)?;
 
         // Guard the SCP ciphersuite invariant: any KP using a non-SCP
         // ciphersuite MUST be rejected even if OpenMLS validates it against
@@ -587,42 +636,19 @@ impl MlsBackend for ProductionMlsBackend {
             ));
         };
 
-        // Parse the opaque signer-state wrapper ONCE; both the bound-init-key
-        // derivation below and the signer/provider rebuild later reuse it.
+        // Parse the opaque signer-state wrapper ONCE and rebuild its signer
+        // and provider; the join reuses both.
         let wrapper = parse_signer_state(&signer_state)?;
+        let own_key_package_bytes = wrapper.key_package_public_bytes.clone();
+        let (signer, provider) = signer_and_provider_from_wrapper(wrapper)?;
 
-        // Derive the init-key set key from the caller-supplied
-        // `key_package_public_bytes`. This also validates the KP, so a malformed
-        // KP is rejected before any group state is built.
-        let consumed_key = Self::consumed_init_key_key(key_package_public_bytes)?;
-
-        // Init-key / Welcome binding (checked BEFORE the join consumes anything).
-        // `key_package_public_bytes` is the marker key source; the
-        // `signer_state` carries its OWN KP public bytes. A successful join over
-        // a provider built SOLELY from `signer_state` necessarily uses THAT KP's
-        // init private key (OpenMLS has no other init key in scope). If a caller
-        // passed a `key_package_public_bytes` whose init key does not match the
-        // one in `signer_state`, the marker would key the WRONG init key.
-        //
-        // Fast path: when the caller-supplied bytes are byte-identical to the
-        // bytes carried in `signer_state` (the actor's normal path — it passes
-        // the reserved KP's OWN bytes), they trivially share an init key, so the
-        // second KeyPackageIn validation is skipped. Only when the bytes DIFFER
-        // (a bare-API misuse) do we re-derive the marker from the signer-state's
-        // own KP and require it to equal `consumed_key`; a mismatch means the
-        // caller violated the `(public_bytes, signer_state)` pairing contract —
-        // reject before consuming any crypto. Behaviour-preserving: the mismatch
-        // rejection still fires for every genuinely-mismatched pair.
-        if wrapper.key_package_public_bytes != key_package_public_bytes {
-            let bound_key = Self::consumed_init_key_key(&wrapper.key_package_public_bytes)?;
-            if bound_key != consumed_key {
-                return Err(MlsError::WelcomeProcessingFailed(
-                    "key_package_public_bytes init key does not match the signer-state's \
-                     key package (mismatched (public_bytes, signer_state) pair)"
-                        .to_owned(),
-                ));
-            }
-        }
+        // The signer state's own KeyPackage, from its locally generated
+        // `KeyPackageBundle`: its `Lifetime` and the consumed-set key of its
+        // HPKE init key, the one secret a join over this provider consumes.
+        let own_key_package = Self::own_key_package(&provider, &own_key_package_bytes)?;
+        let own_lifetime = *own_key_package.life_time();
+        let consumed_key =
+            Self::consumed_init_key_marker(own_key_package.hpke_init_key().as_slice());
 
         // Serialize the retrieve→join→store sequence so two concurrent joins of
         // the same init key cannot both pass the retrieve before either stores
@@ -631,8 +657,12 @@ impl MlsBackend for ProductionMlsBackend {
         // the `join_gate` field doc for the ADR-049 §12 lock-free-read note.
         let _join_guard = self.join_gate.lock().await;
 
-        // Consult the durable consumed set FIRST. An init key already present
-        // means this KP was already consumed → reject the replay.
+        // Consult the durable consumed set FIRST, before any lifetime check.
+        // An init key already present means this KP was already consumed →
+        // reject the replay. A confirm retry after a join that completed must
+        // see `KeyPackageReplay` even once the KeyPackage has expired, because
+        // the key package actor reads that variant as its own prior
+        // completion and finishes the consume.
         let already = store
             .retrieve(&consumed_key)
             .await
@@ -641,8 +671,49 @@ impl MlsBackend for ProductionMlsBackend {
             return Err(MlsError::KeyPackageReplay);
         }
 
-        let (signer, provider) = signer_and_provider_from_wrapper(wrapper)?;
-        let group = group::join_group_from_bytes(welcome_bytes, provider, signer)?;
+        // ADR-057 §Prereq-1: check the own `Lifetime` against the injected
+        // clock before openmls's clock reads it in `KeyPackageIn::validate`,
+        // so an own KeyPackage that is expired, not yet valid, or out of range
+        // is `KeyPackageLifetimeInvalid` on native as in the browser, whatever
+        // openmls's clock says.
+        validate_key_package_lifetime(&own_lifetime, self.clock.as_ref())?;
+
+        // Validate the signer state's own KeyPackage bytes. openmls's clock
+        // rejection there is `KeyPackageLifetimeInvalid` with the bounds of
+        // the KeyPackage it rejected; any other failure, or bytes whose init
+        // key differs from the bundle's, is `WelcomeProcessingFailed`.
+        if Self::own_consumed_init_key_key(&own_key_package_bytes, &own_lifetime)? != consumed_key {
+            return Err(MlsError::WelcomeProcessingFailed(
+                "signer state's key package bytes do not match its key package bundle".to_owned(),
+            ));
+        }
+
+        // Init-key / Welcome binding (checked BEFORE the join consumes anything).
+        // `key_package_public_bytes` names the KP the caller believes it is
+        // consuming; a successful join over a provider built SOLELY from
+        // `signer_state` necessarily uses THAT signer state's init private key
+        // (OpenMLS has no other init key in scope), so the caller's bytes must
+        // carry the same init key. They go through the unmapped
+        // `consumed_init_key_key`, so a lifetime rejection of a mismatched
+        // caller KeyPackage is never reported with the own KeyPackage's
+        // bounds. Fast path: byte-identical bytes (the actor's normal path)
+        // trivially share the init key.
+        if own_key_package_bytes != key_package_public_bytes
+            && Self::consumed_init_key_key(key_package_public_bytes)? != consumed_key
+        {
+            return Err(MlsError::WelcomeProcessingFailed(
+                "key_package_public_bytes init key does not match the signer-state's \
+                 key package (mismatched (public_bytes, signer_state) pair)"
+                    .to_owned(),
+            ));
+        }
+
+        // ADR-057 §Prereq-1: `join_group_from_bytes` checks only the range of
+        // every other member's tree leaf, and checks the joiner's OWN leaf in
+        // the joined group against the injected hardened clock passed here. A rejection drops the group before the init key is
+        // recorded as consumed, so the KeyPackage is not used up.
+        let group =
+            group::join_group_from_bytes(welcome_bytes, provider, signer, self.clock.as_ref())?;
 
         // Join succeeded and the marker key is bound to the consumed init key —
         // durably record it BEFORE returning, so a replay (even on a different
@@ -748,6 +819,130 @@ mod tests {
         ScpCredential::new(format!("did:dht:z6Mk{name}"), None, SigningKeyId::Active).unwrap()
     }
 
+    /// `SerializedSigner`'s `Zeroizing` fields encode exactly as the plain
+    /// `Vec` fields they replaced, so a signer-state written before the change
+    /// still parses and one written after it reads as the plain layout.
+    #[test]
+    fn serialized_signer_encodes_like_plain_fields() {
+        #[derive(Serialize, Deserialize)]
+        struct Plain {
+            signer_bytes: Vec<u8>,
+            mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)>,
+            key_package_public_bytes: Vec<u8>,
+        }
+        let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+        let provider = InMemoryMlsProvider::default();
+        provider
+            .storage()
+            .values()
+            .write()
+            .unwrap()
+            .insert(b"EncryptionKeyPair-a".to_vec(), vec![0xC3_u8; 48]);
+        let wrapper = serialized_signer(&signer, &provider, &[0x5A_u8; 37]).unwrap();
+        assert_eq!(wrapper.mls_storage_entries.len(), 1);
+        let plain = Plain {
+            signer_bytes: wrapper.signer_bytes.to_vec(),
+            mls_storage_entries: wrapper.mls_storage_entries.to_vec(),
+            key_package_public_bytes: wrapper.key_package_public_bytes.clone(),
+        };
+        let plain_bytes = rmp_serde::to_vec_named(&plain).unwrap();
+        assert_eq!(rmp_serde::to_vec_named(&wrapper).unwrap(), plain_bytes);
+        let parsed = parse_signer_state(&SignerState {
+            bytes: zeroize::Zeroizing::new(plain_bytes),
+        })
+        .unwrap();
+        assert_eq!(*parsed.signer_bytes, plain.signer_bytes);
+        assert_eq!(*parsed.mls_storage_entries, plain.mls_storage_entries);
+    }
+
+    /// `RustCrypto::signature_key_gen` draws from the provider's long-lived
+    /// `ChaCha20Rng`, which `scp_mls::provider::OsRand` does not replace.
+    ///
+    /// The `expect` is the control for the `signature_key_gen` entry in this
+    /// crate's `clippy.toml`: it is unfulfilled, and the CI clippy run
+    /// (`-D warnings`) fails, when that entry stops disallowing the call.
+    #[test]
+    fn signature_key_gen_is_disallowed() {
+        use openmls_traits::crypto::OpenMlsCrypto;
+
+        let provider = InMemoryMlsProvider::default();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "control for the lint: generates a signer from the long-lived seed on purpose"
+        )]
+        let (private, public) = provider
+            .crypto()
+            .signature_key_gen(SCP_CIPHERSUITE.signature_algorithm())
+            .unwrap();
+        assert_eq!(public.len(), 32);
+        assert!(!private.is_empty());
+    }
+
+    /// `SignatureKeyPair::store` and a direct `write_signature_key_pair` are
+    /// disallowed by this crate's `clippy.toml`, and the provider's storage
+    /// refuses both at runtime and stores nothing (persistence spec §17.9).
+    ///
+    /// Each `expect` is the control for one `clippy.toml` entry: it is
+    /// unfulfilled, and the CI clippy run (`-D warnings`) fails, when that
+    /// entry stops disallowing the call.
+    #[test]
+    fn signer_store_is_disallowed_and_refused() {
+        use openmls_traits::storage::StorageProvider as _;
+
+        let provider = InMemoryMlsProvider::default();
+        let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "control for the lint and the refusal: stores the signer on purpose"
+        )]
+        let stored = signer.store(provider.storage());
+        assert!(matches!(
+            stored,
+            Err(scp_mls::InMemoryMlsStorageError::SignerStorageForbidden)
+        ));
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "control for the lint and the refusal: stores the signer through the trait on purpose"
+        )]
+        let written = provider
+            .storage()
+            .write_signature_key_pair(&signer.id(), &signer);
+        assert!(matches!(
+            written,
+            Err(scp_mls::InMemoryMlsStorageError::SignerStorageForbidden)
+        ));
+
+        assert!(provider.storage().values().read().unwrap().is_empty());
+    }
+
+    /// A signer-state whose storage entries include one under openmls's
+    /// signature-key-pair label fails the signer and provider rebuild with
+    /// `SignerStorageForbidden` (persistence spec §17.9.1); the same
+    /// signer-state without that entry rebuilds.
+    #[tokio::test]
+    async fn signer_from_wrapper_refuses_signer_entry() {
+        let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
+        let generated = backend
+            .generate_key_package(&test_credential("signer-wrapper"), None)
+            .await
+            .unwrap();
+
+        // Control: the unmodified signer-state rebuilds.
+        let wrapper = parse_signer_state(&generated.signer_state).unwrap();
+        signer_and_provider_from_wrapper(wrapper).unwrap();
+
+        let mut wrapper = parse_signer_state(&generated.signer_state).unwrap();
+        let mut signer_key = b"SignatureKeyPair".to_vec();
+        signer_key.extend_from_slice(b"[1,2,3]");
+        wrapper
+            .mls_storage_entries
+            .push((signer_key, b"signer private key".to_vec()));
+        let result = signer_and_provider_from_wrapper(wrapper);
+        assert!(matches!(result, Err(MlsError::SignerStorageForbidden)));
+    }
+
     /// A `ProductionMlsBackend` with the durable consumed-init-key store
     /// attached over a fresh in-memory `Storage`, so `join_from_welcome` is
     /// JOINABLE (it fails closed without a store). Use for any test that drives
@@ -836,6 +1031,609 @@ mod tests {
             replay_count, 1,
             "exactly one concurrent join must be rejected as a single-use replay \
              (res1={t1}, res2={t2})"
+        );
+    }
+
+    /// ADR-057 §Prereq-1 wiring: `join_from_welcome` accepts a Welcome whose
+    /// tree holds a KeyPackage-sourced leaf that expired under the real clock,
+    /// which both openmls and the backend read, and records the joiner's init
+    /// key as consumed. A member whose leaf expired no longer blocks a join.
+    #[tokio::test]
+    async fn join_from_welcome_accepts_expired_tree_leaf_and_records_consumed_key() {
+        let store: Arc<dyn OpenMlsStorageAdapter> = Arc::new(SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ));
+        let joiner = ProductionMlsBackend::new(Arc::new(SystemClock));
+        joiner.set_consumed_init_key_store(Arc::clone(&store));
+
+        let bob_gen = joiner
+            .generate_key_package(&test_credential("bob-expired-leaf"), None)
+            .await
+            .unwrap();
+
+        let (mut alice, carol_not_after) = group::group_holding_carol_leaf_expired().unwrap();
+        assert!(
+            carol_not_after < SystemClock.now_secs(),
+            "Carol's leaf must be expired under the real clock"
+        );
+        let added = ProductionMlsBackend::new(Arc::new(SystemClock))
+            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .await
+            .unwrap();
+
+        let bob = joiner
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bob.members().unwrap().len(), 3, "Carol, Alice and Bob");
+
+        let consumed_key =
+            ProductionMlsBackend::consumed_init_key_key(&bob_gen.key_package_bytes).unwrap();
+        assert!(
+            store.retrieve(&consumed_key).await.unwrap().is_some(),
+            "an accepted join records the init key as consumed"
+        );
+    }
+
+    /// ADR-057 §Prereq-1 wiring: `join_from_welcome` checks the joiner's own
+    /// `KeyPackage` against the backend's injected clock, not only openmls's
+    /// real clock. The backend clock sits past the `KeyPackage`'s `not_after`
+    /// while the real clock is still inside its `Lifetime`, so openmls's check
+    /// in `own_consumed_init_key_key` passes and only the injected-clock check can
+    /// reject. The rejection records no consumed init key, so the same Welcome
+    /// joins once the backend clock is correct.
+    #[tokio::test]
+    async fn join_from_welcome_rejects_own_key_package_expired_under_injected_clock() {
+        use scp_clock::TestClock;
+        use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+
+        let real_now = SystemClock.now_secs();
+        let joiner_clock = Arc::new(TestClock::new(real_now));
+        let store: Arc<dyn OpenMlsStorageAdapter> = Arc::new(SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ));
+        let joiner = ProductionMlsBackend::new(Arc::clone(&joiner_clock) as Arc<dyn Clock>);
+        joiner.set_consumed_init_key_store(Arc::clone(&store));
+
+        // Minted at the real present, so openmls's real-clock checks on the
+        // adder's side and in `own_consumed_init_key_key` accept it.
+        let bob_gen = joiner
+            .generate_key_package(&test_credential("bob-own-expired"), None)
+            .await
+            .unwrap();
+        let adder = ProductionMlsBackend::new(Arc::new(SystemClock));
+        let mut alice = adder
+            .create_group(&test_credential("alice-own-expired"), None)
+            .await
+            .unwrap();
+        let bob_add = adder
+            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .await
+            .unwrap();
+
+        // Bob's `not_after` is `real_now + KEY_PACKAGE_LIFETIME_SECS`.
+        joiner_clock.set(real_now + KEY_PACKAGE_LIFETIME_SECS + 1);
+        let err = joiner
+            .join_from_welcome(
+                &bob_add.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .err()
+            .expect("an own KeyPackage expired under the injected clock must be rejected");
+        assert!(
+            matches!(
+                err,
+                MlsError::KeyPackageLifetimeInvalid { not_after, now, .. } if not_after <= now
+            ),
+            "expected KeyPackageLifetimeInvalid for Bob's own KeyPackage, got {err:?}"
+        );
+
+        let consumed_key =
+            ProductionMlsBackend::consumed_init_key_key(&bob_gen.key_package_bytes).unwrap();
+        assert!(
+            store.retrieve(&consumed_key).await.unwrap().is_none(),
+            "a rejected join must not record the init key as consumed"
+        );
+
+        // Control: under a correct clock the same Welcome joins and records
+        // the init key.
+        joiner_clock.set(real_now);
+        let bob = joiner
+            .join_from_welcome(
+                &bob_add.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bob.members().unwrap().len(), 2, "Alice and Bob");
+        assert!(
+            store.retrieve(&consumed_key).await.unwrap().is_some(),
+            "an accepted join records the init key as consumed"
+        );
+    }
+
+    /// Security-model spec §9.7.1, the receiver, on `MlsBackend::decrypt`: a
+    /// receiving backend whose injected clock stands past an added
+    /// `KeyPackage`'s `not_after` still merges the add Commit, because a
+    /// receiver checks the received `Lifetime`'s range only and reads no
+    /// clock. The wall clock stays inside Carol's `Lifetime`, so openmls's own
+    /// wall-clock check passes and only an injected-clock check on receive
+    /// could refuse. The native receive path, `decrypt_and_dispatch`, has its
+    /// own tests among the supervisor tests.
+    #[tokio::test]
+    async fn decrypt_merges_add_expired_under_receiver_injected_clock() {
+        use scp_clock::TestClock;
+        use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+
+        let real_now = SystemClock.now_secs();
+        let adder = ProductionMlsBackend::new(Arc::new(SystemClock));
+        let mut alice = adder
+            .create_group(&test_credential("alice-recv-expired"), None)
+            .await
+            .unwrap();
+
+        // Bob joins with his backend clock at the real present.
+        let bob_clock = Arc::new(TestClock::new(real_now));
+        let bob_backend = ProductionMlsBackend::new(Arc::clone(&bob_clock) as Arc<dyn Clock>);
+        bob_backend.set_consumed_init_key_store(Arc::new(SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        )));
+        let bob_gen = bob_backend
+            .generate_key_package(&test_credential("bob-recv-expired"), None)
+            .await
+            .unwrap();
+        let bob_add = adder
+            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .await
+            .unwrap();
+        let mut bob = bob_backend
+            .join_from_welcome(
+                &bob_add.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .unwrap();
+        let bob_epoch_before = bob.epoch().unwrap();
+
+        // Carol's KeyPackage is minted at `real_now`, so its `not_after` is
+        // `real_now + KEY_PACKAGE_LIFETIME_SECS`, and Alice adds her.
+        let carol_gen = ProductionMlsBackend::new(Arc::new(TestClock::new(real_now)))
+            .generate_key_package(&test_credential("carol-recv-expired"), None)
+            .await
+            .unwrap();
+        let carol_add = adder
+            .add_member_raw(&mut alice, &carol_gen.key_package_bytes)
+            .await
+            .unwrap();
+
+        // Bob's injected clock passes Carol's `not_after`; the wall clock
+        // does not.
+        let carol_not_after = real_now + KEY_PACKAGE_LIFETIME_SECS;
+        bob_clock.set(carol_not_after + 1);
+        assert!(SystemClock.now_secs() < carol_not_after);
+        let merged = bob_backend
+            .decrypt(&mut bob, &carol_add.commit)
+            .await
+            .expect("a receiver merges an Add expired under its own clock");
+        assert!(matches!(merged, DecryptedContent::Commit { .. }));
+        assert_eq!(bob.epoch().unwrap(), bob_epoch_before + 1);
+        assert_eq!(bob.members().unwrap().len(), 3, "Alice, Bob and Carol");
+    }
+
+    /// The consumed-set key of the signer state's own `KeyPackage`, read from
+    /// its `KeyPackageBundle` as `join_from_welcome` reads it, so it needs no
+    /// openmls validation of a `KeyPackage` openmls's clock rejects.
+    fn own_consumed_marker(signer_state: &SignerState) -> String {
+        let wrapper = parse_signer_state(signer_state).unwrap();
+        let own_bytes = wrapper.key_package_public_bytes.clone();
+        let (_signer, provider) = signer_and_provider_from_wrapper(wrapper).unwrap();
+        let own = ProductionMlsBackend::own_key_package(&provider, &own_bytes).unwrap();
+        ProductionMlsBackend::consumed_init_key_marker(own.hpke_init_key().as_slice())
+    }
+
+    /// A joiner whose injected clock is the clock Bob's `KeyPackage` was
+    /// minted on, so the injected-clock check passes and only openmls's real
+    /// clock in `KeyPackageIn::validate` can reject. `join_from_welcome` runs
+    /// every own-`KeyPackage` check before it reads the Welcome bytes, so no
+    /// adder and no real-time wait are needed.
+    async fn joiner_on_mint_clock(
+        mint_now: u64,
+        name: &str,
+    ) -> (
+        ProductionMlsBackend,
+        Arc<dyn OpenMlsStorageAdapter>,
+        GeneratedKeyPackage,
+    ) {
+        let store: Arc<dyn OpenMlsStorageAdapter> = Arc::new(SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ));
+        let joiner = ProductionMlsBackend::new(Arc::new(scp_clock::TestClock::new(mint_now)));
+        joiner.set_consumed_init_key_store(Arc::clone(&store));
+        let bob_gen = joiner
+            .generate_key_package(&test_credential(name), None)
+            .await
+            .unwrap();
+        (joiner, store, bob_gen)
+    }
+
+    /// ADR-057 §Prereq-1, residual: the injected clock reads Bob's
+    /// `KeyPackage` as current, but openmls's real clock in
+    /// `KeyPackageIn::validate` (inside `own_consumed_init_key_key`) reads it as
+    /// expired. The join reports that rejection as `KeyPackageLifetimeInvalid`
+    /// with the `KeyPackage`'s bounds and openmls's `now`, the same shape as an
+    /// injected-clock rejection, and records no consumed init key.
+    #[tokio::test]
+    async fn join_from_welcome_reports_openmls_clock_rejection_of_own_key_package_as_lifetime_invalid()
+     {
+        use scp_mls::lifetime::{KEY_PACKAGE_LIFETIME_MARGIN_SECS, KEY_PACKAGE_LIFETIME_SECS};
+
+        // Expired under the real clock since `SystemClock.now_secs() - 10`.
+        let mint_now = SystemClock.now_secs() - 10 - KEY_PACKAGE_LIFETIME_SECS;
+        let (joiner, store, bob_gen) = joiner_on_mint_clock(mint_now, "bob-openmls-expired").await;
+
+        let err = joiner
+            .join_from_welcome(
+                b"never read",
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .err()
+            .expect("openmls's clock rejects Bob's expired KeyPackage");
+        assert!(
+            matches!(
+                err,
+                MlsError::KeyPackageLifetimeInvalid { not_before, not_after, now }
+                    if not_before == mint_now - KEY_PACKAGE_LIFETIME_MARGIN_SECS
+                        && not_after == mint_now + KEY_PACKAGE_LIFETIME_SECS
+                        && not_after <= now
+            ),
+            "expected KeyPackageLifetimeInvalid with Bob's bounds, got {err:?}"
+        );
+        assert!(
+            store
+                .retrieve(&own_consumed_marker(&bob_gen.signer_state))
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected join must not record the init key as consumed"
+        );
+    }
+
+    /// As `join_from_welcome_reports_openmls_clock_rejection_of_own_key_package_as_lifetime_invalid`,
+    /// for openmls's `NotValidYet`: Bob's `KeyPackage` is minted on a clock two
+    /// hours ahead, so its `not_before` lies an hour ahead of the real clock,
+    /// and the injected clock reads that same future time.
+    #[tokio::test]
+    async fn join_from_welcome_reports_openmls_not_valid_yet_of_own_key_package_as_lifetime_invalid()
+     {
+        use scp_mls::lifetime::{KEY_PACKAGE_LIFETIME_MARGIN_SECS, KEY_PACKAGE_LIFETIME_SECS};
+
+        let real_now = SystemClock.now_secs();
+        let mint_now = real_now + 2 * 60 * 60;
+        let (joiner, store, bob_gen) = joiner_on_mint_clock(mint_now, "bob-openmls-early").await;
+
+        let err = joiner
+            .join_from_welcome(
+                b"never read",
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .err()
+            .expect("openmls's clock rejects Bob's not-yet-valid KeyPackage");
+        assert!(
+            matches!(
+                err,
+                MlsError::KeyPackageLifetimeInvalid { not_before, not_after, now }
+                    if not_before == mint_now - KEY_PACKAGE_LIFETIME_MARGIN_SECS
+                        && not_after == mint_now + KEY_PACKAGE_LIFETIME_SECS
+                        && real_now <= now
+                        && now < not_before
+            ),
+            "expected KeyPackageLifetimeInvalid with Bob's bounds, got {err:?}"
+        );
+        assert!(
+            store
+                .retrieve(&own_consumed_marker(&bob_gen.signer_state))
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected join must not record the init key as consumed"
+        );
+    }
+
+    /// A confirm retry after a join that completed, or a replay of a consumed
+    /// `KeyPackage`, is `KeyPackageReplay` even once the own `KeyPackage` has
+    /// expired under the injected clock: the consumed-set check runs before
+    /// any lifetime check, and the key package actor relies on that variant to
+    /// finish an interrupted consume.
+    #[tokio::test]
+    async fn join_from_welcome_replay_after_injected_clock_expiry_is_key_package_replay() {
+        use scp_clock::TestClock;
+        use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+
+        let real_now = SystemClock.now_secs();
+        let joiner_clock = Arc::new(TestClock::new(real_now));
+        let store: Arc<dyn OpenMlsStorageAdapter> = Arc::new(SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ));
+        let joiner = ProductionMlsBackend::new(Arc::clone(&joiner_clock) as Arc<dyn Clock>);
+        joiner.set_consumed_init_key_store(Arc::clone(&store));
+        let bob_gen = joiner
+            .generate_key_package(&test_credential("bob-replay-injected"), None)
+            .await
+            .unwrap();
+        let adder = ProductionMlsBackend::new(Arc::new(SystemClock));
+        let mut alice = adder
+            .create_group(&test_credential("alice-replay-injected"), None)
+            .await
+            .unwrap();
+        let bob_add = adder
+            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .await
+            .unwrap();
+        joiner
+            .join_from_welcome(
+                &bob_add.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .unwrap();
+
+        // Bob's `not_after` is `real_now + KEY_PACKAGE_LIFETIME_SECS`.
+        joiner_clock.set(real_now + KEY_PACKAGE_LIFETIME_SECS + 1);
+        let err = joiner
+            .join_from_welcome(
+                &bob_add.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .err()
+            .expect("a second join of a consumed KeyPackage must be rejected");
+        assert!(
+            matches!(err, MlsError::KeyPackageReplay),
+            "expected KeyPackageReplay for the consumed, since-expired KeyPackage, got {err:?}"
+        );
+    }
+
+    /// As `join_from_welcome_replay_after_injected_clock_expiry_is_key_package_replay`,
+    /// but only openmls's real clock reads the consumed own `KeyPackage` as
+    /// expired; the injected clock still reads it as current. The store holds
+    /// the consumed marker for the bundle's init key, as a completed join
+    /// leaves it.
+    #[tokio::test]
+    async fn join_from_welcome_replay_after_openmls_clock_expiry_is_key_package_replay() {
+        use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+
+        // Expired under the real clock since `SystemClock.now_secs() - 10`.
+        let mint_now = SystemClock.now_secs() - 10 - KEY_PACKAGE_LIFETIME_SECS;
+        let (joiner, store, bob_gen) = joiner_on_mint_clock(mint_now, "bob-replay-openmls").await;
+        store
+            .store(&own_consumed_marker(&bob_gen.signer_state), &[0x01])
+            .await
+            .unwrap();
+
+        let err = joiner
+            .join_from_welcome(
+                b"never read",
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .err()
+            .expect("a second join of a consumed KeyPackage must be rejected");
+        assert!(
+            matches!(err, MlsError::KeyPackageReplay),
+            "expected KeyPackageReplay for the consumed, since-expired KeyPackage, got {err:?}"
+        );
+    }
+
+    /// A mismatched `(key_package_public_bytes, signer_state)` pair whose
+    /// caller `KeyPackage` has expired under openmls's clock is the mismatch
+    /// rejection (`WelcomeProcessingFailed`), never a
+    /// `KeyPackageLifetimeInvalid` carrying the signer state's own, current
+    /// `KeyPackage`'s bounds.
+    #[tokio::test]
+    async fn join_from_welcome_mismatched_expired_caller_key_package_is_not_lifetime_invalid() {
+        use scp_clock::TestClock;
+        use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+
+        let real_now = SystemClock.now_secs();
+        let store: Arc<dyn OpenMlsStorageAdapter> = Arc::new(SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ));
+        let joiner = ProductionMlsBackend::new(Arc::new(TestClock::new(real_now)));
+        joiner.set_consumed_init_key_store(Arc::clone(&store));
+        let bob_gen = joiner
+            .generate_key_package(&test_credential("bob-mismatch-own"), None)
+            .await
+            .unwrap();
+        // Expired under both clocks since `real_now - 10`.
+        let expired = ProductionMlsBackend::new(Arc::new(TestClock::new(
+            real_now - 10 - KEY_PACKAGE_LIFETIME_SECS,
+        )))
+        .generate_key_package(&test_credential("bob-mismatch-expired"), None)
+        .await
+        .unwrap();
+        let adder = ProductionMlsBackend::new(Arc::new(SystemClock));
+        let mut alice = adder
+            .create_group(&test_credential("alice-mismatch"), None)
+            .await
+            .unwrap();
+        let bob_add = adder
+            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .await
+            .unwrap();
+
+        let err = joiner
+            .join_from_welcome(
+                &bob_add.welcome,
+                bob_gen.signer_state.clone(),
+                &expired.key_package_bytes,
+            )
+            .await
+            .err()
+            .expect("a mismatched pair must be rejected");
+        assert!(
+            matches!(err, MlsError::WelcomeProcessingFailed(_)),
+            "expected the mismatch rejection, got {err:?}"
+        );
+        let consumed_key =
+            ProductionMlsBackend::consumed_init_key_key(&bob_gen.key_package_bytes).unwrap();
+        assert!(
+            store.retrieve(&consumed_key).await.unwrap().is_none(),
+            "a rejected join must not record the init key as consumed"
+        );
+    }
+
+    /// Pins the injected-clock check on the signer state's own `KeyPackage`
+    /// in `join_from_welcome`, with no real-time wait. The injected clock
+    /// sits past the own `KeyPackage`'s `not_after` while the real clock
+    /// reads it as current, and the caller passes the bytes of a different,
+    /// current `KeyPackage`. Only the injected-clock check rejects before the
+    /// mismatch check: without it, openmls's clock accepts the own
+    /// `KeyPackage` and the mismatch is `WelcomeProcessingFailed`.
+    #[tokio::test]
+    async fn join_from_welcome_checks_own_key_package_against_injected_clock_before_mismatch() {
+        use scp_clock::TestClock;
+        use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+
+        let real_now = SystemClock.now_secs();
+        let joiner_clock = Arc::new(TestClock::new(real_now));
+        let store: Arc<dyn OpenMlsStorageAdapter> = Arc::new(SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ));
+        let joiner = ProductionMlsBackend::new(Arc::clone(&joiner_clock) as Arc<dyn Clock>);
+        joiner.set_consumed_init_key_store(Arc::clone(&store));
+        let bob_gen = joiner
+            .generate_key_package(&test_credential("bob-injected-own"), None)
+            .await
+            .unwrap();
+        let other = joiner
+            .generate_key_package(&test_credential("bob-injected-other"), None)
+            .await
+            .unwrap();
+        let adder = ProductionMlsBackend::new(Arc::new(SystemClock));
+        let mut alice = adder
+            .create_group(&test_credential("alice-injected-own"), None)
+            .await
+            .unwrap();
+        let bob_add = adder
+            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .await
+            .unwrap();
+
+        // Bob's `not_after` is `real_now + KEY_PACKAGE_LIFETIME_SECS`.
+        let injected_now = real_now + KEY_PACKAGE_LIFETIME_SECS + 1;
+        joiner_clock.set(injected_now);
+        let err = joiner
+            .join_from_welcome(
+                &bob_add.welcome,
+                bob_gen.signer_state.clone(),
+                &other.key_package_bytes,
+            )
+            .await
+            .err()
+            .expect("an own KeyPackage expired under the injected clock must be rejected");
+        assert!(
+            matches!(
+                err,
+                MlsError::KeyPackageLifetimeInvalid { not_after, now, .. }
+                    if now == injected_now && not_after == real_now + KEY_PACKAGE_LIFETIME_SECS
+            ),
+            "expected KeyPackageLifetimeInvalid at the injected clock's now, got {err:?}"
+        );
+        let consumed_key =
+            ProductionMlsBackend::consumed_init_key_key(&bob_gen.key_package_bytes).unwrap();
+        assert!(
+            store.retrieve(&consumed_key).await.unwrap().is_none(),
+            "a rejected join must not record the init key as consumed"
+        );
+    }
+
+    /// ADR-057 §Prereq-1 wiring: `join_from_welcome` rejects a Welcome whose
+    /// tree holds a KeyPackage-sourced leaf over the maximum lifetime range
+    /// with `TreeLeafLifetimeRangeInvalid`. The durable consumed-init-key set
+    /// records nothing, so the rejected join does not use up the `KeyPackage`:
+    /// a later Welcome to the same `KeyPackage` joins.
+    #[tokio::test]
+    async fn join_from_welcome_rejects_over_range_tree_leaf_and_records_no_consumed_key() {
+        let store: Arc<dyn OpenMlsStorageAdapter> = Arc::new(SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        ));
+        let joiner = ProductionMlsBackend::new(Arc::new(SystemClock));
+        joiner.set_consumed_init_key_store(Arc::clone(&store));
+
+        let bob_gen = joiner
+            .generate_key_package(&test_credential("bob-over-range-leaf"), None)
+            .await
+            .unwrap();
+
+        let (mut alice, over_long_not_after) =
+            group::group_holding_carol_leaf_over_max_range().unwrap();
+        let adder = ProductionMlsBackend::new(Arc::new(SystemClock));
+        let over_range_add = adder
+            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .await
+            .unwrap();
+
+        let err = joiner
+            .join_from_welcome(
+                &over_range_add.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .err()
+            .expect("the join must reject a Welcome whose tree holds an over-range leaf");
+        assert!(
+            matches!(
+                err,
+                MlsError::TreeLeafLifetimeRangeInvalid { leaf_index: 1, not_after, .. }
+                    if not_after == over_long_not_after
+            ),
+            "expected TreeLeafLifetimeRangeInvalid for Carol's leaf (leaf 1), got {err:?}"
+        );
+
+        let consumed_key =
+            ProductionMlsBackend::consumed_init_key_key(&bob_gen.key_package_bytes).unwrap();
+        assert!(
+            store.retrieve(&consumed_key).await.unwrap().is_none(),
+            "a rejected join must not record the init key as consumed"
+        );
+
+        // Control: a Welcome to the same KeyPackage from a group without the
+        // over-range leaf joins over the same store and records the init key.
+        let mut clean = adder
+            .create_group(&test_credential("alice-clean"), None)
+            .await
+            .unwrap();
+        let clean_added = adder
+            .add_member_raw(&mut clean, &bob_gen.key_package_bytes)
+            .await
+            .unwrap();
+        joiner
+            .join_from_welcome(
+                &clean_added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.retrieve(&consumed_key).await.unwrap().is_some(),
+            "an accepted join records the init key under the same store key"
         );
     }
 
@@ -1034,7 +1832,7 @@ mod tests {
         use scp_mls::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS;
 
         // Mint the KeyPackage at the REAL present (backend clock is `SystemClock`)
-        // so openmls's un-injectable internal `is_valid` accepts it; the injected
+        // so openmls's un-injectable internal `validate` accepts it; the injected
         // `clock` param is what drives the SCP hardened re-check below.
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let cred = test_credential("carol-stateless");
@@ -1061,8 +1859,43 @@ mod tests {
         );
     }
 
+    /// Security-model spec §9.7.1, the adder: `validate_key_package` (every
+    /// caller is an add path) accepts a `KeyPackage` with exactly the minimum
+    /// remaining lifetime under the injected clock and refuses one a second
+    /// short of it.
     #[tokio::test]
-    async fn process_commit_applies_epoch_advance() {
+    async fn validate_key_package_enforces_min_remaining_lifetime_boundary() {
+        use scp_clock::TestClock;
+        use scp_mls::{KEY_PACKAGE_LIFETIME_SECS, KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS};
+
+        // Mint at a pinned present so `not_after` is known exactly.
+        let minted_at = SystemClock.now_secs();
+        let backend = ProductionMlsBackend::new(Arc::new(TestClock::new(minted_at)));
+        let generated = backend
+            .generate_key_package(&test_credential("dave-boundary"), None)
+            .await
+            .unwrap();
+        let not_after = minted_at + KEY_PACKAGE_LIFETIME_SECS;
+
+        let at_min = TestClock::new(not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS);
+        backend
+            .validate_key_package(&generated.key_package_bytes, &at_min)
+            .await
+            .unwrap();
+
+        let past_min = TestClock::new(not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 1);
+        let err = backend
+            .validate_key_package(&generated.key_package_bytes, &past_min)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MlsError::KeyPackageLifetimeInvalid { not_after: na, .. } if na == not_after),
+            "one second short of the minimum must be KeyPackageLifetimeInvalid, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decrypt_applies_epoch_advance() {
         let backend = joinable_backend();
 
         // `advance_epoch` always proposes a wrapping-extension update on
@@ -1103,10 +1936,8 @@ mod tests {
             .unwrap();
         assert_eq!(alice_grp.epoch().unwrap(), 2);
 
-        backend
-            .process_commit(&mut bob_grp, &adv_commit)
-            .await
-            .unwrap();
+        let merged = backend.decrypt(&mut bob_grp, &adv_commit).await.unwrap();
+        assert!(matches!(merged, DecryptedContent::Commit { .. }));
         assert_eq!(bob_grp.epoch().unwrap(), 2);
     }
 

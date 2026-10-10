@@ -252,6 +252,7 @@ async fn journal_swap_runs_restore_and_replay_legs_over_real_journal() {
 
         let params = ContextParams {
             mode: ContextMode::Encrypted,
+            ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
         sup1.create_context(ctx_id.to_owned(), params, DID::from(creator_did), None)
@@ -385,6 +386,7 @@ async fn journal_swap_restores_context_before_replaying_sagas() {
             .unwrap();
         let params = ContextParams {
             mode: ContextMode::Encrypted,
+            ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
         sup1.create_context(ctx_id.to_owned(), params, DID::from(creator_did), None)
@@ -616,7 +618,7 @@ async fn journal_swap_sqlite_durable_crash_recovery_round_trips_on_disk() {
         // Release the SQLite advisory exclusive lock so process 2 can open the
         // SAME database directory (drop alone would also release it, but close()
         // releases even while outstanding Arc clones persist).
-        storage1.close();
+        storage1.close().expect("close releases the lock");
         drop(journal1);
         drop(storage1);
     }
@@ -661,7 +663,7 @@ async fn journal_swap_sqlite_durable_crash_recovery_round_trips_on_disk() {
          the REAL sqlite file (durable on-disk round-trip), got {unresolved:?}"
     );
 
-    storage2.close();
+    storage2.close().expect("close releases the lock");
 }
 
 // ===========================================================================

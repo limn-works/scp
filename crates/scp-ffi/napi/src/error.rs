@@ -112,14 +112,9 @@ pub enum ScpNapiError {
         code: String,
     },
 
-    /// A §6.2.4 cross-context outlet-invocation saga aborted at a Prepare phase
-    /// (ADR-049 §3a).
+    /// A §6.2.4 cross-context outlet-invocation saga aborted (ADR-049 §3a).
     ///
-    /// This terminal surfaces a §6.2.4 saga `Aborted` and, like its `PyO3` and
-    /// `UniFFI` siblings, may be a PERMANENT rejection (authorization / freshness
-    /// / rate-limit / co-residency policy denial) OR a RETRYABLE transient (a
-    /// rate limit, or a participant actor unavailable to complete the Prepare
-    /// exchange) — distinguished by the `SCP-SAGA-*` code.
+    /// The code tells its causes apart.
     ///
     /// napi-rs collapses every `ScpNapiError` to a single `napi::Error` whose
     /// only payload is a message string (the TypeScript SDK reverses the
@@ -137,7 +132,7 @@ pub enum ScpNapiError {
     SagaAborted {
         /// Human-readable detail.
         message: String,
-        /// The canonical `SCP-SAGA-13xxx` code.
+        /// Stable error code.
         code: String,
         /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
         retry_after_ms: Option<u64>,
@@ -308,6 +303,23 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                 message: format!("{e}"),
                 code: codes::CTX_2096.to_owned(),
             },
+            // construction.md M2: a create with no ceiling or a null one omits
+            // a required field; an empty one is an invalid field value.
+            CE::CeilingRequired(declared) => Self::Validation {
+                message: format!("{e}"),
+                code: match declared {
+                    scp_core::context::CeilingDeclaration::Absent
+                    | scp_core::context::CeilingDeclaration::Null => codes::VALID_7004,
+                    scp_core::context::CeilingDeclaration::Empty => codes::VALID_7005,
+                }
+                .to_owned(),
+            },
+            // ADR-049 §10: dedicated SCP-CTX-2130, not CTX_2001; the
+            // `ContextError::ActorBusy` doc states producers and retry behaviour.
+            CE::ActorBusy(_) => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2130.to_owned(),
+            },
             // ADR-049 §10: actor poisoned (exceeded the respawn budget).
             // Dedicated SCP-CTX-2134 instead of the CTX_2001 catch-all so a
             // caller can detect "dormant, needs operator recovery".
@@ -328,6 +340,13 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
             CE::KeyPackageReplay(_) => Self::Context {
                 message: format!("{e}"),
                 code: codes::CTX_2136.to_owned(),
+            },
+            // ADR-049 Decision 16: the Supervisor refused the operation
+            // because shutdown began. Dedicated SCP-CTX-2138 instead of
+            // CTX_2001. Mirrors the PyO3 bridge for cross-bridge parity.
+            CE::SupervisorShutDown(_) => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2138.to_owned(),
             },
             // §5.9: a `RestoreAccess` requested capabilities that were not
             // actually suspended for the member (and the member is not
@@ -402,6 +421,17 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
 
 impl From<scp_core::context::builder::ContextCreationError> for ScpNapiError {
     fn from(e: scp_core::context::builder::ContextCreationError) -> Self {
+        // The core's empty-ceiling rejection keeps its own validation code
+        // (construction.md M2), the one the parser's rejection carries, and a
+        // create refused because Supervisor shutdown began keeps SCP-CTX-2138
+        // (ADR-049 Decision 16).
+        if let scp_core::context::builder::ContextCreationError::StateTransition(
+            inner @ (scp_core::context::ContextError::CeilingRequired(_)
+            | scp_core::context::ContextError::SupervisorShutDown(_)),
+        ) = e
+        {
+            return inner.into();
+        }
         Self::Context {
             message: format!(
                 "context creation failed: {e} — check context parameters and identity"
@@ -682,6 +712,23 @@ impl ScpNapiError {
 
 impl From<scp_platform::PlatformError> for ScpNapiError {
     fn from(e: scp_platform::PlatformError) -> Self {
+        // Spec §17.6 "One Opener per Durable Directory": the closed-store and
+        // lock-still-held conditions carry their registered storage codes.
+        match &e {
+            scp_platform::PlatformError::StorageClosed => {
+                return Self::Validation {
+                    message: e.to_string(),
+                    code: codes::STORAGE_8006.to_owned(),
+                };
+            }
+            scp_platform::PlatformError::StorageLockHeld { .. } => {
+                return Self::Validation {
+                    message: e.to_string(),
+                    code: codes::STORAGE_8005.to_owned(),
+                };
+            }
+            _ => {}
+        }
         Self::custody_failure(
             format!("platform key operation failed: {e} — check key custody configuration"),
             &scp_crypto::CustodyFailure::from(&e),
@@ -905,6 +952,55 @@ mod tests {
         }
     }
 
+    /// ADR-049 §10: `ContextError::ActorBusy` must surface the dedicated
+    /// SCP-CTX-2130 code, NOT the catch-all SCP-CTX-2001.
+    #[test]
+    fn actor_busy_surfaces_ctx_2130() {
+        let err: ScpNapiError =
+            scp_core::context::ContextError::ActorBusy("ctx-1".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2130);
+    }
+
+    /// construction.md M2: the core's empty-ceiling rejection, which reaches
+    /// the bridge wrapped in `ContextCreationError::StateTransition`, keeps
+    /// `SCP-VALID-7005`; every other creation failure keeps `SCP-CTX-2002`.
+    #[test]
+    fn creation_ceiling_required_keeps_valid_7005() {
+        use scp_core::context::builder::ContextCreationError as CCE;
+        let err: ScpNapiError =
+            CCE::StateTransition(scp_core::context::ContextError::CeilingRequired(
+                scp_core::context::CeilingDeclaration::Empty,
+            ))
+            .into();
+        match err {
+            ScpNapiError::Validation { code, .. } => assert_eq!(code, codes::VALID_7005),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        let err: ScpNapiError =
+            CCE::StateTransition(scp_core::context::ContextError::CeilingImmutable).into();
+        assert_eq!(context_code_of(err), codes::CTX_2002);
+    }
+
+    /// construction.md M2: a create that declared no usable ceiling surfaces
+    /// as a validation error, not a context error: an absent or null ceiling
+    /// with `SCP-VALID-7004`, an empty one with `SCP-VALID-7005`.
+    #[test]
+    fn ceiling_required_surfaces_valid_7004_or_7005() {
+        use scp_core::context::CeilingDeclaration as D;
+        for (declared, expected) in [
+            (D::Absent, codes::VALID_7004),
+            (D::Null, codes::VALID_7004),
+            (D::Empty, codes::VALID_7005),
+        ] {
+            let err: ScpNapiError =
+                scp_core::context::ContextError::CeilingRequired(declared).into();
+            match err {
+                ScpNapiError::Validation { code, .. } => assert_eq!(code, expected, "{declared:?}"),
+                other => panic!("expected ScpNapiError::Validation, got {other:?}"),
+            }
+        }
+    }
+
     /// ADR-049 §10: a poisoned context must surface the dedicated
     /// SCP-CTX-2134 code, NOT the catch-all SCP-CTX-2001.
     #[test]
@@ -930,6 +1026,52 @@ mod tests {
         let err: ScpNapiError =
             scp_core::context::ContextError::KeyPackageReplay("kp".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2136);
+    }
+
+    /// ADR-049 Decision 16: an operation the Supervisor refused because
+    /// shutdown began must surface the dedicated SCP-CTX-2138 code, distinct
+    /// from the catch-all.
+    #[test]
+    fn supervisor_shut_down_surfaces_ctx_2138() {
+        let err: ScpNapiError =
+            scp_core::context::ContextError::SupervisorShutDown("spawn".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2138);
+        let err: ScpNapiError = scp_core::context::builder::ContextCreationError::StateTransition(
+            scp_core::context::ContextError::SupervisorShutDown("spawn".to_owned()),
+        )
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2138);
+        let err: ScpNapiError = scp_core::context::builder::ContextCreationError::StateTransition(
+            scp_core::context::ContextError::CeilingImmutable,
+        )
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2002);
+    }
+
+    /// Spec §17.6 "One Opener per Durable Directory": a held lock and a closed
+    /// store carry their registered storage codes; any other platform error
+    /// is a custody failure, `SCP-CRYPTO-4060`.
+    #[test]
+    fn storage_platform_errors_carry_registered_codes() {
+        let held: ScpNapiError = scp_platform::PlatformError::StorageLockHeld {
+            dir: "/tmp/scp".to_owned(),
+            lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+        }
+        .into();
+        assert!(
+            matches!(&held, ScpNapiError::Validation { code, .. } if code == codes::STORAGE_8005),
+            "{held:?}"
+        );
+        let closed: ScpNapiError = scp_platform::PlatformError::StorageClosed.into();
+        assert!(
+            matches!(&closed, ScpNapiError::Validation { code, .. } if code == codes::STORAGE_8006),
+            "{closed:?}"
+        );
+        let other: ScpNapiError = scp_platform::PlatformError::StorageError("io".to_owned()).into();
+        assert!(
+            matches!(&other, ScpNapiError::Crypto { code, .. } if code == codes::CRYPTO_4060),
+            "{other:?}"
+        );
     }
 
     /// §5.9: a `RestoreAccess` with nothing to restore must surface the

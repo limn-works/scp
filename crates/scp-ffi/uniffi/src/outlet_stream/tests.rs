@@ -350,7 +350,10 @@ async fn live_poll_next_drains_to_terminal() {
     let handle = scp
         .context_create(
             Arc::clone(&creator_identity),
+            // The ceiling admits the registration the creator performs below;
+            // `outlet_register` reads it off the supervisor actor.
             streaming_context_params(&[
+                "outlet:register",
                 "outlet:call:*",
                 "messages:read",
                 "messages:write",
@@ -387,7 +390,7 @@ async fn live_poll_next_drains_to_terminal() {
     handle
         .outlet_handlers
         .lock()
-        .await
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(outlet_id.clone(), handler);
 
     // Make the invoker a real member (clears §9.8.5) and grant it OutletCallAll
@@ -495,6 +498,44 @@ async fn live_poll_next_drains_to_terminal() {
         format!("{after}").contains("no active outlet stream"),
         "post-terminal poll is a not-found error: {after}"
     );
+
+    // Once bridge shutdown has begun, the open call site refuses to register a
+    // stream the still-live Supervisor opened: the caller receives
+    // `SCP-CTX-2139` and the registry holds no entry for it. The late open
+    // carries a token of its own, because the nonce check refuses a second use
+    // of the first open's token before the open reaches registration.
+    let late_ucan = scp
+        .ucan_mint(
+            Arc::clone(&handle),
+            invoker.clone(),
+            vec!["outlet_call:*".to_owned()],
+            None,
+        )
+        .await
+        .expect("ucan_mint should succeed");
+    bi.core.stop_borrowers();
+    let late = outlet_stream_open_impl(
+        &bi,
+        &handle,
+        outlet_id.clone(),
+        r#"{"a":"1","b":"2"}"#.to_owned(),
+        invoker.clone(),
+        late_ucan.encoded(),
+        None,
+        None,
+        None,
+        Some(1),
+    )
+    .await
+    .expect_err("an open after bridge shutdown began must be refused");
+    assert!(
+        format!("{late}").contains(codes::CTX_2139),
+        "a late open is refused with SCP-CTX-2139: {late}"
+    );
+    assert!(
+        bi.outlet_stream_registry.is_empty(),
+        "a refused late open leaves no registry entry"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -563,7 +604,10 @@ mod streaming_vectors_live {
         let handle = scp
             .context_create(
                 Arc::clone(&creator_identity),
+                // The ceiling admits the registration the creator performs
+                // below; `outlet_register` reads it off the supervisor actor.
                 streaming_context_params(&[
+                    "outlet:register",
                     "outlet:call:*",
                     "messages:read",
                     "messages:write",
@@ -595,7 +639,7 @@ mod streaming_vectors_live {
         handle
             .outlet_handlers
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(outlet_id.clone(), handler);
 
         let supervisor = Arc::clone(
@@ -987,7 +1031,7 @@ mod xctx_streaming_saga_tests {
         "governance:propose",
     ];
 
-    /// Drives `context_id` to a real non-active (`Closed`) lifecycle state through
+    /// Drives `context_id` to a real non-active (`Closing`) lifecycle state through
     /// the REAL supervisor close path — the exact `LifecycleCommand::CloseContext`
     /// dispatch the bridge's close uses — so a subsequent
     /// `supervisor.read_context_state(context_id)` returns a non-`Active` state.
@@ -995,7 +1039,7 @@ mod xctx_streaming_saga_tests {
     /// what the streaming-saga open's active-state guard now reads. `initiator_did`
     /// must be the creator of a context created with a `ContextClose`-bearing
     /// ceiling (see [`CLOSEABLE_STREAMING_CEILING`]).
-    async fn drive_context_closed(
+    async fn drive_context_closing(
         bi: &Arc<crate::runtime::UniffiBridgeInstance>,
         context_id: &str,
         initiator_did: &str,
@@ -1024,17 +1068,30 @@ mod xctx_streaming_saga_tests {
             .expect("close should succeed");
     }
 
+    /// Asserts that `msg` is the lifecycle gate's withheld refusal: it carries
+    /// the withheld text, does not contain "closing" in any letter case, and
+    /// does not contain `context_id`.
+    fn assert_withheld(msg: &str, context_id: &str) {
+        assert!(
+            msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "the refusal must come from the lifecycle gate: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("closing") && !msg.contains(context_id),
+            "the refusal must withhold the lifecycle state and the context id: {msg}"
+        );
+    }
+
     /// (LIFECYCLE) A money-moving streaming-saga OPEN against a NON-active source
     /// or target context is rejected with `OUTLET_6010` (caller) / `OUTLET_6011`
-    /// (target) — parity with the UNARY cross-context saga export's two-handle
-    /// guard and the NAPI streaming open — BEFORE any input validation, UCAN
-    /// check, or saga drive, so no saga is started and no receiver is handed out.
+    /// (target) BEFORE any input validation, UCAN check, or saga drive, so no
+    /// saga is started and no receiver is handed out. The refusal withholds the
+    /// lifecycle state and the context id.
     ///
-    /// The context is driven to a REAL `Closed` state through the actual
-    /// supervisor close path; the guard reads the AUTHORITATIVE actor state via
-    /// `read_context_state` (NOT the lagging FFI `ContextHandle::state` cache), so
-    /// this genuinely exercises the authoritative read that closes the
-    /// Closing-cache money gap.
+    /// The context is driven to a REAL `Closing` state through the actual
+    /// supervisor close path; the guard reads the AUTHORITATIVE actor state (NOT
+    /// the lagging FFI `ContextHandle::state` cache), so this genuinely
+    /// exercises the authoritative read that closes the Closing-cache money gap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xctx_streaming_saga_open_rejects_non_active_context() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -1076,7 +1133,7 @@ mod xctx_streaming_saga_tests {
             )
             .await
             .expect("context_create (target) should succeed");
-        drive_context_closed(&bi, &handle_a.context_id(), &hosted_caller).await;
+        drive_context_closing(&bi, &handle_a.context_id(), &hosted_caller).await;
 
         // Precondition: the authoritative supervisor state is non-active — this is
         // what the guard reads, proving the test drives a REAL Closing/Closed
@@ -1115,6 +1172,7 @@ mod xctx_streaming_saga_tests {
             msg.contains(codes::OUTLET_6010),
             "expected caller-axis SCP-OUTLET-6010, got: {msg}"
         );
+        assert_withheld(&msg, &handle_a.context_id());
         assert!(
             bi.outlet_streaming_saga_registry.is_empty(),
             "a rejected non-active open must NOT start a saga / hand out a receiver"
@@ -1136,7 +1194,7 @@ mod xctx_streaming_saga_tests {
             )
             .await
             .expect("context_create (target 2) should succeed");
-        drive_context_closed(&bi, &handle_d.context_id(), &hosted_caller).await;
+        drive_context_closing(&bi, &handle_d.context_id(), &hosted_caller).await;
 
         let (caller, outlet, input, nonce, ucan) = open_args(hosted_caller, outlet_id);
         let err = outlet_streaming_saga_open_impl(
@@ -1162,6 +1220,7 @@ mod xctx_streaming_saga_tests {
             msg.contains(codes::OUTLET_6011),
             "expected target-axis SCP-OUTLET-6011, got: {msg}"
         );
+        assert_withheld(&msg, &handle_d.context_id());
         assert!(
             bi.outlet_streaming_saga_registry.is_empty(),
             "a rejected non-active open must NOT start a saga / hand out a receiver"
@@ -1169,14 +1228,19 @@ mod xctx_streaming_saga_tests {
     }
 
     /// (CRYPTO defense-in-depth, SCP-OUT-047) The streaming-saga RECOVER derives
-    /// the TARGET context's Active Signing Key from the `creator_did` it reads out
-    /// of the UCAN-state registry (`with_ucan_state`), whereas the context handle
-    /// carries its OWN `creator_did`. In the co-resident model these are the SAME
-    /// fact from two sources; this pins that they never diverge for a registered
-    /// context, so a future refactor that lets one drift from the other (letting
-    /// recover seal under a different context's key) is caught here.
+    /// the TARGET context's Active Signing Key from the `creator_did` it reads
+    /// off that context's supervisor actor (`live_role_state`), whereas the
+    /// context handle carries its OWN `creator_did` recorded at creation.
+    ///
+    /// The test pins two facts. At creation the two sources agree, so the key
+    /// recover resolves is the creator's key. Once the supervisor despawns the
+    /// actor, `resolve_context_active_signing_key_by_id` refuses with the
+    /// absent-role-state error, while the handle still carries its copy: a
+    /// resolver that went back to reading the handle or the per-context UCAN
+    /// state would resolve a key for a context no actor serves, and this test
+    /// would go red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn xctx_streaming_saga_ucan_state_creator_did_matches_handle() {
+    async fn xctx_streaming_saga_signing_key_resolves_from_the_live_actor() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = Arc::clone(&scp.inner);
         let _resolver = install_seedable_resolver(&bi);
@@ -1193,14 +1257,31 @@ mod xctx_streaming_saga_tests {
             .await
             .expect("context_create should succeed");
 
-        let ucan_creator = bi
-            .with_ucan_state(&handle.context_id, |state| state.creator_did.clone())
-            .expect("a created context must be registered in the UCAN-state registry");
+        let live_creator = bi
+            .live_role_state(&handle.context_id)
+            .await
+            .expect("a created context's actor must answer the role-state read")
+            .creator_did;
         assert_eq!(
-            ucan_creator, handle.creator_did,
-            "the UCAN-state creator_did (the recover signing-key source) must equal the handle's \
-             creator_did — a divergence would let streaming-saga recover seal under a different \
-             context's Active Signing Key"
+            live_creator, handle.creator_did,
+            "the supervisor's creator_did (the recover signing-key source) must equal the \
+             handle's creator_did at creation — a divergence would let streaming-saga recover \
+             seal under a different context's Active Signing Key"
+        );
+        super::resolve_context_active_signing_key_by_id(&bi, &handle.context_id)
+            .await
+            .expect("a live actor whose creator this bridge hosts resolves the signing key");
+
+        bi.context_manager_or_error()
+            .expect("supervisor")
+            .despawn_actor(&handle.context_id)
+            .await;
+        let err = super::resolve_context_active_signing_key_by_id(&bi, &handle.context_id)
+            .await
+            .expect_err("a context no actor serves must not resolve a signing key");
+        assert!(
+            err.to_string().contains("no live supervisor role state"),
+            "the refusal must come from the live role-state read: {err}"
         );
     }
 }
@@ -1234,4 +1315,95 @@ async fn stream_signer_under_a_destroyed_custody_key_is_crypto_4006() {
         Err(other) => panic!("expected Crypto CRYPTO_4006, got {other:?}"),
         Ok(_) => panic!("a destroyed #active key must not resolve a stream signer"),
     }
+}
+
+/// A stream or streaming saga the bridge refuses to register once bridge
+/// shutdown has begun had already started, so it reaches the caller as the
+/// Context class with `SCP-CTX-2139` (and, for a saga, its id), never with
+/// `SCP-CTX-2138`, the code of the Supervisor's own stream refusal, which
+/// comes before anything started and is also the Context class.
+#[test]
+fn late_shutdown_refusals_differ_from_supervisor_refusal_code() {
+    let ScpError::Context { code, .. } = late_registration_err(
+        scp_ffi_common::bridge_instance::late_registration_refusal(None),
+    ) else {
+        panic!("a late stream refusal must be the Context class");
+    };
+    assert_eq!(code, codes::CTX_2139);
+    let ScpError::Context { code, .. } = open_rejection_to_err(
+        &scp_core::context::outlets::invoke::OutletStreamOpenError::SupervisorShutDown {
+            message: "open outlet stream refused".to_owned(),
+        },
+    ) else {
+        panic!("the Supervisor's own stream refusal must be the Context class");
+    };
+    assert_eq!(code, codes::CTX_2138);
+    assert!(
+        matches!(
+            open_rejection_to_err(
+                &scp_core::context::outlets::invoke::OutletStreamOpenError::Rejected(
+                    scp_core::context::outlets::OpenStreamRejection::ContextNotActive {
+                        current_state: "Closing".to_owned(),
+                    },
+                ),
+            ),
+            ScpError::Outlet { .. }
+        ),
+        "an open rejection keeps the Outlet class"
+    );
+
+    assert!(
+        matches!(
+            map_saga_error(
+                scp_core::context::supervisor::SagaError::SupervisorShutDown {
+                    message: "start cross-context streaming saga".to_owned(),
+                }
+            ),
+            ScpError::SagaAborted { .. }
+        ),
+        "the Supervisor's own streaming-saga refusal keeps the SagaAborted class"
+    );
+}
+
+/// A started streaming saga registers while the bridge runs, and once
+/// `stop_borrowers` has run the registration is refused with the Context
+/// class, `SCP-CTX-2139` and the saga id, and leaves no registry entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_saga_registration_refused_after_shutdown_began() {
+    let scp = crate::scp::Scp::new_in_memory_for_test();
+    let bi = Arc::clone(&scp.inner);
+    let entry = |id: &str| {
+        let (_tx, rx) = mpsc::channel(1);
+        StreamingSagaEntry {
+            receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+            saga_id: scp_core::context::supervisor::SagaId(id.to_owned()),
+            target_context_id: "target-ctx-late".to_owned(),
+            invoker_did: "did:scp:test-invoker".to_owned(),
+            request_id: [0u8; 16],
+        }
+    };
+
+    let registered = register_streaming_saga(&bi, entry("saga-before-1"))
+        .expect("a saga started before shutdown registers");
+    assert_eq!(registered, "saga-before-1");
+    assert!(
+        bi.outlet_streaming_saga_registry
+            .contains_key("saga-before-1")
+    );
+
+    bi.core.stop_borrowers();
+    let Err(ScpError::Context { msg, code }) = register_streaming_saga(&bi, entry("saga-late-1"))
+    else {
+        panic!("a late streaming-saga registration must be refused with the Context class");
+    };
+    assert_eq!(code, codes::CTX_2139);
+    assert!(
+        msg.contains("saga-late-1"),
+        "the error names the started saga: {msg}"
+    );
+    assert!(
+        !bi.outlet_streaming_saga_registry
+            .contains_key("saga-late-1"),
+        "a refused registration leaves no entry"
+    );
 }

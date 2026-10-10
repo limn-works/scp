@@ -866,7 +866,7 @@ pub enum TransportEvent {
 
 ## ADR-006: Platform Abstraction (In-Memory Testing Adapter)
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-09-29 (SCP-307, a pseudonym has no private key, and the typed custody failure).
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling) and 2026-09-29 (SCP-307, a pseudonym has no private key, and the typed custody failure; `InMemoryPush` returns a fixed wake signal and copies no payload byte into it; acceptance criterion 3; the `Push` trait's `handle_notification` returns one fixed wake signal; `WakeSignal`'s `&'static` bytes rule out returning the borrowed payload or a temporary copy of it, and `check_fixed_wake_signal` checks that the signal does not vary across the payloads it sends; `push_conformance!()` requires a fixed wake signal of every adapter, in the testing harness paragraph).
 
 **Amendment (2026-09-10 — the `KeyCustody` key types are both P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `KeyType` enum this ADR defines named one variant per curve and now names both by purpose: `P256Signing` and `P256Agreement`. Every method contract below reads the same way afterwards — `sign` rejects an agreement-only handle, `dh_agree` rejects a signing-only handle — because the split was always a purpose split and the curve names hid that. The pseudonym derivation gains the seed-to-scalar step of §9.10.4 of the security-model spec, because P-256 has no analogue of the seed expansion RFC 8032 fixed for the superseded curve. This ADR's adapter is the in-memory testing one, so no custody claim changes.
 
@@ -918,7 +918,7 @@ None. This is foundational. The traits it implements are defined in `scp-platfor
 
 3. **`InMemoryPush`**
    - `register() -> PushToken`: Returns a synthetic push token (UUID).
-   - `handle_notification(payload) -> WakeSignal`: Passes through the payload as a wake signal.
+   - `handle_notification(payload) -> WakeSignal`: Returns the fixed wake signal `{"aps":{"content-available":1}}` (UTF-8 bytes) for every payload and copies no byte of the payload into it. `10-infrastructure-and-self-hosting.md` §10.7 states: "Push payloads MUST contain a wake signal and nothing else. No context ID, no sender identifier, no message preview, no metadata of any kind." A wake signal built from the received bytes would hand the caller whatever metadata a relay put there. The bytes are the APNs payload ADR-025 criterion 4 (`.docs/adrs/phase-5.md`) names. (Amended 2026-09-29; this bullet previously read "`handle_notification(payload) -> WakeSignal`: Passes through the payload as a wake signal.")
    - For Phase 1 testing, push is not exercised (two processes use direct relay subscriptions). This adapter exists to satisfy the trait requirements.
 
 4. **`InMemoryStorage`**
@@ -998,6 +998,15 @@ pub trait DeviceAttestation: Send + Sync {
 
 pub trait Push: Send + Sync {
     async fn register(&self) -> Result<PushToken, PlatformError>;
+    /// Amended 2026-09-29: returns one fixed WakeSignal for every payload it accepts, and
+    /// may reject a payload instead. §10.7 of 10-infrastructure-and-self-hosting.md states:
+    /// "Push payloads MUST contain a wake signal and nothing else. No context ID, no sender
+    /// identifier, no message preview, no metadata of any kind." The signal must therefore
+    /// not vary with the payload. WakeSignal
+    /// holds &'static bytes, so an implementation cannot return the borrowed payload or a
+    /// temporary copy of it; the type does not stop a signal chosen by payload content, and
+    /// the conformance check check_fixed_wake_signal rejects a signal that varies across the
+    /// payloads it sends.
     async fn handle_notification(&self, payload: &[u8]) -> Result<WakeSignal, PlatformError>;
 }
 
@@ -1028,7 +1037,7 @@ pub trait Storage: Send + Sync {
 
 **Estimated functions:** ~4-5 per trait implementation, ~15-20 total.
 
-**Testing harness.** These in-memory adapters are consumed by the `scp-testing` crate (§16), which composes them into a full network simulation harness: `SimulatedIdentity` wraps a real `Identity` with `InMemoryKeyCustody` + `InMemoryStorage` + `InMemoryTransport` instances. Trait conformance macros (`key_custody_conformance!()`, `storage_conformance!()`, `attestation_conformance!()`, `push_conformance!()`) verify that every adapter implementation — in-memory and production — satisfies the same contract.
+**Testing harness.** These in-memory adapters are consumed by the `scp-testing` crate (§16), which composes them into a full network simulation harness: `SimulatedIdentity` wraps a real `Identity` with `InMemoryKeyCustody` + `InMemoryStorage` + `InMemoryTransport` instances. Trait conformance macros (`key_custody_conformance!()`, `storage_conformance!()`, `attestation_conformance!()`, `push_conformance!()`) verify that every adapter implementation — in-memory and production — satisfies the same contract. `push_conformance!()` requires each adapter to accept at least one permitted wake payload and to return a non-empty wake signal for it, and to return a byte-identical signal for every other payload it accepts among the fixed set the check sends (the other permitted payloads, those payloads with trailing whitespace, and payloads carrying a context ID or sender), as `16-test-infrastructure.md` §16.12.5 states; the adapter may reject any of them instead. The check samples that set; it does not exercise payloads outside it. (Amended 2026-09-29; the macro previously required only that a wake signal be returned.)
 
 ---
 

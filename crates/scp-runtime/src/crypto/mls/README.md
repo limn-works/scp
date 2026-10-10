@@ -16,14 +16,12 @@ in `scp-runtime` import those items from `scp_mls` directly — there is no
 re-export shim (ADR-057 Amendment; enforced by
 `scripts/check-no-shim-reexports.sh`).
 
-This module (`crates/scp-runtime/src/crypto/mls/`) keeps only the **async
-durable-storage bridge** — the `tokio`-coupled, node-only pieces:
+This module (`crates/scp-runtime/src/crypto/mls/`) keeps only the
+`tokio`-coupled, node-only pieces:
 
 - `provider.rs` — `NodeMlsFactory`
 - `backend.rs` — the `MlsBackend` trait + raw-output types
 - `production_backend.rs` — `ProductionMlsBackend`
-- `storage.rs` — the OpenMLS `StorageProvider` bridge (`ScpMlsProvider`,
-  `MlsStorageBridge`)
 - `storage_adapter.rs` — `OpenMlsStorageAdapter` + `SpawnBlockingStorageAdapter`
 
 ## The injected-backend shape (ADR-049 §6)
@@ -71,10 +69,11 @@ resolves both problems:
   replacing the old `block_in_place` pattern that made `current_thread`
   runtimes panic.
 
-`storage.rs` is the OpenMLS `StorageProvider` bridge itself: `MlsStorageBridge`
-wraps an `Arc<ProtocolRepository<S>>` + context ID, and `ScpMlsProvider<S>`
-presents it to `OpenMLS`. It is an allow-listed `block_in_place` sync-bridge
-site in the ratchet (`scripts/check-block-in-place.py`).
+Every live `OpenMLS` provider is `scp_mls::InMemoryMlsProvider`. Its
+`StorageProvider`, `scp_mls::InMemoryMlsStorage`, holds the group state in
+memory and refuses to store the MLS signer (persistence spec §17.9). The
+runtime persists that state as one snapshot blob, and snapshot capture and
+restore refuse a signer-labelled storage entry (§17.9.1).
 
 ## The crypto model at a glance
 
@@ -89,8 +88,8 @@ through the backend traits above.
 - **`scp_mls::encrypt`** — application message seal/open. Membership-tag
   verification, generation-number replay tracking, and forward secrecy are
   enforced by `OpenMLS` internally.
-- **`scp_mls::ratchet`** — epoch advancement (Commit processing) and MLS
-  `Update` proposals for post-compromise security.
+- **`scp_mls::ratchet`** — MLS `Update` proposals for post-compromise
+  security. A receiving member merges a Commit through `scp_mls::encrypt`.
 - **`scp_mls::epoch_grace`** — `EpochGraceStore`. When a Commit advances the
   epoch, old-epoch key material is retained briefly so in-flight messages
   under the prior epoch still decrypt.

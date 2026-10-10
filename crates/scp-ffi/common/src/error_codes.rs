@@ -284,7 +284,7 @@ pub const IDENT_1058: &str = "SCP-IDENT-1058";
 /// Surfaced by all native bridges (`PyO3`, napi-rs, `UniFFI`) and `scp-node`
 /// when a production identity-creation path is invoked on a shipped (no-`testing`)
 /// build. Every identity commits a pre-rotation commitment at creation (spec
-/// §9.7.4.1 §3 — mandatory), which requires a `PreRotationCustody` backend; the
+/// §9.7.4.1 item 5(a)), which requires a `PreRotationCustody` backend; the
 /// only implementation that exists today is the in-memory test nullifier
 /// (`InMemoryPreRotationCustody`), now gated to the test harness only (ADR-062
 /// §Decision 6). Rather than silently mint the nullifier (which would ship a
@@ -540,6 +540,11 @@ pub const CTX_2095: &str = "SCP-CTX-2095";
 ///
 /// Maps from `ContextError::NotPseudonymousContext`.
 pub const CTX_2096: &str = "SCP-CTX-2096";
+/// Actor busy (ADR-049 §10).
+///
+/// Maps from `ContextError::ActorBusy` in each bridge's error translator; that
+/// variant's doc states its producers and retry behaviour.
+pub const CTX_2130: &str = "SCP-CTX-2130";
 /// Context poisoned: its actor exceeded the respawn budget (ADR-049 §10).
 ///
 /// No longer respawned; the context is dormant until an operator clears the
@@ -576,6 +581,33 @@ pub const CTX_2136: &str = "SCP-CTX-2136";
 ///
 /// Maps from `ContextError::NothingToRestore`.
 pub const CTX_2137: &str = "SCP-CTX-2137";
+/// Supervisor shutting down.
+///
+/// The Supervisor that owns the context set its closed flag in
+/// `shutdown_all_contexts`, or has dropped, so it refused to start the
+/// operation (ADR-049 Decision 16, supervisor task drain). Nothing the
+/// refused operation would have done has happened.
+///
+/// Distinct from the generic `CTX_2001` catch-all so a caller can tell an
+/// operation refused by shutdown apart from a failure of the operation
+/// itself. Construct a new `SCP` instance to continue.
+///
+/// Maps from `ContextError::SupervisorShutDown` and
+/// `SagaError::SupervisorShutDown`.
+pub const CTX_2138: &str = "SCP-CTX-2138";
+/// Stream or streaming saga dropped unregistered by bridge shutdown.
+///
+/// A bridge returns this code, built by
+/// [`late_registration_refusal`](crate::bridge_instance::late_registration_refusal),
+/// when bridge shutdown began after the Supervisor opened an outlet stream or
+/// started a streaming saga and before the bridge registered it. The operation
+/// started before the refusal: its outlet handler may have run, and its pump
+/// may append the stream's `OutletInvokedEvent` and settle its escrow. The
+/// bridge holds no handle to the stream after the refusal.
+///
+/// Distinct from `CTX_2138`, whose refused operation has done nothing, so a
+/// caller does not treat a started operation as one that never ran.
+pub const CTX_2139: &str = "SCP-CTX-2139";
 /// Bridge connector context creation error.
 pub const CTX_2100: &str = "SCP-CTX-2100";
 /// Bridge connector context join error.
@@ -762,17 +794,29 @@ pub const TRANS_5016: &str = "SCP-TRANS-5016";
 pub const TRANS_5018: &str = "SCP-TRANS-5018";
 /// Transport proof error.
 pub const TRANS_5019: &str = "SCP-TRANS-5019";
-/// Transport webhook error.
+/// MCP client `tools/list`: no client is registered under the handle.
 pub const TRANS_5020: &str = "SCP-TRANS-5020";
-/// Transport webhook register error.
+/// MCP client `tools/list`: the handle was disconnected while the call
+/// waited for the client's lock, so the call sent no request.
 pub const TRANS_5021: &str = "SCP-TRANS-5021";
-/// Transport webhook unregister error.
+/// MCP client `tools/list`: the request failed on the transport, the server
+/// answered with an error, or the call itself failed.
+///
+/// On NAPI and `UniFFI` the task running the call failed; on `PyO3` an
+/// earlier call panicked while holding the client's lock, which fails every
+/// later call on the handle this way until the host disconnects it.
 pub const TRANS_5022: &str = "SCP-TRANS-5022";
-/// Transport webhook list error.
+/// MCP client `tools/call`: no client is registered under the handle.
 pub const TRANS_5023: &str = "SCP-TRANS-5023";
-/// Transport webhook fire error.
+/// MCP client `tools/call`: the handle was disconnected while the call
+/// waited for the client's lock, so the call sent no request.
 pub const TRANS_5024: &str = "SCP-TRANS-5024";
-/// Transport webhook test error.
+/// MCP client `tools/call`: the request failed on the transport, the server
+/// answered with an error, or the call itself failed.
+///
+/// On NAPI and `UniFFI` the task running the call failed; on `PyO3` an
+/// earlier call panicked while holding the client's lock, which fails every
+/// later call on the handle this way until the host disconnects it.
 pub const TRANS_5025: &str = "SCP-TRANS-5025";
 /// Transport relay configured error.
 pub const TRANS_5030: &str = "SCP-TRANS-5030";
@@ -1037,6 +1081,26 @@ pub const VALID_7076: &str = "SCP-VALID-7076";
 pub const VALID_7077: &str = "SCP-VALID-7077";
 /// Attestation validation error.
 pub const VALID_7080: &str = "SCP-VALID-7080";
+/// SDK-wrapper local guard: no native bridge is installed.
+///
+/// An SDK's native loader raises it when the native bridge for the platform is
+/// absent; the ts-native SDK throws it when no napi addon package resolves for
+/// the platform (`src/internal/native.ts`), and the Python SDK raises it when no
+/// `scp_sdk._scp_core` extension file is present (`scp_sdk/_extension.py`). It
+/// is the only native-load failure a test skip guard may treat as absence. The
+/// code has one meaning in every SDK that loads a native bridge, and no FFI
+/// bridge mints it.
+pub const VALID_7081: &str = "SCP-VALID-7081";
+/// SDK-wrapper local guard: a native bridge is installed and failed to load.
+///
+/// The native bridge is present, and loading it failed (a `dlopen` error, an ABI
+/// or architecture mismatch, a missing shared library), or it loaded without an
+/// export the SDK calls. The ts-native SDK throws it from `src/internal/native.ts`
+/// and `src/scp.ts`; the Python SDK raises it from `scp_sdk/__init__.py`,
+/// `scp_sdk/_extension.py`, and `scp_sdk/scp.py`. The code has one meaning in
+/// every SDK that loads a native bridge, and no FFI bridge mints it. A test skip
+/// guard must fail on it.
+pub const VALID_7082: &str = "SCP-VALID-7082";
 /// Discovery announce validation error.
 pub const VALID_7090: &str = "SCP-VALID-7090";
 /// Discovery search validation error.
@@ -1167,8 +1231,8 @@ pub const STORAGE_8000: &str = "SCP-STORAGE-8000";
 /// Returned when `SqliteStorage::new` or `SqliteStorage::with_passphrase`
 /// rejects the caller's selection: a wrong key or passphrase on an existing
 /// `SQLCipher` database, a directory the process cannot write, a corrupt
-/// file, a salt-sidecar fail-closed condition, or a second handle against a
-/// database another `SCP` instance already holds an advisory lock on.
+/// file, or a salt-sidecar fail-closed condition. A directory whose advisory
+/// lock another store holds is [`STORAGE_8005`] instead.
 /// Spec §17.6 makes this terminal — no bridge downgrades to in-memory
 /// storage after it. All three bridges report this one code, so a caller
 /// reading a code learns the same thing whichever binding raised it.
@@ -1181,6 +1245,29 @@ pub const STORAGE_8000: &str = "SCP-STORAGE-8000";
 /// found" and "durable backend failed to open" inside that app.
 pub const STORAGE_8004: &str = "SCP-STORAGE-8004";
 
+/// The durable storage directory's advisory lock is still held.
+///
+/// Returned when `SqliteStorage::new` or `SqliteStorage::with_passphrase`
+/// finds `{dir}/scp.db.lock` held by another store, in this process or
+/// another (`scp_platform::PlatformError::StorageLockHeld`). Spec §17.6 "One
+/// Opener per Durable Directory" makes the open fail at once: it does not
+/// wait for the lock and does not fall back to another backend.
+///
+/// Also returned by an SDK `shutdown` that left the instance's own store
+/// holding its lock: the Supervisor drain did not finish
+/// (`ShutdownOutcome::TimedOut` with `durable_store_open`), the store refused
+/// to close (`ShutdownError::DurableStoreClose`), or an earlier shutdown had
+/// not closed it (`ShutdownError::AlreadyShutDown` with
+/// `durable_store_open`). A reopen of the
+/// directory then fails with this code until the store is released.
+pub const STORAGE_8005: &str = "SCP-STORAGE-8005";
+
+/// The store has released its database connection.
+///
+/// Each bridge's `From<scp_platform::PlatformError>` translation maps
+/// `scp_platform::PlatformError::StorageClosed` to this code.
+pub const STORAGE_8006: &str = "SCP-STORAGE-8006";
+
 // -------------------------------------------------------------------------
 // Attestation (SCP-ATTEST- 9000--9999)
 // -------------------------------------------------------------------------
@@ -1189,7 +1276,9 @@ pub const STORAGE_8004: &str = "SCP-STORAGE-8004";
 ///
 /// The Android adapter throws it when a Play Integrity token request fails,
 /// and the Apple adapter throws it when Apple's App Attest service answers
-/// with an error that no narrower `SCP-ATTEST-` code names.
+/// with an error that no narrower `SCP-ATTEST-` code names, or when the
+/// caller's task is cancelled while its App Attest call is queued or waiting
+/// for Apple's answer.
 pub const ATTEST_9001: &str = "SCP-ATTEST-9001";
 
 /// Attestation signature verification requires raw JSON, which is absent.
@@ -1224,8 +1313,8 @@ pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
 
 // Codes the Swift `AppleDeviceAttestation` adapter throws as `ScpError`
 // from its UniFFI `DeviceAttestationProvider` callback methods
-// (`AttestationError.scpError`). Each of these three codes belongs to one of
-// the four `AttestationError` cases; the fourth case, `serviceError`, reuses
+// (`AttestationError.scpError`). Each of these nine codes belongs to one of
+// the ten `AttestationError` cases; the tenth case, `serviceError`, reuses
 // `ATTEST_9001`.
 
 /// Apple App Attest is unsupported on this device.
@@ -1235,11 +1324,65 @@ pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
 pub const ATTEST_9019: &str = "SCP-ATTEST-9019";
 /// No App Attest key ID is stored, so no assertion is possible.
 pub const ATTEST_9020: &str = "SCP-ATTEST-9020";
+/// Apple already attested this App Attest key.
+///
+/// `attestKey` answered `DCError.invalidKey` and the key probe's assertion
+/// with that key succeeded. For the stored key, the Apple adapter keeps the
+/// key and records it as attested; for a replacement key, it discards the
+/// replacement key ID and keeps the stored key.
+pub const ATTEST_9021: &str = "SCP-ATTEST-9021";
+/// Apple refused an `assertRequest` assertion with a stored App Attest key that
+/// carries no attestation record.
+///
+/// `assertRequest`'s `generateAssertion` answered `DCError.invalidKey` for a
+/// key that carries no attestation record, which names either an unattested
+/// key or a rejected key whose record was never written; the Apple adapter
+/// keeps the key.
+pub const ATTEST_9022: &str = "SCP-ATTEST-9022";
+/// Apple's App Attest service rejected this device's key.
+///
+/// `generateAssertion` answered `DCError.invalidKey` for a key that carries
+/// an attestation record, or `attestKey` and the key probe's assertion both
+/// answered `DCError.invalidKey`. For the stored key, the Apple adapter
+/// discards the key ID and record; for a replacement key, it discards the
+/// replacement key ID and keeps the stored key and its record.
+pub const ATTEST_9023: &str = "SCP-ATTEST-9023";
+/// App Attest `attestKey` or `generateAssertion` answered
+/// `DCError.serverUnavailable`.
+///
+/// The Apple adapter keeps the key for a retry. A `generateKey` answer of
+/// `DCError.serverUnavailable` gives `SCP-ATTEST-9001`.
+pub const ATTEST_9024: &str = "SCP-ATTEST-9024";
 /// The App Attest adapter reached a state no caller input produces.
 ///
 /// Apple's service answered a completion handler with neither a value nor an
 /// error.
 pub const ATTEST_9025: &str = "SCP-ATTEST-9025";
+/// The attestation challenge or the assertion request hash is not 32 bytes.
+///
+/// ADR-025 acceptance criterion 3 has the Rust core pass the 32-byte binding
+/// digest `D` of `09-security-model.md` §9.3.1 as `challenge` and the 32-byte
+/// assertion digest `A` as `request_hash`, and the Apple adapter hands each to
+/// App Attest as `clientDataHash` unchanged. On a device that supports App
+/// Attest, the Apple adapter throws this code for either input when it is not
+/// 32 bytes, before it generates a key or calls App Attest; on a device that
+/// does not, it throws `SCP-ATTEST-9019` first.
+pub const ATTEST_9026: &str = "SCP-ATTEST-9026";
+/// Apple App Attest did not answer one serialized call within 25 seconds.
+///
+/// ADR-025 acceptance criterion 3 bounds each call the Apple adapter's call
+/// serializer runs, the whole of one `attest` or one `assert_request`, at 25
+/// seconds from the call's start, below the runtime's 30-second actor
+/// `HANDLER_TIMEOUT`. Time the call spends queued behind earlier calls counts
+/// against no bound, so a queued caller's whole wait can pass 30 seconds.
+/// When the bound expires, the waiting
+/// `attest` or `assert_request` throws this code, the serializer starts the
+/// next queued call, and an answer Apple gives later is discarded: it stores
+/// no key ID, writes no attestation record, discards no key ID, and reaches
+/// no caller. `SCP-ATTEST-9025` names a completion
+/// handler that answered with neither a value nor an error, a different
+/// condition.
+pub const ATTEST_9027: &str = "SCP-ATTEST-9027";
 
 // -------------------------------------------------------------------------
 // Economy (SCP-ECON- 12000--12999)

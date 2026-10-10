@@ -3,10 +3,13 @@
 // These tests exercise the software fallback path (Bouncy Castle) since Android Keystore
 // is not available in JVM unit tests. AndroidKeyCustodyPseudonymLifecycleTest runs the
 // Keystore path (API 33+, CustodyType.HARDWARE) against a fake KeystoreKeys; no on-device
-// test of the real Keystore exists yet.
+// test of the real Keystore exists yet. Three checks on a hardware handle throw before they
+// read Keystore, so a JVM test reaches them: exportSigningKeyBytes's SCP-CRYPTO-4005,
+// dhAgree's SCP-CRYPTO-4003 for a peer key that is not 32 bytes, and dhAgree's
+// SCP-CRYPTO-4006 for a 32-byte peer key, because a Keystore handle never enters softwareKeys.
 //
 // Uses InMemorySharedPreferences to inject a test double for EncryptedSharedPreferences,
-// allowing verification of Ed25519 key persistence without the Android framework (#119).
+// allowing verification of Ed25519 key persistence without the Android framework.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // SCP-110 (Implement Android Keystore KeyCustody trait).
@@ -96,15 +99,21 @@ internal class InMemorySharedPreferences : SharedPreferences {
 }
 
 /**
- * Unit tests for [AndroidKeyCustody] software fallback path.
+ * Unit tests for [AndroidKeyCustody]: the software fallback path, plus the three Keystore-handle
+ * checks a JVM test reaches.
  *
  * Android Keystore is not available in JVM unit tests. These tests verify:
  * - Software Ed25519 key generation, signing, and public key extraction
- * - Software X25519 key generation and DH agreement
+ * - Software X25519 key generation and DH agreement, and `SCP-CRYPTO-4003` for a peer key that
+ *   is not 32 bytes and `SCP-CRYPTO-4006` for a 32-byte one from dhAgree for a
+ *   [CustodyType.HARDWARE] handle, each thrown before it reads Keystore
  * - Pseudonym derivation determinism
- * - Key destruction
+ * - Key destruction, and the error codes a destroyed handle yields
+ * - Signing-key export: the seed of a software Ed25519 key, `SCP-CRYPTO-4003` for an X25519
+ *   key, `SCP-CRYPTO-4006` for a missing key, and
+ *   `SCP-CRYPTO-4005` for a [CustodyType.HARDWARE] handle, which throws before it reads Keystore
  * - Error handling (key not found, wrong key type)
- * - Ed25519 key persistence to EncryptedSharedPreferences (#119)
+ * - Ed25519 key persistence to EncryptedSharedPreferences
  *
  * The Build.VERSION.SDK_INT in JVM tests defaults to 0, which is below
  * API 33 (TIRAMISU), so all Ed25519 keys will use the software path.
@@ -365,6 +374,23 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
+        fun `destroyKey makes subsequent dhAgree fail with SCP-CRYPTO-4006 or 4003 for a wrong-length peer`() {
+            val handle = custody.generateKeypair(KeyType.X25519)
+            custody.destroyKey(handle)
+
+            val destroyed = assertThrows<ScpException> {
+                custody.dhAgree(handle, ByteArray(32))
+            }
+            assertEquals("SCP-CRYPTO-4006", destroyed.code)
+
+            // dhAgree checks the peer key's length before it looks up the handle.
+            val wrongLength = assertThrows<ScpException> {
+                custody.dhAgree(handle, ByteArray(31))
+            }
+            assertEquals("SCP-CRYPTO-4003", wrongLength.code)
+        }
+
+        @Test
         fun `destroyKey throws SCP-CRYPTO-4006 for already-destroyed key`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
             custody.destroyKey(handle)
@@ -443,6 +469,22 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
+        fun `dhAgree throws SCP-CRYPTO-4006 for a hardware handle and never reads Keystore`() {
+            // A Keystore handle has no softwareKeyTypes entry, so dhAgree skips the key-type
+            // check and fails the software-key lookup before any Keystore call.
+            val hardwareHandle = KeyHandle(id = "keystore-key", custodyType = CustodyType.HARDWARE)
+            val exception = assertThrows<ScpException> {
+                custody.dhAgree(hardwareHandle, ByteArray(32))
+            }
+            assertEquals("SCP-CRYPTO-4006", exception.code)
+            // The peer length check still runs first for a hardware handle.
+            val lengthException = assertThrows<ScpException> {
+                custody.dhAgree(hardwareHandle, ByteArray(31))
+            }
+            assertEquals("SCP-CRYPTO-4003", lengthException.code)
+        }
+
+        @Test
         fun `dhAgree throws SCP-CRYPTO-4003 for wrong-size peerPublic`() {
             val handle = custody.generateKeypair(KeyType.X25519)
             for (badSize in listOf(0, 16, 31, 33, 64)) {
@@ -451,6 +493,18 @@ class AndroidKeyCustodyTest {
                 }
                 assertEquals("SCP-CRYPTO-4003", exception.code)
             }
+        }
+
+        @Test
+        fun `dhAgree lets IllegalStateException escape for an all-zero low-order peer key`() {
+            val handle = custody.generateKeypair(KeyType.X25519)
+            // A 32-byte peer key passes the length check, so only the low order of the point
+            // separates this call from the successful agreements above.
+            val exception = assertThrows<IllegalStateException> {
+                custody.dhAgree(handle, ByteArray(32))
+            }
+            // assertThrows fails on an ScpException, which is not an IllegalStateException.
+            assertEquals("X25519 agreement failed", exception.message)
         }
     }
 
@@ -520,6 +574,66 @@ class AndroidKeyCustodyTest {
             )
             assertEquals(33, pubKey.size)
             assertTrue(pubKey[0] == 0x02.toByte() || pubKey[0] == 0x03.toByte())
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Signing-key export
+    // -------------------------------------------------------------------
+
+    @Nested
+    inner class ExportSigningKeyBytes {
+
+        @Test
+        fun `exportSigningKeyBytes rejects a hardware handle with SCP-CRYPTO-4005 citing ADR-063`() {
+            // The hardware branch throws before it reads Android Keystore, so a JVM test reaches it.
+            val hardwareHandle = KeyHandle(id = "keystore-key", custodyType = CustodyType.HARDWARE)
+            val exception = assertThrows<ScpException> {
+                custody.exportSigningKeyBytes(hardwareHandle)
+            }
+            assertEquals("SCP-CRYPTO-4005", exception.code)
+            val message = exception.message.orEmpty()
+            assertTrue(message.contains("ADR-063's curve slice"), message)
+            // ADR-063 requires every key-export accessor to leave the custody adapters and all
+            // three bridges, not only for governance signing, so the message may not narrow the
+            // clause.
+            assertTrue(message.contains("every key-export accessor"), message)
+            assertTrue(!message.contains("for governance signing"), message)
+            // The curve slice has not landed, so the message may not state its signer path as current.
+            assertTrue(message.contains("has not landed"), message)
+            assertTrue(!message.contains("replaces raw-key export"), message)
+            assertTrue(!message.contains("GitHub issue"), message)
+            // The adapter never reads KeyInfo.securityLevel, so the message may not claim a TEE.
+            assertTrue(message.contains("Android Keystore custody"), message)
+            assertTrue(!message.contains("TEE"), message)
+        }
+
+        @Test
+        fun `exportSigningKeyBytes returns the 32-byte seed of a software Ed25519 key`() {
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            val seed = custody.exportSigningKeyBytes(handle)
+            assertEquals(32, seed.size)
+            // The exported seed regenerates the handle's public key, so it is that key's seed.
+            val derivedPublic = Ed25519PrivateKeyParameters(seed, 0).generatePublicKey().encoded
+            assertArrayEquals(custody.publicKey(handle), derivedPublic)
+        }
+
+        @Test
+        fun `exportSigningKeyBytes throws SCP-CRYPTO-4003 for an X25519 key`() {
+            val x25519Handle = custody.generateKeypair(KeyType.X25519)
+            val exception = assertThrows<ScpException> {
+                custody.exportSigningKeyBytes(x25519Handle)
+            }
+            assertEquals("SCP-CRYPTO-4003", exception.code)
+        }
+
+        @Test
+        fun `exportSigningKeyBytes throws SCP-CRYPTO-4006 for a missing software key`() {
+            val missing = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
+            val exception = assertThrows<ScpException> {
+                custody.exportSigningKeyBytes(missing)
+            }
+            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
     }
 
@@ -608,7 +722,7 @@ class AndroidKeyCustodyTest {
     }
 
     // -------------------------------------------------------------------
-    // Ed25519 key persistence (#119)
+    // Ed25519 key persistence
     // -------------------------------------------------------------------
 
     @Nested
@@ -683,6 +797,27 @@ class AndroidKeyCustodyTest {
                     KeyHandle(id = handle.id, custodyType = CustodyType.SOFTWARE),
                 )
             }
+        }
+
+        @Test
+        fun `destroyKey on one instance leaves the key signing on another instance that restored it`() {
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            val originalPubKey = custody.publicKey(handle)
+            val other = AndroidKeyCustody(prefs)
+
+            custody.destroyKey(handle)
+
+            val exception = assertThrows<ScpException> {
+                custody.sign(handle, "data".toByteArray())
+            }
+            assertEquals("SCP-CRYPTO-4006", exception.code)
+
+            val data = "signed after another instance destroyed the key".toByteArray(Charsets.UTF_8)
+            val signature = other.sign(handle, data)
+            val verifier = Ed25519Signer()
+            verifier.init(false, Ed25519PublicKeyParameters(originalPubKey, 0))
+            verifier.update(data, 0, data.size)
+            assertTrue(verifier.verifySignature(signature))
         }
 
         @Test

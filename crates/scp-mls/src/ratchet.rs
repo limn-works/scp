@@ -1,13 +1,12 @@
 //! MLS ratcheting and update operations for SCP.
 //!
-//! This module implements epoch advancement (Commit processing) and
-//! post-compromise security (Update proposals) on top of the
-//! [`ScpMlsGroup`] wrapper.
+//! This module implements post-compromise security (Update proposals) on top
+//! of the [`ScpMlsGroup`] wrapper. A receiving member merges the resulting
+//! Commit through [`crate::encrypt::decrypt_with_sender_did`] or
+//! [`crate::encrypt::decrypt_with_membership_changes`].
 //!
 //! # Operations
 //!
-//! - [`process_commit`] — Process an incoming Commit message, advancing the
-//!   group to a new epoch while placing the old epoch into the grace window.
 //! - [`propose_update`] — Issue an MLS Update proposal that generates a fresh
 //!   HPKE key pair and ratchets the sender's path, providing post-compromise
 //!   security. Recommended interval: every 24 hours.
@@ -15,84 +14,10 @@
 //! See ADR-001 acceptance criteria 6 and 7.
 
 use openmls::prelude::*;
-use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
+use tls_codec::Serialize as TlsSerializeTrait;
 
-use crate::epoch_grace::EpochGraceStore;
 use crate::error::MlsError;
 use crate::group::ScpMlsGroup;
-
-/// Processes an incoming Commit message, advancing the group to a new epoch.
-///
-/// The old epoch is placed into the [`EpochGraceStore`] so that in-flight
-/// messages encrypted under it can still be decrypted during the grace window.
-///
-/// # Arguments
-///
-/// * `group` - The MLS group receiving the Commit. Must be active.
-/// * `commit_bytes` - The serialized Commit message bytes (TLS-serialized
-///   `MlsMessageOut` from the committer).
-/// * `grace_store` - The epoch grace store where the old epoch will be tracked.
-///
-/// # Errors
-///
-/// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
-/// Returns [`MlsError::CommitProcessingFailed`] if the Commit message cannot
-/// be deserialized, processed, or merged.
-///
-/// See ADR-001 acceptance criterion 6.
-pub fn process_commit(
-    group: &mut ScpMlsGroup,
-    commit_bytes: &[u8],
-    grace_store: &mut EpochGraceStore,
-) -> Result<(), MlsError> {
-    // Record the current epoch before processing the Commit. This epoch will
-    // enter the grace window after the Commit is merged.
-    let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
-    let old_epoch = g.epoch().as_u64();
-
-    // Deserialize the Commit bytes into an MlsMessageIn.
-    let message_in = MlsMessageIn::tls_deserialize(&mut &*commit_bytes)
-        .map_err(|e| MlsError::CommitProcessingFailed(format!("deserializing commit: {e}")))?;
-
-    // Convert to a ProtocolMessage for processing.
-    let protocol_message = message_in.try_into_protocol_message().map_err(|e| {
-        MlsError::CommitProcessingFailed(format!("extracting protocol message: {e}"))
-    })?;
-
-    // Process the message — this validates the Commit and produces a StagedCommit.
-    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-    let processed = g
-        .process_message(&group.provider, protocol_message)
-        .map_err(|e| MlsError::CommitProcessingFailed(e.to_string()))?;
-
-    // Extract the staged commit from the processed message.
-    let staged_commit = match processed.into_content() {
-        ProcessedMessageContent::StagedCommitMessage(staged) => *staged,
-        _ => {
-            return Err(MlsError::CommitProcessingFailed(
-                "message is not a Commit".to_string(),
-            ));
-        }
-    };
-
-    // Merge the staged commit to advance the group to the new epoch.
-    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-    g.merge_staged_commit(&group.provider, staged_commit)
-        .map_err(|e| MlsError::CommitProcessingFailed(format!("merging staged commit: {e}")))?;
-
-    // Place the old epoch into the grace window. In-flight messages encrypted
-    // under this epoch can still be decrypted until the grace window closes
-    // (30 seconds or until all members send in the new epoch).
-    //
-    // add_epoch() enforces capacity bounds and returns any epochs that were
-    // expired or evicted. OpenMLS handles its own key material deletion
-    // internally (via delete_previous_epoch_keypairs during commit merges),
-    // so we do not need to explicitly delete key material here. The expired
-    // epochs list is available for logging/diagnostics if needed.
-    let _expired_epochs = grace_store.add_epoch(old_epoch);
-
-    Ok(())
-}
 
 /// Issues an MLS Update proposal and immediately commits it.
 ///
@@ -110,7 +35,8 @@ pub fn process_commit(
 /// # Returns
 ///
 /// The Commit message as an [`MlsMessageOut`] that must be sent to all
-/// group members. Members will process this via [`process_commit`].
+/// group members. Members merge it through
+/// [`crate::encrypt::decrypt_with_sender_did`].
 ///
 /// # Errors
 ///
@@ -210,6 +136,7 @@ pub fn serialize_mls_message(message: &MlsMessageOut) -> Result<Vec<u8>, MlsErro
 mod tests {
     use super::*;
     use crate::credential::ScpCredential;
+    use crate::epoch_grace::EpochGraceStore;
     use crate::group::{add_member, create_group, generate_key_package, join_group};
     use scp_clock::SystemClock;
 
@@ -237,7 +164,8 @@ mod tests {
 
         let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
 
-        let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+        let bob_group =
+            join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
 
         (alice_group, bob_group)
     }
@@ -271,66 +199,6 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn process_commit_advances_bobs_epoch() {
-        let (mut alice_group, mut bob_group) = setup_alice_bob();
-        let mut grace_store = EpochGraceStore::new();
-
-        let bob_epoch_before = bob_group.epoch().unwrap();
-
-        // Alice issues an update, producing a Commit.
-        let commit = propose_update(&mut alice_group).unwrap();
-        let commit_bytes = serialize_mls_message(&commit).unwrap();
-
-        // Bob processes the Commit.
-        process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
-
-        let bob_epoch_after = bob_group.epoch().unwrap();
-        assert_eq!(
-            bob_epoch_after,
-            bob_epoch_before + 1,
-            "Bob's epoch should advance after processing Alice's commit"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::unwrap_used)]
-    fn process_commit_adds_old_epoch_to_grace_store() {
-        let (mut alice_group, mut bob_group) = setup_alice_bob();
-        let mut grace_store = EpochGraceStore::new();
-
-        let bob_old_epoch = bob_group.epoch().unwrap();
-
-        let commit = propose_update(&mut alice_group).unwrap();
-        let commit_bytes = serialize_mls_message(&commit).unwrap();
-
-        process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
-
-        assert!(
-            grace_store.is_in_grace(bob_old_epoch),
-            "old epoch should be in grace window after processing commit"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::unwrap_used)]
-    fn process_commit_on_destroyed_group_fails() {
-        let (mut alice_group, mut bob_group) = setup_alice_bob();
-        let mut grace_store = EpochGraceStore::new();
-
-        let commit = propose_update(&mut alice_group).unwrap();
-        let commit_bytes = serialize_mls_message(&commit).unwrap();
-
-        crate::group::destroy_group(&mut bob_group).unwrap();
-
-        let result = process_commit(&mut bob_group, &commit_bytes, &mut grace_store);
-        assert!(
-            result.is_err(),
-            "process_commit must fail on destroyed group"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::unwrap_used)]
     fn propose_update_on_destroyed_group_fails() {
         let (mut alice_group, _bob_group) = setup_alice_bob();
         crate::group::destroy_group(&mut alice_group).unwrap();
@@ -340,46 +208,6 @@ mod tests {
             result.is_err(),
             "propose_update must fail on destroyed group"
         );
-    }
-
-    #[test]
-    fn process_commit_rejects_garbage_bytes() {
-        let (_alice_group, mut bob_group) = setup_alice_bob();
-        let mut grace_store = EpochGraceStore::new();
-
-        let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let result = process_commit(&mut bob_group, &garbage, &mut grace_store);
-        assert!(
-            result.is_err(),
-            "process_commit must reject malformed bytes"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::unwrap_used)]
-    fn multiple_updates_advance_epoch_correctly() {
-        let (mut alice_group, mut bob_group) = setup_alice_bob();
-        let mut grace_store = EpochGraceStore::new();
-        let initial_epoch = bob_group.epoch().unwrap();
-
-        // Perform 3 sequential updates.
-        for i in 0u64..3 {
-            let commit = propose_update(&mut alice_group).unwrap();
-            let commit_bytes = serialize_mls_message(&commit).unwrap();
-            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
-
-            assert_eq!(
-                bob_group.epoch().unwrap(),
-                initial_epoch + i + 1,
-                "epoch should advance correctly after update {i}"
-            );
-        }
-
-        // All 3 old epochs should be in the grace store.
-        assert_eq!(grace_store.len(), 3);
-        for i in 0u64..3 {
-            assert!(grace_store.is_in_grace(initial_epoch + i));
-        }
     }
 
     /// Grace window: after one epoch advance (N→N+1), messages encrypted
@@ -404,7 +232,6 @@ mod tests {
         use crate::encrypt::{decrypt, encrypt, serialize_ciphertext};
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
-        let mut grace_store = EpochGraceStore::new();
 
         // Bob encrypts a message at epoch 1 (before the epoch advance).
         let old_epoch = bob_group.epoch().unwrap();
@@ -419,8 +246,8 @@ mod tests {
         // epoch. With max_past_epochs=2, Alice retains epoch 1 message secrets
         // and can decrypt the in-flight message.
         //
-        // Note: Alice advanced via propose_update (merge_pending_commit), not
-        // via process_commit, so she's the committer. Bob hasn't processed
+        // Note: Alice advanced via propose_update (merge_pending_commit), so
+        // she's the committer. Bob hasn't processed
         // the commit yet, so his message was encrypted at epoch 1.
         // Alice should still be able to decrypt it thanks to retained secrets.
         let result = decrypt(&mut alice_group, &ciphertext_bytes);
@@ -431,7 +258,7 @@ mod tests {
         );
 
         // Also verify Bob can process the commit and advance.
-        process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+        crate::encrypt::decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap();
         assert_eq!(bob_group.epoch().unwrap(), old_epoch + 1);
     }
 
@@ -484,7 +311,6 @@ mod tests {
         use crate::encrypt::{decrypt, encrypt, serialize_ciphertext};
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
-        let mut grace_store = EpochGraceStore::new();
 
         // Alice encrypts at epoch 1.
         let ciphertext_msg = encrypt(&mut alice_group, b"epoch 1 secret").unwrap();
@@ -495,7 +321,7 @@ mod tests {
         for _ in 0..3 {
             let commit = propose_update(&mut alice_group).unwrap();
             let commit_bytes = serialize_mls_message(&commit).unwrap();
-            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+            crate::encrypt::decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap();
         }
 
         assert_eq!(bob_group.epoch().unwrap(), 4);
@@ -520,7 +346,6 @@ mod tests {
         use crate::encrypt::{decrypt, encrypt, serialize_ciphertext};
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
-        let mut grace_store = EpochGraceStore::new();
 
         // Bob encrypts at epoch 1.
         let ciphertext_msg = encrypt(&mut bob_group, b"epoch 1 secret").unwrap();
@@ -531,7 +356,7 @@ mod tests {
         for _ in 0..2 {
             let commit = propose_update(&mut alice_group).unwrap();
             let commit_bytes = serialize_mls_message(&commit).unwrap();
-            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+            crate::encrypt::decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap();
         }
 
         assert_eq!(alice_group.epoch().unwrap(), 3);
@@ -543,47 +368,6 @@ mod tests {
             result.is_ok(),
             "ciphertext from epoch 1 must still be decryptable at epoch 3 \
              (max_past_epochs=2 retains 2 past epochs)"
-        );
-    }
-
-    /// Verify that the epoch expiration callback fires during `process_commit`
-    /// when the grace store is at capacity and must evict old epochs.
-    #[test]
-    #[allow(clippy::unwrap_used)]
-    #[allow(
-        clippy::disallowed_types,
-        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
-    )]
-    fn process_commit_triggers_callback_on_grace_store_eviction() {
-        use std::sync::{Arc, Mutex};
-
-        let (mut alice_group, mut bob_group) = setup_alice_bob();
-        let evicted = Arc::new(Mutex::new(Vec::<u64>::new()));
-        let evicted_clone = Arc::clone(&evicted);
-
-        // Use a very small grace store that will evict quickly.
-        let mut grace_store = EpochGraceStore::with_max_capacity(2);
-        grace_store.set_on_epoch_expired(Box::new(move |epochs| {
-            evicted_clone.lock().unwrap().extend_from_slice(epochs);
-        }));
-
-        // Advance 3 times to fill and then exceed the grace store capacity.
-        for _ in 0..3 {
-            let commit = propose_update(&mut alice_group).unwrap();
-            let commit_bytes = serialize_mls_message(&commit).unwrap();
-            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
-        }
-
-        // The grace store has capacity 2, so the first epoch should have been
-        // evicted when the third was added.
-        assert!(
-            !evicted.lock().unwrap().is_empty(),
-            "callback should have been invoked for evicted epoch"
-        );
-        assert_eq!(
-            grace_store.len(),
-            2,
-            "grace store should be at capacity, not over"
         );
     }
 }

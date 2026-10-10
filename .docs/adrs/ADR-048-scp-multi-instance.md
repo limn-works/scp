@@ -5,6 +5,7 @@
 **Phase:** Phase 4 remainder (issue #1549)
 **Amended by ADR-055 (2026-06-29):** the WASM bridge is removed (browser clients are remote thin clients to a server-side `scp-node`); this ADR's multi-instance model now spans three bridges (PyO3, UniFFI, napi-rs). The §1 per-SDK idiom WASM bullet and the §7b WASM-only semantic-divergence entries (which described behavior in the now-deleted `crates/scp-ffi/wasm/`) have been removed accordingly.
 **Amended 2026-09-10 (the P-256 curve ruling):** ADR-063, inception-derived self-certifying identity over a key-event log, makes every SCP key an ECDSA key on NIST P-256 in its §The curve and the root's custody, which carries the ruling and its reason. Two statements in this ADR named the superseded curve and both now name P-256. The `Identity` struct's `verifying_key_hex` field carries the hex encoding of a 33-byte SEC1 compressed P-256 verifying key, and the `testing_seed` parameter's deterministic generator produces byte-identical P-256 keys across the three bridges. The multi-instance model this ADR decides is unaffected, because it concerns instance lifetime and handle affinity and not the signature algorithm.
+**Amended 2026-10-04 (§5, supervisor drain before storage close):** the bounded shutdown wait covers the Supervisor's tracked tasks (ADR-049, the actor-per-context concurrency model, Decision 16), and bridge storage `close()` runs only after that wait completes.
 **Related:** ADR-021 (UniFFI Bridge), ADR-022 (Language Bindings), ADR-028 (Kotlin SDK), ADR-034 (WASM Constraints), ADR-043 (Scope Registration as Handle Convention, phase-3), ADR-046 (Bridge Parity Harness, sibling), ADR-047 (Bridge Symmetry Enforcement, sibling), ADR-055 (WASM bridge removal)
 
 ## Context
@@ -50,13 +51,13 @@ Detection heuristic during code review: if a `&self` method body never reference
 
 **SDK wrapper layer is governed by §7, not §1.** Each SDK (Python, TypeScript, Swift, Kotlin) chooses whether to surface a pure helper as an `SCP` class method or as a module-level export based on its own language idiom. §1 governs the FFI Rust source; §7 governs the language-specific wrapper layer above it.
 
-The class is named after the protocol, not after internal plumbing. This matches the prevailing SDK convention (`OpenAI()`, `Anthropic()`, `Stripe()`) and avoids the collisions that `Node`, `Bridge`, or `Client` would create with existing application-layer classes (`server.py:125`, `server.ts:223`, `BridgeConnector` in spec §12).
+The class is named after the protocol, not after internal plumbing. This matches the prevailing SDK convention (`OpenAI()`, `Anthropic()`, `Stripe()`) and avoids the collisions that `Node`, `Bridge`, or `Client` would create with existing application-layer classes (`server.py:125`, `server.ts:223`).
 
 ### 2. `BridgeInstance` splits into three per-bridge concrete structs behind a shared trait
 
 `BridgeInstance` stops being a single struct hosting four `Box<dyn Any>` slots. It refactors into:
 
-- `PyBridgeInstance`, `NapiBridgeInstance`, `UniffiBridgeInstance` — concrete per-bridge structs holding typed fields for all bridge-specific registries (FFI_BRIDGE_STATE, MCP server/client registries, CREDENTIAL_STORE, identity_custody_registry, identity_link_attestation_registry, context_handle_registry, etc.).
+- `PyBridgeInstance`, `NapiBridgeInstance`, `UniffiBridgeInstance` — concrete per-bridge structs holding typed fields for all bridge-specific registries (FFI_BRIDGE_STATE, MCP server/client registries, identity_custody_registry, identity_link_attestation_registry, context_handle_registry, etc.).
 - `BridgeInstanceCore` — a shared trait in `scp-ffi-common` exposing the bridge-agnostic fields (ContextManager, transport manager, known_contexts, rate_limiters, economy trackers, persistence, relay_url, shutdown_hooks, petname/handle/scope maps, MCP stdio allowlist) and lifecycle helpers (`suspend()`, `resume()`, `shutdown(timeout)`, `check_ready()`).
 
 Every shared helper in `scp-ffi-common` operates on `&dyn BridgeInstanceCore`. Per-bridge callers pass their concrete instance. The four `Box<dyn Any>` slots introduced in Phase 4a are removed. Type safety is compile-time; there are no runtime downcasts. This satisfies the CLAUDE.md rule "enforce mechanically — type system over documentation."
@@ -95,7 +96,7 @@ Compile-time affinity via phantom lifetime was rejected: not expressible across 
 
 ### 5. `shutdown(timeout: Duration)` replaces terminal infallible shutdown
 
-`BridgeInstance::shutdown` gains a `timeout: Duration` argument and becomes async. Internally it uses a `tokio_util::sync::CancellationToken` propagated into every long-running task, a `JoinSet` of spawned workers, and a bounded wait. Outstanding work gets the full timeout to drain; anything still running at the deadline is forcibly cancelled via the token.
+`BridgeInstance::shutdown` gains a `timeout: Duration` argument and becomes async. Internally it uses a `tokio_util::sync::CancellationToken` propagated into every long-running task, a `JoinSet` of spawned workers, and a bounded wait. Outstanding work gets the full timeout to drain; a task in the bridge's own `JoinSet` that is still running at the deadline is aborted with `JoinSet::abort_all`.
 
 Signature across bridges:
 
@@ -104,6 +105,15 @@ Signature across bridges:
 - UniFFI: `suspend fun shutdown(timeoutMs: Long)` (Kotlin) / `func shutdown(timeoutMs: UInt64) async` (Swift)
 
 This is a breaking change versus the Phase 4a `shutdown()` that took no arguments. Migration is mechanical: pass a sensible default (e.g. 30 seconds). Documented in the Phase 4 migration guide (PR 4).
+
+**Amendment 2026-10-04: the bounded wait drains the Supervisor before storage closes.** The bounded wait covers the Supervisor's tasks as well as the bridge's own `JoinSet`. `shutdown(timeout)` awaits `shutdown_all_contexts`, which awaits every task the Supervisor's task tracker spawned (ADR-049, the actor-per-context concurrency model, Decision 16), inside the same deadline. The bridge's storage `close()` runs only after that wait completes. The bridge first awaits its own `JoinSet` and, when the deadline passes, aborts the tasks still running; it then flushes every context and awaits `shutdown_all_contexts` within the budget that remains.
+
+- **The drain finishes before the deadline.** `shutdown_all_contexts` returns before the deadline, so every Supervisor task has exited. The bridge closes the store, which releases the store's advisory file lock and its database connection. It returns the outcome of its `JoinSet` wait: `ShutdownOutcome::GracefulWithin` when those tasks finished before the deadline, and `ShutdownOutcome::TimedOut` with `drain` set to `DrainState::Finished` and `durable_store_open` false when the bridge aborted them. An instance with no Supervisor attached closes its store the same way, whatever budget remains. An open of the same directory in the same process then succeeds on its first attempt (§17.6 of the persistence and storage spec, One Opener per Durable Directory).
+- **The deadline expires before the drain finishes.** The bridge returns `ShutdownOutcome::TimedOut` with `drain` set to `DrainState::Running`, and with `durable_store_open` set when the instance has a durable store. A `JoinSet` wait that uses the whole budget leaves none for the flush and the drain, so the bridge skips the flush and reports `ShutdownOutcome::TimedOut` even when no Supervisor task runs. The drain keeps running past the deadline and is never aborted; when the last tracked task exits, the drain closes the store, and a close that succeeds releases the lock. Until the store releases its lock, a same-process open of the same directory fails with the typed lock-still-held error, so no moment exists at which two openers hold one directory (red-hat finding RED-1002).
+- **The drain finishes before the deadline, and the store refuses to close.** The bridge returns `ShutdownError::DurableStoreClose`. The store keeps its lock and its connection, so a same-process open of the same directory fails with the typed lock-still-held error.
+- **The drain task panics before the deadline.** The bridge returns `ShutdownOutcome::TimedOut` with `drain` set to `DrainState::Panicked`, and with `durable_store_open` set when the instance has a durable store. `panicked_tasks` counts only the bridge's own `JoinSet` tasks. The bridge does not close the store, and no later task closes it, so the store keeps its lock until the last reference to the store drops, and until then a same-process open of the same directory fails with the typed lock-still-held error. A drain that panics after the deadline likewise leaves the store unclosed. An SDK `shutdown` on an instance with no durable store therefore returns normally after a drain panic.
+
+An SDK `shutdown` returns no `ShutdownOutcome`. It returns normally on `ShutdownOutcome::GracefulWithin`, on a `ShutdownOutcome::TimedOut` whose `durable_store_open` is false, and on a `ShutdownError::AlreadyShutDown` whose `durable_store_open` is false. It raises `SCP-STORAGE-8005` when the instance's own store keeps its lock: a `ShutdownOutcome::TimedOut` whose `durable_store_open` is true, a `ShutdownError::DurableStoreClose`, or a `ShutdownError::AlreadyShutDown` whose `durable_store_open` is true (an earlier shutdown has not closed the store by the time this call's timeout passes).
 
 ### 6. Long-lived background tasks capture `Weak<BridgeInstance>`, not `Arc`
 
@@ -228,6 +238,7 @@ The registry currently has no live entries. The three bridges share the real eng
 - **Multi-identity and multi-relay coexistence work.** A single process may hold multiple `SCP` instances, each with its own identity and its own relay connection. No shared mutable state leaks across them.
 - **Handle misuse is caught at the boundary.** Cross-instance handle reuse returns `SCP-PERM-3030` immediately, rather than corrupting silently.
 - **Shutdown is bounded and recoverable.** `shutdown(timeout)` drains outstanding work deterministically. Callers no longer deadlock on stuck tasks.
+- **A completed shutdown frees the storage directory.** After `shutdown(timeout)` returns `ShutdownOutcome::GracefulWithin`, no Supervisor task holds the store, so the same process can reopen the same directory at once. After it returns `ShutdownOutcome::TimedOut` with `durable_store_open` set, a reopen fails with a typed error while the store holds its lock (§5 amendment, 2026-10-04).
 - **No deprecation window.** The free-function façade is deleted in PR 4. There is no one-release-cycle tolerance period; every call site migrates in the same change that removes the façade. SCP is pre-release with no external consumers, so the cost of dropping the sunset window is zero and the benefit is eliminating a migration that would have to happen anyway two releases later.
 - **Breaking change to `shutdown` signature.** Documented in the migration guide with a minimal upgrade example.
 

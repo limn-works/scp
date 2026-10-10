@@ -108,14 +108,16 @@ impl From<&PlatformError> for StreamSignerCustodyCategory {
             PlatformError::WrongKeyType { .. } => Self::WrongKeyType,
             PlatformError::Unsupported(_) => Self::Unsupported,
             // `CustodyError` is the documented generic custody failure; the
-            // remaining variants (`StorageError`, `AttestationError`,
-            // `PushError`, and `PseudonymRejected`, which only pseudonym
-            // derivation returns) are not expected from `sign`, but are mapped
-            // conservatively rather than panicking or leaking their carried
-            // string.
+            // remaining variants (the three storage variants, `AttestationError`
+            // and `PushError`, which belong to sibling platform traits, and
+            // `PseudonymRejected`, which only pseudonym derivation returns) are
+            // not expected from `sign`, but are mapped conservatively rather
+            // than panicking or leaking their carried string.
             PlatformError::CustodyError(_)
             | PlatformError::PseudonymRejected(_)
             | PlatformError::StorageError(_)
+            | PlatformError::StorageClosed
+            | PlatformError::StorageLockHeld { .. }
             | PlatformError::AttestationError(_)
             | PlatformError::PushError(_) => Self::BackendFault,
         }

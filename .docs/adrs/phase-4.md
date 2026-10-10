@@ -1362,7 +1362,8 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
 
 11. **napi bridge — Bun/Node-specific:**
     - The native addon is loaded via `require('@limn-works/scp-ts-napi-{platform}')`, resolved from `optionalDependencies`.
-    - If the platform-specific package is not installed, `getBridge()` throws `TransportError` with code `SCP-TRANS-5001` and an actionable message indicating the missing package.
+    - If no platform-specific package exists for the platform, or the package does not resolve, the loader throws `ValidationError` with code `SCP-VALID-7081` and an actionable message naming the missing package. This is the only load failure a caller may treat as absence.
+    - If the package resolves and requiring it fails (a `dlopen` error, an ABI or architecture mismatch, a missing shared library), or the loaded addon lacks an export the SDK calls, the SDK throws `ValidationError` with code `SCP-VALID-7082`. A caller must not treat this code as absence. `.docs/standards/sdk-common.md` registers both codes with one meaning for every SDK that loads a native bridge.
     - Async bridge functions run on a multi-threaded tokio runtime. The runtime is created once at addon load time via `OnceLock<Runtime>` and shared across all calls.
     - The tokio runtime is shut down cleanly when the Node.js process exits (via napi-rs cleanup hook).
 
@@ -1612,7 +1613,7 @@ The identifier's textual encoding waits on a later revision of `09-security-mode
 scp:system:{kebab-case-name}
 ```
 
-Protocol-level feature flags for node roles. Not challenge-testable — these describe what a node does, not what an agent can prove. Initial set: `mls-group-management`, `key-rotation`, `governance-participation`, `relay-operation`, `bridge-operation`.
+Protocol-level feature flags for node roles. Not challenge-testable — these describe what a node does, not what an agent can prove. Initial set: `mls-group-management`, `key-rotation`, `governance-participation`, `relay-operation`.
 
 **Anti-spoofing model:**
 
@@ -1657,7 +1658,7 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 
 1. **URI parser** validates `scp:capability:{kebab-case}/v{N}`, `{identifier}:capability:{kebab-case}/v{N}`, and `scp:system:{kebab-case}`. Rejects malformed URIs with specific error variants.
 
-2. **Protocol registry** contains all 28 challenge capability URIs and 5 system capability URIs. Lookup by URI returns registry metadata (category, description, parameter schema). Unknown `scp:capability:*` URIs return `Err(UnknownProtocolCapability)`.
+2. **Protocol registry** contains all 28 challenge capability URIs and 4 system capability URIs. Lookup by URI returns registry metadata (category, description, parameter schema). Unknown `scp:capability:*` URIs return `Err(UnknownProtocolCapability)`.
 
 3. **`ChallengeType` unification:** existing `PromptInjectionResistance` maps to `scp:capability:prompt-injection-resistance/v1`, `SchemaValidation` maps to `scp:capability:schema-validation/v1`, `RateLimitCompliance` maps to `scp:capability:rate-limit-compliance/v1`. `Custom(String)` is replaced by `Uri(CapabilityUri)` which must be a valid identity-scoped or protocol-scoped URI.
 

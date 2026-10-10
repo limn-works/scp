@@ -54,18 +54,18 @@
 │  │  ┌──────────────────────────┼──────────────────────────────┐ │  │
 │  │  │  ADAPTER LAYER           │                               │ │  │
 │  │  │                          │                               │ │  │
-│  │  │  ┌──────────┐ ┌─────────┴┐ ┌──────────┐ ┌───────────┐ │ │  │
-│  │  │  │Transport │ │ Platform │ │ MCP      │ │ Bridge    │ │ │  │
-│  │  │  │          │ │          │ │          │ │           │ │ │  │
-│  │  │  │ • SCP    │ │ • Keys   │ │ • Server │ │ • X       │ │ │  │
-│  │  │  │   native │ │ • Attest  │ │ • Client │ │ • Bluesky │ │ │  │
-│  │  │  │ • Nostr  │ │ • Push   │ │          │ │ • Discord │ │ │  │
-│  │  │  │ • Matrix │ │ • Storage│ │          │ │           │ │ │  │
-│  │  │  │ • Hyper* │ │          │ │          │ │           │ │ │  │
-│  │  │  │ • libp2p │ │          │ │          │ │           │ │ │  │
-│  │  │  │ • WS/RTC │ │          │ │          │ │           │ │ │  │
-│  │  │  │ • +more  │ │          │ │          │ │           │ │ │  │
-│  │  │  └──────────┘ └──────────┘ └──────────┘ └───────────┘ │ │  │
+│  │  │  ┌──────────┐ ┌─────────┴┐ ┌──────────┐               │ │  │
+│  │  │  │Transport │ │ Platform │ │ MCP      │               │ │  │
+│  │  │  │          │ │          │ │          │               │ │  │
+│  │  │  │ • SCP    │ │ • Keys   │ │ • Server │               │ │  │
+│  │  │  │   native │ │ • Attest  │ │ • Client │               │ │  │
+│  │  │  │ • Nostr  │ │ • Push   │ │          │               │ │  │
+│  │  │  │ • Matrix │ │ • Storage│ │          │               │ │  │
+│  │  │  │ • Hyper* │ │          │ │          │               │ │  │
+│  │  │  │ • libp2p │ │          │ │          │               │ │  │
+│  │  │  │ • WS/RTC │ │          │ │          │               │ │  │
+│  │  │  │ • +more  │ │          │ │          │               │ │  │
+│  │  │  └──────────┘ └──────────┘ └──────────┘               │ │  │
 │  │  └──────────────────────────────────────────────────────────┘ │  │
 │  └───────────────────────────────────────────────────────────────┘  │
 │                                                                    │
@@ -258,7 +258,6 @@ scp/
 │   │   ├── crypto/            # UCAN, sender keys, access keys, canonical hashing
 │   │   ├── envelope/          # SCP envelope creation, parsing, validation
 │   │   ├── provenance/        # Data provenance tagging
-│   │   ├── bridge/            # Bridge connector protocol types (§12)
 │   │   ├── economy/           # Economic governance, pricing, spend auth (§19)
 │   │   └── sync/              # Offline/sync strategy (§23)
 │   │
@@ -268,7 +267,7 @@ scp/
 │   │   ├── identity/          # SCPID, custody migration, recovery
 │   │   ├── store/             # ProtocolRepository — typed domain storage (§17.4)
 │   │   ├── event_log/         # Tiered storage, cold-tier provider
-│   │   └── ...                # envelope, discovery, bridge, economy async modules
+│   │   └── ...                # envelope, discovery, economy async modules
 │   │
 │   ├── scp-core/              # Facade re-exporting scp-protocol + scp-runtime
 │   │
@@ -278,6 +277,9 @@ scp/
 │   ├── scp-dht/               # Retired DHT transport leaf — no resolution path reads it
 │   │
 │   ├── scp-event-log/         # Merkle event log
+│   │
+│   ├── scp-alloc/             # Wiping global allocator — wasm-safe leaf, no dependencies; one GlobalAlloc impl and the
+│   │                          #   one #[global_allocator] static, which each shipped binary and cdylib links (09-security-model.md §9.15)
 │   │
 │   ├── scp-clock/             # Clock port — wasm-safe capability leaf (Clock, SystemClock, TestClock)
 │   │
@@ -632,9 +634,6 @@ State:
         ├──► scp-core
         ├──► scp-transport
         └──► scp-platform
-
-   Note: Bridge protocol types live in scp-protocol/bridge/,
-   not in a separate scp-bridge crate.
 ```
 
 Build order follows the dependency graph bottom-up: platform traits → transport → core → FFI → bindings.
@@ -670,7 +669,10 @@ This section documents the layered dependency graph, every replaceable subsystem
 Dependencies flow strictly upward. No crate may depend on a crate at a *higher* layer; intra-layer edges are permitted but must be acyclic. The Layer 0 capability leaves (`scp-clock`, `scp-crypto`, `scp-did`) are mutually independent — each depends only on external crates (`scp-did` on `p256` directly), so there are no intra-layer edges among them. `scp-platform` is the one Layer 0 crate that is not a leaf: it depends on `scp-crypto`, because the `Pseudonym` type its `KeyCustody` trait returns validates its P-256 point and computes its routing id there, and that edge is Layer 0's only intra-layer edge. Violations are compile errors (separate crates) or PR review failures (internal modules).
 
 ```
-Layer 0 ─ scp-clock                 Clock port (wall-clock time). Wasm-safe leaf.
+Layer 0 ─ scp-alloc                 Wiping global allocator (09-security-model.md §9.15). Wasm-safe leaf;
+           │                          no dependencies. Only the shipped binaries and cdylibs, and the
+           │                          relay template and scaffold outside the workspace, depend on it.
+           │  scp-clock               Clock port (wall-clock time). Wasm-safe leaf.
            │  scp-crypto             P-256 primitives (verify, sign, ECDH, SEC1 encoding),
            │                          the ScpSigner trait, HKDF, pseudonym derivation and
            │                          routing id, JOSE ES256, and CustodyFailure. Wasm-safe leaf.
@@ -726,7 +728,7 @@ Every subsystem in the table below is injected through a trait. Callers never co
 | Identity backend | `IdentityBackend` | `scp-identity/src/lib.rs` | Full | Nothing — the seam ADR-063 names, behind which the key-event-log implementation sits. |
 | MLS primitives | `MlsBackend` | `scp-runtime/src/crypto/mls/` | Partial | MLS is protocol-fundamental; the OpenMLS implementation is swappable but any replacement must implement RFC 9420 with the SCP ciphersuite. |
 | HPKE primitives | `HpkeBackend` | `scp-runtime/src/crypto/` | Full | Nothing — any RFC 9180 implementation with the SCP suite. |
-| OpenMLS storage | `OpenMlsStorageAdapter` | `scp-runtime/src/crypto/mls/storage.rs` | None — internal to the OpenMLS `MlsBackend` | Not intended for replacement; swapping this only makes sense if the OpenMLS-based `MlsBackend` itself is replaced. |
+| OpenMLS storage | `OpenMlsStorageAdapter` | `scp-runtime/src/crypto/mls/storage_adapter.rs` | None — internal to the OpenMLS `MlsBackend` | Not intended for replacement; swapping this only makes sense if the OpenMLS-based `MlsBackend` itself is replaced. |
 | Context transport | `ContextTransportProvider` | `scp-runtime/src/context/builder.rs` | Full | Nothing — wraps transport for context-scoped operations. |
 | Context event log | `ContextEventLogProvider` | `scp-runtime/src/context/builder.rs` | Full | Nothing — in-memory, SQLite, custom backend. |
 | Saga journal | `SagaJournal` | `scp-runtime/src/context/supervisor/` | Full | Nothing — durable append-only coordinator log for cross-context sagas. |
@@ -758,8 +760,8 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 - Production implementations wrap App Attest (iOS) or Play Integrity (Android).
 
 **`Push`** (scp-platform) — `Send + Sync`, async methods.
-- `register` obtains a platform push token. `handle_notification` converts a raw payload to a `WakeSignal`.
-- The testing adapter returns a synthetic UUID token and passes payloads through.
+- `register` obtains a platform push token. `handle_notification` returns one fixed `WakeSignal` for every payload it accepts (§10.7 opacity, ADR-006).
+- The in-memory adapter returns a synthetic UUID token and, for every payload, the fixed wake signal `{"aps":{"content-available":1}}`, so no payload byte reaches the caller (§10.7 opacity, ADR-006).
 
 **`TransportAdapter`** (scp-transport) — `Send + Sync`, dyn-compatible (boxed futures).
 - Five methods: `send`, `subscribe`, `unsubscribe`, `query`, `delete`.
@@ -771,11 +773,11 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 **`IdentityBackend`** (scp-identity) — `Send + Sync`, async. `03-identity.md` §3.10.10 declares the trait's methods with their return types and their error type, and this entry lists none of its own. ADR-063 names the seam.
 
 **`MlsBackend`** (scp-runtime/crypto/mls) — `Send + Sync`, async methods (via `#[async_trait]`). Replaces the deleted `ContextCryptoProvider` (ADR-049).
-- Stateless MLS primitives: `create_group`, `add_member_raw`, `remove_member_raw`, `encrypt`, `decrypt`, `process_commit`, `advance_epoch`, `validate_key_package`, `generate_key_package`, `join_from_welcome`.
+- Stateless MLS primitives: `create_group`, `add_member_raw`, `remove_member_raw`, `encrypt`, `decrypt`, `advance_epoch`, `validate_key_package`, `generate_key_package`, `join_from_welcome`. `decrypt` merges a received Commit.
 - Methods take `&mut ScpMlsGroup` (or equivalent) as an explicit parameter; the trait owns no state.
 - **RFC 9420 conformance required.** The SCP ciphersuite (§9.5) is fixed; methods that accept ciphersuite arguments MUST reject any other.
 - **Side-effect class.** `validate_key_package` is side-effect-free (inspects the input, returns a verdict; does not persist or mutate). All other methods mutate the group they operate on.
-- **Cancellation.** Methods that mutate group state (`create_group`, `add_member_raw`, `remove_member_raw`, `encrypt`, `decrypt`, `process_commit`, `advance_epoch`, `join_from_welcome`) are cancel-hostile in the general case: a cancelled call leaves the `&mut ScpMlsGroup` in an implementation-defined state. Callers (the per-context actor) therefore do NOT cancel these mid-flight; an actor processes each command to completion. `validate_key_package` and `generate_key_package` are cancel-safe.
+- **Cancellation.** Methods that mutate group state (`create_group`, `add_member_raw`, `remove_member_raw`, `encrypt`, `decrypt`, `advance_epoch`, `join_from_welcome`) are cancel-hostile in the general case: a cancelled call leaves the `&mut ScpMlsGroup` in an implementation-defined state. Callers (the per-context actor) therefore do NOT cancel these mid-flight; an actor processes each command to completion. `validate_key_package` and `generate_key_package` are cancel-safe.
 - **Rollback idempotency.** Any rollback helper (e.g., reverting a provisional member-add when a downstream step fails) MUST be idempotent: calling it twice is equivalent to calling it once. Handlers rely on this when unwinding on error.
 - Orchestration (seal/open envelopes, rotate_sender_key, execute_revoke, etc.) lives in handler functions on `&mut PerContextState`, NOT in the trait.
 
@@ -1034,7 +1036,7 @@ Build:
   • scp-transport/native/storage.rs — BlobStorage trait (§17.1)
   • scp-platform/testing/ — In-memory key storage (delete_prefix, exists — §17.2)
   • scp-core/store/ — Skeleton ProtocolRepository (§17.4)
-  • scp-core/crypto/mls/storage.rs — MlsStorageBridge (§17.9)
+  • scp-mls/provider.rs — InMemoryMlsProvider, which refuses to store the MLS signer (§17.9)
   • scp-testing/ — Network simulation harness (§16): InMemoryRelay, InMemoryTransport,
     SimulatedClock, ScenarioBuilder, assertion library, trait conformance macros, presets
 
@@ -1045,8 +1047,8 @@ Test:
   • Network simulator: N-party scenarios with fault injection, suppression detection,
     equivocation detection, and deterministic time control (§16.13.1-6)
   • Trait conformance suites pass for all in-memory implementations (§16.12)
-  • MlsStorageBridge: MLS group state roundtrips through bridge, state isolated
-    per context (§16.13.8)
+  • MLS crypto state roundtrips through the snapshot blob, and capture and restore
+    refuse a stored signer (§17.9.1)
   • Assertion library meta-tests: each assert_* function (§16.10) verified against
     known-good inputs (should pass) and known-bad inputs (should return correct error
     variant). Prevents silent assertion bugs from masking protocol failures.
@@ -1084,7 +1086,6 @@ Test:
   • Multi-relay delivery (send to 3 relays, receive from any)
   • Context state persists across process restarts (SqliteStorage)
   • ProtocolRepository integration tests: lifecycle, nonces, event range queries (§17.13)
-  • MlsStorageBridge tests (§16.13.8) gated against SqliteStorage
   • All new Storage/BlobStorage adapters pass conformance suites
   • Block enforcement: assert_block_enforced (§16.10.6) — sender key rotation
     prevents blocked identity from decrypting, other members unaffected
@@ -1161,13 +1162,12 @@ Deliverable: Trust model works. TypeScript SDK ships. Two languages supported.
 
 ### Phase 5: Platform Adapters + Swift + Reference App
 
-**Goal:** iOS SDK, reference app integration, bridge adapters, real-time media transport.
+**Goal:** iOS SDK, reference app integration, real-time media transport.
 
 ```
 Build:
   • bindings/swift/Sources/SCP/Platform/ — Keychain, App Attest, APNs, SQLCipher
   • bindings/swift/ — UniFFI-generated + Swift ergonomics layer
-  • scp-core/bridge/ — Bridge protocol types and per-platform adapters
   • scp-media/ — WebRTC adapter, MLS key export for DTLS-SRTP (§10.9.1), signaling via context messages
   • Reference app integration: quests as contexts, AI guide as agent
 
@@ -1176,7 +1176,6 @@ Test:
   • Apple platform conformance: key_custody_conformance!(), attestation_conformance!(),
     push_conformance!() pass for Keychain/App Attest/APNs adapters (§16.12.3-5)
   • Quest runs as SCP context
-  • Bridge: X user participates in quest via bridge
   • End-to-end: Python agent ↔ Swift app via SCP
   • Media: voice/video call between two context members, keys derived from MLS group state
   • PostgresBlobStore, S3BlobStore pass blob_store_conformance!() (§16.12.6, §17.7)
@@ -1184,7 +1183,6 @@ Test:
 Ship:
   • Swift package
   • Reference app beta with SCP
-  • Bridge adapters
   • Media transport with WebRTC
 
 Deliverable: Reference app runs on SCP. Cross-platform: Python ↔ Swift ↔ TypeScript. Real-time media via delegated WebRTC transport.

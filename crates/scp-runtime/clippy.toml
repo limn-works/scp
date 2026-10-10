@@ -47,3 +47,15 @@ disallowed-types = [
     { path = "tokio::sync::Mutex", reason = "ADR-049 §Decision 12: forbidden on read paths. Use ArcSwap+write_lock, OnceLock/AtomicU64/DashMap, or the actor-owned &mut PerContextState. Sanctioned exceptions carry an #[allow(clippy::disallowed_types, reason = \"ADR-049 §Decision 12 allow-list: …\")]." },
     { path = "tokio::sync::RwLock", reason = "ADR-049 §Decision 12: forbidden on read paths. Use ArcSwap+write_lock, OnceLock/AtomicU64/DashMap, or the actor-owned &mut PerContextState. Sanctioned exceptions carry an #[allow(clippy::disallowed_types, reason = \"ADR-049 §Decision 12 allow-list: …\")]." },
 ]
+
+# Clippy reads only the configuration file nearest the crate, so the workspace
+# `.clippy.toml` does not apply here; these entries repeat its ban.
+# `crypto::mls::production_backend::tests::signer_store_is_disallowed_and_refused`
+# carries a control `expect` for each signer-storage entry, and
+# `crypto::mls::production_backend::tests::signature_key_gen_is_disallowed`
+# one for the `signature_key_gen` entry; each fails when its entry is missing.
+disallowed-methods = [
+    { path = "openmls_basic_credential::SignatureKeyPair::store", reason = "writes the MLS signer's private key into provider storage, which snapshots persist and restores re-inject; every openmls operation SCP calls takes the signer as an argument, so it is never stored (security model spec §9.15)" },
+    { path = "openmls_traits::storage::StorageProvider::write_signature_key_pair", reason = "stores the MLS signer's private key in provider storage (the trait method `SignatureKeyPair::store` calls), which snapshots persist and restores re-inject; every openmls operation SCP calls takes the signer as an argument, so it is never stored (security model spec §9.15)" },
+    { path = "openmls_traits::crypto::OpenMlsCrypto::signature_key_gen", reason = "draws the key pair from the one `ChaCha20Rng` that openmls_rust_crypto's `RustCrypto` seeds once for the provider's life and never reseeds or zeroizes, so anyone who reads that long-lived seed from memory regenerates the signing key; create signers with `openmls_basic_credential::SignatureKeyPair::new`, which draws from `OsRng` (security model spec §9.15)" },
+]

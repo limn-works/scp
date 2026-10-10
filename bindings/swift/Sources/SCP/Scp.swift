@@ -186,8 +186,9 @@ public final class SCP: @unchecked Sendable {
     /// Shuts down this instance with a graceful deadline (seconds).
     ///
     /// Awaits in-flight tasks up to `timeout` seconds, aborts any
-    /// remaining tasks, then runs typed-field cleanup. Permanent. A
-    /// second call is a no-op.
+    /// remaining tasks, then runs typed-field cleanup. Permanent. Throws `ScpError.Validation` with
+    /// `SCP-STORAGE-8005` when the durable store still holds its advisory
+    /// lock after the call.
     ///
     /// Fractional seconds (e.g. `0.25`) are preserved to millisecond
     /// resolution before crossing the UniFFI boundary — the native
@@ -466,10 +467,10 @@ public extension SCP {
     /// (governed-context invitations are not yet implemented).
     ///
     /// The invite routes through the actor governance gate, which requires the
-    /// inviter to hold the `governance:propose` capability. A normally-created
-    /// `SingleAdmin` context grants its admin that capability at genesis, so it
-    /// works out of the box; a context with a custom ceiling must grant
-    /// `governance:propose` to the inviter.
+    /// inviter to hold the `governance:propose` capability. The creator of a
+    /// `SingleAdmin` context holds the admin role, which grants every
+    /// capability in the context's ceiling, so the creator can invite only
+    /// when that ceiling includes `governance:propose`.
     ///
     /// ```swift
     /// let outcome = try await scp.inviteMember(
@@ -862,8 +863,8 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/mcpClientConnectSse`` on ``inner``.
-    func mcpClientConnectSse(url: String) async throws -> String {
-        try await inner.mcpClientConnectSse(url: url)
+    func mcpClientConnectSse(url: String, authToken: String?) async throws -> String {
+        try await inner.mcpClientConnectSse(url: url, authToken: authToken)
     }
 
     /// Forwards to ``Scp/mcpClientConnectStdio`` on ``inner``.

@@ -62,6 +62,10 @@
 // The uniffi::include_scaffolding! macro expands unsafe extern "C" declarations.
 #![allow(unsafe_code)]
 
+// Links the one `#[global_allocator]`, which wipes every heap block before
+// freeing it (09-security-model.md §9.15, freed heap memory).
+use scp_alloc as _;
+
 use scp_ffi_common::error_codes as codes;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -463,14 +467,20 @@ pub trait KeyCustodyProvider: Send + Sync {
 
     /// Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
     ///
-    /// Required for governance vote signing, which uses `ed25519_dalek::SigningKey`
-    /// directly. Platform implementations using software-backed Ed25519 storage
-    /// (e.g., Keychain, Android Keystore with `PURPOSE_SIGN`) MUST support this.
+    /// The bridge's signing paths that sign with an `ed25519_dalek::SigningKey`,
+    /// governance vote signing among them, build that key from the returned
+    /// bytes. A key held in hardware or in Android Keystore does not export its
+    /// bytes, and ADR-063 requires every key-export accessor, this callback
+    /// included, to leave the custody adapters and all three bridges, because
+    /// hardware custody on the governance path is impossible until then.
     ///
     /// # Default
     ///
     /// Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-    /// implemented. A host that needs it overrides it. Third-party
+    /// implemented. A host that needs it overrides it. No Kotlin class
+    /// implements this callback: the Kotlin `AndroidKeyCustody` implements the
+    /// Kotlin SDK's own `KeyCustodyProvider` interface, and no code passes it
+    /// to the Rust engine. Third-party
     /// `KeyCustodyProvider` implementations that do not need governance vote
     /// signing may rely on the default until they add support.
     ///
@@ -568,7 +578,12 @@ pub trait PushProvider: Send + Sync {
 
     /// Handle an incoming push notification `payload`.
     ///
-    /// Returns wake signal bytes indicating which context has new messages.
+    /// An implementation returns fixed wake signal bytes that do not depend on
+    /// `payload` and copy no byte of it. §10.7 of the infrastructure spec
+    /// states: "Push payloads MUST contain a wake signal and nothing else. No
+    /// context ID, no sender identifier, no message preview, no metadata of any
+    /// kind." A wake signal built from the received bytes would hand the caller
+    /// whatever a relay put in them. No Rust code calls this method yet.
     async fn handle_notification(&self, payload: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 }
 
@@ -577,7 +592,9 @@ pub trait PushProvider: Send + Sync {
 /// Swift SDK: `DCAppAttestService` (App Attest on iOS 14+ / macOS 11+).
 /// Kotlin SDK: Play Integrity API on Android.
 ///
-/// Implemented by Swift/Kotlin code and injected into the Rust engine.
+/// The Swift SDK's `AppleDeviceAttestation` conforms to this callback
+/// interface. No Rust code holds or calls it yet, so nothing injects an
+/// implementation into the Rust engine.
 ///
 /// # SAFETY: Thread execution context
 ///
@@ -593,12 +610,20 @@ pub trait PushProvider: Send + Sync {
 pub trait DeviceAttestationProvider: Send + Sync {
     /// Generate a cryptographic attestation for this device.
     ///
-    /// `challenge` — server-provided challenge bytes (SHA-256 digested with
-    ///   `device_id` before submission to the platform attestation service).
-    /// `device_id` — stable identifier for this device instance.
+    /// `challenge` — Apple: the 32-byte binding digest `D` of
+    ///   `09-security-model.md` §9.3.1, which the Swift adapter hands App
+    ///   Attest as `clientDataHash` unchanged. When App Attest is supported,
+    ///   the adapter rejects a `challenge` that is not 32 bytes with
+    ///   `SCP-ATTEST-9026` (ADR-025 acceptance criterion 3); when it is not
+    ///   supported, the adapter throws `SCP-ATTEST-9019` before it reads the
+    ///   length. Android: ADR-027, the Android platform adapter, states
+    ///   what it binds.
+    /// `device_id` — stable identifier for this device instance. The Swift
+    ///   adapter does not read it.
     ///
-    /// Returns the platform attestation object bytes (Apple: CBOR-encoded
-    /// attestation; Android: Play Integrity token bytes).
+    /// Returns the platform attestation bytes. Apple: the raw CBOR attestation
+    /// object Apple signed (ADR-025 acceptance criterion 3). Android: the Play
+    /// Integrity token bytes.
     async fn attest(&self, challenge: Vec<u8>, device_id: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
     /// Generate a per-request assertion proving key possession.
@@ -607,7 +632,12 @@ pub trait DeviceAttestationProvider: Send + Sync {
     ///   `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` of
     ///   `09-security-model.md` §9.3.1 over the caller's request bytes `m`,
     ///   never `SHA-256(m)` and never `m` itself. The domain separator keeps
-    ///   every `A` distinct from every attestation binding digest `D`.
+    ///   every `A` distinct from every attestation binding digest `D`. The
+    ///   Swift adapter hands `A` to App Attest as `clientDataHash` unchanged.
+    ///   When App Attest is supported, the adapter rejects an `A` that is not
+    ///   32 bytes with `SCP-ATTEST-9026` (ADR-025 acceptance criterion 3);
+    ///   when it is not supported, the adapter throws `SCP-ATTEST-9019`
+    ///   before it reads the length.
     ///
     /// Returns the platform assertion object bytes (Apple: CBOR assertion;
     /// Android: integrity verdict).
@@ -822,7 +852,7 @@ mod tests {
 
         let params = bridge::ContextParams {
             mode: bridge::ContextMode::Encrypted,
-            ceiling: Vec::new(),
+            ceiling: vec!["messages:read".to_owned()],
             ceiling_policy: bridge::CeilingPolicy::Immutable,
             governance: bridge::GovernanceModel::SingleAdmin,
             memory_scope: bridge::MemoryScope::Ephemeral,
@@ -885,7 +915,7 @@ mod tests {
 
         let params = bridge::ContextParams {
             mode: bridge::ContextMode::Encrypted,
-            ceiling: Vec::new(),
+            ceiling: vec!["messages:read".to_owned()],
             ceiling_policy: bridge::CeilingPolicy::Immutable,
             governance: bridge::GovernanceModel::SingleAdmin,
             memory_scope: bridge::MemoryScope::Ephemeral,

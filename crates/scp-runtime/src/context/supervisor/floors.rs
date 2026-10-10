@@ -1755,9 +1755,9 @@ mod tests {
     #[test]
     fn handle_accessors_forward_to_registry() {
         let s = sup();
-        let h = SupervisorHandle::wrap(Arc::clone(&s));
+        let h = SupervisorHandle::wrap(&s);
 
-        h.seed_context_floors(&CTX);
+        h.seed_context_floors(&CTX).unwrap();
         assert!(
             h.check_and_advance_sender_epoch(&CTX, DID, 3, MAX_EPOCH_ADVANCE)
                 .is_ok()
@@ -1776,19 +1776,12 @@ mod tests {
         .unwrap();
 
         // The handle reads must agree with the direct Supervisor reads.
-        assert_eq!(
-            h.export_sender_key_epochs(&CTX),
-            s.export_sender_key_epochs(&CTX)
-        );
-        assert_eq!(
-            h.export_recv_sequence_floors(&CTX),
-            s.export_recv_sequence_floors(&CTX)
-        );
-        assert_eq!(h.export_sender_key_epochs(&CTX), vec![(DID.to_owned(), 8)]);
-        assert_eq!(
-            h.export_recv_sequence_floors(&CTX),
-            vec![(DID.to_owned(), rf(8, 2))]
-        );
+        let epochs = h.export_sender_key_epochs(&CTX).unwrap();
+        let recv = h.export_recv_sequence_floors(&CTX).unwrap();
+        assert_eq!(epochs, s.export_sender_key_epochs(&CTX));
+        assert_eq!(recv, s.export_recv_sequence_floors(&CTX));
+        assert_eq!(epochs, vec![(DID.to_owned(), 8)]);
+        assert_eq!(recv, vec![(DID.to_owned(), rf(8, 2))]);
 
         // The remove_member_floors fan-out reaches the registry: pruning DID via
         // the handle drops it from BOTH maps of the direct Supervisor view.

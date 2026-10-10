@@ -261,7 +261,13 @@ async fn end_to_end_network_demo() {
         .unwrap();
     let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
     let add_result = add_member(&mut alice_group, kp_in, &scp_clock::SystemClock).unwrap();
-    let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+    let mut bob_group = join_group(
+        &add_result.welcome,
+        bob_provider,
+        bob_signer,
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
 
     println!("  Alice added Bob to group via Welcome message");
     println!("    epoch:   {} (both sides)", alice_group.epoch().unwrap());

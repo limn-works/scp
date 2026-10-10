@@ -1419,10 +1419,10 @@ mod tests {
     async fn domain_generate_produces_did_dht_identity() {
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // Domain is publishing-capable; this test opts into Production to
-            // exercise the public-hosting path (advisory in P1 — the test's
-            // TestDidDht uses an in-memory client, so nothing is published
-            // offline). `DhtMode::Memory` would be equally valid (see Test 11).
+            // Domain is publishing-capable; Production makes the start publish
+            // through the TestDidDht in-memory client and fail if that publish
+            // fails. `DhtMode::Disabled` would skip the publish, so this test
+            // would stop covering the publishing path (see Test 11).
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1464,8 +1464,8 @@ mod tests {
 
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // Domain is publishing-capable; this test opts into Production for the
-            // public-hosting path (advisory; Memory is equally valid).
+            // Domain is publishing-capable; Production makes the start publish and
+            // fail if that publish fails, where `DhtMode::Disabled` would skip it.
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1506,9 +1506,9 @@ mod tests {
         let external_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // NatTraversal is publishing-capable; this test opts into Production
-            // to exercise the public path (advisory in P1; Memory is equally
-            // valid — see Test 12).
+            // NatTraversal is publishing-capable; Production makes the start
+            // publish and fail if that publish fails. `DhtMode::Disabled` would
+            // skip the publish (see Test 12).
             dht: DhtMode::Production,
             nat: NatSlot::Custom(Arc::new(MockNatStrategy {
                 tier: ReachabilityTier::Stun { external_addr },
@@ -1609,8 +1609,8 @@ mod tests {
 
         let node1 = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // Domain is publishing-capable; this test opts into Production for the
-            // public-hosting path (advisory; Memory is equally valid).
+            // Domain is publishing-capable; Production makes the start publish and
+            // fail if that publish fails, where `DhtMode::Disabled` would skip it.
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1631,8 +1631,8 @@ mod tests {
 
         let node2 = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            // Domain is publishing-capable; this test opts into Production for the
-            // public-hosting path (advisory; Memory is equally valid).
+            // Domain is publishing-capable; Production makes the start publish and
+            // fail if that publish fails, where `DhtMode::Disabled` would skip it.
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1737,15 +1737,15 @@ mod tests {
     // --- Test 11: Domain + DhtMode::Disabled is VALID (the fail-safe direction) --
 
     #[tokio::test]
-    async fn domain_plus_dht_memory_is_valid() {
+    async fn domain_plus_dht_disabled_is_valid() {
         // `NodeConfig::defaults` yields `dht: DhtMode::Disabled`. `DhtMode::Disabled`
         // (do not publish the address to the DHT) is the fail-safe, non-disclosing
         // direction and is valid for EVERY reach, including a publishing-capable
         // `Reach::Domain`: "reachable on the domain, but the address is not
         // published to the DHT; share it out-of-band" — the more-private config.
         // Only `DhtMode::Production` discloses, so only it is an explicit opt-in
-        // (M2); `Memory` is never an error. This is the positive companion to
-        // Test 12 (NatTraversal + Memory).
+        // (M2); `Disabled` is never an error. This is the positive companion to
+        // Test 12 (NatTraversal + Disabled).
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             ..NodeConfig::defaults(
@@ -1774,13 +1774,16 @@ mod tests {
     // --- Test 12: NatTraversal + DhtMode::Disabled is VALID --------------------
 
     #[tokio::test]
-    async fn nat_traversal_plus_dht_memory_is_valid() {
+    async fn nat_traversal_plus_dht_disabled_is_valid() {
         // `Reach::NatTraversal` + `DhtMode::Disabled` is the first-class
         // "reachable-but-not-DHT-discoverable" config: publicly reachable via NAT
         // traversal, but the address is NOT published to the DHT (share it
-        // out-of-band). `Memory` is the fail-safe, non-disclosing direction and
-        // must never be rejected; only `DhtMode::Production` discloses (M2). This
-        // is exactly the `SCP_NODE_DHT_MODE=memory` capability the binary exposes.
+        // out-of-band). `Disabled` is the fail-safe, non-disclosing direction and
+        // must never be rejected; only `DhtMode::Production` discloses (M2). The
+        // binary exposes this configuration as `SCP_NODE_DHT_MODE=disabled` under
+        // `--self-host`. The full relay node rejects that value, because it must
+        // publish its DID to be discoverable; it accepts `production`, and
+        // `memory` in a `testing` build.
         let external_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
@@ -1810,12 +1813,13 @@ mod tests {
     // --- Test 13: Tunnel / Local + DhtMode::Disabled is VALID -------------------
 
     #[tokio::test]
-    async fn tunnel_and_local_with_dht_memory_are_valid() {
+    async fn tunnel_and_local_with_dht_disabled_are_valid() {
         // `DhtMode::Disabled` (the defaults' dht) is the fail-safe, non-disclosing
         // direction and is valid for every reach. Tunnel and Local publish a
-        // loopback URL, so Memory is the natural choice there. Together with
-        // Tests 11/12 (Domain / NatTraversal + Memory) this covers Memory across
-        // all four reaches; it also guards that Tests 5/6 (default Memory) build.
+        // loopback URL, so Disabled is the natural choice there. Together with
+        // Tests 11/12 (Domain / NatTraversal + Disabled) this covers Disabled
+        // across all four reaches; it also guards that Tests 5/6 (which take the
+        // default `Disabled`) build.
         let tunnel = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             ..NodeConfig::defaults(
@@ -1924,7 +1928,8 @@ mod tests {
         // over the SAME storage but a fresh custodyB (no keys) must be rejected
         // by the builder's persisted-identity validation, surfaced through the
         // config-level entry point. Domain is publishing-capable; opt into
-        // Production to exercise the public path (Memory is equally valid).
+        // Production to exercise the public path (`DhtMode::Disabled` is equally
+        // valid).
         let storage = Arc::new(InMemoryStorage::new());
         let custody_a = Arc::new(InMemoryKeyCustody::new());
         let did_method_a = Arc::new(make_test_dht(&custody_a));
@@ -1996,9 +2001,9 @@ mod tests {
         let storage =
             Arc::new(SqliteStorage::new(dir.path(), &key).expect("open encrypted SqliteStorage"));
 
-        // Domain is publishing-capable; this test opts into Production to exercise
-        // the public-hosting path (advisory in P1 — the TestDidDht uses an
-        // in-memory client, so nothing is published offline). Domain + default
+        // Domain is publishing-capable; Production makes the start publish
+        // through the TestDidDht in-memory client (no network) and fail if that
+        // publish fails, where `DhtMode::Disabled` would skip it. Domain + default
         // SelfSigned builds offline (no network/CA).
         let node = Node::start(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
@@ -2123,7 +2128,7 @@ mod tests {
         // The new TLS-axis rule (fix 1): ACME needs a DNS name, which only a
         // Domain reach provides. `TlsMode::Acme` on Local / Tunnel / NatTraversal
         // must be a loud `InvalidConfig`, not a silent no-op. There is no DHT
-        // validity rule to interfere (Memory is valid for every reach), so this
+        // validity rule to interfere (every `DhtMode` is valid on every reach), so this
         // cleanly isolates the Acme×Reach rejection. Validation runs before any
         // build, so no NAT
         // strategy is needed.

@@ -2,8 +2,8 @@
 //! library API (the reusable core behind `scp-node --self-host`).
 //!
 //! Drives the FULL host-a-website flow in-process with no real network
-//! exposure: a hermetic tempdir storage path, an in-memory DHT (nothing
-//! published), plaintext HTTP, NAT probing skipped (no router port opened), an
+//! exposure: a hermetic tempdir storage path, the default `DhtMode::Disabled`
+//! (nothing published), plaintext HTTP, NAT probing skipped (no router port opened), an
 //! OS-assigned free loopback port, and a caller-controlled shutdown. It then
 //! performs a real HTTP `GET` against the running listener and asserts a `200`
 //! with the deployed site body — proving the new API works end to end
@@ -82,8 +82,8 @@ async fn host_site_serves_a_deployed_site_over_http_and_shuts_down() {
 
     let config = HostSiteConfig {
         // Hermetic + offline: plaintext (no TLS dance), Reach::Local (skip NAT,
-        // no router port), in-memory DHT (nothing published; Local is a
-        // non-publishing reach so Memory is valid).
+        // no router port), and the default `DhtMode::Disabled` (nothing
+        // published).
         tls: TlsMode::Plaintext,
         site_dir: Some(site_dir.clone()),
         port,
@@ -155,4 +155,55 @@ async fn host_site_serves_a_deployed_site_over_http_and_shuts_down() {
         result.is_ok(),
         "host_site_until must return Ok(()) on clean shutdown, got {result:?}"
     );
+
+    // -- The shutdown drained the deployer's Supervisor and closed its MLS
+    //    store, so the directory reopens on the first attempt (spec §17.6). --
+    assert_mls_store_reopens(&storage_dir);
+}
+
+/// Opens `{storage_dir}/mls` once and fails the test unless that first
+/// attempt succeeds: the advisory lock must already be released.
+fn assert_mls_store_reopens(storage_dir: &std::path::Path) {
+    let key = scp_node::self_host::resolve_storage_key(storage_dir).expect("storage key");
+    scp_platform::sqlite::SqliteStorage::new(&storage_dir.join("mls"), key.as_ref())
+        .expect("the MLS store must reopen on the first attempt after host_site_until returns");
+}
+
+/// A failure after the deployer is built (here, the public port is already
+/// bound) still drains the deployer's Supervisor and closes its MLS store
+/// before `host_site_until` returns the error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_site_failure_after_deploy_releases_the_mls_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let storage_dir = tmp.path().join("storage");
+    let site_dir = tmp.path().join("site");
+    std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+    std::fs::create_dir_all(&site_dir).expect("create site dir");
+    write_sample_site(&site_dir);
+
+    // Hold the public port for the whole run so opening the public surface
+    // fails after the initial deploy.
+    let held = TcpListener::bind(("0.0.0.0", 0)).expect("bind a port to hold");
+    let port = held.local_addr().expect("local addr").port();
+
+    let config = HostSiteConfig {
+        tls: TlsMode::Plaintext,
+        site_dir: Some(site_dir),
+        port,
+        storage_path: Some(storage_dir.clone()),
+        ..HostSiteConfig::defaults(Reach::Local)
+    };
+    let result = tokio::time::timeout(
+        Duration::from_mins(1),
+        host_site_until(config, std::future::pending::<()>()),
+    )
+    .await
+    .expect("host_site_until must fail within 60s");
+    assert!(
+        matches!(result, Err(scp_node::HostSiteError::Serve(_))),
+        "a held public port must fail the serve step, got {result:?}"
+    );
+    drop(held);
+
+    assert_mls_store_reopens(&storage_dir);
 }

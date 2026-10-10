@@ -66,7 +66,7 @@ impl KeyStore {
     }
 }
 
-/// In-memory implementation of [`KeyCustody`] for testing and development.
+/// In-memory implementation of [`KeyCustody`] for testing.
 ///
 /// Stores cryptographic key material in memory using `HashMap`s. Keys are
 /// identified by opaque integer handles allocated by an atomic counter. This

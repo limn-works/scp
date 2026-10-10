@@ -38,13 +38,12 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import skip_reason_if_extension_absent
+
 try:
     from scp_sdk import SCP, _scp_core
-except (ImportError, AttributeError):
-    pytest.skip(
-        "Native _scp_core extension not available — run maturin develop first",
-        allow_module_level=True,
-    )
+except Exception as _exc:
+    pytest.skip(skip_reason_if_extension_absent(_exc), allow_module_level=True)
 
 
 # Stable 32-byte key for SQLCipher. The specific value does not matter;

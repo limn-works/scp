@@ -118,6 +118,9 @@ ALLOWLIST=(
     PROTOCOL_REGISTRY               # why: protocol capability registry — frozen lookup table of compile-time-known resources (§Trust registry, LazyLock<HashMap>).
     SYSTEM_REGISTRY                 # why: protocol system-action registry — frozen lookup table of compile-time-known system actions.
 
+    # Global allocator (Alec approved this one entry, 2026-10-04; §9.15 of 09-security-model.md)
+    WIPING_ALLOCATOR                # why: the one `#[global_allocator]` in `crates/scp-alloc/src/lib.rs`, a zero-sized immutable `WipingAllocator<System>`; Rust admits one global allocator per artifact, and every shipped artifact links this one.
+
     # ID generators (safe — monotonic counters, no shared mutable state)
     EVENT_COUNTER                   # why: monotonic `AtomicU64` for webhook event IDs; no shared state, safe across instances.
     INSTANCE_ID_COUNTER             # why: monotonic `AtomicU64` used to assign each `*BridgeInstance` a unique u64 identifier at construction.

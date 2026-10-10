@@ -29,7 +29,6 @@
 
 use std::collections::HashMap;
 
-use scp_clock::Clock;
 use scp_mls::ScpMlsGroup;
 use scp_mls::encrypt::{
     InboundChange, decrypt_with_membership_changes, encrypt, serialize_ciphertext,
@@ -134,7 +133,7 @@ pub const INITIAL_SENDER_KEY_EPOCH: u64 = 1;
 /// a `MessageReceived` event, mirrors an add Commit's membership change onto its
 /// event log + membership set (so existing members converge with the committer
 /// and the new joiner), maps the unsupported variant to a fail-closed error, and
-/// treats a proposal as a silent cache.
+/// treats a proposal as a silent no-op.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Inbound {
     /// An application message: recovered plaintext plus the sender's DID.
@@ -196,7 +195,7 @@ pub enum Inbound {
         /// the pre-merge tree.
         removed_dids: Vec<String>,
     },
-    /// A bare proposal cached by `scp-mls`; no membership change is committed.
+    /// A bare proposal, which openmls does not store; no membership change is committed.
     Proposal {
         /// The sender's DID, extracted from the MLS credential.
         sender_did: String,
@@ -715,7 +714,7 @@ impl ContextCryptoState {
     /// - a **Remove-bearing Commit** is rejected by `scp-mls` *without merging*
     ///   (the group stays on its current epoch, MLS + SCP state consistent) and
     ///   [`Inbound::UnsupportedMembershipChange`] is returned;
-    /// - a bare proposal is cached and [`Inbound::Proposal`] is returned.
+    /// - a bare proposal (an Add in it range-checked, none stored) returns [`Inbound::Proposal`].
     ///
     /// For an application message:
     /// 1. Parse the 16-byte `epoch || sequence` header — authoritative.
@@ -734,15 +733,14 @@ impl ContextCryptoState {
     pub fn decrypt_message(
         &mut self,
         ciphertext: &[u8],
-        clock: &dyn Clock,
         channel: RecvChannel,
     ) -> Result<Inbound, ClientError> {
         // Layer 2 (outer): MLS decrypt + classify. `scp-mls` merges any staged
         // commit internally (recovering its Add/Remove DIDs before the merge)
-        // and surfaces the sender DID from the credential. `clock` re-validates
-        // any add-Commit's KeyPackage `Lifetime` against the hardened driver
-        // clock before merge (ADR-057 §Prereq-1).
-        let decrypted = decrypt_with_membership_changes(&mut self.mls_group, ciphertext, clock)?;
+        // and surfaces the sender DID from the credential. A received Add's
+        // KeyPackage `Lifetime` is checked for range only, with no clock
+        // (security-model spec §9.7.1, the receiver).
+        let decrypted = decrypt_with_membership_changes(&mut self.mls_group, ciphertext)?;
         let (sender_did, framed) = match decrypted {
             InboundChange::Application {
                 plaintext,
@@ -894,7 +892,7 @@ impl ContextCryptoState {
 mod tests {
     use super::*;
     use openmls::prelude::KeyPackageIn;
-    use scp_clock::SystemClock;
+    use scp_clock::{Clock, SystemClock};
     use scp_did::SigningKeyId;
     use scp_mls::group::{
         add_member, add_member_with_convergent_timestamp, create_group, generate_key_package,
@@ -928,7 +926,7 @@ mod tests {
         let kp_in = KeyPackageIn::tls_deserialize(&mut &*kp_bytes).unwrap();
         let result = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
 
-        let bob_group = join_group(&result.welcome, provider, signer).unwrap();
+        let bob_group = join_group(&result.welcome, provider, signer, &SystemClock).unwrap();
         let mut bob = ContextCryptoState::from_group(CTX, bob_group);
 
         // Exchange sender keys (out-of-band, mirroring the driver's MISSING SEAM).
@@ -942,10 +940,7 @@ mod tests {
     fn full_double_encryption_round_trip() {
         let (mut alice, mut bob) = alice_and_bob();
         let ct = alice.encrypt_message(b"hello bob", ALICE, 0).unwrap();
-        match bob
-            .decrypt_message(&ct, &SystemClock, RecvChannel::App)
-            .unwrap()
-        {
+        match bob.decrypt_message(&ct, RecvChannel::App).unwrap() {
             Inbound::Application {
                 sender_did,
                 plaintext,
@@ -983,7 +978,13 @@ mod tests {
         let add_carol = add_member(&mut alice.mls_group, carol_kp_in, &SystemClock).unwrap();
         let mut carol = ContextCryptoState::from_group(
             CTX,
-            join_group(&add_carol.welcome, carol_provider, carol_signer).unwrap(),
+            join_group(
+                &add_carol.welcome,
+                carol_provider,
+                carol_signer,
+                &SystemClock,
+            )
+            .unwrap(),
         );
 
         // Alice adds Bob; Carol (existing member) processes the Commit. Bob's
@@ -1006,7 +1007,7 @@ mod tests {
         let commit_bytes = add_bob.commit.tls_serialize_detached().unwrap();
 
         match carol
-            .decrypt_message(&commit_bytes, &SystemClock, RecvChannel::App)
+            .decrypt_message(&commit_bytes, RecvChannel::App)
             .unwrap()
         {
             Inbound::Commit {
@@ -1041,18 +1042,15 @@ mod tests {
         let ct1_dup = alice.encrypt_message(b"first-again", ALICE, 1).unwrap();
 
         assert!(
-            bob.decrypt_message(&ct2, &SystemClock, RecvChannel::App)
-                .is_ok(),
+            bob.decrypt_message(&ct2, RecvChannel::App).is_ok(),
             "newer seq accepted first"
         );
         assert!(
-            bob.decrypt_message(&ct1, &SystemClock, RecvChannel::App)
-                .is_err(),
+            bob.decrypt_message(&ct1, RecvChannel::App).is_err(),
             "older (epoch,seq) rejected as reorder/replay"
         );
         assert!(
-            bob.decrypt_message(&ct1_dup, &SystemClock, RecvChannel::App)
-                .is_err(),
+            bob.decrypt_message(&ct1_dup, RecvChannel::App).is_err(),
             "duplicate (epoch,seq) rejected"
         );
     }
@@ -1085,10 +1083,7 @@ mod tests {
 
         // App message at seq 5 → advances Bob's APP floor for Alice to 5.
         let app5 = alice.encrypt_message(b"app-5", ALICE, 5).unwrap();
-        assert!(
-            bob.decrypt_message(&app5, &SystemClock, RecvChannel::App)
-                .is_ok()
-        );
+        assert!(bob.decrypt_message(&app5, RecvChannel::App).is_ok());
 
         // A tagged announcement at seq 3 (LOWER) arriving on the ANNOUNCEMENT
         // channel is ACCEPTED — the announcement floor is independent of the app
@@ -1097,7 +1092,7 @@ mod tests {
             .encrypt_message(&announcement_payload(), ALICE, 3)
             .unwrap();
         assert!(
-            bob.decrypt_message(&ann3, &SystemClock, RecvChannel::Announcement)
+            bob.decrypt_message(&ann3, RecvChannel::Announcement)
                 .is_ok(),
             "a lower-seq announcement on the announcement channel is accepted despite \
              the higher app-channel floor"
@@ -1107,8 +1102,7 @@ mod tests {
         // confirming the app floor is untouched by the announcement.
         let app3_on_app = alice.encrypt_message(b"app-3", ALICE, 3).unwrap();
         assert!(
-            bob.decrypt_message(&app3_on_app, &SystemClock, RecvChannel::App)
-                .is_err(),
+            bob.decrypt_message(&app3_on_app, RecvChannel::App).is_err(),
             "seq 3 on the app channel is a replay/reorder (app floor already at 5)"
         );
 
@@ -1118,7 +1112,7 @@ mod tests {
             .encrypt_message(&announcement_payload(), ALICE, 3)
             .unwrap();
         assert!(
-            bob.decrypt_message(&ann3_dup, &SystemClock, RecvChannel::Announcement)
+            bob.decrypt_message(&ann3_dup, RecvChannel::Announcement)
                 .is_err(),
             "the announcement channel still rejects its own replay"
         );
@@ -1139,7 +1133,7 @@ mod tests {
         let app_on_ann = alice.encrypt_message(b"app-data", ALICE, 1).unwrap();
         assert!(
             matches!(
-                bob.decrypt_message(&app_on_ann, &SystemClock, RecvChannel::Announcement),
+                bob.decrypt_message(&app_on_ann, RecvChannel::Announcement),
                 Err(ClientError::ChannelContentMismatch)
             ),
             "app data on the announcement channel is a content/channel mismatch"
@@ -1162,7 +1156,7 @@ mod tests {
             .unwrap();
         assert!(
             matches!(
-                bob.decrypt_message(&ann_on_app, &SystemClock, RecvChannel::App),
+                bob.decrypt_message(&ann_on_app, RecvChannel::App),
                 Err(ClientError::ChannelContentMismatch)
             ),
             "an announcement on the app channel is a content/channel mismatch"
@@ -1187,13 +1181,12 @@ mod tests {
         let kp_bytes = bundle.key_package().tls_serialize_detached().unwrap();
         let kp_in = KeyPackageIn::tls_deserialize(&mut &*kp_bytes).unwrap();
         let result = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
-        let bob_group = join_group(&result.welcome, provider, signer).unwrap();
+        let bob_group = join_group(&result.welcome, provider, signer, &SystemClock).unwrap();
         let mut bob = ContextCryptoState::from_group(CTX, bob_group);
 
         let ct = alice.encrypt_message(b"one", ALICE, 1).unwrap();
         assert!(
-            bob.decrypt_message(&ct, &SystemClock, RecvChannel::App)
-                .is_err(),
+            bob.decrypt_message(&ct, RecvChannel::App).is_err(),
             "no sender key → fails"
         );
         assert!(
@@ -1204,10 +1197,7 @@ mod tests {
         // After receiving the key out-of-band, a fresh send at seq 1 decrypts.
         bob.insert_sender_key(ALICE, SenderKey::from_bytes(alice.local_sender_key_bytes()));
         let ct_b = alice.encrypt_message(b"one-b", ALICE, 1).unwrap();
-        assert!(
-            bob.decrypt_message(&ct_b, &SystemClock, RecvChannel::App)
-                .is_ok()
-        );
+        assert!(bob.decrypt_message(&ct_b, RecvChannel::App).is_ok());
     }
 
     #[test]
@@ -1218,8 +1208,7 @@ mod tests {
         alice.sender_key_epoch = u64::MAX;
         let poisoned = alice.encrypt_message(b"poison", ALICE, 0).unwrap();
         assert!(
-            bob.decrypt_message(&poisoned, &SystemClock, RecvChannel::App)
-                .is_err(),
+            bob.decrypt_message(&poisoned, RecvChannel::App).is_err(),
             "epoch beyond store.epoch + MAX_EPOCH_ADVANCE must be rejected"
         );
         assert!(
@@ -1284,7 +1273,7 @@ mod tests {
         )
         .unwrap();
         let add = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
-        let bob_group = join_group(&add.welcome, provider, signer).unwrap();
+        let bob_group = join_group(&add.welcome, provider, signer, &SystemClock).unwrap();
         let mut bob =
             ContextCryptoState::from_group_with_wrapping(CTX, bob_group, bob_wpub, bob_wsec);
 
@@ -1368,7 +1357,7 @@ mod tests {
 
         // Bob receives it: HPKE-opens + installs, returning SenderKeyInstalled.
         match bob
-            .decrypt_message(&dist.ciphertext, &SystemClock, RecvChannel::App)
+            .decrypt_message(&dist.ciphertext, RecvChannel::App)
             .unwrap()
         {
             Inbound::SenderKeyInstalled { sender_did, epoch } => {
@@ -1382,10 +1371,7 @@ mod tests {
         // distributed key — the sender key was delivered ONLY over the wrapping-key
         // extension mesh, never out-of-band.
         let ct = alice.encrypt_message(b"hi bob", ALICE, 0).unwrap();
-        match bob
-            .decrypt_message(&ct, &SystemClock, RecvChannel::App)
-            .unwrap()
-        {
+        match bob.decrypt_message(&ct, RecvChannel::App).unwrap() {
             Inbound::Application {
                 sender_did,
                 plaintext,
@@ -1430,9 +1416,7 @@ mod tests {
             request_nonce: [0u8; 16],
         };
         let ct = frame_distribution(&mut alice, response);
-        let err = bob
-            .decrypt_message(&ct, &SystemClock, RecvChannel::App)
-            .unwrap_err();
+        let err = bob.decrypt_message(&ct, RecvChannel::App).unwrap_err();
         assert!(
             matches!(err, ClientError::Driver(ref m) if m.contains("DID mismatch")),
             "a sender-DID mismatch must be rejected, got {err:?}"
@@ -1465,9 +1449,7 @@ mod tests {
             request_nonce: [0u8; 16],
         };
         let ct = frame_distribution(&mut alice, response);
-        let err = bob
-            .decrypt_message(&ct, &SystemClock, RecvChannel::App)
-            .unwrap_err();
+        let err = bob.decrypt_message(&ct, RecvChannel::App).unwrap_err();
         assert!(
             matches!(err, ClientError::Driver(ref m) if m.contains("ceiling")),
             "a u64::MAX epoch must be rejected by the poisoning ceiling, got {err:?}"
@@ -1492,9 +1474,7 @@ mod tests {
         tagged.extend(std::iter::repeat_n(0u8, MAX_MANAGEMENT_PAYLOAD_SIZE + 1));
         let mls_out = encrypt(&mut alice.mls_group, &tagged).unwrap();
         let ct = serialize_ciphertext(&mls_out).unwrap();
-        let err = bob
-            .decrypt_message(&ct, &SystemClock, RecvChannel::App)
-            .unwrap_err();
+        let err = bob.decrypt_message(&ct, RecvChannel::App).unwrap_err();
         assert!(
             matches!(err, ClientError::Driver(ref m) if m.contains("MAX_MANAGEMENT_PAYLOAD_SIZE")),
             "an oversized management payload must be rejected, got {err:?}"
@@ -1524,9 +1504,7 @@ mod tests {
             request_nonce: [0u8; 16],
         };
         let ct = frame_distribution(&mut alice, response);
-        let err = bob
-            .decrypt_message(&ct, &SystemClock, RecvChannel::App)
-            .unwrap_err();
+        let err = bob.decrypt_message(&ct, RecvChannel::App).unwrap_err();
         assert!(
             matches!(err, ClientError::SenderKey(_)),
             "a distribution sealed to another recipient must fail to open, got {err:?}"
@@ -1542,7 +1520,7 @@ mod tests {
         let dist1 = alice
             .seal_sender_key_distribution(ALICE, BOB, &bob_wk)
             .unwrap();
-        bob.decrypt_message(&dist1.ciphertext, &SystemClock, RecvChannel::App)
+        bob.decrypt_message(&dist1.ciphertext, RecvChannel::App)
             .unwrap();
 
         // Capture an epoch-1 ciphertext BEFORE rotation.
@@ -1553,15 +1531,12 @@ mod tests {
         assert_eq!(alice.sender_key_epoch, INITIAL_SENDER_KEY_EPOCH + 1);
         assert_eq!(rotations.len(), 1, "one distribution to Bob (self skipped)");
         assert_eq!(rotations[0].target_did, BOB);
-        bob.decrypt_message(&rotations[0].ciphertext, &SystemClock, RecvChannel::App)
+        bob.decrypt_message(&rotations[0].ciphertext, RecvChannel::App)
             .unwrap();
 
         // A message under the NEW key/epoch decrypts at Bob.
         let fresh_ct = alice.encrypt_message(b"epoch-2 msg", ALICE, 0).unwrap();
-        match bob
-            .decrypt_message(&fresh_ct, &SystemClock, RecvChannel::App)
-            .unwrap()
-        {
+        match bob.decrypt_message(&fresh_ct, RecvChannel::App).unwrap() {
             Inbound::Application { plaintext, .. } => assert_eq!(plaintext, b"epoch-2 msg"),
             other => panic!("expected Application under the rotated key, got {other:?}"),
         }
@@ -1569,8 +1544,7 @@ mod tests {
         // The pre-rotation (epoch-1) ciphertext is now stale: Bob's replay tracker
         // advanced to epoch 2, so an epoch-1 header is rejected as a reorder.
         assert!(
-            bob.decrypt_message(&stale_ct, &SystemClock, RecvChannel::App)
-                .is_err(),
+            bob.decrypt_message(&stale_ct, RecvChannel::App).is_err(),
             "a stale pre-rotation (epoch-1) message must be rejected after rotation"
         );
     }

@@ -18,13 +18,10 @@
 //! # Lifecycle
 //!
 //! 1. `Scp::with_storage` (the sole public constructor; storage selection
-//!    is mandatory, spec §17.6) constructs a fresh `UniffiBridgeInstance`;
-//!    per-instance setup (e.g. `init_context_manager_with_did`, transport
-//!    setup) happens lazily on the first `Scp::identity_create` /
-//!    `context_create` / `context_join` call.
+//!    is mandatory, spec §17.6) constructs a fresh `UniffiBridgeInstance`.
 //! 2. `Scp::method(...)` delegates to methods on
 //!    `UniffiBridgeInstance` (`context_manager_expect`, `with_ucan_state`,
-//!    `ensure_ucan_registered`, `did_resolver`, etc.) — all per-instance,
+//!    `did_resolver`, etc.) — all per-instance,
 //!    no process-wide shared state. `context_manager_expect` returns the
 //!    instance's `Arc<Supervisor>` (ADR-049 actor migration).
 //! 3. The instance is dropped when the last `Arc` reference is released
@@ -38,13 +35,13 @@
 
 use async_trait::async_trait;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+use scp_ffi_common::bridge_instance::StreamRegistry;
 use scp_ffi_common::credentials::FfiCredentialStore;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so bridge.rs
 // and server.rs can name it in impl blocks without pulling in the full
 // path.
 pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_ffi_common::error_codes as codes;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -170,6 +167,41 @@ pub enum StorageInitError {
         /// The underlying `scp-platform` error rendered via `Display`.
         message: String,
     },
+    /// Another store holds the directory's advisory lock, in this process or
+    /// another (`PlatformError::StorageLockHeld`; spec §17.6 "One Opener per
+    /// Durable Directory").
+    LockHeld {
+        /// The directory path the caller asked for (for the error message).
+        path: String,
+        /// The underlying `scp-platform` error rendered via `Display`.
+        message: String,
+    },
+}
+
+impl StorageInitError {
+    /// Builds the variant for a failed `SqliteStorage` open: the typed
+    /// lock-still-held condition keeps its own variant, every other open
+    /// failure is [`Self::SqliteOpen`].
+    #[must_use]
+    pub fn from_open_failure(path: String, err: &scp_platform::PlatformError) -> Self {
+        let message = err.to_string();
+        if matches!(err, scp_platform::PlatformError::StorageLockHeld { .. }) {
+            Self::LockHeld { path, message }
+        } else {
+            Self::SqliteOpen { path, message }
+        }
+    }
+
+    /// The registered `SCP-STORAGE-` code for this failure
+    /// (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes):
+    /// `8005` for a held lock, `8004` for every other open failure.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::SqliteOpen { .. } => scp_ffi_common::error_codes::STORAGE_8004,
+            Self::LockHeld { .. } => scp_ffi_common::error_codes::STORAGE_8005,
+        }
+    }
 }
 
 impl std::fmt::Display for StorageInitError {
@@ -177,6 +209,12 @@ impl std::fmt::Display for StorageInitError {
         match self {
             Self::SqliteOpen { path, message } => {
                 write!(f, "failed to open SQLCipher storage at {path}: {message}")
+            }
+            Self::LockHeld { path, message } => {
+                write!(
+                    f,
+                    "SQLCipher storage at {path} is held by another store: {message}"
+                )
             }
         }
     }
@@ -188,16 +226,19 @@ impl From<StorageInitError> for crate::ScpError {
     fn from(err: StorageInitError) -> Self {
         match err {
             // A rejected key, an unwritable directory and a held advisory lock
-            // are all caller-supplied selections this bridge could not honour,
-            // which `SCP-STORAGE-8004` names. The `PyO3` and NAPI bridges
-            // report the same code for the same failure, so a caller reading a
-            // code learns the same thing whichever binding raised it. Reporting
+            // are all caller-supplied selections this bridge could not honour;
+            // `err.code()` names each (`SCP-STORAGE-8004`, or `8005` for a held
+            // lock). The `PyO3` and NAPI bridges report the same code for the
+            // same failure, so a caller reading a code learns the same thing
+            // whichever binding raised it. Reporting
             // `SCP-CTX-2000` here said "context error" for a storage-selection
             // failure that no context took part in.
-            StorageInitError::SqliteOpen { .. } => Self::Validation {
-                msg: err.to_string(),
-                code: codes::STORAGE_8004.to_owned(),
-            },
+            StorageInitError::SqliteOpen { .. } | StorageInitError::LockHeld { .. } => {
+                Self::Validation {
+                    msg: err.to_string(),
+                    code: err.code().to_owned(),
+                }
+            }
         }
     }
 }
@@ -207,6 +248,27 @@ impl From<StorageInitError> for crate::ScpError {
 // the UniFFI bridge keep compiling without mass rename. See ADR-048 §2 for
 // the "shared-variant types for storage-backed repositories" exemption.
 pub use scp_ffi_common::bridge_runtime::ProtocolRepoVariant;
+
+// ---------------------------------------------------------------------------
+// UniffiStreamRevocationChecker — LIVE per-context revocation view
+// ---------------------------------------------------------------------------
+
+/// [`RevocationChecker`](scp_core::crypto::ucan::validate::RevocationChecker)
+/// that reads `context_id`'s revocation list in the UCAN registry at each
+/// `is_revoked` call, with no `await`. An id with no UCAN state reports no
+/// token revoked.
+struct UniffiStreamRevocationChecker {
+    states: Arc<DashMap<String, UcanContextState>>,
+    context_id: String,
+}
+
+impl scp_core::crypto::ucan::validate::RevocationChecker for UniffiStreamRevocationChecker {
+    fn is_revoked(&self, token_cid: &str) -> bool {
+        self.states
+            .get(&self.context_id)
+            .is_some_and(|state| state.revocation_list.is_revoked(token_cid))
+    }
+}
 
 /// `UniFFI`-specific concrete bridge instance.
 ///
@@ -236,7 +298,13 @@ pub struct UniffiBridgeInstance {
     /// Previously stored type-erased in `CoreFields::ucan_registry`.
     /// Post PR 1, the registry lives here as a typed field and is cleared by
     /// [`BridgeInstanceCore::bridge_specific_shutdown`].
-    pub(crate) ucan_registry: Arc<DashMap<String, UcanContextState>>,
+    ucan_registry: Arc<DashMap<String, UcanContextState>>,
+
+    /// Release marks, keyed by context id.
+    pub(crate) released_contexts: std::sync::Mutex<std::collections::HashMap<String, ReleaseMark>>,
+
+    /// Generation the next newly created release mark receives.
+    pub(crate) next_release_generation: std::sync::atomic::AtomicU64,
 
     /// Retained identity custody for the production identity ops, keyed by DID.
     ///
@@ -363,9 +431,9 @@ pub struct UniffiBridgeInstance {
     /// `NapiBridgeInstance::outlet_stream_registry` — a per-instance field, NOT a
     /// `static` (`check-no-bridge-globals.sh` / `check-handle-affinity.sh` forbid
     /// the alternative). A stream opened on one instance is invisible to another;
-    /// instance shutdown drops every live stream (and its billing pump `Arc`) via
-    /// [`BridgeInstanceCore::bridge_specific_shutdown`].
-    pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
+    /// instance shutdown drops every live stream (and its billing pump `Arc`).
+    pub(crate) outlet_stream_registry:
+        Arc<StreamRegistry<String, crate::outlet_stream::StreamEntry>>,
 
     /// Per-instance §5.4.5 / §6.2.4 cross-context STREAMING-saga registry
     /// (SCP-OUT-047, pass 3a), keyed by the durable `saga_id` string. Each
@@ -378,9 +446,9 @@ pub struct UniffiBridgeInstance {
     /// field, NOT a `static` (`check-no-bridge-globals.sh` /
     /// `check-handle-affinity.sh` forbid the alternative). A saga opened on one
     /// instance is invisible to another; instance shutdown drops every live saga
-    /// stream via [`BridgeInstanceCore::bridge_specific_shutdown`].
+    /// stream.
     pub(crate) outlet_streaming_saga_registry:
-        Arc<DashMap<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+        Arc<StreamRegistry<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
 }
 
 impl std::fmt::Debug for UniffiBridgeInstance {
@@ -417,9 +485,14 @@ impl UniffiBridgeInstance {
         // selected before the handle is moved into the durable providers.
         let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
+        let core = CoreFields::new();
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::new(),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_release_generation: std::sync::atomic::AtomicU64::new(0),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -428,8 +501,8 @@ impl UniffiBridgeInstance {
             mcp_client_registry: Arc::new(DashMap::new()),
             durable_providers: Some(durable_providers),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -452,9 +525,14 @@ impl UniffiBridgeInstance {
         // selected before the handle is moved into the durable providers.
         let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
+        let core = CoreFields::with_persistence(persistence);
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::with_persistence(persistence),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_release_generation: std::sync::atomic::AtomicU64::new(0),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -463,8 +541,8 @@ impl UniffiBridgeInstance {
             mcp_client_registry: Arc::new(DashMap::new()),
             durable_providers: Some(durable_providers),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -486,7 +564,9 @@ impl UniffiBridgeInstance {
     ///
     /// Returns [`StorageInitError::SqliteOpen`] if the `SQLCipher` database
     /// cannot be opened (bad key/passphrase, permission denied, corrupt file,
-    /// or a salt-sidecar fail-closed condition). FAIL CLOSED (spec §17.6):
+    /// or a salt-sidecar fail-closed condition), and
+    /// [`StorageInitError::LockHeld`] if another store holds the directory's
+    /// advisory lock. FAIL CLOSED (spec §17.6):
     /// the bridge does NOT silently degrade to in-memory or no-storage on a
     /// failed durable-backend open. The error surfaces to Swift as `throws`
     /// and Kotlin as a thrown exception via the [`From`] impl on
@@ -537,10 +617,7 @@ impl UniffiBridgeInstance {
                         path = %path,
                         "with_storage_uniffi: SQLCipher open failed — failing closed, no in-memory fallback"
                     );
-                    StorageInitError::SqliteOpen {
-                        path: path.clone(),
-                        message: e.to_string(),
-                    }
+                    StorageInitError::from_open_failure(path.clone(), &e)
                 })?;
 
                 let arc_storage = Arc::new(storage);
@@ -600,9 +677,14 @@ impl UniffiBridgeInstance {
         durable_providers: scp_core::context::supervisor::DurableProviders,
         credential_store: FfiCredentialStore,
     ) -> Self {
+        let core = CoreFields::with_persistence_arc(persistence);
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::with_persistence_arc(persistence),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_release_generation: std::sync::atomic::AtomicU64::new(0),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository,
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -611,8 +693,8 @@ impl UniffiBridgeInstance {
             mcp_client_registry: Arc::new(DashMap::new()),
             durable_providers: Some(durable_providers),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -649,9 +731,22 @@ impl UniffiBridgeInstance {
         &self.credential_store
     }
 
-    /// Returns a reference to the typed UCAN registry.
-    #[must_use]
-    pub const fn ucan_registry(&self) -> &Arc<DashMap<String, UcanContextState>> {
+    /// Returns a revocation checker that reads `context_id`'s revocation list
+    /// in this instance's UCAN registry at each call.
+    pub(crate) fn live_revocation_checker(
+        &self,
+        context_id: String,
+    ) -> Arc<dyn scp_core::crypto::ucan::validate::RevocationChecker + Send + Sync> {
+        Arc::new(UniffiStreamRevocationChecker {
+            states: Arc::clone(&self.ucan_registry),
+            context_id,
+        })
+    }
+
+    /// Returns this instance's UCAN registry, for a test that inspects its
+    /// entry locks.
+    #[cfg(test)]
+    pub(crate) fn ucan_registry_for_test(&self) -> &DashMap<String, UcanContextState> {
         &self.ucan_registry
     }
 
@@ -808,9 +903,7 @@ impl UniffiBridgeInstance {
         self.core
             .try_supervisor()
             .ok_or_else(|| crate::ScpError::Context {
-                msg: "ContextManager not yet attached — call context_create, \
-                      context_join, context_import, or init_context_manager first"
-                    .to_owned(),
+                msg: "ContextManager not yet attached".to_owned(),
                 code: codes::CTX_2000.to_owned(),
             })
     }
@@ -975,35 +1068,185 @@ impl UniffiBridgeInstance {
         self.core.set_supervisor(supervisor_arc);
     }
 
-    /// Per-instance equivalent of the module-level
-    /// `sync_role_state_from_manager` free function.
+    /// Reads a context's lifecycle state from that context's supervisor actor.
     ///
-    /// Validates that the attached `ContextManager` has role state for the
-    /// given context after a governance operation. Logs the sync for
-    /// traceability.
+    /// An absent actor the crash watchdog poisoned reads as `Some(Poisoned)`,
+    /// because the supervisor keeps that flag outside the actor (ADR-049 §10).
+    /// [`UniffiBridgeInstance::require_active_context`] is the gate form: it
+    /// turns `None` into an error, so a gate never admits an operation on an
+    /// absent answer.
+    ///
+    /// An actor the supervisor still holds but this call could not reach, a
+    /// mailbox send that timed out against a saturated mailbox or a wedged
+    /// actor that took longer than the reply timeout, reads as an error and
+    /// never as `Ok(None)`. `Supervisor::read_context_state` folds that
+    /// outcome into `None`, so this method calls
+    /// `Supervisor::read_context_state_checked`, which keeps the two apart.
     ///
     /// # Errors
     ///
-    /// Returns `ScpError::Context` (code `SCP-CTX-2040`) if the context is
-    /// not registered in the attached `ContextManager`, or any error returned
-    /// by [`UniffiBridgeInstance::context_manager_or_error`] if no manager is
-    /// attached.
-    #[allow(dead_code)]
-    pub async fn sync_role_state_from_manager(
+    /// Returns any error [`UniffiBridgeInstance::context_manager_or_error`]
+    /// returns. Returns `ScpError::Context` with a message that starts
+    /// `SCP-CTX-2130` when an actor serves `context_id` but did not answer the
+    /// state read. Returns `ScpError::Context` with code `SCP-CTX-2135` when
+    /// the crash watchdog despawned `context_id`'s actor for a respawn it has
+    /// not finished or its last respawn failed (ADR-049 §10).
+    pub async fn read_live_context_state(
         &self,
         context_id: &str,
-    ) -> Result<(), crate::ScpError> {
+    ) -> Result<Option<scp_core::context::ContextState>, crate::ScpError> {
         let supervisor = self.context_manager_or_error()?;
-        let _role_state = supervisor.get_role_state(context_id).await.ok_or_else(|| {
-            crate::ScpError::Context {
-                msg: format!(
-                    "context '{context_id}' not found in Supervisor during role state sync"
-                ),
-                code: codes::CTX_2040.to_owned(),
+        supervisor
+            .read_context_state_checked(context_id)
+            .await
+            .map_err(crate::ScpError::from)
+    }
+
+    /// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`.
+    ///
+    /// The gate reads the supervisor actor, never the `state` a
+    /// [`ContextHandle`](crate::ContextHandle) caches. That cached state
+    /// records only the transitions THIS bridge observed, so a TTL expiry the
+    /// supervisor applied on its own timer, a close another member initiated,
+    /// a migration that tombstoned the context, and an actor the watchdog
+    /// poisoned all leave it reading `Active`. `context_join`,
+    /// `context_leave`, `context_send`, and `context_subscribe` gate here.
+    ///
+    /// The gate fails closed: a context no actor serves refuses the
+    /// operation. `mk_err` wraps the refusal message in the error variant and
+    /// the error code the calling operation reports. The refusal names the
+    /// state through [`scp_ffi_common::context_state_str`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` with code `SCP-CTX-2134` when the
+    /// supervisor reports `Poisoned` (ADR-049 §10). Returns whatever `mk_err`
+    /// builds when the supervisor reports any other state than `Active` and
+    /// when no actor serves `context_id`. Returns the
+    /// error [`UniffiBridgeInstance::read_live_context_state`] returns when
+    /// the state read fails.
+    pub async fn require_active_context<F>(
+        &self,
+        context_id: &str,
+        verb: &str,
+        mk_err: F,
+    ) -> Result<(), crate::ScpError>
+    where
+        F: FnOnce(String) -> crate::ScpError,
+    {
+        let state = self.read_live_context_state(context_id).await?;
+        match state {
+            Some(scp_core::context::ContextState::Active) => Ok(()),
+            // ADR-049 §10: a caller detects a poisoned context by the
+            // `SCP-CTX-2134` code on its next per-context operation, so the
+            // gate surfaces `ContextPoisoned` rather than the operation's own
+            // non-active code.
+            Some(scp_core::context::ContextState::Poisoned) => {
+                Err(context_poisoned_error(context_id))
             }
-        })?;
-        tracing::debug!(context_id = %context_id, "UniFFI: role state synced after governance operation");
-        Ok(())
+            Some(other) => Err(mk_err(format!(
+                "cannot {verb} in '{}' state -- context must be active",
+                scp_ffi_common::context_state_str(&other)
+            ))),
+            None => Err(mk_err(format!(
+                "context '{context_id}' has no live supervisor state — refusing to run a \
+                 lifecycle-gated operation against a context no actor serves"
+            ))),
+        }
+    }
+
+    /// Reads a context's role state from that context's supervisor actor.
+    ///
+    /// The method reports each failure as itself, so it suits only a caller
+    /// that has already passed its own authorization check. It does not gate
+    /// on the lifecycle state.
+    ///
+    /// Fails closed. A context whose actor holds no role state yields
+    /// `ScpError::Context` with `SCP-CTX-2023`; no caller receives a
+    /// permissive default.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error [`UniffiBridgeInstance::context_manager_or_error`]
+    /// returns, `ScpError::Context` with `SCP-CTX-2023` when the supervisor
+    /// holds no role state for `context_id`, and the converted `ActorBusy`
+    /// (`SCP-CTX-2130`), `ActorCrashed` (`SCP-CTX-2135`), or `ContextPoisoned`
+    /// (`SCP-CTX-2134`) error when the context's actor is saturated, wedged,
+    /// mid-respawn, or poisoned.
+    pub(crate) async fn live_role_state(
+        &self,
+        context_id: &str,
+    ) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError> {
+        let supervisor = self.context_manager_or_error()?;
+        role_state_on(supervisor, context_id).await
+    }
+
+    /// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`,
+    /// withholds every answer about the context from the refusal, and returns
+    /// the context's role state for the authorization decision that follows.
+    ///
+    /// The outlet PRD's
+    /// SCP-OUT-031 PR-2a note records the rule this gate keeps: the raw
+    /// lifecycle state never reaches an FFI caller before authorization. A
+    /// context that is not `Active`, a context no actor serves, an actor that
+    /// did not answer (`ActorBusy`), a context mid-respawn or past a failed
+    /// respawn (`ActorCrashed`), a poisoned context, and a context whose actor
+    /// returned no role state all refuse with the same text and the caller's
+    /// code, and the text never names the context. Each cause goes to the
+    /// `debug` log.
+    ///
+    /// The gate resolves this bridge's supervisor once and returns that
+    /// resolution's error unchanged: a suspended bridge and a bridge with no
+    /// `ContextManager` attached describe the caller's bridge, not the
+    /// context. Both mailbox reads, the lifecycle state and then the role
+    /// state, run in a private function that takes the resolved supervisor and
+    /// no bridge instance, so neither read can resolve the supervisor again
+    /// and turn a bridge error into a withheld context answer.
+    ///
+    /// `mk_err` wraps the refusal message in the error variant and the error
+    /// code the calling entry point reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error [`UniffiBridgeInstance::context_manager_or_error`]
+    /// returns, unchanged. Returns whatever `mk_err` builds for every answer
+    /// about the context other than an `Active` lifecycle state followed by a
+    /// role state.
+    pub async fn require_active_context_before_authz<F>(
+        &self,
+        context_id: &str,
+        verb: &str,
+        mk_err: F,
+    ) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError>
+    where
+        F: FnOnce(String) -> crate::ScpError,
+    {
+        let supervisor = self.context_manager_or_error()?;
+        active_role_state_on(supervisor, context_id, verb, mk_err).await
+    }
+
+    /// Runs [`Self::require_active_context_before_authz`] and, when it returns
+    /// the role state, builds UCAN validation state for `context_id` from that
+    /// same `Active` read, without reading the supervisor again. No state is
+    /// built while a release mark stands on the id.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Self::require_active_context_before_authz`] returns.
+    pub(crate) async fn require_active_context_with_ucan_before_authz<F>(
+        &self,
+        context_id: &str,
+        verb: &str,
+        mk_err: F,
+    ) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError>
+    where
+        F: FnOnce(String) -> crate::ScpError,
+    {
+        let role_state = self
+            .require_active_context_before_authz(context_id, verb, mk_err)
+            .await?;
+        self.ensure_ucan_registered(context_id);
+        Ok(role_state)
     }
 
     /// Per-instance equivalent of the module-level
@@ -1049,32 +1292,320 @@ impl UniffiBridgeInstance {
             )));
     }
 
-    /// Per-instance equivalent of the module-level `ensure_ucan_registered`
-    /// free function.
+    /// Builds UCAN validation state for `context_id` in this instance's UCAN
+    /// registry. No-op if the context is already registered, and no-op if
+    /// `context_id` carries a release mark.
     ///
-    /// Ensures UCAN validation state is registered for `context_id` in this
-    /// instance's UCAN registry. No-op if the context is already registered.
-    #[allow(dead_code)]
-    pub fn ensure_ucan_registered(&self, context_id: &str, creator_did: &str, ceiling: &[String]) {
-        if self.ucan_registry.contains_key(context_id) {
+    /// The release-mark check and the insert run while this call holds the
+    /// registry entry for `context_id` and then the release-mark lock.
+    ///
+    /// This function is private to this module.
+    fn ensure_ucan_registered(&self, context_id: &str) {
+        let entry = self.ucan_registry.entry(context_id.to_owned());
+        let marks = self.lock_release_marks();
+        if marks.contains_key(context_id) {
             return;
         }
+        entry.or_insert_with(|| Self::build_ucan_context_state(context_id));
+        drop(marks);
+    }
 
-        self.ucan_registry.insert(
-            context_id.to_owned(),
-            Self::build_ucan_context_state(context_id, creator_did, ceiling),
+    /// Builds UCAN validation state for `context_id` only when this instance
+    /// holds none for it, the supervisor reports the context `Active`, and no
+    /// release mark stands on the id. On any other supervisor answer it
+    /// registers nothing and returns `Ok(())`; a failed state read registers
+    /// nothing and returns that read's error.
+    ///
+    /// The ungated builder is private, so a direct call does not compile:
+    ///
+    /// ```compile_fail
+    /// # fn ungated(bi: &scp_ffi_uniffi::runtime::UniffiBridgeInstance) {
+    /// bi.ensure_ucan_registered("ctx");
+    /// # }
+    /// ```
+    ///
+    /// ```no_run
+    /// # async fn gated(bi: &scp_ffi_uniffi::runtime::UniffiBridgeInstance) {
+    /// let _ = bi.ensure_ucan_registered_while_active("ctx").await;
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns the error [`Self::context_manager_or_error`] returns, unchanged,
+    /// and the error [`Self::ensure_ucan_registered_while_active_on`] returns.
+    pub async fn ensure_ucan_registered_while_active(
+        &self,
+        context_id: &str,
+    ) -> Result<(), crate::ScpError> {
+        if self.ucan_registry.contains_key(context_id) {
+            return Ok(());
+        }
+        let supervisor = self.context_manager_or_error()?;
+        self.ensure_ucan_registered_while_active_on(supervisor, context_id)
+            .await
+    }
+
+    /// Builds UCAN validation state for `context_id` only when this instance
+    /// holds none for it, `supervisor` reports the context `Active`, and no
+    /// release mark stands on the id. On any other answer it registers
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error `supervisor`'s lifecycle state read returns, as
+    /// [`Self::read_live_context_state`] maps it, and registers nothing.
+    pub(crate) async fn ensure_ucan_registered_while_active_on(
+        &self,
+        supervisor: &scp_core::context::supervisor::Supervisor,
+        context_id: &str,
+    ) -> Result<(), crate::ScpError> {
+        if self.ucan_registry.contains_key(context_id) {
+            return Ok(());
+        }
+        match supervisor
+            .read_context_state_checked(context_id)
+            .await
+            .map_err(crate::ScpError::from)?
+        {
+            Some(scp_core::context::ContextState::Active) => {
+                self.ensure_ucan_registered(context_id);
+            }
+            state => tracing::debug!(
+                context = %context_id,
+                ?state,
+                "UCAN state not registered: the supervisor does not report the context Active"
+            ),
+        }
+        Ok(())
+    }
+
+    /// Builds UCAN validation state for `context_id` without reading the
+    /// supervisor, for a test that needs state for an id no `Active` actor
+    /// serves.
+    #[cfg(test)]
+    pub(crate) fn ensure_ucan_registered_for_test(&self, context_id: &str) {
+        self.ensure_ucan_registered(context_id);
+    }
+
+    /// Locks this instance's release marks.
+    fn lock_release_marks(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, ReleaseMark>> {
+        self.released_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Sets the release mark on `context_id` to the current instant, adds
+    /// `in_flight` to its count of unsettled closes, and returns the mark's
+    /// generation. A mark created by this call takes a generation no earlier
+    /// mark of this instance took; a mark that already stands keeps its
+    /// generation. When `marks` holds [`MAX_RELEASED_CONTEXTS`] marks and
+    /// `context_id` has none, first removes the earliest mark whose count of
+    /// unsettled closes is zero.
+    fn set_release_mark(
+        marks: &mut std::collections::HashMap<String, ReleaseMark>,
+        next_generation: &std::sync::atomic::AtomicU64,
+        context_id: &str,
+        in_flight: usize,
+    ) -> u64 {
+        if !marks.contains_key(context_id) && marks.len() >= MAX_RELEASED_CONTEXTS {
+            let oldest = marks
+                .iter()
+                .filter(|(_, mark)| mark.in_flight == 0)
+                .min_by_key(|(_, mark)| mark.at)
+                .map(|(id, _)| id.clone());
+            if let Some(oldest) = oldest {
+                marks.remove(&oldest);
+            }
+        }
+        let now = std::time::Instant::now();
+        let mark = marks
+            .entry(context_id.to_owned())
+            .or_insert_with(|| ReleaseMark {
+                at: now,
+                in_flight: 0,
+                generation: next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            });
+        mark.at = now;
+        mark.in_flight = mark.in_flight.saturating_add(in_flight);
+        mark.generation
+    }
+
+    /// Marks `context_id` released, and removes its UCAN state and its
+    /// known-context entry, under one hold of the release-mark lock.
+    pub fn release_ucan_state(&self, context_id: &str) {
+        let entry = self.ucan_registry.entry(context_id.to_owned());
+        let mut marks = self.lock_release_marks();
+        Self::set_release_mark(&mut marks, &self.next_release_generation, context_id, 0);
+        Self::remove_registry_entry(entry);
+        self.core.remove_known_context(context_id);
+        drop(marks);
+    }
+
+    /// Removes the UCAN state `entry` holds, if any, and releases the
+    /// registry shard lock `entry` holds.
+    fn remove_registry_entry(entry: dashmap::mapref::entry::Entry<'_, String, UcanContextState>) {
+        if let dashmap::mapref::entry::Entry::Occupied(occupied) = entry {
+            occupied.remove();
+        }
+    }
+
+    /// Marks `context_id` released with one unsettled close, and returns the
+    /// ticket that names the mark generation this close set or joined.
+    pub(crate) fn mark_released(&self, context_id: &str) -> ReleaseTicket {
+        let generation = Self::set_release_mark(
+            &mut self.lock_release_marks(),
+            &self.next_release_generation,
+            context_id,
+            1,
         );
+        ReleaseTicket {
+            context_id: context_id.to_owned(),
+            generation,
+        }
+    }
+
+    /// Returns the mark on `ticket`'s context id when it stands under
+    /// `ticket`'s generation.
+    fn ticketed_mark<'m>(
+        marks: &'m mut std::collections::HashMap<String, ReleaseMark>,
+        ticket: &ReleaseTicket,
+    ) -> Option<&'m mut ReleaseMark> {
+        marks
+            .get_mut(&ticket.context_id)
+            .filter(|mark| mark.generation == ticket.generation)
+    }
+
+    /// Settles `ticket`'s close on its context id's release mark, if the mark
+    /// stands under `ticket`'s generation.
+    fn settle_release_mark(&self, ticket: ReleaseTicket) {
+        if let Some(mark) = Self::ticketed_mark(&mut self.lock_release_marks(), &ticket) {
+            mark.in_flight = mark.in_flight.saturating_sub(1);
+        }
+    }
+
+    /// Settles `ticket`'s close and clears its context id's release mark when
+    /// no unsettled close remains on it, if the mark stands under `ticket`'s
+    /// generation.
+    fn readmit_ticketed(&self, ticket: ReleaseTicket) {
+        let mut marks = self.lock_release_marks();
+        if let Some(mark) = Self::ticketed_mark(&mut marks, &ticket) {
+            mark.in_flight = mark.in_flight.saturating_sub(1);
+            if mark.in_flight == 0 {
+                marks.remove(&ticket.context_id);
+            }
+        }
+    }
+
+    /// Removes `ticket`'s context id's UCAN state and known-context entry and
+    /// runs `teardown`, only while the release mark stands under `ticket`'s
+    /// generation, and returns whether it stood. When it stood, settles
+    /// `ticket`'s close on it.
+    ///
+    /// The mark check, both removals and `teardown` run while this call holds
+    /// the release-mark lock, and no registry guard is held while `teardown`
+    /// runs.
+    pub(crate) fn remove_ucan_state_while_released(
+        &self,
+        ticket: ReleaseTicket,
+        teardown: impl FnOnce(),
+    ) -> bool {
+        let entry = self.ucan_registry.entry(ticket.context_id.clone());
+        let mut marks = self.lock_release_marks();
+        let Some(mark) = Self::ticketed_mark(&mut marks, &ticket) else {
+            return false;
+        };
+        mark.in_flight = mark.in_flight.saturating_sub(1);
+        Self::remove_registry_entry(entry);
+        self.core.remove_known_context(&ticket.context_id);
+        teardown();
+        drop(marks);
+        true
+    }
+
+    /// Clears the release mark on `context_id` while holding the release-mark
+    /// lock.
+    pub fn readmit_context(&self, context_id: &str) {
+        self.lock_release_marks().remove(context_id);
+    }
+
+    /// Marks `context_id` released and re-reads the supervisor.
+    ///
+    /// A re-read that reports `Active` removes nothing, runs nothing, and
+    /// returns `Ok(false)`; when the mark still stands under the generation
+    /// this call set or joined, it settles this call's close and clears the
+    /// mark once no unsettled close remains on it. On any other answer this
+    /// call runs [`Self::remove_ucan_state_while_released`] with `teardown`
+    /// and returns its result: `Ok(true)` when the mark stood under that
+    /// generation, so the state was removed and `teardown` ran, and
+    /// `Ok(false)` otherwise, so nothing was removed and `teardown` did not
+    /// run.
+    ///
+    /// # Errors
+    ///
+    /// Returns the re-read's error, with the mark kept and nothing removed,
+    /// when [`Self::read_live_context_state`] fails.
+    pub async fn release_ucan_state_unless_readmitted(
+        &self,
+        context_id: &str,
+        teardown: impl FnOnce(),
+    ) -> Result<bool, crate::ScpError> {
+        let ticket = self.mark_released(context_id);
+        match self.read_live_context_state(context_id).await {
+            Err(e) => {
+                self.settle_release_mark(ticket);
+                Err(e)
+            }
+            Ok(Some(scp_core::context::ContextState::Active)) => {
+                self.readmit_ticketed(ticket);
+                Ok(false)
+            }
+            Ok(_) => Ok(self.remove_ucan_state_while_released(ticket, teardown)),
+        }
+    }
+
+    /// Registers UCAN validation state for `context_id` through
+    /// [`Self::register_ucan_occupied`], then awaits `spawn`. When `spawn`
+    /// returns an error, it removes the UCAN state it registered and leaves any
+    /// release mark on `context_id` in place; when `spawn` returns a handle, it
+    /// clears that mark. When the registration fails, `spawn` is dropped
+    /// without being polled.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` (`SCP-CTX-2014`) when this instance already
+    /// holds UCAN state for `context_id`, and `spawn`'s error converted to
+    /// `ScpError` when `spawn` fails.
+    pub(crate) async fn join_from_welcome_occupied<F>(
+        &self,
+        context_id: &str,
+        spawn: F,
+    ) -> Result<scp_core::context::ContextHandle, crate::ScpError>
+    where
+        F: std::future::Future<
+                Output = Result<scp_core::context::ContextHandle, scp_core::context::ContextError>,
+            >,
+    {
+        self.register_ucan_occupied(context_id)?;
+        match spawn.await {
+            Ok(handle) => {
+                self.readmit_context(context_id);
+                Ok(handle)
+            }
+            Err(e) => {
+                self.remove_ucan_state(context_id);
+                Err(crate::ScpError::from(e))
+            }
+        }
     }
 
     /// Atomically registers per-context UCAN validation state for a
     /// Welcome-join, failing CLOSED on a pre-existing entry.
     ///
-    /// The Welcome-join analog of the `PyO3`/napi reference bridges'
-    /// `register_ffi_state`: [`crate::Scp::context_join_from_welcome`] calls
-    /// this as a single ATOMIC gate BEFORE the irreversible
-    /// `Supervisor::spawn_actor_from_welcome`. Unlike the idempotent
-    /// [`Self::ensure_ucan_registered`] (the lazy UCAN-op path), a
-    /// pre-existing entry is a HARD error here.
+    /// This function is private to this module. A pre-existing entry is a
+    /// HARD error here.
     ///
     /// The `DashMap` `Entry::Occupied`/`Vacant` decision is what makes the
     /// gate atomic — the collision test and the state insert are one
@@ -1089,13 +1620,7 @@ impl UniffiBridgeInstance {
     ///
     /// Returns `ScpError::Context` (`SCP-CTX-2014`) if the context's UCAN
     /// state is already registered on this instance.
-    #[allow(dead_code)]
-    pub fn register_ucan_occupied(
-        &self,
-        context_id: &str,
-        creator_did: &str,
-        ceiling: &[String],
-    ) -> Result<(), crate::ScpError> {
+    fn register_ucan_occupied(&self, context_id: &str) -> Result<(), crate::ScpError> {
         use dashmap::mapref::entry::Entry;
 
         match self.ucan_registry.entry(context_id.to_owned()) {
@@ -1107,70 +1632,26 @@ impl UniffiBridgeInstance {
                 // `build_ucan_context_state` never touches `ucan_registry`, so
                 // building it while holding this shard's `Entry` write guard
                 // cannot deadlock (mirrors the napi reference's Vacant arm).
-                vacant.insert(Self::build_ucan_context_state(
-                    context_id,
-                    creator_did,
-                    ceiling,
-                ));
+                // This arm leaves any release mark on the id in place.
+                vacant.insert(Self::build_ucan_context_state(context_id));
                 Ok(())
             }
         }
     }
 
-    /// Builds the per-context UCAN validation state (revocation list, nonce
-    /// tracker, event log, normalized capability ceiling) for a context.
+    /// Builds the per-context UCAN validation state — the revocation list, the
+    /// nonce tracker, and the event log — for a context.
     ///
     /// Shared by [`Self::ensure_ucan_registered`] (idempotent lazy path) and
     /// [`Self::register_ucan_occupied`] (atomic Welcome-join gate) so both
     /// construct byte-identical state. Does NOT insert into `ucan_registry` —
     /// the caller decides the insert semantics.
-    fn build_ucan_context_state(
-        context_id: &str,
-        creator_did: &str,
-        ceiling: &[String],
-    ) -> UcanContextState {
-        let ceiling_strings = if ceiling.is_empty() {
-            scp_core::context::roles::default_ceiling()
-                .iter()
-                .map(scp_core::context::roles::Capability::ucan_capability_name)
-                .collect::<HashSet<String>>()
-        } else {
-            // Ceiling-entry grammar enforcement (spec §5.3.1.1). This per-instance
-            // UCAN-state cache is populated AFTER `context_create` already routed
-            // through the runtime creation gate (`lifecycle_helpers::create_context`
-            // → `ContextRoleState::new`), which rejects any malformed ceiling — so
-            // every surviving entry is well-formed. As infallible defense-in-depth,
-            // a malformed entry is SKIPPED rather than normalized: this forecloses
-            // the silent broadening where a no-colon `payments` would become
-            // `payments:*` via `Capability::new` + `ucan_capability_name`.
-            //
-            // Filter on the PARSED enum (`Capability::new(s)
-            // .validate_as_ceiling_entry()`) — NOT the raw string — so the
-            // accept/skip decision uses EXACTLY the capability that gets enforced
-            // (and mapped via `ucan_capability_name` on the next line). The runtime
-            // gate validates the same parsed-enum form, so this filter never skips
-            // an entry the runtime accepted nor keeps one it rejected. Validating
-            // the raw string instead would diverge on a prefix-stripped custom: the
-            // raw `"custom:payments"` passes a raw-string check but parses to
-            // `Custom("payments")` (enforced `payments:payments`), a no-colon custom
-            // the parsed-enum check correctly rejects (BLACK-003).
-            ceiling
-                .iter()
-                .filter(|s| {
-                    scp_core::context::roles::Capability::new(s)
-                        .is_some_and(|c| c.validate_as_ceiling_entry().is_ok())
-                })
-                .filter_map(|s| {
-                    scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name())
-                })
-                .collect::<HashSet<String>>()
-        };
-
+    ///
+    /// The state carries no capability ceiling and no context creator DID.
+    fn build_ucan_context_state(context_id: &str) -> UcanContextState {
         UcanContextState {
             revocation_list: RevocationList::new(context_id.to_owned()),
             nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-            ceiling_strings,
-            creator_did: creator_did.to_owned(),
             event_log: EventLog::new(context_id.to_owned()),
         }
     }
@@ -1214,32 +1695,19 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
     // gate `scripts/check-bridge-instance-lifecycle.py`.
 
     // `shutdown` inherits the `BridgeInstanceCore` default (ADR-049 §11,
-    // landed in commit 6): `core.shutdown_core_async(timeout).await +
-    // bridge_specific_shutdown()`. Overriding here would diverge from
+    // landed in commit 6). Overriding here would diverge from
     // the shared contract and be caught by the cross-bridge consistency
     // gate `scripts/check-bridge-instance-lifecycle.py`.
 
-    fn bridge_specific_shutdown(&self) {
-        // Clear typed registries. Dropping `Arc<UniffiKeyCustody>` values
-        // zeroizes any key material they hold via the custody provider's
-        // `Drop` impl.
-        self.ucan_registry.clear();
-        self.identity_custody_registry.clear();
-        // Release the SQLite advisory lock on `{dir}/scp.db.lock` for the
-        // `Sqlite` variant. Other `Arc<SqliteStorage>` holders
-        // (`CoreFields::persistence`, `ContextManager`) keep the storage
-        // struct alive until the `UniffiBridgeInstance` drops, but the
-        // advisory lock must be released now so that a subsequent
-        // `SCP.withStorage(sqlite { path, key })` call against the same
-        // directory does not fail with "already open by another SCP
-        // instance". The `InMemory` variant's `close()` is a no-op.
-        self.protocol_repository.close();
-        // Clear MCP registries so server shutdown senders and client
-        // connections drop, allowing background tasks to terminate cleanly.
-        // Migrated off `crate::bridge::clear_mcp_registries` (called by a
-        // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
-        self.mcp_server_registry.clear();
-        self.mcp_client_registry.clear();
+    fn durable_store_closer(&self) -> Option<scp_ffi_common::bridge_instance::DurableStoreCloser> {
+        // The `Sqlite` variant's advisory lock on `{dir}/scp.db.lock` is
+        // released after the Supervisor drain, so a later
+        // `SCP.withStorage(sqlite { path, key })` against the same directory
+        // succeeds once a shutdown finished in time.
+        self.protocol_repository.durable_store_closer()
+    }
+
+    fn release_streams(&self) {
         // Drop every live streaming-outlet session (and its billing pump `Arc`)
         // on shutdown, matching the PyO3 / NAPI bridges.
         self.outlet_stream_registry.clear();
@@ -1247,6 +1715,21 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         // chunk receiver `Arc`) on shutdown, matching the PyO3 / NAPI bridges
         // (SCP-OUT-047).
         self.outlet_streaming_saga_registry.clear();
+    }
+
+    fn bridge_specific_shutdown(&self) {
+        // Clear typed registries. Dropping `Arc<UniffiKeyCustody>` values
+        // zeroizes any key material they hold via the custody provider's
+        // `Drop` impl.
+        self.ucan_registry.clear();
+        self.lock_release_marks().clear();
+        self.identity_custody_registry.clear();
+        // Clear MCP registries so server shutdown senders and client
+        // connections drop, allowing background tasks to terminate cleanly.
+        // Migrated off `crate::bridge::clear_mcp_registries` (called by a
+        // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
+        self.mcp_server_registry.clear();
+        self.mcp_client_registry.clear();
         // Clear identity-link-attestation and context-handle registries.
         // Migrated off module-level `OnceLock` statics in bridge.rs in
         // #1549 Phase 4 PR 2 commit 6. Dropping `Arc<ContextHandle>`
@@ -1430,6 +1913,37 @@ impl scp_core::context::persistence::ContextPersistence for ArcContextPersistenc
 /// bridge.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Builds the `ContextPoisoned` error (`SCP-CTX-2134`, ADR-049 §10) for
+/// `context_id`.
+pub(crate) fn context_poisoned_error(context_id: &str) -> crate::ScpError {
+    crate::ScpError::from(scp_core::context::ContextError::ContextPoisoned(
+        context_id.to_owned(),
+    ))
+}
+
+/// Mark count at which marking a new id first removes the earliest mark that
+/// has no unsettled close.
+pub(crate) const MAX_RELEASED_CONTEXTS: usize = 10_000;
+
+/// One release mark: the instant it was last set, the number of closes
+/// that set it and have not yet settled, and the generation it took when it
+/// was created.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReleaseMark {
+    pub(crate) at: std::time::Instant,
+    pub(crate) in_flight: usize,
+    pub(crate) generation: u64,
+}
+
+/// One close's claim on a release mark: the context id and the mark
+/// generation the close set or joined.
+#[must_use]
+#[derive(Debug)]
+pub(crate) struct ReleaseTicket {
+    context_id: String,
+    generation: u64,
+}
+
 /// Constructs a fresh per-instance `Supervisor` with the given
 /// providers.
 ///
@@ -1537,6 +2051,82 @@ pub fn build_event_log_provider() -> (
 // Per-context UCAN state
 // ---------------------------------------------------------------------------
 
+/// Reads `context_id`'s role state from `supervisor`, a supervisor the caller
+/// has already resolved.
+///
+/// # Errors
+///
+/// Returns the converted `ActorBusy`, `ActorCrashed`, or `ContextPoisoned`
+/// error, and `ScpError::Context` with `SCP-CTX-2023` when the supervisor
+/// holds no role state for `context_id`.
+async fn role_state_on(
+    supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError> {
+    supervisor
+        .get_role_state_checked(context_id)
+        .await?
+        .ok_or_else(|| crate::ScpError::Context {
+            msg: format!(
+                "context '{context_id}' has no live supervisor role state — refusing to \
+                 authorize against an absent membership record"
+            ),
+            code: codes::CTX_2023.to_owned(),
+        })
+}
+
+/// Runs both reads of
+/// [`UniffiBridgeInstance::require_active_context_before_authz`] on
+/// `supervisor`: the lifecycle state, then, only when it reads `Active`, the
+/// role state.
+///
+/// The function takes the resolved supervisor and no bridge instance, so its
+/// signature rules out a second supervisor resolution between the two reads.
+/// Every outcome other than `Active` followed by a role state becomes the one
+/// withheld refusal `mk_err` builds.
+///
+/// # Errors
+///
+/// Returns whatever `mk_err` builds when the lifecycle read fails, finds no
+/// actor, or reports a state other than `Active`, and when the role-state read
+/// fails.
+async fn active_role_state_on<F>(
+    supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+    verb: &str,
+    mk_err: F,
+) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError>
+where
+    F: FnOnce(String) -> crate::ScpError,
+{
+    let refusal = || {
+        format!(
+            "cannot {verb}: {}",
+            scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+        )
+    };
+    match supervisor.read_context_state_checked(context_id).await {
+        Ok(Some(scp_core::context::ContextState::Active)) => {}
+        answer => {
+            tracing::debug!(
+                context_id,
+                ?answer,
+                "pre-authorization lifecycle read did not report Active; withholding the \
+                 answer from the caller"
+            );
+            return Err(mk_err(refusal()));
+        }
+    }
+    role_state_on(supervisor, context_id).await.map_err(|e| {
+        tracing::debug!(
+            context_id,
+            error = %e,
+            "pre-authorization role-state read failed; withholding the cause from the caller"
+        );
+        mk_err(refusal())
+    })
+}
+
 /// Per-context UCAN validation state.
 ///
 /// Type alias for [`scp_ffi_common::bridge_runtime::UcanContextStateCore`].
@@ -1544,10 +2134,7 @@ pub type UcanContextState = scp_ffi_common::bridge_runtime::UcanContextStateCore
 
 // Phase D (#1695): module-level `ucan_registry`, `ensure_ucan_registered`,
 // `with_ucan_state`, `remove_ucan_state`, `sync_role_state_from_manager`,
-// and `with_rate_limit_tracker` free functions deleted. Every caller
-// accesses the per-instance equivalents on `UniffiBridgeInstance`
-// (`ensure_ucan_registered`, `with_ucan_state`, `remove_ucan_state`,
-// `sync_role_state_from_manager`, `with_rate_limit_tracker`).
+// and `with_rate_limit_tracker` free functions deleted.
 
 /// Queries event counts for trust scoring within a context.
 ///
@@ -1563,6 +2150,35 @@ pub const fn query_trust_event_counts(_context_id: &str, _did: &str) -> (u64, u6
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The stream registries this bridge builds share its core's shutdown
+    /// gate: a streaming-saga entry registers before shutdown begins and is
+    /// refused after `stop_borrowers`.
+    #[test]
+    fn stream_registries_refuse_inserts_once_shutdown_begins() {
+        fn entry(saga_id: &str) -> scp_ffi_common::streaming_saga::StreamingSagaEntry {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            scp_ffi_common::streaming_saga::StreamingSagaEntry {
+                receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+                saga_id: scp_core::context::supervisor::SagaId(saga_id.to_owned()),
+                target_context_id: "ctx".to_owned(),
+                invoker_did: "invoker".to_owned(),
+                request_id: [0u8; 16],
+            }
+        }
+        let bi = UniffiBridgeInstance::new_uniffi();
+        assert!(
+            bi.outlet_streaming_saga_registry
+                .insert("early".to_owned(), entry("early"))
+        );
+        bi.core.stop_borrowers();
+        assert!(
+            !bi.outlet_streaming_saga_registry
+                .insert("late".to_owned(), entry("late"))
+        );
+        assert!(!bi.outlet_streaming_saga_registry.contains_key("late"));
+        assert!(bi.outlet_streaming_saga_registry.contains_key("early"));
+    }
 
     // -----------------------------------------------------------------------
     // UniffiBridgeInstance tests (#1549)
@@ -1614,7 +2230,7 @@ mod tests {
         // Typed registries start empty and support insertion via their
         // typed interface (DashMap, Arc).
         let bi = UniffiBridgeInstance::new_uniffi();
-        assert!(bi.ucan_registry().is_empty());
+        assert!(bi.ucan_registry.is_empty());
         assert!(bi.identity_custody_registry().is_empty());
 
         // ucan_registry is `Arc<DashMap<...>>` — typed, not Box<dyn Any>.
@@ -1623,12 +2239,77 @@ mod tests {
             UcanContextState {
                 revocation_list: RevocationList::new("test-ctx".to_owned()),
                 nonce_tracker: NonceTracker::new("test-ctx".to_owned(), SystemClock),
-                ceiling_strings: HashSet::new(),
-                creator_did: "did:dht:test".to_owned(),
                 event_log: EventLog::new("test-ctx".to_owned()),
             },
         );
-        assert_eq!(bi.ucan_registry().len(), 1);
+        assert_eq!(bi.ucan_registry.len(), 1);
+    }
+
+    fn has_mark(bi: &UniffiBridgeInstance, context_id: &str) -> bool {
+        bi.released_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(context_id)
+    }
+
+    /// An id this instance already holds UCAN state for refuses with
+    /// `SCP-CTX-2014`, drops the spawn future unpolled, and keeps the state.
+    #[test]
+    fn join_from_welcome_occupied_refuses_a_held_id_without_polling_the_spawn() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let bi = UniffiBridgeInstance::new_uniffi();
+        bi.ensure_ucan_registered("ctx-held");
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let result = rt.block_on(bi.join_from_welcome_occupied("ctx-held", async {
+            polled.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(scp_core::context::ContextError::CeilingImmutable)
+        }));
+        assert!(
+            matches!(&result, Err(crate::ScpError::Context { code, .. }) if code == codes::CTX_2014),
+            "expected SCP-CTX-2014, got: {result:?}"
+        );
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(bi.ucan_registry.contains_key("ctx-held"));
+    }
+
+    /// A failed spawn removes the state the call registered and keeps the
+    /// release mark a close left on the id.
+    #[test]
+    fn join_from_welcome_occupied_removes_its_state_and_keeps_the_mark_on_a_failed_spawn() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let bi = UniffiBridgeInstance::new_uniffi();
+        bi.release_ucan_state("ctx-released");
+        let result = rt.block_on(bi.join_from_welcome_occupied("ctx-released", async {
+            Err(scp_core::context::ContextError::CeilingImmutable)
+        }));
+        assert!(result.is_err(), "a failed spawn must fail the join");
+        assert!(!bi.ucan_registry.contains_key("ctx-released"));
+        assert!(has_mark(&bi, "ctx-released"));
+    }
+
+    /// The checker reads the registry at each call: a revocation recorded
+    /// after the checker was built is reported, an unrevoked token is not,
+    /// and an id with no UCAN state reports nothing revoked.
+    #[test]
+    fn live_revocation_checker_reads_revocations_recorded_after_it_was_built() {
+        let bi = UniffiBridgeInstance::new_uniffi();
+        bi.ensure_ucan_registered("ctx-live");
+        let checker = bi.live_revocation_checker("ctx-live".to_owned());
+        let absent = bi.live_revocation_checker("ctx-absent".to_owned());
+        assert!(!checker.is_revoked("cid-1"));
+
+        bi.with_ucan_state("ctx-live", |state| {
+            state.revocation_list.revoke("cid-1".to_owned());
+        })
+        .expect("ctx-live has UCAN state");
+
+        assert!(checker.is_revoked("cid-1"));
+        assert!(!checker.is_revoked("cid-2"));
+        assert!(!absent.is_revoked("cid-1"));
     }
 
     #[test]
@@ -1669,6 +2350,78 @@ mod tests {
             bi.durable_providers_ref().is_some(),
             "in-memory dev path must populate the durable providers"
         );
+    }
+
+    /// `from_open_failure` keeps the lock-still-held condition apart from
+    /// every other open failure, and `code()` names each one's registered
+    /// code (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes).
+    #[test]
+    fn open_failure_classification_carries_registered_codes() {
+        let held = StorageInitError::from_open_failure(
+            "/tmp/scp".to_owned(),
+            &scp_platform::PlatformError::StorageLockHeld {
+                dir: "/tmp/scp".to_owned(),
+                lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+            },
+        );
+        assert!(
+            matches!(held, StorageInitError::LockHeld { .. }),
+            "{held:?}"
+        );
+        assert_eq!(held.code(), scp_ffi_common::error_codes::STORAGE_8005);
+        let other = StorageInitError::from_open_failure(
+            "/tmp/scp".to_owned(),
+            &scp_platform::PlatformError::StorageError("bad key".to_owned()),
+        );
+        assert!(
+            matches!(other, StorageInitError::SqliteOpen { .. }),
+            "{other:?}"
+        );
+        assert_eq!(other.code(), scp_ffi_common::error_codes::STORAGE_8004);
+    }
+
+    /// Spec §17.6 "One Opener per Durable Directory": a second open of a
+    /// directory whose store is live fails with `LockHeld`, and a shutdown
+    /// that finished in time closes the store (through the bridge's
+    /// `durable_store_closer`) before it returns, so a reopen succeeds on its
+    /// first attempt even while the shut-down instance is still alive.
+    #[test]
+    fn sqlite_shutdown_releases_the_lock_before_returning() {
+        use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bi = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
+            path: tmp.path().to_string_lossy().into_owned(),
+            key: SqliteKeyMaterial::Raw {
+                key: vec![0x33u8; 32],
+            },
+        })
+        .expect("first open");
+        let second = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
+            path: tmp.path().to_string_lossy().into_owned(),
+            key: SqliteKeyMaterial::Raw {
+                key: vec![0x33u8; 32],
+            },
+        });
+        assert!(
+            matches!(second, Err(StorageInitError::LockHeld { .. })),
+            "a second open of a live store's directory must fail with LockHeld"
+        );
+        let outcome = crate::runtime().block_on(bi.shutdown(std::time::Duration::from_secs(10)));
+        assert!(
+            matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
+            "{outcome:?}"
+        );
+        let reopened = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
+            path: tmp.path().to_string_lossy().into_owned(),
+            key: SqliteKeyMaterial::Raw {
+                key: vec![0x33u8; 32],
+            },
+        });
+        assert!(
+            reopened.is_ok(),
+            "a reopen after a shutdown that finished in time must succeed on its first attempt"
+        );
+        drop(bi);
     }
 
     #[test]

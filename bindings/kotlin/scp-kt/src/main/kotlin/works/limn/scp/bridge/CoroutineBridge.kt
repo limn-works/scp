@@ -24,12 +24,12 @@ package works.limn.scp.bridge
 
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -68,6 +68,8 @@ import works.limn.scp.validateContentPath
 import works.limn.scp.validateDeployId
 import works.limn.scp.validateMimeType
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.logging.Level
+import java.util.logging.Logger
 import kotlin.coroutines.cancellation.CancellationException
 
 /**
@@ -921,7 +923,7 @@ interface OutletBindings {
      *
      * Blocks until the saga reaches a terminal state. On commit returns the
      * JSON-encoded saga result; otherwise throws a [BridgeException] carrying
-     * the typed `SCP-SAGA-13xxx` terminal code (aborted/needs-repair/busy) or
+     * the typed terminal code (aborted/needs-repair/busy) or
      * a bridge-surfaced validation/permission code.
      *
      * @param sourceContextHandle Opaque handle for the calling (source) context.
@@ -935,8 +937,8 @@ interface OutletBindings {
      *   range 0-255 (ADR-043, spec §24.4).
      * @param ucanProofId Optional UCAN proof id for delegation-chain traversal.
      * @return JSON-encoded saga result.
-     * @throws BridgeException with a `SCP-SAGA-13xxx` code on a non-committed
-     *   terminal, or a bridge validation/permission code.
+     * @throws BridgeException on a non-committed terminal, or with a bridge
+     *   validation/permission code.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
     fun outletInvokeCrossContextSaga(
@@ -1686,13 +1688,18 @@ class ContextBridge internal constructor(
     /**
      * Subscribe to incoming messages on a context as a cold [Flow].
      *
-     * Collection begins the UniFFI subscription; cancellation ends it.
-     * Uses [callbackFlow] with [Channel.BUFFERED] capacity (64 items) to
-     * absorb burst delivery from the Rust engine without dropping messages.
+     * Collection begins the UniFFI subscription; closing the flow calls the unsubscribe
+     * function on the bridge's IO dispatcher. An unsubscribe that throws is logged at
+     * WARNING and not rethrown, and the Rust subscription may then stay live.
+     * Uses [callbackFlow] with [Channel.BUFFERED] capacity (64 items) to absorb burst
+     * delivery from the Rust engine; a message that does not fit closes the flow with
+     * [BridgeException] code `SCP-CTX-2001` rather than being dropped silently.
      *
      * Per ADR-028: `callbackFlow` is the streaming primitive for message
      * reception. Cold stream semantics: the subscription starts when the
-     * flow is collected and stops when the collector cancels.
+     * flow is collected and is released when the flow closes, whether the
+     * collector cancels, the collector stops early (for example through
+     * `take`), or the engine calls `onComplete` or `onError`.
      *
      * @param contextHandle Handle from context create or join.
      * @return Cold [Flow] of JSON-encoded messages.
@@ -1720,24 +1727,65 @@ class ContextBridge internal constructor(
                     }
                 }
 
-            // Subscribe on IO dispatcher since it crosses the FFI boundary.
-            val subscriptionHandle =
-                withContext(bridge.ioDispatcher) {
-                    bindings.contextSubscribe(contextHandle, callback)
-                }
+            // Subscribe on IO dispatcher since it crosses the FFI boundary. The handle is
+            // recorded inside the NonCancellable block, never taken from withContext's return
+            // value: when bridge.ioDispatcher differs from the collector's dispatcher, so that
+            // withContext resumes the collector by dispatch, a collector cancelled while
+            // contextSubscribe runs makes withContext throw on that resumption and drop
+            // whatever the block returned, which would leave a live Rust subscription that
+            // nothing releases.
+            var subscriptionHandle: Long? = null
 
-            awaitClose {
-                // Use Dispatchers.IO directly — NOT bridge.ioDispatcher — because
-                // awaitClose is a non-suspend lambda that blocks its thread via
-                // runBlocking. If bridge.ioDispatcher is a single-threaded test
-                // dispatcher, runBlocking would deadlock (blocking the only thread
-                // that the dispatcher can schedule work on). Dispatchers.IO is an
-                // unbounded thread pool that always has capacity.
-                runBlocking(kotlinx.coroutines.Dispatchers.IO) {
-                    bindings.contextUnsubscribe(subscriptionHandle)
+            // Release the subscription by suspending on bridge.ioDispatcher, never by
+            // blocking: the finally below runs on the collector's thread, which is an Android
+            // main thread under collectAsState, so a runBlocking here would park that
+            // thread until the FFI call returns (ADR-028's AutoCloseable amendment).
+            // NonCancellable lets the release run although the collector was cancelled. A
+            // release that throws is logged, never rethrown (sdk-common.md §Cleanup error
+            // handling): rethrown from the finally, it would replace the collector's
+            // cancellation as the failure and propagate to the collector's parent scope.
+            try {
+                withContext(NonCancellable + bridge.ioDispatcher) {
+                    subscriptionHandle = bindings.contextSubscribe(contextHandle, callback)
+                }
+                awaitClose()
+            } finally {
+                val opened = subscriptionHandle
+                if (opened != null) {
+                    withContext(NonCancellable + bridge.ioDispatcher) {
+                        releaseSubscriptionLogged(opened, contextHandle)
+                    }
                 }
             }
         }
+
+    /**
+     * Unsubscribe [subscriptionHandle] and log its failure instead of throwing it.
+     *
+     * Catches [Exception], not [Throwable], so an [Error] such as an out-of-memory condition
+     * still propagates. The caller runs this under [NonCancellable], so no cancellation of the
+     * collector reaches this catch.
+     */
+    @Suppress("TooGenericExceptionCaught")
+    private fun releaseSubscriptionLogged(
+        subscriptionHandle: Long,
+        contextHandle: Long,
+    ) {
+        try {
+            bindings.contextUnsubscribe(subscriptionHandle)
+        } catch (e: Exception) {
+            logger.log(
+                Level.WARNING,
+                "ContextBridge.subscribe: releasing subscription $subscriptionHandle for context " +
+                    "handle $contextHandle failed; the Rust subscription may stay live",
+                e,
+            )
+        }
+    }
+
+    private companion object {
+        val logger: Logger = Logger.getLogger(ContextBridge::class.java.name)
+    }
 }
 
 /**
@@ -1906,7 +1954,7 @@ class OutletBridge internal constructor(
      *
      * Blocks until the saga reaches a terminal state. On commit returns the
      * JSON-encoded saga result; a non-committed terminal throws a
-     * [BridgeException] carrying the typed `SCP-SAGA-13xxx` code.
+     * [BridgeException] carrying its typed code.
      *
      * @param sourceContextHandle Handle for the calling (source) context.
      * @param targetContextHandle Handle for the context holding the outlet.

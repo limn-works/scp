@@ -21,7 +21,6 @@ derives the version from that file:
 | `cargo`, `rustup` | natively, for any command run inside the repository; rustup installs the `channel`, `components`, and `targets` the file names on first use |
 | `Dockerfile` | copies the file into the builder image before the first cargo command; the base tag names a Debian release only |
 | `templates/personal-relay/README.md` | its `COPY . .` brings the file into the image, for the same reason |
-| the CI workflows | their `dtolnay/rust-toolchain@stable` steps select no version — that action reads no toolchain file — so each one installs rustup's `stable` and runs `rustup default stable`, and rustup then applies `rust-toolchain.toml` as a directory override, which beats the default |
 
 `fuzz/rust-toolchain.toml` names the nightly the standalone fuzz crate needs, because
 cargo-fuzz does not run on stable. rustup applies the toolchain file of the directory a
@@ -93,13 +92,13 @@ skipped. In `.github/workflows/ci.yml` the pin decides seven lanes, not one:
 
 | Lane | The jobs it guards whose behaviour the pin decides |
 |--------|----------------------------------------------------|
-| `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
-| `python` | `python-test` runs `maturin develop --release` |
-| `typescript` | `typescript-check` runs `cargo build -p scp-ffi-napi --release` |
+| `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-optional-features`, `rust-test-macos`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
+| `python` | `pyo3-module` and `pyo3-module-macos` run `maturin develop --profile ci-bridge`, `napi-addon` runs `cargo build -p scp-ffi-napi --profile ci-bridge`, `xcframework` runs `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`, and `kotlin-test` runs `cargo build -p scp-ffi-uniffi --features testing`; `python-test`, `bridge-parity`, `bridge-parity-kotlin` and `bridge-parity-swift` download what those producers upload; `rust-build-pyo3-production` (also on the `rust` lane) builds `scp-ffi` with the wheel's `[tool.maturin] features` |
+| `typescript` | `napi-addon` runs `cargo build -p scp-ffi-napi --profile ci-bridge` and `pyo3-module` runs `maturin develop --profile ci-bridge`; `typescript-check` downloads the NAPI addon and `bridge-parity` downloads both |
 | `typescript-wasm` | `typescript-wasm-check` runs `wasm-pack build` from the repository root |
 | `scaffold-typescript-web` | `scaffold-typescript-web-check` builds `bindings/typescript-wasm`, which runs that same `wasm-pack build` |
-| `kotlin` | `kotlin-test` runs `cargo build -p scp-ffi-uniffi --features testing` |
-| `swift` | `swift-build-test` runs `bindings/swift/build-xcframework.sh --dev`, which calls `cargo build` |
+| `kotlin` | `kotlin-test` runs `cargo build -p scp-ffi-uniffi --features testing` and `pyo3-module` runs `maturin develop --profile ci-bridge`; `bridge-parity-kotlin` downloads both uploads |
+| `swift` | `xcframework` runs `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`, which calls `cargo build`, and `pyo3-module-macos` runs `maturin develop --profile ci-bridge`; `swift-build-test` downloads the XCFramework and `bridge-parity-swift` downloads both |
 
 Rather than list the pin in seven filters, the `changes` job declares one `toolchain`
 filter and ORs it into every lane's output, so the workflow names each file that filter
@@ -192,7 +191,12 @@ against that release's glibc 2.41 fails to exec against Debian 12's glibc 2.36.
 #![forbid(unsafe_code)]
 ```
 
-Every crate sets `#![forbid(unsafe_code)]` at the crate root. Unsafe code is forbidden across the entire workspace. If an FFI bridge crate requires unsafe (e.g., cbindgen C ABI), it is the sole exception and must document every `unsafe` block with a `// SAFETY:` comment explaining the invariant.
+Every crate sets `#![forbid(unsafe_code)]` at the crate root. Unsafe code is forbidden across the entire workspace, with three exceptions, and each exception documents every `unsafe` block with a `// SAFETY:` comment explaining the invariant:
+- an FFI bridge crate that requires unsafe (e.g., cbindgen C ABI);
+- `crates/scp-alloc`, the wiping global allocator, whose crate root sets `#![deny(unsafe_code)]` and allows unsafe only on its `GlobalAlloc` implementation and on the wipe routine that implementation calls;
+- `crates/scp-sqlite-pools`, which checks SQLite's lookaside pool and page-cache bulk block off, and no page-cache buffer slot used, for every SQLCipher connection SCP's Rust crates open on a database SCP stores data in (§17.6 of the persistence spec), whose crate root sets `#![deny(unsafe_code)]` and allows unsafe only on its calls into SQLite's C API (`sqlite3_compileoption_used`, `sqlite3_db_config`, `sqlite3_db_status`, `sqlite3_status64`).
+
+`crates/scp-alloc/src/lib.rs` holds the workspace's one `#[global_allocator]` static. The crate root of each shipped binary and cdylib (`scp-node`, `scp-relay`, `scp-ffi`, `scp-ffi-napi`, `scp-ffi-uniffi`, and `scp-client-wasm`) links that static with `use scp_alloc as _;` and defines no global allocator of its own, because §9.15 of the security-model spec (freed heap memory) requires every shipped artifact to wipe each heap block before freeing it. The relay template `templates/personal-relay` and the relay scaffold `scaffolds/relay` link it the same way.
 
 Additional enforced rules:
 - No `unwrap()` or `expect()` in library code — use `?` with typed errors
@@ -290,8 +294,12 @@ proptest! {
 
 SCP uses cargo-fuzz (libFuzzer) for parser safety and security invariant testing at trust
 boundaries. The fuzz crate lives at `fuzz/` (repo root) — a **standalone crate, not a
-workspace member**. All `cargo fuzz` commands require the one nightly that `fuzz/rust-toolchain.toml` pins —
-nightlies after that date reject openmls 0.8.1's prelude re-export (E0365):
+workspace member**. Every `cargo fuzz` command runs from inside `fuzz/`, on the dated nightly
+that `fuzz/rust-toolchain.toml` pins, because some nightlies reject openmls 0.9.0's prelude
+glob re-export (E0365). The exception is `.github/workflows/fuzz.yml`, whose `cargo fuzz`
+commands run from the repository root with `--fuzz-dir fuzz` and name that same nightly
+explicitly as `cargo +<channel>`, the channel its `toolchain` job reads from
+`fuzz/rust-toolchain.toml`:
 
 ```sh
 cd fuzz && cargo fuzz list          # list all 27 targets
@@ -427,6 +435,72 @@ cargo doc --workspace --no-deps --document-private-items \
   --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-node/cloud-blobs,scp-relay/cloud-blobs
 ```
 
+## Clearing a Security Advisory
+
+When a RUSTSEC advisory names a workspace dependency, bump the dependency. Add a
+`deny.toml` ignore entry only when no released version clears the advisory, or when a
+dependency this workspace does not control blocks the upgrade. State that blocking
+upgrade in the entry's comment, and delete the entry in the same change that takes the
+fix — an ignore entry for a patched advisory is a false record.
+
+**Choosing the version.** Take the newest release whose dependency floors this workspace
+already satisfies. Reject a newer release that raises a floor on a native-code dependency
+to supply a capability the workspace does not use, because recompiling a vendored C
+library across every cross-compiled target adds build risk and no security. The case that
+produced this rule: rustls-webpki 0.103.14 raised its `aws-lc-rs` floor from 1.14 to 1.18
+to expose ML-DSA. At the time the workspace compiled `aws-lc-sys`, so taking it would have
+moved `aws-lc-sys` 0.39.0 to 0.44.0 and its vendored AWS-LC 1.71.0 to 5.5.0 across CI's
+cross-compiled targets, for an algorithm this workspace never asserts, while 0.103.13
+cleared the same three advisories and moved nothing. The workspace has since dropped
+`aws-lc-sys` altogether and resolves a later rustls-webpki, so the example is history; the
+rule still applies to the next native-code floor.
+Establish that by evidence: `diff` the candidate's `Cargo.toml` against the current one,
+and read the upstream release notes for every version in between.
+
+**Applying the bump.** Use `cargo update -p <crate> --precise <version>`. A bare
+`cargo update -p <crate>` re-resolves unrelated edges, so read the whole `Cargo.lock` diff
+and revert every change the advisory did not require, except a move off a yanked version,
+which `cargo update -p <crate>@<new> --precise <old>` reports as `was yanked`; name each
+kept change in the pull request. spin 0.9.9 is the case: 0.9.8 is yanked, and 0.9.9 fixes
+unsoundness in three `Once` into-inner methods. When `--precise` fails with a
+version conflict, read whether the conflicting requirement is `locked to` a version: a
+lockfile pin is not a blocker, so unlock that crate first with
+`cargo update -p <crate>@<locked version>` and retry. aws-sdk-s3 1.144.0 is the first
+release that requires the patched `lru ^0.18.2`, which clears RUSTSEC-2026-0253.
+1.119.0 requires `lru ^0.12.2`, which also falls under RUSTSEC-2026-0002 (patched at
+0.16.3); 1.120.0 through 1.143.0 require `lru ^0.16.3`, which clears RUSTSEC-2026-0002
+but not RUSTSEC-2026-0253. `--precise`
+refused 1.144.0 only because `Cargo.lock` held `sha2 0.11.0-rc.5`, which mainline's
+`ed25519-dalek 3.0.0-pre.6` accepts at 0.11.0 too.
+Prove the result resolves with `cargo metadata --locked --all-features`.
+
+**Verifying.** Run the cargo-deny version CI runs, not whatever `cargo install` left on
+the machine. `EmbarkStudios/cargo-deny-action@v2` is a floating major tag, not a pin:
+upstream moves it to each new release, so look up in the action's repository which
+cargo-deny release the tag points at on the day you run. CI's verdict is the one that gates the merge,
+so a local run only predicts CI when the binary matches. `.mise.toml` declares
+`"cargo:cargo-deny" = "latest"`, which pins nothing and drifts, so check the installed
+version rather than assuming the toolchain manifest supplied the one CI runs. Two
+diagnostics decide the outcome and both are version-sensitive: an `error` fails the run,
+and an `advisory-not-detected` warning marks an ignore entry as unnecessary. Do not delete
+an entry on an `advisory-not-detected` from a binary whose version differs from CI's. Count every copy of the crate in
+`Cargo.lock` and in `fuzz/Cargo.lock` before calling an advisory cleared: a bump that adds
+a patched version on top of unpatched duplicates leaves the unpatched ones compiling into
+the shipped artifact. `fuzz/` is a standalone crate whose own lockfile resolves the
+workspace crates through path dependencies, and no CI job runs `cargo deny` against it, so
+repeat every lock-only fix there with `cd fuzz && cargo update -p <crate> --precise <version>`.
+cargo-deny reports a vulnerability advisory against every affected copy, but its
+`[advisories] unsound` key decides which copies an `unsound` informational advisory
+reaches. Its default, `"workspace"`, reports only a crate a workspace member names
+directly: cargo-deny reported the `lru` advisory RUSTSEC-2026-0253 against `lru 0.16.3`
+alone while `lru 0.12.5` also compiled in, and raising the direct dependency to 0.18.2
+turned the check green with both affected copies still in the build. `deny.toml`
+therefore sets `unsound = "all"`, which reports every copy in the graph. Never lower
+that key. Clear a transitive copy by bumping the crate that pins it; an `ignore` entry
+for it follows the rule at the head of this section, and its comment names the pinning
+crate, shows that no release of it takes the patched version, and says why the
+advisory's trigger cannot occur.
+
 ## CI Matrix
 
 Tests are organized into three tiers. See `specs/16-test-infrastructure.md` §16.15 for the full tier definitions, §16.13 test assignments, and feature flag conventions.
@@ -439,16 +513,19 @@ Every push to a PR branch. Target: < 3 minutes.
 |-----|---------|---------|
 | fmt | ubuntu-latest | `cargo fmt --all -- --check` |
 | clippy | ubuntu-latest | The five `cargo clippy` commands the CI Commands section above gives: the workspace sweep, the optional-transport lint, and the three commands that lint the PostgreSQL and S3 blob backends |
-| test | ubuntu-latest, macos-latest | `cargo nextest run --workspace`. Job `rust-test-optional-features` in `.github/workflows/ci.yml` runs the three `cloud-blobs` test commands the CI Commands section above gives. |
+| test | ubuntu-latest | `cargo nextest run --workspace`. Job `rust-test-optional-features` in `.github/workflows/ci.yml` runs the three `cloud-blobs` test commands the CI Commands section above gives, among its other optional-feature commands. That job splits its commands into three matrix groups: of those three commands, `transport` runs the scp-transport one and `node-relay` runs the scp-node and scp-relay ones, and `platform-testing` runs none of them. |
+| test (macOS) | macos-latest | Job `rust-test-macos` in `.github/workflows/ci.yml` tests scp-transport and scp-platform. |
 | build-release | ubuntu-latest, macos-latest, windows-latest | `cargo build --workspace --release` |
 | doc | ubuntu-latest | The `cargo test --workspace --doc`, then the `cargo doc`, that the CI Commands section above gives. A table cell holds no fenced block, and `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` in `.github/workflows/ci.yml` only where a shell block encloses it, so this row names that command rather than repeating its flags. |
 | deny | ubuntu-latest | `cargo deny check` |
+
+A pull request that changes only prose (`.docs/**`, `.claude/**`, a root-level `*.md`, or `docs/guides/**/*.md`) skips every job the `code` output of job `changes` in `.github/workflows/ci.yml` guards, which CODE_JOBS in `scripts/tests/ci-gate/ci_gate_selftest.py` names. Job ci-workflow-selftest runs `scripts/tests/ci-gate/run-tests.sh --group rest`; job ci-workflow-selftest-docs runs `--group docs`, the self-test checks that read tracked prose or list tracked paths, on every pull request. `.docs/lessons/route-a-changed-file-to-every-lane-it-decides.md` states the routing rules, and `scripts/tests/ci-gate/ci_gate_selftest.py` fails when a tracked path is neither prose nor selected by that output, and when the `docs` and `rest` groups do not split its checks between them.
 
 Unit tests and conformance macro suites (`transport_conformance!()`, `storage_conformance!()`, etc.) run as part of `cargo nextest run --workspace` against in-memory implementations.
 
 ### Tier 2 — Merge Gate
 
-Merge queue entry or push to `main`. Target: < 10 minutes. Required to merge.
+Merge queue entry. Target: < 10 minutes. Required to merge.
 
 | Job | Runs on | Command |
 |-----|---------|---------|
@@ -456,7 +533,7 @@ Merge queue entry or push to `main`. Target: < 10 minutes. Required to merge.
 | harness meta-tests | ubuntu-latest, macos-latest | `cargo nextest run --workspace --features scp-testing/ci-tier2` |
 | phase integration | ubuntu-latest | `cargo nextest run --workspace --features scp-testing/ci-tier2 -E 'test(phase_integration)'` |
 
-Harness meta-tests cover §16.13.1–10: InMemoryRelay, InMemoryTransport, SimulatedClock, NetworkTopology, ScenarioBuilder, determinism, ProtocolRepository, MlsStorageBridge, assertion library, and preset scenario validation. Phase integration runs the current phase's end-to-end test (P1 in Phase 1, P2 in Phase 2, etc.).
+Harness meta-tests cover §16.13.1–10: InMemoryRelay, InMemoryTransport, SimulatedClock, NetworkTopology, ScenarioBuilder, determinism, ProtocolRepository, assertion library, and preset scenario validation. Phase integration runs the current phase's end-to-end test (P1 in Phase 1, P2 in Phase 2, etc.).
 
 ### Tier 3 — Nightly / Pre-Release
 

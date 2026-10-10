@@ -22,6 +22,7 @@ import * as crypto from "node:crypto";
 import { CryptoError, ScpError } from "../src/errors";
 import type { KeyCustodyProvider } from "../src/scp";
 import { p256SoftwarePseudonymPoint, SCP } from "../src/scp";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Probe: is the NAPI-backed SCP class available in this environment?
@@ -34,7 +35,7 @@ try {
   scpAvailable = true;
   probe.shutdown(1).catch(() => {});
 } catch (e: unknown) {
-  skipReason = `NAPI SCP class not available: ${e instanceof Error ? e.message : String(e)}`;
+  skipReason = skipReasonIfAddonAbsent(e);
 }
 
 // ---------------------------------------------------------------------------

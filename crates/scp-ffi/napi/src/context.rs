@@ -162,17 +162,11 @@ pub struct NapiContextHandle {
 }
 
 /// Internal context lifecycle state string helper.
+///
+/// Delegates to [`crate::runtime::context_state_str`] so the handle's cached
+/// string and a lifecycle-gate error name each state the same way.
 const fn state_str(state: &ContextState) -> &'static str {
-    match state {
-        ContextState::Creating => "creating",
-        ContextState::Active => "active",
-        ContextState::Closing => "closing",
-        ContextState::Closed => "closed",
-        ContextState::Expired => "expired",
-        ContextState::MigratingOut => "migrating_out",
-        ContextState::Tombstoned => "tombstoned",
-        ContextState::Poisoned => "poisoned",
-    }
+    crate::runtime::context_state_str(state)
 }
 
 #[napi]
@@ -184,7 +178,15 @@ impl NapiContextHandle {
         self.context_id.clone()
     }
 
-    /// Returns the context's current lifecycle state.
+    /// Returns the lifecycle state this handle cached at the last transition
+    /// this bridge observed.
+    ///
+    /// This is a best-effort snapshot, not a live supervisor read. A TTL
+    /// expiry the supervisor applied on its own timer, a close another member
+    /// initiated, a migration that tombstoned the context, and an actor the
+    /// crash watchdog poisoned all leave it reading `"active"`. Join, leave,
+    /// send, and subscribe read the supervisor instead, so each can refuse
+    /// while this getter still reads `"active"`.
     ///
     /// # Errors
     ///
@@ -214,7 +216,13 @@ impl NapiContextHandle {
         self.mode.clone()
     }
 
-    /// Returns the capability ceiling for this context.
+    /// Returns the capability ceiling this handle recorded when this bridge
+    /// built it.
+    ///
+    /// The list is a snapshot taken at registration, not a supervisor read. On
+    /// a context whose `ceilingPolicy` is `"governed"`, a governance
+    /// `ModifyCeiling` changes the supervisor's ceiling and leaves this list
+    /// unchanged.
     #[napi(getter)]
     #[must_use]
     pub fn ceiling(&self) -> Vec<String> {
@@ -290,17 +298,6 @@ impl NapiContextHandle {
 }
 
 impl NapiContextHandle {
-    /// Returns the current state string for validation checks.
-    pub(crate) fn current_state_str(&self) -> Result<String, ScpNapiError> {
-        self.state
-            .lock()
-            .map(|g| state_str(&g).to_owned())
-            .map_err(|_| ScpNapiError::Context {
-                message: "context state lock is poisoned".to_owned(),
-                code: codes::CTX_2012.to_owned(),
-            })
-    }
-
     /// Sets the state to Closed.
     pub(crate) fn set_closed(&self) -> Result<(), ScpNapiError> {
         *self.state.lock().map_err(|_| ScpNapiError::Context {
@@ -329,6 +326,7 @@ impl Drop for NapiContextHandle {
             token.cancel();
         }
         decrement_handle_count();
+        crate::runtime::untrack_context_handle(&self.bi, &self.context_id);
     }
 }
 
@@ -344,7 +342,7 @@ impl NapiContextHandle {
     ) -> Self {
         increment_handle_count();
         let instance_id = bi.instance_id();
-        Self {
+        let handle = Self {
             context_id,
             state: std::sync::Mutex::new(ContextState::Active),
             creator_did,
@@ -362,7 +360,9 @@ impl NapiContextHandle {
             subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             bi: Arc::clone(bi),
             instance_id,
-        }
+        };
+        crate::runtime::track_context_handle(&handle.bi, &handle.context_id);
+        handle
     }
 }
 
@@ -575,8 +575,13 @@ struct ParsedContextParams {
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Validation` (`SCP-VALID-7000`) if the JSON is
-/// malformed or the parameters fail the common builder's validation.
+/// Returns `ScpNapiError::Validation`:
+/// - `SCP-VALID-7004` ([`ContextError::CeilingRequired`](scp_core::context::ContextError::CeilingRequired))
+///   if `ceiling` is absent or `null`;
+/// - `SCP-VALID-7005` (the same variant) if `ceiling` is an empty array;
+/// - `SCP-VALID-7000` if the JSON is malformed or is not an object, if
+///   `ceiling` is neither `null` nor an array, if a `ceiling` entry is not a
+///   string, or if the parameters fail the common builder's validation.
 fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> {
     let params: serde_json::Value = serde_json::from_str(params_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
@@ -586,16 +591,69 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
             code: codes::VALID_7000.to_owned(),
         })
     })?;
+    // Every field below indexes `params` by key, and serde_json's index reads
+    // `Null` for any key of a non-object value, so an array, string, number,
+    // bool, or `null` would otherwise build a context from the defaults of
+    // every field that the caller never declared.
+    if !params.is_object() {
+        return Err(NapiError::from(ScpNapiError::Validation {
+            message: format!(
+                "params_json must be a JSON object of context parameters, got {params}"
+            ),
+            code: codes::VALID_7000.to_owned(),
+        }));
+    }
 
     let mode_str = params["mode"].as_str().unwrap_or("Encrypted").to_owned();
-    let ceiling: Vec<String> = params["ceiling"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+    // ceiling: string[], required and non-empty (construction.md M2).
+    //
+    // An absent key or a `null` value declares no ceiling, which would leave
+    // the context's security boundary to a default nobody chose; an empty
+    // array declares a context no member can use. All three reject with
+    // `ContextError::CeilingRequired` before any context state exists. A
+    // non-empty array stands as written, and the supervisor installs it
+    // verbatim. Any other JSON type, and any non-string entry inside the
+    // array, is a malformed declaration and rejects, because dropping the
+    // entry would hand the caller a narrower ceiling than the one they wrote
+    // and hide the mistake behind a context that refuses the capability.
+    let ceiling: Vec<String> = match &params["ceiling"] {
+        serde_json::Value::Null => {
+            let declared = if params.get("ceiling").is_some() {
+                scp_core::context::CeilingDeclaration::Null
+            } else {
+                scp_core::context::CeilingDeclaration::Absent
+            };
+            return Err(NapiError::from(ScpNapiError::from(
+                scp_core::context::ContextError::CeilingRequired(declared),
+            )));
+        }
+        serde_json::Value::Array(entries) if entries.is_empty() => {
+            return Err(NapiError::from(ScpNapiError::from(
+                scp_core::context::ContextError::CeilingRequired(
+                    scp_core::context::CeilingDeclaration::Empty,
+                ),
+            )));
+        }
+        serde_json::Value::Array(entries) => entries
+            .iter()
+            .map(|entry| {
+                entry.as_str().map(str::to_owned).ok_or_else(|| {
+                    NapiError::from(ScpNapiError::Validation {
+                        message: format!("ceiling entries must be capability strings, got {entry}"),
+                        code: codes::VALID_7000.to_owned(),
+                    })
+                })
+            })
+            .collect::<napi::Result<Vec<String>>>()?,
+        other => {
+            return Err(NapiError::from(ScpNapiError::Validation {
+                message: format!(
+                    "ceiling must be a non-empty array of capability strings, got {other}"
+                ),
+                code: codes::VALID_7000.to_owned(),
+            }));
+        }
+    };
     let ceiling_policy = params["ceilingPolicy"]
         .as_str()
         .unwrap_or("immutable")
@@ -783,12 +841,7 @@ pub(crate) async fn context_create_on(
                     code: codes::CTX_2000.to_owned(),
                 })
             })?
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("create_context failed: {e}"),
-                    code: codes::CTX_2000.to_owned(),
-                })
-            })?
+            .map_err(|e| NapiError::from(create_context_failure(e)))?
     };
 
     // Register the creator's DID as a local DID for defense-in-depth. Routes
@@ -878,6 +931,7 @@ pub(crate) async fn context_create_on(
         bi: Arc::clone(bi),
         instance_id: bi.instance_id(),
     };
+    crate::runtime::track_context_handle(&handle.bi, &handle.context_id);
     increment_handle_count();
     Ok(handle)
 }
@@ -893,14 +947,16 @@ pub(crate) async fn context_join_on(
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Context {
-            message: format!("cannot join context in {state_str:?} state — context must be active"),
+    // The supervisor actor answers the lifecycle question, never the handle's
+    // cached string — see `crate::runtime::require_active_context`.
+    crate::runtime::require_active_context(bi, &handle.context_id, "join context", |msg| {
+        ScpNapiError::Context {
+            message: msg,
             code: codes::CTX_2013.to_owned(),
         }
-        .into());
-    }
+    })
+    .await
+    .map_err(NapiError::from)?;
 
     // Parse the optional spending UCAN JWT once at the bridge boundary so
     // malformed tokens are rejected before any expensive crypto work. Mirrors
@@ -917,12 +973,9 @@ pub(crate) async fn context_join_on(
         })
         .transpose()?;
 
-    // Ensure the Supervisor is initialized — context_join is a valid
-    // first operation (e.g. a device joining a context without creating one).
-    // init_supervisor is idempotent (OnceLock — first call wins). #1073
-    // Passes the joiner DID to NodeMlsFactory for real MLS encryption (#1294).
-    crate::runtime::init_supervisor(bi, &identity_did);
-
+    // No `init_supervisor` call here: the lifecycle gate above already refused
+    // with SCP-CTX-2000 unless this instance holds a supervisor and is not
+    // suspended, so join is never the operation that attaches one.
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
 
     // Generate a real MLS key package for the joining member (#1294).
@@ -1241,9 +1294,10 @@ pub(crate) async fn reserve_key_package_on(
     // Local-custody gate — same trust model as context_create.
     ensure_local_custody(bi, &owning_did)?;
 
-    // reserve may be a node's FIRST context op (it joins before it ever
-    // creates), so attach the supervisor first — the same idempotent init the
-    // join performs (OnceLock, first-call-wins).
+    // reserve may be a node's FIRST context op (it joins from a Welcome before
+    // it ever creates), so attach the supervisor here. `init_supervisor` is
+    // idempotent (OnceLock, first-call-wins); `context_join` never attaches
+    // one and refuses with SCP-CTX-2000 until an earlier operation has.
     crate::runtime::init_supervisor(bi, &owning_did);
 
     let sup = crate::runtime::supervisor(bi)?;
@@ -1252,16 +1306,36 @@ pub(crate) async fn reserve_key_package_on(
         sup.reserve_key_package(DID(owning_did))
             .await
             .map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("reserve_key_package failed: {e}"),
-                    code: codes::CTX_2000.to_owned(),
-                })
+                NapiError::from(typed_supervisor_failure(
+                    "reserve_key_package",
+                    codes::CTX_2000,
+                    &e,
+                ))
             })?;
 
     Ok(NapiKeyPackageReservation {
         reservation_id: reservation_id.to_string(),
         key_package_public: kp_public,
     })
+}
+
+/// Tears down a committed Welcome join whose bridge state a concurrent close
+/// removed, and returns the join's `CTX_2040` error.
+async fn tear_down_vanished_join(
+    bi: &crate::runtime::NapiBridgeInstance,
+    sup: &scp_core::context::supervisor::Supervisor,
+    context_id: &str,
+) -> ScpNapiError {
+    sup.discard_joined_context(context_id).await;
+    crate::runtime::release_context(bi, context_id);
+    ScpNapiError::Context {
+        message: format!(
+            "bridge state for context '{context_id}' vanished between the reversible \
+             registration and the committed join; the just-committed actor was torn down so \
+             no context stays live without bridge state"
+        ),
+        code: codes::CTX_2040.to_owned(),
+    }
 }
 
 /// Per-bridge-instance implementation of `context_join_from_welcome`.
@@ -1300,9 +1374,10 @@ pub(crate) async fn context_join_from_welcome_on(
     // carries no MLS Welcome, spec §5.14) is rejected INSIDE the runtime at the
     // fused `ConfirmConsume` — not at this boundary.
 
-    // spawn-from-Welcome always stands up an ENCRYPTED context; ensure the
-    // node's supervisor is attached first (may be the joiner's first context op
-    // — the same idempotent init the join performs).
+    // spawn-from-Welcome always stands up an ENCRYPTED context and may be the
+    // joiner's first context op, so attach the node's supervisor here.
+    // `init_supervisor` is idempotent (OnceLock, first-call-wins);
+    // `context_join` never attaches one.
     crate::runtime::init_supervisor(bi, &owning_did);
 
     // §9.10.4 + local-custody enforcement: DERIVE the joiner's routing pseudonym
@@ -1368,24 +1443,13 @@ pub(crate) async fn context_join_from_welcome_on(
     // `spawn_actor_from_welcome` consumes the single-use KeyPackage, and leaves
     // any pre-existing entry untouched (never roll back state we did not create).
     //
-    // FLAG-1: the caller no longer supplies a ceiling, so register with the
-    // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on `context_id`, so
-    // the "detect a duplicate BEFORE consuming the single-use KeyPackage"
-    // crash-safety is preserved regardless of the ceiling. The AUTHENTICATED
-    // ceiling is re-synced from the joined handle's signed params AFTER a
-    // successful spawn (see `sync_ceiling_from_params` below).
-    crate::runtime::register_ffi_state(bi, &sealed.context_id, &sealed.creator_did, &[])
-        .map_err(NapiError::from)?;
-    // Insert the joiner as a member of the freshly-registered role state. On the
-    // (practically unreachable) failure of this insert into state we just
-    // created, roll it back so a failed join leaves nothing behind.
-    if let Err(e) = crate::runtime::with_context(bi, &sealed.context_id, |st| {
-        st.role_state.members.insert(owning_did.clone());
-        Ok(())
-    }) {
-        crate::runtime::remove_context(bi, &sealed.context_id);
-        return Err(NapiError::from(e));
-    }
+    // FLAG-1: the caller supplies no ceiling, so register with an empty slice.
+    // The Occupied dedup is keyed on `context_id`, so the "detect a duplicate
+    // BEFORE consuming the single-use KeyPackage" crash-safety holds whatever
+    // the ceiling. The bridge state carries no role state and no membership:
+    // `spawn_actor_from_welcome` stores the AUTHENTICATED membership and
+    // ceiling in the spawned actor.
+    crate::runtime::register_ffi_state(bi, &sealed.context_id, &[]).map_err(NapiError::from)?;
 
     let req = scp_core::context::supervisor::WelcomeJoinRequest {
         creator_did: DID(sealed.creator_did.clone()),
@@ -1408,38 +1472,32 @@ pub(crate) async fn context_join_from_welcome_on(
         Ok(handle) => handle,
         Err(e) => {
             crate::runtime::remove_context(bi, &sealed.context_id);
-            // Through `From<ContextError>`, so a typed custody failure keeps its
-            // code (a destroyed `#active` key is `SCP-CRYPTO-4006`).
-            return Err(NapiError::from(ScpNapiError::from(e)));
+            // A typed custody failure keeps its custody code (a destroyed
+            // `#active` key is `SCP-CRYPTO-4006`) through `typed_supervisor_failure`.
+            return Err(NapiError::from(typed_supervisor_failure(
+                "context_join_from_welcome",
+                codes::CTX_2013,
+                &e,
+            )));
         }
     };
 
-    // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's signed
-    // params, overwriting the default ceiling used for the reversible precheck.
-    // The authoritative ceiling lives in the bundle the creator signed — never in
-    // caller input. This runs AFTER the irreversible commit; the FFI state was
-    // just registered (and not removed on this success path), so the sync targets
-    // a live entry.
-    //
-    // BLACK-2JF-01 — post-irreversible-commit compensation: the sync fails ONLY
-    // if a concurrent close/leave removed the just-registered FFI state in the
-    // window since the spawn returned. A close/leave does NOT despawn the runtime
-    // actor, so returning `Err` here without tearing the actor down would strand a
-    // live, orphaned actor for a join that never fully materialized at the bridge.
-    // Compensate with the COMPLETE teardown (`discard_joined_context`): it removes
-    // the actor handle AND destroys the resident MLS group AND deletes the durable
-    // Class-S snapshot the join persisted — a bare `despawn_actor` would leave the
-    // crypto group and snapshot behind, resurrecting the context on restart and
-    // blocking a fresh re-join. Then purge residual bridge state and surface the
-    // error.
-    if let Err(e) = crate::runtime::sync_ceiling_from_params(
-        bi,
-        &sealed.context_id,
-        &core_handle.params().ceiling,
-    ) {
-        sup.discard_joined_context(&sealed.context_id).await;
-        crate::runtime::remove_context(bi, &sealed.context_id);
-        return Err(NapiError::from(e));
+    // The supervisor serves the id again, so a release mark a prior close left
+    // no longer applies.
+    crate::runtime::readmit_context(bi, &sealed.context_id);
+
+    // BLACK-2JF-01, post-irreversible-commit compensation: the presence probe
+    // below misses when the bridge state this join registered is gone.
+    // Returning without a teardown would strand a live actor behind a handle
+    // with no bridge state. `discard_joined_context` removes the actor handle, destroys
+    // the resident MLS group, and deletes the durable snapshot the join
+    // persisted; a bare `despawn_actor` would leave the group and the snapshot
+    // behind, so a restart would restore the context and a fresh re-join would
+    // collide with it.
+    if !crate::runtime::ucan_registry(bi).contains_key(&sealed.context_id) {
+        return Err(NapiError::from(
+            tear_down_vanished_join(bi, &sup, &sealed.context_id).await,
+        ));
     }
 
     // Runtime join committed. Register the context in the known-contexts
@@ -1448,8 +1506,8 @@ pub(crate) async fn context_join_from_welcome_on(
     // idempotent (overwrites), so it is safe after the irreversible commit and
     // needs no rollback. The routing id is the joiner's derived §9.10.4
     // pseudonym (`local_pseudonym` is `Copy`, still valid after the request
-    // move); the member is the JOINER, matching the role-state member inserted
-    // above.
+    // move); the member is the JOINER, the member `spawn_actor_from_welcome`
+    // recorded in the supervisor's role state.
     //
     // The relay URL comes from the handleless transport probe. On the NAPI
     // bridge the relay URL lives on a `NapiTransportManager` handle, not on the
@@ -1498,6 +1556,7 @@ pub(crate) async fn context_join_from_welcome_on(
         bi: Arc::clone(bi),
         instance_id: bi.instance_id(),
     };
+    crate::runtime::track_context_handle(&handle.bi, &handle.context_id);
     increment_handle_count();
     Ok(handle)
 }
@@ -1572,10 +1631,11 @@ pub(crate) async fn invite_member_on(
     drop(signing_key);
 
     let outcome = outcome.map_err(|e| {
-        NapiError::from(ScpNapiError::Context {
-            message: format!("invite_member failed: {e}"),
-            code: codes::CTX_2013.to_owned(),
-        })
+        NapiError::from(typed_supervisor_failure(
+            "invite_member",
+            codes::CTX_2013,
+            &e,
+        ))
     })?;
     Ok(NapiInviteMemberOutcome::from_outcome(outcome))
 }
@@ -1588,16 +1648,14 @@ pub(crate) async fn context_leave_on(
     identity_did: String,
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, handle);
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Context {
-            message: format!(
-                "cannot leave context in {state_str:?} state — context must be active"
-            ),
+    crate::runtime::require_active_context(bi, &handle.context_id, "leave context", |msg| {
+        ScpNapiError::Context {
+            message: msg,
             code: codes::CTX_2015.to_owned(),
         }
-        .into());
-    }
+    })
+    .await
+    .map_err(NapiError::from)?;
 
     // Cancel the subscription task before leaving so the background relay
     // listener stops promptly.
@@ -1645,36 +1703,101 @@ pub(crate) async fn context_close_on(
     identity_did: String,
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, handle);
-    // Authorization is enforced by the ContextManager (which delegates to
-    // ttl::close_context checking the ContextClose capability). No bridge-layer
-    // auth check — the ContextManager is authoritative.
+    // The bridge runs no capability check of its own. On the `Active` path the
+    // supervisor's `CloseContext` dispatch below runs `ttl::close_context`,
+    // which checks the `ContextClose` capability; the terminal skip runs no
+    // capability check (see below).
 
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Context {
-            message: format!(
-                "cannot close context in {state_str:?} state — context must be active"
-            ),
-            code: codes::CTX_2017.to_owned(),
-        }
-        .into());
-    }
-
-    // Cancel the subscription task before closing so the background relay
-    // listener stops promptly.
-    if let Ok(token) = handle.subscription_cancel.lock() {
-        token.cancel();
-    }
-
-    let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
-    let did = DID(identity_did.clone());
+    // Read the supervisor, not the handle's cached string. An absent actor
+    // (a completed TTL expiry) and a terminal state (`Closed`, `Expired`,
+    // `Tombstoned`) mean the close already happened: they skip the dispatch
+    // and fall through to the release below.
+    //
+    // The terminal skip runs no `ContextClose` check, because
+    // `ttl::close_context` runs inside the dispatch the skip removes, so any
+    // holder of the handle can release this bridge's `UcanContextState` once
+    // the supervisor reports no actor or a terminal state. The release marks
+    // the id, and `crate::runtime::ensure_registered` refuses to rebuild a
+    // marked id's revocation list and nonce tracker. This bridge keeps
+    // revocations in process memory, so a revocation recorded before the
+    // close does not survive a later readmit of the id, just as it does not
+    // survive a process restart.
+    //
+    // `Poisoned` and `MigratingOut` refuse because a release while the
+    // context can still return to `Active` would leave the `Active` context
+    // with no revocation list on this bridge. `Closing` refuses, and the
+    // refusal names `contextFinalizeClose`.
+    let close_already_happened =
+        match crate::runtime::read_live_context_state(bi, &handle.context_id)
+            .await
+            .map_err(NapiError::from)?
+        {
+            // The supervisor holds no actor for the id (a completed TTL
+            // expiry), or the actor reports a terminal state (a finalized
+            // close, an expiry, a migration tombstone): the close already
+            // happened.
+            // `read_live_context_state` reports an actor the supervisor still
+            // holds but this bridge could not reach as `ActorBusy`, and a
+            // context whose actor is mid-respawn or whose last respawn failed
+            // as `ActorCrashed`, rather than as `None`, so a saturated, wedged,
+            // or crashed context refuses the close instead of taking this arm.
+            None
+            | Some(
+                scp_core::context::ContextState::Closed
+                | scp_core::context::ContextState::Expired
+                | scp_core::context::ContextState::Tombstoned,
+            ) => true,
+            Some(scp_core::context::ContextState::Active) => false,
+            // `Closing` names its own successor call.
+            Some(scp_core::context::ContextState::Closing) => {
+                return Err(ScpNapiError::Context {
+                    message: "cannot close context in 'closing' state -- the context is inside \
+                              its cooperative closing window; call contextFinalizeClose to reach \
+                              'closed', then close to release any state this bridge still holds \
+                              for the context"
+                        .to_owned(),
+                    code: codes::CTX_2017.to_owned(),
+                }
+                .into());
+            }
+            Some(scp_core::context::ContextState::Poisoned) => {
+                return Err(ScpNapiError::Context {
+                    message: "cannot close context in 'poisoned' state -- the crash watchdog took \
+                              the context out of service and an operator's clear_poison returns \
+                              it to 'active'; this bridge keeps its revocation list and nonce \
+                              state for the context until a close runs against a live actor"
+                        .to_owned(),
+                    code: codes::CTX_2017.to_owned(),
+                }
+                .into());
+            }
+            Some(other) => {
+                return Err(ScpNapiError::Context {
+                    message: format!(
+                        "cannot close context in '{}' state -- context must be active",
+                        crate::runtime::context_state_str(&other)
+                    ),
+                    code: codes::CTX_2017.to_owned(),
+                }
+                .into());
+            }
+        };
 
     // Route through the ADR-049 lifecycle dispatch surface
     // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
     // rather than calling a `ContextManager` method directly. The actor
     // mailbox wraps the delegated call in the 30s transport-timeout budget
     // and preserves byte-identical close semantics.
-    {
+    //
+    // A close that already happened (see the supervisor read above) skips the
+    // dispatch: either no actor serves the context, or the resident actor
+    // reports `Closed`, `Expired`, or `Tombstoned`, so the bridge only has to
+    // release its own state. `require_core_handle` sits inside the branch for the same
+    // reason — a despawned context needs no core handle to release bridge state,
+    // and demanding one would restore the leak this branch exists to close.
+    if !close_already_happened {
+        let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
+        let did = DID(identity_did.clone());
         use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
         let sup = crate::runtime::supervisor(bi)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1699,15 +1822,35 @@ pub(crate) async fn context_close_on(
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     }
 
-    handle.set_closed().map_err(NapiError::from)?;
-
-    // Clean up UCAN state for this context.
-    crate::runtime::remove_context(bi, &handle.context_id);
-
-    // Clean up per-context bridge connector state and economy state via the
-    // same NapiBridgeInstance's core (not the process-global bridge).
-    bi.core.remove_bridge_state(&handle.context_id);
-    bi.core.remove_economy_state(&handle.context_id);
+    // Release UCAN state for this context, and mark the id so no later call
+    // rebuilds it empty, unless the id returned to `Active` after the
+    // lifecycle read above. The teardown (cancelling the handle's
+    // subscription, writing the handle `Closed`, and dropping the bridge
+    // connector and economy state) runs inside the release, only while the
+    // mark this close set or joined still stands, so a close that reports the
+    // context stays open, or whose mark a readmit cleared, leaves the handle
+    // reading "active" with its subscription running and its state in place.
+    let mut set_closed = Ok(());
+    let released =
+        crate::runtime::release_context_unless_readmitted(bi, &handle.context_id, || {
+            // Stop the background relay listener for this handle.
+            if let Ok(token) = handle.subscription_cancel.lock() {
+                token.cancel();
+            }
+            set_closed = handle.set_closed();
+            // Clean up per-context bridge connector state and economy state via
+            // the same NapiBridgeInstance's core (not the process-global bridge).
+            bi.core.remove_bridge_state(&handle.context_id);
+            bi.core.remove_economy_state(&handle.context_id);
+        })
+        .await;
+    if !released {
+        return Err(NapiError::from(ScpNapiError::Context {
+            message: "the context returned to Active while this close ran; it stays open and keeps its state on this bridge".to_owned(),
+            code: codes::CTX_2017.to_owned(),
+        }));
+    }
+    set_closed.map_err(NapiError::from)?;
 
     Ok(())
 }
@@ -1761,16 +1904,14 @@ pub(crate) async fn context_send_on(
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Context {
-            message: format!(
-                "cannot send to context in {state_str:?} state — context must be active"
-            ),
+    crate::runtime::require_active_context(bi, &handle.context_id, "send to context", |msg| {
+        ScpNapiError::Context {
+            message: msg,
             code: codes::CTX_2019.to_owned(),
         }
-        .into());
-    }
+    })
+    .await
+    .map_err(NapiError::from)?;
 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let did = DID(identity_did.clone());
@@ -1920,14 +2061,21 @@ impl ActiveFlagGuard {
     }
 }
 
-/// Per-bridge-instance implementation of [`Scp::context_subscribe`](crate::scp::Scp::context_subscribe).
-pub(crate) async fn context_subscribe_on(
+/// Admits one subscription on `handle` and returns the guard that resets the
+/// handle's subscription flag when it drops.
+///
+/// Refuses a second concurrent subscription with `CTX_2022`. Refuses through
+/// [`require_active_context`](crate::runtime::require_active_context) a context
+/// the supervisor does not report `Active`: `CTX_2021` for a state other than
+/// `Active` or `Poisoned` and for a context no actor serves, `CTX_2134` for a
+/// poisoned context, and the supervisor query's own error when the state read
+/// fails: `CTX_2130` for a busy actor, `CTX_2135` for a crashed or
+/// mid-respawn actor, and `CTX_2000` when this bridge holds no supervisor or is
+/// suspended (call `resume()` and retry).
+async fn subscribe_admission(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
-    identity_did: String,
-    on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
-) -> napi::Result<()> {
-    crate::napi_check_handle!(&bi.core, handle);
+) -> napi::Result<ActiveFlagGuard> {
     // Guard: prevent duplicate subscriptions. The AtomicBool is swapped to
     // true on the first call; subsequent calls see `true` and bail.
     // The flag is reset to `false` by the spawned task when it exits (via
@@ -1953,17 +2101,27 @@ pub(crate) async fn context_subscribe_on(
     // where the flag is held but un-guarded.
     let outer_guard = ActiveFlagGuard(Some(Arc::clone(&handle.subscription_active)));
 
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
-    if state_str != "active" {
-        // `outer_guard` Drop resets the flag.
-        return Err(ScpNapiError::Context {
-            message: format!(
-                "cannot subscribe to context in {state_str:?} state — context must be active"
-            ),
+    // `outer_guard` Drop resets the flag on the error return.
+    crate::runtime::require_active_context(bi, &handle.context_id, "subscribe to context", |msg| {
+        ScpNapiError::Context {
+            message: msg,
             code: codes::CTX_2021.to_owned(),
         }
-        .into());
-    }
+    })
+    .await
+    .map_err(NapiError::from)?;
+    Ok(outer_guard)
+}
+
+/// Per-bridge-instance implementation of [`Scp::context_subscribe`](crate::scp::Scp::context_subscribe).
+pub(crate) async fn context_subscribe_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    identity_did: String,
+    on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let outer_guard = subscribe_admission(bi, handle).await?;
 
     // `identity_did` is validated at the API boundary and reused below as the
     // heartbeat author DID for the periodic suppression-detection scheduler
@@ -2047,11 +2205,10 @@ pub(crate) async fn context_subscribe_on(
     // orphan the task, making shutdown falsely report `GracefulWithin`
     // while the subscription still held onto `transport_mgr`,
     // `ContextManager`, and the cancel_token Arcs.
-    // Capture an owned `Arc<Supervisor>` scoped to this bridge so the spawned
-    // task doesn't need to re-resolve it via a per-instance lookup. Falls back
-    // gracefully if the supervisor is not attached yet; the spawned task
-    // signals completion when so.
-    let supervisor_for_task = crate::runtime::supervisor(bi).ok().cloned();
+    // A `Weak` (ADR-049 Decision 16): the subscribe task and the heartbeat
+    // scheduler run in the bridge's `JoinSet` and must not keep the Supervisor
+    // alive past shutdown. Each use upgrades it; a failed upgrade ends the task.
+    let supervisor_for_task = crate::runtime::supervisor(bi).ok().map(Arc::downgrade);
 
     // §9.9.2 send side: resolve the local member's signing key now (the key
     // lives at this FFI boundary, never inside the actor) so a periodic
@@ -2099,7 +2256,10 @@ pub(crate) async fn context_subscribe_on(
             None
         } else {
             use scp_core::context::actor::commands::QueriesCommand;
-            match supervisor_for_task.as_ref() {
+            match supervisor_for_task
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+            {
                 Some(sup) => {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let cmd = QueriesCommand::LocalPseudonym {
@@ -2222,16 +2382,24 @@ pub(crate) async fn context_subscribe_on(
                         envelope_bytes: envelope.encrypted_blob.clone(),
                         reply: tx,
                     };
-                    let dispatch_result = supervisor.dispatch_command(&context_id, cmd).await;
+                    let Some(dispatch_result) =
+                        dispatch_to_live_supervisor(&supervisor, &context_id, cmd).await
+                    else {
+                        tracing::debug!(
+                            context_id = %context_id,
+                            "supervisor dropped; subscription ends"
+                        );
+                        break;
+                    };
                     let reply_result = if dispatch_result.is_ok() {
                         rx.await.ok()
                     } else {
                         None
                     };
                     let deliver_result = match (dispatch_result, reply_result) {
-                        (Ok(_), Some(r)) => r,
+                        (Ok(()), Some(r)) => r,
                         (Err(e), _) => Err(e),
-                        (Ok(_), None) => Err(scp_core::context::ContextError::CryptoFailed(
+                        (Ok(()), None) => Err(scp_core::context::ContextError::CryptoFailed(
                             "deliver shim reply dropped".to_owned(),
                         )),
                     };
@@ -2323,8 +2491,8 @@ pub(crate) async fn context_subscribe_on(
         // `cancel_token`; the other three did not, so without this the
         // `run_heartbeat_scheduler` task (which shares this `cancel_token`)
         // would keep firing `Supervisor::send_heartbeat` on a dead
-        // subscription — leaking the task plus its owned `Arc<Supervisor>`
-        // and exported signing key, and emitting false liveness. A later
+        // subscription — leaking the task and exported signing key, and
+        // emitting false liveness. A later
         // re-subscribe overwrites the handle's cancel token without cancelling
         // the old one, so this teardown is the only thing that stops the
         // orphaned scheduler. Cancelling an already-cancelled token (the
@@ -3414,7 +3582,6 @@ pub(crate) async fn context_execute_governance_action_on(
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
-    let proposal_id_log = hex::encode(proposal_id);
 
     // Route through the ADR-049 governance dispatch surface.
     use scp_core::context::actor::commands::{ExecuteGovernanceActionPayload, GovernanceCommand};
@@ -3437,18 +3604,6 @@ pub(crate) async fn context_execute_governance_action_on(
         .await
         .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-    // Re-sync local UCAN role state cache from ContextManager after any
-    // governance action that may have modified roles/membership (#560).
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            proposal_id = %proposal_id_log,
-            error = %e,
-            "failed to sync role state after governance action — \
-             local capability checks may be stale"
-        );
-    }
 
     // Sync FFI handle state for migration transitions (§5.11A).
     match &result {
@@ -3598,7 +3753,8 @@ pub(crate) async fn context_reconnect_on(
     let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     // Hold the 32-byte seed in `Zeroizing` so it is wiped after the driver
-    // call rather than lingering in freed memory.
+    // call, on the stack as well as the heap; the wiping global allocator
+    // reaches freed heap blocks only (security model spec §9.15).
     let signing_key_bytes = zeroize::Zeroizing::new(sk.to_bytes());
 
     let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
@@ -3904,8 +4060,6 @@ pub(crate) async fn context_governance_propose_on(
         })
     })?;
 
-    let action_name = action.variant_name();
-
     use scp_core::context::actor::commands::{
         GovernanceCommand, ProposeGovernanceActionPayload, SigningKeyBytes,
     };
@@ -3953,15 +4107,6 @@ pub(crate) async fn context_governance_propose_on(
                 code: codes::CTX_2041.to_owned(),
             })
         })?;
-
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            action = action_name,
-            error = %e,
-            "failed to sync role state after governance proposal"
-        );
-    }
 
     let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
 
@@ -4025,14 +4170,6 @@ pub(crate) async fn context_governance_approve_on(
             })
         })?;
 
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to sync role state after governance approval"
-        );
-    }
-
     Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
 }
 
@@ -4087,14 +4224,6 @@ pub(crate) async fn context_governance_reject_on(
             })
         })?;
 
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to sync role state after governance rejection"
-        );
-    }
-
     Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
 }
 
@@ -4143,14 +4272,6 @@ pub(crate) async fn context_governance_withdraw_on(
                 code: codes::CTX_2044.to_owned(),
             })
         })?;
-
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to sync role state after governance withdrawal"
-        );
-    }
 
     Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
 }
@@ -4533,16 +4654,17 @@ pub(crate) async fn context_restore_on(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cmd = LifecycleCommand::RestoreContext {
         payload: Box::new(RestoreContextPayload {
-            context_id,
+            context_id: context_id.clone(),
             params: scp_core::context::ContextParams::default(),
         }),
         reply: tx,
     };
     sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
-        NapiError::from(ScpNapiError::Context {
-            message: format!("supervisor dispatch_lifecycle_command failed: {e}"),
-            code: codes::CTX_2064.to_owned(),
-        })
+        NapiError::from(typed_supervisor_failure(
+            "supervisor dispatch_lifecycle_command",
+            codes::CTX_2064,
+            &e,
+        ))
     })?;
     rx.await
         .map_err(|e| {
@@ -4552,11 +4674,14 @@ pub(crate) async fn context_restore_on(
             })
         })?
         .map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!("restore_context failed: {e}"),
-                code: codes::CTX_2064.to_owned(),
-            })
-        })
+            NapiError::from(typed_supervisor_failure(
+                "restore_context",
+                codes::CTX_2064,
+                &e,
+            ))
+        })?;
+    crate::runtime::readmit_context(bi, &context_id);
+    Ok(())
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_restore_all`](crate::scp::Scp::context_restore_all).
@@ -4571,11 +4696,15 @@ pub(crate) async fn context_restore_all_on(bi: &NapiBridgeInstance) -> napi::Res
     let sup = crate::runtime::supervisor(bi)?;
 
     let restored = sup.restore_on_startup().await.map_err(|e| {
-        NapiError::from(ScpNapiError::Context {
-            message: format!("restore_all_contexts failed: {e}"),
-            code: codes::CTX_2065.to_owned(),
-        })
+        NapiError::from(typed_supervisor_failure(
+            "restore_all_contexts",
+            codes::CTX_2065,
+            &e,
+        ))
     })?;
+    for context_id in &restored {
+        crate::runtime::readmit_context(bi, context_id);
+    }
 
     serde_json::to_string(&restored).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
@@ -4987,6 +5116,9 @@ pub(crate) async fn context_import_on(
     sup.import_context(export, &verifying_key, Some(local_pseudonym))
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    // The supervisor serves the id again, so a release mark an earlier close
+    // left on this bridge instance no longer applies.
+    crate::runtime::readmit_context(bi, &context_id);
 
     // §9.10.4: emit a PseudonymAnnouncement so existing members learn this
     // importer's per-context routing ID. Encrypted contexts only — broadcast
@@ -5489,6 +5621,66 @@ fn parse_template_id_napi(
     }
 }
 
+/// Maps a failed supervisor call that otherwise reports every failure under
+/// one fixed `code` to the bridge error, keeping `ActorBusy` and
+/// `SupervisorShutDown` apart.
+///
+/// `ActorBusy` reports `SCP-CTX-2130` (ADR-049 §10), whose producers and retry
+/// behaviour the `ContextError::ActorBusy` doc states. `SupervisorShutDown`
+/// reports `SCP-CTX-2138`. `Custody` keeps its custody code
+/// ([`ScpNapiError::custody_failure`]: a destroyed `#active` key is
+/// `SCP-CRYPTO-4006`). Every other failure reports `code`.
+/// The Welcome join, the key-package reservation and the invite map their
+/// errors through it.
+fn typed_supervisor_failure(
+    op: &str,
+    code: &str,
+    e: &scp_core::context::ContextError,
+) -> ScpNapiError {
+    let code = match e {
+        scp_core::context::ContextError::ActorBusy(_) => codes::CTX_2130,
+        scp_core::context::ContextError::SupervisorShutDown(_) => codes::CTX_2138,
+        scp_core::context::ContextError::Custody(failure) => {
+            return ScpNapiError::custody_failure(format!("{op} failed: {e}"), failure);
+        }
+        _ => code,
+    };
+    ScpNapiError::Context {
+        message: format!("{op} failed: {e}"),
+        code: code.to_owned(),
+    }
+}
+
+/// Maps a refused `CreateContext` to its SDK error. The core's empty-ceiling
+/// rejection keeps its typed validation code (construction.md M2), and a
+/// create refused because Supervisor shutdown began keeps SCP-CTX-2138; every
+/// other failure carries SCP-CTX-2000.
+fn create_context_failure(e: scp_core::context::builder::ContextCreationError) -> ScpNapiError {
+    match e {
+        scp_core::context::builder::ContextCreationError::StateTransition(
+            scp_core::context::ContextError::CeilingRequired(_)
+            | scp_core::context::ContextError::SupervisorShutDown(_),
+        ) => ScpNapiError::from(e),
+        other => ScpNapiError::Context {
+            message: format!("create_context failed: {other}"),
+            code: codes::CTX_2000.to_owned(),
+        },
+    }
+}
+
+/// Dispatches `cmd` to `context_id` through the Supervisor `supervisor` still
+/// points at, holding the upgraded `Arc` only for the dispatch. `None` when the
+/// Supervisor has dropped, which ends the relay subscription loop (ADR-049
+/// Decision 16).
+async fn dispatch_to_live_supervisor(
+    supervisor: &std::sync::Weak<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+    cmd: scp_core::context::actor::commands::MessagingCommand,
+) -> Option<Result<(), scp_core::context::ContextError>> {
+    let live = supervisor.upgrade()?;
+    Some(live.dispatch_command(context_id, cmd).await.map(drop))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5502,15 +5694,49 @@ mod tests {
     #[cfg(feature = "testing")]
     use scp_core::context::membership::KeyPackage;
     use scp_core::context::params::Capability;
-    // The feature-gated economy tests reference `codes::` directly (no
-    // `use super::*`); the ungated export tests reach `codes` through their
-    // in-fn `use super::*` glob (re-exporting the file-level alias). Gate the
-    // alias to its sole direct consumers so the ungated build does not see an
-    // unused import.
+    // The feature-gated economy tests and the ungated
+    // `parse_context_params_rejects_a_non_object_params_json` reference
+    // `codes::` directly (no `use super::*`), so the alias stays ungated; the
+    // ungated export tests reach `codes` through their in-fn `use super::*`
+    // glob.
     use scp_did::DID;
-    #[cfg(feature = "testing")]
     use scp_ffi_common::error_codes as codes;
     use std::sync::Arc;
+
+    /// A create refused because Supervisor shutdown began keeps SCP-CTX-2138;
+    /// an unrelated create failure carries SCP-CTX-2000.
+    #[test]
+    fn create_context_failure_keeps_supervisor_shut_down_typed() {
+        use scp_core::context::builder::ContextCreationError;
+        let code_of = |e: ContextCreationError| match super::create_context_failure(e) {
+            crate::error::ScpNapiError::Context { code, .. } => code,
+            other => panic!("expected a context error, got {other:?}"),
+        };
+        assert_eq!(
+            code_of(ContextCreationError::StateTransition(
+                scp_core::context::ContextError::SupervisorShutDown("create".to_owned()),
+            )),
+            codes::CTX_2138
+        );
+        assert_eq!(
+            code_of(ContextCreationError::TransportNotConnected),
+            codes::CTX_2000
+        );
+    }
+
+    /// A dropped Supervisor yields `None`, which ends the subscription loop.
+    #[tokio::test]
+    async fn dispatch_to_dropped_supervisor_ends_the_subscription() {
+        use scp_core::context::actor::commands::MessagingCommand;
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::DeliverIncoming {
+            context_id: "ctx".to_owned(),
+            envelope_bytes: vec![1, 2, 3],
+            reply,
+        };
+        let outcome = super::dispatch_to_live_supervisor(&std::sync::Weak::new(), "ctx", cmd).await;
+        assert!(outcome.is_none(), "a dropped Supervisor must end the loop");
+    }
 
     /// Test helper: dispatch `LifecycleCommand::CreateContext` through the
     /// supervisor. Mirrors the production rewire pattern but is callable
@@ -5675,6 +5901,8 @@ mod tests {
                 pre_rotation_custody,
             },
         );
+        // Balances the decrement `NapiContextHandle`'s `Drop` runs.
+        crate::increment_handle_count();
         let handle = super::NapiContextHandle {
             context_id: format!("persona-test-{}", uuid::Uuid::new_v4()),
             state: std::sync::Mutex::new(super::ContextState::Active),
@@ -5694,6 +5922,7 @@ mod tests {
             bi: Arc::clone(bi),
             instance_id: bi.instance_id(),
         };
+        crate::runtime::track_context_handle(&handle.bi, &handle.context_id);
         (did, active_key, agent_key, handle)
     }
 
@@ -5836,6 +6065,8 @@ mod tests {
         let custody_b = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
             OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
         )));
+        // Balances the decrement `NapiContextHandle`'s `Drop` runs.
+        crate::increment_handle_count();
         let handle = super::NapiContextHandle {
             context_id: format!("persona-regress-{}", uuid::Uuid::new_v4()),
             state: std::sync::Mutex::new(super::ContextState::Active),
@@ -5855,6 +6086,7 @@ mod tests {
             bi: Arc::clone(&bi),
             instance_id: bi.instance_id(),
         };
+        crate::runtime::track_context_handle(&handle.bi, &handle.context_id);
 
         let signer =
             super::resolve_napi_message_signer(&bi, &handle, &did, scp_did::SigningKeyId::Agent)
@@ -6005,6 +6237,11 @@ mod tests {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         let joiner_did = register_in_memory_joiner(&bi).await;
         let ctx_id = "a".repeat(64);
+        // A close released this id before the join, and a handle from before
+        // the close is still alive, so the release mark must survive the
+        // failed join.
+        let _closed_handle = active_handle_for(&bi, &ctx_id, "did:dht:z6MkNapiRollbackCreator");
+        crate::runtime::release_context(&bi, &ctx_id);
 
         // A well-formed 32-byte `enc` passes the bridge enc-length check, so the
         // failure is the runtime join itself (bogus reservation + ciphertext) —
@@ -6041,6 +6278,240 @@ mod tests {
         assert!(
             !bi.core.has_known_context(&ctx_id),
             "no known-context discovery entry may leak after a failed join"
+        );
+        assert!(
+            crate::runtime::has_release_mark(&bi, &ctx_id),
+            "a failed join must not clear the release mark a close left"
+        );
+    }
+
+    /// A close's release against an `Active` context clears its own mark and
+    /// removes nothing, so the context keeps the revocations it recorded.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_release_clears_its_mark_when_the_supervisor_reports_active() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let active = format!("napi-release-active-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiReleaseActiveCreator";
+        crate::runtime::create_supervisor_context_for_test(&bi, &active, creator)
+            .await
+            .expect("the supervisor creates the context");
+        crate::runtime::register_test_context(&bi, &active);
+        crate::runtime::with_context(&bi, &active, |rt| {
+            rt.core
+                .revocation_list
+                .revoke("revoked-before-release".to_owned());
+            Ok(())
+        })
+        .expect("the Active context must have UCAN state");
+
+        assert!(
+            !crate::runtime::release_context_unless_readmitted(&bi, &active, || {}).await,
+            "a release on an Active context must report the readmit"
+        );
+        assert!(!crate::runtime::has_release_mark(&bi, &active));
+        assert!(
+            crate::runtime::with_context(&bi, &active, |rt| {
+                Ok(rt.core.revocation_list.is_revoked("revoked-before-release"))
+            })
+            .expect("the release must leave the Active context's UCAN state in place"),
+            "a revocation the Active context recorded must survive the release"
+        );
+
+        let absent = format!("napi-release-absent-{}", uuid::Uuid::new_v4());
+        let _absent_handle = active_handle_for(&bi, &absent, creator);
+        assert!(crate::runtime::release_context_unless_readmitted(&bi, &absent, || {}).await);
+        assert!(
+            crate::runtime::has_release_mark(&bi, &absent),
+            "a release on an id no actor serves must keep the mark"
+        );
+    }
+
+    /// A committed Welcome join whose bridge state a racing close removed
+    /// tears the join down and re-marks the id, even though the join's readmit
+    /// had cleared the close's mark, so `ensure_registered` builds no state
+    /// for an id no actor serves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vanished_join_teardown_re_marks_the_id_its_readmit_cleared() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-vanished-join-{}", uuid::Uuid::new_v4());
+        // A handle from before the close, so the mark has a handle to refuse.
+        let handle = active_handle_for(&bi, &ctx_id, "did:key:z6MkNapiVanishedJoinCreator");
+        crate::runtime::release_context(&bi, &ctx_id);
+        crate::runtime::readmit_context(&bi, &ctx_id);
+
+        let sup =
+            Arc::clone(crate::runtime::supervisor(&bi).expect("the supervisor is initialized"));
+        let err = super::tear_down_vanished_join(&bi, &sup, &ctx_id).await;
+        assert!(
+            matches!(err, crate::error::ScpNapiError::Context { ref code, .. } if code == codes::CTX_2040),
+            "the teardown must surface CTX_2040, got {err:?}"
+        );
+        assert!(
+            crate::runtime::has_release_mark(&bi, &ctx_id),
+            "the teardown must re-mark the id the join's readmit cleared"
+        );
+        assert!(
+            crate::runtime::ensure_registered(&bi, &handle).is_err(),
+            "no UCAN state may be rebuilt for a torn-down join"
+        );
+    }
+
+    /// A readmit that clears the release mark before the close's removal takes
+    /// the release-mark lock leaves the readmitted context's state and
+    /// known-context entry in place, runs no teardown, and the removal returns
+    /// `false`; while the mark stands, the removal takes both, runs the
+    /// teardown, and returns `true`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_removal_skips_state_a_readmit_already_claimed() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let ctx_id = format!("napi-release-race-{}", uuid::Uuid::new_v4());
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        crate::runtime::with_context(&bi, &ctx_id, |rt| {
+            rt.core
+                .revocation_list
+                .revoke("revoked-after-readmit".to_owned());
+            Ok(())
+        })
+        .expect("the registered context must have UCAN state");
+        bi.core.register_known_context(
+            &ctx_id,
+            scp_ffi_common::bridge_instance::KnownContext {
+                routing_id: [7; 32],
+                relay_url: None,
+                member_did: "did:key:z6MkNapiReleaseRace".to_owned(),
+                last_seen: 0,
+            },
+        );
+
+        let ticket = crate::runtime::mark_released(&bi, &ctx_id);
+        crate::runtime::readmit_context(&bi, &ctx_id);
+        let mut torn_down = false;
+        assert!(
+            !crate::runtime::remove_context_while_released(&bi, ticket, || torn_down = true),
+            "a removal a readmit pre-empted must report that it removed nothing"
+        );
+        assert!(
+            !torn_down,
+            "a removal a readmit pre-empted must run no teardown"
+        );
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |rt| {
+                Ok(rt.core.revocation_list.is_revoked("revoked-after-readmit"))
+            })
+            .expect("a readmitted context's UCAN state must survive the removal"),
+            "the readmitted context's revocation must survive the removal"
+        );
+        assert!(
+            bi.core.has_known_context(&ctx_id),
+            "a removal a readmit pre-empted must keep the known-context entry"
+        );
+
+        let ticket = crate::runtime::mark_released(&bi, &ctx_id);
+        assert!(
+            crate::runtime::remove_context_while_released(&bi, ticket, || torn_down = true),
+            "a removal while the mark stands must report that it removed"
+        );
+        assert!(
+            torn_down,
+            "a removal while the mark stands must run the teardown"
+        );
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err(),
+            "the removal must take the state while the mark stands"
+        );
+        assert!(
+            !bi.core.has_known_context(&ctx_id),
+            "the removal must take the known-context entry while the mark stands"
+        );
+    }
+
+    /// A close whose mark a readmit cleared and a later release re-set holds
+    /// a ticket for a mark generation that no longer stands, so its removal
+    /// removes nothing and runs no teardown: a close tears down only under the
+    /// mark it set or joined.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_close_skips_a_mark_set_after_a_readmit() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let ctx_id = format!("napi-stale-close-{}", uuid::Uuid::new_v4());
+        let _handle = active_handle_for(&bi, &ctx_id, "did:key:z6MkNapiStaleClose");
+        crate::runtime::register_test_context(&bi, &ctx_id);
+
+        let stale = crate::runtime::mark_released(&bi, &ctx_id);
+        crate::runtime::readmit_context(&bi, &ctx_id);
+        let _later = crate::runtime::mark_released(&bi, &ctx_id);
+        let mut torn_down = false;
+        assert!(
+            !crate::runtime::remove_context_while_released(&bi, stale, || torn_down = true),
+            "a close whose mark generation was cleared must remove nothing"
+        );
+        assert!(!torn_down, "a stale close must run no teardown");
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_ok(),
+            "a stale close must leave the context's state in place"
+        );
+        assert!(crate::runtime::has_release_mark(&bi, &ctx_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_mark_lasts_until_the_last_handle_for_the_id_drops() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let ctx_id = format!("napi-release-prune-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiReleasePrune";
+        let first = active_handle_for(&bi, &ctx_id, creator);
+        let second = active_handle_for(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        crate::runtime::release_context(&bi, &ctx_id);
+        assert!(
+            crate::runtime::has_release_mark(&bi, &ctx_id),
+            "a live handle must keep the mark"
+        );
+
+        drop(first);
+        assert!(
+            crate::runtime::ensure_registered(&bi, &second).is_err(),
+            "the mark must refuse a rebuild while the second handle lives"
+        );
+
+        drop(second);
+        assert!(
+            !crate::runtime::has_release_mark(&bi, &ctx_id),
+            "the last handle's drop must drop the mark"
+        );
+        assert!(!bi.context_handles.contains_key(&ctx_id));
+
+        let unheld = format!("napi-release-unheld-{}", uuid::Uuid::new_v4());
+        crate::runtime::release_context(&bi, &unheld);
+        assert!(
+            !crate::runtime::has_release_mark(&bi, &unheld),
+            "a release with no live handle must leave no mark"
+        );
+
+        let unsettled = format!("napi-release-unsettled-{}", uuid::Uuid::new_v4());
+        let ticket = crate::runtime::mark_released(&bi, &unsettled);
+        crate::runtime::release_context(&bi, &unsettled);
+        assert!(
+            crate::runtime::has_release_mark(&bi, &unsettled),
+            "an unsettled close must keep the mark with no live handle"
+        );
+        assert!(crate::runtime::remove_context_while_released(
+            &bi,
+            ticket,
+            || {}
+        ));
+        crate::runtime::release_context(&bi, &unsettled);
+        assert!(
+            !crate::runtime::has_release_mark(&bi, &unsettled),
+            "a mark with no live handle and no unsettled close must not stay"
+        );
+
+        let closed = format!("napi-release-closed-{}", uuid::Uuid::new_v4());
+        assert!(crate::runtime::release_context_unless_readmitted(&bi, &closed, || {}).await);
+        assert!(
+            !crate::runtime::has_release_mark(&bi, &closed),
+            "a settled close with no live handle must leave no mark"
         );
     }
 
@@ -6106,7 +6577,7 @@ mod tests {
         let ctx_id = "b".repeat(64);
 
         // Pre-occupy the FFI-state slot for this context id.
-        crate::runtime::register_test_context(&bi, &ctx_id, "did:dht:z6MkNapiOccupiedCreator");
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         // A well-formed 32-byte `enc` so control passes the bridge enc-length
         // check and reaches the `register_ffi_state` Occupied precheck (which runs
@@ -6351,7 +6822,7 @@ mod tests {
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         let handle =
             super::NapiContextHandle::test_active_on(&bi, ctx_id.clone(), creator.to_owned());
@@ -6401,7 +6872,7 @@ mod tests {
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         // Seed a RoleAssigned leaf carrying the affected member's subject_did
         // into the supervisor-owned event log (the manager-path source).
@@ -6462,6 +6933,8 @@ mod tests {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         let instance_id = bi.instance_id();
 
+        // Balances the decrement `NapiContextHandle`'s `Drop` runs.
+        crate::increment_handle_count();
         let mut handle = NapiContextHandle {
             context_id: "test-ctx-econ".to_owned(),
             state: Mutex::new(ContextState::Active),
@@ -6481,6 +6954,7 @@ mod tests {
             bi: std::sync::Arc::clone(&bi),
             instance_id,
         };
+        crate::runtime::track_context_handle(&handle.bi, &handle.context_id);
 
         // Initially None.
         assert!(
@@ -6534,7 +7008,7 @@ mod tests {
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         let fabricated = [0xABu8; 32];
         let result = test_dispatch_execute_by_id(&bi, &ctx_id, fabricated).await;
@@ -6548,6 +7022,1373 @@ mod tests {
             "rejection should name the untracked proposal"
         );
         crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// Builds a handle whose cached string reads `"active"` for a context this
+    /// bridge registered, so a test can exercise the gap between that string
+    /// and whatever the supervisor reports.
+    ///
+    /// Builds through `test_active_on`, which increments the process-global
+    /// handle count that `NapiContextHandle`'s `Drop` decrements, so the
+    /// fixture leaves the count balanced.
+    fn active_handle_for(
+        bi: &Arc<crate::runtime::NapiBridgeInstance>,
+        context_id: &str,
+        creator_did: &str,
+    ) -> super::NapiContextHandle {
+        super::NapiContextHandle::test_active_on(bi, context_id.to_owned(), creator_did.to_owned())
+    }
+
+    /// Builds the handle [`active_handle_for`] builds, naming
+    /// `crate::runtime::KEYLESS_HANDLE_CREATOR` as its creator, a creator no
+    /// supervisor context holds.
+    #[cfg(feature = "testing")]
+    fn keyless_creator_handle_for(
+        bi: &Arc<crate::runtime::NapiBridgeInstance>,
+        context_id: &str,
+    ) -> super::NapiContextHandle {
+        active_handle_for(bi, context_id, crate::runtime::KEYLESS_HANDLE_CREATOR)
+    }
+
+    /// Builds a handle for `context_id` whose `ceiling` is the wide default,
+    /// while the supervisor actor for that context holds a narrower ceiling.
+    ///
+    /// NAPI's UCAN mint and delegate sites used to read
+    /// `NapiContextHandle::ceiling`. Every capability `default_ceiling()`
+    /// carries is in this handle, so a site that reads the handle admits what
+    /// the actor withholds.
+    #[cfg(feature = "testing")]
+    fn wide_ceiling_handle_for(
+        bi: &Arc<crate::runtime::NapiBridgeInstance>,
+        context_id: &str,
+        creator_did: &str,
+    ) -> super::NapiContextHandle {
+        let mut handle = active_handle_for(bi, context_id, creator_did);
+        handle.ceiling = scp_core::context::roles::default_ceiling()
+            .to_ucan_string_set()
+            .into_iter()
+            .collect();
+        handle
+    }
+
+    /// A DID that no identity and no supervisor context carries, for the
+    /// tests below that need a caller who is not the context's creator.
+    #[cfg(feature = "testing")]
+    const OUTSIDER_DID: &str = "did:dht:z6MkNapiOutsiderOnly";
+
+    /// Calls all five UCAN entry points against `handle` and asserts each one
+    /// refuses with the withheld pre-authorization refusal: `SCP-CTX-2023`, the
+    /// shared withheld text, and neither the context id, the lifecycle state,
+    /// nor an actor fault code.
+    #[cfg(feature = "testing")]
+    async fn assert_every_ucan_entry_point_withholds(
+        bi: &Arc<crate::runtime::NapiBridgeInstance>,
+        handle: &super::NapiContextHandle,
+        token: &str,
+        capability: &str,
+        holder_did: &str,
+        revoker_did: &str,
+        label: &str,
+    ) {
+        let ctx_id = handle.context_id();
+        let results: [(&str, Result<(), napi::Error>); 5] = [
+            (
+                "validate",
+                crate::ucan::ucan_validate_on(
+                    bi,
+                    handle,
+                    token.to_owned(),
+                    capability.to_owned(),
+                    holder_did.to_owned(),
+                    None,
+                )
+                .await,
+            ),
+            (
+                "evaluate",
+                crate::ucan::ucan_evaluate_on(
+                    bi,
+                    handle,
+                    token.to_owned(),
+                    Some(capability.to_owned()),
+                    holder_did.to_owned(),
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "mint",
+                crate::ucan::ucan_mint_on(
+                    bi,
+                    handle,
+                    holder_did.to_owned(),
+                    vec!["messages:read".to_owned()],
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "delegate",
+                crate::ucan::ucan_delegate_on(
+                    bi,
+                    handle,
+                    holder_did.to_owned(),
+                    "did:dht:z6MkNapiWithheldDelegatee".to_owned(),
+                    token.to_owned(),
+                    vec![capability.to_owned()],
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "revoke",
+                crate::ucan::ucan_revoke_on(bi, handle, token.to_owned(), revoker_did.to_owned())
+                    .await,
+            ),
+        ];
+        for (call, result) in results {
+            let Err(err) = result else {
+                panic!("{call} must refuse ({label})");
+            };
+            let text = err.to_string();
+            assert!(
+                text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                    && text.contains(codes::CTX_2023),
+                "{call} must refuse with the withheld text and SCP-CTX-2023 ({label}): {text}"
+            );
+            for leaked in [
+                ctx_id.as_str(),
+                codes::CTX_2130,
+                codes::CTX_2134,
+                codes::CTX_2135,
+                "closing",
+                "poisoned",
+            ] {
+                assert!(
+                    !text.contains(leaked),
+                    "{call} must not disclose {leaked:?} before authorization ({label}): {text}"
+                );
+            }
+        }
+    }
+
+    /// Creates an in-memory `Scp`, an owner and a holder identity on it, and an
+    /// Active supervisor context the owner created with `ceiling`, then mints a
+    /// `messages:write` token from the owner to the holder in that context.
+    ///
+    /// Returns the bridge instance, the handle [`keyless_creator_handle_for`]
+    /// builds, the token, its capability URI, the owner DID, and the holder
+    /// DID.
+    #[cfg(feature = "testing")]
+    async fn active_context_with_token(
+        scp: &crate::scp::Scp,
+        ceiling: &[&str],
+    ) -> (
+        Arc<crate::runtime::NapiBridgeInstance>,
+        super::NapiContextHandle,
+        String,
+        String,
+        String,
+        String,
+    ) {
+        let bi = Arc::clone(&scp.inner);
+        let owner_did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed")
+            .inner
+            .did
+            .clone();
+        let holder_did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed")
+            .inner
+            .did
+            .clone();
+        let ctx_id = format!("napi-ucan-live-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi, &ctx_id, &owner_did, ceiling,
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        let handle = keyless_creator_handle_for(&bi, &ctx_id);
+        let token = crate::ucan::ucan_mint_on(
+            &bi,
+            &handle,
+            holder_did.clone(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect("a mint inside the supervisor ceiling must succeed")
+        .encoded();
+        let capability = format!("scp:ctx:{ctx_id}/messages:write");
+        (bi, handle, token, capability, owner_did, holder_did)
+    }
+
+    /// Every UCAN entry point refuses a context whose actor is resident but
+    /// reports `Closing`, and withholds that state from the refusal.
+    ///
+    /// The actor still answers the role-state read, so an entry point that
+    /// dropped its pre-authorization gate would pass here: validate and
+    /// evaluate would accept the token, and mint, delegate and revoke would
+    /// issue or record against a context the supervisor stopped serving.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_ucan_entry_point_refuses_a_resident_actor_in_closing() {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let (bi, handle, token, capability, owner_did, holder_did) =
+            active_context_with_token(&scp, &["messages:read", "messages:write", "context:close"])
+                .await;
+        let ctx_id = handle.context_id();
+
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sup.dispatch_lifecycle_command(LifecycleCommand::CloseContext {
+            payload: Box::new(CloseContextPayload {
+                context_id: ctx_id.clone(),
+                params: ContextParams::default(),
+                initiator_did: DID(owner_did.clone()),
+            }),
+            reply: tx,
+        })
+        .await
+        .expect("close dispatch");
+        rx.await.expect("close reply").expect("close must succeed");
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &ctx_id)
+                .await
+                .expect("the resident actor answers"),
+            Some(scp_core::context::ContextState::Closing),
+        );
+        assert!(
+            crate::runtime::live_role_state(&bi, &ctx_id).await.is_ok(),
+            "the closing actor still answers the role-state read, so only the gate can refuse"
+        );
+
+        assert_every_ucan_entry_point_withholds(
+            &bi,
+            &handle,
+            &token,
+            &capability,
+            &holder_did,
+            &owner_did,
+            "closing",
+        )
+        .await;
+    }
+
+    /// Every UCAN entry point refuses a context no actor serves, a poisoned
+    /// context, a context mid-respawn or past a failed respawn, and an actor
+    /// that does not answer, with the one withheld refusal.
+    ///
+    /// The supervisor reports the faults as `Some(Poisoned)`, `ActorCrashed`
+    /// (`SCP-CTX-2135`) and `ActorBusy` (`SCP-CTX-2130`). Passing either code
+    /// through told a caller this call had not yet authorized that the context
+    /// exists and is faulted, which the outlet PRD's SCP-OUT-031 PR-2a note
+    /// forbids, and the absent-role-state refusal names the context.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_ucan_entry_point_withholds_an_absent_or_faulted_actor() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        // A real token from a healthy context, so each refusal below comes
+        // from the gate and not from a malformed input.
+        let (bi, _donor, token, capability, owner_did, holder_did) =
+            active_context_with_token(&scp, &["messages:read", "messages:write"]).await;
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+
+        for fault in [
+            "absent",
+            "poisoned",
+            "mid_respawn",
+            "respawn_failed",
+            "unreachable",
+        ] {
+            let ctx_id = format!("napi-ucan-{fault}-{}", uuid::Uuid::new_v4());
+            if fault != "absent" {
+                crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, &owner_did)
+                    .await
+                    .expect("test supervisor context creation must succeed");
+            }
+            crate::runtime::register_test_context(&bi, &ctx_id);
+            match fault {
+                "poisoned" => sup.test_poison_context(&ctx_id).await,
+                "mid_respawn" => sup.test_hold_context_mid_respawn(&ctx_id).await,
+                "respawn_failed" => sup.test_fail_context_respawn(&ctx_id).await,
+                "unreachable" => sup.test_make_actor_unreachable(&ctx_id),
+                _ => {}
+            }
+            assert_ne!(
+                crate::runtime::read_live_context_state(&bi, &ctx_id)
+                    .await
+                    .ok(),
+                Some(Some(scp_core::context::ContextState::Active)),
+                "the fixture must take the context out of Active ({fault})"
+            );
+            let handle = active_handle_for(&bi, &ctx_id, &owner_did);
+            assert_every_ucan_entry_point_withholds(
+                &bi,
+                &handle,
+                &token,
+                &capability,
+                &holder_did,
+                &owner_did,
+                fault,
+            )
+            .await;
+        }
+    }
+
+    /// `ucan_mint_on` grants no more than the ceiling the supervisor actor
+    /// holds, even when the handle's ceiling is wider.
+    ///
+    /// The handle carries `default_ceiling()`, and an empty handle ceiling used
+    /// to widen to `default_ceiling()` too, so a mint that read the handle
+    /// would grant `messages:write` here.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_mint_enforces_the_supervisor_ceiling_not_the_handle_ceiling() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let owner_did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed")
+            .inner
+            .did
+            .clone();
+        let ctx_id = format!("napi-mint-live-ceiling-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi,
+            &ctx_id,
+            &owner_did,
+            &["messages:read"],
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        let handle = wide_ceiling_handle_for(&bi, &ctx_id, &owner_did);
+        assert!(
+            handle.ceiling.iter().any(|c| c == "messages:write"),
+            "the fixture's handle must carry the capability the actor withholds"
+        );
+
+        let Err(err) = crate::ucan::ucan_mint_on(
+            &bi,
+            &handle,
+            "did:dht:z6MkNapiLiveCeilingMember".to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        else {
+            panic!("a mint outside the supervisor's ceiling must fail");
+        };
+        assert!(
+            err.to_string().contains("ceiling"),
+            "expected a ceiling refusal, got: {err}"
+        );
+
+        // The capability the actor holds still mints, so the refusal above is
+        // the ceiling check and not a broken fixture.
+        crate::ucan::ucan_mint_on(
+            &bi,
+            &handle,
+            "did:dht:z6MkNapiLiveCeilingMember".to_owned(),
+            vec!["messages:read".to_owned()],
+            None,
+        )
+        .await
+        .expect("a mint inside the supervisor's ceiling must succeed");
+    }
+
+    /// `ucan_validate_on`, `ucan_evaluate_on`, and `ucan_delegate_on` compare a
+    /// token's grants against the ceiling the supervisor holds for the handle's
+    /// context, and anchor the chain on the creator the supervisor holds.
+    ///
+    /// One owner creates two contexts: `wide` holds `messages:write` and
+    /// `narrow` omits it. A `messages:write` token minted in `wide` passes each
+    /// call there and fails the ceiling check in `narrow`. An edit that hands
+    /// the core the handle's empty ceiling widened to the default, or the other
+    /// context's ceiling, fails the `narrow` half.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let (bi, wide, token, cap, owner_did, holder_did) =
+            active_context_with_token(&scp, &["messages:read", "messages:write"]).await;
+        let delegatee = "did:dht:z6MkNapiLiveCeilingDelegatee".to_owned();
+        let narrow_id = format!("napi-narrow-live-ceiling-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi,
+            &narrow_id,
+            &owner_did,
+            &["messages:read"],
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &narrow_id);
+        let narrow = keyless_creator_handle_for(&bi, &narrow_id);
+
+        for (handle, inside) in [(&wide, true), (&narrow, false)] {
+            let evaluation = crate::ucan::ucan_evaluate_on(
+                &bi,
+                handle,
+                token.clone(),
+                Some(cap.clone()),
+                holder_did.clone(),
+                None,
+            )
+            .await
+            .expect("evaluate");
+            assert_eq!(
+                evaluation.within_ceiling, inside,
+                "evaluate must report the supervisor ceiling of the handle's context"
+            );
+            assert!(
+                evaluation.signatures_valid,
+                "evaluate must anchor the chain on the supervisor's creator (inside={inside})"
+            );
+
+            let delegation = crate::ucan::ucan_delegate_on(
+                &bi,
+                handle,
+                holder_did.clone(),
+                delegatee.clone(),
+                token.clone(),
+                vec![cap.clone()],
+            )
+            .await;
+            let validation = crate::ucan::ucan_validate_on(
+                &bi,
+                handle,
+                token.clone(),
+                cap.clone(),
+                holder_did.clone(),
+                None,
+            )
+            .await;
+            if inside {
+                delegation.expect("a delegation inside the wide ceiling must succeed");
+                validation.expect("a validation inside the wide ceiling must succeed");
+            } else {
+                for (call, err) in [
+                    ("delegation", delegation.err()),
+                    ("validation", validation.err()),
+                ] {
+                    let err = err.unwrap_or_else(|| {
+                        panic!("the narrow supervisor ceiling must refuse the {call}")
+                    });
+                    assert!(
+                        err.to_string().to_lowercase().contains("ceiling"),
+                        "the {call} refusal must be the ceiling check: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `ucan_mint_on` signs with the custody this bridge holds for the
+    /// supervisor's creator, not with the custody the handle carries.
+    ///
+    /// The handle carries an unrelated identity's custody and signing key. A
+    /// mint that signed with them would issue a token whose `iss` names the
+    /// creator and whose signature belongs to someone else, and the
+    /// validation below would reject it at the signature check.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_mint_signs_with_the_live_creators_custody_not_the_handle_custody() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let owner_did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed")
+            .inner
+            .did
+            .clone();
+        let holder_did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed")
+            .inner
+            .did
+            .clone();
+        let stranger = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let ctx_id = format!("napi-mint-live-custody-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi,
+            &ctx_id,
+            &owner_did,
+            &["messages:read", "messages:write"],
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        let mut handle = active_handle_for(&bi, &ctx_id, &owner_did);
+        handle
+            .in_memory_custody
+            .clone_from(&stranger.inner.in_memory_custody);
+        handle.signing_key = stranger
+            .inner
+            .scp_identity
+            .as_ref()
+            .map(|identity| identity.active_signing_key);
+        assert!(
+            handle.in_memory_custody.is_some() && handle.signing_key.is_some(),
+            "the fixture's handle must carry the stranger's custody"
+        );
+
+        let token = crate::ucan::ucan_mint_on(
+            &bi,
+            &handle,
+            holder_did.clone(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect("the creator's custody is on this bridge, so the mint must succeed");
+        assert_eq!(
+            token.data.issuer, owner_did,
+            "the issuer is the supervisor's creator"
+        );
+        crate::ucan::ucan_validate_on(
+            &bi,
+            &handle,
+            token.encoded(),
+            format!("scp:ctx:{ctx_id}/messages:write"),
+            holder_did,
+            None,
+        )
+        .await
+        .expect("the token must carry the creator's own signature");
+    }
+
+    /// `ucan_revoke_on` admits the creator the supervisor holds, and refuses
+    /// a revoker who is neither that creator nor the token's issuer, the
+    /// handle's creator included.
+    ///
+    /// The token's issuer is a third identity, so only the creator clause of
+    /// the revocation authorizer can admit either revoker.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_revoke_authorizes_the_supervisor_creator_not_an_outsider() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        // The donor context's owner issues the token; the revocation runs in a
+        // second context with a different supervisor creator.
+        let (bi, _donor, token, _cap, issuer_did, _holder) =
+            active_context_with_token(&scp, &["messages:read", "messages:write"]).await;
+        let creator_did = "did:dht:z6MkNapiRevokeLiveCreator";
+        let ctx_id = format!("napi-revoke-live-creator-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator_did)
+            .await
+            .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        let handle = keyless_creator_handle_for(&bi, &ctx_id);
+        assert_ne!(issuer_did, creator_did);
+        assert_ne!(issuer_did, crate::runtime::KEYLESS_HANDLE_CREATOR);
+
+        for revoker in [OUTSIDER_DID, crate::runtime::KEYLESS_HANDLE_CREATOR] {
+            let err = crate::ucan::ucan_revoke_on(&bi, &handle, token.clone(), revoker.to_owned())
+                .await
+                .expect_err("a revoker that is neither the issuer nor the live creator");
+            assert!(
+                err.to_string().contains("neither the token issuer"),
+                "the refusal of {revoker} must come from BridgeRevocationAuthorizer, got: {err}"
+            );
+        }
+
+        crate::ucan::ucan_revoke_on(&bi, &handle, token, creator_did.to_owned())
+            .await
+            .expect("the supervisor's creator may revoke a token in its context");
+    }
+
+    /// A context no supervisor actor serves fails every lifecycle gate closed.
+    ///
+    /// `register_test_context` registers the bridge's per-context UCAN state
+    /// without spawning an actor, which is the state a completed TTL expiry
+    /// leaves behind. The handle's cached string still reads `"active"`, so a
+    /// gate reading that string would admit join, leave, send, and subscribe
+    /// into a context the supervisor stopped serving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_gates_fail_closed_without_a_supervisor_actor() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-no-actor-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiNoActorCreator";
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+        assert_eq!(handle.state().expect("state"), "active");
+
+        let join = super::context_join_on(&bi, &handle, creator.to_owned(), None)
+            .await
+            .expect_err("join must refuse a context no actor serves");
+        assert!(
+            join.to_string().contains("no live supervisor state"),
+            "join reported: {join}"
+        );
+
+        let leave = super::context_leave_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect_err("leave must refuse a context no actor serves");
+        assert!(
+            leave.to_string().contains("no live supervisor state"),
+            "leave reported: {leave}"
+        );
+
+        let send = super::context_send_on(&bi, &handle, creator.to_owned(), b"hi".to_vec(), None)
+            .await
+            .expect_err("send must refuse a context no actor serves");
+        assert!(
+            send.to_string().contains("no live supervisor state"),
+            "send reported: {send}"
+        );
+
+        let Err(subscribe) = super::subscribe_admission(&bi, &handle).await else {
+            panic!("subscribe must refuse a context no actor serves");
+        };
+        assert!(
+            subscribe.to_string().contains("no live supervisor state"),
+            "subscribe reported: {subscribe}"
+        );
+        assert!(
+            !handle
+                .subscription_active
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a refused subscribe must reset the subscription flag"
+        );
+    }
+
+    /// Join, leave, send, and subscribe refuse a context whose actor is
+    /// resident but reports `Closing`, the state a close another member
+    /// started leaves while this handle's cached string still reads "active".
+    /// A gate weakened to an existence check admits all four here, because the
+    /// actor answers the lifecycle read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_gates_refuse_a_resident_actor_in_closing() {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-closing-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiClosingCreator";
+        // The creator needs `context:close` for the supervisor's close to run.
+        let mut params = ContextParams::default();
+        params.ceiling.push(
+            scp_core::context::roles::Capability::new("context:close")
+                .expect("context:close parses"),
+        );
+        test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+
+        let admitted = super::subscribe_admission(&bi, &handle)
+            .await
+            .expect("an Active context admits a subscription");
+        drop(admitted);
+
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sup.dispatch_lifecycle_command(LifecycleCommand::CloseContext {
+            payload: Box::new(CloseContextPayload {
+                context_id: ctx_id.clone(),
+                params: ContextParams::default(),
+                initiator_did: DID(creator.to_owned()),
+            }),
+            reply: tx,
+        })
+        .await
+        .expect("close dispatch");
+        rx.await.expect("close reply").expect("close must succeed");
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &ctx_id)
+                .await
+                .expect("the resident actor answers"),
+            Some(scp_core::context::ContextState::Closing),
+        );
+        assert_eq!(handle.state().expect("state"), "active");
+
+        let closing = "'closing' state";
+        let join = super::context_join_on(&bi, &handle, creator.to_owned(), None)
+            .await
+            .expect_err("join must refuse a closing context");
+        assert!(join.to_string().contains(closing), "join reported: {join}");
+        let leave = super::context_leave_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect_err("leave must refuse a closing context");
+        assert!(
+            leave.to_string().contains(closing),
+            "leave reported: {leave}"
+        );
+        let send = super::context_send_on(&bi, &handle, creator.to_owned(), b"hi".to_vec(), None)
+            .await
+            .expect_err("send must refuse a closing context");
+        assert!(send.to_string().contains(closing), "send reported: {send}");
+        let Err(subscribe) = super::subscribe_admission(&bi, &handle).await else {
+            panic!("subscribe must refuse a closing context");
+        };
+        assert!(
+            subscribe.to_string().contains(closing),
+            "subscribe reported: {subscribe}"
+        );
+    }
+
+    /// Join, leave, send, and subscribe refuse a context the supervisor still
+    /// holds while its actor is poisoned, mid-respawn, past a failed respawn,
+    /// or not answering, and each refusal carries the supervisor's own answer.
+    ///
+    /// In every case the handle's cached string reads "active" and the gate
+    /// reads the supervisor: a poisoned context reads `Some(Poisoned)` and
+    /// refuses with `ContextPoisoned` (`SCP-CTX-2134`), a context mid-respawn or past a
+    /// failed respawn reads `ActorCrashed` (`SCP-CTX-2135`), and an actor whose
+    /// mailbox does not answer reads `ActorBusy` (`SCP-CTX-2130`). Each row
+    /// asserts the bracketed typed code the TypeScript SDK parses, not a
+    /// message substring, so a mapping that delivered the `SCP-CTX-2001`
+    /// catch-all fails the row. A gate that folded a failed read into `None`
+    /// would report "no live supervisor state" for the last three, and a gate
+    /// that read the cached string would admit all four.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_gates_refuse_a_poisoned_crashed_or_unreachable_actor() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let creator = "did:key:z6MkNapiGateFaultCreator";
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+
+        for (fault, expected) in [
+            ("poisoned", codes::CTX_2134),
+            ("mid_respawn", codes::CTX_2135),
+            ("respawn_failed", codes::CTX_2135),
+            ("unreachable", codes::CTX_2130),
+        ] {
+            let ctx_id = format!("napi-gate-{fault}-{}", uuid::Uuid::new_v4());
+            crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
+                .await
+                .expect("test supervisor context creation must succeed");
+            crate::runtime::register_test_context(&bi, &ctx_id);
+            let handle = active_handle_for(&bi, &ctx_id, creator);
+            match fault {
+                "poisoned" => sup.test_poison_context(&ctx_id).await,
+                "mid_respawn" => sup.test_hold_context_mid_respawn(&ctx_id).await,
+                "respawn_failed" => sup.test_fail_context_respawn(&ctx_id).await,
+                _ => sup.test_make_actor_unreachable(&ctx_id),
+            }
+            assert_eq!(handle.state().expect("state"), "active");
+
+            let join = super::context_join_on(&bi, &handle, creator.to_owned(), None)
+                .await
+                .expect_err("join must refuse");
+            let leave = super::context_leave_on(&bi, &handle, creator.to_owned())
+                .await
+                .expect_err("leave must refuse");
+            let send =
+                super::context_send_on(&bi, &handle, creator.to_owned(), b"hi".to_vec(), None)
+                    .await
+                    .expect_err("send must refuse");
+            let Err(subscribe) = super::subscribe_admission(&bi, &handle).await else {
+                panic!("subscribe must refuse a {fault} context");
+            };
+            for (call, err) in [
+                ("join", join),
+                ("leave", leave),
+                ("send", send),
+                ("subscribe", subscribe),
+            ] {
+                assert!(
+                    err.reason.starts_with(&format!("[{expected}] ")),
+                    "{call} on a {fault} context must carry typed code {expected}, got: {}",
+                    err.reason
+                );
+            }
+            assert!(
+                !handle
+                    .subscription_active
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "a refused subscribe must reset the subscription flag ({fault})"
+            );
+        }
+    }
+
+    /// A Welcome join, a key-package reservation or an invite that meets a
+    /// busy actor reports `SCP-CTX-2130`, one refused because Supervisor
+    /// shutdown began reports `SCP-CTX-2138`, and any other failure reads the
+    /// operation's own code.
+    #[test]
+    fn typed_supervisor_failure_keeps_typed_codes() {
+        use scp_core::context::ContextError;
+        let code_of = |e: crate::error::ScpNapiError| match e {
+            crate::error::ScpNapiError::Context { code, .. } => code,
+            other => panic!("expected ScpNapiError::Context, got {other:?}"),
+        };
+        for fallback in [codes::CTX_2013, codes::CTX_2000] {
+            assert_eq!(
+                code_of(super::typed_supervisor_failure(
+                    "reserve_key_package",
+                    fallback,
+                    &ContextError::ActorBusy("key-package actor".to_owned())
+                )),
+                codes::CTX_2130
+            );
+            assert_eq!(
+                code_of(super::typed_supervisor_failure(
+                    "context_join_from_welcome",
+                    fallback,
+                    &ContextError::SupervisorShutDown("spawn context actor".to_owned())
+                )),
+                codes::CTX_2138
+            );
+            assert_eq!(
+                code_of(super::typed_supervisor_failure(
+                    "context_join_from_welcome",
+                    fallback,
+                    &ContextError::MembershipFailed("bad welcome".to_owned())
+                )),
+                fallback
+            );
+            for (kind, expected) in [
+                (
+                    scp_crypto::CustodyFailureKind::KeyNotFound,
+                    codes::CRYPTO_4006,
+                ),
+                (scp_crypto::CustodyFailureKind::Failed, codes::CRYPTO_4060),
+            ] {
+                let failure = scp_crypto::CustodyFailure {
+                    kind,
+                    detail: "custody detail".to_owned(),
+                };
+                match super::typed_supervisor_failure(
+                    "context_join_from_welcome",
+                    fallback,
+                    &ContextError::Custody(failure),
+                ) {
+                    crate::error::ScpNapiError::Crypto { code, .. } => {
+                        assert_eq!(code, expected);
+                    }
+                    other => panic!("expected a {expected} Crypto error, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// A single or restore-all restore refused because Supervisor shutdown
+    /// began keeps `SCP-CTX-2138`; any other failure reads the site's own
+    /// code (`SCP-CTX-2064` for one context, `SCP-CTX-2065` for restore-all).
+    #[test]
+    fn restore_failures_keep_supervisor_shut_down_typed() {
+        use scp_core::context::ContextError;
+        let code_of = |e: crate::error::ScpNapiError| match e {
+            crate::error::ScpNapiError::Context { code, .. } => code,
+            other => panic!("expected ScpNapiError::Context, got {other:?}"),
+        };
+        for (op, fallback) in [
+            ("restore_context", codes::CTX_2064),
+            ("restore_all_contexts", codes::CTX_2065),
+        ] {
+            assert_eq!(
+                code_of(super::typed_supervisor_failure(
+                    op,
+                    fallback,
+                    &ContextError::SupervisorShutDown("spawn context actor".to_owned()),
+                )),
+                codes::CTX_2138
+            );
+            assert_eq!(
+                code_of(super::typed_supervisor_failure(
+                    op,
+                    fallback,
+                    &ContextError::MembershipFailed("bad snapshot".to_owned()),
+                )),
+                fallback
+            );
+        }
+    }
+
+    /// `context_create` and `context_restore`, called through the bridge
+    /// after the Supervisor's shutdown began, fail with `SCP-CTX-2138`.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_and_restore_after_supervisor_shutdown_keep_ctx_2138() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let owner = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        crate::runtime::init_supervisor(&bi, &owner.inner.did);
+        crate::runtime::supervisor(&bi)
+            .expect("supervisor initialized")
+            .shutdown_all_contexts()
+            .await;
+        let restore = super::context_restore_on(&bi, "0".repeat(64))
+            .await
+            .expect_err("a restore after shutdown must be refused");
+        let create = super::context_create_on(
+            &bi,
+            &owner,
+            r#"{"memoryScope":"ephemeral","ceiling":["messages:read"]}"#.to_owned(),
+        )
+        .await
+        .err()
+        .expect("a create after shutdown must be refused");
+        for (name, err) in [("restore", restore), ("create", create)] {
+            assert!(
+                err.reason.starts_with(&format!("[{}] ", codes::CTX_2138)),
+                "{name}: expected {}, got: {}",
+                codes::CTX_2138,
+                err.reason
+            );
+        }
+    }
+
+    /// `context_create` rejects a params object whose ceiling is absent or
+    /// `null` with `SCP-VALID-7004` and one whose ceiling is an empty array
+    /// with `SCP-VALID-7005`, and creates a context
+    /// whose supervisor-held ceiling and role state carry a non-empty declared
+    /// ceiling as written. The accepted case proves the check does not reject
+    /// every create.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_create_rejects_an_absent_null_or_empty_ceiling() {
+        use scp_core::context::roles::Capability;
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let owner = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+
+        for (params_json, code) in [
+            (r#"{"memoryScope":"ephemeral"}"#, codes::VALID_7004),
+            (
+                r#"{"memoryScope":"ephemeral","ceiling":null}"#,
+                codes::VALID_7004,
+            ),
+            (
+                r#"{"memoryScope":"ephemeral","ceiling":[]}"#,
+                codes::VALID_7005,
+            ),
+        ] {
+            let err = super::context_create_on(&bi, &owner, params_json.to_owned())
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{params_json}: context_create must reject"));
+            assert!(
+                err.reason.starts_with(&format!("[{code}] ")),
+                "{params_json}: expected {code}, got: {}",
+                err.reason
+            );
+        }
+
+        let handle = super::context_create_on(
+            &bi,
+            &owner,
+            r#"{"memoryScope":"ephemeral","ceiling":["messages:write"]}"#.to_owned(),
+        )
+        .await
+        .expect("a non-empty ceiling creates the context");
+        let stored = test_dispatch_context_params(&bi, &handle.context_id).await;
+        assert_eq!(
+            stored.ceiling,
+            vec![Capability::MessagesWrite],
+            "the actor holds the declared ceiling as written"
+        );
+        let sup = std::sync::Arc::clone(
+            crate::runtime::supervisor(&bi).expect("context_create attaches a supervisor"),
+        );
+        let role_state = sup
+            .get_role_state(&handle.context_id)
+            .await
+            .expect("the created context's actor must answer");
+        assert!(
+            role_state.member_has_capability(&handle.creator_did, &Capability::MessagesWrite),
+            "the actor grants the creator the declared messages:write"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Ceiling: required and non-empty (construction.md M2)
+    // -------------------------------------------------------------------
+
+    /// The capability names a parsed ceiling carries.
+    fn parsed_ceiling_names(params_json: &str) -> std::collections::HashSet<String> {
+        super::parse_context_params(params_json)
+            .expect("params must parse")
+            .core
+            .ceiling
+            .iter()
+            .map(|cap| cap.name().into_owned())
+            .collect()
+    }
+
+    /// Asserts `params_json` fails to parse with `code` and a message naming
+    /// `detail`.
+    fn assert_ceiling_required(params_json: &str, code: &str, detail: &str) {
+        let err = super::parse_context_params(params_json)
+            .err()
+            .unwrap_or_else(|| panic!("{params_json} must not parse"));
+        assert!(
+            err.reason.starts_with(&format!("[{code}] ")),
+            "{params_json}: expected {code}, got: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains(detail),
+            "{params_json}: expected the message to name {detail:?}, got: {}",
+            err.reason
+        );
+    }
+
+    /// An absent `ceiling` key rejects as a missing required field
+    /// (`SCP-VALID-7004`): no default ceiling is substituted.
+    #[test]
+    fn parse_context_params_rejects_an_absent_ceiling() {
+        assert_ceiling_required(
+            r#"{"mode":"Encrypted"}"#,
+            codes::VALID_7004,
+            "no `ceiling` was declared",
+        );
+        assert_ceiling_required("{}", codes::VALID_7004, "no `ceiling` was declared");
+    }
+
+    /// A `ceiling` key holding `null` rejects as a missing required field
+    /// (`SCP-VALID-7004`), the same as an absent key.
+    #[test]
+    fn parse_context_params_rejects_a_null_ceiling() {
+        assert_ceiling_required(
+            r#"{"mode":"Encrypted","ceiling":null}"#,
+            codes::VALID_7004,
+            "`ceiling` is null",
+        );
+    }
+
+    /// An empty `ceiling` array rejects as an invalid field value
+    /// (`SCP-VALID-7005`): it describes a context no member can use.
+    #[test]
+    fn parse_context_params_rejects_an_empty_ceiling() {
+        assert_ceiling_required(
+            r#"{"mode":"Encrypted","ceiling":[]}"#,
+            codes::VALID_7005,
+            "`ceiling` is an empty list",
+        );
+    }
+
+    /// A supplied `ceiling` array stands as written, with no default merged in.
+    #[test]
+    fn parse_context_params_keeps_a_supplied_ceiling_as_written() {
+        let actual = parsed_ceiling_names(r#"{"mode":"Encrypted","ceiling":["messages:write"]}"#);
+        assert_eq!(
+            actual,
+            std::iter::once("messages:write".to_owned()).collect::<std::collections::HashSet<_>>()
+        );
+    }
+
+    /// A `ceiling` value that is neither `null` nor an array is a malformed
+    /// declaration, so the parser rejects it with a type error instead of
+    /// reading it as absent.
+    #[test]
+    fn parse_context_params_rejects_a_non_array_ceiling() {
+        let err = super::parse_context_params(r#"{"mode":"Encrypted","ceiling":"messages:write"}"#)
+            .err()
+            .expect("a string ceiling must not parse");
+        assert!(
+            err.to_string().contains("ceiling must be"),
+            "parser reported: {err}"
+        );
+    }
+
+    /// A non-string entry inside the `ceiling` array rejects rather than
+    /// dropping out of the parsed ceiling.
+    ///
+    /// Dropping the entry would build a context whose ceiling is narrower than
+    /// the one the caller wrote, and every later mint, delegate, and validate
+    /// would refuse the missing capability with no record of the parse. The
+    /// `PyO3` bridge rejects the same shape through
+    /// `extract::<Vec<String>>()`.
+    #[test]
+    fn parse_context_params_rejects_a_non_string_ceiling_entry() {
+        let err =
+            super::parse_context_params(r#"{"mode":"Encrypted","ceiling":["messages:write",7]}"#)
+                .err()
+                .expect("a numeric ceiling entry must not parse");
+        assert!(
+            err.to_string().contains("ceiling entries must be"),
+            "parser reported: {err}"
+        );
+    }
+
+    /// A top-level `params_json` that is not a JSON object rejects with
+    /// `SCP-VALID-7000` instead of building a context from every field's
+    /// default, while an object that declares a ceiling parses.
+    ///
+    /// `serde_json`'s index reads `Null` for every key of a non-object value, so
+    /// without the object check an array, a double-encoded string, a number, a
+    /// bool, or `null` would reach the field parsers as if every field were
+    /// undeclared.
+    #[test]
+    fn parse_context_params_rejects_a_non_object_params_json() {
+        for params_json in [
+            "null",
+            "42",
+            "true",
+            r#"["messages:write"]"#,
+            r#""{\"ceiling\":[]}""#,
+        ] {
+            let err = super::parse_context_params(params_json)
+                .err()
+                .unwrap_or_else(|| panic!("{params_json} must not parse"));
+            assert!(
+                err.reason.starts_with(&format!("[{}] ", codes::VALID_7000)),
+                "{params_json} must reject with {}, got: {}",
+                codes::VALID_7000,
+                err.reason
+            );
+            assert!(
+                err.reason.contains("must be a JSON object"),
+                "{params_json} must be rejected by the object check, got: {}",
+                err.reason
+            );
+        }
+        assert_eq!(
+            parsed_ceiling_names(r#"{"ceiling":["messages:write"]}"#),
+            std::iter::once("messages:write".to_owned()).collect::<std::collections::HashSet<_>>()
+        );
+    }
+
+    /// A close of a context whose actor the supervisor despawned succeeds
+    /// idempotently and releases the bridge's per-context UCAN state.
+    ///
+    /// `register_test_context` registers bridge state with no actor, the
+    /// state a completed TTL expiry leaves, and the handle's cached string
+    /// still reads `"active"`. The close already happened, so
+    /// `context_close_on` skips the supervisor dispatch and releases the
+    /// state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_after_the_supervisor_despawned_the_actor_releases_bridge_state() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-close-despawned-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiCloseDespawned";
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        assert!(crate::runtime::ucan_registry(&bi).contains_key(&ctx_id));
+
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+        super::context_close_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect("close of a despawned context must succeed idempotently");
+        assert!(
+            !crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+            "close must release the bridge state for a despawned context"
+        );
+        assert_eq!(handle.state().expect("state"), "closed");
+
+        // A second close stays idempotent: no state to release, no error.
+        super::context_close_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect("a repeated close must stay idempotent");
+    }
+
+    /// A close refuses a context the supervisor holds in its §5.9 cooperative
+    /// closing window and releases none of that context's bridge state.
+    ///
+    /// The `Closing` arm refuses before any capability read, so the outsider
+    /// this test uses gets the refusal the creator would, and the test proves
+    /// the state refusal, not a capability check.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_a_closing_context_and_keeps_its_bridge_state() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read", "messages:write", "context:close"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &identity, params_json)
+            .await
+            .expect("context_create should succeed");
+        let ctx_id = handle.context_id.clone();
+
+        // The creator's authorized close drives the supervisor into the
+        // cooperative window and releases the bridge state, so re-register the
+        // state: this case asks what a close does to a LIVE entry, not to an
+        // absent one.
+        super::context_close_on(&bi, &handle, identity.inner.did.clone())
+            .await
+            .expect("the creator's close should succeed");
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &ctx_id)
+                .await
+                .expect("state read"),
+            Some(scp_core::context::ContextState::Closing),
+            "the creator's close must leave the supervisor inside the cooperative window"
+        );
+
+        let outsider = "did:key:z6MkNapiClosingWindowOutsider".to_owned();
+        let err = super::context_close_on(&bi, &handle, outsider)
+            .await
+            .expect_err("close must refuse a context inside its closing window");
+        assert!(
+            err.to_string()
+                .contains("cannot close context in 'closing'"),
+            "close reported: {err}"
+        );
+        assert!(
+            crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+            "a refused close must leave the bridge state registered"
+        );
+    }
+
+    /// A close refuses a context whose actor the supervisor still holds but
+    /// this bridge could not reach, and releases none of that context's bridge
+    /// state or the handle's cached string.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_a_context_whose_actor_this_bridge_cannot_reach() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-close-unreachable-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiCloseUnreachable";
+        crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
+            .await
+            .expect("the supervisor creates the context");
+        crate::runtime::register_test_context(&bi, &ctx_id);
+
+        crate::runtime::supervisor(&bi)
+            .expect("supervisor")
+            .test_make_actor_unreachable(&ctx_id);
+
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+        let err = super::context_close_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect_err("a close must refuse a context whose actor did not answer");
+        assert!(
+            err.to_string().contains("SCP-CTX-2130"),
+            "the refusal must report the actor-busy code, got: {err}"
+        );
+        assert!(
+            crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+            "a refused close must leave the bridge state registered"
+        );
+        assert_eq!(
+            handle.state().expect("state"),
+            "active",
+            "a refused close must not write the handle's cached string"
+        );
+    }
+
+    /// A close refuses a context whose actor the crash watchdog is respawning,
+    /// and a context whose last respawn failed below the poison threshold, and
+    /// releases none of either context's bridge state.
+    ///
+    /// Neither context has a registered actor, and the supervisor classifies
+    /// both as crashed (ADR-049 §10).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_a_context_the_crash_watchdog_has_not_recovered() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let creator = "did:key:z6MkNapiCloseCrashed";
+
+        for mid_respawn in [true, false] {
+            let ctx_id = format!("napi-close-crashed-{}", uuid::Uuid::new_v4());
+            crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
+                .await
+                .expect("the supervisor creates the context");
+            crate::runtime::register_test_context(&bi, &ctx_id);
+
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+            if mid_respawn {
+                sup.test_hold_context_mid_respawn(&ctx_id).await;
+            } else {
+                sup.test_fail_context_respawn(&ctx_id).await;
+            }
+
+            let handle = active_handle_for(&bi, &ctx_id, creator);
+            let err = super::context_close_on(&bi, &handle, creator.to_owned())
+                .await
+                .expect_err("a close must refuse a context the watchdog has not recovered");
+            assert!(
+                err.to_string().contains("SCP-CTX-2135"),
+                "the refusal must report the actor-crashed code (mid_respawn={mid_respawn}), \
+                 got: {err}"
+            );
+            assert!(
+                crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+                "a refused close must leave the bridge state registered (mid_respawn={mid_respawn})"
+            );
+            assert_eq!(
+                handle.state().expect("state"),
+                "active",
+                "a refused close must not write the handle's cached string"
+            );
+        }
+    }
+
+    /// A close of a poisoned context refuses and keeps the bridge state for
+    /// that id.
+    ///
+    /// The crash watchdog poisons a context once its actor exhausts the
+    /// respawn budget (ADR-049 §10) and despawns the actor, so the supervisor
+    /// reports `Poisoned` and no actor answers. `Poisoned` is not terminal:
+    /// `clear_poison` respawns the actor as `Active`, so a revocation list
+    /// released here would come back empty. The creator, who holds
+    /// `context:close`, gets the refusal.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_a_poisoned_context_and_keeps_its_bridge_state() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-close-poisoned-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiClosePoisoned";
+        crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
+            .await
+            .expect("the supervisor creates the context");
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        assert!(crate::runtime::ucan_registry(&bi).contains_key(&ctx_id));
+
+        crate::runtime::supervisor(&bi)
+            .expect("supervisor")
+            .test_poison_context(&ctx_id)
+            .await;
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &ctx_id)
+                .await
+                .expect("state read"),
+            Some(scp_core::context::ContextState::Poisoned),
+            "the fixture must leave the supervisor reporting Poisoned"
+        );
+
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+        let err = super::context_close_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect_err("close of a poisoned context must refuse");
+        assert!(
+            err.to_string()
+                .contains("cannot close context in 'poisoned' state"),
+            "unexpected refusal: {err}"
+        );
+        assert!(
+            crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+            "a refused close must keep the bridge state for a poisoned context"
+        );
+        assert_eq!(
+            handle.state().expect("state"),
+            "active",
+            "a refused close must not write the handle's cached string"
+        );
     }
 
     /// A rejected direct-execute leaves context membership/role state unchanged
@@ -6565,29 +8406,28 @@ mod tests {
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(!st.role_state.members.contains(victim));
-            Ok(())
-        })
-        .unwrap();
+        assert!(
+            !crate::runtime::live_role_state(&bi, &ctx_id)
+                .await
+                .expect("live role state")
+                .members
+                .contains(victim)
+        );
 
         let fabricated = [0x11u8; 32];
         let result = test_dispatch_execute_by_id(&bi, &ctx_id, fabricated).await;
         assert!(result.is_err(), "forged direct-execute must be rejected");
 
-        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id)
-            .await
-            .unwrap();
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(
-                !st.role_state.members.contains(victim),
-                "rejected forgery must not have added the victim as a member"
-            );
-            Ok(())
-        })
-        .unwrap();
+        assert!(
+            !crate::runtime::live_role_state(&bi, &ctx_id)
+                .await
+                .expect("live role state")
+                .members
+                .contains(victim),
+            "rejected forgery must not have added the victim as a member"
+        );
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
@@ -7533,6 +9373,8 @@ mod tests {
         let core_handle = test_dispatch_create_context(&bi, &ctx_id, params, creator.clone()).await;
 
         // Build a handle with NO retained custody — the externally-loaded shape.
+        // Balances the decrement `NapiContextHandle`'s `Drop` runs.
+        crate::increment_handle_count();
         let handle = NapiContextHandle {
             context_id: ctx_id.clone(),
             state: std::sync::Mutex::new(ContextState::Active),
@@ -7552,6 +9394,7 @@ mod tests {
             bi: std::sync::Arc::clone(&bi),
             instance_id: bi.instance_id(),
         };
+        crate::runtime::track_context_handle(&handle.bi, &handle.context_id);
 
         let err = super::context_export_on(&bi, &handle)
             .await
@@ -7741,6 +9584,672 @@ mod tests {
         assert!(
             reason.contains("SCP-IDENT-1017"),
             "expected SCP-IDENT-1017, got: {reason}"
+        );
+    }
+
+    /// Outlet registration, exposure, and acceptance each refuse a context no
+    /// supervisor actor serves.
+    ///
+    /// Each entry point runs the lifecycle gate before the role-state read, so
+    /// after the despawn the three refusals come from that gate.
+    /// `outlet_register_follows_the_supervisor_ceiling_not_the_bridge_copy`
+    /// covers the value the read returns for registration.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outlet_authorization_fails_closed_without_a_supervisor_actor() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let ctx_id = format!("napi-outlet-no-actor-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiOutletNoActor";
+        // Spawn an actor so the lifecycle gate passes and the role-state read
+        // answers, then drop the actor: the lifecycle gate then refuses all
+        // three entry points before their role-state read runs.
+        crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
+            .await
+            .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+
+        let role_state = crate::runtime::live_role_state(&bi, &ctx_id)
+            .await
+            .expect("a spawned actor answers the role-state read");
+        assert_eq!(role_state.creator_did, creator);
+
+        let expose = crate::outlets::outlet_interface_expose_on(
+            &bi,
+            &handle,
+            "outlet-that-does-not-exist".to_owned(),
+            format!("napi-outlet-target-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .await
+        .expect_err("exposing an unregistered outlet must fail");
+        assert!(
+            expose.to_string().contains("expose_outlet failed"),
+            "expose reported: {expose}"
+        );
+
+        crate::runtime::supervisor(&bi)
+            .expect("supervisor")
+            .despawn_actor(&ctx_id)
+            .await;
+
+        let register = crate::outlets::outlet_register_on(
+            &bi,
+            &handle,
+            outlet_fixture_definition("napi-no-actor-register-probe", creator),
+        )
+        .await
+        .expect_err("registration must refuse a context no actor serves");
+        assert!(
+            register
+                .to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "register reported: {register}"
+        );
+
+        // A malformed definition is refused by its input check before the
+        // lifecycle gate runs.
+        let mut malformed_definition =
+            outlet_fixture_definition("napi-no-actor-malformed-probe", creator);
+        malformed_definition.input_schema_json = "not valid json{{{".to_owned();
+        let malformed = crate::outlets::outlet_register_on(&bi, &handle, malformed_definition)
+            .await
+            .expect_err("a malformed definition must be refused");
+        assert!(
+            malformed.to_string().contains("input_schema_json")
+                && !malformed
+                    .to_string()
+                    .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "the input check must answer before the lifecycle gate, got: {malformed}"
+        );
+
+        let expose = crate::outlets::outlet_interface_expose_on(
+            &bi,
+            &handle,
+            "outlet-that-does-not-exist".to_owned(),
+            format!("napi-outlet-target-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .await
+        .expect_err("exposure must refuse a context no actor serves");
+        assert!(
+            expose
+                .to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "expose reported: {expose}"
+        );
+
+        let accept = crate::outlets::outlet_interface_accept_on(&bi, &handle, "{}".to_owned())
+            .await
+            .expect_err("acceptance must refuse a context no actor serves");
+        assert!(
+            accept
+                .to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "accept reported: {accept}"
+        );
+    }
+
+    /// An outlet definition with a valid schema pair, for the outlet tests
+    /// below.
+    #[cfg(feature = "testing")]
+    fn outlet_fixture_definition(
+        name: &str,
+        operator_did: &str,
+    ) -> crate::outlets::NapiOutletDefinition {
+        crate::outlets::NapiOutletDefinition {
+            name: name.to_owned(),
+            description: "an outlet test fixture".to_owned(),
+            kind: crate::outlets::NapiOutletKind::Action,
+            input_schema_json:
+                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                    .to_owned(),
+            output_schema_json: r#"{"type":"object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: operator_did.to_owned(),
+            cost: None,
+        }
+    }
+
+    /// `outlet_stream_open_on` gates on the live lifecycle before the UCAN
+    /// pipeline reads the role state, so a context no actor serves refuses with
+    /// the withheld text and `SCP-OUTLET-6005`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_open_withholds_an_absent_actor_before_authorization() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-stream-open-no-actor-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiStreamOpenNoActor";
+        crate::runtime::register_test_context(&bi, &ctx_id);
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+
+        let err = crate::outlet_stream::outlet_stream_open_on(
+            &bi,
+            &handle,
+            "probe-outlet".to_owned(),
+            "{}".to_owned(),
+            creator.to_owned(),
+            "bogus.jwt.token".to_owned(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("no supervisor actor must refuse the stream open");
+        let text = err.to_string();
+        assert!(
+            text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                && text.contains(codes::OUTLET_6005),
+            "the refusal must come from the lifecycle gate: {text}"
+        );
+        assert!(
+            !text.contains(&ctx_id) && !text.contains("no live supervisor role state"),
+            "the refusal must not report the absent actor or echo the id: {text}"
+        );
+    }
+
+    /// `outlet_stream_open_on` builds bridge UCAN state only after the
+    /// lifecycle gate admits the context: a context no actor serves refuses
+    /// and leaves no registry entry, while a live context gets its entry built
+    /// before the UCAN pipeline rejects the token.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_open_builds_bridge_state_only_after_the_gate() {
+        let creator = "did:key:z6MkNapiStreamOpenStateOrder";
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let open = |ctx_id: String| {
+            let bi = Arc::clone(&bi);
+            async move {
+                let handle = active_handle_for(&bi, &ctx_id, creator);
+                crate::outlet_stream::outlet_stream_open_on(
+                    &bi,
+                    &handle,
+                    "probe-outlet".to_owned(),
+                    "{}".to_owned(),
+                    creator.to_owned(),
+                    "bogus.jwt.token".to_owned(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("a bogus token never opens a stream")
+            }
+        };
+
+        let absent = format!("napi-stream-open-absent-state-{}", uuid::Uuid::new_v4());
+        let err = open(absent.clone()).await;
+        assert!(
+            err.to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "the lifecycle gate must refuse: {err}"
+        );
+        assert!(
+            !crate::runtime::ucan_registry(&bi).contains_key(&absent),
+            "a refused stream open must not build bridge state"
+        );
+
+        let live = format!("napi-stream-open-live-state-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi,
+            &live,
+            creator,
+            &["messages:write"],
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        let err = open(live.clone()).await;
+        assert!(
+            !err.to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "a live context must pass the lifecycle gate: {err}"
+        );
+        assert!(
+            crate::runtime::ucan_registry(&bi).contains_key(&live),
+            "an admitted stream open must build bridge state"
+        );
+    }
+
+    /// `outlet_register_on` refuses the creator when the supervisor ceiling
+    /// omits `outlet:register`, although the handle's ceiling carries it, and
+    /// admits the creator once the supervisor ceiling carries it.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outlet_register_follows_the_supervisor_ceiling_not_the_bridge_copy() {
+        let creator = "did:dht:z6MkNapiRegisterLiveCeiling";
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+
+        let narrow = format!("napi-register-narrow-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi,
+            &narrow,
+            creator,
+            &["messages:write"],
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &narrow);
+        let err = crate::outlets::outlet_register_on(
+            &bi,
+            &wide_ceiling_handle_for(&bi, &narrow, creator),
+            outlet_fixture_definition("napi-narrow-ceiling-probe", creator),
+        )
+        .await
+        .expect_err("a supervisor ceiling without outlet:register must refuse registration");
+        assert!(
+            err.to_string().contains("OutletRegister")
+                && err.to_string().contains(codes::OUTLET_6001),
+            "the refusal must name the missing capability: {err}"
+        );
+
+        let wide = format!("napi-register-wide-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi,
+            &wide,
+            creator,
+            &["messages:write", "outlet:register"],
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &wide);
+        crate::outlets::outlet_register_on(
+            &bi,
+            &wide_ceiling_handle_for(&bi, &wide, creator),
+            outlet_fixture_definition("napi-wide-ceiling-probe", creator),
+        )
+        .await
+        .expect("a supervisor ceiling carrying outlet:register must admit registration");
+    }
+
+    /// Outlet invocation, cross-context invocation, session invocation,
+    /// exposure and acceptance pass with the ceiling, roles and creator the
+    /// supervisor holds. Both handles name
+    /// `crate::runtime::KEYLESS_HANDLE_CREATOR`, so a call that took the
+    /// creator from a handle fails.
+    #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outlet_authorization_follows_the_supervisor_not_the_bridge_copy() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let (bi, target, _token, _cap, owner_did, holder_did) = active_context_with_token(
+            &scp,
+            &[
+                "messages:read",
+                "messages:write",
+                "outlet:register",
+                "outlet:call:*",
+                "role:assign",
+            ],
+        )
+        .await;
+        let target_id = target.context_id();
+        let source_id = format!("napi-outlet-live-source-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(&bi, &source_id, &owner_did)
+            .await
+            .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &source_id);
+        let source = keyless_creator_handle_for(&bi, &source_id);
+
+        let outlet_id = crate::outlets::outlet_register_on(
+            &bi,
+            &target,
+            outlet_fixture_definition("napi-live-authz-probe", &owner_did),
+        )
+        .await
+        .expect("the supervisor ceiling carries outlet:register");
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        sup.test_insert_member(&target_id, DID(holder_did.clone()), "member")
+            .await
+            .expect("test_insert_member seeds the holder as a member");
+        sup.test_grant_member_capability(&target_id, DID(holder_did.clone()), "outlet_call:*")
+            .await
+            .expect("grant OutletCallAll to the member holder");
+        let mut tokens = Vec::new();
+        for _ in 0..3 {
+            tokens.push(
+                crate::ucan::ucan_mint_on(
+                    &bi,
+                    &target,
+                    holder_did.clone(),
+                    vec!["outlet_call:*".to_owned()],
+                    None,
+                )
+                .await
+                .expect("the supervisor ceiling carries outlet_call:*")
+                .encoded(),
+            );
+        }
+        let session_id = crate::outlets::outlet_session_create_on(
+            &bi,
+            &target,
+            outlet_id.clone(),
+            source_id.clone(),
+            None,
+        )
+        .await
+        .expect("session creation must succeed");
+
+        let input = r#"{"a":"x","b":1}"#;
+
+        crate::outlets::outlet_invoke_on(
+            &bi,
+            &target,
+            outlet_id.clone(),
+            input.to_owned(),
+            holder_did.clone(),
+            tokens[0].clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("invocation authorizes against the supervisor ceiling and creator");
+        crate::outlets::outlet_invoke_cross_context_on(
+            &bi,
+            &source,
+            &target,
+            outlet_id.clone(),
+            input.to_owned(),
+            holder_did.clone(),
+            tokens[1].clone(),
+            1,
+            None,
+        )
+        .await
+        .expect("cross-context invocation authorizes against the target's supervisor state");
+        crate::outlets::outlet_session_invoke_on(
+            &bi,
+            &target,
+            session_id,
+            input.to_owned(),
+            holder_did.clone(),
+            tokens[2].clone(),
+            None,
+        )
+        .await
+        .expect("session invocation authorizes against the supervisor ceiling and creator");
+        let interface =
+            crate::outlets::outlet_interface_expose_on(&bi, &target, outlet_id, source_id, None)
+                .await
+                .expect("the supervisor's creator holds role:assign in the target");
+        crate::outlets::outlet_interface_accept_on(&bi, &source, interface)
+            .await
+            .expect("the supervisor's creator holds role:assign in the source");
+    }
+
+    /// Each outlet entry point this test calls refuses a context whose actor is
+    /// resident but reports `Closing`, with its own outlet code and the withheld text,
+    /// and names neither the lifecycle state nor the context id.
+    ///
+    /// The actor still answers the role-state read, so an entry point that
+    /// dropped its gate would reach its authorization or its registry instead.
+    /// Each cross-context entry point is called twice, once with the closing
+    /// context as the source and once as the target, so each axis's gate is
+    /// exercised alone.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn called_outlet_entry_points_refuse_a_resident_actor_in_closing() {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let (bi, closing, token, _capability, owner_did, _holder_did) = active_context_with_token(
+            &scp,
+            &[
+                "messages:read",
+                "messages:write",
+                "context:close",
+                "outlet:register",
+            ],
+        )
+        .await;
+        let closing_id = closing.context_id();
+        let active_id = format!("napi-outlet-active-peer-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(&bi, &active_id, &owner_did)
+            .await
+            .expect("test supervisor context creation must succeed");
+        let active = active_handle_for(&bi, &active_id, &owner_did);
+
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sup.dispatch_lifecycle_command(LifecycleCommand::CloseContext {
+            payload: Box::new(CloseContextPayload {
+                context_id: closing_id.clone(),
+                params: ContextParams::default(),
+                initiator_did: DID(owner_did.clone()),
+            }),
+            reply: tx,
+        })
+        .await
+        .expect("close dispatch");
+        rx.await.expect("close reply").expect("close must succeed");
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &closing_id)
+                .await
+                .expect("the resident actor answers"),
+            Some(scp_core::context::ContextState::Closing),
+        );
+        assert!(
+            crate::runtime::live_role_state(&bi, &closing_id)
+                .await
+                .is_ok(),
+            "the closing actor still answers the role-state read, so only the gate can refuse"
+        );
+
+        let outlet_id = scp_ffi_common::outlet_id::generate_outlet_id("napi-closing-probe");
+        let input = r#"{"a":"x","b":1}"#;
+        let results: Vec<(&str, &str, Result<(), napi::Error>)> = vec![
+            (
+                "register",
+                codes::OUTLET_6003,
+                crate::outlets::outlet_register_on(
+                    &bi,
+                    &closing,
+                    outlet_fixture_definition("napi-closing-register-probe", &owner_did),
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "invoke",
+                codes::OUTLET_6005,
+                crate::outlets::outlet_invoke_on(
+                    &bi,
+                    &closing,
+                    outlet_id.clone(),
+                    input.to_owned(),
+                    owner_did.clone(),
+                    token.clone(),
+                    None,
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "verify",
+                codes::OUTLET_6007,
+                crate::outlets::outlet_verify_on(&bi, &closing, outlet_id.clone())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "session_create",
+                codes::OUTLET_6014,
+                crate::outlets::outlet_session_create_on(
+                    &bi,
+                    &closing,
+                    outlet_id.clone(),
+                    active_id.clone(),
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "session_invoke",
+                codes::OUTLET_6017,
+                crate::outlets::outlet_session_invoke_on(
+                    &bi,
+                    &closing,
+                    "napi-closing-session".to_owned(),
+                    input.to_owned(),
+                    owner_did.clone(),
+                    token.clone(),
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "expose",
+                codes::OUTLET_6030,
+                crate::outlets::outlet_interface_expose_on(
+                    &bi,
+                    &closing,
+                    outlet_id.clone(),
+                    active_id.clone(),
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "accept",
+                codes::OUTLET_6032,
+                crate::outlets::outlet_interface_accept_on(&bi, &closing, "{}".to_owned())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "stream_open",
+                codes::OUTLET_6005,
+                crate::outlet_stream::outlet_stream_open_on(
+                    &bi,
+                    &closing,
+                    outlet_id.clone(),
+                    input.to_owned(),
+                    owner_did.clone(),
+                    token.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "cross_context source",
+                codes::OUTLET_6010,
+                crate::outlets::outlet_invoke_cross_context_on(
+                    &bi,
+                    &closing,
+                    &active,
+                    outlet_id.clone(),
+                    input.to_owned(),
+                    owner_did.clone(),
+                    token.clone(),
+                    1,
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "cross_context target",
+                codes::OUTLET_6011,
+                crate::outlets::outlet_invoke_cross_context_on(
+                    &bi,
+                    &active,
+                    &closing,
+                    outlet_id.clone(),
+                    input.to_owned(),
+                    owner_did.clone(),
+                    token.clone(),
+                    1,
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "cross_context_saga caller",
+                codes::OUTLET_6010,
+                crate::outlets::outlet_invoke_cross_context_saga_on(
+                    &bi,
+                    &closing,
+                    &active,
+                    owner_did.clone(),
+                    outlet_id.clone(),
+                    input.to_owned(),
+                    "0123456789abcdef0123456789abcdef".to_owned(),
+                    1,
+                    1,
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "cross_context_saga target",
+                codes::OUTLET_6011,
+                crate::outlets::outlet_invoke_cross_context_saga_on(
+                    &bi,
+                    &active,
+                    &closing,
+                    owner_did.clone(),
+                    outlet_id.clone(),
+                    input.to_owned(),
+                    "0123456789abcdef0123456789abcdef".to_owned(),
+                    1,
+                    1,
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+        ];
+        for (call, code, result) in results {
+            let Err(err) = result else {
+                panic!("{call} must refuse a closing context");
+            };
+            let text = err.to_string();
+            assert!(
+                text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD) && text.contains(code),
+                "{call} must refuse with the withheld text and {code}: {text}"
+            );
+            assert!(
+                !text.to_lowercase().contains("closing") && !text.contains(&closing_id),
+                "{call} must name neither the lifecycle state nor the context id: {text}"
+            );
+        }
+    }
+
+    /// `outlet_session_close_on` on a context with no `UcanContextState` on this
+    /// bridge instance reports `SCP-OUTLET-6021` and builds no registry entry.
+    ///
+    /// The call carries no lifecycle gate and authorizes nothing; building the
+    /// entry would resurrect per-context state `context_close_on` released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_close_without_bridge_state_builds_none() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let ctx_id = format!("napi-session-close-no-state-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiSessionCloseNoState";
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+        assert!(!crate::runtime::ucan_registry(&bi).contains_key(&ctx_id));
+
+        let err =
+            crate::outlets::outlet_session_close_on(&bi, &handle, "napi-no-session".to_owned())
+                .await
+                .expect_err("a context with no bridge state holds no session");
+        assert!(
+            err.to_string().contains(codes::OUTLET_6021),
+            "session close reported: {err}"
+        );
+        assert!(
+            !crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+            "session close must not build bridge state"
         );
     }
 }

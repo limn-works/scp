@@ -3,9 +3,32 @@
 An SCP self-hosted site is an ordinary Rust program that calls
 [`scp_node::host_site`](../../crates/scp-node/examples/website.rs) — the SCP node *is* the
 web server (content is published as encrypted broadcast blobs and decrypted on serve; there is
-no separate web server and no DNS requirement on the origin). See the runnable example at
+no separate web server and no DNS requirement on the origin). See the example at
 `crates/scp-node/examples/website.rs` and the background guide
 [`self-hosting-a-website-on-scp.md`](./self-hosting-a-website-on-scp.md).
+
+On every build without `scp-node`'s `testing` feature, `host_site` fails closed when it has
+to create an identity, returning
+`HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend))`, a typed
+value a caller matches without reading the message text. `host_site` first
+reloads any identity its storage directory holds, and creates one on `Node::start`'s
+`Generate` path only when the directory holds none. On a build without `testing`, that path
+returns `NoPreRotationBackend` whatever custody or storage the caller supplies: it takes no
+`PreRotationCustody` input. A failed run persists no identity, so the next run against the
+same directory takes the same path. So on a shipped build, each recipe below fails on every
+run whose `storage_path` directory holds no identity, and its `Verify` step cannot succeed.
+No build creates an identity without a test-harness stand-in until a production
+`PreRotationCustody` backend exists ([#1729](https://github.com/limn-works/scp/issues/1729)):
+a `testing` build mints it through `InMemoryPreRotationCustody`, which holds the
+pre-rotation key only in process memory, so the reveal that spec §9.7.4.1 item 4 says
+recovers a root compromise is unreachable for that identity.
+
+A shipped build that finds an identity in its `storage_path` directory reloads it and serves,
+without checking how it was created ([#2558](https://github.com/limn-works/scp/issues/2558)).
+Each recipe uses `storage_path: Some("./data")`, so a recipe run once from a `testing` build
+leaves an identity that a shipped build then serves with. Never point a shipped build at a
+directory a `testing` build wrote. `crates/scp-node/examples/README.md` states the same limits
+for the example.
 
 What changes between deployments is **not the code** — it's a few `HostSiteConfig` fields plus
 the surrounding network plumbing. The same `host_site` call powers all three recipes below; each
@@ -17,18 +40,22 @@ The three knobs that matter:
 |---|---|
 | `reach: Reach` | `Reach::NatTraversal` = probe the external address (STUN) and open a router port via NAT-PMP/UPnP (needs `--features upnp`). `Reach::Tunnel { public_url }` = the tunnel provides external reachability; skip NAT probing entirely. *(Note: `public_url` is not yet threaded — the node publishes a loopback URL and emits a runtime warning; reachability comes from the tunnel/proxy itself, not this field.)* `Reach::Local` = no probing; loopback only (dev/demo). *(Only these three variants are valid for `host_site`. `Reach::Domain` is valid in `NodeConfig` but returns `HostSiteError::InvalidConfig` here.)* |
 | `tls: TlsMode` | `TlsMode::SelfSigned` (default) = serve self-signed HTTPS (be-your-own-CA, no DNS). `TlsMode::Plaintext` = serve plain HTTP (for when a tunnel or proxy terminates TLS in front). *(Only these two variants are valid for `host_site`. `Acme`/`Terminated`/`Custom` are valid in `NodeConfig` but return `HostSiteError::InvalidConfig` here.)* |
-| `dht: DhtMode` | `DhtMode::Memory` (default) = never publish this node's address (fail-safe default). `DhtMode::Production` = publish the node's public address bound to its DID to the global Mainline DHT — an IP-to-identity / approximate-location disclosure, and a deliberate opt-in. |
+| `dht: DhtMode` | `DhtMode::Disabled` (default) = turn the DHT layer off, so the node publishes nothing (it discloses no address) and its DHT resolution arm answers `Ok(None)`. `DhtMode::Production` = publish the node's public address bound to its DID to the global Mainline DHT — an IP-to-identity / approximate-location disclosure, and a deliberate opt-in. A third variant, `DhtMode::Memory`, compiles only under `scp-node`'s `testing` feature, because ADR-062, capability injection, made it test-harness-only. A build that does not enable `testing` cannot name it. |
 
 ---
 
 > **Annotation, 2026-09-13.** Everything below is the record as its author wrote it on the
-> date this file carries, restored unedited. The identity model it reads — the Mainline distributed hash table and the identifier written as a `did:` string — was
+> date this file carries, restored unedited except for one later rename: four lines
+> below (Recipe 1's IP-exposure trade-off, the Recipe 2 and Recipe 3 code comments, and the
+> `dht` row of the At a glance table) replaced `DhtMode::Memory` with `DhtMode::Disabled`,
+> because `Disabled` is now the no-publish default and `Memory` compiles only under
+> `testing`. The identity model it reads — the Mainline distributed hash table and the identifier written as a `did:` string — was
 > replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity substrate,
 > whose rules `.docs/specs/09-security-model.md` §9.7.4.2 and `.docs/specs/03-identity.md`
 > §3.10 carry, and whose curve Alec settled on 2026-09-10 as ECDSA on NIST P-256
 > (`.docs/specs/09-security-model.md` §9.5). A record of what a named party read on a named
 > date states what that party read, so this annotation records what replaced the model and
-> no sentence below is edited to match.
+> no other sentence below is edited to match.
 
 ## Recipe 1 — Direct (raw public IP, no operator)
 
@@ -67,7 +94,7 @@ External infrastructure:
 Trade-offs:
 
 - **IP exposure:** every visitor sees your machine's public IP. With `dht: DhtMode::Production` that
-  IP is additionally bound to your node's DID in the global DHT. Use `dht: DhtMode::Memory` to keep
+  IP is additionally bound to your node's DID in the global DHT. Use `dht: DhtMode::Disabled` to keep
   the address out of the DHT and share the raw IP out-of-band instead.
 - **Certificate:** self-signed, so browsers show a warning. A browser-trusted cert without a CA
   dependency requires a DNS name + ACME, which reintroduces DNS — out of scope for the pure path.
@@ -89,7 +116,7 @@ host_site(HostSiteConfig {
     site_dir: Some("./site".into()),
     storage_path: Some("./data".into()),
     // tls defaults to TlsMode::SelfSigned — self-signed HTTPS origin; tunnel connects noTLSVerify
-    // dht defaults to DhtMode::Memory — don't publish; the tunnel hostname is the address
+    // dht defaults to DhtMode::Disabled — don't publish; the tunnel hostname is the address
     ..HostSiteConfig::defaults(Reach::Tunnel {
         public_url: "https://example.com".into(),  // the tunnel provides reachability; no NAT probe
     })
@@ -136,7 +163,7 @@ host_site(HostSiteConfig {
     site_dir: Some("./site".into()),
     storage_path: Some("./data".into()),
     tls: TlsMode::Plaintext,         // node serves plain HTTP on loopback; proxy adds TLS
-    // dht defaults to DhtMode::Memory
+    // dht defaults to DhtMode::Disabled
     ..HostSiteConfig::defaults(Reach::Tunnel {
         public_url: "https://example.com".into(),  // the proxy faces the internet, not the node
     })
@@ -187,7 +214,7 @@ Verify: `curl https://example.com/`; locally `curl http://127.0.0.1:8443/`.
 |---|---|---|---|
 | `reach` | `Reach::NatTraversal` | `Reach::Tunnel { public_url }` | `Reach::Tunnel { public_url }` |
 | `tls` | `TlsMode::SelfSigned` (default) | `TlsMode::SelfSigned` (default) | `TlsMode::Plaintext` (or `SelfSigned`) |
-| `dht` | `DhtMode::Production` or `Memory` | `DhtMode::Memory` (default) | `DhtMode::Memory` (default) |
+| `dht` | `DhtMode::Production` or `Disabled` | `DhtMode::Disabled` (default) | `DhtMode::Disabled` (default) |
 | Third-party operator in path | none | the tunnel edge | none (you run the proxy) |
 | Home IP exposed | yes | no | only if proxy is on the same machine |
 | Browser-trusted cert | no (self-signed) | yes (edge) | yes (proxy ACME) |

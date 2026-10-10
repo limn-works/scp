@@ -1,195 +1,19 @@
-# Phase 5 Architecture Decision Records — Bridges, Media, Apple Platform, Swift SDK
+# Phase 5 Architecture Decision Records — Media, Apple Platform, Swift SDK
 
 **Date:** February 23, 2026
-**Phase goal:** Platform bridge infrastructure, real-time media transport, Apple platform, Swift SDK.
+**Phase goal:** Real-time media transport, Apple platform, Swift SDK.
 **Timeline:** Weeks 17-20
 **Dependencies between ADRs:**
 
 ```
 Phase 1-4 ADRs
        |
-       ├── ADR-023 (Bridges) <── ADR-019 (Provenance), ADR-008 (Governance)
        ├── ADR-024 (Media) <── ADR-001 (MLS), ADR-018 (TTL/Ceiling)
        ├── ADR-025 (Apple) <── Phase 1-2 Rust + ADR-021 (UniFFI)
        └── ADR-026 (Swift) <── ADR-021 (UniFFI) + ADR-025 (Apple)
 ```
 
-Build order: ADR-023 + ADR-024 (parallel, both depend on Phase 1-4) --> ADR-025 (depends on Phase 1-2 Rust + ADR-021) --> ADR-026 (depends on ADR-021 + ADR-025)
-
----
-
-## ADR-023: Bridge Connector Protocol
-
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
-
-**Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, left an identity one operational role, so a bridge operator holds no second key on its own identity. `09-security-model.md` §9.1 invariant 1 states the replacing model and records that its delegation anchor is unspecified, so the bridge signs under the operator's `#active` key until that anchor lands.
-
-**Amendment (2026-09-10 — the connector signature is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `signature` field on this ADR's signed connector structure carries the type `P256Signature`. No other sentence of this ADR names a curve, so the ruling reaches its wire type and no decision in it.
-
-### Context
-
-Spec §12 comprehensively specifies bridge architecture. Bridges are protocol entities (not agents) that translate between external platforms and SCP. They have an accountable operator identity, operate in one of four modes, and create shadow identities for external platform participants. All bridged content carries full provenance chain. Shadow claiming via identity attestation enables users to transition from shadow to native SCP identity.
-
-### Decision
-
-Implement bridge support in `scp-core/bridge/`. Bridge connector as registered protocol entity with an accountable operator identity. The bridge operator signs bridge protocol messages with its `#active` key, because a human identity's key state names one operational role and names no agent key. Shadow identities as restricted participants (observer default). Four operating modes (Relay, Puppet, Api, Cooperative). All bridged content carries full provenance chain. Shadow claiming via identity attestation (§3.5) is one-way and irreversible.
-
-### Rationale
-
-- **Protocol entity over agent:** Bridges are not agents — they don't exercise judgment or make decisions. They translate between external platforms and SCP mechanically. Making them a distinct entity type prevents confusion with agents and enforces different trust evaluation (bridges are trusted to translate faithfully, not to act autonomously).
-- **Accountable operator identity:** Every bridge has a human operator whose identifier is visible in context metadata. This satisfies the "human accountability" protocol tenet — bridged actions trace to the bridge operator, and through the bridge to the external platform participant.
-- **Shadow identities over anonymous bridging:** External platform participants don't have SCP identities. Shadow identities give them protocol-level representation (with provenance) rather than attributing everything to the bridge operator. Shadows are restricted by default (observer role) to prevent capability escalation through bridges.
-- **One-way claiming:** Once a shadow is claimed (bound to an identifier via identity attestation), the binding is permanent. This prevents identity confusion and simplifies attribution — historical actions are retroattributed once and for all.
-- **Four modes for different integration depths:** Relay (read-only mirroring), Puppet (bridge acts on behalf of external user), Api (platform API integration), Cooperative (native SCP support on external platform). Each mode has different trust implications visible before opt-in.
-
-### Implementation
-
-- **Language:** Rust
-- **Crate:** `scp-core` (bridge protocol types), `scp-bridge/*` (per-platform implementations)
-- **Module:** `scp-core/bridge/`
-
-### Dependencies
-
-- **ADR-008 (Context Governance):** Bridge registration requires context governance approval. Bridge revocation is a governance action.
-- **ADR-003 (identity attestation):** Shadow claiming uses identity attestation (§3.5) to bind an external handle to an identifier.
-- **ADR-019 (Data Provenance):** All bridged content carries `BridgeProvenance` extending `DataProvenance`.
-- **ADR-011 (Event Log):** Bridge registration, shadow creation, and claiming are context events.
-
-### Acceptance Criteria
-
-1. **Key types:**
-
-```rust
-pub struct BridgeConnector {
-    pub bridge_id: String,
-    pub operator_did: [u8; 32],
-    pub platform: String,
-    pub mode: BridgeMode,
-    pub status: BridgeStatus,
-    pub registration_context: ContextId,
-    pub registered_at: u64,
-}
-
-pub enum BridgeMode {
-    Relay,        // Read-only mirroring from external platform
-    Puppet,       // Bridge acts on behalf of external users
-    Api,          // Platform API integration
-    Cooperative,  // Native SCP support on external platform
-}
-
-pub enum BridgeStatus {
-    Active,
-    Suspended,
-    Revoked,
-}
-
-pub struct ShadowIdentity {
-    pub shadow_id: String,
-    pub platform_handle: String,
-    pub bridge_id: String,
-    pub attributed_role: String,     // Default: "observer"
-    pub provenance_status: ShadowProvenanceStatus,
-    pub created_at: u64,
-}
-
-pub enum ShadowProvenanceStatus {
-    Shadow,   // Unclaimed — attributed via bridge
-    Claimed,  // Bound to an identifier via identity attestation
-}
-
-/// Extension of DataProvenance for bridged content.
-pub struct BridgeProvenance {
-    pub base: DataProvenance,
-    pub originating_platform: String,
-    pub bridge_connector_id: String,
-    pub operator_did: [u8; 32],
-    pub bridge_mode: BridgeMode,
-    pub shadow_status: ShadowProvenanceStatus,
-}
-
-pub struct ClaimRequest {
-    pub shadow_id: String,
-    pub claimant_did: [u8; 32],
-    pub platform_handle: String,
-    pub identity_attestation: Attestation,  // §3.5 attestation binding handle to identifier
-    pub timestamp: u64,
-    pub signature: P256Signature,
-}
-
-// claim_shadow returns Result<ShadowClaimEvent, ClaimError>
-
-pub enum ClaimError {
-    HandleMismatch,
-    AttestationInvalid,
-    AlreadyClaimed,
-    ShadowNotFound,
-}
-```
-
-2. **Bridge registration:**
-   - The operator presents a registration request to context governance.
-   - Context governance approves or rejects. The approver must be a different identity from the operator (self-approval is forbidden).
-   - Registered bridge visible in context metadata (visible before opt-in, per legibility tenet).
-   - Registration is a context event in the Merkle log.
-
-3. **Shadow identity creation:**
-   - Bridge creates protocol entity per external platform participant.
-   - Shadow carries platform handle, bridge reference, and operating mode.
-
-4. **Shadow default role:**
-   - Observer-equivalent with restricted capabilities.
-   - Cannot exercise capabilities requiring verified identity.
-   - Specific role upgradeable by context governance.
-
-5. **Provenance marking:**
-   - All actions/content attributed to shadow identities carry `BridgeProvenance`.
-   - `BridgeProvenance` includes: originating platform, bridge connector ID, operator identifier, operating mode, shadow/claimed status.
-   - No shadow action mistakable for native SCP action.
-
-6. **Trust hierarchy (two axes per §12.5):**
-   - Native identity + native transport (strongest).
-   - Native identity + bridged transport.
-   - Claimed shadow + historical bridged.
-   - Shadow + bridged (weakest).
-   - Both identity confidence and transport confidence factor into evaluation.
-
-7. **Shadow claiming:**
-   - Claimant publishes identity attestation (§3.5) binding an external handle to its identifier.
-   - Protocol verifies attestation matches shadow's platform handle.
-   - Shadow retired, historical actions retroattributed to the claimant's identifier.
-
-8. **Claiming is one-way and irreversible:**
-   - Claimed shadow cannot be unclaimed.
-   - Claimed shadow cannot be re-assigned to a different identity.
-
-9. **Bridge revocation:**
-   - Context governance removes bridge at any time.
-   - Severing bridge disconnects all shadow identities from external platform.
-   - Shadows retain their attributed actions but can no longer receive/send.
-
-10. **Context isolation:**
-    - Bridge in Context A has zero access to Context B.
-    - Same platform bridged into two contexts = two separate bridge instances with separate registrations.
-
-11. **Self-hosted bridges:**
-    - Protocol treats self-hosted and managed identically.
-    - Self-hosted eliminates third-party credential delegation (puppet mode).
-
-### Scope
-
-**Files (~5):**
-
-| File | Purpose |
-|------|---------|
-| `mod.rs` | Module root, `BridgeConnector`, `BridgeMode`, `ShadowIdentity`, re-exports |
-| `registration.rs` | Bridge registration, governance approval, context metadata integration |
-| `shadow.rs` | Shadow identity creation, role management, provenance status |
-| `claiming.rs` | `ClaimRequest`, `ClaimError`, attestation verification, retroattribution |
-| `provenance.rs` | `BridgeProvenance`, provenance marking for bridged content |
-
-Per-platform bridge adapter implementations are built on these primitives.
-
-**Estimated functions:** ~15 public functions, ~10 internal helpers.
+Build order: ADR-024 (depends on Phase 1-4) --> ADR-025 (depends on Phase 1-2 Rust + ADR-021) --> ADR-026 (depends on ADR-021 + ADR-025)
 
 ---
 
@@ -328,13 +152,13 @@ WebRTC library integration is platform-specific (webrtc-rs for native, browser W
 
 ## ADR-025: Apple Platform Adapter
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling and the passkey root custody ruling) and 2026-09-29 (SCP-307, `derivePseudonym` returns the pseudonym point) and 2026-09-27 (the device-attestation binding and offline verification, the bind and byte-count requirements of `AppleStorage`, and the typed `ScpError` the adapter throws when App Attest is unavailable) — see the amendments below.
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling and the passkey root custody ruling) and 2026-09-27 (the device-attestation binding and offline verification, the bind and byte-count requirements of `AppleStorage`, and the typed `ScpError` the adapter throws when App Attest is unavailable) and 2026-09-28 (the adapter handing `challenge` to `attestKey` unchanged and rejecting a `challenge` that is not 32 bytes before it generates a key or calls Apple, the 32-byte `requestHash` check of `assertRequest`, and the Rust core, not the adapter, publishing the attestation object and stripping `receipt`) and 2026-09-29 (SCP-307, `derivePseudonym` returns the pseudonym point; acceptance criterion 4: the `registerPush` name, the token bytes and `ScpError` of `ApplePushProvider`, the fixed wake signal its `handleNotification` returns, its rejection of received bytes that differ from the permitted payload by more than JSON whitespace outside string literals, its conformance to the UniFFI `PushProvider` protocol, and the §10.7 quotation in place of the paraphrases in the Decision's push-notifications paragraph and criterion 4's opacity item; acceptance criterion 3: the adapter running its App Attest calls one at a time, each bounded at 25 seconds with `SCP-ATTEST-9027` on expiry, discarding an answer that arrives after the bound, and releasing a cancelled caller) and 2026-10-03 (acceptance criterion 3: the adapter's attestation record, the `SCP-ATTEST-9021` an `attest` on a recorded key throws without calling Apple, and the key each App Attest error keeps or discards, with codes `SCP-ATTEST-9022` through `SCP-ATTEST-9024`) and 2026-10-04 (acceptance criterion 3: the key probe that follows an `attestKey` answer of `DCErrorInvalidKey`, the code each probe answer throws, and the replacement key an `attest` generates and attests when the stored key carries an attestation record; acceptance criteria 7 and 10 and the Scope row of `AppleDeviceAttestation.swift`; and the Context, File layout, Scope and Dependencies sentences that said the Swift providers implement their UniFFI callback interfaces and are passed into the Rust engine). The 2026-09-10 amendment, the 2026-09-29 SCP-307 amendment and the 2026-09-27 amendment follow, in that order; the 2026-09-28 changes are edits to the 2026-09-27 amendment, which marks them in its closing note, and to the `attest` and `assertRequest` items of acceptance criterion 3; the 2026-09-29 changes are edits to the Decision's push-notifications paragraph, to the `registerPush`, `handleNotification` and opacity items of acceptance criterion 4, the new `PushProvider` conformance item, and the call-ordering item of acceptance criterion 3, each of which marks its own; the 2026-10-03 changes are the new key-lifecycle item and an edit to the call-ordering item of acceptance criterion 3, each of which marks its own; the 2026-10-04 changes are edits to the call-ordering and key-lifecycle items of acceptance criterion 3, to acceptance criteria 7 and 10, to the Scope table, to the Context's UniFFI paragraph, to the File layout table and to the Dependencies list, each of which marks its own.
 
 **Amendment (2026-09-10 — every SCP key is ECDSA on P-256, and root custody defaults to a passkey).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. `09-security-model.md` §9.7.4.1 item 4 states the passkey default. This ADR's Context named the Secure Enclave's P-256-only support as "the key constraint shaping this ADR" and called it "not a limitation the protocol can design around". That sentence inverted cause and effect: Apple fixed the hardware and SCP chose the curve. Three consequences for this ADR, each written into the text below. The Secure Enclave now holds SCP operational signing keys on Apple platforms, so the Rationale's "Why Keychain … not Secure Enclave" argument is withdrawn. Acceptance criterion 8, which forbade `AppleKeyCustody` from generating or using a Secure Enclave key for SCP signing, is inverted and restated. The root member is held by a passkey through Apple's passkey provider, so no Keychain generic-password item holds it.
 
 **Amendment (2026-09-29 — SCP-307).** When `AppleKeyCustody` implements the UniFFI `KeyCustodyProvider` (ADR-021, as its 2026-09-29 amendment states), `derivePseudonym` returns the 33-byte compressed pseudonym point rather than the `PseudonymKeypair` below, and stores no pseudonym key.
 
-**Amendment (2026-09-27 — App Attest binds the identifier, the context and its challenge, and a peer verifies the attestation offline).** `09-security-model.md` §9.3.1, reading a device attestation, owns the construction and the reader's procedure, and this ADR carries them into the Apple adapter. Three consequences, each written into the text below. First, `clientDataHash` is the binding digest `D = SHA-256("SCP-DEVICE-ATTESTATION-V1:" ‖ BE32(56) ‖ identifier_text ‖ BE32(n) ‖ context_id ‖ challenge)`, where `identifier_text` is the identifier's `scp:` text form, `context_id` is the UTF-8 bytes of the context's id, and `challenge` is the context's 32-byte `device_attestation_challenge`. That replaces both earlier inputs this ADR carried: the Decision's `SHA-256(challenge || deviceID)` and acceptance criterion 3's `SHA-256(clientDataJSON)`, which disagreed with each other and named no identifier. App Attest therefore writes `SHA-256(authData ‖ D)` as the credential certificate's nonce. The Rust core computes `D` and passes it to the adapter as the shipped trait's `challenge`, and the adapter hashes no identifier. Second, no relay and no Apple endpoint verifies the attestation. The adapter publishes the attestation object in an `ScpDeviceAttestation` service-record entry, and every reader verifies offline the certificate chain to Apple's App Attestation Root CA at the credential certificate's `notBefore`, the context's maximum age, the nonce, the key ID, the App ID, the counter, the AAGUID, the platform path the certificate's extensions select, the `aclBlob` on the macOS path, and the `apple_validation_category_01` and `apple_bundle_version_01` extensions. The adapter strips `receipt` from the attestation object before publishing, because no peer can use it, and the SDK re-attests before the entry passes the context's `device_attestation_max_age_secs`. Assertions carry the assertion digest `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` as their client data, so no assertion input equals a `D`. Third, an unsupported device and a simulator publish no entry, so the synthetic software-only token this ADR once decided is withdrawn, as the no-dev-stand-in tenet of `AGENTS.md` requires. A reader returns `Rejected{MalformedToken}` for a placeholder token. The shipped `AppleDeviceAttestation` still builds the JSON document, and it throws on an unsupported device instead of returning the synthetic token; story SCP-095 of `.docs/prds/main.json` stands in progress until every requirement of acceptance criterion 3 holds, in the adapter and in the Rust core. Three of them the adapter does not yet meet: it passes no 32-byte `challenge` to App Attest unchanged, it rejects no `challenge` of another length, and it writes `device_id` into the JSON document it hashes. Three more the Rust core does not meet, because no Rust code yet holds or calls the `DeviceAttestationProvider` callback: it computes no `D`, passes nothing to the adapter, and publishes no attestation object. Story SCP-316 implements the reader. The adapter carries no verifier, because the maintainer ruled on 2026-09-26 that reading-side verification belongs to the keri workstream.
+**Amendment (2026-09-27 — App Attest binds the identifier, the context and its challenge, and a peer verifies the attestation offline).** `09-security-model.md` §9.3.1, reading a device attestation, owns the construction and the reader's procedure, and this ADR carries them into the Apple adapter. Three consequences, each written into the text below. First, `clientDataHash` is the binding digest `D = SHA-256("SCP-DEVICE-ATTESTATION-V1:" ‖ BE32(56) ‖ identifier_text ‖ BE32(n) ‖ context_id ‖ challenge)`, where `identifier_text` is the identifier's `scp:` text form, `context_id` is the UTF-8 bytes of the context's id, and `challenge` is the context's 32-byte `device_attestation_challenge`. That replaces both earlier inputs this ADR carried: the Decision's `SHA-256(challenge || deviceID)` and acceptance criterion 3's `SHA-256(clientDataJSON)`, which disagreed with each other and named no identifier. App Attest therefore writes `SHA-256(authData ‖ D)` as the credential certificate's nonce. The Rust core computes `D` and passes it to the adapter as the shipped trait's `challenge`, and the adapter hashes no identifier. Second, no relay and no Apple endpoint verifies the attestation. The Rust core publishes the attestation object in an `ScpDeviceAttestation` service-record entry, and every reader verifies offline the certificate chain to Apple's App Attestation Root CA at the credential certificate's `notBefore`, the context's maximum age, the nonce, the key ID, the App ID, the counter, the AAGUID, the platform path the certificate's extensions select, the `aclBlob` on the macOS path, and the `apple_validation_category_01` and `apple_bundle_version_01` extensions. The Rust core strips `receipt` from the attestation object before publishing, because no peer can use it, and the SDK re-attests before the entry passes the context's `device_attestation_max_age_secs`. Assertions carry the assertion digest `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` as their client data, so no assertion input equals a `D`. Third, an unsupported device and a simulator publish no entry, so the synthetic software-only token this ADR once decided is withdrawn, as the no-dev-stand-in tenet of `AGENTS.md` requires. A reader returns `Rejected{MalformedToken}` for a placeholder token. The shipped `AppleDeviceAttestation` hands App Attest a 32-byte `challenge` unchanged, rejects a `challenge` of another length, reads no `device_id`, and throws on an unsupported device instead of returning the synthetic token; story SCP-095 of `.docs/prds/main.json` stands in progress until every requirement of acceptance criterion 3 holds, in the adapter and in the Rust core. No Rust code meets the requirements that fall outside the adapter, because no Rust code yet holds or calls the `DeviceAttestationProvider` callback: nothing computes `D`, passes `D` to `attest`, publishes the attestation object, strips `attStmt.receipt` from it, re-attests before the credential certificate's `notBefore` plus the context's `device_attestation_max_age_secs`, computes the assertion digest `A`, or passes `A` to `assertRequest`. Story SCP-316, still pending, specifies the reader, and no code verifies a device attestation yet. The adapter carries no verifier, because the maintainer ruled on 2026-09-26 that reading-side verification belongs to the keri workstream. (Edited 2026-09-28. This amendment previously said the adapter publishes the attestation object and strips `receipt`, which `09-security-model.md` §9.3.1 ("What the owner's SDK does") assigns to the SDK rather than the adapter. It also said the adapter still builds the JSON document, passes no 32-byte `challenge` to App Attest unchanged, rejects no `challenge` of another length, and writes `device_id` into the JSON document it hashes.)
 
 ### Context
 
@@ -344,7 +168,7 @@ SCP's platform adapter layer (ADR-006) defines four traits: `KeyCustody`, `Devic
 
 The root member follows a different substrate again: `09-security-model.md` §9.7.4.1 item 4 makes a passkey the default root custody, which on Apple platforms is the system passkey provider rather than a Keychain generic-password item or an enclave key this adapter creates. §17.8 of the persistence spec names the Secure Enclave and the passkey in its Apple row. Android reaches the same hardware floor from API 23 (ADR-027, the Android platform adapter).
 
-The UniFFI bridge (ADR-021) exposes platform traits as callback interfaces. Swift implementations of `KeyCustodyProvider`, `StorageProvider`, and `PushProvider` are passed into the Rust engine at initialization. This means the Apple adapter is implemented in Swift and bridged into Rust through UniFFI's callback interface mechanism — not as a Rust implementation of the traits.
+The Apple adapter is implemented in Swift. (Amended 2026-10-04; this paragraph previously read "The UniFFI bridge (ADR-021) exposes platform traits as callback interfaces. Swift implementations of `KeyCustodyProvider`, `StorageProvider`, and `PushProvider` are passed into the Rust engine at initialization. This means the Apple adapter is implemented in Swift and bridged into Rust through UniFFI's callback interface mechanism — not as a Rust implementation of the traits.". `AppleKeyCustody`, `AppleStorage` and `ApplePushProvider` do not conform to those three callback interfaces.)
 
 ### What This ADR Will Decide
 
@@ -364,7 +188,7 @@ Implement the Apple platform adapter in Swift (`bindings/swift/Sources/SCP/Platf
 
 **Device attestation:** `AppleDeviceAttestation` uses `DCAppAttestService` (App Attest). A Secure Enclave-backed P-256 key is generated via `generateKey(completionHandler:)`. Attestations are requested via `attestKey(_:clientDataHash:completionHandler:)` where `clientDataHash` is the binding digest `D` of `09-security-model.md` §9.3.1, which the Rust core computes over the identifier's `scp:` text form, the context id and the context's `device_attestation_challenge` and passes to the adapter as `challenge`. Assertions are generated via `generateAssertion(_:clientDataHash:completionHandler:)` for subsequent operations, over the assertion digest `A` of §9.3.1. The Rust core is to publish the attestation object the adapter returns in an `ScpDeviceAttestation` service-record entry, though no Rust code yet holds or calls the `DeviceAttestationProvider` callback, as the 2026-09-27 binding amendment above records; each reader verifies it offline against Apple's App Attestation Root CA under §9.3.1. On simulator and in environments where App Attest is unavailable, `attest()` and `assertRequest()` throw `ScpError.Identity` carrying code `SCP-ATTEST-9019`, the adapter mints no token, and the SDK publishes no entry. App Attest is unavailable when `isSupported` is `false` or when `generateKey`, `attestKey` or `generateAssertion` answers with `DCError.featureUnsupported`.
 
-**Push notifications:** `ApplePushProvider` wraps UNUserNotificationCenter and registers with APNs via `UIApplication.registerForRemoteNotifications()` / `NSApplication.registerForRemoteNotifications()`. The APNs payload is strictly opaque per §10.7: `{"aps": {"content-available": 1}}` with no additional fields. A content-available notification (silent push) wakes the app. The app then connects to its relay set and pulls all pending encrypted envelopes. No context ID, sender identifier, message preview, or other metadata is included in the payload. Apple/Google learn only that the device received a notification at a specific time.
+**Push notifications:** `ApplePushProvider` wraps UNUserNotificationCenter and registers with APNs via `UIApplication.registerForRemoteNotifications()` / `NSApplication.registerForRemoteNotifications()`. The APNs payload is strictly opaque per §10.7: `{"aps": {"content-available": 1}}` with no additional fields. A content-available notification (silent push) wakes the app. The app then connects to its relay set and pulls all pending encrypted envelopes. `10-infrastructure-and-self-hosting.md` §10.7 states: "Push payloads MUST contain a wake signal and nothing else. No context ID, no sender identifier, no message preview, no metadata of any kind." (Amended 2026-09-29; this paragraph previously read "No context ID, sender identifier, message preview, or other metadata is included in the payload." in place of the §10.7 quotation.) Apple/Google learn only that the device received a notification at a specific time.
 
 **Storage:** `AppleStorage` wraps a SQLCipher-encrypted SQLite database (`rusqlite` with `bundled-sqlcipher` feature, bridged via UniFFI). The encryption key is a 32-byte secret stored in Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. The SQLite database file itself carries `NSFileProtectionCompleteUntilFirstUserAuthentication` (iOS only), which allows background processing while the device is locked after first unlock. On macOS, file-level protection is not applicable.
 
@@ -450,10 +274,10 @@ SCP with `.required` provides the strongest custody model Apple platforms offer:
 
 | File | Purpose |
 |------|---------|
-| `bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift` | `KeyCustodyProvider` implementation: Keychain read/write, signing, DH agreement, pseudonym derivation, key destruction |
+| `bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift` | Keychain read/write, signing, DH agreement, pseudonym derivation, key destruction (amended 2026-10-04; this cell previously began "`KeyCustodyProvider` implementation:", and `AppleKeyCustody` does not conform to that callback interface) |
 | `bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift` | `DeviceAttestationProvider` implementation: App Attest key generation, attestation, assertion |
-| `bindings/swift/Sources/SCP/Platform/ApplePushProvider.swift` | `PushProvider` implementation: APNs registration, opaque silent push payload, wake signal routing |
-| `bindings/swift/Sources/SCP/Platform/AppleStorage.swift` | `StorageProvider` implementation: SQLCipher bridge, Keychain key derivation, `NSFileProtectionCompleteUntilFirstUserAuthentication` |
+| `bindings/swift/Sources/SCP/Platform/ApplePushProvider.swift` | APNs registration, opaque silent push payload, wake signal routing (amended 2026-10-04; this cell previously began "`PushProvider` implementation:", and `ApplePushProvider` does not conform to that callback interface) |
+| `bindings/swift/Sources/SCP/Platform/AppleStorage.swift` | SQLCipher bridge, Keychain key derivation, `NSFileProtectionCompleteUntilFirstUserAuthentication` (amended 2026-10-04; this cell previously began "`StorageProvider` implementation:", and `AppleStorage` does not conform to that callback interface) |
 | `bindings/swift/Sources/SCP/Platform/PlatformAdapter.swift` | `ApplePlatformAdapter`: aggregates the four providers, exposes `make()` factory, injects into `SCP.init()` |
 
 **Key platform API usage:**
@@ -477,7 +301,8 @@ service.generateKey { keyId, error in
     // DeviceAttestationProvider.attest(challenge:deviceId:); the adapter hashes no identifier.
     let clientDataHash = challenge
     service.attestKey(keyId, clientDataHash: clientDataHash) { attestation, error in
-        // attestation: Data — strip attStmt.receipt, then publish in an ScpDeviceAttestation entry
+        // attestation: Data — return the raw attestation object; the Rust core strips
+        // attStmt.receipt and publishes it in an ScpDeviceAttestation entry
     }
 }
 
@@ -522,8 +347,8 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 
 ### Dependencies
 
-- **ADR-006 (Platform Abstraction):** Defines the `KeyCustody`, `DeviceAttestation`, `Push`, and `Storage` trait signatures. The Apple adapter implements these.
-- **ADR-021 (UniFFI Bridge):** Defines the callback interfaces (`KeyCustodyProvider`, `StorageProvider`, `PushProvider`) in `scp.udl`. The Apple adapter implements these callback interfaces in Swift. The adapter is injected into the Rust engine via UniFFI's callback interface binding.
+- **ADR-006 (Platform Abstraction):** Defines the `KeyCustody`, `DeviceAttestation`, `Push`, and `Storage` trait signatures. (Amended 2026-10-04; this item previously ended "The Apple adapter implements these.".)
+- **ADR-021 (UniFFI Bridge):** Defines the callback interfaces (`KeyCustodyProvider`, `StorageProvider`, `PushProvider`) in `scp.udl`. (Amended 2026-10-04; this item previously ended "The Apple adapter implements these callback interfaces in Swift. The adapter is injected into the Rust engine via UniFFI's callback interface binding." `AppleKeyCustody`, `AppleStorage` and `ApplePushProvider` do not conform to those three callback interfaces.)
 - **Phase 1-2 Rust core:** The Apple adapter is called from `scp-core` through the UniFFI bridge. Phase 1-2 must be implemented before the adapter can be exercised in integration tests.
 - **ADR-026 (Swift SDK):** The Swift SDK initializes the Apple adapter and injects it into `SCP.init()`. The adapter is not directly visible to SDK consumers — it is the default platform implementation selected when `custody: "platform"` is specified.
 
@@ -545,15 +370,18 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
    - No Keychain item ever uses `kSecAttrAccessibleAlways` or an iCloud-synced protection class.
 
 3. **`AppleDeviceAttestation` — App Attest:**
-   - `attest(challenge, deviceId) -> Data`: Generates an App Attest key via `DCAppAttestService.generateKey`, requests attestation with `clientDataHash = D`, the binding digest of `09-security-model.md` §9.3.1 over the identifier's `scp:` text form, the context id and the context's `device_attestation_challenge`. The Rust core computes `D` and passes it as the shipped trait method `attest(challenge, device_id)`'s `challenge`; the adapter rejects a `challenge` that is not 32 bytes, hashes no identifier, and does not read `device_id`. Returns the raw attestation object, which the Rust core publishes, with `attStmt.receipt` removed, as the context's one `app-attest` entry in the §9.3.1 format. The SDK re-attests before the credential certificate's `notBefore` plus the context's `device_attestation_max_age_secs`. (Amended 2026-09-27; this criterion previously hashed a `clientDataJSON` document that named no identifier.)
-   - The adapter does not verify. Every reader runs the offline checks of `09-security-model.md` §9.3.1 on the published entry and returns `DeviceAttestationVerdict`; story SCP-316 implements that reader in Rust.
+   - `attest(challenge, deviceId) -> Data`: Generates an App Attest key via `DCAppAttestService.generateKey`, requests attestation with `clientDataHash = D`, the binding digest of `09-security-model.md` §9.3.1 over the identifier's `scp:` text form, the context id and the context's `device_attestation_challenge`. The Rust core computes `D` and passes it as the shipped trait method `attest(challenge, device_id)`'s `challenge`; the adapter passes that `challenge` to `attestKey(_:clientDataHash:completionHandler:)` unchanged, hashes no identifier, and does not read `device_id`. The adapter reads `DCAppAttestService.isSupported` first and throws `SCP-ATTEST-9019` when it is `false`, whatever the `challenge` length; on a device that supports App Attest, it rejects a `challenge` that is not 32 bytes with `SCP-ATTEST-9026` before it calls `generateKey` or `attestKey`. Returns the raw attestation object, which the Rust core publishes, with `attStmt.receipt` removed, as the context's one `app-attest` entry in the §9.3.1 format. The SDK re-attests before the credential certificate's `notBefore` plus the context's `device_attestation_max_age_secs`. (Amended 2026-09-27; this criterion previously hashed a `clientDataJSON` document that named no identifier. Amended 2026-09-28; this criterion previously read "the adapter rejects a `challenge` that is not 32 bytes, hashes no identifier", and named neither the App Attest call that receives `challenge`, when the rejection happens, nor that `SCP-ATTEST-9019` takes precedence over the length check on a device without App Attest.)
+   - The adapter does not verify. Every reader runs the offline checks of `09-security-model.md` §9.3.1 on the published entry and returns `DeviceAttestationVerdict`; story SCP-316, still pending, specifies that reader, and no code verifies a device attestation yet.
    - On simulator or when App Attest is unavailable: `DCAppAttestService.shared.isSupported == false`, or `generateKey`, `attestKey` or `generateAssertion` answers with `DCError.featureUnsupported` → `attest()` and `assertRequest()` throw `ScpError.Identity` carrying code `SCP-ATTEST-9019`, which the adapter's `AttestationError.unsupported` maps to, and return no bytes, and the SDK publishes no entry, so a reader returns `Absent`. The adapter throws `ScpError` rather than a `PlatformError` case, because the UniFFI `DeviceAttestationProvider` callback declares `ScpError` as its error type and UniFFI panics on the Rust side when a callback throws a type the callback does not declare. The adapter mints no attestation object, no assertion, and no stand-in for either. (Amended 2026-09-27, twice. This criterion previously read "`attest()` throws `PlatformError.attestationUnavailable`, a case the shipped enum does not yet carry", and before that it returned a synthetic software-only token.)
-   - `assertRequest(requestHash: Data) -> Data`: Generates a per-request assertion via `DCAppAttestService.generateAssertion(_:clientDataHash:)`, passing `requestHash` as `clientDataHash`. Used for subsequent authenticated operations after initial attestation. `requestHash` is the assertion digest `A` of `09-security-model.md` §9.3.1 over the caller's request bytes, never the caller's bytes themselves. (Amended 2026-09-27, twice. This criterion previously named a `generateAssertion(keyId: String, clientData: Data)` method, which the adapter does not have, and gave Apple's selector as `generateAssertion(_:clientData:)`, which `DCAppAttestService` does not have.)
+   - `assertRequest(requestHash: Data) -> Data`: Generates a per-request assertion via `DCAppAttestService.generateAssertion(_:clientDataHash:)`, passing `requestHash` as `clientDataHash` unchanged. Used for subsequent authenticated operations after initial attestation. `requestHash` is the 32-byte assertion digest `A` of `09-security-model.md` §9.3.1 over the caller's request bytes, never the caller's bytes themselves, The adapter reads `DCAppAttestService.isSupported` first and throws `SCP-ATTEST-9019` when it is `false`, whatever the `requestHash` length; on a device that supports App Attest, it rejects a `requestHash` that is not 32 bytes with `SCP-ATTEST-9026` before it calls `generateAssertion`. (Amended 2026-09-28; this criterion previously read "passing `requestHash` as `clientDataHash`" and "`requestHash` is the assertion digest `A`", and set no length check and no precedence between `SCP-ATTEST-9019` and the length check. Amended 2026-09-27, twice. This criterion previously named a `generateAssertion(keyId: String, clientData: Data)` method, which the adapter does not have, and gave Apple's selector as `generateAssertion(_:clientData:)`, which `DCAppAttestService` does not have.)
+   - Call ordering: the adapter serializes its calls. One call is the whole of one `attest` (`generateKey` when neither a replacement key ID nor a stored key ID without an attestation record is stored, then `attestKey`, then the key probe's `generateAssertion` when `attestKey` answers `DCErrorInvalidKey`) or of one `assertRequest` (`generateAssertion`), from its read of the stored key ID until the call ends. The serializer runs one call at a time, in the order it accepts them. The serializer accepts a call when its actor runs that call's job, and Swift's actor executor may run a later, higher-priority job first, so the acceptance order can differ from the order callers called `attest` or `assertRequest`; mutual exclusion holds under either order. The `isSupported` check and the 32-byte check run before a call is queued, so a call either check rejects waits for no other call. The stored key ID lives in a `UserDefaults` object, and every instance `init()` builds reads `UserDefaults.standard`, which the process shares, so the adapter attaches one lock and one call serializer to the `UserDefaults` object that holds the key ID, and every instance over that object takes that pair. No Swift global holds the pair. Each call waits until every call the serializer accepted before it ends, so an `assertRequest` accepted after an `attest` waits while that `attest`'s `attestKey` waits for Apple's server. A running call ends at the first of four events: its read of the stored key ID ends it without an App Attest call, with `SCP-ATTEST-9020` when an `assertRequest` reads no stored key ID; Apple's answers end it (every answer from its App Attest methods except a `generateKey` answer that carries a key ID and no error, which leads to `attestKey`, and an `attestKey` answer of `DCErrorInvalidKey`, which leads to the key probe); 25 seconds pass from the call's start; or its caller's task is cancelled. The 25 seconds cover `generateKey`, `attestKey` and the key probe together, not each method. When the bound expires, the waiting `attest` or `assertRequest` throws `SCP-ATTEST-9027`, which no other condition carries, and the serializer starts the next queued call. The bound starts when the call starts: time a caller spends queued counts against no bound, and a caller queued behind `n` calls can wait up to `n + 1` times 25 seconds in all. The 25-second bound therefore sits below the runtime's 30-second actor `HANDLER_TIMEOUT` for a call that starts at once, and a caller queued behind a slow call can exceed `HANDLER_TIMEOUT` before its own call starts. When the caller's task is cancelled, whether its call is queued or running, the caller stops waiting and the adapter throws `SCP-ATTEST-9001` (`AttestationError.serviceError`, with a message that begins `CancellationError:`), and its call leaves the queue; a call cancelled while queued never reaches Apple. A completion handler that runs after its call ended is discarded: it writes no key ID or attestation record to `UserDefaults`, discards no key ID, starts no further App Attest call, and resumes no caller. An end that arrives while the adapter stores a key ID or hands App Attest a method takes effect when that step returns. An end that arrives while the adapter reads the stored key ID takes effect at once, and the adapter checks whether the call ended immediately before it stores a key ID or hands App Attest a method, so a call never starts an App Attest method after it ended. While every call ends with Apple's answer, App Attest has one outstanding call at a time, and each call reads the stored key ID after every preceding call wrote it. After a timeout or a cancellation, Apple can still be working on the abandoned call while the next call runs, and the adapter does not wait for Apple's answer to an abandoned call or count abandoned calls, so after `k` abandoned calls App Attest can hold up to `k + 1` outstanding calls. Each `generateKey` abandoned that way can leave a key that no stored key ID names, and the next `attest` generates another. The adapter serializes its calls because a call that bypassed the serializer could read the stored key ID before a preceding `attest` wrote it. (Amended 2026-09-29; this criterion previously set no call ordering. The time bound, `SCP-ATTEST-9027`, the discard of a late answer and cancellation follow Alec's ruling of 2026-09-29. Amended 2026-10-03; this item previously read "an `assertRequest` that reads no stored key ID ends its call at that read with `SCP-ATTEST-9020` and calls no App Attest method" and "it writes no key ID to `UserDefaults`". Amended 2026-10-04; this item previously read "One call is the whole of one `attest` (`generateKey` when no key ID is stored, then `attestKey`)", "except a `generateKey` answer that carries a key ID and no error, which leads to `attestKey`)" and "The 25 seconds cover `generateKey` and `attestKey` together, not each method", and it read "`generateKey` when no key ID is stored" and "with `SCP-ATTEST-9020` when an `assertRequest` reads no stored key ID and with `SCP-ATTEST-9021` when an `attest` reads a stored key that carries an attestation record", "mutual exclusion and the one-key guarantee below hold under either order" and "so concurrent `attest` calls on a device with no stored key generate one key".)
+   - **Key lifecycle on error.** `DCError.h` lists three conditions behind one code, `DCErrorInvalidKey`: calling `attestKey:clientDataHash:completionHandler:` for a key already attested, calling `generateAssertion:clientDataHash:completionHandler:` with an unattested key, and an App Attest service rejecting a key. When `attestKey` returns an attestation object, the adapter records that key ID as attested in `UserDefaults`, beside the key ID. A key the adapter generates while its stored key carries an attestation record is stored as a replacement beside that key. When `attestKey` returns an attestation object for a replacement key, the adapter makes that key ID the stored key ID. `attestKey` therefore receives only a key with no record, and its `DCErrorInvalidKey` names either a key Apple attested whose record was never written or a rejected key; the record cannot tell those apart, so the adapter runs the key probe: it asks `generateAssertion` for an assertion with that key over the key-probe input `K` of `09-security-model.md` §9.3.1, inside the same serialized call, and discards that assertion. When the probe returns an assertion, the adapter throws `SCP-ATTEST-9021`: for the stored key, it records the key ID as attested and keeps the key, so a later `attest` generates a replacement key; for a replacement key, it discards the replacement key ID, writes no record, and keeps the stored key, because the adapter holds no record that the `attestKey` call Apple answered returned an attestation object to a caller, and promoting that key would move `assertRequest` off the key an earlier published attestation names, onto a key no published attestation may name. When the probe answers `DCErrorInvalidKey`, the adapter throws `SCP-ATTEST-9023` and discards the key ID: for the stored key, the key ID and its record; for a replacement key, the replacement key ID alone, keeping the stored key and its record. Every other probe answer keeps the key and writes no record: `DCErrorServerUnavailable` throws `SCP-ATTEST-9024`, `DCErrorFeatureUnsupported` throws `SCP-ATTEST-9019`, any other error throws `SCP-ATTEST-9001`, and an answer with neither an assertion nor an error throws `SCP-ATTEST-9025`. `assertRequest`'s `generateAssertion` answering `DCErrorInvalidKey` for a key with no record names either an unattested key or a key Apple attested whose record was never written and that Apple's service then rejected; the record cannot tell those apart, so the adapter keeps the key and throws `SCP-ATTEST-9022` (`AttestationError.keyNotAttested`). For a key with a record it means a rejected key: the adapter discards the key ID and the record, makes any replacement key ID the stored key ID, and throws `SCP-ATTEST-9023` (`AttestationError.keyRejected`). `DCErrorServerUnavailable` from `attestKey` or `generateAssertion` keeps the key and throws `SCP-ATTEST-9024` (`AttestationError.serverUnavailable`). For `attestKey`, `DCError.h` instructs a caller to "try the attestation again later using the same key and the same value for the `clientDataHash` parameter", since "retrying with the same inputs helps to preserve the risk metric for a given device". `DCError.h` documents `DCErrorServerUnavailable` for `attestKey` only; for `generateAssertion` the adapter keeps the key because the code names no rejection. The adapter writes the record, makes a replacement key ID the stored key ID, or discards a key ID only for the App Attest answer that ends its call, before the caller resumes and before the next serialized call reads the stored key ID. (Amended 2026-10-03; this criterion previously set no key lifecycle on error, and every App Attest error other than `DCErrorFeatureUnsupported` threw `SCP-ATTEST-9001`. Amended 2026-10-04; for an `attestKey` answer of `DCErrorInvalidKey` this item previously read "the record cannot tell those apart, so the adapter keeps the key and throws `SCP-ATTEST-9001`". Amended 2026-10-04 again; this item previously read "an `attest` that reads a stored key carrying that record throws `SCP-ATTEST-9021` (`AttestationError.keyAlreadyAttested`), calls no App Attest method, and keeps the key and its record", "When the probe returns an assertion, the adapter records the key ID as attested, keeps the key, and throws `SCP-ATTEST-9021`" and "When the probe answers `DCErrorInvalidKey`, the adapter discards the key ID and throws `SCP-ATTEST-9023`", "the adapter discards the key ID and the record and throws `SCP-ATTEST-9023`", "and the next `attest` generates a new key" and "the code names no rejection, the one condition for which the adapter discards a key", and it read "The adapter discards a stored key ID for the third condition alone, the one in which Apple's service rejects the key" and "Discarding a key on any condition other than a rejection strands a live Secure Enclave key, and a retry of `attestKey` after `DCErrorServerUnavailable` needs the same key".)
 
 4. **`ApplePushProvider` — APNs:**
-   - `register() -> PushToken`: Registers with APNs via `registerForRemoteNotifications()`. Returns the device token as hex string. Fails with `PlatformError.pushRegistrationFailed(String)` if APNs registration fails.
-   - `handleNotification(payload: Data) -> WakeSignal`: Processes an incoming silent push notification. Verifies the payload is `{"aps": {"content-available": 1}}`. Returns `WakeSignal.wake`. Rejects payloads containing any field other than `aps.content-available`.
-   - The relay MUST send only `{"aps": {"content-available": 1}}` payloads. The adapter enforces opacity on receipt. No context ID, sender identifier, or message count is acceptable in the payload.
+   - `registerPush() -> Data`: Registers with APNs via `registerForRemoteNotifications()`. The method carries the name the UniFFI `PushProvider` callback declares. Returns the APNs device token bytes, because the UniFFI `PushProvider` callback returns token bytes. Throws an `ScpError` if APNs registration fails, because the UniFFI `PushProvider` callback declares `ScpError` as its error type. (Amended 2026-09-29; this criterion previously read "`register() -> PushToken`: Registers with APNs via `registerForRemoteNotifications()`. Returns the device token as hex string. Fails with `PlatformError.pushRegistrationFailed(String)` if APNs registration fails.")
+   - `handleNotification(payload: Data) -> Data`: Processes an incoming silent push notification. Verifies the payload is `{"aps": {"content-available": 1}}`. Returns the fixed UTF-8 bytes `{"aps":{"content-available":1}}` as the wake signal, because the UniFFI `PushProvider` callback returns wake signal bytes and the permitted payload carries no context ID. The adapter never returns the received bytes, because accepted bytes can still carry whitespace the relay chose. Throws an `ScpError` for a payload larger than 4096 bytes, the APNs maximum, for a payload containing any field other than `aps.content-available`, for a `content-available` value other than the integer 1, for bytes that are not a JSON object, and for bytes that differ from `{"aps":{"content-available":1}}` by more than JSON whitespace (space, tab, line feed, carriage return) outside string literals, before, between, or after tokens. The last rule reads the received bytes, not the parsed object, because a JSON parser keeps one value for a key the object repeats: a second `aps` or `content-available` member carrying a context ID parses to the permitted object and would otherwise pass. Whitespace inside a key sits inside a string literal, so the key `"a ps"` does not match `"aps"`. (Amended 2026-09-29; this criterion previously read "`handleNotification(payload: Data) -> WakeSignal`: Processes an incoming silent push notification. Verifies the payload is `{"aps": {"content-available": 1}}`. Returns `WakeSignal.wake`. Rejects payloads containing any field other than `aps.content-available`.")
+   - The relay MUST send only `{"aps": {"content-available": 1}}` payloads. The adapter enforces opacity on receipt. `10-infrastructure-and-self-hosting.md` §10.7 states: "Push payloads MUST contain a wake signal and nothing else. No context ID, no sender identifier, no message preview, no metadata of any kind." (Amended 2026-09-29; this item previously ended "No context ID, sender identifier, or message count is acceptable in the payload.", a list §10.7 does not use.)
+   - `ApplePushProvider` conforms to the UniFFI `PushProvider` protocol, as the Decision requires, and every method of that conformance throws only `ScpError`. UniFFI panics on the Rust side when a callback throws a type the callback does not declare, so a conformance that let a `PushError` cross the callback would turn each rejected payload into a panic; the conformance translates each `PushError` case to an `ScpError`. The shipped actor does not meet this bullet yet: it declares no conformance, names its registration method `register()` where the protocol names `registerPush()`, and throws `PushError`. `AppleStorage` and `AppleKeyCustody` have the same gap against the `StorageProvider` and `KeyCustodyProvider` protocols, and GitHub issue #2492, "Swift AppleStorage, ApplePushProvider, and AppleKeyCustody do not conform to their UniFFI callback protocols, and throw types the callbacks do not declare", tracks all three. No Rust code holds or calls a `PushProvider` yet. (Amended 2026-09-29; criterion 4 stated no conformance requirement before this bullet.)
    - APNs registration uses the `.alert` notification category with `UNAuthorizationOptions.alert` only for system notification permission; the actual push payload remains silent.
 
 5. **`AppleStorage` — SQLCipher:**
@@ -592,12 +420,12 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
    - All four providers are initialized before the Rust engine starts. If any provider fails to initialize (e.g., Keychain inaccessible at boot), `make()` returns a descriptive `PlatformError`.
 
 7. **Conformance test suite:**
-   - All four providers pass the platform trait conformance macros defined in `scp-platform/testing/` (ADR-006): `key_custody_conformance!()`, `storage_conformance!()`, `attestation_conformance!()`, `push_conformance!()`.
-   - Tests run on real devices (CI must include a physical iOS device lane for Keychain and App Attest tests). Simulator-only tests use `#if targetEnvironment(simulator)` fallback paths.
+   - A Swift test suite under `bindings/swift/Tests/SCPTests/Platform/` covers each of the four providers by applying this ADR's acceptance criteria to it directly. A suite covers a provider when, for each constraint that provider's criteria state and a `swift test` host reaches, one case exists that fails if that constraint is removed. A constraint falls outside a `swift test` host when it depends on an API that host lacks: the host runs no App Attest service, holds no APNs entitlement, runs outside an app bundle with no Keychain access group, holds no Secure Enclave key it can generate under an app entitlement, and compiles no iOS file-protection code. Examples of such constraints are `attest()` reaching Apple's App Attest service, criterion 2's `kSecAttrAccessGroup` on every `AppleKeyCustody` item, criterion 8's Secure Enclave generation of every operational signing key, `AppleStorage` holding its encryption key in the Keychain under `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, and the iOS database file carrying `NSFileProtectionCompleteUntilFirstUserAuthentication`. Each Rust implementation of an `scp-platform` trait that calls one of the four providers through a UniFFI callback interface passes the matching conformance macro in `crates/scp-testing/src/conformance/` (ADR-006): `key_custody_conformance!()`, `storage_conformance!()`, `attestation_conformance!()` or `push_conformance!()`. (Amended 2026-10-04; this item previously read "All four providers pass the platform trait conformance macros defined in `scp-platform/testing/` (ADR-006): `key_custody_conformance!()`, `storage_conformance!()`, `attestation_conformance!()`, `push_conformance!()`.")
+   - Tests run on real devices (CI must include a physical iOS device lane for Keychain, App Attest, and APNs registration tests). On the simulator `DCAppAttestService.shared.isSupported` reads `false`, so a simulator lane asserts the fail-closed path against the real `DCAppAttestService.shared` and exercises no substitute attestation. CI runs neither lane yet: its one Swift test job runs `swift test` on a macOS host, and the host tests inject a fake App Attest service. GitHub issue #2521, "CI runs no iOS simulator or physical-device lane for the Apple platform adapters (ADR-025 criterion 7)", tracks both lanes. (Amended 2026-10-04; this item previously read "Tests run on real devices (CI must include a physical iOS device lane for Keychain and App Attest tests). Simulator-only tests use `#if targetEnvironment(simulator)` fallback paths.")
    - `AppleKeyCustody` round-trip test: `generateKeypair(.p256Signing)` → `sign(data)` → `publicKey()` → verify signature → `destroyKey()` → confirm re-fetch fails.
-   - `AppleStorage` round-trip test: `store(key, data)` → `retrieve(key)` → `listKeys(prefix)` → `delete(key)` → `exists(key) == false`.
-   - `AppleDeviceAttestation` test on real device: `attest()` returns an attestation object whose credential-certificate nonce equals `SHA-256(authData ‖ D)`. On simulator: `attest()` throws `PlatformError.attestationUnavailable` without crashing.
-   - `ApplePushProvider` test: `register()` returns a non-empty token string. `handleNotification` rejects non-opaque payloads.
+   - `AppleStorage` round-trip test: `set(key, data)` → `get(key)` → `listKeys(prefix)` → `delete(key)` → `exists(key) == false`. (Amended 2026-10-04; this item previously read "`store(key, data)` → `retrieve(key)`", method names that criterion 5's 2026-09-27 amendment replaced with `set` and `get`.)
+   - `AppleDeviceAttestation` test on real device: `attest()` returns an attestation object whose credential-certificate nonce equals `SHA-256(authData ‖ D)`. On simulator: `attest()` throws `ScpError.Identity` carrying `SCP-ATTEST-9019`, and the test asserts that thrown error. (Amended 2026-10-04; this item previously read "On simulator: `attest()` throws `PlatformError.attestationUnavailable` without crashing.", a case the shipped `PlatformError` enum does not carry.)
+   - `ApplePushProvider` test on real device: APNs registration returns non-empty APNs device token bytes. On a `swift test` host: `handleNotification` accepts `{"aps":{"content-available":1}}` and throws for each payload criterion 4 rejects. (Amended 2026-10-04; this item previously read "`ApplePushProvider` test: `register()` returns a non-empty token string. `handleNotification` rejects non-opaque payloads.".)
 
 8. **Secure Enclave signing keys (inverted by the 2026-09-10 amendment):**
    - `AppleKeyCustody` MUST generate every P-256 operational signing key in the Secure Enclave through `SecKeyCreateRandomKey` with `kSecAttrTokenIDSecureEnclave`, and MUST perform every signature and every ECDH agreement on such a key inside the enclave.
@@ -613,7 +441,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 10. **Conditional compilation:**
     - All Apple platform APIs are gated behind `#if os(iOS) || os(macOS)`.
     - Background processing code is gated behind `#if canImport(UIKit)` (iOS) vs `#if canImport(AppKit)` (macOS).
-    - Simulator paths are gated behind `#if targetEnvironment(simulator)`, and none of them produces an attestation token.
+    - Simulator paths are gated behind `#if targetEnvironment(simulator)`, and none of them produces an attestation token. `AppleDeviceAttestation` has no simulator path: it reads `isSupported` from its App Attest service at runtime and throws `ScpError.Identity` carrying `SCP-ATTEST-9019` when that reads `false`, as it does on the simulator. (Amended 2026-10-04; this item previously ended at "none of them produces an attestation token" and named no class.)
 
 ### Scope
 
@@ -621,10 +449,10 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 
 | File | Purpose |
 |------|---------|
-| `bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift` | `KeyCustodyProvider` — Secure Enclave key generation, P-256 signing, P-256 ECDH, pseudonym derivation, key destruction |
-| `bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift` | `DeviceAttestationProvider` — App Attest key generation, attestation, assertion, simulator fallback |
-| `bindings/swift/Sources/SCP/Platform/ApplePushProvider.swift` | `PushProvider` — APNs registration, opaque silent push payload enforcement |
-| `bindings/swift/Sources/SCP/Platform/AppleStorage.swift` | `StorageProvider` — SQLCipher-encrypted SQLite, Keychain key derivation, `NSFileProtection` |
+| `bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift` | Secure Enclave key generation, P-256 signing, P-256 ECDH, pseudonym derivation, key destruction (amended 2026-10-04; this cell previously began "`KeyCustodyProvider` —") |
+| `bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift` | `DeviceAttestationProvider` — App Attest key generation, attestation, assertion, fail-closed error when App Attest is unavailable (amended 2026-10-04; this cell previously ended "simulator fallback", and the adapter has no simulator fallback) |
+| `bindings/swift/Sources/SCP/Platform/ApplePushProvider.swift` | APNs registration, opaque silent push payload enforcement (amended 2026-10-04; this cell previously began "`PushProvider` —") |
+| `bindings/swift/Sources/SCP/Platform/AppleStorage.swift` | SQLCipher-encrypted SQLite, Keychain key derivation, `NSFileProtection` (amended 2026-10-04; this cell previously began "`StorageProvider` —") |
 | `bindings/swift/Sources/SCP/Platform/PlatformAdapter.swift` | `ApplePlatformAdapter.make()` — aggregates all four providers, injected by `SCP.init()` |
 
 **Estimated functions:** ~20 public methods across four provider implementations, ~10 internal helpers (Keychain query builders, error mapping, SQLCipher connection setup).
@@ -656,7 +484,7 @@ Actor isolation follows the Swift 6.2 approachable concurrency rules: data carri
 - **Actor isolation over `@MainActor` default for interactive types:** `SCP` and `SCPContext` manage mutable protocol state (MLS group, sender keys, connection handles). Custom actors enforce serial access to this state without blocking the main thread. `@MainActor` would block UI updates during crypto operations — wrong for any non-trivial workload.
 - **`AsyncStream<Message>` over Combine:** Swift 6 strict concurrency treats Combine as a compatibility layer, not the forward path. `AsyncStream` integrates naturally with `for await` loops, structured concurrency cancellation, and `TaskGroup`. It requires zero imported frameworks and works identically on iOS, macOS, and in Swift package tests. Combine's `Publisher` → `AsyncSequence` bridging adds indirection without benefit.
 - **`@Observable` for SwiftUI state:** The `@Observable` macro (Swift 5.9+, iOS 17+) tracks property access at the granularity of individual properties rather than the whole object. This means `SCPContextState` annotated with `@Observable` triggers minimal view updates when only `memberCount` changes, not when `lastMessage` changes. Property wrappers like `@Published` (Combine) are legacy in this context.
-- **`deinit` + explicit `close()` for resource cleanup:** SCP contexts hold live crypto state (MLS group keys, sender AES-256 keys) that must be zeroed on deallocation. `close()` is the user-visible method for graceful teardown (leave the MLS group, flush the event log, close the transport connection). `deinit` is the safety net — it schedules a `Task { try? await close() }` to prevent resource leaks when a context object is dropped without explicit close. This matches the `Symbol.asyncDispose` pattern in the TypeScript SDK.
+- **`deinit` + explicit `close()` for resource cleanup:** SCP contexts hold live crypto state (MLS group keys, sender AES-256 keys) that must be zeroed on deallocation. `close()` is the user-visible method for graceful teardown (leave the MLS group, flush the event log, close the transport connection). `deinit` is the safety net — it schedules a `Task { try? await close() }` to prevent resource leaks when a context object is dropped without explicit close. The Rust core holds that crypto state: its owned secret fields zeroize on drop, and the allocator that §9.15 of the security-model spec (freed heap memory) requires wipes each heap block the core frees. §9.15 lists the Swift runtime's heap among the limits of that wipe. This matches the `Symbol.asyncDispose` pattern in the TypeScript SDK.
 - **`nonisolated struct` for DTOs:** Data carrier types (`Message`, `ResolutionOutcome`, `OutletDefinition`, `Provenance`) are value types with no mutable state after construction. Marking them `nonisolated struct` makes all members inherit nonisolated context, satisfying Swift 6 `Sendable` without `@unchecked Sendable`. They cross actor boundaries freely as `Sendable` values.
 - **`SCP.create()` as async factory, not `init`:** The identity initialization path (`identity_create()`) is async, because it generates keys and publishes the inception event. Swift actors cannot have `async init`. The factory pattern `await SCP.create()` is the idiomatic solution. `ApplePlatformAdapter.make()` is injected at creation time — the caller controls custody.
 - **SPM binary framework target:** XCFramework binary distribution via SPM `binaryTarget` with checksum verification gives consumers a single `Package.swift` dependency with no Rust toolchain requirement. Swift compiler verifies the binary against the declared checksum on resolution.

@@ -9,7 +9,7 @@
 // cdylib (the records are plain data classes), so they run regardless of native
 // library availability. The full SCP.evaluateTrust / SCP.ucanEvaluate /
 // SCP.participationRecord round-trips dispatch through `inner` and are covered
-// by the real-FFI suite (which skips when the native lib is absent).
+// by the real-FFI suite (which fails when the native lib is absent or does not load).
 
 package works.limn.scp
 

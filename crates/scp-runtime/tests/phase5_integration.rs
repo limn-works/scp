@@ -566,7 +566,13 @@ fn media_session_mls_key_derivation() {
     let add_result =
         add_member(&mut alice_group, bob_kp, &scp_clock::SystemClock).expect("add bob");
 
-    let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).expect("bob joins");
+    let bob_group = join_group(
+        &add_result.welcome,
+        bob_provider,
+        bob_signer,
+        &scp_clock::SystemClock,
+    )
+    .expect("bob joins");
 
     // -- Step 3: Export DTLS-SRTP key material from both members --
     let alice_keys =
@@ -676,12 +682,15 @@ async fn platform_push_notifications() {
     assert!(!token.as_bytes().is_empty());
 
     // -- Handle notification --
+    // §10.7: "Push payloads MUST contain a wake signal and nothing else. No
+    // context ID, no sender identifier, no message preview, no metadata of any
+    // kind." The wake signal must not carry the context ID this payload holds.
     let payload = b"new-message-ctx-123";
     let wake = push
         .handle_notification(payload)
         .await
         .expect("notification handling");
-    assert_eq!(wake.payload, payload);
+    assert_eq!(wake.payload(), br#"{"aps":{"content-available":1}}"#);
 }
 
 #[tokio::test]
@@ -997,7 +1006,13 @@ fn media_session_keys_derived_from_mls_group_state() {
     let bob_kp = bob_kp_bundle.key_package().clone().into();
     let add_result =
         add_member(&mut alice_group, bob_kp, &scp_clock::SystemClock).expect("add bob");
-    let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).expect("bob join");
+    let bob_group = join_group(
+        &add_result.welcome,
+        bob_provider,
+        bob_signer,
+        &scp_clock::SystemClock,
+    )
+    .expect("bob join");
 
     // Export keys at 32 bytes (standard DTLS-SRTP keying material length).
     let context_bytes = b"ctx-mls-media-integration";

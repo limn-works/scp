@@ -52,7 +52,7 @@ AGGREGATE_JOB = "ci"
 DRAFT_GATE_JOB = "check-draft"
 FILTER_JOB = "changes"
 
-# Literal operands this evaluator understands to a right of `==`.
+# A quoted literal operand.
 _QUOTED = re.compile(r"^'([^']*)'$")
 
 
@@ -85,27 +85,98 @@ def resolve_operand(token: str, outputs: dict[str, str], event_name: str) -> str
     raise Unreadable(f"operand {token!r}")
 
 
-def evaluate(expression: str, outputs: dict[str, str], event_name: str) -> bool:
-    """Evaluate a disjunction of equality comparisons.
+# Tokens an `if:` expression may hold. Everything else, a unary `!` and a function
+# call among them, is a construct this evaluator does not implement.
+_TOKEN = re.compile(r"\s*(?:(?P<op>&&|\|\||==|!=|\(|\))|(?P<operand>'[^']*'|[A-Za-z_][\w.-]*))")
 
-    Grammar accepted here is exactly what this workflow uses today: one or
-    more `LHS == RHS` comparisons joined by `||`. Anything else raises
-    Unreadable, so a new construct stops this gate instead of being guessed at.
+
+def tokenize(expression: str) -> list[tuple[str, str]]:
+    """Split one `if:` expression into (kind, text) tokens, refusing any other text."""
+    tokens: list[tuple[str, str]] = []
+    position = 0
+    stripped = expression.rstrip()
+    while position < len(stripped):
+        match = _TOKEN.match(stripped, position)
+        if match is None or match.end() == position:
+            raise Unreadable(f"expression {expression!r} at {stripped[position:]!r}")
+        kind = "op" if match.group("op") else "operand"
+        tokens.append((kind, match.group(kind)))
+        position = match.end()
+    if not tokens:
+        raise Unreadable(f"empty expression {expression!r}")
+    return tokens
+
+
+def evaluate(expression: str, outputs: dict[str, str], event_name: str) -> bool:
+    """Evaluate one job's `if:` expression.
+
+    Grammar, which is exactly what this workflow uses today:
+
+        disjunction := conjunction ( '||' conjunction )*
+        conjunction := term ( '&&' term )*
+        term        := '(' disjunction ')' | operand ( '==' | '!=' ) operand
+
+    `&&` binds tighter than `||`, as it does in GitHub's expression language. Every
+    comparison is evaluated, with no short-circuit, so an operand naming a filter
+    output `changes` did not publish raises Unreadable whatever the other clauses
+    answer: on a push run a `github.event_name != 'push' && (…)` condition would
+    otherwise never read its filter outputs, and a renamed output would pass there
+    unseen. Anything outside the grammar raises Unreadable, so a new construct
+    stops this gate instead of being guessed at.
     """
-    expression = " ".join(expression.split())
-    if "&&" in expression or "!" in expression or "(" in expression:
-        raise Unreadable(f"expression {expression!r}")
-    for clause in expression.split("||"):
-        if "!=" in clause:
-            raise Unreadable(f"clause {clause!r}")
-        parts = clause.split("==")
-        if len(parts) != 2:
-            raise Unreadable(f"clause {clause!r}")
-        left = resolve_operand(parts[0], outputs, event_name)
-        right = resolve_operand(parts[1], outputs, event_name)
-        if left == right:
-            return True
-    return False
+    tokens = tokenize(" ".join(expression.split()))
+    position = 0
+
+    def peek() -> tuple[str, str] | None:
+        return tokens[position] if position < len(tokens) else None
+
+    def take() -> tuple[str, str]:
+        nonlocal position
+        token = peek()
+        if token is None:
+            raise Unreadable(f"expression {expression!r} ends early")
+        position += 1
+        return token
+
+    def disjunction() -> bool:
+        results = [conjunction()]
+        while peek() == ("op", "||"):
+            take()
+            results.append(conjunction())
+        return any(results)
+
+    def conjunction() -> bool:
+        results = [term()]
+        while peek() == ("op", "&&"):
+            take()
+            results.append(term())
+        return all(results)
+
+    def term() -> bool:
+        kind, text = take()
+        if (kind, text) == ("op", "("):
+            value = disjunction()
+            if take() != ("op", ")"):
+                raise Unreadable(f"expression {expression!r}: unbalanced parenthesis")
+            return value
+        if kind != "operand":
+            raise Unreadable(f"expression {expression!r}: {text!r} where an operand belongs")
+        operator = take()
+        if operator not in (("op", "=="), ("op", "!=")):
+            raise Unreadable(f"expression {expression!r}: {text!r} is not compared")
+        right_kind, right_text = take()
+        if right_kind != "operand":
+            raise Unreadable(
+                f"expression {expression!r}: {right_text!r} where an operand belongs"
+            )
+        left = resolve_operand(text, outputs, event_name)
+        right = resolve_operand(right_text, outputs, event_name)
+        return (left == right) if operator[1] == "==" else (left != right)
+
+    value = disjunction()
+    if peek() is not None:
+        raise Unreadable(f"expression {expression!r}: unread text from {peek()[1]!r}")
+    return value
 
 
 def main() -> int:

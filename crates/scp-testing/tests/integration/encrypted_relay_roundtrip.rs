@@ -267,7 +267,13 @@ async fn alice_bob_encrypted_message_via_relay() {
     let add_result = add_member(&mut alice_group, bob_kp_in, &scp_clock::SystemClock).unwrap();
 
     // Bob joins the group via the Welcome message.
-    let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+    let mut bob_group = join_group(
+        &add_result.welcome,
+        bob_provider,
+        bob_signer,
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
 
     // Both should see 2 members at epoch 1.
     assert_eq!(alice_group.members().unwrap().len(), 2);

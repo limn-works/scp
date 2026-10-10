@@ -1404,6 +1404,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
         mode: ContextMode::Broadcast,
         // Broadcast contexts only support `MemoryScope::Full`.
         memory_scope: scp_protocol::context::params::MemoryScope::Full,
+        ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
         ..ContextParams::default()
     };
     sup.create_context(
@@ -1518,12 +1519,12 @@ fn welcome_snapshot_crypto_durability_predicate_fails_closed_on_empty_or_error()
 
     // A populated crypto blob is durable — the spawn may proceed.
     assert!(
-        welcome_snapshot_crypto_is_durable(&Ok(vec![0x01, 0x02, 0x03])),
+        welcome_snapshot_crypto_is_durable(&Ok(zeroize::Zeroizing::new(vec![0x01, 0x02, 0x03]))),
         "a non-empty crypto export is durable"
     );
     // An EMPTY blob is the keyless-snapshot signal — NOT durable, fail closed.
     assert!(
-        !welcome_snapshot_crypto_is_durable(&Ok(Vec::new())),
+        !welcome_snapshot_crypto_is_durable(&Ok(zeroize::Zeroizing::default())),
         "an empty crypto export must fail closed (a joiner cannot reconnect-derive)"
     );
     // An ERRORED export is likewise not durable — fail closed.
@@ -3493,9 +3494,10 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
 ///
 /// Application messages ride a per-sender AEAD layer on top of the MLS group key,
 /// so for the creator (Alice) to open a joiner's (Bob's) application traffic she
-/// must first hold Bob's sender key. A Welcome-joiner cannot PUSH its key (a push
-/// seals to each incumbent's STABLE `0xFF01` wrapping key, which openmls 0.8.1
-/// does not expose from a joined group, ADR-057), so incumbents PULL it (§9.16.2).
+/// must first hold Bob's sender key. A Welcome-joiner does not PUSH its key (a
+/// push seals to each incumbent's STABLE `0xFF01` wrapping key, and
+/// [`scp_mls::extract_member_wrapping_key`] returns only the local member's
+/// key; its rustdoc says why), so incumbents PULL it (§9.16.2).
 /// The pull answer originally gated membership on the `member_wrapping_keys` cache
 /// — EMPTY for a joiner — and rejected every incumbent's request as "from a
 /// non-member", leaving the joiner RECEIVE-ONLY. The fix reads membership from the

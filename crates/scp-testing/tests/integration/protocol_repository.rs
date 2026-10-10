@@ -17,16 +17,13 @@
 //! - **Sender Keys**: store/load/list/remove roundtrip; context isolation.
 //! - **DID Cache**: cache with expiry; TOFU record roundtrip.
 //! - **Transport**: relay score store/load/list roundtrip.
-//! - **MLS**: group state roundtrip via `MlsStorageBridge`; context isolation.
 //!
 //! See spec sections 17.3 and 17.4.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
-use scp_core::crypto::mls::MlsStorageBridge;
 use scp_core::store::ProtocolRepository;
 use scp_did::DID;
 use scp_platform::in_memory::InMemoryStorage;
@@ -1169,68 +1166,4 @@ async fn relay_score_missing_returns_none() {
             .unwrap()
             .is_none()
     );
-}
-
-// =========================================================================
-// MLS module — group state roundtrip via MlsStorageBridge; context isolation
-// =========================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mls_bridge_group_state_roundtrip() {
-    use openmls::group::{GroupId as MlsGroupId, MlsGroupState};
-    use openmls_traits::storage::StorageProvider;
-
-    let store = Arc::new(make_store());
-    let bridge = MlsStorageBridge::new(store, "ctx-mls-rt".to_owned()).unwrap();
-
-    let group_id = MlsGroupId::from_slice(b"test-group-rt");
-
-    StorageProvider::write_group_state(&bridge, &group_id, &MlsGroupState::Operational).unwrap();
-
-    let loaded: Option<MlsGroupState> = StorageProvider::group_state(&bridge, &group_id).unwrap();
-    assert!(loaded.is_some(), "group state should be loaded");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mls_bridge_context_isolation() {
-    use openmls::group::{GroupId as MlsGroupId, MlsGroupState};
-    use openmls_traits::storage::StorageProvider;
-
-    let store = Arc::new(make_store());
-
-    let bridge_a = MlsStorageBridge::new(Arc::clone(&store), "ctx-mls-a".to_owned()).unwrap();
-    let bridge_b = MlsStorageBridge::new(Arc::clone(&store), "ctx-mls-b".to_owned()).unwrap();
-
-    let group_id = MlsGroupId::from_slice(b"shared-group-id");
-
-    StorageProvider::write_group_state(&bridge_a, &group_id, &MlsGroupState::Operational).unwrap();
-    StorageProvider::write_group_state(&bridge_b, &group_id, &MlsGroupState::Inactive).unwrap();
-
-    // Same group_id, different contexts — values are independent.
-    let a: Option<MlsGroupState> = StorageProvider::group_state(&bridge_a, &group_id).unwrap();
-    let b: Option<MlsGroupState> = StorageProvider::group_state(&bridge_b, &group_id).unwrap();
-    assert!(a.is_some(), "bridge_a state should exist");
-    assert!(b.is_some(), "bridge_b state should exist");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mls_bridge_survives_restart() {
-    use openmls::group::{GroupId as MlsGroupId, MlsGroupState};
-    use openmls_traits::storage::StorageProvider;
-
-    let store = Arc::new(make_store());
-    let group_id = MlsGroupId::from_slice(b"restart-group");
-
-    // Write via one bridge instance.
-    {
-        let bridge =
-            MlsStorageBridge::new(Arc::clone(&store), "ctx-mls-restart".to_owned()).unwrap();
-        StorageProvider::write_group_state(&bridge, &group_id, &MlsGroupState::Operational)
-            .unwrap();
-    }
-
-    // Read via a fresh bridge instance backed by the same store.
-    let bridge2 = MlsStorageBridge::new(store, "ctx-mls-restart".to_owned()).unwrap();
-    let loaded: Option<MlsGroupState> = StorageProvider::group_state(&bridge2, &group_id).unwrap();
-    assert!(loaded.is_some(), "state should survive bridge recreation");
 }

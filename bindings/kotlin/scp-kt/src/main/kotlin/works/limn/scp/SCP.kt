@@ -49,6 +49,7 @@ import uniffi.scp.PublishResult
 import uniffi.scp.ReconnectReport
 import uniffi.scp.ReservedKeyPackage
 import uniffi.scp.SagaResult
+import uniffi.scp.ScpException
 import uniffi.scp.SealedInvitation
 import uniffi.scp.SqliteKeyMaterial
 import uniffi.scp.StorageConfig
@@ -65,6 +66,9 @@ import java.util.logging.Logger
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import uniffi.scp.Scp as NativeScp
+
+/** The code an SDK `shutdown` raises when the durable store still holds its advisory lock. */
+private const val STORAGE_LOCK_HELD_CODE = "SCP-STORAGE-8005"
 
 /**
  * Caller-owned SCP instance — the SDK entry point.
@@ -97,14 +101,22 @@ class SCP internal constructor(
     internal val inner: NativeScp,
 ) {
     /**
-     * Tracks whether [shutdown] has completed successfully. Read from the
+     * Tracks whether a [shutdown] call's teardown has run. Read from the
      * finalizer fallback to decide whether to emit a "leaked without
      * shutdown" warning; written inside [shutdown] after the FFI call
-     * returns. Must be atomic because finalizers run on a JVM-internal
+     * returns or throws `SCP-STORAGE-8005`. Must be atomic because finalizers run on a JVM-internal
      * thread pool that does not happen-before the coroutine that invoked
      * [shutdown].
      */
-    private val isShutdown: AtomicBoolean = AtomicBoolean(false)
+    private val shutdownRecorded: AtomicBoolean = AtomicBoolean(false)
+
+    /**
+     * `true` once a [shutdown] call's FFI teardown has returned, or has thrown
+     * `SCP-STORAGE-8005` after the teardown ran. Internal so that ScpShutdownTest can check
+     * that a failed teardown leaves it false and a cancelled caller still sets it.
+     */
+    internal val isShutdown: Boolean
+        get() = shutdownRecorded.get()
 
     /**
      * Constructs a fresh [SCP] with an explicit storage configuration.
@@ -166,8 +178,8 @@ class SCP internal constructor(
      * Shuts down this instance with a graceful deadline.
      *
      * Awaits in-flight tasks up to [timeout], aborts any remaining
-     * tasks, then runs typed-field cleanup. A second call is a no-op
-     * (AlreadyShutDown is swallowed at the SDK surface).
+     * tasks, then runs typed-field cleanup. Throws `ScpException.Validation` with `SCP-STORAGE-8005`
+     * when the durable store still holds its advisory lock after the call.
      *
      * Converted to unsigned milliseconds for the UniFFI boundary after
      * the #1549 Phase 4 timeout unit unification — sub-millisecond
@@ -188,13 +200,22 @@ class SCP internal constructor(
         timeout: Duration = 5.seconds,
     ) {
         val millis = timeout.inWholeMilliseconds.coerceAtLeast(0).toULong()
-        bridge.ffiCallSuspend { inner.shutdown(timeoutMillis = millis) }
-        // Record shutdown AFTER the FFI call returns so that a failed
-        // shutdown does not silence the finalizer warning — a caller
-        // who sees an exception here should know the instance is still
-        // live and still worth a second [shutdown] attempt. SetRelease
-        // orders the flip after the FFI mutation, matching Atomic default.
-        isShutdown.set(true)
+        bridge.ffiCallSuspend {
+            try {
+                inner.shutdown(timeoutMillis = millis)
+            } catch (e: ScpException.Validation) {
+                // `SCP-STORAGE-8005` is raised after the teardown ran, so the instance is
+                // recorded as shut down.
+                if (e.code == STORAGE_LOCK_HELD_CODE) shutdownRecorded.set(true)
+                throw e
+            }
+            // Record shutdown as soon as the FFI call returns, inside the bridge block: an
+            // engine failure throws before this line, so a failed shutdown does not silence
+            // the finalizer warning, while a cancellation the bridge raises after a finished
+            // teardown (its trailing ensureActive, or resuming a cancelled caller) cannot
+            // leave a torn-down instance recorded as live.
+            shutdownRecorded.set(true)
+        }
     }
 
     /**
@@ -221,7 +242,7 @@ class SCP internal constructor(
      */
     @Suppress("ProtectedMemberInFinalClass", "Unused")
     protected fun finalize() {
-        if (!isShutdown.get()) {
+        if (!isShutdown) {
             Logger.getLogger("works.limn.scp.SCP").log(
                 Level.WARNING,
                 "SCP instance (id={0}) was garbage-collected without a shutdown() call. " +
@@ -866,10 +887,10 @@ class SCP internal constructor(
      *
      * The invite routes through the actor's capability-checked governance gate,
      * which requires the inviter to hold the `governance:propose` capability
-     * (that is the ONLY capability the invite gate enforces). A normally-created
-     * `SingleAdmin` context grants its admin `governance:propose` at genesis, so
-     * it works out of the box; a context with a custom ceiling must grant
-     * `governance:propose` to the inviter. The inviter's `#active` signing key
+     * (that is the ONLY capability the invite gate enforces). The creator of a
+     * `SingleAdmin` context holds the admin role, which grants every capability
+     * in the context's ceiling, so the creator can invite only when that
+     * ceiling includes `governance:propose`. The inviter's `#active` signing key
      * is resolved from its retained local custody (never crossing the FFI as raw
      * bytes) and wiped immediately after the invite is produced.
      *
@@ -1448,7 +1469,10 @@ class SCP internal constructor(
     suspend fun isLocalDid(did: String): Boolean = inner.isLocalDid(did = did)
 
     /** Forwards to [NativeScp.mcpClientConnectSse] on [inner]. */
-    suspend fun mcpClientConnectSse(url: String): String = inner.mcpClientConnectSse(url = url)
+    suspend fun mcpClientConnectSse(
+        url: String,
+        authToken: String?,
+    ): String = inner.mcpClientConnectSse(url = url, authToken = authToken)
 
     /**
      * Forwards to [NativeScp.mcpClientConnectStdio] on [inner].
@@ -1828,10 +1852,8 @@ class SCP internal constructor(
      * [SagaResult] on commit (carrying the supervisor-minted `sagaId` plus the
      * target's signed receipt and captured output, each `null` when absent and
      * never synthesized), or throws a typed [uniffi.scp.ScpException] for a
-     * non-committed terminal — `ScpException.SagaAborted` (a Prepare-phase
-     * abort: a PERMANENT rejection OR a RETRYABLE transient — rate limit or
-     * participant actor unavailable — distinguished by the `SCP-SAGA-*` code;
-     * carries an optional `retryAfterMs` back-off hint),
+     * non-committed terminal — `ScpException.SagaAborted` (carries an
+     * optional `retryAfterMs` back-off hint),
      * `ScpException.SagaNeedsRepair` (commit retries exhausted; carries
      * the durable `sagaId` operator-repair handle), or `ScpException.SagaBusy`
      * (the participant context set is contended; carries the

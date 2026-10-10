@@ -27,6 +27,9 @@ testing = ["scp-client/testing"]
 # plus the wasm-bindgen stack — and MUST NOT depend on scp-runtime,
 # scp-identity, or tokio (the ADR-057 mechanical fence; verified via
 # `cargo tree`). The openmls wire types arrive transitively through scp-client.
+# Links the wiping global allocator every shipped artifact installs
+# (09-security-model.md §9.15, freed heap memory).
+scp-alloc = { path = "../scp-alloc", version = "=0.1.0-beta.2" }
 scp-client = { path = "../scp-client", version = "=0.1.0-beta.2" }
 # scp-mls (a wasm-safe shared crate, within the fence) is a direct dep ONLY so
 # the error mapping can name `MlsError`'s convergent-timestamp variants and give
@@ -58,11 +61,13 @@ serde_json = { workspace = true }
 # reconstructs the invoker's `SigningKey` from a 32-byte seed via this crate.
 ed25519-dalek = { workspace = true }
 
-# Best-effort zeroization of the transient private-key seed copies in the
-# `outlet_stream_sign_*` invoker-signing predicates (SCP-OUT-048). Hygiene, not
-# a load-bearing guarantee — ADR-057 §Consequences "As-built caveat (Slice 3)"
-# records that a private key momentarily in wasm memory is not a property
-# confidentiality currently rests on. Pure Rust, wasm-safe, inside the fence.
+# Zeroizes the transient private-key seed copies in the
+# `outlet_stream_sign_*` invoker-signing predicates (SCP-OUT-048) while they are
+# live, on the stack included; the wiping global allocator this crate links
+# wipes heap blocks only as they are freed (09-security-model.md §9.15, freed
+# heap memory). ADR-057 §Consequences "As-built caveat (Slice 3)" records that
+# confidentiality does not rest on a private key never sitting in wasm memory.
+# Pure Rust, wasm-safe, inside the fence.
 zeroize = { workspace = true }
 
 # wasm-bindgen is needed on BOTH targets: on wasm32 it generates the real JS
@@ -113,7 +118,7 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 # set mirrors `scp-client`, so `js` sits in the wasm32 dev-dependency section below and
 # `libcrux-provider` is absent — see the note in crates/scp-mls/Cargo.toml.
 openmls = { workspace = true }
-tls_codec = "0.4"
+tls_codec = "0.5"
 
 # The single-sourced faithful in-memory relay mock (the fidelity anchor for the
 # surface exchange tests). The `native_host` test module is `cfg(not(wasm32))`
