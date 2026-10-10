@@ -96,7 +96,7 @@ pub trait ContextPersistence: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// NoopContextPersistence — every operation is a no-op success.
+// NoOpContextPersistence — every operation is a no-op success.
 // ---------------------------------------------------------------------------
 
 /// No-op persistence — every operation is a no-op success.
@@ -107,11 +107,11 @@ pub trait ContextPersistence: Send + Sync {
 /// reports every write as durable and stores nothing nullifies restart
 /// recovery (§17.17 `SCP-CAPSEL-8000`), so no shipped build may reach it.
 #[cfg(any(test, feature = "testing"))]
-pub struct NoopContextPersistence;
+pub struct NoOpContextPersistence;
 
 #[cfg(any(test, feature = "testing"))]
 #[async_trait]
-impl ContextPersistence for NoopContextPersistence {
+impl ContextPersistence for NoOpContextPersistence {
     async fn persist_context(
         &self,
         _context_id: &str,
