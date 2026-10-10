@@ -5,6 +5,35 @@ All notable changes to SCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-10-10
+
+### SDK member roles
+
+**Two protocol-defined roles stopped reading as governance-defined ones.**
+`member_role` on the `PyO3` and `UniFFI` bridges reports
+`RoleAssignment.role_name`, which for a built-in role is one of the six names
+`crates/scp-protocol/src/context/roles.rs` reserves. Python's `MemberRole`,
+Swift's `MemberRole`, and TypeScript's `MemberRole` carried four of those six, so
+a member holding `author` or `subscriber` resolved to `Custom`, the answer each
+SDK documents as "a role a context's governance defined", which
+`RESERVED_ROLE_NAMES` forbids either name from being. **All three now carry
+`Author` and `Subscriber`**, so a broadcast app tells a writing author from a
+read-only subscriber. TypeScript's bridge wrapper capitalized a first letter and
+asserted the result into `MemberRole`, which put values outside that union into
+a typed field: `"Author"` before this union carried it, and `"My-role"` for any
+governance-defined role, so a `switch` over `MemberRole` matched no case. It
+now parses a name the way Swift and Python do.
+
+**A governance-defined role now carries its name.** Each SDK reported every
+custom role as one bare `Custom` value, so a caller could not tell
+`night-shift-reviewer` from any other custom role. Python returns
+`CustomRole(name=...)`, Swift returns `.custom(name:)`, and TypeScript returns
+`{ kind: "Custom", name }`; the bare `Custom` member is gone. A role name that
+is neither one of the six built-in names nor a name `validate_role_name` admits
+raises `SCP-GOV-11040` in place of a guess. Matching is exact, because every
+bridge reports the stored lowercase name. Kotlin returns the bridge's role name
+as a `String`, so no name collapsed there.
+
 ## [Unreleased] - 2026-05-10
 
 ### Enforcement infra hardening — PR-E (PR #1735)

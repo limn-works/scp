@@ -57,7 +57,8 @@ from typing import (
 
 from scp_sdk._extension import EXTENSION_LOAD_FAILED_CODE, native_module
 from scp_sdk.errors import ScpError, ValidationError, _coded_bridge_error
-from scp_sdk.types import CustodyType
+from scp_sdk.governance import GovernanceActionResult, check_proposal_response
+from scp_sdk.types import CustodyType, CustomRole, MemberRole
 
 if TYPE_CHECKING:
     from scp_sdk.outlets import OutletDefinition, SagaResult, StreamingSagaHandle
@@ -1459,9 +1460,17 @@ class SCP:
         """Delegate to ``_scp_core.SCP.context_member_dids``."""
         return await asyncio.to_thread(self._native.context_member_dids, handle)
 
-    async def context_member_role(self, handle: Any, did: str) -> Any:
-        """Delegate to ``_scp_core.SCP.context_member_role``."""
-        return await asyncio.to_thread(self._native.context_member_role, handle, did)
+    async def context_member_role(self, handle: Any, did: str) -> MemberRole | CustomRole | None:
+        """Return the role ``did`` holds in the context, or ``None`` for a non-member.
+
+        Raises:
+            UnknownGovernanceOutcomeError: the bridge reported a role name
+                :meth:`MemberRole.from_bridge` cannot parse (code ``SCP-GOV-11040``).
+        """
+        raw = await asyncio.to_thread(self._native.context_member_role, handle, did)
+        if raw is None:
+            return None
+        return MemberRole.from_bridge(raw)
 
     async def context_propose_ttl_extension(
         self, handle: Any, member_did: str, proposed_seconds: int
@@ -1922,12 +1931,22 @@ class SCP:
         return await asyncio.to_thread(self._native.finalize_close, handle)
 
     async def governance_approve(self, handle: Any, identity_did: str, proposal_id_hex: str) -> Any:
-        """Delegate to ``_scp_core.SCP.governance_approve``."""
-        return await asyncio.to_thread(
+        """Delegate to ``_scp_core.SCP.governance_approve``.
+
+        Returns the bridge's JSON ``{status, reason?, rejector?}`` after
+        :func:`~scp_sdk.governance.check_proposal_response` checks every name
+        in it.
+
+        Raises:
+            UnknownGovernanceOutcomeError: The response names a status or
+                reason this SDK version does not carry (``SCP-GOV-11040``).
+        """
+        raw = await asyncio.to_thread(
             self._native.governance_approve, handle, identity_did, proposal_id_hex
         )
+        return check_proposal_response(raw)
 
-    async def governance_execute(self, handle: Any, proposal_id_hex: str) -> Any:
+    async def governance_execute(self, handle: Any, proposal_id_hex: str) -> GovernanceActionResult:
         """Delegate to ``_scp_core.SCP.governance_execute``.
 
         Executes a previously-approved governance proposal *by id*. The runtime
@@ -1935,8 +1954,16 @@ class SCP:
         quorum-validated governance engine; the caller supplies no proposal,
         action, status, or identity. The executor and consequence subject are
         resolved from the tracked proposal's proposer.
+
+        Returns:
+            The outcome naming which action ran.
+
+        Raises:
+            UnknownGovernanceOutcomeError: The bridge reported an outcome this
+                SDK version does not carry (``SCP-GOV-11040``).
         """
-        return await asyncio.to_thread(self._native.governance_execute, handle, proposal_id_hex)
+        raw = await asyncio.to_thread(self._native.governance_execute, handle, proposal_id_hex)
+        return GovernanceActionResult.from_bridge(raw)
 
     async def governance_get_proposal(self, handle: Any, proposal_id_hex: str) -> Any:
         """Delegate to ``_scp_core.SCP.governance_get_proposal``."""
@@ -1949,28 +1976,63 @@ class SCP:
         return await asyncio.to_thread(self._native.governance_list_proposals, handle)
 
     async def governance_propose(self, handle: Any, identity_did: str, action_json: str) -> Any:
-        """Delegate to ``_scp_core.SCP.governance_propose``."""
+        """Delegate to ``_scp_core.SCP.governance_propose``.
+
+        Returns the bridge's JSON ``{proposal_id, status, reason?, rejector?,
+        execution_result}`` after
+        :func:`~scp_sdk.governance.check_proposal_response` checks every name
+        in it. ``execution_result`` names the action a ``single_admin``
+        context auto-executed, and is ``null`` while a proposal awaits votes.
+
+        Raises:
+            UnknownGovernanceOutcomeError: The response names a status,
+                reason, or outcome this SDK version does not carry
+                (``SCP-GOV-11040``).
+        """
 
         try:
-            return await asyncio.to_thread(
+            raw = await asyncio.to_thread(
                 self._native.governance_propose, handle, identity_did, action_json
             )
         except Exception as exc:
             raise _coded_bridge_error(exc) from exc
+        # Checked outside the try block, so an unknown name is never re-coded
+        # as a bridge error.
+        return check_proposal_response(raw)
 
     async def governance_reject(self, handle: Any, identity_did: str, proposal_id_hex: str) -> Any:
-        """Delegate to ``_scp_core.SCP.governance_reject``."""
-        return await asyncio.to_thread(
+        """Delegate to ``_scp_core.SCP.governance_reject``.
+
+        Returns the bridge's JSON ``{status, reason?, rejector?}`` after
+        :func:`~scp_sdk.governance.check_proposal_response` checks every name
+        in it.
+
+        Raises:
+            UnknownGovernanceOutcomeError: The response names a status or
+                reason this SDK version does not carry (``SCP-GOV-11040``).
+        """
+        raw = await asyncio.to_thread(
             self._native.governance_reject, handle, identity_did, proposal_id_hex
         )
+        return check_proposal_response(raw)
 
     async def governance_withdraw(
         self, handle: Any, identity_did: str, proposal_id_hex: str
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.governance_withdraw``."""
-        return await asyncio.to_thread(
+        """Delegate to ``_scp_core.SCP.governance_withdraw``.
+
+        Returns the bridge's JSON ``{status, reason?, rejector?}`` after
+        :func:`~scp_sdk.governance.check_proposal_response` checks every name
+        in it.
+
+        Raises:
+            UnknownGovernanceOutcomeError: The response names a status or
+                reason this SDK version does not carry (``SCP-GOV-11040``).
+        """
+        raw = await asyncio.to_thread(
             self._native.governance_withdraw, handle, identity_did, proposal_id_hex
         )
+        return check_proposal_response(raw)
 
     async def migration_state(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.migration_state``."""

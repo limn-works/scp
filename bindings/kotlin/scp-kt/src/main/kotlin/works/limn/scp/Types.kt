@@ -8,11 +8,16 @@
 
 package works.limn.scp
 
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import uniffi.scp.OutletKind
+import uniffi.scp.ScpException
 import works.limn.scp.bridge.BridgeException
 import java.text.Normalizer
 
@@ -730,4 +735,207 @@ private fun deployIdError(deployId: String): String? =
  */
 fun validateDeployId(deployId: String) {
     deployIdError(deployId)?.let { throw BridgeException(it, "SCP-VALID-7012") }
+}
+
+// ---------------------------------------------------------------------------
+// Governance names
+// ---------------------------------------------------------------------------
+//
+// Every bridge names a governance outcome, a proposal status, and a rejection
+// reason through the exhaustive name functions in
+// `crates/scp-ffi/common/src/governance_result.rs`. The three enums below carry
+// exactly those names, and each `fromBridge` throws `SCP-GOV-11040` for a name
+// it does not carry. `crates/scp-testing/tests/governance_outcome_parity.rs`
+// fails when an enum here and its Rust name function list different names, and
+// reads each entry list up to its `;` as entries only.
+
+/**
+ * Error code a governance parser throws for a name this SDK version does not
+ * carry. UniFFI's `ScpException` has no governance case, so the parsers throw
+ * [ScpException.Context] with this code.
+ */
+const val UNKNOWN_GOVERNANCE_OUTCOME_CODE: String = "SCP-GOV-11040"
+
+private fun unknownGovernanceName(
+    kind: String,
+    raw: String,
+    known: List<String>,
+): ScpException =
+    ScpException.Context(
+        msg =
+            "bridge reported $kind \"$raw\", which this SDK version does not name; " +
+                "known names: ${known.joinToString(", ")}. Upgrade the SDK to the version of the bridge it calls.",
+        code = UNKNOWN_GOVERNANCE_OUTCOME_CODE,
+    )
+
+/**
+ * Result of executing a governance action (ADR-031).
+ *
+ * Each [rawValue] is the name `governance_action_result_name` gives one
+ * variant of `scp_core::context::state::GovernanceActionResult`.
+ */
+enum class GovernanceActionResult(val rawValue: String) {
+    MEMBER_ADDED("MemberAdded"),
+    MEMBER_REMOVED("MemberRemoved"),
+    ROLE_CHANGED("RoleChanged"),
+    OUTLET_REGISTERED("OutletRegistered"),
+    OUTLET_REMOVED("OutletRemoved"),
+    CEILING_MODIFIED("CeilingModified"),
+    CONTEXT_CLOSED("ContextClosed"),
+    TTL_EXTENDED("TtlExtended"),
+    PRUNING_POLICY_MODIFIED("PruningPolicyModified"),
+    ADMIN_TRANSFERRED("AdminTransferred"),
+    SIGNER_ADDED("SignerAdded"),
+    SIGNER_REMOVED("SignerRemoved"),
+    THRESHOLD_MODIFIED("ThresholdModified"),
+    CHILD_CONTEXT_CREATED("ChildContextCreated"),
+    OUTLET_INTERFACE_ESTABLISHED("OutletInterfaceEstablished"),
+    MEMBER_RESET("MemberReset"),
+    CONFLICT_RESOLVED("ConflictResolved"),
+    CONTEXT_PROMOTED("ContextPromoted"),
+    MEMBER_SUSPENDED("MemberSuspended"),
+    ACCESS_REVOKED("AccessRevoked"),
+    ACCESS_RESTORED("AccessRestored"),
+    CONTENT_KEYS_ROTATED("ContentKeysRotated"),
+    GOVERNANCE_RECONFIGURED("GovernanceReconfigured"),
+    SUBSCRIBER_BANNED("SubscriberBanned"),
+    SUBSCRIBER_UNBANNED("SubscriberUnbanned"),
+    EXECUTED("Executed"),
+    MIGRATION_PROPOSED("MigrationProposed"),
+    MIGRATION_CANCELLED("MigrationCancelled"),
+    CONTEXT_TOMBSTONED("ContextTombstoned"),
+    ;
+
+    companion object {
+        /**
+         * Parses the outcome name a bridge's governance execute returns.
+         *
+         * @throws ScpException.Context with code `SCP-GOV-11040` when [raw]
+         *   names no entry. The action ran and this SDK cannot say which
+         *   action it was, so it never reports [EXECUTED] in its place.
+         */
+        fun fromBridge(raw: String): GovernanceActionResult =
+            entries.find { it.rawValue == raw }
+                ?: throw unknownGovernanceName("governance outcome", raw, entries.map { it.rawValue })
+    }
+}
+
+/**
+ * Lifecycle status of a governance proposal (ADR-031).
+ *
+ * Each [rawValue] is the name `proposal_status_name` gives one variant of
+ * `scp_core::context::governance::ProposalStatus`.
+ */
+enum class ProposalStatus(val rawValue: String) {
+    PENDING("Pending"),
+    APPROVED("Approved"),
+    REJECTED("Rejected"),
+    EXPIRED("Expired"),
+    CANCELLED("Cancelled"),
+    INVALIDATED("Invalidated"),
+    ;
+
+    companion object {
+        /**
+         * Parses a proposal status name a bridge reports.
+         *
+         * @throws ScpException.Context with code `SCP-GOV-11040` when [raw]
+         *   names no entry.
+         */
+        fun fromBridge(raw: String): ProposalStatus =
+            entries.find { it.rawValue == raw }
+                ?: throw unknownGovernanceName("proposal status", raw, entries.map { it.rawValue })
+    }
+}
+
+/**
+ * Reason a governance proposal was rejected (ADR-031).
+ *
+ * Each [rawValue] is the name `rejection_reason_name` gives one variant of
+ * `scp_core::context::governance::RejectionReason`.
+ */
+enum class RejectionReason(val rawValue: String) {
+    ADMIN_REJECTED("AdminRejected"),
+    MAJORITY_REJECTED("MajorityRejected"),
+    UNANIMITY_BROKEN("UnanimityBroken"),
+    APPROVAL_IMPOSSIBLE("ApprovalImpossible"),
+    INSUFFICIENT_PARTICIPATION("InsufficientParticipation"),
+    ;
+
+    companion object {
+        /**
+         * Parses a rejection reason name a bridge reports.
+         *
+         * @throws ScpException.Context with code `SCP-GOV-11040` when [raw]
+         *   names no entry.
+         */
+        fun fromBridge(raw: String): RejectionReason =
+            entries.find { it.rawValue == raw }
+                ?: throw unknownGovernanceName("rejection reason", raw, entries.map { it.rawValue })
+    }
+}
+
+private fun unreadableProposalResponse(why: String): ScpException =
+    ScpException.Context(
+        msg = "governance proposal response $why",
+        code = UNKNOWN_GOVERNANCE_OUTCOME_CODE,
+    )
+
+/**
+ * Checks every name in a governance proposal response and returns [raw].
+ *
+ * Propose, approve, reject, and withdraw each return a JSON object
+ * `{status, reason?, rejector?}`; propose adds `proposal_id` and
+ * `execution_result`. This function parses `status`, the `reason` of a
+ * `Rejected` status, and a non-null `execution_result`. An `Invalidated`
+ * status carries free-text `reason`, which must be a string.
+ *
+ * @throws ScpException.Context with code `SCP-GOV-11040` when [raw] is not a
+ *   JSON object, a required name is missing or is not a string, or a name
+ *   matches no entry of its enum.
+ */
+fun checkProposalResponse(raw: String): String {
+    val body = parseProposalResponse(raw)
+    val statusRaw =
+        body.stringField("status") ?: throw unreadableProposalResponse("carries no string status")
+    checkProposalReason(body, statusRaw, ProposalStatus.fromBridge(statusRaw))
+    checkExecutionResult(body)
+    return raw
+}
+
+private fun parseProposalResponse(raw: String): JsonObject =
+    try {
+        Json.parseToJsonElement(raw) as? JsonObject
+    } catch (_: SerializationException) {
+        null
+    } ?: throw unreadableProposalResponse("is not a JSON object, so this SDK cannot read its status")
+
+private fun checkProposalReason(
+    body: JsonObject,
+    statusRaw: String,
+    status: ProposalStatus,
+) {
+    if (status != ProposalStatus.REJECTED && status != ProposalStatus.INVALIDATED) return
+    val reason =
+        body.stringField("reason")
+            ?: throw unreadableProposalResponse("has status $statusRaw and no string reason")
+    if (status == ProposalStatus.REJECTED) {
+        RejectionReason.fromBridge(reason)
+    }
+}
+
+private fun checkExecutionResult(body: JsonObject) {
+    val executionResult = body["execution_result"]
+    if (executionResult == null || executionResult is JsonNull) return
+    val name =
+        (executionResult as? JsonPrimitive)?.takeIf { it.isString }?.content
+            ?: throw unreadableProposalResponse(
+                "carries an execution_result that is neither a string nor null",
+            )
+    GovernanceActionResult.fromBridge(name)
+}
+
+private fun JsonObject.stringField(key: String): String? {
+    val primitive = this[key] as? JsonPrimitive
+    return primitive?.takeIf { it.isString }?.content
 }

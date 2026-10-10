@@ -1,11 +1,19 @@
 import Foundation
 
-// MARK: - GovernanceActionResult
+// MARK: - Governance names
+
+// Every bridge names a governance outcome, a proposal status, and a rejection
+// reason through the exhaustive name functions in
+// `crates/scp-ffi/common/src/governance_result.rs`. The three enums below carry
+// exactly those names, and each `fromBridge` throws `SCP-GOV-11040` for a name
+// it does not carry. `crates/scp-testing/tests/governance_outcome_parity.rs`
+// fails when an enum here and its Rust name function list different names, and
+// reads each enum body as cases only, so methods live in the extensions below.
 
 /// Result of executing a governance action (ADR-031).
 ///
-/// Each case corresponds to one of the 28 governance action outcomes from
-/// `scp_core::context::manager::GovernanceActionResult`.
+/// Each raw value is the name `governance_action_result_name` gives one variant
+/// of `scp_core::context::state::GovernanceActionResult`.
 ///
 /// See `.docs/specs/05-contexts.md` section 5.9 and ADR-031.
 public enum GovernanceActionResult: String, Sendable {
@@ -35,34 +43,206 @@ public enum GovernanceActionResult: String, Sendable {
     case subscriberBanned = "SubscriberBanned"
     case subscriberUnbanned = "SubscriberUnbanned"
     case executed = "Executed"
+    case migrationProposed = "MigrationProposed"
+    case migrationCancelled = "MigrationCancelled"
+    case contextTombstoned = "ContextTombstoned"
+}
+
+/// Lifecycle status of a governance proposal (ADR-031).
+///
+/// Each raw value is the name `proposal_status_name` gives one variant of
+/// `scp_core::context::governance::ProposalStatus`.
+public enum ProposalStatus: String, Sendable {
+    case pending = "Pending"
+    case approved = "Approved"
+    case rejected = "Rejected"
+    case expired = "Expired"
+    case cancelled = "Cancelled"
+    case invalidated = "Invalidated"
+}
+
+/// Reason a governance proposal was rejected (ADR-031).
+///
+/// Each raw value is the name `rejection_reason_name` gives one variant of
+/// `scp_core::context::governance::RejectionReason`.
+public enum RejectionReason: String, Sendable {
+    case adminRejected = "AdminRejected"
+    case majorityRejected = "MajorityRejected"
+    case unanimityBroken = "UnanimityBroken"
+    case approvalImpossible = "ApprovalImpossible"
+    case insufficientParticipation = "InsufficientParticipation"
+}
+
+/// Error code a governance parser throws for a name this SDK version does not
+/// carry. UniFFI's `ScpError` has no governance case, so the parsers throw
+/// ``ScpError/Context(msg:code:)`` with this code, as the governance bridge
+/// errors do.
+public let unknownGovernanceOutcomeCode = "SCP-GOV-11040"
+
+private func unknownGovernanceName<T: CaseIterable & RawRepresentable>(
+    _ kind: String, _ raw: String, _: T.Type
+) -> ScpError where T.RawValue == String {
+    let known = T.allCases.map(\.rawValue).joined(separator: ", ")
+    return ScpError.Context(
+        msg: "bridge reported \(kind) \"\(raw)\", which this SDK version does not name; "
+            + "known names: \(known). Upgrade the SDK to the version of the bridge it calls.",
+        code: unknownGovernanceOutcomeCode
+    )
+}
+
+extension GovernanceActionResult: CaseIterable {}
+extension ProposalStatus: CaseIterable {}
+extension RejectionReason: CaseIterable {}
+
+public extension GovernanceActionResult {
+    /// Parses the outcome name a bridge's governance execute returns.
+    ///
+    /// - Throws: ``ScpError/Context(msg:code:)`` with code `SCP-GOV-11040`
+    ///   when `raw` names no case. The action ran and this SDK cannot say which
+    ///   action it was, so it never reports ``executed`` in its place.
+    static func fromBridge(_ raw: String) throws -> GovernanceActionResult {
+        guard let value = GovernanceActionResult(rawValue: raw) else {
+            throw unknownGovernanceName("governance outcome", raw, GovernanceActionResult.self)
+        }
+        return value
+    }
+}
+
+public extension ProposalStatus {
+    /// Parses a proposal status name a bridge reports.
+    ///
+    /// - Throws: ``ScpError/Context(msg:code:)`` with code `SCP-GOV-11040`
+    ///   when `raw` names no case.
+    static func fromBridge(_ raw: String) throws -> ProposalStatus {
+        guard let value = ProposalStatus(rawValue: raw) else {
+            throw unknownGovernanceName("proposal status", raw, ProposalStatus.self)
+        }
+        return value
+    }
+}
+
+public extension RejectionReason {
+    /// Parses a rejection reason name a bridge reports.
+    ///
+    /// - Throws: ``ScpError/Context(msg:code:)`` with code `SCP-GOV-11040`
+    ///   when `raw` names no case.
+    static func fromBridge(_ raw: String) throws -> RejectionReason {
+        guard let value = RejectionReason(rawValue: raw) else {
+            throw unknownGovernanceName("rejection reason", raw, RejectionReason.self)
+        }
+        return value
+    }
+}
+
+/// Checks every name in a governance proposal response and returns `raw`.
+///
+/// Propose, approve, reject, and withdraw each return a JSON object
+/// `{status, reason?, rejector?}`; propose adds `proposal_id` and
+/// `execution_result`. This function parses `status`, the `reason` of a
+/// `Rejected` status, and a non-null `execution_result`. An `Invalidated`
+/// status carries free-text `reason`, which must be a string.
+///
+/// - Throws: ``ScpError/Context(msg:code:)`` with code `SCP-GOV-11040` when
+///   `raw` is not a JSON object, a required name is missing or is not a
+///   string, or a name matches no case of its enum.
+public func checkProposalResponse(_ raw: String) throws -> String {
+    func unreadable(_ why: String) -> ScpError {
+        ScpError.Context(msg: "governance proposal response \(why)", code: unknownGovernanceOutcomeCode)
+    }
+    guard let data = raw.data(using: .utf8),
+          let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    else {
+        throw unreadable("is not a JSON object, so this SDK cannot read its status")
+    }
+    guard let statusRaw = body["status"] as? String else {
+        throw unreadable("carries no string status")
+    }
+    let status = try ProposalStatus.fromBridge(statusRaw)
+    if status == .rejected || status == .invalidated {
+        guard let reason = body["reason"] as? String else {
+            throw unreadable("has status \(statusRaw) and no string reason")
+        }
+        if status == .rejected {
+            _ = try RejectionReason.fromBridge(reason)
+        }
+    }
+    if let executionResult = body["execution_result"], !(executionResult is NSNull) {
+        guard let name = executionResult as? String else {
+            throw unreadable("carries an execution_result that is neither a string nor null")
+        }
+        _ = try GovernanceActionResult.fromBridge(name)
+    }
+    return raw
 }
 
 // MARK: - MemberRole
 
 /// Role assigned to a member within a context (spec section 5.5).
 ///
-/// Mirrors `scp_core::context::roles::Role`.
-public enum MemberRole: String, Sendable {
+/// The six cases before ``custom(name:)`` carry the six names
+/// `RESERVED_ROLE_NAMES` in `crates/scp-protocol/src/context/roles.rs`
+/// reserves, each case named exactly as the bridge reports it. No custom role
+/// may take any of those names, so a member holding one holds the
+/// protocol-defined role of that name.
+public enum MemberRole: Sendable, Hashable {
     /// Context administrator with full governance capabilities.
-    case admin = "Admin"
+    case admin
     /// Moderator with messaging, moderation, and governance proposal capabilities.
-    case moderator = "Moderator"
+    case moderator
     /// Regular participant with standard capabilities.
-    case member = "Member"
+    case member
     /// Read-only observer with no write capabilities.
-    case observer = "Observer"
-    /// Custom role defined by context governance.
-    case custom = "Custom"
+    case observer
+    /// Broadcast author: writes messages and holds the outlet capabilities.
+    case author
+    /// Broadcast subscriber: the role a broadcast subscribe assigns; reads only.
+    case subscriber
+    /// A role a context's governance defined, carrying the name governance gave it.
+    case custom(name: String)
+}
 
-    /// Parse a bridge-layer role string into a ``MemberRole``.
+extension MemberRole {
+    /// Parses a bridge-layer role name into a ``MemberRole``.
     ///
-    /// Falls back to ``custom`` for unrecognised strings.
-    public static func fromBridge(_ raw: String) -> MemberRole {
-        let normalised = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        return MemberRole(rawValue: normalised)
-            ?? MemberRole(rawValue: normalised.capitalized)
-            ?? .custom
+    /// Every bridge reports `RoleAssignment.role_name`, which stores a built-in
+    /// role in lowercase (`"author"`) and a custom role under the name
+    /// governance gave it. Matching is exact.
+    ///
+    /// - Throws: ``ScpError/Context(msg:code:)`` with code `SCP-GOV-11040`
+    ///   when `raw` is neither a built-in role name nor a name
+    ///   `validate_role_name` admits for a custom role.
+    public static func fromBridge(_ raw: String) throws -> MemberRole {
+        switch raw {
+        case "admin": return .admin
+        case "moderator": return .moderator
+        case "member": return .member
+        case "observer": return .observer
+        case "author": return .author
+        case "subscriber": return .subscriber
+        default:
+            guard isCustomRoleName(raw) else {
+                throw ScpError.Context(
+                    msg: "bridge reported role name \(raw.debugDescription), which is neither "
+                        + "a built-in nor a valid custom role name",
+                    code: unknownGovernanceOutcomeCode
+                )
+            }
+            return .custom(name: raw)
+        }
+    }
+
+    /// Whether `validate_role_name` in `crates/scp-protocol/src/context/roles.rs`
+    /// admits `name`: 1 to 64 bytes of lowercase ASCII letters, digits, hyphens,
+    /// and underscores, neither starting nor ending with a hyphen or underscore.
+    private static func isCustomRoleName(_ name: String) -> Bool {
+        let bytes = Array(name.utf8)
+        guard (1 ... 64).contains(bytes.count) else { return false }
+        let edge = { (byte: UInt8) in (byte >= 0x61 && byte <= 0x7A) || (byte >= 0x30 && byte <= 0x39) }
+        let inner = { (byte: UInt8) in edge(byte) || byte == 0x2D || byte == 0x5F }
+        guard let first = bytes.first, let last = bytes.last, edge(first), edge(last) else {
+            return false
+        }
+        return bytes.allSatisfy(inner)
     }
 }
 
@@ -292,9 +472,10 @@ public extension Context {
     ///
     /// - Parameters:
     ///   - proposalIdHex: Hex-encoded id of the approved, tracked proposal.
-    /// - Returns: A ``GovernanceActionResult`` describing the outcome.
+    /// - Returns: The ``GovernanceActionResult`` naming which action ran.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
-    ///   active or governance execution fails.
+    ///   active, governance execution fails, or the bridge reports an outcome
+    ///   this SDK version does not name (code `SCP-GOV-11040`).
     func executeGovernanceAction(
         proposalIdHex: String
     ) async throws -> GovernanceActionResult {
@@ -305,11 +486,10 @@ public extension Context {
             )
         }
 
-        let raw = try await scp.governanceExecute(
+        return try await scp.governanceExecute(
             handle: handle,
             proposalIdHex: proposalIdHex
         )
-        return GovernanceActionResult(rawValue: raw) ?? .executed
     }
 }
 
@@ -519,7 +699,7 @@ public extension Context {
         guard let raw = await scp.contextMemberRole(handle: handle, did: did) else {
             return nil
         }
-        return MemberRole.fromBridge(raw)
+        return try MemberRole.fromBridge(raw)
     }
 }
 

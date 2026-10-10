@@ -7,6 +7,8 @@
  * See ADR-022 in `.docs/adrs/phase-4.md` and `.docs/scaffold/typescript.md`.
  */
 
+import { UnknownGovernanceOutcomeError } from "./errors";
+
 // ---------------------------------------------------------------------------
 // Capability strings
 // ---------------------------------------------------------------------------
@@ -451,11 +453,67 @@ function encodeConsequenceCapability(capability: ConsequenceCapability): unknown
 // ---------------------------------------------------------------------------
 
 /**
- * Role assigned to a member within a context (spec section 5.5).
- *
- * Mirrors `scp_core::context::roles::Role`.
+ * The six protocol-defined roles (spec section 5.5), one per name
+ * `RESERVED_ROLE_NAMES` in `crates/scp-protocol/src/context/roles.rs`
+ * reserves. No custom role may take any of them, so a member holding one of
+ * these names holds the protocol-defined role of that name.
  */
-export type MemberRole = "Admin" | "Moderator" | "Member" | "Observer" | "Custom";
+export const BUILT_IN_ROLES = [
+  "Admin",
+  "Moderator",
+  "Member",
+  "Observer",
+  "Author",
+  "Subscriber",
+] as const;
+
+/** A protocol-defined role; see {@link BUILT_IN_ROLES}. */
+export type BuiltInRole = (typeof BUILT_IN_ROLES)[number];
+
+/** A role a context's governance defined, carrying the name governance gave it. */
+export interface CustomRole {
+  readonly kind: "Custom";
+  /** The role's name, for example `"night-shift-reviewer"`. */
+  readonly name: string;
+}
+
+/**
+ * Role assigned to a member within a context (spec section 5.5): a
+ * {@link BuiltInRole}, or a {@link CustomRole} carrying its name.
+ */
+export type MemberRole = BuiltInRole | CustomRole;
+
+/**
+ * A custom role name `validate_role_name` in
+ * `crates/scp-protocol/src/context/roles.rs` admits: 1 to 64 bytes of
+ * lowercase ASCII letters, digits, hyphens, and underscores, neither starting
+ * nor ending with a hyphen or underscore.
+ */
+const CUSTOM_ROLE_NAME = /^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/;
+
+/**
+ * Parses a bridge-layer role name into a {@link MemberRole}.
+ *
+ * Every bridge reports `RoleAssignment.role_name`, which stores a built-in
+ * role in lowercase (`"author"`) and a custom role under the name governance
+ * gave it. Matching is exact. Swift's `MemberRole.fromBridge` and Python's
+ * `MemberRole.from_bridge` parse the same way.
+ *
+ * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when `raw` is
+ *   neither a built-in role name nor a name `validate_role_name` admits for a
+ *   custom role.
+ */
+export function memberRoleFromBridge(raw: string): MemberRole {
+  const builtIn = BUILT_IN_ROLES.find((role) => role.toLowerCase() === raw);
+  if (builtIn !== undefined) return builtIn;
+  if (!CUSTOM_ROLE_NAME.test(raw)) {
+    throw new UnknownGovernanceOutcomeError(
+      `bridge reported role name ${JSON.stringify(raw)}, which is neither a built-in nor a valid custom role name`,
+      raw,
+    );
+  }
+  return { kind: "Custom", name: raw };
+}
 
 // ---------------------------------------------------------------------------
 // Broadcast
@@ -514,37 +572,180 @@ export interface BatchPublishResult {
 // ---------------------------------------------------------------------------
 
 /**
- * Result of executing a governance action (ADR-031).
- *
- * Each variant corresponds to one of the 28 governance action outcomes.
+ * Every governance outcome a bridge reports (ADR-031). Each entry is the name
+ * `governance_action_result_name` in
+ * `crates/scp-ffi/common/src/governance_result.rs` gives one variant of
+ * `scp_core::context::state::GovernanceActionResult`.
+ * `crates/scp-testing/tests/governance_outcome_parity.rs` fails when this list
+ * and that function list different names.
  */
-export type GovernanceActionResult =
-  | "MemberAdded"
-  | "MemberRemoved"
-  | "RoleChanged"
-  | "OutletRegistered"
-  | "OutletRemoved"
-  | "CeilingModified"
-  | "ContextClosed"
-  | "TtlExtended"
-  | "PruningPolicyModified"
-  | "AdminTransferred"
-  | "SignerAdded"
-  | "SignerRemoved"
-  | "ThresholdModified"
-  | "ChildContextCreated"
-  | "OutletInterfaceEstablished"
-  | "MemberReset"
-  | "ConflictResolved"
-  | "ContextPromoted"
-  | "MemberSuspended"
-  | "AccessRevoked"
-  | "AccessRestored"
-  | "ContentKeysRotated"
-  | "GovernanceReconfigured"
-  | "SubscriberBanned"
-  | "SubscriberUnbanned"
-  | "Executed";
+export const GOVERNANCE_ACTION_RESULTS = [
+  "MemberAdded",
+  "MemberRemoved",
+  "RoleChanged",
+  "OutletRegistered",
+  "OutletRemoved",
+  "CeilingModified",
+  "ContextClosed",
+  "TtlExtended",
+  "PruningPolicyModified",
+  "AdminTransferred",
+  "SignerAdded",
+  "SignerRemoved",
+  "ThresholdModified",
+  "ChildContextCreated",
+  "OutletInterfaceEstablished",
+  "MemberReset",
+  "ConflictResolved",
+  "ContextPromoted",
+  "MemberSuspended",
+  "AccessRevoked",
+  "AccessRestored",
+  "ContentKeysRotated",
+  "GovernanceReconfigured",
+  "SubscriberBanned",
+  "SubscriberUnbanned",
+  "Executed",
+  "MigrationProposed",
+  "MigrationCancelled",
+  "ContextTombstoned",
+] as const;
+
+/** Result of executing a governance action (ADR-031). */
+export type GovernanceActionResult = (typeof GOVERNANCE_ACTION_RESULTS)[number];
+
+/**
+ * Every proposal status a bridge reports: the names `proposal_status_name`
+ * gives the variants of `scp_core::context::governance::ProposalStatus`.
+ */
+export const PROPOSAL_STATUSES = [
+  "Pending",
+  "Approved",
+  "Rejected",
+  "Expired",
+  "Cancelled",
+  "Invalidated",
+] as const;
+
+/** Lifecycle status of a governance proposal (ADR-031). */
+export type ProposalStatus = (typeof PROPOSAL_STATUSES)[number];
+
+/**
+ * Every rejection reason a bridge reports: the names `rejection_reason_name`
+ * gives the variants of `scp_core::context::governance::RejectionReason`.
+ */
+export const REJECTION_REASONS = [
+  "AdminRejected",
+  "MajorityRejected",
+  "UnanimityBroken",
+  "ApprovalImpossible",
+  "InsufficientParticipation",
+] as const;
+
+/** Reason a governance proposal was rejected (ADR-031). */
+export type RejectionReason = (typeof REJECTION_REASONS)[number];
+
+function parseGovernanceName<T extends string>(kind: string, known: readonly T[], raw: string): T {
+  const found = known.find((name) => name === raw);
+  if (found === undefined) {
+    throw new UnknownGovernanceOutcomeError(
+      `bridge reported ${kind} ${JSON.stringify(raw)}, which this SDK version does not name; ` +
+        `known names: ${known.join(", ")}. Upgrade the SDK to the version of the bridge it calls.`,
+      raw,
+    );
+  }
+  return found;
+}
+
+/**
+ * Parses the outcome name a bridge's governance execute returns.
+ *
+ * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when `raw` names no
+ *   entry of {@link GOVERNANCE_ACTION_RESULTS}. The action ran and this SDK
+ *   cannot say which action it was, so it never reports `"Executed"` in its
+ *   place.
+ */
+export function governanceActionResultFromBridge(raw: string): GovernanceActionResult {
+  return parseGovernanceName("governance outcome", GOVERNANCE_ACTION_RESULTS, raw);
+}
+
+/**
+ * Parses a proposal status name a bridge reports.
+ *
+ * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when `raw` names no
+ *   entry of {@link PROPOSAL_STATUSES}.
+ */
+export function proposalStatusFromBridge(raw: string): ProposalStatus {
+  return parseGovernanceName("proposal status", PROPOSAL_STATUSES, raw);
+}
+
+/**
+ * Parses a rejection reason name a bridge reports.
+ *
+ * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when `raw` names no
+ *   entry of {@link REJECTION_REASONS}.
+ */
+export function rejectionReasonFromBridge(raw: string): RejectionReason {
+  return parseGovernanceName("rejection reason", REJECTION_REASONS, raw);
+}
+
+/**
+ * Checks every name in a governance proposal response and returns `raw`.
+ *
+ * Propose, approve, reject, and withdraw each return a JSON object
+ * `{status, reason?, rejector?}`; propose adds `proposal_id` and
+ * `execution_result`. This function parses `status`, the `reason` of a
+ * `"Rejected"` status, and a non-null `execution_result`. An `"Invalidated"`
+ * status carries free-text `reason`, which must be a string.
+ *
+ * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when `raw` is not a
+ *   JSON object, a required name is missing or is not a string, or a name
+ *   matches no entry of its list.
+ */
+export function checkProposalResponse(raw: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new UnknownGovernanceOutcomeError(
+      "governance proposal response is not a JSON object, so this SDK cannot read its status",
+      raw,
+    );
+  }
+  const body = parsed as Record<string, unknown>;
+  if (typeof body.status !== "string") {
+    throw new UnknownGovernanceOutcomeError(
+      "governance proposal response carries no string status",
+      raw,
+    );
+  }
+  const status = proposalStatusFromBridge(body.status);
+  if (status === "Rejected" || status === "Invalidated") {
+    if (typeof body.reason !== "string") {
+      throw new UnknownGovernanceOutcomeError(
+        `governance proposal response has status ${status} and no string reason`,
+        raw,
+      );
+    }
+    if (status === "Rejected") {
+      rejectionReasonFromBridge(body.reason);
+    }
+  }
+  const executionResult = body.execution_result;
+  if (executionResult !== undefined && executionResult !== null) {
+    if (typeof executionResult !== "string") {
+      throw new UnknownGovernanceOutcomeError(
+        "governance proposal response carries an execution_result that is neither a string nor null",
+        raw,
+      );
+    }
+    governanceActionResultFromBridge(executionResult);
+  }
+  return raw;
+}
 
 // ---------------------------------------------------------------------------
 // Invitations (ADR-049 Phase 2J / FFI-02 Option A)

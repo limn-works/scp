@@ -1334,6 +1334,26 @@ pub const ATTEST_9026: &str = "SCP-ATTEST-9026";
 pub const ATTEST_9027: &str = "SCP-ATTEST-9027";
 
 // -------------------------------------------------------------------------
+// Governance (SCP-GOV- 11000--11999)
+// -------------------------------------------------------------------------
+
+/// A bridge reported a governance name the SDK reading it does not enumerate.
+///
+/// Every bridge names a governance outcome, a proposal status, and a rejection
+/// reason through the exhaustive functions in
+/// [`crate::governance_result`]. Each SDK parses those names into typed enums,
+/// and an SDK older than its bridge reads a name its enum lacks. The SDK
+/// raises this code instead of substituting a known name: governance decides
+/// authorization, and a substituted name reports an action or status the
+/// engine never reported. Each SDK's member-role parser raises it too, for a
+/// role name that is neither one of the names `RESERVED_ROLE_NAMES` reserves
+/// nor a name `validate_role_name` admits for a custom role. SDK-side only; no
+/// bridge emits it.
+/// `crates/scp-testing/tests/governance_outcome_parity.rs` holds each SDK's
+/// name set equal to the Rust set.
+pub const GOV_11040: &str = "SCP-GOV-11040";
+
+// -------------------------------------------------------------------------
 // Economy (SCP-ECON- 12000--12999)
 // -------------------------------------------------------------------------
 

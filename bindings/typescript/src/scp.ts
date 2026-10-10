@@ -67,7 +67,9 @@ import type {
   ChallengeVerification,
   ConsequenceRule,
   EventLogEntry,
+  GovernanceActionResult,
   InviteMemberOutcome,
+  MemberRole,
   OutletDefinition,
   ParticipationProfile,
   RequireParticipation,
@@ -77,6 +79,7 @@ import type {
   TrustEvaluation,
 } from "./types";
 import {
+  checkProposalResponse,
   encodeAttestation,
   encodeAttestorSets,
   encodeCachedAttestations,
@@ -90,6 +93,8 @@ import {
   encodeParticipationProfile,
   encodeRequireParticipation,
   encodeThresholdRequirements,
+  governanceActionResultFromBridge,
+  memberRoleFromBridge,
 } from "./types";
 
 /**
@@ -1840,14 +1845,23 @@ export class SCP {
     }
   }
 
-  async contextMemberRole(handle: unknown, did: string): Promise<string | null> {
+  /**
+   * Returns the role `did` holds in the context, or `null` for a non-member.
+   *
+   * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when the bridge
+   *   reports a role name {@link memberRoleFromBridge} cannot parse.
+   */
+  async contextMemberRole(handle: unknown, did: string): Promise<MemberRole | null> {
+    let raw: string | null;
     try {
-      return await (
+      raw = await (
         this.#native.contextMemberRole as (h: unknown, d: string) => Promise<string | null>
       )(handle, did);
     } catch (err) {
       throw mapBridgeError(err);
     }
+    if (raw === null) return null;
+    return memberRoleFromBridge(raw);
   }
 
   async contextDrainEvents(handle: unknown): Promise<readonly string[]> {
@@ -2232,44 +2246,68 @@ export class SCP {
    * and consequence subject are resolved from the tracked proposal's proposer,
    * never from a caller-supplied DID.
    *
-   * @returns A JSON string describing the action result. For membership-changing
-   * actions (`RemoveMember`) the JSON includes a `commit` field: a hex-encoded
-   * MLS Commit that evicts the removed member from the group key schedule.
+   * The native addon has an internal transport and broadcasts any MLS commit
+   * the action produces (for example the commit that evicts a removed member)
+   * to the other context members, so the caller relays nothing.
    *
-   * This call routes through the native addon, which has an internal
-   * transport and **auto-broadcasts** the eviction `commit` to the other
-   * context members. The caller does not need to relay it.
-   *
-   * An empty `commit` string means no MLS commit was produced
-   * (broadcast/unencrypted context, or the removed member held no MLS leaf) and
-   * there is nothing to distribute.
+   * @returns The outcome naming which action ran.
+   * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when the bridge
+   *   reports an outcome this SDK version does not name.
    */
-  async contextExecuteGovernanceAction(handle: unknown, proposalIdHex: string): Promise<string> {
+  async contextExecuteGovernanceAction(
+    handle: unknown,
+    proposalIdHex: string,
+  ): Promise<GovernanceActionResult> {
+    let raw: string;
     try {
-      return await (
+      raw = await (
         this.#native.contextExecuteGovernanceAction as (h: unknown, p: string) => Promise<string>
       )(handle, proposalIdHex);
     } catch (err) {
       throw mapBridgeError(err);
     }
+    // Parsed outside the try block, so an unknown name is never re-mapped as a
+    // bridge error.
+    return governanceActionResultFromBridge(raw);
   }
 
+  /**
+   * Proposes a governance action.
+   *
+   * @returns The bridge's JSON `{proposal_id, status, reason?, rejector?,
+   *   execution_result}` after {@link checkProposalResponse} checks every name
+   *   in it. `execution_result` names the action a `single_admin` context
+   *   auto-executed, and is `null` while a proposal awaits votes.
+   * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when the response
+   *   names a status, reason, or outcome this SDK version does not name.
+   */
   async contextGovernancePropose(
     handle: unknown,
     actionJson: string,
     proposerDid: string,
   ): Promise<string> {
     const bridge = await getBridge(this);
-    return bridge.contextGovernancePropose(handle as BridgeContextHandle, actionJson, proposerDid);
+    return checkProposalResponse(
+      await bridge.contextGovernancePropose(handle as BridgeContextHandle, actionJson, proposerDid),
+    );
   }
 
+  /**
+   * Approves a governance proposal.
+   *
+   * @returns The bridge's JSON `{status, reason?, rejector?}` after
+   *   {@link checkProposalResponse} checks every name in it.
+   * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when the response
+   *   names a status or reason this SDK version does not name.
+   */
   async contextGovernanceApprove(
     handle: unknown,
     proposalIdHex: string,
     voterDid: string,
   ): Promise<string> {
+    let raw: string;
     try {
-      return await (
+      raw = await (
         this.#native.contextGovernanceApprove as (
           h: unknown,
           p: string,
@@ -2279,15 +2317,25 @@ export class SCP {
     } catch (err) {
       throw mapBridgeError(err);
     }
+    return checkProposalResponse(raw);
   }
 
+  /**
+   * Rejects a governance proposal.
+   *
+   * @returns The bridge's JSON `{status, reason?, rejector?}` after
+   *   {@link checkProposalResponse} checks every name in it.
+   * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when the response
+   *   names a status or reason this SDK version does not name.
+   */
   async contextGovernanceReject(
     handle: unknown,
     proposalIdHex: string,
     voterDid: string,
   ): Promise<string> {
+    let raw: string;
     try {
-      return await (
+      raw = await (
         this.#native.contextGovernanceReject as (
           h: unknown,
           p: string,
@@ -2297,15 +2345,25 @@ export class SCP {
     } catch (err) {
       throw mapBridgeError(err);
     }
+    return checkProposalResponse(raw);
   }
 
+  /**
+   * Withdraws a governance proposal.
+   *
+   * @returns The bridge's JSON `{status, reason?, rejector?}` after
+   *   {@link checkProposalResponse} checks every name in it.
+   * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when the response
+   *   names a status or reason this SDK version does not name.
+   */
   async contextGovernanceWithdraw(
     handle: unknown,
     proposalIdHex: string,
     voterDid: string,
   ): Promise<string> {
+    let raw: string;
     try {
-      return await (
+      raw = await (
         this.#native.contextGovernanceWithdraw as (
           h: unknown,
           p: string,
@@ -2315,6 +2373,7 @@ export class SCP {
     } catch (err) {
       throw mapBridgeError(err);
     }
+    return checkProposalResponse(raw);
   }
 
   async contextGovernanceGetProposal(handle: unknown, proposalIdHex: string): Promise<string> {

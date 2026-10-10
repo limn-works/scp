@@ -233,6 +233,33 @@ export class GovernanceError extends ScpError {
   }
 }
 
+/**
+ * A bridge reported a governance name this SDK version does not enumerate.
+ *
+ * Every bridge names what a governance call did through one shared mapping in
+ * `scp_ffi_common::governance_result`: an action outcome
+ * (`GOVERNANCE_ACTION_RESULTS`), a proposal status (`PROPOSAL_STATUSES`), and
+ * a rejection reason (`REJECTION_REASONS`). An SDK older than its bridge reads
+ * a name none of those lists carries. `memberRoleFromBridge` throws it too, for
+ * a role name that is neither built in nor a name `validate_role_name` admits
+ * for a custom role. This error reports that name instead of
+ * substituting a known one: governance decides authorization, and a
+ * substituted name reports an action or status the engine never reported.
+ */
+export class UnknownGovernanceOutcomeError extends GovernanceError {
+  /**
+   * The name the bridge reported, or the whole response when the response
+   * carried no readable name.
+   */
+  readonly rawOutcome: string;
+
+  constructor(message: string, rawOutcome: string, code = "SCP-GOV-11040") {
+    super(message, code);
+    this.name = "UnknownGovernanceOutcomeError";
+    this.rawOutcome = rawOutcome;
+  }
+}
+
 /** Economy / payment / spending UCAN / budget failures (SCP-ECON-* range). */
 export class EconomyError extends ScpError {
   constructor(message: string, code: string) {
