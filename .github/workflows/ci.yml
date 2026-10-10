@@ -4127,6 +4127,37 @@ jobs:
           # would otherwise rebuild the crate, so these tests compile against the
           # bindings this job uploads and load the cdylib it uploads.
           ./gradlew :scp-kt:test :scp-kt-android:testDebugUnitTest -Pscp.uniffi.prebuiltBindings=true
+      # Gradle prints no test totals, so a change that moved this suite between jobs or
+      # artifacts and lost tests would pass unseen. This step sums the JUnit XML each
+      # test task wrote and prints one line per task, which a reviewer compares between
+      # runs. It reports and asserts nothing, and it runs after a failed test step too.
+      - name: Report the test counts
+        if: ${{ !cancelled() }}
+        working-directory: bindings/kotlin
+        run: |
+          python3 - <<'PY'
+          import glob
+          import xml.etree.ElementTree as ET
+
+          for task, pattern in (
+              (":scp-kt:test", "scp-kt/build/test-results/test/TEST-*.xml"),
+              (
+                  ":scp-kt-android:testDebugUnitTest",
+                  "scp-kt-android/build/test-results/testDebugUnitTest/TEST-*.xml",
+              ),
+          ):
+              totals = dict.fromkeys(("tests", "failures", "errors", "skipped"), 0)
+              files = sorted(glob.glob(pattern))
+              for path in files:
+                  suite = ET.parse(path).getroot()
+                  for field in totals:
+                      totals[field] += int(suite.get(field, "0"))
+              print(
+                  f"{task}: {len(files)} suites, {totals['tests']} tests, "
+                  f"{totals['failures']} failures, {totals['errors']} errors, "
+                  f"{totals['skipped']} skipped"
+              )
+          PY
       # This step replaces the generator script with one that exits 0, so
       # `generateUniffiBindings` and `compileKotlin` run without a Rust toolchain
       # and the JAR must record `Scp-Uniffi-Bindings: generated`.
