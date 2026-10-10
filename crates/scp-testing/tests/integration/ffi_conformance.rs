@@ -38,8 +38,6 @@ const PYO3_OUTLETS: &str = include_str!("../../../../crates/scp-ffi/src/outlets.
 const PYO3_UCAN: &str = include_str!("../../../../crates/scp-ffi/src/ucan.rs");
 const PYO3_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/src/event_log.rs");
 const PYO3_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/src/transport.rs");
-const PYO3_BRIDGE_CONNECTOR: &str =
-    include_str!("../../../../crates/scp-ffi/src/bridge_connector.rs");
 const PYO3_SYNC: &str = include_str!("../../../../crates/scp-ffi/src/sync.rs");
 const PYO3_PROVENANCE: &str = include_str!("../../../../crates/scp-ffi/src/provenance.rs");
 const PYO3_DISCOVERY: &str = include_str!("../../../../crates/scp-ffi/src/discovery.rs");
@@ -92,8 +90,6 @@ const NAPI_OUTLETS: &str = include_str!("../../../../crates/scp-ffi/napi/src/out
 const NAPI_UCAN: &str = include_str!("../../../../crates/scp-ffi/napi/src/ucan.rs");
 const NAPI_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/napi/src/event_log.rs");
 const NAPI_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/napi/src/transport.rs");
-const NAPI_BRIDGE_CONNECTOR: &str =
-    include_str!("../../../../crates/scp-ffi/napi/src/bridge_connector.rs");
 const NAPI_SYNC: &str = include_str!("../../../../crates/scp-ffi/napi/src/sync.rs");
 const NAPI_PROVENANCE: &str = include_str!("../../../../crates/scp-ffi/napi/src/provenance.rs");
 const NAPI_DISCOVERY: &str = include_str!("../../../../crates/scp-ffi/napi/src/discovery.rs");
@@ -682,7 +678,6 @@ fn pyo3_sources() -> Vec<&'static str> {
         PYO3_UCAN,
         PYO3_EVENT_LOG,
         PYO3_TRANSPORT,
-        PYO3_BRIDGE_CONNECTOR,
         PYO3_SYNC,
         PYO3_PROVENANCE,
         PYO3_DISCOVERY,
@@ -706,7 +701,6 @@ fn napi_sources() -> Vec<&'static str> {
         NAPI_UCAN,
         NAPI_EVENT_LOG,
         NAPI_TRANSPORT,
-        NAPI_BRIDGE_CONNECTOR,
         NAPI_SYNC,
         NAPI_PROVENANCE,
         NAPI_DISCOVERY,
@@ -3399,7 +3393,7 @@ fn ffi_export_allowlist_reasons_are_justified() {
             //
             // The earlier gate ran this only when `cites_matrix` was true, so an
             // entry that justified itself via a real ADR/§/SCP (the alternative
-            // path) while naming a cross-bridge matrix op — e.g. "Per ADR-023 the
+            // path) while naming a cross-bridge matrix op — e.g. "Per ADR-015 the
             // create operation is implemented only on PyO3 here" — skipped the
             // contradiction check entirely and buried a 4-SDK op as one-bridge.
             // "Is this entry justified at all" (cites matrix OR real ADR/§/SCP,

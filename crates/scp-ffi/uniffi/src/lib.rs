@@ -121,8 +121,6 @@ pub use bridge::{
     TrustInput,
     UcanToken,
     UcanTokenData,
-    // Free functions — bridge connector (#370)
-    bridge_evaluate_trust,
     // Free functions — broadcast (#387)
     // Free functions — transport
     // Free functions — context lifecycle
