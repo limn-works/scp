@@ -249,10 +249,13 @@ ENVIRONMENT VARIABLES:
     SCP_STORAGE_KEY             Hex-encoded 32-byte SQLCipher encryption key
                                 (auto-generated and stored if not set)
     SCP_RELAY_BIND_ADDR         Relay bind address (default: 0.0.0.0:9000)
-    SCP_RELAY_STORAGE_BACKEND   Blob storage backend for relay: sqlite (default), redb,
-                                postgres, s3 (both need scp-transport's postgres-blob/s3-blob,
-                                which --features cloud-blobs enables), memory
-    SCP_RELAY_STORAGE_PATH      Path for sqlite/redb blob storage (default: ./scp-relay.db)
+    SCP_RELAY_STORAGE_BACKEND   Blob storage backend for relay: sqlite, redb, postgres, s3
+                                (both need scp-transport's postgres-blob/s3-blob, which
+                                --features cloud-blobs enables), memory. Required in
+                                --relay-only and full node mode: no default, and an unset
+                                or empty value exits 1
+    SCP_RELAY_STORAGE_PATH      Absolute path for sqlite/redb blob storage (required for
+                                those backends: no default, and a relative path exits 1)
     SCP_RELAY_DATABASE_URL      PostgreSQL connection URL (required when backend=postgres)
     SCP_RELAY_S3_BUCKET         S3 bucket name (required when backend=s3)
     SCP_RELAY_S3_PREFIX         S3 key prefix (default: blobs/)
@@ -273,6 +276,20 @@ ENVIRONMENT VARIABLES:
 // ---------------------------------------------------------------------------
 
 // `env_or` is provided by `scp_transport::startup::env_or`.
+
+/// Returns the value inside `result`, or prints its [`startup::StartupError`]
+/// to stderr and exits 1.
+///
+/// The `startup` library returns every failure to this binary, and this
+/// function is where a failure becomes an exit code. The error goes to stderr
+/// because tracing may not be installed yet.
+fn or_exit<T>(result: Result<T, startup::StartupError>) -> T {
+    result.unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        tracing::error!(error = %e, "startup failed");
+        std::process::exit(1);
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Storage path resolution
@@ -344,8 +361,8 @@ const CLOUD_BLOBS_FEATURE: &str = "cloud-blobs";
 
 /// Runs a bare relay server (same as `scp-relay` binary).
 async fn run_relay_only() {
-    let backend = startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE);
-    let config = startup::relay_config_from_env();
+    let backend = or_exit(startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE));
+    let config = or_exit(startup::relay_config_from_env());
     tracing::info!(
         bind_addr = %config.bind_addr,
         max_blob_size = config.max_blob_size,
@@ -353,7 +370,8 @@ async fn run_relay_only() {
         "starting scp-node in relay-only mode"
     );
 
-    let storage = Arc::new(startup::storage_from_env(backend).await);
+    let storage = Arc::new(or_exit(startup::storage_from_env(backend).await));
+    let shutdown = or_exit(startup::shutdown_signal());
     let server = RelayServer::new(config, storage);
 
     let (handle, local_addr) = match server.start().await {
@@ -366,7 +384,7 @@ async fn run_relay_only() {
 
     tracing::info!(addr = %local_addr, "relay listening");
 
-    startup::shutdown_signal().await;
+    shutdown.await;
 
     tracing::info!("shutdown signal received, stopping relay");
     handle.shutdown();
@@ -552,9 +570,16 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // Parse the blob backend before anything below creates the storage
     // directory, the storage key, or a store, so a backend this build cannot
     // serve exits with nothing left on disk.
-    let backend = startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE);
+    let backend = or_exit(startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE));
     let domain = require_domain();
     let http_addr = node_http_addr();
+
+    // Persistent mode: the durable blob backend the operator named in
+    // `SCP_RELAY_STORAGE_BACKEND` (no default), configured by
+    // `SCP_RELAY_STORAGE_PATH` — the same explicit selection relay-only mode
+    // makes (SCP-CAPINJECT-010). It opens before the node storage directory and
+    // key exist, so a missing or relative blob path exits with neither created.
+    let blob_storage = or_exit(startup::storage_from_env(backend).await);
 
     // Validate the storage path upfront before attempting to open databases.
     let resolved_path = resolve_storage_path_or_exit(storage_path);
@@ -615,11 +640,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 custody,
                 did_method,
                 Arc::clone(&node_storage_arc),
-                // Persistent mode: operator-configured durable blob backend
-                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
-                // `SCP_RELAY_STORAGE_PATH` — the same explicit selection
-                // relay-only mode makes (SCP-CAPINJECT-010).
-                startup::storage_from_env(backend).await,
+                blob_storage,
             )
             .await;
         }
@@ -647,10 +668,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 custody,
                 did_method,
                 Arc::clone(&node_storage_arc),
-                // Persistent mode: operator-configured durable blob backend
-                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
-                // `SCP_RELAY_STORAGE_PATH` (SCP-CAPINJECT-010).
-                startup::storage_from_env(backend).await,
+                blob_storage,
             )
             .await;
         }
@@ -814,7 +832,9 @@ fn fixed_store_backend_conflict(flag: &str, store: &str, selected: Option<&str>)
     let cloud = match startup::BackendChoice::parse(value) {
         Ok(choice) => choice.is_cloud(),
         Err(startup::BackendSelectionError::NotCompiled { .. }) => true,
-        Err(startup::BackendSelectionError::Unknown { .. }) => false,
+        Err(
+            startup::BackendSelectionError::Unknown { .. } | startup::BackendSelectionError::Unset,
+        ) => false,
     };
     if !cloud {
         return None;
@@ -861,7 +881,7 @@ const EPHEMERAL_STORE: &str = "in memory";
 /// startup banner.
 async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
     exit_on_ignored_cloud_backend("--self-host", SELF_HOST_STORE);
-    let port: u16 = startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16);
+    let port: u16 = or_exit(startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16));
     let plaintext = self_host_plaintext();
     let skip_nat = self_host_skip_nat();
 
@@ -887,20 +907,20 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
         "self-host mode enabled — opening inbound port to the public internet"
     );
 
-    let refresh_secs: u64 = startup::env_or(
+    let refresh_secs: u64 = or_exit(startup::env_or(
         "SCP_NODE_SELF_HOST_REFRESH_SECS",
         // The default refresh interval is reach-independent; read it off a
         // throwaway `defaults(...)` (there is no whole-struct `Default` — M4).
         scp_node::HostSiteConfig::defaults(Reach::Local)
             .refresh_interval
             .as_secs(),
-    )
+    ))
     .max(1);
 
-    let projection_rate_limit: u32 = startup::env_or(
+    let projection_rate_limit: u32 = or_exit(startup::env_or(
         "SCP_NODE_PROJECTION_RATE_LIMIT",
         scp_node::DEFAULT_PROJECTION_RATE_LIMIT,
-    );
+    ));
 
     // -- Lower the binary's `plaintext` / `skip_nat` booleans onto the
     //    construction-pattern enums (ADR-052 M1): `plaintext` → `TlsMode`,
@@ -934,7 +954,8 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
         })),
     };
 
-    if let Err(e) = scp_node::host_site_until(config, startup::shutdown_signal()).await {
+    let shutdown = or_exit(startup::shutdown_signal());
+    if let Err(e) = scp_node::host_site_until(config, shutdown).await {
         tracing::error!(error = %e, "self-host mode failed");
         std::process::exit(1);
     }
@@ -998,9 +1019,13 @@ fn require_domain() -> String {
     }
 }
 
-/// Reads the HTTP bind address from env or returns the default.
+/// Reads the HTTP bind address from env, returns the default when it is unset,
+/// and exits 1 when it does not parse.
 fn node_http_addr() -> SocketAddr {
-    startup::env_or("SCP_NODE_BIND_ADDR", SocketAddr::from(([0, 0, 0, 0], 9000)))
+    or_exit(startup::env_or(
+        "SCP_NODE_BIND_ADDR",
+        SocketAddr::from(([0, 0, 0, 0], 9000)),
+    ))
 }
 
 /// Reads the comma-separated `SCP_NODE_DHT_GATEWAYS` env var into a list of
@@ -1048,18 +1073,18 @@ async fn run_node_with<
     // and would break ephemeral mode's all-in-memory contract). Ephemeral mode
     // passes `ephemeral_blob_backend()` (in-memory, no persistence, env-ignoring);
     // persistent mode passes `startup::storage_from_env(backend)` (durable, honors
-    // env). `startup::backend_choice_from_env` chose `backend`, and it defaults to
-    // SQLite.
+    // env). `startup::backend_choice_from_env` chose `backend` from
+    // `SCP_RELAY_STORAGE_BACKEND`, which has no default.
     blob_storage: BlobStorageBackend,
 ) {
     let use_self_signed = env_flag_is_truthy(env::var("SCP_NODE_TLS_SELF_SIGNED").ok().as_deref());
 
     let use_dns_provider = env_flag_is_truthy(env::var("SCP_NODE_DNS_PROVIDER").ok().as_deref());
 
-    let projection_rate: u32 = startup::env_or(
+    let projection_rate: u32 = or_exit(startup::env_or(
         "SCP_NODE_PROJECTION_RATE_LIMIT",
         scp_node::DEFAULT_PROJECTION_RATE_LIMIT,
-    );
+    ));
 
     // Decide TLS + DNS provider from the two env booleans BEFORE building the
     // config (ADR-052 Phase B-P2). The three TLS arms map exactly onto the
@@ -1160,7 +1185,8 @@ async fn run_node_with<
     // Install Prometheus metrics recorder and add /metrics endpoint (#1467).
     let metrics_router = install_metrics_recorder();
 
-    if let Err(e) = node.serve(metrics_router, startup::shutdown_signal()).await {
+    let shutdown = or_exit(startup::shutdown_signal());
+    if let Err(e) = node.serve(metrics_router, shutdown).await {
         tracing::error!(error = %e, "application node exited with error");
         std::process::exit(1);
     }
@@ -1229,27 +1255,29 @@ async fn main() {
     // --health: probe the appropriate bind address and exit.
     if config.health {
         let addr: SocketAddr = if config.relay_only {
-            startup::env_or(
+            or_exit(startup::env_or(
                 "SCP_RELAY_BIND_ADDR",
                 SocketAddr::from(([127, 0, 0, 1], 9000)),
-            )
+            ))
         } else if config.self_host {
             // Self-host binds the site listener on SCP_NODE_SELF_HOST_PORT
             // (default 8443), NOT SCP_NODE_BIND_ADDR. Probe that port on
             // loopback so `--health` matches the port `--self-host` opens.
-            let port: u16 = startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16);
+            let port: u16 = or_exit(startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16));
             SocketAddr::from(([127, 0, 0, 1], port))
         } else {
-            startup::env_or(
+            or_exit(startup::env_or(
                 "SCP_NODE_BIND_ADDR",
                 SocketAddr::from(([127, 0, 0, 1], 9000)),
-            )
+            ))
         };
-        startup::health_check(addr).await;
-        return;
+        if startup::health_check(addr).await {
+            return;
+        }
+        std::process::exit(1);
     }
 
-    startup::init_tracing();
+    or_exit(startup::init_tracing());
 
     if config.relay_only {
         run_relay_only().await;
@@ -1299,7 +1327,7 @@ mod tests {
                 );
             }
             assert_eq!(fixed_store_backend_conflict(flag, store, None), None);
-            for value in ["sqlite", "redb", "memory", "banana"] {
+            for value in ["sqlite", "redb", "memory", "banana", "", " "] {
                 assert_eq!(
                     fixed_store_backend_conflict(flag, store, Some(value)),
                     None,
@@ -1313,7 +1341,7 @@ mod tests {
     /// in-memory blob backend — no persistence, env overrides ignored. This pins
     /// the ephemeral caller's boundary selection so it cannot silently regress to
     /// a durable / env-driven backend (`startup::storage_from_env` on the choice
-    /// `startup::backend_choice_from_env` makes, which defaults to `Sqlite`),
+    /// `startup::backend_choice_from_env` reads from `SCP_RELAY_STORAGE_BACKEND`),
     /// which would break the all-in-memory contract documented on
     /// `run_full_node_ephemeral` and re-persist blobs to disk. If someone swaps
     /// `ephemeral_blob_backend()` to any non-in-memory backend, this fails.

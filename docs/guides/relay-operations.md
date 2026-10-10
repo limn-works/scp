@@ -76,8 +76,11 @@ cargo build --release -p scp-node --features cloud-blobs
 Runs a bare `RelayServer`. No identity, no HTTP, no TLS. Suitable for infrastructure operators who want a minimal relay that accepts WebSocket connections.
 
 ```bash
-scp-relay
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
 ```
+
+`scp-relay` has no default storage backend and no default database path; section 4
+lists the values and what an unset value does.
 
 ### scp-node modes
 
@@ -91,10 +94,10 @@ scp-relay
 
 ```bash
 # Full node (a shipped binary logs "no production pre-rotation custody backend available" and exits 1; see section 6)
-SCP_NODE_DOMAIN=relay.example.com scp-node
+SCP_NODE_DOMAIN=relay.example.com SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/blobs.db scp-node
 
-# Relay-only mode
-scp-node --relay-only
+# Relay-only mode (names its storage backend and path, which have no default; see section 4)
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-node --relay-only
 
 # Ephemeral mode (everything in memory); a shipped binary exits 1 on --ephemeral, alone or beside another mode flag
 SCP_NODE_DOMAIN=localhost cargo run -p scp-node --features testing -- --ephemeral
@@ -173,21 +176,21 @@ OPTIONS:
 
 ## 4. Blob Storage Backend Selection
 
-`scp-relay` selects a blob storage backend via `SCP_RELAY_STORAGE_BACKEND`, and so does `scp-node` in `--relay-only` mode and in its default persistent full-node mode. `scp-node --self-host` always stores blobs in SQLite under its storage directory, and exits when the variable names `postgres` or `s3`. `scp-node --ephemeral`, which only a `testing` build compiles, always stores blobs in memory, and exits on those two values the same way. The value maps to a `BlobStorageBackend` enum variant. A default build, including the container image the repository's `Dockerfile` builds, compiles neither `postgres` nor `s3`: build the binary with `--features cloud-blobs` to use them. Cargo unifies `scp-transport`'s features across every package one `cargo build` invocation builds, so `cargo build -p scp-relay -p scp-node --features scp-node/cloud-blobs` compiles both backends into `scp-relay` as well: build each binary in its own invocation when only one of them should carry the backends. `scp-relay`, and `scp-node` in `--relay-only` and persistent full-node mode, exit on either value when their build did not compile that backend, in any letter case, with `storage backend 'postgres' is not compiled into this binary` or `storage backend 's3' is not compiled into this binary`: the message names the backend in lowercase, not the value as the operator typed it. `scp-node --self-host` exits on either value in every build, with its own message: `--self-host stores blobs in SQLite under its storage directory and cannot use SCP_RELAY_STORAGE_BACKEND='<value>'`, which echoes the value as the operator typed it. `scp-node --ephemeral` exits with `--ephemeral stores blobs in memory and cannot use SCP_RELAY_STORAGE_BACKEND='<value>'`.
+`scp-relay` selects a blob storage backend via `SCP_RELAY_STORAGE_BACKEND`, and so does `scp-node` in `--relay-only` mode and in its default persistent full-node mode. `scp-node --self-host` always stores blobs in SQLite under its storage directory, and exits when the variable names `postgres` or `s3`. `scp-node --ephemeral`, which only a `testing` build compiles, always stores blobs in memory, and exits on those two values the same way. The variable has no default (persistence spec §17.7, SCP-CAPSEL-8000): when it is unset, empty, or only whitespace, each of those binaries prints `SCP_RELAY_STORAGE_BACKEND is unset or empty, and it has no default (SCP-CAPSEL-8000 ...)` followed by the valid values, and exits 1 before it opens any store. The `sqlite` and `redb` backends also require `SCP_RELAY_STORAGE_PATH` to hold an absolute path: an unset or empty path exits 1 with `SCP_RELAY_STORAGE_BACKEND=sqlite requires SCP_RELAY_STORAGE_PATH to be set to a non-empty value`, and a relative path exits 1 with `SCP_RELAY_STORAGE_PATH='<path>' is a relative path`, because a relative path opens a different file for each working directory the binary starts in. A config variable that is set but empty, such as `SCP_RELAY_DATABASE_URL` or `SCP_RELAY_S3_BUCKET`, is refused the same way. The value maps to a `BlobStorageBackend` enum variant. A default build, including the container image the repository's `Dockerfile` builds, compiles neither `postgres` nor `s3`: build the binary with `--features cloud-blobs` to use them. Cargo unifies `scp-transport`'s features across every package one `cargo build` invocation builds, so `cargo build -p scp-relay -p scp-node --features scp-node/cloud-blobs` compiles both backends into `scp-relay` as well: build each binary in its own invocation when only one of them should carry the backends. `scp-relay`, and `scp-node` in `--relay-only` and persistent full-node mode, exit on either value when their build did not compile that backend, in any letter case, with `storage backend 'postgres' is not compiled into this binary` or `storage backend 's3' is not compiled into this binary`: the message names the backend in lowercase, not the value as the operator typed it. `scp-node --self-host` exits on either value in every build, with its own message: `--self-host stores blobs in SQLite under its storage directory and cannot use SCP_RELAY_STORAGE_BACKEND='<value>'`, which echoes the value as the operator typed it. `scp-node --ephemeral` exits with `--ephemeral stores blobs in memory and cannot use SCP_RELAY_STORAGE_BACKEND='<value>'`.
 
-| Value | Backend | Required env vars | Default path |
+| Value | Backend | Required env vars | Defaults |
 |-------|---------|-------------------|-------------|
-| `sqlite` (default) | SQLite | `SCP_RELAY_STORAGE_PATH` | `./scp-relay.db` |
-| `redb` | redb (embedded) | `SCP_RELAY_STORAGE_PATH` | `./scp-relay.redb` |
-| `postgres` (needs `cloud-blobs`) | PostgreSQL | `SCP_RELAY_DATABASE_URL` (required) | N/A |
-| `s3` (needs `cloud-blobs`) | S3-compatible | `SCP_RELAY_S3_BUCKET` (required), `SCP_RELAY_S3_PREFIX` | prefix: `blobs/` |
-| `memory` | In-memory | none | N/A (data lost on restart) |
+| `sqlite` | SQLite | `SCP_RELAY_STORAGE_PATH` (absolute) | none |
+| `redb` | redb (embedded) | `SCP_RELAY_STORAGE_PATH` (absolute) | none |
+| `postgres` (needs `cloud-blobs`) | PostgreSQL | `SCP_RELAY_DATABASE_URL` | none |
+| `s3` (needs `cloud-blobs`) | S3-compatible | `SCP_RELAY_S3_BUCKET`; optional `SCP_RELAY_S3_PREFIX` | prefix: `blobs/` |
+| `memory` | In-memory | none | none (data lost on restart) |
 
 ### Examples
 
 ```bash
-# SQLite (default)
-SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
+# SQLite
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
 
 # PostgreSQL (binary built with: cargo build --release -p scp-relay --features cloud-blobs)
 SCP_RELAY_STORAGE_BACKEND=postgres \
@@ -216,9 +219,11 @@ All backends implement the `BlobStorage` trait and pass the `blob_store_conforma
 
 ```bash
 # Minimal: SQLite storage, bind 0.0.0.0:9000
-scp-relay
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
 
 # Custom bind address and limits
+SCP_RELAY_STORAGE_BACKEND=sqlite \
+SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db \
 SCP_RELAY_BIND_ADDR=127.0.0.1:8080 \
 SCP_RELAY_MAX_CONNECTIONS=5000 \
 SCP_RELAY_MAX_BLOB_SIZE=524288 \
@@ -226,7 +231,9 @@ SCP_RELAY_RATE_LIMIT=200 \
 scp-relay
 ```
 
-The relay logs to stderr. Control verbosity with `SCP_RELAY_LOG_LEVEL` or `RUST_LOG`:
+Each limit and bind variable takes its default only when it is unset: a value that does not parse, including an empty one, makes the relay exit 1 with an error naming the variable.
+
+The relay logs to stderr. Control verbosity with `SCP_RELAY_LOG_LEVEL` or `RUST_LOG`; a filter that does not parse, or a `SCP_RELAY_LOG_FORMAT` other than `json` or `pretty`, exits 1. The commands below assume `SCP_RELAY_STORAGE_BACKEND` and `SCP_RELAY_STORAGE_PATH` are already exported, as in the examples above:
 
 ```bash
 # Structured JSON logs for production
@@ -263,9 +270,11 @@ The full node (`scp-node` without `--relay-only`) starts an `ApplicationNode` (d
 ### Production deployment
 
 ```bash
-# Required: domain and storage path
+# Required: domain, storage path, and blob backend and path (section 4)
 SCP_NODE_DOMAIN=relay.example.com \
 SCP_STORAGE_PATH=/var/lib/scp/node \
+SCP_RELAY_STORAGE_BACKEND=sqlite \
+SCP_RELAY_STORAGE_PATH=/var/lib/scp/blobs.db \
 scp-node
 ```
 
@@ -486,7 +495,7 @@ Both binaries use the `tracing` crate with configurable output:
 | Pretty | `SCP_RELAY_LOG_FORMAT=pretty` (default) | Human-readable output to stderr |
 | JSON | `SCP_RELAY_LOG_FORMAT=json` | Structured JSON output to stderr |
 
-Log levels are controlled by `RUST_LOG` (takes precedence) or `SCP_RELAY_LOG_LEVEL`:
+Log levels are controlled by `RUST_LOG` (takes precedence) or `SCP_RELAY_LOG_LEVEL`. These commands assume the storage variables from section 4 are exported:
 
 ```bash
 # Module-level filtering, on relay-only mode because a shipped full node exits 1 (see section 6)

@@ -1284,6 +1284,12 @@ pub enum HostSiteError {
     /// The public listener failed to start.
     #[error("serve error: {0}")]
     Serve(String),
+    /// [`host_site`] could not register the operating system's shutdown
+    /// signal handlers, so it would have no way to learn when to stop serving.
+    /// [`host_site_until`] never returns this variant, because its caller
+    /// supplies the shutdown future.
+    #[error("shutdown signal error: {0}")]
+    ShutdownSignal(scp_transport::startup::StartupError),
 }
 
 /// Validates a [`HostSiteConfig`]'s `reach` / `tls` / `dht` triple and lowers
@@ -1406,7 +1412,9 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 /// [`DhtMode::Disabled`] is valid for every reach) or any stage fails: storage
 /// path/key resolution,
 /// storage/custody/blob open, DID method construction, node build, asset load,
-/// TLS config, deploy, or serve.
+/// TLS config, deploy, or serve. Returns [`HostSiteError::ShutdownSignal`],
+/// before any of those stages runs, when the operating system refuses the
+/// SIGINT or SIGTERM handler.
 ///
 /// After the shutdown signal, returns [`HostSiteError::Drain`] when the
 /// deployer's Supervisor does not drain within [`SELF_HOST_DRAIN_DEADLINE`]
@@ -1423,10 +1431,9 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 /// identity, because no production `PreRotationCustody` backend exists to
 /// create one.
 pub async fn host_site(config: HostSiteConfig) -> Result<(), HostSiteError> {
-    host_site_until(config, async {
-        scp_transport::startup::shutdown_signal().await;
-    })
-    .await
+    let shutdown =
+        scp_transport::startup::shutdown_signal().map_err(HostSiteError::ShutdownSignal)?;
+    host_site_until(config, shutdown).await
 }
 
 /// Like [`host_site`] but serves until the provided `shutdown` future resolves,

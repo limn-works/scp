@@ -142,15 +142,23 @@ SCP provides two binary entrypoints for local development and testing:
 
 #### From source
 
+Both binaries require `SCP_RELAY_STORAGE_BACKEND`, and the `sqlite` and `redb`
+backends also require an absolute `SCP_RELAY_STORAGE_PATH`. Neither variable has
+a default: a binary that reads either one unset or empty prints an error and
+exits 1 (persistence spec §17.7, SCP-CAPSEL-8000).
+
 ```sh
 # Bare relay — listens on 0.0.0.0:9000
-cargo run --release -p scp-relay
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH="$PWD/scp-relay.db" \
+  cargo run --release -p scp-relay
 
 # Full application node — requires SCP_NODE_DOMAIN
-SCP_NODE_DOMAIN=localhost cargo run --release -p scp-node
+SCP_NODE_DOMAIN=localhost SCP_RELAY_STORAGE_BACKEND=sqlite \
+  SCP_RELAY_STORAGE_PATH="$PWD/scp-node-relay.db" cargo run --release -p scp-node
 
 # Relay-only mode via scp-node
-cargo run --release -p scp-node -- --relay-only
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH="$PWD/scp-relay.db" \
+  cargo run --release -p scp-node -- --relay-only
 ```
 
 #### With Docker
@@ -187,6 +195,8 @@ scp-node --health
 
 | Variable | Default | Description |
 |---|---|---|
+| `SCP_RELAY_STORAGE_BACKEND` | none (required) | Blob storage backend: `sqlite`, `redb`, `postgres`, `s3` (the last two need `--features cloud-blobs`), or `memory`. Unset or empty exits 1 |
+| `SCP_RELAY_STORAGE_PATH` | none (required for `sqlite` and `redb`) | Absolute path of the database file. Unset, empty, or relative exits 1 |
 | `SCP_RELAY_BIND_ADDR` | `0.0.0.0:9000` | Listen address |
 | `SCP_RELAY_MAX_BLOB_SIZE` | `262144` | Max blob size (bytes) |
 | `SCP_RELAY_MAX_BLOB_TTL` | `604800` | Max blob TTL (seconds) |
@@ -195,6 +205,9 @@ scp-node --health
 | `SCP_RELAY_RATE_LIMIT` | `100` | Publishes/sec/IP |
 | `SCP_RELAY_LOG_FORMAT` | `pretty` | `pretty` or `json` |
 | `SCP_RELAY_LOG_LEVEL` | `info` | Default log level (`RUST_LOG` takes precedence) |
+
+A variable in this table that is set to a value that does not parse makes the
+binary exit 1; the default applies only when the variable is unset.
 
 **Node-only configuration** (`scp-node` in full mode):
 
