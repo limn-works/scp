@@ -3915,9 +3915,6 @@ jobs:
       # dependency on it.
       - run: ./gradlew :scp-kt-android:detekt
 
-  # ORs on `rust` for a reason spelled out above python-test: this job builds
-  # a UniFFI cdylib and runs a Kotlin suite against it, and that cdylib
-  # reaches every Rust workspace crate through scp-core.
   # Producer of artifact `uniffi-kotlin-linux`, which kotlin-test and
   # bridge-parity-kotlin download: the `scp-ffi-uniffi --features testing` cdylib and
   # the Kotlin bindings uniffi-bindgen generates from it. Building them here, instead of
@@ -4058,6 +4055,9 @@ jobs:
             bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
           key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
 
+  # ORs on `rust` for a reason spelled out above python-test: the UniFFI cdylib
+  # job uniffi-cdylib-linux builds for this job's Kotlin suite reaches every Rust
+  # workspace crate through scp-core.
   kotlin-test:
     # Job uniffi-cdylib-linux builds the UniFFI cdylib and the Kotlin bindings these
     # tests load and compile against. This job builds no Rust and reads no cargo cache;
