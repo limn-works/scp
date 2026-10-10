@@ -165,10 +165,10 @@ pub enum Inbound {
         /// its member-wrapping-key directory and HPKE-seals its own sender key to
         /// each new member (the bystander re-distribution trigger, INVARIANT 2).
         added_wrapping_keys: Vec<scp_protocol::crypto::hpke::p256::P256Point>,
-        /// `(did, key)` for each member whose own Update replaced its leaf
-        /// with a new `scp_wrapping_key`; the driver refreshes each directory
-        /// entry. Empty when no leaf's key changed.
-        wrapping_key_updates: Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>,
+        /// The tree's leaves after the Commit, as `scp-mls` admitted them
+        /// before the merge; the driver points its wrapping-key directory at
+        /// them.
+        members: scp_mls::MemberLeaves,
         /// The **authenticated** convergent committer timestamp (Unix seconds),
         /// recovered from the Commit's verified MLS AAD *before* the merge and
         /// adopted **verbatim** by `scp-mls` (ADR-057). The driver stamps this on
@@ -232,7 +232,7 @@ impl std::fmt::Debug for Inbound {
                 sender_did,
                 added_dids,
                 added_wrapping_keys,
-                wrapping_key_updates,
+                members,
                 committer_timestamp_secs,
             } => f
                 .debug_struct("Commit")
@@ -243,8 +243,8 @@ impl std::fmt::Debug for Inbound {
                     &format_args!("[{} keys]", added_wrapping_keys.len()),
                 )
                 .field(
-                    "wrapping_key_updates",
-                    &format_args!("[{} keys]", wrapping_key_updates.len()),
+                    "rotated",
+                    &format_args!("[{} keys]", members.rotated().len()),
                 )
                 .field("committer_timestamp_secs", committer_timestamp_secs)
                 .finish(),
@@ -411,8 +411,8 @@ impl ContextCryptoState {
     /// so the two can never drift apart. An Add never overwrites a recorded key
     /// (spec 10 §10.8.1(7)): re-admitting a DID with its recorded key is a
     /// no-op (a second device of the member), and a different key is refused
-    /// with the recorded entry left in place. A key changes only through
-    /// [`Self::refresh_member_wrapping_key`].
+    /// with the recorded entry left in place. After a merged Commit the
+    /// directory follows the tree instead (`PerContextState::follow_tree`).
     ///
     /// # Errors
     ///
@@ -436,32 +436,6 @@ impl ContextCryptoState {
                 Ok(())
             }
         }
-    }
-
-    /// Replaces a recorded member's wrapping key with the key its own Update
-    /// published, as `scp-mls` admission reported it
-    /// ([`InboundChange::Commit`]'s `wrapping_key_updates`).
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Driver`] when `member_did` is not in the directory: an
-    /// Update comes only from a member, so an unrecorded DID means the
-    /// directory has drifted from the MLS tree.
-    pub fn refresh_member_wrapping_key(
-        &mut self,
-        member_did: &str,
-        wrapping_key: scp_protocol::crypto::hpke::p256::P256Point,
-    ) -> Result<(), ClientError> {
-        let recorded = self
-            .member_wrapping_keys
-            .get_mut(member_did)
-            .ok_or_else(|| {
-                ClientError::Driver(format!(
-                    "wrapping-key update for '{member_did}', who is not in the member directory"
-                ))
-            })?;
-        *recorded = wrapping_key;
-        Ok(())
     }
 
     /// The member-wrapping-key directory as a sorted `(did, wrapping_key)` list.
@@ -814,14 +788,14 @@ impl ContextCryptoState {
                 sender_did,
                 added_dids,
                 added_wrapping_keys,
-                wrapping_key_updates,
+                members,
                 committer_timestamp_secs,
             } => {
                 return Ok(Inbound::Commit {
                     sender_did,
                     added_dids,
                     added_wrapping_keys,
-                    wrapping_key_updates,
+                    members,
                     committer_timestamp_secs,
                 });
             }
@@ -1095,11 +1069,11 @@ mod tests {
                 sender_did,
                 added_dids,
                 added_wrapping_keys,
-                wrapping_key_updates,
+                members,
                 committer_timestamp_secs,
             } => {
                 assert_eq!(sender_did, ALICE, "committer is Alice");
-                assert!(wrapping_key_updates.is_empty(), "no leaf was replaced");
+                assert!(members.rotated().is_empty(), "no leaf was replaced");
                 assert_eq!(added_dids, vec![BOB.to_owned()], "Bob's DID surfaced");
                 assert_eq!(
                     added_wrapping_keys,
@@ -1692,28 +1666,6 @@ mod tests {
             other => panic!("expected a WrappingKeyMismatch rejection, got {other:?}"),
         }
         assert_eq!(recorded_key(&alice, BOB), Some(bob_key));
-    }
-
-    /// An Update's new key replaces a recorded member's key; a key for a DID
-    /// outside the directory is a drift error that records nothing.
-    #[test]
-    #[allow(clippy::unwrap_used)]
-    fn refresh_member_wrapping_key_replaces_only_a_recorded_member() {
-        const CAROL: &str = "did:key:z6MkCarolCryptoStateUnitFixtureCCCCCCCCC";
-        let (mut alice, _bob) = distribution_pair();
-        let (new_key, _secret) = generate_wrapping_keypair();
-
-        alice.refresh_member_wrapping_key(BOB, new_key).unwrap();
-        assert_eq!(recorded_key(&alice, BOB), Some(new_key));
-
-        match alice.refresh_member_wrapping_key(CAROL, new_key) {
-            Err(ClientError::Driver(msg)) => assert_eq!(
-                msg,
-                format!("wrapping-key update for '{CAROL}', who is not in the member directory")
-            ),
-            other => panic!("expected a Driver error, got {other:?}"),
-        }
-        assert_eq!(recorded_key(&alice, CAROL), None);
     }
 
     /// A hostile member commits an Add of an existing member's DID with its own

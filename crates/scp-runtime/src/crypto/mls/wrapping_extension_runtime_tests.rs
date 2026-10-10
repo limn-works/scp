@@ -244,9 +244,12 @@ fn sender_keys_wrapping_stable_001() {
     let _add =
         scp_mls::group::add_member(&mut group_mut, bob_kp_in, &scp_clock::SystemClock).unwrap();
 
-    let _commit =
-        scp_mls::ratchet::propose_update_with_wrapping_key(&mut group_mut, pub_key.as_bytes())
-            .unwrap();
+    let _commit = scp_mls::ratchet::propose_update_with_wrapping_key(
+        &mut group_mut,
+        pub_key.as_bytes(),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
 
     let after_update = extract_own_wrapping_key(&group_mut).unwrap();
     assert_eq!(
@@ -257,9 +260,12 @@ fn sender_keys_wrapping_stable_001() {
 
     // 5. Wrapping key can be rotated (identity key rotation simulation).
     let (new_pub, _new_sec) = generate_wrapping_keypair();
-    let _commit2 =
-        scp_mls::ratchet::propose_update_with_wrapping_key(&mut group_mut, new_pub.as_bytes())
-            .unwrap();
+    let _commit2 = scp_mls::ratchet::propose_update_with_wrapping_key(
+        &mut group_mut,
+        new_pub.as_bytes(),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
 
     let after_rotation = extract_own_wrapping_key(&group_mut).unwrap();
     assert_eq!(

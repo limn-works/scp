@@ -202,7 +202,7 @@ async fn mls_remove_member() {
         .expect("should find non-self member");
     let other_index = other.index;
 
-    remove_member(&mut group, other_index).unwrap();
+    remove_member(&mut group, other_index, &scp_clock::SystemClock).unwrap();
     assert!(group.epoch().unwrap() > epoch_after_add);
     assert_eq!(group.members().unwrap().len(), 1);
 }

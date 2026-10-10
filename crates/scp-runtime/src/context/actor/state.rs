@@ -1939,18 +1939,13 @@ impl ContextCryptoState {
             }
             scp_mls::encrypt::DecryptedContent::Commit {
                 sender_did: _,
-                wrapping_key_updates,
+                members,
             } => {
-                // A member's own Update published a new wrapping key, which
-                // `scp-mls` admitted (same DID, valid key) before the merge.
-                // A cached entry follows it so later seals reach the new key;
-                // the cache holds only keys this node already learned, so an
+                // `scp-mls` admitted the Commit on its post-commit tree and
+                // merged it. The cache follows that tree: a removed member
+                // leaves it, a rotated key replaces the cached one, and an
                 // uncached DID stays uncached.
-                for (did, key) in wrapping_key_updates {
-                    if let Some(cached) = self.member_wrapping_keys.get_mut(&did) {
-                        *cached = key;
-                    }
-                }
+                self.follow_tree(&members, &[]);
                 Ok(OpenResult::Control)
             }
             scp_mls::encrypt::DecryptedContent::Proposal { sender_did: _ } => {
@@ -1959,40 +1954,13 @@ impl ContextCryptoState {
         }
     }
 
-    /// Caches a member's admitted wrapping key. An Add never overwrites a
-    /// recorded key (spec 10 §10.8.1(7)): the same key again (a second device)
-    /// changes nothing, and a different key is refused with the cached entry
-    /// left in place.
-    ///
-    /// # Errors
-    ///
-    /// [`ContextError::CryptoFailed`] carrying the
-    /// [`scp_mls::LeafAdmissionRejection::WrappingKeyMismatch`] rejection when
-    /// `member_did` is cached with a different key.
-    pub(crate) fn admit_member_wrapping_key(
-        &mut self,
-        member_did: String,
-        wrapping_key: scp_protocol::crypto::hpke::p256::P256Point,
-    ) -> Result<(), ContextError> {
-        match self.member_wrapping_keys.entry(member_did) {
-            std::collections::hash_map::Entry::Occupied(recorded) => {
-                if *recorded.get() == wrapping_key {
-                    Ok(())
-                } else {
-                    Err(ContextError::CryptoFailed(
-                        scp_mls::MlsError::LeafAdmissionRejected {
-                            did: recorded.key().clone(),
-                            reason: scp_mls::LeafAdmissionRejection::WrappingKeyMismatch,
-                        }
-                        .to_string(),
-                    ))
-                }
-            }
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(wrapping_key);
-                Ok(())
-            }
-        }
+    /// Replaces the member wrapping-key cache with its view of the tree after
+    /// a merged Commit ([`scp_mls::MemberLeaves::follow_directory`]): the cached
+    /// DIDs plus `added`, each at the key the tree publishes for it, minus any
+    /// DID with no leaf left. Infallible, so it runs after the merge without
+    /// a step that could leave the cache behind the tree.
+    pub(crate) fn follow_tree(&mut self, members: &scp_mls::MemberLeaves, added: &[&str]) {
+        self.member_wrapping_keys = members.follow_directory(&self.member_wrapping_keys, added);
     }
 
     /// MLS-encrypts a management payload (SCPM-tagged), no sender-layer sequence.
@@ -2536,22 +2504,23 @@ impl PerContextState {
     pub(crate) fn advance_epoch(
         &mut self,
         wrapping_public_key: [u8; 65],
+        clock: &dyn Clock,
     ) -> Result<AdvanceEpochOutput, ContextError> {
-        use openmls::prelude::tls_codec::Serialize as _;
-
         let crypto = self.encrypted_crypto_mut()?;
         let mls_group = crypto.mls_group.as_mut().ok_or_else(|| {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
         })?;
-        let commit =
-            scp_mls::ratchet::propose_update_with_wrapping_key(mls_group, &wrapping_public_key)
-                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let update = scp_mls::ratchet::propose_update_with_wrapping_key(
+            mls_group,
+            &wrapping_public_key,
+            clock,
+        )
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        crypto.follow_tree(&update.members, &[]);
 
-        let commit_bytes = commit.tls_serialize_detached().map_err(|e| {
-            ContextError::CryptoFailed(format!("serializing epoch advance commit: {e}"))
-        })?;
-
-        Ok(AdvanceEpochOutput { commit_bytes })
+        Ok(AdvanceEpochOutput {
+            commit_bytes: update.commit_bytes,
+        })
     }
 
     /// Adds a member to the MLS group by their optional TLS-serialized
@@ -2608,18 +2577,18 @@ impl PerContextState {
     /// Real MLS add-member from explicit `KeyPackage` bytes on this actor's OWNED
     /// group. Parses the key package once, binds its credential to
     /// `member_did`, performs the MLS add through `scp-mls` admission (a present,
-    /// valid `0xFF01` that matches any key the DID already publishes; spec 09
-    /// §9.16.1), records the admitted wrapping key without overwriting a
-    /// recorded one, and returns the TLS-serialized Welcome (for the joiner) and
-    /// Commit (for existing members).
+    /// valid `0xFF01` that matches the key every other leaf of the DID publishes
+    /// in the tree after the Commit; spec 09 §9.16.1), points the wrapping-key
+    /// cache at that tree, and returns the TLS-serialized Welcome (for the
+    /// joiner) and Commit (for existing members).
     ///
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch, a malformed
     /// `KeyPackage`, a credential DID other than `member_did`, an admission
-    /// rejection, or any MLS / serialization failure; all of these leave the
-    /// epoch unchanged. After the add, [`ContextCryptoState::admit_member_wrapping_key`]
-    /// refuses to overwrite a different cached key.
+    /// rejection, a serialization failure, or a failed merge. Every error but a
+    /// failed merge leaves the epoch and the cache unchanged; nothing runs
+    /// after the merge that can fail.
     fn add_member_from_bytes(
         &mut self,
         member_did: &str,
@@ -2627,7 +2596,6 @@ impl PerContextState {
         clock: &dyn Clock,
     ) -> Result<AddMemberOutput, ContextError> {
         use openmls::prelude::ProtocolVersion;
-        use openmls::prelude::tls_codec::Serialize as _;
 
         let kp_in = scp_mls::wire::parse_key_package_in(bytes)
             .map_err(|e| ContextError::CryptoFailed(format!("key package deserialization: {e}")))?;
@@ -2651,21 +2619,13 @@ impl PerContextState {
         let result = scp_mls::group::add_member(mls_group, kp_in, clock)
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-        // TLS-serialize Welcome and Commit for cross-process delivery.
-        let welcome_bytes = result
-            .welcome
-            .tls_serialize_detached()
-            .map_err(|e| ContextError::CryptoFailed(format!("serializing welcome: {e}")))?;
-        let commit_bytes = result
-            .commit
-            .tls_serialize_detached()
-            .map_err(|e| ContextError::CryptoFailed(format!("serializing commit: {e}")))?;
-
-        crypto.admit_member_wrapping_key(result.admitted_did, result.admitted_wrapping_key)?;
+        // The merge was the last fallible step: `scp-mls` serialized the
+        // Welcome and Commit before it, and the cache follows the tree.
+        crypto.follow_tree(&result.members, &[result.admitted_did.as_str()]);
 
         Ok(AddMemberOutput {
-            welcome_bytes,
-            commit_bytes,
+            welcome_bytes: result.welcome_bytes,
+            commit_bytes: result.commit_bytes,
         })
     }
 
@@ -2680,9 +2640,8 @@ impl PerContextState {
         &mut self,
         local_did: &str,
         member_did: &str,
+        clock: &dyn Clock,
     ) -> Result<RemoveMemberOutput, ContextError> {
-        use openmls::prelude::tls_codec::Serialize as _;
-
         // Self-removal (leave): the local member simply abandons their local
         // group state; remaining members process a Commit from the admin.
         if member_did == local_did {
@@ -2731,32 +2690,18 @@ impl PerContextState {
             return Ok(RemoveMemberOutput::default());
         };
 
-        let result = scp_mls::group::remove_member(mls_group, leaf_index)
+        let result = scp_mls::group::remove_member(mls_group, leaf_index, clock)
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-        let commit_bytes = result
-            .commit
-            .tls_serialize_detached()
-            .map_err(|e| ContextError::CryptoFailed(format!("serializing remove commit: {e}")))?;
-
-        let group_info_bytes = result
-            .group_info
-            .map(|gi| {
-                gi.tls_serialize_detached().map_err(|e| {
-                    ContextError::CryptoFailed(format!("serializing remove group info: {e}"))
-                })
-            })
-            .transpose()?
-            .unwrap_or_default();
+        crypto.follow_tree(&result.members, &[]);
 
         Ok(RemoveMemberOutput {
-            commit_bytes,
-            group_info_bytes,
+            commit_bytes: result.commit_bytes,
+            group_info_bytes: result.group_info_bytes.unwrap_or_default(),
         })
     }
 
-    /// Removes the departed member's sender key AND wrapping key from the local
-    /// crypto sub-state, verbatim from the former provider
+    /// Removes the departed member's sender key from the local crypto
+    /// sub-state, verbatim from the former provider
     /// `remove_member_sender_key`.
     ///
     /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the actor twin of the provider's
@@ -2779,8 +2724,8 @@ impl PerContextState {
         let ctx_id_hex = hex::encode(self.context_id);
         let crypto = self.encrypted_crypto_mut()?;
         crypto.sender_key_store.remove(&ctx_id_hex, member_did);
-        // Also remove the member's wrapping key — they are no longer a member.
-        crypto.member_wrapping_keys.remove(member_did);
+        // The wrapping-key cache follows the tree: the Remove Commit that
+        // dropped the member's last leaf already dropped its key.
         Ok(())
     }
 
@@ -4436,15 +4381,15 @@ mod crypto_ops_golden {
         bob_a
             .encrypted_crypto_mut()
             .unwrap()
-            .admit_member_wrapping_key(
+            .member_wrapping_keys
+            .insert(
                 ALICE.to_owned(),
                 scp_protocol::crypto::hpke::p256::P256Point::try_from(*alice_p.public()).unwrap(),
-            )
-            .unwrap();
+            );
         let (new_key, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
 
         let commit = alice_a
-            .advance_epoch(*new_key.as_bytes())
+            .advance_epoch(*new_key.as_bytes(), &SystemClock)
             .unwrap()
             .commit_bytes;
         let outer =
@@ -4457,6 +4402,56 @@ mod crypto_ops_golden {
             other => panic!("expected Control, got {other:?}"),
         }
         assert_eq!(cached_key(&bob_a, ALICE), Some(new_key));
+    }
+
+    /// `open` of `commit` by `state`, which must yield a control message.
+    fn open_commit(state: &mut PerContextState, ctx: &[u8; 32], commit: Vec<u8>) {
+        let outer =
+            scp_protocol::envelope::outer::create_outer_envelope(&routing(ctx), None, 300, commit)
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+        match state.open(&SystemClock, CTX_STR, &outer).unwrap() {
+            OpenResult::Control => {}
+            other => panic!("expected Control, got {other:?}"),
+        }
+    }
+
+    /// A member another member removed leaves this node's wrapping-key cache
+    /// when this node processes the Remove, so re-adding it under a new key
+    /// succeeds and the adder's epoch matches its peer's afterwards.
+    #[test]
+    fn peer_removed_member_re_added_with_a_new_key_succeeds() {
+        const CAROL: &str = "did:dht:z6MkCarolCarolCarolCarolCarolCarolCarolCa";
+        let (_alice_p, mut alice_a, _bob_p, mut bob_a, ctx) = setup();
+        let (k1, _s1) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+        let (k2, _s2) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+
+        let add = alice_a
+            .add_member(
+                CAROL,
+                Some(&key_package_bytes(CAROL, k1.as_bytes())),
+                &SystemClock,
+            )
+            .unwrap();
+        open_commit(&mut bob_a, &ctx, add.commit_bytes);
+        assert_eq!(cached_key(&alice_a, CAROL), Some(k1));
+
+        let remove = bob_a.remove_member(BOB, CAROL, &SystemClock).unwrap();
+        open_commit(&mut alice_a, &ctx, remove.commit_bytes);
+        assert_eq!(cached_key(&alice_a, CAROL), None, "the Remove pruned Carol");
+        assert_eq!(actor_mls_epoch(&alice_a), actor_mls_epoch(&bob_a));
+
+        let re_add = alice_a
+            .add_member(
+                CAROL,
+                Some(&key_package_bytes(CAROL, k2.as_bytes())),
+                &SystemClock,
+            )
+            .expect("Carol holds no leaf, so her new key contradicts nothing");
+        assert_eq!(cached_key(&alice_a, CAROL), Some(k2));
+        open_commit(&mut bob_a, &ctx, re_add.commit_bytes);
+        assert_eq!(actor_mls_epoch(&alice_a), actor_mls_epoch(&bob_a));
     }
 
     /// #2199: `dispose_secrets` on a REAL seeded encrypted state (a live MLS
@@ -4892,7 +4887,7 @@ mod crypto_ops_golden {
         // `advance_epoch` self-merges the committer's Update+Commit, advancing
         // the local MLS epoch by one.
         let epoch_before = actor_mls_epoch(&alice_a);
-        let out_a = alice_a.advance_epoch(wpub).unwrap();
+        let out_a = alice_a.advance_epoch(wpub, &SystemClock).unwrap();
         assert!(
             !out_a.commit_bytes.is_empty(),
             "actor advance_epoch produces a non-empty commit"
@@ -4923,7 +4918,7 @@ mod crypto_ops_golden {
         // Self-removal is a no-op (empty output).
         assert!(
             alice_a
-                .remove_member(ALICE, ALICE)
+                .remove_member(ALICE, ALICE, &SystemClock)
                 .unwrap()
                 .commit_bytes
                 .is_empty()
@@ -4932,7 +4927,7 @@ mod crypto_ops_golden {
         // Removing Bob self-merges the remove-Commit, advancing Alice's epoch by
         // one; the output is a non-empty Commit + group-info.
         let epoch_before = actor_mls_epoch(&alice_a);
-        let out_a = alice_a.remove_member(ALICE, BOB).unwrap();
+        let out_a = alice_a.remove_member(ALICE, BOB, &SystemClock).unwrap();
         assert!(
             !out_a.commit_bytes.is_empty(),
             "actor remove_member produces a Commit"

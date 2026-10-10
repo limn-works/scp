@@ -696,7 +696,8 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
         })
         .map(|m| m.index)
         .expect("Carol's leaf index");
-    let remove_carol = remove_member(&mut alice_group, carol_leaf).expect("Alice removes Carol");
+    let remove_carol =
+        remove_member(&mut alice_group, carol_leaf, &SystemClock).expect("Alice removes Carol");
     let remove_carol_commit = remove_carol
         .commit
         .tls_serialize_detached()

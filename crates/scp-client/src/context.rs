@@ -139,6 +139,20 @@ impl PerContextState {
         self.local_pseudonym
     }
 
+    /// Points the wrapping-key directory at the tree after a merged Commit
+    /// ([`scp_mls::MemberLeaves::wrapping_key_directory`]): every DID with a
+    /// leaf, at the key the tree publishes for it. Seeds the
+    /// outgoing-sequence counter of each DID in `added`.
+    pub fn follow_tree(&mut self, members: &scp_mls::MemberLeaves, added: &[&str]) {
+        self.crypto.member_wrapping_keys =
+            members.wrapping_key_directory(&self.crypto.member_wrapping_keys);
+        for did in added {
+            self.member_sequence_numbers
+                .entry((*did).to_owned())
+                .or_insert(0);
+        }
+    }
+
     /// Admits a member into the context's wrapping-key directory (the
     /// authoritative member set — ADR-057 sender-key distribution INVARIANT 1)
     /// with the wrapping key a peer needs to HPKE-seal a sender key to it, and
@@ -161,21 +175,6 @@ impl PerContextState {
             .entry(member_did.to_owned())
             .or_insert(0);
         Ok(())
-    }
-
-    /// Replaces a recorded member's wrapping key with the key its own Update
-    /// published.
-    ///
-    /// # Errors
-    ///
-    /// See [`ContextCryptoState::refresh_member_wrapping_key`].
-    pub fn refresh_member_wrapping_key(
-        &mut self,
-        member_did: &str,
-        wrapping_key: scp_protocol::crypto::hpke::p256::P256Point,
-    ) -> Result<(), ClientError> {
-        self.crypto
-            .refresh_member_wrapping_key(member_did, wrapping_key)
     }
 
     /// Returns the member DIDs of this context, sorted (the wrapping-key directory

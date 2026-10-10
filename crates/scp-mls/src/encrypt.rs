@@ -82,11 +82,14 @@ pub enum DecryptedContent {
     Commit {
         /// The sender's DID string extracted from the MLS credential.
         sender_did: String,
-        /// `(did, key)` for each leaf this Commit replaced (an Update proposal
-        /// or the committer's `UpdatePath`) whose `0xFF01` wrapping key
-        /// changed, in the order the Commit applies them. The member directory
-        /// refreshes these entries; an Add never changes a recorded key.
-        wrapping_key_updates: Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>,
+        /// The tree's leaves after this Commit, computed before the merge.
+        /// A holder of a wrapping-key directory replaces it with
+        /// [`MemberLeaves::wrapping_key_directory`](crate::admission::MemberLeaves::wrapping_key_directory),
+        /// so the directory follows every Add, Remove and Update this Commit
+        /// carried. [`MemberLeaves::rotated`](crate::admission::MemberLeaves::rotated)
+        /// lists each leaf this Commit replaced (an Update proposal or the
+        /// committer's `UpdatePath`) whose `0xFF01` changed.
+        members: crate::admission::MemberLeaves,
     },
     /// A Proposal message cached by `OpenMLS` during `process_message`.
     /// No explicit merge is needed — `OpenMLS` caches proposals automatically.
@@ -251,9 +254,11 @@ fn sender_member(group: &MlsGroup, sender: &Sender) -> Result<(LeafNodeIndex, St
 /// - **`StagedCommitMessage`** — calls `merge_staged_commit` to apply the
 ///   epoch change (preventing MLS group corruption), then returns
 ///   `DecryptedContent::Commit` with the sender DID.
-/// - **`ProposalMessage` / `ExternalJoinProposalMessage`** — proposals are
-///   cached by `OpenMLS` during `process_message` automatically. Returns
-///   `DecryptedContent::Proposal` with the sender DID.
+/// - **`ProposalMessage` / `ExternalJoinProposalMessage`** — returns
+///   `DecryptedContent::Proposal` with the sender DID. The proposal is **not**
+///   stored: `OpenMLS` keeps a received proposal only through
+///   `store_pending_proposal`, which this path does not call, so a later
+///   Commit that names it by reference fails to process.
 ///
 /// # Arguments
 ///
@@ -348,13 +353,13 @@ pub fn decrypt_with_sender_did(
                 })?;
             Ok(DecryptedContent::Commit {
                 sender_did,
-                wrapping_key_updates: admission.wrapping_key_updates,
+                members: admission.members,
             })
         }
         ProcessedMessageContent::ProposalMessage(_)
         | ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
-            // Proposals are cached by OpenMLS automatically during
-            // process_message — no explicit action needed.
+            // Not stored: OpenMLS keeps a received proposal only through
+            // `store_pending_proposal`, which this path does not call.
             Ok(DecryptedContent::Proposal { sender_did })
         }
     }
@@ -417,9 +422,8 @@ pub enum InboundChange {
         /// vector is therefore always exactly as long as `added_dids`; it is empty
         /// only for a no-add Commit.
         added_wrapping_keys: Vec<scp_protocol::crypto::hpke::p256::P256Point>,
-        /// `(did, key)` for each leaf this Commit replaced whose `0xFF01`
-        /// wrapping key changed; see [`DecryptedContent::Commit`].
-        wrapping_key_updates: Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>,
+        /// The tree's leaves after this Commit; see [`DecryptedContent::Commit`].
+        members: crate::admission::MemberLeaves,
         /// The authenticated convergent committer timestamp (Unix seconds),
         /// recovered from the Commit's verified MLS AAD *before* the merge and
         /// adopted **verbatim** (ADR-057). The receiver stamps this exact value
@@ -480,7 +484,7 @@ impl std::fmt::Debug for InboundChange {
                 sender_did,
                 added_dids,
                 added_wrapping_keys,
-                wrapping_key_updates,
+                members,
                 committer_timestamp_secs,
             } => f
                 .debug_struct("Commit")
@@ -493,12 +497,14 @@ impl std::fmt::Debug for InboundChange {
                     &format_args!("[{} keys]", added_wrapping_keys.len()),
                 )
                 .field(
-                    "wrapping_key_updates",
-                    &wrapping_key_updates
+                    "rotated",
+                    &members
+                        .rotated()
                         .iter()
                         .map(|(did, _)| did.as_str())
                         .collect::<Vec<_>>(),
                 )
+                .field("leaves", &format_args!("[{} leaves]", members.leaves().len()))
                 .field("committer_timestamp_secs", committer_timestamp_secs)
                 .finish(),
             Self::UnsupportedMembershipChange {
@@ -582,8 +588,9 @@ fn credential_to_did(credential: &Credential) -> Result<String, MlsError> {
 ///   so the group stays on its current epoch, consistent with the caller's
 ///   SCP-layer state.
 /// - **`ProposalMessage` / `ExternalJoinProposalMessage`** →
-///   [`InboundChange::Proposal`]; `OpenMLS` caches the proposal, no membership
-///   change is committed yet, and the AAD is ignored.
+///   [`InboundChange::Proposal`]; the proposal is not stored (`OpenMLS` keeps
+///   one only through `store_pending_proposal`, which this path does not call),
+///   no membership change is committed, and the AAD is ignored.
 ///
 /// # Errors
 ///
@@ -778,7 +785,7 @@ pub fn decrypt_with_membership_changes(
                 sender_did,
                 added_dids,
                 added_wrapping_keys,
-                wrapping_key_updates: admission.wrapping_key_updates,
+                members: admission.members,
                 committer_timestamp_secs,
             })
         }
@@ -1139,11 +1146,11 @@ mod tests {
         );
         if let DecryptedContent::Commit {
             sender_did,
-            wrapping_key_updates,
+            members,
         } = &content
         {
             assert!(
-                wrapping_key_updates.is_empty(),
+                members.rotated().is_empty(),
                 "an Update keeping its key changes none"
             );
             assert!(
@@ -1224,11 +1231,11 @@ mod tests {
                 sender_did,
                 added_dids,
                 added_wrapping_keys,
-                wrapping_key_updates,
+                members,
                 committer_timestamp_secs,
             } => {
                 assert!(
-                    wrapping_key_updates.is_empty(),
+                    members.rotated().is_empty(),
                     "an Add changes no recorded key"
                 );
                 assert_eq!(sender_did, "did:dht:z6Mkalice", "committer is Alice");
@@ -1323,7 +1330,9 @@ mod tests {
                 }
             })
             .unwrap();
-        let remove = crate::group::remove_member(&mut alice_group, carol_member.index).unwrap();
+        let remove =
+            crate::group::remove_member(&mut alice_group, carol_member.index, &SystemClock)
+                .unwrap();
         let remove_bytes = remove.commit.tls_serialize_detached().unwrap();
 
         // Bob is on epoch 2 (create + add-Bob + add-Carol = two epoch advances

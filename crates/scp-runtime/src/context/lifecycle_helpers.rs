@@ -280,7 +280,8 @@ pub async fn leave_context(
                 // twins. `local_did` is node-resident identity (retained on the
                 // provider); the actor `remove_member` skips a self-leave.
                 let local_did = deps.crypto.local_did();
-                let remove_output = state.remove_member(local_did, member_did.as_ref())?;
+                let remove_output =
+                    state.remove_member(local_did, member_did.as_ref(), deps.clock.as_ref())?;
                 if let Err(e) = state.remove_member_sender_key(member_did.as_ref()) {
                     tracing::warn!(
                         context_id = %context_id,
@@ -1062,7 +1063,7 @@ pub async fn join_context(
         let _ = cell
             .commit_class_s_keep(deps, &context_id, |mut v| {
                 let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did);
+                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
                 s.remove_member_sender_key(&member_did)
             })
             .await;
@@ -1104,7 +1105,7 @@ pub async fn join_context(
         let _ = cell
             .commit_class_s_keep(deps, &context_id, |mut v| {
                 let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did);
+                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
                 s.remove_member_sender_key(&member_did)
             })
             .await;
@@ -1143,7 +1144,7 @@ pub async fn join_context(
         let _ = cell
             .commit_class_s_keep(deps, &context_id, |mut v| {
                 let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did);
+                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
                 s.remove_member_sender_key(&member_did)
             })
             .await;

@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use openmls::prelude::{KeyPackageBundle, MlsMessageOut};
+use openmls::prelude::KeyPackageBundle;
 use scp_clock::Clock;
 use scp_event_log::{Event, EventType};
 use scp_mls::group::{
@@ -583,15 +583,18 @@ impl ScpClient {
             clock.as_ref(),
             timestamp,
         )?;
-        let commit = serialize_message(&result.commit)?;
-        let welcome = serialize_message(&result.welcome)?;
+        // `scp-mls` serialized both messages before the merge.
+        let commit = result.commit_bytes;
+        let welcome = result.welcome_bytes;
 
         // The joiner's DID and wrapping key come from the leaf `scp-mls`
         // admitted (spec 09 §9.16.1): its credential and a present, valid
-        // `0xFF01` that matches any key the DID already publishes in the tree.
+        // `0xFF01` that matches the key every other leaf of the DID publishes
+        // in the tree after the Commit. The directory follows that tree; this
+        // step cannot fail.
         let new_member_did = result.admitted_did;
         let new_member_wrapping_key = result.admitted_wrapping_key;
-        state.admit_member_record(&new_member_did, new_member_wrapping_key)?;
+        state.follow_tree(&result.members, &[new_member_did.as_str()]);
         state.append_log_event(
             EventType::MemberJoined,
             &committer_did,
@@ -1388,15 +1391,15 @@ impl ScpClient {
                 sender_did: committer_did,
                 added_dids,
                 added_wrapping_keys,
-                wrapping_key_updates,
+                members,
                 committer_timestamp_secs,
             } => {
-                // A member's own Update may publish a new wrapping key; `scp-mls`
-                // admitted it (same DID, valid key) before merging. Only these
-                // updates change a recorded key; an Add never does.
-                for (member_did, wrapping_key) in &wrapping_key_updates {
-                    state.refresh_member_wrapping_key(member_did, *wrapping_key)?;
-                }
+                // `scp-mls` admitted the Commit on its post-commit tree and
+                // merged it; the directory follows that tree (a rotated key
+                // replaces the recorded one, added members enter). Infallible,
+                // so the directory cannot fall behind the merged epoch.
+                let added: Vec<&str> = added_dids.iter().map(String::as_str).collect();
+                state.follow_tree(&members, &added);
                 // A no-add Commit (e.g. a self-update) has `committer_timestamp_secs
                 // == None` and empty `added_dids` by construction: it advanced the
                 // MLS epoch inside `scp-mls` but stamps no membership leaf and
@@ -1430,7 +1433,6 @@ impl ScpClient {
                             Vec::new(),
                             timestamp,
                         )?;
-                        state.admit_member_record(added_did, *added_wrapping_key)?;
                         sender_key_distributions.push(state.crypto.seal_sender_key_distribution(
                             &self_did,
                             added_did,
@@ -2039,13 +2041,6 @@ fn ingest_application_plaintext(
             false,
         ),
     }
-}
-
-/// Serializes an MLS message to wire bytes.
-fn serialize_message(message: &MlsMessageOut) -> Result<Vec<u8>, ClientError> {
-    message
-        .tls_serialize_detached()
-        .map_err(|e| ClientError::Codec(format!("serializing MLS message: {e}")))
 }
 
 #[cfg(test)]

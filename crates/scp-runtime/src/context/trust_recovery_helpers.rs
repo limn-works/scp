@@ -246,7 +246,7 @@ pub async fn recovery_advance_epoch(
     let epoch_commit_bytes = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
             v.rest_mut()
-                .advance_epoch(wrapping_public_key)
+                .advance_epoch(wrapping_public_key, deps.clock.as_ref())
                 .map(|out| out.commit_bytes)
         })
         .await?;

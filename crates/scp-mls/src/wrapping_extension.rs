@@ -424,9 +424,13 @@ mod tests {
             crate::group::join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
 
         // Alice performs an update WITH her wrapping key to preserve it.
-        let commit =
-            crate::ratchet::propose_update_with_wrapping_key(&mut alice_group, &wrapping_key)
-                .unwrap();
+        let commit = crate::ratchet::propose_update_with_wrapping_key(
+            &mut alice_group,
+            &wrapping_key,
+            &SystemClock,
+        )
+        .unwrap()
+        .commit;
         let commit_bytes = crate::ratchet::serialize_mls_message(&commit).unwrap();
 
         // Bob processes Alice's commit.
@@ -471,7 +475,9 @@ mod tests {
         // publish it via update.
         let new_key = point(0xFF);
         let _commit =
-            crate::ratchet::propose_update_with_wrapping_key(&mut group, &new_key).unwrap();
+            crate::ratchet::propose_update_with_wrapping_key(&mut group, &new_key, &SystemClock)
+                .unwrap()
+                .commit;
 
         // After the update, the wrapping key should be the new value.
         let extracted = extract_own_wrapping_key(&group).unwrap();

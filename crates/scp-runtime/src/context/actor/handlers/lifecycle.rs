@@ -750,7 +750,7 @@ async fn handle_issue_mls_update_actor(
     let result = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
             let s = v.rest_mut();
-            let out = s.advance_epoch(wrapping_public_key)?;
+            let out = s.advance_epoch(wrapping_public_key, deps.clock.as_ref())?;
             s.epoch.mls_epoch = s.epoch.mls_epoch.saturating_add(1);
             Ok(out.commit_bytes)
         })

@@ -357,29 +357,12 @@ impl MlsBackend for ProductionMlsBackend {
 
         let result = group::add_member(group, kp, self.clock.as_ref())?;
 
-        // Serialize the outputs. TLS-serialize matches the primitive
-        // `AddMemberResult` fields exactly — byte-identical to the pre-
-        // refactor path.
-        let commit = result
-            .commit
-            .tls_serialize_detached()
-            .map_err(|e| MlsError::AddMemberFailed(format!("serializing commit: {e}")))?;
-        let welcome = result
-            .welcome
-            .tls_serialize_detached()
-            .map_err(|e| MlsError::AddMemberFailed(format!("serializing welcome: {e}")))?;
-        let group_info = result
-            .group_info
-            .map(|gi| {
-                gi.tls_serialize_detached()
-                    .map_err(|e| MlsError::AddMemberFailed(format!("serializing group_info: {e}")))
-            })
-            .transpose()?;
-
+        // `scp-mls` serialized every message before the merge, so nothing
+        // after the epoch advanced can fail.
         Ok(AddMemberRaw {
-            commit,
-            welcome,
-            group_info,
+            commit: result.commit_bytes,
+            welcome: result.welcome_bytes,
+            group_info: result.group_info_bytes,
         })
     }
 
@@ -388,22 +371,11 @@ impl MlsBackend for ProductionMlsBackend {
         group: &mut ScpMlsGroup,
         leaf_index: LeafNodeIndex,
     ) -> Result<RemoveMemberRaw, MlsError> {
-        let result = group::remove_member(group, leaf_index)?;
-
-        let commit = result
-            .commit
-            .tls_serialize_detached()
-            .map_err(|e| MlsError::RemoveMemberFailed(format!("serializing commit: {e}")))?;
-        let group_info = result
-            .group_info
-            .map(|gi| {
-                gi.tls_serialize_detached().map_err(|e| {
-                    MlsError::RemoveMemberFailed(format!("serializing group_info: {e}"))
-                })
-            })
-            .transpose()?;
-
-        Ok(RemoveMemberRaw { commit, group_info })
+        let result = group::remove_member(group, leaf_index, self.clock.as_ref())?;
+        Ok(RemoveMemberRaw {
+            commit: result.commit_bytes,
+            group_info: result.group_info_bytes,
+        })
     }
 
     async fn encrypt(
@@ -433,10 +405,7 @@ impl MlsBackend for ProductionMlsBackend {
         // `process_message` + `merge_staged_commit` sequence verbatim.
         let content = decrypt_with_sender_did(group, commit_bytes, self.clock.as_ref())?;
         match content {
-            DecryptedContent::Commit {
-                wrapping_key_updates,
-                ..
-            } => Ok(wrapping_key_updates),
+            DecryptedContent::Commit { members, .. } => Ok(members.rotated().to_vec()),
             DecryptedContent::Application { .. } => Err(MlsError::CommitProcessingFailed(
                 "expected Commit, got Application message".to_string(),
             )),
@@ -451,10 +420,12 @@ impl MlsBackend for ProductionMlsBackend {
         group: &mut ScpMlsGroup,
         wrapping_pubkey: &[u8; 65],
     ) -> Result<Vec<u8>, MlsError> {
-        let commit = scp_mls::ratchet::propose_update_with_wrapping_key(group, wrapping_pubkey)?;
-        commit
-            .tls_serialize_detached()
-            .map_err(|e| MlsError::CommitProcessingFailed(format!("serializing commit: {e}")))
+        Ok(scp_mls::ratchet::propose_update_with_wrapping_key(
+            group,
+            wrapping_pubkey,
+            self.clock.as_ref(),
+        )?
+        .commit_bytes)
     }
 
     async fn validate_key_package(

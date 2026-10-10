@@ -108,7 +108,7 @@ fn three_members_interoperate_on_cs2() -> TestResult {
     assert_eq!(decrypt(&mut c, &from_b)?, b"from B");
 
     let c_leaf = c.own_leaf_index()?;
-    let removal = remove_member(&mut a, c_leaf)?;
+    let removal = remove_member(&mut a, c_leaf, &SystemClock)?;
     let removal_bytes = serialize_mls_message(&removal.commit)?;
     process_commit(&mut b, &removal_bytes, &mut b_grace, &SystemClock)?;
     // C processes its own removal too, so the final assertion shows that C

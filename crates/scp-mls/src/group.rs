@@ -703,6 +703,16 @@ pub struct AddMemberResult {
     pub admitted_did: String,
     /// The `0xFF01` wrapping public key the added leaf publishes.
     pub admitted_wrapping_key: scp_protocol::crypto::hpke::p256::P256Point,
+    /// The tree's leaves after the add, computed before the merge; the caller
+    /// rebuilds its wrapping-key directory from them without a fallible step.
+    pub members: crate::admission::MemberLeaves,
+    /// [`Self::commit`] TLS-serialized before the merge, so a caller needs no
+    /// fallible step after the epoch advanced.
+    pub commit_bytes: Vec<u8>,
+    /// [`Self::welcome`] TLS-serialized before the merge.
+    pub welcome_bytes: Vec<u8>,
+    /// [`Self::group_info`] TLS-serialized before the merge.
+    pub group_info_bytes: Option<Vec<u8>>,
 }
 
 /// Adds a member to the group using their pre-published `KeyPackage`.
@@ -738,8 +748,13 @@ pub struct AddMemberResult {
 /// Returns [`MlsError::InvalidCredential`], [`MlsError::ExtensionError`] or
 /// [`MlsError::LeafAdmissionRejected`] if the leaf fails SCP admission
 /// ([`crate::admission`]): no SCP credential, no or a malformed `0xFF01`, a
-/// `0xFF01` other than the one the DID already publishes, or an 11th leaf.
-/// Returns [`MlsError::MergePendingCommitFailed`] if committing fails.
+/// `0xFF01` other than one another leaf of the DID publishes after the
+/// Commit, or an 11th leaf. The Commit is admitted on the tree after it, so
+/// a refusal leaves the epoch unchanged.
+/// Returns [`MlsError::CommitProcessingFailed`] if serializing the Commit,
+/// Welcome or `GroupInfo` fails; the epoch is unchanged.
+/// Returns [`MlsError::MergePendingCommitFailed`] if committing fails. The
+/// merge is the last step that can fail.
 ///
 /// See ADR-001 acceptance criterion 2.
 pub fn add_member(
@@ -752,22 +767,18 @@ pub fn add_member(
         .validate(group.provider.crypto(), ProtocolVersion::Mls10)
         .map_err(|e| MlsError::AddMemberFailed(format!("key package validation: {e}")))?;
 
-    // SCP admission before openmls sees the add (spec 09 §9.16.1): the
-    // hardened-clock `Lifetime` re-check (ADR-057 §Prereq-1; openmls's
-    // `validate` above used its own clock), the SCP credential, a present and
-    // valid 0xFF01, and the per-DID key-equality and leaf-count rules against
-    // the current tree. The same function runs for bystanders before they merge.
-    let admitted = {
-        let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
-        let tree = crate::admission::tree_leaves(g)?;
-        crate::admission::admit_added_leaf(&verified_key_package, &tree, &[], clock)?
-    };
+    // The leaf's own checks before openmls builds a Commit (spec 09 §9.16.1):
+    // the hardened-clock `Lifetime` re-check (ADR-057 §Prereq-1; openmls's
+    // `validate` above used its own clock), the SCP credential, and a present,
+    // valid 0xFF01.
+    let admitted = crate::admission::admit_added_leaf(&verified_key_package, clock)?;
 
     let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
 
     // Add the member to the group. Returns (commit, welcome, group_info).
-    // Both commit and welcome are MlsMessageOut.
+    // Both commit and welcome are MlsMessageOut. The Commit is pending, not
+    // merged: it may also carry proposals openmls held from earlier messages.
     let (commit, welcome, group_info) = g
         .add_members(
             &group.provider,
@@ -776,18 +787,85 @@ pub fn add_member(
         )
         .map_err(|e| MlsError::AddMemberFailed(e.to_string()))?;
 
-    // Merge the pending commit to advance the group epoch locally.
-    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-    g.merge_pending_commit(&group.provider)
-        .map_err(|e| MlsError::MergePendingCommitFailed(e.to_string()))?;
+    // Both messages are serialized while the Commit is still pending, so
+    // nothing after the merge can fail.
+    let (admission, (commit_bytes, welcome_bytes, group_info_bytes)) =
+        admit_and_merge_own_commit(group, clock, || {
+            Ok((
+                serialize_out(&commit, "commit")?,
+                serialize_out(&welcome, "welcome")?,
+                group_info
+                    .as_ref()
+                    .map(|gi| serialize_out(gi, "group info"))
+                    .transpose()?,
+            ))
+        })?;
 
     Ok(AddMemberResult {
+        commit_bytes,
+        welcome_bytes,
+        group_info_bytes,
         commit,
         welcome,
         group_info,
         admitted_did: admitted.did,
         admitted_wrapping_key: admitted.wrapping_key,
+        members: admission.members,
     })
+}
+
+/// Admits this member's own pending Commit and merges it.
+///
+/// The pending Commit passes the admission a receiver runs
+/// ([`crate::admission::admit_staged_commit`]) on the tree after the Commit,
+/// so a Commit this member sends is one every honest receiver accepts. This
+/// covers proposals openmls folded in from earlier messages, not only the
+/// operation the caller asked for. `before_merge` runs after admission and
+/// before the merge (the caller serializes its outgoing messages there). A
+/// refusal or a `before_merge` error clears the pending Commit, so the group
+/// stays on its epoch; the merge is the last fallible step.
+///
+/// # Errors
+///
+/// Any admission or `before_merge` error (after the pending Commit is cleared),
+/// [`MlsError::CommitProcessingFailed`] if openmls holds no pending Commit or
+/// cannot clear a refused one, or [`MlsError::MergePendingCommitFailed`].
+pub(crate) fn admit_and_merge_own_commit<T>(
+    group: &mut ScpMlsGroup,
+    clock: &dyn Clock,
+    before_merge: impl FnOnce() -> Result<T, MlsError>,
+) -> Result<(crate::admission::CommitAdmission, T), MlsError> {
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    let admission = {
+        let staged = g.pending_commit().ok_or_else(|| {
+            MlsError::CommitProcessingFailed("openmls staged no pending commit".to_owned())
+        })?;
+        crate::admission::admit_staged_commit(g, staged, g.own_leaf_index(), clock)
+    };
+    match admission.and_then(|a| before_merge().map(|t| (a, t))) {
+        Ok(admitted) => {
+            g.merge_pending_commit(&group.provider)
+                .map_err(|e| MlsError::MergePendingCommitFailed(e.to_string()))?;
+            Ok(admitted)
+        }
+        Err(refusal) => {
+            g.clear_pending_commit(group.provider.storage())
+                .map_err(|e| {
+                    MlsError::CommitProcessingFailed(format!("clearing a refused commit: {e}"))
+                })?;
+            Err(refusal)
+        }
+    }
+}
+
+/// TLS-serializes `message` (named `what` in the error).
+pub(crate) fn serialize_out<M: TlsSerializeTrait>(
+    message: &M,
+    what: &str,
+) -> Result<Vec<u8>, MlsError> {
+    message
+        .tls_serialize_detached()
+        .map_err(|e| MlsError::CommitProcessingFailed(format!("serializing {what}: {e}")))
 }
 
 /// Adds a member, binding a **convergent committer timestamp** into the Commit's
@@ -930,6 +1008,14 @@ pub struct RemoveMemberResult {
     pub commit: MlsMessageOut,
     /// Optional group info.
     pub group_info: Option<GroupInfo>,
+    /// [`Self::commit`] TLS-serialized before the merge.
+    pub commit_bytes: Vec<u8>,
+    /// [`Self::group_info`] TLS-serialized before the merge.
+    pub group_info_bytes: Option<Vec<u8>>,
+    /// The tree's leaves after the remove, computed before the merge; the
+    /// caller rebuilds its wrapping-key directory from them without a fallible
+    /// step.
+    pub members: crate::admission::MemberLeaves,
 }
 
 /// Removes a member from the group by their leaf index.
@@ -946,22 +1032,28 @@ pub struct RemoveMemberResult {
 /// * `group` - The MLS group to remove the member from. Must be active.
 /// * `leaf_index` - The leaf index of the member to remove. Obtain this from
 ///   the group's member list via [`ScpMlsGroup::members`].
+/// * `clock` - The injected hardened [`Clock`] for the admission of any Add
+///   openmls folds into the Commit from earlier proposals.
 ///
 /// # Returns
 ///
-/// A [`RemoveMemberResult`] containing the Commit message.
+/// A [`RemoveMemberResult`] containing the Commit message and the tree's
+/// leaves after the remove.
 ///
 /// # Errors
 ///
 /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
 /// Returns [`MlsError::RemoveMemberFailed`] if `OpenMLS` rejects the remove
 /// operation (e.g., invalid leaf index, removing self).
+/// Returns any [`crate::admission`] error, with the Commit cleared and the
+/// epoch unchanged, if the Commit fails admission.
 /// Returns [`MlsError::MergePendingCommitFailed`] if committing fails.
 ///
 /// See ADR-001 acceptance criterion 3.
 pub fn remove_member(
     group: &mut ScpMlsGroup,
     leaf_index: LeafNodeIndex,
+    clock: &dyn Clock,
 ) -> Result<RemoveMemberResult, MlsError> {
     let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
@@ -971,12 +1063,26 @@ pub fn remove_member(
         .remove_members(&group.provider, signer, core::slice::from_ref(&leaf_index))
         .map_err(|e| MlsError::RemoveMemberFailed(e.to_string()))?;
 
-    // Merge the pending commit to advance the group epoch locally.
-    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-    g.merge_pending_commit(&group.provider)
-        .map_err(|e| MlsError::MergePendingCommitFailed(e.to_string()))?;
+    // Admit the pending commit on the tree after it, then merge it to advance
+    // the group epoch locally.
+    let (admission, (commit_bytes, group_info_bytes)) =
+        admit_and_merge_own_commit(group, clock, || {
+            Ok((
+                serialize_out(&commit, "remove commit")?,
+                group_info
+                    .as_ref()
+                    .map(|gi| serialize_out(gi, "remove group info"))
+                    .transpose()?,
+            ))
+        })?;
 
-    Ok(RemoveMemberResult { commit, group_info })
+    Ok(RemoveMemberResult {
+        commit,
+        group_info,
+        commit_bytes,
+        group_info_bytes,
+        members: admission.members,
+    })
 }
 
 /// Destroys all MLS group state.
@@ -1882,7 +1988,8 @@ mod tests {
         let bob_member = members.iter().find(|m| m.index != alice_own_index).unwrap();
 
         // Remove Bob.
-        let remove_result = remove_member(&mut alice_group, bob_member.index).unwrap();
+        let remove_result =
+            remove_member(&mut alice_group, bob_member.index, &SystemClock).unwrap();
 
         // Verify epoch advanced to 2.
         assert_eq!(alice_group.epoch().unwrap(), 2);

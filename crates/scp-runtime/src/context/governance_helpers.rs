@@ -1582,7 +1582,7 @@ pub async fn execute_remove_member(
             // persist (Class-S), so the epoch bump is durable. `local_did` is
             // sourced from the retained `deps.crypto.local_did()`.
             let remove_output = state
-                .remove_member(deps.crypto.local_did(), did.as_ref())
+                .remove_member(deps.crypto.local_did(), did.as_ref(), deps.clock.as_ref())
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             if let Err(e) = state.remove_member_sender_key(did.as_ref()) {
@@ -2801,7 +2801,7 @@ pub async fn execute_reset_member(
         .commit_class_s_keep(deps, context_id, |mut v| {
             let s = v.rest_mut();
             let remove_output = s
-                .remove_member(&local_did, did.as_ref())
+                .remove_member(&local_did, did.as_ref(), deps.clock.as_ref())
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
             let add_output = s
                 .add_member(did.as_ref(), None, deps.clock.as_ref())
@@ -3238,7 +3238,7 @@ pub async fn execute_rotate_content_keys(
                     .supervisor
                     .my_wrapping_keypair(&deps.owned_identity)?
                     .public();
-                let epoch_out = state.advance_epoch(wrapping_public_key)?;
+                let epoch_out = state.advance_epoch(wrapping_public_key, deps.clock.as_ref())?;
 
                 let member_dids: Vec<String> = state
                     .membership

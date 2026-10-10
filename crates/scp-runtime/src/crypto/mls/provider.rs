@@ -1429,7 +1429,7 @@ mod tests {
             .unwrap();
 
         // Remove Bob through the actor seam.
-        let result = actor.remove_member(TEST_DID, bob_did);
+        let result = actor.remove_member(TEST_DID, bob_did, &SystemClock);
         assert!(result.is_ok(), "remove_member failed: {result:?}");
         let output = result.unwrap();
         assert!(
@@ -1446,7 +1446,9 @@ mod tests {
         // Self-removal (leave) returns empty commit bytes — the local node
         // does not produce a Commit for its own departure.
         let mut actor = take_into_actor(&provider, &ctx_id);
-        let output = actor.remove_member(TEST_DID, TEST_DID).unwrap();
+        let output = actor
+            .remove_member(TEST_DID, TEST_DID, &SystemClock)
+            .unwrap();
         assert!(
             output.commit_bytes.is_empty(),
             "self-removal must return empty commit_bytes"
@@ -1462,7 +1464,7 @@ mod tests {
         // the node-resident wrapping public key as a parameter.
         let wrapping = WrappingKeyPair::generate();
         let mut actor = take_into_actor(&provider, &ctx_id);
-        let output = actor.advance_epoch(*wrapping.public());
+        let output = actor.advance_epoch(*wrapping.public(), &SystemClock);
         assert!(output.is_ok(), "advance_epoch failed: {output:?}");
         let output = output.unwrap();
         assert!(
@@ -1526,7 +1528,7 @@ mod tests {
         // via a Commit from the group admin (#1294). Relocated onto the actor
         // `remove_member` seam.
         let mut actor = take_into_actor(&provider, &ctx_id);
-        let result = actor.remove_member(TEST_DID, TEST_DID);
+        let result = actor.remove_member(TEST_DID, TEST_DID, &SystemClock);
         assert!(result.is_ok());
     }
 

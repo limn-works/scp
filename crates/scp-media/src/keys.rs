@@ -422,7 +422,8 @@ mod tests {
         let alice_own = group.own_leaf_index().unwrap();
         let members = group.members().unwrap();
         let bob_member = members.iter().find(|m| m.index != alice_own).unwrap();
-        let _remove_result = remove_member(&mut group, bob_member.index).unwrap();
+        let _remove_result =
+            remove_member(&mut group, bob_member.index, &scp_clock::SystemClock).unwrap();
 
         let keys_epoch_2 = export_media_keys(&group, b"ctx-1", TEST_KEY_LENGTH).unwrap();
         assert_eq!(
