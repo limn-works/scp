@@ -5350,7 +5350,6 @@ dependencies = [
  "openmls_memory_storage",
  "openmls_rust_crypto",
  "openmls_traits",
- "percent-encoding",
  "proptest",
  "rand 0.8.8",
  "rmp-serde",
