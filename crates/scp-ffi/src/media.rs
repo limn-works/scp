@@ -480,7 +480,10 @@ pub fn py_media_send_signaling(
         "payload",
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &payload),
     )?;
-    dict.set_item("message_type", format!("{message_type:?}"))?;
+    dict.set_item(
+        "message_type",
+        scp_ffi_common::wire_name::message_type_name(message_type),
+    )?;
     Ok(dict)
 }
 

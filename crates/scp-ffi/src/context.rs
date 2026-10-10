@@ -36,7 +36,6 @@ use scp_platform::traits::KeyCustody;
 use tokio::sync::mpsc;
 
 use scp_ffi_common::error_codes as codes;
-use scp_ffi_common::html_escape_event_string;
 
 use crate::validate;
 
@@ -1561,10 +1560,9 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::Sc
 ///
 /// Events are converted from [`ContextEvent`](scp_core::context::membership::ContextEvent) to [`PyMessage`]:
 /// - `MessageSent` -> payload is the message bytes, `sender_did` is the sender.
-/// - `MemberJoined` -> payload is `"member_joined:{did}:{role}"`.
-/// - `MemberLeft` -> payload is `"member_left:{did}"`.
-/// - `SystemClose` -> payload is `"system_close:{did}"`.
-/// - Other events -> payload is a debug representation.
+/// - Every other event -> `sender_did` is `"scp:system"` and payload is
+///   [`context_event_wire_string`](scp_ffi_common::context_event::context_event_wire_string),
+///   such as `"member_joined:{did}:{role}"`.
 ///
 /// If no receive channel is open (i.e., `py_context_receive` has not been
 /// called), events are silently discarded. This is intentional: the channel
@@ -1573,11 +1571,9 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::Sc
 /// Converts a [`ContextEvent`](scp_core::context::membership::ContextEvent) into the `(sender_did, payload, timestamp)` triple
 /// used by the `PyO3` bridge event delivery pipeline.
 #[allow(clippy::cast_precision_loss)]
-#[allow(clippy::too_many_lines)]
 fn convert_context_event(
     event: scp_core::context::membership::ContextEvent,
 ) -> (String, Vec<u8>, f64) {
-    use scp_core::context::membership::ContextEvent::{ConsequenceEnforced, ConsequenceTriggered};
     let ts = scp_clock::SystemClock.now_secs() as f64;
     match event {
         scp_core::context::membership::ContextEvent::MessageSent {
@@ -1585,120 +1581,9 @@ fn convert_context_event(
             payload,
             ..
         } => (sender_did.to_string(), payload, ts),
-        scp_core::context::membership::ContextEvent::MemberJoined {
-            member_did,
-            role_name,
-        } => (
-            "scp:system".to_owned(),
-            // M10: HTML-escape all user-supplied values in event strings.
-            format!(
-                "member_joined:{}:{}",
-                html_escape_event_string(member_did.as_ref()),
-                html_escape_event_string(&role_name),
-            )
-            .into_bytes(),
-            ts,
-        ),
-        scp_core::context::membership::ContextEvent::MemberLeft { member_did } => (
-            "scp:system".to_owned(),
-            format!(
-                "member_left:{}",
-                html_escape_event_string(member_did.as_ref()),
-            )
-            .into_bytes(),
-            ts,
-        ),
-        scp_core::context::membership::ContextEvent::SystemClose { initiator_did } => (
-            "scp:system".to_owned(),
-            format!(
-                "system_close:{}",
-                html_escape_event_string(initiator_did.as_ref()),
-            )
-            .into_bytes(),
-            ts,
-        ),
-        scp_core::context::membership::ContextEvent::SequenceGapDetected {
-            sender_did,
-            expected_sequence,
-            first_delivered_sequence,
-            reason,
-        } => (
-            "scp:system".to_owned(),
-            format!(
-                "sequence_gap_detected:sender={},\
-                 expected={expected_sequence},\
-                 first_delivered={first_delivered_sequence},\
-                 reason={}",
-                html_escape_event_string(&sender_did),
-                html_escape_event_string(&reason),
-            )
-            .into_bytes(),
-            ts,
-        ),
-        ConsequenceTriggered {
-            context_id: ctx_id,
-            member_did,
-            rule_index,
-            trigger_type,
-            action_type,
-        } => (
-            "scp:system".to_owned(),
-            format!(
-                "consequence_triggered:member={},\
-                 rule={rule_index},trigger={},\
-                 action={},context={}",
-                html_escape_event_string(member_did.as_ref()),
-                html_escape_event_string(&trigger_type),
-                html_escape_event_string(&action_type),
-                html_escape_event_string(&ctx_id),
-            )
-            .into_bytes(),
-            ts,
-        ),
-        ConsequenceEnforced {
-            context_id: ctx_id,
-            member_did,
-            action_type,
-            success,
-        } => (
-            "scp:system".to_owned(),
-            format!(
-                "consequence_enforced:member={},\
-                 action={},success={success},\
-                 context={}",
-                html_escape_event_string(member_did.as_ref()),
-                html_escape_event_string(&action_type),
-                html_escape_event_string(&ctx_id),
-            )
-            .into_bytes(),
-            ts,
-        ),
-        // Relay equivocation detected (§9.9.3, §23.7). This is a security event
-        // and MUST NOT be silently discarded (§9.9.4) — surface it as a
-        // structured, non-lossy, HTML-escaped record rather than a Debug blob.
-        scp_core::context::membership::ContextEvent::EquivocationDetected {
-            context_id: ctx_id,
-            remote_sender_did,
-            event_count,
-            local_merkle_root,
-            remote_merkle_root,
-        } => (
-            "scp:system".to_owned(),
-            format!(
-                "equivocation_detected:context={},\
-                 remote_sender={},event_count={event_count},\
-                 local_merkle_root={},remote_merkle_root={}",
-                html_escape_event_string(&ctx_id),
-                html_escape_event_string(remote_sender_did.as_ref()),
-                hex::encode(local_merkle_root),
-                hex::encode(remote_merkle_root),
-            )
-            .into_bytes(),
-            ts,
-        ),
         other => (
             "scp:system".to_owned(),
-            html_escape_event_string(&format!("{other:?}")).into_bytes(),
+            scp_ffi_common::context_event::context_event_wire_string(&other).into_bytes(),
             ts,
         ),
     }
@@ -4314,7 +4199,9 @@ impl crate::scp::PyScp {
                 })?
                 .map_err(|e| typed_supervisor_failure("SCP-CTX-2042: governance approval", &e))?;
 
-            Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+            Ok(scp_ffi_common::governance_result::proposal_status_response(
+                &status,
+            ))
         })
     }
 
@@ -4382,7 +4269,9 @@ impl crate::scp::PyScp {
                 })?
                 .map_err(|e| typed_supervisor_failure("SCP-CTX-2043: governance rejection", &e))?;
 
-            Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+            Ok(scp_ffi_common::governance_result::proposal_status_response(
+                &status,
+            ))
         })
     }
 
@@ -4430,7 +4319,9 @@ impl crate::scp::PyScp {
                     typed_supervisor_failure("SCP-CTX-2044: governance vote withdrawal", &e)
                 })?;
 
-            Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+            Ok(scp_ffi_common::governance_result::proposal_status_response(
+                &status,
+            ))
         })
     }
 
@@ -4777,11 +4668,15 @@ impl crate::scp::PyScp {
                     typed_supervisor_failure("SCP-CTX-2063: add_checkpoint_cosignature", &e)
                 })?;
 
-            let response = serde_json::json!({
-                "attestation_status": format!("{status:?}"),
-                "checkpoint": serde_json::to_value(&updated_checkpoint).unwrap_or_default(),
-            });
-            Ok(response.to_string())
+            scp_ffi_common::governance_result::checkpoint_cosignature_response(
+                &updated_checkpoint,
+                &status,
+            )
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2063: add_checkpoint_cosignature failed to encode checkpoint: {e}"
+                ))
+            })
         })
     }
 
@@ -5723,8 +5618,8 @@ impl crate::scp::PyScp {
 
     /// Drains all pending events from the context's receive buffer.
     ///
-    /// Returns a list of event descriptions as debug strings. Returns empty
-    /// if the context is not registered.
+    /// Returns one [`context_event_wire_string`](scp_ffi_common::context_event::context_event_wire_string)
+    /// per event. Returns empty if the context is not registered.
     #[pyo3(signature = (handle,))]
     pub fn context_drain_events(&self, handle: &PyContextHandle) -> PyResult<Vec<String>> {
         let bi = &*self.inner;
@@ -5737,7 +5632,7 @@ impl crate::scp::PyScp {
         Ok(rt
             .block_on(sup.drain_events(&context_id))
             .into_iter()
-            .map(|e| format!("{e:?}"))
+            .map(|e| scp_ffi_common::context_event::context_event_wire_string(&e))
             .collect())
     }
 

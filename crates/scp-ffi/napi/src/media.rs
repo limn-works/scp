@@ -548,7 +548,7 @@ pub(crate) fn media_send_signaling_on(
     use base64::Engine;
     serde_json::to_string(&serde_json::json!({
         "payload": base64::engine::general_purpose::STANDARD.encode(&payload),
-        "message_type": format!("{message_type:?}"),
+        "message_type": scp_ffi_common::wire_name::message_type_name(message_type),
     }))
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {

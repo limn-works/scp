@@ -647,14 +647,25 @@ async fn context_drain_events_returns_the_join_events() {
 
     let events = scp.context_drain_events(Arc::clone(&handle)).await;
 
-    // Admitting a member buffers `MemberJoined` and `WelcomeGenerated`. An
-    // earlier assertion here read `events.is_empty() || !events.is_empty()`,
-    // which every value satisfies.
+    // Admitting a member buffers `MemberJoined` and `WelcomeGenerated`, each
+    // rendered as a `<name>:` record and never as a `Debug` dump such as
+    // `MemberJoined { member_did: .. }`.
+    let joined = format!("member_joined:{bob_did}:");
+    assert!(
+        events.iter().any(|e| e.starts_with(&joined)),
+        "drained events must carry {joined}<role>, got: {events:?}"
+    );
     assert!(
         events
             .iter()
-            .any(|e| e.contains("MemberJoined") && e.contains(&bob_did)),
-        "drained events must carry MemberJoined naming whichever DID joined, got: {events:?}"
+            .all(|e| !e.contains(" {") && !e.contains("DID(")),
+        "no drained event may be a Debug dump, got: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.starts_with("welcome_generated:") && e.contains("welcome_bytes_len=")),
+        "a Welcome renders as byte counts only, got: {events:?}"
     );
 
     // Draining removes what it returned, so a second call over one buffer

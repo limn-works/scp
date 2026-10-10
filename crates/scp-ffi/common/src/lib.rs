@@ -183,6 +183,15 @@ pub mod saga_errors;
 #[cfg(feature = "resolvers")]
 pub mod broadcast;
 
+// Wire names for protocol enums that bridges hand an SDK (signaling message
+// type, provenance source type, memory scope), so no bridge sends a Rust
+// `Debug` rendering across its FFI boundary.
+pub mod wire_name;
+
+// One string rendering per `ContextEvent`, shared by every bridge's event
+// drain and PyO3's receive pipeline in place of `Debug` dumps.
+pub mod context_event;
+
 // Wire names for governance outcomes, shared by PyO3, napi-rs, and UniFFI so
 // no bridge sends a Rust `Debug` dump across its FFI boundary. Requires
 // scp-core (behind `resolvers`).
