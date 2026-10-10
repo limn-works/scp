@@ -3769,8 +3769,8 @@ def selects(expression: str, outputs: dict[str, str], event_name: str) -> bool:
             return event_name
         if token == "github.event.pull_request.draft":
             # Held at false, so the enumeration covers the runs in which check-draft
-            # runs. On a draft pull request check-draft skips, every job that needs it
-            # skips with it, and scripts/ci-aggregate-result.py returns 0 on exactly
+            # and `changes` run. On a draft pull request both skip, every job that
+            # needs either skips with it, and scripts/ci-aggregate-result.py returns 0 on exactly
             # that state, because GitHub blocks merging a draft and a merge queue
             # re-runs this workflow on a merge_group event where the gate applies. A
             # draft run therefore has no job whose skip a merge could ride, which is
@@ -3900,6 +3900,64 @@ def check_dependency_conditions(doc: dict) -> None:
         "ci.yml: every job's `needs` are selected wherever the job is",
         not gaps,
         "; ".join(gaps),
+    )
+
+
+def draft_condition_gaps(doc: dict) -> list[str]:
+    """Return each way job `changes` fails to carry job check-draft's `if:`.
+
+    CRITERION: job `changes` carries an `if:` whose whitespace-normalised text equals
+    check-draft's, and that text reads `github.event.pull_request.draft`.
+
+    WHY: `changes` does not need check-draft, so that it starts when the run is
+    created. Every path-filtered job reaches the draft gate only through `changes`,
+    so `changes` without the draft `if:` runs on a draft pull request and every job
+    that needs it runs with it. scripts/ci-aggregate-result.py returns 0 for a
+    draft once it sees check-draft skipped, and fails a run in which check-draft
+    skipped and `changes` did not, so a divergence would also turn every draft run
+    red; this check reports it on the pull request that introduces it.
+    """
+    jobs = doc["jobs"]
+    gate = jobs.get("check-draft", {}).get("if")
+    if gate is None or "github.event.pull_request.draft" not in str(gate):
+        return [f"check-draft carries no draft `if:` (it carries {gate!r})"]
+    condition = jobs.get("changes", {}).get("if")
+    if condition is None:
+        return ["changes carries no `if:`, so it runs on a draft pull request"]
+    if " ".join(str(condition).split()) != " ".join(str(gate).split()):
+        return [f"changes carries `if: {condition}`, not check-draft's `if: {gate}`"]
+    return []
+
+
+def check_draft_condition(doc: dict) -> None:
+    gaps = draft_condition_gaps(doc)
+    check("ci.yml: job changes carries check-draft's `if:`", not gaps, "; ".join(gaps))
+    # Controls: `changes` without the `if:`, `changes` with a narrower one, and a
+    # check-draft whose `if:` changed while `changes` kept the old text each report.
+    absent = copy.deepcopy(doc)
+    del absent["jobs"]["changes"]["if"]
+    gaps = draft_condition_gaps(absent)
+    check(
+        "a changes job without the draft `if:` is reported",
+        any("changes carries no `if:`" in gap for gap in gaps),
+        f"{gaps}",
+    )
+    narrowed = copy.deepcopy(doc)
+    narrowed["jobs"]["changes"]["if"] = "github.event_name == 'push'"
+    gaps = draft_condition_gaps(narrowed)
+    check(
+        "a changes job whose `if:` differs from check-draft's is reported",
+        any("not check-draft's" in gap for gap in gaps),
+        f"{gaps}",
+    )
+    moved = copy.deepcopy(doc)
+    gate = moved["jobs"]["check-draft"]
+    gate["if"] = f"github.event_name != 'push' && ({gate['if']})"
+    gaps = draft_condition_gaps(moved)
+    check(
+        "a check-draft `if:` that changes alone no longer carries is reported",
+        any("not check-draft's" in gap for gap in gaps),
+        f"{gaps}",
     )
 
 
@@ -7084,13 +7142,26 @@ def check_push_writer_mutants(doc: dict) -> None:
         f"{gaps}",
     )
 
+    # Every writer reaches the draft gate through `changes`, which carries
+    # check-draft's `if:` instead of needing check-draft. A push skip on `changes`
+    # is reported as a dependency gap; a push skip on check-draft alone is reported
+    # as a divergence between the two draft conditions.
     draft = copy.deepcopy(doc)
-    gate = draft["jobs"]["check-draft"]
+    gate = draft["jobs"]["changes"]
     gate["if"] = f"github.event_name != 'push' && ({gate['if']})"
     gaps = dependency_condition_gaps(draft)
     check(
-        "a push skip on check-draft, which every writer needs, is reported",
-        any("changes runs and check-draft skips on event push" in gap for gap in gaps),
+        "a push skip on changes, which every writer needs, is reported",
+        any("and changes skips on event push" in gap for gap in gaps),
+        f"{gaps}",
+    )
+    draft = copy.deepcopy(doc)
+    gate = draft["jobs"]["check-draft"]
+    gate["if"] = f"github.event_name != 'push' && ({gate['if']})"
+    gaps = dependency_condition_gaps(draft) + draft_condition_gaps(draft)
+    check(
+        "a push skip on check-draft is reported",
+        any("not check-draft's" in gap for gap in gaps),
         f"{gaps}",
     )
 
@@ -7669,7 +7740,10 @@ def run_one_job_aggregate(expression: str, event: str) -> tuple[int, str]:
     workflow = {
         "jobs": {
             "check-draft": {"runs-on": "ubuntu-latest"},
-            "changes": {"needs": "check-draft", "outputs": {"rust": "x", "python": "x"}},
+            "changes": {
+                "if": "github.event.pull_request.draft == false",
+                "outputs": {"rust": "x", "python": "x"},
+            },
             "probe": {"needs": "changes", "if": expression},
             "ci": {"if": "always()", "needs": ["check-draft", "changes", "probe"]},
         }
@@ -8179,6 +8253,7 @@ def run_needs_condition(inputs: Inputs) -> None:
     workflow = inputs.workflow
     print("needs-condition — a job's dependencies run wherever the job does")
     check_dependency_conditions(workflow)
+    check_draft_condition(workflow)
     check_dependency_conditions_detect_a_narrowed_producer(workflow)
     check_dependency_conditions_detect_a_conditionless_consumer(workflow)
     check_dependency_conditions_read_a_status_guarded_consumer(workflow)
@@ -8562,6 +8637,28 @@ def run_push_skips(inputs: Inputs) -> None:
     needs["changes"]["outputs"] = dict(docs_pr.filters)
     code, out = run_aggregate(needs, docs_pr.event)
     check("draft pull request, every job skipped -> exit 0", code == 0, out)
+
+    # `changes` carries check-draft's `if:` rather than needing it, so the two skip
+    # together. Either one skipping alone means their conditions diverged.
+    needs = build_needs(jobs, docs_pr)
+    for entry in needs.values():
+        entry["result"] = "skipped"
+    needs["changes"] = {"result": "success", "outputs": dict(docs_pr.filters)}
+    code, out = run_aggregate(needs, docs_pr.event)
+    check(
+        "check-draft skipped while changes ran -> exit 1",
+        code == 1 and "conditions diverged" in out,
+        f"exit {code}: {out}",
+    )
+
+    needs = build_needs(jobs, docs_pr)
+    needs["changes"] = {"result": "skipped", "outputs": {}}
+    code, out = run_aggregate(needs, docs_pr.event)
+    check(
+        "check-draft ran while changes skipped -> exit 1",
+        code == 1 and "changes: skipped" in out,
+        f"exit {code}: {out}",
+    )
 
     needs = build_needs(jobs, docs_pr)
     needs.pop("wasm-test")

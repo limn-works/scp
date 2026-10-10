@@ -218,7 +218,19 @@ def main() -> int:
         return 1
 
     draft_result = needs[DRAFT_GATE_JOB]["result"]
+    filter_result = needs[FILTER_JOB]["result"]
     if draft_result == "skipped":
+        # `changes` carries check-draft's `if:` rather than needing check-draft, so
+        # both skip on a draft pull request. A `changes` that did not skip here means
+        # the two conditions diverged, and a check-draft skip no longer proves the
+        # run is a draft whose skipped jobs a merge cannot ride.
+        if filter_result != "skipped":
+            print(
+                f"::error::{DRAFT_GATE_JOB} skipped but {FILTER_JOB} reported "
+                f"{filter_result}: the two jobs carry one draft condition, so a "
+                "skip of one without the other means their `if:` conditions diverged"
+            )
+            return 1
         print(
             f"`{DRAFT_GATE_JOB}` skipped: this pull request is a draft, so no CI job ran. "
             "GitHub blocks merging a draft, and a merge queue re-runs this workflow on "
@@ -231,7 +243,6 @@ def main() -> int:
         )
         return 1
 
-    filter_result = needs[FILTER_JOB]["result"]
     if filter_result != "success":
         print(
             f"::error::{FILTER_JOB}: {filter_result} — every path-filtered job skips when "
