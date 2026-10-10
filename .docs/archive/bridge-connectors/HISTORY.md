@@ -23,7 +23,7 @@ On 2026-10-09 Alec ruled how the cut treats documents: "delete all the code, kee
 
 Pull request #2483, "chore: cut platform bridge connectors from every layer (Track BR)", deleted the feature from every layer in one 152-file change. It was too large for one review, so the Track BR plan splits it into stacked slices: S1 archives the ADRs, PRDs and sketch text; S2 archives spec 12 and the other prose; S3a to S9 delete the code. Three pull requests that extended bridges closed unmerged after Alec cut the feature: #2373, "fix(node): bridge handlers restrict every read and write to their authenticated scope"; #2463, "docs(spec): a bridge node admits a bridge only on a governance approval it verifies"; and #2472, "feat(bridge): the four bridge lifecycle EventType variants, the two registration actions, and the eight SCP-BCH stories".
 
-The merged pull requests that carried out the Track BR slices: S1, #2740; S2, #2745; S3a, #2754; S3b, #2756; S4, #2771; S5, #2775; S6, #2785; S7, #2790; S8, #2808.
+The merged pull requests that carried out the Track BR slices: S1, #2740; S2, #2745; S3a, #2754; S3b, #2756; S4, #2771; S5, #2775; S6, #2785; S7, #2790; S8, #2808; S9, #2818.
 
 ## Design origin
 
