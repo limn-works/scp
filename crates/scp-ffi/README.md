@@ -51,7 +51,6 @@ A single multi-threaded tokio runtime (`RUNTIME`, an `OnceLock<Runtime>` in
 |--------|--------|
 | `scp.rs` | The `SCP` `#[pyclass]` -- sole SDK entry point; mandatory storage-config constructor |
 | `bridge_adapters.rs` | Shared bridge adapter types for the UCAN validation pipeline |
-| `bridge_connector.rs` | Bridge connector operations (register, trust evaluation, shadow identities) |
 | `context.rs` | Context create, join, leave, close, send, receive |
 | `custody.rs` | `FfiKeyCustody` enum dispatch for `KeyCustody` trait (in-memory + file) |
 | `discovery.rs` | Context discovery (local + relay probe) |
