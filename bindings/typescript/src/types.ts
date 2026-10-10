@@ -453,11 +453,67 @@ function encodeConsequenceCapability(capability: ConsequenceCapability): unknown
 // ---------------------------------------------------------------------------
 
 /**
- * Role assigned to a member within a context (spec section 5.5).
- *
- * Mirrors `scp_core::context::roles::Role`.
+ * The six protocol-defined roles (spec section 5.5), one per name
+ * `RESERVED_ROLE_NAMES` in `crates/scp-protocol/src/context/roles.rs`
+ * reserves. No custom role may take any of them, so a member holding one of
+ * these names holds the protocol-defined role of that name.
  */
-export type MemberRole = "Admin" | "Moderator" | "Member" | "Observer" | "Custom";
+export const BUILT_IN_ROLES = [
+  "Admin",
+  "Moderator",
+  "Member",
+  "Observer",
+  "Author",
+  "Subscriber",
+] as const;
+
+/** A protocol-defined role; see {@link BUILT_IN_ROLES}. */
+export type BuiltInRole = (typeof BUILT_IN_ROLES)[number];
+
+/** A role a context's governance defined, carrying the name governance gave it. */
+export interface CustomRole {
+  readonly kind: "Custom";
+  /** The role's name, for example `"night-shift-reviewer"`. */
+  readonly name: string;
+}
+
+/**
+ * Role assigned to a member within a context (spec section 5.5): a
+ * {@link BuiltInRole}, or a {@link CustomRole} carrying its name.
+ */
+export type MemberRole = BuiltInRole | CustomRole;
+
+/**
+ * A custom role name `validate_role_name` in
+ * `crates/scp-protocol/src/context/roles.rs` admits: 1 to 64 bytes of
+ * lowercase ASCII letters, digits, hyphens, and underscores, neither starting
+ * nor ending with a hyphen or underscore.
+ */
+const CUSTOM_ROLE_NAME = /^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/;
+
+/**
+ * Parses a bridge-layer role name into a {@link MemberRole}.
+ *
+ * Every bridge reports `RoleAssignment.role_name`, which stores a built-in
+ * role in lowercase (`"author"`) and a custom role under the name governance
+ * gave it. Matching is exact. Swift's `MemberRole.fromBridge` and Python's
+ * `MemberRole.from_bridge` parse the same way.
+ *
+ * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when `raw` is
+ *   neither a built-in role name nor a name `validate_role_name` admits for a
+ *   custom role.
+ */
+export function memberRoleFromBridge(raw: string): MemberRole {
+  const builtIn = BUILT_IN_ROLES.find((role) => role.toLowerCase() === raw);
+  if (builtIn !== undefined) return builtIn;
+  if (!CUSTOM_ROLE_NAME.test(raw)) {
+    throw new UnknownGovernanceOutcomeError(
+      `bridge reported role name ${JSON.stringify(raw)}, which is neither a built-in nor a valid custom role name`,
+      raw,
+    );
+  }
+  return { kind: "Custom", name: raw };
+}
 
 // ---------------------------------------------------------------------------
 // Broadcast

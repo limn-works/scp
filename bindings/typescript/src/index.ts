@@ -267,6 +267,7 @@ export type {
   AttestorInfo,
   BatchPublishResult,
   BroadcastAdmissionPolicy,
+  BuiltInRole,
   CachedAttestation,
   CachedAttestationDuration,
   CachedAttestationEnvelope,
@@ -281,6 +282,7 @@ export type {
   Checkpoint,
   ContextParams,
   CrossContextInvocationResult,
+  CustomRole,
   DIDDocument,
   Event,
   EventClaim,
@@ -325,10 +327,12 @@ export type {
 
 export {
   allValid,
+  BUILT_IN_ROLES,
   Capabilities,
   checkProposalResponse,
   GOVERNANCE_ACTION_RESULTS,
   governanceActionResultFromBridge,
+  memberRoleFromBridge,
   outletCall,
   outletQuery,
   PROPOSAL_STATUSES,

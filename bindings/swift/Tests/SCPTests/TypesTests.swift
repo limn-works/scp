@@ -112,3 +112,36 @@ final class GovernanceTypesTests: XCTestCase {
         }
     }
 }
+
+/// `MemberRole.fromBridge` reads `RoleAssignment.role_name`.
+final class MemberRoleTypesTests: XCTestCase {
+    func testAuthorAndSubscriberAreBuiltInRoles() throws {
+        XCTAssertEqual(try MemberRole.fromBridge("author"), .author)
+        XCTAssertEqual(try MemberRole.fromBridge("subscriber"), .subscriber)
+    }
+
+    func testEveryReservedNameParsesToItsBuiltInRole() throws {
+        // The six names `RESERVED_ROLE_NAMES` in
+        // `crates/scp-protocol/src/context/roles.rs` reserves.
+        let expected: [String: MemberRole] = [
+            "admin": .admin, "moderator": .moderator, "member": .member,
+            "observer": .observer, "author": .author, "subscriber": .subscriber
+        ]
+        for (raw, role) in expected {
+            XCTAssertEqual(try MemberRole.fromBridge(raw), role, raw)
+        }
+    }
+
+    func testGovernanceDefinedRoleCarriesItsName() throws {
+        XCTAssertEqual(
+            try MemberRole.fromBridge("night-shift-reviewer"),
+            .custom(name: "night-shift-reviewer")
+        )
+    }
+
+    func testMalformedNameThrowsGov11040() {
+        for raw in ["Author", "My-role", "", "-lead", "a b", String(repeating: "x", count: 65)] {
+            assertGov11040 { try MemberRole.fromBridge(raw) }
+        }
+    }
+}

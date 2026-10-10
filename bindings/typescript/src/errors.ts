@@ -240,7 +240,9 @@ export class GovernanceError extends ScpError {
  * `scp_ffi_common::governance_result`: an action outcome
  * (`GOVERNANCE_ACTION_RESULTS`), a proposal status (`PROPOSAL_STATUSES`), and
  * a rejection reason (`REJECTION_REASONS`). An SDK older than its bridge reads
- * a name none of those lists carries. This error reports that name instead of
+ * a name none of those lists carries. `memberRoleFromBridge` throws it too, for
+ * a role name that is neither built in nor a name `validate_role_name` admits
+ * for a custom role. This error reports that name instead of
  * substituting a known one: governance decides authorization, and a
  * substituted name reports an action or status the engine never reported.
  */

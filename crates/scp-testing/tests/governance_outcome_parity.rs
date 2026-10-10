@@ -1,5 +1,12 @@
 //! Governance name parity between the Rust bridges and the four SDKs.
 //!
+//! The same closed extraction holds each SDK's built-in member roles equal to
+//! `RESERVED_ROLE_NAMES` in `crates/scp-protocol/src/context/roles.rs`: every
+//! bridge reports `RoleAssignment.role_name`, and an SDK that lacks a reserved
+//! name reports a protocol-defined role as a governance-defined one or rejects
+//! it. Kotlin returns the bridge's role name as a `String` and declares no
+//! role type, so it has no role set to compare.
+//!
 //! Every bridge names a governance outcome, a proposal status, and a rejection
 //! reason through the exhaustive name functions in
 //! `crates/scp-ffi/common/src/governance_result.rs`. Each SDK parses those
@@ -84,6 +91,8 @@ const PYTHON_FILE: &str = "bindings/python/scp_sdk/governance.py";
 const SWIFT_FILE: &str = "bindings/swift/Sources/SCP/Governance.swift";
 const KOTLIN_FILE: &str = "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Types.kt";
 const TS_FILE: &str = "bindings/typescript/src/types.ts";
+const ROLES_FILE: &str = "crates/scp-protocol/src/context/roles.rs";
+const PYTHON_ROLE_FILE: &str = "bindings/python/scp_sdk/types.py";
 
 // ---------------------------------------------------------------------------
 // Rust side: syn
@@ -122,6 +131,47 @@ fn rust_names(source: &str, fn_name: &str) -> Result<Vec<String>, String> {
     }
     if names.is_empty() {
         return Err(format!("`{fn_name}`'s match has no arms"));
+    }
+    Ok(names)
+}
+
+/// Returns the string literals of the `&[&str]` constant `const_name`, in
+/// source order.
+fn rust_const_names(source: &str, const_name: &str) -> Result<Vec<String>, String> {
+    let file = syn::parse_file(source).map_err(|e| format!("parse {ROLES_FILE}: {e}"))?;
+    let item = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Const(c) if c.ident == const_name => Some(c),
+            _ => None,
+        })
+        .ok_or_else(|| format!("{ROLES_FILE} defines no const `{const_name}`"))?;
+    let syn::Expr::Reference(syn::ExprReference { expr, .. }) = item.expr.as_ref() else {
+        return Err(format!(
+            "`{const_name}` is not a reference to an array literal"
+        ));
+    };
+    let syn::Expr::Array(array) = expr.as_ref() else {
+        return Err(format!(
+            "`{const_name}` is not a reference to an array literal"
+        ));
+    };
+    let mut names = Vec::with_capacity(array.elems.len());
+    for elem in &array.elems {
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) = elem
+        else {
+            return Err(format!(
+                "an element of `{const_name}` is something other than a string literal"
+            ));
+        };
+        names.push(s.value());
+    }
+    if names.is_empty() {
+        return Err(format!("`{const_name}` is empty"));
     }
     Ok(names)
 }
@@ -201,6 +251,17 @@ fn ts_entry(line: &str) -> Option<String> {
     quoted_then(line.strip_prefix("  ")?, ",")
 }
 
+/// `    case name`, a case with no raw value, whose identifier is the name.
+fn swift_bare_case_entry(line: &str) -> Option<String> {
+    let ident = line.strip_prefix("    case ")?;
+    is_ident(
+        ident,
+        |c| c.is_ascii_lowercase(),
+        |c| c.is_ascii_lowercase(),
+    )
+    .then(|| ident.to_owned())
+}
+
 const PYTHON: Shape = Shape {
     declaration: "class {}(enum.Enum):",
     terminator: "    @classmethod",
@@ -224,6 +285,14 @@ const TS: Shape = Shape {
     terminator: "] as const;",
     allowed_prefixes: &["  //"],
     entry: ts_entry,
+};
+/// Swift's `MemberRole`: one bare case per built-in role, then the
+/// `custom(name:)` case that carries a governance-defined role's name.
+const SWIFT_ROLE: Shape = Shape {
+    declaration: "public enum {}: Sendable, Hashable {",
+    terminator: "}",
+    allowed_prefixes: &["    //", "    case custom(name: String)"],
+    entry: swift_bare_case_entry,
 };
 
 /// Returns the names in `name`'s entry block, in source order.
@@ -323,6 +392,66 @@ fn every_sdk_names_exactly_the_rust_governance_names() -> Result<(), String> {
 }
 
 #[test]
+fn every_sdk_member_role_names_exactly_the_reserved_role_names() -> Result<(), String> {
+    let rust = rust_const_names(&read(ROLES_FILE)?, "RESERVED_ROLE_NAMES")?;
+    let rust = as_set(&rust, "RESERVED_ROLE_NAMES");
+    // Each SDK spells a built-in role in its own case; its parser matches the
+    // lowercase form, which is the form `RESERVED_ROLE_NAMES` holds.
+    let sdks: [(&str, String, &Shape, &str); 3] = [
+        ("Python", read(PYTHON_ROLE_FILE)?, &PYTHON, "MemberRole"),
+        ("Swift", read(SWIFT_FILE)?, &SWIFT_ROLE, "MemberRole"),
+        ("TypeScript", read(TS_FILE)?, &TS, "BUILT_IN_ROLES"),
+    ];
+    for (sdk, src, shape, decl) in &sdks {
+        let label = format!("{sdk} `{decl}`");
+        let names: Vec<String> = sdk_names(src, shape, decl)
+            .map_err(|err| format!("{label}: {err}"))?
+            .iter()
+            .map(|n| n.to_ascii_lowercase())
+            .collect();
+        let sdk_set = as_set(&names, &label);
+        let missing: Vec<_> = rust.difference(&sdk_set).collect();
+        let extra: Vec<_> = sdk_set.difference(&rust).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "{label} differs from `RESERVED_ROLE_NAMES`: missing {missing:?}, extra {extra:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_extraction_reads_the_reserved_role_names() -> Result<(), String> {
+    // A positive control for the const extraction.
+    let names = rust_const_names(&read(ROLES_FILE)?, "RESERVED_ROLE_NAMES")?;
+    assert_eq!(
+        names,
+        [
+            "admin",
+            "moderator",
+            "member",
+            "observer",
+            "author",
+            "subscriber"
+        ]
+    );
+    let cases = [
+        (r#"const R: &[&str] = &["a", B];"#, "R", "string literal"),
+        (
+            r#"const R: [&str; 1] = ["a"];"#,
+            "R",
+            "reference to an array",
+        ),
+        (r#"const R: &[&str] = &["a"];"#, "S", "defines no const"),
+    ];
+    for (source, name, expected) in cases {
+        let err = expect_err(rust_const_names(source, name), source)?;
+        assert!(err.contains(expected), "{source}: {err}");
+    }
+    Ok(())
+}
+
+#[test]
 fn rust_extraction_reads_the_shipped_names() -> Result<(), String> {
     // The shipped function list; a positive control for the syn extraction.
     let names = rust_names(&read(RUST_FILE)?, "proposal_status_name")?;
@@ -365,6 +494,8 @@ fn sdk_extraction_reads_each_shape() -> Result<(), String> {
     for (source, shape) in [(py, &PYTHON), (swift, &SWIFT), (kt, &KOTLIN), (ts, &TS)] {
         assert_eq!(sdk_names(source, shape, "X")?, ["A", "BC"], "{source}");
     }
+    let role = "public enum X: Sendable, Hashable {\n    /// doc\n    case admin\n    case author\n    case custom(name: String)\n}\n";
+    assert_eq!(sdk_names(role, &SWIFT_ROLE, "X")?, ["admin", "author"]);
     Ok(())
 }
 
@@ -377,11 +508,13 @@ fn sdk_extraction_rejects_a_line_it_cannot_classify() -> Result<(), String> {
     let kt = "enum class X(val rawValue: String) {\n    A(\"A\"), B(\"B\"),\n    ;\n";
     let ts = "export const X = [\n  \"A\", \"B\",\n] as const;\n";
     let unterminated = "export const X = [\n  \"A\",\n";
+    let role = "public enum X: Sendable, Hashable {\n    case admin, author\n}\n";
     let cases = [
         (py, &PYTHON, "X", "not an entry"),
         (swift, &SWIFT, "X", "not an entry"),
         (kt, &KOTLIN, "X", "not an entry"),
         (ts, &TS, "X", "not an entry"),
+        (role, &SWIFT_ROLE, "X", "not an entry"),
         (unterminated, &TS, "X", "never reaches"),
         (ts, &TS, "Y", "no line equals"),
     ];

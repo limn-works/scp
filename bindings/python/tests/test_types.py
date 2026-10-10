@@ -12,6 +12,8 @@ See ``.docs/standards/python.md`` for test naming conventions.
 
 from __future__ import annotations
 
+import pytest
+
 import scp_sdk
 from scp_sdk.errors import (
     BRIDGE_ERROR_MAP,
@@ -1176,3 +1178,45 @@ class TestScpGovernanceWrappers:
                 await call(self._scp(method, raw), "ctx", "did:dht:zA", "ab")
             assert excinfo.value.code == "SCP-GOV-11040", method
             assert await call(self._scp(method, ok), "ctx", "did:dht:zA", "ab") == ok
+
+
+# The six names ``RESERVED_ROLE_NAMES`` in
+# ``crates/scp-protocol/src/context/roles.rs`` reserves, as bridges report them.
+RUST_RESERVED_ROLE_NAMES = ("admin", "moderator", "member", "observer", "author", "subscriber")
+
+
+class TestMemberRoleFromBridge:
+    """``MemberRole.from_bridge`` reads ``RoleAssignment.role_name``.
+
+    The imports sit inside each test so that a source without the parsed types
+    fails these tests alone.
+    """
+
+    def test_author_and_subscriber_are_built_in_roles(self) -> None:
+        from scp_sdk.types import MemberRole
+
+        assert MemberRole.from_bridge("author") is MemberRole.AUTHOR
+        assert MemberRole.from_bridge("subscriber") is MemberRole.SUBSCRIBER
+
+    def test_every_reserved_name_parses_to_its_built_in_role(self) -> None:
+        from scp_sdk.types import MemberRole
+
+        parsed = [MemberRole.from_bridge(name) for name in RUST_RESERVED_ROLE_NAMES]
+        assert parsed == list(MemberRole)
+
+    def test_governance_defined_role_carries_its_name(self) -> None:
+        from scp_sdk.types import CustomRole, MemberRole
+
+        assert MemberRole.from_bridge("night-shift-reviewer") == CustomRole(
+            name="night-shift-reviewer"
+        )
+
+    @pytest.mark.parametrize("raw", ["Author", "My-role", "", "-lead", "a b", "x" * 65])
+    def test_malformed_name_raises_gov_11040(self, raw: str) -> None:
+        from scp_sdk.errors import UnknownGovernanceOutcomeError
+        from scp_sdk.types import MemberRole
+
+        with pytest.raises(UnknownGovernanceOutcomeError) as excinfo:
+            MemberRole.from_bridge(raw)
+        assert excinfo.value.code == "SCP-GOV-11040"
+        assert excinfo.value.raw_outcome == raw

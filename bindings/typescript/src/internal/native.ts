@@ -41,6 +41,7 @@ import type {
   TransportStatus,
   UcanToken,
 } from "../types";
+import { memberRoleFromBridge } from "../types";
 import type {
   Bridge,
   BridgeContextHandle,
@@ -437,10 +438,7 @@ export function createNativeBridge(scp: SCP): Bridge {
         native.contextMemberRole as (h: BridgeContextHandle, d: string) => Promise<string | null>
       )(handle, did);
       if (raw === null) return null;
-      // The NAPI bridge returns lowercase ("admin", "member") but the Bridge
-      // interface expects PascalCase ("Admin", "Member"). Normalize here.
-      // Closes #1236.
-      return (raw.charAt(0).toUpperCase() + raw.slice(1)) as MemberRole;
+      return memberRoleFromBridge(raw);
     },
 
     // Broadcast operations

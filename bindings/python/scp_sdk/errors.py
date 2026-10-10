@@ -206,7 +206,9 @@ class UnknownGovernanceOutcomeError(GovernanceError):
     (:class:`~scp_sdk.governance.GovernanceActionResult`), a proposal status
     (:class:`~scp_sdk.governance.ProposalStatus`), and a rejection reason
     (:class:`~scp_sdk.governance.RejectionReason`). An SDK older than its bridge
-    reads a name none of those enums carries. This error reports that name
+    reads a name none of those enums carries. :meth:`~scp_sdk.types.MemberRole.from_bridge`
+    raises it too, for a role name that is neither built in nor a name
+    ``validate_role_name`` admits for a custom role. This error reports that name
     instead of substituting a known one, because governance decides
     authorization and a substituted name would report an action or status the
     engine never reported.

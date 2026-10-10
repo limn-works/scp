@@ -179,28 +179,70 @@ public func checkProposalResponse(_ raw: String) throws -> String {
 
 /// Role assigned to a member within a context (spec section 5.5).
 ///
-/// Mirrors `scp_core::context::roles::Role`.
-public enum MemberRole: String, Sendable {
+/// The six cases before ``custom(name:)`` carry the six names
+/// `RESERVED_ROLE_NAMES` in `crates/scp-protocol/src/context/roles.rs`
+/// reserves, each case named exactly as the bridge reports it. No custom role
+/// may take any of those names, so a member holding one holds the
+/// protocol-defined role of that name.
+public enum MemberRole: Sendable, Hashable {
     /// Context administrator with full governance capabilities.
-    case admin = "Admin"
+    case admin
     /// Moderator with messaging, moderation, and governance proposal capabilities.
-    case moderator = "Moderator"
+    case moderator
     /// Regular participant with standard capabilities.
-    case member = "Member"
+    case member
     /// Read-only observer with no write capabilities.
-    case observer = "Observer"
-    /// Custom role defined by context governance.
-    case custom = "Custom"
+    case observer
+    /// Broadcast author: writes messages and holds the outlet capabilities.
+    case author
+    /// Broadcast subscriber: the role a broadcast subscribe assigns; reads only.
+    case subscriber
+    /// A role a context's governance defined, carrying the name governance gave it.
+    case custom(name: String)
+}
 
-    /// Parse a bridge-layer role string into a ``MemberRole``.
+extension MemberRole {
+    /// Parses a bridge-layer role name into a ``MemberRole``.
     ///
-    /// Falls back to ``custom`` for unrecognised strings.
-    public static func fromBridge(_ raw: String) -> MemberRole {
-        let normalised = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        return MemberRole(rawValue: normalised)
-            ?? MemberRole(rawValue: normalised.capitalized)
-            ?? .custom
+    /// Every bridge reports `RoleAssignment.role_name`, which stores a built-in
+    /// role in lowercase (`"author"`) and a custom role under the name
+    /// governance gave it. Matching is exact.
+    ///
+    /// - Throws: ``ScpError/Context(msg:code:)`` with code `SCP-GOV-11040`
+    ///   when `raw` is neither a built-in role name nor a name
+    ///   `validate_role_name` admits for a custom role.
+    public static func fromBridge(_ raw: String) throws -> MemberRole {
+        switch raw {
+        case "admin": return .admin
+        case "moderator": return .moderator
+        case "member": return .member
+        case "observer": return .observer
+        case "author": return .author
+        case "subscriber": return .subscriber
+        default:
+            guard isCustomRoleName(raw) else {
+                throw ScpError.Context(
+                    msg: "bridge reported role name \(raw.debugDescription), which is neither "
+                        + "a built-in nor a valid custom role name",
+                    code: unknownGovernanceOutcomeCode
+                )
+            }
+            return .custom(name: raw)
+        }
+    }
+
+    /// Whether `validate_role_name` in `crates/scp-protocol/src/context/roles.rs`
+    /// admits `name`: 1 to 64 bytes of lowercase ASCII letters, digits, hyphens,
+    /// and underscores, neither starting nor ending with a hyphen or underscore.
+    private static func isCustomRoleName(_ name: String) -> Bool {
+        let bytes = Array(name.utf8)
+        guard (1 ... 64).contains(bytes.count) else { return false }
+        let edge = { (byte: UInt8) in (byte >= 0x61 && byte <= 0x7A) || (byte >= 0x30 && byte <= 0x39) }
+        let inner = { (byte: UInt8) in edge(byte) || byte == 0x2D || byte == 0x5F }
+        guard let first = bytes.first, let last = bytes.last, edge(first), edge(last) else {
+            return false
+        }
+        return bytes.allSatisfy(inner)
     }
 }
 
@@ -657,7 +699,7 @@ public extension Context {
         guard let raw = await scp.contextMemberRole(handle: handle, did: did) else {
             return nil
         }
-        return MemberRole.fromBridge(raw)
+        return try MemberRole.fromBridge(raw)
     }
 }
 

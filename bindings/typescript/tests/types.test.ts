@@ -16,6 +16,7 @@ import type {
   DIDDocument,
   Event,
   GovernanceActionResult,
+  MemberRole,
   Message,
   OutletDefinition,
   ParticipationFact,
@@ -32,9 +33,11 @@ import type {
   UcanToken,
 } from "../src/types";
 import {
+  BUILT_IN_ROLES,
   Capabilities,
   checkProposalResponse,
   governanceActionResultFromBridge,
+  memberRoleFromBridge,
   outletCall,
   outletQuery,
   proposalStatusFromBridge,
@@ -843,6 +846,47 @@ describe("SCP governance wrappers", () => {
       expect(err).toBeInstanceOf(UnknownGovernanceOutcomeError);
       expect((err as UnknownGovernanceOutcomeError).code).toBe("SCP-GOV-11040");
       expect(await call(scpReturning(method, ok))).toBe(ok);
+    }
+  });
+});
+
+describe("memberRoleFromBridge", () => {
+  // The six names `RESERVED_ROLE_NAMES` in
+  // `crates/scp-protocol/src/context/roles.rs` reserves, as bridges report them.
+  const rustReservedRoleNames = [
+    "admin",
+    "moderator",
+    "member",
+    "observer",
+    "author",
+    "subscriber",
+  ];
+
+  it("names author and subscriber as built-in roles, not as custom ones", () => {
+    expect(memberRoleFromBridge("author")).toBe("Author");
+    expect(memberRoleFromBridge("subscriber")).toBe("Subscriber");
+  });
+
+  it("parses every reserved name to the built-in role of that name", () => {
+    expect(rustReservedRoleNames.map(memberRoleFromBridge)).toEqual([...BUILT_IN_ROLES]);
+  });
+
+  it("reports a governance-defined role as Custom carrying its name", () => {
+    const role: MemberRole = memberRoleFromBridge("night-shift-reviewer");
+    expect(role).toEqual({ kind: "Custom", name: "night-shift-reviewer" });
+  });
+
+  it("throws SCP-GOV-11040 for a name that is neither built in nor a valid custom name", () => {
+    for (const raw of ["Author", "My-role", "", "-lead", "a b", "x".repeat(65)]) {
+      let err: unknown;
+      try {
+        memberRoleFromBridge(raw);
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(UnknownGovernanceOutcomeError);
+      expect((err as UnknownGovernanceOutcomeError).code).toBe("SCP-GOV-11040");
+      expect((err as UnknownGovernanceOutcomeError).rawOutcome).toBe(raw);
     }
   });
 });
