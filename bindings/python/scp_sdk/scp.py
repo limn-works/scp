@@ -182,7 +182,7 @@ class KeyCustodyProvider(Protocol):
 
         Canonical recipe (all software custody backends MUST produce identical
         bytes; ``ikm`` is the identity private key material, the 32-byte
-        Ed25519 seed until slice S12)::
+        Ed25519 seed until the identity key moves to P-256, SCP-315)::
 
             pseudonym_secret = HKDF-SHA256(
                 ikm=ikm, salt=b"scp-pseudonym-secret-v1", info=b"", length=32)

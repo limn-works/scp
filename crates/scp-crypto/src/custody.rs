@@ -3,14 +3,11 @@
 //! The runtime reports a failed `KeyCustody` call through error types that
 //! live in crates below `scp-platform` (`scp-protocol`, `scp-event-log`),
 //! which therefore cannot hold a `PlatformError`. They hold a
-//! [`CustodyFailure`] instead, and every bridge reads its [`CustodyFailureKind`]
-//! to report `SCP-CRYPTO-4006` (key not found), `SCP-IDENT-1055` (a host
-//! pseudonym the bridge rejects, ADR-021), `SCP-STORAGE-8006` (the custody
-//! store is closed), `SCP-STORAGE-8005` (the custody store's directory lock is
-//! still held) or `SCP-CRYPTO-4060` (any other custody failure), as
-//! `.docs/standards/sdk-common.md` registers them. A
-//! pseudonym whose identity key was destroyed fails with key-not-found
-//! (`09-security-model.md` §9.10.4.A).
+//! [`CustodyFailure`] instead, and every bridge reports the code
+//! `scp_ffi_common::error_codes::custody_failure_code` assigns to its
+//! [`CustodyFailureKind`], from the codes `.docs/standards/sdk-common.md`
+//! registers. A pseudonym whose identity key was destroyed fails with
+//! key-not-found (`09-security-model.md` §9.10.4.A).
 
 /// Which custody failure occurred. The kind alone decides the error code a
 /// bridge reports.

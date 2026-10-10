@@ -167,7 +167,8 @@ class _FakeKeychain:
 
     def _point(self, key_id: str, context_id: bytes, epoch: int | None = None) -> bytes:
         # The SDK's software helper derives the point from the Ed25519
-        # identity seed (the native interim ikm until S12). Nothing is stored.
+        # identity seed (the native interim ikm until the identity key moves to
+        # P-256, SCP-315). Nothing is stored.
         point = p256_software_pseudonym_point(self._seeds[key_id], bytes(context_id), epoch)
         if self._fault == "legacy32":
             point = point[1:]

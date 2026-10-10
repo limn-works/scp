@@ -188,8 +188,9 @@ pub enum CancelError {
 
 impl CancelError {
     /// The custody failure behind a [`Self::Signing`] error, or `None`. A
-    /// bridge reports it to the local caller as `SCP-CRYPTO-4006` or
-    /// `SCP-CRYPTO-4060`; the wire slug stays [`cancel_error_to_slug`]'s.
+    /// bridge reports it to the local caller with the code
+    /// `scp_ffi_common::error_codes::custody_failure_code` assigns; the wire slug stays
+    /// [`cancel_error_to_slug`]'s.
     #[must_use]
     pub fn custody_failure(&self) -> Option<scp_crypto::CustodyFailure> {
         match self {

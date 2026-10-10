@@ -425,10 +425,8 @@ async fn derive_context_pseudonym_required(
 
 /// The error a failed custody pseudonym derivation surfaces as, coded by
 /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
-/// of its [`CustodyFailure`](scp_crypto::CustodyFailure): key-not-found →
-/// `SCP-CRYPTO-4006` (a key destroyed mid-derivation fails as key-not-found,
-/// §9.10.4.A), a host pseudonym the bridge cannot bind → `SCP-IDENT-1055`, any
-/// other custody failure → `SCP-CRYPTO-4060`.
+/// of its [`CustodyFailure`](scp_crypto::CustodyFailure). A key destroyed
+/// mid-derivation fails as key-not-found (§9.10.4.A).
 pub(crate) fn pseudonym_derivation_failed(e: &scp_platform::PlatformError) -> ScpNapiError {
     ScpNapiError::custody_failure(
         format!("pseudonym derivation failed: {e}"),

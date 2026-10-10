@@ -495,10 +495,11 @@ async fn publish_to_resolver_dht_for<C: KeyCustody + Send + Sync>(
 /// (only in `testing` builds) the retained in-memory custody.
 /// Failures carry the cross-bridge contract codes: missing key material →
 /// `IDENT_1054`, custody unavailable in this build → `IDENT_1056`, and a
-/// custody derivation failure → its custody code ([`ScpError::custody_failure`]):
-/// key-not-found → `CRYPTO_4006` (§9.10.4.A), any other custody failure →
-/// `CRYPTO_4060`. A host pseudonym that is not a valid 33-byte compressed P-256
-/// point → `IDENT_1055`.
+/// custody derivation failure → the code
+/// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+/// assigns ([`ScpError::custody_failure`]); a key destroyed mid-derivation
+/// fails as key-not-found (§9.10.4.A). A host pseudonym that is not a valid
+/// 33-byte compressed P-256 point → `IDENT_1055`.
 ///
 /// Callers gate this themselves: `context_create`/`context_join` skip it for
 /// broadcast contexts (soft `None`, spec §5.14), while `context_import` calls
@@ -1759,11 +1760,7 @@ impl From<scp_transport::TransportError> for ScpError {
 impl ScpError {
     /// A custody failure the runtime carried as a typed
     /// [`CustodyFailure`](scp_crypto::CustodyFailure), coded by
-    /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code):
-    /// key-not-found is `SCP-CRYPTO-4006`, a rejected host pseudonym
-    /// `SCP-IDENT-1055`, a closed custody store `SCP-STORAGE-8006`, a custody
-    /// store whose directory lock is still held `SCP-STORAGE-8005` (spec §17.6),
-    /// and any other custody failure `SCP-CRYPTO-4060`.
+    /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code).
     pub(crate) fn custody_failure(msg: String, e: &scp_crypto::CustodyFailure) -> Self {
         let code = scp_ffi_common::error_codes::custody_failure_code(e).to_owned();
         match e.kind {
@@ -7031,8 +7028,9 @@ fn export_signing_key(handle: &ContextHandle) -> Result<KeyHandle, ScpError> {
 /// key-bearing `UniFFI` path.
 ///
 /// Returns the custody's [`PlatformError`], which
-/// `export_context` carries as `ContextError::Custody` so the caller sees
-/// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise. It
+/// `export_context` carries as `ContextError::Custody` so the caller sees the
+/// code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+/// assigns. It
 /// validates that the returned signature is exactly 64 bytes (Ed25519), so a
 /// misbehaving custody can never yield an under-length signature that would
 /// later fail verification in a confusing place. The caller
@@ -20029,10 +20027,10 @@ mod tests {
     }
 
     /// Every runtime error that carries a custody failure reaches the caller
-    /// with the custody code: key-not-found as `SCP-CRYPTO-4006`, any other
-    /// custody failure as `SCP-CRYPTO-4060`, a rejected host pseudonym as
-    /// `SCP-IDENT-1055`. Broadcast publish signing and join key agreement
-    /// arrive as `ContextError::Custody`.
+    /// with the code `custody_failure_code` assigns (checked here for
+    /// key-not-found, a generic custody failure and a rejected host
+    /// pseudonym). Broadcast publish signing and join key agreement arrive as
+    /// `ContextError::Custody`.
     #[test]
     fn custody_failures_carry_the_custody_codes_in_every_carrier() {
         use scp_crypto::{CustodyFailure, CustodyFailureKind as K};
@@ -28851,7 +28849,7 @@ mod tests {
     }
 
     /// Spec §17.6 "One Opener per Durable Directory": a held lock and a closed
-    /// store carry their registered storage codes; any other platform error
+    /// store carry their registered storage codes, and a generic storage error
     /// is a custody failure, `SCP-CRYPTO-4060`.
     #[test]
     fn storage_platform_errors_carry_registered_codes() {

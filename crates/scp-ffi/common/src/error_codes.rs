@@ -252,7 +252,7 @@ pub const IDENT_1053: &str = "SCP-IDENT-1053";
 // identity key material. Encrypted / pseudonymous contexts hard-fail on
 // derivation error; broadcast contexts (spec §5.14) skip derivation entirely.
 // A custody failure during derivation is not a pseudonym error: it carries
-// CRYPTO_4006 (key not found) or CRYPTO_4060 (any other custody failure).
+// the code `custody_failure_code` assigns.
 // -----------------------------------------------------------------------
 
 /// Pseudonym derivation: identity missing core key material.
@@ -262,7 +262,7 @@ pub const IDENT_1054: &str = "SCP-IDENT-1054";
 /// The bridge rejects a malformed key id or point, a `get_public_key(key_id)`
 /// that fails with any code or returns a different point, or a key id already
 /// bound to another point (ADR-021 2026-09-27 amendment). Custody failures of
-/// the derive call itself carry [`CRYPTO_4006`] or [`CRYPTO_4060`].
+/// the derive call itself carry the code [`custody_failure_code`] assigns.
 pub const IDENT_1055: &str = "SCP-IDENT-1055";
 /// Pseudonym derivation: no custody provider available.
 pub const IDENT_1056: &str = "SCP-IDENT-1056";
@@ -756,12 +756,9 @@ pub const CRYPTO_4058: &str = "SCP-CRYPTO-4058";
 /// `UniFFI` HPKE error.
 pub const CRYPTO_4059: &str = "SCP-CRYPTO-4059";
 /// Key custody error: a key custody provider, or a host's custody callback,
-/// failed for a reason other than key-not-found ([`CRYPTO_4006`]) or a
-/// rejected host pseudonym ([`IDENT_1055`]).
+/// failed for a reason that has no more specific code.
 ///
-/// Every native bridge reports every `PlatformError` variant with this code
-/// except `KeyNotFound` ([`CRYPTO_4006`]) and `PseudonymRejected`
-/// ([`IDENT_1055`]).
+/// [`custody_failure_code`] decides which custody failures carry this code.
 pub const CRYPTO_4060: &str = "SCP-CRYPTO-4060";
 
 // -------------------------------------------------------------------------

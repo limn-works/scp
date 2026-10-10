@@ -747,8 +747,8 @@ fn outlet_stream_poll_next_impl(
 // ---------------------------------------------------------------------------
 
 /// Maps a credit-grant signing failure to the caller's error. A custody
-/// failure carries `SCP-CRYPTO-4006` (key not found) or `SCP-CRYPTO-4060`; a
-/// canonicalization failure carries `SCP-CTX-2001`.
+/// failure carries the code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+/// assigns; a canonicalization failure carries `SCP-CTX-2001`.
 fn credit_sign_error(e: &StreamSignerError) -> ScpPyError {
     e.custody_failure().map_or_else(
         || ScpPyError::context(format!("failed to sign credit grant: {e:?}")),
@@ -759,8 +759,9 @@ fn credit_sign_error(e: &StreamSignerError) -> ScpPyError {
 }
 
 /// Maps a rejected stream cancel to the caller's error. A custody failure
-/// while signing the cancel carries `SCP-CRYPTO-4006` (key not found) or
-/// `SCP-CRYPTO-4060`; every other rejection carries its §5.4.4 code.
+/// while signing the cancel carries the code
+/// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code) assigns; every
+/// other rejection carries its §5.4.4 code.
 fn cancel_rejected_error(e: &scp_core::context::outlets::CancelError) -> ScpPyError {
     e.custody_failure().map_or_else(
         || ScpPyError::ContextError {
@@ -2075,10 +2076,10 @@ mod custody_error_tests {
             .to_owned()
     }
 
-    /// A key-not-found custody failure while signing a credit grant or a
-    /// cancel reaches the caller as `SCP-CRYPTO-4006`, any other custody
-    /// failure as `SCP-CRYPTO-4060`, and a non-custody failure keeps its
-    /// own code.
+    /// A custody failure while signing a credit grant or a cancel reaches the
+    /// caller with the code `custody_failure_code` assigns (checked here for
+    /// key-not-found and a generic custody failure), and a non-custody failure
+    /// keeps its own code.
     #[test]
     fn outlet_signing_custody_failures_carry_the_custody_codes() {
         let not_found = StreamSignerError::Custody {

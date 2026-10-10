@@ -525,8 +525,8 @@ impl FileKeyCustody {
         let (_key_bytes, signing_key) = self.decrypt_ed25519_key(&KeyHandle::new(key_id)).await?;
 
         // Software custody (§9.10.4.A): the ikm is the identity private
-        // seed, never the public key. Until S12 the identity key is
-        // Ed25519, so its 32-byte seed is the ikm.
+        // seed, never the public key. Until the identity key moves to P-256
+        // (SCP-315) it is Ed25519, so its 32-byte seed is the ikm.
         let ikm = Zeroizing::new(signing_key.to_bytes());
         drop(signing_key);
         Ok(Pseudonym::new(derive_pseudonym(&ikm, context_id, version)))
@@ -1228,8 +1228,8 @@ mod tests {
         );
     }
 
-    /// §25.19 Vector 30 through production software custody. Until S12 the
-    /// §9.10.4.A ikm is the Ed25519 seed, so the vector's identity scalar is
+    /// §25.19 Vector 30 through production software custody. Until the identity key
+    /// moves to P-256 (SCP-315) the §9.10.4.A ikm is the Ed25519 seed, so the vector's identity scalar is
     /// imported as that seed; the v1 and v2 (`epoch` = 1) points and routing
     /// ids on `context-alpha` must equal the spec's literal bytes. Keying the
     /// derivation on the public key, or dropping a recipe step, fails this.

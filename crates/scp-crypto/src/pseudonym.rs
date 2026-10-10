@@ -19,7 +19,7 @@
 //! under one, so every function here returns the point and wipes `d`.
 //!
 //! `ikm` is the 32-byte identity private key material. The spec's target is the
-//! P-256 private scalar; until the identity key moves to P-256 (S12), native
+//! P-256 private scalar; until the identity key moves to P-256 (SCP-315), native
 //! software custody passes the Ed25519 seed and the browser passes its per-context
 //! MLS key's private bytes (§9.10.4.A interim). The algorithm is the same either
 //! way; only the key material differs.

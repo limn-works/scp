@@ -214,9 +214,7 @@ impl From<StreamSignerCustodyCategory> for scp_crypto::CustodyFailure {
 impl StreamSignerError {
     /// The custody failure behind this error, or `None` when the signer failed
     /// before reaching custody (JCS canonicalization). The bridges code it with
-    /// `custody_failure_code`: `SCP-CRYPTO-4006` for key-not-found,
-    /// `SCP-STORAGE-8006` and `SCP-STORAGE-8005` for the two storage
-    /// categories, and `SCP-CRYPTO-4060` otherwise.
+    /// `scp_ffi_common::error_codes::custody_failure_code`.
     #[must_use]
     pub fn custody_failure(&self) -> Option<scp_crypto::CustodyFailure> {
         match self {

@@ -176,8 +176,8 @@ impl InMemoryKeyCustody {
             .ok_or(PlatformError::KeyNotFound)?;
 
         // Software custody (§9.10.4.A): the ikm is the identity private
-        // seed, never the public key. Until S12 the identity key is
-        // Ed25519, so its 32-byte seed is the ikm.
+        // seed, never the public key. Until the identity key moves to P-256
+        // (SCP-315) it is Ed25519, so its 32-byte seed is the ikm.
         let ikm = Zeroizing::new(signing_key.to_bytes());
         drop(store);
         Ok(Pseudonym::new(derive_pseudonym(&ikm, context_id, version)))
@@ -856,7 +856,8 @@ mod tests {
 
         // Compute expected pseudonym seed using the v2 reference algorithm:
         // seed = HMAC-SHA256(pseudonym_secret, context_id || epoch_BE || "scp-pseudonym-v2")
-        // Native software custody: the ikm is the Ed25519 identity seed (S0).
+        // Native software custody: the ikm is the Ed25519 identity seed until the
+        // identity key moves to P-256 (SCP-315).
         let pseudonym_secret = derive_pseudonym_secret(&Zeroizing::new(seed_bytes));
         let mut mac = Hmac::<Sha256>::new_from_slice(pseudonym_secret.as_slice()).unwrap();
         mac.update(context_id);
@@ -903,7 +904,8 @@ mod tests {
         // seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
         // §9.10.4.A: HMAC key is a secret derived from the private key via HKDF,
         // NOT the public key, to prevent membership enumeration attacks.
-        // Native software custody: the ikm is the Ed25519 identity seed (S0).
+        // Native software custody: the ikm is the Ed25519 identity seed until the
+        // identity key moves to P-256 (SCP-315).
         let pseudonym_secret = derive_pseudonym_secret(&Zeroizing::new(seed_bytes));
         let mut mac = Hmac::<Sha256>::new_from_slice(pseudonym_secret.as_slice()).unwrap();
         mac.update(context_id);

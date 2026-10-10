@@ -159,7 +159,7 @@ fn pseudonym_derivation_matches_golden_vectors() {
 // C2 — the FULL `ScpMlsGroup::derive_pseudonym` serde-extraction path, driven on
 // BOTH native and wasm32. The KAT above pins the raw `derive_pseudonym`
 // recipe; this exercises the driver's actual reach into the openmls
-// `SignatureKeyPair` (recovering the 32-byte Ed25519 seed, the S0 ikm, through the type's serde
+// `SignatureKeyPair` (recovering the 32-byte Ed25519 seed, the interim ikm, through the type's serde
 // form — the step whose wasm32 32-bit-`usize` behavior the byte-parity claim
 // depends on). The MLS key is random, so this is not a fixed-byte golden; instead
 // it pins determinism + context-separation + restore-stability of the serde path

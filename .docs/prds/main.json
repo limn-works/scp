@@ -10675,14 +10675,14 @@
         "scripts/ffi-export-allowlist.json",
         "scripts/gen-test-vectors-p256.py"
       ],
-      "description": "Architecture slice S0 of the key-event-log identity substrate. ADR-063 moves every SCP key to ECDSA over NIST P-256 with SHA-256, and `09-security-model.md` §9.5 states the encoding and verification rules. This story adds P-256 to the wasm-safe `scp-crypto` crate and to `KeyCustody`, moves MLS to RFC 9420 ciphersuite 2 and HPKE to DHKEM(P-256), and adds the JOSE ES256 codec. S12 (SCP-315) wires that codec to UCAN. The key-event preimage types are SCP-308.",
+      "description": "The first architecture slice of the key-event-log identity substrate. ADR-063 moves every SCP key to ECDSA over NIST P-256 with SHA-256, and `09-security-model.md` §9.5 states the encoding and verification rules. This story adds P-256 to the wasm-safe `scp-crypto` crate and to `KeyCustody`, moves MLS to RFC 9420 ciphersuite 2 and HPKE to DHKEM(P-256), and adds the JOSE ES256 codec. SCP-315 wires that codec to UCAN. The key-event preimage types are SCP-308.",
       "acceptanceCriteria": [
         "`scp-crypto` verifies an ECDSA P-256/SHA-256 signature carried as 64 bytes of raw `r‖s`, each a 32-byte big-endian integer, and rejects any other length (`09-security-model.md` §9.5)",
         "`scp-crypto` rejects a signature whose `s` exceeds half the group order: a test flips a valid signature to `(r, n − s)` and asserts rejection (`09-security-model.md` §9.5)",
         "`scp-crypto` rejects a public key that is not a point on P-256, and rejects the point at infinity: one test per case (`09-security-model.md` §9.5)",
         "`scp-crypto` converts a DER-encoded ECDSA signature to the 64-byte raw form and rejects DER that is not canonical: a test per case",
         "Signing derives the per-signature nonce under RFC 6979 with SHA-256: a known-answer test reproduces the P-256 signatures Vectors 41 and 42 of `25-test-vectors.md` §25.26 carry (`09-security-model.md` §9.5)",
-        "`KeyCustody` generates, holds and signs with P-256 keys beside the Ed25519 keys the S12 cut-over deletes",
+        "`KeyCustody` generates, holds and signs with P-256 keys beside the Ed25519 keys the SCP-315 cut-over deletes",
         "MLS groups use RFC 9420 ciphersuite 2, HPKE uses DHKEM(P-256) under RFC 9180 Base mode, and the JOSE ES256 codec round-trips: one round-trip test per protocol (`09-security-model.md` §9.5)",
         "`cargo check -p scp-crypto --target wasm32-unknown-unknown` exits 0",
         "A host `KeyCustodyProvider.derive_pseudonym` and `derive_rotatable_pseudonym` return the 33-byte SEC1 compressed P-256 pseudonym point and nothing else, in the UniFFI, PyO3 and napi bridges, and each bridge computes the routing id from it (`09-security-model.md` §9.10.4)",
@@ -10695,8 +10695,8 @@
       ],
       "actionItems": [
         "Add P-256 verification, low-s, point validation, DER-to-raw conversion and SHA-256 to `scp-crypto`.",
-        "Add P-256 key generation, holding and signing to `KeyCustody` in every backend, beside the Ed25519 keys the S12 cut-over (SCP-315) deletes.",
-        "Move MLS and HPKE to their P-256 suites, and add the JOSE ES256 codec that S12 (SCP-315) wires to UCAN.",
+        "Add P-256 key generation, holding and signing to `KeyCustody` in every backend, beside the Ed25519 keys the SCP-315 cut-over deletes.",
+        "Move MLS and HPKE to their P-256 suites, and add the JOSE ES256 codec that SCP-315 wires to UCAN.",
         "Write the known-answer and negative tests the acceptance criteria name."
       ],
       "blockedBy": [],

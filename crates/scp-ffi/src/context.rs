@@ -2066,9 +2066,10 @@ fn derive_member_pseudonym(
 
 /// Derives the §9.10.4 routing id of `identity_key`'s pseudonym in
 /// `context_id` over `custody`: the derivation step every member-pseudonym
-/// path shares. A failure carries its custody code: key-not-found →
-/// SCP-CRYPTO-4006 (§9.10.4.A), a host pseudonym point the bridge rejects →
-/// SCP-IDENT-1055, any other custody failure → SCP-CRYPTO-4060.
+/// path shares. A failure carries the code
+/// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+/// assigns; a key destroyed mid-derivation fails as key-not-found
+/// (§9.10.4.A).
 pub(crate) fn pseudonym_routing_id_on(
     rt: &tokio::runtime::Runtime,
     custody: &crate::custody::FfiKeyCustody,

@@ -243,8 +243,8 @@ impl SqliteKeyCustody {
             .ok_or(PlatformError::KeyNotFound)?;
 
         // Software custody (§9.10.4.A): the ikm is the identity private
-        // seed, never the public key. Until S12 the identity key is
-        // Ed25519, so its 32-byte seed is the ikm.
+        // seed, never the public key. Until the identity key moves to P-256
+        // (SCP-315) it is Ed25519, so its 32-byte seed is the ikm.
         let ikm = Zeroizing::new(signing_key.to_bytes());
         drop(store);
         Ok(Pseudonym::new(derive_pseudonym(&ikm, context_id, version)))

@@ -468,8 +468,8 @@ pub struct TestingCallbackCustody {
 }
 
 /// The error production reports for a custody failure outside derivation:
-/// the bridge's `From<PlatformError>` (`SCP-CRYPTO-4006` for key-not-found,
-/// `SCP-CRYPTO-4060` for a custody error).
+/// the bridge's `From<PlatformError>`, which codes it with
+/// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code).
 fn custody_err(e: scp_platform::PlatformError) -> napi::Error {
     napi::Error::from(ScpNapiError::from(e))
 }
@@ -498,8 +498,8 @@ impl TestingCallbackCustody {
     ///
     /// # Errors
     ///
-    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` for any other
-    /// custody error, as production reports them.
+    /// The code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+    /// assigns to the custody error, as production reports it.
     #[napi(js_name = "generateKeypair")]
     pub async fn generate_keypair(&self) -> napi::Result<String> {
         use scp_platform::KeyCustody;
@@ -516,9 +516,8 @@ impl TestingCallbackCustody {
     ///
     /// # Errors
     ///
-    /// The adapter's custody error coded as production derivation reports it:
-    /// `SCP-CRYPTO-4006` for key-not-found, `SCP-IDENT-1055` for host bytes
-    /// that are not a compressed P-256 point, `SCP-CRYPTO-4060` otherwise.
+    /// The adapter's custody error coded as production derivation reports it,
+    /// by [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code).
     #[napi(js_name = "derivePseudonym")]
     pub async fn derive_pseudonym(
         &self,
@@ -565,8 +564,8 @@ impl TestingCallbackCustody {
     ///
     /// # Errors
     ///
-    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` for any other
-    /// custody error, as production reports them.
+    /// The code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+    /// assigns to the custody error, as production reports it.
     #[napi]
     pub async fn sign(&self, key_id: String, data: Buffer) -> napi::Result<Buffer> {
         use scp_platform::KeyCustody;
@@ -583,9 +582,9 @@ impl TestingCallbackCustody {
     ///
     /// # Errors
     ///
-    /// `SCP-VALID-7005` when `peer_public` is not 32 bytes; otherwise
-    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` for any other
-    /// custody error, as production reports them.
+    /// `SCP-VALID-7005` when `peer_public` is not 32 bytes; otherwise the code
+    /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+    /// assigns to the custody error, as production reports it.
     #[napi(js_name = "dhAgree")]
     pub async fn dh_agree(&self, key_id: String, peer_public: Buffer) -> napi::Result<Buffer> {
         use scp_platform::KeyCustody;
@@ -607,8 +606,8 @@ impl TestingCallbackCustody {
     ///
     /// # Errors
     ///
-    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` for any other
-    /// custody error, as production reports them.
+    /// The code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+    /// assigns to the custody error, as production reports it.
     #[napi(js_name = "destroyKey")]
     pub async fn destroy_key(&self, key_id: String) -> napi::Result<()> {
         use scp_platform::KeyCustody;

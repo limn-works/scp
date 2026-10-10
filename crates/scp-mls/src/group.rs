@@ -222,7 +222,7 @@ impl ScpMlsGroup {
     /// groups are Ed25519-only per [`SCP_CIPHERSUITE`]).
     pub fn derive_pseudonym(&self, context_id: &[u8]) -> Result<[u8; 32], MlsError> {
         let signer = self.signer_key_pair()?;
-        // The MLS signer is still Ed25519 in S0, so its 32-byte seed is the
+        // The MLS signer is still Ed25519 (SCP-307), so its 32-byte seed is the
         // ikm; when the ciphersuite moves to P-256 the ikm becomes the MLS
         // P-256 scalar, with the same recipe.
         let ikm = extract_ed25519_seed(signer)?;

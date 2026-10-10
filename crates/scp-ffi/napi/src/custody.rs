@@ -102,7 +102,8 @@ pub struct NapiKeyCustodyProvider {
     /// the identity key is not found.
     ///
     /// Canonical recipe (§9.10.4, §9.10.4.A; `ikm` is the identity private key
-    /// material, the 32-byte Ed25519 seed until slice S12):
+    /// material, the 32-byte Ed25519 seed until the identity key
+    /// moves to P-256 (SCP-315)):
     ///   1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
     ///   2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
     ///   3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; return the

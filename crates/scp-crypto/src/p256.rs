@@ -423,8 +423,8 @@ pub fn ecdh_p256(key: &P256SecretKey, peer: &P256PublicKey) -> Zeroizing<[u8; 32
 /// signing input, with the signature as the fixed 64-byte `r ‖ s`.
 ///
 /// This is only the signature codec and the `alg` value. It is not wired into
-/// UCAN or any JWT in S0: UCAN issuers resolve through did:dht, which carries
-/// only Ed25519 until S12.
+/// UCAN or any JWT yet: UCAN issuers resolve through did:dht, which carries
+/// only Ed25519 until the identity key moves to P-256 (SCP-315).
 pub mod jose {
     use sha2::{Digest, Sha256};
 

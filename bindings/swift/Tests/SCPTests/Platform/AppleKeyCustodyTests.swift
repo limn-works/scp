@@ -15,7 +15,8 @@
 // The HMAC key is a private-derived `pseudonym_secret`, NEVER the public key
 // (public-key keying would be a membership-enumeration oracle). For software
 // custody, `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
-// salt="scp-pseudonym-secret-v1")` until slice S12, which is cross-platform
+// salt="scp-pseudonym-secret-v1")` until the identity key moves to P-256
+// (SCP-315), which is cross-platform
 // deterministic; for
 // hardware custody (Secure Enclave) it is a device-local secret and the
 // pseudonym is device-local by design. The earlier ADR-027 amendment proposing

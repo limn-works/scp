@@ -160,8 +160,8 @@ pub enum SenderKeyError {
     #[error("signing failed: {0}")]
     SigningFailed(String),
 
-    /// A key custody call failed (`KeyCustody`). The bridges report
-    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise.
+    /// A key custody call failed (`KeyCustody`). The bridges report the code
+    /// `scp_ffi_common::error_codes::custody_failure_code` assigns to the failure's kind.
     #[error(transparent)]
     Custody(#[from] scp_crypto::CustodyFailure),
 
