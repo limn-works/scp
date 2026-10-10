@@ -3582,7 +3582,20 @@ const MESSAGE_TYPE: &str = "message_type_name";
 const SOURCE_TYPE: &str = "source_type_name";
 const MEMORY_SCOPE: &str = "memory_scope_name";
 const EVENT_TYPE: &str = "event_type_label";
+const ADMISSION: &str = "broadcast_admission_name";
+const ROLE: &str = "role_name";
 const WIRE_SITES: &[WireSite] = &[
+    ("pyo3", PYO3_CONTEXT, "broadcast_admission", &[ADMISSION]),
+    ("pyo3", PYO3_CONTEXT, "context_member_role", &[ROLE]),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_broadcast_admission_on",
+        &[ADMISSION],
+    ),
+    ("napi", NAPI_CONTEXT, "context_member_role_on", &[ROLE]),
+    ("uniffi", UNIFFI_BRIDGE, "broadcast_admission", &[ADMISSION]),
+    ("uniffi", UNIFFI_BRIDGE, "context_member_role", &[ROLE]),
     ("pyo3", PYO3_CONTEXT, "governance_execute", &[OUTCOME]),
     ("pyo3", PYO3_CONTEXT, "governance_propose", &[PROPOSE]),
     ("pyo3", PYO3_CONTEXT, "governance_approve", &[STATUS]),
@@ -3699,8 +3712,8 @@ const WIRE_SITES: &[WireSite] = &[
 
 /// Every bridge function that hands an SDK a governance outcome, proposal
 /// status, checkpoint attestation status, signaling message type, provenance
-/// source type or memory scope, event-log `event_type`, or drained context
-/// event builds that string through `scp_ffi_common`'s exhaustive name
+/// source type or memory scope, event-log `event_type`, drained context
+/// event, broadcast admission, or member role builds that string through `scp_ffi_common`'s exhaustive name
 /// function and holds no `Debug` format literal (`{x:?}`).
 ///
 /// A `Debug` rendering is a Rust implementation detail: a payload-carrying
@@ -3710,8 +3723,37 @@ const WIRE_SITES: &[WireSite] = &[
 /// fails when a site reverts to `format!("{x:?}")`.
 #[test]
 fn no_bridge_hands_an_sdk_a_debug_rendering() {
+    let offenders = wire_site_offenders(WIRE_SITES);
+    assert!(
+        offenders.is_empty(),
+        "{} bridge site(s) can hand an SDK a Debug rendering:\n  {}",
+        offenders.len(),
+        offenders.join("\n  ")
+    );
+}
+
+/// The scan flags a site that formats with `{x:?}` and skips its shared name
+/// function, and passes the same site once it calls that function.
+#[test]
+fn wire_site_scan_rejects_a_debug_rendering() {
+    // `concat!` keeps the Debug literal out of one string clippy would read
+    // as a format string.
+    let reverted = concat!(
+        "fn broadcast_admission(a: Admission) -> String { format!(\"{a",
+        ":?}\") }"
+    );
+    let offenders = wire_site_offenders(&[("t", reverted, "broadcast_admission", &[ADMISSION])]);
+    assert_eq!(offenders.len(), 2, "got {offenders:?}");
+
+    let named = "fn broadcast_admission(a: Admission) -> String { \
+                 broadcast_admission_name(a).to_owned() }";
+    let offenders = wire_site_offenders(&[("t", named, "broadcast_admission", &[ADMISSION])]);
+    assert!(offenders.is_empty(), "got {offenders:?}");
+}
+
+fn wire_site_offenders(sites: &[WireSite]) -> Vec<String> {
     let mut offenders = Vec::new();
-    for &(bridge, src, name, required) in WIRE_SITES {
+    for &(bridge, src, name, required) in sites {
         let file =
             syn::parse_file(src).unwrap_or_else(|e| panic!("{bridge} source failed to parse: {e}"));
         let mut finder = WireFnFinder {
@@ -3739,10 +3781,5 @@ fn no_bridge_hands_an_sdk_a_debug_rendering() {
             }
         }
     }
-    assert!(
-        offenders.is_empty(),
-        "{} bridge site(s) can hand an SDK a Debug rendering:\n  {}",
-        offenders.len(),
-        offenders.join("\n  ")
-    );
+    offenders
 }

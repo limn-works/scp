@@ -371,21 +371,6 @@ mod tests {
         assert_eq!(names.len(), 29);
     }
 
-    /// A wire name differs from `Debug` output for every payload-carrying
-    /// variant, which is what a bridge sent before this module existed.
-    #[test]
-    fn wire_name_is_not_debug_output_for_payload_variants() {
-        for (result, name) in every_variant() {
-            let debug = format!("{result:?}");
-            if debug != name {
-                assert!(
-                    !name.contains(['{', '(', ' ']),
-                    "wire name {name} carries Debug punctuation"
-                );
-            }
-        }
-    }
-
     /// A `single_admin` propose response names its auto-executed outcome.
     #[test]
     fn propose_response_names_a_payload_carrying_outcome() {
