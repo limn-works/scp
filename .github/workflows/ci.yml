@@ -3205,6 +3205,87 @@ jobs:
       # means re-deriving its 13 steps from `.docs/adrs/phase-3.md`, which is a
       # scoped work item rather than a CI wiring change.
 
+  # Builds a debug wheel of scp-python from bindings/python under
+  # `RUSTFLAGS=-D warnings`, one for CPython 3.10 and one for 3.12, then installs
+  # each wheel into a fresh virtualenv and checks two things. The installed
+  # scp_sdk package holds every module bindings/python/scp_sdk holds plus the
+  # extension, and each of them imports. readelf lists at least one NEEDED entry
+  # for the extension and none naming libcrypto or libssl.
+  python-wheel-build:
+    needs: changes
+    if: >-
+      github.event_name != 'push' &&
+      (needs.changes.outputs.rust == 'true' ||
+      needs.changes.outputs.python == 'true')
+    name: Python / wheel (vendored OpenSSL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.10
+            3.12
+      - name: Install maturin
+        run: python3.12 -m pip install 'maturin>=1.0,<2.0'
+      # No --features, no --manifest-path and no --release: maturin reads the
+      # features and the manifest from the `[tool.maturin]` table of
+      # bindings/python/pyproject.toml and builds the dev profile.
+      - name: Build a debug wheel for CPython 3.10 and 3.12
+        env:
+          RUSTFLAGS: "-D warnings"
+        working-directory: bindings/python
+        run: maturin build --out dist -i python3.10 python3.12 --locked
+      - name: Install each wheel, import every scp_sdk module, and read the extension's NEEDED entries
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/import_every_module.py" <<'PY'
+          import importlib
+          import pkgutil
+          import sys
+
+          import scp_sdk
+          import scp_sdk._scp_core as core
+
+          source = sys.argv[1]
+          expected = {m.name for m in pkgutil.walk_packages([source], "scp_sdk.")}
+          expected.add("scp_sdk._scp_core")
+          installed = {m.name for m in pkgutil.walk_packages(scp_sdk.__path__, "scp_sdk.")}
+          missing = sorted(expected - installed)
+          if missing:
+              raise SystemExit("the wheel lacks " + ", ".join(missing))
+          if not core.__file__.startswith(sys.prefix):
+              raise SystemExit(core.__file__ + " is not inside " + sys.prefix)
+          for name in sorted(installed):
+              importlib.import_module(name)
+          print(f"imported {len(installed)} modules: {', '.join(sorted(installed))}", file=sys.stderr)
+          print(core.__file__)
+          PY
+          for py in python3.10 python3.12; do
+            venv="$RUNNER_TEMP/venv-$py"
+            "$py" -m venv "$venv"
+            "$venv/bin/pip" install --no-index --find-links "$GITHUB_WORKSPACE/bindings/python/dist" scp-python
+            # Run from outside the checkout, so `import scp_sdk` resolves to the
+            # installed wheel and not to bindings/python/scp_sdk.
+            so="$(cd "$RUNNER_TEMP" && "$venv/bin/python" import_every_module.py "$GITHUB_WORKSPACE/bindings/python/scp_sdk")"
+            echo "$py imported $so"
+            # Captured before any grep, so a readelf failure stops the step under
+            # `set -e` instead of reading as an empty dependency list.
+            dynamic="$(readelf -d "$so")"
+            needed="$(printf '%s\n' "$dynamic" | grep -F '(NEEDED)' || true)"
+            if [ -z "$needed" ]; then
+              echo "::error::readelf lists no NEEDED entry for $so"
+              exit 1
+            fi
+            printf '%s\n' "$needed"
+            if printf '%s\n' "$needed" | grep -E 'lib(crypto|ssl)'; then
+              echo "::error::$so links OpenSSL dynamically"
+              exit 1
+            fi
+            echo "$py: no NEEDED entry names libcrypto or libssl"
+          done
+
   # ── TypeScript ──────────────────────────────────────────────────────
   # ORs on `rust` for a reason spelled out above python-test: the NAPI addon job
   # napi-addon compiles for this job reaches every Rust workspace crate through
@@ -4521,6 +4602,7 @@ jobs:
       - pyo3-module-macos
       - python-lint
       - python-test
+      - python-wheel-build
       - typescript-check
       - typescript-wasm-check
       - scaffold-typescript-web-check
