@@ -13,7 +13,9 @@ scp-runtime = { path = "../scp-runtime", version = "=0.1.0-beta.2" }
 scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
 
 [features]
-testing = ["scp-runtime/testing"]
+# `scp-protocol/testing` is named directly because `trust::NoOpRevocationChecker`
+# re-exports an item that `scp-protocol` compiles only under that feature.
+testing = ["scp-runtime/testing", "scp-protocol/testing"]
 allow_unencrypted_storage = ["scp-runtime/allow_unencrypted_storage"]
 # Forwards the runtime's non-leaking capability-escalation test seam feature.
 # Deliberately NOT implied by `testing` (see scp-runtime/Cargo.toml).

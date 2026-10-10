@@ -29,7 +29,8 @@
 //! - [`CategoryARejection`] — What a verification point returns when it rejects
 //!   a Category A action, carrying the record ADR-039 layer 3 requires it to log.
 //! - [`ViolationStore`] — Trait for custody violation storage (append-only).
-//! - [`InMemoryViolationStore`] — In-memory implementation for testing.
+//! - `InMemoryViolationStore` — In-memory implementation, compiled only under
+//!   `#[cfg(any(test, feature = "testing"))]`, so no shipped artifact contains it.
 //!
 //! # Signature verification
 //!
@@ -74,6 +75,7 @@
 //! `.docs/adrs/phase-1.md`, and spec section §9.5.2 of
 //! `.docs/specs/09-security-model.md` for both signing-preimage field tables.
 
+#[cfg(any(test, feature = "testing"))]
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -1341,10 +1343,15 @@ pub trait ViolationStore {
 // InMemoryViolationStore
 // ---------------------------------------------------------------------------
 
-/// In-memory implementation of [`ViolationStore`].
+/// In-memory implementation of [`ViolationStore`], for tests only.
 ///
-/// Suitable for testing and short-lived processes. Production deployments
-/// should use a persistent store via the `Storage` trait.
+/// It forgets every custody violation when dropped, and ADR-039 requires these
+/// records to be durable, so the `#[cfg(any(test, feature = "testing"))]` gate
+/// keeps it out of every shipped artifact. No durable implementation of
+/// [`ViolationStore`] exists, so a shipped build has none; open question OQ-26
+/// of `.docs/specs/27-attestations.md` asks which durable store holds these
+/// records.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 pub struct InMemoryViolationStore {
     /// Violations keyed by subject DID.
@@ -1354,6 +1361,7 @@ pub struct InMemoryViolationStore {
     counter_attestations: HashMap<DID, Vec<VerifiedCounterAttestation>>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl InMemoryViolationStore {
     /// Create a new empty in-memory violation store.
     #[must_use]
@@ -1362,6 +1370,7 @@ impl InMemoryViolationStore {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl ViolationStore for InMemoryViolationStore {
     fn log_violation(
         &mut self,

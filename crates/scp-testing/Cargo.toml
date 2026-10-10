@@ -301,6 +301,10 @@ name = "ffi_conformance"
 path = "tests/integration/ffi_conformance.rs"
 
 [[test]]
+name = "test_double_gating"
+path = "tests/integration/test_double_gating.rs"
+
+[[test]]
 name = "sdk_wrapper"
 path = "tests/integration/sdk_wrapper.rs"
 
