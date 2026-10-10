@@ -2355,6 +2355,91 @@ mod tests {
         );
     }
 
+    // Construction fails closed (§17.17.1 SCP-CAPSEL-8001 of
+    // `.docs/specs/17-persistence-and-storage.md`, §17.8): a key file that
+    // cannot be created, or that a reader cannot parse, makes `new` return
+    // `PlatformError::CustodyError` and no custody object.
+
+    /// `FileKeyCustody::new` at a path whose parent component is a regular
+    /// file returns `PlatformError::CustodyError` naming the failed create. A
+    /// custody object returned here would hold keys no restart can recover.
+    #[test]
+    fn new_at_an_uncreatable_path_fails_closed_with_custody_error() {
+        let dir = TempDir::new().unwrap();
+        let blocker = dir.path().join("this-is-a-file");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("keys.scp");
+
+        match FileKeyCustody::new(&path, "correct-horse-battery-staple") {
+            Err(PlatformError::CustodyError(msg)) => assert!(
+                msg.contains(&path.display().to_string()),
+                "the error must name the key file it could not create: {msg}"
+            ),
+            Err(other) => panic!("expected PlatformError::CustodyError, got {other:?}"),
+            Ok(_) => panic!(
+                "FileKeyCustody::new must fail closed when its key file cannot be created \
+                 (spec §17.17.1 SCP-CAPSEL-8001)"
+            ),
+        }
+        assert!(
+            !path.exists(),
+            "no key file may exist after a failed create"
+        );
+    }
+
+    /// A file that carries this format's version byte but ends before a full
+    /// header is refused at construction by its length, before any key
+    /// derivation reads a salt or commitment past its end.
+    #[test]
+    fn new_on_a_file_shorter_than_its_header_fails_closed_with_custody_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let mut data = vec![FORMAT_VERSION];
+        data.extend_from_slice(&[0x11u8; SALT_LEN]);
+        std::fs::write(&path, &data).unwrap();
+
+        match FileKeyCustody::new(&path, "correct-horse-battery-staple") {
+            Err(PlatformError::CustodyError(msg)) => assert!(
+                msg.contains("too short for header"),
+                "the error must name the short header: {msg}"
+            ),
+            Err(other) => panic!("expected PlatformError::CustodyError, got {other:?}"),
+            Ok(_) => panic!(
+                "FileKeyCustody::new must fail closed on a file shorter than its header \
+                 (spec §17.17.1 SCP-CAPSEL-8001)"
+            ),
+        }
+    }
+
+    /// A key file cut back to its header while its entry count still names
+    /// one entry is refused at construction by length, rather than opening a
+    /// custody store that silently lacks the key the count promises.
+    #[tokio::test]
+    async fn new_on_a_file_missing_its_counted_entries_fails_closed_with_custody_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let custody = FileKeyCustody::new(&path, "passphrase").unwrap();
+        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        drop(custody);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(HEADER_SIZE);
+        std::fs::write(&path, &bytes).unwrap();
+
+        match FileKeyCustody::new(&path, "passphrase") {
+            Err(PlatformError::CustodyError(msg)) => assert!(
+                msg.contains("does not match its entry count"),
+                "the error must name the missing entries: {msg}"
+            ),
+            Err(other) => panic!("expected PlatformError::CustodyError, got {other:?}"),
+            Ok(_) => panic!(
+                "FileKeyCustody::new must fail closed on a file missing its counted entries \
+                 (spec §17.17.1 SCP-CAPSEL-8001)"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn key_file_does_not_contain_raw_private_key() {
         let dir = TempDir::new().unwrap();

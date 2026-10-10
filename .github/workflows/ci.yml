@@ -1833,6 +1833,12 @@ jobs:
           # are cloud backends. The node-relay group runs the two binaries'
           # `cloud-blobs` tests.
           cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib startup::tests
+          # The PostgreSQL and S3 blob stores' fail-closed construction tests
+          # (persistence spec §17.17.1 SCP-CAPSEL-8001) are `[[test]]` targets
+          # that require `postgres-blob` and `s3-blob`, so no --workspace run
+          # builds them. Each `--test` names one target; a target that stops
+          # existing fails this command.
+          cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --test postgres_blob_fail_closed --test s3_blob_fail_closed
       - name: Run node and relay tests
         if: matrix.group == 'node-relay'
         run: |

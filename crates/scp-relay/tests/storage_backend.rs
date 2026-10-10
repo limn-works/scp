@@ -307,12 +307,20 @@ fn sqlite_blob_persistence_across_reopens() {
 
 /// AC 2 (explicit selection): `SCP_RELAY_STORAGE_BACKEND=sqlite` with an
 /// absolute `SCP_RELAY_STORAGE_PATH` starts a relay on `SQLite`. Verify by
-/// starting the relay with a temp storage path and confirming the sqlite DB
-/// file is created. The backend has no default, so this test names it.
+/// starting the relay with a temp storage path and waiting for it to log
+/// `using sqlite blob storage`, then confirming the sqlite DB file exists. The
+/// backend has no default, so this test names it.
+///
+/// The relay logs that line only after the store has opened, and it creates
+/// the file when the open begins. The test therefore waits for the line, not
+/// for the file: a relay killed once the file appears can die before the open
+/// returns and logs.
 #[test]
 fn explicit_sqlite_backend_starts() {
-    use std::io::Read;
-    use std::time::Duration;
+    use std::io::BufRead;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+
+    const OPENED: &str = "using sqlite blob storage";
 
     let tmp = tempfile::tempdir().expect("failed to create tempdir");
     let db_path = tmp.path().join("explicit-backend.db");
@@ -323,25 +331,27 @@ fn explicit_sqlite_backend_starts() {
         .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
         .env("SCP_RELAY_LOG_FORMAT", "json")
         .env("RUST_LOG", "scp_relay=info,scp_transport=info")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("failed to start scp-relay");
 
-    // Read stderr in a background thread so kill doesn't lose buffered data.
+    // Forward stderr line by line as it arrives. The channel disconnects when
+    // the relay closes stderr, which it does only by exiting.
     let stderr_handle = child.stderr.take().expect("no stderr");
-    let output_thread = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut reader = stderr_handle;
-        let _ = reader.read_to_string(&mut buf);
-        buf
+    let (lines_tx, lines_rx) = mpsc::channel::<String>();
+    let reader_thread = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr_handle).lines() {
+            let Ok(line) = line else { break };
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
     });
 
-    // Wait for the relay to initialize by polling for the DB file.
-    //
     // The deadline bounds how long this test waits; it states nothing about
     // the relay, because the assertions below still require that a relay
-    // created its sqlite file and logged `using sqlite blob storage`. A longer
+    // logged `using sqlite blob storage` and created its sqlite file. A longer
     // wait therefore weakens nothing. Under `cargo nextest run --workspace`
     // this binary starts alongside ~11,000 other tests: a 10-second deadline
     // expired twice on one 2026-08-17 local run, and once more on a pass over
@@ -351,30 +361,71 @@ fn explicit_sqlite_backend_starts() {
     // seconds, so 10 seconds measured machine load rather than relay behavior.
     // One minute leaves headroom under that load and still fails within one
     // test-run budget when a relay genuinely never starts.
-    let deadline = std::time::Instant::now() + Duration::from_mins(1);
-    let mut db_created = false;
-    while std::time::Instant::now() < deadline {
-        if db_path.exists() {
-            db_created = true;
-            break;
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let mut output = String::new();
+    let mut opened = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match lines_rx.recv_timeout(remaining) {
+            Ok(line) => {
+                opened = line.contains(OPENED);
+                output.push_str(&line);
+                output.push('\n');
+                if opened {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Kill the relay to release the stderr pipe.
+    // Stop the relay, which closes stderr and ends the reader thread.
     child.kill().ok();
     child.wait().ok();
-
-    let output = output_thread.join().expect("output thread panicked");
+    output.extend(lines_rx.iter().map(|line| line + "\n"));
+    reader_thread.join().expect("stderr reader thread panicked");
 
     assert!(
-        db_created,
+        opened,
+        "relay should have logged '{OPENED}' within one minute; output: {output}"
+    );
+    assert!(
+        db_path.exists(),
         "sqlite database file should be created when the operator names sqlite; output: {output}"
     );
+}
 
-    // Verify the relay used sqlite (logged "using sqlite blob storage").
+/// A `sqlite` store that cannot open makes the relay exit 1 with the
+/// `StoreOpen` error, and the relay never logs `using sqlite blob storage`
+/// (persistence spec §17.17.1 SCP-CAPSEL-8001: a failed selection is
+/// terminal). A log line naming a backend the relay never opened tells an
+/// operator reading the log that the store is up when it is not.
+///
+/// The path's parent component is a regular file, so the directory and the
+/// database cannot be created.
+#[test]
+fn sqlite_store_that_cannot_open_exits_without_logging_the_backend() {
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let blocker = tmp.path().join("this-is-a-file");
+    std::fs::write(&blocker, b"not a directory").expect("write blocker file");
+    let db_path = blocker.join("relay.db");
+
+    let output = output_within_deadline(
+        Command::new(relay_bin())
+            .current_dir(tmp.path())
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env("RUST_LOG", "scp_relay=info,scp_transport=info"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
-        output.contains("using sqlite blob storage"),
-        "relay should have logged 'using sqlite blob storage'; output: {output}"
+        stderr.contains("failed to open the sqlite blob store"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("using sqlite blob storage"),
+        "the relay logged a backend it never opened: {stderr}"
     );
 }
