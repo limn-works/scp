@@ -3,8 +3,9 @@
 # WHY IT EXISTS. `ci.yml`'s `rust-test` job reports one `Finished ... in Xm Ys` line per
 # cargo invocation and nothing about which unit cost what, so an engineer reducing compile
 # time cannot tell a 40-second dependency from a 2-second one. `cargo build --timings`
-# writes a per-unit table and a concurrency plot. Job `timings` runs the same four cargo
-# invocations `rust-test` runs, each under `--timings`, and uploads the reports.
+# writes a per-unit table and a concurrency plot. Job `timings` builds each `rust-test`
+# leg's packages under that leg's features, each from an empty target directory under
+# `--timings`, and uploads the reports.
 #
 # Job `bridge-timings` measures the two bridge crates whose compile ends the Swift chain
 # in ci.yml: `scp-ffi-uniffi` (job `xcframework`) and the PyO3 `scp-ffi` (job
@@ -79,7 +80,8 @@ jobs:
     name: Cold compile timings (ubuntu-latest)
     if: inputs.measure != 'bridges'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # One cold build per rust-test leg, then the three builds after them.
+    timeout-minutes: 90
     steps:
       - name: Free disk space
         run: |
@@ -94,24 +96,22 @@ jobs:
           rustc --version
           cargo --version
           nproc
-      # The feature list is read out of ci.yml rather than copied here. A copy would name
-      # the same list in two files, and the authoritative one lives in a file this workflow
-      # does not own, so a change there would leave this job measuring a different graph
-      # while still reading as correct.
+      # Each leg's packages and features are read out of ci.yml rather than copied here. A
+      # copy would name the same arguments in two files, and the authoritative ones live in
+      # a file this workflow does not own, so a change there would leave this job
+      # measuring a different graph while still reading as correct.
       # `.docs/lessons/route-a-changed-file-to-every-lane-it-decides.md` names that failure.
-      # The script parses ci.yml and prints the `rust-test` job's `env.TEST_FEATURES`: the
-      # canonical workspace feature list each of that job's package shards is checked
-      # against, so prose describing it does not count as it. Its `--self-test` runs first;
-      # it exits non-zero when the job sets no such value or the value is not one
-      # comma-separated list of `package/feature` items.
-      - name: Read the feature list out of ci.yml
+      # `scripts/check-test-shard-features.py --legs` parses ci.yml with the reader the
+      # shard check uses and prints each `rust-test` leg's `-p` and `--features`
+      # arguments; it exits non-zero on a leg command that check rejects.
+      - name: Read each rust-test leg out of ci.yml
         run: |
           set -euo pipefail
           pip install 'pyyaml>=6,<7'
-          python3 scripts/read-workspace-test-features.py --self-test
-          features="$(python3 scripts/read-workspace-test-features.py)"
-          echo "TEST_FEATURES=$features" >> "$GITHUB_ENV"
-          echo "measuring the graph these features select: $features"
+          python3 scripts/check-test-shard-features.py --self-test
+          python3 scripts/check-test-shard-features.py --legs > rust-test-legs.tsv
+          test -s rust-test-legs.tsv
+          cat rust-test-legs.tsv
       - name: Measure each cargo invocation the rust-test job runs
         run: |
           set -euo pipefail
@@ -131,7 +131,14 @@ jobs:
             cp target/cargo-timings/cargo-timing.html "timings/${label}/timing.html"
           }
 
-          measure workspace-test --workspace --all-targets --features "$TEST_FEATURES"
+          # Each rust-test leg compiles its graph on its own runner, so each leg's build
+          # starts from an empty target directory. Package names and feature lists hold
+          # no spaces, so word splitting yields each argument whole.
+          while IFS=$'\t' read -r leg args; do
+            cargo clean
+            # shellcheck disable=SC2086
+            measure "test-${leg}" $args --all-targets
+          done < rust-test-legs.tsv
           measure transport-combined -p scp-transport --all-targets --features combined,local-cache
           measure transport-network -p scp-transport --all-targets --features quic,http3,udp,coap
           measure testing-sqlite -p scp-testing --tests --features sqlite

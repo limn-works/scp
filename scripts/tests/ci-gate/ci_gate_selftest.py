@@ -7403,7 +7403,7 @@ def output_patterns(doc: dict, output: str) -> set[str] | str:
 
 
 # rust_test_reads lists the files outside `crates/` that a workspace source, and so
-# rust-test (`cargo nextest run --workspace`), can read, by scanning every tracked
+# rust-test, can read, by scanning every tracked
 # `crates/**/*.rs` file: the literal of
 # each `include_str!` or `include_bytes!`, resolved against that file's directory, and
 # the literal of each `workspace_root().join(...)`. It also walks the directories

@@ -40,6 +40,12 @@ command can name them (cargo accepts `--features dep/feature` only for a depende
 selected package). The check prints each such difference and does not fail on it: the
 package's own tests run in the shard that selects it, with its canonical features.
 
+`--legs` prints one line per shard, `<shard>` then a tab then the shard command's `-p` and
+`--features` arguments, read out of the workflow without invoking cargo.
+`.github/workflows/compile-timings.yml` builds each line's arguments under `--timings`, so
+it times the graphs rust-test compiles. It exits non-zero on any workflow `read_shards`
+rejects.
+
 `--suggest` prints, for each shard, the feature list that reproduces the canonical
 resolution as far as cargo lets one command name features: it adds each missing
 `package/feature` one at a time and keeps it when cargo accepts it and it adds no feature
@@ -311,6 +317,25 @@ def selection_args(packages: list[str]) -> list[str]:
     return [arg for package in packages for arg in ("-p", package)]
 
 
+def leg_lines(document: dict) -> list[str]:
+    """Return `<shard>\t<-p and --features arguments>` for each shard command."""
+    _, shards = read_shards(document)
+    return [
+        f"{shard}\t"
+        + " ".join(
+            selection_args(packages)
+            + (["--features", ",".join(features)] if features else [])
+        )
+        for shard, (packages, features) in shards.items()
+    ]
+
+
+def legs(workflow: Path) -> int:
+    for line in leg_lines(yaml.safe_load(workflow.read_text(encoding="utf-8"))):
+        print(line)
+    return 0
+
+
 def check(workflow: Path) -> int:
     document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
     canonical_features, shards = read_shards(document)
@@ -430,6 +455,22 @@ def self_test() -> int:
         "reads both shards",
         shards == {"one": (["a", "b"], ["a/x", "b/y"]), "two": (["c"], [])},
         shards,
+    )
+
+    expect(
+        "--legs prints each shard's -p and --features arguments",
+        leg_lines(base) == ["one\t-p a -p b --features a/x,b/y", "two\t-p c"],
+        leg_lines(base),
+    )
+    try:
+        leg_lines(yaml.safe_load(SELF_TEST_WORKFLOW.replace("-p c", "-p c --lib")))
+        refused = "printed"
+    except CheckError as error:
+        refused = str(error)
+    expect(
+        "--legs refuses a shard command it cannot reproduce",
+        "--lib" in refused,
+        refused,
     )
 
     members = {"a": ["lib:a"], "b": ["lib:b", "test:it"], "c": ["lib:c"]}
@@ -593,6 +634,9 @@ def main() -> int:
     mode = check
     if args[:1] == ["--suggest"]:
         mode = suggest
+        args = args[1:]
+    elif args[:1] == ["--legs"]:
+        mode = legs
         args = args[1:]
     workflow = Path(args[0]) if args else WORKFLOW
     try:

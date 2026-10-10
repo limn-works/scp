@@ -1558,8 +1558,8 @@ jobs:
   # that script's `--suggest` mode: it adds every `package/feature` cargo
   # accepts that moves the leg's resolution toward the canonical one, so the
   # leg tests the same code and restores the same dependency artifacts the
-  # canonical resolution built. scripts/read-workspace-test-features.py reads
-  # `TEST_FEATURES` for .github/workflows/compile-timings.yml.
+  # canonical resolution built. .github/workflows/compile-timings.yml times
+  # each leg's build from the arguments that script's `--legs` mode prints.
   #
   # A push to `main` runs one `all` leg, which runs every leg's step in turn
   # and is the only writer of the `workspace-debug` cache, so the entry holds
