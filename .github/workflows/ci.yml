@@ -3748,7 +3748,17 @@ jobs:
           echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/android-googlexr-license"
           echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
       - run: sdkmanager "platforms;android-35"
+      # setup-gradle writes the Gradle cache only on the default branch, because its
+      # `cache-read-only` input defaults to true on every other ref. On those writes,
+      # `cache-cleanup: always` makes the action delete files in the Gradle user home
+      # that no build in the job used, before it saves the cache. The default,
+      # `on-success`, skips that deletion when a Gradle build failed, and the action
+      # still saves the cache. The other two setup-gradle steps in this file set the
+      # same input for the same reason. Cleanup removes files inside the saved entries;
+      # it does not delete superseded GitHub cache entries, which LRU eviction removes.
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-cleanup: always
       # `ktlintCheck`, not `runKtlintCheckOverMainSourceSet`: the `runKtlint*`
       # tasks only write the report and exit 0 whatever it lists; the
       # ktlint-gradle plugin fails the build in the `ktlint*SourceSetCheck`
@@ -4166,7 +4176,10 @@ jobs:
       # `Run tests`, and RUSTUP_AUTO_INSTALL is "0", so the pinned toolchain must be
       # installed before it.
       - uses: ./.github/actions/rust-toolchain
+      # `cache-cleanup: always`: see the setup-gradle step in job kotlin-lint.
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-cleanup: always
       - name: Run tests
         working-directory: bindings/kotlin
         env:
@@ -4539,7 +4552,10 @@ jobs:
         with:
           distribution: zulu
           java-version: "17"
+      # `cache-cleanup: always`: see the setup-gradle step in job kotlin-lint.
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-cleanup: always
       - name: Download PyO3 native module
         uses: actions/download-artifact@v4
         with:
