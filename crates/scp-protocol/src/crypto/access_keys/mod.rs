@@ -141,7 +141,8 @@ pub enum AccessKeyError {
     #[error("serialization failed: {0}")]
     SerializationFailed(String),
 
-    /// Custody returned a wrapping (X25519) public key that is not 32 bytes.
+    /// Custody returned a wrapping (DHKEM P-256) public key that is not a
+    /// 65-byte uncompressed point.
     #[error("malformed wrapping public key: {0}")]
     MalformedWrappingPublicKey(String),
 
@@ -162,6 +163,16 @@ pub enum AccessKeyError {
     /// the expiry window).
     #[error("replayed access key request: nonce already seen")]
     ReplayedNonce,
+
+    /// An access key request names a context other than the one the holder
+    /// serves (spec 09 §9.17.1).
+    #[error("access key request for context {actual}, expected {expected}")]
+    ContextMismatch {
+        /// The context the holder serves.
+        expected: String,
+        /// The context the request names.
+        actual: String,
+    },
 
     /// AES-256-GCM encryption failed.
     #[error("content encryption failed: {0}")]

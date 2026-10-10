@@ -528,7 +528,7 @@ pub enum MessagingCommand {
     /// NOT run the authoritative anti-replay gate
     /// (`check_and_advance_recv_sequence`), touch the Class-M floor registry,
     /// mutate `nonce_dedup`, or change the epoch. Those live at the messaging
-    /// seam ([`decrypt_and_dispatch`](crate::context::messaging_helpers::decrypt_and_dispatch)),
+    /// seam (`messaging_helpers::deliver_incoming`),
     /// which this inspection deliberately skips. The sole state change is the
     /// unavoidable MLS decryption-ratchet advance inherent to any decrypt (the
     /// deleted provider inspection twin was likewise non-mutating in exactly this
@@ -1844,10 +1844,11 @@ pub enum BroadcastCommand {
         author_did: scp_did::DID,
         /// Requester DID.
         requester_did: scp_did::DID,
-        /// Requester's X25519 wrapping public key. The broadcast key is
-        /// HPKE-sealed to this key inside the protocol handler (§5.14.2) — the
-        /// raw key never leaves the protocol layer.
-        wrapping_pubkey: [u8; 32],
+        /// Requester's DHKEM(P-256) wrapping public key, a validated
+        /// uncompressed point (§9.5). The broadcast key is HPKE-sealed to this
+        /// key inside the protocol handler (§5.14.2); the raw key never leaves
+        /// the protocol layer.
+        wrapping_pubkey: scp_protocol::crypto::hpke::p256::P256Point,
         /// Oneshot reply channel. See
         /// [`HandleBroadcastKeyRequestReply`].
         reply: HandleBroadcastKeyRequestReply,

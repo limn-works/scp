@@ -1688,8 +1688,10 @@ class SCP:
     ) -> str | None:
         """Delegate to ``_scp_core.SCP.broadcast_handle_key_request``.
 
-        Seals the author's current broadcast key to the requester's 32-byte
-        X25519 ``wrapping_pubkey`` (HPKE, spec §5.14.2). Returns the JSON of a
+        Seals the author's current broadcast key to the requester's
+        ``wrapping_pubkey``, a 65-byte uncompressed DHKEM(P-256) point (HPKE,
+        spec §5.14.2, §9.5); any other length or an invalid point raises
+        ``ValidationError`` with code ``SCP-VALID-7007``. Returns the JSON of a
         sealed broadcast key on grant, or ``None`` on deny (§5.14.8 — a denied
         requester receives no key material). The subscriber opens the returned
         JSON with :meth:`broadcast_open_key`.
@@ -1706,10 +1708,13 @@ class SCP:
         """Delegate to ``_scp_core.SCP.broadcast_open_key``.
 
         Opens an HPKE-sealed broadcast key (spec §5.14.2) using the
-        subscriber's 32-byte X25519 ``wrapping_secret``, returning the raw
+        subscriber's 32-byte DHKEM(P-256) ``wrapping_secret`` scalar, returning the raw
         32-byte AES-256 broadcast key. ``sealed_json`` is the JSON returned by
         :meth:`broadcast_handle_key_request` on grant. Pure crypto — invoked as
         a static method on the native ``SCP`` class via the instance handle.
+        Raises ``ValidationError`` with ``SCP-VALID-7002`` for malformed JSON or
+        ``SCP-VALID-7007`` for a secret that is not 32 bytes, and
+        ``ContextError`` with ``SCP-CTX-2023`` if the HPKE open fails.
         """
         return await asyncio.to_thread(
             self._native.broadcast_open_key, sealed_json, wrapping_secret

@@ -426,7 +426,9 @@ async fn join_time_sender_key_distribution_uses_management_channel() {
                 sender_did: alice_did.to_owned(),
                 epoch: 1,
                 hpke_sealed_key: [0u8; 48],
-                ephemeral_pubkey: [0u8; 32],
+                ephemeral_pubkey:
+                    scp_core::crypto::sender_keys::key_protocol_verify::generate_wrapping_keypair()
+                        .0,
                 request_nonce: [0u8; 16],
             },
         )

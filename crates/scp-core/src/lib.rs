@@ -35,7 +35,7 @@ pub mod crypto {
         // Synchronous MLS state machine (wasm-safe) from scp-mls.
         pub use scp_mls::{
             InMemoryMlsProvider, credential, encrypt, epoch_grace, error, group, key_package,
-            ratchet, wrapping_extension,
+            ratchet, wire, wrapping_extension,
         };
         // Node-only async durable-storage bridge from scp-runtime.
         pub use scp_runtime::crypto::mls::{
@@ -254,11 +254,8 @@ pub mod envelope {
     }
     pub mod outer {
         pub use scp_protocol::envelope::outer::*;
-        pub use scp_runtime::envelope::outer::ops;
-        pub use scp_runtime::envelope::outer::ops::{open_envelope, seal_envelope};
     }
     pub use scp_runtime::envelope::inner::sign::create_inner_envelope;
-    pub use scp_runtime::envelope::outer::ops::seal_envelope;
 }
 
 pub mod sync {

@@ -19,116 +19,26 @@ use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
 
-use openmls::prelude::KeyPackageIn;
+use scp_core::context::{Capability, ContextMode, ContextParams, context_id_bytes};
 use scp_core::crypto::mls::credential::ScpCredential;
-use scp_core::crypto::mls::group::ScpMlsGroup;
 use scp_core::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
 use scp_core::crypto::sender_keys::{
     HandleRequestParams, NonceDedup, SenderKeyRequest, SenderKeyResponse, SenderKeyStore,
     generate_sender_key, handle_sender_key_request, open_sender_key_response,
     publish_sender_key_epoch_advance, request_sender_key, verify_epoch_advance,
 };
-use scp_core::envelope::inner::{
-    InnerEnvelopeParams, MessageType, SCP_INNER_ENVELOPE_VERSION, create_inner_envelope,
-};
-use scp_core::envelope::outer::{open_envelope, seal_envelope};
-use scp_core::envelope::padding::strip_padding;
 use scp_core::envelope::pseudonym::derive_pseudonym;
-use scp_did::SigningKeyId;
-use scp_platform::error::PlatformError;
+use scp_did::{DID, SigningKeyId};
 use scp_platform::testing::InMemoryKeyCustody;
-use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
-};
+use scp_platform::traits::{KeyCustody, KeyType};
 use scp_testing::builder::ScenarioBuilder;
 use scp_testing::clock::Clock;
+use scp_testing::fullstack::FullStackNetwork;
 use scp_testing::relay::behavior::SuppressionConfig;
 use scp_testing::relay::{BehaviorMode, InMemoryRelay};
 use scp_testing::transport::InMemoryTransport;
 use scp_transport::traits::{RoutingId, TransportAdapter, TransportEvent};
-use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
-
-// -------------------------------------------------------------------------
-// MLS signer adapter (reused from encrypted_relay_roundtrip.rs pattern)
-// -------------------------------------------------------------------------
-
-struct MlsGroupKeyCustody<'a> {
-    group: &'a ScpMlsGroup,
-}
-
-#[allow(clippy::manual_async_fn)]
-impl KeyCustody for MlsGroupKeyCustody<'_> {
-    fn generate_keypair(
-        &self,
-        _: KeyType,
-    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
-        async { Err(PlatformError::CustodyError("not supported".into())) }
-    }
-    fn generate_identity_keypair(
-        &self,
-    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
-        async { Err(PlatformError::CustodyError("not supported".into())) }
-    }
-    fn sign(
-        &self,
-        _: &KeyHandle,
-        data: &[u8],
-    ) -> impl Future<Output = Result<Signature, PlatformError>> + Send {
-        let r = self
-            .group
-            .sign(data)
-            .map(Signature::new)
-            .map_err(|e| PlatformError::CustodyError(e.to_string()));
-        async { r }
-    }
-    fn public_key(
-        &self,
-        _: &KeyHandle,
-    ) -> impl Future<Output = Result<PublicKey, PlatformError>> + Send {
-        let r = self
-            .group
-            .signer_public_key()
-            .map(PublicKey::new)
-            .map_err(|e| PlatformError::CustodyError(e.to_string()));
-        async { r }
-    }
-    fn destroy_key(&self, _: &KeyHandle) -> impl Future<Output = Result<(), PlatformError>> + Send {
-        async { Err(PlatformError::CustodyError("not supported".into())) }
-    }
-    fn dh_agree(
-        &self,
-        _: &KeyHandle,
-        _: &[u8],
-    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
-        async { Err(PlatformError::CustodyError("not supported".into())) }
-    }
-    fn derive_pseudonym(
-        &self,
-        _: &KeyHandle,
-        _: &[u8],
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
-        async { Err(PlatformError::CustodyError("not supported".into())) }
-    }
-    fn derive_rotatable_pseudonym(
-        &self,
-        _: &KeyHandle,
-        _: &[u8],
-        _: u64,
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
-        async { Err(PlatformError::CustodyError("not supported".into())) }
-    }
-    fn ed25519_to_x25519_agree(
-        &self,
-        _: &KeyHandle,
-        _: &[u8; 32],
-    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
-        async { Err(PlatformError::CustodyError("not supported".into())) }
-    }
-    fn custody_type(&self, _: &KeyHandle) -> CustodyType {
-        CustodyType::InMemory
-    }
-}
+use tls_codec::Serialize as TlsSerializeTrait;
 
 // -------------------------------------------------------------------------
 // The demo
@@ -195,7 +105,6 @@ async fn end_to_end_network_demo() {
         .await
         .unwrap();
     let alice_pubkey = alice_custody.public_key(&alice_sign_key).await.unwrap();
-    let alice_identity_key = alice_custody.generate_identity_keypair().await.unwrap();
 
     let bob_custody = InMemoryKeyCustody::from_seed_bytes({
         let mut __s = [0u8; 32];
@@ -207,6 +116,7 @@ async fn end_to_end_network_demo() {
         .await
         .unwrap();
     let bob_pubkey = bob_custody.public_key(&bob_sign_key).await.unwrap();
+    let bob_identity_key = bob_custody.generate_identity_keypair().await.unwrap();
 
     println!(
         "  Alice: Ed25519 signing key generated (handle={})",
@@ -240,7 +150,12 @@ async fn end_to_end_network_demo() {
 
     let alice_cred =
         ScpCredential::new(alice_did_str.to_owned(), None, SigningKeyId::Active).unwrap();
-    let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).unwrap();
+    let mut alice_group = create_group(
+        &alice_cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
     println!("  Alice created MLS group");
     println!(
         "    group_id:   {}...",
@@ -248,13 +163,17 @@ async fn end_to_end_network_demo() {
     );
     println!("    epoch:      {}", alice_group.epoch().unwrap());
     println!("    members:    {}", alice_group.members().unwrap().len());
-    println!("    ciphersuite: MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519");
+    println!("    ciphersuite: MLS_128_DHKEMP256_AES128GCM_SHA256_P256");
     println!();
 
     // Bob joins.
     let bob_cred = ScpCredential::new(bob_did_str.to_owned(), None, SigningKeyId::Active).unwrap();
-    let (bob_kp_bundle, bob_signer, bob_provider) =
-        generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
+    let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(
+        &bob_cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
 
     println!("  Bob generated KeyPackage for group join");
 
@@ -262,9 +181,11 @@ async fn end_to_end_network_demo() {
         .key_package()
         .tls_serialize_detached()
         .unwrap();
-    let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
+    let kp_in = scp_core::crypto::mls::wire::parse_key_package_in(kp_bytes.as_slice()).unwrap();
     let add_result = add_member(&mut alice_group, kp_in, &scp_clock::SystemClock).unwrap();
-    let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+    let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+    assert_eq!(bob_group.epoch().unwrap(), alice_group.epoch().unwrap());
+    assert_eq!(bob_group.members().unwrap().len(), 2);
 
     println!("  Alice added Bob to group via Welcome message");
     println!("    epoch:   {} (both sides)", alice_group.epoch().unwrap());
@@ -378,69 +299,72 @@ async fn end_to_end_network_demo() {
     println!("  Message size:     {} bytes", original_msg.len());
     println!();
 
-    // Step 1: Create inner envelope with signature.
-    let alice_mls_custody = MlsGroupKeyCustody {
-        group: &alice_group,
+    // The context actor is the only place an envelope is sealed or opened, so
+    // this phase runs Alice and Bob as full nodes over the same MLS ciphersuite.
+    let network = FullStackNetwork::new();
+    let alice_node = network.create_node(alice_did_str);
+    let bob_node = network.create_node(bob_did_str);
+    let ctx_bytes = context_id_bytes(ctx_id);
+    // The ceiling grants Alice what this phase exercises: adding Bob runs a
+    // governance proposal, and both sides exchange messages.
+    let params = ContextParams {
+        mode: ContextMode::Encrypted,
+        ceiling: vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::MemberInvite,
+            Capability::GovernancePropose,
+            Capability::GovernanceVote,
+        ],
+        ..ContextParams::default()
     };
-    let dummy_handle = KeyHandle::new(0);
-    let inner_env = create_inner_envelope(
-        &InnerEnvelopeParams {
-            context_id: ctx_id,
-            sender_did: alice_did_str,
-            epoch: alice_group.epoch().unwrap(),
-            generation: 0,
-            sequence: 1,
-            timestamp: sim.clock().now_secs() * 1000,
-            message_type: MessageType::Content,
-            payload: original_msg,
-            provenance: None,
-            signing_key_id: SigningKeyId::Active,
-            version: SCP_INNER_ENVELOPE_VERSION,
-        },
-        &alice_mls_custody,
-        &dummy_handle,
-    )
-    .await
-    .unwrap();
-
-    let inner_bytes = rmp_serde::to_vec_named(&inner_env).unwrap();
-    println!("  Step 1: InnerEnvelope created");
-    println!("    context_id:  {}", inner_env.context_id);
-    println!("    sender_did:  {}", inner_env.sender_did);
-    println!("    epoch:       {}", inner_env.epoch);
-    println!("    sequence:    {}", inner_env.sequence);
-    println!(
-        "    payload:     {} bytes (padded to bucket)",
-        inner_env.payload.len()
-    );
-    println!("    signature:   {} bytes", inner_env.signature.len());
-    println!("    serialized:  {} bytes", inner_bytes.len());
-    println!();
-
-    // Step 2: Derive pseudonym for routing.
-    let pseudonym = derive_pseudonym(&alice_custody, &alice_identity_key, ctx_id.as_bytes())
+    let handle = alice_node.create_context(ctx_id, params).await.unwrap();
+    alice_node.add_member(&handle, bob_did_str).await.unwrap();
+    bob_node
+        .join_from_welcome(ctx_id, &ctx_bytes)
         .await
         .unwrap();
-    // §9.10.4: routing fields carry the routing id of the 33-byte P-256 point.
-    let routing_arr: [u8; 32] = *pseudonym.routing_id();
+    println!("  Step 1: Alice and Bob run full nodes; Bob joined the context via Welcome");
 
-    println!("  Step 2: Pseudonym derived for routing");
+    // Step 2: Bob's per-context pseudonym is the routing id Alice addresses him
+    // on (§9.10.4). Alice learns it from Bob's pseudonym announcement; here it
+    // is seeded directly.
+    let pseudonym = derive_pseudonym(&bob_custody, &bob_identity_key, ctx_id.as_bytes())
+        .await
+        .unwrap();
+    let routing_arr: [u8; 32] = *pseudonym.routing_id();
+    alice_node
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(bob_did_str), routing_arr)
+        .await
+        .unwrap();
+    println!("  Step 2: Bob's pseudonym derived for routing");
     println!("    routing_id:  {}...", hex::encode(&routing_arr[..8]));
-    println!("    (unlinkable to Alice's DID without identity key)");
+    println!("    (unlinkable to Bob's DID without his identity key)");
     println!();
 
-    // Step 3: Seal — sender key encrypt → MLS encrypt → outer envelope.
-    let outer_env = seal_envelope(
-        &inner_env,
-        &mut alice_group,
-        &alice_sender_key,
+    // Step 3: Alice's node seals: inner envelope signed under her #active key,
+    // sender-key layer, MLS layer, outer envelope.
+    alice_node
+        .send_message(&handle, original_msg)
+        .await
+        .unwrap();
+    let mut sent = alice_node.take_sent_ciphertexts();
+    assert_eq!(sent.len(), 1, "exactly one ciphertext for the one peer");
+    let (sent_routing, sealed) = sent.remove(0);
+    assert_eq!(sent_routing, routing_arr, "addressed to Bob's pseudonym");
+    // The harness captures the sealed envelope and its routing id separately;
+    // the transport layer addresses the blob to Bob's pseudonym.
+    let captured = scp_core::envelope::OuterEnvelope::from_bytes(&sealed).unwrap();
+    let outer_env = scp_core::envelope::outer::create_outer_envelope(
         &routing_arr,
         None,
-        3600,
+        captured.blob_ttl,
+        captured.encrypted_blob.clone(),
     )
     .unwrap();
 
-    println!("  Step 3: OuterEnvelope sealed (double encryption)");
+    println!("  Step 3: OuterEnvelope sealed by Alice's context actor");
     println!("    Layer 1: AES-256-GCM sender key encryption");
     println!("    Layer 2: MLS AES-128-GCM group encryption");
     println!(
@@ -475,7 +399,9 @@ async fn end_to_end_network_demo() {
     println!("    relay blob count: {relay_blobs}");
     println!();
 
-    // Step 5: Bob receives and decrypts.
+    // Step 5: Bob receives and opens on his node's production receive path:
+    // MLS decrypt, sender-key decrypt, sender binding, inner signature,
+    // anti-replay floor, access-key unwrap.
     let received = tokio::time::timeout(std::time::Duration::from_secs(2), bob_stream.next())
         .await
         .expect("timeout")
@@ -496,23 +422,17 @@ async fn end_to_end_network_demo() {
         received_outer.encrypted_blob.len()
     );
 
-    let bob_alice_sk = bob_sk_store
-        .get(ctx_id, alice_did_str)
-        .expect("Bob has Alice's sender key");
-    let verified_inner = open_envelope(
-        &received_outer,
-        &mut bob_group,
-        bob_alice_sk,
-        &inner_env.context_id,
-        &inner_env.sender_did,
-        inner_env.epoch,
-        inner_env.sequence,
-    )
-    .unwrap();
-
-    let decrypted_msg = strip_padding(&verified_inner.payload).unwrap();
+    assert_eq!(
+        received_outer.encrypted_blob, captured.encrypted_blob,
+        "the relay delivers the sealed blob unchanged"
+    );
+    let outer_bytes = received_outer.to_bytes().unwrap();
+    let decrypted_msg = bob_node
+        .decrypt_message(ctx_id, &ctx_bytes, &sealed, alice_did_str)
+        .await
+        .unwrap();
     let msg_str = String::from_utf8_lossy(&decrypted_msg);
-    println!("    MLS decrypt:      OK (epoch {})", verified_inner.epoch);
+    println!("    MLS decrypt:      OK");
     println!("    Sender key layer: OK");
     println!("    Signature verify: OK");
     println!("    Decrypted:        \"{msg_str}\"");
@@ -521,7 +441,6 @@ async fn end_to_end_network_demo() {
     println!();
 
     // Verify relay never saw sensitive data.
-    let outer_bytes = received_outer.to_bytes().unwrap();
     let ctx_leaked = outer_bytes
         .windows(ctx_id.len())
         .any(|w| w == ctx_id.as_bytes());

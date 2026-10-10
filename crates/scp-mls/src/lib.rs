@@ -18,7 +18,7 @@
 //!
 //! # Ciphersuite
 //!
-//! All groups use `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (no
+//! All groups use `MLS_128_DHKEMP256_AES128GCM_SHA256_P256` (no
 //! ciphersuite negotiation). See ADR-001 for the rationale.
 //!
 //! # Modules
@@ -40,10 +40,12 @@
 //!   helpers (§5.13.3, finding FFI-02).
 //! - [`epoch_grace`] — Epoch grace-window store (forward-secrecy bound).
 //! - [`error`] — MLS-specific error types.
+//! - [`admission`] — SCP leaf admission for added and replaced leaves.
 //!
 //! See ADR-001 in `.docs/adrs/phase-1.md` for the MLS wrapper design and
 //! ADR-057 for the `scp-mls` extraction.
 
+pub mod admission;
 pub mod context_extension;
 pub mod convergent_timestamp;
 pub mod credential;
@@ -56,16 +58,18 @@ pub mod keypackage_attestation;
 pub mod lifetime;
 pub mod ratchet;
 pub mod snapshot;
+pub mod wire;
 pub mod wrapping_extension;
 
 // Re-export primary public API types for convenience.
+pub use admission::{AdmittedLeaf, LeafAdmissionRejection, MAX_LEAVES_PER_DID, MemberLeaves};
 pub use convergent_timestamp::{
     CONVERGENT_TIMESTAMP_AAD_LEN, CONVERGENT_TIMESTAMP_AAD_MAGIC, CONVERGENT_TIMESTAMP_AAD_VERSION,
     decode_convergent_timestamp_aad, encode_convergent_timestamp_aad,
 };
 pub use credential::ScpCredential;
 pub use encrypt::{DecryptedContent, InboundChange};
-pub use error::MlsError;
+pub use error::{MlsError, SignerDefect};
 pub use keypackage_attestation::{
     AttestationLeafGroundTruth, AttestationResolutionVerifyError, AttestationTrigger,
     AttestationVerifyError, KeyPackageAttestation, MAX_ATTESTATION_KEY_RESOLUTION_STALENESS,
@@ -84,10 +88,10 @@ pub use context_extension::{
 };
 pub use group::{
     AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member,
-    add_member_with_convergent_timestamp, create_group, create_group_with_context,
-    create_group_with_wrapping_key, destroy_group, generate_key_package,
-    generate_key_package_with_context_params, generate_key_package_with_wrapping_key, join_group,
-    key_package_in_did, key_package_in_wrapping_key, remove_member,
+    add_member_with_convergent_timestamp, check_p256_signer, create_group,
+    create_group_with_context, destroy_group, generate_key_package,
+    generate_key_package_with_context_params, join_group, key_package_in_did, remove_member,
+    require_scp_ciphersuite,
 };
 pub use lifetime::{
     KEY_PACKAGE_LIFETIME_MARGIN_SECS, KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS,

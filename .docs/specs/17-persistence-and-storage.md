@@ -123,8 +123,7 @@ context/{context_id}/economic_policy
 context/{context_id}/payment_receipt/{receipt_id}
 context/{context_id}/spending_ucan/{token_id}
 
-wrapping_key/{context_id}/{did}/public
-wrapping_key/{context_id}/{did}/secret
+wrapping_key/{did}
 
 key_event_log_cache/{did}
 tofu/{did}
@@ -771,24 +770,23 @@ The exact sub-prefix structure follows OpenMLS's `StorageProvider` method signat
 `MlsStorageBridge` (§17.9) implements the OpenMLS `StorageProvider` trait for fine-grained per-item persistence under the `mls/{context_id}/...` key prefix. A complete MLS crypto context also includes state that lives outside the OpenMLS `StorageProvider` contract:
 
 - **Sender keys and sender key store** — per-member symmetric keys for the sender key layer (ADR-001, §23)
-- **DHKEM(P-256) wrapping keypair** — HPKE encapsulation key for sender key distribution
 - **MLS signer** (`SignatureKeyPair`) — P-256 signing credential used by OpenMLS under RFC 9420 ciphersuite 2
-- **Member wrapping keys** — per-member AES-256 keys for sender key wrapping
+- **Member wrapping keys** — per-member DHKEM(P-256) wrapping public keys (65-byte uncompressed SEC1), read from each member's `scp_wrapping_key` (0xFF01) leaf extension (`09-security-model.md` §9.16.1)
 - **Sender key epoch** — monotonic counter tracking sender key rotation
 
-Per ADR-049, this state is owned by the per-context actor (`PerContextState.mode`) — encrypted contexts carry an MLS+sender-key variant, broadcast contexts carry a per-author-key variant. The narrow backend traits `MlsBackend` and `HpkeBackend` (architecture.md §2.5.3 [no such section]) provide stateless primitives over this state; state serialization is an inherent concern of the state itself, not the trait.
+Per ADR-049, this state is owned by the per-context actor (`PerContextState.mode`) — encrypted contexts carry an MLS+sender-key variant, broadcast contexts carry a per-author-key variant. The narrow backend trait `MlsBackend` (`architecture.md`, "Trait Contracts") provides stateless MLS primitives over this state, and HPKE is a direct call to `scp_protocol::crypto::hpke::p256`; state serialization is an inherent concern of the state itself, not the trait.
 
 Two inherent operations on the encrypted-mode state handle snapshot serialization atomically:
 
-- **`export_crypto_state(context_id) -> Vec<u8>`** — Serializes the full crypto state for a context into an opaque `MlsCryptoSnapshot` blob (MessagePack). This includes the OpenMLS in-memory storage entries, the signer, sender keys, wrapping keys, and epoch metadata. Sensitive key material (signer bytes, sender keys, wrapping secret key, MLS storage entries) is zeroized from the intermediate snapshot struct immediately after serialization.
+- **`export_crypto_state(context_id) -> Vec<u8>`** — Serializes the full crypto state for a context into an opaque `MlsCryptoSnapshot` blob (MessagePack). This includes the OpenMLS in-memory storage entries, the signer, sender keys, member wrapping public keys, and epoch metadata. The member's own DHKEM(P-256) wrapping keypair is per identity (`09-security-model.md` §9.16.1), is stored once under `wrapping_key/{did}`, and is not part of any context snapshot. Sensitive key material (signer bytes, sender keys, MLS storage entries) is zeroized from the intermediate snapshot struct immediately after serialization.
 
-- **`restore_crypto_state(context_id, data) -> Result<()>`** — Deserializes the snapshot blob and reconstructs the full crypto state: rebuilds the `InMemoryMlsProvider` with persisted storage entries, loads the MLS group via `MlsGroup::load`, restores the signer to OpenMLS's key store, reconstructs the sender key store and member wrapping keys, and restores the DHKEM(P-256) wrapping keypair. Intermediate buffers are zeroized after deserialization via `drain()` and explicit `zeroize()` calls.
+- **`restore_crypto_state(context_id, data) -> Result<()>`** — Deserializes the snapshot blob and reconstructs the full crypto state: rebuilds the `InMemoryMlsProvider` with persisted storage entries, loads the MLS group via `MlsGroup::load`, restores the signer to OpenMLS's key store, and reconstructs the sender key store and member wrapping public keys. Restoring a context never writes the member's own wrapping keypair. Intermediate buffers are zeroized after deserialization via `drain()` and explicit `zeroize()` calls.
 
 The snapshot blob is stored in `ContextSnapshot.mls_crypto_state` and persisted alongside the rest of the context state in `context/{context_id}/full_snapshot`. On context restoration, the blob is restored before the per-context actor resumes so that its MLS group and sender keys are available for subsequent encrypt/decrypt operations.
 
 **Relationship to `MlsStorageBridge`.** The blob snapshot is the **sole active** persistence mechanism for MLS crypto state in the current implementation. The actor-local OpenMLS provider uses in-memory storage at runtime; `MlsStorageBridge` (§17.9) remains implemented but is **not wired into the runtime crypto provider path**. It exists as infrastructure for future fine-grained persistence if needed.
 
-- **The blob snapshot** (active) captures the complete crypto provider state atomically — both the OpenMLS-managed portion (group state, tree nodes, key schedules) and the SCP-managed portion (sender keys, wrapping keys, signer) — as a single unit. On restore, it re-populates the in-memory structures that OpenMLS operates against.
+- **The blob snapshot** (active) captures the complete crypto provider state atomically — both the OpenMLS-managed portion (group state, tree nodes, key schedules) and the SCP-managed portion (sender keys, member wrapping public keys, signer) — as a single unit. On restore, it re-populates the in-memory structures that OpenMLS operates against.
 - **`MlsStorageBridge`** (not currently instantiated) provides the OpenMLS `StorageProvider` trait implementation for fine-grained, per-item MLS storage. If activated in a future iteration, it would allow OpenMLS to persist individual items incrementally rather than relying on full-state snapshots.
 
 The snapshot approach ensures atomicity: all crypto state is persisted and restored as a single unit. Without it, a crash between persisting MLS state and persisting sender key state would leave the context in an inconsistent state where MLS decryption succeeds but sender key decryption fails (or vice versa).

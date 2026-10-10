@@ -25,23 +25,26 @@ fn test_credential(name: &str) -> scp_mls::ScpCredential {
     .unwrap()
 }
 
-/// AC: generate_wrapping_keypair produces distinct 32-byte keypairs.
+/// AC: generate_wrapping_keypair produces distinct DHKEM(P-256) keypairs: a
+/// 65-byte uncompressed public point and its 32-byte scalar.
 #[test]
 fn generate_wrapping_keypair_produces_valid_keypair() {
     let (pub1, sec1) = crate::crypto::sender_keys::key_protocol::generate_wrapping_keypair();
     let (pub2, sec2) = crate::crypto::sender_keys::key_protocol::generate_wrapping_keypair();
 
-    assert_eq!(pub1.len(), 32);
+    assert_eq!(pub1.as_bytes()[0], 0x04);
     assert_eq!(sec1.len(), 32);
     assert_ne!(pub1, pub2, "wrapping keypairs must be distinct");
     assert_ne!(sec1, sec2, "wrapping secret keys must be distinct");
 
     // Verify the public key is derived from the secret key.
-    let secret = x25519_dalek::StaticSecret::from(sec1);
-    let derived_pub = x25519_dalek::PublicKey::from(&secret);
+    let derived_pub = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&sec1)
+        .unwrap()
+        .public_key()
+        .to_uncompressed();
     assert_eq!(
-        pub1,
-        derived_pub.to_bytes(),
+        pub1.as_bytes(),
+        &derived_pub,
         "public key must derive from secret key"
     );
 }
@@ -205,12 +208,14 @@ fn sender_keys_wrapping_stable_001() {
     let (pub_key, sec_key) = generate_wrapping_keypair();
 
     // 1. Wrapping keypair is valid (public derives from secret).
-    let secret = x25519_dalek::StaticSecret::from(sec_key);
-    let derived_pub = x25519_dalek::PublicKey::from(&secret);
-    assert_eq!(pub_key, derived_pub.to_bytes(), "public key derivation");
+    let derived_pub = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&sec_key)
+        .unwrap()
+        .public_key()
+        .to_uncompressed();
+    assert_eq!(pub_key.as_bytes(), &derived_pub, "public key derivation");
 
-    // 2. Extension publishes 32-byte X25519 public key.
-    let ext = make_wrapping_key_extension(&pub_key);
+    // 2. Extension publishes the 65-byte DHKEM(P-256) public key.
+    let ext = make_wrapping_key_extension(pub_key.as_bytes());
     assert_eq!(
         ext.extension_type(),
         ExtensionType::Unknown(SCP_WRAPPING_KEY_EXTENSION_TYPE),
@@ -219,28 +224,32 @@ fn sender_keys_wrapping_stable_001() {
 
     // 3. Create group with wrapping key -> LeafNode contains extension.
     let cred = test_credential("conformance");
-    let group = scp_mls::group::create_group_with_wrapping_key(
-        &cred,
-        Some(&pub_key),
-        &scp_clock::SystemClock,
-    )
-    .unwrap();
+    let group =
+        scp_mls::group::create_group(&cred, pub_key.as_bytes(), &scp_clock::SystemClock).unwrap();
     let extracted = extract_own_wrapping_key(&group).unwrap();
     assert_eq!(extracted, Some(pub_key), "wrapping key in LeafNode");
 
     // 4. Extension survives as the same value across MLS Updates when
     //    the wrapping key is explicitly preserved.
     let bob_cred = test_credential("bob");
-    let (bob_kp, _bob_signer, _bob_provider) =
-        scp_mls::group::generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
+    let (bob_kp, _bob_signer, _bob_provider) = scp_mls::group::generate_key_package(
+        &bob_cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
     let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
 
     let mut group_mut = group;
     let _add =
         scp_mls::group::add_member(&mut group_mut, bob_kp_in, &scp_clock::SystemClock).unwrap();
 
-    let _commit =
-        scp_mls::ratchet::propose_update_with_wrapping_key(&mut group_mut, &pub_key).unwrap();
+    let _commit = scp_mls::ratchet::propose_update_with_wrapping_key(
+        &mut group_mut,
+        pub_key.as_bytes(),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
 
     let after_update = extract_own_wrapping_key(&group_mut).unwrap();
     assert_eq!(
@@ -251,8 +260,12 @@ fn sender_keys_wrapping_stable_001() {
 
     // 5. Wrapping key can be rotated (identity key rotation simulation).
     let (new_pub, _new_sec) = generate_wrapping_keypair();
-    let _commit2 =
-        scp_mls::ratchet::propose_update_with_wrapping_key(&mut group_mut, &new_pub).unwrap();
+    let _commit2 = scp_mls::ratchet::propose_update_with_wrapping_key(
+        &mut group_mut,
+        new_pub.as_bytes(),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
 
     let after_rotation = extract_own_wrapping_key(&group_mut).unwrap();
     assert_eq!(

@@ -51,6 +51,8 @@ getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] 
 uuid = { version = "1", features = ["v4", "js"] }
 
 [dev-dependencies]
+# The shared valid-P-256-point test fixture (`scp_crypto::p256::testing`).
+scp-crypto = { path = "../scp-crypto", features = ["testing"] }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 proptest = "1"

@@ -1582,7 +1582,7 @@ pub async fn execute_remove_member(
             // persist (Class-S), so the epoch bump is durable. `local_did` is
             // sourced from the retained `deps.crypto.local_did()`.
             let remove_output = state
-                .remove_member(deps.crypto.local_did(), did.as_ref())
+                .remove_member(deps.crypto.local_did(), did.as_ref(), deps.clock.as_ref())
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             if let Err(e) = state.remove_member_sender_key(did.as_ref()) {
@@ -2801,7 +2801,7 @@ pub async fn execute_reset_member(
         .commit_class_s_keep(deps, context_id, |mut v| {
             let s = v.rest_mut();
             let remove_output = s
-                .remove_member(&local_did, did.as_ref())
+                .remove_member(&local_did, did.as_ref(), deps.clock.as_ref())
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
             let add_output = s
                 .add_member(did.as_ref(), None, deps.clock.as_ref())
@@ -3230,10 +3230,15 @@ pub async fn execute_rotate_content_keys(
             } else {
                 // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): advance the MLS epoch on the
                 // actor state (already inside this fail-closed `commit_class_s_keep`
-                // closure — §9 Class-S). `wrapping_public_key` from the retained
-                // `deps.crypto.wrapping_keypair()`. Behavior otherwise unchanged
-                // (content-key rotation does not touch the `mls_epoch` mirror).
-                let epoch_out = state.advance_epoch(deps.crypto.wrapping_keypair().0)?;
+                // closure — §9 Class-S), keeping the identity's wrapping key in
+                // the leaf (spec 09 §9.16.1); with none loaded it fails closed.
+                // Behavior otherwise unchanged (content-key rotation does not
+                // touch the `mls_epoch` mirror).
+                let wrapping_public_key = *deps
+                    .supervisor
+                    .my_wrapping_keypair(&deps.owned_identity)?
+                    .public();
+                let epoch_out = state.advance_epoch(wrapping_public_key, deps.clock.as_ref())?;
 
                 let member_dids: Vec<String> = state
                     .membership

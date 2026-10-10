@@ -99,12 +99,15 @@ pub struct AttestationAddGroundTruth<'a> {
     /// and its `did`/`signing_key_id` are the check-9/10 ground truth; its
     /// `signing_key_id` names the current verification method for check 1.
     pub credential: &'a ScpCredential,
-    /// The leaf's actual `signature_key` (check 4).
-    pub leaf_signature_key: &'a [u8; 32],
-    /// The leaf's actual ratchet-tree `encryption_key` (check 5).
-    pub leaf_encryption_key: &'a [u8; 32],
-    /// The value of the leaf's `scp_wrapping_key` (`0xFF01`) extension (check 6).
-    pub leaf_wrapping_key: &'a [u8; 32],
+    /// The leaf's actual `signature_key`, a 65-byte uncompressed P-256 point
+    /// (check 4).
+    pub leaf_signature_key: &'a [u8; 65],
+    /// The leaf's actual ratchet-tree `encryption_key`, a 65-byte DHKEM(P-256)
+    /// public key (check 5).
+    pub leaf_encryption_key: &'a [u8; 65],
+    /// The value of the leaf's `scp_wrapping_key` (`0xFF01`) extension, a
+    /// 65-byte DHKEM(P-256) public key (check 6).
+    pub leaf_wrapping_key: &'a [u8; 65],
     /// The leaf's `Lifetime.not_before` (check 11).
     pub leaf_lifetime_not_before: u64,
     /// The leaf's `Lifetime.not_after` (check 11).
@@ -112,7 +115,7 @@ pub struct AttestationAddGroundTruth<'a> {
     /// The `KeyPackage`'s `init_key` (checks 7–8) — the Add-specific payload
     /// the [`AttestationTrigger::Add`] variant carries. `verify_add_attestation`
     /// constructs that variant from this field internally.
-    pub kp_init_key: &'a [u8; 32],
+    pub kp_init_key: &'a [u8; 65],
 }
 
 /// A typed reason [`verify_add_attestation`] rejected a
@@ -374,6 +377,14 @@ mod tests {
         SigningKey::generate(&mut OsRng).verifying_key().to_bytes()
     }
 
+    /// A fresh 65-byte uncompressed P-256 point for a leaf key position.
+    fn fresh_leaf() -> [u8; 65] {
+        scp_crypto::p256::P256SigningKey::from_seed(b"attestation-verification-test", &fresh_pub())
+            .unwrap()
+            .public_key()
+            .to_uncompressed()
+    }
+
     fn did_doc_with_active(active_key: &[u8; 32]) -> DidDocument {
         let identity_key = fresh_pub();
         let commitment = [0u8; 32];
@@ -385,10 +396,10 @@ mod tests {
     struct Fx {
         att: KeyPackageAttestation,
         credential: ScpCredential,
-        leaf_sig: [u8; 32],
-        leaf_enc: [u8; 32],
-        leaf_wrap: [u8; 32],
-        kp_init: [u8; 32],
+        leaf_sig: [u8; 65],
+        leaf_enc: [u8; 65],
+        leaf_wrap: [u8; 65],
+        kp_init: [u8; 65],
         signer_pub: [u8; 32],
     }
 
@@ -412,10 +423,10 @@ mod tests {
     fn add_fixture(did: &str) -> Fx {
         let signer = SigningKey::generate(&mut OsRng);
         let signer_pub = signer.verifying_key().to_bytes();
-        let leaf_sig = fresh_pub();
-        let leaf_enc = fresh_pub();
-        let leaf_wrap = fresh_pub();
-        let kp_init = fresh_pub();
+        let leaf_sig = fresh_leaf();
+        let leaf_enc = fresh_leaf();
+        let leaf_wrap = fresh_leaf();
+        let kp_init = fresh_leaf();
         let mut att = KeyPackageAttestation {
             did: did.to_owned(),
             leaf_signature_key: leaf_sig,

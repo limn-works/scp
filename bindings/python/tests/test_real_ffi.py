@@ -1228,10 +1228,22 @@ class TestBroadcastKeyDistribution:
     to a requester) and ``broadcast_open_key`` (subscriber unwraps the sealed
     key). These are dependency-free assertions on the binding contract — they
     cover the deny decision (§5.14.8 cryptographic exclusion), the
-    ``broadcast_open_key`` input validation, and the grant JSON shape. A true
-    open round-trip needs a real X25519 keypair (no stdlib X25519, no test
-    crypto dependency) and is covered by the TypeScript suite.
+    ``broadcast_open_key`` input validation, the requester wrapping-key
+    validation, and a full grant-then-open round trip.
+
+    The round trip needs a DHKEM(P-256) keypair without a test crypto
+    dependency, so it uses the P-256 base point ``G``: its secret scalar is 1.
     """
+
+    #: The uncompressed P-256 base point G (SEC 2 §2.4.2), a valid point whose
+    #: secret scalar is 1.
+    P256_G = bytes.fromhex(
+        "04"
+        "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
+        "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+    )
+    #: The scalar 1, big-endian, the secret for :attr:`P256_G`.
+    P256_G_SECRET = (1).to_bytes(32, "big")
 
     @staticmethod
     def _broadcast_handle(scp: SCP, author_did: str):
@@ -1247,9 +1259,9 @@ class TestBroadcastKeyDistribution:
 
     async def test_key_request_denies_unregistered_requester(self, scp: SCP):
         """§5.14.8: an author returns no key material to a requester that never
-        subscribed. The deny decision short-circuits before any sealing, so it
-        needs no real X25519 wrapping key — ``bytes(32)`` is accepted and the
-        wrapper surfaces the deny as ``None`` (not an empty/sealed blob)."""
+        subscribed. The request carries a valid wrapping key, so the deny
+        decision is the check that fails, and the wrapper surfaces the deny as
+        ``None`` (not an empty/sealed blob)."""
         author = await scp.identity_create(CustodyType.IN_MEMORY)
         stranger = await scp.identity_create(CustodyType.IN_MEMORY)
         handle = self._broadcast_handle(scp, author.did)
@@ -1259,14 +1271,39 @@ class TestBroadcastKeyDistribution:
             handle,
             author.did,
             stranger.did,
-            bytes(32),
+            self.P256_G,
         )
         assert decision is None
+
+    @pytest.mark.parametrize(
+        "wrapping_pubkey",
+        [bytes(32), bytes(64), b"\x04" + bytes(64)],
+        ids=["32-bytes", "64-bytes", "off-curve"],
+    )
+    async def test_key_request_rejects_malformed_wrapping_key(
+        self, scp: SCP, wrapping_pubkey: bytes
+    ):
+        """§9.5: the requester's wrapping key is a 65-byte uncompressed P-256
+        point. A 32-byte key (the retired X25519 width), a 64-byte key (the
+        point without its tag) and a 65-byte value off the curve are each a
+        ``ValidationError`` with ``SCP-VALID-7007`` before any decision."""
+        author = await scp.identity_create(CustodyType.IN_MEMORY)
+        subscriber = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = self._broadcast_handle(scp, author.did)
+        await scp.broadcast_subscribe(handle, subscriber.did)
+
+        with pytest.raises(
+            _scp_core.ValidationError,
+            match=r"^\[SCP-VALID-7007\] .*must be a 65-byte uncompressed P-256 point",
+        ):
+            await scp.broadcast_handle_key_request(
+                handle, author.did, subscriber.did, wrapping_pubkey
+            )
 
     async def test_open_key_rejects_malformed_sealed_json(self, scp: SCP):
         """``broadcast_open_key`` must reject a sealed payload that is not valid
         JSON before attempting any HPKE open."""
-        with pytest.raises(ValueError):
+        with pytest.raises(_scp_core.ValidationError, match=r"^\[SCP-VALID-7002\] "):
             await scp.broadcast_open_key("not valid json", bytes(32))
 
     async def test_open_key_rejects_wrong_length_secret(self, scp: SCP):
@@ -1276,23 +1313,22 @@ class TestBroadcastKeyDistribution:
         not deserialization."""
         sealed_json = json.dumps(
             {
-                "enc": [0] * 32,
+                "enc": list(self.P256_G),
                 "ct": [0] * 48,
                 "epoch": 0,
                 "author_did": "did:dht:z6MkBroadcastAuthorForLenCheck",
                 "context_id": "ctx-broadcast-len-check",
             }
         )
-        with pytest.raises(ValueError):
+        with pytest.raises(
+            _scp_core.ValidationError, match=r"^\[SCP-VALID-7007\] .*must be 32 bytes"
+        ):
             await scp.broadcast_open_key(sealed_json, b"short")
 
     async def test_key_request_grants_registered_subscriber_shape(self, scp: SCP):
-        """A registered subscriber receives a sealed broadcast key. ``bytes(32)``
-        (the all-zero X25519 point) is a valid HPKE recipient input, so the seal
-        succeeds and the wrapper returns the SealedBroadcastKey JSON. We assert
-        the JSON shape only — a true open round-trip would need the X25519 secret
-        matching the all-zero *public* key (which is not the all-zero secret), so
-        the full unwrap is left to the TypeScript suite (real WebCrypto X25519)."""
+        """A registered subscriber receives a sealed broadcast key: the seal to
+        the requester's P-256 wrapping key succeeds, the wrapper returns the
+        SealedBroadcastKey JSON, and the matching secret opens it."""
         author = await scp.identity_create(CustodyType.IN_MEMORY)
         subscriber = await scp.identity_create(CustodyType.IN_MEMORY)
         handle = self._broadcast_handle(scp, author.did)
@@ -1304,7 +1340,7 @@ class TestBroadcastKeyDistribution:
             handle,
             author.did,
             subscriber.did,
-            bytes(32),
+            self.P256_G,
         )
         assert isinstance(sealed_json, str)
         assert len(sealed_json) > 0
@@ -1319,3 +1355,11 @@ class TestBroadcastKeyDistribution:
         assert sealed["author_did"] == author.did
         assert sealed["context_id"] == handle.context_id
         assert isinstance(sealed["epoch"], int)
+        # The encapsulated key is a 65-byte uncompressed P-256 point (§9.5).
+        assert len(sealed["enc"]) == 65
+        assert sealed["enc"][0] == 0x04
+
+        # The secret matching the requester's wrapping key opens the grant.
+        key = await scp.broadcast_open_key(sealed_json, self.P256_G_SECRET)
+        assert isinstance(key, bytes)
+        assert len(key) == 32

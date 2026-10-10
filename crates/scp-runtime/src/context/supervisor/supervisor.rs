@@ -48,7 +48,6 @@ use crate::context::actor::commands::{
 };
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
-use crate::context::actor::state::WrappingKeyPair;
 use crate::context::actor::{BoundedReplyError, bounded_reply_await};
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use crate::context::outlets::stream::{OriginAdmissionTracker, StreamAdmissionTracker};
@@ -57,6 +56,7 @@ use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::context::supervisor::saga_journal::{
     JournalEntry, SagaId, SagaJournal, SagaState, SagaTerminalState,
 };
+use crate::crypto::wrapping::WrappingKeyPair;
 use crate::economy::adapter::PaymentAdapterDyn;
 use scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt;
 use serde::{Deserialize, Serialize};
@@ -1371,9 +1371,13 @@ pub struct Supervisor {
     /// invisible to that actor's `local_dids` view — breaking the
     /// author-DID-controlled gate on broadcast key requests.
     pub(in crate::context::supervisor) local_dids: Arc<ArcSwap<HashSet<DID>>>,
-    /// Per-identity X25519 wrapping keys. Wrapped in `ArcSwap` so
-    /// rotation is atomic; outer `DashMap` keyed by DID.
-    pub(in crate::context::supervisor) wrapping_keys: DashMap<DID, ArcSwap<WrappingKeyPair>>,
+    /// Per-identity DHKEM(P-256) wrapping keypairs (spec 09 §9.16.1), the only
+    /// owner of each identity's pair. [`Self::ensure_wrapping_key`] fills an
+    /// entry from durable storage (or generates and stores one) before the
+    /// identity's first actor is built. The `Arc<ArcSwap<_>>` lets the
+    /// identity's `KeyPackageStoreActor` hold the same slot and read the
+    /// current pair at every KeyPackage it generates.
+    pub(in crate::context::supervisor) wrapping_keys: DashMap<DID, Arc<ArcSwap<WrappingKeyPair>>>,
     /// Persistence backend; stored so `spawn_actor` / `crash_recovery`
     /// can plumb it through to per-actor state.
     // Operational in Phase 2 of post-review-round-1 plan (actor model wiring).
@@ -2427,10 +2431,6 @@ impl Supervisor {
     /// (lock-free read per ADR-049 §Decision 12). Returns `None` if
     /// [`Self::with_providers`] was not used (e.g. a supervisor built
     /// via `Self::for_query_shim` / `Self::new`).
-    // Non-test callers land when `dispatch_lifecycle_direct` switches to
-    // actor-shape (storage-foundation Step 5); until then this accessor is
-    // reached only from `build_actor_deps`' test fixtures.
-    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub(in crate::context) fn mls_storage_ref(
         &self,
@@ -2478,148 +2478,87 @@ impl Supervisor {
     }
 
     // -------------------------------------------------------------------
-    // ADR-049 §15 — per-identity wrapping-key accessors.
+    // Per-identity wrapping keypair (spec 09 §9.16.1; spec 10 §10.8.1(4)).
     //
-    // The plan §"NodeMlsFactory dissolution" lifts the wrapping
-    // keypair off [`crate::crypto::mls::provider::NodeMlsFactory`]
-    // (where it was held in `Mutex<[u8;32]>` / `Mutex<Zeroizing<...>>`
-    // fields) onto the supervisor's per-identity
-    // `wrapping_keys: DashMap<DID, ArcSwap<WrappingKeyPair>>` map. The
-    // following accessors give helper code on `&Supervisor` (the
-    // ADR-049 §15 hoisted helper paths) a stable read/write surface
-    // without requiring callers to reach for `&self.wrapping_keys`
-    // directly.
-    //
-    // Read accessors return `Arc<Vec<u8>>` / `Arc<Zeroizing<Vec<u8>>>`
-    // newly allocated for each call so the caller owns a fresh
-    // refcounted handle. The map itself stays the source of truth;
-    // the caller is responsible for dropping the returned `Arc`
-    // promptly so a subsequent rotation can zeroize the prior bytes
-    // when the last reference drops.
-    //
-    // The write accessor [`Self::set_wrapping_keys`] acquires
-    // [`Self::write_lock`] before any per-identity mutation per the
-    // struct-level docs ("any mutation of `actors`, `standing_contexts`,
-    // `local_dids`, or `wrapping_keys` acquires `Self::write_lock`
-    // first"). The async lock is fine because the write path is rare
-    // (initial keypair generation + governance-driven rotations).
+    // One pair per identity, shared by every context the identity joins. The
+    // supervisor's `wrapping_keys` map is its only owner; actors read it
+    // through `SupervisorHandle::my_wrapping_keypair`, and the identity's
+    // `KeyPackageStoreActor` holds the same slot. Context snapshots carry no
+    // wrapping key, so restoring a context never changes it.
     // -------------------------------------------------------------------
-
-    /// Returns a freshly-cloned `Arc` to the X25519 wrapping public key
-    /// for `did`, or `None` if no keypair has been registered.
-    ///
-    /// The returned `Arc<Vec<u8>>` carries the public key bytes the
-    /// HPKE seal path uses; the caller MUST drop the `Arc` within the
-    /// same poll (no storage in async-state struct fields) so a
-    /// subsequent [`Self::set_wrapping_keys`] rotation can drop the
-    /// prior bytes promptly.
-    ///
-    /// Visibility is `pub(in crate::context::supervisor)` until Phase 2
-    /// of the post-review-round-1 plan threads `OwnedIdentityDid`
-    /// through `ActorDeps` — handlers call this through
-    /// [`SupervisorHandle::my_wrapping_public_key`](crate::context::supervisor::handle::SupervisorHandle::my_wrapping_public_key)
-    /// which wraps the read with the capability proof. Direct
-    /// `&Supervisor` access elsewhere in `crate::context::*` is
-    /// forbidden so the wrapping-key surface is reachable only from
-    /// supervisor-module code.
-    #[must_use]
-    #[allow(dead_code)] // first caller lands in Phase 2 with the actor wiring + capability thread
-    pub(in crate::context::supervisor) fn wrapping_public_key_for(
-        &self,
-        did: &DID,
-    ) -> Option<Arc<Vec<u8>>> {
-        self.wrapping_keys.get(did).map(|entry| {
-            let pair = entry.value().load_full();
-            Arc::new(pair.public.to_vec())
-        })
-    }
-
-    /// Returns a freshly-cloned `Arc` to the X25519 wrapping secret
-    /// key for `did`, or `None` if no keypair has been registered.
-    ///
-    /// Same reader discipline as [`Self::wrapping_public_key_for`]:
-    /// drop the returned `Arc` within the same poll. The inner
-    /// [`Zeroizing`] wrapper guarantees the bytes are zeroed on drop.
-    ///
-    /// Visibility is `pub(in crate::context::supervisor)` per
-    /// ADR-049 §5 — wrapping-secret
-    /// access must be capability-gated by `&OwnedIdentityDid`. Until
-    /// Phase 2 wires that capability through `ActorDeps`, the
-    /// narrower visibility scopes call sites to supervisor-module code
-    /// so handler code outside `supervisor/` cannot read another
-    /// identity's secret.
-    #[must_use]
-    #[allow(dead_code)] // first caller lands in Phase 2 with the actor wiring + capability thread
-    pub(in crate::context::supervisor) fn wrapping_secret_key_for(
-        &self,
-        did: &DID,
-    ) -> Option<Arc<zeroize::Zeroizing<Vec<u8>>>> {
-        self.wrapping_keys.get(did).map(|entry| {
-            let pair = entry.value().load_full();
-            Arc::new(zeroize::Zeroizing::new(pair.secret.to_vec()))
-        })
-    }
 
     /// Clear every per-identity wrapping keypair. Used by the
     /// shutdown helper so a fresh
     /// [`Self::with_providers`] observes empty per-identity state.
     /// Wrapping-key secrets zeroize on drop via the
     /// `Zeroizing<[u8;32]>` field on
-    /// [`WrappingKeyPair`](crate::context::actor::state::WrappingKeyPair).
-    /// Phase 1 fix-up of ADR-049 (post-review-round-1).
+    /// [`WrappingKeyPair`](crate::crypto::wrapping::WrappingKeyPair).
     pub(crate) fn clear_wrapping_keys(&self) {
         self.wrapping_keys.clear();
     }
 
-    /// Atomically registers (or rotates) the X25519 wrapping keypair
-    /// for `did`. Acquires [`Self::write_lock`] first per the
-    /// supervisor's write-path discipline; the per-identity
-    /// `ArcSwap<WrappingKeyPair>` handles the atomic swap.
+    /// Returns `identity`'s wrapping-key slot, loading it from durable storage
+    /// on first use and, when none is stored, generating a pair and storing it
+    /// once.
     ///
-    /// Idempotent — calling with the same DID a second time replaces
-    /// the prior keypair (the old `Arc<WrappingKeyPair>` zeroizes its
-    /// secret on drop when the last reference releases).
+    /// Lock-free when the slot is already loaded. Otherwise it takes
+    /// [`Self::write_lock`] (the write path of `wrapping_keys`) and re-checks,
+    /// so concurrent first uses load or generate exactly once. The pair is
+    /// stored before it enters the map: a pair this node could lose on restart
+    /// is never published.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::InvalidState`] if `public` or `secret`
-    /// are not exactly 32 bytes (X25519 keypair fixed sizes per
-    /// RFC 7748 §5).
-    pub async fn set_wrapping_keys(
-        self: &Arc<Self>,
-        did: DID,
-        public: Vec<u8>,
-        secret: zeroize::Zeroizing<Vec<u8>>,
-    ) -> Result<(), ContextError> {
-        let _guard = self.write_lock.lock().await;
-        // Convert from runtime-API `Vec<u8>` to the per-identity
-        // [`crate::context::actor::state::WrappingKeyPair`] shape
-        // (fixed 32-byte arrays, secret behind `Zeroizing`). Length
-        // mismatches surface as `InvalidState` so misuse fails loudly
-        // rather than silently truncating key material.
-        let public_arr: [u8; 32] = public.as_slice().try_into().map_err(|_| {
-            ContextError::InvalidState(format!(
-                "Supervisor::set_wrapping_keys — wrapping public key must be 32 bytes (got {})",
-                public.len(),
-            ))
-        })?;
-        let secret_arr: [u8; 32] = secret.as_slice().try_into().map_err(|_| {
-            ContextError::InvalidState(format!(
-                "Supervisor::set_wrapping_keys — wrapping secret key must be 32 bytes (got {})",
-                secret.len(),
-            ))
-        })?;
-        let pair = WrappingKeyPair {
-            public: public_arr,
-            secret: zeroize::Zeroizing::new(secret_arr),
-        };
-        match self.wrapping_keys.get(&did) {
-            Some(entry) => entry.value().store(Arc::new(pair)),
-            None => {
-                self.wrapping_keys.insert(did, ArcSwap::from_pointee(pair));
-            }
+    /// - [`ContextError::NotInitialized`] if the supervisor has no storage.
+    /// - [`ContextError::PersistenceFailed`] if the read or write fails.
+    /// - [`ContextError::CryptoFailed`] if the stored value is not a valid
+    ///   scalar; the stored value is left as it is and no pair is generated
+    ///   over it.
+    pub(crate) async fn ensure_wrapping_key(
+        &self,
+        identity: &DID,
+    ) -> Result<Arc<ArcSwap<WrappingKeyPair>>, ContextError> {
+        if let Some(slot) = self.wrapping_keys.get(identity) {
+            return Ok(Arc::clone(slot.value()));
         }
-        Ok(())
+        let _guard = self.write_lock.lock().await;
+        if let Some(slot) = self.wrapping_keys.get(identity) {
+            return Ok(Arc::clone(slot.value()));
+        }
+        let storage = self.mls_storage_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                crate::context::manager_methods::PROVIDER_NOT_INITIALIZED.to_owned(),
+            )
+        })?;
+        let stored =
+            crate::store::wrapping_key::load_wrapping_key(storage.as_ref(), identity).await?;
+        let pair = if let Some(pair) = stored {
+            pair
+        } else {
+            let pair = WrappingKeyPair::generate();
+            crate::store::wrapping_key::store_wrapping_key(storage.as_ref(), identity, &pair)
+                .await?;
+            pair
+        };
+        let slot = Arc::new(ArcSwap::from_pointee(pair));
+        self.wrapping_keys
+            .insert(identity.clone(), Arc::clone(&slot));
+        Ok(slot)
+    }
+
+    /// Returns `identity`'s current 65-byte wrapping public key, the value it
+    /// publishes as the `0xFF01` leaf extension (spec 09 §9.16.1). Loads or
+    /// generates the pair exactly as [`Self::ensure_wrapping_key`] does.
+    ///
+    /// A bridge that mints a KeyPackage outside the KeyPackage store attaches
+    /// this key, so the leaf it adds advertises the key whose secret this
+    /// supervisor holds.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::ensure_wrapping_key`].
+    pub async fn wrapping_public_key(&self, identity: &DID) -> Result<[u8; 65], ContextError> {
+        Ok(*self.ensure_wrapping_key(identity).await?.load().public())
     }
 
     /// Get-or-spawn this identity's
@@ -2650,6 +2589,12 @@ impl Supervisor {
             return Err(Self::kp_poison_err(identity));
         }
 
+        // Every actor of this identity is built after this call, so loading the
+        // identity's wrapping keypair here gives each of them one (spec 09
+        // §9.16.1). Runs before `write_lock` is taken below: it takes that lock
+        // itself when it has to load.
+        let wrapping_key = self.ensure_wrapping_key(identity).await?;
+
         if let Some(handle) = self.key_package_stores.get(identity) {
             return Ok(handle.value().clone());
         }
@@ -2662,7 +2607,7 @@ impl Supervisor {
         if let Some(handle) = self.key_package_stores.get(identity) {
             return Ok(handle.value().clone());
         }
-        let deps = self.build_kp_store_deps(identity)?;
+        let deps = self.build_kp_store_deps(wrapping_key)?;
         let (handle, join) =
             crate::context::supervisor::key_package_actor::KeyPackageStoreActor::spawn(
                 identity.clone(),
@@ -2733,8 +2678,8 @@ impl Supervisor {
     }
 
     /// Assemble a [`KeyPackageStoreDeps`](crate::context::supervisor::key_package_actor::KeyPackageStoreDeps)
-    /// from the supervisor's own provider slots, scoped to `identity`'s
-    /// wrapping key (if any).
+    /// from the supervisor's own provider slots and the identity's
+    /// wrapping-key slot.
     ///
     /// # Errors
     ///
@@ -2742,7 +2687,7 @@ impl Supervisor {
     /// is empty (i.e. [`Self::with_providers`] was not used).
     fn build_kp_store_deps(
         &self,
-        identity: &DID,
+        wrapping_key: Arc<ArcSwap<WrappingKeyPair>>,
     ) -> Result<crate::context::supervisor::key_package_actor::KeyPackageStoreDeps, ContextError>
     {
         use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
@@ -2753,23 +2698,37 @@ impl Supervisor {
         let transport = Arc::clone(self.transport_ref().ok_or_else(not_init)?);
         let clock = Arc::clone(self.clock_ref().ok_or_else(not_init)?);
         let mls_storage = Arc::clone(self.mls_storage_ref().ok_or_else(not_init)?);
-        // The identity's published wrapping pubkey (§9.16.1) is embedded in each
-        // generated KP leaf node when present. Absent → KPs carry no wrapping
-        // extension, which is valid (the extension is optional).
-        let wrapping_pubkey = self
-            .wrapping_keys
-            .get(identity)
-            .map(|entry| entry.value().load_full().public);
-
         Ok(
             crate::context::supervisor::key_package_actor::KeyPackageStoreDeps {
                 mls,
                 mls_storage,
                 transport,
                 clock,
-                wrapping_pubkey,
+                wrapping_key,
             },
         )
+    }
+
+    /// The identity a context acts as when its bootstrap names none: a
+    /// restore, an import, or a recovery respawn rehydrates a persisted
+    /// snapshot instead of joining. That identity is the DID of this node's
+    /// crypto provider, the credential identity its MLS groups carry. It
+    /// selects the identity's KeyPackage store and its wrapping keypair
+    /// (spec 09 §9.16.1), which the context publishes in its own leaf's
+    /// `0xFF01` and opens sender keys with, so it is never a roster member
+    /// chosen by position or a DID derived from the context id.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::NotInitialized`] if no crypto provider is wired.
+    fn node_identity(&self) -> Result<DID, ContextError> {
+        self.crypto_ref()
+            .map(|crypto| DID(crypto.local_did().to_owned()))
+            .ok_or_else(|| {
+                ContextError::NotInitialized(
+                    crate::context::manager_methods::PROVIDER_NOT_INITIALIZED.to_owned(),
+                )
+            })
     }
 
     /// Build an [`ActorDeps`](crate::context::actor::deps::ActorDeps)
@@ -2777,9 +2736,8 @@ impl Supervisor {
     /// (ADR-049 §1 / ADR-049 §15), scoped to `owning_did`.
     ///
     /// Self-sources every collaborator from the `OnceLock`s populated by
-    /// [`Self::with_providers`]: the `MlsBackend` / `HpkeBackend` pair is
-    /// read transitively through `crypto.mls_backend()` /
-    /// `crypto.hpke_backend()` (the [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory)
+    /// [`Self::with_providers`]: the `MlsBackend` is read transitively
+    /// through `crypto.mls_backend()` (the [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory)
     /// owns the only instance — no second supervisor field, so there is
     /// one source of truth per ADR §6). The OpenMLS storage adapter is
     /// the supervisor's `mls_storage` slot. The `KeyPackageStoreHandle`
@@ -2789,24 +2747,18 @@ impl Supervisor {
     ///
     /// # `owning_did` scope (ADR-049 §10 respawn safety)
     ///
-    /// `owning_did` selects ONLY which per-identity `KeyPackageStore` actor
-    /// this context's deps touch — it does NOT scope the context to that
-    /// identity. Crypto, transport, event-log, key-resolver, payment-adapter,
-    /// and `mls_storage` are the supervisor-wide shared providers (read from
-    /// the `OnceLock` slots), and `local_dids` is the SHARED swap cell
-    /// (`local_dids_shared()`), i.e. the node's FULL set of local DIDs — not a
-    /// snapshot of `owning_did`. This matters for the watchdog respawn path,
-    /// which derives `owning_did = local_dids.min()` (a deterministic, genuine
-    /// participant): because the broadcast author-DID authorization gate is
-    /// keyed off the caller-supplied `author_did` resolved against the SHARED
-    /// `local_dids` (see `publish_broadcast_two_phase`), and the MLS crypto is
-    /// rehydrated from the persisted snapshot (not re-derived from
-    /// `owning_did`), a respawn on a multi-identity node CANNOT mis-scope the
-    /// context to the wrong identity. The only `owning_did`-dependent effect
-    /// is which identity's KeyPackage pool actor is get-or-spawned, which is
-    /// correctness-neutral for a snapshot-rehydrated restore (it does not key
-    /// crypto). See the `respawn_preserves_owning_identity_on_multi_did_node`
-    /// test.
+    /// `owning_did` selects the per-identity `KeyPackageStore` actor and the
+    /// identity's wrapping keypair (spec 09 §9.16.1) that this context's deps
+    /// read, and the capability token the actor carries. Crypto, transport,
+    /// event-log, key-resolver, payment-adapter, and `mls_storage` are the
+    /// supervisor-wide shared providers (read from the `OnceLock` slots), and
+    /// `local_dids` is the SHARED swap cell (`local_dids_shared()`), i.e. the
+    /// node's FULL set of local DIDs — not a snapshot of `owning_did`. Because
+    /// the wrapping keypair is keyed on `owning_did`, a caller passes the
+    /// identity the context acts as: the joining or creating DID, or
+    /// [`Self::node_identity`] for a snapshot-rehydrated bootstrap; a watchdog
+    /// respawn reuses the DID the crashed actor's deps were built for. See the
+    /// `respawn_preserves_owning_identity_on_multi_did_node` test.
     ///
     /// # Errors
     ///
@@ -2847,7 +2799,6 @@ impl Supervisor {
         // mls/hpke stay transitive — the NodeMlsFactory owns the only
         // backend pair (ADR §6); no Supervisor field mirrors them.
         let mls = Arc::clone(crypto.mls_backend());
-        let hpke = Arc::clone(crypto.hpke_backend());
         let transport = Arc::clone(self.transport_ref().ok_or_else(not_init)?);
         let event_log = Arc::clone(self.event_log_ref().ok_or_else(not_init)?);
         let clock = Arc::clone(self.clock_ref().ok_or_else(not_init)?);
@@ -2882,7 +2833,6 @@ impl Supervisor {
             supervisor: handle,
             key_package_store,
             mls,
-            hpke,
             mls_storage,
             clock,
             event_tx: self.event_tx_ref().cloned(),
@@ -3301,26 +3251,17 @@ impl Supervisor {
                     let _ = reply.send(Err(e));
                     return Outcome::err_mutated(sketch);
                 }
-                // ADR-049 Phase 2A finalization: scope the actor-shape
-                // deps to a deterministic member of the imported roster
-                // (the lexicographically-minimum member DID). The import
-                // path never consumes the resolved `KeyPackageStoreHandle`
-                // (it rehydrates a snapshot rather than joining), so the
-                // identity choice only selects which per-identity store
-                // actor is touched; picking the min member DID keeps it
-                // deterministic and a genuine context participant rather
-                // than fabricating one. An empty roster falls back to the
-                // context id so deps construction never panics. The roster
-                // is now trusted: the snapshot signature verified above, so
-                // `owning_did` is an authenticated member, not an
-                // attacker-chosen value.
-                let owning_did = export
-                    .snapshot
-                    .membership
-                    .members()
-                    .map(|m| m.did.clone())
-                    .min()
-                    .unwrap_or_else(|| DID(context_id.clone()));
+                // The import rehydrates a snapshot rather than joining, so the
+                // context acts as this node's identity; the imported roster
+                // never selects the wrapping keypair the actor reads.
+                let owning_did = match self.node_identity() {
+                    Ok(did) => did,
+                    Err(e) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        let _ = reply.send(Err(e));
+                        return Outcome::err_mutated(sketch);
+                    }
+                };
                 // Serialize the whole import replace sequence against every
                 // other same-id bootstrap (import/create/restore): the actor
                 // mailbox only serializes the `PrepareForReplace` turn, but the
@@ -3430,22 +3371,15 @@ impl Supervisor {
                     let _ = reply.send(Err(e));
                     return Outcome::err(sketch);
                 }
-                // ADR-049 Phase 2A finalization: the restore payload
-                // carries no identity (it rehydrates a persisted snapshot
-                // rather than joining), and `restore_context` never
-                // consumes the resolved `KeyPackageStoreHandle`. Scope the
-                // deps to a registered local DID when one exists (the node
-                // performing the restore), falling back to a context-id-
-                // derived seed so deps construction stays deterministic
-                // and never fabricates a foreign participant.
-                let owning_did = self
-                    .local_dids_ref()
-                    .load()
-                    .iter()
-                    .min()
-                    .cloned()
-                    .unwrap_or_else(|| DID(p.context_id.clone()));
-                let deps = match self.build_actor_deps(&owning_did).await {
+                // The restore payload carries no identity (it rehydrates a
+                // persisted snapshot rather than joining), so the context
+                // acts as this node's identity.
+                let deps = match async {
+                    let owning_did = self.node_identity()?;
+                    self.build_actor_deps(&owning_did).await
+                }
+                .await
+                {
                     Ok(deps) => deps,
                     Err(e) => {
                         let sketch = standing_outcome_error_sketch(&e);
@@ -4258,18 +4192,9 @@ impl Supervisor {
                 ));
             }
 
-            // Derive `owning_did` exactly as the watchdog respawn path does: prefer
-            // a registered local DID (the node performing the recovery), falling
-            // back to a context-id-derived seed. Restore/respawn does not key crypto
-            // on this DID (it rehydrates the snapshot's MLS state), so the seed
-            // fallback is sound and never fabricates a foreign participant.
-            let owning_did = self
-                .local_dids_ref()
-                .load()
-                .iter()
-                .min()
-                .cloned()
-                .unwrap_or_else(|| DID(context_id.clone()));
+            // The recovery respawn rehydrates the persisted snapshot, so the
+            // context acts as this node's identity.
+            let owning_did = self.node_identity()?;
 
             // Respawn holds `bootstrap_spawn_lock` internally and is re-entrancy-
             // safe (the caller holds no bootstrap lock). A failed respawn (genuinely
@@ -4502,21 +4427,10 @@ impl Supervisor {
         deps: crate::context::actor::deps::ActorDeps,
         mailbox_capacity: Option<usize>,
     ) -> Result<ContextActorHandle, ContextError> {
-        // Derive the DID this context's deps were scoped to so the watchdog
-        // can rebuild deps if the actor crashes and must be respawned. This
-        // mirrors the `RestoreContext` direct arm: prefer a registered local
-        // DID (the node performing the work), falling back to a context-id-
-        // derived seed so respawn-deps construction stays deterministic and
-        // never fabricates a foreign participant. Restore/respawn do not key
-        // crypto on this DID (they rehydrate the persisted snapshot's MLS
-        // state), so the seed fallback is sound.
-        let owning_did = self
-            .local_dids_ref()
-            .load()
-            .iter()
-            .min()
-            .cloned()
-            .unwrap_or_else(|| DID(state.handle.context_id().to_owned()));
+        // The watchdog rebuilds a crashed actor's deps for the same identity
+        // its deps were built for, so a respawn keeps the context's KeyPackage
+        // store and wrapping keypair.
+        let owning_did = deps.owned_identity.as_did().clone();
         // `Box::pin` keeps the (large, state-carrying) spawn future off the
         // caller's stack frame — `PerContextState` + `ActorDeps` are ~20KB.
         Box::pin(self.spawn_actor_with_watchdog(state, deps, owning_did, mailbox_capacity)).await
@@ -14435,11 +14349,7 @@ impl Supervisor {
                     // #2148 (ADR-049 birth-into-actor) WELCOME seam: the crypto is
                     // OWNED by the seeded actor `state` (born owned at step 2), so read
                     // the export off `state` — identical to what
-                    // `build_snapshot_for_persist` (step 4) will persist. The X25519
-                    // wrapping keypair is node-level and enters as params from the
-                    // RETAINED `deps.crypto.wrapping_keypair()` accessor.
-                    let (welcome_wrapping_public, welcome_wrapping_secret) =
-                        deps.crypto.wrapping_keypair();
+                    // `build_snapshot_for_persist` (step 4) will persist.
                     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the crypto move relocated
                     // `export_crypto_state` onto the actor `state`, so the former
                     // provider `arm_export_failure_once` seam no longer sits on
@@ -14460,8 +14370,6 @@ impl Supervisor {
                                 deps.supervisor.export_sender_key_epochs(&context_id_bytes),
                                 deps.supervisor
                                     .export_recv_sequence_floors(&context_id_bytes),
-                                welcome_wrapping_public,
-                                &*welcome_wrapping_secret,
                             ),
                         )
                     {
@@ -16832,81 +16740,251 @@ mod tests {
         s.reap_stream_admission("never-existed");
     }
 
-    /// ADR-049 §15: per-identity wrapping-key accessors lift
-    /// the keypair off `NodeMlsFactory`. Verifies that `set` →
-    /// `get` returns the same bytes via the supervisor's
-    /// `DashMap<DID, ArcSwap<WrappingKeyPair>>`.
-    #[tokio::test]
-    async fn wrapping_keys_set_and_get_round_trip() {
-        let s = Arc::new(test_supervisor());
-        let did = DID("did:example:wrap-roundtrip".to_owned());
-        let public = vec![0x11u8; 32];
-        let secret = zeroize::Zeroizing::new(vec![0x22u8; 32]);
-
-        // Pre-set the slot is empty for this DID.
-        assert!(s.wrapping_public_key_for(&did).is_none());
-        assert!(s.wrapping_secret_key_for(&did).is_none());
-
-        s.set_wrapping_keys(did.clone(), public.clone(), secret.clone())
-            .await
-            .expect("set_wrapping_keys succeeds for valid 32-byte inputs");
-
-        let got_pub = s.wrapping_public_key_for(&did).expect("public set");
-        assert_eq!(*got_pub, public);
-        let got_sec = s.wrapping_secret_key_for(&did).expect("secret set");
-        assert_eq!(&**got_sec, &*secret);
+    /// A supervisor whose `mls_storage` view is over `storage`, so two
+    /// supervisors built on one store model a node restart.
+    fn supervisor_over_storage(storage: Arc<InMemoryStorage>) -> Arc<Supervisor> {
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+            "did:dht:z6MktestDoNotRely".to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        ));
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(storage),
+            );
+        Supervisor::with_providers(
+            crypto,
+            Box::new(crate::context::builder::NotConfiguredTransportProvider),
+            Box::new(TestEventLog),
+            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
+            None,
+            None,
+            None,
+            None,
+            mls_storage,
+        )
     }
 
-    /// Rotation replaces the prior keypair atomically; subsequent
-    /// reads observe the new bytes.
+    /// The first use of an identity generates one pair and stores it; later
+    /// uses return the same slot; a supervisor restarted over the same store
+    /// loads that pair instead of generating another (spec 09 §9.16.1: one
+    /// wrapping keypair per identity). Another identity gets its own pair.
     #[tokio::test]
-    async fn wrapping_keys_rotation_atomically_replaces() {
-        let s = Arc::new(test_supervisor());
-        let did = DID("did:example:wrap-rotate".to_owned());
+    async fn ensure_wrapping_key_generates_once_and_reloads_after_restart() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let alice = DID("did:example:wrap-alice".to_owned());
+        let bob = DID("did:example:wrap-bob".to_owned());
 
-        s.set_wrapping_keys(
-            did.clone(),
-            vec![0x01u8; 32],
-            zeroize::Zeroizing::new(vec![0x02u8; 32]),
+        let first = supervisor_over_storage(Arc::clone(&storage));
+        let slot = first.ensure_wrapping_key(&alice).await.unwrap();
+        let public = *slot.load().public();
+        let again = first.ensure_wrapping_key(&alice).await.unwrap();
+        assert!(Arc::ptr_eq(&slot, &again), "one slot per identity");
+        let stored = crate::store::wrapping_key::load_wrapping_key(
+            first.mls_storage_ref().unwrap().as_ref(),
+            &alice,
         )
         .await
-        .unwrap();
-        assert_eq!(*s.wrapping_public_key_for(&did).unwrap(), vec![0x01u8; 32]);
+        .unwrap()
+        .expect("the generated pair is stored before use");
+        assert_eq!(*stored.public(), public);
+        let bob_public = *first
+            .ensure_wrapping_key(&bob)
+            .await
+            .unwrap()
+            .load()
+            .public();
+        assert_ne!(bob_public, public, "each identity has its own pair");
+        drop(first);
 
-        s.set_wrapping_keys(
-            did.clone(),
-            vec![0xAAu8; 32],
-            zeroize::Zeroizing::new(vec![0xBBu8; 32]),
-        )
-        .await
-        .unwrap();
-        assert_eq!(*s.wrapping_public_key_for(&did).unwrap(), vec![0xAAu8; 32]);
+        let restarted = supervisor_over_storage(storage);
+        let reloaded = restarted.ensure_wrapping_key(&alice).await.unwrap();
         assert_eq!(
-            &**s.wrapping_secret_key_for(&did).unwrap(),
-            &vec![0xBBu8; 32]
+            *reloaded.load().public(),
+            public,
+            "a restart loads the stored pair, never a fresh one"
         );
     }
 
-    /// Wrong-length inputs surface as `InvalidState` rather than
-    /// silently truncating key material.
+    /// The `0xFF01` key the own leaf publishes in a context's persisted
+    /// crypto snapshot.
+    fn persisted_own_wrapping_key(
+        contexts: &DashMap<String, crate::context::state::ContextSnapshot>,
+        context_id: &str,
+    ) -> Option<[u8; 65]> {
+        let mls_state = contexts
+            .get(context_id)
+            .expect("context persisted")
+            .mls_crypto_state
+            .clone();
+        let (owned, _floors) = crate::crypto::mls::provider::NodeMlsFactory::build_restored_owned(
+            &crate::context::state::context_id_to_bytes(context_id),
+            &mls_state,
+        )
+        .unwrap();
+        scp_mls::wrapping_extension::extract_own_wrapping_key(&owned.mls_group)
+            .unwrap()
+            .map(|key| *key.as_bytes())
+    }
+
+    /// One identity publishes one wrapping key (spec 09 §9.16.1): two
+    /// contexts it creates carry the same `0xFF01`, equal to the key the
+    /// supervisor holds for it; restoring one of them leaves that key and its
+    /// slot as they were and loads no key for any other DID.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn contexts_of_one_identity_share_its_wrapping_key_across_a_restore() {
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_and_persistence(
+            Arc::new(TestClock::new(1_700_000_000)),
+            Box::new(persistence),
+        );
+        let identity = sup.node_identity().unwrap();
+        let ctx_a = hex::encode([0xA1u8; 32]);
+        let ctx_b = hex::encode([0xB2u8; 32]);
+        let mut handle_a = None;
+        for ctx in [&ctx_a, &ctx_b] {
+            let handle = sup
+                .create_context(
+                    ctx.clone(),
+                    scp_protocol::context::ContextParams::default(),
+                    identity.clone(),
+                    None,
+                )
+                .await
+                .unwrap();
+            handle_a.get_or_insert(handle);
+        }
+        let slot = sup.ensure_wrapping_key(&identity).await.unwrap();
+        let owner = *slot.load().public();
+        assert_eq!(persisted_own_wrapping_key(&contexts, &ctx_a), Some(owner));
+        assert_eq!(persisted_own_wrapping_key(&contexts, &ctx_b), Some(owner));
+
+        assert!(sup.despawn_actor(&ctx_a).await);
+        sup.restore_context(&ctx_a, &handle_a.unwrap())
+            .await
+            .unwrap();
+        let after = sup.ensure_wrapping_key(&identity).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&slot, &after),
+            "the restore keeps the owner's slot"
+        );
+        assert_eq!(
+            *after.load().public(),
+            owner,
+            "the restore keeps the owner's key"
+        );
+        assert_eq!(
+            sup.wrapping_keys.len(),
+            1,
+            "no key is loaded for another DID"
+        );
+        assert_eq!(persisted_own_wrapping_key(&contexts, &ctx_a), Some(owner));
+    }
+
+    /// The `0xFF01` wrapping key a KeyPackage's leaf publishes.
+    fn key_package_wrapping_key(kp_bytes: &[u8]) -> Option<[u8; 65]> {
+        use openmls::prelude::{OpenMlsProvider as _, ProtocolVersion};
+        let provider = scp_mls::InMemoryMlsProvider::default();
+        let verified = scp_mls::wire::parse_key_package_in(kp_bytes)
+            .unwrap()
+            .validate(provider.crypto(), ProtocolVersion::Mls10)
+            .unwrap();
+        scp_mls::wrapping_extension::extract_wrapping_key(verified.leaf_node().extensions())
+            .unwrap()
+            .map(|key| *key.as_bytes())
+    }
+
+    /// A KeyPackage the production store actor mints publishes, in `0xFF01`,
+    /// the wrapping public key of the identity that owns the store.
     #[tokio::test]
-    async fn wrapping_keys_rejects_wrong_byte_length() {
-        let s = Arc::new(test_supervisor());
-        let did = DID("did:example:wrap-bad-len".to_owned());
-        let err = s
-            .set_wrapping_keys(
-                did.clone(),
-                vec![0u8; 16],
-                zeroize::Zeroizing::new(vec![0u8; 32]),
-            )
+    async fn production_key_package_carries_the_owner_wrapping_key() {
+        let sup = supervisor_with_providers();
+        let did = DID("did:dht:z6MkKpWrapOwner".to_owned());
+        let (_reservation, kp_bytes) = sup.reserve_key_package(did.clone()).await.unwrap();
+        let owner = *sup.ensure_wrapping_key(&did).await.unwrap().load().public();
+        assert_eq!(key_package_wrapping_key(&kp_bytes), Some(owner));
+    }
+
+    /// The store reads the owner's key when it mints each KeyPackage: after
+    /// the owner's slot is swapped, KeyPackages minted from then on carry the
+    /// new key. The pool held `MIN_BUFFER` KeyPackages minted before the swap;
+    /// each reservation is cancelled, which discards its KeyPackage, so
+    /// reserving twice that many reaches ones minted after the swap.
+    #[tokio::test]
+    async fn key_packages_minted_after_a_rotation_carry_the_new_key() {
+        use crate::context::supervisor::key_package_actor::{KeyPackageCommand, MIN_BUFFER};
+        let sup = supervisor_with_providers();
+        let did = DID("did:dht:z6MkKpWrapRotate".to_owned());
+        let store = sup.key_package_store_for(&did).await.unwrap();
+        let slot = sup.ensure_wrapping_key(&did).await.unwrap();
+        let old = *slot.load().public();
+        let cancel = |reservation_id| {
+            let store = store.clone();
+            async move {
+                store
+                    .send(|reply| KeyPackageCommand::CancelReservation {
+                        reservation_id,
+                        reply,
+                    })
+                    .await
+                    .unwrap();
+            }
+        };
+        let (r, first) = sup.reserve_key_package(did.clone()).await.unwrap();
+        assert_eq!(key_package_wrapping_key(&first), Some(old));
+        cancel(r).await;
+
+        let rotated = WrappingKeyPair::generate();
+        let new = *rotated.public();
+        slot.store(Arc::new(rotated));
+        let mut seen_new = false;
+        for _ in 0..2 * MIN_BUFFER {
+            let (r, kp) = sup.reserve_key_package(did.clone()).await.unwrap();
+            let key = key_package_wrapping_key(&kp).expect("every KeyPackage carries 0xFF01");
+            assert!(
+                key == old || key == new,
+                "only the owner's keys are published"
+            );
+            seen_new |= key == new;
+            cancel(r).await;
+        }
+        assert!(
+            seen_new,
+            "a KeyPackage minted after the swap carries the new key"
+        );
+    }
+
+    /// A stored value that is not a valid scalar fails closed with
+    /// `CryptoFailed`: no pair is generated over it, the stored bytes stay, and
+    /// the identity has no loaded pair afterwards.
+    #[tokio::test]
+    async fn ensure_wrapping_key_fails_closed_on_a_corrupt_stored_key() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let sup = supervisor_over_storage(Arc::clone(&storage));
+        let did = DID("did:example:wrap-corrupt".to_owned());
+        let bytes = scp_platform::store_value::to_stored_value_bytes(
+            &crate::store::wrapping_key::StoredWrappingSecretKey { key: vec![0u8; 32] },
+        )
+        .unwrap();
+        let adapter = sup.mls_storage_ref().unwrap();
+        adapter
+            .store("wrapping_key/did:example:wrap-corrupt", &bytes)
             .await
-            .expect_err("16-byte public must reject");
-        assert!(matches!(err, ContextError::InvalidState(_)));
-        let err = s
-            .set_wrapping_keys(did, vec![0u8; 32], zeroize::Zeroizing::new(vec![0u8; 16]))
-            .await
-            .expect_err("16-byte secret must reject");
-        assert!(matches!(err, ContextError::InvalidState(_)));
+            .unwrap();
+
+        let err = sup.ensure_wrapping_key(&did).await.unwrap_err();
+        assert!(matches!(err, ContextError::CryptoFailed(_)), "{err:?}");
+        assert!(sup.wrapping_keys.get(&did).is_none());
+        assert_eq!(
+            adapter
+                .retrieve("wrapping_key/did:example:wrap-corrupt")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(bytes.as_slice()),
+            "the stored value is not overwritten"
+        );
     }
 
     #[tokio::test]
@@ -17170,20 +17248,6 @@ mod tests {
         )
     }
 
-    /// Export a provider-resident context through the relocated actor
-    /// [`PerContextState::export_crypto_state`](crate::context::actor::state::PerContextState::export_crypto_state)
-    /// seam — the provider `export_crypto_state` twin is deleted post-ADR-049
-    /// PR-7. Sources the node-resident wrapping keypair from the provider exactly
-    /// as the production actor-export caller does. DESTRUCTIVE: the one-way
-    /// `take_crypto_state` empties the source provider for `ctx`, so capture
-    /// anything else you need off it first.
-    /// Destructively move a provider-resident context onto a throwaway actor
-    /// [`PerContextState`](crate::context::actor::state::PerContextState) via the
-    /// retained `take_crypto_state` + the production
-    /// `seed_encrypted_crypto_from_owned` seed primitive. Post-ADR-049 PR-7 the
-    /// steady-state crypto twins (`seal` / `rotate_sender_key` / `drain_pending_
-    /// sender_key_messages` / …) live on the actor, so tests that drive them move
-    /// the party onto the actor first. One-way: the provider loses the context.
     /// A minimal valid `0xFF02` extension bound to `ctx` for test births. The
     /// export/restore tests below only exercise the crypto MATERIAL + floors, not
     /// the §5.13.3 binding, so any well-formed extension suffices.
@@ -17211,7 +17275,10 @@ mod tests {
         ext: &scp_protocol::context::ScpContextExtension,
     ) -> crate::context::actor::state::PerContextState {
         let owned = crypto
-            .create_mls_group_with_context(ext)
+            .create_mls_group_with_context(
+                ext,
+                crate::crypto::wrapping::WrappingKeyPair::generate().public(),
+            )
             .expect("birth owned crypto material");
         let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             *ctx,
@@ -17222,6 +17289,8 @@ mod tests {
         state
     }
 
+    /// Births a context on a throwaway actor and exports it through
+    /// [`PerContextState::export_crypto_state`](crate::context::actor::state::PerContextState::export_crypto_state).
     fn actor_export(
         crypto: &Arc<crate::crypto::mls::provider::NodeMlsFactory>,
         ctx: &[u8; 32],
@@ -17229,9 +17298,8 @@ mod tests {
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, scp_protocol::context::builder::ReceiveFloor)>,
     ) -> Result<Vec<u8>, ContextError> {
-        let (wpub, wsec) = crypto.wrapping_keypair_snapshot();
         let state = take_into_actor(crypto, ctx, ext);
-        state.export_crypto_state(sender_key_epochs, recv_sequence_floors, wpub, &*wsec)
+        state.export_crypto_state(sender_key_epochs, recv_sequence_floors)
     }
 
     /// Build a `Supervisor` around an EXISTING crypto provider `Arc` — used by the
@@ -17330,7 +17398,10 @@ mod tests {
         )
         .expect("valid credential");
         let generated = backend
-            .generate_key_package(&joiner, None)
+            .generate_key_package(
+                &joiner,
+                &scp_crypto::p256::testing::uncompressed_point_for(&joiner.did),
+            )
             .await
             .expect("generate kp");
 
@@ -17342,7 +17413,10 @@ mod tests {
         )
         .expect("valid inviter credential");
         let mut group = backend
-            .create_group(&inviter, None)
+            .create_group(
+                &inviter,
+                &scp_crypto::p256::testing::uncompressed_point_for(&inviter.did),
+            )
             .await
             .expect("create group");
         let added = backend
@@ -20113,9 +20187,8 @@ mod tests {
     }
 
     /// Build a VALIDLY-signed full-scope export for `context_id` whose
-    /// roster contains exactly `owning_member` (so the import arm's
-    /// lex-min-member derivation resolves `owning_did == owning_member`).
-    /// Signed by `signing_key`; verifies under its public half.
+    /// roster contains exactly `owning_member`. Signed by `signing_key`;
+    /// verifies under its public half.
     async fn signed_import_export_with_member(
         context_id: &str,
         creator: &str,
@@ -20124,9 +20197,8 @@ mod tests {
     ) -> crate::context::export_import::ContextExport {
         use ed25519_dalek::Signer;
         let mut snapshot = import_test_snapshot(context_id, creator);
-        // The roster is the only input to `owning_did` selection. A
-        // single member makes it the deterministic lex-min, and a fresh
-        // DID guarantees it is NOT already in `key_package_stores`.
+        // A fresh DID guarantees the member is NOT already in
+        // `key_package_stores`.
         snapshot
             .membership
             .add_member(DID(owning_member.to_owned()), "member".to_owned(), vec![]);
@@ -20160,10 +20232,11 @@ mod tests {
         let context_id = spawn_live_context(&supervisor, ctx_id_bytes).await;
 
         let creator = "did:key:evict-test-creator";
-        // Fresh owning-member DID: not pre-seeded, so the import arm
-        // newly spawns its key-package store, then evicts it on the
-        // live-context rejection.
+        // The import acts as the node identity, whose store is not
+        // pre-seeded, so the import arm newly spawns it, then evicts it on
+        // the live-context rejection. The roster member selects nothing.
         let owning_member = "did:key:aaa-evict-owning-member";
+        let node_did = supervisor.node_identity().unwrap();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let verifying_key = signing_key.verifying_key();
 
@@ -20171,15 +20244,13 @@ mod tests {
             signed_import_export_with_member(&context_id, creator, owning_member, &signing_key)
                 .await;
 
-        // Baseline: `spawn_live_context` builds deps for an admin DID,
-        // so the map already holds that store. The owning member's store
-        // must NOT yet exist — the import is what spawns it.
+        // Baseline: `spawn_live_context` builds deps for a test DID, so
+        // the map already holds that store. The node identity's store must
+        // NOT yet exist — the import is what spawns it.
         let baseline = supervisor.key_package_stores.len();
         assert!(
-            !supervisor
-                .key_package_stores
-                .contains_key(&DID(owning_member.to_owned())),
-            "owning member's key-package store must not exist before the import"
+            !supervisor.key_package_stores.contains_key(&node_did),
+            "the node identity's key-package store must not exist before the import"
         );
 
         let result = supervisor
@@ -20192,13 +20263,18 @@ mod tests {
             matches!(result, Err(ContextError::MembershipFailed(_))),
             "import over a live context must be rejected, got {result:?}"
         );
-        // The store this import spawned for `owning_member` must have
-        // been evicted on the failure path (no orphan).
+        // The store this import spawned for the node identity must have
+        // been evicted on the failure path (no orphan), and none was ever
+        // spawned for the roster member.
+        assert!(
+            !supervisor.key_package_stores.contains_key(&node_did),
+            "the newly-spawned key-package store must be evicted on a rejected import"
+        );
         assert!(
             !supervisor
                 .key_package_stores
                 .contains_key(&DID(owning_member.to_owned())),
-            "the newly-spawned key-package store must be evicted on a rejected import"
+            "a roster member never selects the import's identity"
         );
         // No net change to the store map: the only store the import
         // touched was the one it spawned, and that was evicted.
@@ -20223,9 +20299,9 @@ mod tests {
 
         let creator = "did:key:preserve-test-creator";
         let owning_member = "did:key:aaa-preserve-owning-member";
-        let owning_did = DID(owning_member.to_owned());
+        let owning_did = supervisor.node_identity().unwrap();
 
-        // Pre-seed the owning member's key-package store, simulating a
+        // Pre-seed the node identity's key-package store, simulating a
         // store already in use by another context/import. The rejected
         // import below must NOT evict it.
         let preexisting = supervisor
@@ -20822,10 +20898,6 @@ mod tests {
         assert!(
             Arc::ptr_eq(&deps.mls, crypto.mls_backend()),
             "mls must be the crypto provider's single MlsBackend"
-        );
-        assert!(
-            Arc::ptr_eq(&deps.hpke, crypto.hpke_backend()),
-            "hpke must be the crypto provider's single HpkeBackend"
         );
         assert!(
             Arc::ptr_eq(&deps.mls_storage, &mls_storage),
@@ -22415,7 +22487,7 @@ mod tests {
     /// `local_floors.is_empty()` short-circuit would have broken — it skips the
     /// merge on an empty live registry, silently losing the blob floors) and that
     /// a replay AT or BELOW the restored recv floor is REJECTED by the same gate
-    /// primitive the `decrypt_and_dispatch` recv seam calls fail-closed
+    /// primitive the `deliver_incoming` recv seam calls fail-closed
     /// (`check_and_advance_recv_sequence`; the seam→gate wiring is enforced
     /// structurally in `pipeline_wiring.rs`).
     #[cfg(feature = "testing")]
@@ -22777,20 +22849,51 @@ mod tests {
         assert_eq!(importer.export_recv_sequence_floors(&ctx), recv_before);
     }
 
+    /// Seals a `Content` inner envelope that Alice (`sender`, signing with
+    /// `alice_signing_key`) sends at `epoch`, through her actor state as the
+    /// send path does.
+    #[cfg(feature = "testing")]
+    fn alice_seals_content(
+        state: &mut crate::context::actor::PerContextState,
+        ctx_str: &str,
+        sender: &str,
+        epoch: u64,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let params = crate::envelope::inner::InnerEnvelopeParams {
+            version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
+            context_id: ctx_str,
+            sender_did: sender,
+            epoch,
+            generation: 0,
+            sequence: 0,
+            timestamp: 1_700_000_000,
+            message_type: crate::envelope::inner::MessageType::Content,
+            payload,
+            provenance: None,
+            signing_key_id: scp_did::SigningKeyId::Active,
+        };
+        let inner = crate::envelope::inner::sign::create_inner_envelope_raw(
+            &params,
+            &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+        )
+        .expect("the sender signs its inner envelope");
+        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
+        state
+            .seal(sender, &inner, &routing_id, 3600)
+            .expect("the sender seals the application message")
+    }
+
     /// ADR-049 §9(1) FAIL-CLOSED-BLOCKS (e2e). Alice seals two REAL application
-    /// envelopes through the joined MLS group; Bob drives the production
-    /// `decrypt_and_dispatch` seam. Proves, POST-`open()`-H9-deletion, that (a)
-    /// the surfaced `env.receive_floor` is correct and the recv seam CONSUMES it
-    /// into the authoritative registry, and (b) an out-of-order / replayed older
-    /// floor is REJECTED fail-closed at that seam with NO `OpenedEnvelope`
-    /// surfacing.
+    /// envelopes through the joined MLS group; Bob opens them with the
+    /// production `decrypt_and_dispatch` seam and feeds each surfaced
+    /// `receive_floor` to the Supervisor recv-floor gate, as `deliver_incoming`
+    /// does after verification. Proves that (a) the surfaced floor is correct and
+    /// the gate consumes it into the authoritative registry, and (b) an
+    /// out-of-order or replayed older floor is rejected fail-closed.
     #[cfg(feature = "testing")]
     #[test]
-    fn decrypt_and_dispatch_fail_closed_blocks_reorder_and_replay_e2e() {
-        use crate::envelope::inner::sign::create_inner_envelope_raw;
-        use crate::envelope::inner::{InnerEnvelopeParams, MessageType};
-        use scp_did::SigningKeyId;
-
+    fn recv_floor_gate_blocks_reorder_and_replay_e2e() {
         const ALICE: &str = "did:dht:z6MkAliceE2eSenderAliceE2eSenderAlice1";
         const BOB: &str = "did:dht:z6MkBobE2eReceiverBobE2eReceiverBob123";
         let ctx_str = "e2e-decrypt-and-dispatch-fail-closed";
@@ -22819,57 +22922,55 @@ mod tests {
             .block_on(bob_sup.build_actor_deps(&DID::from(BOB)))
             .expect("build bob's actor deps");
 
-        // Alice seals an Application envelope; the sender-layer header carries her
-        // current (epoch, send_sequence). First seal → sequence 0, second → 1.
-        let mut seal_app = |payload: &[u8]| -> Vec<u8> {
-            let params = InnerEnvelopeParams {
-                version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
-                context_id: ctx_str,
-                sender_did: ALICE,
-                epoch: 1,
-                generation: 0,
-                sequence: 0,
-                timestamp: 1_700_000_000,
-                message_type: MessageType::Content,
-                payload,
-                provenance: None,
-                signing_key_id: SigningKeyId::Active,
-            };
-            let inner = create_inner_envelope_raw(
-                &params,
-                &crate::crypto::mls::two_party_test_support::alice_signing_key(),
-            )
-            .expect("alice signs her inner application envelope");
-            let routing_id = scp_protocol::context::context_routing_id(ctx_str);
-            alice_actor
-                .seal(ALICE, &inner, &routing_id, 3600)
-                .expect("alice seals the application message")
-        };
-
-        let msg_a = seal_app(b"first-application-message"); // header sequence 0
-        let msg_b = seal_app(b"second-application-message"); // header sequence 1
+        let msg_a = alice_seals_content(
+            &mut alice_actor,
+            ctx_str,
+            ALICE,
+            1,
+            b"first-application-message",
+        ); // header sequence 0
+        let msg_b = alice_seals_content(
+            &mut alice_actor,
+            ctx_str,
+            ALICE,
+            1,
+            b"second-application-message",
+        ); // header sequence 1
 
         // Hand `decrypt_and_dispatch` Bob's actor-owned crypto state: the receive
         // seam opens through the actor's `&mut ContextCryptoState`.
-        let bob_cs = match &mut bob_actor.mode {
-            crate::context::actor::ContextModeState::Encrypted(c) => c,
-            crate::context::actor::ContextModeState::Broadcast(_) => {
-                panic!("expected encrypted mode")
-            }
+        let crate::context::actor::ContextModeState::Encrypted(bob_cs) = &mut bob_actor.mode else {
+            panic!("expected encrypted mode")
+        };
+        let mut open = |msg: &[u8]| {
+            crate::context::messaging_helpers::decrypt_and_dispatch(
+                &bob_deps,
+                Some(&mut *bob_cs),
+                ctx_str,
+                &ctx_bytes,
+                msg,
+            )
+        };
+
+        // The gate `deliver_incoming` runs once the inner envelope verifies.
+        let gate = |floor| {
+            bob_sup
+                .check_and_advance_recv_sequence(
+                    &ctx_bytes,
+                    ALICE,
+                    floor,
+                    scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+                )
+                .map_err(ContextError::from)
         };
 
         // Deliver the LATER message (b, sequence 1) FIRST. Accepted; the registry
         // recv floor advances to exactly the surfaced receive_floor.
-        let opened_b = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &msg_b,
-        )
-        .expect("first (in-order) delivery must succeed")
-        .expect("an Application envelope must surface");
+        let opened_b = open(&msg_b)
+            .expect("first (in-order) delivery must succeed")
+            .expect("an Application envelope must surface");
         let floor_b = opened_b.receive_floor;
+        gate(floor_b).expect("the first floor is accepted");
         assert_eq!(
             bob_sup.export_recv_sequence_floors(&ctx_bytes),
             vec![(ALICE.to_owned(), floor_b)],
@@ -22878,14 +22979,11 @@ mod tests {
 
         // Now deliver the EARLIER message (a, sequence 0) — a DISTINCT, never-seen
         // MLS ciphertext (so MLS decrypts it), but an older floor. The authoritative
-        // registry recv gate MUST reject it fail-closed, and NO envelope surfaces.
-        let reorder = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &msg_a,
-        );
+        // registry recv gate MUST reject it fail-closed.
+        let opened_a = open(&msg_a)
+            .expect("MLS decrypts the distinct older ciphertext")
+            .expect("an Application envelope must surface");
+        let reorder = gate(opened_a.receive_floor);
         // Pin the REASON: the rejection must be the registry recv-floor gate
         // (`FloorAdvanceError::RecvSequenceNotMonotonic`, whose Display is
         // "recv-sequence floor … is non-monotonic …"), NOT an MLS-decrypt failure
@@ -22906,17 +23004,16 @@ mod tests {
             "a rejected reorder must not move the registry floor"
         );
 
-        // A replay of the accepted message b is also rejected (no envelope).
-        let replay = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &msg_b,
-        );
+        // A replay of the accepted message b is also rejected: MLS refuses the
+        // reused ciphertext, and its floor would not pass the gate either.
+        let replay = open(&msg_b);
         assert!(
             replay.is_err(),
             "a replay of an already-accepted message must be rejected, got {replay:?}"
+        );
+        assert!(
+            gate(floor_b).is_err(),
+            "the accepted floor must not be accepted twice"
         );
     }
 
@@ -22927,10 +23024,7 @@ mod tests {
     /// from the same registry (no stale-floor over-rejection).
     #[cfg(feature = "testing")]
     #[test]
-    fn decrypt_and_dispatch_catch_up_after_epoch_rotation_e2e() {
-        use crate::envelope::inner::sign::create_inner_envelope_raw;
-        use crate::envelope::inner::{InnerEnvelopeParams, MessageType};
-        use scp_did::SigningKeyId;
+    fn recv_floor_gate_catch_up_after_epoch_rotation_e2e() {
         use scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE;
 
         const ALICE: &str = "did:dht:z6MkAliceCatchUpAliceCatchUpAliceCat1";
@@ -22940,6 +23034,7 @@ mod tests {
         let crate::crypto::mls::two_party_test_support::TwoPartyPair {
             alice_state: mut alice_actor,
             bob_provider: bob_crypto,
+            bob_wrapping,
             bob_state: mut bob_actor,
             ctx_bytes,
             ..
@@ -22948,7 +23043,7 @@ mod tests {
         // Alice rotates her sender key (epoch 1 → 2) on her owned actor state and
         // redistributes it to Bob, who installs it on HIS owned actor state via
         // the actor-native receive-side seams — exactly what the live flow does.
-        let bob_secret: [u8; 32] = *bob_crypto.wrapping_keypair_snapshot().1;
+        let bob_secret: [u8; 32] = **bob_wrapping.secret();
         alice_actor.rotate_sender_key(ALICE).unwrap();
         alice_actor.distribute_sender_key(ALICE, ALICE).ok();
         for (_t, msg) in alice_actor.drain_pending_sender_key_messages().unwrap() {
@@ -22976,28 +23071,13 @@ mod tests {
         // Alice seals at the NEW epoch (2); Bob's recv at epoch 2 is ACCEPTED (the
         // recv ceiling reads the just-advanced sender_epochs[alice]=2, not a stale
         // lower floor).
-        let params = InnerEnvelopeParams {
-            version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
-            context_id: ctx_str,
-            sender_did: ALICE,
-            epoch: 2,
-            generation: 0,
-            sequence: 0,
-            timestamp: 1_700_000_000,
-            message_type: MessageType::Content,
-            payload: b"post-rotation-application-message",
-            provenance: None,
-            signing_key_id: SigningKeyId::Active,
-        };
-        let inner = create_inner_envelope_raw(
-            &params,
-            &crate::crypto::mls::two_party_test_support::alice_signing_key(),
-        )
-        .expect("alice signs her inner envelope");
-        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
-        let sealed = alice_actor
-            .seal(ALICE, &inner, &routing_id, 3600)
-            .expect("alice seals at the rotated epoch");
+        let sealed = alice_seals_content(
+            &mut alice_actor,
+            ctx_str,
+            ALICE,
+            2,
+            b"post-rotation-application-message",
+        );
 
         // Hand Bob's actor-owned crypto state (carrying the rotated key installed
         // above) to the receive seam; it opens through the actor's
@@ -23015,18 +23095,494 @@ mod tests {
             &ctx_bytes,
             &sealed,
         )
-        .expect("a recv at the just-advanced epoch must be ACCEPTED (no stale over-reject)")
+        .expect("a recv at the just-advanced epoch must open")
         .expect("an Application envelope must surface");
         assert_eq!(
             opened.receive_floor.epoch, 2,
             "the surfaced recv floor must be at the rotated epoch 2"
         );
+        bob_sup
+            .check_and_advance_recv_sequence(
+                &ctx_bytes,
+                ALICE,
+                opened.receive_floor,
+                MAX_EPOCH_ADVANCE,
+            )
+            .expect("a recv at the just-advanced epoch must be ACCEPTED (no stale over-reject)");
         assert!(
             bob_sup
                 .export_recv_sequence_floors(&ctx_bytes)
                 .iter()
                 .any(|(d, f)| d == ALICE && f.epoch == 2),
             "the registry recv floor must track the epoch-2 receive"
+        );
+    }
+
+    /// Bob's receive side for the `deliver_incoming` tests: his actor-owned
+    /// state (active, holding Bob and Alice as members and Bob's access key) in
+    /// a cell, his production `ActorDeps` over `resolver`, Alice's actor state
+    /// for sealing, and Bob's access key.
+    #[cfg(feature = "testing")]
+    struct DeliverFixture {
+        rt: tokio::runtime::Runtime,
+        bob_cell: crate::context::actor::class_s::ClassSCell,
+        bob_deps: crate::context::actor::deps::ActorDeps,
+        bob_sup: Arc<Supervisor>,
+        alice_state: crate::context::actor::state::PerContextState,
+        bob_access_key: scp_protocol::crypto::access_keys::AccessKey,
+        ctx_bytes: [u8; 32],
+    }
+
+    #[cfg(feature = "testing")]
+    impl DeliverFixture {
+        const ALICE: &'static str = "did:dht:z6MkAliceDeliverAliceDeliverAliceDeli1";
+        const BOB: &'static str = "did:dht:z6MkBobDeliverBobDeliverBobDeliverBo1";
+
+        fn new(ctx_str: &str, resolver: KeyResolver) -> Self {
+            use scp_protocol::context::ContextState;
+
+            let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+                alice_state,
+                bob_provider,
+                mut bob_state,
+                ctx_bytes,
+                ..
+            } = crate::crypto::mls::two_party_test_support::stand_up_two_party(
+                ctx_str,
+                Self::ALICE,
+                Self::BOB,
+            );
+            let bob_sup = supervisor_with_crypto_and_resolver(bob_provider, resolver);
+            let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, drives Bob's actor dispatch from a sync #[test]; not a production async bridge
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(bob_sup.register_local_did(DID::from(Self::BOB)))
+                .expect("register bob as a local DID");
+            let bob_deps = rt
+                .block_on(bob_sup.build_actor_deps(&DID::from(Self::BOB)))
+                .expect("build bob's actor deps");
+
+            bob_state
+                .handle
+                .transition_to(&ContextState::Active)
+                .expect("transition bob's context to Active");
+            for did in [Self::ALICE, Self::BOB] {
+                bob_state
+                    .membership
+                    .add_member(DID::from(did), "member".to_owned(), Vec::new());
+                bob_state.members.insert(DID::from(did));
+                // The receive path delivers only a sender holding
+                // `messages:write`, so each member gets it.
+                bob_state.role_state.members.insert(did.to_owned());
+                bob_state.role_state.member_capabilities.insert(
+                    did.to_owned(),
+                    std::collections::HashSet::from([
+                        scp_protocol::context::roles::Capability::MessagesWrite,
+                    ]),
+                );
+            }
+            let bob_access_key =
+                scp_protocol::crypto::access_keys::generate_access_key(ctx_str, Self::BOB);
+            bob_state
+                .access
+                .access_key_store
+                .set(ctx_str, Self::BOB, bob_access_key.clone());
+
+            Self {
+                rt,
+                bob_cell: crate::context::actor::class_s::ClassSCell::new(bob_state),
+                bob_deps,
+                bob_sup,
+                alice_state,
+                bob_access_key,
+                ctx_bytes,
+            }
+        }
+
+        /// Seals `payload` through Alice's production app-data seal at sender
+        /// sequence `aad_sequence`, naming `claimed_sender` as the inner sender
+        /// and signing with `signing_key`. Sequences start at 1; the receive
+        /// path rejects sequence 0.
+        fn seal_from_alice(
+            &mut self,
+            ctx_str: &str,
+            claimed_sender: &str,
+            signing_key: &ed25519_dalek::SigningKey,
+            aad_sequence: u64,
+            payload: &[u8],
+        ) -> Vec<u8> {
+            let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::SystemClock);
+            let recipients = std::collections::HashMap::from([(
+                Self::BOB.to_owned(),
+                self.bob_access_key.clone(),
+            )]);
+            crate::context::messaging_helpers::build_encrypted_envelope_actor(
+                &clock,
+                self.alice_state
+                    .mode
+                    .crypto_mut()
+                    .expect("encrypted context"),
+                Self::ALICE,
+                ctx_str,
+                &DID::from(claimed_sender),
+                payload,
+                crate::context::supervisor::MessageSigner::Active(signing_key),
+                &recipients,
+                aad_sequence,
+                None,
+                scp_protocol::envelope::inner::MessageType::Content,
+            )
+            .expect("alice seals the application message")
+        }
+
+        /// Alice's correctly signed inner envelope for `payload` at sender
+        /// sequence `aad_sequence`, before sealing.
+        fn alice_inner(
+            &self,
+            ctx_str: &str,
+            aad_sequence: u64,
+            payload: &[u8],
+        ) -> (crate::envelope::inner::InnerEnvelope, [u8; 32]) {
+            let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::SystemClock);
+            let recipients = std::collections::HashMap::from([(
+                Self::BOB.to_owned(),
+                self.bob_access_key.clone(),
+            )]);
+            crate::context::messaging_helpers::build_inner_wire(
+                &clock,
+                ctx_str,
+                &DID::from(Self::ALICE),
+                payload,
+                crate::context::supervisor::MessageSigner::Active(
+                    &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+                ),
+                &recipients,
+                aad_sequence,
+                None,
+                scp_protocol::envelope::inner::MessageType::Content,
+            )
+            .expect("alice builds the inner envelope")
+        }
+
+        /// Seals `inner` through Alice's production sender-key and MLS seal at
+        /// sender sequence `aad_sequence`.
+        fn seal_inner_from_alice(
+            &mut self,
+            context_id_bytes: &[u8; 32],
+            inner: &crate::envelope::inner::InnerEnvelope,
+            aad_sequence: u64,
+        ) -> Vec<u8> {
+            self.alice_state
+                .mode
+                .crypto_mut()
+                .expect("encrypted context")
+                .seal(
+                    context_id_bytes,
+                    Self::ALICE,
+                    inner,
+                    &[0u8; 32],
+                    3600,
+                    aad_sequence,
+                )
+                .expect("alice seals the application message")
+        }
+
+        /// Asserts `result` is the receive path's content-integrity rejection
+        /// and that Bob's recv floor did not move.
+        fn assert_integrity_rejection(
+            &self,
+            result: &Result<crate::context::messaging_helpers::DeliverOutcome, ContextError>,
+        ) {
+            assert!(
+                matches!(result, Err(ContextError::CryptoFailed(m)) if m == "content integrity check failed"),
+                "the content-integrity check must reject the envelope, got {result:?}"
+            );
+            assert!(
+                self.bob_sup
+                    .export_recv_sequence_floors(&self.ctx_bytes)
+                    .is_empty(),
+                "a rejected envelope must not move the recv floor"
+            );
+        }
+
+        /// Delivers `blob` to Bob through the production actor receive path
+        /// (`MessagingCommand::DeliverIncoming` → `deliver_incoming`).
+        fn deliver(
+            &mut self,
+            ctx_str: &str,
+            blob: Vec<u8>,
+        ) -> Result<crate::context::messaging_helpers::DeliverOutcome, ContextError> {
+            use crate::context::actor::commands::MessagingCommand;
+            self.rt.block_on(async {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _outcome = crate::context::actor::handlers::messaging::dispatch(
+                    &mut self.bob_cell,
+                    &self.bob_deps,
+                    MessagingCommand::DeliverIncoming {
+                        context_id: ctx_str.to_owned(),
+                        envelope_bytes: blob,
+                        reply: tx,
+                    },
+                )
+                .await;
+                rx.await.expect("deliver reply")
+            })
+        }
+    }
+
+    /// §9.8.1 on the production receive path: Alice, an authenticated MLS
+    /// member, sends an inner envelope whose `sender_did` names Carol. The
+    /// receive path rejects it with `SenderMismatch` naming only the MLS sender,
+    /// and it rejects it before resolving any key.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn deliver_incoming_rejects_inner_sender_other_than_mls_sender() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CAROL: &str = "did:dht:z6MkCarolDeliverCarolDeliverCarolDelive1";
+        let ctx_str = "deliver-incoming-sender-binding";
+
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&lookups);
+        let inner_resolver = crate::crypto::mls::two_party_test_support::pair_resolver(
+            DeliverFixture::ALICE,
+            DeliverFixture::BOB,
+        );
+        let resolver: KeyResolver = Arc::new(move |did: &DID, kid| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            inner_resolver(did, kid)
+        });
+        let mut fx = DeliverFixture::new(ctx_str, resolver);
+
+        let forged = fx.seal_from_alice(
+            ctx_str,
+            CAROL,
+            &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+            1,
+            b"claims to come from carol",
+        );
+        let before = lookups.load(Ordering::SeqCst);
+        let result = fx.deliver(ctx_str, forged);
+
+        match &result {
+            Err(ContextError::SenderMismatch { mls_sender }) => {
+                assert_eq!(mls_sender, DeliverFixture::ALICE);
+            }
+            other => panic!("expected SenderMismatch naming the MLS sender, got {other:?}"),
+        }
+        let rendered = format!("{}", result.unwrap_err());
+        assert!(
+            !rendered.contains(CAROL),
+            "the error must not echo the attacker-chosen inner sender: {rendered}"
+        );
+        assert_eq!(
+            lookups.load(Ordering::SeqCst) - before,
+            0,
+            "no key may be resolved for a mismatched sender"
+        );
+    }
+
+    /// §9.8.2 on the production receive path: an envelope whose inner
+    /// signature fails at `(epoch, sequence)` does not advance the recv floor,
+    /// so the genuine envelope at the same `(epoch, sequence)` is still
+    /// accepted.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn deliver_incoming_failed_verification_does_not_burn_the_floor() {
+        let ctx_str = "deliver-incoming-floor-after-verify";
+        let resolver = crate::crypto::mls::two_party_test_support::pair_resolver(
+            DeliverFixture::ALICE,
+            DeliverFixture::BOB,
+        );
+        let mut fx = DeliverFixture::new(ctx_str, resolver);
+
+        let wrong_key = ed25519_dalek::SigningKey::from_bytes(&[0x99; 32]);
+        let forged = fx.seal_from_alice(
+            ctx_str,
+            DeliverFixture::ALICE,
+            &wrong_key,
+            1,
+            b"forged at (1, 1)",
+        );
+        let genuine = fx.seal_from_alice(
+            ctx_str,
+            DeliverFixture::ALICE,
+            &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+            1,
+            b"genuine at (1, 1)",
+        );
+
+        let rejected = fx.deliver(ctx_str, forged);
+        assert!(
+            matches!(&rejected, Err(ContextError::CryptoFailed(m)) if m.contains("signature")),
+            "a bad inner signature must be rejected, got {rejected:?}"
+        );
+        assert!(
+            fx.bob_sup
+                .export_recv_sequence_floors(&fx.ctx_bytes)
+                .is_empty(),
+            "a rejected envelope must not move the recv floor"
+        );
+
+        let accepted = fx
+            .deliver(ctx_str, genuine)
+            .expect("the genuine envelope at the same (epoch, sequence) is accepted");
+        assert!(
+            matches!(
+                &accepted,
+                crate::context::messaging_helpers::DeliverOutcome::Application((pt, sender))
+                    if pt.as_slice() == b"genuine at (1, 1)" && sender == DeliverFixture::ALICE
+            ),
+            "the genuine envelope must surface as Alice's application message, got {accepted:?}"
+        );
+    }
+
+    /// The production receive path rejects an inner envelope whose payload was
+    /// replaced after Alice signed it. The signature covers `payload_hash`, not
+    /// the padded payload, so only the content-integrity check
+    /// (`payload_hash == SHA256(stripped_payload)`) catches the swap.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn deliver_incoming_rejects_a_payload_altered_after_signing() {
+        let ctx_str = "deliver-incoming-altered-payload";
+        let resolver = crate::crypto::mls::two_party_test_support::pair_resolver(
+            DeliverFixture::ALICE,
+            DeliverFixture::BOB,
+        );
+        let mut fx = DeliverFixture::new(ctx_str, resolver);
+
+        let (mut inner, ctx_id) = fx.alice_inner(ctx_str, 1, b"signed content");
+        let (other, _) = fx.alice_inner(ctx_str, 1, b"swapped content");
+        assert_ne!(inner.payload, other.payload);
+        inner.payload = other.payload;
+        let altered = fx.seal_inner_from_alice(&ctx_id, &inner, 1);
+
+        let result = fx.deliver(ctx_str, altered);
+        fx.assert_integrity_rejection(&result);
+    }
+
+    /// The production receive path rejects an inner envelope whose signed
+    /// `payload_hash` does not match its payload: Alice signs the hash of other
+    /// content, so the signature verifies and only the content-integrity check
+    /// rejects it.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn deliver_incoming_rejects_a_signed_payload_hash_that_does_not_match_the_payload() {
+        let ctx_str = "deliver-incoming-mismatched-payload-hash";
+        let resolver = crate::crypto::mls::two_party_test_support::pair_resolver(
+            DeliverFixture::ALICE,
+            DeliverFixture::BOB,
+        );
+        let mut fx = DeliverFixture::new(ctx_str, resolver);
+
+        let (mut inner, ctx_id) = fx.alice_inner(ctx_str, 1, b"signed content");
+        let (other, _) = fx.alice_inner(ctx_str, 1, b"other content");
+        inner.payload_hash = other.payload_hash;
+        let canonical = scp_protocol::envelope::inner::compute_canonical_hash(
+            &crate::envelope::inner::InnerEnvelopeParams {
+                version: inner.version,
+                context_id: &inner.context_id,
+                sender_did: &inner.sender_did,
+                epoch: inner.epoch,
+                generation: inner.generation,
+                sequence: inner.sequence,
+                timestamp: inner.timestamp,
+                message_type: inner.message_type,
+                payload: &[],
+                provenance: None,
+                signing_key_id: inner.signing_key_id,
+            },
+            &inner.payload_hash,
+            &inner.provenance_hash,
+        )
+        .expect("canonical hash");
+        inner.signature = ed25519_dalek::Signer::sign(
+            &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+            &canonical,
+        )
+        .to_bytes();
+        assert!(
+            scp_protocol::envelope::inner::verify_inner_signature(
+                &inner,
+                crate::crypto::mls::two_party_test_support::alice_signing_key()
+                    .verifying_key()
+                    .as_bytes(),
+            )
+            .expect("verifiable"),
+            "the mismatched hash carries Alice's valid signature"
+        );
+        let mismatched = fx.seal_inner_from_alice(&ctx_id, &inner, 1);
+
+        let result = fx.deliver(ctx_str, mismatched);
+        fx.assert_integrity_rejection(&result);
+    }
+
+    /// An application message whose MLS sender is the receiving node's own DID
+    /// is rejected with an error, in debug builds too. The receiver here is
+    /// Bob's group state driven by deps whose local DID is Alice's, which is the
+    /// shape a second device of Alice's identity would have.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn decrypt_and_dispatch_rejects_application_message_from_own_did() {
+        use crate::envelope::inner::sign::create_inner_envelope_raw;
+        use crate::envelope::inner::{InnerEnvelopeParams, MessageType};
+        use scp_did::SigningKeyId;
+
+        const ALICE: &str = "did:dht:z6MkAliceOwnDidAliceOwnDidAliceOwnDidA1";
+        const BOB: &str = "did:dht:z6MkBobOwnDidBobOwnDidBobOwnDidBobOwnD1";
+        let ctx_str = "decrypt-and-dispatch-own-did";
+
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_provider,
+            alice_state: mut alice_actor,
+            bob_state: mut bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+
+        let alice_sup = supervisor_with_crypto(Arc::clone(&alice_provider));
+        let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, builds ActorDeps from a sync #[test]; not a production async bridge
+            .enable_all()
+            .build()
+            .unwrap();
+        let own_did_deps = rt
+            .block_on(alice_sup.build_actor_deps(&DID::from(ALICE)))
+            .expect("build deps whose local DID is alice");
+
+        let inner = create_inner_envelope_raw(
+            &InnerEnvelopeParams {
+                version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
+                context_id: ctx_str,
+                sender_did: ALICE,
+                epoch: 1,
+                generation: 0,
+                sequence: 0,
+                timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
+                payload: b"from alice to her own identity",
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            },
+            &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+        )
+        .expect("alice signs");
+        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
+        let sealed = alice_actor
+            .seal(ALICE, &inner, &routing_id, 3600)
+            .expect("alice seals");
+
+        let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
+        let result = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &own_did_deps,
+            Some(bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &sealed,
+        );
+        assert!(
+            matches!(&result, Err(ContextError::CryptoFailed(m)) if m == "application message from own DID"),
+            "an application message from the local DID must be rejected, got {result:?}"
         );
     }
 
@@ -23170,35 +23726,38 @@ mod tests {
         // Build a Bob-signed KeyRequest (for Alice's key) sealing to a fresh
         // ephemeral wrapping key, wrapped in the distribution-message envelope.
         let bob_sk = crate::crypto::mls::two_party_test_support::bob_signing_key();
-        let build_request = |requester_did: &str, nonce: [u8; 16]| -> (Vec<u8>, [u8; 32]) {
-            let (wrapping_pub, wrapping_secret) =
-                scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
-            let timestamp = scp_clock::SystemClock.now_secs();
-            let hash =
-                scp_protocol::crypto::sender_keys::key_protocol_verify::compute_request_hash(
-                    requester_did,
-                    ALICE,
-                    1,
-                    &wrapping_pub,
-                    &nonce,
+        let build_request =
+            |requester_did: &str, nonce: [u8; 16]| -> (Vec<u8>, zeroize::Zeroizing<[u8; 32]>) {
+                let (wrapping_pub, wrapping_secret) =
+                    scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+                let timestamp = scp_clock::SystemClock.now_secs();
+                let hash =
+                    scp_protocol::crypto::sender_keys::key_protocol_verify::compute_request_hash(
+                        requester_did,
+                        ALICE,
+                        &wrapping_pub,
+                        &nonce,
+                        scp_protocol::crypto::sender_keys::key_protocol_verify::RequestHashInput {
+                            epoch: 1,
+                            requested_at: timestamp,
+                        },
+                    )
+                    .unwrap();
+                let signature: [u8; 64] = bob_sk.sign(&hash).to_bytes();
+                let request = SenderKeyRequest {
+                    requester_did: requester_did.to_owned(),
+                    sender_did: ALICE.to_owned(),
+                    epoch: 1,
+                    wrapping_pubkey: wrapping_pub,
+                    nonce,
                     timestamp,
-                )
-                .unwrap();
-            let signature: [u8; 64] = bob_sk.sign(&hash).to_bytes();
-            let request = SenderKeyRequest {
-                requester_did: requester_did.to_owned(),
-                sender_did: ALICE.to_owned(),
-                epoch: 1,
-                wrapping_pubkey: wrapping_pub,
-                nonce,
-                timestamp,
-                signature,
+                    signature,
+                };
+                let dist = SenderKeyDistributionMessage::KeyRequest(request)
+                    .to_bytes()
+                    .unwrap();
+                (dist, wrapping_secret)
             };
-            let dist = SenderKeyDistributionMessage::KeyRequest(request)
-                .to_bytes()
-                .unwrap();
-            (dist, wrapping_secret)
-        };
 
         // Bob seals both requests through his actor-owned MLS group as management
         // envelopes (in MLS-generation order: mismatch first, then well-formed).
@@ -24302,7 +24861,9 @@ mod tests {
         let ctx_key = hex::encode(ctx_id_bytes);
 
         let owning_member = "did:key:aaa-replace-gap-owning-member";
-        sup.key_package_store_for(&DID(owning_member.to_owned()))
+        // Pre-load the node identity's store and wrapping keypair, so the
+        // import's deps build does not wait on the `write_lock` held below.
+        sup.key_package_store_for(&sup.node_identity().unwrap())
             .await
             .expect("kp store resolves with providers");
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
@@ -24494,13 +25055,11 @@ mod tests {
         );
     }
 
-    /// Multi-identity node (ADR-049 §10): a respawn derives
-    /// `owning_did = local_dids.min()` and passes it to `build_actor_deps`.
-    /// This must NOT mis-scope the context to the wrong identity — the crypto
-    /// is rehydrated from the snapshot (not re-derived from `owning_did`), and
-    /// the deps' `local_dids` view is the SHARED full set, not a snapshot of
-    /// the min DID. Verify the respawn succeeds and the actor is responsive on
-    /// a node with two local DIDs.
+    /// Multi-identity node (ADR-049 §10): a respawn rebuilds deps for the DID
+    /// the crashed actor's deps were built for, and the deps' `local_dids`
+    /// view is the SHARED full set, not a snapshot of one DID. Verify the
+    /// respawn succeeds and the actor is responsive on a node with two local
+    /// DIDs.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn respawn_preserves_owning_identity_on_multi_did_node() {
@@ -24535,15 +25094,14 @@ mod tests {
             .persist_context(&ctx_key, &snap)
             .await
             .unwrap();
-        let deps = test_actor_deps(&sup).await;
+        let deps = sup.build_actor_deps(&did_b).await.unwrap();
         let handle = Box::pin(sup.spawn_actor_with_state(state, deps, None))
             .await
             .expect("spawn registers");
 
-        // Crash it once: the watchdog respawns using `owning_did = min` =
-        // did_a, even though the context's creator was did_b. The respawn must
-        // still succeed and the actor must be responsive (Active), proving the
-        // respawn `owning_did` does not mis-scope the context.
+        // Crash it once: the watchdog respawns with deps for did_b, the DID
+        // the crashed actor's deps were built for, not the min DID did_a. The
+        // respawn must succeed and the actor must be responsive (Active).
         induce_panic(&handle, "SECRET_SENTINEL_abc123").await;
         let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
             sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
@@ -24552,12 +25110,15 @@ mod tests {
         .await;
         assert!(
             respawned,
-            "respawn on a multi-DID node must succeed and yield a responsive Active actor \
-             regardless of which local DID is min()"
+            "respawn on a multi-DID node must succeed and yield a responsive Active actor"
+        );
+        assert!(
+            !sup.key_package_stores.contains_key(&did_a) && !sup.wrapping_keys.contains_key(&did_a),
+            "the respawn acts as did_b and never loads did_a's store or wrapping keypair"
         );
 
         // Both DIDs remain registered (the respawn did not narrow the node's
-        // identity set to the min DID).
+        // identity set).
         let dids = sup.local_dids_ref().load();
         assert!(
             dids.contains(&did_a) && dids.contains(&did_b),
@@ -25479,7 +26040,11 @@ mod tests {
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
 
         let decision = crate::context::broadcast_helpers::handle_broadcast_key_request(
-            &mut cell, &deps, &author, &requester, &[0u8; 32],
+            &mut cell,
+            &deps,
+            &author,
+            &requester,
+            &scp_protocol::crypto::sender_keys::generate_wrapping_keypair().0,
         )
         .expect("serve consult returns a decision");
         assert!(
@@ -25626,8 +26191,11 @@ mod tests {
         // request (per-author block-list check).
         let restored_bc =
             scp_protocol::context::broadcast::BroadcastContext::from_snapshot(bc_snap);
-        let decision =
-            restored_bc.handle_key_request(author.as_ref(), blocked.as_ref(), &[0u8; 32]);
+        let decision = restored_bc.handle_key_request(
+            author.as_ref(),
+            blocked.as_ref(),
+            &scp_protocol::crypto::sender_keys::generate_wrapping_keypair().0,
+        );
         assert!(
             matches!(
                 &decision,
@@ -25730,7 +26298,11 @@ mod tests {
         );
         let restored_bc =
             scp_protocol::context::broadcast::BroadcastContext::from_snapshot(bc_snap);
-        let decision = restored_bc.handle_key_request(author.as_ref(), banned.as_ref(), &[0u8; 32]);
+        let decision = restored_bc.handle_key_request(
+            author.as_ref(),
+            banned.as_ref(),
+            &scp_protocol::crypto::sender_keys::generate_wrapping_keypair().0,
+        );
         assert!(
             matches!(
                 &decision,

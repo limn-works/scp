@@ -139,3 +139,109 @@ fn reference_seal_opens_under_custody() {
         hpke::custody::open_with_external_dh(dh.as_bytes(), &pk, &enc_arr, info, aad, &ct).unwrap();
     assert_eq!(recovered.as_slice(), pt);
 }
+
+// ---------------------------------------------------------------------------
+// DHKEM(P-256, HKDF-SHA256) / HKDF-SHA256 / AES-128-GCM (`hpke::p256`)
+// ---------------------------------------------------------------------------
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+/// The §9.5 suite under the `hpke-rs` reference implementation, Base mode.
+fn ref_hpke_p256() -> Hpke<HpkeRustCrypto> {
+    Hpke::<HpkeRustCrypto>::new(
+        Mode::Base,
+        KemAlgorithm::DhKemP256,
+        KdfAlgorithm::HkdfSha256,
+        AeadAlgorithm::Aes128Gcm,
+    )
+}
+
+/// A fresh recipient from our `DeriveKeyPair(random ikm)`, checked against
+/// the reference `DeriveKeyPair` on the same `ikm`.
+fn fresh_p256_recipient() -> Result<([u8; 32], [u8; 65]), Box<dyn std::error::Error>> {
+    let mut ikm = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut OsRng, &mut ikm);
+    let ours = hpke::p256::derive_key_pair(&ikm)?;
+    let sk = *ours.to_scalar_bytes();
+    let pk = ours.public_key().to_uncompressed();
+
+    // `HpkePrivateKey` exposes its bytes only under hpke-rs's `hazmat`
+    // feature. `d ↦ d·G` is injective on [1, n − 1], so equal public keys
+    // prove equal scalars.
+    let reference = ref_hpke_p256()
+        .derive_key_pair(&ikm)
+        .map_err(|e| format!("reference derive_key_pair: {e:?}"))?;
+    assert_eq!(
+        reference.public_key().as_slice(),
+        pk.as_slice(),
+        "DeriveKeyPair pkR"
+    );
+    Ok((sk, pk))
+}
+
+/// Our P-256 `seal` opens under the reference, and the reference's P-256
+/// `seal` opens under our software and custody open paths. Empty plaintext is
+/// only sealed by the reference, for the reason `our_seal_opens_under_reference`
+/// gives.
+#[test]
+fn p256_round_trips_against_reference() -> TestResult {
+    let cases: &[(&[u8], &[u8], &[u8])] = &[
+        (b"", b"", b"x"),
+        (
+            b"scp-sender-key-v1",
+            b"aad",
+            b"32-byte-payload-padded-to-len!!!",
+        ),
+        (b"info", b"", &[0xAB; 257]),
+        (b"\x00\x01\x02", b"\xff\xfe", b"yz"),
+    ];
+
+    for (idx, (info, aad, pt)) in cases.iter().enumerate() {
+        let (sk, pk) = fresh_p256_recipient()?;
+
+        // Ours → reference.
+        let (enc, ct) = hpke::p256::seal(&hpke::p256::P256Point::try_from(pk)?, info, aad, pt)?;
+        let enc = *enc.as_bytes();
+        assert_eq!(enc.len(), hpke::p256::ENC_LEN, "case {idx}: enc length");
+        assert_eq!(enc[0], 0x04, "case {idx}: enc is uncompressed SEC1");
+        let recovered = ref_hpke_p256()
+            .open(
+                &enc,
+                &HpkePrivateKey::new(sk.to_vec()),
+                info,
+                aad,
+                &ct,
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| format!("case {idx}: reference open: {e:?}"))?;
+        assert_eq!(recovered.as_slice(), *pt, "case {idx}: ours → reference");
+
+        // Reference → ours (software and custody paths), empty plaintext included.
+        for ref_pt in [*pt, b"".as_slice()] {
+            let (ref_enc, ref_ct) = ref_hpke_p256()
+                .seal(
+                    &HpkePublicKey::new(pk.to_vec()),
+                    info,
+                    aad,
+                    ref_pt,
+                    None,
+                    None,
+                    None,
+                )
+                .map_err(|e| format!("case {idx}: reference seal: {e:?}"))?;
+            let got: zeroize::Zeroizing<Vec<u8>> =
+                hpke::p256::open(&sk, &ref_enc, info, aad, &ref_ct)?;
+            assert_eq!(got.as_slice(), ref_pt, "case {idx}: reference → ours");
+
+            let sk_key = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&sk)?;
+            let enc = hpke::p256::validate_enc(&ref_enc)?;
+            let dh = scp_crypto::p256::ecdh_p256(&sk_key, enc.point());
+            let got: zeroize::Zeroizing<Vec<u8>> =
+                hpke::p256::custody::open_with_external_dh(&dh, &pk, &enc, info, aad, &ref_ct)?;
+            assert_eq!(got.as_slice(), ref_pt, "case {idx}: reference → custody");
+        }
+    }
+    Ok(())
+}

@@ -280,7 +280,8 @@ pub async fn leave_context(
                 // twins. `local_did` is node-resident identity (retained on the
                 // provider); the actor `remove_member` skips a self-leave.
                 let local_did = deps.crypto.local_did();
-                let remove_output = state.remove_member(local_did, member_did.as_ref())?;
+                let remove_output =
+                    state.remove_member(local_did, member_did.as_ref(), deps.clock.as_ref())?;
                 if let Err(e) = state.remove_member_sender_key(member_did.as_ref()) {
                     tracing::warn!(
                         context_id = %context_id,
@@ -1062,7 +1063,7 @@ pub async fn join_context(
         let _ = cell
             .commit_class_s_keep(deps, &context_id, |mut v| {
                 let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did);
+                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
                 s.remove_member_sender_key(&member_did)
             })
             .await;
@@ -1104,7 +1105,7 @@ pub async fn join_context(
         let _ = cell
             .commit_class_s_keep(deps, &context_id, |mut v| {
                 let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did);
+                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
                 s.remove_member_sender_key(&member_did)
             })
             .await;
@@ -1143,7 +1144,7 @@ pub async fn join_context(
         let _ = cell
             .commit_class_s_keep(deps, &context_id, |mut v| {
                 let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did);
+                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
                 s.remove_member_sender_key(&member_did)
             })
             .await;
@@ -1603,13 +1604,22 @@ pub async fn create_context(
     // every member as the base for the TTL expiry deadline
     // (= creation + params.ttl), which IS computed identically on each member.
     let creation_timestamp_secs = deps.clock.now_secs();
+    // The creator's leaf publishes the owning identity's wrapping key (spec 09
+    // §9.16.1); with none loaded the creation fails closed before any group exists.
+    let wrapping_public_key = *deps
+        .supervisor
+        .my_wrapping_keypair(&deps.owned_identity)?
+        .public();
     let (handle, created_owned_crypto) = crate::context::builder::create_context(
         context_id.clone(),
         params.clone(),
         deps.crypto.as_ref(),
         deps.transport.as_ref(),
         deps.event_log.as_ref(),
-        creator_did.as_ref(),
+        crate::context::builder::ContextCreator {
+            did: creator_did.as_ref(),
+            wrapping_public_key: &wrapping_public_key,
+        },
         creation_timestamp_secs,
     )
     .await?;
@@ -1968,12 +1978,13 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
             crate::crypto::mls::provider::RestoredFloors::default(),
         )
     } else {
-        let (owned, floors) = deps
-            .crypto
-            .build_restored_owned(ctx_id_bytes, mls_state)
-            .map_err(|e| {
-                ContextError::PersistenceFailed(format!("import: crypto state restore failed: {e}"))
-            })?;
+        let (owned, floors) = crate::crypto::mls::provider::NodeMlsFactory::build_restored_owned(
+            ctx_id_bytes,
+            mls_state,
+        )
+        .map_err(|e| {
+            ContextError::PersistenceFailed(format!("import: crypto state restore failed: {e}"))
+        })?;
         (Some(owned), floors)
     };
 
@@ -3031,9 +3042,9 @@ pub async fn restore_context(
     // floors → `seed_encrypted_crypto_from_owned`). This is the RESPAWN
     // (`Supervisor::respawn_from_snapshot`) AND COLD-RESTART
     // (`restore_all_contexts`) path — both reach here through `restore_context`.
-    // `build_restored_owned` restores the node-level wrapping keypair as a `&self`
-    // side effect (OBS-2 — NOT side-effect-free) but touches NO provider
-    // per-context state (the provider holds none — its `contexts` map is DELETED).
+    // `build_restored_owned` is a pure function of the snapshot: it touches no
+    // provider state and no wrapping key (a snapshot carries none; the keypair is
+    // one per identity, owned by the supervisor, spec 09 §9.16.1).
     // The actor is the SOLE crypto authority by construction; there is no
     // provider-resident second home to tear down first.
     let mut restored_owned: Option<crate::crypto::mls::provider::OwnedMlsCryptoState> = None;
@@ -3046,9 +3057,11 @@ pub async fn restore_context(
         // rehydrates from the last COALESCED snapshot, which may lag the live
         // per-sender epoch floors by up to one coalesce interval (ADR-049 §9); the
         // max-merge below tolerates that lag.
-        let (owned, restored_floors) = deps
-            .crypto
-            .build_restored_owned(&ctx_id_bytes, &ctx_snapshot.mls_crypto_state)
+        let (owned, restored_floors) =
+            crate::crypto::mls::provider::NodeMlsFactory::build_restored_owned(
+                &ctx_id_bytes,
+                &ctx_snapshot.mls_crypto_state,
+            )
             .map_err(|e| {
                 ContextError::PersistenceFailed(format!(
                     "restore: crypto state restore failed: {e}"
@@ -4506,9 +4519,12 @@ mod restore_reconcile_tests {
             scp_did::SigningKeyId::Active,
         )
         .expect("joiner credential");
-        let (kp_bundle, _signer, _provider) =
-            scp_mls::group::generate_key_package(&joiner_cred, &scp_clock::SystemClock)
-                .expect("generate joiner key package");
+        let (kp_bundle, _signer, _provider) = scp_mls::group::generate_key_package(
+            &joiner_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&joiner_cred.did),
+            &scp_clock::SystemClock,
+        )
+        .expect("generate joiner key package");
         let kp_bytes =
             openmls::prelude::tls_codec::Serialize::tls_serialize_detached(kp_bundle.key_package())
                 .expect("serialize key package");

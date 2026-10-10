@@ -94,7 +94,9 @@ fn deps_with(
         mls_storage: storage,
         transport,
         clock: Arc::new(SystemClock) as Arc<dyn Clock>,
-        wrapping_pubkey: None,
+        wrapping_key: Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::crypto::wrapping::WrappingKeyPair::generate(),
+        )),
     }
 }
 
@@ -179,7 +181,13 @@ async fn real_welcome_for(mls: &Arc<dyn MlsBackend>, kp_public_bytes: &[u8]) -> 
         scp_did::SigningKeyId::Active,
     )
     .unwrap();
-    let mut group = mls.create_group(&inviter, None).await.unwrap();
+    let mut group = mls
+        .create_group(
+            &inviter,
+            &scp_crypto::p256::testing::uncompressed_point_for(&inviter.did),
+        )
+        .await
+        .unwrap();
     let added = mls
         .add_member_raw(&mut group, kp_public_bytes)
         .await
@@ -365,7 +373,13 @@ async fn second_join_same_init_key_rejected_at_backend() {
     // (two separate inviter groups both add the same KP). The first join
     // consumes the init key durably; the second must be rejected.
     let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
-    let generated = mls.generate_key_package(&joiner, None).await.unwrap();
+    let generated = mls
+        .generate_key_package(
+            &joiner,
+            &scp_crypto::p256::testing::uncompressed_point_for(&joiner.did),
+        )
+        .await
+        .unwrap();
     let welcome_a = real_welcome_for(&mls, &generated.key_package_bytes).await;
     let welcome_b = real_welcome_for(&mls, &generated.key_package_bytes).await;
 
@@ -408,7 +422,13 @@ async fn join_without_consumed_store_fails_closed() {
     )));
 
     let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
-    let generated = mls.generate_key_package(&joiner, None).await.unwrap();
+    let generated = mls
+        .generate_key_package(
+            &joiner,
+            &scp_crypto::p256::testing::uncompressed_point_for(&joiner.did),
+        )
+        .await
+        .unwrap();
     let welcome = real_welcome_for(&mls, &generated.key_package_bytes).await;
 
     let result = mls
@@ -434,9 +454,21 @@ async fn join_with_mismatched_public_bytes_rejected() {
     let mls = backend_with_consumed_set(&storage);
 
     let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
-    let generated = mls.generate_key_package(&joiner, None).await.unwrap();
+    let generated = mls
+        .generate_key_package(
+            &joiner,
+            &scp_crypto::p256::testing::uncompressed_point_for(&joiner.did),
+        )
+        .await
+        .unwrap();
     // A DIFFERENT KP — its public bytes do not match `generated.signer_state`.
-    let other = mls.generate_key_package(&joiner, None).await.unwrap();
+    let other = mls
+        .generate_key_package(
+            &joiner,
+            &scp_crypto::p256::testing::uncompressed_point_for(&joiner.did),
+        )
+        .await
+        .unwrap();
     let welcome = real_welcome_for(&mls, &generated.key_package_bytes).await;
 
     // Pass the welcome + signer-state for `generated`, but the PUBLIC bytes of
@@ -2596,7 +2628,9 @@ async fn expired_reservation_is_swept_and_kp_burned() {
             mls_storage: Arc::clone(&storage),
             transport: no_transport(),
             clock: Arc::clone(&clock) as Arc<dyn Clock>,
-            wrapping_pubkey: None,
+            wrapping_key: Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::crypto::wrapping::WrappingKeyPair::generate(),
+            )),
         };
         KeyPackageStoreActor::spawn(alice(), deps)
     };
@@ -2997,7 +3031,7 @@ impl MlsBackend for FailingBackend {
     async fn create_group(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: &[u8; 65],
     ) -> Result<ScpMlsGroup, MlsError> {
         self.inner.create_group(credential, wrapping_pubkey).await
     }
@@ -3033,13 +3067,13 @@ impl MlsBackend for FailingBackend {
         &self,
         group: &mut ScpMlsGroup,
         commit_bytes: &[u8],
-    ) -> Result<(), MlsError> {
+    ) -> Result<Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>, MlsError> {
         self.inner.process_commit(group, commit_bytes).await
     }
     async fn advance_epoch(
         &self,
         group: &mut ScpMlsGroup,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: &[u8; 65],
     ) -> Result<Vec<u8>, MlsError> {
         self.inner.advance_epoch(group, wrapping_pubkey).await
     }
@@ -3055,7 +3089,7 @@ impl MlsBackend for FailingBackend {
     async fn generate_key_package(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: &[u8; 65],
     ) -> Result<GeneratedKeyPackage, MlsError> {
         loop {
             let cur = self.remaining.load(Ordering::Acquire);

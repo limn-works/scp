@@ -25,6 +25,9 @@ zeroize = { workspace = true }
 # Test-only: supplies `SystemClock` for the MLS group fixtures, which now take
 # an injected `Clock` for KeyPackage `Lifetime` stamping (ADR-057 §Prereq-1).
 scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
+# Test-only: `p256::testing::uncompressed_point_for`, the wrapping public key
+# every MLS group and KeyPackage fixture publishes in its leaf (spec 09 §9.16.1).
+scp-crypto = { path = "../scp-crypto", features = ["testing"] }
 
 [lints]
 workspace = true

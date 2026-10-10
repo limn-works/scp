@@ -4,10 +4,11 @@
 //! SCP's MLS leaf `signature_key` is an **ephemeral, context-scoped** key that
 //! is NOT the member's DID identity key (§9.7.4). Admission and attribution are
 //! instead provided by a **`KeyPackage` attestation**: an `#active`/`#agent`-signed
-//! statement that binds **all four** of the leaf's own public keys — the Ed25519
-//! leaf `signature_key`, and the three distinct X25519 HPKE keys (the `LeafNode`
-//! ratchet-tree `encryption_key`, the `KeyPackage` `init_key`, and the
-//! `scp_wrapping_key` (`0xFF01`) `wrapping_key`) — to the member's `did`
+//! statement that binds **all four** of the leaf's own public keys — the P-256
+//! leaf `signature_key`, and the three distinct DHKEM(P-256) HPKE keys (the
+//! `LeafNode` ratchet-tree `encryption_key`, the `KeyPackage` `init_key`, and the
+//! `scp_wrapping_key` (`0xFF01`) `wrapping_key`), each a 65-byte uncompressed
+//! SEC1 point — to the member's `did`
 //! (§9.5.2). The attestation rides in the leaf as an MLS `LeafNode` extension,
 //! mirroring [`crate::wrapping_extension`] (`scp_wrapping_key`, `0xFF01`).
 //!
@@ -25,9 +26,12 @@
 //! # What a later signer signs
 //!
 //! The **only** signable output is [`signing_hash`]: the 32-byte
-//! `SHA-256(signing_preimage())` prehash. A later CRYPTO-22 slice's signer MUST
-//! compute the Ed25519 signature over that 32-byte hash — and over **nothing
-//! else**. It MUST NOT sign the raw `signing_preimage()` bytes, and it MUST NOT
+//! `SHA-256(signing_preimage())` prehash. The signer MUST compute the
+//! signature over that 32-byte hash — and over **nothing else**. §9.5.2 and
+//! Vector 37 specify a P-256 signature; this module still verifies an Ed25519
+//! signature from the attester's `#active`/`#agent` key until identity signing
+//! moves to P-256 (SCP-307 criterion 15 / SCP-315), and treats the 64 signature bytes as
+//! opaque when it serializes them. It MUST NOT sign the raw `signing_preimage()` bytes, and it MUST NOT
 //! sign the [`to_extension_body`] output. `signing_preimage()` is
 //! module-private: it exists only to build the hash and to
 //! reproduce the §25.23 Vector 37 known-answer test. Signing the wrong bytes
@@ -40,13 +44,13 @@
 //!
 //! The **signing preimage** is the domain separator followed by the eight fields
 //! in order, encoded per §9.5.1 (variable-length fields carry a 4-byte
-//! big-endian length prefix; the four public keys are raw 32-byte values with no
-//! prefix; `issued_at`/`expires_at` are 8-byte big-endian). The **signing hash**
-//! is `SHA-256(preimage)`; the Ed25519 signature (a later slice) covers that
-//! 32-byte hash. The **`0xFF03` extension body** is the same eight fields in the
-//! same order **without** the domain separator, followed by the raw 64-byte
-//! signature. A byte-exact known-answer vector is §25.23 Vector 37, pinned by the
-//! `tests::vector_37_*` unit tests below.
+//! big-endian length prefix; the four public keys are raw 65-byte uncompressed
+//! P-256 points with no prefix; `issued_at`/`expires_at` are 8-byte big-endian).
+//! The **signing hash** is `SHA-256(preimage)`; the signature covers that 32-byte
+//! hash. The **`0xFF03` extension body** is the same eight fields in the same
+//! order **without** the domain separator, followed by the raw 64-byte
+//! signature. A byte-exact known-answer vector is §25.23 Vector 37 (377-byte
+//! preimage, 411-byte body), pinned by `tests::spec_vector37_matches` below.
 //!
 //! See spec §9.5.2 (field table + wire format) and §9.7.1 (the full model).
 
@@ -97,8 +101,14 @@ const _: () = assert!(MAX_KEYPACKAGE_ATTESTATION_LIFETIME == 7_261_200);
 /// alongside the type it governs.
 pub const MAX_ATTESTATION_KEY_RESOLUTION_STALENESS: u64 = 300;
 
-/// Size of a raw Ed25519 or X25519 public key in bytes.
-const PUBLIC_KEY_SIZE: usize = 32;
+/// Size of each of the four bound leaf public keys: a 65-byte uncompressed SEC1
+/// P-256 point (§9.5.2).
+const LEAF_PUBLIC_KEY_SIZE: usize = 65;
+
+/// Size of the attester's resolved Ed25519 `#active`/`#agent` key, which
+/// verifies the signature until identity signing moves to P-256 (SCP-307
+/// criterion 15 / SCP-315).
+const ED25519_PUBLIC_KEY_SIZE: usize = 32;
 
 /// Size of a raw Ed25519 signature in bytes.
 const SIGNATURE_SIZE: usize = 64;
@@ -127,10 +137,10 @@ pub enum AttestationTrigger<'a> {
     /// runtime fail-closed check (per the SCP "encode required choices as required
     /// fields" tenet).
     Add {
-        /// The `KeyPackage`'s `init_key`: a raw 32-byte X25519 public key. Check 7
+        /// The `KeyPackage`'s `init_key`: a 65-byte DHKEM(P-256) public key. Check 7
         /// binds `attestation.init_key` to it; check 8 (RFC 9420 §10.1) rejects a
         /// `KeyPackage` whose `init_key` equals its `encryption_key`.
-        kp_init_key: &'a [u8; PUBLIC_KEY_SIZE],
+        kp_init_key: &'a [u8; LEAF_PUBLIC_KEY_SIZE],
     },
     /// An already-admitted member is **replacing its own leaf** (Update /
     /// Commit-with-`UpdatePath`). A ratchet-tree leaf has no `init_key`, so checks
@@ -158,22 +168,22 @@ pub struct KeyPackageAttestation {
     /// The attested DID. MUST equal the leaf's `ScpCredential.did` (§9.7.1
     /// check 9).
     pub did: String,
-    /// The MLS leaf `signature_key` being bound: the raw 32-byte Ed25519 public
-    /// key that self-signs the `LeafNode` (§9.5.2 field 2).
-    pub leaf_signature_key: [u8; PUBLIC_KEY_SIZE],
-    /// The `LeafNode` ratchet-tree `encryption_key`: a raw 32-byte X25519 public
+    /// The MLS leaf `signature_key` being bound: the 65-byte uncompressed P-256
+    /// public key that self-signs the `LeafNode` (§9.5.2 field 2).
+    pub leaf_signature_key: [u8; LEAF_PUBLIC_KEY_SIZE],
+    /// The `LeafNode` ratchet-tree `encryption_key`: a 65-byte DHKEM(P-256) public
     /// key that receives HPKE-sealed path secrets (RFC 9420 §7.2, §9.5.2
     /// field 3). Distinct from [`init_key`](Self::init_key).
-    pub leaf_encryption_key: [u8; PUBLIC_KEY_SIZE],
-    /// The `KeyPackage` `init_key`: a raw 32-byte X25519 public key the Welcome's
+    pub leaf_encryption_key: [u8; LEAF_PUBLIC_KEY_SIZE],
+    /// The `KeyPackage` `init_key`: a 65-byte DHKEM(P-256) public key the Welcome's
     /// `EncryptedGroupSecrets` is HPKE-sealed to at join (RFC 9420 §7.1, §9.5.2
     /// field 4). On a bare creator/PCS-Update leaf (no `KeyPackage`) this carries
     /// [`leaf_encryption_key`](Self::leaf_encryption_key); distinctness is a
     /// `KeyPackage`-only property.
-    pub init_key: [u8; PUBLIC_KEY_SIZE],
-    /// The `scp_wrapping_key` (`0xFF01`) LeafNode-extension value: a raw 32-byte
-    /// X25519 public key used for §9.16 per-sender-key wrapping (§9.5.2 field 5).
-    pub wrapping_key: [u8; PUBLIC_KEY_SIZE],
+    pub init_key: [u8; LEAF_PUBLIC_KEY_SIZE],
+    /// The `scp_wrapping_key` (`0xFF01`) LeafNode-extension value: a 65-byte
+    /// DHKEM(P-256) public key used for §9.16 per-sender-key wrapping (§9.5.2 field 5).
+    pub wrapping_key: [u8; LEAF_PUBLIC_KEY_SIZE],
     /// Which DID verification method signed this attestation (`#active` or
     /// `#agent` — never `#0`, §9.5.2 field 6).
     pub signing_key_id: SigningKeyId,
@@ -181,10 +191,11 @@ pub struct KeyPackageAttestation {
     pub issued_at: u64,
     /// Unix seconds; equals the leaf's `Lifetime.not_after` (§9.5.2 field 8).
     pub expires_at: u64,
-    /// The raw 64-byte Ed25519 signature over [`signing_hash`](Self::signing_hash).
+    /// The raw 64-byte signature over [`signing_hash`](Self::signing_hash).
     ///
-    /// Produced by a later CRYPTO-22 slice's signer; this slice stores and parses
-    /// it opaquely.
+    /// Serialized and parsed as opaque bytes; [`verify_attestation`] checks it as
+    /// Ed25519 until identity signing moves to P-256 (SCP-307 criterion 15 /
+    /// SCP-315).
     pub signature: [u8; SIGNATURE_SIZE],
 }
 
@@ -199,18 +210,18 @@ impl KeyPackageAttestation {
     /// passes an empty domain and appends the signature). The two
     /// variable-length fields (`did`, `signing_key_id`) are encoded as
     /// [`CanonicalField::VarBytes`] (4-byte big-endian length prefix + bytes);
-    /// the four public keys are [`CanonicalField::Fixed32`] (raw 32 bytes, no
+    /// the four public keys are [`CanonicalField::RawBytes`] (raw 65 bytes, no
     /// prefix); the two timestamps are [`CanonicalField::U64`] (8-byte
     /// big-endian).
     const fn canonical_fields(&self) -> [CanonicalField<'_>; 8] {
         [
             // Field 1: did.
             CanonicalField::VarBytes(self.did.as_bytes()),
-            // Fields 2–5: the four raw 32-byte public keys.
-            CanonicalField::Fixed32(&self.leaf_signature_key),
-            CanonicalField::Fixed32(&self.leaf_encryption_key),
-            CanonicalField::Fixed32(&self.init_key),
-            CanonicalField::Fixed32(&self.wrapping_key),
+            // Fields 2–5: the four raw 65-byte P-256 public keys.
+            CanonicalField::RawBytes(&self.leaf_signature_key),
+            CanonicalField::RawBytes(&self.leaf_encryption_key),
+            CanonicalField::RawBytes(&self.init_key),
+            CanonicalField::RawBytes(&self.wrapping_key),
             // Field 6: signing_key_id ("#active"/"#agent").
             CanonicalField::VarBytes(self.signing_key_id.as_bytes()),
             // Fields 7–8: the two timestamps.
@@ -221,8 +232,8 @@ impl KeyPackageAttestation {
 
     /// Returns the §9.5.1 canonical **signing preimage**: the domain separator
     /// followed by the eight fields (§9.5.2). This is the byte string whose
-    /// SHA-256 is the [`signing_hash`](Self::signing_hash) that the Ed25519
-    /// signature covers. For §25.23 Vector 37 this is exactly 211 bytes.
+    /// SHA-256 is the [`signing_hash`](Self::signing_hash) that the signature
+    /// covers. For §25.23 Vector 37 this is exactly 377 bytes.
     ///
     /// Module-private: the only external signable output is
     /// [`signing_hash`](Self::signing_hash). This method exists to build that
@@ -239,9 +250,8 @@ impl KeyPackageAttestation {
 
     /// Returns the 32-byte signing hash `SHA-256(signing_preimage())` (§9.5.1).
     ///
-    /// The Ed25519 signature (a later slice) is computed over this hash. For
-    /// §25.23 Vector 37 this is
-    /// `50cf61db5a97e0ddbd762de07e107684dfd0f00cfe53bad2750a70103ac38957`.
+    /// The signature is computed over this hash. For §25.23 Vector 37 this is
+    /// `f3e2825b6d0534827fec7a6b196b729578ef47be0c0847f6e8879cf5242aa4ad`.
     #[must_use]
     pub fn signing_hash(&self) -> [u8; 32] {
         Sha256::digest(self.signing_preimage()).into()
@@ -252,9 +262,9 @@ impl KeyPackageAttestation {
     /// separator — followed by the raw 64-byte signature. A deterministic
     /// length-prefixed binary encoding (explicitly NOT MessagePack/JCS) so all
     /// bindings produce byte-identical bytes. For §25.23 Vector 37 this is exactly
-    /// 245 bytes (181 field bytes + 64 signature bytes).
+    /// 411 bytes (347 field bytes + 64 signature bytes).
     ///
-    /// This is NOT a signable input: the Ed25519 signature is computed over
+    /// This is NOT a signable input: the signature is computed over
     /// [`signing_hash`](Self::signing_hash), never over this body.
     ///
     /// Infallible: as with [`signing_preimage`](Self::signing_preimage), the
@@ -279,7 +289,9 @@ impl KeyPackageAttestation {
     /// - trailing bytes after the trailing 64-byte signature,
     /// - a length prefix that overruns the remaining bytes (implausible/oversized
     ///   length),
-    /// - non-UTF-8 `did` or `signing_key_id`, and
+    /// - non-UTF-8 `did` or `signing_key_id`,
+    /// - a public key that is not a valid 65-byte uncompressed P-256 point
+    ///   (wrong prefix, off the curve, or a coordinate not below `p`), and
     /// - a `signing_key_id` that is not exactly `"#active"` or `"#agent"`.
     ///
     /// # Errors
@@ -293,10 +305,10 @@ impl KeyPackageAttestation {
             .map_err(|_| ext_err("scp_keypackage_attestation did is not valid UTF-8"))?
             .to_owned();
 
-        let leaf_signature_key = cursor.take_array::<PUBLIC_KEY_SIZE>()?;
-        let leaf_encryption_key = cursor.take_array::<PUBLIC_KEY_SIZE>()?;
-        let init_key = cursor.take_array::<PUBLIC_KEY_SIZE>()?;
-        let wrapping_key = cursor.take_array::<PUBLIC_KEY_SIZE>()?;
+        let leaf_signature_key = cursor.take_point("leaf_signature_key")?;
+        let leaf_encryption_key = cursor.take_point("leaf_encryption_key")?;
+        let init_key = cursor.take_point("init_key")?;
+        let wrapping_key = cursor.take_point("wrapping_key")?;
 
         let skid_bytes = cursor.take_var_bytes()?;
         let skid_str = core::str::from_utf8(skid_bytes)
@@ -480,8 +492,9 @@ pub enum AttestationVerifyError {
 #[derive(Debug, Clone, Copy)]
 pub struct AttestationVerificationContext<'a> {
     /// The **current** `#active`/`#agent` public key the caller resolved from
-    /// the signer's DID document (raw 32-byte Ed25519). The signature (check 3)
-    /// is verified against this key.
+    /// the signer's DID document (raw 32-byte Ed25519, until identity signing
+    /// moves to P-256 per SCP-307 criterion 15 / SCP-315). The signature (check 3) is verified
+    /// against this key.
     ///
     /// **Caller contract (§9.7.1 checks 1–2 — NOT re-checked here).** The caller
     /// MUST resolve the verification method named by
@@ -496,13 +509,13 @@ pub struct AttestationVerificationContext<'a> {
     /// that check 3 fails (rotation = revocation). Passing a stale or
     /// wrong-persona key silently defeats revocation — this pure function cannot
     /// detect that and trusts the caller for it.
-    pub resolved_current_vm_pubkey: &'a [u8; PUBLIC_KEY_SIZE],
+    pub resolved_current_vm_pubkey: &'a [u8; ED25519_PUBLIC_KEY_SIZE],
     /// The leaf's actual `signature_key` (check 4).
-    pub leaf_signature_key: &'a [u8; PUBLIC_KEY_SIZE],
+    pub leaf_signature_key: &'a [u8; LEAF_PUBLIC_KEY_SIZE],
     /// The leaf's actual ratchet-tree `encryption_key` (check 5).
-    pub leaf_encryption_key: &'a [u8; PUBLIC_KEY_SIZE],
+    pub leaf_encryption_key: &'a [u8; LEAF_PUBLIC_KEY_SIZE],
     /// The value of the leaf's `scp_wrapping_key` (`0xFF01`) extension (check 6).
-    pub leaf_wrapping_key: &'a [u8; PUBLIC_KEY_SIZE],
+    pub leaf_wrapping_key: &'a [u8; LEAF_PUBLIC_KEY_SIZE],
     /// The DID carried in the leaf's `ScpCredential` (check 9).
     pub leaf_credential_did: &'a str,
     /// The `signing_key_id` carried in the leaf's `ScpCredential` (check 10).
@@ -677,11 +690,11 @@ pub struct AttestationLeafGroundTruth<'a> {
     /// [`ScpCredential::resolve_signing_key`].
     pub credential: &'a ScpCredential,
     /// The leaf's actual `signature_key` (check 4).
-    pub leaf_signature_key: &'a [u8; PUBLIC_KEY_SIZE],
+    pub leaf_signature_key: &'a [u8; LEAF_PUBLIC_KEY_SIZE],
     /// The leaf's actual ratchet-tree `encryption_key` (check 5).
-    pub leaf_encryption_key: &'a [u8; PUBLIC_KEY_SIZE],
+    pub leaf_encryption_key: &'a [u8; LEAF_PUBLIC_KEY_SIZE],
     /// The value of the leaf's `scp_wrapping_key` (`0xFF01`) extension (check 6).
-    pub leaf_wrapping_key: &'a [u8; PUBLIC_KEY_SIZE],
+    pub leaf_wrapping_key: &'a [u8; LEAF_PUBLIC_KEY_SIZE],
     /// The leaf's `Lifetime.not_before` (check 11).
     pub leaf_lifetime_not_before: u64,
     /// The leaf's `Lifetime.not_after` (check 11).
@@ -895,6 +908,15 @@ impl<'a> Cursor<'a> {
             .map_err(|_| ext_err("scp_keypackage_attestation fixed-field length mismatch"))
     }
 
+    /// Takes a 65-byte public key and validates it as an uncompressed P-256
+    /// point (§9.5.2), naming `field` in the error.
+    fn take_point(&mut self, field: &str) -> Result<[u8; LEAF_PUBLIC_KEY_SIZE], MlsError> {
+        let bytes = self.take(LEAF_PUBLIC_KEY_SIZE)?;
+        scp_protocol::crypto::hpke::p256::P256Point::try_from(bytes)
+            .map(|point| *point.as_bytes())
+            .map_err(|e| ext_err(format!("scp_keypackage_attestation {field}: {e}")))
+    }
+
     /// Reads a 4-byte big-endian length prefix, then that many bytes.
     fn take_var_bytes(&mut self) -> Result<&'a [u8], MlsError> {
         let len_bytes = self.take(LEN_PREFIX_SIZE)?;
@@ -943,106 +965,152 @@ mod tests {
             .collect()
     }
 
-    /// Builds the §25.23 Vector 37 attestation from the spec's exact input
-    /// values. `leaf_signature_key`, the three X25519 keys, and the signature
-    /// are the literal 32/64-byte values from the vector (this slice does not
-    /// sign; the signature is an authoritative KAT constant).
-    fn vector_37() -> KeyPackageAttestation {
-        let arr32 = |s: &str| -> [u8; 32] { hex(s).try_into().expect("32 bytes") };
+    /// The §25.23 Vector 37 preimage (377 bytes), spec line 1255.
+    const V37_PREIMAGE: &str = "5343502d4b45595041434b4147452d4154544553544154494f4e2d56313a000000387363703a676f6d6a786c786a74346b6573623566676862367470796b727668737864647577776c6f337577676d7668326a686f71766a79710423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da604bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac30000000723616374697665000000006553f1000000000065554280";
+
+    /// The §25.23 Vector 37 `0xFF03` extension body (411 bytes), spec line 1265.
+    const V37_BODY: &str = "000000387363703a676f6d6a786c786a74346b6573623566676862367470796b727668737864647577776c6f337577676d7668326a686f71766a79710423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da604bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac30000000723616374697665000000006553f1000000000065554280e84f59744b0fba5ebc162f26a59d027694c1fae7c73dcdeb8d776e357bbf12632abea2a97205d75ca50e3914eec8af68f7315e27dd6f9296136e75ecb044ff24";
+
+    /// The §25.23 Vector 37 DID: 56 bytes.
+    const V37_DID: &str = "scp:gomjxlxjt4kesb5fghb6tpykrvhsxdduwwlo3uwgmvh2jhoqvjyq";
+
+    /// Builds the §25.23 Vector 37 attestation from the spec's input values
+    /// (spec lines 1229-1239). The four keys are the spec's 65-byte points; the
+    /// signature is the spec's 64-byte P-256 `r || s`, carried as opaque bytes.
+    fn v37_attestation() -> KeyPackageAttestation {
+        let key = |s: &str| -> [u8; LEAF_PUBLIC_KEY_SIZE] { hex(s).try_into().expect("65 bytes") };
         KeyPackageAttestation {
-            did: "did:dht:z6MkLeafAttest".to_owned(),
-            leaf_signature_key: arr32(
-                "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+            did: V37_DID.to_owned(),
+            leaf_signature_key: key(
+                "0423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da6",
             ),
-            leaf_encryption_key: arr32(
-                "b6c6192e66300f4bbb4e3d870bfd02e416154ebb06661a70a84ea376244b3c20",
+            leaf_encryption_key: key(
+                "04bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550",
             ),
-            init_key: arr32("7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13"),
-            wrapping_key: arr32("0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20"),
+            init_key: key(
+                "041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a",
+            ),
+            wrapping_key: key(
+                "04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac3",
+            ),
             signing_key_id: SigningKeyId::Active,
             issued_at: 1_700_000_000,
             expires_at: 1_700_086_400,
             signature: hex(
-                "fcf01ea58941c9e88acc14ef1ada7d00ac4c0239c75655160fc5b248ee0299e0\
-                 18526235bc9b6d2a3efa37ab8db5d86b45b58deb5ad24540229d2804052e3509",
+                "e84f59744b0fba5ebc162f26a59d027694c1fae7c73dcdeb8d776e357bbf12632abea2a97205d75ca50e3914eec8af68f7315e27dd6f9296136e75ecb044ff24",
             )
             .try_into()
             .expect("64 bytes"),
         }
     }
 
-    /// KAT: the signing preimage reproduces the §25.23 Vector 37 211-byte hex
-    /// byte-for-byte.
+    /// §25.23 Vector 37 (spec lines 1220-1265). The preimage is the 377-byte
+    /// hex, the hash is the spec's SHA-256, the body is the 411-byte hex, and
+    /// parsing the spec body returns the same struct. The spec's P-256 signature
+    /// verifies over the hash under the §25.2 reference key, which proves the
+    /// hash this module computes is the one the spec signed. Production
+    /// attestation signing stays Ed25519 under SCP-307 criterion 15; SCP-315
+    /// moves it to P-256.
     #[test]
-    fn vector_37_signing_preimage_matches_spec() {
-        let expected = hex(
-            "5343502d4b45595041434b4147452d4154544553544154494f4e2d56313a
-             000000166469643a6468743a7a364d6b4c656166417474657374
-             3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c
-             b6c6192e66300f4bbb4e3d870bfd02e416154ebb06661a70a84ea376244b3c20
-             7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13
-             0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20
-             0000000723616374697665
-             000000006553f100
-             0000000065554280",
-        );
-        let preimage = vector_37().signing_preimage();
-        assert_eq!(
-            preimage.len(),
-            211,
-            "Vector 37 preimage must be exactly 211 bytes"
-        );
-        assert_eq!(
-            preimage, expected,
-            "signing_preimage() must reproduce §25.23 Vector 37 byte-for-byte"
-        );
-    }
+    fn spec_vector37_matches() {
+        let att = v37_attestation();
+        let preimage = att.signing_preimage();
+        assert_eq!(preimage.len(), 377);
+        assert_eq!(preimage, hex(V37_PREIMAGE));
 
-    /// KAT: the signing hash equals the §25.23 Vector 37 SHA-256.
-    #[test]
-    fn vector_37_signing_hash_matches_spec() {
-        let expected: [u8; 32] =
-            hex("50cf61db5a97e0ddbd762de07e107684dfd0f00cfe53bad2750a70103ac38957")
+        let hash = att.signing_hash();
+        let expected_hash: [u8; 32] =
+            hex("f3e2825b6d0534827fec7a6b196b729578ef47be0c0847f6e8879cf5242aa4ad")
                 .try_into()
                 .unwrap();
+        assert_eq!(hash, expected_hash);
+
+        let body = att.to_extension_body();
+        assert_eq!(body.len(), 411);
+        assert_eq!(body, hex(V37_BODY));
         assert_eq!(
-            vector_37().signing_hash(),
-            expected,
-            "signing_hash() must equal §25.23 Vector 37 SHA-256"
+            KeyPackageAttestation::from_extension_body(&hex(V37_BODY)).unwrap(),
+            att
         );
+
+        let reference = scp_crypto::p256::P256PublicKey::from_sec1(&hex(
+            "033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027",
+        ))
+        .unwrap();
+        scp_crypto::p256::verify_prehash_strict(&reference, &hash, &att.signature).unwrap();
     }
 
-    /// KAT: the `0xFF03` extension body reproduces the §25.23 Vector 37 245-byte
-    /// hex byte-for-byte.
+    /// A 65-byte-key attestation round-trips through the extension body.
     #[test]
-    fn vector_37_extension_body_matches_spec() {
-        let expected = hex("000000166469643a6468743a7a364d6b4c656166417474657374
-             3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c
-             b6c6192e66300f4bbb4e3d870bfd02e416154ebb06661a70a84ea376244b3c20
-             7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13
-             0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20
-             0000000723616374697665
-             000000006553f100
-             0000000065554280
-             fcf01ea58941c9e88acc14ef1ada7d00ac4c0239c75655160fc5b248ee0299e0
-             18526235bc9b6d2a3efa37ab8db5d86b45b58deb5ad24540229d2804052e3509");
-        let body = vector_37().to_extension_body();
-        assert_eq!(
-            body.len(),
-            245,
-            "Vector 37 extension body must be exactly 245 bytes"
-        );
-        assert_eq!(
-            body, expected,
-            "to_extension_body() must reproduce §25.23 Vector 37 byte-for-byte"
-        );
+    fn attestation_extension_body_roundtrips() {
+        let att = v37_attestation();
+        let parsed = KeyPackageAttestation::from_extension_body(&att.to_extension_body()).unwrap();
+        assert_eq!(parsed, att);
+    }
+
+    /// Every one of the four key positions rejects a point that is not a
+    /// valid uncompressed P-256 point.
+    ///
+    /// | row | bytes at the key position | rejected by |
+    /// |---|---|---|
+    /// | 33-byte compressed key | `0x02 ‖ x` (the body shifts by 32 bytes) | parse (length/UTF-8/trailing checks) |
+    /// | `0x02` prefix | 65 bytes led by `0x02` | the per-key point check |
+    /// | off curve | `0x04 ‖ x=0 ‖ y=1` | the per-key point check |
+    /// | x = p | `0x04 ‖ p ‖ y` | the per-key point check |
+    ///
+    /// Removing the point check for one position makes that position's last
+    /// three rows parse, and the test fails.
+    #[test]
+    fn from_extension_body_rejects_invalid_point_at_each_key_position() {
+        const P: &str = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff";
+        let valid = v37_attestation().to_extension_body();
+        // did occupies 4 + 56 bytes; the four keys follow back to back.
+        let key_offset = |i: usize| 4 + V37_DID.len() + i * LEAF_PUBLIC_KEY_SIZE;
+        let mut off_curve = [0u8; LEAF_PUBLIC_KEY_SIZE];
+        off_curve[0] = 0x04;
+        off_curve[LEAF_PUBLIC_KEY_SIZE - 1] = 1;
+        for position in 0..4 {
+            let off = key_offset(position);
+            let original: [u8; LEAF_PUBLIC_KEY_SIZE] =
+                valid[off..off + LEAF_PUBLIC_KEY_SIZE].try_into().unwrap();
+
+            let mut compressed = valid.clone();
+            let mut short = original[..33].to_vec();
+            short[0] = 0x02 | (original[64] & 1);
+            compressed.splice(off..off + LEAF_PUBLIC_KEY_SIZE, short);
+
+            let mut wrong_prefix = original;
+            wrong_prefix[0] = 0x02;
+            let mut x_is_p = original;
+            x_is_p[1..33].copy_from_slice(&hex(P));
+
+            let mut rows = vec![("compressed", compressed)];
+            for (name, key) in [
+                ("0x02 prefix", wrong_prefix),
+                ("off curve", off_curve),
+                ("x = p", x_is_p),
+            ] {
+                let mut body = valid.clone();
+                body[off..off + LEAF_PUBLIC_KEY_SIZE].copy_from_slice(&key);
+                rows.push((name, body));
+            }
+            for (name, body) in rows {
+                assert!(
+                    matches!(
+                        KeyPackageAttestation::from_extension_body(&body),
+                        Err(MlsError::ExtensionError(_))
+                    ),
+                    "key position {position}, row {name:?} must be rejected"
+                );
+            }
+        }
     }
 
     /// The extension body is exactly the preimage minus the 30-byte domain
     /// separator, plus the 64-byte signature (§9.5.2 wire-format invariant).
     #[test]
     fn extension_body_is_preimage_minus_domain_plus_signature() {
-        let att = vector_37();
+        let att = v37_attestation();
         let preimage = att.signing_preimage();
         let body = att.to_extension_body();
         // Body's field portion == preimage without the domain prefix.
@@ -1055,21 +1123,11 @@ mod tests {
         assert_eq!(&body[body.len() - SIGNATURE_SIZE..], &att.signature);
     }
 
-    /// Round-trip: `from_extension_body(to_extension_body())` reconstructs an
-    /// equal struct.
-    #[test]
-    fn vector_37_extension_body_roundtrips() {
-        let att = vector_37();
-        let body = att.to_extension_body();
-        let parsed = KeyPackageAttestation::from_extension_body(&body).unwrap();
-        assert_eq!(parsed, att);
-    }
-
     /// Round-trip with the `#agent` signing key id (exercises the other
     /// `SigningKeyId` arm).
     #[test]
     fn agent_signing_key_id_roundtrips() {
-        let mut att = vector_37();
+        let mut att = v37_attestation();
         att.signing_key_id = SigningKeyId::Agent;
         let body = att.to_extension_body();
         let parsed = KeyPackageAttestation::from_extension_body(&body).unwrap();
@@ -1081,7 +1139,7 @@ mod tests {
 
     #[test]
     fn from_extension_body_rejects_truncated() {
-        let body = vector_37().to_extension_body();
+        let body = v37_attestation().to_extension_body();
         // Drop the final signature byte.
         let truncated = &body[..body.len() - 1];
         assert!(KeyPackageAttestation::from_extension_body(truncated).is_err());
@@ -1094,14 +1152,14 @@ mod tests {
 
     #[test]
     fn from_extension_body_rejects_trailing_byte() {
-        let mut body = vector_37().to_extension_body();
+        let mut body = v37_attestation().to_extension_body();
         body.push(0x00); // one extra trailing byte after the signature
         assert!(KeyPackageAttestation::from_extension_body(&body).is_err());
     }
 
     #[test]
     fn from_extension_body_rejects_oversized_length_prefix() {
-        let mut body = vector_37().to_extension_body();
+        let mut body = v37_attestation().to_extension_body();
         // The first 4 bytes are the `did` length prefix. Set it to a value that
         // overruns the remaining bytes.
         body[0] = 0xFF;
@@ -1124,10 +1182,11 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&did_len_prefix);
         body.extend_from_slice(did);
-        body.extend_from_slice(&[0u8; PUBLIC_KEY_SIZE]); // leaf_signature_key
-        body.extend_from_slice(&[0u8; PUBLIC_KEY_SIZE]); // leaf_encryption_key
-        body.extend_from_slice(&[0u8; PUBLIC_KEY_SIZE]); // init_key
-        body.extend_from_slice(&[0u8; PUBLIC_KEY_SIZE]); // wrapping_key
+        // Four valid points, so the parse reaches the field under test.
+        let key = v37_attestation().leaf_signature_key;
+        for _ in 0..4 {
+            body.extend_from_slice(&key);
+        }
         body.extend_from_slice(&skid_len_prefix);
         body.extend_from_slice(skid);
         body.extend_from_slice(&1_700_000_000u64.to_be_bytes());
@@ -1157,7 +1216,7 @@ mod tests {
         // signing_key_id bytes 0xFF 0xFE are not valid UTF-8 (rejected at the
         // UTF-8 check, before the "#active"/"#agent" fragment check).
         let bad_skid: &[u8] = &[0xFF, 0xFE];
-        let did = b"did:dht:z6MkLeafAttest";
+        let did = V37_DID.as_bytes();
         let body = build_body(
             u32::try_from(did.len()).unwrap().to_be_bytes(),
             did,
@@ -1174,7 +1233,7 @@ mod tests {
     fn from_extension_body_rejects_oversized_signing_key_id_length_prefix() {
         // Oversized length prefix on the signing_key_id field specifically
         // (the `did` field parses cleanly first, isolating the skid overrun).
-        let did = b"did:dht:z6MkLeafAttest";
+        let did = V37_DID.as_bytes();
         let body = build_body(
             u32::try_from(did.len()).unwrap().to_be_bytes(),
             did,
@@ -1191,13 +1250,14 @@ mod tests {
     fn from_extension_body_rejects_unknown_signing_key_id() {
         // Hand-build a body with a bogus signing_key_id fragment ("#0").
         let mut body = Vec::new();
-        let did = b"did:dht:z6MkLeafAttest";
+        let did = V37_DID.as_bytes();
         body.extend_from_slice(&u32::try_from(did.len()).unwrap().to_be_bytes());
         body.extend_from_slice(did);
-        body.extend_from_slice(&[0u8; PUBLIC_KEY_SIZE]); // leaf_signature_key
-        body.extend_from_slice(&[0u8; PUBLIC_KEY_SIZE]); // leaf_encryption_key
-        body.extend_from_slice(&[0u8; PUBLIC_KEY_SIZE]); // init_key
-        body.extend_from_slice(&[0u8; PUBLIC_KEY_SIZE]); // wrapping_key
+        // Four valid points, so the parse reaches the field under test.
+        let key = v37_attestation().leaf_signature_key;
+        for _ in 0..4 {
+            body.extend_from_slice(&key);
+        }
         let bad_skid = b"#0";
         body.extend_from_slice(&u32::try_from(bad_skid.len()).unwrap().to_be_bytes());
         body.extend_from_slice(bad_skid);
@@ -1211,7 +1271,7 @@ mod tests {
 
     #[test]
     fn make_and_extract_attestation_roundtrip() {
-        let att = vector_37();
+        let att = v37_attestation();
         let ext = att.make_attestation_extension();
         assert_eq!(
             ext.extension_type(),
@@ -1285,11 +1345,15 @@ mod tests {
     const EXPIRES: u64 = 1_700_086_400; // ISSUED + 86_400 (1 day)
     const NOW: u64 = 1_700_000_100; // inside [ISSUED, EXPIRES]
 
-    /// A fresh random 32-byte key (CSPRNG; test-only ground-truth material).
-    fn rand_key() -> [u8; PUBLIC_KEY_SIZE] {
-        let mut b = [0u8; PUBLIC_KEY_SIZE];
-        OsRng.fill_bytes(&mut b);
-        b
+    /// A fresh random 65-byte uncompressed P-256 point (CSPRNG; test-only
+    /// ground-truth material).
+    fn rand_key() -> [u8; LEAF_PUBLIC_KEY_SIZE] {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        scp_crypto::p256::P256SigningKey::from_seed(b"attestation-test", &seed)
+            .unwrap()
+            .public_key()
+            .to_uncompressed()
     }
 
     /// Signs `att` in place under `signer`, over its §9.5.1 `signing_hash()`
@@ -1318,11 +1382,11 @@ mod tests {
     /// `Lifetime` bounds, `leaf_credential_*`) can be flipped here alone, leaving
     /// a still-valid signature so the target check fails in isolation.
     struct Truth {
-        signer_pubkey: [u8; PUBLIC_KEY_SIZE],
-        leaf_sig: [u8; PUBLIC_KEY_SIZE],
-        leaf_enc: [u8; PUBLIC_KEY_SIZE],
-        leaf_wrap: [u8; PUBLIC_KEY_SIZE],
-        kp_init: [u8; PUBLIC_KEY_SIZE],
+        signer_pubkey: [u8; ED25519_PUBLIC_KEY_SIZE],
+        leaf_sig: [u8; LEAF_PUBLIC_KEY_SIZE],
+        leaf_enc: [u8; LEAF_PUBLIC_KEY_SIZE],
+        leaf_wrap: [u8; LEAF_PUBLIC_KEY_SIZE],
+        kp_init: [u8; LEAF_PUBLIC_KEY_SIZE],
         did: String,
         skid: SigningKeyId,
         not_before: u64,
@@ -1665,8 +1729,18 @@ mod resolution_seam_tests {
 
     /// A fresh random Ed25519 public key (a valid curve point — required by
     /// `decode_multibase_key`, so raw `[u8; 32]` patterns won't do).
-    fn fresh_pub() -> [u8; PUBLIC_KEY_SIZE] {
+    fn fresh_pub() -> [u8; ED25519_PUBLIC_KEY_SIZE] {
         SigningKey::generate(&mut OsRng).verifying_key().to_bytes()
+    }
+
+    /// A fresh random 65-byte uncompressed P-256 point for a leaf key position.
+    fn fresh_leaf() -> [u8; LEAF_PUBLIC_KEY_SIZE] {
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut OsRng, &mut seed);
+        scp_crypto::p256::P256SigningKey::from_seed(b"attestation-seam-test", &seed)
+            .unwrap()
+            .public_key()
+            .to_uncompressed()
     }
 
     /// Whether the fixture models an Add (`KeyPackage`, distinct `init_key`) or an
@@ -1685,10 +1759,10 @@ mod resolution_seam_tests {
     struct Fx {
         att: KeyPackageAttestation,
         credential: ScpCredential,
-        leaf_sig: [u8; PUBLIC_KEY_SIZE],
-        leaf_enc: [u8; PUBLIC_KEY_SIZE],
-        leaf_wrap: [u8; PUBLIC_KEY_SIZE],
-        kp_init: [u8; PUBLIC_KEY_SIZE],
+        leaf_sig: [u8; LEAF_PUBLIC_KEY_SIZE],
+        leaf_enc: [u8; LEAF_PUBLIC_KEY_SIZE],
+        leaf_wrap: [u8; LEAF_PUBLIC_KEY_SIZE],
+        kp_init: [u8; LEAF_PUBLIC_KEY_SIZE],
         doc: DidDocument,
         kind: Kind,
     }
@@ -1714,7 +1788,7 @@ mod resolution_seam_tests {
 
     /// Builds a DID document whose `#active` verification method carries
     /// `active_key` (the pattern `resolve_signing_key` decodes back to 32 bytes).
-    fn did_doc_with_active(active_key: &[u8; PUBLIC_KEY_SIZE]) -> DidDocument {
+    fn did_doc_with_active(active_key: &[u8; ED25519_PUBLIC_KEY_SIZE]) -> DidDocument {
         let identity_key = fresh_pub();
         let commitment = [0u8; 32];
         DidDocument::new(TEST_DID, &identity_key, active_key, &commitment)
@@ -1727,10 +1801,10 @@ mod resolution_seam_tests {
     fn valid_fixture(kind: Kind) -> Fx {
         let signer = SigningKey::generate(&mut OsRng);
         let signer_pub = signer.verifying_key().to_bytes();
-        let leaf_sig = fresh_pub();
-        let leaf_enc = fresh_pub();
-        let leaf_wrap = fresh_pub();
-        let kp_init = fresh_pub();
+        let leaf_sig = fresh_leaf();
+        let leaf_enc = fresh_leaf();
+        let leaf_wrap = fresh_leaf();
+        let kp_init = fresh_leaf();
         let att_init = match kind {
             Kind::Add => kp_init,
             Kind::Update => leaf_enc,
@@ -1771,10 +1845,10 @@ mod resolution_seam_tests {
     fn agent_fixture(include_agent_vm: bool) -> Fx {
         let signer = SigningKey::generate(&mut OsRng);
         let agent_pub = signer.verifying_key().to_bytes();
-        let leaf_sig = fresh_pub();
-        let leaf_enc = fresh_pub();
-        let leaf_wrap = fresh_pub();
-        let kp_init = fresh_pub();
+        let leaf_sig = fresh_leaf();
+        let leaf_enc = fresh_leaf();
+        let leaf_wrap = fresh_leaf();
+        let kp_init = fresh_leaf();
         let mut att = KeyPackageAttestation {
             did: TEST_DID.to_owned(),
             leaf_signature_key: leaf_sig,
@@ -2000,7 +2074,7 @@ mod resolution_seam_tests {
         // check 1 pass, then the pure core's check 4 fails. The wrapped
         // AttestationVerifyError must surface verbatim through Delegated(..).
         let mut fx = valid_fixture(Kind::Add);
-        fx.leaf_sig = fresh_pub();
+        fx.leaf_sig = fresh_leaf();
         let err =
             verify_attestation_with_resolution(&fx.att, &fx.ground_truth(), &fx.doc, NOW, NOW)
                 .unwrap_err();

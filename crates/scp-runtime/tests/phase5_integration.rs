@@ -551,7 +551,12 @@ fn media_session_mls_key_derivation() {
         scp_did::SigningKeyId::Active,
     )
     .expect("alice credential");
-    let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).expect("create group");
+    let mut alice_group = create_group(
+        &alice_cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+        &scp_clock::SystemClock,
+    )
+    .expect("create group");
 
     // -- Step 2: Add Bob to the group --
     let bob_cred = ScpCredential::new(
@@ -560,8 +565,12 @@ fn media_session_mls_key_derivation() {
         scp_did::SigningKeyId::Active,
     )
     .expect("bob credential");
-    let (bob_kp_bundle, bob_signer, bob_provider) =
-        generate_key_package(&bob_cred, &scp_clock::SystemClock).expect("bob key package");
+    let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(
+        &bob_cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+        &scp_clock::SystemClock,
+    )
+    .expect("bob key package");
     let bob_kp = bob_kp_bundle.key_package().clone().into();
     let add_result =
         add_member(&mut alice_group, bob_kp, &scp_clock::SystemClock).expect("add bob");
@@ -984,7 +993,12 @@ fn media_session_keys_derived_from_mls_group_state() {
         scp_did::SigningKeyId::Active,
     )
     .expect("alice cred");
-    let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).expect("alice group");
+    let mut alice_group = create_group(
+        &alice_cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+        &scp_clock::SystemClock,
+    )
+    .expect("alice group");
 
     let bob_cred = ScpCredential::new(
         "did:dht:z6MkBob".to_owned(),
@@ -992,8 +1006,12 @@ fn media_session_keys_derived_from_mls_group_state() {
         scp_did::SigningKeyId::Active,
     )
     .expect("bob cred");
-    let (bob_kp_bundle, bob_signer, bob_provider) =
-        generate_key_package(&bob_cred, &scp_clock::SystemClock).expect("bob kp");
+    let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(
+        &bob_cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+        &scp_clock::SystemClock,
+    )
+    .expect("bob kp");
     let bob_kp = bob_kp_bundle.key_package().clone().into();
     let add_result =
         add_member(&mut alice_group, bob_kp, &scp_clock::SystemClock).expect("add bob");

@@ -1174,17 +1174,6 @@ mod tests {
 
     use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 
-    /// Test DID used by the real [`NodeMlsFactory`] in test bodies.
-    ///
-    /// The prior `MockCrypto` / `FailingMlsCrypto` / `TransientFailCrypto`
-    /// scaffolds are deleted along with the `ContextCryptoProvider`
-    /// trait in ADR-049 §15. Success-path tests now build a
-    /// real [`NodeMlsFactory::new(TEST_DID.to_owned())`]; tests that
-    /// asserted mock trackers (`mls_destroyed` counts, sender-key-destroyed
-    /// counts) or fail-injection semantics are `#[ignore]`d pending
-    /// `MlsBackend`-level fail-injection in ADR-049 §15.
-    const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
-
     // #2148 (ADR-049 birth-into-actor): `mk_crypto` was DELETED — the production
     // TTL/close paths no longer take a crypto provider (key destruction runs on
     // the actor-owned crypto), and these tests exercise the FSM + leaf/relay
@@ -1803,34 +1792,6 @@ mod tests {
         assert_eq!(ext.active_consent_count(&active), 2);
         assert!(!ext.is_unanimous_active(&active));
         assert_eq!(ext.active_remaining(&active), 1);
-    }
-
-    // ADR-049 §15: backend-injection seam landed via
-    // `NodeMlsFactory::with_backends`. Pre-existing tests that
-    // asserted `MockCrypto` tracker behaviour (mls_destroyed counters,
-    // sender-key-destroyed counters, fail-injection retry semantics)
-    // are now expressed by passing a fail-injecting
-    // `Arc<dyn MlsBackend>` into `with_backends`. The smoke below
-    // confirms the seam exists; functional fail-injection tests live
-    // next to the production-backend tests in
-    // `crate::crypto::mls::production_backend`.
-    #[test]
-    fn ttl_fail_injection_uses_backend_injection() {
-        use crate::crypto::hpke_backend::ProductionHpkeBackend;
-        use crate::crypto::mls::production_backend::ProductionMlsBackend;
-        use crate::crypto::mls::provider::NodeMlsFactory;
-        use std::sync::Arc;
-
-        let provider = NodeMlsFactory::with_backends(
-            TEST_DID.to_owned(),
-            Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
-                scp_clock::SystemClock,
-            ))),
-            Arc::new(ProductionHpkeBackend::new()),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        );
-        let _mls = provider.mls_backend();
-        let _hpke = provider.hpke_backend();
     }
 
     // Unused trait/type imports from the pre-ADR-049 §15 test scaffolding

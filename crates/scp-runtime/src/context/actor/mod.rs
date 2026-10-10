@@ -61,7 +61,7 @@ pub use sequence::{SendSequenceTracker, SequenceReservation};
 pub use state::{
     AuthorKeyEntry, BroadcastRecvTracker, BroadcastState, ContextCryptoState, ContextEventLog,
     ContextLifecycleState, ContextModeState, ContextRouting, PendingBroadcastKeyRotation,
-    PerContextState, RecvSequenceTracker, WelcomeProcessing, WrappingKeyPair,
+    PerContextState, RecvSequenceTracker, WelcomeProcessing,
 };
 
 /// Re-export of [`scp_protocol::context::ContextError`] for handler-side

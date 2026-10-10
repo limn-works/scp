@@ -40,19 +40,22 @@ use crate::{decrement_handle_count, increment_handle_count};
 /// and TLS-serializes it to bytes suitable for
 /// `ContextCryptoProvider::validate_key_package` and `add_member`.
 ///
-/// Uses `generate_key_package_with_context_params` with `None` so the leaf
-/// **declares the `0xFF02` (`scp_context_params`) capability** — mandatory to
+/// Uses `generate_key_package_with_context_params` so the leaf **declares the `0xFF02` (`scp_context_params`) capability** — mandatory to
 /// be added to an encrypted context group (`valn0502`, §5.13.3). The base
-/// `generate_key_package` declares no SCP capabilities and real MLS rejects it
-/// from a context group. No wrapping-key leaf extension is attached (this
-/// single-process membership path retains no joiner private state).
+/// `generate_key_package` declares no `0xFF02` capability and real MLS rejects
+/// it from a context group. The leaf carries `wrapping_public` as its `0xFF01`
+/// extension: the identity's wrapping public key, whose secret the supervisor
+/// holds (spec 09 §9.16.1).
 ///
 /// # Errors
 ///
 /// Returns `ScpNapiError::Crypto` if the DID format is invalid (must be
 /// `did:dht:z...`), key package generation fails, or TLS serialization
 /// fails.
-fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpNapiError> {
+fn generate_mls_key_package_bytes(
+    did: &str,
+    wrapping_public: &[u8; 65],
+) -> Result<Vec<u8>, ScpNapiError> {
     use scp_core::crypto::mls::credential::ScpCredential;
     use scp_core::crypto::mls::group::generate_key_package_with_context_params;
     use tls_codec::Serialize as TlsSerializeTrait;
@@ -66,12 +69,11 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpNapiError> {
         })?;
 
     let (kp_bundle, _signer, _provider) =
-        generate_key_package_with_context_params(&cred, None, &scp_clock::SystemClock).map_err(
-            |e| ScpNapiError::Crypto {
-                message: format!("MLS key package generation failed: {e}"),
-                code: codes::CRYPTO_4011.to_owned(),
-            },
-        )?;
+        generate_key_package_with_context_params(&cred, wrapping_public, &scp_clock::SystemClock)
+            .map_err(|e| ScpNapiError::Crypto {
+            message: format!("MLS key package generation failed: {e}"),
+            code: codes::CRYPTO_4011.to_owned(),
+        })?;
 
     kp_bundle
         .key_package()
@@ -945,7 +947,11 @@ pub(crate) async fn context_join_on(
     // The key package contains the joiner's SCP credential (DID) and is
     // validated by NodeMlsFactory::validate_key_package before MLS
     // group addition.
-    let kp_bytes = generate_mls_key_package_bytes(&identity_did)?;
+    let wrapping_public = crate::runtime::supervisor(bi)?
+        .wrapping_public_key(&DID(identity_did.clone()))
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    let kp_bytes = generate_mls_key_package_bytes(&identity_did, &wrapping_public)?;
 
     let key_package = scp_core::context::membership::KeyPackage {
         owner_did: DID(identity_did.clone()),
@@ -3311,8 +3317,8 @@ pub(crate) async fn broadcast_unblock_subscriber_on(
 /// Per-bridge-instance implementation of [`Scp::broadcast_handle_key_request`](crate::scp::Scp::broadcast_handle_key_request).
 ///
 /// Validates the author DID is locally controlled, then HPKE-seals the author's
-/// current broadcast key to the requester's X25519 `wrapping_pubkey`
-/// (§5.14.2). Returns `Some(json)` (a serialized `SealedBroadcastKey`) on
+/// current broadcast key to the requester's `wrapping_pubkey`, a 65-byte
+/// uncompressed DHKEM(P-256) point (§5.14.2, §9.5). Returns `Some(json)` (a serialized `SealedBroadcastKey`) on
 /// grant, or `None` on deny (§5.14.8 — no key material to a denied requester).
 /// The raw broadcast key never crosses the FFI boundary.
 /// Routed through the ADR-049 broadcast dispatch surface.
@@ -3328,15 +3334,13 @@ pub(crate) async fn broadcast_handle_key_request_on(
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&requester_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let wrapping: [u8; 32] = wrapping_pubkey.as_slice().try_into().map_err(|_| {
-        NapiError::from(ScpNapiError::Validation {
-            message: format!(
-                "wrapping_pubkey must be 32 bytes, got {}",
-                wrapping_pubkey.len()
-            ),
-            code: codes::VALID_7007.to_owned(),
-        })
-    })?;
+    let wrapping =
+        scp_ffi_common::broadcast::parse_wrapping_pubkey(&wrapping_pubkey).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: e.to_string(),
+                code: e.error_code().to_owned(),
+            })
+        })?;
     let sup = crate::runtime::supervisor(bi)?;
     let context_id = handle.context_id.clone();
     let context_id_for_seal = context_id.clone();
@@ -3377,8 +3381,8 @@ pub(crate) async fn broadcast_handle_key_request_on(
     })
 }
 
-/// Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held X25519
-/// wrapping secret, returning the raw 32-byte AES-256 broadcast key.
+/// Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held 32-byte
+/// DHKEM(P-256) wrapping scalar, returning the raw 32-byte AES-256 broadcast key.
 ///
 /// Pure crypto — no bridge-instance state, so it is a module-level free
 /// `#[napi]` fn (ADR-048 §1) with no per-instance `_on` variant. `sealed_json`
@@ -3395,22 +3399,16 @@ pub fn broadcast_open_key(sealed_json: String, wrapping_secret: Vec<u8>) -> napi
     scp_ffi_common::broadcast::open_sealed_broadcast_key(&sealed_json, &wrapping_secret).map_err(
         |e| {
             // Malformed JSON / wrong-length secret are caller-input validation
-            // errors; a failed HPKE open is a context/crypto error. Mirrors the
-            // PyO3/UniFFI classification so the error variant is consistent
-            // across every SDK.
-            let scp_err = match &e {
-                OpenSealedKeyError::InvalidJson { .. } => ScpNapiError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7002.to_owned(),
-                },
-                OpenSealedKeyError::InvalidSecretLength { .. } => ScpNapiError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7007.to_owned(),
-                },
-                OpenSealedKeyError::OpenFailed { .. } => ScpNapiError::Context {
-                    message: e.to_string(),
-                    code: codes::CTX_2023.to_owned(),
-                },
+            // errors; a failed HPKE open is a context error. The code comes
+            // from `error_code`, which every bridge shares.
+            let message = e.to_string();
+            let code = e.error_code().to_owned();
+            let scp_err = match e {
+                OpenSealedKeyError::InvalidJson { .. }
+                | OpenSealedKeyError::InvalidSecretLength { .. } => {
+                    ScpNapiError::Validation { message, code }
+                }
+                OpenSealedKeyError::OpenFailed { .. } => ScpNapiError::Context { message, code },
             };
             NapiError::from(scp_err)
         },

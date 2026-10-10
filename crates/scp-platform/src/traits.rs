@@ -1153,15 +1153,7 @@ pub(crate) fn sign_p256_digest(
 pub fn hpke_p256_peer(
     peer_public: &[u8],
 ) -> Result<scp_crypto::p256::P256PublicKey, PlatformError> {
-    use scp_crypto::p256::UNCOMPRESSED_POINT_LEN;
-    if peer_public.len() != UNCOMPRESSED_POINT_LEN || peer_public[0] != 0x04 {
-        return Err(PlatformError::CustodyError(format!(
-            "an HPKE P-256 peer public key is the {UNCOMPRESSED_POINT_LEN}-byte uncompressed \
-             point (0x04 || x || y), got {} bytes",
-            peer_public.len()
-        )));
-    }
-    scp_crypto::p256::P256PublicKey::from_sec1(peer_public)
+    scp_crypto::p256::P256PublicKey::from_uncompressed(peer_public)
         .map_err(|e| PlatformError::CustodyError(format!("P-256 peer public key: {e}")))
 }
 

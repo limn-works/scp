@@ -93,7 +93,7 @@ pub const CURRENT_EXPORT_VERSION: u32 = 4;
 /// bounding the pre-verification work to a constant. Mirrors the
 /// pre-deserialization size-check pattern used for inner envelopes
 /// (`scp_protocol::serde_util::MAX_ENVELOPE_SIZE`, see
-/// `crate::envelope::outer::ops`).
+/// `scp_protocol::envelope::inner::InnerEnvelope::from_bytes`).
 pub const MAX_CONTEXT_EXPORT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Domain separator for the Tier-2 sync-delta `ContextSnapshot` hash (§23.16.4).

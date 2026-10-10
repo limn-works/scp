@@ -100,7 +100,9 @@ scp-relay-client = { path = "../scp-relay-client" }
 # `scp-crypto::pseudonym` derivation (§9.10.4.A, ADR-057 Option A) on BOTH native
 # and wasm32, asserting byte-parity against the §25.19 golden vectors. A
 # types-only dev edge to a leaf already in the wasm tree — inside the fence.
-scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
+# `testing` adds `p256::testing::uncompressed_point_for`, the wrapping public key
+# the MLS group fixtures publish in their leaf (spec 09 §9.16.1).
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2", features = ["testing"] }
 
 # The cross-target determinism KAT round-trips committed golden MLS wire blobs
 # (Commit / Welcome / KeyPackage) through openmls's canonical TLS codec on BOTH

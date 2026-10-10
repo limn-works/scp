@@ -879,6 +879,16 @@ fn context_id_bytes(context_id: &str) -> [u8; 32] {
     super::state::context_id_to_bytes(context_id)
 }
 
+/// The identity creating a context: its DID and the wrapping public key its
+/// leaf publishes as the `0xFF01` extension (spec 09 §9.16.1).
+#[derive(Clone, Copy)]
+pub struct ContextCreator<'a> {
+    /// The creator's DID.
+    pub did: &'a str,
+    /// The creator identity's 65-byte wrapping public key.
+    pub wrapping_public_key: &'a [u8; 65],
+}
+
 /// Executes the two-phase context creation flow.
 ///
 /// **Phase 1 (validate):** Checks params and identity with zero side effects.
@@ -930,7 +940,7 @@ pub async fn create_context(
     crypto: &NodeMlsFactory,
     transport: &dyn ContextTransportProvider,
     event_log_provider: &dyn ContextEventLogProvider,
-    creator_did: &str,
+    creator: ContextCreator<'_>,
     creation_timestamp_secs: u64,
 ) -> Result<
     (
@@ -942,6 +952,10 @@ pub async fn create_context(
     // ------------------------------------------------------------------
     // Phase 1 -- Validate (no side effects)
     // ------------------------------------------------------------------
+    let ContextCreator {
+        did: creator_did,
+        wrapping_public_key,
+    } = creator;
 
     // 1. Validate ContextParams (including template validation).
     validate_params(&params)?;
@@ -1002,7 +1016,7 @@ pub async fn create_context(
             })?;
             // Owned birth. On `Err` the `?` drops nothing — no group / sender
             // key was installed into any provider map.
-            Some(crypto.create_mls_group_with_context(&context_extension)?)
+            Some(crypto.create_mls_group_with_context(&context_extension, wrapping_public_key)?)
         }
         ContextMode::Broadcast => None,
     };
@@ -1282,33 +1296,6 @@ mod tests {
         assert!(validate_params(&params).is_ok());
     }
 
-    /// Smoke verifying that ADR-049 §15's
-    /// [`NodeMlsFactory::with_backends`] seam compiles and that
-    /// inherent backend accessors return the injected pointers.
-    /// Functional fail-injection tests (one per orchestration path)
-    /// extend this seam with mock `MlsBackend`/`HpkeBackend` impls
-    /// that return `Err(...)` on a single primitive call; the harness
-    /// for those mocks lives next to the production-backend tests in
-    /// `crate::crypto::mls::production_backend`.
-    #[tokio::test]
-    async fn create_context_fail_paths_use_backend_injection() {
-        use crate::crypto::hpke_backend::ProductionHpkeBackend;
-        use crate::crypto::mls::production_backend::ProductionMlsBackend;
-        use crate::crypto::mls::provider::NodeMlsFactory;
-        use std::sync::Arc;
-
-        let provider = NodeMlsFactory::with_backends(
-            TEST_DID.to_owned(),
-            Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
-                scp_clock::SystemClock,
-            ))),
-            Arc::new(ProductionHpkeBackend::new()),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        );
-        let _mls = provider.mls_backend();
-        let _hpke = provider.hpke_backend();
-    }
-
     /// ADR-056 (Model A) / §6.2.4:276 conformance: a context whose
     /// id is a real 64-hex string (the shape `generate_context_id` produces:
     /// `hex(32 random bytes)`) keys its creation crypto under the **decoded
@@ -1361,7 +1348,10 @@ mod tests {
             &crypto,
             &TestTransport,
             &TestEventLog,
-            TEST_DID,
+            ContextCreator {
+                did: TEST_DID,
+                wrapping_public_key: crate::crypto::wrapping::WrappingKeyPair::generate().public(),
+            },
             1_700_000_000,
         )
         .await
@@ -1414,7 +1404,10 @@ mod tests {
             &crypto,
             &TestTransport,
             &provider,
-            TEST_DID,
+            ContextCreator {
+                did: TEST_DID,
+                wrapping_public_key: crate::crypto::wrapping::WrappingKeyPair::generate().public(),
+            },
             CREATION_TS,
         )
         .await
@@ -1542,7 +1535,10 @@ mod tests {
             &crypto,
             &TestTransport,
             &provider,
-            TEST_DID,
+            ContextCreator {
+                did: TEST_DID,
+                wrapping_public_key: crate::crypto::wrapping::WrappingKeyPair::generate().public(),
+            },
             CREATION_TS,
         )
         .await

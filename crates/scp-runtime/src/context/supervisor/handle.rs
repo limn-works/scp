@@ -66,7 +66,7 @@ impl SupervisorHandle {
     // AXIS: actor-internal (ADR-049 §5 placement invariant). Every
     // PER-IDENTITY method on this handle takes `&OwnedIdentityDid`, never a
     // bare `&DID` — an actor reaches only the identity that owns it, even for
-    // PUBLIC reads (`my_wrapping_public_key` returns public data yet is
+    // PUBLIC reads (`my_wrapping_keypair` exposes public data too, yet is
     // token-gated, because the discriminator is caller-isolation, not
     // data-sensitivity). A per-identity op callable by the FFI/bridge
     // orchestrator does NOT belong here: add a bare-`DID` `pub fn` on
@@ -448,40 +448,45 @@ impl SupervisorHandle {
         self.supervisor.reconnect_all_standing().await
     }
 
-    /// Look up this identity's wrapping public key. Returns `None` if
-    /// the identity has not set a wrapping keypair yet.
+    /// This identity's DHKEM(P-256) wrapping keypair (spec 09 §9.16.1): the
+    /// public point every context of the identity publishes in `0xFF01`, and
+    /// the scalar that opens what is sealed to it.
     ///
-    /// Takes `&OwnedIdentityDid` — not `&DID` — so the caller must hold
-    /// the capability proof that they are the actor for this identity.
-    /// The token is minted only in `supervisor/` code (the `pub(super)`
-    /// `issue_for_actor` constructor) and its `did` field is private;
-    /// handler code can hold and pass a token but cannot fabricate one.
+    /// The supervisor loads or creates the pair when it builds the identity's
+    /// first actor (`Supervisor::key_package_store_for`), so every actor's
+    /// owner has one. The returned `Arc` is a snapshot of the current pair;
+    /// drop it within the operation that needed it.
     ///
-    /// Visibility is `pub(in crate::context)` — the SAME visibility as
-    /// `OwnedIdentityDid` itself. The token-by-value lives in
-    /// `ActorDeps`; this method is reachable from handler code under
-    /// `crate::context::actor::handlers/` that holds an `&OwnedIdentityDid`
-    /// borrow. Because the type and the method share visibility, there is
-    /// no `private_interfaces` asymmetry to allow — the mint guarantee is
-    /// carried entirely by the `pub(super)` constructor and the private
-    /// field, not by any visibility gap here.
-    #[must_use]
-    #[allow(dead_code)]
-    pub(in crate::context) fn my_wrapping_public_key(
+    /// Takes `&OwnedIdentityDid` — not `&DID` — so the caller must hold the
+    /// capability proof that it is an actor of this identity. The token is
+    /// minted only in `supervisor/` code and its `did` field is private.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::InvalidState`] if no pair is loaded for the identity.
+    /// That fails the operation closed rather than publishing or opening with
+    /// another key.
+    pub(in crate::context) fn my_wrapping_keypair(
         &self,
         identity: &OwnedIdentityDid,
-    ) -> Option<Arc<Vec<u8>>> {
+    ) -> Result<Arc<crate::crypto::wrapping::WrappingKeyPair>, ContextError> {
         let did = identity.as_did();
         self.supervisor
             .wrapping_keys
             .get(did)
-            .map(|entry| Arc::new(entry.value().load_full().public.to_vec()))
+            .map(|entry| entry.value().load_full())
+            .ok_or_else(|| {
+                ContextError::InvalidState(format!(
+                    "no wrapping keypair is loaded for identity {}",
+                    did.0
+                ))
+            })
     }
 
     /// Look up this identity's `KeyPackageStoreActor` handle. Returns
     /// `None` if no KeyPackage actor has been spawned for the identity.
     ///
-    /// Same capability discipline as [`Self::my_wrapping_public_key`]:
+    /// Same capability discipline as [`Self::my_wrapping_keypair`]:
     /// `&OwnedIdentityDid` proves ownership, the token cannot be minted
     /// outside `supervisor/`, and the method shares the type's
     /// `pub(in crate::context)` visibility — so no `private_interfaces`
@@ -964,13 +969,12 @@ const fn _assert_send_sync() {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::context::actor::state::WrappingKeyPair;
     use crate::context::supervisor::key_package_actor::KeyPackageStoreActor;
     use crate::context::supervisor::saga_journal::{ProtocolRepositorySagaJournal, SagaJournal};
     use crate::context::supervisor::supervisor::SupervisorConfig;
+    use crate::crypto::wrapping::WrappingKeyPair;
     use arc_swap::ArcSwap;
     use scp_platform::in_memory::InMemoryStorage;
-    use zeroize::Zeroizing;
 
     struct TestPersistence;
     #[async_trait::async_trait]
@@ -1032,27 +1036,44 @@ mod tests {
         assert!(handle.standing_peer(&unknown).is_none());
     }
 
+    /// An identity with no loaded pair gets a typed error, never a default key.
     #[tokio::test]
-    async fn my_wrapping_public_key_returns_none_when_unset() {
+    async fn my_wrapping_keypair_fails_closed_when_unset() {
         let (_sup, handle) = test_handle();
         let did = DID("did:example:alice".to_owned());
         let token = OwnedIdentityDid::issue_for_actor(did);
-        assert!(handle.my_wrapping_public_key(&token).is_none());
+        assert!(matches!(
+            handle.my_wrapping_keypair(&token),
+            Err(ContextError::InvalidState(_))
+        ));
     }
 
+    /// The reader returns the identity's own pair, and after the owner's slot
+    /// is swapped it returns the new pair.
     #[tokio::test]
-    async fn my_wrapping_public_key_reads_registered_value() {
+    async fn my_wrapping_keypair_reads_the_owner_slot() {
         let (sup, handle) = test_handle();
         let did = DID("did:example:alice".to_owned());
-        let kp = WrappingKeyPair {
-            public: [0x42; 32],
-            secret: Zeroizing::new([0u8; 32]),
-        };
-        sup.wrapping_keys
-            .insert(did.clone(), ArcSwap::new(Arc::new(kp)));
+        let kp = WrappingKeyPair::generate();
+        let public = *kp.public();
+        let slot = Arc::new(ArcSwap::new(Arc::new(kp)));
+        sup.wrapping_keys.insert(did.clone(), Arc::clone(&slot));
+        sup.wrapping_keys.insert(
+            DID("did:example:bob".to_owned()),
+            Arc::new(ArcSwap::from_pointee(WrappingKeyPair::generate())),
+        );
         let token = OwnedIdentityDid::issue_for_actor(did);
-        let got = handle.my_wrapping_public_key(&token).unwrap();
-        assert_eq!(&*got, &vec![0x42u8; 32]);
+        assert_eq!(
+            *handle.my_wrapping_keypair(&token).unwrap().public(),
+            public
+        );
+        let rotated = WrappingKeyPair::generate();
+        let rotated_public = *rotated.public();
+        slot.store(Arc::new(rotated));
+        assert_eq!(
+            *handle.my_wrapping_keypair(&token).unwrap().public(),
+            rotated_public
+        );
     }
 
     #[tokio::test]
@@ -1087,7 +1108,9 @@ mod tests {
             mls_storage,
             transport,
             clock,
-            wrapping_pubkey: None,
+            wrapping_key: Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::crypto::wrapping::WrappingKeyPair::generate(),
+            )),
         };
         let (kp_handle, _join) = KeyPackageStoreActor::spawn(did.clone(), deps);
         sup.key_package_stores.insert(did.clone(), kp_handle);

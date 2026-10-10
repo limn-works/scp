@@ -1211,16 +1211,32 @@ fn import_context_is_actor_native_not_dashmap_dual_write() {
 #[test]
 fn adr049_pr6_read_authority_switch_is_wired_fail_closed() {
     // G1 — the receive seam GATES fail-closed on the registry, never
-    // log-and-drops. `decrypt_and_dispatch` must call the registry recv gate and
-    // install remote keys via the unchecked wrapper (gate-before-install), with
-    // no "non-fatal" mirror-forward drop.
+    // log-and-drops. The recv floor gates in `deliver_incoming` AFTER
+    // `verify_and_unwrap`, so a frame whose signature fails never advances the
+    // replay floor, and `decrypt_and_dispatch` must not call the recv gate.
+    // `decrypt_and_dispatch` gates the remote sender epoch and then installs
+    // remote keys via the unchecked wrapper (gate-before-install).
+    {
+        let body = extract_fn_body(MANAGER_SRC, "deliver_incoming")
+            .expect("deliver_incoming body must be extractable");
+        let gate = body
+            .find("check_and_advance_recv_sequence")
+            .expect("deliver_incoming must gate the recv floor on the authoritative registry");
+        let verify = body
+            .find("verify_and_unwrap(")
+            .expect("deliver_incoming must verify the sender signature");
+        assert!(
+            verify < gate,
+            "deliver_incoming must gate the recv floor only after verify_and_unwrap"
+        );
+    }
     assert!(
-        fn_body_contains(
+        !fn_body_contains(
             MANAGER_SRC,
             "decrypt_and_dispatch",
             "check_and_advance_recv_sequence"
         ),
-        "decrypt_and_dispatch must gate the recv floor on the authoritative registry"
+        "decrypt_and_dispatch must not gate the recv floor before signature verification"
     );
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the KeyResponse install moved off the
     // emptied provider (`deps.crypto.set_sender_key_unchecked`, a no-op on a taken

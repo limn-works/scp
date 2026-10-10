@@ -300,6 +300,17 @@ pub enum ContextError {
     #[error("crypto operation failed: {0}")]
     CryptoFailed(String),
 
+    /// A received inner envelope names a sender other than the sender its MLS
+    /// leaf credential authenticates (`09-security-model.md` §9.8.1). A member
+    /// holding another member's sender key cannot re-send that member's signed
+    /// inner envelope from its own leaf. The error names only the authenticated
+    /// MLS sender; the inner `sender_did` is attacker-chosen and is not echoed.
+    #[error("inner envelope sender does not match the MLS sender {mls_sender}")]
+    SenderMismatch {
+        /// The DID in the MLS sender's leaf credential.
+        mls_sender: String,
+    },
+
     /// A key custody call failed (`KeyCustody`). The bridges report
     /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise.
     #[error(transparent)]

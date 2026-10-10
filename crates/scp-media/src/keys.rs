@@ -273,7 +273,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn export_media_keys_returns_key_material() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let result = export_media_keys(&group, b"ctx-1", TEST_KEY_LENGTH);
         assert!(
@@ -291,7 +296,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn export_media_keys_contains_dtls_srtp_keys_epoch_and_context_id() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let keys = export_media_keys(&group, b"ctx-1", TEST_KEY_LENGTH).unwrap();
 
@@ -309,7 +319,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn export_different_lengths() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         for &len in &[16, 32, 48, 64, 128] {
             let keys = export_media_keys(&group, b"ctx-1", len).unwrap();
@@ -327,7 +342,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn different_contexts_produce_different_keys() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let keys_a = export_media_keys(&group, b"ctx-1", TEST_KEY_LENGTH).unwrap();
         let keys_b = export_media_keys(&group, b"ctx-2", TEST_KEY_LENGTH).unwrap();
@@ -344,15 +364,24 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn epoch_advances_after_member_add() {
         let cred = test_credential("alice");
-        let mut group = create_group(&cred, &SystemClock).unwrap();
+        let mut group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let keys_before = export_media_keys(&group, b"ctx-1", TEST_KEY_LENGTH).unwrap();
         assert_eq!(keys_before.epoch, 0);
 
         // Add Bob -- this advances the epoch.
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, _bob_signer, _bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let bob_kp = bob_kp_bundle.key_package().clone().into();
         let _add_result = add_member(&mut group, bob_kp, &SystemClock).unwrap();
 
@@ -368,12 +397,21 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn epoch_advances_after_member_removal() {
         let cred = test_credential("alice");
-        let mut group = create_group(&cred, &SystemClock).unwrap();
+        let mut group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Add Bob.
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, _bob_signer, _bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let bob_kp = bob_kp_bundle.key_package().clone().into();
         let _add_result = add_member(&mut group, bob_kp, &SystemClock).unwrap();
 
@@ -384,7 +422,8 @@ mod tests {
         let alice_own = group.own_leaf_index().unwrap();
         let members = group.members().unwrap();
         let bob_member = members.iter().find(|m| m.index != alice_own).unwrap();
-        let _remove_result = remove_member(&mut group, bob_member.index).unwrap();
+        let _remove_result =
+            remove_member(&mut group, bob_member.index, &scp_clock::SystemClock).unwrap();
 
         let keys_epoch_2 = export_media_keys(&group, b"ctx-1", TEST_KEY_LENGTH).unwrap();
         assert_eq!(
@@ -401,7 +440,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn same_epoch_produces_same_keys() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let keys_1 = export_media_keys(&group, b"ctx-1", TEST_KEY_LENGTH).unwrap();
         let keys_2 = export_media_keys(&group, b"ctx-1", TEST_KEY_LENGTH).unwrap();
@@ -419,11 +463,20 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn both_members_derive_same_keys() {
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
+        let mut alice_group = create_group(
+            &alice_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let bob_kp = bob_kp_bundle.key_package().clone().into();
         let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
 
@@ -446,7 +499,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn export_on_destroyed_group_fails() {
         let cred = test_credential("alice");
-        let mut group = create_group(&cred, &SystemClock).unwrap();
+        let mut group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         destroy_group(&mut group).unwrap();
 
         let result = export_media_keys(&group, b"ctx-1", TEST_KEY_LENGTH);
@@ -463,7 +521,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn export_with_excessive_key_length_fails() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let result = export_media_keys(&group, b"ctx-1", 70_000);
         assert!(
@@ -482,7 +545,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn export_with_key_length_below_minimum_fails() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         for &too_short in &[0, 1, 8, 15] {
             let result = export_media_keys(&group, b"ctx-1", too_short);
@@ -503,7 +571,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn export_with_minimum_key_length_succeeds() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let result = export_media_keys(&group, b"ctx-1", MIN_KEY_LENGTH);
         assert!(result.is_ok(), "minimum key length should succeed");
@@ -514,7 +587,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn export_with_empty_context_succeeds() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let result = export_media_keys(&group, b"", TEST_KEY_LENGTH);
         assert!(result.is_ok(), "empty context bytes should be valid");
@@ -526,7 +604,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn debug_output_redacts_key_material() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let keys = export_media_keys(&group, b"ctx-1", TEST_KEY_LENGTH).unwrap();
         let debug_output = format!("{keys:?}");

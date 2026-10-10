@@ -17,7 +17,6 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { generateKeyPairSync } from "node:crypto";
 import { createRequire } from "node:module";
 import type { BridgeMode } from "../src/bridge";
 import { ContextError } from "../src/errors";
@@ -27,18 +26,23 @@ import type { BehavioralRecord, CapabilityRequirement, ParticipationProfile } fr
 import { allValid } from "../src/types";
 
 /**
- * Generates a raw X25519 keypair (32-byte secret + 32-byte public key) for
- * broadcast key-distribution tests. Uses Node/Bun's WebCrypto-backed
- * `generateKeyPairSync('x25519')` and extracts the raw scalars from the JWK
- * `d` (private) and `x` (public) base64url fields — no third-party dependency.
+ * Generates a DHKEM(P-256) wrapping keypair (32-byte secret scalar + 65-byte
+ * uncompressed public point, spec §9.5) for broadcast key-distribution tests.
+ * Uses WebCrypto ECDH P-256: the public key is exported raw (65 bytes) and the
+ * scalar is the JWK `d` field — no third-party dependency.
  */
-function generateX25519KeyPair(): { secret: Uint8Array; publicKey: Uint8Array } {
-  const { publicKey: pub, privateKey: priv } = generateKeyPairSync("x25519");
-  const pubJwk = pub.export({ format: "jwk" }) as { x: string };
-  const privJwk = priv.export({ format: "jwk" }) as { d: string };
+async function generateP256WrappingKeyPair(): Promise<{
+  secret: Uint8Array;
+  publicKey: Uint8Array;
+}> {
+  const pair = (await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, [
+    "deriveBits",
+  ])) as CryptoKeyPair;
+  const publicKey = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  const jwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
   return {
-    publicKey: new Uint8Array(Buffer.from(pubJwk.x, "base64url")),
-    secret: new Uint8Array(Buffer.from(privJwk.d, "base64url")),
+    publicKey,
+    secret: new Uint8Array(Buffer.from(jwk.d as string, "base64url")),
   };
 }
 
@@ -2130,8 +2134,9 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
       await napi.broadcastSubscribe(ctx, subscriber.did);
 
-      // Real X25519 wrapping keypair for the subscriber (HPKE recipient).
-      const { secret, publicKey } = generateX25519KeyPair();
+      // Real DHKEM(P-256) wrapping keypair for the subscriber (HPKE recipient).
+      const { secret, publicKey } = await generateP256WrappingKeyPair();
+      expect(publicKey.length).toBe(65);
       const sealedJson = await napi.broadcastHandleKeyRequest(
         ctx,
         identity.did,
@@ -2161,7 +2166,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       );
 
       // `stranger` never subscribed — the author returns no key material.
-      const { publicKey } = generateX25519KeyPair();
+      const { publicKey } = await generateP256WrappingKeyPair();
       const decision = await napi.broadcastHandleKeyRequest(
         ctx,
         identity.did,
@@ -2169,6 +2174,33 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         publicKey,
       );
       expect(decision).toBeNull();
+    });
+
+    test("handle key request rejects a wrapping key that is not a 65-byte P-256 point", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const subscriber = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          mode: "Broadcast",
+          memoryScope: "full",
+        }),
+      );
+      await napi.broadcastSubscribe(ctx, subscriber.did);
+
+      // A 32-byte key (the retired X25519 width), a 64-byte key (the point
+      // without its 0x04 tag) and a 65-byte value off the curve are each a
+      // validation error with SCP-VALID-7007.
+      const offCurve = new Uint8Array(65);
+      offCurve[0] = 0x04;
+      for (const key of [new Uint8Array(32), new Uint8Array(64), offCurve]) {
+        await expect(
+          napi.broadcastHandleKeyRequest(ctx, identity.did, subscriber.did, key),
+        ).rejects.toThrow(
+          /^\[SCP-VALID-7007\] validation error: wrapping_pubkey must be a 65-byte uncompressed P-256 point/,
+        );
+      }
     });
   });
 
