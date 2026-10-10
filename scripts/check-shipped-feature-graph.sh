@@ -182,7 +182,8 @@ cd "$REPO_ROOT"
 #     as enabled on that default member and it activates nothing.
 # The `scp-ffi|--features extension-module,vendored-openssl` ARTIFACTS entry, the
 # PyPI wheel's configuration read from `[tool.maturin]`, resolves the two
-# `scp-ffi` rows above that no other entry reaches.
+# `scp-ffi` rows above that no other entry reaches. This gate does not read which
+# artifacts reach `openssl-src`; see `scripts/check-vendored-openssl-scope.sh`.
 # None of the eleven forwards a `testing` edge or an `allow_unencrypted_storage`
 # edge. The reader reports cargo's RESOLVED list, so every feature a `default`
 # row expands to appears as its own row and meets this ⊆ check on its own —
@@ -291,6 +292,10 @@ EOF
 # libcrypto on Linux and Windows, and activates nothing on an Apple target. The
 # `scp-ffi|--features extension-module,vendored-openssl` entry below is the
 # wheel's configuration.
+#
+# `scripts/check-vendored-openssl-scope.sh` reads this array through
+# `--print-artifacts` and the wheel entry through `--print-wheel-entries`, so an
+# entry added here reaches that gate on the same commit.
 #
 # uniffi-bindgen (the third workspace `[[bin]]`, in `crates/scp-ffi/uniffi`) is
 # deliberately NOT a separate ARTIFACTS entry: it is a build-time code-generation
