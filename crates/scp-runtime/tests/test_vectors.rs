@@ -989,7 +989,6 @@ fn domain_separators_are_all_unique() {
         "scp-private-state-v1",
         "scp-private-state-salt-v1",
         "scp-media-key-v1",
-        "scp-bridge-credential-v1",
         "scp-pseudonym-secret-v1",
         "scp-participation-statement-v1",
         "scp-context-export-integrity-v1",

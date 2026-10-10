@@ -1,11 +1,14 @@
 //! §26 Conformance Test Suite — SCP protocol conformance validation.
 //!
-//! 39 tests across 9 protocol layers (Identity, Context, Messaging, Sync,
+//! Tests across 9 protocol layers (Identity, Context, Messaging, Sync,
 //! Trust, Transport, Discovery, Economy, Interop).
 //!
-//! Two conformance tiers:
-//! - **SCP Core Conformance** — identity, contexts, messaging, sync (26 tests)
-//! - **SCP Full Conformance** — all protocol layers (39 tests)
+//! Two conformance tiers, with membership defined in spec 26 §26.13:
+//! - **SCP Core Conformance** — identity, contexts, messaging, sync
+//! - **SCP Full Conformance** — all protocol layers
+//!
+//! CONF-043 through CONF-046 test outlet registration (§5.4.1); spec 26
+//! does not list them.
 //!
 //! Run with `--nocapture` to see step-by-step output:
 //! ```bash
@@ -1736,7 +1739,7 @@ fn conf_042_cross_implementation_sync() {
 // ===========================================================================
 
 /// CONF-043: Outlet Registration V2 Vector File Shape
-/// Layer: Bridge | Tier: Full | Spec: §5.4.1, §25 | ADR-049 | Story: SCP-OUT-009
+/// Layer: Context | Tier: Full | Spec: §5.4.1, §25 | ADR-049 | Story: SCP-OUT-009
 fn load_outlet_registration_vector_file()
 -> scp_testing::conformance::outlet_registration::OutletRegistrationVectorFile {
     let path = scp_testing::conformance::outlet_registration::vectors_path();
@@ -1819,7 +1822,7 @@ fn conf_043_outlet_registration_v2_shape() {
 }
 
 /// CONF-044: Outlet Registration V2 Sign-Verify Round-Trip
-/// Layer: Bridge | Tier: Full | Spec: §5.4.1 | ADR-049 | Story: SCP-OUT-009
+/// Layer: Context | Tier: Full | Spec: §5.4.1 | ADR-049 | Story: SCP-OUT-009
 #[test]
 fn conf_044_outlet_registration_v2_sign_verify() {
     use scp_core::context::outlets::registry::{
@@ -1911,7 +1914,7 @@ fn conf_044_outlet_registration_v2_sign_verify() {
 }
 
 /// CONF-045: V1 Domain Separator Rejection (Negative Corpus)
-/// Layer: Bridge | Tier: Full | Spec: §5.4.1 hard-break | ADR-049 §1 | Story: SCP-OUT-009
+/// Layer: Context | Tier: Full | Spec: §5.4.1 hard-break | ADR-049 §1 | Story: SCP-OUT-009
 #[test]
 fn conf_045_outlet_registration_v1_rejected() {
     use scp_core::context::outlets::registry::compute_outlet_registration_canonical_bytes;
@@ -1995,7 +1998,7 @@ fn conf_045_outlet_registration_v1_rejected() {
 }
 
 /// CONF-046: Outlet Registration V2 Vectors Match Generator
-/// Layer: Bridge | Tier: Full | Spec: §5.4.1 | ADR-049 | Story: SCP-OUT-009
+/// Layer: Context | Tier: Full | Spec: §5.4.1 | ADR-049 | Story: SCP-OUT-009
 ///
 /// Confirms the on-disk JSON file is byte-identical to what the generator
 /// would currently produce. Detects accidental drift between the in-tree
