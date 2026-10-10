@@ -895,6 +895,10 @@ run_step format cargo fmt --all -- --check
 # --no-deps`, which resolves no dependency and compiles nothing.
 # `scripts/check-test-shard-features.py` runs one `cargo metadata --no-deps` and five
 # `cargo tree` resolutions, one canonical and one per rust-test shard.
+# `scripts/check-vendored-openssl-scope.sh` reads every version from the root Cargo.lock
+# (its header's "Locks" paragraph says how), and can still reach crates.io to download
+# the packages that lock pins, so the network can slow that gate or fail it, never change
+# the versions it resolves.
 #
 # Measured on 2026-09-13, one run each, in the order below: 47 seconds for the 28 this
 # list held that day. `scripts/check-workflow-compile-steps.py` joined it afterwards: the
@@ -994,7 +998,8 @@ if ! "$PYTHON" -c 'import yaml' >/dev/null 2>&1; then
 fi
 # `scripts/check-shipped-feature-graph.sh` runs python3.12 itself, whatever $PYTHON
 # resolved to, and imports `tomllib` under it; `scripts/check-vendored-openssl-scope.sh`
-# reads its wheel entry from that gate's `--print-wheel-entries`. This line names that
+# reads its wheel entry from that gate's `--print-wheel-entries` and compares Cargo.lock
+# files with `tomllib` under python3.12 itself. This line names that
 # cause when the interpreter is absent or lacks the module, for the same reason as the
 # line above.
 if ! python3.12 -P -c 'import tomllib' >/dev/null 2>&1; then
