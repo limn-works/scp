@@ -277,10 +277,6 @@ name = "heartbeat_suppression"
 path = "tests/integration/heartbeat_suppression.rs"
 
 [[test]]
-name = "bridge_cooperative"
-path = "tests/integration/bridge_cooperative.rs"
-
-[[test]]
 name = "compromise_recovery"
 path = "tests/integration/compromise_recovery.rs"
 

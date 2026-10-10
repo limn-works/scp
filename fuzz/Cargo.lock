@@ -2436,9 +2436,12 @@ name = "scp-crypto"
 version = "0.1.0-beta.2"
 dependencies = [
  "ed25519-dalek",
+ "getrandom 0.2.17",
  "hkdf 0.12.4",
  "hmac 0.12.1",
+ "p256",
  "sha2 0.10.9",
+ "thiserror 2.0.18",
  "zeroize",
 ]
 
@@ -2542,7 +2545,6 @@ dependencies = [
 name = "scp-mls"
 version = "0.1.0-beta.2"
 dependencies = [
- "ed25519-dalek",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "openmls",
@@ -2638,7 +2640,6 @@ name = "scp-runtime"
 version = "0.1.0-beta.2"
 dependencies = [
  "aes",
- "aes-gcm",
  "arc-swap",
  "async-trait",
  "base64",
@@ -2647,7 +2648,6 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "hex",
- "hkdf 0.12.4",
  "jsonschema",
  "lru",
  "metrics",
@@ -2656,7 +2656,6 @@ dependencies = [
  "openmls_memory_storage",
  "openmls_rust_crypto",
  "openmls_traits",
- "percent-encoding",
  "rand 0.8.8",
  "rmp-serde",
  "rmpv",
@@ -2677,6 +2676,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "unicode-normalization",
  "uuid",
@@ -3141,6 +3141,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
