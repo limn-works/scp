@@ -325,11 +325,17 @@ impl NonceTracker for InMemoryNonceTracker {
 }
 
 /// In-memory [`RevocationChecker`] backed by a `HashSet`.
+///
+/// Restricted to test builds: an empty set reports every token as not
+/// revoked, so a production path wired to this checker would honour revoked
+/// delegations.
+#[cfg(any(test, feature = "testing"))]
 pub struct InMemoryRevocationChecker {
     /// Set of revoked token CIDs.
     pub revoked: HashSet<String>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl InMemoryRevocationChecker {
     /// Creates a new empty revocation checker.
     #[must_use]
@@ -340,12 +346,14 @@ impl InMemoryRevocationChecker {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl Default for InMemoryRevocationChecker {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl RevocationChecker for InMemoryRevocationChecker {
     fn is_revoked(&self, token_cid: &str) -> bool {
         self.revoked.contains(token_cid)
@@ -504,18 +512,20 @@ impl CaveatResolver for TokenNbCaveatResolver {
 
 /// In-memory [`CaveatResolver`] keyed by encoded JWT string.
 ///
-/// Used by tests and by adapters that pre-compute caveats out-of-band
-/// (e.g., during a transient envelope rewrite) rather than reading from
-/// the `nb` field.
+/// Restricted to test builds. Tests use it to attach caveats to a token
+/// without re-signing its `nb` field; production paths read the signed `nb`
+/// through [`TokenNbCaveatResolver`].
 ///
 /// Map values are owned [`InvocationCaveats`](crate::trust::caveats::InvocationCaveats) records — the resolver
 /// returns clones so the validation pipeline can take an owned snapshot
 /// without holding a borrow on the resolver across recursive chain walks.
+#[cfg(any(test, feature = "testing"))]
 pub struct InMemoryCaveatResolver {
     /// Map of `UcanToken::encoded` → [`InvocationCaveats`](crate::trust::caveats::InvocationCaveats).
     pub caveats: std::collections::HashMap<String, crate::trust::caveats::InvocationCaveats>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl InMemoryCaveatResolver {
     /// Creates an empty resolver.
     #[must_use]
@@ -535,12 +545,14 @@ impl InMemoryCaveatResolver {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl Default for InMemoryCaveatResolver {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl CaveatResolver for InMemoryCaveatResolver {
     fn resolve_caveats(
         &self,

@@ -11,7 +11,9 @@
 //! the types in [`GATED_DOUBLES`]: it parses every Rust source file under
 //! `crates/` with `syn` and fails when an item that declares, implements, or
 //! re-exports one of them carries no cfg predicate that implies
-//! `test || feature = "testing"`.
+//! `test || feature = "testing"`. A file under a crate's own `tests/` directory
+//! counts as gated, because Cargo compiles it only into an integration-test
+//! target.
 
 use std::path::{Path, PathBuf};
 
@@ -21,11 +23,18 @@ use std::path::{Path, PathBuf};
 /// aggregation through it reads an empty store. `InMemoryViolationStore`
 /// forgets every custody violation, which ADR-039 requires to be durable.
 /// `NoOpRevocationChecker` reports every attestation as not revoked without
-/// consulting a revocation list.
+/// consulting a revocation list. `InMemoryPersistence` forgets every context
+/// snapshot when dropped, so a restart restores nothing.
+/// `InMemoryRevocationChecker` starts empty and so reports every UCAN as not
+/// revoked. `InMemoryCaveatResolver` attaches caveats that no token signature
+/// covers.
 const GATED_DOUBLES: &[&str] = &[
     "InMemoryFfiTrustStore",
     "InMemoryViolationStore",
     "NoOpRevocationChecker",
+    "InMemoryPersistence",
+    "InMemoryRevocationChecker",
+    "InMemoryCaveatResolver",
 ];
 
 /// True when a cfg predicate holds only if `test` or `feature = "testing"` holds.
@@ -159,6 +168,26 @@ fn mentions_in_source(src: &str) -> Vec<Mention> {
     out
 }
 
+/// True when `path` sits under the `tests/` directory of the crate that owns
+/// it, the nearest ancestor directory holding a `Cargo.toml`.
+///
+/// Cargo compiles a file there only into an integration-test target, so no
+/// shipped artifact contains it whatever cfg its items carry. Every manifest
+/// under `crates/` that sets a target `path` into `tests/` declares that
+/// target as `[[test]]`.
+fn in_integration_test_target(path: &Path) -> bool {
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if d.join("Cargo.toml").is_file() {
+            return path.strip_prefix(d).is_ok_and(|rel| {
+                rel.components().next() == Some(std::path::Component::Normal("tests".as_ref()))
+            });
+        }
+        dir = d.parent();
+    }
+    false
+}
+
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -199,7 +228,11 @@ fn named_test_doubles_compile_only_under_test_or_testing() {
             panic!("{} does not parse", path.display());
         };
         let mut found = Vec::new();
-        collect(&file.items, attrs_gated(&file.attrs), &mut found);
+        collect(
+            &file.items,
+            in_integration_test_target(path) || attrs_gated(&file.attrs),
+            &mut found,
+        );
         for m in found {
             if m.kind == "struct" || m.kind == "enum" {
                 declarations.push(m.name);
@@ -271,4 +304,35 @@ fn checker_rejects_each_weakened_gate() {
         assert_eq!(found.len(), 1, "{src}: {found:?}");
         assert!(!found[0].gated, "checker accepted an ungated item: {src}");
     }
+}
+
+/// The integration-test exemption covers files under a crate's own `tests/`
+/// directory and nothing else: a `tests` directory inside `src/`, or a
+/// `tests.rs` module file, stays subject to the cfg check.
+#[test]
+fn integration_test_exemption_covers_only_the_crate_tests_dir() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(in_integration_test_target(
+        &crate_dir.join("tests/integration/attacks.rs")
+    ));
+    assert!(in_integration_test_target(
+        &crate_dir.join("tests/integration/test_double_gating.rs")
+    ));
+    let runtime_dir = crate_dir.parent().unwrap().join("scp-runtime");
+    assert!(in_integration_test_target(
+        &runtime_dir.join("tests/ucan_validate_integration.rs")
+    ));
+    assert!(!in_integration_test_target(
+        &runtime_dir.join("src/context/providers/persistence.rs")
+    ));
+    assert!(!in_integration_test_target(
+        &runtime_dir.join("src/tests/fixture.rs")
+    ));
+    assert!(!in_integration_test_target(
+        &runtime_dir.join("src/tests.rs")
+    ));
+    let protocol_dir = crate_dir.parent().unwrap().join("scp-protocol");
+    assert!(!in_integration_test_target(
+        &protocol_dir.join("src/crypto/ucan/validate.rs")
+    ));
 }

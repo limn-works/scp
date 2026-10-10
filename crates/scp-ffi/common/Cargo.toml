@@ -128,6 +128,11 @@ scp-platform = { path = "../../scp-platform", features = ["testing"] }
 # The crate's own tests (resolvers.rs, dht_capability_injection.rs) construct
 # `InMemoryDhtClient`; activate `scp-dht/testing` for this crate's test build.
 scp-dht = { path = "../../scp-dht", features = ["testing"] }
+# The `bridge_instance.rs` unit tests construct `InMemoryPersistence`, which
+# scp-runtime compiles only under `test` or its `testing` feature. This edge
+# turns on `scp-core/testing` for this crate's own test build only, so no
+# shipped artifact resolves it (`scripts/check-shipped-feature-graph.sh`).
+scp-core = { path = "../../scp-core", features = ["testing"] }
 # `test-util` enables tokio's paused-clock test harness (time::pause/advance,
 # #[tokio::test(start_paused = true)]) — not pulled in by the optional runtime
 # `tokio` dep's "full" features, which intentionally excludes it.
