@@ -405,8 +405,8 @@ gate_paths() {
 #
 # `scripts/fix-round-check.sh` reads the repository holding it, through
 # `cd "$(dirname "$0")/.."`, so each fixture holds a copy of that script, a copy of the
-# resolved-compiler check that script runs as its first step, and a copy of
-# `rust-toolchain.toml`, which that step reads.
+# resolved-compiler check that script runs as its first step, and a `rust-toolchain.toml`
+# naming the pin's channel, which that step reads.
 #
 # The fixture holds three manifests whose directories nest — `crates/scp-ffi` contains
 # `crates/scp-ffi/napi` — because the longest-prefix rule in `crate_of_path` is what maps a
@@ -432,7 +432,9 @@ build_fixture() {
         "$root/bindings/python/scp_sdk" "$root/.github/workflows" "$root/notes"
     cp "$SCRIPT" "$root/scripts/fix-round-check.sh"
     cp "$REPO_ROOT/scripts/check-resolved-rustc.sh" "$root/scripts/check-resolved-rustc.sh"
-    cp "$REPO_ROOT/rust-toolchain.toml" "$root/rust-toolchain.toml"
+    # The channel alone: the components and targets the root file lists would make rustup
+    # install them, in one attempt, on the stub's first real cargo call in this fixture.
+    printf '[toolchain]\nchannel = "%s"\n' "$PIN_CHANNEL" > "$root/rust-toolchain.toml"
 
     while IFS= read -r g; do
         [[ -n $g ]] || continue

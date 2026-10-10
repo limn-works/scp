@@ -71,8 +71,7 @@ def _cargo_target_dir() -> Path:
     value of that variable against the directory it runs in, which for the
     `cargo metadata` call below is the repository root. Job
     `bridge-parity-kotlin` in `.github/workflows/ci.yml` sets it because that job
-    installs no Rust toolchain, and a `cargo metadata` there would make rustup
-    install the pinned channel.
+    installs no Rust toolchain.
     """
     env_target_dir = os.environ.get("CARGO_TARGET_DIR", "")
     if env_target_dir:

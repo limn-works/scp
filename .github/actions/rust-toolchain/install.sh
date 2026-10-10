@@ -31,7 +31,8 @@
 # FAILURE IS TYPED, NEVER DEGRADED. Each case below exits non-zero with a `::error::` line
 # naming the case: an unreadable toolchain file or channel, a `RUSTUP_TOOLCHAIN` in the
 # environment (it outranks the override, so the job would compile on some other
-# toolchain), an install that failed on every attempt (the line carries rustup's own error
+# toolchain), a `RUSTUP_AUTO_INSTALL` other than 0 (rustup would then install the file's
+# full list on first use wherever the override does not reach), an install that failed on every attempt (the line carries rustup's own error
 # chain), an override rustup refused, and a `rustc -V` in that directory that does not
 # report the toolchain just installed.
 #
@@ -82,6 +83,10 @@ fi
 
 if [[ -n ${RUSTUP_TOOLCHAIN:-} ]]; then
     error "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN is set, and rustup applies it ahead of any directory override, so a cargo command in this job would compile on that toolchain instead of $channel. Remove the variable from the job's environment."
+    exit 1
+fi
+if [[ ${RUSTUP_AUTO_INSTALL:-} != 0 ]]; then
+    error "RUSTUP_AUTO_INSTALL is '${RUSTUP_AUTO_INSTALL:-}', not 0, so a cargo command this step's override does not cover would make rustup download $channel with every component and target $toolchain_file lists in one attempt. Set RUSTUP_AUTO_INSTALL: \"0\" in the workflow's env."
     exit 1
 fi
 

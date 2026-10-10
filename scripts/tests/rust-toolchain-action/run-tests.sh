@@ -15,7 +15,8 @@
 # `::error::` line and sets no override; it asks rustup for the minimal profile plus only
 # the components and targets it was given; it sets the override on the toolchain file's own
 # directory; and it refuses, before installing anything, a missing file, a file with no
-# channel, and a `RUSTUP_TOOLCHAIN` in the environment, and refuses, after installing, an
+# channel, a `RUSTUP_TOOLCHAIN` in the environment, and a `RUSTUP_AUTO_INSTALL` other
+# than 0 (every other case runs with it set to 0 and passes), and refuses, after installing, an
 # override rustup rejected and a `rustc -V` that does not report the installed toolchain.
 set -uo pipefail
 
@@ -111,7 +112,7 @@ run_install() {
     if [[ $toolchain_body != "<absent>" ]]; then
         printf '%s\n' "$toolchain_body" > "$CHECKOUT/rust-toolchain.toml"
     fi
-    OUT=$(cd "$CHECKOUT" && env -u RUSTUP_TOOLCHAIN PATH="$STUB_BIN:$PATH" STUB_STATE="$STATE" "$@" \
+    OUT=$(cd "$CHECKOUT" && env -u RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL=0 PATH="$STUB_BIN:$PATH" STUB_STATE="$STATE" "$@" \
         bash "$INSTALL" rust-toolchain.toml "$components" "$targets" 2>&1)
     RC=$?
 }
@@ -175,6 +176,12 @@ report "an install that never succeeded sets no override" $? "calls: $(tr '\n' '
 run_install "$PIN" "" "" RUSTUP_TOOLCHAIN=stable
 [[ $RC -ne 0 && $(install_calls) -eq 0 && $OUT == *"RUSTUP_TOOLCHAIN=stable is set"* ]]
 report "a RUSTUP_TOOLCHAIN in the environment is refused before any install" $? "rc=$RC installs=$(install_calls) out: $OUT"
+
+for value in "" 1; do
+    run_install "$PIN" "" "" "RUSTUP_AUTO_INSTALL=$value"
+    [[ $RC -ne 0 && $(install_calls) -eq 0 && $OUT == *"RUSTUP_AUTO_INSTALL is '$value', not 0"* ]]
+    report "RUSTUP_AUTO_INSTALL='$value' is refused before any install" $? "rc=$RC installs=$(install_calls) out: $OUT"
+done
 
 run_install "<absent>" "" ""
 [[ $RC -ne 0 && $(install_calls) -eq 0 && $OUT == *"does not exist"* ]]

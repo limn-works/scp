@@ -81,10 +81,7 @@ val uniffiBindingsDir = file("src/main/kotlin/works/limn/scp/internal")
 // A set `CARGO_TARGET_DIR` is read directly instead. Cargo resolves a relative
 // value of that variable against the directory it runs in, which for the
 // `cargo metadata` call below is the repository root, so the answer is the one
-// cargo would give. The `kotlin-test` job in `.github/workflows/ci.yml` sets it
-// because on an artifact-cache hit that job installs no Rust toolchain, and a
-// `cargo metadata` there would make rustup install the pinned channel with every
-// target `rust-toolchain.toml` lists.
+// cargo would give.
 val workspaceRoot: File = rootProject.projectDir.parentFile.parentFile
 val cargoTargetDir: Provider<String> =
     providers

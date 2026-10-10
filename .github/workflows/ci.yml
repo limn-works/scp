@@ -42,6 +42,11 @@ env:
   # rejects a missing workflow-level key and any job-level or step-level one, in this
   # file and in compile-timings.yml.
   CARGO_PROFILE_DEV_DEBUG: "0"
+  # rustup installs nothing on first use, so a cargo or rustc call that no
+  # `./.github/actions/rust-toolchain` step covers fails with "toolchain '1.98.0' is not
+  # installed" in place of a one-attempt download of every target and component
+  # `rust-toolchain.toml` lists. See "The Rust toolchain each job compiles on" below.
+  RUSTUP_AUTO_INSTALL: "0"
 
 # ── Cargo cache groups ────────────────────────────────────────────────────────
 #
@@ -255,6 +260,9 @@ env:
 # failure it reports. The version is still the one `rust-toolchain.toml` names, so
 # rust-cache keys, which hash `rustc -vV`, are unchanged. Job `toolchain-wiring` alone
 # keeps no override, so its check 4 sees the checkout a developer's shell sees.
+# `RUSTUP_AUTO_INSTALL: "0"` in this file's `env:` turns a job that lacks the step, or a
+# cargo call outside the directory the override covers, into a failed job, and install.sh
+# refuses to run without it.
 
 jobs:
   check-draft:
@@ -875,6 +883,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/rust-toolchain
       - run: bash scripts/check-protocol-deps.sh
       - run: bash scripts/check-no-shim-reexports.sh
 
@@ -4029,8 +4038,9 @@ jobs:
       - name: Mark the start of the build
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: touch "$RUNNER_TEMP/uniffi-kotlin-build-start"
+      # Unconditional: on a cache hit `Run tests` still runs `cargo metadata` through
+      # `cargoTargetDir` in bindings/kotlin/scp-kt-android/build.gradle.kts.
       - uses: ./.github/actions/rust-toolchain
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
@@ -4100,8 +4110,7 @@ jobs:
         working-directory: bindings/kotlin
         env:
           # Read by `cargoTargetDir` in bindings/kotlin/scp-kt/build.gradle.kts in place
-          # of a `cargo metadata` call, which on a cache hit, where no cargo command has
-          # run, would make rustup install the pinned toolchain for that call alone.
+          # of a `cargo metadata` call.
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           # Set JNA library path to find the compiled Rust cdylib
@@ -4514,8 +4523,7 @@ jobs:
           # JNA loads the UniFFI cdylib via the system library path.
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
           # The kotlin_runner fixture reads this instead of running `cargo metadata`,
-          # which on this toolchain-less job would make rustup install the pinned
-          # channel.
+          # which this job, having no `./.github/actions/rust-toolchain` step, cannot run.
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
           # Explicit runner-binary override (conftest also falls back
           # to the default installDist output; this makes CI failures
