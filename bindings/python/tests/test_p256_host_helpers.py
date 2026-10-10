@@ -14,7 +14,12 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("scp_sdk._scp_core")
+from tests.conftest import skip_reason_if_extension_absent
+
+try:
+    from scp_sdk import _scp_core  # noqa: F401
+except Exception as _exc:
+    pytest.skip(skip_reason_if_extension_absent(_exc), allow_module_level=True)
 
 from scp_sdk import (
     ValidationError,

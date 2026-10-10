@@ -495,7 +495,7 @@ async fn publish_to_resolver_dht_for<C: KeyCustody + Send + Sync>(
 /// (only in `testing` builds) the retained in-memory custody.
 /// Failures carry the cross-bridge contract codes: missing key material →
 /// `IDENT_1054`, custody unavailable in this build → `IDENT_1056`, and a
-/// custody derivation failure → its custody code ([`ScpError::custody`]):
+/// custody derivation failure → its custody code ([`ScpError::custody_failure`]):
 /// key-not-found → `CRYPTO_4006` (§9.10.4.A), any other custody failure →
 /// `CRYPTO_4060`. A host pseudonym that is not a valid 33-byte compressed P-256
 /// point → `IDENT_1055`.
