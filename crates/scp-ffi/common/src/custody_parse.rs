@@ -133,8 +133,9 @@ mod tests {
 
     /// Every [`PlatformError`] variant reaches a bridge with one code:
     /// key-not-found is `SCP-CRYPTO-4006`, a rejected host pseudonym
-    /// `SCP-IDENT-1055` (ADR-021, 2026-09-29 amendment), and every other
-    /// variant `SCP-CRYPTO-4060`.
+    /// `SCP-IDENT-1055` (ADR-021, 2026-09-29 amendment), a closed store
+    /// `SCP-STORAGE-8006`, a still-held directory lock `SCP-STORAGE-8005`
+    /// (spec §17.6), and every other variant `SCP-CRYPTO-4060`.
     #[test]
     fn custody_failure_code_covers_every_platform_error() {
         use crate::error_codes as codes;
@@ -154,6 +155,14 @@ mod tests {
             (
                 PlatformError::StorageError("x".to_owned()),
                 codes::CRYPTO_4060,
+            ),
+            (PlatformError::StorageClosed, codes::STORAGE_8006),
+            (
+                PlatformError::StorageLockHeld {
+                    dir: "d".to_owned(),
+                    lock_path: "d/scp.db.lock".to_owned(),
+                },
+                codes::STORAGE_8005,
             ),
             (
                 PlatformError::AttestationError("x".to_owned()),

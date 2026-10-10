@@ -665,13 +665,17 @@ impl ScpNapiError {
     /// [`CustodyFailure`](scp_crypto::CustodyFailure), coded by
     /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code):
     /// key-not-found is `SCP-CRYPTO-4006`, a rejected host pseudonym
-    /// `SCP-IDENT-1055`, and any other custody failure `SCP-CRYPTO-4060`.
+    /// `SCP-IDENT-1055`, a closed custody store `SCP-STORAGE-8006`, a custody
+    /// store whose directory lock is still held `SCP-STORAGE-8005` (spec §17.6),
+    /// and any other custody failure `SCP-CRYPTO-4060`.
     pub(crate) fn custody_failure(message: String, e: &scp_crypto::CustodyFailure) -> Self {
         let code = scp_ffi_common::error_codes::custody_failure_code(e).to_owned();
-        if matches!(e.kind, scp_crypto::CustodyFailureKind::PseudonymRejected) {
-            Self::Identity { message, code }
-        } else {
-            Self::Crypto { message, code }
+        match e.kind {
+            scp_crypto::CustodyFailureKind::PseudonymRejected => Self::Identity { message, code },
+            scp_crypto::CustodyFailureKind::StorageClosed
+            | scp_crypto::CustodyFailureKind::StorageLockHeld => Self::Validation { message, code },
+            scp_crypto::CustodyFailureKind::KeyNotFound
+            | scp_crypto::CustodyFailureKind::Failed => Self::Crypto { message, code },
         }
     }
 }
@@ -712,23 +716,9 @@ impl ScpNapiError {
 
 impl From<scp_platform::PlatformError> for ScpNapiError {
     fn from(e: scp_platform::PlatformError) -> Self {
-        // Spec §17.6 "One Opener per Durable Directory": the closed-store and
-        // lock-still-held conditions carry their registered storage codes.
-        match &e {
-            scp_platform::PlatformError::StorageClosed => {
-                return Self::Validation {
-                    message: e.to_string(),
-                    code: codes::STORAGE_8006.to_owned(),
-                };
-            }
-            scp_platform::PlatformError::StorageLockHeld { .. } => {
-                return Self::Validation {
-                    message: e.to_string(),
-                    code: codes::STORAGE_8005.to_owned(),
-                };
-            }
-            _ => {}
-        }
+        // Every variant, the two §17.6 storage conditions included, takes its
+        // code from `custody_failure_code`, so a bare and a wrapped
+        // `PlatformError` report the same code.
         Self::custody_failure(
             format!("platform key operation failed: {e} — check key custody configuration"),
             &scp_crypto::CustodyFailure::from(&e),
@@ -1072,6 +1062,78 @@ mod tests {
             matches!(&other, ScpNapiError::Crypto { code, .. } if code == codes::CRYPTO_4060),
             "{other:?}"
         );
+    }
+
+    /// Spec §17.6 and ADR-006's SCP-307 amendment: every `PlatformError`
+    /// variant reaches the caller with one code, whether it arrives bare or
+    /// wrapped in a `CustodyFailure` (here inside `ContextError::Custody`). A
+    /// real closed `SqliteStorage` supplies the `StorageClosed`, which must
+    /// report `SCP-STORAGE-8006` on the wrapped path, not `SCP-CRYPTO-4060`.
+    #[tokio::test]
+    async fn platform_errors_keep_one_code_bare_or_wrapped_in_a_custody_failure() {
+        use scp_platform::Storage as _;
+        fn variant_and_code(e: &ScpNapiError) -> (&'static str, String) {
+            match e {
+                ScpNapiError::Identity { code, .. } => ("identity", code.clone()),
+                ScpNapiError::Crypto { code, .. } => ("crypto", code.clone()),
+                ScpNapiError::Validation { code, .. } => ("validation", code.clone()),
+                other => panic!("unexpected custody error variant: {other:?}"),
+            }
+        }
+        fn wrapped(e: &scp_platform::PlatformError) -> ScpNapiError {
+            scp_core::context::ContextError::Custody(scp_crypto::CustodyFailure::from(e)).into()
+        }
+
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("create a tempdir");
+        };
+        let storage = match scp_platform::sqlite::SqliteStorage::new(dir.path(), &[0x5a; 32]) {
+            Ok(storage) => storage,
+            Err(e) => panic!("open the store: {e}"),
+        };
+        if let Err(e) = storage.close() {
+            panic!("close the store: {e}");
+        }
+        let closed = match storage.retrieve("custody/next_id").await {
+            Err(e) => e,
+            Ok(v) => panic!("a closed store refuses every operation, got {v:?}"),
+        };
+        assert!(
+            matches!(closed, scp_platform::PlatformError::StorageClosed),
+            "{closed:?}"
+        );
+        assert_eq!(
+            variant_and_code(&wrapped(&closed)),
+            ("validation", codes::STORAGE_8006.to_owned())
+        );
+
+        for error in [
+            closed,
+            scp_platform::PlatformError::StorageLockHeld {
+                dir: "/tmp/scp".to_owned(),
+                lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+            },
+            scp_platform::PlatformError::KeyNotFound,
+            scp_platform::PlatformError::PseudonymRejected("x".to_owned()),
+            scp_platform::PlatformError::WrongKeyType {
+                expected: scp_platform::traits::KeyType::Ed25519,
+                actual: scp_platform::traits::KeyType::X25519,
+            },
+            scp_platform::PlatformError::StorageError("io".to_owned()),
+            scp_platform::PlatformError::AttestationError("x".to_owned()),
+            scp_platform::PlatformError::PushError("x".to_owned()),
+            scp_platform::PlatformError::CustodyError("x".to_owned()),
+            scp_platform::PlatformError::Unsupported("x"),
+        ] {
+            let wrapped_error = wrapped(&error);
+            let debug = format!("{error:?}");
+            let bare: ScpNapiError = error.into();
+            assert_eq!(
+                variant_and_code(&bare),
+                variant_and_code(&wrapped_error),
+                "{debug}"
+            );
+        }
     }
 
     /// §5.9: a `RestoreAccess` with nothing to restore must surface the

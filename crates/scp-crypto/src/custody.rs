@@ -5,8 +5,10 @@
 //! which therefore cannot hold a `PlatformError`. They hold a
 //! [`CustodyFailure`] instead, and every bridge reads its [`CustodyFailureKind`]
 //! to report `SCP-CRYPTO-4006` (key not found), `SCP-IDENT-1055` (a host
-//! pseudonym the bridge rejects, ADR-021) or `SCP-CRYPTO-4060` (any other
-//! custody failure), as `.docs/standards/sdk-common.md` registers them. A
+//! pseudonym the bridge rejects, ADR-021), `SCP-STORAGE-8006` (the custody
+//! store is closed), `SCP-STORAGE-8005` (the custody store's directory lock is
+//! still held) or `SCP-CRYPTO-4060` (any other custody failure), as
+//! `.docs/standards/sdk-common.md` registers them. A
 //! pseudonym whose identity key was destroyed fails with key-not-found
 //! (`09-security-model.md` §9.10.4.A).
 
@@ -18,6 +20,12 @@ pub enum CustodyFailureKind {
     KeyNotFound,
     /// The bridge rejected a pseudonym the host custody derived.
     PseudonymRejected,
+    /// The custody backend's durable store is closed (spec §17.6 "One Opener
+    /// per Durable Directory").
+    StorageClosed,
+    /// The custody backend's durable directory lock is still held (spec §17.6
+    /// "One Opener per Durable Directory").
+    StorageLockHeld,
     /// The custody backend failed for any other reason.
     Failed,
 }

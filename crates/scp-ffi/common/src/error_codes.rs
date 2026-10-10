@@ -1435,13 +1435,17 @@ pub const SAGA_13066: &str = "SCP-SAGA-13066";
 /// The bridge error code for a runtime [`CustodyFailure`](scp_crypto::CustodyFailure).
 ///
 /// One mapping for the `PyO3`, napi-rs and `UniFFI` bridges: key-not-found is
-/// [`CRYPTO_4006`], a rejected host pseudonym is [`IDENT_1055`], and any other
-/// custody failure is [`CRYPTO_4060`].
+/// [`CRYPTO_4006`], a rejected host pseudonym is [`IDENT_1055`], a closed
+/// custody store is [`STORAGE_8006`], a custody store whose directory lock is
+/// still held is [`STORAGE_8005`], and any other custody failure is
+/// [`CRYPTO_4060`].
 #[must_use]
 pub const fn custody_failure_code(e: &scp_crypto::CustodyFailure) -> &'static str {
     match e.kind {
         scp_crypto::CustodyFailureKind::KeyNotFound => CRYPTO_4006,
         scp_crypto::CustodyFailureKind::PseudonymRejected => IDENT_1055,
+        scp_crypto::CustodyFailureKind::StorageClosed => STORAGE_8006,
+        scp_crypto::CustodyFailureKind::StorageLockHeld => STORAGE_8005,
         scp_crypto::CustodyFailureKind::Failed => CRYPTO_4060,
     }
 }

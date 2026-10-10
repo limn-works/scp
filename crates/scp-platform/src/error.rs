@@ -97,18 +97,23 @@ pub enum PlatformError {
 impl From<&PlatformError> for scp_crypto::CustodyFailure {
     /// Classifies a custody error for the error types that cannot hold a
     /// [`PlatformError`]: [`PlatformError::KeyNotFound`] is key-not-found,
-    /// [`PlatformError::PseudonymRejected`] is a rejected pseudonym, and every
-    /// other variant is a custody failure.
+    /// [`PlatformError::PseudonymRejected`] is a rejected pseudonym,
+    /// [`PlatformError::StorageClosed`] and [`PlatformError::StorageLockHeld`]
+    /// keep their own kinds so a bridge reports the same storage code whether
+    /// the error arrives bare or wrapped, and every other variant is a custody
+    /// failure.
     fn from(e: &PlatformError) -> Self {
         let kind = match e {
             PlatformError::KeyNotFound => scp_crypto::CustodyFailureKind::KeyNotFound,
             PlatformError::PseudonymRejected(_) => {
                 scp_crypto::CustodyFailureKind::PseudonymRejected
             }
+            PlatformError::StorageClosed => scp_crypto::CustodyFailureKind::StorageClosed,
+            PlatformError::StorageLockHeld { .. } => {
+                scp_crypto::CustodyFailureKind::StorageLockHeld
+            }
             PlatformError::WrongKeyType { .. }
             | PlatformError::StorageError(_)
-            | PlatformError::StorageClosed
-            | PlatformError::StorageLockHeld { .. }
             | PlatformError::AttestationError(_)
             | PlatformError::PushError(_)
             | PlatformError::CustodyError(_)
