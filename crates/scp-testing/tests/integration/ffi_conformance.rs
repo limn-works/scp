@@ -63,6 +63,9 @@ const PYO3_SERVER: &str = include_str!("../../../../crates/scp-ffi/src/server.rs
 // single-shot outlet ops in `outlets.rs`. Embedded so the streaming
 // canonicals resolve in the forward coverage tests.
 const PYO3_OUTLET_STREAM: &str = include_str!("../../../../crates/scp-ffi/src/outlet_stream.rs");
+// P-256 custody-host helpers (§9.10.4, §9.5): module-level free functions each
+// bridge exports from its own `p256_host.rs`.
+const PYO3_P256_HOST: &str = include_str!("../../../../crates/scp-ffi/src/p256_host.rs");
 
 // UniFFI bridge spans three files: the central `bridge.rs` (most ops),
 // `server.rs` (site-projection methods on the `Server` type), and `scp.rs`
@@ -80,6 +83,7 @@ const UNIFFI_SCP: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/scp
 // streaming canonicals resolve in the forward coverage tests.
 const UNIFFI_OUTLET_STREAM: &str =
     include_str!("../../../../crates/scp-ffi/uniffi/src/outlet_stream.rs");
+const UNIFFI_P256_HOST: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/p256_host.rs");
 
 // NAPI bridge sources
 const NAPI_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/napi/src/identity.rs");
@@ -104,6 +108,7 @@ const NAPI_SCP: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp.rs"
 // NAPI server module hosts `enable_site_projection` / `disable_site_projection`
 // methods on the `Server` type — added in Batch 2 (#1543).
 const NAPI_SERVER: &str = include_str!("../../../../crates/scp-ffi/napi/src/server.rs");
+const NAPI_P256_HOST: &str = include_str!("../../../../crates/scp-ffi/napi/src/p256_host.rs");
 
 // ---------------------------------------------------------------------------
 // Shared alias table — compiled in at build time from scripts/bridge-aliases.json
@@ -655,6 +660,7 @@ fn uniffi_has_operation(canonical: &str) -> bool {
             || source_has_fn(UNIFFI_SERVER, name)
             || source_has_fn(UNIFFI_SCP, name)
             || source_has_fn(UNIFFI_OUTLET_STREAM, name)
+            || source_has_fn(UNIFFI_P256_HOST, name)
     })
 }
 
@@ -688,6 +694,7 @@ fn pyo3_sources() -> Vec<&'static str> {
         PYO3_SCPID,
         PYO3_SERVER,
         PYO3_OUTLET_STREAM,
+        PYO3_P256_HOST,
     ]
 }
 
@@ -709,6 +716,7 @@ fn napi_sources() -> Vec<&'static str> {
         NAPI_MEDIA,
         NAPI_SCP,
         NAPI_SERVER,
+        NAPI_P256_HOST,
     ]
 }
 
@@ -1431,7 +1439,27 @@ fn discovery_and_provenance_coverage() {
 // native bridge (PyO3 / UniFFI / NAPI) and removing the pass-1 bridge-alias
 // exemptions. Pure coverage expansion, not a swap for the removed
 // `economy_adjust_relay_price`.
-const MIN_PARITY_OPERATIONS: usize = 109;
+//
+// Subsequently RAISED 109 -> 112 by the three P-256 custody-host helpers
+// (`p256_pseudonym_scalar` / `p256_public_key` / `p256_sign_prehash_rfc6979`,
+// §9.10.4 and §9.5): one implementation in `scp_ffi_common::p256_host`, first
+// exported by UniFFI alone and now by PyO3 and NAPI too, so their
+// `ffi-export-allowlist.json` bridge-specific entries are gone. Pure coverage
+// expansion, not a swap for the removed `economy_adjust_relay_price`.
+//
+// Subsequently RAISED 112 -> 114 by the two pseudonym point helpers
+// (`p256_pseudonym_point` / `p256_software_pseudonym_point`, §9.10.4.A): a
+// keystore host and a software host each get the pseudonym point without any
+// scalar reaching them, exported by all three native bridges. Pure coverage
+// expansion, not a swap for the removed `economy_adjust_relay_price`.
+//
+// Subsequently LOWERED 114 -> 111, with human approval, by removing the three
+// scalar and sign helpers (`p256_pseudonym_scalar` / `p256_public_key` /
+// `p256_sign_prehash_rfc6979`) from every bridge and SDK: under SCP-307 and
+// §9.10.4.A a pseudonym is a point with no private key that any party holds
+// or signs with, so no host may receive a pseudonym scalar. The two point
+// helpers above replace them, and nothing is added in their place.
+const MIN_PARITY_OPERATIONS: usize = 111;
 
 // ---------------------------------------------------------------------------
 // Ratchet meta-tests — detect weakening of enforcement
@@ -1583,10 +1611,11 @@ fn every_alias_resolves_to_a_real_fn_or_exemption() {
                     || source_has_fn(UNIFFI_SERVER, name)
                     || source_has_fn(UNIFFI_SCP, name)
                     || source_has_fn(UNIFFI_OUTLET_STREAM, name)
+                    || source_has_fn(UNIFFI_P256_HOST, name)
             });
             if !any_resolves {
                 phantom.push(format!(
-                    "uniffi:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/uniffi/src/{{bridge,server,scp,outlet_stream}}.rs",
+                    "uniffi:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/uniffi/src/{{bridge,server,scp,outlet_stream,p256_host}}.rs",
                     op.canonical, op.uniffi
                 ));
             }

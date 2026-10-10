@@ -427,7 +427,8 @@ mod tests {
         let bob_kp = bob_kp_bundle.key_package().clone().into();
         let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
 
-        let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+        let bob_group =
+            join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
 
         let alice_keys = export_media_keys(&alice_group, b"ctx-1", TEST_KEY_LENGTH).unwrap();
         let bob_keys = export_media_keys(&bob_group, b"ctx-1", TEST_KEY_LENGTH).unwrap();

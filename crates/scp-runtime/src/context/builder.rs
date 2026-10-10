@@ -478,6 +478,28 @@ pub trait ContextEventLogProvider: Send + Sync {
         ))
     }
 
+    /// Returns the entry count and the Merkle root of a context's event log,
+    /// both read from one state of the log.
+    ///
+    /// An implementation reads the two values under one acquisition of its
+    /// log state, so an append that lands concurrently is either counted and
+    /// hashed or neither. Calling [`Self::event_log_entries`] and then
+    /// [`Self::event_log_merkle_root`] gives no such guarantee.
+    ///
+    /// An existing log with no entries reports a count of 0 and the
+    /// empty-tree root, `SHA-256("")`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if no log exists for the
+    /// context, or if this provider does not support the summary.
+    fn event_log_summary(&self, context_id: &[u8; 32]) -> Result<(usize, [u8; 32]), ContextError> {
+        let _ = context_id;
+        Err(ContextError::EventLogFailed(
+            "event log summary not supported by this provider".into(),
+        ))
+    }
+
     // -- Persistence for process restart recovery (#636) --------------------
 
     /// Restores the event log for a context from persistent storage.
@@ -704,12 +726,11 @@ impl ContextTransportProvider for NotConfiguredTransportProvider {
 // it back to the caller, which seeds the spawning actor directly. There is no
 // provider-side crypto to roll back. On a post-birth creation failure the owned
 // material is disposed on the rollback branch (`OwnedMlsCryptoState::dispose_secrets`,
-// F6) — a bare drop FREES the group's in-memory OpenMLS storage but does NOT
-// zeroize the Ed25519 signer (OpenMLS `SignatureKeyPair` has no `Zeroize`;
-// scp-mls `EagerDropSigner` / issue #82). `destroy_group` eagerly frees the same
-// material (signer freed, NOT zeroized — #82); on this rollback branch the owner
-// drops immediately after, so the explicit dispose is defense-in-depth /
-// forward-compat with #82. The `SenderKey` zeroizes on its own `ZeroizeOnDrop`.
+// F6) — a bare drop zeroizes the group's in-memory OpenMLS storage values and
+// the Ed25519 signer (OpenMLS `SignatureKeyPair` holds its private key in
+// `SecretVLBytes`). `destroy_group` releases the same material; on this rollback
+// branch the owner drops immediately after, so the explicit dispose is
+// equivalent to that drop. The `SenderKey` zeroizes on its own `ZeroizeOnDrop`.
 // Only the event log retains a provider-resident rollback handle.
 
 /// Opaque handle representing ownership of a created event log.
@@ -750,8 +771,8 @@ impl EventLogHandle {
 /// and transport publication (`bool` — no recoverable local state, rollback
 /// issues a best-effort DELETE to remote relays). A post-birth creation failure
 /// disposes the `OwnedMlsCryptoState` on the rollback branch (`dispose_secrets`,
-/// which eagerly frees the group via `destroy_group` — signer freed, NOT
-/// zeroized, #82; the `SenderKey` zeroizes on drop), so there is nothing
+/// which eagerly frees the group via `destroy_group` — the signer and the
+/// `SenderKey` zeroize on drop), so there is nothing
 /// crypto-shaped left for the receipt to roll back.
 #[derive(Debug, Default)]
 pub struct CreationReceipt {
@@ -773,9 +794,9 @@ impl CreationReceipt {
     /// rollback arms are GONE — crypto is never provider-resident during
     /// creation. A post-birth failure disposes the owned material on the caller's
     /// rollback branch (`dispose_secrets` eagerly frees the group via
-    /// `destroy_group` — signer freed, NOT zeroized, #82; the `SenderKey`
-    /// zeroizes on drop). On this branch the owner drops immediately after, so
-    /// the dispose is defense-in-depth / forward-compat with #82. Only the event
+    /// `destroy_group` — the signer and the `SenderKey` zeroize on drop). On
+    /// this branch the owner drops immediately after, so the dispose is
+    /// equivalent to that drop. Only the event
     /// log + publication are reversed here.
     pub async fn rollback(
         &self,
@@ -807,6 +828,11 @@ impl CreationReceipt {
 ///
 /// # Errors
 ///
+/// Returns [`ContextCreationError::StateTransition`] wrapping
+/// [`ContextError::CeilingRequired`] with
+/// [`CeilingDeclaration::Empty`](scp_protocol::context::CeilingDeclaration::Empty)
+/// if the ceiling is empty (construction.md M2).
+///
 /// Returns [`ContextCreationError::TemplateValidationFailed`] if a template
 /// is specified and the params do not match the template definition.
 fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
@@ -819,9 +845,18 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // type system, since GovernanceModel has no Option wrapper).
     let _ = &params.governance; // field presence guaranteed by the type
 
-    // Validate ceiling policy / ceiling consistency: if ceiling is empty and
-    // policy is Governed, that is technically valid (no capabilities to
-    // narrow). No structural constraint to enforce here.
+    // The ceiling must be non-empty (construction.md M2, Alec's ruling of
+    // 2026-09-30): an empty ceiling describes a context no member can use.
+    // `lifecycle_helpers::create_context` rejects it too, before it builds any
+    // governance state; this check makes the rule hold for every in-crate
+    // caller of `builder::create_context`, test code included.
+    if params.ceiling.is_empty() {
+        return Err(ContextCreationError::StateTransition(
+            scp_protocol::context::ContextError::CeilingRequired(
+                scp_protocol::context::CeilingDeclaration::Empty,
+            ),
+        ));
+    }
 
     // §5.1/§5.12: outlets are declared at creation and the creator installs them
     // into the live registry (GitHub #2020). The creator therefore writes
@@ -881,6 +916,9 @@ fn context_id_bytes(context_id: &str) -> [u8; 32] {
 
 /// Executes the two-phase context creation flow.
 ///
+/// Crate-private: no other crate can create a context through this function.
+/// Phase 1 rejects an empty ceiling (construction.md M2) for every caller.
+///
 /// **Phase 1 (validate):** Checks params and identity with zero side effects.
 /// Returns early on any validation failure. Transport connectivity is NOT
 /// checked — context creation is a local operation.
@@ -924,7 +962,7 @@ fn context_id_bytes(context_id: &str) -> [u8; 32] {
 // splitting the sequential phases across helpers would reduce, not improve,
 // readability.
 #[allow(clippy::too_many_lines)]
-pub async fn create_context(
+pub(crate) async fn create_context(
     context_id: String,
     params: ContextParams,
     crypto: &NodeMlsFactory,
@@ -1009,12 +1047,11 @@ pub async fn create_context(
 
     // Step 4: Initialise event log.
     if let Err(e) = event_log_provider.init_event_log(&id_bytes).await {
-        // #2148 F6: eagerly free the born-but-never-seeded crypto's OpenMLS
-        // group (`destroy_group`) before `owned` drops on this rollback. A bare
-        // drop already frees the in-memory group storage; the signer is freed
-        // either way, NOT zeroized (#82) — so this explicit dispose is
-        // defense-in-depth / forward-compat with #82. `SenderKey` zeroizes on
-        // its own drop.
+        // Dispose the born-but-never-seeded crypto's OpenMLS group
+        // (`destroy_group`) before `owned` drops on this rollback. A bare drop
+        // already wipes the in-memory group storage and zeroizes the signer, so
+        // this explicit dispose is equivalent to that drop. `SenderKey`
+        // zeroizes on its own drop.
         if let Some(mut owned) = owned_crypto {
             owned.dispose_secrets();
         }
@@ -1048,8 +1085,8 @@ pub async fn create_context(
 
     // Step 6: Transition state to Active.
     if let Err(e) = handle.transition_to(&ContextState::Active) {
-        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
-        // freed, NOT zeroized — #82) before it drops on this rollback (see step 4).
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop.
         if let Some(mut owned) = owned_crypto {
             owned.dispose_secrets();
         }
@@ -1072,8 +1109,8 @@ pub async fn create_context(
         )
         .await
     {
-        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
-        // freed, NOT zeroized — #82) before it drops on this rollback (see step 4).
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop.
         // The handle is Active but `owned_crypto` is still live (returned to the
         // caller on success at step 9), so it is the live owner here.
         if let Some(mut owned) = owned_crypto {
@@ -1110,8 +1147,8 @@ pub async fn create_context(
         )
         .await
     {
-        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
-        // freed, NOT zeroized — #82) before it drops on this rollback (see step 4).
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop.
         // `owned_crypto` is still live (returned to the caller on success at
         // step 9), so it is the live owner here.
         if let Some(mut owned) = owned_crypto {
@@ -1186,8 +1223,8 @@ pub async fn create_context(
     }
     .await;
     if let Err(e) = genesis_outlet_leaves {
-        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
-        // freed, NOT zeroized — #82) before it drops on this rollback.
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop.
         // `owned_crypto` is still live (returned to the caller on success at
         // step 9), so it is the live owner here.
         if let Some(mut owned) = owned_crypto {
@@ -1229,6 +1266,41 @@ mod tests {
     /// Success-path tests bind a real provider; fail-injection tests are
     /// `#[ignore]`d pending `MlsBackend` injection.
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+
+    /// Default params with a non-empty ceiling, which every create requires
+    /// (construction.md M2).
+    fn ceilinged_params() -> ContextParams {
+        ContextParams {
+            ceiling: vec![
+                scp_protocol::context::roles::Capability::MessagesRead,
+                scp_protocol::context::roles::Capability::MessagesWrite,
+            ],
+            ..ContextParams::default()
+        }
+    }
+
+    #[test]
+    fn validate_params_rejects_an_empty_ceiling() {
+        let params = ContextParams::default();
+        assert!(
+            params.ceiling.is_empty(),
+            "test precondition: default ceiling is empty"
+        );
+        let err = validate_params(&params).expect_err("an empty ceiling must be rejected");
+        assert!(
+            matches!(
+                err,
+                ContextCreationError::StateTransition(ContextError::CeilingRequired(
+                    scp_protocol::context::CeilingDeclaration::Empty
+                ))
+            ),
+            "expected CeilingRequired(Empty), got {err:?}"
+        );
+        assert!(
+            validate_params(&ceilinged_params()).is_ok(),
+            "a non-empty ceiling must be accepted"
+        );
+    }
 
     struct TestTransport;
     #[async_trait::async_trait]
@@ -1277,7 +1349,7 @@ mod tests {
         // Pure data test — no crypto provider needed.
         let params = ContextParams {
             memory_scope: MemoryScope::Full,
-            ..Default::default()
+            ..ceilinged_params()
         };
         assert!(validate_params(&params).is_ok());
     }
@@ -1357,7 +1429,7 @@ mod tests {
         );
         let (handle, owned_crypto) = create_context(
             id.clone(),
-            ContextParams::default(),
+            ceilinged_params(),
             &crypto,
             &TestTransport,
             &TestEventLog,
@@ -1410,7 +1482,7 @@ mod tests {
 
         create_context(
             id.clone(),
-            ContextParams::default(),
+            ceilinged_params(),
             &crypto,
             &TestTransport,
             &provider,
@@ -1533,7 +1605,7 @@ mod tests {
 
         let params = ContextParams {
             outlets: vec![outlet_fixture("alpha"), outlet_fixture("beta")],
-            ..Default::default()
+            ..ceilinged_params()
         };
 
         create_context(
@@ -1629,7 +1701,7 @@ mod tests {
         };
         let params = ContextParams {
             outlets: vec![degenerate],
-            ..Default::default()
+            ..ceilinged_params()
         };
         let err = validate_params(&params)
             .expect_err("property-free schemas fail the §6.2/§9.2.1 specificity floor");
@@ -1646,7 +1718,7 @@ mod tests {
         under_floor.schema.output_schema = serde_json::json!({"type": "object"});
         let params = ContextParams {
             outlets: vec![under_floor],
-            ..Default::default()
+            ..ceilinged_params()
         };
         assert!(
             validate_params(&params).is_err(),
@@ -1658,7 +1730,7 @@ mod tests {
         bad_operator.operator_did = "not-a-did".into();
         let params = ContextParams {
             outlets: vec![bad_operator],
-            ..Default::default()
+            ..ceilinged_params()
         };
         assert!(
             validate_params(&params).is_err(),
@@ -1675,7 +1747,7 @@ mod tests {
     fn validate_params_rejects_duplicate_genesis_outlet_ids() {
         let params = ContextParams {
             outlets: vec![outlet_fixture("alpha"), outlet_fixture("alpha")],
-            ..Default::default()
+            ..ceilinged_params()
         };
         let err = validate_params(&params).expect_err("a duplicate outlet id must be refused");
         assert!(
@@ -1694,7 +1766,7 @@ mod tests {
             outlets: (0..=crate::context::state::MAX_REGISTERED_OUTLETS)
                 .map(|i| outlet_fixture(&format!("outlet-{i}")))
                 .collect(),
-            ..Default::default()
+            ..ceilinged_params()
         };
         assert!(
             params.outlets.len() > crate::context::state::MAX_REGISTERED_OUTLETS,
@@ -1713,7 +1785,7 @@ mod tests {
             outlets: (0..crate::context::state::MAX_REGISTERED_OUTLETS)
                 .map(|i| outlet_fixture(&format!("outlet-{i}")))
                 .collect(),
-            ..Default::default()
+            ..ceilinged_params()
         };
         assert!(
             validate_params(&params).is_ok(),

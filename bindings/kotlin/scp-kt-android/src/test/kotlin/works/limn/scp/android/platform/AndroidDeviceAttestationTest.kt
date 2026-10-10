@@ -16,15 +16,18 @@ import java.security.MessageDigest
 // Unit tests for AndroidDeviceAttestation
 // ---------------------------------------------------------------------------
 //
-// Play Integrity API calls require a real Android device with Google Play
-// Services. These tests cover the deterministic, locally-testable parts of
-// the attestation flow:
+// Play Integrity API calls need Google Play services, which the host JVM lacks.
+// ADR-027 acceptance criterion 13 runs hardware tests on an API 33+ physical
+// device or on an API 33 emulator with Play Store. These tests cover the
+// deterministic, locally-testable parts of the attestation flow:
 //   - clientDataJSON construction (fixed field order, Base64 encoding)
 //   - Nonce computation (SHA-256 + Base64)
-//   - assertRequest delegation to attest
 //
-// End-to-end integration tests with actual Play Integrity require a physical
-// device and are covered by instrumentation tests.
+// No test covers the Play Integrity request, `attest` end to end, or
+// `assertRequest`: each calls the Play Integrity API, which only an
+// instrumented test on such a device or emulator can reach, and the module has
+// no instrumented tests.
+// Story SCP-111's criterion for end-to-end tests on a physical device is unmet.
 //
 // Uses Robolectric to provide android.util.Base64 on the host JVM.
 
@@ -205,7 +208,10 @@ class AndroidDeviceAttestationTest {
     // -----------------------------------------------------------------------
 
     @Test
-    fun `ATTESTATION_TYPE constant matches spec value`() {
+    fun `ATTESTATION_TYPE constant holds the legacy clientDataJSON type value`() {
+        // Spec 27 quotes "scp-device-attestation-v1" only as part of the
+        // clientDataJSON construction that the 2026-09-27 amendments to
+        // ADR-025 and ADR-027 replaced; no normative text requires it.
         assertEquals("scp-device-attestation-v1", AndroidDeviceAttestation.ATTESTATION_TYPE)
     }
 
@@ -232,19 +238,20 @@ class AndroidDeviceAttestationTest {
     }
 
     // -----------------------------------------------------------------------
-    // Cross-platform determinism (matches Apple adapter formula)
+    // Legacy clientDataJSON field order
     // -----------------------------------------------------------------------
 
     @Test
-    fun `clientDataJSON field order matches Apple adapter formula`() {
-        // The relay reconstructs clientDataJSON with the same fixed-field-order
-        // formula. This test ensures the Android adapter produces the same
-        // structure as the Apple adapter (AppleDeviceAttestation.swift).
-        //
-        // Apple formula: {"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}
+    fun `clientDataJSON fields appear in the fixed order challenge then deviceId then type`() {
         // Android formula: {"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}
         //
-        // Both use the same fixed order: challenge, deviceId, type.
+        // This test pins the legacy clientDataJSON behaviour of the shipped
+        // adapter. ADR-027 acceptance criterion 7, as its 2026-09-27 amendment
+        // states it, replaced this JSON with requestHash = hex(D), where D is
+        // the binding digest of 09-security-model.md section 9.3.1; story
+        // SCP-111 carries that change. OQ-22 of spec 27 keeps two questions
+        // open: which of the two device-attestation traits is normative, and
+        // whether that trait's attest takes a challenge and an identifier.
         val attestation = createAttestationWithMockContext()
         val json = attestation.buildClientDataJSON(
             byteArrayOf(1, 2, 3),
@@ -256,6 +263,7 @@ class AndroidDeviceAttestationTest {
         val deviceIdIdx = json.indexOf("\"deviceId\"")
         val typeIdx = json.indexOf("\"type\"")
 
+        assertTrue("challenge field must appear", challengeIdx >= 0)
         assertTrue("challenge must come before deviceId", challengeIdx < deviceIdIdx)
         assertTrue("deviceId must come before type", deviceIdIdx < typeIdx)
     }

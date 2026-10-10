@@ -3542,11 +3542,13 @@ async fn abort(
 // caller builds the snapshot (holding its `&mut ClassSCell`) BEFORE calling this,
 // then hands over the owned snapshot; the event-log append targets
 // `deps.event_log` (independent of `state`), so building the snapshot first is
-// behaviour-preserving.
+// behaviour-preserving. A snapshot the caller could not build (no floor export:
+// the Supervisor has dropped, ADR-049 Decision 16) persists nothing and replies
+// with that typed error.
 #[allow(clippy::too_many_arguments)]
 async fn emit_divergence_marker(
     context_id: [u8; 32],
-    snapshot: crate::context::state::ContextSnapshot,
+    snapshot: Result<crate::context::state::ContextSnapshot, ContextError>,
     deps: &ActorDeps,
     saga_id: &SagaId,
     nonce: [u8; 16],
@@ -3556,6 +3558,16 @@ async fn emit_divergence_marker(
     signing_key: &SigningKeyBytes,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // Bound by reference: a moved-out copy would give this future a second
+    // `ContextSnapshot`-sized slot (clippy `large_futures`).
+    let snapshot = match snapshot {
+        Ok(ref snapshot) => snapshot,
+        Err(e) => {
+            let sketch = outcome_error_sketch(&e);
+            let _ = reply.send(Err(e));
+            return Outcome::err(sketch);
+        }
+    };
     let context_hex = hex_context_id(&context_id);
 
     let key = signing_key.to_signing_key();
@@ -3619,7 +3631,7 @@ async fn emit_divergence_marker(
     // audit witness operator-repair relies on; it MUST land before acking. The
     // `snapshot` was built by the caller (from its `&mut ClassSCell`) before this
     // handler ran, so no `&PerContextState` is held across the persist `.await`.
-    if let Err(persist_err) = persist_snapshot_fail_closed(&snapshot, deps, &context_hex).await {
+    if let Err(persist_err) = persist_snapshot_fail_closed(snapshot, deps, &context_hex).await {
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
         return Outcome::err_mutated(sketch);
@@ -4144,6 +4156,7 @@ mod tests {
             None,
             mls_storage,
         );
+        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
             .build_actor_deps(&DID("did:example:saga-test-owner".to_owned()))
             .await
@@ -4189,6 +4202,7 @@ mod tests {
             None,
             mls_storage,
         );
+        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
             .build_actor_deps(&DID("did:example:saga-test-owner".to_owned()))
             .await
@@ -6146,6 +6160,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emit_divergence_marker_writes_nothing_after_supervisor_drops() {
+        use crate::context::messaging_helpers::dropped_supervisor_tests::{
+            Fixture, assert_shut_down, ctx_hex, state,
+        };
+        let f = Fixture::new().await.drop_supervisor();
+        let st = state();
+        let snap = build_snapshot_for_persist(&st, &f.deps, &ctx_hex());
+        let (tx, rx) = oneshot::channel();
+        let out = emit_divergence_marker(
+            st.context_id,
+            snap,
+            &f.deps,
+            &SagaId("saga-divergence-dropped".to_owned()),
+            [0xAB; 16],
+            CommittedSide::Target,
+            "evt-committed-10",
+            1_700_000_000,
+            &signing_key_bytes(0x99),
+            tx,
+        )
+        .await;
+        assert!(
+            out.result.is_err(),
+            "the Outcome must record the refused marker"
+        );
+        assert_shut_down(&rx.await.unwrap());
+        assert_eq!(
+            f.appends.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no marker append"
+        );
+        assert_eq!(
+            f.persists.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no snapshot persist"
+        );
+    }
+
+    #[tokio::test]
     async fn commit_b_reserve_without_staged_slot_is_rejected() {
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let st = target_state(0xC8, OTHER, CALLER).await;
@@ -6408,6 +6461,7 @@ mod tests {
             None,
             mls_storage,
         );
+        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
             .build_actor_deps(&DID("did:example:saga-test-owner".to_owned()))
             .await

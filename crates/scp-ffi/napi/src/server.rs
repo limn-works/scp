@@ -687,7 +687,7 @@ pub(crate) async fn node_start_local_on(
     .map_err(server_err)?;
     // This node holds a clone of this instance's storage `Arc`, so register it
     // before anything else: `SCP.shutdown()` must stop this node before
-    // `bridge_specific_shutdown` closes that `SQLCipher` handle and drops an
+    // the durable store closer closes that `SQLCipher` handle and drops an
     // advisory `flock(2)`
     // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
     let inner = server::register_node(&bi.core, inner);

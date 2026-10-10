@@ -1,15 +1,14 @@
-//! The curve-neutral signer abstraction (ADR-063 build constraint, plan §1.8).
+//! The curve-neutral signer abstraction (ADR-063 build constraint).
 //!
-//! [`ScpSigner`] lets protocol code sign without holding raw key material:
-//! production paths back it with a `KeyCustody` handle, so no private key
-//! crosses a crate or FFI boundary. [`P256SigningKey`] implements it for
-//! software keys. In S0 no shipped path calls it yet; the
-//! per-crate migration off `&ed25519_dalek::SigningKey` parameters follows in
-//! later PRs, and S12 swaps the implementation to P-256.
+//! [`ScpSigner`] is the interface through which protocol code is to sign
+//! without holding raw key material. [`P256SecretKey`] implements it for a
+//! software key held in process. No protocol path calls it yet, and no
+//! `KeyCustody`-backed implementation exists yet; protocol code still takes
+//! `&ed25519_dalek::SigningKey` parameters.
 
 use core::future::Future;
 
-use crate::p256::{P256SigningKey, sign_prehash_rfc6979};
+use crate::p256::{P256SecretKey, sign_prehash_rfc6979};
 
 /// The signature algorithm an [`ScpSigner`] produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,11 +65,11 @@ pub trait ScpSigner: Send + Sync {
     fn sign(&self, msg: &[u8]) -> impl Future<Output = Result<[u8; 64], SignError>> + Send;
 }
 
-/// The software P-256 signer: a locally held [`P256SigningKey`].
+/// The software P-256 signer: a locally held [`P256SecretKey`].
 ///
 /// `sign` takes the 32-byte §9.5.1 digest and returns the low-`s` raw
 /// signature; any other input length is [`SignError::InvalidDigestLength`].
-impl ScpSigner for P256SigningKey {
+impl ScpSigner for P256SecretKey {
     fn algorithm(&self) -> SigAlg {
         SigAlg::EcdsaP256Sha256
     }
@@ -91,7 +90,7 @@ impl ScpSigner for P256SigningKey {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::p256::{P256PublicKey, verify_prehash_strict};
+    use crate::p256::{P256PublicKey, SeedLabel, verify_prehash_strict};
 
     fn block_on<F: Future>(f: F) -> F::Output {
         use core::pin::pin;
@@ -104,12 +103,12 @@ mod tests {
         }
     }
 
-    /// The shipped `P256SigningKey` signer honours the trait contract: the
+    /// The software `P256SecretKey` signer honours the trait contract: the
     /// 33-byte compressed key, strict-verifiable low-`s` signatures that match
     /// the direct RFC 6979 path, and a typed error for a non-digest input.
     #[test]
-    fn p256_signing_key_signer_contract() {
-        let key = P256SigningKey::from_seed(b"t", &[5u8; 32]).unwrap();
+    fn p256_secret_key_signer_contract() {
+        let key = P256SecretKey::from_seed(SeedLabel::TestVectorKey, &[5u8; 32]);
         assert_eq!(ScpSigner::algorithm(&key), SigAlg::EcdsaP256Sha256);
         let encoded = ScpSigner::public_key(&key);
         assert_eq!(encoded.len(), 33);

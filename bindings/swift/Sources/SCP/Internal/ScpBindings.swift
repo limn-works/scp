@@ -2182,9 +2182,22 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
      * `Identity` whose `instance_id` does not match this `SCP`'s.
      *
-     * Authorization is enforced by the `ContextManager` (which delegates
-     * to `ttl::close_context` checking the `ContextClose` capability) —
-     * no bridge-layer auth check.
+     * Reads the context's lifecycle state from its supervisor actor, not
+     * from the handle's cached state. On `Active` it dispatches
+     * `CloseContext`, whose `ttl::close_context` checks the `ContextClose`
+     * capability; this function runs no capability check of its own. When
+     * no actor serves the context, or the actor reports `Closed`, `Expired`,
+     * or `Tombstoned`, it skips the dispatch and only releases this bridge's
+     * per-context state. It refuses `Poisoned` with `SCP-CTX-2134` and every
+     * other state with `SCP-CTX-2017`, keeps that state, and propagates a
+     * failed state read.
+     *
+     * The release marks the id. When a re-read after the mark reports
+     * `Active`, or a readmit clears the mark before the release removes the
+     * state, this function removes nothing, leaves the handle's cached state
+     * unchanged, and refuses with `SCP-CTX-2017`. When that re-read fails,
+     * it removes nothing, leaves the handle's cached state unchanged, and
+     * returns the read's error.
      */
     func contextClose(handle: ContextHandle, identity: Identity) async throws 
     
@@ -2864,37 +2877,57 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func isLocalDid(did: String) async  -> Bool
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_connect_sse`.
+     * Connects to the MCP SSE server at `url`.
      *
-     * Routes through the module-level MCP client registry.
+     * Registers the client in this instance's MCP client registry; the
+     * returned handle works only on this instance. `auth_token` is
+     * sent as `Authorization: Bearer <token>` on the `GET` and on every POST,
+     * or `None` for a server that runs no bearer check; an SCP SSE server
+     * always runs one (ADR-015). The transport has no TLS, so a token is
+     * sent only to a loopback host.
      */
-    func mcpClientConnectSse(url: String) async throws  -> String
+    func mcpClientConnectSse(url: String, authToken: String?) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
+     * Starts `command` as an MCP server subprocess and connects to it over
+     * stdio.
      *
-     * Routes through the module-level MCP client registry.
+     * Registers the client in this instance's MCP client registry; the
+     * returned handle works only on this instance.
      */
     func mcpClientConnectStdio(command: [String]) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_disconnect`.
+     * Disconnects the MCP client registered under `handle`.
      *
-     * Routes through the module-level MCP client registry.
+     * Removes the entry from this instance's MCP client registry; a handle
+     * another instance returned is not found. Dropping the
+     * entry closes the client's transport, even while a call on the handle
+     * is in flight. A stdio client's server process group, which holds the
+     * processes the server started, is dead when this returns. An SSE
+     * client's POST and `GET`
+     * sockets are shut down, and the call fails as closed. A call queued
+     * behind the in-flight one, on a stdio or an SSE client, fails as
+     * disconnected once it takes the client's lock and sends nothing. A
+     * connect still waiting for its server to answer `initialize` (stdio or
+     * SSE) has no handle yet, so no disconnect, and no instance shutdown,
+     * ends it.
      */
     func mcpClientDisconnect(handle: String) async throws 
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_invoke`.
+     * Invokes a tool on the MCP server behind `handle`.
      *
-     * Routes through the module-level MCP client registry.
+     * Looks the handle up in this instance's MCP client registry; a handle
+     * another instance returned is not found.
      */
     func mcpClientInvoke(handle: String, outletName: String, inputJson: String, contextId: String, invokerDid: String) async throws  -> McpInvokeResult
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_list_tools`.
+     * Lists the tools the MCP server behind `handle` exposes.
      *
-     * Routes through the module-level MCP client registry.
+     * Looks the handle up in this instance's MCP client registry; a handle
+     * another instance returned is not found.
      */
     func mcpClientListTools(handle: String) async throws  -> [McpOutletInfo]
     
@@ -2933,19 +2966,46 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func mcpResetStdioAllowlist() throws 
     
     /**
-     * Per-instance equivalent of the free-function `mcp_server_create`.
+     * Starts an MCP server over this instance's contexts on the `stdio` or
+     * `sse` transport.
      *
-     * Routes through `&*self.inner`. The MCP server registry is
-     * module-level (not per-instance) so the returned opaque handle
-     * string is globally unique; this method preserves that behaviour.
+     * Registers the server in this instance's MCP server registry under a
+     * random opaque handle; only this instance's `mcp_server_stop` finds it.
+     *
+     * A server created while the instance has no supervisor serves no
+     * resource subscriptions for its whole life: it advertises
+     * `resources.subscribe: false` and rejects `resources/subscribe`, and
+     * attaching a supervisor does not change that. Create the server again
+     * once the instance has a supervisor and is not suspended to get
+     * subscriptions.
+     *
+     * A `stdio` server writes to this process's stdout, and its event pump
+     * writes there after the reading client may have exited. Before serving,
+     * this call makes such a write fail with `EPIPE` instead of raising
+     * SIGPIPE, whose default action terminates the host: on Apple targets it
+     * sets `F_SETNOSIGPIPE` on stdout alone; on other Unix targets, where a
+     * pipe has no such switch, it sets SIGPIPE to ignored when SIGPIPE still
+     * has its default action, for the whole process.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` with `SCP-TRANS-5050` when a `stdio`
+     * server's stdout cannot be made to fail without SIGPIPE, for example
+     * because stdout is closed.
+     *
+     * With a supervisor attached, returns `ScpError::Context` with
+     * `SCP-CTX-2000` when the instance is suspended, and `ScpError::Transport`
+     * with `SCP-TRANS-5001` when the supervisor does not report a served
+     * context `Active` (the refusal withholds the state) or does not count
+     * `identity_did` among that context's members.
      */
     func mcpServerCreate(config: McpServerConfig) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function `mcp_server_stop`.
+     * Stops the MCP server registered under `handle`.
      *
-     * Routes through the module-level MCP server registry (the registry
-     * is not per-instance; the opaque handle string is globally unique).
+     * Looks the handle up in this instance's MCP server registry; a handle
+     * another instance returned is not found.
      */
     func mcpServerStop(handle: String) async throws 
     
@@ -3016,6 +3076,12 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Carries no lifecycle gate. It reads no context state and grants
+     * nothing: it builds an `InterfaceRevoked` event from the interface id,
+     * the handle's context id and the clock and hands it back for the caller to distribute, so a gate
+     * would deny a member the record of a revocation without withholding any
+     * capability.
      */
     func outletInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String) async throws  -> String
     
@@ -3107,17 +3173,17 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * # Errors
      *
-     * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
-     * Prepare-phase abort that may be a permanent rejection — authorization,
-     * freshness, rate limit, or co-residency — OR a retryable transient: a rate
-     * limit, or a participant actor unavailable to complete the Prepare
-     * exchange; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+     * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (its causes told
+     * apart by its code; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
      * (Commit-retry exhausted — carries the durable `saga_id` operator-repair
      * handle), or [`ScpError::SagaBusy`] (the participant context set
      * overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
      * if an id/DID/outlet-id is malformed or `asserted_nonce_hex` does not
      * decode to 16 bytes, and [`ScpError::Outlet`] if `input_json` is not valid
-     * JSON.
+     * JSON. Returns [`ScpError::Outlet`] with `SCP-OUTLET-6010` (caller
+     * context) or `SCP-OUTLET-6011` (target context) and the text "context is
+     * not active" when that context's supervisor actor does not report
+     * `Active`, when no actor serves it, or when either read fails.
      *
      * See spec §6.2.4 and ADR-049 §3a.
      */
@@ -3136,6 +3202,11 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Carries no lifecycle gate. It releases one session entry the handle
+     * itself owns and decides no authorization question, and refusing that
+     * release in a `Closing` or `Expired` context would strand the entry until
+     * the handle drops.
      */
     func outletSessionClose(handle: ContextHandle, sessionId: String) async throws 
     
@@ -3538,15 +3609,17 @@ public protocol ScpProtocol: AnyObject, Sendable {
     /**
      * Shuts down this bridge instance with a graceful deadline.
      *
-     * Awaits in-flight tasks up to `timeout_millis` **milliseconds**,
-     * aborts any remaining tasks, then clears registries and runs
-     * shutdown hooks. Permanent — a shut-down instance cannot be
-     * reused. A second call is a no-op from the caller's perspective
-     * (the underlying `ShutdownError::AlreadyShutDown` is swallowed).
+     * Awaits in-flight tasks up to `timeout_millis` **milliseconds**.
+     * Permanent — a shut-down instance cannot be reused.
      *
      * The unit is **milliseconds** — unified across all Rust bridges
      * so the Swift and Kotlin SDKs can share a single conversion
      * surface.
+     *
+     * # Errors
+     *
+     * Returns [`ScpError::Validation`] with `SCP-STORAGE-8005` when the
+     * durable store still holds its advisory lock after the call.
      */
     func shutdown(timeoutMillis: UInt64) async throws 
     
@@ -3806,8 +3879,10 @@ open class Scp: ScpProtocol, @unchecked Sendable {
      *
      * FAIL CLOSED (spec §17.6): if a durable (`Sqlite`) backend cannot be
      * opened — bad key/passphrase, permission denied, corrupt file, or a
-     * salt-sidecar fail-closed condition — this returns `ScpError::Context`
-     * rather than silently degrading to in-memory storage. Surfaces to Swift
+     * salt-sidecar fail-closed condition — this returns
+     * `ScpError::Validation` with `SCP-STORAGE-8004`, or with
+     * `SCP-STORAGE-8005` when another store holds the directory's advisory
+     * lock, rather than silently degrading to in-memory storage. Surfaces to Swift
      * as `throws` and Kotlin as a thrown exception.
      */
 public static func withStorage(config: StorageConfig)throws  -> Scp  {
@@ -4407,9 +4482,22 @@ open func configureRelayTransport(relayUrl: String, localDid: String)async throw
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
      * `Identity` whose `instance_id` does not match this `SCP`'s.
      *
-     * Authorization is enforced by the `ContextManager` (which delegates
-     * to `ttl::close_context` checking the `ContextClose` capability) —
-     * no bridge-layer auth check.
+     * Reads the context's lifecycle state from its supervisor actor, not
+     * from the handle's cached state. On `Active` it dispatches
+     * `CloseContext`, whose `ttl::close_context` checks the `ContextClose`
+     * capability; this function runs no capability check of its own. When
+     * no actor serves the context, or the actor reports `Closed`, `Expired`,
+     * or `Tombstoned`, it skips the dispatch and only releases this bridge's
+     * per-context state. It refuses `Poisoned` with `SCP-CTX-2134` and every
+     * other state with `SCP-CTX-2017`, keeps that state, and propagates a
+     * failed state read.
+     *
+     * The release marks the id. When a re-read after the mark reports
+     * `Active`, or a readmit clears the mark before the release removes the
+     * state, this function removes nothing, leaves the handle's cached state
+     * unchanged, and refuses with `SCP-CTX-2017`. When that re-read fails,
+     * it removes nothing, leaves the handle's cached state unchanged, and
+     * returns the read's error.
      */
 open func contextClose(handle: ContextHandle, identity: Identity)async throws   {
     return
@@ -5862,17 +5950,22 @@ open func isLocalDid(did: String)async  -> Bool  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_connect_sse`.
+     * Connects to the MCP SSE server at `url`.
      *
-     * Routes through the module-level MCP client registry.
+     * Registers the client in this instance's MCP client registry; the
+     * returned handle works only on this instance. `auth_token` is
+     * sent as `Authorization: Bearer <token>` on the `GET` and on every POST,
+     * or `None` for a server that runs no bearer check; an SCP SSE server
+     * always runs one (ADR-015). The transport has no TLS, so a token is
+     * sent only to a loopback host.
      */
-open func mcpClientConnectSse(url: String)async throws  -> String  {
+open func mcpClientConnectSse(url: String, authToken: String?)async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_mcp_client_connect_sse(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(url)
+                    FfiConverterString.lower(url),FfiConverterOptionString.lower(authToken)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -5884,9 +5977,11 @@ open func mcpClientConnectSse(url: String)async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
+     * Starts `command` as an MCP server subprocess and connects to it over
+     * stdio.
      *
-     * Routes through the module-level MCP client registry.
+     * Registers the client in this instance's MCP client registry; the
+     * returned handle works only on this instance.
      */
 open func mcpClientConnectStdio(command: [String])async throws  -> String  {
     return
@@ -5906,9 +6001,20 @@ open func mcpClientConnectStdio(command: [String])async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_disconnect`.
+     * Disconnects the MCP client registered under `handle`.
      *
-     * Routes through the module-level MCP client registry.
+     * Removes the entry from this instance's MCP client registry; a handle
+     * another instance returned is not found. Dropping the
+     * entry closes the client's transport, even while a call on the handle
+     * is in flight. A stdio client's server process group, which holds the
+     * processes the server started, is dead when this returns. An SSE
+     * client's POST and `GET`
+     * sockets are shut down, and the call fails as closed. A call queued
+     * behind the in-flight one, on a stdio or an SSE client, fails as
+     * disconnected once it takes the client's lock and sends nothing. A
+     * connect still waiting for its server to answer `initialize` (stdio or
+     * SSE) has no handle yet, so no disconnect, and no instance shutdown,
+     * ends it.
      */
 open func mcpClientDisconnect(handle: String)async throws   {
     return
@@ -5928,9 +6034,10 @@ open func mcpClientDisconnect(handle: String)async throws   {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_invoke`.
+     * Invokes a tool on the MCP server behind `handle`.
      *
-     * Routes through the module-level MCP client registry.
+     * Looks the handle up in this instance's MCP client registry; a handle
+     * another instance returned is not found.
      */
 open func mcpClientInvoke(handle: String, outletName: String, inputJson: String, contextId: String, invokerDid: String)async throws  -> McpInvokeResult  {
     return
@@ -5950,9 +6057,10 @@ open func mcpClientInvoke(handle: String, outletName: String, inputJson: String,
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_list_tools`.
+     * Lists the tools the MCP server behind `handle` exposes.
      *
-     * Routes through the module-level MCP client registry.
+     * Looks the handle up in this instance's MCP client registry; a handle
+     * another instance returned is not found.
      */
 open func mcpClientListTools(handle: String)async throws  -> [McpOutletInfo]  {
     return
@@ -6024,11 +6132,38 @@ open func mcpResetStdioAllowlist()throws   {try rustCallWithError(FfiConverterTy
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_server_create`.
+     * Starts an MCP server over this instance's contexts on the `stdio` or
+     * `sse` transport.
      *
-     * Routes through `&*self.inner`. The MCP server registry is
-     * module-level (not per-instance) so the returned opaque handle
-     * string is globally unique; this method preserves that behaviour.
+     * Registers the server in this instance's MCP server registry under a
+     * random opaque handle; only this instance's `mcp_server_stop` finds it.
+     *
+     * A server created while the instance has no supervisor serves no
+     * resource subscriptions for its whole life: it advertises
+     * `resources.subscribe: false` and rejects `resources/subscribe`, and
+     * attaching a supervisor does not change that. Create the server again
+     * once the instance has a supervisor and is not suspended to get
+     * subscriptions.
+     *
+     * A `stdio` server writes to this process's stdout, and its event pump
+     * writes there after the reading client may have exited. Before serving,
+     * this call makes such a write fail with `EPIPE` instead of raising
+     * SIGPIPE, whose default action terminates the host: on Apple targets it
+     * sets `F_SETNOSIGPIPE` on stdout alone; on other Unix targets, where a
+     * pipe has no such switch, it sets SIGPIPE to ignored when SIGPIPE still
+     * has its default action, for the whole process.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` with `SCP-TRANS-5050` when a `stdio`
+     * server's stdout cannot be made to fail without SIGPIPE, for example
+     * because stdout is closed.
+     *
+     * With a supervisor attached, returns `ScpError::Context` with
+     * `SCP-CTX-2000` when the instance is suspended, and `ScpError::Transport`
+     * with `SCP-TRANS-5001` when the supervisor does not report a served
+     * context `Active` (the refusal withholds the state) or does not count
+     * `identity_did` among that context's members.
      */
 open func mcpServerCreate(config: McpServerConfig)async throws  -> String  {
     return
@@ -6048,10 +6183,10 @@ open func mcpServerCreate(config: McpServerConfig)async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_server_stop`.
+     * Stops the MCP server registered under `handle`.
      *
-     * Routes through the module-level MCP server registry (the registry
-     * is not per-instance; the opaque handle string is globally unique).
+     * Looks the handle up in this instance's MCP server registry; a handle
+     * another instance returned is not found.
      */
 open func mcpServerStop(handle: String)async throws   {
     return
@@ -6225,6 +6360,12 @@ open func outletInterfaceExpose(handle: ContextHandle, outletId: String, targetC
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Carries no lifecycle gate. It reads no context state and grants
+     * nothing: it builds an `InterfaceRevoked` event from the interface id,
+     * the handle's context id and the clock and hands it back for the caller to distribute, so a gate
+     * would deny a member the record of a revocation without withholding any
+     * capability.
      */
 open func outletInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String)async throws  -> String  {
     return
@@ -6361,17 +6502,17 @@ open func outletInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: Co
      *
      * # Errors
      *
-     * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
-     * Prepare-phase abort that may be a permanent rejection — authorization,
-     * freshness, rate limit, or co-residency — OR a retryable transient: a rate
-     * limit, or a participant actor unavailable to complete the Prepare
-     * exchange; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+     * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (its causes told
+     * apart by its code; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
      * (Commit-retry exhausted — carries the durable `saga_id` operator-repair
      * handle), or [`ScpError::SagaBusy`] (the participant context set
      * overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
      * if an id/DID/outlet-id is malformed or `asserted_nonce_hex` does not
      * decode to 16 bytes, and [`ScpError::Outlet`] if `input_json` is not valid
-     * JSON.
+     * JSON. Returns [`ScpError::Outlet`] with `SCP-OUTLET-6010` (caller
+     * context) or `SCP-OUTLET-6011` (target context) and the text "context is
+     * not active" when that context's supervisor actor does not report
+     * `Active`, when no actor serves it, or when either read fails.
      *
      * See spec §6.2.4 and ADR-049 §3a.
      */
@@ -6420,6 +6561,11 @@ open func outletRegister(handle: ContextHandle, definition: OutletDefinition)asy
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Carries no lifecycle gate. It releases one session entry the handle
+     * itself owns and decides no authorization question, and refusing that
+     * release in a `Closing` or `Expired` context would strand the entry until
+     * the handle drops.
      */
 open func outletSessionClose(handle: ContextHandle, sessionId: String)async throws   {
     return
@@ -7278,15 +7424,17 @@ open func setEconomicPolicy(handle: ContextHandle, policyJson: String)throws   {
     /**
      * Shuts down this bridge instance with a graceful deadline.
      *
-     * Awaits in-flight tasks up to `timeout_millis` **milliseconds**,
-     * aborts any remaining tasks, then clears registries and runs
-     * shutdown hooks. Permanent — a shut-down instance cannot be
-     * reused. A second call is a no-op from the caller's perspective
-     * (the underlying `ShutdownError::AlreadyShutDown` is swallowed).
+     * Awaits in-flight tasks up to `timeout_millis` **milliseconds**.
+     * Permanent — a shut-down instance cannot be reused.
      *
      * The unit is **milliseconds** — unified across all Rust bridges
      * so the Swift and Kotlin SDKs can share a single conversion
      * surface.
+     *
+     * # Errors
+     *
+     * Returns [`ScpError::Validation`] with `SCP-STORAGE-8005` when the
+     * durable store still holds its advisory lock after the call.
      */
 open func shutdown(timeoutMillis: UInt64)async throws   {
     return
@@ -9184,8 +9332,6 @@ public func FfiConverterTypeCheckpoint_lower(_ value: Checkpoint) -> RustBuffer 
 /**
  * Context creation parameters.
  *
- * All fields are optional and fall back to protocol defaults when omitted.
- *
  * See ADR-008 (Context Lifecycle) and spec §5 (Contexts).
  */
 public struct ContextParams {
@@ -9196,7 +9342,8 @@ public struct ContextParams {
     public var mode: ContextMode
     /**
      * Capability ceiling — maximum capabilities any participant can hold.
-     * Empty list means no ceiling restriction.
+     * Required and non-empty (construction.md M2): an empty list fails the
+     * create with `SCP-VALID-7005`.
      */
     public var ceiling: [String]
     /**
@@ -9273,7 +9420,8 @@ public struct ContextParams {
          */mode: ContextMode, 
         /**
          * Capability ceiling — maximum capabilities any participant can hold.
-         * Empty list means no ceiling restriction.
+         * Required and non-empty (construction.md M2): an empty list fails the
+         * create with `SCP-VALID-7005`.
          */ceiling: [String], 
         /**
          * Ceiling mutability policy — `Immutable` (default) or `Governed`.
@@ -11481,93 +11629,6 @@ public func FfiConverterTypeProof_lift(_ buf: RustBuffer) throws -> Proof {
 #endif
 public func FfiConverterTypeProof_lower(_ value: Proof) -> RustBuffer {
     return FfiConverterTypeProof.lower(value)
-}
-
-
-/**
- * A host-derived §9.10.4 pseudonym, returned by
- * [`KeyCustodyProvider::derive_pseudonym`] and
- * [`KeyCustodyProvider::derive_rotatable_pseudonym`].
- */
-public struct PseudonymResult {
-    /**
-     * The 33-byte SEC1 compressed P-256 pseudonym public key.
-     */
-    public var publicKey: Data
-    /**
-     * The key id of the pseudonym's signing key in the host's custody.
-     */
-    public var keyId: String
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * The 33-byte SEC1 compressed P-256 pseudonym public key.
-         */publicKey: Data, 
-        /**
-         * The key id of the pseudonym's signing key in the host's custody.
-         */keyId: String) {
-        self.publicKey = publicKey
-        self.keyId = keyId
-    }
-}
-
-#if compiler(>=6)
-extension PseudonymResult: Sendable {}
-#endif
-
-
-extension PseudonymResult: Equatable, Hashable {
-    public static func ==(lhs: PseudonymResult, rhs: PseudonymResult) -> Bool {
-        if lhs.publicKey != rhs.publicKey {
-            return false
-        }
-        if lhs.keyId != rhs.keyId {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(publicKey)
-        hasher.combine(keyId)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypePseudonymResult: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PseudonymResult {
-        return
-            try PseudonymResult(
-                publicKey: FfiConverterData.read(from: &buf), 
-                keyId: FfiConverterString.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: PseudonymResult, into buf: inout [UInt8]) {
-        FfiConverterData.write(value.publicKey, into: &buf)
-        FfiConverterString.write(value.keyId, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypePseudonymResult_lift(_ buf: RustBuffer) throws -> PseudonymResult {
-    return try FfiConverterTypePseudonymResult.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypePseudonymResult_lower(_ value: PseudonymResult) -> RustBuffer {
-    return FfiConverterTypePseudonymResult.lower(value)
 }
 
 
@@ -14001,32 +14062,23 @@ public enum ScpError: Swift.Error {
     case Validation(msg: String, code: String
     )
     /**
-     * A §6.2.4 cross-context outlet-invocation saga aborted at a Prepare phase.
+     * A §6.2.4 cross-context outlet-invocation saga aborted.
      *
-     * Surfaces the `Aborted` terminal of
-     * `Supervisor::start_cross_context_outlet_invocation_saga`. This terminal may
-     * be a PERMANENT rejection (authorization / freshness / rate-limit /
-     * co-residency policy denial, or the §6.2.4 *Caller authentication*
-     * mismatch this bridge enforces before the saga runs) OR a RETRYABLE
-     * transient (a rate-limit back-off, or a participant actor unavailable to
-     * complete the Prepare exchange) — distinguished by the `SCP-SAGA-*` code.
+     * The code tells its causes apart.
      * Carries the rate-limit back-off hint STRUCTURALLY
      * (`retry_after_ms`): `Some(ms)` is the limiter's computed cooldown;
-     * `None` (NEVER `0`) means no precise back-off instant exists (a
-     * token-bucket hard limit, an unavailable participant actor, or a permanent
-     * rejection) — `0` would read as "retry immediately" and re-trip the same
-     * hard limit. `code` is the
-     * canonical `SCP-SAGA-13xxx` string. Maps to Swift `ScpError.SagaAborted`
-     * / Kotlin `ScpException.SagaAborted` (the `msg` field surfaces as the
-     * Swift `msg:` label — the `UniFFI` field-name convention every variant
-     * here follows).
+     * `None` (NEVER `0`) means no precise back-off instant exists — `0` would
+     * read as "retry immediately" and re-trip the same hard limit. Maps to
+     * Swift `ScpError.SagaAborted` / Kotlin `ScpException.SagaAborted` (the
+     * `msg` field surfaces as the Swift `msg:` label — the `UniFFI`
+     * field-name convention every variant here follows).
      */
     case SagaAborted(
         /**
-         * Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+         * Human-readable detail.
          */msg: String, 
         /**
-         * The canonical `SCP-SAGA-13xxx` code.
+         * Stable error code.
          */code: String, 
         /**
          * Rate-limit back-off hint in milliseconds, or `None` (never `0`).
@@ -14561,7 +14613,9 @@ extension StorageConfig: Equatable, Hashable {}
  * Swift SDK: `DCAppAttestService` (App Attest on iOS 14+ / macOS 11+).
  * Kotlin SDK: Play Integrity API on Android.
  *
- * Implemented by Swift/Kotlin code and injected into the Rust engine.
+ * The Swift SDK's `AppleDeviceAttestation` conforms to this callback
+ * interface. No Rust code holds or calls it yet, so nothing injects an
+ * implementation into the Rust engine.
  *
  * # SAFETY: Thread execution context
  *
@@ -14578,12 +14632,20 @@ public protocol DeviceAttestationProvider: AnyObject, Sendable {
     /**
      * Generate a cryptographic attestation for this device.
      *
-     * `challenge` — server-provided challenge bytes (SHA-256 digested with
-     * `device_id` before submission to the platform attestation service).
-     * `device_id` — stable identifier for this device instance.
+     * `challenge` — Apple: the 32-byte binding digest `D` of
+     * `09-security-model.md` §9.3.1, which the Swift adapter hands App
+     * Attest as `clientDataHash` unchanged. When App Attest is supported,
+     * the adapter rejects a `challenge` that is not 32 bytes with
+     * `SCP-ATTEST-9026` (ADR-025 acceptance criterion 3); when it is not
+     * supported, the adapter throws `SCP-ATTEST-9019` before it reads the
+     * length. Android: ADR-027, the Android platform adapter, states
+     * what it binds.
+     * `device_id` — stable identifier for this device instance. The Swift
+     * adapter does not read it.
      *
-     * Returns the platform attestation object bytes (Apple: CBOR-encoded
-     * attestation; Android: Play Integrity token bytes).
+     * Returns the platform attestation bytes. Apple: the raw CBOR attestation
+     * object Apple signed (ADR-025 acceptance criterion 3). Android: the Play
+     * Integrity token bytes.
      */
     func attest(challenge: Data, deviceId: Data) async throws  -> Data
     
@@ -14594,7 +14656,12 @@ public protocol DeviceAttestationProvider: AnyObject, Sendable {
      * `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` of
      * `09-security-model.md` §9.3.1 over the caller's request bytes `m`,
      * never `SHA-256(m)` and never `m` itself. The domain separator keeps
-     * every `A` distinct from every attestation binding digest `D`.
+     * every `A` distinct from every attestation binding digest `D`. The
+     * Swift adapter hands `A` to App Attest as `clientDataHash` unchanged.
+     * When App Attest is supported, the adapter rejects an `A` that is not
+     * 32 bytes with `SCP-ATTEST-9026` (ADR-025 acceptance criterion 3);
+     * when it is not supported, the adapter throws `SCP-ATTEST-9019`
+     * before it reads the length.
      *
      * Returns the platform assertion object bytes (Apple: CBOR assertion;
      * Android: integrity verdict).
@@ -14782,8 +14849,7 @@ public func FfiConverterCallbackInterfaceDeviceAttestationProvider_lower(_ v: De
  *
  * Implemented by host code and injected into the Rust engine. No in-tree
  * Swift or Kotlin host implements this protocol yet: `AppleKeyCustody` and
- * `AndroidKeyCustody` implement their SDKs' own custody interfaces (UUID or
- * hex key ids, no [`PseudonymResult`]), and S0 PR8 conforms them to it.
+ * `AndroidKeyCustody` implement their SDKs' own custody interfaces.
  *
  * A method reports failure by returning an [`ScpError`]. Return one whose
  * code is `SCP-CRYPTO-4006` (key not found) for a key id that was destroyed or
@@ -14793,10 +14859,21 @@ public func FfiConverterCallbackInterfaceDeviceAttestationProvider_lower(_ v: De
  * reports these two codes, including the pseudonym derivation inside
  * `context_create` and the identity key reads and signatures of identity
  * operations. There are two exceptions: `SCP-IDENT-1055`, reported when the
- * bridge rejects the pseudonym a `derive_pseudonym` call returned, and
- * `SCP-IDENT-1037`, which `scpid_sign` reports for any custody failure (spec
- * §3.11.4). Throw only
+ * bytes a `derive_pseudonym` or `derive_rotatable_pseudonym` call returned
+ * are not a compressed P-256 point, and `SCP-IDENT-1037`, which `scpid_sign`
+ * reports for any custody failure (spec §3.11.4). Throw only
  * [`ScpError`]: `UniFFI` 0.29 panics on any other error a callback throws.
+ *
+ * Every key id the host returns is the canonical decimal form of a `u64`, as
+ * `String(n)` (Swift, `UInt64`) or `n.toString()` (Kotlin, `ULong`) writes it:
+ * ASCII digits only, with no sign, no leading zero (`"0"` itself is allowed)
+ * and no whitespace. The bridge rejects any other id (`"007"`, `"+7"`,
+ * `" 7"`, a UUID) from `generate_keypair` with the custody error
+ * `SCP-CRYPTO-4060`.
+ *
+ * A pseudonym has no private key (`09-security-model.md` §9.10.4): a host
+ * stores no pseudonym key and signs with none, so `sign`, `get_public_key`
+ * and `destroy_key` never receive a pseudonym.
  *
  * # SAFETY: Thread execution context
  *
@@ -14815,36 +14892,28 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     /**
      * Sign `message` bytes with the key identified by `key_id`.
      *
-     * For an Ed25519 key, returns the raw 64-byte Ed25519 signature. For a
-     * pseudonym key id from `derive_pseudonym`, `message` is a 32-byte digest
-     * and the return is the 64-byte low-`s` P-256 `r || s` (§9.5); the
-     * bridge verifies it strictly and rejects anything else, for a pseudonym
-     * key this adapter derived and still holds bound; for a handle the adapter
-     * did not bind, the bridge returns the host's bytes unchecked. A software host
-     * signs with [`crate::p256_host::p256_sign_prehash_rfc6979`] rather than
-     * its own ECDSA.
+     * Returns the raw 64-byte Ed25519 signature.
      */
     func sign(keyId: String, message: Data) async throws  -> Data
     
     /**
-     * Return the public key bytes for `key_id`: 32 bytes for an Ed25519 or
-     * X25519 key, the 33-byte compressed point for a pseudonym key.
+     * Return the 32 public key bytes of the Ed25519 or X25519 key `key_id`.
      */
     func getPublicKey(keyId: String) async throws  -> Data
     
     /**
-     * Destroy key material for `key_id`. Subsequent operations must fail.
-     *
-     * Destroying an identity key also destroys its `pseudonym_secret` and
-     * every v1 and v2 pseudonym key derived from it, so each such pseudonym
-     * key id then fails too (`09-security-model.md` §9.10.4.A).
+     * Destroy key material for `key_id`. Subsequent operations must fail,
+     * including pseudonym derivation under a destroyed identity key, which
+     * returns `SCP-CRYPTO-4006` (`09-security-model.md` §9.10.4.A).
      */
     func destroyKey(keyId: String) async throws 
     
     /**
      * Generate a new keypair. `key_type` is `"ed25519"` or `"x25519"`.
      *
-     * Returns an opaque key identifier string.
+     * Returns the new key's id, a canonical decimal `u64` string (see
+     * [`KeyCustodyProvider`]); the bridge rejects any other id with
+     * `SCP-CRYPTO-4060`.
      */
     func generateKeypair(keyType: String) async throws  -> String
     
@@ -14860,55 +14929,39 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     func dhAgree(keyId: String, peerPublic: Data) async throws  -> Data
     
     /**
-     * Derive a deterministic, context-scoped P-256 pseudonym keypair (§9.10.4).
+     * Derive the deterministic, context-scoped P-256 pseudonym point (§9.10.4).
      *
-     * The derivation runs inside the host's custody. Algorithm:
+     * The derivation runs inside the host's custody. Canonical recipe
+     * (§9.10.4, §9.10.4.A; every software host MUST produce identical bytes;
+     * `ikm` is the identity private key material, the 32-byte Ed25519 seed
+     * until the identity key moves to P-256 (SCP-315)):
      * 1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
      * 2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
-     * 3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; the public key
-     * is the 33-byte SEC1 compressed point `d·G`.
+     * 3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; return the
+     * 33-byte SEC1 compressed point `d·G`. `d` is discarded, never stored.
      *
      * The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key —
-     * public key bytes would be a membership-enumeration oracle (§9.10.4).
+     * public key bytes would be a membership-enumeration oracle (§9.10.4.A).
      * Routing fields carry `SHA-256("scp-pseudonym-routing-v1:" || point)`,
      * which the Rust side computes from the returned point.
      *
-     * Returns the pseudonym's 33-byte compressed point and the key id of its
-     * signing key as a [`PseudonymResult`]. The bridge rejects (fail closed,
-     * `SCP-IDENT-1055`) a point that is not a valid compressed P-256 point, a
-     * non-numeric key id, and a key id whose `get_public_key` does not return
-     * the same 33 bytes. `sign` on that key id receives a 32-byte digest and
-     * must return a 64-byte low-`s` `r || s` that verifies under the point.
-     * A host maps the seed with [`crate::p256_host::p256_seed_to_scalar`]
-     * rather than reducing it itself.
-     *
-     * The pseudonym dies with its identity (`09-security-model.md`
-     * §9.10.4.A): `destroy_key` on `key_id` destroys it, and a derivation
-     * still in flight when `key_id` is destroyed fails with key-not-found
-     * (`SCP-CRYPTO-4006`) and stores nothing.
-     *
-     * The same (`key_id`, `context_id`) MUST return the same pseudonym key id
-     * on every call, so re-deriving names one key rather than minting another;
-     * the bridge's per-key-id point bindings grow with the distinct ids a
-     * host returns.
+     * Returns the 33-byte compressed point and nothing else. The bridge
+     * fails the derivation with `SCP-IDENT-1055` when the bytes are not a
+     * valid compressed P-256 point. A host returns `SCP-CRYPTO-4006` when
+     * `key_id` was destroyed or never existed, and the caller receives
+     * key-not-found.
      */
-    func derivePseudonym(keyId: String, contextId: Data) async throws  -> PseudonymResult
+    func derivePseudonym(keyId: String, contextId: Data) async throws  -> Data
     
     /**
-     * Derive a rotatable (epoch-versioned) per-context pseudonym keypair.
+     * Derive a rotatable (epoch-versioned) per-context pseudonym point.
      *
-     * Canonical recipe (spec §9.10.4.A / §9.10.4.1): the HMAC key is the
-     * private-derived `pseudonym_secret` (HKDF over the identity private seed),
-     * NEVER the public key.
-     * `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`;
-     * `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`. Returns a
-     * [`PseudonymResult`], checked exactly as for `derive_pseudonym`.
-     *
-     * The same (`key_id`, `context_id`, `pseudonym_epoch`) MUST return the
-     * same pseudonym key id on every call, as for `derive_pseudonym`.
-     * Destroying `key_id` destroys this pseudonym, and an in-flight
-     * derivation fails and stores nothing, as for `derive_pseudonym`
-     * (`09-security-model.md` §9.10.4.A).
+     * Canonical recipe (§9.10.4.1): steps 1 and 3 of `derive_pseudonym`, with
+     * step 2 replaced by
+     * `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`
+     * where `BE64` is the 8-byte big-endian epoch. The HMAC key is the
+     * `pseudonym_secret`, NEVER the public key. Returns the 33-byte
+     * compressed point, checked exactly as for `derive_pseudonym`.
      *
      * The `pseudonym_epoch` is passed through to the provider so it performs
      * the canonical v2 derivation itself. Bridges MUST NOT synthesize a
@@ -14920,8 +14973,7 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      *
      * Rust-side providers that do not rotate return `ScpError::Context`
      * (SCP-CTX-2050) indicating the method is not implemented. A host that
-     * rotates overrides it; no in-tree Swift or Kotlin host implements this
-     * protocol yet (S0 PR8).
+     * rotates overrides it.
      *
      * **Note:** `UniFFI` callback interfaces require foreign implementations to
      * define all methods. The generated Swift protocol / Kotlin interface will
@@ -14929,23 +14981,32 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      *
      * # Errors
      *
-     * Returns `ScpError` if the key is not found, is not an Ed25519 key, or the
-     * provider does not support rotatable pseudonyms.
+     * The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
+     * destroyed or never existed, and the caller receives key-not-found
+     * (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
+     * `SCP-CTX-2050`, reaches the caller as the custody error `SCP-CRYPTO-4060`
+     * carrying the host's code and message. A returned result the bridge
+     * rejects is `SCP-IDENT-1055`, as for `derive_pseudonym`.
      */
-    func deriveRotatablePseudonym(keyId: String, contextId: Data, pseudonymEpoch: UInt64) async throws  -> PseudonymResult
+    func deriveRotatablePseudonym(keyId: String, contextId: Data, pseudonymEpoch: UInt64) async throws  -> Data
     
     /**
      * Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
      *
-     * Required for governance vote signing, which uses `ed25519_dalek::SigningKey`
-     * directly. Platform implementations using software-backed Ed25519 storage
-     * (e.g., Keychain, Android Keystore with `PURPOSE_SIGN`) MUST support this.
+     * The bridge's signing paths that sign with an `ed25519_dalek::SigningKey`,
+     * governance vote signing among them, build that key from the returned
+     * bytes. A key held in hardware or in Android Keystore does not export its
+     * bytes, and ADR-063 requires every key-export accessor, this callback
+     * included, to leave the custody adapters and all three bridges, because
+     * hardware custody on the governance path is impossible until then.
      *
      * # Default
      *
      * Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-     * implemented. A host that needs it overrides it (no in-tree Swift or
-     * Kotlin host implements this protocol yet, S0 PR8). Third-party
+     * implemented. A host that needs it overrides it. No Kotlin class
+     * implements this callback: the Kotlin `AndroidKeyCustody` implements the
+     * Kotlin SDK's own `KeyCustodyProvider` interface, and no code passes it
+     * to the Rust engine. Third-party
      * `KeyCustodyProvider` implementations that do not need governance vote
      * signing may rely on the default until they add support.
      *
@@ -14955,8 +15016,12 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      *
      * # Errors
      *
-     * Returns `ScpError` if the key is not found, not exportable, or not
-     * an Ed25519 key.
+     * The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
+     * destroyed or never existed, and the caller receives key-not-found
+     * (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
+     * `SCP-CTX-2050` and a key that is not exportable or not Ed25519, reaches
+     * the caller as the custody error `SCP-CRYPTO-4060` carrying the host's
+     * code and message.
      */
     func exportSigningKeyBytes(keyId: String) async throws  -> Data
     
@@ -15204,7 +15269,7 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
             uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
         ) in
             let makeCall = {
-                () async throws -> PseudonymResult in
+                () async throws -> Data in
                 guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
@@ -15214,11 +15279,11 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                 )
             }
 
-            let uniffiHandleSuccess = { (returnValue: PseudonymResult) in
+            let uniffiHandleSuccess = { (returnValue: Data) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
                     UniffiForeignFutureStructRustBuffer(
-                        returnValue: FfiConverterTypePseudonymResult_lower(returnValue),
+                        returnValue: FfiConverterData.lower(returnValue),
                         callStatus: RustCallStatus()
                     )
                 )
@@ -15250,7 +15315,7 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
             uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
         ) in
             let makeCall = {
-                () async throws -> PseudonymResult in
+                () async throws -> Data in
                 guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
@@ -15261,11 +15326,11 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                 )
             }
 
-            let uniffiHandleSuccess = { (returnValue: PseudonymResult) in
+            let uniffiHandleSuccess = { (returnValue: Data) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
                     UniffiForeignFutureStructRustBuffer(
-                        returnValue: FfiConverterTypePseudonymResult_lower(returnValue),
+                        returnValue: FfiConverterData.lower(returnValue),
                         callStatus: RustCallStatus()
                     )
                 )
@@ -15661,7 +15726,12 @@ public protocol PushProvider: AnyObject, Sendable {
     /**
      * Handle an incoming push notification `payload`.
      *
-     * Returns wake signal bytes indicating which context has new messages.
+     * An implementation returns fixed wake signal bytes that do not depend on
+     * `payload` and copy no byte of it. §10.7 of the infrastructure spec
+     * states: "Push payloads MUST contain a wake signal and nothing else. No
+     * context ID, no sender identifier, no message preview, no metadata of any
+     * kind." A wake signal built from the received bytes would hand the caller
+     * whatever a relay put in them. No Rust code calls this method yet.
      */
     func handleNotification(payload: Data) async throws  -> Data
     
@@ -17401,55 +17471,40 @@ public func metadataRecordToJson(contextId: String, sequence: UInt64, signerDid:
 })
 }
 /**
- * The 33-byte SEC1 compressed public key `d·G` of a 32-byte scalar.
+ * The compressed pseudonym point of a §9.10.4 `context_seed`.
+ *
+ * The 33-byte SEC1 point of a 32-byte `context_seed` (v1 or v2), for a
+ * host that computes the seed inside its keystore. No scalar reaches the
+ * host.
  *
  * # Errors
  *
- * `SCP-VALID-7005` when `scalar` is not 32 bytes; `SCP-CRYPTO-4001` when it
- * is zero or not below `n`.
+ * `SCP-VALID-7005` when `context_seed` is not 32 bytes.
  */
-public func p256PublicKey(scalar: Data)throws  -> Data  {
+public func p256PseudonymPoint(contextSeed: Data)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_p256_public_key(
-        FfiConverterData.lower(scalar),$0
+    uniffi_scp_ffi_uniffi_fn_func_p256_pseudonym_point(
+        FfiConverterData.lower(contextSeed),$0
     )
 })
 }
 /**
- * Maps a 32-byte seed to a P-256 private scalar in `[1, n − 1]` under `label`.
+ * The compressed pseudonym point a software custody derives (§9.10.4.A).
  *
- * FIPS 186-5 A.2.1, §9.10.4: `HKDF-Expand(seed, label, 48) mod (n − 1) + 1`.
- * Returns the 32-byte big-endian scalar. For a pseudonym the label is
- * `"SCP-PSEUDONYM-P256-V1"` and the seed the §9.10.4 `context_seed`.
- *
- * # Errors
- *
- * `SCP-VALID-7005` when `seed` is not 32 bytes; `SCP-CRYPTO-4001` if the
- * reduction fails (unreachable for a 32-byte seed).
- */
-public func p256SeedToScalar(label: Data, seed: Data)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_p256_seed_to_scalar(
-        FfiConverterData.lower(label),
-        FfiConverterData.lower(seed),$0
-    )
-})
-}
-/**
- * Signs a 32-byte digest with the scalar: RFC 6979 deterministic nonce
- * (`h1 = digest`), low-`s` normalized, returned as the 64-byte `r || s`
- * (§9.5).
+ * From the 32-byte identity key material `ikm`: the v1 point for
+ * `context_id` when `epoch` is `None`, the v2 point at `epoch` otherwise. No
+ * scalar reaches the host.
  *
  * # Errors
  *
- * `SCP-VALID-7005` when `scalar` or `digest` is not 32 bytes;
- * `SCP-CRYPTO-4001` when the scalar is out of range or signing fails.
+ * `SCP-VALID-7005` when `ikm` is not 32 bytes.
  */
-public func p256SignPrehashRfc6979(scalar: Data, digest: Data)throws  -> Data  {
+public func p256SoftwarePseudonymPoint(ikm: Data, contextId: Data, epoch: UInt64?)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_p256_sign_prehash_rfc6979(
-        FfiConverterData.lower(scalar),
-        FfiConverterData.lower(digest),$0
+    uniffi_scp_ffi_uniffi_fn_func_p256_software_pseudonym_point(
+        FfiConverterData.lower(ikm),
+        FfiConverterData.lower(contextId),
+        FfiConverterOptionUInt64.lower(epoch),$0
     )
 })
 }
@@ -17842,13 +17897,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_metadata_record_to_json() != 58960) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_p256_public_key() != 39495) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_pseudonym_point() != 15648) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_p256_seed_to_scalar() != 31098) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_p256_sign_prehash_rfc6979() != 49215) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_software_pseudonym_point() != 30231) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_provenance_check_chain_depth() != 15774) {
@@ -18076,7 +18128,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_relay_transport() != 46916) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_close() != 41503) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_close() != 6358) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_create() != 337) {
@@ -18256,19 +18308,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_is_local_did() != 10856) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_sse() != 44028) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_sse() != 35239) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_stdio() != 2953) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_stdio() != 55993) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 63976) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 3151) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_invoke() != 16053) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_invoke() != 47603) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_list_tools() != 20301) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_list_tools() != 56929) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_configure_stdio_allowlist() != 7937) {
@@ -18283,10 +18335,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_reset_stdio_allowlist() != 39655) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_create() != 11371) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_create() != 21168) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_stop() != 46867) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_stop() != 10523) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_media_activate_session() != 3062) {
@@ -18310,7 +18362,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_interface_expose() != 3812) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_interface_revoke() != 20193) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_interface_revoke() != 18966) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_invoke() != 47804) {
@@ -18319,13 +18371,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_invoke_cross_context() != 45495) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_invoke_cross_context_saga() != 11316) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_invoke_cross_context_saga() != 6751) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_register() != 48642) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_session_close() != 2713) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_session_close() != 40222) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_session_create() != 284) {
@@ -18445,7 +18497,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_set_economic_policy() != 12223) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_shutdown() != 65387) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_shutdown() != 20138) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_suspend() != 57088) {
@@ -18526,37 +18578,37 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_token_id() != 51675) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 20129) {
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 22077) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 4506) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 18976) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 3156) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 50940) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 34161) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 48481) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 51576) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 60738) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_destroy_key() != 41195) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_destroy_key() != 48628) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 22511) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 65380) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 52565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 36664) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 1572) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 41285) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 54334) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 44263) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 56607) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 30807) {
@@ -18574,7 +18626,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_register_push() != 31432) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_handle_notification() != 49354) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_handle_notification() != 50826) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_storageprovider_get() != 34518) {

@@ -68,14 +68,15 @@ use scp_platform::error::PlatformError;
 use scp_platform::traits::KeyCustody;
 use tokio::sync::mpsc;
 
+use scp_core::context::outlets::invoke::OutletStreamOpenError;
 use scp_core::context::outlets::stream::{
     OutletStreamChunk, OutletStreamCredit, TerminateReason, compute_caveats_binding,
     compute_credit_sig_preimage, verify_chunk_signature,
 };
 use scp_core::context::outlets::{
-    AdmissionCaps, CancelIdentity, OpenStreamParams, OpenStreamRejection, OutletExecutor,
-    OutletExecutorError, StreamIdentity, StreamSessionHandle, StreamSigner,
-    StreamSignerCustodyCategory, StreamSignerError, cancel_error_to_code, grant_error_to_code,
+    AdmissionCaps, CancelIdentity, OpenStreamParams, OutletExecutor, OutletExecutorError,
+    StreamIdentity, StreamSessionHandle, StreamSigner, StreamSignerCustodyCategory,
+    StreamSignerError, cancel_error_to_code, grant_error_to_code,
 };
 
 use scp_ffi_common::error_codes as codes;
@@ -207,9 +208,9 @@ async fn resolve_stream_signer(
         Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })?;
     let public_key = custody.public_key(&handle).await.map_err(|e| {
-        ScpNapiError::custody(
+        ScpNapiError::custody_failure(
             format!("failed to resolve stream signing key for '{identity_did}': {e}"),
-            &e,
+            &scp_crypto::CustodyFailure::from(&e),
         )
     })?;
     let verifying_key = scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
@@ -309,19 +310,40 @@ impl OutletExecutor for NapiStreamExecutor {
 }
 
 // ---------------------------------------------------------------------------
-// Error mapping — every code is a canonical SCP-OUTLET-/SCP-PERM- literal
+// Error mapping
 // ---------------------------------------------------------------------------
 
-/// Maps an [`OpenStreamRejection`] onto the bridge error surface, carrying the
-/// rejection's own §5.4.4 `SCP-OUTLET-NNNN` code verbatim.
-fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpNapiError {
-    ScpNapiError::Outlet {
-        message: format!(
-            "outlet stream open rejected ({}): {}",
-            rejection.error_code(),
-            rejection.slug()
+/// Maps an [`OutletStreamOpenError`] onto the bridge error surface. A
+/// Supervisor shutdown refusal takes the conversion of
+/// `ContextError::SupervisorShutDown`; a rejection carries its own code
+/// verbatim.
+fn open_rejection_to_err(err: &OutletStreamOpenError) -> ScpNapiError {
+    match err {
+        OutletStreamOpenError::SupervisorShutDown { message } => ScpNapiError::from(
+            scp_core::context::ContextError::SupervisorShutDown(message.clone()),
         ),
-        code: rejection.error_code().to_owned(),
+        OutletStreamOpenError::Rejected(rejection) => ScpNapiError::Outlet {
+            message: format!(
+                "outlet stream open rejected ({}): {}",
+                rejection.error_code(),
+                rejection.slug()
+            ),
+            code: rejection.error_code().to_owned(),
+        },
+    }
+}
+
+/// The error for a stream or streaming saga the Supervisor started but the
+/// bridge refused to register because bridge shutdown had begun, built from
+/// the refusal
+/// [`CoreFields::register_or_refuse`](scp_ffi_common::bridge_instance::CoreFields::register_or_refuse)
+/// returns. The stream had already reserved escrow and started its pump, and
+/// the saga had already staged its Prepare phase, so this is the Context class
+/// with `SCP-CTX-2139`.
+fn late_registration_err((code, message): (&'static str, String)) -> ScpNapiError {
+    ScpNapiError::Context {
+        message,
+        code: code.to_owned(),
     }
 }
 
@@ -416,7 +438,6 @@ pub(crate) async fn outlet_stream_open_on(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     let input_json_value: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Outlet {
@@ -424,6 +445,24 @@ pub(crate) async fn outlet_stream_open_on(
             code: codes::OUTLET_6002.to_owned(),
         })
     })?;
+
+    // The supervisor actor answers the lifecycle question before the UCAN
+    // pipeline reads the live role state, so a context no actor serves refuses
+    // with the same withheld text as every other non-`Active` state — see
+    // `crate::runtime::active_role_state_before_authz`.
+    let open_refusal = |message: String| ScpNapiError::Outlet {
+        message,
+        code: codes::OUTLET_6005.to_owned(),
+    };
+    let role_state = crate::runtime::active_role_state_before_authz(
+        bi,
+        &context_id,
+        "open outlet stream in context",
+        open_refusal,
+    )
+    .await
+    .map_err(napi::Error::from)?;
+    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     // Primary authorization: the full 11-step ADR-016 UCAN pipeline over the
     // bridge-owned per-context UCAN state — IDENTICAL to `outlet_invoke_on`. The
@@ -443,6 +482,7 @@ pub(crate) async fn outlet_stream_open_on(
         &caller_did,
         &ucan_token,
         &proof_resolver,
+        &role_state,
     )
     .map_err(napi::Error::from)?;
 
@@ -645,20 +685,24 @@ pub(crate) async fn outlet_stream_open_on(
     };
 
     let handle_id = hex::encode(request_id);
-    bi.outlet_stream_registry.insert(
-        handle_id.clone(),
-        StreamEntry {
-            handle: Arc::new(tokio::sync::Mutex::new(stream_handle)),
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-            invoker_did: caller_did,
-            context_id,
-            outlet_id,
-            caveats_binding,
-            request_id,
-            stream_epoch,
-            cost_per_chunk,
-        },
-    );
+    bi.core
+        .register_or_refuse(
+            &bi.outlet_stream_registry,
+            handle_id.clone(),
+            StreamEntry {
+                handle: Arc::new(tokio::sync::Mutex::new(stream_handle)),
+                receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+                invoker_did: caller_did,
+                context_id,
+                outlet_id,
+                caveats_binding,
+                request_id,
+                stream_epoch,
+                cost_per_chunk,
+            },
+            None,
+        )
+        .map_err(late_registration_err)?;
     Ok(handle_id)
 }
 
@@ -734,8 +778,8 @@ pub(crate) async fn outlet_stream_poll_next_on(
 // ---------------------------------------------------------------------------
 
 /// Maps a credit-grant signing failure to the caller's error. A custody
-/// failure carries `SCP-CRYPTO-4006` (key not found) or `SCP-CRYPTO-4060`; a
-/// canonicalization failure carries `SCP-CTX-2001`.
+/// failure carries the code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+/// assigns; a canonicalization failure carries `SCP-CTX-2001`.
 fn credit_sign_error(e: &StreamSignerError) -> ScpNapiError {
     e.custody_failure().map_or_else(
         || ScpNapiError::Context {
@@ -749,8 +793,9 @@ fn credit_sign_error(e: &StreamSignerError) -> ScpNapiError {
 }
 
 /// Maps a rejected stream cancel to the caller's error. A custody failure
-/// while signing the cancel carries `SCP-CRYPTO-4006` (key not found) or
-/// `SCP-CRYPTO-4060`; every other rejection carries its §5.4.4 code.
+/// while signing the cancel carries the code
+/// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code) assigns; every
+/// other rejection carries its §5.4.4 code.
 fn cancel_rejected_error(e: &scp_core::context::outlets::CancelError) -> ScpNapiError {
     e.custody_failure().map_or_else(
         || ScpNapiError::Outlet {
@@ -1170,17 +1215,14 @@ pub(crate) async fn outlet_streaming_saga_open_on(
 
     let caller_context_id = source_handle.context_id();
     let target_context_id = target_handle.context_id();
-    let caller_creator_did = source_handle.creator_did();
-    let target_creator_did = target_handle.creator_did();
 
     // Both contexts MUST be Active before this money-moving open touches any
     // state. Read the AUTHORITATIVE lifecycle state from the per-context
-    // supervisor actor (`read_context_state`) — NOT the bridge-cached
+    // supervisor actor (`Supervisor::read_context_state_checked`) — NOT the bridge-cached
     // `NapiContextHandle::state()`, which LAGS: on close the core handle flips to
     // `Closing` immediately, but the FFI cache stays `"active"` until the async
     // finalize completes. A stale-cache read would let a `Closing` context (actor
-    // alive, members intact) pass this gate and DEBIT ESCROW. Mirrors the PyO3
-    // reference's authoritative `read_context_state`. A missing actor (`None`) is
+    // alive, members intact) pass this gate and DEBIT ESCROW. A missing actor is
     // treated as non-active (fail-closed).
     //
     // TARGET axis: DEFENSE-IN-DEPTH (#2196). CALLER/source axis: still primary.
@@ -1196,30 +1238,36 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     // non-active source from initiating the saga. Both checked BEFORE input
     // validation, the caller-principal binding, and the saga drive, so a
     // non-active context is rejected before any receiver is handed out.
-    // Codes: OUTLET_6010 (caller axis) / OUTLET_6011 (target axis).
-    let supervisor = crate::runtime::supervisor(bi)?;
-    let source_state = supervisor.read_context_state(&caller_context_id).await;
-    if !matches!(source_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot start cross-context streaming saga: caller context in \
-                 {source_state:?} state"
-            ),
-            code: codes::OUTLET_6010.to_owned(),
-        }
-        .into());
-    }
-    let target_state = supervisor.read_context_state(&target_context_id).await;
-    if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot start cross-context streaming saga: target context in \
-                 {target_state:?} state"
-            ),
-            code: codes::OUTLET_6011.to_owned(),
-        }
-        .into());
-    }
+    // Codes: OUTLET_6010 (caller axis) / OUTLET_6011 (target axis). Both gates
+    // run before the caller-principal binding, so both withhold the lifecycle
+    // state (see `crate::runtime::active_role_state_before_authz`). The caller
+    // gate also reads the creator the caller side signs as, and the target gate
+    // reads the role state step (c) authorizes against.
+    let caller_refusal = |message: String| ScpNapiError::Outlet {
+        message,
+        code: codes::OUTLET_6010.to_owned(),
+    };
+    let target_refusal = |message: String| ScpNapiError::Outlet {
+        message,
+        code: codes::OUTLET_6011.to_owned(),
+    };
+    let caller_creator_did = crate::runtime::active_role_state_before_authz(
+        bi,
+        &caller_context_id,
+        "start cross-context streaming saga from caller context",
+        caller_refusal,
+    )
+    .await
+    .map_err(napi::Error::from)?
+    .creator_did;
+    let target_role_state = crate::runtime::active_role_state_before_authz(
+        bi,
+        &target_context_id,
+        "start cross-context streaming saga into target context",
+        target_refusal,
+    )
+    .await
+    .map_err(napi::Error::from)?;
 
     // ----- (a) validate inputs ------------------------------------------------
     validate_context_id(&caller_context_id)
@@ -1251,8 +1299,8 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     //
     // Runs before ANY per-context state mutation or outlet read, so an
     // unauthenticated caller is rejected before it can touch B's state (identical
-    // to the `PyO3` reference's ordering). `supervisor` was resolved above for the
-    // authoritative lifecycle gate; reuse it.
+    // to the `PyO3` reference's ordering).
+    let supervisor = crate::runtime::supervisor(bi)?;
     crate::outlets::enforce_caller_principal_binding(
         bi,
         supervisor,
@@ -1287,6 +1335,7 @@ pub(crate) async fn outlet_streaming_saga_open_on(
         &caller_did,
         &ucan_token,
         &proof_resolver,
+        &target_role_state,
     )
     .map_err(napi::Error::from)?;
 
@@ -1444,9 +1493,15 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     };
 
     // ----- (d) signing keys: each co-resident context's Active Signing Key ----
-    let target_signing_key =
-        crate::outlets::resolve_context_signing_key(bi, &target_creator_did, &target_context_id)
-            .await?;
+    //
+    // Each side signs as the creator its supervisor actor reported to that
+    // side's gate at the top of this function.
+    let target_signing_key = crate::outlets::resolve_context_signing_key(
+        bi,
+        &target_role_state.creator_did,
+        &target_context_id,
+    )
+    .await?;
     let caller_signing_key =
         crate::outlets::resolve_context_signing_key(bi, &caller_creator_did, &caller_context_id)
             .await?;
@@ -1491,19 +1546,35 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     .map_err(|e| napi::Error::from(crate::outlets::map_saga_error(e)))?;
 
     // ----- (g) register the promptly-returned receiver ------------------------
-    let saga_id = handle.saga_id;
-    let receiver = handle.receiver;
-    let handle_id = saga_id.0.clone();
-    bi.outlet_streaming_saga_registry.insert(
-        handle_id.clone(),
+    register_streaming_saga(
+        bi,
         StreamingSagaEntry {
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-            saga_id,
+            receiver: Arc::new(tokio::sync::Mutex::new(handle.receiver)),
+            saga_id: handle.saga_id,
             target_context_id,
             invoker_did: caller_did,
             request_id,
         },
-    );
+    )
+    .map_err(napi::Error::from)
+}
+
+/// Registers a started streaming saga's entry under its saga id and returns
+/// the id. Returns [`late_registration_err`], with the entry dropped, when
+/// bridge shutdown began before the insert.
+fn register_streaming_saga(
+    bi: &NapiBridgeInstance,
+    entry: StreamingSagaEntry,
+) -> Result<String, ScpNapiError> {
+    let handle_id = entry.saga_id.0.clone();
+    bi.core
+        .register_or_refuse(
+            &bi.outlet_streaming_saga_registry,
+            handle_id.clone(),
+            entry,
+            Some(&handle_id),
+        )
+        .map_err(late_registration_err)?;
     Ok(handle_id)
 }
 
@@ -1623,11 +1694,12 @@ pub(crate) async fn outlet_streaming_saga_recover_truncated_close_on(
     }
 
     // Resolve the TARGET context's Active Signing Key per-call from custody
-    // (never envelope-asserted): its creator_did off the per-context FFI state,
-    // then the raw signing key via the shared saga resolver.
-    let target_creator_did =
-        crate::runtime::with_context(bi, &target_context_id, |rt| Ok(rt.core.creator_did.clone()))
-            .map_err(napi::Error::from)?;
+    // (never envelope-asserted). Recovery runs after the invoker check above,
+    // so a failed read is reported as itself.
+    let target_creator_did = crate::runtime::live_role_state(bi, &target_context_id)
+        .await
+        .map_err(napi::Error::from)?
+        .creator_did;
     let target_key =
         crate::outlets::resolve_context_signing_key(bi, &target_creator_did, &target_context_id)
             .await?;
@@ -1660,6 +1732,11 @@ impl crate::scp::Scp {
     /// budget injection has no bridge-public wiring — same rationale as the
     /// unary-saga bridge tests). The receiver's sender is dropped immediately
     /// (recover never polls it).
+    ///
+    /// # Panics
+    ///
+    /// Panics when bridge shutdown has begun, because the registry then refuses
+    /// the entry and the test would run against an empty registry.
     pub fn insert_test_streaming_saga_entry(
         &self,
         saga_id: &str,
@@ -1667,7 +1744,7 @@ impl crate::scp::Scp {
         invoker_did: &str,
     ) {
         let (_tx, rx) = mpsc::channel(1);
-        self.inner.outlet_streaming_saga_registry.insert(
+        let registered = self.inner.outlet_streaming_saga_registry.insert(
             saga_id.to_owned(),
             StreamingSagaEntry {
                 receiver: Arc::new(tokio::sync::Mutex::new(rx)),
@@ -1676,6 +1753,10 @@ impl crate::scp::Scp {
                 invoker_did: invoker_did.to_owned(),
                 request_id: [0u8; 16],
             },
+        );
+        assert!(
+            registered,
+            "bridge shutdown began before the test entry for {saga_id} was registered"
         );
     }
 
@@ -1706,10 +1787,10 @@ mod custody_error_tests {
             .to_owned()
     }
 
-    /// A key-not-found custody failure while signing a credit grant or a
-    /// cancel reaches the caller as `SCP-CRYPTO-4006`, any other custody
-    /// failure as `SCP-CRYPTO-4060`, and a non-custody failure keeps its
-    /// own code.
+    /// A custody failure while signing a credit grant or a cancel reaches the
+    /// caller with the code `custody_failure_code` assigns (checked here for
+    /// key-not-found and a generic custody failure), and a non-custody failure
+    /// keeps its own code.
     #[test]
     fn outlet_signing_custody_failures_carry_the_custody_codes() {
         let not_found = StreamSignerError::Custody {

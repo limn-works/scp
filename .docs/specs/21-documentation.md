@@ -19,7 +19,7 @@ An agent with no prior context should be able to visit the SCP repository, under
 | 7 | SDK binding READMEs | `bindings/{python,typescript,swift,kotlin}/README.md` | Install, quickstart, platform notes |
 | 8 | Architecture guide | `docs/guides/architecture.md` | Reading guide with entry points |
 | 9 | Transport adapter guide | `docs/guides/transport-adapters.md` | Trait requirements, step-by-step, conformance |
-| 10 | Wire format tables | §9.5.2, §12.12, §19.15, §22.11, §23.16 | Signed structures, bridge, economy, discovery, sync |
+| 10 | Wire format tables | §9.5.2, §19.15, §22.11, §23.16 | Signed structures, economy, discovery, sync |
 | 11 | Protocol constants registry | §9.18 (16 subsections, ~100 constants) | Domain separators, key derivation labels, sizes, timeouts |
 | 12 | Cryptographic test vectors | §25 (18 subsections) | All crypto operations; hex outputs pending (§25.18) |
 | 13 | Conformance suite spec | §26 | Language-independent test case definitions |
@@ -300,7 +300,7 @@ Not a replacement for `.docs/architecture.md` — a reading guide for it:
 ### 21.10.2 Rust (rustdoc)
 
 1. Add `#![doc = include_str!("../README.md")]` to each crate's `lib.rs` so the crate-level doc page shows the README.
-2. Generate with the command below. Job `rust-doc` in `.github/workflows/ci.yml` runs that command and a merge waits on it, so every command this specification names carries the same flags: `--document-private-items` makes rustdoc resolve a link a private module writes, the six features gate items that four intra-doc links in `crates/scp-node` name, and `scp-node/cloud-blobs` with `scp-relay/cloud-blobs` compiles the PostgreSQL and S3 blob backends, so rustdoc resolves the intra-doc links in their modules in `crates/scp-transport`, which no other feature in the list compiles. `cargo doc` compiles no doctest; the doctest in `crates/scp-transport/src/native/postgres_blob.rs` compiles in the `cargo test --workspace --doc` command that job `rust-doc` runs with the same features. A fenced shell block holds the command because `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` only where a shell block encloses it, so an inline copy of these flags goes stale under a green self-test.
+2. Generate with the command below. Job `rust-doc` in `.github/workflows/ci.yml` runs that command and a merge waits on it, so every command this specification names carries the same flags: `--document-private-items` makes rustdoc resolve a link a private module writes, the six features gate items that four intra-doc links in `crates/scp-node` name, and `scp-node/cloud-blobs` with `scp-relay/cloud-blobs` compiles the PostgreSQL and S3 blob backends, so rustdoc resolves the intra-doc links in their modules in `crates/scp-transport`, which no other feature in the list compiles. `cargo doc` compiles no doctest; the doctest in `crates/scp-transport/src/native/postgres_blob.rs` compiles in the `cargo test --workspace --doc` command that job `rust-doctest` runs with the same features. A fenced shell block holds the command because `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` only where a shell block encloses it, so an inline copy of these flags goes stale under a green self-test.
 
    ```bash
    cargo doc --workspace --no-deps --document-private-items \
@@ -502,7 +502,7 @@ This is P2 — the content in `docs/` is the priority. The website is presentati
 For agents implementing SCP from the spec (not using the reference implementation):
 
 1. **Protocol compliance checklist** — Every MUST/SHOULD/MAY from the spec, as a checkable list.
-2. **Wire format reference** — Field-by-field tables for all types that cross the network. Covered in: §12.12 (bridge), §19.15 (economy), §22.11 (discovery). Envelope types in §9.5.2. Sync in §23.16.
+2. **Wire format reference** — Field-by-field tables for all types that cross the network. Covered in: §19.15 (economy), §22.11 (discovery). Envelope types in §9.5.2. Sync in §23.16.
 3. **Cryptographic requirements** — Exact algorithms, parameters, key sizes, derivation paths. Covered in §9.5 (primitives) and §9.18 (constants registry, 16 subsections, ~100 constants).
 4. **Test vectors** — Known-good inputs and outputs for crypto operations. Covered in §25 (cryptographic test vectors).
 5. **Conformance test suite** — Language-independent test cases that any implementation must pass. Covered in §26 (conformance suite).
@@ -530,7 +530,6 @@ This requires that every protocol-level behavior is specified with enough precis
 | MLS group management | §9.7 | Complete |
 | Protocol constants | §9.18 (16 subsections, ~100 constants) | Complete |
 | Relay wire protocol | §10.5 | Complete |
-| Bridge connectors | §12 | Complete |
 | Governance | §5.6, §9.5.2 (30 GovernanceAction variants) | Complete |
 | Sync and offline recovery | §23, §23.16 (wire formats) | Complete |
 | Discovery and addressing | §22, §22.11 (wire formats) | Complete |

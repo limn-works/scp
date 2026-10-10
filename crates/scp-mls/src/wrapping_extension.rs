@@ -145,26 +145,35 @@ pub fn extract_own_wrapping_key(
 /// Extracts the `scp_wrapping_key` from a member's `LeafNode`, identified by
 /// their DID in the SCP credential.
 ///
-/// For the local member, reads `own_leaf_node()` directly which provides full
-/// access to the `LeafNode` extensions. For a REMOTE member this returns
-/// [`MlsError::MemberNotFound`]: openmls 0.8.1 exposes no public way to reach
-/// another member's `LeafNode` from a joined group (the `RatchetTree` returned
-/// by `export_ratchet_tree()` has no public node iterator, `full_leaves()` lives
-/// on the `pub(crate)` `TreeSync`, and `members()` yields a `Member` without
-/// extensions — see ADR-057 and the notes in [`crate::lifetime`]). Remote
-/// members' stable wrapping keys are therefore NOT read from the tree; they are
-/// only ever needed for the proactive/offline PUSH path (§9.16.1), where the
-/// key holder caches them from the added `KeyPackage` at `add_member` time. The
+/// For the local member's DID, reads `own_leaf_node()` and returns the key the
+/// local leaf publishes. For any other DID it returns
+/// [`MlsError::MemberNotFound`]. openmls 0.9.0 exposes every remote leaf
+/// (`MlsGroup::public_group().leaf(index)`), so the tree could be read; SCP
+/// deliberately offers no remote lookup yet, because a remote lookup must first
+/// bind the identifier to leaves:
+///
+/// - A leaf's credential identifier is self-asserted. It is trustworthy only on
+///   a leaf whose `KeyPackage` attestation verified (§9.7.1 of the security model
+///   spec), which binds the leaf's keys, its `scp_wrapping_key` among them, to
+///   the identifier.
+/// - One identity may hold several leaves, one per device, that share one
+///   wrapping key (§10.8.1 of the infrastructure spec), so a lookup by
+///   identifier names a set of leaves, not one leaf.
+///
+/// That binding belongs to the leaf-signing and custody slice (ADR-057 T4
+/// residual (3), the self-certifying directory; §23.13, Event Verification
+/// During Reconciliation). Until it lands, a remote member's stable wrapping key
+/// is needed only on the proactive/offline PUSH path (§9.16.1), where the key
+/// holder caches it from the added `KeyPackage` at `add_member` time. The
 /// canonical new-member key exchange is the PULL protocol (§9.16.2), which
 /// carries a fresh ephemeral wrapping key inline in each `SenderKeyRequest` and
-/// needs no stable-key lookup at all.
+/// needs no stable-key lookup.
 ///
 /// # Errors
 ///
 /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
-/// Returns [`MlsError::MemberNotFound`] if `target_did` is not the local member
-///   (remote members' extensions are not accessible via openmls's public API,
-///   per the note above).
+/// Returns [`MlsError::MemberNotFound`] if `target_did` is not the local
+///   member's DID.
 /// Returns [`MlsError::ExtensionError`] if the extension data is malformed.
 pub fn extract_member_wrapping_key(
     group: &crate::group::ScpMlsGroup,
@@ -181,11 +190,10 @@ pub fn extract_member_wrapping_key(
         return extract_wrapping_key(own_leaf.extensions());
     }
 
-    // Remote members' `LeafNode` extensions are not accessible through openmls
-    // 0.8.1's public API (ADR-057; see this function's doc comment). A joiner
-    // does not need remote stable wrapping keys: it exchanges sender keys via
-    // the pull protocol (§9.16.2), which carries a fresh ephemeral wrapping key
-    // inline in each `SenderKeyRequest`.
+    // No remote lookup until the identifier-to-leaf binding lands (see this
+    // function's doc comment). A joiner does not need remote stable wrapping
+    // keys: it exchanges sender keys via the pull protocol (§9.16.2), which
+    // carries a fresh ephemeral wrapping key inline in each `SenderKeyRequest`.
     Err(MlsError::MemberNotFound(u32::MAX))
 }
 
@@ -334,7 +342,8 @@ mod tests {
             crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
 
         let bob_group =
-            crate::group::join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+            crate::group::join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock)
+                .unwrap();
 
         // Bob's own wrapping key should be present after joining.
         let bob_extracted = extract_own_wrapping_key(&bob_group).unwrap();
@@ -343,6 +352,61 @@ mod tests {
             Some(bob_wrapping),
             "Bob's own leaf node must contain scp_wrapping_key after joining"
         );
+    }
+
+    /// The local member's DID returns the key its own leaf publishes, on the
+    /// creator and on a Welcome joiner. A remote member's DID returns
+    /// `MemberNotFound` even though the remote leaf publishes a key (SCP offers
+    /// no remote lookup), and so does a DID that is not a member.
+    #[test]
+    fn extract_member_wrapping_key_reads_only_the_local_member() {
+        let alice_cred = test_credential("alice");
+        let alice_wrapping = [0xA1_u8; 32];
+        let mut alice_group = crate::group::create_group_with_wrapping_key(
+            &alice_cred,
+            Some(&alice_wrapping),
+            &SystemClock,
+        )
+        .unwrap();
+
+        let bob_cred = test_credential("bob");
+        let bob_wrapping = [0xB2_u8; 32];
+        let (bob_kp, bob_signer, bob_provider) =
+            crate::group::generate_key_package_with_wrapping_key(
+                &bob_cred,
+                Some(&bob_wrapping),
+                &SystemClock,
+            )
+            .unwrap();
+        let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
+        let add_result =
+            crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
+        let bob_group =
+            crate::group::join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock)
+                .unwrap();
+
+        assert_eq!(
+            extract_member_wrapping_key(&alice_group, &alice_cred.did).unwrap(),
+            Some(alice_wrapping),
+            "the local member's DID returns its own leaf's key"
+        );
+        assert_eq!(
+            extract_member_wrapping_key(&bob_group, &bob_cred.did).unwrap(),
+            Some(bob_wrapping),
+            "a Welcome joiner's own DID returns its own leaf's key"
+        );
+        assert!(matches!(
+            extract_member_wrapping_key(&alice_group, &bob_cred.did),
+            Err(MlsError::MemberNotFound(_))
+        ));
+        assert!(matches!(
+            extract_member_wrapping_key(&bob_group, &alice_cred.did),
+            Err(MlsError::MemberNotFound(_))
+        ));
+        assert!(matches!(
+            extract_member_wrapping_key(&alice_group, &test_credential("carol").did),
+            Err(MlsError::MemberNotFound(_))
+        ));
     }
 
     /// AC: advance MLS epoch via Commit -> extract LeafNode -> scp_wrapping_key
@@ -373,7 +437,8 @@ mod tests {
             crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
 
         let mut bob_group =
-            crate::group::join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+            crate::group::join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock)
+                .unwrap();
 
         // Alice performs an update WITH her wrapping key to preserve it.
         let commit =
@@ -382,8 +447,7 @@ mod tests {
         let commit_bytes = crate::ratchet::serialize_mls_message(&commit).unwrap();
 
         // Bob processes Alice's commit.
-        let mut grace_store = crate::epoch_grace::EpochGraceStore::new();
-        crate::ratchet::process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+        crate::encrypt::decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap();
 
         // Alice's wrapping key should be unchanged after the update.
         let alice_extracted = extract_own_wrapping_key(&alice_group).unwrap();

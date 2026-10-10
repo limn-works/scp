@@ -1,31 +1,21 @@
-// AndroidKeyCustodyPseudonymLifecycleTest.kt — pseudonym key lifecycle in AndroidKeyCustody.
+// AndroidKeyCustodyPseudonymLifecycleTest.kt — pseudonym lifecycle in AndroidKeyCustody.
 //
 // Covers the Keystore identity path through a fake KeystoreKeys (JVM tests cannot reach
-// AndroidKeyStore), destruction of an identity's pseudonyms, and concurrent re-derivation.
+// AndroidKeyStore): a pseudonym is derivable only while its identity exists, and a destroy
+// interrupted between the pseudonym secret and the identity is completed by a retry.
 //
 // Provenance: spec §9.10.4 (pseudonym derivation), §9.10.4.A (pseudonym secret, and
 // a pseudonym dies with its identity), ADR-027 (Android Platform Adapter).
 
 package works.limn.scp.android.platform
 
-import org.bouncycastle.crypto.ec.CustomNamedCurves
-import org.bouncycastle.crypto.params.ECDomainParameters
-import org.bouncycastle.crypto.params.ECPublicKeyParameters
-import org.bouncycastle.crypto.signers.ECDSASigner
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
-import java.math.BigInteger
-import java.security.MessageDigest
 import java.security.SecureRandom
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -33,7 +23,11 @@ import javax.crypto.spec.SecretKeySpec
  * [KeystoreKeys] fake: Ed25519 entries are markers (the tests here never sign with the
  * identity), HMAC entries hold a random 32-byte key and compute a real HMAC-SHA256.
  */
-private class FakeKeystoreKeys(private val failHmacGeneration: Boolean = false) : KeystoreKeys {
+private class FakeKeystoreKeys(
+    private val failHmacGeneration: Boolean = false,
+    /** Aliases whose next [deleteEntry] throws, once each. */
+    val failDeleteOnce: MutableSet<String> = mutableSetOf(),
+) : KeystoreKeys {
     val ed25519 = mutableSetOf<String>()
     val hmacKeys = mutableMapOf<String, ByteArray>()
 
@@ -57,32 +51,17 @@ private class FakeKeystoreKeys(private val failHmacGeneration: Boolean = false) 
     override fun containsAlias(alias: String): Boolean = alias in ed25519 || alias in hmacKeys
 
     override fun deleteEntry(alias: String) {
+        if (failDeleteOnce.remove(alias)) throw java.security.KeyStoreException("injected delete failure")
         ed25519.remove(alias)
         hmacKeys.remove(alias)
     }
 }
 
 class AndroidKeyCustodyPseudonymLifecycleTest {
-    private val curve = CustomNamedCurves.getByName("secp256r1")
-    private val domain = ECDomainParameters(curve.curve, curve.g, curve.n, curve.h)
-
-    private fun handleOf(pseudonym: PseudonymKeyHandle) =
-        KeyHandle(id = pseudonym.id, custodyType = pseudonym.custodyType)
-
-    private fun verifies(publicKey: ByteArray, digest: ByteArray, signature: ByteArray): Boolean {
-        val verifier = ECDSASigner()
-        verifier.init(false, ECPublicKeyParameters(curve.curve.decodePoint(publicKey), domain))
-        return verifier.verifySignature(
-            digest,
-            BigInteger(1, signature.copyOfRange(0, 32)),
-            BigInteger(1, signature.copyOfRange(32, 64)),
-        )
-    }
-
     /**
      * The Keystore identity path end to end: the pseudonym secret is created with the
-     * identity, derivation is stable, destroying the identity deletes the secret alias,
-     * and derivation then fails with `SCP-CRYPTO-4006`.
+     * identity, derivation is stable, destroying the identity deletes both aliases, and
+     * derivation then fails with `SCP-CRYPTO-4006`.
      */
     @Test
     fun `keystore identity pseudonym secret lives and dies with the identity`() {
@@ -94,10 +73,8 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
 
         val contextId = "keystore-context".toByteArray()
         val first = custody.derivePseudonym(identity, contextId)
-        val firstPoint = custody.publicKey(handleOf(first))
-        val second = custody.derivePseudonym(identity, contextId)
-        assertEquals(first.id, second.id)
-        assertArrayEquals(firstPoint, custody.publicKey(handleOf(second)))
+        assertEquals(33, first.size)
+        assertArrayEquals(first, custody.derivePseudonym(identity, contextId))
 
         assertTrue(custody.destroyKey(identity).confirmed)
         assertFalse(keystore.containsAlias(PseudonymSecret.alias(identity.id)))
@@ -117,175 +94,86 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
         assertTrue(keystore.hmacKeys.isEmpty())
     }
 
-    /** Destroying an identity destroys every pseudonym derived from it (§9.10.4.A). */
+    /**
+     * Destroying identity U makes every v1 and v2 pseudonym of U underivable with
+     * `SCP-CRYPTO-4006`, on both the software and the Keystore path, while bystander V
+     * still derives the same points (§9.10.4.A).
+     */
     @Test
-    fun `destroying an identity destroys its pseudonyms`() {
-        val custody = AndroidKeyCustody(InMemorySharedPreferences())
+    fun `destroying an identity makes its pseudonyms underivable while a bystander still derives`() {
+        val custodies = listOf(
+            AndroidKeyCustody(InMemorySharedPreferences()),
+            AndroidKeyCustody(InMemorySharedPreferences(), FakeKeystoreKeys(), keystoreEd25519 = true),
+        )
+        for (custody in custodies) {
+            val identity = custody.generateKeypair(KeyType.ED25519)
+            val bystander = custody.generateKeypair(KeyType.ED25519)
+            val contextId = "context-a".toByteArray()
+            val bystanderV1 = custody.derivePseudonym(bystander, contextId)
+            val bystanderV2 = custody.deriveRotatablePseudonym(bystander, contextId, 3)
+            custody.derivePseudonym(identity, contextId)
+            custody.deriveRotatablePseudonym(identity, contextId, 3)
+
+            assertTrue(custody.destroyKey(identity).confirmed)
+
+            val v1Error = assertThrows<ScpException> { custody.derivePseudonym(identity, contextId) }
+            assertEquals("SCP-CRYPTO-4006", v1Error.code, "${identity.custodyType} v1")
+            val v2Error = assertThrows<ScpException> {
+                custody.deriveRotatablePseudonym(identity, contextId, 3)
+            }
+            assertEquals("SCP-CRYPTO-4006", v2Error.code, "${identity.custodyType} v2")
+            assertArrayEquals(bystanderV1, custody.derivePseudonym(bystander, contextId))
+            assertArrayEquals(bystanderV2, custody.deriveRotatablePseudonym(bystander, contextId, 3))
+        }
+    }
+
+    /**
+     * A destroy whose pseudonym-secret delete fails leaves the identity in place and
+     * reports `SCP-CRYPTO-4004`; the identity then still derives. A retry deletes both
+     * aliases, after which derivation fails with `SCP-CRYPTO-4006` and no secret alias
+     * is left.
+     */
+    @Test
+    fun `a destroy that fails on the secret alias is completed by a retry`() {
+        val keystore = FakeKeystoreKeys()
+        val custody = AndroidKeyCustody(InMemorySharedPreferences(), keystore, keystoreEd25519 = true)
         val identity = custody.generateKeypair(KeyType.ED25519)
-        val first = custody.derivePseudonym(identity, "context-a".toByteArray())
-        val second = custody.deriveRotatablePseudonym(identity, "context-b".toByteArray(), 3)
-        val digest = MessageDigest.getInstance("SHA-256").digest("before".toByteArray())
-        custody.sign(handleOf(first), digest)
-        custody.sign(handleOf(second), digest)
+        val secretAlias = PseudonymSecret.alias(identity.id)
+        val contextId = "retry-context".toByteArray()
+        val point = custody.derivePseudonym(identity, contextId)
+
+        keystore.failDeleteOnce.add(secretAlias)
+        val failed = assertThrows<ScpException> { custody.destroyKey(identity) }
+        assertEquals("SCP-CRYPTO-4004", failed.code)
+        assertTrue(keystore.containsAlias("scp.key.${identity.id}"), "the identity must survive a failed destroy")
+        assertArrayEquals(point, custody.derivePseudonym(identity, contextId))
 
         assertTrue(custody.destroyKey(identity).confirmed)
-        assertEquals(0, custody.pseudonymKeys.size)
-        for (pseudonym in listOf(first, second)) {
-            val signError = assertThrows<ScpException> { custody.sign(handleOf(pseudonym), digest) }
-            assertEquals("SCP-CRYPTO-4006", signError.code)
-            val keyError = assertThrows<ScpException> { custody.publicKey(handleOf(pseudonym)) }
-            assertEquals("SCP-CRYPTO-4006", keyError.code)
-        }
-    }
-
-    /**
-     * Re-deriving a pseudonym while another thread signs with it never corrupts a
-     * signature: every signature verifies under the pseudonym's public key.
-     */
-    @Test
-    fun `concurrent re-derive and sign on one pseudonym always verify`() {
-        val custody = AndroidKeyCustody(InMemorySharedPreferences())
-        val identity = custody.generateKeypair(KeyType.ED25519)
-        val contextId = "race-context".toByteArray()
-        val pseudonym = custody.derivePseudonym(identity, contextId)
-        val publicKey = custody.publicKey(handleOf(pseudonym))
-        val rounds = 300
-        val pool = Executors.newFixedThreadPool(4)
-        val start = CountDownLatch(1)
-        try {
-            val derivers = List(2) {
-                pool.submit {
-                    start.await()
-                    repeat(rounds) { custody.derivePseudonym(identity, contextId) }
-                }
-            }
-            val signers = List(2) { thread ->
-                pool.submit<List<Boolean>> {
-                    start.await()
-                    List(rounds) { round ->
-                        val digest = MessageDigest.getInstance("SHA-256")
-                            .digest("t$thread r$round".toByteArray())
-                        verifies(publicKey, digest, custody.sign(handleOf(pseudonym), digest))
-                    }
-                }
-            }
-            start.countDown()
-            derivers.forEach { it.get(60, TimeUnit.SECONDS) }
-            val results = signers.flatMap { it.get(60, TimeUnit.SECONDS) }
-            assertEquals(2 * rounds, results.size)
-            assertTrue(results.all { it }, "every concurrent signature must verify")
-        } finally {
-            pool.shutdownNow()
-        }
-    }
-
-    /**
-     * Destroying a pseudonym while other threads sign with it never yields a bad
-     * signature: each sign either verifies under the pseudonym's point or fails with
-     * `SCP-CRYPTO-4006`. A sign that used the stored scalar array instead of a copy
-     * would see it wiped mid-signature.
-     *
-     * The signers sign without pause until the cycler finishes, so every destroy lands
-     * while a sign may be in flight. Before each destroy the cycler waits for one more
-     * verified signature, so every cycle overlaps signing whatever the scheduler does.
-     */
-    @Test
-    fun `destroying a pseudonym while others sign never yields a bad signature`() {
-        val custody = AndroidKeyCustody(InMemorySharedPreferences())
-        val identity = custody.generateKeypair(KeyType.ED25519)
-        val contextId = "destroy-race-context".toByteArray()
-        val pseudonym = custody.derivePseudonym(identity, contextId)
-        val publicKey = custody.publicKey(handleOf(pseudonym))
-        val rounds = 300
-        val verified = AtomicInteger(0)
-        val done = AtomicBoolean(false)
-        val pool = Executors.newFixedThreadPool(3)
-        val start = CountDownLatch(1)
-        try {
-            val cycler = pool.submit {
-                start.await()
-                try {
-                    repeat(rounds) {
-                        val seen = verified.get()
-                        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
-                        while (verified.get() == seen) {
-                            check(System.nanoTime() < deadline) { "no signature verified within 30 s" }
-                            Thread.onSpinWait()
-                        }
-                        custody.destroyKey(handleOf(pseudonym))
-                        assertEquals(pseudonym.id, custody.derivePseudonym(identity, contextId).id)
-                    }
-                } finally {
-                    done.set(true)
-                }
-            }
-            val signers = List(2) { thread ->
-                pool.submit {
-                    start.await()
-                    var round = 0
-                    while (!done.get()) {
-                        val digest = MessageDigest.getInstance("SHA-256")
-                            .digest("d$thread r${round++}".toByteArray())
-                        val signature = try {
-                            custody.sign(handleOf(pseudonym), digest)
-                        } catch (e: ScpException) {
-                            assertEquals("SCP-CRYPTO-4006", e.code, "only not-found may fail a sign")
-                            null
-                        }
-                        if (signature != null) {
-                            assertTrue(verifies(publicKey, digest, signature), "signature must verify")
-                            verified.incrementAndGet()
-                        }
-                    }
-                }
-            }
-            start.countDown()
-            cycler.get(60, TimeUnit.SECONDS)
-            signers.forEach { it.get(60, TimeUnit.SECONDS) }
-            assertTrue(verified.get() >= rounds, "a signature must verify before every destroy")
-        } finally {
-            done.set(true)
-            pool.shutdownNow()
-        }
-    }
-
-    /**
-     * A derivation still in flight when its identity is retired stores nothing: the
-     * scalar is wiped and `SCP-CRYPTO-4006` is thrown.
-     */
-    @Test
-    fun `register after the identity is retired stores nothing`() {
-        val keys = PseudonymKeys()
-        keys.retireIdentity("retired-identity")
-        val contextSeed = ByteArray(32) { 0x5a }
-        val error = assertThrows<ScpException> {
-            P256Pseudonym.register(keys, "retired-identity", "p256-retired", contextSeed)
-        }
+        assertFalse(keystore.containsAlias(secretAlias))
+        assertFalse(keystore.containsAlias("scp.key.${identity.id}"))
+        val error = assertThrows<ScpException> { custody.derivePseudonym(identity, contextId) }
         assertEquals("SCP-CRYPTO-4006", error.code)
-        assertTrue(contextSeed.all { it == 0.toByte() }, "the context seed must be wiped")
-        assertEquals(0, keys.size)
     }
 
     /**
-     * [PseudonymKeys.withScalar] lends a copy: removing the pseudonym inside the block
-     * wipes the stored array but not the lent one, and the lent copy is wiped once the
-     * block returns.
+     * A pseudonym secret left behind without its identity alias is not derivable, and
+     * a destroy of that identity deletes the secret before reporting `SCP-CRYPTO-4006`.
      */
     @Test
-    fun `withScalar lends a copy that survives removal and is wiped afterwards`() {
-        val keys = PseudonymKeys()
-        val original = ByteArray(32) { (it + 1).toByte() }
-        keys.put("identity", "p", original.copyOf())
-        var lent: ByteArray? = null
-        val result = keys.withScalar("p") { scalar ->
-            lent = scalar
-            assertTrue(keys.remove("p"), "the pseudonym must be stored")
-            assertArrayEquals(original, scalar, "removal must not wipe the lent copy")
-            "done"
+    fun `an orphaned pseudonym secret is underivable and removed by destroy`() {
+        val keystore = FakeKeystoreKeys()
+        val custody = AndroidKeyCustody(InMemorySharedPreferences(), keystore, keystoreEd25519 = true)
+        val identity = custody.generateKeypair(KeyType.ED25519)
+        val secretAlias = PseudonymSecret.alias(identity.id)
+        keystore.ed25519.remove("scp.key.${identity.id}")
+
+        val deriveError = assertThrows<ScpException> {
+            custody.derivePseudonym(identity, "orphan".toByteArray())
         }
-        assertEquals("done", result)
-        val captured = checkNotNull(lent) { "withScalar must run the block" }
-        assertTrue(captured.all { it == 0.toByte() }, "the lent copy must be wiped after the block")
-        assertEquals(0, keys.size)
+        assertEquals("SCP-CRYPTO-4006", deriveError.code)
+
+        val destroyError = assertThrows<ScpException> { custody.destroyKey(identity) }
+        assertEquals("SCP-CRYPTO-4006", destroyError.code)
+        assertFalse(keystore.containsAlias(secretAlias), "the orphaned secret must be deleted")
     }
 }

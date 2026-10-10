@@ -2524,11 +2524,16 @@ async fn persist_finalized_send(
 /// `dyn FnMut` sink), so a `&PerContextState` held across an `.await` makes the
 /// actor future `!Send` and fails `tokio::spawn`. Building the snapshot first
 /// keeps the borrow off the await point (ADR-049 Decision 7).
+///
+/// # Errors
+///
+/// Returns [`ContextError::SupervisorShutDown`] when the Supervisor has
+/// dropped, so no sender-epoch or receive-sequence floor export exists.
 pub fn build_snapshot_for_persist(
     state: &PerContextState,
     deps: &ActorDeps,
     context_id: &str,
-) -> crate::context::state::ContextSnapshot {
+) -> Result<crate::context::state::ContextSnapshot, ContextError> {
     let mut snapshot = build_snapshot_from_state(state);
     // ADR-056: canonical digest, not a re-hash of the hex id.
     let ctx_id_bytes = state::context_id_to_bytes(context_id);
@@ -2539,17 +2544,25 @@ pub fn build_snapshot_for_persist(
     // on the actor's `state` (was the provider); the X25519 wrapping keypair enters
     // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
     // sequence is read from `state.send_tracker` inside the twin.
+    //
+    // When the Supervisor has dropped (ADR-049 Decision 16) no floor export
+    // exists; the error propagates, because a snapshot written with empty
+    // floors would durably regress them.
+    let sender_epochs = deps.supervisor.export_sender_key_epochs(&ctx_id_bytes)?;
+    let recv_floors = deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes)?;
     let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
     match state.export_crypto_state(
-        deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
-        deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
+        sender_epochs,
+        recv_floors,
         wrapping_public_key,
         &*wrapping_secret_key,
     ) {
-        Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
+        Ok(crypto_state) => {
+            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState(crypto_state);
+        }
         Err(e) => {
             snapshot.needs_reconnect = true;
-            snapshot.mls_crypto_state = Vec::new();
+            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState::default();
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -2559,7 +2572,7 @@ pub fn build_snapshot_for_persist(
             );
         }
     }
-    snapshot
+    Ok(snapshot)
 }
 
 /// Whether an MLS crypto export is durable enough to stand up a Welcome-JOINER.
@@ -2582,7 +2595,9 @@ pub fn build_snapshot_for_persist(
 /// The sole caller is `Supervisor::spawn_actor_from_welcome`, which the FFI
 /// slice (pull request #2036) wired to production bridge consumers.
 #[must_use]
-pub const fn welcome_snapshot_crypto_is_durable(export: &Result<Vec<u8>, ContextError>) -> bool {
+pub(super) fn welcome_snapshot_crypto_is_durable(
+    export: &Result<zeroize::Zeroizing<Vec<u8>>, ContextError>,
+) -> bool {
     matches!(export, Ok(blob) if !blob.is_empty())
 }
 
@@ -2618,11 +2633,21 @@ pub fn persist_state_best_effort<'d, 'c>(
 ) -> impl std::future::Future<Output = ()> + Send + use<'d, 'c> {
     let snapshot = build_snapshot_for_persist(state, deps, context_id);
     async move {
-        if let Err(e) = deps
-            .persistence
-            .persist_context(context_id, &snapshot)
-            .await
-        {
+        // Bound by reference: a moved-out copy would give this future a second
+        // `ContextSnapshot`-sized slot (clippy `large_futures`).
+        let snapshot = match snapshot {
+            Ok(ref snapshot) => snapshot,
+            Err(e) => {
+                crate::metrics::record_persistence_failure();
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "context snapshot not persisted: no floor export"
+                );
+                return;
+            }
+        };
+        if let Err(e) = deps.persistence.persist_context(context_id, snapshot).await {
             crate::metrics::record_persistence_failure();
             tracing::warn!(
                 context_id = %context_id,
@@ -2653,7 +2678,9 @@ pub fn persist_state_best_effort<'d, 'c>(
 /// # Errors
 ///
 /// Returns [`ContextError::PersistenceFailed`] if the underlying
-/// `persist_context` write fails.
+/// `persist_context` write fails, and [`ContextError::SupervisorShutDown`] when
+/// [`build_snapshot_for_persist`] returns it.
+///
 /// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
 ///
 /// SYNC fn returning a future (see [`persist_state_best_effort`] for the full
@@ -2669,7 +2696,14 @@ pub fn persist_state_fail_closed<'d, 'c>(
     // before the returned future — keeps this future `Send` (see
     // [`build_snapshot_for_persist`]).
     let snapshot = build_snapshot_for_persist(state, deps, context_id);
-    async move { persist_snapshot_fail_closed(&snapshot, deps, context_id).await }
+    // Matched by reference: `&snapshot?` would move the snapshot into a second
+    // slot of this future (clippy `large_futures`).
+    async move {
+        match snapshot {
+            Ok(ref snapshot) => persist_snapshot_fail_closed(snapshot, deps, context_id).await,
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Fail-closed persist of an ALREADY-BUILT snapshot (ADR-049 §9 Class S).
@@ -2809,7 +2843,7 @@ pub fn build_snapshot_from_state(
         epoch_coordination_records: state.epoch.coordinator.records().to_vec(),
         grace_entries,
         needs_reconnect: state.epoch.needs_reconnect,
-        mls_crypto_state: Vec::new(),
+        mls_crypto_state: crate::context::state::MlsCryptoState::default(),
         migration_state: state.migration_state.clone(),
         access_key_store: state.access.access_key_store.clone(),
         consequence_rules: state.governance.consequence_rules.clone(),
@@ -3057,7 +3091,7 @@ pub fn decrypt_and_dispatch(
             "no MLS crypto state for decrypt (context has no group)".to_string(),
         )
     })?;
-    let open_result = cs.open(&*deps.clock, context_id_bytes, context_id, encrypted_blob)?;
+    let open_result = cs.open(context_id_bytes, context_id, encrypted_blob)?;
     crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
 
     match open_result {
@@ -4557,6 +4591,7 @@ mod pseudonym_routing_tests {
             Some(clock),
             mls_storage,
         );
+        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
             .build_actor_deps(&DID(ALICE.to_owned()))
             .await
@@ -4956,5 +4991,215 @@ mod pseudonym_routing_tests {
             CHECKPOINT_PAYLOAD_TAG, PSEUDONYM_ANNOUNCEMENT_TAG,
             "checkpoint and announcement tags must be distinct"
         );
+    }
+}
+
+/// Fixture and tests for the persist paths after the Supervisor has dropped
+/// (ADR-049 Decision 16): no floor export exists, so nothing is persisted and
+/// the caller gets [`ContextError::SupervisorShutDown`].
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+pub mod dropped_supervisor_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use scp_did::DID;
+    use scp_protocol::context::ContextError;
+    use scp_protocol::context::builder::ContextCreationError;
+
+    use crate::context::actor::deps::ActorDeps;
+    use crate::context::actor::state::PerContextState;
+    use crate::context::supervisor::supervisor::Supervisor;
+
+    const OWNER: &str = "did:example:dropped-supervisor-owner";
+    const CTX_BYTE: u8 = 0x5d;
+
+    /// Persistence counting every `persist_context` call.
+    struct CountingPersistence(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::context::persistence::ContextPersistence for CountingPersistence {
+        async fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Event log counting every `append_event` call.
+    struct CountingEventLog(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for CountingEventLog {
+        async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _: &[u8; 32],
+            _event_type: scp_event_log::EventType,
+            _actor_did: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), ContextCreationError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// The owning `Arc<Supervisor>` (not leaked, so a test can drop it), the
+    /// `ActorDeps` built from it, and the persist and event-append counters.
+    pub struct Fixture {
+        supervisor: Option<Arc<Supervisor>>,
+        pub deps: ActorDeps,
+        pub persists: Arc<AtomicUsize>,
+        pub appends: Arc<AtomicUsize>,
+    }
+
+    impl Fixture {
+        pub async fn new() -> Self {
+            use scp_platform::in_memory::InMemoryStorage;
+
+            let persists = Arc::new(AtomicUsize::new(0));
+            let appends = Arc::new(AtomicUsize::new(0));
+            let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+                OWNER.to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ));
+            let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+                Arc::new(
+                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                        Arc::new(InMemoryStorage::new()),
+                    ),
+                );
+            let clock: Arc<dyn scp_clock::Clock> =
+                Arc::new(scp_clock::TestClock::new(1_700_000_000));
+            let key_resolver: scp_protocol::context::governance::KeyResolver =
+                Arc::new(|_, _| None);
+            let supervisor = Supervisor::with_providers(
+                crypto,
+                Box::new(crate::context::builder::NotConfiguredTransportProvider),
+                Box::new(CountingEventLog(Arc::clone(&appends))),
+                key_resolver,
+                Some(Box::new(CountingPersistence(Arc::clone(&persists)))),
+                None,
+                None,
+                Some(clock),
+                mls_storage,
+            );
+            let deps = supervisor
+                .build_actor_deps(&DID(OWNER.to_owned()))
+                .await
+                .expect("build_actor_deps");
+            Self {
+                supervisor: Some(supervisor),
+                deps,
+                persists,
+                appends,
+            }
+        }
+
+        /// Drops the owning `Arc` and asserts the Supervisor is gone, so a test
+        /// cannot pass against a Supervisor that another reference keeps alive.
+        pub fn drop_supervisor(mut self) -> Self {
+            let supervisor = self.supervisor.take().expect("supervisor not yet dropped");
+            let weak = Arc::downgrade(&supervisor);
+            drop(supervisor);
+            assert!(weak.upgrade().is_none(), "the Supervisor must have dropped");
+            self
+        }
+    }
+
+    pub fn state() -> PerContextState {
+        PerContextState::new_for_test_encrypted(
+            [CTX_BYTE; 32],
+            1_700_000_000,
+            DID(OWNER.to_owned()),
+        )
+    }
+
+    pub fn ctx_hex() -> String {
+        hex::encode([CTX_BYTE; 32])
+    }
+
+    pub fn assert_shut_down<T: std::fmt::Debug>(r: &Result<T, ContextError>) {
+        assert!(
+            matches!(r, Err(ContextError::SupervisorShutDown(_))),
+            "expected SupervisorShutDown, got {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_paths_write_with_live_supervisor() {
+        let f = Fixture::new().await;
+        let st = state();
+        assert!(super::build_snapshot_for_persist(&st, &f.deps, &ctx_hex()).is_ok());
+        super::persist_state_best_effort(&st, &f.deps, &ctx_hex()).await;
+        assert_eq!(f.persists.load(Ordering::SeqCst), 1);
+        super::persist_state_fail_closed(&st, &f.deps, &ctx_hex())
+            .await
+            .expect("fail-closed persist with a live supervisor");
+        assert_eq!(f.persists.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn persist_paths_write_nothing_after_supervisor_drops() {
+        let f = Fixture::new().await.drop_supervisor();
+        let st = state();
+        assert_shut_down(&super::build_snapshot_for_persist(&st, &f.deps, &ctx_hex()));
+        super::persist_state_best_effort(&st, &f.deps, &ctx_hex()).await;
+        assert_shut_down(&super::persist_state_fail_closed(&st, &f.deps, &ctx_hex()).await);
+        assert_eq!(
+            f.persists.load(Ordering::SeqCst),
+            0,
+            "no snapshot with empty floors may be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn standing_helpers_answer_with_live_supervisor() {
+        use crate::context::standing_helpers as sh;
+        let f = Fixture::new().await;
+        let peer = DID("did:example:standing-peer".to_owned());
+        assert_eq!(sh::standing_context_count(&f.deps).unwrap(), 0);
+        sh::register_standing_context(&f.deps, peer.clone())
+            .await
+            .expect("register with a live supervisor");
+        assert_eq!(sh::standing_context_count(&f.deps).unwrap(), 1);
+        assert!(sh::has_standing_context(&f.deps, &peer).unwrap());
+    }
+
+    #[tokio::test]
+    async fn standing_helpers_fail_closed_after_supervisor_drops() {
+        use crate::context::standing_helpers as sh;
+        let f = Fixture::new().await.drop_supervisor();
+        let peer = DID("did:example:standing-peer".to_owned());
+        assert_shut_down(&sh::standing_context_count(&f.deps));
+        assert_shut_down(&sh::has_standing_context(&f.deps, &peer));
+        assert_shut_down(&sh::register_standing_context(&f.deps, peer).await);
     }
 }

@@ -374,6 +374,12 @@ impl ContextExport {
 /// # Errors
 ///
 /// Returns [`ContextError::EventLogFailed`] if serialization fails.
+///
+/// A `Full` export carries the context's access keys, and a snapshot handed
+/// in with `mls_crypto_state` set carries the MLS signer; buffers the encoder
+/// outgrows are wiped as they are freed (security model spec §9.15, freed heap
+/// memory), and by nothing in an application that links this crate without
+/// `scp-alloc`. The returned `Vec` goes to the bridge to hand to the host.
 pub fn serialize_export(export: &ContextExport) -> Result<Vec<u8>, ContextError> {
     let envelope = StoredValue {
         version: 1u16,
@@ -755,7 +761,7 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         grace_entries: Vec::new(),
         // Reconnection flag is not exported — only meaningful to the local node.
         needs_reconnect: false,
-        mls_crypto_state: Vec::new(),
+        mls_crypto_state: crate::context::state::MlsCryptoState::default(),
         migration_state: None,
         // Access keys are sensitive material — not exported in public scope.
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
@@ -940,7 +946,7 @@ mod tests {
     // (`FnOnce(&[u8; 32]) -> Result<[u8; 64], E>`); the test signer is
     // infallible.
     #[allow(clippy::unnecessary_wraps)]
-    fn sign_with_test_key(hash: &[u8; 32]) -> Result<[u8; 64], std::convert::Infallible> {
+    fn sign_with_test_key(hash: &[u8; 32]) -> Result<[u8; 64], scp_crypto::CustodyFailure> {
         use ed25519_dalek::Signer;
         Ok(test_signing_key().sign(hash).to_bytes())
     }
@@ -954,6 +960,68 @@ mod tests {
     /// `exporter_did == role_state.creator_did`, so exports built in these
     /// tests use this DID as the exporter unless a mismatch is being tested.
     const TEST_CREATOR_DID: &str = "did:key:test-creator";
+
+    /// `{:?}` on a snapshot, or on an export that carries one, prints the
+    /// MLS crypto state's length and never its bytes.
+    #[test]
+    fn debug_redacts_the_mls_crypto_state() {
+        let mut snapshot = test_snapshot("ctx-debug-redacts");
+        snapshot.mls_crypto_state =
+            crate::context::state::MlsCryptoState(zeroize::Zeroizing::new(vec![
+                0xC3, 0x5A, 0x77, 0x19,
+            ]));
+        let export = ContextExport {
+            snapshot: snapshot.clone(),
+            event_log_data: Vec::new(),
+            version: CURRENT_EXPORT_VERSION,
+            exporter_did: DID::from(TEST_CREATOR_DID),
+            exported_at: 0,
+            scope: ExportScope::Full,
+            snapshot_signature: [0u8; 64],
+        };
+        for printed in [format!("{snapshot:?}"), format!("{export:?}")] {
+            assert!(printed.contains("[4 bytes, REDACTED]"), "{printed}");
+            assert!(!printed.contains("195, 90, 119, 25"), "{printed}");
+        }
+    }
+
+    /// `MlsCryptoState` encodes exactly as the `#[serde(with = "serde_bytes")]`
+    /// `Vec<u8>` field it replaced (`MessagePack` bin), so stored snapshots
+    /// still decode. A `#[serde(transparent)]` derive would encode through
+    /// zeroize's serde impl, an array of integers, which is a different
+    /// encoding; that is why its serde impls are written by hand.
+    #[test]
+    fn mls_crypto_state_encodes_like_a_serde_bytes_field() {
+        #[derive(serde::Serialize)]
+        struct Plain {
+            #[serde(with = "serde_bytes")]
+            mls_crypto_state: Vec<u8>,
+        }
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Wiping {
+            mls_crypto_state: crate::context::state::MlsCryptoState,
+        }
+        let bytes = vec![0xA7; 97];
+        let wiping = Wiping {
+            mls_crypto_state: crate::context::state::MlsCryptoState(zeroize::Zeroizing::new(
+                bytes.clone(),
+            )),
+        };
+        let encoded = rmp_serde::to_vec_named(&wiping).unwrap();
+        assert_eq!(
+            encoded,
+            rmp_serde::to_vec_named(&Plain {
+                mls_crypto_state: bytes.clone()
+            })
+            .unwrap()
+        );
+        let back: Wiping = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(*back.mls_crypto_state, bytes[..]);
+        assert_ne!(
+            rmp_serde::to_vec(&zeroize::Zeroizing::new(bytes.clone())).unwrap(),
+            rmp_serde::to_vec(&serde_bytes::ByteBuf::from(bytes)).unwrap()
+        );
+    }
 
     /// Helper to build a test snapshot.
     fn test_snapshot(context_id: &str) -> ContextSnapshot {
@@ -995,7 +1063,7 @@ mod tests {
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
-            mls_crypto_state: Vec::new(),
+            mls_crypto_state: crate::context::state::MlsCryptoState::default(),
             migration_state: None,
             access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
             consequence_rules: Vec::new(),
@@ -1249,7 +1317,8 @@ mod tests {
         let mut snapshot = test_snapshot("ctx-roundtrip-2");
         // MLS group state rides inside the SIGNED snapshot, not the envelope.
         // Populate it so the round-trip exercises the signed-blob path.
-        snapshot.mls_crypto_state = vec![0xDE, 0xAD];
+        snapshot.mls_crypto_state =
+            crate::context::state::MlsCryptoState(zeroize::Zeroizing::new(vec![0xDE, 0xAD]));
         let export = create_export(
             snapshot,
             event_log_data,
@@ -1270,7 +1339,7 @@ mod tests {
             decoded.snapshot.event_log_merkle_root,
             export.snapshot.event_log_merkle_root
         );
-        assert_eq!(decoded.snapshot.mls_crypto_state, vec![0xDE, 0xAD]);
+        assert_eq!(*decoded.snapshot.mls_crypto_state, vec![0xDE, 0xAD]);
         assert_eq!(decoded.version, CURRENT_EXPORT_VERSION);
         assert!(!decoded.event_log_data.is_empty());
     }
@@ -1884,7 +1953,8 @@ mod tests {
     fn public_export_strips_sensitive_data() {
         let mut snapshot = test_snapshot("ctx-public-1");
         // Sensitive MLS group state must NOT survive a public-scope export.
-        snapshot.mls_crypto_state = vec![1, 2, 3];
+        snapshot.mls_crypto_state =
+            crate::context::state::MlsCryptoState(zeroize::Zeroizing::new(vec![1, 2, 3]));
         let export = create_export(
             snapshot,
             Vec::new(),
@@ -1912,7 +1982,8 @@ mod tests {
 
         let mut snapshot = test_snapshot("ctx-full-1");
         // MLS group state rides inside the signed snapshot; full scope keeps it.
-        snapshot.mls_crypto_state = vec![0xFF];
+        snapshot.mls_crypto_state =
+            crate::context::state::MlsCryptoState(zeroize::Zeroizing::new(vec![0xFF]));
         let export = create_export(
             snapshot,
             event_log_data,
@@ -1925,7 +1996,7 @@ mod tests {
 
         assert_eq!(export.scope, ExportScope::Full);
         assert!(!export.event_log_data.is_empty());
-        assert_eq!(export.snapshot.mls_crypto_state, vec![0xFF]);
+        assert_eq!(*export.snapshot.mls_crypto_state, vec![0xFF]);
         assert_ne!(export.snapshot.event_log_merkle_root, [0u8; 32]);
     }
 

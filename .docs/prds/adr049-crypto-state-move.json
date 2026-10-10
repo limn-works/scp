@@ -46,7 +46,7 @@
         { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 6. `ContextCryptoProvider` (26 methods) is deleted; replaced by two narrow traits" },
         { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 15. PR-7 crypto-state move is one atomic PR, not per-domain" }
       ],
-      "details": { "phase": "2 (ADR-049)", "crate": "scp-runtime", "adr": "ADR-049", "pr": "PR-7-prep" }
+      "details": { "phase": "2 (ADR-049)", "crate": "scp-runtime", "adr": "ADR-049", "pr": "PR-7-prep", "superseded_acceptance_criteria": "The primitive list in the fifth criterion names `process_commit`, which no longer exists. On 2026-10-09 Alec ruled that the MLS paths with no production caller are deleted, and this change deletes `MlsBackend::process_commit`, `ProductionMlsBackend::process_commit`, and `scp_mls::ratchet::process_commit`; a received Commit merges through `MlsBackend::decrypt`. The criterion's property, that MLS primitives stay on the backends, still holds. Read this story against the commit that merged it, not against current HEAD." }
     },
     {
       "id": "SCP-CRYPTOMOVE-000b",
@@ -235,7 +235,7 @@
         "Add the async tests enumerated in the acceptance criteria (pre-dispatch-seed for restore/respawn/welcome, fresh-create in-dispatch take timing, send_sequence-seeds-send_tracker, cross-domain reachability, rotation Class-S fail-closed + registry-floor-no-regress, respawn one-way-invariant via returned owned material, provider-returns-owned-by-actor).",
         "Apply the mandatory hardening folded into the atomic core: H1 retain provider destroy_mls_group + destroy_sender_key as birth-seam machinery (builder.rs rollback); H2 make create_group_into_slot / install_joined_group / generate_sender_key return CreationFailed when taken_context_ids.contains(context_id) and have the build_restored_owned seeding path record the context into taken_context_ids; H3 unify the wrapping keypair to a single ArcSwap<Arc<(public, Zeroizing<secret>)>> (superseding prep-B's two separate accessors, updating their callers/tests); H4 discard/zeroize the whole PerContextState crypto material at every destroy seam (ttl terminal, close, broadcast no-op); H5 route build_restored_owned's RestoredFloors into validate_and_merge_all_floors on the cold-restart empty-registry path with a behavioral replay-rejection test; H6 delete the parallel SequenceReservation::reserve at actor/handlers/messaging.rs (~362) so the send_tracker advances exactly once via the inherent seal (u64::MAX guard inherited).",
         "Document the pre-existing OBS-2 property in the restore split: build_restored_owned mutates the node wrapping-keypair slot as a side effect (last-writer-wins, idempotent for a consistent snapshot set), and the wrapping keypair is NOT rolled back on a floor-merge reject — cite this as deliberate, not a regression. Keep MlsCryptoSnapshot pub(crate) (do not re-narrow to private; the actor export references it).",
-        "Run the full ADR-049 Verification command block plus the review roster to double-zero before opening the PR."
+        "Run the full ADR-049 Verification command block plus the review loop in the root AGENTS.md before opening the PR."
       ],
       "blockedBy": ["SCP-CRYPTOMOVE-000a", "SCP-CRYPTOMOVE-000b", "SCP-CRYPTOMOVE-000c", "SCP-CRYPTOMOVE-000d", "SCP-CRYPTOMOVE-000e"],
       "sources": [

@@ -53,6 +53,10 @@ pub mod socket;
 pub mod storage;
 pub mod time;
 
+// Links the one `#[global_allocator]`, which wipes every heap block before
+// freeing it (09-security-model.md §9.15, freed heap memory).
+use scp_alloc as _;
+
 use std::sync::Arc;
 
 use scp_client::{ContextStatus, RelaySink, ScpClient, Signer, Storage};

@@ -21,7 +21,7 @@
  * If a bindings-only publication lands (tracked as a follow-up in the
  * Kotlin SDK build), switch this dependency over.
  *
- * Run: ./gradlew :kotlin-bridge-runner:run --args="" --quiet
+ * Run: ./gradlew :kotlin-bridge-runner:run --args="" --quiet -Pscp.uniffi.cargoFeatures=testing
  * (The harness resolves the application script directly via distTar /
  * installDist — see conftest.py.)
  */
@@ -74,7 +74,7 @@ application {
 // `./gradlew run` — it uses `installDist` and then launches the bin
 // script directly so stdin is the harness's pipe. This configuration
 // block exists so `./gradlew run` is still usable for manual smoke
-// testing (e.g. `echo '{...}' | ./gradlew run --quiet`).
+// testing (e.g. `echo '{...}' | ./gradlew run --quiet -Pscp.uniffi.cargoFeatures=testing`).
 tasks.named<JavaExec>("run") {
     standardInput = System.`in`
 }

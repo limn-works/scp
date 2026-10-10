@@ -18,6 +18,7 @@
 pub mod bridge_state;
 pub mod error_codes;
 pub mod outlet_id;
+pub mod p256_host;
 pub mod ucan_errors;
 pub mod validate;
 

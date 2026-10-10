@@ -34,8 +34,8 @@ testing = [
 ]
 # Shared callback-custody byte/string parsing helpers (custody_parse module).
 # Requires only scp-platform for the typed return values (KeyHandle,
-# PseudonymKeypair, PublicKey, PlatformError); scp-crypto, for the P-256
-# point and strict signature checks on host pseudonym returns. Deliberately NOT folded into
+# Pseudonym, PublicKey, PlatformError); scp-crypto, for the P-256 host
+# helpers and the custody failure kind. Deliberately NOT folded into
 # `resolvers`: these are pure byte/string ops far lighter than the resolver
 # stack.
 custody = ["dep:scp-platform"]

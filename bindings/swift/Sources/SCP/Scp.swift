@@ -186,8 +186,9 @@ public final class SCP: @unchecked Sendable {
     /// Shuts down this instance with a graceful deadline (seconds).
     ///
     /// Awaits in-flight tasks up to `timeout` seconds, aborts any
-    /// remaining tasks, then runs typed-field cleanup. Permanent. A
-    /// second call is a no-op.
+    /// remaining tasks, then runs typed-field cleanup. Permanent. Throws `ScpError.Validation` with
+    /// `SCP-STORAGE-8005` when the durable store still holds its advisory
+    /// lock after the call.
     ///
     /// Fractional seconds (e.g. `0.25`) are preserved to millisecond
     /// resolution before crossing the UniFFI boundary — the native
@@ -287,10 +288,6 @@ public extension SCP {
     func applyPendingCeilingModification(handle: ContextHandle, currentTimestamp: UInt64) async throws -> Bool {
         try await inner.applyPendingCeilingModification(handle: handle, currentTimestamp: currentTimestamp)
     }
-
-    // `bridgeEvaluateTrust` moved to a UniFFI-generated free top-level
-    // function under ADR-048 §1 + §7 Swift bullet. Call it directly:
-    // `try bridgeEvaluateTrust(isBridged:isNativeTransport:shadowStatus:)`.
 
     /// Forwards to ``Scp/broadcastAdmission`` on ``inner``.
     func broadcastAdmission(handle: ContextHandle) async -> String? {
@@ -466,10 +463,10 @@ public extension SCP {
     /// (governed-context invitations are not yet implemented).
     ///
     /// The invite routes through the actor governance gate, which requires the
-    /// inviter to hold the `governance:propose` capability. A normally-created
-    /// `SingleAdmin` context grants its admin that capability at genesis, so it
-    /// works out of the box; a context with a custom ceiling must grant
-    /// `governance:propose` to the inviter.
+    /// inviter to hold the `governance:propose` capability. The creator of a
+    /// `SingleAdmin` context holds the admin role, which grants every
+    /// capability in the context's ceiling, so the creator can invite only
+    /// when that ceiling includes `governance:propose`.
     ///
     /// ```swift
     /// let outcome = try await scp.inviteMember(
@@ -862,8 +859,8 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/mcpClientConnectSse`` on ``inner``.
-    func mcpClientConnectSse(url: String) async throws -> String {
-        try await inner.mcpClientConnectSse(url: url)
+    func mcpClientConnectSse(url: String, authToken: String?) async throws -> String {
+        try await inner.mcpClientConnectSse(url: url, authToken: authToken)
     }
 
     /// Forwards to ``Scp/mcpClientConnectStdio`` on ``inner``.
@@ -1112,90 +1109,6 @@ public extension SCP {
     /// Forwards to ``Scp/scpidVerify`` on ``inner``.
     func scpidVerify(responseJson: String, challengeJson: String) throws -> String {
         try inner.scpidVerify(responseJson: responseJson, challengeJson: challengeJson)
-    }
-
-    // MARK: - Bridge credential store (spec §12.11)
-
-    //
-    // Per-instance credential store ops. Each forwards to ``inner`` — the
-    // credentials live in THIS instance's store (ADR-048 §1). The encrypted
-    // credential bytes never cross the FFI boundary; only metadata is
-    // returned for provision/rotate.
-
-    /// Provisions (stores) an encrypted credential for a bridge instance.
-    /// Forwards to ``Scp/bridgeCredentialProvision`` on ``inner``.
-    func bridgeCredentialProvision(
-        bridgeId: String,
-        credentialType: String,
-        plaintext: Data,
-        bridgeCredentialKey: Data
-    ) throws -> BridgeCredentialResult {
-        try inner.bridgeCredentialProvision(
-            bridgeId: bridgeId,
-            credentialType: credentialType,
-            plaintext: plaintext,
-            bridgeCredentialKey: bridgeCredentialKey
-        )
-    }
-
-    /// Retrieves and decrypts a credential for a bridge instance.
-    /// Forwards to ``Scp/bridgeCredentialRetrieve`` on ``inner``.
-    func bridgeCredentialRetrieve(
-        bridgeId: String,
-        credentialType: String,
-        bridgeCredentialKey: Data
-    ) throws -> Data {
-        try inner.bridgeCredentialRetrieve(
-            bridgeId: bridgeId,
-            credentialType: credentialType,
-            bridgeCredentialKey: bridgeCredentialKey
-        )
-    }
-
-    /// Rotates (replaces) a credential for a bridge instance.
-    /// Forwards to ``Scp/bridgeCredentialRotate`` on ``inner``.
-    func bridgeCredentialRotate(
-        bridgeId: String,
-        credentialType: String,
-        newPlaintext: Data,
-        bridgeCredentialKey: Data
-    ) throws -> BridgeCredentialResult {
-        try inner.bridgeCredentialRotate(
-            bridgeId: bridgeId,
-            credentialType: credentialType,
-            newPlaintext: newPlaintext,
-            bridgeCredentialKey: bridgeCredentialKey
-        )
-    }
-
-    /// Revokes all credentials for a bridge instance.
-    /// Forwards to ``Scp/bridgeCredentialRevoke`` on ``inner``.
-    func bridgeCredentialRevoke(bridgeId: String) throws {
-        try inner.bridgeCredentialRevoke(bridgeId: bridgeId)
-    }
-
-    /// Lists all credential types stored for a bridge instance.
-    /// Forwards to ``Scp/bridgeCredentialList`` on ``inner``.
-    func bridgeCredentialList(bridgeId: String) throws -> [String] {
-        try inner.bridgeCredentialList(bridgeId: bridgeId)
-    }
-
-    /// Stores a bridge credential key in the custody boundary.
-    /// Forwards to ``Scp/bridgeCredentialStoreKey`` on ``inner``.
-    func bridgeCredentialStoreKey(bridgeId: String, key: Data) throws {
-        try inner.bridgeCredentialStoreKey(bridgeId: bridgeId, key: key)
-    }
-
-    /// Retrieves a bridge credential key from the custody boundary.
-    /// Forwards to ``Scp/bridgeCredentialGetKey`` on ``inner``.
-    func bridgeCredentialGetKey(bridgeId: String) throws -> Data {
-        try inner.bridgeCredentialGetKey(bridgeId: bridgeId)
-    }
-
-    /// Deletes and zeroizes a bridge credential key.
-    /// Forwards to ``Scp/bridgeCredentialDeleteKey`` on ``inner``.
-    func bridgeCredentialDeleteKey(bridgeId: String) throws {
-        try inner.bridgeCredentialDeleteKey(bridgeId: bridgeId)
     }
 
     /// Forwards to ``Scp/setEconomicPolicy`` on ``inner``.

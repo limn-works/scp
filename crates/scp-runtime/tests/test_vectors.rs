@@ -25,7 +25,7 @@
 use sha2::{Digest, Sha256};
 
 use scp_crypto::p256::{
-    P256Error, P256PublicKey, P256SigningKey, sign_prehash_rfc6979, verify_prehash_strict,
+    P256Error, P256PublicKey, P256SecretKey, SeedLabel, sign_prehash_rfc6979, verify_prehash_strict,
 };
 use scp_did::{DID, SigningKeyId};
 use scp_protocol::context::governance::{GovernanceAction, compute_proposal_id};
@@ -109,8 +109,8 @@ fn fixture_identifier_bytes(role: &str) -> [u8; 32] {
     sha256(format!("SCP test vector identifier {role}").as_bytes())
 }
 
-fn reference_key() -> P256SigningKey {
-    P256SigningKey::from_seed(TEST_VECTOR_KEY_LABEL, &unhex32(REFERENCE_KEYS[0].0)).unwrap()
+fn reference_key() -> P256SecretKey {
+    P256SecretKey::from_seed(SeedLabel::TestVectorKey, &unhex32(REFERENCE_KEYS[0].0))
 }
 
 /// Asserts that the spec's printed preimage is `expected_len` bytes and hashes
@@ -186,8 +186,9 @@ fn assert_reference_signature(label: &str, digest: &[u8; 32], expected_hex: &str
 
 #[test]
 fn vector_0_reference_keys_derive_from_seeds() {
+    assert_eq!(SeedLabel::TestVectorKey.as_bytes(), TEST_VECTOR_KEY_LABEL);
     for (seed, scalar, compressed, uncompressed) in REFERENCE_KEYS {
-        let key = P256SigningKey::from_seed(TEST_VECTOR_KEY_LABEL, &unhex32(seed)).unwrap();
+        let key = P256SecretKey::from_seed(SeedLabel::TestVectorKey, &unhex32(seed));
         assert_eq!(
             hex::encode(*key.to_scalar_bytes()),
             scalar,
@@ -597,8 +598,7 @@ fn continuity_preimage(
 #[test]
 fn vectors_20_38_key_continuity_fingerprint() {
     let key = |seed: u8| {
-        P256SigningKey::from_seed(TEST_VECTOR_KEY_LABEL, &[seed; 32])
-            .unwrap()
+        P256SecretKey::from_seed(SeedLabel::TestVectorKey, &[seed; 32])
             .public_key()
             .to_compressed()
     };
@@ -902,8 +902,7 @@ fn trust_attestation_verify_round_trip_rule_b_ed25519() {
 #[test]
 fn vector_37_keypackage_attestation() {
     let derived = |seed: u8| {
-        P256SigningKey::from_seed(TEST_VECTOR_KEY_LABEL, &[seed; 32])
-            .unwrap()
+        P256SecretKey::from_seed(SeedLabel::TestVectorKey, &[seed; 32])
             .public_key()
             .to_uncompressed()
     };

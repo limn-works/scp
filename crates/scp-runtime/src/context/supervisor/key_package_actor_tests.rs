@@ -2365,11 +2365,10 @@ async fn reserved_kp_with_lost_index_entry_restored_as_reserved_on_respawn() {
     let public_bytes = {
         let key = format!("scp-kp/{}/{kp_ref}", alice().0);
         let record = storage.retrieve(&key).await.unwrap().unwrap();
-        // The restored reserved KP record still holds the public bytes; clone
-        // them by reference (`PersistedKeyPackage` has a zeroizing `Drop`, so its
-        // fields cannot be moved out by value).
-        let parsed = rmp_serde::from_slice::<super::PersistedKeyPackage>(&record).unwrap();
-        parsed.public_bytes.clone()
+        // The restored reserved KP record still holds the public bytes.
+        rmp_serde::from_slice::<super::PersistedKeyPackage>(&record)
+            .unwrap()
+            .public_bytes
     };
     let welcome = real_welcome_for(&mls2, &public_bytes).await;
     handle2
@@ -2879,6 +2878,262 @@ async fn fused_welcome_confirm_flow_joins_real_reserved_kp() {
     handle.send_shutdown().await.unwrap();
 }
 
+/// [`spawn_filled`] over fresh storage, then one KeyPackage reserved. Returns
+/// the actor handle, its storage, the reserved KeyPackage's ref, the
+/// reservation id, and the KeyPackage's public bytes.
+async fn spawn_and_reserve_real() -> (
+    KeyPackageStoreHandle,
+    Arc<dyn OpenMlsStorageAdapter>,
+    KpRef,
+    ReservationId,
+    Vec<u8>,
+) {
+    let storage = in_memory_storage();
+    let (handle, _join) = spawn_filled(Arc::clone(&storage)).await;
+    let kp_ref = live_index(&storage, &alice()).await[0].clone();
+    let (reservation_id, public_bytes) = handle
+        .send(|reply| KeyPackageCommand::Reserve {
+            kp_ref: kp_ref.clone(),
+            reply,
+        })
+        .await
+        .unwrap();
+    (handle, storage, kp_ref, reservation_id, public_bytes)
+}
+
+/// A Welcome whose tree holds a KeyPackage-sourced leaf that expired under the
+/// real clock, which both openmls and the actor backend read, joins through the
+/// fused confirm, and the confirm deletes the reserved KeyPackage record (ADR-057
+/// §Prereq-1). A member whose leaf expired no longer blocks a join.
+#[tokio::test]
+async fn fused_confirm_joins_welcome_with_expired_tree_leaf() {
+    let (handle, storage, kp_ref, reservation_id, public_bytes) = spawn_and_reserve_real().await;
+
+    let (mut group, carol_not_after) = scp_mls::group::group_holding_carol_leaf_expired().unwrap();
+    assert!(
+        carol_not_after < SystemClock.now_secs(),
+        "Carol's leaf must be expired under the real clock"
+    );
+    let added = real_backend()
+        .add_member_raw(&mut group, &public_bytes)
+        .await
+        .unwrap();
+
+    handle
+        .send(|reply| KeyPackageCommand::ConfirmConsume {
+            reservation_id,
+            welcome_bytes: added.welcome,
+            reply,
+        })
+        .await
+        .expect("a Welcome holding an expired tree leaf joins");
+    assert!(
+        !kp_record_present(&storage, &alice(), &kp_ref).await,
+        "confirm deletes the KP key from storage"
+    );
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// A Welcome whose tree holds a KeyPackage-sourced leaf over the maximum
+/// lifetime range fails the fused join with `CryptoFailed` carrying
+/// `TreeLeafLifetimeRangeInvalid`, not `InvalidKeyPackage`, because the
+/// rejected leaf is in the sender's tree, not the caller's KeyPackage. This
+/// pins `map_join_error`'s mapping. The reserved KeyPackage is not burned.
+#[tokio::test]
+async fn fused_confirm_rejects_over_range_tree_leaf_as_crypto_failed() {
+    let (handle, storage, kp_ref, reservation_id, public_bytes) = spawn_and_reserve_real().await;
+
+    let (mut group, over_long_not_after) =
+        scp_mls::group::group_holding_carol_leaf_over_max_range().unwrap();
+    let added = real_backend()
+        .add_member_raw(&mut group, &public_bytes)
+        .await
+        .unwrap();
+
+    let err = handle
+        .send(|reply| KeyPackageCommand::ConfirmConsume {
+            reservation_id,
+            welcome_bytes: added.welcome,
+            reply,
+        })
+        .await
+        .err()
+        .expect("a Welcome holding an over-range leaf makes the fused join fail");
+    let expected_not_after = format!("not_after={over_long_not_after}");
+    assert!(
+        matches!(
+            &err,
+            ContextError::CryptoFailed(msg)
+                if msg.starts_with("join from welcome: ")
+                    && msg.contains("tree leaf lifetime range")
+                    && msg.contains(&expected_not_after)
+        ),
+        "expected CryptoFailed carrying Carol's range error, got {err:?}"
+    );
+    assert!(
+        kp_record_present(&storage, &alice(), &kp_ref).await,
+        "a rejected join must not burn the KP"
+    );
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// The joiner's own reserved KeyPackage, minted on the joiner clock at the
+/// real time, has expired under that clock by the time the Welcome arrives.
+/// The fused join fails with `InvalidKeyPackage`, because the rejected
+/// `Lifetime` is the caller's own KeyPackage's, not a leaf in the sender's
+/// tree. This pins `map_join_error`'s mapping of `KeyPackageLifetimeInvalid`.
+/// The join records no consumed init key and keeps the reservation and the
+/// KeyPackage: a retry reaches the same rejection rather than `InvalidState`
+/// for an unknown reservation.
+#[tokio::test]
+async fn fused_confirm_rejects_own_key_package_expired_under_joiner_clock_as_invalid_key_package() {
+    let real_now = SystemClock.now_secs();
+    let joiner_clock = Arc::new(scp_clock::TestClock::new(real_now));
+    let storage = in_memory_storage();
+    let backend = Arc::new(ProductionMlsBackend::new(
+        Arc::clone(&joiner_clock) as Arc<dyn Clock>
+    ));
+    backend.set_consumed_init_key_store(Arc::clone(&storage));
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        deps_with(backend, Arc::clone(&storage), no_transport()),
+    );
+    handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect("startup reconcile + replenish barrier: Replenish reply must be Ok");
+    let kp_ref = live_index(&storage, &alice()).await[0].clone();
+    let (reservation_id, public_bytes) = handle
+        .send(|reply| KeyPackageCommand::Reserve {
+            kp_ref: kp_ref.clone(),
+            reply,
+        })
+        .await
+        .unwrap();
+    let consumed_key = ProductionMlsBackend::consumed_init_key_key(&public_bytes).unwrap();
+    // The adder reads the real clock, under which the KeyPackage is current.
+    let welcome_bytes = real_welcome_for(&real_backend(), &public_bytes).await;
+    joiner_clock.set(real_now + scp_mls::KEY_PACKAGE_LIFETIME_SECS + 1);
+
+    for attempt in ["first", "retry"] {
+        let err = handle
+            .send(|reply| KeyPackageCommand::ConfirmConsume {
+                reservation_id: reservation_id.clone(),
+                welcome_bytes: welcome_bytes.clone(),
+                reply,
+            })
+            .await
+            .err()
+            .expect("an own KeyPackage expired under the joiner clock makes the fused join fail");
+        assert!(
+            matches!(
+                &err,
+                ContextError::InvalidKeyPackage(msg) if msg.contains("key package lifetime invalid")
+            ),
+            "{attempt}: expected InvalidKeyPackage for the caller's own expired KeyPackage, got {err:?}"
+        );
+    }
+    assert!(
+        storage.retrieve(&consumed_key).await.unwrap().is_none(),
+        "a rejected join must not record the init key as consumed"
+    );
+    assert!(
+        kp_record_present(&storage, &alice(), &kp_ref).await,
+        "a rejected join must not burn the KP"
+    );
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// A tombstone store failure after a successful fused join, then a healed
+/// retry once the own KeyPackage has expired under the joiner clock: the
+/// retry's inner join is `KeyPackageReplay`, because the consumed-set check
+/// runs before any lifetime check, so the actor recognizes its own prior
+/// completion and finishes the consume (`InvalidState`, record and
+/// reservation gone) instead of reporting `InvalidKeyPackage`.
+#[tokio::test]
+async fn confirm_retry_after_completed_join_finishes_consume_once_own_key_package_expired() {
+    let real_now = SystemClock.now_secs();
+    let joiner_clock = Arc::new(scp_clock::TestClock::new(real_now));
+    let healthy = Arc::new(InMemoryStorage::new());
+    let faulty = Arc::new(FaultyStorage::new(Arc::clone(&healthy)));
+    let storage: Arc<dyn OpenMlsStorageAdapter> =
+        Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&faulty)));
+    let backend = Arc::new(ProductionMlsBackend::new(
+        Arc::clone(&joiner_clock) as Arc<dyn Clock>
+    ));
+    backend.set_consumed_init_key_store(Arc::clone(&storage));
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        deps_with(backend, Arc::clone(&storage), no_transport()),
+    );
+    handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect("startup reconcile + replenish barrier: Replenish reply must be Ok");
+    let kp_ref = live_index(&storage, &alice()).await[0].clone();
+    let (reservation_id, public_bytes) = handle
+        .send(|reply| KeyPackageCommand::Reserve {
+            kp_ref: kp_ref.clone(),
+            reply,
+        })
+        .await
+        .unwrap();
+    let welcome = real_welcome_for(&real_backend(), &public_bytes).await;
+
+    // The fused join completes and records the init key; the tombstone write,
+    // the last durable step, fails.
+    faulty.fail_prefix("scp-kp-consumed/");
+    let err = handle
+        .send(|reply| KeyPackageCommand::ConfirmConsume {
+            reservation_id: reservation_id.clone(),
+            welcome_bytes: welcome.clone(),
+            reply,
+        })
+        .await
+        .err()
+        .expect("first confirm errs when the tombstone store fails");
+    assert!(matches!(err, ContextError::PersistenceFailed(_)));
+
+    // The own KeyPackage's `not_after` is `real_now + KEY_PACKAGE_LIFETIME_SECS`.
+    joiner_clock.set(real_now + scp_mls::KEY_PACKAGE_LIFETIME_SECS + 1);
+    faulty.clear_fail();
+    let retry = handle
+        .send(|reply| KeyPackageCommand::ConfirmConsume {
+            reservation_id: reservation_id.clone(),
+            welcome_bytes: welcome.clone(),
+            reply,
+        })
+        .await
+        .err()
+        .expect("healed retry errs: the joined group is not retained across confirms");
+    assert!(
+        matches!(retry, ContextError::InvalidState(_)),
+        "the retry must finish the consume as the actor's own prior completion, got {retry:?}"
+    );
+    assert!(
+        !kp_record_present(&storage, &alice(), &kp_ref).await,
+        "the consume removed the KP private record"
+    );
+    let unknown = handle
+        .send(|reply| KeyPackageCommand::ConfirmConsume {
+            reservation_id,
+            welcome_bytes: welcome,
+            reply,
+        })
+        .await
+        .err()
+        .expect("a consumed reservation must not confirm again");
+    assert!(
+        matches!(&unknown, ContextError::InvalidState(msg) if msg == "unknown or already-consumed reservation"),
+        "the reservation is gone, got {unknown:?}"
+    );
+
+    handle.send_shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn fused_welcome_cancel_flow() {
     let storage = in_memory_storage();
@@ -3028,13 +3283,6 @@ impl MlsBackend for FailingBackend {
         ciphertext: &[u8],
     ) -> Result<DecryptedContent, MlsError> {
         self.inner.decrypt(group, ciphertext).await
-    }
-    async fn process_commit(
-        &self,
-        group: &mut ScpMlsGroup,
-        commit_bytes: &[u8],
-    ) -> Result<(), MlsError> {
-        self.inner.process_commit(group, commit_bytes).await
     }
     async fn advance_epoch(
         &self,
@@ -3444,5 +3692,28 @@ async fn send_reply_await_is_bounded_when_actor_never_replies() {
         elapsed >= KP_REPLY_TIMEOUT,
         "reply-await must span the full KP_REPLY_TIMEOUT budget before failing \
          closed (elapsed {elapsed:?} < {KP_REPLY_TIMEOUT:?})"
+    );
+}
+
+/// A KeyPackage record's `Zeroizing` signer-state encodes as the plain
+/// `Vec<u8>` field it replaced, so stored records still decode.
+#[test]
+fn kp_record_encodes_like_plain_fields() {
+    #[derive(serde::Serialize)]
+    struct Plain {
+        public_bytes: Vec<u8>,
+        signer_state: Vec<u8>,
+    }
+    let record = super::PersistedKeyPackage {
+        public_bytes: vec![0x11; 200],
+        signer_state: zeroize::Zeroizing::new(vec![0x5A; 300]),
+    };
+    let plain = Plain {
+        public_bytes: vec![0x11; 200],
+        signer_state: vec![0x5A; 300],
+    };
+    assert_eq!(
+        rmp_serde::to_vec_named(&record).unwrap(),
+        rmp_serde::to_vec_named(&plain).unwrap()
     );
 }

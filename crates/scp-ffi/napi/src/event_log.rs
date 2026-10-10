@@ -501,18 +501,7 @@ pub(crate) fn event_log_checkpoint_on(
                     &signer,
                 )
                 .await
-                .map_err(|e| match &e {
-                    scp_event_log::EventLogError::Custody(failure) => {
-                        ScpNapiError::custody_failure(
-                            format!("checkpoint generation failed: {e}"),
-                            failure,
-                        )
-                    }
-                    _ => ScpNapiError::Context {
-                        message: format!("checkpoint generation failed: {e}"),
-                        code: codes::CTX_2023.to_owned(),
-                    },
-                })
+                .map_err(|e| ScpNapiError::checkpoint_error(&e))
             })
         })
         .map_err(napi::Error::from)?;
@@ -568,18 +557,7 @@ pub(crate) fn event_log_checkpoint_by_did_on(
                     &signer,
                 )
                 .await
-                .map_err(|e| match &e {
-                    scp_event_log::EventLogError::Custody(failure) => {
-                        ScpNapiError::custody_failure(
-                            format!("checkpoint generation failed: {e}"),
-                            failure,
-                        )
-                    }
-                    _ => ScpNapiError::Context {
-                        message: format!("checkpoint generation failed: {e}"),
-                        code: codes::CTX_2023.to_owned(),
-                    },
-                })
+                .map_err(|e| ScpNapiError::checkpoint_error(&e))
             })
         })
         .map_err(napi::Error::from)?;
@@ -712,6 +690,57 @@ mod tests {
         assert!(
             reason.contains("SCP-IDENT-1017"),
             "expected SCP-IDENT-1017, got: {reason}"
+        );
+    }
+
+    /// An identity whose `#active` key custody no longer holds fails the
+    /// checkpoint with `SCP-CRYPTO-4006`: `KeyCustodySigner` carries the
+    /// signing failure as `EventLogError::Custody`, and the bridge maps its
+    /// kind.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn event_log_checkpoint_with_a_destroyed_signing_key_is_crypto_4006() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let (creator, handle) = crate::runtime().block_on(async {
+            let creator = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let params = serde_json::json!({
+                "mode": "broadcast",
+                "ceiling": ["messages:read"],
+                "memoryScope": "full",
+                "governance": "single_admin",
+            })
+            .to_string();
+            let handle = crate::context::context_create_on(&bi, &creator, params)
+                .await
+                .expect("context_create should succeed");
+            let custody = creator
+                .inner
+                .in_memory_custody
+                .as_ref()
+                .expect("an in-memory identity retains its custody");
+            let key = creator
+                .inner
+                .scp_identity
+                .as_ref()
+                .expect("an in-memory identity retains its identity state")
+                .active_signing_key;
+            scp_platform::traits::KeyCustody::destroy_key(custody.as_ref(), &key)
+                .await
+                .expect("destroy_key should succeed");
+            (creator, handle)
+        });
+
+        let Err(err) = event_log_checkpoint_on(&bi, &handle, &creator, 1.0) else {
+            panic!("a checkpoint under a destroyed signing key must fail")
+        };
+        assert!(
+            err.reason.contains(codes::CRYPTO_4006),
+            "expected SCP-CRYPTO-4006 for a destroyed signing key, got: {}",
+            err.reason
         );
     }
 

@@ -42,6 +42,9 @@ testing = [
 outlet-capability-test-grant = ["scp-core/outlet-capability-test-grant"]
 
 [dependencies]
+# Links the wiping global allocator every shipped artifact installs
+# (09-security-model.md §9.15, freed heap memory).
+scp-alloc = { path = "../../scp-alloc" }
 napi = { version = "3", default-features = false, features = ["napi9", "tokio_rt", "async", "error_anyhow"] }
 napi-derive = "3"
 tokio = { workspace = true }
@@ -58,7 +61,7 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 rmp-serde = { workspace = true }
 ed25519-dalek = { workspace = true }
-tls_codec = "0.4"
+tls_codec = "0.5"
 # `CustodyFailure`, the typed custody error the runtime carries to the bridge;
 # tests also recompute P-256 pseudonym points and signatures.
 scp-crypto = { path = "../../scp-crypto" }
@@ -95,6 +98,9 @@ tokio-util = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
+# The MCP subscription tests build a wired server with
+# `McpServer::with_event_source`, public only under `scp-mcp/testing`.
+scp-mcp = { path = "../../scp-mcp", features = ["testing"] }
 scp-ffi-common = { path = "../common", features = ["testing", "custody"] }
 # This bridge constructs `InMemoryDhtClient` in its own tests (identity.rs,
 # scp.rs) which is gated behind `scp-dht/testing`; activate it for this crate's

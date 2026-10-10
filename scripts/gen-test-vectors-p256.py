@@ -1336,6 +1336,47 @@ PSEUDONYM_SEEDS = [
 ]
 
 
+def pseudonym_v1_public(identity_seed: bytes, context_id: bytes, name: str) -> bytes:
+    """Returns the compressed v1 pseudonym point for an identity seed and context.
+
+    The identity scalar comes from `identity_seed` under the §25.2 test-vector
+    label, and the point follows the §9.10.4.A static (v1) recipe.
+    """
+    identity = keypair_from_seed(
+        identity_seed, TEST_VECTOR_KEY_LABEL, f"{name} identity"
+    )
+    secret = hkdf(
+        ikm=identity.private_bytes,
+        salt=PSEUDONYM_SECRET_SALT,
+        info=b"",
+        length=32,
+    )
+    seed_v1 = hmac_sha256(secret, context_id + b"scp-pseudonym")
+    return KeyPair(
+        seed_to_scalar(seed_v1, PSEUDONYM_SCALAR_LABEL), f"{name} pseudonym v1"
+    ).compressed
+
+
+# The scp-client-wasm cross-target determinism test runs the §9.10.4.A recipe
+# on native and on wasm32 against one golden. Its seed and context differ from
+# Vectors 30 and 31, so a target that reproduced only those vectors (for
+# example, through a lookup) would still fail it.
+CROSS_TARGET_PSEUDONYM_SEED = bytes.fromhex("07" * 32)
+CROSS_TARGET_PSEUDONYM_CONTEXT = b"scp-transport-kat-ctx"
+
+
+def emit_cross_target_pseudonym() -> None:
+    section("scp-client-wasm cross-target pseudonym golden (§9.10.4.A, v1)")
+    emit_hex("cross_target.identity_seed", CROSS_TARGET_PSEUDONYM_SEED)
+    emit("cross_target.context_id", CROSS_TARGET_PSEUDONYM_CONTEXT.decode())
+    emit_hex(
+        "cross_target.pseudonym_public_v1",
+        pseudonym_v1_public(
+            CROSS_TARGET_PSEUDONYM_SEED, CROSS_TARGET_PSEUDONYM_CONTEXT, "cross_target"
+        ),
+    )
+
+
 def emit_pseudonym_derivation() -> None:
     section("§25.19 Per-context pseudonym derivation")
     context_id = "context-alpha"
@@ -1362,6 +1403,10 @@ def emit_pseudonym_derivation() -> None:
         emit_hex(f"{label}.pseudonym_secret", secret)
         emit_hex(f"{label}.context_seed_v1", seed_v1)
         emit_hex(f"{label}.pseudonym_public_v1", key_v1.compressed)
+        if key_v1.compressed != pseudonym_v1_public(seed, context_id.encode(), label):
+            raise AssertionError(
+                f"{label}: pseudonym_v1_public diverges from the vector"
+            )
         emit_hex(
             f"{label}.routing_id_v1",
             sha256(PSEUDONYM_ROUTING_PREFIX + key_v1.compressed),
@@ -2555,6 +2600,7 @@ def main() -> int:
     emit_identity_link_attestation()
     emit_hash_only_vectors()
     emit_pseudonym_derivation()
+    emit_cross_target_pseudonym()
     emit_pseudonym_announcement()
     emit_trust_attestation()
     emit_keypackage_attestation()

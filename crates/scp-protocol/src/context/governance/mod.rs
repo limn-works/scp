@@ -1425,6 +1425,17 @@ pub trait GovernanceEngine: Send + Sync {
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), GovernanceError>;
 
+    /// Refuse a proposer this engine does not let propose, without recording
+    /// anything. `propose` runs this same check before any other, so a caller
+    /// that must refuse an ineligible proposer before validating the action
+    /// payload calls it first.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error `propose` would return for this proposer: `NotAdmin`
+    /// in single-admin mode, `NotEligible` in the voting modes.
+    fn check_proposer(&self, proposer: &DID) -> Result<(), GovernanceError>;
+
     /// Cast an approval vote on a pending proposal.
     ///
     /// The voter must hold `GovernanceVote` capability (UCAN-validated).
@@ -1679,10 +1690,7 @@ impl GovernanceEngine for SingleAdminEngine {
         context: &GovernanceContext,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), GovernanceError> {
-        // Only the admin can propose in single-admin mode.
-        if *proposer != self.admin_did {
-            return Err(GovernanceError::NotAdmin);
-        }
+        self.check_proposer(proposer)?;
 
         // RFC 8785 JCS canonical serialization for cross-implementation
         // deterministic proposal ID computation (§9.5.2). JCS (not
@@ -1764,6 +1772,15 @@ impl GovernanceEngine for SingleAdminEngine {
         self.proposals.insert(proposal_id, proposal.clone());
 
         Ok((proposal, events))
+    }
+
+    fn check_proposer(&self, proposer: &DID) -> Result<(), GovernanceError> {
+        // Only the admin can propose in single-admin mode.
+        if *proposer == self.admin_did {
+            Ok(())
+        } else {
+            Err(GovernanceError::NotAdmin)
+        }
     }
 
     fn approve(

@@ -62,6 +62,13 @@ pub enum StreamSignerCustodyCategory {
     /// The custody backend does not support signing through this seam (e.g. a
     /// non-extractable HSM path). Maps from [`PlatformError::Unsupported`].
     Unsupported,
+    /// The custody backend's durable store is closed (spec §17.6 "One Opener
+    /// per Durable Directory"). Maps from [`PlatformError::StorageClosed`].
+    StorageClosed,
+    /// The custody backend's durable directory lock is still held (spec §17.6).
+    /// Maps from [`PlatformError::StorageLockHeld`]; the directory and lock
+    /// paths it carries are dropped.
+    StorageLockHeld,
     /// The custody backend failed for another reason (a generic backend
     /// fault). Maps from [`PlatformError::CustodyError`] and — conservatively,
     /// so an unclassified failure never falls through to a more permissive
@@ -82,6 +89,8 @@ impl StreamSignerCustodyCategory {
             Self::KeyNotFound => "signing key not found",
             Self::WrongKeyType => "wrong key type for signing",
             Self::Unsupported => "signing operation unsupported by backend",
+            Self::StorageClosed => "custody store closed",
+            Self::StorageLockHeld => "custody store lock still held",
             Self::BackendFault => "backend fault",
         }
     }
@@ -97,7 +106,10 @@ impl From<&PlatformError> for StreamSignerCustodyCategory {
     /// Maps a custody backend error into a bounded category, discarding all
     /// free-form detail. `KeyCustody::sign` documents [`PlatformError::KeyNotFound`]
     /// and [`PlatformError::WrongKeyType`]; a backend may additionally surface
-    /// [`PlatformError::CustodyError`] or [`PlatformError::Unsupported`]. Every
+    /// [`PlatformError::CustodyError`] or [`PlatformError::Unsupported`], and a
+    /// durable backend [`PlatformError::StorageClosed`] or
+    /// [`PlatformError::StorageLockHeld`], which keep their own categories so
+    /// the bridges report the same storage code as for the bare error. Every
     /// other variant is mapped to the conservative [`BackendFault`] category
     /// rather than reintroducing the error string.
     ///
@@ -107,12 +119,14 @@ impl From<&PlatformError> for StreamSignerCustodyCategory {
             PlatformError::KeyNotFound => Self::KeyNotFound,
             PlatformError::WrongKeyType { .. } => Self::WrongKeyType,
             PlatformError::Unsupported(_) => Self::Unsupported,
+            PlatformError::StorageClosed => Self::StorageClosed,
+            PlatformError::StorageLockHeld { .. } => Self::StorageLockHeld,
             // `CustodyError` is the documented generic custody failure; the
-            // remaining variants (`StorageError`, `AttestationError`,
-            // `PushError`, and `PseudonymRejected`, which only pseudonym
-            // derivation returns) are not expected from `sign`, but are mapped
-            // conservatively rather than panicking or leaking their carried
-            // string.
+            // remaining variants (`StorageError`, `AttestationError`
+            // and `PushError`, which belong to sibling platform traits, and
+            // `PseudonymRejected`, which only pseudonym derivation returns) are
+            // not expected from `sign`, but are mapped conservatively rather
+            // than panicking or leaking their carried string.
             PlatformError::CustodyError(_)
             | PlatformError::PseudonymRejected(_)
             | PlatformError::StorageError(_)
@@ -172,13 +186,20 @@ impl std::error::Error for StreamSignerError {}
 
 impl From<StreamSignerCustodyCategory> for scp_crypto::CustodyFailure {
     /// Carries a bounded category to the bridges: [`KeyNotFound`] is
-    /// key-not-found, every other category a custody failure. The detail is the
+    /// key-not-found, the two storage categories keep their storage kinds, and
+    /// every other category is a custody failure. The detail is the
     /// category's fixed string, so no backend text crosses (ADR-061).
     ///
     /// [`KeyNotFound`]: StreamSignerCustodyCategory::KeyNotFound
     fn from(category: StreamSignerCustodyCategory) -> Self {
         let kind = match category {
             StreamSignerCustodyCategory::KeyNotFound => scp_crypto::CustodyFailureKind::KeyNotFound,
+            StreamSignerCustodyCategory::StorageClosed => {
+                scp_crypto::CustodyFailureKind::StorageClosed
+            }
+            StreamSignerCustodyCategory::StorageLockHeld => {
+                scp_crypto::CustodyFailureKind::StorageLockHeld
+            }
             StreamSignerCustodyCategory::WrongKeyType
             | StreamSignerCustodyCategory::Unsupported
             | StreamSignerCustodyCategory::BackendFault => scp_crypto::CustodyFailureKind::Failed,
@@ -192,8 +213,8 @@ impl From<StreamSignerCustodyCategory> for scp_crypto::CustodyFailure {
 
 impl StreamSignerError {
     /// The custody failure behind this error, or `None` when the signer failed
-    /// before reaching custody (JCS canonicalization). The bridges report it as
-    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise.
+    /// before reaching custody (JCS canonicalization). The bridges code it with
+    /// `scp_ffi_common::error_codes::custody_failure_code`.
     #[must_use]
     pub fn custody_failure(&self) -> Option<scp_crypto::CustodyFailure> {
         match self {
@@ -460,5 +481,37 @@ mod tests {
             StreamSignerCustodyCategory::from(&PlatformError::StorageError("x".to_owned())),
             StreamSignerCustodyCategory::BackendFault
         );
+    }
+
+    /// The two §17.6 storage conditions keep their own category through the
+    /// signer and reach the bridges as the storage kinds, so a closed or
+    /// still-locked custody store reports the same code as the bare
+    /// `PlatformError`; the lock paths `StorageLockHeld` carries are dropped.
+    #[test]
+    fn storage_conditions_keep_their_custody_kind_through_the_signer() {
+        let lock_path = "/secret/dir/scp.db.lock";
+        for (error, category, kind) in [
+            (
+                PlatformError::StorageClosed,
+                StreamSignerCustodyCategory::StorageClosed,
+                scp_crypto::CustodyFailureKind::StorageClosed,
+            ),
+            (
+                PlatformError::StorageLockHeld {
+                    dir: "/secret/dir".to_owned(),
+                    lock_path: lock_path.to_owned(),
+                },
+                StreamSignerCustodyCategory::StorageLockHeld,
+                scp_crypto::CustodyFailureKind::StorageLockHeld,
+            ),
+        ] {
+            let mapped = StreamSignerCustodyCategory::from(&error);
+            assert_eq!(mapped, category, "{error:?}");
+            let failure = StreamSignerError::Custody { category: mapped }
+                .custody_failure()
+                .expect("a custody error carries a custody failure");
+            assert_eq!(failure.kind, kind, "{error:?}");
+            assert!(!failure.detail.contains("/secret"), "{}", failure.detail);
+        }
     }
 }

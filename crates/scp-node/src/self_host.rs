@@ -42,12 +42,12 @@ use scp_dht::{DhtClient, DisabledDhtClient, PkarrDhtClient};
 use scp_dht::InMemoryDhtClient;
 use scp_identity::dht::SequenceStore;
 use scp_identity::{DidCache, DidDht, DidMethod as _, IdentityError};
-use scp_platform::KeyCustody;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
+use scp_platform::{KeyCustody, PlatformError};
 
 use crate::config::{DhtMode, IdentitySource, NatSlot, Node, NodeConfig, Reach, TlsMode};
-use crate::{ApplicationNode, PublicSurface, projection};
+use crate::{ApplicationNode, NodeError, PublicSurface, projection};
 
 /// A single static asset to publish: HTTP path, content type, and body bytes.
 ///
@@ -109,6 +109,118 @@ pub enum SelfHostError {
         /// Number of assets that were published.
         expected: usize,
     },
+    /// The Supervisor's tracked tasks did not all exit within
+    /// [`SELF_HOST_DRAIN_DEADLINE`]. The caller must not close the storage the
+    /// deployer's `DurableProviders` wrap: a task may still write through it.
+    #[error(
+        "supervisor drain did not finish within {deadline:?}{}",
+        cause.as_deref().map(|c| format!(" (draining after: {c})")).unwrap_or_default()
+    )]
+    DrainTimedOut {
+        /// The drain deadline that expired.
+        deadline: Duration,
+        /// The setup error that started the drain, when one did.
+        cause: Option<String>,
+    },
+    /// The Supervisor drain task panicked or was cancelled before it finished.
+    /// The caller must not close the storage the deployer's
+    /// `DurableProviders` wrap: a task may still write through it.
+    #[error(
+        "supervisor drain failed: {failure}{}",
+        cause.as_deref().map(|c| format!(" (draining after: {c})")).unwrap_or_default()
+    )]
+    DrainFailed {
+        /// How the drain task ended.
+        failure: scp_core::context::supervisor::JoinFailure,
+        /// The setup error that started the drain, when one did.
+        cause: Option<String>,
+    },
+}
+
+/// How long a self-host drain waits for the Supervisor's tracked
+/// tasks to exit.
+pub const SELF_HOST_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Drains `supervisor` (ADR-049 Decision 16) through
+/// `Supervisor::drain_with_deadline`, waiting up to
+/// [`SELF_HOST_DRAIN_DEADLINE`]. A drain that misses the deadline keeps
+/// running to completion.
+///
+/// # Errors
+///
+/// [`SelfHostError::DrainTimedOut`] when the deadline passes first, and
+/// [`SelfHostError::DrainFailed`] when the drain task panics or is cancelled;
+/// each carries `cause`.
+async fn drain_supervisor(
+    supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
+    cause: Option<String>,
+) -> Result<(), SelfHostError> {
+    use scp_core::context::supervisor::JoinFailure;
+    let deadline = tokio::time::Instant::now() + SELF_HOST_DRAIN_DEADLINE;
+    let on_late = |late: Result<(), JoinFailure>| {
+        if let Err(failure) = late {
+            tracing::error!("late {}", self_host_drain_failed_message(failure));
+        }
+    };
+    drain_result(
+        &supervisor
+            .drain_with_deadline(deadline, || (), on_late)
+            .await,
+        cause,
+    )
+}
+
+/// Maps a self-host drain outcome onto [`SelfHostError`]: a timeout to
+/// [`SelfHostError::DrainTimedOut`] and a panicked or cancelled drain to
+/// [`SelfHostError::DrainFailed`], each carrying `cause`.
+fn drain_result(
+    outcome: &scp_core::context::supervisor::DrainWithDeadline<()>,
+    cause: Option<String>,
+) -> Result<(), SelfHostError> {
+    use scp_core::context::supervisor::DrainWithDeadline;
+    match outcome {
+        DrainWithDeadline::Finished(()) => Ok(()),
+        DrainWithDeadline::Failed(failure) => {
+            tracing::error!("{}", self_host_drain_failed_message(*failure));
+            Err(SelfHostError::DrainFailed {
+                failure: *failure,
+                cause,
+            })
+        }
+        DrainWithDeadline::TimedOut => Err(SelfHostError::DrainTimedOut {
+            deadline: SELF_HOST_DRAIN_DEADLINE,
+            cause,
+        }),
+    }
+}
+
+/// Log line for a self-host Supervisor drain task that ended without
+/// returning: a panic is named as a panic and a cancellation as a
+/// cancellation.
+const fn self_host_drain_failed_message(
+    failure: scp_core::context::supervisor::JoinFailure,
+) -> &'static str {
+    match failure {
+        scp_core::context::supervisor::JoinFailure::Panicked => {
+            "self-host Supervisor drain panicked"
+        }
+        scp_core::context::supervisor::JoinFailure::Cancelled => {
+            "self-host Supervisor drain was cancelled"
+        }
+    }
+}
+
+/// Drains `supervisor` on a path failing with `cause`. Returns `cause` when
+/// the drain finishes, and the [`drain_supervisor`] error carrying it when
+/// the drain does not.
+async fn drain_after_failure(
+    supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
+    cause: SelfHostError,
+) -> SelfHostError {
+    match drain_supervisor(supervisor, Some(cause.to_string())).await {
+        Ok(()) => cause,
+        Err(drain) => drain,
+    }
 }
 
 /// Parameters for [`deploy_site`].
@@ -267,6 +379,14 @@ fn inject_did_meta(html: &str, did: &str) -> String {
 /// Returns a [`SelfHostError`] if any stage fails: relay connect, DID
 /// registration, context creation, asset publish, key resolution, projection
 /// enable, or deploy commit.
+///
+/// Returns [`SelfHostError::DrainTimedOut`] when the Supervisor drain exceeds
+/// [`SELF_HOST_DRAIN_DEADLINE`], and [`SelfHostError::DrainFailed`] when the
+/// drain task panics or is cancelled; the caller must then leave the storage
+/// behind `durable` open. Either error's `cause` is `Some` when a stage
+/// failed before the drain, and `None` when the deploy had already committed:
+/// a `None` cause means the assets are published, so a retry would publish a
+/// second deploy.
 pub async fn deploy_site<S, C>(
     node: &ApplicationNode<S>,
     params: DeploySiteParams<'_, C>,
@@ -298,7 +418,13 @@ where
     )
     .await?;
 
-    deployer.deploy(node, &deploy_id, custody, assets).await
+    let deploy_result = deployer.deploy(node, &deploy_id, custody, assets).await;
+    // The caller owns the storage behind `durable`; drain before handing it
+    // back so no tracked task outlives this call (ADR-049 Decision 16).
+    match deploy_result {
+        Ok(committed) => deployer.shutdown().await.map(|()| committed),
+        Err(e) => Err(drain_after_failure(&deployer.supervisor, e).await),
+    }
 }
 
 /// A long-lived self-host site deployer bound to ONE in-process supervisor and
@@ -336,6 +462,11 @@ impl SelfHostDeployer {
     ///
     /// Returns a [`SelfHostError`] if relay connect, DID/context registration,
     /// context creation, key resolution, or projection enable fails.
+    /// Returns [`SelfHostError::DrainTimedOut`], carrying that failure as its
+    /// `cause`, when the Supervisor drain after the failure exceeds
+    /// [`SELF_HOST_DRAIN_DEADLINE`], and [`SelfHostError::DrainFailed`],
+    /// carrying it the same way, when that drain task panics or is cancelled;
+    /// the caller must then leave the storage behind `durable` open.
     // Provider-bootstrap entry: each argument is a distinct, required provider
     // the loopback supervisor needs (node, identity, hostname, signing key,
     // governance resolver, durable providers). The durable saga journal and the
@@ -366,27 +497,47 @@ impl SelfHostDeployer {
         let supervisor =
             connect_loopback_supervisor(node, &node_did, &author_did, key_resolver, durable)
                 .await?;
-        node.register_broadcast_context(context_id.clone(), Some("SCP Self-Host Site".to_owned()))
+        // Every setup failure past this point drains the Supervisor before
+        // returning, so no tracked task outlives the caller's storage
+        // (ADR-049 Decision 16).
+        let setup: Result<(), SelfHostError> = async {
+            node.register_broadcast_context(
+                context_id.clone(),
+                Some("SCP Self-Host Site".to_owned()),
+            )
             .await
             .map_err(|e| SelfHostError::RegisterContext(e.to_string()))?;
-        let context_params = scp_core::context::ContextParams {
-            mode: scp_core::context::params::ContextMode::Broadcast,
-            // Broadcast contexts only support `MemoryScope::Full`; the default
-            // scope is `Ephemeral`, which `create_context` rejects for
-            // broadcast mode.
-            memory_scope: scp_core::context::params::MemoryScope::Full,
-            ..Default::default()
-        };
-        supervisor
-            .create_context(context_id.clone(), context_params, author_did.clone(), None)
-            .await
-            .map_err(|e| SelfHostError::CreateContext(e.to_string()))?;
+            let context_params = scp_core::context::ContextParams {
+                mode: scp_core::context::params::ContextMode::Broadcast,
+                // Broadcast contexts only support `MemoryScope::Full`; the default
+                // scope is `Ephemeral`, which `create_context` rejects for
+                // broadcast mode.
+                memory_scope: scp_core::context::params::MemoryScope::Full,
+                // A create must declare a non-empty ceiling (construction.md M2);
+                // the site's author publishes content and its subscribers read
+                // it, so the ceiling is messaging only.
+                ceiling: vec![
+                    scp_core::context::roles::Capability::MessagesRead,
+                    scp_core::context::roles::Capability::MessagesWrite,
+                ],
+                ..Default::default()
+            };
+            supervisor
+                .create_context(context_id.clone(), context_params, author_did.clone(), None)
+                .await
+                .map_err(|e| SelfHostError::CreateContext(e.to_string()))?;
 
-        // Enable projection ONCE with the group's broadcast key/epoch. Because
-        // the group (and thus the key/epoch) is stable for this deployer's
-        // lifetime, every later `deploy` publishes under the same key and the
-        // registry needs no further key updates.
-        enable_projection(&supervisor, node, &context_id, &node_did, hostname).await?;
+            // Enable projection ONCE with the group's broadcast key/epoch. Because
+            // the group (and thus the key/epoch) is stable for this deployer's
+            // lifetime, every later `deploy` publishes under the same key and the
+            // registry needs no further key updates.
+            enable_projection(&supervisor, node, &context_id, &node_did, hostname).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = setup {
+            return Err(drain_after_failure(&supervisor, e).await);
+        }
 
         Ok(Self {
             supervisor,
@@ -394,6 +545,25 @@ impl SelfHostDeployer {
             context_id,
             signing_key_handle,
         })
+    }
+
+    /// Drains the deployer's Supervisor (ADR-049 Decision 16) on a detached
+    /// task and waits up to [`SELF_HOST_DRAIN_DEADLINE`] for that drain to
+    /// finish; a drain that misses the deadline keeps running. The owner calls
+    /// this before it closes the storage the deployer's `DurableProviders`
+    /// wrap. Every later [`deploy`] fails,
+    /// because the Supervisor serves no context.
+    ///
+    /// # Errors
+    ///
+    /// [`SelfHostError::DrainTimedOut`] when a tracked task is still running
+    /// at the deadline, and [`SelfHostError::DrainFailed`] when the drain
+    /// task panics or is cancelled; the owner must then leave the storage
+    /// open.
+    ///
+    /// [`deploy`]: Self::deploy
+    pub async fn shutdown(&self) -> Result<(), SelfHostError> {
+        drain_supervisor(&self.supervisor, None).await
     }
 
     /// Publishes `assets` under `deploy_id` through the reused supervisor/group
@@ -463,8 +633,7 @@ impl SelfHostDeployer {
 ///
 /// The async resolution is bridged to the sync `KeyResolver` signature with a
 /// runtime-FLAVOR-aware match, mirroring the repo's other async→sync bridges
-/// ([`ApplicationNode`]'s `stop_and_wait` and the supervisor's
-/// `try_consume_hard_rate_limit_from_any_context`):
+/// (the supervisor's `try_consume_hard_rate_limit_from_any_context`):
 /// - **No ambient runtime** (a bare sync caller / `block_on`-driven entry):
 ///   `handle.block_on` drives the resolve directly.
 /// - **Multi-thread runtime:** [`block_in_place`](tokio::task::block_in_place)
@@ -526,7 +695,7 @@ pub fn colocated_document_vm_key_resolver<R: scp_identity::resolver::DidResolver
                 tokio::runtime::RuntimeFlavor::MultiThread => {
                     let outcome = tokio::task::block_in_place(|| {
                         handle.block_on(resolver.resolve(&did_owned)) // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread branch re-enters handle)
-                    }); // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread block_in_place; mirrors stop_and_wait / try_consume_hard_rate_limit_from_any_context)
+                    }); // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread block_in_place; mirrors try_consume_hard_rate_limit_from_any_context)
                     let doc = outcome.ok().flatten()?;
                     scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
                 }
@@ -655,10 +824,12 @@ where
         durable,
     );
 
-    supervisor
-        .register_local_did(author_did.clone())
-        .await
-        .map_err(|e| SelfHostError::RegisterDid(e.to_string()))?;
+    if let Err(e) = supervisor.register_local_did(author_did.clone()).await {
+        // Drain before failing, so no tracked task outlives the caller's
+        // storage (ADR-049 Decision 16).
+        let cause = SelfHostError::RegisterDid(e.to_string());
+        return Err(drain_after_failure(&supervisor, cause).await);
+    }
 
     Ok(supervisor)
 }
@@ -879,8 +1050,16 @@ pub struct HostSiteReady {
 /// config (share the address out-of-band) — never an error. [`DhtMode::Memory`]
 /// is the test-harness-only analog and is not a shipped option.
 ///
-/// See the runnable example at `crates/scp-node/examples/website.rs` and the
-/// guide `.docs/guides/self-hosting-a-website-on-scp.md`.
+/// See the example at `crates/scp-node/examples/website.rs` and the guide
+/// `.docs/guides/self-hosting-a-website-on-scp.md`. Until a production
+/// `PreRotationCustody` backend exists, [`host_site`] and [`host_site_until`]
+/// fail on every build without the `testing` feature whenever the resolved
+/// `storage_path` directory holds no persisted identity, a first deployment
+/// included: they return [`HostSiteError::NodeBuild`] holding
+/// `NodeError::Identity(IdentityError::NoPreRotationBackend)` as a typed value,
+/// and the example exits 1 with it. A
+/// `testing` build creates the identity only through the test-harness
+/// `InMemoryPreRotationCustody` stand-in.
 pub struct HostSiteConfig {
     // --- Required (irreducible; no whole-struct Default — M4) ---
     /// How the hosted site is reached from the outside (addressing XOR).
@@ -1045,9 +1224,28 @@ pub enum HostSiteError {
     /// The `SQLCipher` encryption key could not be resolved or generated.
     #[error("storage key error: {0}")]
     StorageKey(String),
-    /// An encrypted `SQLite` database could not be opened.
-    #[error("storage open error: {0}")]
-    StorageOpen(String),
+    /// An encrypted `SQLite` database at `dir` could not be opened. Carries
+    /// the typed [`PlatformError`], so a caller matches
+    /// `StorageOpen { error: PlatformError::StorageLockHeld { .. }, .. }` to
+    /// detect a directory whose lock is still held without reading the
+    /// message text. The `PlatformError` text is in this variant's Display and
+    /// not returned from `source()`, so a chain-walking reporter prints it
+    /// once.
+    #[error("failed to open SQLite storage at '{}': {error}", dir.display())]
+    StorageOpen {
+        /// The directory whose database failed to open.
+        dir: PathBuf,
+        /// The typed open failure from [`SqliteStorage::new`].
+        error: PlatformError,
+    },
+    /// The deployer's encrypted `SQLite` MLS store refused to close after its
+    /// Supervisor drained. The store keeps its connection and advisory lock.
+    #[error("storage close error: {0}")]
+    StorageClose(String),
+    /// The deployer's Supervisor drain timed out or failed, so the MLS store
+    /// was left open and keeps its connection and advisory lock.
+    #[error("self-host deployer drain error: {0}")]
+    Drain(SelfHostError),
     /// The persistent key custody backend failed to initialize.
     #[error("key custody error: {0}")]
     Custody(String),
@@ -1057,18 +1255,25 @@ pub enum HostSiteError {
     /// The DID method (DHT client) could not be constructed.
     #[error("DID method error: {0}")]
     DidMethod(String),
-    /// The application node failed to build.
+    /// The application node failed to build. Carries the typed [`NodeError`],
+    /// so a caller matches `NodeBuild(NodeError::Identity(
+    /// IdentityError::NoPreRotationBackend))` to detect a missing pre-rotation
+    /// custody backend without reading the message text. The `NodeError` text is
+    /// in this variant's Display and not returned from `source()`, so a
+    /// chain-walking reporter prints it once.
     #[error("node build error: {0}")]
-    NodeBuild(String),
+    NodeBuild(NodeError),
     /// The site assets could not be loaded from the site directory.
     #[error("load assets error: {0}")]
     LoadAssets(String),
     /// The self-signed TLS configuration could not be built.
     #[error("TLS config error: {0}")]
     Tls(String),
-    /// The site deploy (publish + commit) failed.
+    /// The site deploy (publish + commit) failed. The `SelfHostError` text is
+    /// in this variant's Display and not returned from `source()`, so a
+    /// chain-walking reporter prints it once.
     #[error("deploy error: {0}")]
-    Deploy(#[from] SelfHostError),
+    Deploy(SelfHostError),
     /// The deployer setup (loopback supervisor / broadcast group) failed.
     #[error("deployer setup error: {0}")]
     DeployerSetup(String),
@@ -1171,9 +1376,15 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 /// shutdown.
 ///
 /// See [`HostSiteConfig`] for configuration (including the local-demo vs
-/// public-hosting distinction), the runnable example at
+/// public-hosting distinction), the example at
 /// `crates/scp-node/examples/website.rs`, and the guide
-/// `.docs/guides/self-hosting-a-website-on-scp.md`.
+/// `.docs/guides/self-hosting-a-website-on-scp.md`. Until a production
+/// `PreRotationCustody` backend exists, this function fails on every build
+/// without the `testing` feature whenever the resolved `storage_path`
+/// directory holds no persisted identity, a first deployment included (see
+/// `# Errors`), and the example exits 1 with that error. A `testing` build
+/// creates the identity only through the test-harness
+/// `InMemoryPreRotationCustody` stand-in.
 ///
 /// The default [`DhtMode::Disabled`] publishes nothing to the network (fail-safe).
 /// To make the site publicly reachable, opt in with [`DhtMode::Production`],
@@ -1191,7 +1402,22 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 /// [`DhtMode::Disabled`] is valid for every reach) or any stage fails: storage
 /// path/key resolution,
 /// storage/custody/blob open, DID method construction, node build, asset load,
-/// TLS config, deploy, or serve. Returns `Ok(())` on clean shutdown.
+/// TLS config, deploy, or serve.
+///
+/// After the shutdown signal, returns [`HostSiteError::Drain`] when the
+/// deployer's Supervisor does not drain within [`SELF_HOST_DRAIN_DEADLINE`]
+/// and [`HostSiteError::StorageClose`] when the MLS store refuses to close;
+/// in both cases the store keeps its connection and advisory lock. A failure
+/// after the deployer is built also returns one of those two variants,
+/// carrying the original error, when its teardown leaves the store open.
+/// Returns `Ok(())` when the shutdown drains and closes the store.
+///
+/// On every build without the `testing` feature, returns
+/// [`HostSiteError::NodeBuild`] holding
+/// `NodeError::Identity(IdentityError::NoPreRotationBackend)` as a typed value
+/// whenever the resolved `storage_path` directory holds no persisted
+/// identity, because no production `PreRotationCustody` backend exists to
+/// create one.
 pub async fn host_site(config: HostSiteConfig) -> Result<(), HostSiteError> {
     host_site_until(config, async {
         scp_transport::startup::shutdown_signal().await;
@@ -1251,7 +1477,7 @@ where
     // -- Root storage + custody. The single root `SqliteStorage` handle owns the
     //    advisory lock on `{dir}/scp.db.lock`; it is shared via `Arc::clone`
     //    between the BEP44 sequence store and the node builder so there is
-    //    exactly one lock holder (a second open would fail with os error 35). --
+    //    exactly one lock holder. --
     let node_storage_arc = Arc::new(open_sqlite(&storage_dir, &storage_key)?);
     let custody_storage = open_sqlite(&storage_dir.join("custody"), &storage_key)?;
     let custody = Arc::new(
@@ -1327,8 +1553,9 @@ where
             tracing::info!(
                 "DhtMode::Disabled — DHT layer off: the DID document is NOT published (no address \
                  disclosed, fail-closed on publish) and the DHT resolution arm returns Ok(None). \
-                 DID resolution composes the relay layer around the off DHT arm (the fail-safe \
-                 default; set DhtMode::Production to host publicly)"
+                 The relay layer is a NoOpRelayQuerier until SCP-RELAYRES-006, so resolution \
+                 answers from the cache alone (the fail-safe default; set DhtMode::Production \
+                 to host publicly)"
             );
             let did_method = build_disabled_did_method(cache);
             let key_resolver = build_shared_cache_key_resolver(
@@ -1528,12 +1755,13 @@ where
     )
     .await
     {
-        Ok(d) => Arc::new(d),
+        Ok((d, mls_store)) => (Arc::new(d), mls_store),
         Err(e) => {
             release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
             return Err(e);
         }
     };
+    let (deployer, mls_store) = deployer;
 
     // -- Initial deploy BEFORE the public port opens. --
     if let Err(e) = deployer
@@ -1541,7 +1769,9 @@ where
         .await
     {
         release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
-        return Err(HostSiteError::Deploy(e));
+        return Err(
+            retire_deployer_after_failure(&deployer, &mls_store, HostSiteError::Deploy(e)).await,
+        );
     }
     tracing::info!(committed = asset_count, "self-host site deployed");
 
@@ -1565,7 +1795,7 @@ where
     // -- Build the TLS config and open the RESTRICTED public surface in the
     //    background. On either failure the retained NAT mappings are released
     //    best-effort before returning. --
-    open_self_host_public_surface(
+    if let Err(e) = open_self_host_public_surface(
         node.as_ref(),
         http_addr,
         plaintext,
@@ -1573,11 +1803,14 @@ where
         &upnp_mapper,
         &natpmp_mapper,
     )
-    .await?;
+    .await
+    {
+        return Err(retire_deployer_after_failure(&deployer, &mls_store, e).await);
+    }
 
     // -- Run the refresh + NAT-renewal loops, await shutdown, and tear down. --
     run_refresh_and_serve_until_shutdown(RefreshAndServe {
-        deployer,
+        deployer: Arc::clone(&deployer),
         node,
         custody,
         assets,
@@ -1589,8 +1822,71 @@ where
     })
     .await;
 
+    // The refresh loop has exited, so the deployer's Supervisor is the last
+    // writer to the MLS store: drain it, then close the store.
+    retire_deployer(&deployer, &mls_store).await?;
     tracing::info!("host_site stopped");
     Ok(())
+}
+
+/// Drains the deployer's Supervisor, then closes the MLS store its
+/// `DurableProviders` wrap (ADR-049 Decision 16: drain before close).
+///
+/// # Errors
+///
+/// [`HostSiteError::Drain`] when the Supervisor does not drain within
+/// [`SELF_HOST_DRAIN_DEADLINE`], and [`HostSiteError::StorageClose`] when the
+/// store refuses to close; in both cases the store keeps its connection and
+/// advisory lock.
+async fn retire_deployer(
+    deployer: &SelfHostDeployer,
+    mls_store: &SqliteStorage,
+) -> Result<(), HostSiteError> {
+    deployer.shutdown().await.map_err(HostSiteError::Drain)?;
+    mls_store.close().map_err(|e| {
+        HostSiteError::StorageClose(format!("failed to close MLS SQLite storage: {e}"))
+    })
+}
+
+/// [`retire_deployer`] on a path failing with `cause`. Returns `cause` when
+/// the teardown succeeds, and the teardown error carrying `cause` when it
+/// fails (see [`teardown_outcome`]).
+async fn retire_deployer_after_failure(
+    deployer: &SelfHostDeployer,
+    mls_store: &SqliteStorage,
+    cause: HostSiteError,
+) -> HostSiteError {
+    teardown_outcome(retire_deployer(deployer, mls_store).await, cause)
+}
+
+/// Picks the error a failing path returns after it settles the MLS store.
+/// A successful teardown returns `cause`. A teardown that left the store
+/// open returns its own error with `cause` attached: a drain timeout or
+/// failure as [`HostSiteError::Drain`] carrying `cause` in
+/// [`SelfHostError::DrainTimedOut`] or [`SelfHostError::DrainFailed`], and a
+/// refused close as [`HostSiteError::StorageClose`] naming `cause`.
+fn teardown_outcome(teardown: Result<(), HostSiteError>, cause: HostSiteError) -> HostSiteError {
+    match teardown {
+        Ok(()) => cause,
+        Err(HostSiteError::Drain(SelfHostError::DrainTimedOut {
+            deadline,
+            cause: None,
+        })) => HostSiteError::Drain(SelfHostError::DrainTimedOut {
+            deadline,
+            cause: Some(cause.to_string()),
+        }),
+        Err(HostSiteError::Drain(SelfHostError::DrainFailed {
+            failure,
+            cause: None,
+        })) => HostSiteError::Drain(SelfHostError::DrainFailed {
+            failure,
+            cause: Some(cause.to_string()),
+        }),
+        Err(HostSiteError::StorageClose(close)) => {
+            HostSiteError::StorageClose(format!("{close} (closing after: {cause})"))
+        }
+        Err(other) => other,
+    }
 }
 
 /// Builds the self-signed multi-SAN TLS config (unless `plaintext`) and opens the
@@ -1864,11 +2160,9 @@ pub fn resolve_storage_key(storage_dir: &Path) -> Result<Zeroizing<[u8; 32]>, Ho
 ///
 /// Returns [`HostSiteError::StorageOpen`] if the database cannot be opened.
 pub fn open_sqlite(dir: &Path, key: &Zeroizing<[u8; 32]>) -> Result<SqliteStorage, HostSiteError> {
-    SqliteStorage::new(dir, key.as_ref()).map_err(|e| {
-        HostSiteError::StorageOpen(format!(
-            "failed to open SQLite storage at '{}': {e}",
-            dir.display()
-        ))
+    SqliteStorage::new(dir, key.as_ref()).map_err(|error| HostSiteError::StorageOpen {
+        dir: dir.to_path_buf(),
+        error,
     })
 }
 
@@ -1975,9 +2269,12 @@ pub fn build_memory_did_method(
 /// disclosed) and resolve contributes an honest `Ok(None)` — never a fabricated
 /// or in-memory answer (ADR-062 §Decision 1, A2). The method shares the node's
 /// [`DidCache`] with the co-located resolver but carries no signer (it never
-/// publishes). DID resolution still runs: the
-/// [`DualLayerResolver`](scp_identity::DualLayerResolver) composes the
-/// relay layer around the off DHT arm.
+/// publishes). The [`DualLayerResolver`](scp_identity::DualLayerResolver)
+/// composes the relay layer around the off DHT arm, but the relay layer
+/// `host_site` wires is a
+/// [`NoOpRelayQuerier`](scp_identity::resolver::NoOpRelayQuerier) that also
+/// answers `Ok(None)` until SCP-RELAYRES-006, so resolution answers from the
+/// cache alone.
 #[must_use]
 pub fn build_disabled_did_method(
     cache: Arc<DidCache>,
@@ -2279,13 +2576,14 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
             // `Node::start` establishes the inbound port mapping during NAT tier
             // selection and CAN still fail afterward, so release best-effort.
             release_self_host_mappings(upnp_mapper, natpmp_mapper, http_addr.port()).await;
-            Err(HostSiteError::NodeBuild(e.to_string()))
+            Err(HostSiteError::NodeBuild(e))
         }
     }
 }
 
 /// Performs the one-time [`SelfHostDeployer`] setup over a `SQLite` MLS store
-/// under `storage_dir/mls`. Mirrors the binary's `build_self_host_deployer`.
+/// under `storage_dir/mls`, and returns the store with the deployer so the
+/// caller can close it after [`SelfHostDeployer::shutdown`].
 async fn build_host_site_deployer<S>(
     node: &ApplicationNode<S>,
     storage_dir: &Path,
@@ -2293,15 +2591,11 @@ async fn build_host_site_deployer<S>(
     node_did: &str,
     context_id: &str,
     key_resolver: scp_core::context::governance::KeyResolver,
-) -> Result<SelfHostDeployer, HostSiteError>
+) -> Result<(SelfHostDeployer, Arc<SqliteStorage>), HostSiteError>
 where
     S: scp_platform::EncryptedStorage + 'static,
 {
-    let mls_inner = Arc::new(
-        SqliteStorage::new(&storage_dir.join("mls"), storage_key.as_ref()).map_err(|e| {
-            HostSiteError::StorageOpen(format!("failed to open MLS SQLite storage: {e}"))
-        })?,
-    );
+    let mls_inner = Arc::new(open_sqlite(&storage_dir.join("mls"), storage_key)?);
     // The durable saga journal and the `mls_storage` view are bound into one
     // `DurableProviders` derived from the SAME `Arc<SqliteStorage>`, so
     // crash-recovery replay and the `OpenMLS` view read and write one
@@ -2311,10 +2605,11 @@ where
     // separate calls let a single mutated constructor pass a fresh in-memory
     // store to the journal while leaving every gate/test green — binding them
     // into one newtype makes that divergence a compile error.
-    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
+    let durable =
+        scp_core::context::supervisor::DurableProviders::from_handle(Arc::clone(&mls_inner));
 
     let signing_key_handle = node.identity().identity().active_signing_key;
-    SelfHostDeployer::start(
+    let started = SelfHostDeployer::start(
         node,
         node_did.to_owned(),
         context_id.to_owned(),
@@ -2323,8 +2618,31 @@ where
         key_resolver,
         durable,
     )
-    .await
-    .map_err(|e| HostSiteError::DeployerSetup(e.to_string()))
+    .await;
+    match started {
+        Ok(deployer) => Ok((deployer, mls_inner)),
+        Err(e) => Err(deployer_setup_failure(e, &mls_inner)),
+    }
+}
+
+/// Maps a failed [`SelfHostDeployer::start`] onto [`HostSiteError`] and
+/// settles the MLS store behind it.
+fn deployer_setup_failure(e: SelfHostError, mls_store: &SqliteStorage) -> HostSiteError {
+    match e {
+        // The drain timed out or failed, so a tracked task may still write:
+        // leave the store open.
+        e @ (SelfHostError::DrainTimedOut { .. } | SelfHostError::DrainFailed { .. }) => {
+            HostSiteError::Drain(e)
+        }
+        // `start` drained any Supervisor it built before failing, so the
+        // store has no writer left.
+        e => teardown_outcome(
+            mls_store.close().map_err(|close| {
+                HostSiteError::StorageClose(format!("failed to close MLS SQLite storage: {close}"))
+            }),
+            HostSiteError::DeployerSetup(e.to_string()),
+        ),
+    }
 }
 
 /// Mints a unique deploy id for a single self-host deploy run.
@@ -2500,6 +2818,272 @@ pub fn external_ip_from_relay_url(relay_url: &str) -> Option<std::net::IpAddr> {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The self-host drain failure line names a panic as a panic and a
+    /// cancellation as a cancellation.
+    #[test]
+    fn self_host_drain_failed_message_never_names_a_cancellation_a_panic() {
+        use scp_core::context::supervisor::JoinFailure;
+        let panicked = self_host_drain_failed_message(JoinFailure::Panicked);
+        assert!(panicked.contains("panicked"), "{panicked}");
+        assert!(!panicked.contains("cancelled"), "{panicked}");
+        let cancelled = self_host_drain_failed_message(JoinFailure::Cancelled);
+        assert!(cancelled.contains("cancelled"), "{cancelled}");
+        assert!(!cancelled.contains("panicked"), "{cancelled}");
+    }
+
+    /// A finished drain is `Ok`, a timeout is `DrainTimedOut` naming the
+    /// deadline, and a panicked or cancelled drain is `DrainFailed` naming the
+    /// failure and no deadline; both errors carry the cause.
+    #[test]
+    fn drain_result_keeps_a_failed_drain_apart_from_a_timeout() {
+        use scp_core::context::supervisor::{DrainWithDeadline, JoinFailure};
+        assert!(drain_result(&DrainWithDeadline::Finished(()), None).is_ok());
+
+        let timed_out = drain_result(&DrainWithDeadline::TimedOut, Some("c".to_owned()));
+        assert!(
+            matches!(
+                &timed_out,
+                Err(SelfHostError::DrainTimedOut { deadline, cause: Some(c) })
+                    if *deadline == SELF_HOST_DRAIN_DEADLINE && c == "c"
+            ),
+            "a timeout must be DrainTimedOut: {timed_out:?}"
+        );
+
+        for failure in [JoinFailure::Panicked, JoinFailure::Cancelled] {
+            let failed = drain_result(&DrainWithDeadline::Failed(failure), Some("c".to_owned()));
+            assert!(
+                matches!(
+                    &failed,
+                    Err(SelfHostError::DrainFailed { failure: f, cause: Some(c) })
+                        if *f == failure && c == "c"
+                ),
+                "a {failure:?} drain must be DrainFailed: {failed:?}"
+            );
+            let text = failed.err().map(|e| e.to_string()).unwrap_or_default();
+            assert_eq!(
+                text,
+                format!("supervisor drain failed: {failure} (draining after: c)")
+            );
+            assert!(!text.contains("within"), "{text}");
+        }
+    }
+
+    /// `HostSiteError::NodeBuild` keeps the typed `NodeError`, so a caller
+    /// detects a missing pre-rotation backend by pattern, and the same pattern
+    /// rejects every other node-build failure. `NodeBuild` and `Deploy` each
+    /// print their wrapped error once, in Display, and return no `source()`.
+    #[test]
+    fn node_build_error_keeps_typed_no_pre_rotation_backend() {
+        let is_missing_backend = |e: &HostSiteError| {
+            matches!(
+                e,
+                HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend))
+            )
+        };
+        let missing =
+            HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend));
+        assert!(is_missing_backend(&missing));
+        // The NodeError text is in Display only; returning it from `source()`
+        // as well would print it twice in a chain-walking reporter.
+        assert!(
+            std::error::Error::source(&missing).is_none(),
+            "NodeBuild must not return its NodeError from source(), Display already carries it"
+        );
+        assert!(
+            missing
+                .to_string()
+                .starts_with("node build error: identity error: no production pre-rotation"),
+            "Display keeps the message text: {missing}"
+        );
+
+        // `Deploy` wraps a typed error the same way and follows the same rule.
+        let deploy = HostSiteError::Deploy(SelfHostError::CommitDeploy("x".to_owned()));
+        assert!(
+            std::error::Error::source(&deploy).is_none(),
+            "Deploy must not return its SelfHostError from source(), Display already carries it"
+        );
+        assert_eq!(
+            deploy.to_string(),
+            "deploy error: failed to commit deploy: x"
+        );
+
+        let other = HostSiteError::NodeBuild(NodeError::Nat("no tier".to_owned()));
+        assert!(!is_missing_backend(&other));
+        let other_config = HostSiteError::InvalidConfig("x".to_owned());
+        assert!(!is_missing_backend(&other_config));
+    }
+
+    /// A setup drain that times out or fails reaches the caller as the typed
+    /// `HostSiteError::Drain` and leaves the MLS store open with its lock; any
+    /// other setup failure is `DeployerSetup` and closes the store.
+    #[test]
+    fn deployer_setup_failure_keeps_store_open_only_on_unfinished_drain() {
+        let key = [7u8; 32];
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("mls");
+        let store = SqliteStorage::new(&dir, &key).expect("open store");
+
+        let timed_out = SelfHostError::DrainTimedOut {
+            deadline: SELF_HOST_DRAIN_DEADLINE,
+            cause: Some("x".to_owned()),
+        };
+        let err = deployer_setup_failure(timed_out, &store);
+        assert!(
+            matches!(
+                err,
+                HostSiteError::Drain(SelfHostError::DrainTimedOut { .. })
+            ),
+            "a setup drain timeout must be HostSiteError::Drain, got {err:?}"
+        );
+        let held = open_sqlite(&dir, &Zeroizing::new(key));
+        assert!(
+            matches!(
+                &held,
+                Err(HostSiteError::StorageOpen {
+                    dir: d,
+                    error: PlatformError::StorageLockHeld { .. },
+                }) if *d == dir
+            ),
+            "the store must keep its lock after a setup drain timeout, and the \
+             self-host open must report it typed: {:?}",
+            held.err()
+        );
+
+        let drain_failed = SelfHostError::DrainFailed {
+            failure: scp_core::context::supervisor::JoinFailure::Panicked,
+            cause: Some("x".to_owned()),
+        };
+        let err = deployer_setup_failure(drain_failed, &store);
+        assert!(
+            matches!(err, HostSiteError::Drain(SelfHostError::DrainFailed { .. })),
+            "a failed setup drain must be HostSiteError::Drain, got {err:?}"
+        );
+        let held = open_sqlite(&dir, &Zeroizing::new(key));
+        assert!(
+            matches!(
+                &held,
+                Err(HostSiteError::StorageOpen {
+                    error: PlatformError::StorageLockHeld { .. },
+                    ..
+                })
+            ),
+            "the store must keep its lock after a failed setup drain: {:?}",
+            held.err()
+        );
+
+        let failed = SelfHostError::CommitDeploy("y".to_owned());
+        let err = deployer_setup_failure(failed, &store);
+        assert!(
+            matches!(&err, HostSiteError::DeployerSetup(m) if m == "failed to commit deploy: y"),
+            "a drained setup failure must be DeployerSetup, got {err:?}"
+        );
+        let reopened = open_sqlite(&dir, &Zeroizing::new(key));
+        assert!(
+            reopened.is_ok(),
+            "the store must release its lock after a drained setup failure: {:?}",
+            reopened.err()
+        );
+    }
+
+    /// A failing path returns its own error only when the teardown settles the
+    /// store; a drain timeout, failed drain or refused close replaces it with the typed
+    /// teardown error carrying it, so the caller learns the store stays open.
+    #[test]
+    fn teardown_outcome_surfaces_a_store_left_open() {
+        let cause = || HostSiteError::Deploy(SelfHostError::CommitDeploy("x".to_owned()));
+
+        let err = teardown_outcome(Ok(()), cause());
+        assert!(
+            matches!(&err, HostSiteError::Deploy(SelfHostError::CommitDeploy(m)) if m == "x"),
+            "a settled teardown must return the original error, got {err:?}"
+        );
+
+        let timed_out = Err(HostSiteError::Drain(SelfHostError::DrainTimedOut {
+            deadline: SELF_HOST_DRAIN_DEADLINE,
+            cause: None,
+        }));
+        let err = teardown_outcome(timed_out, cause());
+        assert!(
+            matches!(
+                &err,
+                HostSiteError::Drain(SelfHostError::DrainTimedOut { deadline, cause: Some(c) })
+                    if *deadline == SELF_HOST_DRAIN_DEADLINE
+                        && c == "deploy error: failed to commit deploy: x"
+            ),
+            "a drain timeout must be Drain carrying the original error, got {err:?}"
+        );
+
+        let failed = Err(HostSiteError::Drain(SelfHostError::DrainFailed {
+            failure: scp_core::context::supervisor::JoinFailure::Panicked,
+            cause: None,
+        }));
+        let err = teardown_outcome(failed, cause());
+        assert!(
+            matches!(
+                &err,
+                HostSiteError::Drain(SelfHostError::DrainFailed {
+                    failure: scp_core::context::supervisor::JoinFailure::Panicked,
+                    cause: Some(c),
+                }) if c == "deploy error: failed to commit deploy: x"
+            ),
+            "a failed drain must be Drain carrying the original error, got {err:?}"
+        );
+
+        let refused = Err(HostSiteError::StorageClose("refused".to_owned()));
+        let err = teardown_outcome(refused, cause());
+        assert!(
+            matches!(
+                &err,
+                HostSiteError::StorageClose(m)
+                    if m == "refused (closing after: deploy error: failed to commit deploy: x)"
+            ),
+            "a refused close must be StorageClose naming the original error, got {err:?}"
+        );
+    }
+
+    /// On a build without `testing`, `host_site_until` over an empty storage
+    /// directory returns `HostSiteError::NodeBuild(NodeError::Identity(
+    /// IdentityError::NoPreRotationBackend))`, the typed value the rustdoc,
+    /// `examples/website.rs`, and the deploying guide promise an embedder can
+    /// match. The name carries `pre_rotation_severance` so the CI lane that
+    /// runs `-p scp-node --lib -E 'test(pre_rotation_severance)'` without
+    /// `testing` selects it.
+    #[cfg(not(feature = "testing"))]
+    #[tokio::test]
+    async fn pre_rotation_severance_host_site_returns_typed_node_build() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage_dir = tmp.path().join("storage");
+        let site_dir = tmp.path().join("site");
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        std::fs::create_dir_all(&site_dir).expect("create site dir");
+        std::fs::write(site_dir.join("index.html"), "<html></html>").expect("write index");
+
+        let config = HostSiteConfig {
+            tls: TlsMode::Plaintext,
+            site_dir: Some(site_dir),
+            port: 0,
+            storage_path: Some(storage_dir),
+            ..HostSiteConfig::defaults(Reach::Local)
+        };
+        // A shutdown that never fires: a regression that builds the node would
+        // serve until the timeout below and fail instead of hanging.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_mins(1),
+            host_site_until(config, std::future::pending::<()>()),
+        )
+        .await
+        .expect("host_site_until must fail closed, not serve");
+        match outcome {
+            Err(HostSiteError::NodeBuild(NodeError::Identity(
+                IdentityError::NoPreRotationBackend,
+            ))) => {}
+            other => panic!(
+                "expected NodeBuild(Identity(NoPreRotationBackend)) on a build without \
+                 `testing`, got: {other:?}"
+            ),
+        }
+    }
 
     // -----------------------------------------------------------------------
     // HostSiteConfig shape + reach/tls lowering (`lower_host_site_reach_tls`)

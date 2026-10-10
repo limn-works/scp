@@ -4,7 +4,7 @@
 //! `KeyCustodyProvider` (a Python object / JS callback record / `UniFFI`
 //! callback interface) to scp-platform's [`KeyCustody`](scp_platform::KeyCustody) trait. The provider
 //! protocol speaks in raw byte arrays and opaque key-id strings; the adapters
-//! must translate those into the typed [`KeyHandle`] / [`PseudonymKeypair`] /
+//! must translate those into the typed [`KeyHandle`] / [`Pseudonym`] /
 //! `[u8; 32]` surface. That translation — and the error messages it produces on
 //! malformed provider returns — is mechanism-independent: it is identical
 //! across all three bridges.
@@ -21,34 +21,8 @@
 //!
 //! See ADR-006 and the per-bridge `CallbackKeyCustody` adapters.
 
-use scp_crypto::p256::P256PublicKey;
 use scp_platform::error::PlatformError;
-use scp_platform::traits::{KeyHandle, PseudonymKeypair};
-
-/// The bridge error code for a custody [`PlatformError`], one mapping for the
-/// `PyO3`, napi-rs and `UniFFI` bridges.
-///
-/// [`PlatformError::KeyNotFound`] is
-/// [`CRYPTO_4006`](crate::error_codes::CRYPTO_4006), [`PlatformError::CustodyError`] is
-/// [`CRYPTO_4060`](crate::error_codes::CRYPTO_4060), and
-/// [`PlatformError::PseudonymRejected`] is
-/// [`IDENT_1055`](crate::error_codes::IDENT_1055), the code ADR-021's
-/// 2026-09-27 amendment gives a host pseudonym the bridge cannot bind. Every
-/// other variant keeps [`CRYPTO_4004`](crate::error_codes::CRYPTO_4004).
-#[must_use]
-pub const fn platform_error_code(e: &PlatformError) -> &'static str {
-    use crate::error_codes as codes;
-    match e {
-        PlatformError::KeyNotFound => codes::CRYPTO_4006,
-        PlatformError::CustodyError(_) => codes::CRYPTO_4060,
-        PlatformError::PseudonymRejected(_) => codes::IDENT_1055,
-        PlatformError::WrongKeyType { .. }
-        | PlatformError::StorageError(_)
-        | PlatformError::AttestationError(_)
-        | PlatformError::PushError(_)
-        | PlatformError::Unsupported(_) => codes::CRYPTO_4004,
-    }
-}
+use scp_platform::traits::{KeyHandle, Pseudonym};
 
 /// Maps a host custody callback's failure to a [`PlatformError`], one mapping
 /// for the `PyO3`, napi-rs and `UniFFI` bridges.
@@ -108,163 +82,22 @@ pub fn expect_32(method: &str, bytes: &[u8]) -> Result<[u8; 32], PlatformError> 
     })
 }
 
-/// Length of the pseudonym public key a provider returns: a SEC1 compressed
-/// P-256 point (§9.10.4).
-pub const PSEUDONYM_PUBLIC_KEY_LEN: usize = scp_crypto::p256::COMPRESSED_POINT_LEN;
-
-/// Validates a structured `derive_pseudonym`-style return (`public_key`,
-/// `key_id`) into a [`PseudonymKeypair`].
-///
-/// The host returns the two fields separately; no byte-splitting happens here,
-/// so a key id can never be read as part of the point or the reverse.
+/// Validates the point a host's `derive_pseudonym` or
+/// `derive_rotatable_pseudonym` returned into a [`Pseudonym`] (ADR-021's
+/// 2026-09-29 amendment).
 ///
 /// # Errors
 ///
-/// Returns [`PlatformError::PseudonymRejected`] if `key_id` is not a canonical
-/// numeric key id or `public_key` is not a 33-byte SEC1 compressed point on
-/// P-256 (a provider still returning a 32-byte Ed25519 pseudonym fails here).
-pub fn parse_pseudonym(
-    method: &str,
-    public_key: &[u8],
-    key_id: &str,
-) -> Result<PseudonymKeypair, PlatformError> {
-    let handle = parse_handle(method, key_id).map_err(|e| match e {
-        PlatformError::CustodyError(msg) => PlatformError::PseudonymRejected(msg),
+/// Returns [`PlatformError::PseudonymRejected`] naming `method` and the reason
+/// when `point` is not a 33-byte SEC1 compressed point on P-256 (a provider
+/// still returning a 32-byte Ed25519 pseudonym fails here).
+pub fn parse_pseudonym(method: &str, point: &[u8]) -> Result<Pseudonym, PlatformError> {
+    Pseudonym::from_point(point).map_err(|e| match e {
+        PlatformError::PseudonymRejected(reason) => {
+            PlatformError::PseudonymRejected(format!("KeyCustodyProvider.{method}: {reason}"))
+        }
         other => other,
-    })?;
-    PseudonymKeypair::new(public_key, handle)
-        .map_err(|e| PlatformError::PseudonymRejected(format!("KeyCustodyProvider.{method}: {e}")))
-}
-
-/// The pseudonym handles a callback custody adapter has derived, each bound to
-/// the P-256 point the host returned for it.
-///
-/// A bridge [`bind`](Self::bind)s a handle after checking that the host's own
-/// `public_key(key_id)` reports the same point, and routes every `sign` through
-/// [`check_sign_input`](Self::check_sign_input) and
-/// [`check_signature`](Self::check_signature) so a pseudonym signature is a
-/// strict §9.5 signature under the bound point. A host that returns a high-`s`
-/// or otherwise invalid signature fails closed; the bridge never normalizes it.
-#[derive(Debug, Default)]
-pub struct PseudonymBindings {
-    points: dashmap::DashMap<u64, P256PublicKey>,
-}
-
-impl PseudonymBindings {
-    /// Binds `pseudonym`'s handle to its point once the host's
-    /// `public_key(key_id)` return (`host_public_key`) matches it byte for byte.
-    /// Re-binding the same point to the same handle is a no-op.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlatformError::PseudonymRejected`] if `host_public_key` differs
-    /// from the derived point, or if the handle is already bound to a different
-    /// point (a host that reuses one key id for two pseudonyms).
-    pub fn bind(
-        &self,
-        method: &str,
-        pseudonym: &PseudonymKeypair,
-        host_public_key: &[u8],
-    ) -> Result<(), PlatformError> {
-        let derived = pseudonym.public_key().as_bytes();
-        if host_public_key != derived {
-            return Err(PlatformError::PseudonymRejected(format!(
-                "KeyCustodyProvider.{method}: public_key(key_id) does not match the derived \
-                 pseudonym point"
-            )));
-        }
-        let point = P256PublicKey::from_sec1(derived).map_err(|e| {
-            PlatformError::PseudonymRejected(format!("KeyCustodyProvider.{method}: {e}"))
-        })?;
-        match self.points.entry(pseudonym.key_handle().id()) {
-            dashmap::Entry::Occupied(existing) if *existing.get() != point => {
-                Err(PlatformError::PseudonymRejected(format!(
-                    "KeyCustodyProvider.{method}: key_id {} is already bound to a different \
-                     pseudonym point",
-                    pseudonym.key_handle().id()
-                )))
-            }
-            dashmap::Entry::Occupied(_) => Ok(()),
-            dashmap::Entry::Vacant(slot) => {
-                slot.insert(point);
-                Ok(())
-            }
-        }
-    }
-
-    /// Destroys `key` through `host_destroy` with its binding removed first.
-    ///
-    /// The binding is removed before the host call, so a concurrent re-derive
-    /// of the same handle that binds while the host destroys lands after the
-    /// removal and survives it. When `host_destroy` fails, the removed point is
-    /// bound again unless a concurrent re-derive has already bound one.
-    ///
-    /// # Errors
-    ///
-    /// Returns the error of `host_destroy`.
-    pub async fn destroy_unbound(
-        &self,
-        key: &KeyHandle,
-        host_destroy: impl core::future::Future<Output = Result<(), PlatformError>>,
-    ) -> Result<(), PlatformError> {
-        let removed = self.points.remove(&key.id()).map(|(_, point)| point);
-        let result = host_destroy.await;
-        if let (Err(_), Some(point)) = (&result, removed) {
-            self.points.entry(key.id()).or_insert(point);
-        }
-        result
-    }
-
-    /// Whether `key` is bound to a pseudonym point. Tests read it from inside
-    /// a host `destroy_key` to prove the bridge unbinds before calling the host.
-    #[cfg(any(test, feature = "testing"))]
-    #[must_use]
-    pub fn is_bound(&self, key: &KeyHandle) -> bool {
-        self.points.contains_key(&key.id())
-    }
-
-    /// Checks the input to a `sign` call. Returns the bound point and the
-    /// digest when `key` is a pseudonym handle, and `None` for any other handle.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlatformError::CustodyError`] if `key` is a pseudonym handle
-    /// and `data` is not a 32-byte digest (§9.5 prehash).
-    pub fn check_sign_input(
-        &self,
-        key: &KeyHandle,
-        data: &[u8],
-    ) -> Result<Option<(P256PublicKey, [u8; 32])>, PlatformError> {
-        let Some(point) = self.points.get(&key.id()).map(|p| *p) else {
-            return Ok(None);
-        };
-        let digest: [u8; 32] = data.try_into().map_err(|_| {
-            PlatformError::CustodyError(format!(
-                "pseudonym key {} signs only a 32-byte digest, got {} bytes",
-                key.id(),
-                data.len()
-            ))
-        })?;
-        Ok(Some((point, digest)))
-    }
-
-    /// Verifies a host signature from a pseudonym handle under its bound point.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlatformError::CustodyError`] unless `signature` is a 64-byte
-    /// low-`s` `r ‖ s` that verifies strictly over `digest`.
-    pub fn check_signature(
-        point: &P256PublicKey,
-        digest: &[u8; 32],
-        signature: &[u8],
-    ) -> Result<(), PlatformError> {
-        scp_crypto::p256::verify_prehash_strict(point, digest, signature).map_err(|e| {
-            PlatformError::CustodyError(format!(
-                "KeyCustodyProvider.sign returned an invalid pseudonym signature: {e}"
-            ))
-        })
-    }
+    })
 }
 
 #[cfg(test)]
@@ -298,109 +131,55 @@ mod tests {
         }
     }
 
+    /// Every [`PlatformError`] variant reaches a bridge with the one code
+    /// [`custody_failure_code`](crate::error_codes::custody_failure_code)
+    /// assigns (ADR-021 2026-09-29 amendment, spec §17.6).
     #[test]
-    fn platform_error_code_names_key_not_found_and_custody_codes() {
+    fn custody_failure_code_covers_every_platform_error() {
         use crate::error_codes as codes;
-        assert_eq!(
-            platform_error_code(&PlatformError::KeyNotFound),
-            codes::CRYPTO_4006
-        );
-        assert_eq!(
-            platform_error_code(&PlatformError::CustodyError("x".to_owned())),
-            codes::CRYPTO_4060
-        );
-        assert_eq!(
-            platform_error_code(&PlatformError::PseudonymRejected("x".to_owned())),
-            codes::IDENT_1055
-        );
-    }
-
-    #[test]
-    fn custody_failure_code_follows_the_platform_error_kind() {
-        use crate::error_codes as codes;
-        let code =
-            |e: PlatformError| codes::custody_failure_code(&scp_crypto::CustodyFailure::from(e));
-        assert_eq!(code(PlatformError::KeyNotFound), codes::CRYPTO_4006);
-        assert_eq!(
-            code(PlatformError::PseudonymRejected("x".to_owned())),
-            codes::IDENT_1055
-        );
-        assert_eq!(
-            code(PlatformError::CustodyError("x".to_owned())),
-            codes::CRYPTO_4060
-        );
-        assert_eq!(
-            code(PlatformError::StorageError("x".to_owned())),
-            codes::CRYPTO_4060
-        );
-    }
-
-    /// Drives a future to completion on a current-thread runtime.
-    fn block_on<F: core::future::Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime")
-            .block_on(future)
-    }
-
-    /// The binding is gone during the host destroy, so a re-derive binding in
-    /// that window survives a successful destroy; a failed destroy restores
-    /// the removed binding.
-    #[test]
-    fn destroy_unbound_unbinds_before_the_host_call() {
-        let bindings = PseudonymBindings::default();
-        let pseudo = parse_pseudonym("derive_pseudonym", &REFERENCE_POINT, "9").expect("valid");
-        let handle = pseudo.key_handle();
-        bindings
-            .bind("derive_pseudonym", &pseudo, &REFERENCE_POINT)
-            .expect("bind");
-
-        // A re-derive that binds while the host destroys survives the destroy.
-        block_on(bindings.destroy_unbound(handle, async {
-            assert!(
-                bindings
-                    .check_sign_input(handle, &[0u8; 32])
-                    .expect("unbound during the host call")
-                    .is_none(),
-                "the binding is removed before the host call"
+        let table = [
+            (PlatformError::KeyNotFound, codes::CRYPTO_4006),
+            (
+                PlatformError::PseudonymRejected("x".to_owned()),
+                codes::IDENT_1055,
+            ),
+            (
+                PlatformError::WrongKeyType {
+                    expected: scp_platform::traits::KeyType::Ed25519,
+                    actual: scp_platform::traits::KeyType::X25519,
+                },
+                codes::CRYPTO_4060,
+            ),
+            (
+                PlatformError::StorageError("x".to_owned()),
+                codes::CRYPTO_4060,
+            ),
+            (PlatformError::StorageClosed, codes::STORAGE_8006),
+            (
+                PlatformError::StorageLockHeld {
+                    dir: "d".to_owned(),
+                    lock_path: "d/scp.db.lock".to_owned(),
+                },
+                codes::STORAGE_8005,
+            ),
+            (
+                PlatformError::AttestationError("x".to_owned()),
+                codes::CRYPTO_4060,
+            ),
+            (PlatformError::PushError("x".to_owned()), codes::CRYPTO_4060),
+            (
+                PlatformError::CustodyError("x".to_owned()),
+                codes::CRYPTO_4060,
+            ),
+            (PlatformError::Unsupported("x"), codes::CRYPTO_4060),
+        ];
+        for (error, expected) in table {
+            assert_eq!(
+                codes::custody_failure_code(&scp_crypto::CustodyFailure::from(&error)),
+                expected,
+                "{error:?}"
             );
-            bindings
-                .bind("derive_pseudonym", &pseudo, &REFERENCE_POINT)
-                .expect("concurrent re-derive binds");
-            Ok(())
-        }))
-        .expect("destroy");
-        assert!(
-            bindings
-                .check_sign_input(handle, &[0u8; 32])
-                .expect("bound")
-                .is_some(),
-            "the re-derive's binding survives"
-        );
-
-        // A failed host destroy keeps the key, so its binding comes back.
-        assert_custody_error(
-            &block_on(bindings.destroy_unbound(handle, async {
-                Err(PlatformError::CustodyError("host refused".to_owned()))
-            }))
-            .expect_err("host failure propagates"),
-        );
-        assert!(
-            bindings
-                .check_sign_input(handle, &[0u8; 32])
-                .expect("bound")
-                .is_some(),
-            "a failed destroy restores the binding"
-        );
-
-        // A successful destroy leaves it unbound.
-        block_on(bindings.destroy_unbound(handle, async { Ok(()) })).expect("destroy");
-        assert!(
-            bindings
-                .check_sign_input(handle, &[0u8; 32])
-                .expect("unbound")
-                .is_none()
-        );
+        }
     }
 
     /// §25.2 reference key, compressed:
@@ -463,203 +242,54 @@ mod tests {
         );
     }
 
-    fn assert_pseudonym_rejected(err: &PlatformError) {
-        assert!(
-            matches!(err, PlatformError::PseudonymRejected(_)),
-            "expected PseudonymRejected, got {err:?}"
-        );
-    }
-
     #[test]
-    fn parse_pseudonym_accepts_point_and_key_id() {
-        let pseudo = parse_pseudonym("derive_pseudonym", &REFERENCE_POINT, "123")
-            .expect("valid pseudonym parses");
-        assert_eq!(pseudo.public_key().as_bytes(), &REFERENCE_POINT);
-        assert_eq!(pseudo.key_handle().id(), 123);
+    fn parse_pseudonym_accepts_a_compressed_point() {
+        let pseudo =
+            parse_pseudonym("derive_pseudonym", &REFERENCE_POINT).expect("valid pseudonym parses");
+        assert_eq!(pseudo.public_key().to_compressed(), REFERENCE_POINT);
     }
 
-    /// Every malformed point reaches a distinct rejection path in
-    /// `P256PublicKey::from_sec1` (length, prefix, curve equation).
+    /// Each malformed point is rejected as `PseudonymRejected`, and the message
+    /// names the method and the reason for that row: the length for a wrong
+    /// length, the leading byte for a bad prefix, and the curve for an x with
+    /// no point.
     #[test]
     fn parse_pseudonym_rejects_invalid_points() {
-        let reject = |bytes: &[u8]| {
-            assert_pseudonym_rejected(
-                &parse_pseudonym("derive_pseudonym", bytes, "7")
-                    .expect_err("invalid point rejected"),
-            );
+        let reject = |bytes: &[u8], reason: &str| match parse_pseudonym("derive_pseudonym", bytes)
+            .expect_err("invalid point rejected")
+        {
+            PlatformError::PseudonymRejected(m) => {
+                assert!(
+                    m.starts_with("KeyCustodyProvider.derive_pseudonym: "),
+                    "{m}"
+                );
+                assert!(m.contains(reason), "{reason:?} not in {m}");
+            }
+            other => panic!("expected PseudonymRejected, got {other:?}"),
         };
-        // Wrong lengths: 32 (a legacy Ed25519 key) and 34.
-        reject(&REFERENCE_POINT[1..]);
+        // Wrong lengths: 32 (a legacy Ed25519 key), 34, and 65 (an
+        // uncompressed point, which `from_sec1` alone would accept).
+        reject(&REFERENCE_POINT[1..], "got 32 bytes");
         let mut long = REFERENCE_POINT.to_vec();
         long.push(0x00);
-        reject(&long);
+        reject(&long, "got 34 bytes");
+        let mut uncompressed = [0u8; 65];
+        uncompressed[0] = 0x04;
+        reject(&uncompressed, "got 65 bytes");
         // Bad prefix: 33 bytes led by 0x04 (the uncompressed tag).
         let mut bad_prefix = REFERENCE_POINT;
         bad_prefix[0] = 0x04;
-        reject(&bad_prefix);
+        reject(&bad_prefix, "invalid leading byte 0x04");
         // Off-curve x: x = 1 is a field element, but 1 - 3 + b is a quadratic
         // non-residue mod p, so no y exists.
         let mut off_curve = [0u8; 33];
         off_curve[0] = 0x02;
         off_curve[32] = 0x01;
-        reject(&off_curve);
+        reject(&off_curve, "not on the curve");
         // x = 2^256 - 1 is not a field element at all.
         let mut not_field = [0xFFu8; 33];
         not_field[0] = 0x02;
-        reject(&not_field);
-    }
-
-    /// The fail-open counterexample against the old concatenated return: a
-    /// 32-byte Ed25519 key `K` with key id `"22"` concatenated to `K || "22"`,
-    /// whose first 33 bytes `K || 0x32` happen to be a valid P-256 point, so the
-    /// split parse accepted it as a pseudonym with handle 2. With separate fields
-    /// the 32-byte key is rejected on length, and a host that forwards the
-    /// concatenated point anyway fails the `public_key(key_id)` binding.
-    #[test]
-    fn legacy_concatenation_counterexample_is_rejected() {
-        let legacy_key: [u8; 32] = [
-            0x02, 0x6e, 0x34, 0x0b, 0x9c, 0xff, 0xb3, 0x7a, 0x98, 0x9c, 0xa5, 0x44, 0xe6, 0xbb,
-            0x78, 0x0a, 0x2c, 0x78, 0x90, 0x1d, 0x3f, 0xb3, 0x37, 0x38, 0x76, 0x85, 0x11, 0xa3,
-            0x06, 0x17, 0xaf, 0xa0,
-        ];
-        assert_pseudonym_rejected(
-            &parse_pseudonym("derive_pseudonym", &legacy_key, "22").expect_err("32 bytes rejected"),
-        );
-
-        let mut old_split_point = legacy_key.to_vec();
-        old_split_point.push(b'2');
-        let pseudo = parse_pseudonym("derive_pseudonym", &old_split_point, "2")
-            .expect("the old split's first 33 bytes are a valid point");
-        let bindings = PseudonymBindings::default();
-        assert_pseudonym_rejected(
-            &bindings
-                .bind("derive_pseudonym", &pseudo, &legacy_key)
-                .expect_err("host key 2 is not that point"),
-        );
-        assert!(
-            bindings
-                .check_sign_input(pseudo.key_handle(), &[0u8; 32])
-                .expect("unbound handle")
-                .is_none(),
-            "a failed bind leaves the handle unbound"
-        );
-    }
-
-    #[test]
-    fn parse_pseudonym_rejects_non_numeric_key_id() {
-        assert_pseudonym_rejected(
-            &parse_pseudonym("derive_rotatable_pseudonym", &REFERENCE_POINT, "xyz")
-                .expect_err("non-numeric key_id is rejected"),
-        );
-    }
-
-    #[test]
-    fn bind_rejects_rebinding_a_key_id_to_another_point() {
-        let bindings = PseudonymBindings::default();
-        let first = parse_pseudonym("derive_pseudonym", &REFERENCE_POINT, "5").expect("valid");
-        bindings
-            .bind("derive_pseudonym", &first, &REFERENCE_POINT)
-            .expect("bind");
-        let other = signing_key().public_key().to_compressed();
-        let second = parse_pseudonym("derive_pseudonym", &other, "5").expect("valid");
-        assert_pseudonym_rejected(
-            &bindings
-                .bind("derive_pseudonym", &second, &other)
-                .expect_err("rebinding is rejected"),
-        );
-        block_on(bindings.destroy_unbound(first.key_handle(), async { Ok(()) })).expect("destroy");
-        bindings
-            .bind("derive_pseudonym", &second, &other)
-            .expect("bind after destroy");
-    }
-
-    const N: [u8; 32] = [
-        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63,
-        0x25, 0x51,
-    ];
-
-    fn signing_key() -> scp_crypto::p256::P256SigningKey {
-        scp_crypto::p256::P256SigningKey::from_seed(b"SCP-FFI-COMMON-TEST", &[9u8; 32])
-            .expect("seed maps to a scalar")
-    }
-
-    /// `n - s` for a big-endian 32-byte `s < n`.
-    fn negate_s(s: &[u8]) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        let mut borrow = 0i16;
-        for i in (0..32).rev() {
-            let mut d = i16::from(N[i]) - i16::from(s[i]) - borrow;
-            borrow = i16::from(d < 0);
-            if d < 0 {
-                d += 256;
-            }
-            out[i] = u8::try_from(d).expect("byte");
-        }
-        out
-    }
-
-    #[test]
-    fn pseudonym_sign_is_checked_strictly_against_the_bound_point() {
-        let key = signing_key();
-        let point = key.public_key().to_compressed();
-        let pseudo = parse_pseudonym("derive_pseudonym", &point, "9").expect("valid");
-        let bindings = PseudonymBindings::default();
-        bindings
-            .bind("derive_pseudonym", &pseudo, &point)
-            .expect("bind");
-        let handle = pseudo.key_handle();
-
-        // Non-pseudonym handles pass through unchecked.
-        assert!(
-            bindings
-                .check_sign_input(&KeyHandle::new(10), b"any length")
-                .expect("identity handle")
-                .is_none()
-        );
-        // A pseudonym handle signs only a 32-byte digest.
-        assert_custody_error(
-            &bindings
-                .check_sign_input(handle, &[0u8; 12])
-                .expect_err("12-byte input rejected"),
-        );
-
-        let digest = [0x5au8; 32];
-        let (bound, checked) = bindings
-            .check_sign_input(handle, &digest)
-            .expect("32-byte digest")
-            .expect("pseudonym handle is bound");
-        assert_eq!(checked, digest);
-        let good = scp_crypto::p256::sign_prehash_rfc6979(&key, &digest).expect("sign");
-        PseudonymBindings::check_signature(&bound, &digest, &good).expect("low-s verifies");
-
-        // High-s form of the same signature: valid ECDSA, rejected, not normalized.
-        let mut high = good;
-        high[32..].copy_from_slice(&negate_s(&good[32..]));
-        assert_custody_error(
-            &PseudonymBindings::check_signature(&bound, &digest, &high).expect_err("high-s"),
-        );
-        assert!(
-            scp_crypto::p256::verify_prehash_lenient(&bound, &digest, &high).is_ok(),
-            "the high-s mutant is otherwise a valid signature"
-        );
-
-        // Wrong length and wrong key.
-        assert_custody_error(
-            &PseudonymBindings::check_signature(&bound, &digest, &good[..63]).expect_err("63"),
-        );
-        let other = scp_crypto::p256::P256PublicKey::from_sec1(&REFERENCE_POINT).expect("point");
-        assert_custody_error(
-            &PseudonymBindings::check_signature(&other, &digest, &good).expect_err("wrong key"),
-        );
-
-        block_on(bindings.destroy_unbound(handle, async { Ok(()) })).expect("destroy");
-        assert!(
-            bindings
-                .check_sign_input(handle, &[0u8; 12])
-                .expect("unbound")
-                .is_none()
-        );
+        reject(&not_field, "not on the curve");
     }
 
     #[test]
@@ -680,24 +310,5 @@ mod tests {
                 .id(),
             u64::MAX
         );
-    }
-
-    /// B1: a host that returns the same key id for the same pseudonym (the
-    /// §9.10.4 determinism the provider interfaces require) re-binds cleanly.
-    #[test]
-    fn rebinding_the_same_point_under_the_same_id_is_ok() {
-        let bindings = PseudonymBindings::default();
-        let pseudo = parse_pseudonym("derive_pseudonym", &REFERENCE_POINT, "5").expect("valid");
-        bindings
-            .bind("derive_pseudonym", &pseudo, &REFERENCE_POINT)
-            .expect("first bind");
-        bindings
-            .bind("derive_pseudonym", &pseudo, &REFERENCE_POINT)
-            .expect("same point re-binds");
-        let (point, _) = bindings
-            .check_sign_input(pseudo.key_handle(), &[0u8; 32])
-            .expect("32-byte digest")
-            .expect("still bound");
-        assert_eq!(point.to_compressed(), REFERENCE_POINT);
     }
 }

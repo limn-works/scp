@@ -257,7 +257,7 @@ impl KeyPackageAttestation {
     /// This is NOT a signable input: the Ed25519 signature is computed over
     /// [`signing_hash`](Self::signing_hash), never over this body.
     ///
-    /// Infallible: as with [`signing_preimage`](Self::signing_preimage), the
+    /// Infallible: as with `signing_preimage`, the
     /// shared builder cannot error for these bounded fields, so
     /// `unwrap_or_default` never panics.
     #[must_use]

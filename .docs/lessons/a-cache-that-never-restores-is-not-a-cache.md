@@ -32,6 +32,6 @@ different, because eighteen `Swatinem/rust-cache` steps evicted each other. A ca
   as the library build**, and the `--library` path must sit in the directory those flags
   select. Otherwise cargo compiles about 650 dependencies a second time, or reads a library
   no step produced.
-- **A cache decides how long a job takes, never what it reports**, because cargo recompiles
+- **A `Swatinem/rust-cache` entry decides how long a job takes, never what it reports**, because cargo recompiles
   whatever fingerprint does not match. A misnamed group costs a miss, which is also why
   nobody notices when caching silently stops working.
