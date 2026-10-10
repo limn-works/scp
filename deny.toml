@@ -97,8 +97,6 @@ wildcards = "allow"
 # scalar multiplication behind `ecdh_p256`): no other workspace crate may depend
 # on the curve crates, normal or dev. `wrappers` lists every crate allowed to
 # depend on each one directly; the rest are the upstream crates that need them.
-# The clippy `disallowed-types` bans on the P-256 point and scalar types are the
-# second layer; this one also catches a type the compiler infers.
 #
 # The lru ignore above holds an advisory ID for every lru version in the graph. This
 # ban keeps it scoped to the transitive copy it justifies: an lru below the patched

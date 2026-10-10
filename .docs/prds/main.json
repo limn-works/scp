@@ -10595,7 +10595,6 @@
         "crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs",
         "crates/scp-crypto/Cargo.toml",
         "crates/scp-crypto/README.md",
-        "crates/scp-crypto/clippy.toml",
         "crates/scp-crypto/src/custody.rs",
         "crates/scp-crypto/src/lib.rs",
         "crates/scp-crypto/src/p256.rs",
