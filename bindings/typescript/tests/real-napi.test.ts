@@ -18,7 +18,6 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
-import type { BridgeMode } from "../src/bridge";
 import { ContextError } from "../src/errors";
 import { __getNativeScp, SCP } from "../src/scp";
 import type { Relay } from "../src/server";
@@ -55,7 +54,7 @@ type NativeBridge = Awaited<ReturnType<typeof import("../src/internal/bridge").g
 //
 // A small set of stateless helpers deliberately remain as module-level
 // free functions on the raw addon — `discovery_*`, `context_discover`,
-// `bridge_evaluate_trust`, `bridge_register`, `scp_version`. They touch
+// `scp_version`. They touch
 // no bridge state, so they never needed instance-scoping (see the
 // "sub-slice B" comment in `crates/scp-ffi/napi/src/scp.rs`). These calls
 // dispatch through `rawAddon` below rather than through the `SCP` wrapper.
@@ -87,7 +86,7 @@ try {
   probe.shutdown(1).catch(() => {});
 
   // Also load the raw addon — it still exports the stateless module-level
-  // helpers (discovery, bridge_evaluate_trust, bridge_register). `loadNativeAddon`
+  // helpers (discovery). `loadNativeAddon`
   // is the SDK's one loader: resolving the platform package here instead would let
   // this file's copy of the platform map drift from the loader's, and this file
   // would then skip over an addon the loader resolves.
@@ -1556,151 +1555,6 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     test("checks chain depth with custom limit", () => {
       expect(napi.provenanceCheckChainDepth(1, 1)).toBe(true);
       expect(napi.provenanceCheckChainDepth(2, 1)).toBe(false);
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // 9. Bridge trust evaluation
-  // ---------------------------------------------------------------------------
-
-  describe("Bridge trust (real NAPI)", () => {
-    // `bridgeEvaluateTrust` and `bridgeRegister` are stateless module-level
-    // helpers on the raw addon — not on the `Scp` class. Post-ADR-048 the
-    // test calls dispatch through `addon` directly. The raw addon returns
-    // camelCase keys (napi-rs `#[napi(object)]` default); the Bridge
-    // wrapper's snake_case normalization no longer applies here so the
-    // assertions below read the camelCase shape.
-    test("evaluates trust for native non-bridged action (highest tier)", () => {
-      const tier = addon.bridgeEvaluateTrust(false, true, "shadow");
-      expect(typeof tier).toBe("number");
-      // Native + non-bridged should be highest trust.
-      expect(tier).toBe(3);
-    });
-
-    test("evaluates trust for shadow bridged action (lowest tier)", () => {
-      const tier = addon.bridgeEvaluateTrust(true, false, "shadow");
-      expect(typeof tier).toBe("number");
-      expect(tier).toBeLessThan(3);
-    });
-
-    test("evaluates trust for claimed bridged action", () => {
-      const tier = addon.bridgeEvaluateTrust(true, false, "claimed");
-      expect(typeof tier).toBe("number");
-      // Claimed should be higher trust than shadow when bridged.
-      const shadowTier = addon.bridgeEvaluateTrust(true, false, "shadow");
-      expect(tier).toBeGreaterThanOrEqual(shadowTier);
-    });
-
-    test("registers a bridge connector", () => {
-      const reg = addon.bridgeRegister(
-        "ctx-bridge-test",
-        "did:key:operator",
-        "did:key:governance",
-        "discord",
-        "relay",
-      );
-      // Raw addon returns camelCase keys.
-      expect(reg.bridgeId).toBeTruthy();
-      expect(reg.operatorDid).toBe("did:key:operator");
-      expect(reg.platform).toBe("discord");
-      expect(reg.mode).toBe("relay");
-      expect(reg.status).toBe("active");
-      expect(reg.contextId).toBe("ctx-bridge-test");
-    });
-
-    test("rejects self-approval (operator === governance)", () => {
-      expect(() =>
-        addon.bridgeRegister(
-          "ctx-self",
-          "did:key:operator",
-          "did:key:operator",
-          "discord",
-          "relay",
-        ),
-      ).toThrow(/approver cannot be the same/);
-    });
-
-    test("creates a shadow identity", () => {
-      const shadow = napi.bridgeCreateShadow("bridge-1", "@discorduser", "relay", "ctx-shadow");
-      expect(shadow.shadow_id).toBeTruthy();
-      expect(shadow.platform_handle).toBe("@discorduser");
-      expect(shadow.bridge_id).toBe("bridge-1");
-      expect(shadow.attributed_role).toBe("observer");
-      // Provenance status should be "Shadow" (Debug format from Rust).
-      expect(shadow.provenance_status).toBeTruthy();
-    });
-
-    test("registers bridges with all four modes", () => {
-      for (const mode of [
-        "relay",
-        "puppet",
-        "api",
-        "cooperative",
-      ] as const satisfies readonly BridgeMode[]) {
-        const reg = addon.bridgeRegister(`ctx-${mode}`, "did:key:op", "did:key:gov", "slack", mode);
-        expect(reg.status).toBe("active");
-      }
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // 9b. Bridge credential store (spec §12.11) — per-instance SCP methods
-  // ---------------------------------------------------------------------------
-
-  describe("Bridge credentials (real NAPI)", () => {
-    const key = new Uint8Array(32).fill(7);
-
-    test("provision -> retrieve -> rotate -> revoke lifecycle", () => {
-      const bridgeId = "bridge-cred-ts-001";
-
-      const provisioned = scpInstance.bridgeCredentialProvision(
-        bridgeId,
-        "ApiKey",
-        new TextEncoder().encode("first-secret"),
-        key,
-      );
-      expect(provisioned.bridgeId).toBe(bridgeId);
-      expect(provisioned.credentialType).toBe("ApiKey");
-      expect(typeof provisioned.createdAt).toBe("number");
-
-      const retrieved = scpInstance.bridgeCredentialRetrieve(bridgeId, "ApiKey", key);
-      expect(new TextDecoder().decode(retrieved)).toBe("first-secret");
-
-      scpInstance.bridgeCredentialRotate(
-        bridgeId,
-        "ApiKey",
-        new TextEncoder().encode("second-secret"),
-        key,
-      );
-      const rotated = scpInstance.bridgeCredentialRetrieve(bridgeId, "ApiKey", key);
-      expect(new TextDecoder().decode(rotated)).toBe("second-secret");
-
-      expect(scpInstance.bridgeCredentialList(bridgeId)).toEqual(["ApiKey"]);
-
-      scpInstance.bridgeCredentialRevoke(bridgeId);
-      expect(() => scpInstance.bridgeCredentialRetrieve(bridgeId, "ApiKey", key)).toThrow();
-    });
-
-    test("credential key store -> get -> delete lifecycle", () => {
-      const bridgeId = "bridge-cred-ts-002";
-
-      scpInstance.bridgeCredentialStoreKey(bridgeId, key);
-      const got = scpInstance.bridgeCredentialGetKey(bridgeId);
-      expect(Array.from(got)).toEqual(Array.from(key));
-
-      scpInstance.bridgeCredentialDeleteKey(bridgeId);
-      expect(() => scpInstance.bridgeCredentialGetKey(bridgeId)).toThrow();
-    });
-
-    test("rejects a non-32-byte credential key", () => {
-      expect(() =>
-        scpInstance.bridgeCredentialProvision(
-          "bridge-cred-ts-003",
-          "ApiKey",
-          new TextEncoder().encode("secret"),
-          new Uint8Array(16),
-        ),
-      ).toThrow();
     });
   });
 
