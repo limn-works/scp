@@ -695,9 +695,9 @@ jobs:
   # wheel's configuration with libsqlite3-sys's
   # `bundled-sqlcipher-vendored-openssl` feature on, and no other configuration
   # scripts/check-shipped-feature-graph.sh --print-artifacts lists and no package
-  # of the root workspace, each resolved under `cargo tree --target all`. Its
-  # fixture harness runs first and must pass. It compiles nothing, so it reads the
-  # `workspace-debug` group for its registry alone.
+  # of a shipped workspace root the script lists, each resolved under
+  # `cargo tree --target all`. Its fixture harness runs first and must pass. It
+  # compiles nothing, so it reads the `workspace-debug` group for its registry alone.
   vendored-openssl-scope:
     needs: changes
     if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
