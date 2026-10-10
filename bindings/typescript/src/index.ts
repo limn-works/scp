@@ -213,6 +213,8 @@ export { Node, Relay } from "./server";
 
 export type {
   ContextReconnectResult,
+  CustodyKeyRole,
+  CustodyKeyType,
   CustodyPublicKey,
   KeyCustodyProvider,
   KeyPackageReservation,

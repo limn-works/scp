@@ -530,14 +530,26 @@ export interface KeyPackageReservation {
   readonly keyPackagePublic: Uint8Array;
 }
 
-/** A custody key's stated type and public key, returned by {@link KeyCustodyProvider.getPublicKey}. */
+/**
+ * The type of a custody key: Ed25519 or X25519, `"p256"` (ECDSA P-256
+ * signing) or `"hpke-p256"` (P-256 ECDH for HPKE).
+ */
+export type CustodyKeyType = "ed25519" | "x25519" | "p256" | "hpke-p256";
+
+/**
+ * The role a custody key was minted in: `"identity"` (the only source a
+ * pseudonym derives from) or `"operational"`.
+ */
+export type CustodyKeyRole = "identity" | "operational";
+
+/** A custody key's type, public key and role, returned by {@link KeyCustodyProvider.getPublicKey}. */
 export interface CustodyPublicKey {
-  /** `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`. */
-  keyType: string;
+  /** The key's type. */
+  keyType: CustodyKeyType;
   /** The public key in the exact encoding its type names. */
   publicKey: Uint8Array;
-  /** `"identity"` or `"operational"`: the role the key was minted in. */
-  role: string;
+  /** The role the key was minted in. */
+  role: CustodyKeyRole;
 }
 
 /**
@@ -593,15 +605,13 @@ export interface CustodyPublicKey {
 export interface KeyCustodyProvider {
   /**
    * Generate a keypair and return its id, a canonical decimal `u64` string
-   * (`SCP-CRYPTO-4060` otherwise). `keyType` is `"ed25519"`, `"x25519"`,
-   * `"p256"` (ECDSA P-256 signing) or `"hpke-p256"` (P-256 ECDH for HPKE).
-   * `role` is `"identity"` (the only source a pseudonym derives from) or
-   * `"operational"`. Record `role` and report it from {@link getPublicKey}
-   * for the key's lifetime; the bridge refuses and destroys a key whose
-   * reported role differs. Never reuse a key id: an id returned here names no
-   * other key for the provider's lifetime, even after that key is destroyed.
+   * (`SCP-CRYPTO-4060` otherwise). Record `role` and report it from
+   * {@link getPublicKey} for the key's lifetime; the bridge refuses and
+   * destroys a key whose reported type or role differs. Never reuse a key
+   * id: an id returned here names no other key for the provider's lifetime,
+   * even after that key is destroyed.
    */
-  generateKeypair(keyType: string, role: string): string;
+  generateKeypair(keyType: CustodyKeyType, role: CustodyKeyRole): string;
   /**
    * Sign `message` under `keyId`. An Ed25519 key returns the 64-byte
    * signature. A `"p256"` key receives a 32-byte digest (§9.5.1, no second
@@ -613,8 +623,8 @@ export interface KeyCustodyProvider {
    */
   sign(keyId: string, message: Uint8Array): Uint8Array;
   /**
-   * Return the type and public key of `keyId`. `keyType` is the type the key
-   * was generated with (`"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`).
+   * Return the type, public key and role of `keyId`. `keyType` is the type
+   * the key was generated with.
    * `publicKey` is 32 bytes for Ed25519 and X25519, the 33-byte compressed
    * SEC1 point for `"p256"`, and the 65-byte uncompressed SEC1 point for
    * `"hpke-p256"`. The bridge registers the key under the stated type and

@@ -20,7 +20,12 @@ import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 
 import { CryptoError, KeyNotFoundError, ScpError } from "../src/errors";
-import type { CustodyPublicKey, KeyCustodyProvider } from "../src/scp";
+import type {
+  CustodyKeyRole,
+  CustodyKeyType,
+  CustodyPublicKey,
+  KeyCustodyProvider,
+} from "../src/scp";
 import { p256SoftwarePseudonymPoint, SCP } from "../src/scp";
 import { skipReasonIfAddonAbsent } from "./napi-guard";
 
@@ -48,7 +53,7 @@ type PseudonymFault = "legacy32" | "deriveKeyNotFound";
 class CryptoKeychain implements KeyCustodyProvider {
   #seeds = new Map<string, Uint8Array>();
   // Key id -> the role generateKeypair minted it in.
-  #roles = new Map<string, string>();
+  #roles = new Map<string, CustodyKeyRole>();
   #next = 1;
   readonly #fault: PseudonymFault | undefined;
 
@@ -56,7 +61,7 @@ class CryptoKeychain implements KeyCustodyProvider {
     this.#fault = fault;
   }
 
-  generateKeypair(_keyType: string, role: string): string {
+  generateKeypair(_keyType: CustodyKeyType, role: CustodyKeyRole): string {
     const { privateKey } = crypto.generateKeyPairSync("ed25519");
     const jwk = privateKey.export({ format: "jwk" }) as { d: string };
     const kid = String(this.#next++);
@@ -93,8 +98,14 @@ class CryptoKeychain implements KeyCustodyProvider {
     return {
       keyType: "ed25519",
       publicKey: new Uint8Array(Buffer.from(jwk.x, "base64url")),
-      role: this.#roles.get(keyId) ?? "missing",
+      role: this.#role(keyId),
     };
+  }
+
+  #role(keyId: string): CustodyKeyRole {
+    const role = this.#roles.get(keyId);
+    if (role === undefined) throw new KeyNotFoundError(`no role recorded for ${keyId}`);
+    return role;
   }
 
   destroyKey(keyId: string): void {

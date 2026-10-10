@@ -42,6 +42,33 @@ pub enum KeyType {
     HpkeP256,
 }
 
+impl KeyType {
+    /// The type's name in a host custody contract: `"ed25519"`, `"x25519"`,
+    /// `"p256"` or `"hpke-p256"` (ADR-021, amended 2026-10-10).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ed25519 => "ed25519",
+            Self::X25519 => "x25519",
+            Self::P256Signing => "p256",
+            Self::HpkeP256 => "hpke-p256",
+        }
+    }
+
+    /// Parses a name that [`as_str`](Self::as_str) produces; any other string
+    /// is `None`.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "ed25519" => Some(Self::Ed25519),
+            "x25519" => Some(Self::X25519),
+            "p256" => Some(Self::P256Signing),
+            "hpke-p256" => Some(Self::HpkeP256),
+            _ => None,
+        }
+    }
+}
+
 /// What a custody key is for, fixed when custody first holds the key
 /// (ADR-006, amended 2026-10-10).
 ///
@@ -1423,4 +1450,32 @@ pub fn x25519_agree_from_ed25519(
     // defense-in-depth — ensures zeroing even if the feature is ever removed.
     let shared_bytes = zeroize::Zeroizing::new(shared.to_bytes());
     SharedSecret::new(*shared_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KeyRole, KeyType};
+
+    /// Every key type and role names itself in the host contract and parses
+    /// back; a near miss in case or spelling parses to nothing.
+    #[test]
+    fn host_contract_names_round_trip() {
+        for t in [
+            KeyType::Ed25519,
+            KeyType::X25519,
+            KeyType::P256Signing,
+            KeyType::HpkeP256,
+        ] {
+            assert_eq!(KeyType::parse(t.as_str()), Some(t));
+        }
+        assert_eq!(KeyType::P256Signing.as_str(), "p256");
+        assert_eq!(KeyType::HpkeP256.as_str(), "hpke-p256");
+        for r in [KeyRole::Identity, KeyRole::Operational] {
+            assert_eq!(KeyRole::parse(r.as_str()), Some(r));
+        }
+        for bad in ["P256", "", "hpke_p256", "Identity", "admin"] {
+            assert_eq!(KeyType::parse(bad), None, "{bad}");
+            assert_eq!(KeyRole::parse(bad), None, "{bad}");
+        }
+    }
 }

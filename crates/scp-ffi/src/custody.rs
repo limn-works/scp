@@ -420,6 +420,10 @@ impl PyKeyCustodyProvider {
             "derive_pseudonym" | "derive_rotatable_pseudonym" => {
                 " (expected bytes: the 33-byte compressed P-256 pseudonym point)"
             }
+            "get_public_key" => {
+                " (expected an object with key_type, public_key and role attributes, \
+                 such as scp_sdk.CustodyPublicKey)"
+            }
             _ => "",
         };
         PlatformError::CustodyError(format!(
@@ -472,26 +476,29 @@ impl FfiKeyCustody {
 ///   leading zero, no whitespace), which
 ///   [`parse_handle`](scp_ffi_common::custody_parse::parse_handle) enforces
 ///   (`SCP-CRYPTO-4060` otherwise). `key_type` is `"ed25519"`, `"x25519"`,
-///   `"p256"` or `"hpke-p256"`, and `role` is `"identity"` (the only
-///   pseudonym-derivation source) or `"operational"`. The host records
-///   `role` and reports it from `get_public_key` for the key's lifetime; the
-///   bridge refuses and destroys a key whose reported role differs. The host
-///   never reuses a key id: an id it returns here names no other key for the
-///   host's lifetime, even after that key is destroyed.
+///   `"p256"` or `"hpke-p256"` (`scp_sdk.CustodyKeyType`), and `role` is
+///   `"identity"` (the only pseudonym-derivation source) or `"operational"`
+///   (`scp_sdk.CustodyKeyRole`). The host records `role` and reports it from
+///   `get_public_key` for the key's lifetime; the bridge refuses and destroys
+///   a key whose reported type or role differs. The host never reuses a key
+///   id: an id it returns here names no other key for the host's lifetime,
+///   even after that key is destroyed.
 /// - `sign(key_id: str, message: bytes) -> bytes` — a 64-byte Ed25519 sig;
 ///   for a `"p256"` key, `message` is the 32-byte digest and the result is
 ///   raw `r ‖ s` or DER, which the bridge normalises to low-`s` and verifies
 ///   strictly under the key's registered point. A software host MUST derive
 ///   the ECDSA nonce by RFC 6979 with SHA-256; a hardware host (Secure
 ///   Enclave, `StrongBox`/TEE) may use a random nonce.
-/// - `get_public_key(key_id: str) -> tuple[str, bytes, str]` — `(key_type,
-///   public_key, role)`: the key's type (`"ed25519"`, `"x25519"`, `"p256"` or
-///   `"hpke-p256"`), its public key, exactly 32 bytes (Ed25519 / X25519), 33
-///   (compressed SEC1, `"p256"`) or 65 (uncompressed SEC1, `"hpke-p256"`),
-///   and the role `generate_keypair` minted it in. The bridge types the key
-///   from `key_type`, never from the length, and refuses any other length. A
-///   key id the bridge has not seen binds as an identity only when `role` is
-///   `"identity"`. The bridge cannot check the host's word: a host that
+/// - `get_public_key(key_id: str) -> scp_sdk.CustodyPublicKey` — an object
+///   whose `key_type` attribute is the key's type (as above), whose
+///   `public_key` attribute is its public key, exactly 32 bytes (Ed25519 /
+///   X25519), 33 (compressed SEC1, `"p256"`) or 65 (uncompressed SEC1,
+///   `"hpke-p256"`), and whose `role` attribute is the role
+///   `generate_keypair` minted it in. The bridge types the key from
+///   `key_type`, never from the length, and refuses any other length, and
+///   any type or role name outside the two `Literal`s. A key id the bridge
+///   has not seen binds as an identity only when `role` is `"identity"`. The
+///   bridge cannot check the host's word: a host that
 ///   reports `"identity"` for a key it minted as `"operational"` lets that
 ///   key derive pseudonyms, which is outside Rust's control.
 /// - Any method raises `scp_sdk.KeyNotFoundError`, or any exception whose
@@ -515,30 +522,51 @@ impl FfiKeyCustody {
 ///   `"in_memory"`.
 pub struct PyCallbackKeyCustody {
     provider: PyKeyCustodyProvider,
-    /// Every handle's type, role and life-cycle state, resolved through the
-    /// host's structured `get_public_key` for handles this adapter did not
-    /// mint.
+    /// The type, public key and role of each handle this adapter minted or
+    /// resolved through the host's structured `get_public_key`.
     registry: scp_ffi_common::callback_custody::CallbackKeyRegistry,
 }
 
+/// The attributes of a host's `get_public_key` answer
+/// (`scp_sdk.CustodyPublicKey`), before the type and role names are parsed.
+#[derive(FromPyObject)]
+struct PyHostPublicKey {
+    #[pyo3(attribute)]
+    key_type: String,
+    #[pyo3(attribute)]
+    public_key: Vec<u8>,
+    #[pyo3(attribute)]
+    role: String,
+}
+
 impl PyKeyCustodyProvider {
-    /// `get_public_key(key_id)` as the structured `(key_type, public_key,
-    /// role)` answer the shared flows take.
+    /// `get_public_key(key_id)` as the typed answer the shared flows take.
+    /// A type or role name outside the host contract is a custody error.
     fn host_public_key(
         &self,
         key_id: &str,
     ) -> std::future::Ready<Result<scp_ffi_common::callback_custody::HostPublicKey, PlatformError>>
     {
         std::future::ready(
-            self.call_str::<(String, Vec<u8>, String)>("get_public_key", key_id)
-                .map(|(key_type, public_key, role)| {
-                    scp_ffi_common::callback_custody::HostPublicKey {
-                        key_type,
-                        public_key,
-                        role,
-                    }
+            self.call_str::<PyHostPublicKey>("get_public_key", key_id)
+                .and_then(|answer| {
+                    scp_ffi_common::callback_custody::HostPublicKey::from_names(
+                        "get_public_key",
+                        &answer.key_type,
+                        answer.public_key,
+                        &answer.role,
+                    )
                 }),
         )
+    }
+
+    /// `generate_keypair(key_type, role)`, passing the contract's names.
+    fn host_generate(
+        &self,
+        key_type: KeyType,
+        role: scp_platform::KeyRole,
+    ) -> std::future::Ready<Result<String, PlatformError>> {
+        std::future::ready(self.call_str_str("generate_keypair", key_type.as_str(), role.as_str()))
     }
 }
 
@@ -569,48 +597,18 @@ impl PyCallbackKeyCustody {
     ///
     /// [`PlatformError::WrongKeyType`] for a handle of another type, before
     /// any export call; [`PlatformError::KeyNotFound`] for a handle the host
-    /// does not hold; [`PlatformError::CustodyError`] if the provider raises
-    /// or returns a non-32-byte value.
+    /// does not hold; [`PlatformError::CustodyError`] if the provider raises,
+    /// returns a non-32-byte value, or returns a seed for another key.
     pub async fn export_ed25519_signing_key(
         &self,
         handle: &KeyHandle,
     ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
         let p = &self.provider;
-        scp_ffi_common::callback_custody::require_ed25519(&self.registry, handle, |key_id| {
-            p.host_public_key(&key_id)
-        })
-        .await?;
-        // Private seed material: wrap in `Zeroizing` the moment it crosses
-        // back from Python so the heap buffer is wiped on drop (ADR-006).
-        let bytes: zeroize::Zeroizing<Vec<u8>> = zeroize::Zeroizing::new(
-            self.provider
-                .call_str("export_signing_key_bytes", &handle.id().to_string())?,
-        );
-        let arr = zeroize::Zeroizing::new(scp_ffi_common::custody_parse::expect_32(
-            "export_signing_key_bytes",
-            &bytes,
-        )?);
-        Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
-    }
-}
-
-impl PyCallbackKeyCustody {
-    /// Mints a key of `key_type` in `role` through the shared flow.
-    async fn generate(
-        &self,
-        key_type: KeyType,
-        role: scp_ffi_common::callback_custody::KeyRole,
-    ) -> Result<KeyHandle, PlatformError> {
-        let p = &self.provider;
-        scp_ffi_common::callback_custody::generate_keypair(
+        scp_ffi_common::callback_custody::export_ed25519_signing_key(
             &self.registry,
-            key_type,
-            role,
-            |type_str, role_str| {
-                std::future::ready(p.call_str_str("generate_keypair", type_str, role_str))
-            },
+            handle,
+            |key_id| std::future::ready(p.call_str("export_signing_key_bytes", &key_id)),
             |key_id| p.host_public_key(&key_id),
-            |key_id| std::future::ready(p.call_str_void("destroy_key", &key_id)),
         )
         .await
     }
@@ -623,17 +621,24 @@ impl KeyCustody for PyCallbackKeyCustody {
     // entry point resolves a handle this adapter has not registered through
     // `get_public_key`.
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
-        self.generate(
+        let p = &self.provider;
+        scp_ffi_common::callback_custody::generate_operational(
+            &self.registry,
             key_type,
-            scp_ffi_common::callback_custody::KeyRole::Operational,
+            |key_type, role| p.host_generate(key_type, role),
+            |key_id| p.host_public_key(&key_id),
+            |key_id| std::future::ready(p.call_str_void("destroy_key", &key_id)),
         )
         .await
     }
 
     async fn generate_identity_keypair(&self) -> Result<KeyHandle, PlatformError> {
-        self.generate(
-            KeyType::Ed25519,
-            scp_ffi_common::callback_custody::KeyRole::Identity,
+        let p = &self.provider;
+        scp_ffi_common::callback_custody::generate_identity(
+            &self.registry,
+            |key_type, role| p.host_generate(key_type, role),
+            |key_id| p.host_public_key(&key_id),
+            |key_id| std::future::ready(p.call_str_void("destroy_key", &key_id)),
         )
         .await
     }
@@ -738,28 +743,15 @@ impl KeyCustody for PyCallbackKeyCustody {
         ed25519_handle: &KeyHandle,
         peer_x25519_public: &[u8; 32],
     ) -> Result<SharedSecret, PlatformError> {
-        // The Python callback protocol does not expose a distinct birational
-        // conversion; the provider manages key types internally, so delegate
-        // to dh_agree (mirrors the UniFFI CallbackKeyCustody contract) once
-        // the handle resolves to an Ed25519 key.
         let p = &self.provider;
-        scp_ffi_common::callback_custody::require_ed25519(&self.registry, ed25519_handle, |id| {
-            p.host_public_key(&id)
-        })
-        .await?;
-        // Wrap the raw shared secret in `Zeroizing` so the intermediate heap
-        // buffer is wiped on drop once it has been copied into `SharedSecret`
-        // (defense-in-depth, matching `export_ed25519_signing_key`; ADR-006).
-        let shared: zeroize::Zeroizing<Vec<u8>> =
-            zeroize::Zeroizing::new(self.provider.call_str_bytes(
-                "dh_agree",
-                &ed25519_handle.id().to_string(),
-                peer_x25519_public,
-            )?);
-        Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
-            "ed25519_to_x25519_agree",
-            &shared,
-        )?))
+        scp_ffi_common::callback_custody::ed25519_to_x25519_agree(
+            &self.registry,
+            ed25519_handle,
+            peer_x25519_public,
+            |key_id, peer| std::future::ready(p.call_str_bytes("dh_agree", &key_id, &peer)),
+            |key_id| p.host_public_key(&key_id),
+        )
+        .await
     }
 
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
@@ -846,7 +838,7 @@ pub(crate) mod test_fakes {
     /// 64 junk bytes from an Ed25519 `sign` (`ed_junk_sig`), `sign` raising
     /// `ConnectionError` (`transport`) or a coded host error (`sign_4001`).
     const FAKE_PROVIDER_PY: &std::ffi::CStr = c"
-import hashlib, hmac
+import hashlib, hmac, types
 
 class KeyNotFoundError(Exception):
     code = 'SCP-CRYPTO-4006'
@@ -985,7 +977,8 @@ class FakeCustody:
     def get_public_key(self, key_id):
         # The role generate_keypair recorded.
         key_type, public_key = self._public(key_id)
-        return (key_type, public_key, self._roles[key_id])
+        return types.SimpleNamespace(
+            key_type=key_type, public_key=public_key, role=self._roles[key_id])
 
     def _public(self, key_id):
         self._count('get_public_key')
@@ -1612,13 +1605,40 @@ mod tests {
         }
     }
 
-    /// The adapter retires a handle (`Destroying`) before it
-    /// calls the host's `destroy_key`: a probe the host's `destroy_key` calls
-    /// reads the adapter's registry and finds the handle no longer live.
-    /// Calling the host first leaves the handle live during that call, and
-    /// this fails.
+    /// `generate_keypair` asks the host for an operational key and
+    /// `generate_identity_keypair` for an identity: the host records the role
+    /// string the bridge passed.
     #[tokio::test]
-    async fn ffi_custody_callback_unbinds_before_the_host_destroy() {
+    async fn ffi_custody_callback_passes_each_role_to_the_host() {
+        let (adapter, host) = super::test_fakes::fake_py_custody_and_host(None);
+        let operational = adapter
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("operational key");
+        let identity = adapter
+            .generate_identity_keypair()
+            .await
+            .expect("identity key");
+        let role = |h: KeyHandle| {
+            Python::with_gil(|py| {
+                host.bind(py)
+                    .getattr("_roles")
+                    .and_then(|roles| roles.get_item(h.id().to_string()))
+                    .and_then(|role| role.extract::<String>())
+                    .expect("recorded role")
+            })
+        };
+        assert_eq!(role(operational), "operational");
+        assert_eq!(role(identity), "identity");
+    }
+
+    /// The adapter drops a handle's cache entry only after the host
+    /// confirms the destroy: a probe the host's `destroy_key` calls reads the
+    /// adapter's registry and still finds the entry, and once the destroy
+    /// returns the entry is gone. Dropping the entry before the host call
+    /// fails this.
+    #[tokio::test]
+    async fn ffi_custody_callback_unbinds_after_the_host_destroy() {
         use pyo3::types::{PyCFunction, PyDict, PyTuple};
         let (adapter, host) = super::test_fakes::fake_py_custody_and_host(None);
         let custody = std::sync::Arc::new(adapter);
@@ -1639,7 +1659,7 @@ mod tests {
                         .expect("adapter is alive during destroy");
                     let handle = KeyHandle::new(key_id.parse().expect("numeric key id"));
                     *probe_seen.lock().expect("probe mutex") =
-                        Some(custody.registry.is_live(&handle));
+                        Some(custody.registry.get(&handle).expect("lock").is_some());
                     PyResult::Ok(())
                 },
             )
@@ -1651,17 +1671,18 @@ mod tests {
             .generate_keypair(KeyType::Ed25519)
             .await
             .expect("operational key");
-        assert!(custody.registry.is_live(&key));
+        assert!(custody.registry.get(&key).expect("lock").is_some());
         custody.destroy_key(&key).await.expect("destroy");
         assert_eq!(
             *bound_during_host_destroy.lock().expect("probe mutex"),
-            Some(false),
-            "the host's destroy_key ran while the handle was still live"
+            Some(true),
+            "the entry was dropped before the host confirmed the destroy"
         );
+        assert_eq!(custody.registry.get(&key).expect("lock"), None);
     }
 
     /// Only an identity key derives a pseudonym: an operational Ed25519 key
-    /// is `WrongKeyType` for both derivations. A handle the adapter never
+    /// is `NotIdentityKey` for both derivations. A handle the adapter never
     /// minted is looked up through `get_public_key` by every entry point, so
     /// a host without it (the fake raises `KeyNotFoundError`) fails each one
     /// with `KeyNotFound`.
@@ -1679,13 +1700,13 @@ mod tests {
             .expect("key");
         assert!(matches!(
             custody.derive_pseudonym(&operational, b"ctx").await,
-            Err(PlatformError::WrongKeyType { .. })
+            Err(PlatformError::NotIdentityKey)
         ));
         assert!(matches!(
             custody
                 .derive_rotatable_pseudonym(&operational, b"ctx", 1)
                 .await,
-            Err(PlatformError::WrongKeyType { .. })
+            Err(PlatformError::NotIdentityKey)
         ));
 
         let unknown = KeyHandle::new(4242);
@@ -1846,13 +1867,13 @@ mod tests {
             .expect("key");
         assert!(matches!(
             custody.derive_pseudonym(&operational, b"ctx").await,
-            Err(PlatformError::WrongKeyType { .. })
+            Err(PlatformError::NotIdentityKey)
         ));
         assert!(matches!(
             custody
                 .derive_rotatable_pseudonym(&operational, b"ctx", 1)
                 .await,
-            Err(PlatformError::WrongKeyType { .. })
+            Err(PlatformError::NotIdentityKey)
         ));
         assert_eq!(fake_calls(&custody, "derive_pseudonym"), 0);
         assert_eq!(fake_calls(&custody, "derive_rotatable_pseudonym"), 0);

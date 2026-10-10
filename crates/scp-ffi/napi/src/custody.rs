@@ -21,10 +21,11 @@ use std::fmt;
 use napi::bindgen_prelude::Function;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
-use scp_ffi_common::callback_custody::{self as flow, CallbackKeyRegistry, HostPublicKey, KeyRole};
+use scp_ffi_common::callback_custody::{self as flow, CallbackKeyRegistry, HostPublicKey};
 use scp_platform::error::PlatformError;
 use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyRole, KeyType, Pseudonym, PublicKey, SharedSecret,
+    Signature,
 };
 
 #[cfg(feature = "testing")]
@@ -70,19 +71,19 @@ use crate::identity::OpaqueInMemoryKeyCustody;
 /// `getPublicKey` and `destroyKey` never receive a pseudonym.
 #[napi(object, object_to_js = false)]
 pub struct NapiKeyCustodyProvider {
-    /// `(keyType: string, role: string) => string` — generate a keypair,
-    /// return its id, a canonical decimal `u64` string (`SCP-CRYPTO-4060`
-    /// otherwise). `keyType` is `"ed25519"`, `"x25519"`, `"p256"` or
-    /// `"hpke-p256"`; `role` is `"identity"` (the only pseudonym-derivation
-    /// source) or `"operational"`. The host records `role` and reports it from
-    /// `getPublicKey` for the key's lifetime; the bridge refuses and destroys
-    /// a key whose reported role differs. The host never reuses a key id: an
-    /// id it returns here names no other key for the host's lifetime, even
-    /// after that key is destroyed.
+    /// `(keyType: CustodyKeyType, role: CustodyKeyRole) => string` —
+    /// generate a keypair, return its id, a canonical decimal `u64` string
+    /// (`SCP-CRYPTO-4060` otherwise). `role` is `"identity"` (the only
+    /// pseudonym-derivation source) or `"operational"`. The host records
+    /// `role` and reports it from `getPublicKey` for the key's lifetime; the
+    /// bridge refuses and destroys a key whose reported type or role differs.
+    /// The host never reuses a key id: an id it returns here names no other
+    /// key for the host's lifetime, even after that key is destroyed.
     #[napi(
-        ts_type = "(args: [string, string]) => { ok: boolean; value?: string; code?: string; message?: string }"
+        ts_type = "(args: [\"ed25519\" | \"x25519\" | \"p256\" | \"hpke-p256\", \"identity\" | \"operational\"]) => { ok: boolean; value?: string; code?: string; message?: string }"
     )]
-    pub generate_keypair: Function<'static, (String, String), HostStringResult>,
+    pub generate_keypair:
+        Function<'static, (NapiCustodyKeyType, NapiCustodyKeyRole), HostStringResult>,
     /// `(keyId: string, message: Uint8Array) => Uint8Array` — 64-byte sig.
     /// For a `"p256"` key `message` is a 32-byte prehash and the result is
     /// raw `r || s` (64 bytes) or DER; Rust normalises to low-s and verifies
@@ -102,11 +103,12 @@ pub struct NapiKeyCustodyProvider {
     /// hold is a failure whose `code` is `"SCP-CRYPTO-4006"`. `role` is the
     /// role `generateKeypair` minted the key in, reported across sessions. A
     /// key id the bridge has not seen binds as an identity only when `role`
-    /// is `"identity"`. The bridge cannot check the host's word: a host that
+    /// is `"identity"`. A `keyType` or `role` outside the two enums is a
+    /// custody error. The bridge cannot check the host's word: a host that
     /// reports `"identity"` for a key it minted as `"operational"` lets that
     /// key derive pseudonyms, which is outside Rust's control.
     #[napi(
-        ts_type = "(keyId: string) => { ok: boolean; value?: { keyType: string; publicKey: number[]; role: string }; code?: string; message?: string }"
+        ts_type = "(keyId: string) => { ok: boolean; value?: { keyType: \"ed25519\" | \"x25519\" | \"p256\" | \"hpke-p256\"; publicKey: number[]; role: \"identity\" | \"operational\" }; code?: string; message?: string }"
     )]
     pub get_public_key: Function<'static, String, HostPublicKeyResult>,
     /// `(keyId: string) => void` — destroy key material.
@@ -164,16 +166,87 @@ pub struct NapiKeyCustodyProvider {
     pub custody_type: Function<'static, String, HostStringResult>,
 }
 
-/// A host key's stated type and public key, returned by `getPublicKey`.
+/// The type of a host custody key, as the host contract names it.
+#[napi(string_enum, js_name = "CustodyKeyType")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NapiCustodyKeyType {
+    /// An Ed25519 signing key.
+    #[napi(value = "ed25519")]
+    Ed25519,
+    /// An X25519 key-agreement key.
+    #[napi(value = "x25519")]
+    X25519,
+    /// A P-256 signing key.
+    #[napi(value = "p256")]
+    P256,
+    /// A P-256 HPKE key-agreement key.
+    #[napi(value = "hpke-p256")]
+    HpkeP256,
+}
+
+impl From<KeyType> for NapiCustodyKeyType {
+    fn from(key_type: KeyType) -> Self {
+        match key_type {
+            KeyType::Ed25519 => Self::Ed25519,
+            KeyType::X25519 => Self::X25519,
+            KeyType::P256Signing => Self::P256,
+            KeyType::HpkeP256 => Self::HpkeP256,
+        }
+    }
+}
+
+impl From<NapiCustodyKeyType> for KeyType {
+    fn from(key_type: NapiCustodyKeyType) -> Self {
+        match key_type {
+            NapiCustodyKeyType::Ed25519 => Self::Ed25519,
+            NapiCustodyKeyType::X25519 => Self::X25519,
+            NapiCustodyKeyType::P256 => Self::P256Signing,
+            NapiCustodyKeyType::HpkeP256 => Self::HpkeP256,
+        }
+    }
+}
+
+/// The role a host custody key was minted in.
+#[napi(string_enum, js_name = "CustodyKeyRole")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NapiCustodyKeyRole {
+    /// The participant's identity key, the only pseudonym-derivation source.
+    #[napi(value = "identity")]
+    Identity,
+    /// Any other key.
+    #[napi(value = "operational")]
+    Operational,
+}
+
+impl From<KeyRole> for NapiCustodyKeyRole {
+    fn from(role: KeyRole) -> Self {
+        match role {
+            KeyRole::Identity => Self::Identity,
+            KeyRole::Operational => Self::Operational,
+        }
+    }
+}
+
+impl From<NapiCustodyKeyRole> for KeyRole {
+    fn from(role: NapiCustodyKeyRole) -> Self {
+        match role {
+            NapiCustodyKeyRole::Identity => Self::Identity,
+            NapiCustodyKeyRole::Operational => Self::Operational,
+        }
+    }
+}
+
+/// A host key's stated type, public key and role, returned by `getPublicKey`.
 #[napi(object)]
 pub struct NapiCustodyPublicKey {
-    /// `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`.
-    pub key_type: String,
+    /// The key's type.
+    pub key_type: NapiCustodyKeyType,
     /// The public key in the exact encoding its type names.
     pub public_key: Vec<u8>,
-    /// `"identity"` or `"operational"`: the role the key was minted in.
-    pub role: String,
+    /// The role the key was minted in.
+    pub role: NapiCustodyKeyRole,
 }
+
 /// A host callback outcome carrying a string (`generateKeypair`, `custodyType`).
 #[napi(object, object_to_js = false)]
 pub struct HostStringResult {
@@ -384,9 +457,9 @@ fn js_error_code(env: &napi::Env, e: napi::Error) -> Option<String> {
 #[allow(clippy::type_complexity)]
 pub(crate) struct CallbackTsfns {
     generate_keypair: ThreadsafeFunction<
-        (String, String),
+        (NapiCustodyKeyType, NapiCustodyKeyRole),
         HostStringResult,
-        (String, String),
+        (NapiCustodyKeyType, NapiCustodyKeyRole),
         napi::Status,
         false,
     >,
@@ -432,8 +505,8 @@ pub(crate) struct CallbackTsfns {
 pub(crate) trait JsCustodyHost: Send + Sync {
     fn generate_keypair(
         &self,
-        key_type: String,
-        role: String,
+        key_type: KeyType,
+        role: KeyRole,
     ) -> impl Future<Output = Result<String, PlatformError>> + Send;
     fn sign(
         &self,
@@ -473,10 +546,15 @@ pub(crate) trait JsCustodyHost: Send + Sync {
 impl JsCustodyHost for CallbackTsfns {
     async fn generate_keypair(
         &self,
-        key_type: String,
-        role: String,
+        key_type: KeyType,
+        role: KeyRole,
     ) -> Result<String, PlatformError> {
-        call_host("generate_keypair", &self.generate_keypair, (key_type, role)).await
+        call_host(
+            "generate_keypair",
+            &self.generate_keypair,
+            (key_type.into(), role.into()),
+        )
+        .await
     }
 
     async fn sign(&self, key_id: String, data: Vec<u8>) -> Result<Vec<u8>, PlatformError> {
@@ -486,9 +564,9 @@ impl JsCustodyHost for CallbackTsfns {
     async fn get_public_key(&self, key_id: String) -> Result<HostPublicKey, PlatformError> {
         let answer = call_host("get_public_key", &self.get_public_key, key_id).await?;
         Ok(HostPublicKey {
-            key_type: answer.key_type,
+            key_type: answer.key_type.into(),
             public_key: answer.public_key,
-            role: answer.role,
+            role: answer.role.into(),
         })
     }
 
@@ -551,8 +629,8 @@ impl JsCustodyHost for CallbackTsfns {
 /// [`call_host`].
 pub(crate) struct CallbackAdapter<H> {
     host: H,
-    /// Every handle's type, role and life-cycle state, resolved through the
-    /// host's structured `getPublicKey` for handles this adapter did not mint.
+    /// The type, public key and role of each handle this adapter minted or
+    /// resolved through the host's structured `getPublicKey`.
     pub(crate) registry: CallbackKeyRegistry,
 }
 
@@ -638,43 +716,29 @@ impl NapiCallbackKeyCustody {
 }
 
 impl<H: JsCustodyHost> CallbackAdapter<H> {
-    /// Mints a key of `key_type` in `role` through the shared flow.
-    async fn generate(&self, key_type: KeyType, role: KeyRole) -> Result<KeyHandle, PlatformError> {
-        let h = &self.host;
-        flow::generate_keypair(
-            &self.registry,
-            key_type,
-            role,
-            |type_str, role_str| h.generate_keypair(type_str.to_owned(), role_str.to_owned()),
-            |key_id| h.get_public_key(key_id),
-            |key_id| h.destroy_key(key_id),
-        )
-        .await
-    }
-
     /// Exports the raw Ed25519 signing key via the provider's
-    /// `exportSigningKeyBytes` callback, after the handle resolves to an
-    /// Ed25519 key.
+    /// `exportSigningKeyBytes` callback through
+    /// [`flow::export_ed25519_signing_key`], which requires the seed to
+    /// produce the handle's verifying key.
     ///
     /// # Errors
     ///
     /// [`PlatformError::WrongKeyType`] for a handle of another type, before
     /// any export call; [`PlatformError::KeyNotFound`] for a handle the host
-    /// does not hold; [`PlatformError::CustodyError`] if the callback raises
-    /// or returns a non-32-byte value.
+    /// does not hold; [`PlatformError::CustodyError`] if the callback raises,
+    /// returns a non-32-byte value, or returns a seed for another key.
     pub async fn export_ed25519_signing_key(
         &self,
         handle: &KeyHandle,
     ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
         let h = &self.host;
-        flow::require_ed25519(&self.registry, handle, |key_id| h.get_public_key(key_id)).await?;
-        let bytes =
-            zeroize::Zeroizing::new(h.export_signing_key_bytes(handle.id().to_string()).await?);
-        let arr = zeroize::Zeroizing::new(scp_ffi_common::custody_parse::expect_32(
-            "export_signing_key_bytes",
-            &bytes,
-        )?);
-        Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
+        flow::export_ed25519_signing_key(
+            &self.registry,
+            handle,
+            |key_id| h.export_signing_key_bytes(key_id),
+            |key_id| h.get_public_key(key_id),
+        )
+        .await
     }
 }
 
@@ -684,11 +748,26 @@ impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
     // callback. Every entry point resolves a handle this adapter has not
     // registered through `getPublicKey`.
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
-        self.generate(key_type, KeyRole::Operational).await
+        let h = &self.host;
+        flow::generate_operational(
+            &self.registry,
+            key_type,
+            |key_type, role| h.generate_keypair(key_type, role),
+            |key_id| h.get_public_key(key_id),
+            |key_id| h.destroy_key(key_id),
+        )
+        .await
     }
 
     async fn generate_identity_keypair(&self) -> Result<KeyHandle, PlatformError> {
-        self.generate(KeyType::Ed25519, KeyRole::Identity).await
+        let h = &self.host;
+        flow::generate_identity(
+            &self.registry,
+            |key_type, role| h.generate_keypair(key_type, role),
+            |key_id| h.get_public_key(key_id),
+            |key_id| h.destroy_key(key_id),
+        )
+        .await
     }
 
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError> {
@@ -776,26 +855,15 @@ impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
         ed25519_handle: &KeyHandle,
         peer_x25519_public: &[u8; 32],
     ) -> Result<SharedSecret, PlatformError> {
-        // The JS callback protocol does not expose a distinct birational
-        // conversion; the provider manages key types internally, so delegate
-        // to dh_agree (matches the UniFFI/PyO3 contract) once the handle
-        // resolves to an Ed25519 key.
         let h = &self.host;
-        flow::require_ed25519(&self.registry, ed25519_handle, |key_id| {
-            h.get_public_key(key_id)
-        })
-        .await?;
-        // Wrap the raw shared secret in `Zeroizing` so the intermediate heap
-        // buffer is wiped on drop once it has been copied into `SharedSecret`
-        // (defense-in-depth, matching `export_ed25519_signing_key`; ADR-006).
-        let shared = zeroize::Zeroizing::new(
-            h.dh_agree(ed25519_handle.id().to_string(), peer_x25519_public.to_vec())
-                .await?,
-        );
-        Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
-            "ed25519_to_x25519_agree",
-            &shared,
-        )?))
+        flow::ed25519_to_x25519_agree(
+            &self.registry,
+            ed25519_handle,
+            peer_x25519_public,
+            |key_id, peer| h.dh_agree(key_id, peer),
+            |key_id| h.get_public_key(key_id),
+        )
+        .await
     }
 
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
@@ -1118,10 +1186,10 @@ mod adapter_tests {
     impl JsCustodyHost for TestHost {
         async fn generate_keypair(
             &self,
-            key_type: String,
-            role: String,
+            key_type: KeyType,
+            role: KeyRole,
         ) -> Result<String, PlatformError> {
-            self.host.generate_keypair(&key_type, &role)
+            self.host.generate_keypair(key_type, role)
         }
 
         async fn sign(&self, key_id: String, data: Vec<u8>) -> Result<Vec<u8>, PlatformError> {
@@ -1304,7 +1372,7 @@ mod adapter_tests {
             .expect("ed25519 generation");
         assert!(matches!(
             custody.derive_pseudonym(&operational, b"ctx").await,
-            Err(PlatformError::WrongKeyType { .. })
+            Err(PlatformError::NotIdentityKey)
         ));
         assert_eq!(host.calls("derive_pseudonym"), 1);
     }
@@ -1396,7 +1464,7 @@ mod adapter_tests {
             .await
             .expect("p256 generation");
         let resolved = KeyHandle::new(
-            host.generate_keypair("p256", "operational")
+            host.generate_keypair(KeyType::P256Signing, KeyRole::Operational)
                 .expect("host-side key")
                 .parse()
                 .expect("numeric id"),

@@ -168,6 +168,9 @@ from scp_sdk.outlets import (
 )
 from scp_sdk.scp import (
     SCP,
+    CustodyKeyRole,
+    CustodyKeyType,
+    CustodyPublicKey,
     InMemoryStorage,
     InviteMemberOutcome,
     KeyCustodyProvider,
@@ -261,6 +264,9 @@ __all__ = [
     "ContextMode",
     "Credit",
     "CryptoError",
+    "CustodyKeyRole",
+    "CustodyKeyType",
+    "CustodyPublicKey",
     "CustodyType",
     "DIDDocument",
     "DiscoveryMethod",

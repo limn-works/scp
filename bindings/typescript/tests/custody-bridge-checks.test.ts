@@ -33,14 +33,21 @@
 import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 
-import { CryptoError, IdentityError, mapBridgeError } from "../src/errors";
+import { CryptoError, IdentityError, KeyNotFoundError, mapBridgeError } from "../src/errors";
 import { toNativeCustodyProvider } from "../src/internal/custody-adapter";
 import { loadNativeAddon } from "../src/internal/native";
-import type { CustodyPublicKey, KeyCustodyProvider } from "../src/scp";
+import type {
+  CustodyKeyRole,
+  CustodyKeyType,
+  CustodyPublicKey,
+  KeyCustodyProvider,
+} from "../src/scp";
 import { p256SoftwarePseudonymPoint } from "../src/scp";
 
 interface TestingCustody {
   generateKeypair(): Promise<string>;
+  /** Generates an operational key, as `KeyCustody::generate_keypair` does. */
+  generateOperationalKeypair(keyType: CustodyKeyType): Promise<string>;
   /** Returns the 32-byte routing id of the host's v1 point. */
   derivePseudonym(identityKeyId: string, contextId: string): Promise<Buffer>;
   /** Returns the 32-byte routing id of the host's v2 point. */
@@ -77,12 +84,12 @@ type Fault = "signThrows" | "sign4001" | "legacy32";
 class StoreKeychain implements KeyCustodyProvider {
   seeds = new Map<string, Uint8Array>();
   /** Key id -> the role `generateKeypair` minted it in. */
-  roles = new Map<string, string>();
+  roles = new Map<string, CustodyKeyRole>();
   next = 1;
 
   constructor(readonly fault?: Fault) {}
 
-  generateKeypair(_keyType: string, role: string): string {
+  generateKeypair(_keyType: CustodyKeyType, role: CustodyKeyRole): string {
     const kid = String(this.next++);
     this.seeds.set(kid, new Uint8Array(crypto.randomBytes(32)));
     this.roles.set(kid, role);
@@ -117,7 +124,7 @@ class StoreKeychain implements KeyCustodyProvider {
     return {
       keyType: "ed25519",
       publicKey: new Uint8Array(spki.subarray(spki.length - 32)),
-      role: this.roles.get(keyId) ?? "missing",
+      role: roleOf(this.roles, keyId),
     };
   }
 
@@ -150,7 +157,99 @@ class StoreKeychain implements KeyCustodyProvider {
   }
 }
 
-function adapter(host: StoreKeychain): TestingCustody {
+/** The role `roles` recorded for `keyId`; key-not-found when none was. */
+function roleOf(roles: Map<string, CustodyKeyRole>, keyId: string): CustodyKeyRole {
+  const role = roles.get(keyId);
+  if (role === undefined) throw new KeyNotFoundError(`no role recorded for ${keyId}`);
+  return role;
+}
+
+/**
+ * A host keychain of ECDSA P-256 signing keys that answers in DER. Node signs
+ * only over a message, never over a digest, so the test registers the
+ * preimage of every digest it hands the bridge, and `sign` signs that
+ * preimage with SHA-256: the signature covers exactly the digest the bridge
+ * passed.
+ */
+class P256Keychain implements KeyCustodyProvider {
+  keys = new Map<string, crypto.KeyObject>();
+  roles = new Map<string, CustodyKeyRole>();
+  /** Hex SHA-256 digest -> the message it hashes. */
+  preimages = new Map<string, Buffer>();
+  next = 1;
+
+  generateKeypair(keyType: CustodyKeyType, role: CustodyKeyRole): string {
+    if (keyType !== "p256") throw new Error(`this keychain holds only p256 keys, not ${keyType}`);
+    const kid = String(this.next++);
+    this.keys.set(kid, crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" }).privateKey);
+    this.roles.set(kid, role);
+    return kid;
+  }
+
+  #key(keyId: string): crypto.KeyObject {
+    const key = this.keys.get(keyId);
+    if (key === undefined) throw new KeyNotFoundError(`unknown key id: ${keyId}`);
+    return key;
+  }
+
+  /** Returns the SHA-256 digest of `message` and records its preimage. */
+  digestOf(message: Buffer): Buffer {
+    const digest = crypto.createHash("sha256").update(message).digest();
+    this.preimages.set(digest.toString("hex"), message);
+    return digest;
+  }
+
+  sign(keyId: string, digest: Uint8Array): Uint8Array {
+    const message = this.preimages.get(Buffer.from(digest).toString("hex"));
+    if (message === undefined) throw new Error("the bridge passed a digest the test never made");
+    return new Uint8Array(
+      crypto.sign("sha256", message, { key: this.#key(keyId), dsaEncoding: "der" }),
+    );
+  }
+
+  getPublicKey(keyId: string): CustodyPublicKey {
+    const jwk = crypto.createPublicKey(this.#key(keyId)).export({ format: "jwk" }) as {
+      x: string;
+      y: string;
+    };
+    const x = Buffer.from(jwk.x, "base64url");
+    const y = Buffer.from(jwk.y, "base64url");
+    // The 33-byte compressed SEC1 point: 0x02 or 0x03 by the parity of y.
+    const prefix = 0x02 | ((y[y.length - 1] ?? 0) & 1);
+    return {
+      keyType: "p256",
+      publicKey: new Uint8Array(Buffer.concat([Buffer.from([prefix]), x])),
+      role: roleOf(this.roles, keyId),
+    };
+  }
+
+  destroyKey(keyId: string): void {
+    this.keys.delete(keyId);
+    this.roles.delete(keyId);
+  }
+
+  dhAgree(): Uint8Array {
+    throw new Error("unused");
+  }
+
+  derivePseudonym(): Uint8Array {
+    throw new Error("unused");
+  }
+
+  deriveRotatablePseudonym(): Uint8Array {
+    throw new Error("unused");
+  }
+
+  exportSigningKeyBytes(): Uint8Array {
+    throw new Error("unused");
+  }
+
+  custodyType(_keyId: string): string {
+    return "software";
+  }
+}
+
+function adapter(host: KeyCustodyProvider): TestingCustody {
   const Ctor = native.TestingCallbackCustody as TestingCustodyCtor;
   return new Ctor(toNativeCustodyProvider(host));
 }
@@ -203,6 +302,45 @@ async function rejectionOf(call: () => Promise<unknown>): Promise<Error & { code
 }
 
 describe.skipIf(skipReason !== "")("napi callback custody", () => {
+  test("an operational key reaches the host as role operational and does not derive", async () => {
+    const host = new StoreKeychain();
+    const custody = adapter(host);
+    const operational = await custody.generateOperationalKeypair("ed25519");
+    expect(host.roles.get(operational)).toBe("operational");
+    const refused = await rejectionOf(() => custody.derivePseudonym(operational, "context-alpha"));
+    expect(refused).toBeInstanceOf(CryptoError);
+    expect(refused.code).toBe("SCP-CRYPTO-4060");
+    const identity = await custody.generateKeypair();
+    expect(host.roles.get(identity)).toBe("identity");
+  });
+
+  test("a p256 host's DER signature over the bridge's digest verifies as low-s r || s", async () => {
+    const host = new P256Keychain();
+    const custody = adapter(host);
+    const key = await custody.generateOperationalKeypair("p256");
+    const digest = host.digestOf(MESSAGE);
+    const signature = await custody.sign(key, digest);
+    expect(signature.length).toBe(64);
+    // The bridge normalises to low-s: s <= n / 2.
+    const halfOrder = BigInt("0x7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8");
+    expect(BigInt(`0x${signature.subarray(32).toString("hex")}`) <= halfOrder).toBe(true);
+    const publicKey = crypto.createPublicKey(host.keys.get(key) as crypto.KeyObject);
+    expect(
+      crypto.verify("sha256", MESSAGE, { key: publicKey, dsaEncoding: "ieee-p1363" }, signature),
+    ).toBe(true);
+  });
+
+  test("a host that throws KeyNotFoundError for an unseen id rejects with SCP-CRYPTO-4006", async () => {
+    const custody = adapterWith({
+      getPublicKey: () => {
+        throw new KeyNotFoundError("unseen key id");
+      },
+    });
+    const missing = await rejectionOf(() => custody.sign("99", MESSAGE));
+    expect(missing).toBeInstanceOf(CryptoError);
+    expect(missing.code).toBe("SCP-CRYPTO-4006");
+  });
+
   test("the host receives the caller's context and epoch unchanged and the bridge returns the §25.19 Vector 30 routing ids", async () => {
     // §25.19 Vector 30 (`context_id` = "context-alpha", epoch 1): the points
     // and routing ids, copied verbatim from the spec.

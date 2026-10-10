@@ -731,28 +731,23 @@ impl fmt::Debug for CallbackKeyCustody {
 unsafe impl Send for CallbackKeyCustody {}
 unsafe impl Sync for CallbackKeyCustody {}
 
-impl CallbackKeyCustody {
-    /// Mints a key of `key_type` in `role` through the shared flow.
-    async fn generate(
-        &self,
-        key_type: KeyType,
-        role: scp_ffi_common::callback_custody::KeyRole,
-    ) -> Result<KeyHandle, PlatformError> {
-        let p = &*self.provider;
-        scp_ffi_common::callback_custody::generate_keypair(
-            &self.registry,
-            key_type,
-            role,
-            |type_str, role_str| async move {
-                p.generate_keypair(type_str.to_owned(), role_str.to_owned())
-                    .await
-                    .map_err(host_err("generate_keypair"))
-            },
-            |key_id| host_public_key(p, key_id),
-            |key_id| async move { p.destroy_key(key_id).await.map_err(host_err("destroy_key")) },
-        )
+/// `generate_keypair` on the provider, as the shared flows take it.
+async fn host_generate(
+    p: &dyn crate::KeyCustodyProvider,
+    key_type: KeyType,
+    role: scp_platform::KeyRole,
+) -> Result<String, PlatformError> {
+    p.generate_keypair(key_type.into(), role.into())
         .await
-    }
+        .map_err(host_err("generate_keypair"))
+}
+
+/// `destroy_key` on the provider, as the shared flows take it.
+async fn host_destroy(
+    p: &dyn crate::KeyCustodyProvider,
+    key_id: String,
+) -> Result<(), PlatformError> {
+    p.destroy_key(key_id).await.map_err(host_err("destroy_key"))
 }
 
 /// `get_public_key` on the provider, as the shared flows take it.
@@ -765,9 +760,9 @@ async fn host_public_key(
         .await
         .map_err(host_err("get_public_key"))?;
     Ok(scp_ffi_common::callback_custody::HostPublicKey {
-        key_type: answer.key_type,
+        key_type: answer.key_type.into(),
         public_key: answer.public_key,
-        role: answer.role,
+        role: answer.role.into(),
     })
 }
 
@@ -777,17 +772,24 @@ impl KeyCustody for CallbackKeyCustody {
     // drift; each closure is one provider call. Every entry point resolves a
     // handle this adapter has not registered through `get_public_key`.
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
-        self.generate(
+        let p = &*self.provider;
+        scp_ffi_common::callback_custody::generate_operational(
+            &self.registry,
             key_type,
-            scp_ffi_common::callback_custody::KeyRole::Operational,
+            |key_type, role| host_generate(p, key_type, role),
+            |key_id| host_public_key(p, key_id),
+            |key_id| host_destroy(p, key_id),
         )
         .await
     }
 
     async fn generate_identity_keypair(&self) -> Result<KeyHandle, PlatformError> {
-        self.generate(
-            KeyType::Ed25519,
-            scp_ffi_common::callback_custody::KeyRole::Identity,
+        let p = &*self.provider;
+        scp_ffi_common::callback_custody::generate_identity(
+            &self.registry,
+            |key_type, role| host_generate(p, key_type, role),
+            |key_id| host_public_key(p, key_id),
+            |key_id| host_destroy(p, key_id),
         )
         .await
     }
@@ -890,24 +892,15 @@ impl KeyCustody for CallbackKeyCustody {
         ed25519_handle: &KeyHandle,
         peer_x25519_public: &[u8; 32],
     ) -> Result<SharedSecret, PlatformError> {
-        // The callback protocol does not expose ed25519→x25519 conversion.
-        // Delegates to dh_agree since the callback provider manages key types internally.
         let p = &*self.provider;
-        scp_ffi_common::callback_custody::require_ed25519(&self.registry, ed25519_handle, |id| {
-            host_public_key(p, id)
-        })
-        .await?;
-        // The host's shared secret is key material: wipe the buffer on drop.
-        let shared = Zeroizing::new(
-            self.provider
-                .dh_agree(ed25519_handle.id().to_string(), peer_x25519_public.to_vec())
-                .await
-                .map_err(host_err("dh_agree"))?,
-        );
-        Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
-            "ed25519_to_x25519_agree",
-            &shared,
-        )?))
+        scp_ffi_common::callback_custody::ed25519_to_x25519_agree(
+            &self.registry,
+            ed25519_handle,
+            peer_x25519_public,
+            |key_id, peer| async move { p.dh_agree(key_id, peer).await.map_err(host_err("dh_agree")) },
+            |key_id| host_public_key(p, key_id),
+        )
+        .await
     }
 
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
@@ -998,31 +991,26 @@ impl KeyCustody for CallbackKeyCustody {
 impl CallbackKeyCustody {
     /// Exports the raw Ed25519 signing key for the given handle.
     ///
-    /// Delegates to [`KeyCustodyProvider::export_signing_key_bytes`](crate::KeyCustodyProvider::export_signing_key_bytes) on the
-    /// platform callback. Required for governance vote signing.
+    /// Delegates to [`KeyCustodyProvider::export_signing_key_bytes`](crate::KeyCustodyProvider::export_signing_key_bytes)
+    /// on the platform callback through the shared flow, which requires the
+    /// seed to produce the handle's verifying key. Required for governance
+    /// vote signing.
     pub(crate) async fn export_ed25519_signing_key(
         &self,
         handle: &KeyHandle,
     ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
         let p = &*self.provider;
-        scp_ffi_common::callback_custody::require_ed25519(&self.registry, handle, |id| {
-            host_public_key(p, id)
-        })
-        .await?;
-        // Private seed material: the host's buffer and the parsed 32-byte
-        // array are both `Zeroizing`, so each is wiped on drop, matching the
-        // PyO3 and NAPI callback custody paths (ADR-006).
-        let key_bytes = Zeroizing::new(
-            self.provider
-                .export_signing_key_bytes(handle.id().to_string())
-                .await
-                .map_err(host_err("export_signing_key_bytes"))?,
-        );
-        let arr = zeroize::Zeroizing::new(scp_ffi_common::custody_parse::expect_32(
-            "export_signing_key_bytes",
-            &key_bytes,
-        )?);
-        Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
+        scp_ffi_common::callback_custody::export_ed25519_signing_key(
+            &self.registry,
+            handle,
+            |key_id| async move {
+                p.export_signing_key_bytes(key_id)
+                    .await
+                    .map_err(host_err("export_signing_key_bytes"))
+            },
+            |key_id| host_public_key(p, key_id),
+        )
+        .await
     }
 }
 
@@ -19523,8 +19511,8 @@ mod tests {
 
         async fn generate_keypair(
             &self,
-            _key_type: String,
-            _role: String,
+            _key_type: crate::CustodyKeyType,
+            _role: crate::CustodyKeyRole,
         ) -> Result<String, ScpError> {
             Err(Self::refuse("generate_keypair"))
         }
@@ -23649,9 +23637,9 @@ mod tests {
                 .get_public_key(&key_id)
                 .map_err(|e| fake_host_err(&e))?;
             Ok(crate::CustodyPublicKey {
-                key_type: answer.key_type,
+                key_type: answer.key_type.into(),
                 public_key: answer.public_key,
-                role: answer.role,
+                role: answer.role.into(),
             })
         }
 
@@ -23663,11 +23651,11 @@ mod tests {
 
         async fn generate_keypair(
             &self,
-            key_type: String,
-            role: String,
+            key_type: crate::CustodyKeyType,
+            role: crate::CustodyKeyRole,
         ) -> Result<String, ScpError> {
             self.host
-                .generate_keypair(&key_type, &role)
+                .generate_keypair(key_type.into(), role.into())
                 .map_err(|e| fake_host_err(&e))
         }
 
@@ -23827,7 +23815,7 @@ mod tests {
 
         let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
         let id = host
-            .generate_keypair("p256", "operational")
+            .generate_keypair(KeyType::P256Signing, scp_platform::KeyRole::Operational)
             .expect("host-side key");
         let point =
             P256PublicKey::from_sec1(&host.get_public_key(&id).expect("host point").public_key)
@@ -23904,6 +23892,41 @@ mod tests {
         assert_eq!(host.calls("sign"), 2);
     }
 
+    /// `generate_keypair` asks the host for an operational key and
+    /// `generate_identity_keypair` for an identity: the host records the role
+    /// the bridge passed, and an operational key does not derive.
+    #[tokio::test]
+    async fn callback_custody_passes_each_role_to_the_host() {
+        use scp_platform::KeyCustody;
+        use scp_platform::error::PlatformError;
+
+        let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
+        let custody = CallbackKeyCustody::new(Box::new(FakeHostProvider::over(&host)));
+        let operational = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("operational generation");
+        let identity = custody
+            .generate_identity_keypair()
+            .await
+            .expect("identity generation");
+        let role = |h: KeyHandle| {
+            host.get_public_key(&h.id().to_string())
+                .expect("host key")
+                .role
+        };
+        assert_eq!(role(operational), scp_platform::KeyRole::Operational);
+        assert_eq!(role(identity), scp_platform::KeyRole::Identity);
+        assert!(matches!(
+            custody.derive_pseudonym(&operational, b"ctx").await,
+            Err(PlatformError::NotIdentityKey)
+        ));
+        custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect("an identity derives");
+    }
+
     /// `export_ed25519_signing_key` and `ed25519_to_x25519_agree` refuse a
     /// P-256 handle with `WrongKeyType` before any host export or agreement
     /// call, whether the adapter minted the handle or resolves it.
@@ -23919,7 +23942,7 @@ mod tests {
             .await
             .expect("p256 generation");
         let resolved = KeyHandle::new(
-            host.generate_keypair("p256", "operational")
+            host.generate_keypair(KeyType::P256Signing, scp_platform::KeyRole::Operational)
                 .expect("host-side key")
                 .parse()
                 .expect("numeric id"),
@@ -24022,9 +24045,9 @@ mod tests {
             _key_id: String,
         ) -> Result<crate::CustodyPublicKey, ScpError> {
             Ok(crate::CustodyPublicKey {
-                key_type: "ed25519".to_owned(),
+                key_type: crate::CustodyKeyType::Ed25519,
                 public_key: self.signing_key.verifying_key().to_bytes().to_vec(),
-                role: "identity".to_owned(),
+                role: crate::CustodyKeyRole::Identity,
             })
         }
 
@@ -24034,8 +24057,8 @@ mod tests {
 
         async fn generate_keypair(
             &self,
-            _key_type: String,
-            _role: String,
+            _key_type: crate::CustodyKeyType,
+            _role: crate::CustodyKeyRole,
         ) -> Result<String, ScpError> {
             // Single fixed key; handle id `1` is what the test wires.
             Ok("1".to_owned())
@@ -29093,7 +29116,7 @@ mod tests {
         /// host forgets the key.
         destroy_probe: Option<DestroyProbe>,
         /// The role each key id was minted in, as `get_public_key` reports it.
-        roles: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        roles: std::sync::Mutex<std::collections::HashMap<String, crate::CustodyKeyRole>>,
     }
 
     /// One derivation call a host received: identity key id, context, epoch.
@@ -29207,12 +29230,13 @@ mod tests {
                 .lock()
                 .expect("role mutex")
                 .get(&key_id)
-                .cloned()
-                // No recorded role is a host defect; an unparseable role
-                // makes the bridge refuse the key.
-                .unwrap_or_else(|| "missing".to_owned());
+                .copied()
+                .ok_or_else(|| ScpError::Crypto {
+                    msg: format!("host holds key {key_id} without a recorded role"),
+                    code: codes::CRYPTO_4001.to_owned(),
+                })?;
             Ok(crate::CustodyPublicKey {
-                key_type: "ed25519".to_owned(),
+                key_type: crate::CustodyKeyType::Ed25519,
                 public_key: sk.verifying_key().to_bytes().to_vec(),
                 role,
             })
@@ -29229,8 +29253,8 @@ mod tests {
 
         async fn generate_keypair(
             &self,
-            _key_type: String,
-            role: String,
+            _key_type: crate::CustodyKeyType,
+            role: crate::CustodyKeyRole,
         ) -> Result<String, ScpError> {
             use rand::RngCore;
             // Derive a deterministic-per-call seed from an OS draw so each key is
@@ -29443,13 +29467,13 @@ mod tests {
         );
     }
 
-    /// The adapter retires a handle (`Destroying`) before it
-    /// calls the host's `destroy_key`: a probe inside the host's
-    /// `destroy_key` reads the adapter's registry and finds the handle no
-    /// longer live. Calling the host first leaves the handle live during
-    /// that call, and this fails.
+    /// The adapter drops a handle's cache entry only after the host
+    /// confirms the destroy: a probe inside the host's `destroy_key` reads
+    /// the adapter's registry and still finds the entry, and once the
+    /// destroy returns the entry is gone. Dropping the entry before the host
+    /// call fails this.
     #[tokio::test]
-    async fn destroy_unbinds_before_the_host_call() {
+    async fn destroy_unbinds_after_the_host_call() {
         type Cell = std::sync::OnceLock<std::sync::Weak<CallbackKeyCustody>>;
         let adapter = Arc::new(Cell::new());
         let bound_during_host_destroy = Arc::new(std::sync::Mutex::new(None::<bool>));
@@ -29461,7 +29485,8 @@ mod tests {
                 .and_then(std::sync::Weak::upgrade)
                 .expect("adapter is alive during destroy");
             let handle = KeyHandle::new(key_id.parse().expect("numeric key id"));
-            *probe_seen.lock().expect("probe mutex") = Some(custody.registry.is_live(&handle));
+            *probe_seen.lock().expect("probe mutex") =
+                Some(custody.registry.get(&handle).expect("lock").is_some());
         }));
         let custody = Arc::new(CallbackKeyCustody::new(Box::new(host)));
         adapter
@@ -29472,13 +29497,14 @@ mod tests {
             .generate_keypair(KeyType::Ed25519)
             .await
             .expect("operational key");
-        assert!(custody.registry.is_live(&key));
+        assert!(custody.registry.get(&key).expect("lock").is_some());
         custody.destroy_key(&key).await.expect("destroy");
         assert_eq!(
             *bound_during_host_destroy.lock().expect("probe mutex"),
-            Some(false),
-            "the host's destroy_key ran while the handle was still live"
+            Some(true),
+            "the entry was dropped before the host confirmed the destroy"
         );
+        assert_eq!(custody.registry.get(&key).expect("lock"), None);
     }
 
     /// `identity_create_with_custody` must register the callback identity in the

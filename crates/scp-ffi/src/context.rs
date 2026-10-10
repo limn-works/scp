@@ -10101,6 +10101,8 @@ mod tests {
     /// surface (`PyKeyCustodyProvider::REQUIRED_METHODS`).
     #[cfg(feature = "testing")]
     const SIGN_ONLY_PROVIDER_PY: &std::ffi::CStr = c"
+import types
+
 from _scp_core_export_signer import ed25519_sign, ed25519_public_key
 
 class SignOnlyCustody:
@@ -10118,7 +10120,11 @@ class SignOnlyCustody:
 
     def get_public_key(self, key_id):
         # The provider's single key is the identity the test wires.
-        return ('ed25519', ed25519_public_key(str(key_id)), 'identity')
+        return types.SimpleNamespace(
+            key_type='ed25519',
+            public_key=ed25519_public_key(str(key_id)),
+            role='identity',
+        )
 
     def destroy_key(self, key_id):
         return None

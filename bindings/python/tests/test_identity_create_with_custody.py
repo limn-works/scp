@@ -25,7 +25,12 @@ from typing import Literal
 
 import pytest
 
-from scp_sdk import p256_software_pseudonym_point
+from scp_sdk import (
+    CustodyKeyRole,
+    CustodyKeyType,
+    CustodyPublicKey,
+    p256_software_pseudonym_point,
+)
 from scp_sdk.errors import KeyNotFoundError
 
 # ---------------------------------------------------------------------------
@@ -143,10 +148,10 @@ class _FakeKeychain:
         # Every (identity key id, context) a derivation received.
         self.derive_calls: list[tuple[str, bytes]] = []
         # Key id -> the role generate_keypair minted it in.
-        self._roles: dict[str, str] = {}
+        self._roles: dict[str, CustodyKeyRole] = {}
         self._next = 1
 
-    def generate_keypair(self, key_type: str, role: str) -> str:
+    def generate_keypair(self, key_type: CustodyKeyType, role: CustodyKeyRole) -> str:
         kid = str(self._next)
         self._next += 1
         self._roles[kid] = role
@@ -158,10 +163,14 @@ class _FakeKeychain:
     def sign(self, key_id: str, message: bytes) -> bytes:
         return ed25519_sign(self._seeds[key_id], bytes(message))
 
-    def get_public_key(self, key_id: str) -> tuple[str, bytes, str]:
+    def get_public_key(self, key_id: str) -> CustodyPublicKey:
         if key_id not in self._seeds:
             raise KeyNotFoundError(f"unknown key id: {key_id}")
-        return "ed25519", ed25519_publickey(self._seeds[key_id]), self._roles[key_id]
+        return CustodyPublicKey(
+            key_type="ed25519",
+            public_key=ed25519_publickey(self._seeds[key_id]),
+            role=self._roles[key_id],
+        )
 
     def destroy_key(self, key_id: str) -> None:
         self._seeds.pop(key_id, None)
@@ -314,3 +323,19 @@ async def test_coroutine_derive_fails_with_custody_error(scp) -> None:
     with pytest.raises(_scp_core.ScpError, match="coroutine") as excinfo:
         await scp.context_create(identity.did, _ENCRYPTED_PARAMS)
     assert str(excinfo.value).startswith("[SCP-CRYPTO-4060]"), excinfo.value
+
+
+@pytest.mark.asyncio
+async def test_key_not_found_error_from_the_host_reaches_the_caller_as_4006(scp) -> None:
+    """A host that raises :class:`KeyNotFoundError` for a key id it does not
+    hold fails the operation with key-not-found ``SCP-CRYPTO-4006``, not the
+    custody error ``SCP-CRYPTO-4060``: the bridge reads the class's code."""
+    from scp_sdk import _scp_core
+
+    class _ForgetsEveryKey(_FakeKeychain):
+        def get_public_key(self, key_id: str) -> CustodyPublicKey:
+            raise KeyNotFoundError(f"unseen key id: {key_id}")
+
+    with pytest.raises(_scp_core.ScpError) as excinfo:
+        await scp.identity_create_with_custody(_ForgetsEveryKey())
+    assert str(excinfo.value).startswith("[SCP-CRYPTO-4006]"), excinfo.value

@@ -82,6 +82,9 @@ logger = logging.getLogger("scp_sdk")
 
 __all__ = [
     "SCP",
+    "CustodyKeyRole",
+    "CustodyKeyType",
+    "CustodyPublicKey",
     "InMemoryStorage",
     "InviteMemberOutcome",
     "KeyCustodyProvider",
@@ -93,6 +96,32 @@ __all__ = [
     "p256_pseudonym_point",
     "p256_software_pseudonym_point",
 ]
+
+
+CustodyKeyType = Literal["ed25519", "x25519", "p256", "hpke-p256"]
+"""The type of a custody key: Ed25519 or X25519, ``"p256"`` (ECDSA P-256
+signing) or ``"hpke-p256"`` (P-256 ECDH for HPKE)."""
+
+CustodyKeyRole = Literal["identity", "operational"]
+"""The role a custody key was minted in: ``"identity"`` (the only source a
+pseudonym derives from) or ``"operational"``."""
+
+
+@dataclass(frozen=True)
+class CustodyPublicKey:
+    """A custody key's type, public key and role.
+
+    Returned by :meth:`KeyCustodyProvider.get_public_key`. The bridge reads
+    the three attributes by name and refuses a ``key_type`` or ``role``
+    outside its ``Literal`` with the custody error ``SCP-CRYPTO-4060``.
+    """
+
+    key_type: CustodyKeyType
+    """The type the key was generated with."""
+    public_key: bytes
+    """The public key in the exact encoding ``key_type`` names."""
+    role: CustodyKeyRole
+    """The role the key was minted in."""
 
 
 @runtime_checkable
@@ -144,15 +173,12 @@ class KeyCustodyProvider(Protocol):
     (spec §3.11.4).
     """
 
-    def generate_keypair(self, key_type: str, role: str) -> str:
+    def generate_keypair(self, key_type: CustodyKeyType, role: CustodyKeyRole) -> str:
         """Generate a keypair and return its id.
 
-        ``key_type`` is ``"ed25519"``, ``"x25519"``, ``"p256"`` (ECDSA P-256
-        signing) or ``"hpke-p256"`` (P-256 ECDH for HPKE). ``role`` is
-        ``"identity"`` (the only source a pseudonym derives from) or
-        ``"operational"``. Record ``role`` and report it from
-        :meth:`get_public_key` for the key's lifetime; the bridge refuses and
-        destroys a key whose reported role differs. The id is a canonical
+        Record ``role`` and report it from :meth:`get_public_key` for the
+        key's lifetime; the bridge refuses and destroys a key whose reported
+        type or role differs. The id is a canonical
         decimal ``u64`` string (``SCP-CRYPTO-4060`` otherwise). Never reuse a
         key id: an id returned here names no other key for the provider's
         lifetime, even after that key is destroyed.
@@ -171,11 +197,10 @@ class KeyCustodyProvider(Protocol):
         """
         ...
 
-    def get_public_key(self, key_id: str) -> tuple[str, bytes, str]:
-        """Return ``(key_type, public_key, role)`` for ``key_id``.
+    def get_public_key(self, key_id: str) -> CustodyPublicKey:
+        """Return the :class:`CustodyPublicKey` of ``key_id``.
 
-        ``key_type`` is the type the key was generated with (``"ed25519"``,
-        ``"x25519"``, ``"p256"`` or ``"hpke-p256"``). ``public_key`` is 32
+        ``public_key`` is 32
         bytes for Ed25519 and X25519, the 33-byte compressed SEC1 point for
         ``"p256"``, and the 65-byte uncompressed SEC1 point for
         ``"hpke-p256"``. The bridge registers the key under the stated type

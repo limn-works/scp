@@ -3,14 +3,22 @@
 // it to the bridge; the bridge-check tests drive the same record through the
 // napi `TestingCallbackCustody` hook.
 
-import type { CustodyPublicKey, KeyCustodyProvider } from "../scp";
+import type { CustodyKeyRole, CustodyKeyType, CustodyPublicKey, KeyCustodyProvider } from "../scp";
 
 /** The shape napi-rs marshals for a `CustodyPublicKey`: bytes as a number array. */
 export interface NativeCustodyPublicKey {
-  keyType: string;
+  keyType: CustodyKeyType;
   publicKey: number[];
-  role: string;
+  role: CustodyKeyRole;
 }
+
+const KEY_TYPES: readonly unknown[] = [
+  "ed25519",
+  "x25519",
+  "p256",
+  "hpke-p256",
+] satisfies CustodyKeyType[];
+const KEY_ROLES: readonly unknown[] = ["identity", "operational"] satisfies CustodyKeyRole[];
 
 /**
  * The one outcome shape every custody callback hands the bridge. A host
@@ -115,13 +123,20 @@ function asPublicKey(method: string): (raw: unknown) => NativeCustodyPublicKey {
     if (
       typeof raw !== "object" ||
       result === null ||
-      typeof result.keyType !== "string" ||
+      !KEY_TYPES.includes(result.keyType) ||
       !(result.publicKey instanceof Uint8Array) ||
-      typeof result.role !== "string"
+      !KEY_ROLES.includes(result.role)
     ) {
-      throw wrongType(method, "a { keyType: string, publicKey: Uint8Array, role: string } result");
+      throw wrongType(
+        method,
+        "a { keyType: CustodyKeyType, publicKey: Uint8Array, role: CustodyKeyRole } result",
+      );
     }
-    return { keyType: result.keyType, publicKey: Array.from(result.publicKey), role: result.role };
+    return {
+      keyType: result.keyType as CustodyKeyType,
+      publicKey: Array.from(result.publicKey),
+      role: result.role as CustodyKeyRole,
+    };
   };
 }
 
@@ -162,7 +177,10 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
   // `deriveRotatablePseudonym`) accept
   // one array and destructure it.
   return {
-    generateKeypair: ([keyType, role]: [string, string]): NativeHostResult<string> =>
+    generateKeypair: ([keyType, role]: [
+      CustodyKeyType,
+      CustodyKeyRole,
+    ]): NativeHostResult<string> =>
       hostCall(
         "generateKeypair",
         () => provider.generateKeypair(keyType, role),
