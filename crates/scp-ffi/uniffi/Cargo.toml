@@ -122,6 +122,9 @@ scp-platform = { path = "../../scp-platform", features = ["testing"] }
 # `scp-ffi-common/testing`; enable it for this crate's test build. The normal
 # dep (below) carries `custody`; the test build unifies to `custody` + `testing`.
 scp-ffi-common = { path = "../common", features = ["testing", "custody"] }
+# The test build needs `scp-core/testing`, which turns on `scp-runtime/testing`.
+# Name it here instead of relying on another crate's feature list.
+scp-core = { path = "../../scp-core", features = ["testing"] }
 # Tests / test seams construct `FfiDhtClient::InMemory(InMemoryDhtClient::new())`,
 # which is gated behind `scp-dht/testing`; activate it for this crate's test
 # build (ADR-062 §Decision 1). `scp-dht/testing` never appears in a non-testing
