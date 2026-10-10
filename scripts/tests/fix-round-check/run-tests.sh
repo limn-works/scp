@@ -405,8 +405,8 @@ gate_paths() {
 #
 # `scripts/fix-round-check.sh` reads the repository holding it, through
 # `cd "$(dirname "$0")/.."`, so each fixture holds a copy of that script, a copy of the
-# resolved-compiler check that script runs as its first step, and a copy of
-# `rust-toolchain.toml`, which that step reads.
+# resolved-compiler check that script runs as its first step, and a `rust-toolchain.toml`
+# naming the pin's channel, which that step reads.
 #
 # The fixture holds three manifests whose directories nest — `crates/scp-ffi` contains
 # `crates/scp-ffi/napi` — because the longest-prefix rule in `crate_of_path` is what maps a
@@ -432,7 +432,9 @@ build_fixture() {
         "$root/bindings/python/scp_sdk" "$root/.github/workflows" "$root/notes"
     cp "$SCRIPT" "$root/scripts/fix-round-check.sh"
     cp "$REPO_ROOT/scripts/check-resolved-rustc.sh" "$root/scripts/check-resolved-rustc.sh"
-    cp "$REPO_ROOT/rust-toolchain.toml" "$root/rust-toolchain.toml"
+    # The channel alone: the components and targets the root file lists would make rustup
+    # install them, in one attempt, on the stub's first real cargo call in this fixture.
+    printf '[toolchain]\nchannel = "%s"\n' "$PIN_CHANNEL" > "$root/rust-toolchain.toml"
 
     while IFS= read -r g; do
         [[ -n $g ]] || continue
@@ -1601,9 +1603,11 @@ case_25() {
 # agent that an edit to a workflow has coverage it does not have.
 #
 # EVIDENCE, not the criterion: a file of the suite's own directory holds a line naming a
-# repository-root variable and a `workflows/` path together. `scripts/tests/ci-gate/
-# ci_gate_selftest.py` writes `WORKFLOW = REPO / ".github/workflows/ci.yml"` and this file
-# writes `"$REPO_ROOT/.github/workflows/ci.yml"`, while `scripts/tests/toolchain-wiring/
+# repository-root variable and a `.github/` path together. `scripts/tests/ci-gate/
+# ci_gate_selftest.py` writes `WORKFLOW = REPO / ".github/workflows/ci.yml"`, this file
+# writes `"$REPO_ROOT/.github/workflows/ci.yml"`, and `scripts/tests/rust-toolchain-action/
+# run-tests.sh` writes `"$REPO_ROOT/.github/actions/rust-toolchain/install.sh"`, a file
+# under `.github/` that is not a workflow, while `scripts/tests/toolchain-wiring/
 # run-tests.sh` writes `"$root/.github/workflows/ci.yml"` against a fixture tree it created
 # and `scripts/tests/signing-guard/run-tests.sh` names no workflow path at all. A suite
 # that roots a path at this repository under a variable spelled some other way fails this
@@ -1633,7 +1637,7 @@ while IFS= read -r suite; do
         [[ $suite_dir == scripts/tests/* ]] && scan="$REPO_ROOT/$suite_dir"
     fi
     qualifies=0
-    grep -rqE 'REPO[A-Z_]*[^a-zA-Z0-9_].*workflows/' "$scan" 2>/dev/null && qualifies=1
+    grep -rqE 'REPO[A-Z_]*[^a-zA-Z0-9_].*\.github/' "$scan" 2>/dev/null && qualifies=1
     named=0
     case $GITHUB_LANE_LINE in
         *"$suite"*) named=1 ;;

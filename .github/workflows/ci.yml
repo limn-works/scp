@@ -42,6 +42,11 @@ env:
   # rejects a missing workflow-level key and any job-level or step-level one, in this
   # file and in compile-timings.yml.
   CARGO_PROFILE_DEV_DEBUG: "0"
+  # rustup installs nothing on first use, so a cargo or rustc call that no
+  # `./.github/actions/rust-toolchain` step covers fails with "toolchain '1.98.0' is not
+  # installed" in place of a one-attempt download of every target and component
+  # `rust-toolchain.toml` lists. See "The Rust toolchain each job compiles on" below.
+  RUSTUP_AUTO_INSTALL: "0"
 
 # ── Cargo cache groups ────────────────────────────────────────────────────────
 #
@@ -241,6 +246,24 @@ env:
 # fingerprints against every restored artifact and recompiles what does not match. A
 # group named wrong costs a miss, never a wrong result.
 
+# ── The Rust toolchain each job compiles on ───────────────────────────────────
+# Every job that runs cargo or rustc, on Linux and macOS alike, first runs
+# `./.github/actions/rust-toolchain`, ahead of `Swatinem/rust-cache` (whose `rustc -vV`
+# would otherwise install the pin) and ahead of every cargo command. The step reads the
+# channel out of `rust-toolchain.toml`, installs it under rustup's minimal profile plus
+# only the components (`components:`) and targets (`targets:`) that job compiles with,
+# retries a failed download with backoff, sets it as the checkout's directory override,
+# and fails unless `rustc -V` there reports it. Left to rustup's install on first use,
+# each job downloaded all 13 targets the file lists plus clippy, rustfmt and
+# rust-analyzer in one attempt; on 2026-10-10 two jobs died when that one attempt timed
+# out. `.github/actions/rust-toolchain/install.sh` states the mechanism and every
+# failure it reports. The version is still the one `rust-toolchain.toml` names, so
+# rust-cache keys, which hash `rustc -vV`, are unchanged. Job `toolchain-wiring` alone
+# keeps no override, so its check 4 sees the checkout a developer's shell sees.
+# `RUSTUP_AUTO_INSTALL: "0"` in this file's `env:` turns a job that lacks the step, or a
+# cargo call outside the directory the override covers, into a failed job, and install.sh
+# refuses to run without it.
+
 jobs:
   check-draft:
     if: >-
@@ -345,6 +368,11 @@ jobs:
               # `scaffold-typescript-web-check` fail to link without it. A `[build]`
               # stanza added there would change what every other lane compiles.
               - '.cargo/**'
+              # The step every Rust job runs before its first cargo command: it installs
+              # the channel `rust-toolchain.toml` names with the job's components and
+              # targets and makes it the checkout's override, so a change to it decides
+              # which compiler every Rust lane runs on.
+              - '.github/actions/rust-toolchain/**'
             rust:
               - 'crates/**'
               - 'Cargo.toml'
@@ -510,6 +538,9 @@ jobs:
               # that rewrites that command and changes nothing else would otherwise
               # skip the one job that runs it.
               - '.github/workflows/ci.yml'
+              # fuzz-build installs its nightly through this action, and the `fuzz`
+              # output reads this filter alone.
+              - '.github/actions/rust-toolchain/**'
             # Every path a job compiles, executes, or feeds a gate as input, written as
             # the complement of prose rather than as `'**'` minus exclusions. A pull
             # request that changes only prose (`.docs/**`, `.claude/**`, a root-level
@@ -575,6 +606,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
@@ -644,6 +676,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
@@ -673,6 +706,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
@@ -704,6 +738,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/rust-toolchain
       - name: Every shipped artifact links the wiping global allocator
         run: bash scripts/check-wiping-allocator.sh
 
@@ -849,6 +884,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/rust-toolchain
       - run: bash scripts/check-protocol-deps.sh
       - run: bash scripts/check-no-shim-reexports.sh
 
@@ -950,6 +986,11 @@ jobs:
           python-version: "3.12"
       - name: Run toolchain-wiring cases
         run: bash scripts/tests/toolchain-wiring/run-tests.sh
+      # The install step every Rust job runs (`.github/actions/rust-toolchain`) against a
+      # stub rustup: retry with backoff, rustup's error after the last attempt, the
+      # minimal profile with only the named extras, and each refusal.
+      - name: Run rust-toolchain action cases
+        run: bash scripts/tests/rust-toolchain-action/run-tests.sh
       # scripts/hooks/pre-commit runs `scripts/check-resolved-rustc.sh` on every commit,
       # and runs each language's format and lint steps only for files that differ from what the
       # commit's parent — or, on a merge, each merged-in head — already carries. These
@@ -1042,6 +1083,7 @@ jobs:
       - run: pip install 'tree-sitter-rust>=0.21,<0.25' tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift ruff==0.15.4 'pyyaml>=6,<7'
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
+      - uses: ./.github/actions/rust-toolchain
       # This job reads the `workspace-debug` cache group for its registry alone,
       # the way job shipped-feature-graph does: the `cargo tree`
       # resolutions the suite drives download the index and the `.crate` files,
@@ -1282,6 +1324,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: wasm32-unknown-unknown
       # Reads the `wasm32` group typescript-wasm-check writes. This command compiles
       # under the dev profile and that job builds under release, so what this restore
       # supplies is the registry — the crates.io sources every dependency of these ten
@@ -1305,6 +1350,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: wasm32-unknown-unknown
       # Reads the `wasm32` group typescript-wasm-check writes. `wasm-pack test` compiles
       # scp-client-wasm under the dev profile and that job builds under release, so this
       # restore supplies the registry rather than compiled artifacts. It writes nothing,
@@ -1335,6 +1383,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: rustfmt
       - run: cargo fmt --all -- --check
 
   # ── Why this job is a matrix ────────────────────────────────────────────────
@@ -1404,6 +1455,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
       # Writes the `workspace-check` group. The `--workspace` sweep compiles every
       # dependency in check mode, to an `.rmeta` under a metadata hash that includes
       # the mode, so the `workspace-debug` entry rust-test writes under build mode
@@ -1608,6 +1662,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
@@ -1728,6 +1783,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: transport-optional-${{ matrix.group }}
@@ -1930,6 +1986,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: apple-transport-platform
@@ -2003,6 +2060,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
@@ -2102,6 +2160,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
@@ -2219,6 +2278,7 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
@@ -2337,6 +2397,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
       # Restores the build-mode artifacts rust-test writes to the `workspace-debug`
       # group, and writes nothing.
       - uses: Swatinem/rust-cache@v2
@@ -2374,6 +2435,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: ./.github/actions/rust-toolchain
       # Restores the check-mode artifacts rust-clippy's `workspace` leg writes to the
       # `workspace-check` group, and writes nothing.
       - uses: Swatinem/rust-cache@v2
@@ -2432,12 +2494,13 @@ jobs:
       # inputs (`--log-level warn --manifest-path ./Cargo.toml --all-features check`),
       # and 0.20.2 is the cargo-deny version its v2 Dockerfile installed, so the job
       # checks advisories, bans, licenses and sources against `deny.toml` exactly as it
-      # did. The runner's rustup installs the `rust-toolchain.toml` pin on cargo-deny's
-      # first `cargo metadata`, as it does for job rust-fmt. To move the version, change
-      # it here; install-action fails on a version its manifest does not list.
+      # did. cargo-deny's `cargo metadata` runs on the pin the toolchain step below
+      # installs, as every other Rust job does. To move the version, change it here;
+      # install-action fails on a version its manifest does not list.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny@0.20.2
+      - uses: ./.github/actions/rust-toolchain
       - run: cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features check
 
   # ── Container image ─────────────────────────────────────────────────
@@ -2777,6 +2840,8 @@ jobs:
         with:
           path: bindings/python/scp_sdk/_scp_core*.so
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/python/pyproject.toml') }}-${{ steps.artifact-inputs.outputs.digest }}
+      - uses: ./.github/actions/rust-toolchain
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
@@ -2878,6 +2943,8 @@ jobs:
         with:
           path: target/ci-bridge/libscp_ffi_napi.so
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**') }}-${{ steps.artifact-inputs.outputs.digest }}
+      - uses: ./.github/actions/rust-toolchain
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
@@ -2974,6 +3041,8 @@ jobs:
             bindings/swift/Headers
             bindings/swift/Sources/SCP/Internal/ScpBindings.swift
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/swift/build-xcframework.sh') }}-${{ steps.artifact-inputs.outputs.digest }}
+      - uses: ./.github/actions/rust-toolchain
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
@@ -3107,6 +3176,8 @@ jobs:
         with:
           path: bindings/python/scp_sdk/_scp_core*.so
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/python/pyproject.toml') }}-${{ steps.artifact-inputs.outputs.digest }}
+      - uses: ./.github/actions/rust-toolchain
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
@@ -3305,6 +3376,7 @@ jobs:
           python-version: |
             3.10
             3.12
+      - uses: ./.github/actions/rust-toolchain
       - name: Install maturin
         run: python3.12 -m pip install 'maturin>=1.0,<2.0'
       # No --features, no --manifest-path and no --release: maturin reads the
@@ -3506,6 +3578,9 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: wasm32
@@ -3576,6 +3651,9 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: wasm32
@@ -3961,6 +4039,9 @@ jobs:
       - name: Mark the start of the build
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: touch "$RUNNER_TEMP/uniffi-kotlin-build-start"
+      # Unconditional: on a cache hit `Run tests` still runs `cargo metadata` through
+      # `cargoTargetDir` in bindings/kotlin/scp-kt-android/build.gradle.kts.
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
@@ -4030,8 +4111,7 @@ jobs:
         working-directory: bindings/kotlin
         env:
           # Read by `cargoTargetDir` in bindings/kotlin/scp-kt/build.gradle.kts in place
-          # of a `cargo metadata` call, which on a cache hit, where no cargo command has
-          # run, would make rustup install the pinned toolchain for that call alone.
+          # of a `cargo metadata` call.
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           # Set JNA library path to find the compiled Rust cdylib
@@ -4139,16 +4219,24 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      # rust-cache runs `rustc -vV` in the checkout root, where the stable pin governs,
+      # so the first step installs that pin (minimal, no extras) for rust-cache alone.
+      # The second installs the nightly `fuzz/rust-toolchain.toml` names and sets it as
+      # the override of `fuzz/`; the nearer toolchain file and override both outrank the
+      # root's, so every cargo command below, run from `fuzz/`, compiles on that nightly.
+      - uses: ./.github/actions/rust-toolchain
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain-file: fuzz/rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz -> target"
           shared-key: fuzz
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # This step names no channel. rustup applies the toolchain file of the directory a
-      # command runs in, so running `cargo check` from `fuzz/` resolves
-      # `fuzz/rust-toolchain.toml` and installs the nightly it names — the same
-      # invocation `fuzz/README.md` documents. That file records why the channel is a
-      # dated nightly.
+      # This step names no channel. Run from `fuzz/`, `cargo check` resolves the nightly
+      # `fuzz/rust-toolchain.toml` names, which the toolchain step above installed — the
+      # same invocation `fuzz/README.md` documents. That file records why the channel is
+      # a dated nightly.
       - name: Check fuzz crate compiles
         working-directory: fuzz
         run: cargo check
@@ -4436,8 +4524,7 @@ jobs:
           # JNA loads the UniFFI cdylib via the system library path.
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
           # The kotlin_runner fixture reads this instead of running `cargo metadata`,
-          # which on this toolchain-less job would make rustup install the pinned
-          # channel.
+          # which this job, having no `./.github/actions/rust-toolchain` step, cannot run.
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
           # Explicit runner-binary override (conftest also falls back
           # to the default installDist output; this makes CI failures

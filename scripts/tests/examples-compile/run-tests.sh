@@ -65,13 +65,18 @@ FAILED=0
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export CARGO_TARGET_DIR="$WORK/target"
+# Each fixture's toolchain file names the root file's channel alone: the components and
+# targets the root file lists would make rustup install them, in one attempt, on the first
+# cargo call in a fixture.
+PIN_CHANNEL=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$ROOT/rust-toolchain.toml" | head -n 1)
+[[ -n $PIN_CHANNEL ]] || { echo "ERROR: $ROOT/rust-toolchain.toml names no channel" >&2; exit 1; }
 
 # new_ws NAME [EXTRA_MANIFEST_LINES]: a workspace with one package `demo` and one example `good`.
 new_ws() {
     local ws="$WORK/$1"
     mkdir -p "$ws/scripts" "$ws/demo/src" "$ws/demo/examples"
     cp "$GATE" "$ws/scripts/"
-    cp "$ROOT/rust-toolchain.toml" "$ws/"
+    printf '[toolchain]\nchannel = "%s"\n' "$PIN_CHANNEL" > "$ws/rust-toolchain.toml"
     printf '[workspace]\nmembers = ["demo"]\nresolver = "2"\n' > "$ws/Cargo.toml"
     printf '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\nlicense = "MIT"\ndescription = "fixture"\n%s\n' "${2:-}" > "$ws/demo/Cargo.toml"
     echo 'pub fn f() {}' > "$ws/demo/src/lib.rs"
