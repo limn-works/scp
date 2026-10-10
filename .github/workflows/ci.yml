@@ -645,6 +645,12 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      # `maturin_artifact_entry` parses each maturin project file and its Cargo.toml
+      # with `tomllib` under python3.12, and fails when that interpreter is absent
+      # or cannot import it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: G1 — shipped-feature-graph ⊆ permitted-production allowlist (ZERO-nullifier mandate)
         run: bash scripts/check-shipped-feature-graph.sh
 
@@ -950,7 +956,9 @@ jobs:
   # This job installs what case 3 of that suite needs, which is what the 29
   # gates in the runner's list read: the tree-sitter grammars nine Python gates
   # parse with, the PyYAML check-workflow-compile-steps.py reads every workflow
-  # file with, the ruff check-pyi-generated.sh runs, the jq
+  # file with, the Python 3.12 whose tomllib check-shipped-feature-graph.sh
+  # reads each pyproject.toml's [tool.maturin] table with, the ruff
+  # check-pyi-generated.sh runs, the jq
   # check-bridge-symmetry.sh requires, a Rust toolchain for the twelve `cargo
   # tree` resolutions check-shipped-feature-graph.sh and check-protocol-deps.sh
   # run, and the base ref check-cross-layer.sh diffs against. No step here

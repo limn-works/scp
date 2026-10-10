@@ -983,6 +983,12 @@ fi
 if ! "$PYTHON" -c 'import yaml' >/dev/null 2>&1; then
     printf 'fix-round-check: %s cannot import yaml, which scripts/check-workflow-compile-steps.py parses every workflow file with, so that gate fails below for the missing library. Install it with: pip install '"'"'pyyaml>=6,<7'"'"'\n' "$PYTHON" >&2
 fi
+# `scripts/check-shipped-feature-graph.sh` runs python3.12 itself, whatever $PYTHON
+# resolved to, and imports `tomllib` under it. This line names that cause when the
+# interpreter is absent or lacks the module, for the same reason as the line above.
+if ! python3.12 -P -c 'import tomllib' >/dev/null 2>&1; then
+    printf 'fix-round-check: python3.12 is not on PATH or cannot import tomllib, which scripts/check-shipped-feature-graph.sh reads the [tool.maturin] table of each pyproject.toml with, so that gate fails below for the missing interpreter. Install Python 3.12 (.mise.toml names it).\n' >&2
+fi
 
 gates_t0=$(date +%s)
 gate_failures=0

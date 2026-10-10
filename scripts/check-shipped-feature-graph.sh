@@ -112,10 +112,19 @@
 # Usage:
 #   scripts/check-shipped-feature-graph.sh            # gate the real workspace
 #   scripts/check-shipped-feature-graph.sh --self-test # run the fixture harness only
+#   scripts/check-shipped-feature-graph.sh --print-artifacts
+#       # write the ARTIFACTS array, one entry per line, and run no check
+#   scripts/check-shipped-feature-graph.sh --print-wheel-entries
+#       # write one `<maturin project file><TAB><ARTIFACTS entry>` line per
+#       # MATURIN_PROJECT_FILES entry, and run no check
 #
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# This file's absolute path, fixed before the cd below: a relative
+# BASH_SOURCE stops resolving once the working directory moves to the root,
+# and the fixtures that read or re-run this file would then read nothing.
+GATE_SELF="$REPO_ROOT/scripts/$(basename "${BASH_SOURCE[0]}")"
 cd "$REPO_ROOT"
 
 # ---------------------------------------------------------------------------
@@ -1047,7 +1056,9 @@ expect() { # <label> <expected: PASS|FAIL> <actual-rc>
 assert_every_pipeline_reader_consumes_its_input() {
   echo ">> fixture: every stage this gate pipes into reads its whole input, so no probe can report SIGPIPE (141) as a verdict"
   local self offenders
-  self="${BASH_SOURCE[0]}"
+  self="$GATE_SELF"
+  expect "(sigpipe) the file this fixture scans is this gate, by an absolute path" "PASS" \
+    "$([[ "$self" == /* && -r "$self" && "${self##*/}" == "${BASH_SOURCE[0]##*/}" ]] && echo 0 || echo 1)"
   offenders="$(grep -nE '\|[[:space:]]*(head[[:space:]]|awk[[:space:]]|grep[[:space:]]+(-[a-zA-Z]*q|--quiet|--silent|-m[[:space:]]|--max-count))' "$self" \
     | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
   if [[ -n "$offenders" ]]; then
@@ -1111,6 +1122,103 @@ assert_every_cargo_tree_resolves_every_target() {
     return
   fi
   echo "   ok   — every cargo tree invocation under scripts/ resolves every target triple"
+}
+
+# assert_print_modes_emit_what_this_gate_holds
+#   CRITERION: `--print-artifacts` writes the ARTIFACTS array as bash holds it
+#   when main runs, one entry per line and nothing else, and
+#   `--print-wheel-entries` writes the entry `maturin_artifact_entry` derives for
+#   each MATURIN_PROJECT_FILES file, beside that file's path. Each mode exits
+#   non-zero, writing no line, when its array is empty.
+#
+#   Bash expands every spelling of an assignment before either mode writes a
+#   line, so a copy of this file carrying an appended `ARTIFACTS+=(` writes the
+#   appended entry, and a copy carrying a second `ARTIFACTS=(` assignment writes
+#   the replacement rather than the block this file holds. Each plant copies this
+#   file rather than writing a small stand-in, so the fixture states what a caller
+#   gets from this gate, including the `cd` it runs before main.
+assert_print_modes_emit_what_this_gate_holds() {
+  echo ">> fixture: --print-artifacts writes the array bash holds and --print-wheel-entries writes one entry per maturin project file"
+  local self expected printed rc plant_dir copy last_line project_file
+
+  self="$GATE_SELF"
+  expect "(print-modes) the file this fixture re-runs is this gate, by an absolute path" "PASS" \
+    "$([[ "$self" == /* && -r "$self" && "${self##*/}" == "${BASH_SOURCE[0]##*/}" ]] && echo 0 || echo 1)"
+  expected="$(printf '%s\n' "${ARTIFACTS[@]}")"
+  printed="$(bash "$self" --print-artifacts)"; rc=$?
+  expect "(print-modes) --print-artifacts exits 0" "PASS" "$rc"
+  same_string "$printed" "$expected"; rc=$?
+  expect "(print-modes) its output is the ARTIFACTS array and carries no other line this gate writes" "PASS" "$rc"
+
+  expected="$(for project_file in "${MATURIN_PROJECT_FILES[@]}"; do
+    printf '%s\t%s\n' "$project_file" "$(maturin_artifact_entry "$project_file")"
+  done)"
+  printed="$(bash "$self" --print-wheel-entries)"; rc=$?
+  expect "(print-modes) --print-wheel-entries exits 0" "PASS" "$rc"
+  same_string "$printed" "$expected"; rc=$?
+  expect "(print-modes) its output names each maturin project file and the entry maturin_artifact_entry derives from it" "PASS" "$rc"
+
+  # Each plant deletes the `main "$@"` line, adds an assignment, and writes that
+  # line back, so the added assignment runs before main reads the array. A copy
+  # whose last line held something else would carry dead code and prove nothing,
+  # so this reads the line it is about to delete.
+  plant_dir="$(mktemp -d)"
+  mkdir -p "$plant_dir/scripts"
+  copy="$plant_dir/scripts/gate.sh"
+  last_line="$(tail -n 1 "$self")"
+  same_string "$last_line" 'main "$@"'; rc=$?
+  expect "(print-modes) this file's last line invokes main, which is the line each plant below writes back" "PASS" "$rc"
+
+  sed '$d' "$self" > "$copy"
+  printf '%s\n' 'ARTIFACTS+=("planted-appender|")' 'main "$@"' >> "$copy"
+  printed="$(bash "$copy" --print-artifacts)"; rc=$?
+  expect "(print-modes) a copy carrying an ARTIFACTS+=( appender exits 0" "PASS" "$rc"
+  same_string "$printed" "$(printf '%s\n' "${ARTIFACTS[@]}"; echo 'planted-appender|')"; rc=$?
+  expect "(print-modes) that copy writes the appended entry" "PASS" "$rc"
+
+  sed '$d' "$self" > "$copy"
+  printf '%s\n' 'ARTIFACTS=("planted-second|")' 'main "$@"' >> "$copy"
+  printed="$(bash "$copy" --print-artifacts)"; rc=$?
+  expect "(print-modes) a copy carrying a second ARTIFACTS=( assignment exits 0" "PASS" "$rc"
+  same_string "$printed" "planted-second|"; rc=$?
+  expect "(print-modes) that copy writes what bash holds after the second assignment, not the first block" "PASS" "$rc"
+
+  sed '$d' "$self" > "$copy"
+  printf '%s\n' 'ARTIFACTS=()' 'main "$@"' >> "$copy"
+  # The two empty-array cases also read stderr: bash before 4.4 aborts on an
+  # empty "${array[@]}" under `set -u` for a reason of its own, so the exit code
+  # alone would not show that the guard in main ran.
+  local print_err="$plant_dir/stderr"
+  printed="$(bash "$copy" --print-artifacts 2>"$print_err")"; rc=$?
+  expect "(print-modes) a copy whose ARTIFACTS is empty FAILS --print-artifacts" "FAIL" "$rc"
+  same_string "$printed" ""; rc=$?
+  expect "(print-modes) that copy writes no line" "PASS" "$rc"
+  same_string "$(cat "$print_err")" "--print-artifacts: ARTIFACTS is empty"; rc=$?
+  expect "(print-modes) that copy states ARTIFACTS is empty" "PASS" "$rc"
+
+  sed '$d' "$self" > "$copy"
+  printf '%s\n' 'MATURIN_PROJECT_FILES=()' 'main "$@"' >> "$copy"
+  printed="$(bash "$copy" --print-wheel-entries 2>"$print_err")"; rc=$?
+  expect "(print-modes) a copy whose MATURIN_PROJECT_FILES is empty FAILS --print-wheel-entries" "FAIL" "$rc"
+  same_string "$printed" ""; rc=$?
+  expect "(print-modes) that copy writes no line" "PASS" "$rc"
+  same_string "$(cat "$print_err")" "--print-wheel-entries: MATURIN_PROJECT_FILES is empty"; rc=$?
+  expect "(print-modes) that copy states MATURIN_PROJECT_FILES is empty" "PASS" "$rc"
+
+  sed '$d' "$self" > "$copy"
+  printf '%s\n' "MATURIN_PROJECT_FILES=(\"$REPO_ROOT/${MATURIN_PROJECT_FILES[0]}\")" 'main "$@"' >> "$copy"
+  printed="$(bash "$copy" --print-wheel-entries 2>/dev/null)"; rc=$?
+  expect "(print-modes) a copy naming only the first maturin project file by its absolute path exits 0" "PASS" "$rc"
+  same_string "$printed" "$REPO_ROOT/${MATURIN_PROJECT_FILES[0]}"$'\t'"$(maturin_artifact_entry "${MATURIN_PROJECT_FILES[0]}")"; rc=$?
+  expect "(print-modes) that copy writes the file's line, so the next case's readable file is readable" "PASS" "$rc"
+
+  sed '$d' "$self" > "$copy"
+  printf '%s\n' "MATURIN_PROJECT_FILES=(\"$REPO_ROOT/${MATURIN_PROJECT_FILES[0]}\" \"nowhere/pyproject.toml\")" 'main "$@"' >> "$copy"
+  printed="$(bash "$copy" --print-wheel-entries 2>/dev/null)"; rc=$?
+  expect "(print-modes) a copy naming a maturin project file the reader cannot read FAILS --print-wheel-entries" "FAIL" "$rc"
+  same_string "$printed" ""; rc=$?
+  expect "(print-modes) that copy writes no line, not even for the readable file listed before the unreadable one" "PASS" "$rc"
+  rm -rf "$plant_dir"
 }
 
 # ---------------------------------------------------------------------------
@@ -1291,7 +1399,7 @@ packages_built_by_shipping_lines() {
 # The wheel's feature selection lives outside the shipping files. maturin reads
 # `features`, `all-features`, and `no-default-features` from the
 # `[tool.maturin]` table of a pyproject.toml and passes them to cargo, so the
-# four functions below read that table, derive the cargo configuration it
+# functions below read that table, derive the cargo configuration it
 # selects, and tie it to an ARTIFACTS entry.
 # ---------------------------------------------------------------------------
 
@@ -1321,113 +1429,143 @@ maturin_project_files_named_by_shipping_lines() {
   done <<<"$1" | sed -E 's#^\./##; /^$/d' | sort -u
 }
 
-# maturin_table_text <pyproject.toml>
-#   Emit the body of the `[tool.maturin]` table as one space-joined line, with
-#   comments removed. A `[tool.maturin.<sub>]` table is a different table and is
-#   not emitted. FAILS (non-zero, reason on stderr) when the file does not
-#   exist, or when the file spells a maturin key in a TOML form this reader does
-#   not parse — an inline table (`maturin = { … }`) or a dotted key
-#   (`tool.maturin.features = …`) — because a spelling the reader cannot parse
-#   must not read as "no features selected".
-maturin_table_text() {
-  local file="$1" unparsed
-  if [[ ! -f "$file" ]]; then
-    echo "maturin project file does not exist: $file" >&2
-    return 1
-  fi
-  unparsed="$(grep -nE '(^|[[:space:].])maturin[[:space:]]*=[[:space:]]*\{|(^|[[:space:].])maturin\.(features|all-features|no-default-features|manifest-path)[[:space:]]*=' "$file" || true)"
-  if [[ -n "$unparsed" ]]; then
-    { echo "$file spells a maturin key as an inline table or a dotted key, which this reader does not parse:"
-      printf '%s\n' "$unparsed" | sed 's/^/  /'; } >&2
-    return 1
-  fi
-  awk '
-    /^[[:space:]]*\[/ {
-      in_table = ($0 ~ /^[[:space:]]*\[[[:space:]]*tool[[:space:]]*\.[[:space:]]*maturin[[:space:]]*\][[:space:]]*(#.*)?$/)
-      next
-    }
-    in_table { sub(/(^|[[:space:]])#.*$/, ""); printf "%s ", $0 }
-    END { printf "\n" }
-  ' "$file"
-}
+# The program that derives a wheel's ARTIFACTS entry from a maturin project file.
+#
+# CRITERION: it reports the cargo configuration maturin compiles, for every TOML
+# spelling of that project file, or it fails.
+#
+# `tomllib` decides what the document says, so `[tool.maturin]`, `[tool."maturin"]`,
+# `tool.maturin.features = […]`, and `maturin = { features = […] }` are four
+# spellings of one table and reach one code path. A reader that matches the table
+# header as source text reads `[tool."maturin"]`, which is valid TOML naming the
+# table maturin reads, as an absent table, and derives `scp-ffi|`, an ARTIFACTS
+# entry this gate holds, from a document selecting `testing`.
+#
+# The keys of the table are a positive whitelist, MATURIN_KEYS. maturin passes
+# more of that table to cargo than the feature keys: `rustc-args` reaches rustc
+# (`--cfg feature="testing"` compiles `testing` code that cargo's feature
+# resolution never sees), `config` overrides cargo configuration, and `profile`,
+# `target`, `unstable-flags` and more change the build. The program therefore
+# fails on any key outside MATURIN_KEYS: the four it interprets, and
+# `module-name`, `python-source`, `python-packages`, `include` and `exclude`,
+# which place files in the wheel and select no compilation. A subtable of
+# `[tool.maturin]` is a key too, so it fails the same way. A key maturin adds
+# later fails here until someone classifies it into that set.
+#
+# The program reads the `[package] name` of the manifest with the same parser.
+#
+# It writes the entry in the spelling ARTIFACTS uses: `--all-features`, then
+# `--no-default-features`, then `--features a,b`, each present only when the table
+# selects it. It fails on a `tool` that is not a table, on a `[tool.maturin]` that
+# is not a table, on a `features` that is not an array of strings, on a feature
+# name outside FEATURE_NAME (an empty name or one carrying whitespace, which
+# cargo would split or drop), on an `all-features` or `no-default-features` that
+# is not a boolean, on a `manifest-path` that is not a string, on a project file
+# or manifest it cannot read or parse, and on a manifest carrying no
+# `[package] name` — because a value this reader cannot interpret must not read
+# as "no features selected".
+read -r -d '' MATURIN_ENTRY_PROGRAM <<'PYTHON' || true
+import os
+import re
+import sys
+import tomllib
 
-# maturin_feature_args <pyproject.toml>
-#   Emit the cargo feature arguments the `[tool.maturin]` table of the file
-#   selects, spelled the way ARTIFACTS spells them: `--all-features`, then
-#   `--no-default-features`, then `--features a,b`, each present only when the
-#   table selects it; an empty line when the table selects nothing. FAILS
-#   (non-zero) on anything maturin_table_text fails on, and on a key whose value
-#   is not a TOML array of strings (`features`) or a TOML boolean
-#   (`all-features`, `no-default-features`).
-maturin_feature_args() {
-  local file="$1" text args="" list features
-  text="$(maturin_table_text "$file")" || return 1
-  local re_all='(^|[[:space:]])all-features[[:space:]]*=[[:space:]]*(true|false)([[:space:]]|$)'
-  local re_nodef='(^|[[:space:]])no-default-features[[:space:]]*=[[:space:]]*(true|false)([[:space:]]|$)'
-  local re_feat='(^|[[:space:]])features[[:space:]]*=[[:space:]]*\[([^]]*)\]'
-  if [[ "$text" =~ (^|[[:space:]])all-features[[:space:]]*= ]]; then
-    if [[ ! "$text" =~ $re_all ]]; then
-      echo "$file: all-features is not a TOML boolean" >&2; return 1
-    fi
-    if [[ "${BASH_REMATCH[2]}" == "true" ]]; then args="--all-features"; fi
-  fi
-  if [[ "$text" =~ (^|[[:space:]])no-default-features[[:space:]]*= ]]; then
-    if [[ ! "$text" =~ $re_nodef ]]; then
-      echo "$file: no-default-features is not a TOML boolean" >&2; return 1
-    fi
-    if [[ "${BASH_REMATCH[2]}" == "true" ]]; then args="${args:+$args }--no-default-features"; fi
-  fi
-  if [[ "$text" =~ (^|[[:space:]])features[[:space:]]*= ]]; then
-    if [[ ! "$text" =~ $re_feat ]]; then
-      echo "$file: features is not a TOML array" >&2; return 1
-    fi
-    list="${BASH_REMATCH[2]}"
-    local re_bad='[^-A-Za-z0-9_./@:+, "'"'"']'
-    if [[ "$list" =~ $re_bad ]]; then
-      echo "$file: features carries a character no quoted cargo feature name uses: $list" >&2; return 1
-    fi
-    features="$(printf '%s\n' "$list" | tr -d "\"'" | tr ',' '\n' \
-      | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' | paste -sd, -)"
-    if [[ -n "$features" ]]; then args="${args:+$args }--features $features"; fi
-  fi
-  printf '%s\n' "$args"
-}
+MATURIN_KEYS = frozenset(
+    {
+        "all-features",
+        "no-default-features",
+        "features",
+        "manifest-path",
+        "module-name",
+        "python-source",
+        "python-packages",
+        "include",
+        "exclude",
+    }
+)
+FEATURE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_+./?-]*")
+
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def load(path, what):
+    try:
+        with open(path, "rb") as handle:
+            return tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        fail(f"{project_file}: {what} {path}: {error}")
+
+
+project_file = sys.argv[1]
+document = load(project_file, "cannot read maturin project file")
+
+tool = document.get("tool", {})
+if not isinstance(tool, dict):
+    fail(f"{project_file}: tool is not a table")
+table = tool.get("maturin", {})
+if not isinstance(table, dict):
+    fail(f"{project_file}: [tool.maturin] is not a table")
+
+unclassified = sorted(set(table) - MATURIN_KEYS)
+if unclassified:
+    fail(
+        f"{project_file}: [tool.maturin] names key(s) this reader does not classify: {', '.join(unclassified)}"
+    )
+
+args = []
+for key in ("all-features", "no-default-features"):
+    if key in table:
+        value = table[key]
+        if not isinstance(value, bool):
+            fail(f"{project_file}: {key} is not a TOML boolean")
+        if value:
+            args.append(f"--{key}")
+
+if "features" in table:
+    features = table["features"]
+    if not isinstance(features, list) or not all(
+        isinstance(name, str) for name in features
+    ):
+        fail(f"{project_file}: features is not a TOML array of strings")
+    malformed = [name for name in features if not FEATURE_NAME.fullmatch(name)]
+    if malformed:
+        fail(
+            f"{project_file}: features holds name(s) that are not a cargo feature spelling: {malformed!r}"
+        )
+    if features:
+        args.append("--features " + ",".join(features))
+
+manifest = table.get("manifest-path", "Cargo.toml")
+if not isinstance(manifest, str):
+    fail(f"{project_file}: manifest-path is not a TOML string")
+if not os.path.isabs(manifest):
+    manifest = os.path.join(os.path.dirname(project_file) or ".", manifest)
+
+package = load(manifest, "manifest-path names no manifest this reader can read:").get(
+    "package"
+)
+name = package.get("name") if isinstance(package, dict) else None
+if not isinstance(name, str) or not name:
+    fail(f"{project_file}: {manifest} carries no [package] name")
+
+print(f"{name}|{' '.join(args)}")
+PYTHON
 
 # maturin_artifact_entry <pyproject.toml>
 #   Emit the ARTIFACTS entry (`<package>|<feature-args>`) the file's
 #   `[tool.maturin]` table makes maturin build: the package is the `[package]
 #   name` of the Cargo.toml the table's `manifest-path` names, resolved against
 #   the pyproject.toml's directory, or of the Cargo.toml beside the
-#   pyproject.toml when the table names none. FAILS (non-zero) when
-#   maturin_feature_args fails, when that Cargo.toml does not exist, or when it
-#   carries no `[package] name`.
+#   pyproject.toml when the table names none. FAILS (non-zero, reason on stderr)
+#   on anything MATURIN_ENTRY_PROGRAM above fails on, and when python3.12, the
+#   interpreter AGENTS.md §Toolchain names, is absent or cannot import tomllib.
+#   `-P` keeps the working directory off sys.path, so no tomllib.py there
+#   replaces the parser.
 maturin_artifact_entry() {
-  local file="$1" args text dir manifest pkg
-  args="$(maturin_feature_args "$file")" || return 1
-  text="$(maturin_table_text "$file")" || return 1
-  dir="$(dirname "$file")"
-  local re_mp='(^|[[:space:]])manifest-path[[:space:]]*=[[:space:]]*["'"'"']([^"'"'"']+)["'"'"']'
-  if [[ "$text" =~ $re_mp ]]; then
-    manifest="${BASH_REMATCH[2]}"
-    if [[ "$manifest" != /* ]]; then manifest="$dir/$manifest"; fi
-  else
-    manifest="$dir/Cargo.toml"
-  fi
-  if [[ ! -f "$manifest" ]]; then
-    echo "$file: manifest-path names no file: $manifest" >&2
-    return 1
-  fi
-  pkg="$(awk '
-    /^[[:space:]]*\[/ { in_pkg = ($0 ~ /^[[:space:]]*\[package\][[:space:]]*(#.*)?$/); next }
-    in_pkg && /^[[:space:]]*name[[:space:]]*=/ {
-      sub(/^[[:space:]]*name[[:space:]]*=[[:space:]]*["'"'"']/, ""); sub(/["'"'"'].*$/, ""); print; exit
-    }
-  ' "$manifest")"
-  if [[ -z "$pkg" ]]; then
-    echo "$file: $manifest carries no [package] name" >&2
-    return 1
-  fi
-  printf '%s|%s\n' "$pkg" "$args"
+  python3.12 -P -c "$MATURIN_ENTRY_PROGRAM" "$1"
 }
 
 # assert_wheel_feature_selection_is_gated <pyproject.toml>...
@@ -1918,9 +2056,6 @@ TREE
     "manifest-path = \"$wheel_manifest\"" \
     'module-name = "scp_sdk._scp_core"' \
     '' \
-    '[tool.maturin.sub]' \
-    'features = ["not-read-from-a-subtable"]' \
-    '' \
     '[tool.other]' \
     'features = ["not-read-from-another-table"]' > "$wheel_file"
   wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
@@ -1938,6 +2073,11 @@ TREE
   expect "(wheel-drift) a table that adds 'testing' still derives an entry" "PASS" "$rc"
   same_string "$wheel_entry" "scp-ffi|--features extension-module,testing"; rc=$?
   expect "(wheel-drift) that entry names both features in cargo's comma spelling" "PASS" "$rc"
+  printf '%s\n' 'def load(f): return {"tool": {"maturin": {"features": ["extension-module", "vendored-openssl"], "manifest-path": "'"$wheel_manifest"'"}}, "package": {"name": "scp-ffi"}}' > "$wheel_dir/tomllib.py"
+  wheel_entry="$(cd "$wheel_dir" && maturin_artifact_entry "$wheel_file" 2>/dev/null)"
+  rm -f "$wheel_dir/tomllib.py"
+  same_string "$wheel_entry" "scp-ffi|--features extension-module,testing"; rc=$?
+  expect "(wheel-drift) a tomllib.py in the working directory does not replace the parser" "PASS" "$rc"
   printf '%s\n' "${ARTIFACTS[@]}" | grep -xF -- "$wheel_entry" >/dev/null; rc=$?
   expect "(wheel-drift) ARTIFACTS gates no configuration carrying 'testing'" "FAIL" "$rc"
   ( fixture_failures=0; assert_wheel_feature_selection_is_gated "$wheel_file" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
@@ -1970,12 +2110,106 @@ TREE
   same_string "$wheel_entry" "fixture-pkg|"; rc=$?
   expect "(wheel-drift) that entry is the package's default configuration" "PASS" "$rc"
 
+  # A `[tool.maturin]` table that is present and names no feature key. The case
+  # above deletes the table, which takes a different branch of this reader.
+  printf '%s\n' '[tool.maturin]' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift) a [tool.maturin] table naming no feature key derives an entry" "PASS" "$rc"
+  same_string "$wheel_entry" "scp-ffi|"; rc=$?
+  expect "(wheel-drift) that entry selects the package's default features" "PASS" "$rc"
+
+  # A manifest carrying no `[package] name`, such as a workspace root. The reader
+  # fails rather than derive an entry whose package half is empty.
+  printf '%s\n' '[workspace]' 'members = []' > "$wheel_dir/Cargo.toml"
+  printf '%s\n' '[build-system]' 'build-backend = "maturin"' > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift) a manifest carrying no [package] name FAILS" "FAIL" "$rc"
+
+  # (wheel-drift, spellings) TOML names one table four ways, and maturin reads the
+  # same table however the document spells it, so each spelling below derives the
+  # same entry, and none reads as "no features selected".
+  local spelling_entry
+  printf '%s\n' '[tool."maturin"]' 'features = ["testing"]' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  spelling_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift, spellings) a quoted table header derives an entry" "PASS" "$rc"
+  same_string "$spelling_entry" "scp-ffi|--features testing"; rc=$?
+  expect "(wheel-drift, spellings) that entry names the feature the quoted table selects" "PASS" "$rc"
   printf '%s\n' 'tool.maturin.features = ["testing"]' "tool.maturin.manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  spelling_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift, spellings) a dotted-key spelling derives an entry" "PASS" "$rc"
+  same_string "$spelling_entry" "scp-ffi|--features testing"; rc=$?
+  expect "(wheel-drift, spellings) that entry names the feature too, not 'no features'" "PASS" "$rc"
+  printf '%s\n' '[tool]' "maturin = { features = [\"testing\"], manifest-path = \"$wheel_manifest\" }" > "$wheel_file"
+  spelling_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift, spellings) an inline-table spelling derives an entry" "PASS" "$rc"
+  same_string "$spelling_entry" "scp-ffi|--features testing"; rc=$?
+  expect "(wheel-drift, spellings) that entry names the feature too, not 'no features'" "PASS" "$rc"
+  ( fixture_failures=0; assert_wheel_feature_selection_is_gated "$wheel_file" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(wheel-drift, spellings) the assertion REJECTS an inline-table wheel selecting 'testing'" "FAIL" "$rc"
+
+  # (wheel-drift, keys) a key outside MATURIN_KEYS fails, whether it passes rustc
+  # a cfg, overrides cargo configuration, or is a subtable of [tool.maturin]. The
+  # last case carries only whitelisted keys and derives, so the three before it
+  # fail on the key and on nothing else.
+  printf '%s\n' '[tool.maturin]' 'features = ["extension-module"]' 'rustc-args = ["--cfg", "feature=\"testing\""]' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
   maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
-  expect "(wheel-drift) a dotted-key spelling FAILS instead of reading as 'no features'" "FAIL" "$rc"
-  printf '%s\n' '[tool]' 'maturin = { features = ["testing"] }' > "$wheel_file"
+  expect "(wheel-drift, keys) a rustc-args key FAILS" "FAIL" "$rc"
+  printf '%s\n' '[tool.maturin]' 'features = ["extension-module"]' 'config = ["build.rustflags=[]"]' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
   maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
-  expect "(wheel-drift) an inline-table spelling FAILS instead of reading as 'no features'" "FAIL" "$rc"
+  expect "(wheel-drift, keys) a config key FAILS" "FAIL" "$rc"
+  printf '%s\n' '[tool.maturin]' 'features = ["extension-module"]' "manifest-path = \"$wheel_manifest\"" '[tool.maturin.sub]' 'features = ["testing"]' > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift, keys) a subtable of [tool.maturin] FAILS" "FAIL" "$rc"
+  printf '%s\n' '[tool.maturin]' 'features = ["extension-module"]' "manifest-path = \"$wheel_manifest\"" 'module-name = "m"' 'python-source = "."' 'python-packages = []' 'include = []' 'exclude = []' 'all-features = false' 'no-default-features = false' > "$wheel_file"
+  wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift, keys) every whitelisted key together derives an entry" "PASS" "$rc"
+  same_string "$wheel_entry" "scp-ffi|--features extension-module"; rc=$?
+  expect "(wheel-drift, keys) that entry is the one the feature keys select" "PASS" "$rc"
+
+  # (wheel-drift, shapes) a value this reader cannot interpret fails. The first
+  # four cases also read the reason on stderr, because without its guard each
+  # value raises a Python exception that exits non-zero for a reason the reader
+  # never states.
+  local shape_err
+  printf '%s\n' 'tool = 5' > "$wheel_file"
+  shape_err="$(maturin_artifact_entry "$wheel_file" 2>&1 >/dev/null)"; rc=$?
+  expect "(wheel-drift, shapes) a tool key that is not a table FAILS" "FAIL" "$rc"
+  same_string "$shape_err" "$wheel_file: tool is not a table"; rc=$?
+  expect "(wheel-drift, shapes) that failure states the tool key is not a table" "PASS" "$rc"
+  printf '%s\n' '[tool]' 'maturin = 5' > "$wheel_file"
+  shape_err="$(maturin_artifact_entry "$wheel_file" 2>&1 >/dev/null)"; rc=$?
+  expect "(wheel-drift, shapes) a tool.maturin key that is not a table FAILS" "FAIL" "$rc"
+  same_string "$shape_err" "$wheel_file: [tool.maturin] is not a table"; rc=$?
+  expect "(wheel-drift, shapes) that failure states [tool.maturin] is not a table" "PASS" "$rc"
+  printf '%s\n' '[tool.maturin]' 'features = ["testing"]' 'manifest-path = 17' > "$wheel_file"
+  shape_err="$(maturin_artifact_entry "$wheel_file" 2>&1 >/dev/null)"; rc=$?
+  expect "(wheel-drift, shapes) a manifest-path that is not a TOML string FAILS" "FAIL" "$rc"
+  same_string "$shape_err" "$wheel_file: manifest-path is not a TOML string"; rc=$?
+  expect "(wheel-drift, shapes) that failure states manifest-path is not a TOML string" "PASS" "$rc"
+  printf '%s\n' '[tool.maturin]' 'features = ["testing"' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  shape_err="$(maturin_artifact_entry "$wheel_file" 2>&1 >/dev/null)"; rc=$?
+  expect "(wheel-drift, shapes) a document no TOML parser accepts FAILS" "FAIL" "$rc"
+  [[ "$shape_err" == "$wheel_file: cannot read maturin project file $wheel_file: "* ]]; rc=$?
+  expect "(wheel-drift, shapes) that failure states the project file cannot be read" "PASS" "$rc"
+  printf '%s\n' '[tool.maturin]' 'features = ["testing", 17]' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift, shapes) a features array holding a non-string FAILS" "FAIL" "$rc"
+  printf '%s\n' '[tool.maturin]' 'features = ["extension-module", ""]' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift, shapes) a features array holding an empty name FAILS" "FAIL" "$rc"
+  printf '%s\n' '[tool.maturin]' 'features = ["extension-module", "vendored-openssl testing"]' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
+  expect "(wheel-drift, shapes) a feature name carrying whitespace FAILS" "FAIL" "$rc"
+  # A commented-out key above the live one decides nothing.
+  printf '%s\n' \
+    '[tool.maturin]' \
+    '# features = ["extension-module", "vendored-openssl"]' \
+    'features = ["extension-module"]' \
+    "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
+  wheel_entry="$(maturin_artifact_entry "$wheel_file" 2>/dev/null)"; rc=$?
+  expect "(wheel-drift) a table whose live features key sits under a commented-out one derives an entry" "PASS" "$rc"
+  same_string "$wheel_entry" "scp-ffi|--features extension-module"; rc=$?
+  expect "(wheel-drift) that entry comes from the live key" "PASS" "$rc"
   printf '%s\n' '[tool.maturin]' 'features = "testing"' "manifest-path = \"$wheel_manifest\"" > "$wheel_file"
   maturin_artifact_entry "$wheel_file" >/dev/null 2>&1; rc=$?
   expect "(wheel-drift) a features value that is not an array FAILS" "FAIL" "$rc"
@@ -2029,6 +2263,8 @@ TREE
 
   assert_every_cargo_tree_resolves_every_target
 
+  assert_print_modes_emit_what_this_gate_holds
+
   assert_allowlist_has_no_nullifier
 
   assert_shipping_invocations_are_gated
@@ -2048,6 +2284,38 @@ TREE
 
 # ---------------------------------------------------------------------------
 main() {
+  # The two print modes write this gate's own declarations and exit without
+  # running a check: `--print-artifacts` writes the ARTIFACTS array as bash holds
+  # it, and `--print-wheel-entries` writes the configuration each
+  # MATURIN_PROJECT_FILES file makes maturin build, beside the file it read. A
+  # caller compares the whole output against the entries it expects, so neither
+  # mode writes a fixture line. An empty array, or a project file the reader
+  # cannot read, exits non-zero. `assert_print_modes_emit_what_this_gate_holds`
+  # proves each property.
+  case "${1:-}" in
+    --print-artifacts)
+      if [[ ${#ARTIFACTS[@]} -eq 0 ]]; then
+        echo "--print-artifacts: ARTIFACTS is empty" >&2
+        exit 1
+      fi
+      printf '%s\n' "${ARTIFACTS[@]}"
+      exit 0
+      ;;
+    --print-wheel-entries)
+      if [[ ${#MATURIN_PROJECT_FILES[@]} -eq 0 ]]; then
+        echo "--print-wheel-entries: MATURIN_PROJECT_FILES is empty" >&2
+        exit 1
+      fi
+      local project_file wheel_entry lines=""
+      for project_file in "${MATURIN_PROJECT_FILES[@]}"; do
+        wheel_entry="$(maturin_artifact_entry "$project_file")" || exit 1
+        lines+="$project_file"$'\t'"$wheel_entry"$'\n'
+      done
+      printf '%s' "$lines"
+      exit 0
+      ;;
+  esac
+
   # Always run the fixture harness first — a broken gate must fail loud before it
   # can pass a real (possibly regressed) tree.
   run_fixtures || exit 1

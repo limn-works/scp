@@ -618,6 +618,14 @@ if grep -q 'compile ok' "$WORK/failing-gate/out.txt"; then
 else
     report "case 6 leaves the compile step reported as passing" 1 "the summary holds no 'compile ok': $(tail -n 3 "$WORK/failing-gate/out.txt")"
 fi
+# The stub python3.12 refuses `-P -c 'import tomllib'` like every other call, so the
+# preflight names the interpreter as the reason the owner gate fails. Deleting that
+# preflight branch from `scripts/fix-round-check.sh` turns this assertion red.
+if grep -qF 'python3.12 is not on PATH or cannot import tomllib, which scripts/check-shipped-feature-graph.sh' "$WORK/failing-gate/out.txt"; then
+    report "case 6 names python3.12 without tomllib as the cause of the owner gate's failure" 0 ""
+else
+    report "case 6 names python3.12 without tomllib as the cause of the owner gate's failure" 1 "the output holds no tomllib preflight line"
+fi
 }
 
 case_4() {
