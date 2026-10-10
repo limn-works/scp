@@ -1303,11 +1303,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      # Self-test MUST run first: it plants an upper-CamelCase and a
-      # lower-camelCase non-canonical spelling (both must be DETECTED) and
-      # confirms the canonical spelling, the bare word in prose, and a
-      # SCREAMING_SNAKE_CASE constant are NOT flagged — proving the gate is
-      # alive before we trust it on the tree. This gate is naming hygiene so
+      # Self-test MUST run first: it proves the detector flags the planted
+      # non-canonical spellings and passes the benign controls listed in the
+      # script header, before the real check runs on the tree. This gate is naming hygiene so
       # name-based searches stay honest; it is NOT the nullifier check.
       - name: Self-test gate
         run: bash scripts/check-noop-spelling.sh --self-test
