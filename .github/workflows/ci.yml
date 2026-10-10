@@ -108,7 +108,8 @@ env:
 #                     `cargo build -p scp-ffi-napi --profile ci-bridge`. The four
 #                     producers other than kotlin-test (pyo3-module, pyo3-module-macos,
 #                     napi-addon and xcframework) build under the `ci-bridge` profile the root
-#                     Cargo.toml defines (SCP's crates at opt-level 1, dependencies at
+#                     Cargo.toml defines (scp-ffi, scp-ffi-napi and scp-ffi-uniffi at
+#                     opt-level 0, SCP's other crates at opt-level 1, dependencies at
 #                     opt-level 3). This group and the two `-ci-bridge` groups below
 #                     replaced `workspace-release`, `apple-uniffi` and `apple-parity`,
 #                     which held `--release` output, when the producers moved to the

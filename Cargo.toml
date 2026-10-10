@@ -344,9 +344,17 @@ debug-assertions = false
 
 # ── CI test-bridge profile ──────────────────────────────────────────────────
 # Used by the four bridge-artifact producer jobs in `.github/workflows/ci.yml`
-# (pyo3-module, pyo3-module-macos, napi-addon, xcframework) and by nothing else:
-# Alec's ruling of 2026-10-04 builds SCP's own crates at opt-level 1 and every
-# dependency at opt-level 3 for those test bridges. Release builds,
+# (pyo3-module, pyo3-module-macos, napi-addon, xcframework) and by nothing else.
+# Opt-levels for those test bridges:
+#   - the three bridge crates scp-ffi, scp-ffi-napi and scp-ffi-uniffi: 0
+#     (Alec's ruling of 2026-10-09);
+#   - every other SCP workspace member: 1 (Alec's ruling of 2026-10-04);
+#   - every dependency: 3 (Alec's ruling of 2026-10-04).
+# Each bridge crate's build ends on one crate's codegen: rebuilding
+# scp-ffi-uniffi took about 105 s on a 3-vCPU macOS runner, of which
+# `cargo check` was about 12 s, so code generation at level 1 was most of it.
+# The bridge crates hold FFI glue; the protocol work they call compiles in the
+# other members at 1 and in dependencies at 3. Release builds,
 # `.github/workflows/release.yml`, `build-matrix.yml` and local-developer
 # commands keep `--release`.
 #
@@ -364,3 +372,12 @@ opt-level = 1
 
 [profile.ci-bridge.package."*"]
 opt-level = 3
+
+[profile.ci-bridge.package.scp-ffi]
+opt-level = 0
+
+[profile.ci-bridge.package.scp-ffi-napi]
+opt-level = 0
+
+[profile.ci-bridge.package.scp-ffi-uniffi]
+opt-level = 0
