@@ -2924,7 +2924,9 @@ pub(crate) async fn context_broadcast_admission_on(
         .await
         .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-    Ok(admission.map(|a| format!("{a:?}")))
+    Ok(admission
+        .map(scp_ffi_common::broadcast::broadcast_admission_name)
+        .map(str::to_owned))
 }
 
 // ---------------------------------------------------------------------------
@@ -3622,7 +3624,7 @@ pub(crate) async fn context_execute_governance_action_on(
         _ => {}
     }
 
-    Ok(format!("{result:?}"))
+    Ok(scp_ffi_common::governance_result::governance_action_result_name(&result).to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -4105,14 +4107,13 @@ pub(crate) async fn context_governance_propose_on(
             })
         })?;
 
-    let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
-
-    let response = serde_json::json!({
-        "proposal_id": hex::encode(outcome.proposal.proposal_id),
-        "status": format!("{:?}", outcome.status),
-        "execution_result": result_str,
-    });
-    Ok(response.to_string())
+    Ok(
+        scp_ffi_common::governance_result::governance_propose_response(
+            &outcome.proposal.proposal_id,
+            &outcome.status,
+            outcome.execution_result.as_ref(),
+        ),
+    )
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_governance_approve`](crate::scp::Scp::context_governance_approve).

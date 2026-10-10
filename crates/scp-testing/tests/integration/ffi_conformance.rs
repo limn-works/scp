@@ -3461,3 +3461,31 @@ fn ffi_export_allowlist_reasons_are_justified() {
         offenders.join("\n  ")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Shared wire names for governance outcomes
+// ---------------------------------------------------------------------------
+
+/// Every native bridge names a governance outcome through
+/// `scp_ffi_common::governance_result`: `governance_execute` through
+/// `governance_action_result_name` and `governance_propose` through
+/// `governance_propose_response`. A bridge that builds its own string can
+/// send a Rust `Debug` dump, which no SDK enum parses.
+#[test]
+fn every_bridge_names_governance_outcomes_through_the_shared_functions() {
+    for (bridge, src) in [
+        ("pyo3", PYO3_CONTEXT),
+        ("napi", NAPI_CONTEXT),
+        ("uniffi", UNIFFI_BRIDGE),
+    ] {
+        for call in [
+            "scp_ffi_common::governance_result::governance_action_result_name(",
+            "scp_ffi_common::governance_result::governance_propose_response(",
+        ] {
+            assert!(
+                src.contains(call),
+                "{bridge} bridge must call {call}...) to name a governance outcome"
+            );
+        }
+    }
+}

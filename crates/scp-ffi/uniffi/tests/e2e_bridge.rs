@@ -682,15 +682,11 @@ async fn context_member_role_returns_role_for_creator() {
         .await
         .unwrap();
 
+    // `context_member_role` returns `RoleAssignment.role_name`, which every
+    // SDK's `MemberRole` parser reads. A `Debug` dump of `RoleAssignment`
+    // also contains "admin", so only equality proves a bare name crossed.
     let role = scp.context_member_role(handle, alice.did()).await;
-    assert!(role.is_some(), "Creator should have a role");
-    let role_str = role.unwrap();
-    // The role may be returned as a string name or as a debug representation.
-    // Check that it contains "admin" somewhere.
-    assert!(
-        role_str.contains("admin"),
-        "Creator role should contain 'admin', got: {role_str}"
-    );
+    assert_eq!(role.as_deref(), Some("admin"));
 }
 
 // ---------------------------------------------------------------------------
@@ -762,6 +758,51 @@ async fn governance_execute_rejects_untracked_proposal() {
     assert!(
         msg.contains("not tracked"),
         "rejection should name the untracked proposal, got: {msg}"
+    );
+}
+
+/// A `single_admin` context auto-approves and auto-executes a proposal, so
+/// `governance_propose`'s `execution_result` field names which action ran.
+/// `SuspendCapability` yields `GovernanceActionResult::MemberSuspended`, whose
+/// `SuspendMemberResult` payload made `format!("{r:?}")` send
+/// `MemberSuspended(SuspendMemberResult { .. })`; `execution_result` must
+/// equal `governance_action_result_name`'s bare name.
+#[tokio::test]
+async fn governance_propose_execution_result_is_a_wire_name() {
+    let scp = Scp::new_in_memory_for_test();
+    let alice = scp
+        .identity_create("in_memory".to_owned(), None)
+        .await
+        .unwrap();
+    let alice_did = alice.did();
+    let mut params = full_capability_params();
+    params.ceiling = vec![
+        "governance:propose".to_owned(),
+        "member:ban".to_owned(),
+        "messages:read".to_owned(),
+        "messages:write".to_owned(),
+    ];
+    let handle = scp.context_create(alice, params).await.unwrap();
+
+    let action_json = serde_json::json!({
+        "SuspendCapability": { "did": alice_did, "capabilities": ["MessagesWrite"] }
+    })
+    .to_string();
+    let response = scp
+        .governance_propose(handle, alice_did, action_json)
+        .await
+        .expect("SuspendCapability must auto-execute under single_admin");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&response).expect("governance_propose must return JSON");
+    assert_eq!(
+        parsed["status"].as_str(),
+        Some("Approved"),
+        "got {response}"
+    );
+    assert_eq!(
+        parsed["execution_result"].as_str(),
+        Some("MemberSuspended"),
+        "execution_result must be a bare outcome name; got {response}"
     );
 }
 

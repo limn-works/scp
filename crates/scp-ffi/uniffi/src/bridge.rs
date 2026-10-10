@@ -11549,40 +11549,8 @@ impl Scp {
                         .map_err(ScpError::from)?
                 };
                 // Serialize the result variant name for the caller.
-                use scp_core::context::state::GovernanceActionResult;
-                let result_str = match result {
-                    GovernanceActionResult::MemberAdded { .. } => "MemberAdded",
-                    GovernanceActionResult::MemberRemoved => "MemberRemoved",
-                    GovernanceActionResult::RoleChanged => "RoleChanged",
-                    GovernanceActionResult::OutletRegistered => "OutletRegistered",
-                    GovernanceActionResult::OutletRemoved => "OutletRemoved",
-                    GovernanceActionResult::CeilingModified => "CeilingModified",
-                    GovernanceActionResult::ContextClosed => "ContextClosed",
-                    GovernanceActionResult::TtlExtended => "TtlExtended",
-                    GovernanceActionResult::PruningPolicyModified => "PruningPolicyModified",
-                    GovernanceActionResult::AdminTransferred => "AdminTransferred",
-                    GovernanceActionResult::SignerAdded => "SignerAdded",
-                    GovernanceActionResult::SignerRemoved => "SignerRemoved",
-                    GovernanceActionResult::ThresholdModified => "ThresholdModified",
-                    GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
-                    GovernanceActionResult::OutletInterfaceEstablished => {
-                        "OutletInterfaceEstablished"
-                    }
-                    GovernanceActionResult::MemberReset => "MemberReset",
-                    GovernanceActionResult::ConflictResolved => "ConflictResolved",
-                    GovernanceActionResult::ContextPromoted => "ContextPromoted",
-                    GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
-                    GovernanceActionResult::AccessRevoked(_) => "AccessRevoked",
-                    GovernanceActionResult::AccessRestored(_) => "AccessRestored",
-                    GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
-                    GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
-                    GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
-                    GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
-                    GovernanceActionResult::Executed => "Executed",
-                    GovernanceActionResult::MigrationProposed(_) => "MigrationProposed",
-                    GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
-                    GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
-                };
+                let result_str =
+                    scp_ffi_common::governance_result::governance_action_result_name(&result);
                 Ok::<_, ScpError>(result_str.to_owned())
             })
             .await
@@ -11645,14 +11613,13 @@ impl Scp {
                     .await
                     .map_err(ScpError::from)?;
 
-                let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
-
-                let response = serde_json::json!({
-                    "proposal_id": hex::encode(outcome.proposal.proposal_id),
-                    "status": format!("{:?}", outcome.status),
-                    "execution_result": result_str,
-                });
-                Ok::<_, ScpError>(response.to_string())
+                Ok::<_, ScpError>(
+                    scp_ffi_common::governance_result::governance_propose_response(
+                        &outcome.proposal.proposal_id,
+                        &outcome.status,
+                        outcome.execution_result.as_ref(),
+                    ),
+                )
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -13222,7 +13189,9 @@ impl Scp {
             return None;
         }
         match rx.await {
-            Ok(Ok(admission)) => admission.map(|a| format!("{a:?}")),
+            Ok(Ok(admission)) => {
+                admission.map(|a| scp_ffi_common::broadcast::broadcast_admission_name(a).to_owned())
+            }
             _ => None,
         }
     }
@@ -13354,7 +13323,7 @@ impl Scp {
         manager
             .member_role(&handle.context_id, &did)
             .await
-            .map(|r| format!("{r:?}"))
+            .map(|r| r.role_name)
     }
 
     /// Per-instance equivalent of the free-function `context_drain_events`.

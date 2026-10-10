@@ -183,6 +183,12 @@ pub mod saga_errors;
 #[cfg(feature = "resolvers")]
 pub mod broadcast;
 
+// Wire names for governance outcomes, shared by PyO3, napi-rs, and UniFFI so
+// no bridge sends a Rust `Debug` dump across its FFI boundary. Requires
+// scp-core (behind `resolvers`).
+#[cfg(feature = "resolvers")]
+pub mod governance_result;
+
 // Shared signed-context-export verifying-key resolver (§23.16.8, ADR-050).
 // Local-custody-first then DID-resolver (#active/#agent) fallback. Closure-based
 // so each bridge keeps its own custody accessor and error type. Requires

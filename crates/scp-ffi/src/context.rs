@@ -4046,38 +4046,8 @@ impl crate::scp::PyScp {
                 })?
                 .map_err(|e| typed_supervisor_failure("governance execution", &e))?;
 
-            use scp_core::context::state::GovernanceActionResult;
-            let result_str = match result {
-                GovernanceActionResult::MemberAdded { .. } => "MemberAdded",
-                GovernanceActionResult::MemberRemoved => "MemberRemoved",
-                GovernanceActionResult::RoleChanged => "RoleChanged",
-                GovernanceActionResult::OutletRegistered => "OutletRegistered",
-                GovernanceActionResult::OutletRemoved => "OutletRemoved",
-                GovernanceActionResult::CeilingModified => "CeilingModified",
-                GovernanceActionResult::ContextClosed => "ContextClosed",
-                GovernanceActionResult::TtlExtended => "TtlExtended",
-                GovernanceActionResult::PruningPolicyModified => "PruningPolicyModified",
-                GovernanceActionResult::AdminTransferred => "AdminTransferred",
-                GovernanceActionResult::SignerAdded => "SignerAdded",
-                GovernanceActionResult::SignerRemoved => "SignerRemoved",
-                GovernanceActionResult::ThresholdModified => "ThresholdModified",
-                GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
-                GovernanceActionResult::OutletInterfaceEstablished => "OutletInterfaceEstablished",
-                GovernanceActionResult::MemberReset => "MemberReset",
-                GovernanceActionResult::ConflictResolved => "ConflictResolved",
-                GovernanceActionResult::ContextPromoted => "ContextPromoted",
-                GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
-                GovernanceActionResult::AccessRevoked(_) => "AccessRevoked",
-                GovernanceActionResult::AccessRestored(_) => "AccessRestored",
-                GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
-                GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
-                GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
-                GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
-                GovernanceActionResult::Executed => "Executed",
-                GovernanceActionResult::MigrationProposed(_) => "MigrationProposed",
-                GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
-                GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
-            };
+            let result_str =
+                scp_ffi_common::governance_result::governance_action_result_name(&result);
 
             // Sync FFI handle state for migration transitions (§5.11A).
             // The core ContextManager has already transitioned; keep the
@@ -4268,14 +4238,13 @@ impl crate::scp::PyScp {
                 .await
                 .map_err(|e| typed_supervisor_failure("SCP-CTX-2041: governance proposal", &e))?;
 
-            let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
-
-            let response = serde_json::json!({
-                "proposal_id": hex::encode(outcome.proposal.proposal_id),
-                "status": format!("{:?}", outcome.status),
-                "execution_result": result_str,
-            });
-            Ok(response.to_string())
+            Ok(
+                scp_ffi_common::governance_result::governance_propose_response(
+                    &outcome.proposal.proposal_id,
+                    &outcome.status,
+                    outcome.execution_result.as_ref(),
+                ),
+            )
         })
     }
 
@@ -5622,7 +5591,9 @@ impl crate::scp::PyScp {
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-                .map(|opt| opt.map(|a| format!("{a:?}")))
+                .map(|opt| {
+                    opt.map(|a| scp_ffi_common::broadcast::broadcast_admission_name(a).to_owned())
+                })
         })
     }
 
@@ -5728,7 +5699,8 @@ impl crate::scp::PyScp {
         Ok(rt.block_on(sup.member_dids(&context_id)))
     }
 
-    /// Returns the role assignment for a specific member as a debug string.
+    /// Returns a member's assigned role name (`RoleAssignment.role_name`, such
+    /// as `"admin"`), matching what napi-rs and `UniFFI` return.
     ///
     /// Returns `None` if the member is not found or the context is not registered.
     #[pyo3(signature = (handle, did))]
@@ -5746,7 +5718,7 @@ impl crate::scp::PyScp {
         let context_id = handle.context_id.clone();
         Ok(rt
             .block_on(sup.member_role(&context_id, did))
-            .map(|r| format!("{r:?}")))
+            .map(|r| r.role_name))
     }
 
     /// Drains all pending events from the context's receive buffer.
