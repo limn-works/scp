@@ -739,6 +739,7 @@ NOT_ON_PUSH_JOBS = (
     "no-mutable-globals-rust",
     "no-mutable-globals-ts",
     "no-panic-abort",
+    "noop-spelling",
     "pyi-generated",
     "protocol-sync",
     "saga-gating-granularity",
