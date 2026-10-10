@@ -453,14 +453,16 @@ impl ContextActor {
                         // PrepareForReplace breaks, which have an external
                         // caller that despawns/replaces — an internal TTL exit
                         // has none. Without this the dead-but-registered handle
-                        // lingers in `actors`, so `read_context_state` reports
-                        // `None` (closed mailbox) instead of the persisted
-                        // `Expired`, and the context id cannot be re-created.
+                        // lingers in `actors` with a closed mailbox, so a
+                        // lifecycle read reaches no actor (the checked read
+                        // reports `ActorBusy`, the Option form `None`) instead
+                        // of the absent answer a completed expiry gives, and
+                        // the context id cannot be re-created.
                         // `despawn_actor` removes our OWN registry entry
                         // (`&self.context_id`) under the supervisor write lock;
                         // safe to call from here — the actor holds no lock, and
                         // the removal has no `.await` while the lock is held.
-                        self.deps.supervisor.despawn_actor(&self.context_id).await;
+                        despawn_self_after_ttl_exit(&self.deps.supervisor, &self.context_id).await;
                         break;
                     }
                 }
@@ -489,7 +491,7 @@ impl ContextActor {
                     if self.on_ttl_tick().await {
                         // Same internal-TTL-exit despawn as Arm 2: no external
                         // despawner for a timer-driven terminal exit.
-                        self.deps.supervisor.despawn_actor(&self.context_id).await;
+                        despawn_self_after_ttl_exit(&self.deps.supervisor, &self.context_id).await;
                         break;
                     }
                 }
@@ -1015,6 +1017,26 @@ impl ContextActor {
     }
 }
 
+/// Removes an actor's own registry entry after a timer-driven terminal exit.
+/// When the Supervisor has dropped (ADR-049 Decision 16) its registry dropped
+/// with it, so no entry remains to remove; that case logs at debug.
+///
+/// A free function over the two fields, not a `&self` method: `ContextActor` is
+/// `!Sync`, so a `&self` held across the `.await` would make the actor future
+/// `!Send`.
+async fn despawn_self_after_ttl_exit(
+    supervisor: &crate::context::supervisor::handle::SupervisorHandle,
+    context_id: &str,
+) {
+    if let Err(e) = supervisor.despawn_actor(context_id).await {
+        tracing::debug!(
+            context_id,
+            error = %e,
+            "TTL exit despawn skipped: supervisor dropped, registry already gone"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1269,6 +1291,7 @@ mod tests {
         // key_resolver/mls_storage/persistence from the supervisor and the
         // MLS/HPKE backends transitively through `crypto`; only the owning
         // DID is supplied (resolves this identity's KeyPackageStoreActor).
+        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
             .build_actor_deps(&DID("did:example:actor-with-state-test".to_owned()))
             .await
@@ -1961,6 +1984,7 @@ mod tests {
             mls_storage,
         );
 
+        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
             .build_actor_deps(&DID("did:example:sec1-ttl-test".to_owned()))
             .await

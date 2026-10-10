@@ -7,9 +7,9 @@
 // the encoders emit the pinned shapes (TrustAggregateTest.kt covers that
 // without the native lib).
 //
-// All tests require the compiled UniFFI cdylib; if the native library is not
-// loadable the suite skips via JUnit 5 assumptions, matching
-// TrustAdmissionFfiTest.
+// All tests require the compiled UniFFI cdylib. A cdylib that is absent or fails
+// to load throws `UnsatisfiedLinkError` from the first native call and fails the
+// test.
 
 package works.limn.scp
 
@@ -20,8 +20,6 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.Assumptions.assumeTrue
-import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import uniffi.scp.StorageConfig
@@ -32,30 +30,6 @@ import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
 
 class TrustAggregateFfiTest {
-    companion object {
-        private var nativeAvailable = false
-        private var skipReason = ""
-
-        @JvmStatic
-        @BeforeAll
-        fun probeNativeLibrary() {
-            try {
-                Class.forName("uniffi.scp.ScpKt")
-                // Touch a UniFFI helper to force JNA library resolution.
-                Class.forName("uniffi.scp.Scp\$Companion")
-                nativeAvailable = true
-            } catch (e: ClassNotFoundException) {
-                skipReason = "UniFFI bindings not available: ${e.message}"
-            } catch (e: UnsatisfiedLinkError) {
-                skipReason = "Native library link error: ${e.message}"
-            } catch (e: ExceptionInInitializerError) {
-                skipReason = "Native library init error: ${e.cause?.message ?: e.message}"
-            } catch (e: NoClassDefFoundError) {
-                skipReason = "Native library class not found: ${e.message}"
-            }
-        }
-    }
-
     private lateinit var scp: SCP
 
     private fun bridge(): CoroutineBridge =
@@ -67,7 +41,6 @@ class TrustAggregateFfiTest {
 
     @BeforeEach
     fun setUp() {
-        assumeTrue(nativeAvailable, skipReason)
         scp = SCP(StorageConfig.InMemory)
     }
 

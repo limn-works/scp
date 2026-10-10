@@ -288,7 +288,13 @@ mod seal_open_tests {
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
         let add_result = add_member(&mut alice_group, bob_kp, &scp_clock::SystemClock).unwrap();
-        let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+        let bob_group = join_group(
+            &add_result.welcome,
+            bob_provider,
+            bob_signer,
+            &scp_clock::SystemClock,
+        )
+        .unwrap();
 
         (alice_group, bob_group)
     }

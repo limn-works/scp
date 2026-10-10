@@ -2,8 +2,7 @@
 
 Contains dataclasses and enums used across multiple SDK modules:
 ``Message``, ``Provenance``, ``Capability``, ``CustodyType``,
-``BridgeMode``, ``ShadowStatus``, ``ContextMode``,
-``CeilingPolicy``, ``PromotionPolicy``, ``MemoryScope``,
+``ContextMode``, ``CeilingPolicy``, ``PromotionPolicy``, ``MemoryScope``,
 ``SourceType``, ``DiscoveryMethod``, and ``ProvenanceQuality``.
 
 All types mirror their Rust counterparts in ``scp-core`` and carry full
@@ -48,38 +47,6 @@ class CustodyType(enum.Enum):
     #: Ephemeral in-memory key store, suitable for testing or short-lived
     #: agents.  Keys are lost on process exit.
     IN_MEMORY = "in_memory"
-
-
-class BridgeMode(enum.Enum):
-    """Bridge operating mode (spec section 12.2).
-
-    Determines how a bridge connector relays messages between an
-    external platform and an SCP context.
-    Mirrors ``scp_core::bridge::BridgeMode``.
-    """
-
-    #: Messages forwarded verbatim.  Bridge is a transparent pipe.
-    RELAY = "relay"
-    #: Bridge controls external-side identity and can act on behalf
-    #: of participants.
-    PUPPET = "puppet"
-    #: Bridge exposes a programmatic API rather than a chat interface.
-    API = "api"
-    #: Both SCP and external participants have equal agency.
-    COOPERATIVE = "cooperative"
-
-
-class ShadowStatus(enum.Enum):
-    """Shadow identity provenance status (spec section 12.2).
-
-    Indicates how a bridged participant's identity was established.
-    Used for trust evaluation.
-    """
-
-    #: Identity is a shadow -- no verified link to external identity.
-    SHADOW = "shadow"
-    #: External participant has completed an identity claim verification.
-    CLAIMED = "claimed"
 
 
 class ContextMode(enum.Enum):
@@ -245,7 +212,6 @@ class Capability(enum.Enum):
     CONTEXT_CLOSE = "context:close"
     CHILD_CONTEXT_CREATE = "context:child:create"
     OUTLET_INTERFACE = "outlet:interface"
-    BRIDGING = "bridging"
     MEDIA_VOICE = "media:voice"
     MEDIA_VIDEO = "media:video"
     MEDIA_SCREEN_SHARE = "media:screen_share"
@@ -351,7 +317,6 @@ class Message:
 
 
 __all__ = [
-    "BridgeMode",
     "Capability",
     "CeilingPolicy",
     "ContextMode",
@@ -363,6 +328,5 @@ __all__ = [
     "PromotionPolicy",
     "Provenance",
     "ProvenanceQuality",
-    "ShadowStatus",
     "SourceType",
 ]

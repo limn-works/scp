@@ -6,7 +6,7 @@
 //! standard SCP messages through an existing context.
 //!
 //! The [`DataChannelProvider`] trait abstracts the platform-specific WebRTC
-//! data channel implementation. Platform code (webrtc-rs, web_sys, etc.)
+//! data channel implementation. Platform code (webrtc-rs, `web_sys`, etc.)
 //! implements this trait; the adapter orchestrates SCP message framing over
 //! whatever data channel implementation is provided.
 
@@ -15,6 +15,13 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::error::TransportError;
+
+/// A heap-allocated future that borrows its receiver for `'a` and resolves to `T`.
+///
+/// Both traits in this module return this shape because platform code stores
+/// them behind `dyn`, and a trait that declares `async fn` is not
+/// dyn-compatible.
+type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// A WebRTC signaling message exchanged during connection setup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,17 +54,10 @@ pub enum SignalingMessage {
 /// carrying signaling messages through an existing context.
 pub trait SignalingChannel: Send + Sync {
     /// Send a signaling message to the remote peer.
-    fn send_signal(
-        &self,
-        message: SignalingMessage,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>;
+    fn send_signal(&self, message: SignalingMessage) -> BoxFuture<'_, Result<(), TransportError>>;
 
     /// Receive the next signaling message from the remote peer.
-    fn recv_signal(
-        &self,
-    ) -> Pin<
-        Box<dyn std::future::Future<Output = Result<SignalingMessage, TransportError>> + Send + '_>,
-    >;
+    fn recv_signal(&self) -> BoxFuture<'_, Result<SignalingMessage, TransportError>>;
 }
 
 /// Trait for WebRTC data channel implementations.
@@ -77,10 +77,7 @@ pub trait DataChannelProvider: Send + Sync {
     ///
     /// If the channel already exists, this should return successfully.
     /// The label is the hex-encoded routing ID.
-    fn open_channel(
-        &self,
-        label: &str,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>;
+    fn open_channel(&self, label: &str) -> BoxFuture<'_, Result<(), TransportError>>;
 
     /// Send binary data on the channel with the given label.
     ///
@@ -90,11 +87,7 @@ pub trait DataChannelProvider: Send + Sync {
     /// or the send operation fails.
     /// Returns [`TransportError::PayloadTooLarge`] if the data exceeds the
     /// maximum message size.
-    fn send_data(
-        &self,
-        label: &str,
-        data: Vec<u8>,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>;
+    fn send_data(&self, label: &str, data: Vec<u8>) -> BoxFuture<'_, Result<(), TransportError>>;
 
     /// Receive the next binary message from the channel with the given label.
     ///
@@ -103,26 +96,15 @@ pub trait DataChannelProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`TransportError::NotConnected`] if the channel does not exist.
-    fn recv_data(
-        &self,
-        label: &str,
-    ) -> Pin<
-        Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>, TransportError>> + Send + '_>,
-    >;
+    fn recv_data(&self, label: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, TransportError>>;
 
     /// Close the data channel with the given label.
     ///
     /// If the channel does not exist, this should return successfully.
-    fn close_channel(
-        &self,
-        label: &str,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>;
+    fn close_channel(&self, label: &str) -> BoxFuture<'_, Result<(), TransportError>>;
 
     /// Check whether a channel with the given label is open.
-    fn is_channel_open(
-        &self,
-        label: &str,
-    ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>;
+    fn is_channel_open(&self, label: &str) -> BoxFuture<'_, bool>;
 }
 
 /// Configuration for ICE servers (STUN/TURN).

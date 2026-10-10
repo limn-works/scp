@@ -254,21 +254,6 @@ pub trait MlsBackend: Send + Sync {
         ciphertext: &[u8],
     ) -> Result<DecryptedContent, MlsError>;
 
-    /// Processes a TLS-serialized MLS Commit (external; not produced by this
-    /// local group) against `group` and merges the staged commit. This is
-    /// the lower-level alternative to `decrypt` when the caller has already
-    /// decomposed the incoming wire bytes (e.g. federation / restore).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MlsError::DecryptionFailed`] for parse / verification
-    /// failures; [`MlsError::CommitProcessingFailed`] if merging fails.
-    async fn process_commit(
-        &self,
-        group: &mut ScpMlsGroup,
-        commit_bytes: &[u8],
-    ) -> Result<(), MlsError>;
-
     /// Advances the group epoch via a self-update Commit that republishes
     /// the caller's `LeafNode` with `wrapping_pubkey` (§9.16.1). Returns the
     /// TLS-serialized Commit bytes.
@@ -298,7 +283,11 @@ pub trait MlsBackend: Send + Sync {
     /// Returns [`MlsError::AddMemberFailed`] on validation failure (malformed
     /// KP, signature invalid, ciphersuite mismatch), or
     /// [`MlsError::KeyPackageLifetimeInvalid`] when the accepted `Lifetime`
-    /// is expired / out of range under `clock`.
+    /// is expired / out of range under `clock`, keeps less than
+    /// [`scp_mls::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS`] under `clock`, or
+    /// has a `not_before` later than `now -`
+    /// [`scp_mls::KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS`] under `clock`
+    /// (security-model spec §9.7.1, the adder; every caller is an add path).
     async fn validate_key_package(
         &self,
         key_package_bytes: &[u8],
@@ -349,8 +338,25 @@ pub trait MlsBackend: Send + Sync {
     /// # Errors
     ///
     /// See [`MlsError`]. Cancel-hostile on the caller's key material.
-    /// Returns [`MlsError::KeyPackageReplay`] if the KP's init key is already
-    /// in the durable consumed-init-key set.
+    /// Returns [`MlsError::KeyPackageReplay`] if the init key of the signer
+    /// state's own `KeyPackage` is already in the durable consumed-init-key
+    /// set, whether or not that `KeyPackage` has since expired: the production implementation checks the consumed
+    /// set before any lifetime check, because the key package actor reads
+    /// that variant on a confirm retry as its own completed join. For an
+    /// unconsumed init key, the production implementation returns
+    /// [`MlsError::KeyPackageLifetimeInvalid`] when the joiner's own
+    /// `KeyPackage` is expired, not yet valid, or out of range under the
+    /// injected clock, and also when openmls's internal clock rejects its
+    /// `Lifetime` while the injected clock accepts it, carrying that
+    /// `KeyPackage`'s bounds either way (ADR-057 §Prereq-1). It checks the
+    /// injected clock before openmls's, so the error variant does not depend
+    /// on which clock rejects it, and it records no consumed init key on that
+    /// rejection. A mismatched `(key_package_public_bytes, signer_state)` pair
+    /// is [`MlsError::WelcomeProcessingFailed`] when the signer state's own
+    /// `KeyPackage` is unconsumed and current; otherwise the
+    /// `KeyPackageReplay` or `KeyPackageLifetimeInvalid` for the signer
+    /// state's own `KeyPackage` comes first. A mismatched pair never carries
+    /// the caller `KeyPackage`'s lifetime as `KeyPackageLifetimeInvalid`.
     async fn join_from_welcome(
         &self,
         welcome_bytes: &[u8],

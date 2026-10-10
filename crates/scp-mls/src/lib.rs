@@ -11,10 +11,9 @@
 //!
 //! `scp-mls` depends only on `scp-clock`, `scp-did`, `scp-protocol`, and the
 //! `openmls` stack. It **must not** depend on `scp-runtime` (tokio/actor
-//! orchestration) or `scp-identity` (tokio-coupled custody/DHT). The async
-//! durable-storage bridge (`ScpMlsProvider<S>`, the `block_in_place` storage
-//! adapters) stays in `scp-runtime`; only the in-memory provider alias lives
-//! here.
+//! orchestration) or `scp-identity` (tokio-coupled custody/DHT). Every live
+//! MLS provider is the in-memory provider here; the runtime persists its state
+//! as a snapshot blob (persistence spec §17.9.1).
 //!
 //! # Ciphersuite
 //!
@@ -28,7 +27,7 @@
 //! - [`convergent_timestamp`] — Authenticated convergent committer timestamp
 //!   carried in the MLS AAD (ADR-057).
 //! - [`encrypt`] — Application-message encrypt/decrypt over the MLS group.
-//! - [`ratchet`] — Commit processing and epoch advance.
+//! - [`ratchet`] — Update proposals and MLS message serialization.
 //! - [`key_package`] — Single-use `KeyPackage` buffer management.
 //! - [`lifetime`] — `KeyPackage` `Lifetime` minting/validation via the injected
 //!   [`scp_clock::Clock`] (ADR-057 Prereq-1).
@@ -39,10 +38,16 @@
 //! - [`context_extension`] — `scp_context_params` `group_context` extension
 //!   helpers (§5.13.3, finding FFI-02).
 //! - [`epoch_grace`] — Epoch grace-window store (forward-secrecy bound).
+//! - [`provider`] — The in-memory MLS provider, which zeroizes its storage on
+//!   drop and refuses to store the MLS signer (persistence spec §17.9).
 //! - [`error`] — MLS-specific error types.
 //!
 //! See ADR-001 in `.docs/adrs/phase-1.md` for the MLS wrapper design and
 //! ADR-057 for the `scp-mls` extraction.
+
+// The crate holds the MLS signer, `destroy_group`, and the zeroizing provider;
+// no unsafe code may enter it.
+#![forbid(unsafe_code)]
 
 pub mod context_extension;
 pub mod convergent_timestamp;
@@ -54,6 +59,7 @@ pub mod group;
 pub mod key_package;
 pub mod keypackage_attestation;
 pub mod lifetime;
+pub mod provider;
 pub mod ratchet;
 pub mod snapshot;
 pub mod wrapping_extension;
@@ -91,7 +97,9 @@ pub use group::{
 };
 pub use lifetime::{
     KEY_PACKAGE_LIFETIME_MARGIN_SECS, KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS,
-    KEY_PACKAGE_LIFETIME_SECS, key_package_lifetime, validate_key_package_lifetime,
+    KEY_PACKAGE_LIFETIME_SECS, KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS,
+    KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS, key_package_lifetime, validate_key_package_lifetime,
+    validate_key_package_lifetime_for_add,
 };
 pub use openmls_basic_credential::SignatureKeyPair;
 // The snapshot STRUCTS (`MlsGroupSnapshot`, `PendingJoinSnapshot`) are NOT
@@ -105,13 +113,10 @@ pub use wrapping_extension::{
     make_wrapping_key_extension, scp_capabilities_with_wrapping_key,
 };
 
-/// The in-memory MLS provider type.
-///
-/// This is the `openmls_rust_crypto` provider with all key material held in
-/// process memory. The native runtime's persistent `ScpMlsProvider<S>` (which
-/// snapshots out to durable storage) wraps this; an in-browser client snapshots
-/// it to `IndexedDB` out-of-band. Lifted out of `scp-runtime`'s `storage.rs` into
-/// `scp-mls` so the sync MLS machine is self-contained (ADR-057).
-///
-/// See ADR-001 and ADR-006 for the storage provider strategy.
-pub type InMemoryMlsProvider = openmls_rust_crypto::OpenMlsRustCrypto;
+// The in-memory MLS provider holds all key material in process memory,
+// zeroizes its storage values on drop, and refuses to store the MLS signer
+// (persistence spec §17.9). The native runtime snapshots it to durable storage
+// and an in-browser client snapshots it to `IndexedDB`, both out of band
+// (§17.9.1). It lives in `scp-mls` so the sync MLS machine is self-contained
+// (ADR-057).
+pub use provider::{InMemoryMlsProvider, InMemoryMlsStorage, InMemoryMlsStorageError};

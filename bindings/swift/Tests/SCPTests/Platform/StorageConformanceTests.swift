@@ -7,11 +7,19 @@
 // Keychain access or file-system persistence.
 //
 // The in-memory backend uses the identical SQL schema and query
-// patterns as ``AppleStorage`` — the only difference is the absence
-// of SQLCipher encryption pragmas and the use of `:memory:` instead
-// of a file path. This validates the storage contract (sorted key
-// enumeration, prefix scans, delete semantics, concurrent safety)
-// without coupling to platform-specific Keychain infrastructure.
+// patterns as ``AppleStorage``, and it binds every parameter through
+// ``AppleStorage/bindText(_:to:at:)`` and
+// ``AppleStorage/bindBlob(_:to:at:)``, and its `listKeys` reads rows
+// through ``AppleStorage/readKeys(from:)``, rather than through a second
+// copy of that code. A copy would let one of the two spellings carry a
+// defect the other had fixed.
+// Three differences remain: this backend applies no SQLCipher encryption
+// pragma, opens `:memory:` instead of a file path, and serializes access
+// through a serial `DispatchQueue` where ``AppleStorage`` is an actor, so
+// its method bodies are not ``AppleStorage``'s. This validates the
+// storage contract (sorted key enumeration, prefix scans, delete
+// semantics, concurrent safety) without coupling to platform-specific
+// Keychain infrastructure.
 //
 // See SCP-PERSIST-061.
 
@@ -87,11 +95,8 @@
                 guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                     throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
                 }
-                let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-                sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, transient)
-                value.withUnsafeBytes { ptr in
-                    sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(ptr.count), transient)
-                }
+                try AppleStorage.bindText(key, to: stmt, at: 1)
+                try AppleStorage.bindBlob(value, to: stmt, at: 2)
                 guard sqlite3_step(stmt) == SQLITE_DONE else {
                     throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
                 }
@@ -107,8 +112,7 @@
                 guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                     throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
                 }
-                let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-                sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, transient)
+                try AppleStorage.bindText(key, to: stmt, at: 1)
 
                 let result = sqlite3_step(stmt)
                 if result == SQLITE_ROW {
@@ -134,8 +138,7 @@
                 guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                     throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
                 }
-                let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-                sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, transient)
+                try AppleStorage.bindText(key, to: stmt, at: 1)
                 guard sqlite3_step(stmt) == SQLITE_DONE else {
                     throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
                 }
@@ -147,30 +150,22 @@
                 var stmt: OpaquePointer?
                 defer { sqlite3_finalize(stmt) }
 
-                let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-
                 if let upper = AppleStorage.prefixSuccessor(prefix) {
                     let sql = "SELECT key FROM kv WHERE key >= ?1 AND key < ?2 ORDER BY key"
                     guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                         throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
                     }
-                    sqlite3_bind_text(stmt, 1, (prefix as NSString).utf8String, -1, transient)
-                    sqlite3_bind_text(stmt, 2, (upper as NSString).utf8String, -1, transient)
+                    try AppleStorage.bindText(prefix, to: stmt, at: 1)
+                    try AppleStorage.bindText(upper, to: stmt, at: 2)
                 } else {
                     let sql = "SELECT key FROM kv WHERE key >= ?1 ORDER BY key"
                     guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                         throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
                     }
-                    sqlite3_bind_text(stmt, 1, (prefix as NSString).utf8String, -1, transient)
+                    try AppleStorage.bindText(prefix, to: stmt, at: 1)
                 }
 
-                var keys: [String] = []
-                while sqlite3_step(stmt) == SQLITE_ROW {
-                    if let cStr = sqlite3_column_text(stmt, 0) {
-                        keys.append(String(cString: cStr))
-                    }
-                }
-                return keys
+                return try AppleStorage.readKeys(from: stmt)
             }
         }
 
@@ -179,21 +174,19 @@
                 var stmt: OpaquePointer?
                 defer { sqlite3_finalize(stmt) }
 
-                let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-
                 if let upper = AppleStorage.prefixSuccessor(prefix) {
                     let sql = "DELETE FROM kv WHERE key >= ?1 AND key < ?2"
                     guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                         throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
                     }
-                    sqlite3_bind_text(stmt, 1, (prefix as NSString).utf8String, -1, transient)
-                    sqlite3_bind_text(stmt, 2, (upper as NSString).utf8String, -1, transient)
+                    try AppleStorage.bindText(prefix, to: stmt, at: 1)
+                    try AppleStorage.bindText(upper, to: stmt, at: 2)
                 } else {
                     let sql = "DELETE FROM kv WHERE key >= ?1"
                     guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                         throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
                     }
-                    sqlite3_bind_text(stmt, 1, (prefix as NSString).utf8String, -1, transient)
+                    try AppleStorage.bindText(prefix, to: stmt, at: 1)
                 }
 
                 guard sqlite3_step(stmt) == SQLITE_DONE else {
@@ -212,8 +205,7 @@
                 guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                     throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
                 }
-                let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-                sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, transient)
+                try AppleStorage.bindText(key, to: stmt, at: 1)
 
                 let result = sqlite3_step(stmt)
                 if result == SQLITE_ROW {
@@ -404,6 +396,28 @@
             try storage.set(key: "empty", value: Data())
             let result = try storage.get(key: "empty")
             #expect(result == Data())
+        }
+
+        // MARK: - Prefix binds carrying a zero byte
+
+        @Test("a prefix that carries a zero byte selects only the keys past it")
+        func prefixCarryingAZeroByteSelectsOnlyItsKeys() throws {
+            // `delta` sorts below every key that starts with `delta\u{0}`. A
+            // lower bound bound as a C string stops at the zero byte, scans
+            // from `delta`, and selects `delta` too; an upper bound bound as
+            // a C string scans up to `delta` and selects no key.
+            let storage = try InMemoryStorage()
+            try storage.set(key: "delta", value: Data([0x00]))
+            try storage.set(key: "delta\u{0}one", value: Data([0x01]))
+            try storage.set(key: "delta\u{0}two", value: Data([0x02]))
+
+            #expect(try storage.listKeys(prefix: "delta\u{0}o").count == 1)
+            #expect(try storage.listKeys(prefix: "delta\u{0}").count == 2)
+
+            #expect(try storage.deletePrefix(prefix: "delta\u{0}o") == 1)
+            #expect(try storage.exists(key: "delta") == true)
+            #expect(try storage.exists(key: "delta\u{0}one") == false)
+            #expect(try storage.exists(key: "delta\u{0}two") == true)
         }
 
         // MARK: - prefixSuccessor unit tests

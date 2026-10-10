@@ -32,7 +32,7 @@
 
 use rand::RngCore;
 use rand::rngs::OsRng;
-use scp_crypto::p256::{P256PublicKey, P256SigningKey, ecdh_p256};
+use scp_crypto::p256::{P256PublicKey, P256SecretKey, ecdh_p256};
 use zeroize::Zeroizing;
 
 use super::{
@@ -89,7 +89,7 @@ const HPKE_SUITE_ID: [u8; 10] = hpke_suite_id_for(KEM_ID, KDF_ID, AEAD_ID);
 /// when all 256 candidates fall outside `[1, n − 1]` (probability about
 /// 2^-8192). RFC 9180 §7.1.3 says `ikm` SHOULD be at least `Nsk` bytes; SCP
 /// rejects a shorter one.
-pub fn derive_key_pair(ikm: &[u8]) -> Result<P256SigningKey, HpkeError> {
+pub fn derive_key_pair(ikm: &[u8]) -> Result<P256SecretKey, HpkeError> {
     if ikm.len() < PRIVATE_KEY_LEN {
         return Err(HpkeError::InvalidKey(format!(
             "DeriveKeyPair ikm must be at least {PRIVATE_KEY_LEN} bytes, got {}",
@@ -131,11 +131,11 @@ impl CandidateSource for DkpPrk {
 /// [`derive_key_pair`]; the tests pass fixed candidates to reach the
 /// rejection branch, which the real expansion reaches with probability
 /// about 2^-32.
-fn select_candidate(source: &mut impl CandidateSource) -> Result<P256SigningKey, HpkeError> {
+fn select_candidate(source: &mut impl CandidateSource) -> Result<P256SecretKey, HpkeError> {
     for counter in 0..=u8::MAX {
         let mut candidate = Zeroizing::new([0u8; PRIVATE_KEY_LEN]);
         source.candidate(counter, &mut candidate)?;
-        if let Ok(sk) = P256SigningKey::from_scalar_bytes(&candidate) {
+        if let Ok(sk) = P256SecretKey::from_scalar_bytes(&candidate) {
             return Ok(sk);
         }
     }
@@ -191,7 +191,7 @@ pub fn open(
     ct: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, HpkeError> {
     let enc = validate_enc(enc)?;
-    let sk = P256SigningKey::from_scalar_bytes(recipient_sk)
+    let sk = P256SecretKey::from_scalar_bytes(recipient_sk)
         .map_err(|e| HpkeError::InvalidKey(format!("recipient scalar: {e}")))?;
     let pk_rm = sk.public_key().to_uncompressed();
     let dh = ecdh_p256(&sk, enc.point());
@@ -317,7 +317,7 @@ pub mod custody {
 /// Private: the only production caller is [`seal`], which passes a fresh
 /// random ephemeral. The known-answer tests pass the RFC 9180 A.3 `skEm`.
 fn seal_with_ephemeral(
-    ephemeral: &P256SigningKey,
+    ephemeral: &P256SecretKey,
     recipient_pk: &[u8; PUBLIC_KEY_LEN],
     info: &[u8],
     aad: &[u8],
@@ -478,7 +478,7 @@ mod tests {
     }
 
     /// The A.3.1 recipient key and the Encap intermediates (`dh`, `enc`).
-    fn a3_encap() -> Result<(P256SigningKey, [u8; 32]), Box<dyn std::error::Error>> {
+    fn a3_encap() -> Result<(P256SecretKey, [u8; 32]), Box<dyn std::error::Error>> {
         let sk_e = derive_key_pair(&unhex(IKM_E)?)?;
         let pk_r = P256PublicKey::from_sec1(&unhex(PK_RM)?)?;
         let dh = ecdh_p256(&sk_e, &pk_r);
@@ -540,7 +540,7 @@ mod tests {
         let ss = dhkem_extract_and_expand(KEM_SUITE_ID, &dh, &kem_context)?;
         assert_eq!(hex::encode(ss.as_ref()), SHARED_SECRET, "shared_secret");
 
-        let sk_r = P256SigningKey::from_scalar_bytes(&arr::<32>(SK_RM)?)?;
+        let sk_r = P256SecretKey::from_scalar_bytes(&arr::<32>(SK_RM)?)?;
         let enc = P256PublicKey::from_sec1(&unhex(ENC)?)?;
         assert_eq!(*ecdh_p256(&sk_r, &enc), dh, "Decap DH equals Encap DH");
         Ok(())
@@ -648,7 +648,7 @@ mod tests {
     #[test]
     fn custody_open_recovers_rfc9180_a3_1_pt() -> TestResult {
         let (_, aad, _, ct) = ENCRYPTIONS[0];
-        let sk_r = P256SigningKey::from_scalar_bytes(&arr::<32>(SK_RM)?)?;
+        let sk_r = P256SecretKey::from_scalar_bytes(&arr::<32>(SK_RM)?)?;
         let enc = validate_enc(&unhex(ENC)?)?;
         let dh = ecdh_p256(&sk_r, enc.point());
         let pt = custody::open_with_external_dh(
@@ -681,7 +681,7 @@ mod tests {
             let opened: Zeroizing<Vec<u8>> = open(&sk, &enc, b"info", b"aad", &ct)?;
             assert_eq!(*opened, pt, "len {len}");
 
-            let sk_key = P256SigningKey::from_scalar_bytes(&sk)?;
+            let sk_key = P256SecretKey::from_scalar_bytes(&sk)?;
             let valid = validate_enc(&enc)?;
             assert_eq!(valid.as_bytes(), &enc, "ValidatedEnc keeps the wire bytes");
             let dh = ecdh_p256(&sk_key, valid.point());
@@ -807,7 +807,7 @@ mod tests {
             Err(HpkeError::OpenFailed(_))
         ));
 
-        let sk_key = P256SigningKey::from_scalar_bytes(&sk)?;
+        let sk_key = P256SecretKey::from_scalar_bytes(&sk)?;
         let valid = validate_enc(&enc)?;
         let dh = ecdh_p256(&sk_key, valid.point());
         assert!(matches!(

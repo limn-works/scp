@@ -55,7 +55,8 @@ from typing import (
     runtime_checkable,
 )
 
-from scp_sdk.errors import ScpError, _coded_bridge_error
+from scp_sdk._extension import EXTENSION_LOAD_FAILED_CODE, native_module
+from scp_sdk.errors import ScpError, ValidationError, _coded_bridge_error
 from scp_sdk.types import CustodyType
 
 if TYPE_CHECKING:
@@ -89,6 +90,8 @@ __all__ = [
     "SealedInvitation",
     "SqliteStorage",
     "StorageConfig",
+    "p256_pseudonym_point",
+    "p256_software_pseudonym_point",
 ]
 
 
@@ -107,77 +110,99 @@ class KeyCustodyProvider(Protocol):
     the GIL while orchestrating, then re-acquires it per call), so a method
     body may block on a keystore without stalling the asyncio event loop.
 
-    Key identifiers are opaque, numeric-string handles your implementation
-    assigns in :meth:`generate_keypair` and maps internally to real key
-    material. Byte values are passed and returned as ``bytes``.
+    Key identifiers are handles your implementation assigns in :meth:`generate_keypair` and maps
+    internally to real key material. Each is the canonical decimal form of an unsigned 64-bit
+    integer, as ``str(n)`` writes it for an ``int`` ``n`` in ``[0, 2**64 - 1]``: ASCII digits only,
+    with no sign, no leading zero (``"0"`` itself is allowed) and no whitespace. The bridge rejects
+    any other id (``"007"``, ``"+7"``, ``" 7"``, a UUID) with the custody error ``SCP-CRYPTO-4060``.
+    Byte values are passed and returned as ``bytes``.
+
+    A pseudonym has no private key (``09-security-model.md`` §9.10.4): your
+    implementation stores no pseudonym key and signs with none, so
+    :meth:`sign`, :meth:`get_public_key` and :meth:`destroy_key` never receive
+    a pseudonym.
+
+    Every method is a plain ``def``. A method that returns a coroutine (an
+    ``async def``), or a value of the wrong type (for :meth:`derive_pseudonym`,
+    anything but ``bytes``), fails the operation with the custody error
+    ``SCP-CRYPTO-4060``; ``SCP-IDENT-1055`` covers only ``bytes`` that are not
+    a compressed P-256 point.
+
+    A method reports failure by raising. Raise an exception whose ``code`` is
+    ``"SCP-CRYPTO-4006"`` (key not found), such as
+    ``CryptoError(msg, "SCP-CRYPTO-4006")``, for a key id that was destroyed
+    or never existed; the bridge reports it as key-not-found. Any other
+    exception, whatever its ``code``, becomes the custody error
+    ``SCP-CRYPTO-4060`` carrying that code and the exception text. Every SDK
+    operation that calls the provider reports these two codes, including the
+    pseudonym derivation inside ``context_create`` and the identity key reads
+    and signatures of identity operations. There are two exceptions:
+    ``SCP-IDENT-1055``, reported when the bytes a :meth:`derive_pseudonym` or
+    :meth:`derive_rotatable_pseudonym` call returned are not a compressed
+    P-256 point, and ``SCP-IDENT-1037``, which ``scpid_sign`` reports for any custody failure
+    (spec §3.11.4).
     """
 
     def generate_keypair(self, key_type: str) -> str:
-        """Generate a keypair (``"ed25519"`` or ``"x25519"``); return its id."""
+        """Generate a keypair (``"ed25519"`` or ``"x25519"``); return its id.
+
+        The id is a canonical decimal ``u64`` string (``SCP-CRYPTO-4060``
+        otherwise).
+        """
         ...
 
     def sign(self, key_id: str, message: bytes) -> bytes:
-        """Return the 64-byte signature of ``message`` under ``key_id``.
-
-        An Ed25519 key signs ``message`` itself. A pseudonym key id from
-        :meth:`derive_pseudonym` receives a 32-byte digest and returns the
-        64-byte low-s P-256 ``r || s`` over it with no second hash (§9.5);
-        the bridge verifies it strictly under the pseudonym point and rejects
-        anything else, for a pseudonym key this adapter derived and still holds
-        bound; for a handle the adapter did not bind, the bridge returns the
-        host's bytes unchecked.
-        """
+        """Return the 64-byte Ed25519 signature of ``message`` under ``key_id``."""
         ...
 
     def get_public_key(self, key_id: str) -> bytes:
-        """Return the public key for ``key_id``.
-
-        32 bytes for an Ed25519 or X25519 key; the 33-byte compressed P-256
-        point for a pseudonym key id, byte-identical to the ``public_key``
-        :meth:`derive_pseudonym` returned for it.
-        """
+        """Return the 32 public-key bytes of the Ed25519 or X25519 key ``key_id``."""
         ...
 
     def destroy_key(self, key_id: str) -> None:
-        """Destroy key material for ``key_id``; subsequent ops must fail."""
+        """Destroy key material for ``key_id``; subsequent ops must fail.
+
+        That includes pseudonym derivation under a destroyed identity key,
+        which raises key-not-found ``SCP-CRYPTO-4006``
+        (``09-security-model.md`` §9.10.4.A).
+        """
         ...
 
     def dh_agree(self, key_id: str, peer_public: bytes) -> bytes:
         """Return the 32-byte X25519 shared secret with ``peer_public``."""
         ...
 
-    def derive_pseudonym(self, key_id: str, context_id: bytes) -> tuple[bytes, str]:
-        """Derive a context-scoped P-256 pseudonym keypair (v1, static; §9.10.4).
+    def derive_pseudonym(self, key_id: str, context_id: bytes) -> bytes:
+        """Derive the context-scoped P-256 pseudonym point (v1, static; §9.10.4).
 
-        Returns ``(public_key, key_id)``: the 33-byte SEC1 compressed P-256
-        pseudonym point and the numeric id of its signing key. The bridge
-        rejects (``SCP-IDENT-1055``) a point that is not a valid compressed
-        P-256 point, and a key id whose :meth:`get_public_key` differs from it.
-        The same ``(key_id, context_id)`` MUST return the same pseudonym key
-        id on every call, so re-deriving names one key rather than minting
-        another.
+        Returns the 33-byte SEC1 compressed P-256 pseudonym point and nothing
+        else. The bridge fails the operation with ``SCP-IDENT-1055`` when the
+        bytes are not a valid compressed P-256 point. Raise key-not-found
+        (``SCP-CRYPTO-4006``) when ``key_id`` was destroyed or never existed.
 
         Canonical recipe (all software custody backends MUST produce identical
         bytes; ``ikm`` is the identity private key material, the 32-byte
-        Ed25519 seed until slice S12)::
+        Ed25519 seed until the identity key moves to P-256, SCP-315)::
 
             pseudonym_secret = HKDF-SHA256(
                 ikm=ikm, salt=b"scp-pseudonym-secret-v1", info=b"", length=32)
             seed = HMAC-SHA256(pseudonym_secret, context_id + b"scp-pseudonym")
-            d = int(HKDF-Expand-SHA256(
-                prk=seed, info=b"SCP-PSEUDONYM-P256-V1", length=48)) % (n - 1) + 1
-            public_key = SEC1_compressed(d * G)
+            d = int.from_bytes(HKDF-Expand-SHA256(
+                prk=seed, info=b"SCP-PSEUDONYM-P256-V1", length=48),
+                "big") % (n - 1) + 1
+            point = SEC1_compressed(d * G)
+
+        ``d`` is discarded, never stored.
         """
         ...
 
     def derive_rotatable_pseudonym(
         self, key_id: str, context_id: bytes, pseudonym_epoch: int
-    ) -> tuple[bytes, str]:
-        """Derive a rotatable, epoch-scoped P-256 pseudonym keypair (v2).
+    ) -> bytes:
+        """Derive a rotatable, epoch-scoped P-256 pseudonym point (v2).
 
-        Returns ``(public_key, key_id)``, checked as for
-        :meth:`derive_pseudonym`; the same ``(key_id, context_id,
-        pseudonym_epoch)`` MUST return the same pseudonym key id. Including
+        Returns the 33-byte compressed point, checked as for
+        :meth:`derive_pseudonym`. Including
         the rotation epoch in the HMAC derivation produces a different
         pseudonym per epoch within the same context, mitigating relay-side
         pseudonym correlation.
@@ -344,20 +369,54 @@ def _native_mod() -> Any:
     Raised at call time (not import time) so that pure-Python environments
     — where the native extension isn't available — can still ``import
     scp_sdk`` without an ImportError. The caller sees a meaningful
-    :class:`ScpError` the first time they actually use the bridge.
+    :class:`~scp_sdk.errors.ValidationError` the first time they actually use the bridge.
 
     Used by SDK wrappers that route to module-level free functions per
     ADR-048 §1 (pure helpers exposed as ``_scp_core.<name>``).
     """
+    return native_module()
+
+
+def p256_pseudonym_point(context_seed: bytes | bytearray) -> bytes:
+    """Return the 33-byte SEC1 compressed pseudonym point of a 32-byte §9.10.4 ``context_seed``.
+
+    For a host that computes the v1 or v2 seed itself, such as inside a
+    keystore. The seed is reduced to a scalar under the fixed
+    ``SCP-PSEUDONYM-P256-V1`` label (FIPS 186-5 A.2.1) and only the point
+    ``d * G`` is returned: no scalar reaches the host.
+
+    Raises:
+        ValidationError: ``SCP-VALID-7005`` when ``context_seed`` is not 32 bytes.
+    """
+    fn = _native_mod().p256_pseudonym_point
     try:
-        import _scp_core  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise ScpError(
-            "The _scp_core extension module is not installed. "
-            "Install scp-python with: pip install scp-python",
-            code="SCP-UNKNOWN-0001",
-        ) from exc
-    return _scp_core
+        return fn(context_seed)
+    except Exception as exc:
+        raise _coded_bridge_error(exc) from exc
+
+
+def p256_software_pseudonym_point(
+    ikm: bytes | bytearray, context_id: bytes, epoch: int | None = None
+) -> bytes:
+    """Return the 33-byte SEC1 compressed pseudonym point a software custody derives from ``ikm``.
+
+    ``09-security-model.md`` §9.10.4.A: ``pseudonym_secret =
+    HKDF-SHA256(ikm, "scp-pseudonym-secret-v1")``, the v1 context seed when
+    ``epoch`` is ``None`` and the v2 seed at ``epoch`` otherwise, then the
+    point. No scalar reaches the host; a host that must wipe ``ikm`` passes
+    it as a ``bytearray`` and clears it after the call.
+
+    Raises:
+        ValidationError: ``SCP-VALID-7005`` when ``ikm`` is not 32 bytes.
+        OverflowError: when ``epoch`` is negative or wider than 64 bits.
+    """
+    fn = _native_mod().p256_software_pseudonym_point
+    try:
+        return fn(ikm, context_id, epoch)
+    except OverflowError:
+        raise
+    except Exception as exc:
+        raise _coded_bridge_error(exc) from exc
 
 
 def _native_cls() -> Any:
@@ -366,16 +425,21 @@ def _native_cls() -> Any:
     Raised at call time (not import time) so that pure-Python environments
     — where the native extension isn't available — can still ``import
     scp_sdk`` without an ImportError. The caller sees a meaningful
-    :class:`ScpError` the first time they actually construct an instance.
+    :class:`~scp_sdk.errors.ValidationError` the first time they actually construct an instance.
     """
     mod = _native_mod()
     cls = getattr(mod, "SCP", None)
     if cls is None:
-        raise ScpError(
-            "_scp_core does not export the SCP class — rebuild the native "
-            "extension with `maturin develop --release` from the Phase 4 "
-            "PR 1 codebase.",
-            code="SCP-UNKNOWN-0001",
+        # The module loaded, so the extension is installed and this is a wrong
+        # or partial build. ``EXTENSION_LOAD_FAILED_CODE`` says so, and the
+        # ``scp`` fixture in bindings/python/tests/conftest.py fails on that
+        # code instead of skipping, which ``EXTENSION_ABSENT_CODE`` would have
+        # done.
+        raise ValidationError(
+            "_scp_core loaded but does not export the SCP class — rebuild the "
+            "native extension with `maturin develop --release` from "
+            "bindings/python.",
+            code=EXTENSION_LOAD_FAILED_CODE,
         )
     return cls
 
@@ -588,9 +652,7 @@ class SCP:
         """Shut down this instance with a graceful deadline.
 
         Drains in-flight tasks within ``timeout`` seconds, aborts any
-        stragglers, then runs typed-field cleanup. A second call is a
-        no-op (the underlying :class:`ShutdownError::AlreadyShutDown` is
-        swallowed at the SDK surface).
+        stragglers, then runs typed-field cleanup.
 
         ``timeout`` is clamped defensively: ``NaN`` and negative values
         map to ``0`` (abort immediately); ``math.inf`` or values that
@@ -612,10 +674,14 @@ class SCP:
         :param timeout: Maximum seconds to wait for in-flight tasks
             (float — fractional seconds are preserved to millisecond
             resolution before crossing the FFI boundary).
-        :raises ContextError: If the tokio runtime is unavailable.
+        :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
+            store still holds its advisory lock after the call.
         """
         millis = self._shutdown_millis(timeout)
-        await asyncio.to_thread(self._native.shutdown, millis)
+        try:
+            await asyncio.to_thread(self._native.shutdown, millis)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     def __enter__(self) -> SCP:
         """Enter the synchronous context-manager scope — returns ``self``."""
@@ -632,9 +698,20 @@ class SCP:
         Calls ``_native.shutdown`` directly — the PyO3 bridge already
         runs ``block_on`` internally, so the sync path is correct here.
         Async callers should use :meth:`__aexit__` / ``async with``.
+
+        :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
+            store still holds its advisory lock after the call and the
+            ``with`` body raised nothing. When the body raised, the
+            shutdown error is logged and the body's exception propagates.
         """
-        del exc_type, exc, tb
-        self._native.shutdown(self._shutdown_millis(5.0))
+        del exc_type, tb
+        try:
+            self._native.shutdown(self._shutdown_millis(5.0))
+        except Exception as shutdown_exc:
+            coded = _coded_bridge_error(shutdown_exc)
+            if exc is None:
+                raise coded from shutdown_exc
+            logger.warning("SCP shutdown on with-scope exit failed: %s", coded)
 
     async def __aenter__(self) -> SCP:
         """Enter the asynchronous context-manager scope — returns ``self``."""
@@ -650,9 +727,19 @@ class SCP:
 
         Awaits :meth:`shutdown` so the event loop keeps running while
         the tokio runtime drains in-flight tasks.
+
+        :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
+            store still holds its advisory lock after the call and the
+            ``async with`` body raised nothing. When the body raised, the
+            shutdown error is logged and the body's exception propagates.
         """
-        del exc_type, exc, tb
-        await self.shutdown()
+        del exc_type, tb
+        try:
+            await self.shutdown()
+        except ScpError as shutdown_exc:
+            if exc is None:
+                raise
+            logger.warning("SCP shutdown on async-with exit failed: %s", shutdown_exc)
 
     # ------------------------------------------------------------------
     # Operation methods — 159 bridge delegators (PyO3 → asyncio.to_thread)
@@ -1306,10 +1393,10 @@ class SCP:
         (governed-context invitations are not yet implemented).
 
         The invite routes through the actor governance gate, which requires the
-        inviter to hold the ``governance:propose`` capability. A normally-created
-        ``SingleAdmin`` context grants its admin that capability at genesis, so it
-        works out of the box; a context with a custom ceiling must grant
-        ``governance:propose`` to the inviter.
+        inviter to hold the ``governance:propose`` capability. The creator of a
+        ``SingleAdmin`` context holds the admin role, which grants every
+        capability in the context's declared ceiling, so the creator can invite
+        only when that ceiling includes ``governance:propose``.
 
         Example::
 
@@ -1489,17 +1576,24 @@ class SCP:
         parent_token: str,
         capabilities: list[str],
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.ucan_delegate`` (returns :class:`UcanToken`)."""
+        """Delegate to ``_scp_core.SCP.ucan_delegate`` (returns :class:`UcanToken`).
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
+        """
         from scp_sdk.ucan import UcanToken
 
-        raw = await asyncio.to_thread(
-            self._native.ucan_delegate,
-            context_id,
-            delegator_did,
-            delegatee_did,
-            parent_token,
-            capabilities,
-        )
+        try:
+            raw = await asyncio.to_thread(
+                self._native.ucan_delegate,
+                context_id,
+                delegator_did,
+                delegatee_did,
+                parent_token,
+                capabilities,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return UcanToken._from_bridge(raw)
 
     async def ucan_mint(
@@ -1509,17 +1603,31 @@ class SCP:
         capabilities: list[str],
         proofs: list[str] | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.ucan_mint`` (returns :class:`UcanToken`)."""
+        """Delegate to ``_scp_core.SCP.ucan_mint`` (returns :class:`UcanToken`).
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
+        """
         from scp_sdk.ucan import UcanToken
 
-        raw = await asyncio.to_thread(
-            self._native.ucan_mint, context_id, member_did, capabilities, proofs
-        )
+        try:
+            raw = await asyncio.to_thread(
+                self._native.ucan_mint, context_id, member_did, capabilities, proofs
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return UcanToken._from_bridge(raw)
 
     async def ucan_revoke(self, context_id: str, token: str, revoker_did: str) -> Any:
-        """Delegate to ``_scp_core.SCP.ucan_revoke``."""
-        return await asyncio.to_thread(self._native.ucan_revoke, context_id, token, revoker_did)
+        """Delegate to ``_scp_core.SCP.ucan_revoke``.
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
+        """
+        try:
+            return await asyncio.to_thread(self._native.ucan_revoke, context_id, token, revoker_did)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def ucan_validate(
         self,
@@ -1536,6 +1644,9 @@ class SCP:
         presenting agent to the token's own ``aud`` (which would make the
         step-5 audience check the tautology ``aud == aud`` and inflate trust).
         Pass the DID the token must be addressed to.
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
         """
 
         try:
@@ -1591,21 +1702,27 @@ class SCP:
         capability URI to additionally require the token grants it. (The
         enforcing :meth:`ucan_validate` gate keeps a mandatory capability.)
 
-        Raises ``ValidationError`` only for malformed FFI input
+        Raises ``ValidationError`` for malformed FFI input
         (e.g. an invalid ``context_id`` / ``token`` / ``capability`` /
         ``did``); capability/signature/expiry outcomes are reported via the
         returned booleans, never as exceptions.
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
         """
         from scp_sdk.trust import structured_to_capability_validation
 
-        raw = await asyncio.to_thread(
-            self._native.ucan_evaluate,
-            context_id,
-            token,
-            capability,
-            presenting_agent_did,
-            proof_tokens,
-        )
+        try:
+            raw = await asyncio.to_thread(
+                self._native.ucan_evaluate,
+                context_id,
+                token,
+                capability,
+                presenting_agent_did,
+                proof_tokens,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         # Shared six-field projection — pins the canonical CapabilityValidation
         # shape in one place (the same helper Layer 1 of ``evaluate_trust`` uses).
         return structured_to_capability_validation(raw)
@@ -1867,12 +1984,18 @@ class SCP:
 
     # region MCP
 
-    async def mcp_client_connect_sse(self, url: str) -> Any:
-        """Connect an MCP client via SSE transport (returns :class:`McpClient`)."""
+    async def mcp_client_connect_sse(self, url: str, auth_token: str | None) -> Any:
+        """Connect an MCP client via SSE transport (returns :class:`McpClient`).
+
+        *auth_token* is the bearer token sent in an ``Authorization`` header
+        on every request, or ``None`` for a server that runs no bearer check.
+        An SCP SSE server always runs one (ADR-015). The transport has no
+        TLS, so a token is sent only to a loopback host.
+        """
         from scp_sdk.mcp import McpClient, validate_client_connect
 
         validate_client_connect("sse", url=url)
-        raw = await asyncio.to_thread(self._native.py_mcp_client_connect_sse, url)
+        raw = await asyncio.to_thread(self._native.py_mcp_client_connect_sse, url, auth_token)
         return McpClient(raw)
 
     async def mcp_client_connect_stdio(self, command: list[str]) -> Any:
@@ -2693,11 +2816,9 @@ class SCP:
         receipt and captured output bytes — or reaches a typed terminal,
         which is re-raised as one of the SDK saga exceptions:
 
-        - :class:`~scp_sdk.errors.SagaAbortedError` — a Prepare-phase abort:
-          a PERMANENT rejection OR a RETRYABLE transient (rate limit /
-          participant actor unavailable), distinguished by the
-          ``SCP-SAGA-*`` code; carries ``retry_after_ms`` (``None``, never
-          ``0``, when no precise back-off exists).
+        - :class:`~scp_sdk.errors.SagaAbortedError` — the code tells its
+          causes apart; carries ``retry_after_ms`` (``None``, never ``0``,
+          when no precise back-off exists).
         - :class:`~scp_sdk.errors.SagaNeedsRepairError` — Commit retries
           exhausted; carries the durable ``saga_id`` repair handle.
         - :class:`~scp_sdk.errors.SagaBusyError` — the participant context
@@ -3202,77 +3323,6 @@ class SCP:
         return Relay(raw)
 
     # endregion Server
-
-    # region Bridge
-
-    async def bridge_create_shadow(
-        self, bridge_id: str, platform_handle: str, bridge_mode: str, context_id: str = "ctx-shadow"
-    ) -> Any:
-        """Delegate to ``_scp_core.SCP.bridge_create_shadow``."""
-        return await asyncio.to_thread(
-            self._native.bridge_create_shadow, bridge_id, platform_handle, bridge_mode, context_id
-        )
-
-    async def bridge_credential_delete_key(self, bridge_id: str) -> Any:
-        """Delegate to ``_scp_core.SCP.bridge_credential_delete_key``."""
-        return await asyncio.to_thread(self._native.bridge_credential_delete_key, bridge_id)
-
-    async def bridge_credential_get_key(self, bridge_id: str) -> Any:
-        """Delegate to ``_scp_core.SCP.bridge_credential_get_key``."""
-        return await asyncio.to_thread(self._native.bridge_credential_get_key, bridge_id)
-
-    async def bridge_credential_list(self, bridge_id: str) -> Any:
-        """Delegate to ``_scp_core.SCP.bridge_credential_list``."""
-        return await asyncio.to_thread(self._native.bridge_credential_list, bridge_id)
-
-    async def bridge_credential_provision(
-        self, bridge_id: str, credential_type: str, plaintext: bytes, bridge_credential_key: bytes
-    ) -> Any:
-        """Delegate to ``_scp_core.SCP.bridge_credential_provision``."""
-        return await asyncio.to_thread(
-            self._native.bridge_credential_provision,
-            bridge_id,
-            credential_type,
-            plaintext,
-            bridge_credential_key,
-        )
-
-    async def bridge_credential_retrieve(
-        self, bridge_id: str, credential_type: str, bridge_credential_key: bytes
-    ) -> Any:
-        """Delegate to ``_scp_core.SCP.bridge_credential_retrieve``."""
-        return await asyncio.to_thread(
-            self._native.bridge_credential_retrieve,
-            bridge_id,
-            credential_type,
-            bridge_credential_key,
-        )
-
-    async def bridge_credential_revoke(self, bridge_id: str) -> Any:
-        """Delegate to ``_scp_core.SCP.bridge_credential_revoke``."""
-        return await asyncio.to_thread(self._native.bridge_credential_revoke, bridge_id)
-
-    async def bridge_credential_rotate(
-        self,
-        bridge_id: str,
-        credential_type: str,
-        new_plaintext: bytes,
-        bridge_credential_key: bytes,
-    ) -> Any:
-        """Delegate to ``_scp_core.SCP.bridge_credential_rotate``."""
-        return await asyncio.to_thread(
-            self._native.bridge_credential_rotate,
-            bridge_id,
-            credential_type,
-            new_plaintext,
-            bridge_credential_key,
-        )
-
-    async def bridge_credential_store_key(self, bridge_id: str, key: bytes) -> Any:
-        """Delegate to ``_scp_core.SCP.bridge_credential_store_key``."""
-        return await asyncio.to_thread(self._native.bridge_credential_store_key, bridge_id, key)
-
-    # endregion Bridge
 
     def __repr__(self) -> str:
         """Developer-facing repr including the native ``instance_id``."""

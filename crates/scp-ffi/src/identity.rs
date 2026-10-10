@@ -99,7 +99,7 @@ pub(crate) fn build_ffi_dht_client() -> Result<FfiDhtClient, ScpPyError> {
 /// pre-rotation custody backend is available (ADR-062 §Decision 6).
 ///
 /// Every identity commits a pre-rotation commitment at creation (spec §9.7.4.1
-/// §3 — mandatory), which requires a `PreRotationCustody` backend. The only
+/// item 5(a) — mandatory), which requires a `PreRotationCustody` backend. The only
 /// implementation is the test-harness `InMemoryPreRotationCustody` nullifier, so
 /// a shipped (no-`testing`) build returns this typed [`IDENT_1059`] error rather
 /// than silently minting the nullifier. See #1729 / RFC #2130 for the real
@@ -1114,7 +1114,7 @@ impl crate::scp::PyScp {
             rt.block_on(async {
                 let did_method = shared_did_method(&bi_arc)?;
 
-                // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3), which
+                // Pre-rotation is mandatory at creation (spec §9.7.4.1 item 5(a)), which
                 // requires a `PreRotationCustody` backend. The only implementation
                 // is the test-harness `InMemoryPreRotationCustody` nullifier, so a
                 // shipped build FAILS CLOSED (ADR-062 §Decision 6, IDENT_1059)
@@ -1150,9 +1150,10 @@ impl crate::scp::PyScp {
                         .public_key(&identity.identity_key)
                         .await
                         .map_err(|e| {
-                            ScpPyError::identity(format!(
-                                "failed to read identity key after identity create: {e}"
-                            ))
+                            ScpPyError::custody_failure(
+                                format!("failed to read identity key after identity create: {e}"),
+                                &scp_crypto::CustodyFailure::from(&e),
+                            )
                         })?;
                     let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
 
@@ -1273,9 +1274,10 @@ impl crate::scp::PyScp {
                         .public_key(&identity.identity_key)
                         .await
                         .map_err(|e| {
-                            ScpPyError::identity(format!(
-                                "failed to read identity key after identity create: {e}"
-                            ))
+                            ScpPyError::custody_failure(
+                                format!("failed to read identity key after identity create: {e}"),
+                                &scp_crypto::CustodyFailure::from(&e),
+                            )
                         })?;
                     let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
 
@@ -1428,9 +1430,10 @@ impl crate::scp::PyScp {
                         .public_key(&identity.identity_key)
                         .await
                         .map_err(|e| {
-                            ScpPyError::identity(format!(
-                                "failed to read identity key after identity create: {e}"
-                            ))
+                            ScpPyError::custody_failure(
+                                format!("failed to read identity key after identity create: {e}"),
+                                &scp_crypto::CustodyFailure::from(&e),
+                            )
                         })?;
                     let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
 
@@ -2495,7 +2498,9 @@ impl crate::scp::PyScp {
             // Phase 2: sign (no DashMap lock held — safe to block_on).
             let sig = rt
                 .block_on(custody.sign(&key_handle, &built.canonical_bytes))
-                .map_err(|e| ScpPyError::identity(format!("Ed25519 signing failed: {e}")))?;
+                .map_err(|e| {
+                    ScpPyError::custody_failure(format!("link attestation signing failed: {e}"), &scp_crypto::CustodyFailure::from(&e))
+                })?;
             attestation.signature = sig.as_bytes().to_vec();
 
             // Phase 3: re-acquire lock, verify key unchanged (TOCTOU guard), store.
@@ -2705,9 +2710,11 @@ impl crate::scp::PyScp {
 
     /// Executes the custody migration protocol for the given DID.
     ///
-    /// This method creates a `CustodyMigrationOrchestrator` and runs the
-    /// 5-step migration protocol using an FFI backend that succeeds for all
-    /// operations by default.
+    /// This method creates a `CustodyMigrationOrchestrator` and runs the 5-step
+    /// migration protocol against `NotConfiguredMigrationBackend`, a backend this
+    /// method builds itself and whose five operations each return "custody
+    /// migration backend not configured". No parameter lets a caller supply
+    /// another backend, so this method fails on every call.
     ///
     /// # Arguments
     ///
@@ -2718,11 +2725,15 @@ impl crate::scp::PyScp {
     ///
     /// # Returns
     ///
-    /// A JSON string with migration outcome fields.
+    /// A JSON string with migration outcome fields, which no call reaches while
+    /// the backend is `NotConfiguredMigrationBackend`.
     ///
     /// # Errors
     ///
-    /// Raises `IdentityError` if migration fails.
+    /// Raises on every call: `ValidationError` for a malformed `did`,
+    /// `IdentityError` for an unrecognized `target`, and otherwise
+    /// `IdentityError` from the backend's first step. `bindings/python/tests/
+    /// test_real_ffi.py::test_execute_custody_migration` asserts the error.
     ///
     /// See spec §3.2.1.
     #[pyo3(name = "identity_execute_custody_migration")]

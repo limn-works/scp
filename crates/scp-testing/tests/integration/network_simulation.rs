@@ -38,8 +38,7 @@ use scp_did::SigningKeyId;
 use scp_platform::error::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
 use scp_testing::builder::ScenarioBuilder;
 use scp_testing::clock::Clock;
@@ -102,7 +101,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         &self,
         _: &KeyHandle,
         _: &[u8],
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
     fn derive_rotatable_pseudonym(
@@ -110,7 +109,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         _: &KeyHandle,
         _: &[u8],
         _: u64,
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
     fn ed25519_to_x25519_agree(
@@ -262,7 +261,13 @@ async fn end_to_end_network_demo() {
         .unwrap();
     let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
     let add_result = add_member(&mut alice_group, kp_in, &scp_clock::SystemClock).unwrap();
-    let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+    let mut bob_group = join_group(
+        &add_result.welcome,
+        bob_provider,
+        bob_signer,
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
 
     println!("  Alice added Bob to group via Welcome message");
     println!("    epoch:   {} (both sides)", alice_group.epoch().unwrap());

@@ -105,7 +105,7 @@ pub(crate) fn build_ffi_dht_client() -> Result<FfiDhtClient, ScpNapiError> {
 /// custody backend is available (ADR-062 §Decision 6).
 ///
 /// Every identity commits a pre-rotation commitment at creation (spec §9.7.4.1
-/// §3 — mandatory), which requires a `PreRotationCustody` backend. The only
+/// item 5(a) — mandatory), which requires a `PreRotationCustody` backend. The only
 /// implementation is the test-harness `InMemoryPreRotationCustody` nullifier,
 /// severed from every production dependency line, so a shipped (no-`testing`)
 /// build returns this typed [`codes::IDENT_1059`] error rather than silently
@@ -1379,9 +1379,9 @@ mod tests {
     /// identity (stamped with a dedicated `NapiBridgeInstance`) and its
     /// initial active signing key's public key (multibase).
     async fn create_test_identity() -> (NapiIdentity, String) {
-        let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+        let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
             OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
-        ));
+        )));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
 
@@ -2025,9 +2025,9 @@ mod tests {
         // `SHARED_DHT_CLIENT` initialization that real `identityCreate` does,
         // to simulate a caller that reached `migrate()` before any create.
         let identity = rt.block_on(async {
-            let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+            let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
                 OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
-            ));
+            )));
             let pre_rotation_custody =
                 Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
             let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));

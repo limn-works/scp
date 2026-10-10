@@ -50,7 +50,7 @@ run_kotlin() (
   if [[ -n "$java_home" ]]; then
     export JAVA_HOME="$java_home"
   fi
-  ./gradlew test
+  ./gradlew test -Pscp.uniffi.cargoFeatures=testing
 )
 
 run_typescript() (

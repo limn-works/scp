@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/scp-alloc",
+    "crates/scp-sqlite-pools",
     "crates/scp-clock",
     "crates/scp-crypto",
     "crates/scp-did",
@@ -138,20 +140,21 @@ hkdf = "0.12"
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "alloc"] }
 uuid = { version = "1", features = ["v4", "v7"] }
 # No `libcrux-provider`. That feature does one thing — add the optional dependency
-# `openmls_libcrux_crypto` (openmls 0.8.1 Cargo.toml, `[features] libcrux-provider`) — and
+# `openmls_libcrux_crypto` (openmls 0.9.0 Cargo.toml: `libcrux-provider =
+# ["dep:openmls_libcrux_crypto", "openmls_test?/libcrux-provider"]`) — and
 # openmls itself names that crate only under `#[cfg(test)]` and
 # `#[cfg(feature = "libcrux-provider")]`. No file in this repository names libcrux, and
-# every SCP call site takes a provider: `scp-runtime`'s `ScpMlsProvider` wraps
-# `openmls_rust_crypto::RustCrypto` (crates/scp-runtime/src/crypto/mls/storage.rs) and
-# `scp-mls`'s `InMemoryMlsProvider` aliases `openmls_rust_crypto::OpenMlsRustCrypto`
-# (crates/scp-mls/src/lib.rs). Enabling it compiled 23 libcrux crates, 2 hax crates,
-# `openmls_libcrux_crypto` and `hpke-rs-libcrux` into every build, and carried eleven
-# RUSTSEC advisories that `deny.toml` had to ignore.
-openmls = { version = "0.8" }
-openmls_traits = "0.5"
-openmls_basic_credential = "0.5"
-openmls_rust_crypto = "0.5"
-openmls_memory_storage = "0.5"
+# every SCP call site takes a provider: `scp-mls`'s `InMemoryMlsProvider` wraps
+# `openmls_rust_crypto::RustCrypto` (crates/scp-mls/src/provider.rs) and takes its
+# randomness from `scp_mls::provider::OsRand`, a stateless operating-system source. Enabling it
+# compiled 23 libcrux crates, 2 hax crates, `openmls_libcrux_crypto` and
+# `hpke-rs-libcrux` into every build, and carried eleven RUSTSEC advisories that
+# `deny.toml` had to ignore.
+openmls = { version = "0.9" }
+openmls_traits = "0.6"
+openmls_basic_credential = "0.6"
+openmls_rust_crypto = "0.6"
+openmls_memory_storage = "0.6"
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 serde_bytes = "0.11"
@@ -191,6 +194,29 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false, feat
 unicode-normalization = "0.1"
 arc-swap = "1"
 futures = "0.3"
+# SQLCipher compiles from the bundled amalgamation and takes its crypto from the
+# build host. For a Linux or Android target libsqlite3-sys 0.30 emits a dynamic link
+# to `crypto`, which the linker resolves in that target's library path: the build
+# host's libcrypto for a native Linux build, and no library at all for a cross build
+# whose sysroot holds no libcrypto. On an Apple host building an Apple target it
+# builds against CommonCrypto from the Security framework unless OPENSSL_DIR (or
+# both OPENSSL_LIB_DIR and OPENSSL_INCLUDE_DIR) is set, in which case it links that
+# OpenSSL's libcrypto dynamically; on a Windows host building a Windows target its
+# build script panics unless OPENSSL_DIR (or both OPENSSL_LIB_DIR and
+# OPENSSL_INCLUDE_DIR) names an OpenSSL installation. The build script reads each
+# of these variables first under the target triple as a prefix
+# (`AARCH64_APPLE_DARWIN_OPENSSL_DIR`), which acts as the bare name does.
+# The PyPI wheel, which runs on a machine this build never saw, selects
+# `scp-platform/vendored-openssl`. On a non-Apple target that feature sets
+# `bundled-sqlcipher-vendored-openssl` on the libsqlite3-sys package `scp-platform`
+# compiles, and the build links a static OpenSSL built from source. On an Apple target
+# it sets nothing, so the macOS wheel, which a macOS runner builds, keeps
+# CommonCrypto: libsqlite3-sys 0.30.1's build script checks the vendored feature
+# before its Apple branch, and `crates/scp-platform/Cargo.toml` declares the edge for
+# non-Apple targets only so that the vendored feature never reaches an Apple build.
+# Naming `bundled-sqlcipher-vendored-openssl` here instead vendors OpenSSL into every
+# artifact the workspace ships on every target, including the `scp-relay` and
+# `scp-node` binaries.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 redb = "2"
 static_assertions = "1.1"
@@ -283,10 +309,10 @@ await_holding_lock = "deny"
 
 # ── Dev/test profile ────────────────────────────────────────────────────────
 # Dev/test builds emit line-tables-only debug info instead of the cargo default
-# full DWARF (`debug = 2`). Every compiled artifact keeps its line table (so
-# panic/backtrace frames still resolve to `file:line:col` — what tests and CI
-# need) but drops the bulky variable/type DWARF that only an interactive
-# debugger consumes.
+# full DWARF (`debug = 2`). In a build that does not set
+# `CARGO_PROFILE_DEV_DEBUG`, every compiled artifact keeps its line table (so
+# panic/backtrace frames still resolve to `file:line:col`) but
+# drops the bulky variable/type DWARF that only an interactive debugger consumes.
 #
 # MEASURED on this 24-member workspace, two clean from-scratch builds of
 # `cargo build --workspace --all-targets` with the CI feature set, isolated
@@ -309,37 +335,55 @@ await_holding_lock = "deny"
 # inspectable in lldb/gdb. Anyone who needs either can override
 # per-invocation: `RUSTFLAGS="-C debuginfo=2" cargo test ...`.
 #
-# NOT load-bearing for the `[profile.release]` guarantee below: this key sets
-# debug-info VERBOSITY only. It does not touch `debug-assertions`, codegen, or
-# behavior — dev/test builds keep `debug-assertions = true`, so the openmls
-# `debug_assert!` still fires under `cargo test` exactly as before. The `fuzz/`
-# crate is a standalone non-member with its own `[profile.release]` and is
-# unaffected.
-#
 # `test` and `bench` inherit `dev`, so `cargo test`/`cargo nextest` are covered.
 [profile.dev]
 debug = "line-tables-only"
 
 # ── Release profile ─────────────────────────────────────────────────────────
-# `debug-assertions = false` is the cargo release DEFAULT — this line changes no
-# behavior; it makes an otherwise-implicit invariant EXPLICIT and greppable.
-#
-# LOAD-BEARING (ADR-057 §Prereq-4, in-browser client untrusted-relay guarantee):
-# the one known attacker-reachable panic on the openmls 0.8.1 MLS decrypt path is
-# a `debug_assert!` ("Ciphertext decryption failed",
-# openmls-0.8.1/src/framing/private_message_in.rs) that is compiled OUT of release
-# builds — a construction guarantee. No OTHER release-mode panic has been FOUND on
-# that path (evidenced by the `fuzz_mls_decrypt` decrypt-path fuzz target, pinned
-# to openmls 0.8.1; a future version bump could add one, caught by the nightly
-# fuzz job). With debug-assertions off, a tampered/malformed ciphertext from an
-# untrusted relay makes `process_message` return a typed `Err`
-# (→ MlsError::DecryptionFailed → [SCP-CRYPTO-4010]) instead of panicking — so a
-# hostile relay cannot abort a browser tab (or a native process). Keeping this
-# anchor explicit guards against a future `debug-assertions = true` override
-# silently re-arming that panic. The shipped browser wasm MUST be a `--release`
-# build for the same reason (a `wasm-pack build --dev` would re-arm it); the
-# decrypt-path fuzz target `fuzz/fuzz_targets/fuzz_mls_decrypt.rs` (run with
-# debug-assertions off) is the standing evidence that no found tampered input
-# panics the release decrypt path.
+# `debug-assertions = false` is the cargo release default; this line changes no
+# behavior and keeps the setting explicit. The shipped browser wasm is a
+# `--release` build (ADR-057 §Prereq-4). openmls 0.9.0 returns a typed error on a
+# tampered ciphertext in every build profile, so no decrypt-path guarantee
+# depends on this line.
 [profile.release]
 debug-assertions = false
+
+# ── CI test-bridge profile ──────────────────────────────────────────────────
+# Used by the four bridge-artifact producer jobs in `.github/workflows/ci.yml`
+# (pyo3-module, pyo3-module-macos, napi-addon, xcframework) and by nothing else.
+# Opt-levels for those test bridges:
+#   - the three bridge crates scp-ffi, scp-ffi-napi and scp-ffi-uniffi: 0
+#     (Alec's ruling of 2026-10-09);
+#   - every other SCP workspace member: 1 (Alec's ruling of 2026-10-04);
+#   - every dependency: 3 (Alec's ruling of 2026-10-04).
+# Each bridge crate's build ends on one crate's codegen: rebuilding
+# scp-ffi-uniffi took about 105 s on a 3-vCPU macOS runner, of which
+# `cargo check` was about 12 s, so code generation at level 1 was most of it.
+# The bridge crates hold FFI glue; the protocol work they call compiles in the
+# other members at 1 and in dependencies at 3. Release builds,
+# `.github/workflows/release.yml`, `build-matrix.yml` and local-developer
+# commands keep `--release`.
+#
+# `inherits = "release"` keeps every release setting this file or cargo's
+# defaults give, `debug-assertions = false` included; only `opt-level` differs.
+# Cargo reference, Profiles: `package."*"` matches every package that is not a
+# workspace member, and a named or `"*"` package override takes precedence over
+# `build-override`, so dependency build scripts and proc macros compile at
+# opt-level 3 here where `--release` compiles them at 0. Cargo writes this
+# profile's output to `target/ci-bridge/` (`target/<triple>/ci-bridge/` under
+# `--target`).
+[profile.ci-bridge]
+inherits = "release"
+opt-level = 1
+
+[profile.ci-bridge.package."*"]
+opt-level = 3
+
+[profile.ci-bridge.package.scp-ffi]
+opt-level = 0
+
+[profile.ci-bridge.package.scp-ffi-napi]
+opt-level = 0
+
+[profile.ci-bridge.package.scp-ffi-uniffi]
+opt-level = 0

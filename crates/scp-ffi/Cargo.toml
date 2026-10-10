@@ -19,6 +19,16 @@ default = ["server"]
 # but incompatible with test binaries. Maturin passes this explicitly.
 # cargo test runs WITHOUT it, so auto-initialize can embed Python.
 extension-module = ["pyo3/extension-module"]
+# On a non-Apple target, compile OpenSSL from source into SQLCipher instead of
+# linking the build host's libcrypto; on an Apple target this feature changes nothing,
+# and SQLCipher built on an Apple host uses CommonCrypto unless OPENSSL_DIR (or both
+# OPENSSL_LIB_DIR and OPENSSL_INCLUDE_DIR), bare or prefixed with the target triple as
+# in AARCH64_APPLE_DARWIN_OPENSSL_DIR, is set in the build environment. The PyPI wheel
+# selects this feature through `[tool.maturin] features` in
+# `bindings/python/pyproject.toml`.
+# The `vendored-openssl` comment in `crates/scp-platform/Cargo.toml` says how the
+# Apple exclusion works and which shipped artifacts leave it off.
+vendored-openssl = ["scp-platform/vendored-openssl"]
 # Shared relay/node startup code. Pulls in scp-node.
 server = ["scp-ffi-common/server", "dep:scp-node"]
 # Enables testing-only affordances like `scpid_sign(signed_at_override=...)`
@@ -52,10 +62,16 @@ testing = [
 outlet-capability-test-grant = ["scp-core/outlet-capability-test-grant"]
 
 [dependencies]
+# Links the wiping global allocator every shipped artifact installs
+# (09-security-model.md §9.15, freed heap memory).
+scp-alloc = { path = "../scp-alloc" }
 async-trait = { workspace = true }
 pyo3 = { version = "0.24.1", features = ["experimental-async", "multiple-pymethods"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+# `CustodyFailure`, the typed custody error the runtime carries to the bridge;
+# tests also recompute P-256 pseudonym points and signatures.
+scp-crypto = { path = "../scp-crypto" }
 scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
 # The real Mainline DHT backend (PkarrDhtClient) is compiled unconditionally —
@@ -93,17 +109,18 @@ z-base-32 = { workspace = true }
 ed25519-dalek = { workspace = true }
 tracing = { workspace = true }
 rmp-serde = { workspace = true }
-tls_codec = "0.4"
+tls_codec = "0.5"
 zeroize = { workspace = true }
 
 [dev-dependencies]
+# The MCP subscription tests build a wired server with
+# `McpServer::with_event_source`, public only under `scp-mcp/testing`.
+scp-mcp = { path = "../scp-mcp", features = ["testing"] }
 pyo3 = { version = "0.24.1", features = ["auto-initialize", "multiple-pymethods"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 scp-ffi-common = { path = "common", features = ["testing", "custody"] }
 # Tests need InMemoryKeyCustody.
 scp-platform = { path = "../scp-platform", features = ["testing"] }
-# Tests recompute and verify P-256 pseudonym points and signatures.
-scp-crypto = { path = "../scp-crypto" }
 # Tests construct `InMemoryDhtClient` directly (the §17.17.3 DHT nullifier) via
 # the `FfiDhtClient::InMemory` test seam. `features = ["testing"]` (no
 # slash-string in a feature list) is fine per the ADR-062 §Decision 1 invariant.

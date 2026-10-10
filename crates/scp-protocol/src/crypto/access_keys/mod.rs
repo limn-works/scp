@@ -38,8 +38,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// (CEKs) via AES-256-KW (RFC 3394). The epoch is a monotonic counter
 /// incremented on revocation+restoration or context-wide rotation.
 ///
-/// Key material is zeroized on drop to prevent sensitive bytes from
-/// persisting in freed memory.
+/// Key material is zeroized on drop, wherever the value lives, a stack slot
+/// included; the wiping global allocator of security model spec §9.15 (freed
+/// heap memory) reaches freed heap blocks only.
 ///
 /// See spec §9.17.1 and ADR-038 §2.
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -141,9 +142,14 @@ pub enum AccessKeyError {
     #[error("serialization failed: {0}")]
     SerializationFailed(String),
 
-    /// A key custody operation failed.
-    #[error("key custody error: {0}")]
-    KeyCustodyError(String),
+    /// Custody returned a wrapping (X25519) public key that is not 32 bytes.
+    #[error("malformed wrapping public key: {0}")]
+    MalformedWrappingPublicKey(String),
+
+    /// A key custody call failed (`KeyCustody`). The bridges report the code
+    /// `scp_ffi_common::error_codes::custody_failure_code` assigns to the failure's kind.
+    #[error(transparent)]
+    Custody(#[from] scp_crypto::CustodyFailure),
 
     /// The epoch counter overflowed (reached `u64::MAX`).
     #[error("epoch counter overflow: already at u64::MAX")]

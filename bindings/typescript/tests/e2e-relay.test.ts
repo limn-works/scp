@@ -37,6 +37,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Guard: skip if native addon unavailable
@@ -58,13 +59,10 @@ try {
   scp = new SCP({ storage: { type: "in_memory" } });
   bridge = createNativeBridge(scp);
   if (typeof (scp as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
-    skipReason = "SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
-    bridge = null;
-    scp = null;
+    throw new Error("SCP missing relayStartInMemory — rebuild with the Phase 4 changes");
   }
 } catch (e: unknown) {
-  const msg = e instanceof Error ? e.message : String(e);
-  skipReason = `Native NAPI bridge not available: ${msg}`;
+  skipReason = skipReasonIfAddonAbsent(e);
 }
 
 if (bridge === null || scp === null) {
@@ -405,12 +403,17 @@ if (bridge === null || scp === null) {
         }),
       );
 
-      // Close the context first.
+      // Close the context first. The creator's close takes the supervisor to
+      // `Closing`, while the handle's cached state string reads "closed".
       await napi.contextClose(ctx, alice.did);
 
       // Subscription to a closed context must fail. Promise-rejection,
-      // not synchronous throw.
-      await expect(scpInstance.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow();
+      // not synchronous throw. The message names `closing`, the state the
+      // supervisor reports, so the assertion fails if the subscribe gate is
+      // removed or reads the handle's cached string instead of the supervisor.
+      await expect(scpInstance.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow(
+        /cannot subscribe to context in 'closing' state/,
+      );
     });
   });
 

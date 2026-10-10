@@ -65,7 +65,7 @@ Each commit should be independently revertible. Never bundle unrelated changes.
 
 ### Python
 
-- Python 3.12+ (never system python3, which is Xcode 3.9)
+- Python 3.12, which mise installs, for development (never system python3, which is Xcode 3.9); the SDK's supported floor is CPython 3.10, and the release wheels cover CPython 3.10-3.13
 - async-first with sync wrappers where needed
 - Type hints on all public APIs
 

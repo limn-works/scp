@@ -637,13 +637,17 @@ agent_deregister(did) -> { removed }
 
 ## ADR-021: UniFFI Bridge Definitions
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-09-27 (SCP-307, the structured pseudonym result).
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-09-29 (SCP-307, `derive_pseudonym` returns the pseudonym point).
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, gave an identity a root set, one operational key, and a pre-rotation commitment, and resolution returns a key state (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
 
 **Amendment (2026-09-10 — the bridge's pseudonym derivation and Secure Enclave custody move to P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The pseudonym derivation this ADR's bridge exposes gains the seed-to-scalar step of §9.10.4 of the security-model spec, so its comment reads `P256_keygen(seed_to_scalar(seed[0..32]))`. The `KeyCustodyProvider` note states that the Swift implementation generates each P-256 key in the Secure Enclave, which the ruling made reachable and which ADR-025, the Apple platform adapter, carries in its own 2026-09-10 amendment. The UniFFI type mapping and the callback-interface shape are untouched.
 
-**Amendment (2026-09-27 — `derive_pseudonym` returns a structured result, and the bridge checks the host's pseudonym key).** SCP-307 (spec §9.10.4 and §9.5) supersedes the 2026-09-10 amendment's sentence that the callback-interface shape is untouched. `derive_pseudonym` and `derive_rotatable_pseudonym` return a `PseudonymResult { public_key, key_id }`: `public_key` is the 33-byte SEC1 compressed P-256 point, and `key_id` names the pseudonym's signing key in the host's custody. The same identity key, context and epoch MUST return the same `key_id`. The bridge binds the key only when `get_public_key(key_id)` returns the same 33 bytes, and otherwise fails with `SCP-IDENT-1055`. `sign` on a pseudonym key takes a 32-byte digest and returns the 64-byte low-`s` `r || s`, which the bridge verifies strictly before accepting it, for a pseudonym key this adapter derived and still holds bound; PR #2514 covers handles the adapter did not bind. The `bytes derive_pseudonym` line in the interface definition below, which returned `[pseudonym_public_key_bytes(32) || key_id_utf8_bytes]`, is kept as history.
+**Amendment (2026-09-29 — SCP-307, `derive_pseudonym` returns the pseudonym point).** SCP-307 (spec §9.10.4 and §9.10.4.A) supersedes the 2026-09-10 amendment's sentence that the callback-interface shape is untouched. This amendment binds the UniFFI `KeyCustodyProvider`, the PyO3 custody protocol and the napi custody interface alike. `derive_pseudonym` and `derive_rotatable_pseudonym` return the 33-byte SEC1 compressed P-256 point and nothing else, and the bridge computes the routing id from it. The bridge fails the derivation with `SCP-IDENT-1055` when those bytes are not a valid compressed P-256 point. It reports a host's `SCP-CRYPTO-4006` as key-not-found. No host stores a pseudonym key or signs with one, so `sign`, `get_public_key` and `destroy_key` never receive a pseudonym. Each bridge exports two helpers from one Rust implementation, so no host re-implements the derivation:
+- `p256_pseudonym_point(context_seed)` is for a host whose `pseudonym_secret` stays inside a keystore that computes the context seed. It runs the §9.10.4 seed-to-scalar step and returns the point.
+- `p256_software_pseudonym_point(ikm, context_id, epoch)` is for a software host. It runs the whole §9.10.4.A recipe from the identity's private key material (the Ed25519 seed until the identity key moves to P-256, SCP-315) and returns the point. An absent epoch selects v1, and a present one selects v2 (§9.10.4.1). The helper receives key material the host's software custody already holds, and it wipes its own copy.
+
+Neither helper returns a private scalar. The `bytes derive_pseudonym` line in the interface definition below, which returned `[pseudonym_public_key_bytes(32) || key_id_utf8_bytes]`, is kept as history.
 
 ### Context
 
@@ -1358,7 +1362,8 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
 
 11. **napi bridge — Bun/Node-specific:**
     - The native addon is loaded via `require('@limn-works/scp-ts-napi-{platform}')`, resolved from `optionalDependencies`.
-    - If the platform-specific package is not installed, `getBridge()` throws `TransportError` with code `SCP-TRANS-5001` and an actionable message indicating the missing package.
+    - If no platform-specific package exists for the platform, or the package does not resolve, the loader throws `ValidationError` with code `SCP-VALID-7081` and an actionable message naming the missing package. This is the only load failure a caller may treat as absence.
+    - If the package resolves and requiring it fails (a `dlopen` error, an ABI or architecture mismatch, a missing shared library), or the loaded addon lacks an export the SDK calls, the SDK throws `ValidationError` with code `SCP-VALID-7082`. A caller must not treat this code as absence. `.docs/standards/sdk-common.md` registers both codes with one meaning for every SDK that loads a native bridge.
     - Async bridge functions run on a multi-threaded tokio runtime. The runtime is created once at addon load time via `OnceLock<Runtime>` and shared across all calls.
     - The tokio runtime is shut down cleanly when the Node.js process exits (via napi-rs cleanup hook).
 
@@ -1608,7 +1613,7 @@ The identifier's textual encoding waits on a later revision of `09-security-mode
 scp:system:{kebab-case-name}
 ```
 
-Protocol-level feature flags for node roles. Not challenge-testable — these describe what a node does, not what an agent can prove. Initial set: `mls-group-management`, `key-rotation`, `governance-participation`, `relay-operation`, `bridge-operation`.
+Protocol-level feature flags for node roles. Not challenge-testable — these describe what a node does, not what an agent can prove. Initial set: `mls-group-management`, `key-rotation`, `governance-participation`, `relay-operation`.
 
 **Anti-spoofing model:**
 
@@ -1653,7 +1658,7 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 
 1. **URI parser** validates `scp:capability:{kebab-case}/v{N}`, `{identifier}:capability:{kebab-case}/v{N}`, and `scp:system:{kebab-case}`. Rejects malformed URIs with specific error variants.
 
-2. **Protocol registry** contains all 28 challenge capability URIs and 5 system capability URIs. Lookup by URI returns registry metadata (category, description, parameter schema). Unknown `scp:capability:*` URIs return `Err(UnknownProtocolCapability)`.
+2. **Protocol registry** contains all 28 challenge capability URIs and 4 system capability URIs. Lookup by URI returns registry metadata (category, description, parameter schema). Unknown `scp:capability:*` URIs return `Err(UnknownProtocolCapability)`.
 
 3. **`ChallengeType` unification:** existing `PromptInjectionResistance` maps to `scp:capability:prompt-injection-resistance/v1`, `SchemaValidation` maps to `scp:capability:schema-validation/v1`, `RateLimitCompliance` maps to `scp:capability:rate-limit-compliance/v1`. `Custom(String)` is replaced by `Uri(CapabilityUri)` which must be a valid identity-scoped or protocol-scoped URI.
 

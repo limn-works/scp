@@ -3,12 +3,24 @@
 # WHY IT EXISTS. `ci.yml`'s `rust-test` job reports one `Finished ... in Xm Ys` line per
 # cargo invocation and nothing about which unit cost what, so an engineer reducing compile
 # time cannot tell a 40-second dependency from a 2-second one. `cargo build --timings`
-# writes a per-unit table and a concurrency plot. This workflow runs the same four cargo
+# writes a per-unit table and a concurrency plot. Job `timings` runs the same four cargo
 # invocations `rust-test` runs, each under `--timings`, and uploads the reports.
 #
-# WHY IT IS COLD. It installs no `Swatinem/rust-cache` step, so every run compiles the
-# whole dependency graph from scratch. The cache-miss path is the number this workflow
-# exists to measure.
+# Job `bridge-timings` measures the two bridge crates whose compile ends the Swift chain
+# in ci.yml: `scp-ffi-uniffi` (job `xcframework`) and the PyO3 `scp-ffi` (job
+# `pyo3-module-macos`). It runs on the runner class those jobs run on, under the
+# `ci-bridge` profile and the features those jobs pass, and reports how long the crate
+# alone takes to recompile under `cargo check` and under `cargo build` after its lib.rs
+# changes. The check time divided by the build time is the share of the recompile that
+# the compiler front end takes. Splitting a crate into several crates parallelizes only
+# that front end, because codegen already spreads over the runner's cores, so this share
+# decides whether splitting the bridge crates shortens CI.
+#
+# WHY IT IS COLD. Neither job installs a `Swatinem/rust-cache` step or any other cache
+# step, so every run compiles the whole dependency graph from scratch, and no run writes
+# a cache entry that a ci.yml job restores. The cache-miss path is the number job
+# `timings` exists to measure. Job `bridge-timings` warms its own target directory inside
+# the run before it times a recompile.
 #
 # WHEN IT RUNS. Only when someone dispatches it, and then against whatever ref that person
 # names. No push starts it, and it never runs on `main`, on a pull request, or in the merge
@@ -31,17 +43,41 @@ on:
   # A dispatch reaches this job on any ref without editing this file, so adding a `push:`
   # trigger back pays off only for a branch that someone pushes to repeatedly, and such a
   # trigger must name a branch that exists.
+  #
+  # WHICH JOBS RUN. The `measure` input picks them: `workspace` runs job `timings`,
+  # `bridges` runs job `bridge-timings`, and `all` runs both. Run
+  # `gh workflow run compile-timings.yml --ref <branch> -f measure=bridges` to time only
+  # the bridge crates.
   workflow_dispatch:
+    inputs:
+      measure:
+        description: "Which compile to time: workspace, bridges, or all"
+        type: choice
+        options:
+          - all
+          - workspace
+          - bridges
+        default: all
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # ci.yml sets this key in its workflow-level `env:`, so its dev-profile builds carry
+  # no debug info. The same key here makes this job time those builds rather than the
+  # `line-tables-only` build `[profile.dev]` in the root Cargo.toml gives.
+  # Check `profile-env` in scripts/tests/ci-gate/ci_gate_selftest.py requires it here
+  # and in ci.yml.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  # Turns off incremental compilation, so these timings measure the compile every
+  # other CI job runs.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   timings:
     name: Cold compile timings (ubuntu-latest)
+    if: inputs.measure != 'bridges'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -50,7 +86,6 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -110,4 +145,182 @@ jobs:
         with:
           name: cargo-timings
           path: timings/
+          retention-days: 30
+
+  bridge-timings:
+    name: Bridge crate recompile timings (${{ matrix.bridge }}, macos-latest)
+    if: inputs.measure != 'workspace'
+    # ci.yml's `xcframework` and `pyo3-module-macos` jobs run on `macos-latest`, so the
+    # times this job reports apply to them.
+    runs-on: macos-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `bindings/swift/build-xcframework.sh --dev --profile ci-bridge` runs
+          # `cargo build --profile ci-bridge --target aarch64-apple-darwin
+          # --manifest-path crates/scp-ffi/uniffi/Cargo.toml --features testing`.
+          # `--lib` leaves out the `uniffi-bindgen` binary target, so the times cover the
+          # library crate a split would divide.
+          - bridge: scp-ffi-uniffi
+            lib_rs: crates/scp-ffi/uniffi/src/lib.rs
+            build_cmd: cargo build
+            cargo_args: >-
+              --lib --profile ci-bridge --target aarch64-apple-darwin
+              --manifest-path crates/scp-ffi/uniffi/Cargo.toml --features testing
+            rustc_args: ""
+          # `maturin develop --profile ci-bridge --features testing` in bindings/python
+          # runs `cargo rustc --lib --crate-type cdylib` over crates/scp-ffi with the
+          # macOS link arguments below. Its `--features testing` takes the place of the
+          # `features` list in `[tool.maturin]` of bindings/python/pyproject.toml, so
+          # the build enables `testing` and not `extension-module`: crates/scp-ffi/src/
+          # lib.rs fails to compile when both are on. `-undefined dynamic_lookup` lets
+          # the macOS linker leave Python symbols for the interpreter to resolve at load
+          # time.
+          - bridge: scp-ffi
+            lib_rs: crates/scp-ffi/src/lib.rs
+            build_cmd: cargo rustc --crate-type cdylib
+            cargo_args: >-
+              --lib --profile ci-bridge --manifest-path crates/scp-ffi/Cargo.toml
+              --features testing
+            rustc_args: "-C link-arg=-undefined -C link-arg=dynamic_lookup"
+    env:
+      BUILD_CMD: ${{ matrix.build_cmd }}
+      CARGO_ARGS: ${{ matrix.cargo_args }}
+      RUSTC_ARGS: ${{ matrix.rustc_args }}
+      LIB_RS: ${{ matrix.lib_rs }}
+      BRIDGE: ${{ matrix.bridge }}
+      # Two timed recompiles per command, so a reader can see how far one run strays
+      # from the next. The summary reports the faster of the two.
+      REPEATS: 2
+    steps:
+      - uses: actions/checkout@v5
+      # PyO3's build script runs a Python interpreter to learn the ABI it compiles
+      # against, and crates/scp-ffi/build.rs asks `python3.12` for its LIBDIR.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Report the compiler and machine this job resolved
+        run: |
+          rustc --version
+          cargo --version
+          sysctl -n hw.ncpu
+          sysctl -n machdep.cpu.brand_string
+      - name: Install cargo-llvm-lines
+        run: cargo install cargo-llvm-lines --version 0.4.48 --locked
+      - name: Time the recompile under cargo check and cargo build
+        run: |
+          set -euo pipefail
+          mkdir -p bridge-timings/cold bridge-timings/rebuild
+          results=bridge-timings/results.txt
+          : > "$results"
+          stamp() { perl -MTime::HiRes=time -e 'printf "%.3f", time'; }
+          # Runs a command, then appends `<label> <seconds>` to the results file.
+          timed() {
+            local label="$1"; shift
+            local t0 t1
+            t0=$(stamp)
+            "$@"
+            t1=$(stamp)
+            perl -e 'printf "%s %.1f\n", $ARGV[0], $ARGV[2] - $ARGV[1]' "$label" "$t0" "$t1" \
+              | tee -a "$results"
+          }
+          # `cargo rustc` passes the arguments after `--` to the final crate alone, so
+          # the PyO3 link arguments reach `scp-ffi` and change no dependency's hash.
+          # CARGO_ARGS and RUSTC_ARGS hold flags with no space inside any one flag, so
+          # word splitting yields each flag as one argument.
+          build() {
+            if [ -n "$RUSTC_ARGS" ]; then
+              # shellcheck disable=SC2086
+              $BUILD_CMD $CARGO_ARGS "$@" -- $RUSTC_ARGS
+            else
+              # shellcheck disable=SC2086
+              $BUILD_CMD $CARGO_ARGS "$@"
+            fi
+          }
+          check() {
+            # shellcheck disable=SC2086
+            cargo check $CARGO_ARGS
+          }
+
+          # Cold build under --timings. It warms the build-mode target directory and
+          # records every unit's compile time.
+          rm -rf target/cargo-timings
+          timed cold-build build --timings
+          cp target/cargo-timings/cargo-timing.html bridge-timings/cold/timing.html
+
+          # A recompile after lib.rs changes rebuilds the bridge crate alone, which is
+          # the work that ends the ci.yml bridge jobs.
+          for _ in $(seq 1 "$REPEATS"); do
+            touch "$LIB_RS"
+            rm -rf target/cargo-timings
+            timed build build --timings
+          done
+          cp target/cargo-timings/cargo-timing.html bridge-timings/rebuild/timing.html
+
+          # `cargo check` compiles every dependency to metadata, a unit kind the
+          # build above did not produce, so check needs its own warm-up.
+          timed cold-check check
+          for _ in $(seq 1 "$REPEATS"); do
+            touch "$LIB_RS"
+            timed check check
+          done
+      - name: Count LLVM IR lines per function
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          cargo llvm-lines $CARGO_ARGS > bridge-timings/llvm-lines-full.txt
+          # Three header rows (column names, rule, total) and the top 30 functions.
+          head -n 33 bridge-timings/llvm-lines-full.txt > bridge-timings/llvm-lines.txt
+          cat bridge-timings/llvm-lines.txt
+      - name: Write the job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import os
+          from pathlib import Path
+
+          root = Path("bridge-timings")
+          runs = {}
+          results = root / "results.txt"
+          if results.exists():
+              for line in results.read_text().splitlines():
+                  label, seconds = line.split()
+                  runs.setdefault(label, []).append(float(seconds))
+          print(f"## {os.environ['BRIDGE']}\n")
+          print("| measurement | runs (s) |")
+          print("|---|---|")
+          for label in ("cold-build", "build", "cold-check", "check"):
+              values = ", ".join(f"{v:.1f}" for v in runs.get(label, [])) or "missing"
+              print(f"| {label} | {values} |")
+          if runs.get("build") and runs.get("check"):
+              check_s, build_s = min(runs["check"]), min(runs["build"])
+              print(
+                  f"\nfastest recompile after touching lib.rs: check {check_s:.1f} s, "
+                  f"build {build_s:.1f} s, front-end share {100 * check_s / build_s:.0f}%\n"
+              )
+          else:
+              print("\nthe front-end share is missing because a timed step failed\n")
+          lines = root / "llvm-lines.txt"
+          if lines.exists():
+              print("### cargo llvm-lines, top 30\n\n```")
+              print(lines.read_text().rstrip())
+              print("```\n")
+          PY
+          if [ -f bridge-timings/cold/timing.html ]; then
+            {
+              echo '### cargo build --timings'
+              echo
+              echo '```'
+              python3 scripts/summarize-cargo-timings.py bridge-timings "$(sysctl -n hw.ncpu)"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bridge-timings-${{ matrix.bridge }}
+          path: bridge-timings/
           retention-days: 30

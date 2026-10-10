@@ -37,14 +37,18 @@
 // standalone at runtime — the handle-wrapping helpers call
 // `_fromHandle` statics which are resolved lazily inside the SCP
 // methods via dynamic `import()` calls.
-import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
 import type { PaymentReceiptVerificationResult } from "./economy";
-import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./errors";
+import { ContextError, mapBridgeError, mapSagaError, ScpError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import { type BridgeContextHandle, getBridge, toCapabilityValidation } from "./internal/bridge";
 import { toNativeCustodyProvider } from "./internal/custody-adapter";
-import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
+import {
+  loadNativeAddon,
+  NATIVE_ADDON_ABSENT_CODE,
+  NATIVE_ADDON_LOAD_FAILED_CODE,
+  type NativeAddon as RawNativeAddon,
+} from "./internal/native";
 import { assertTestEnvironment } from "./internal/test-guard";
 import type { StreamingSagaNative, StreamingSagaOptions } from "./outlets";
 import { StreamingSagaHandle } from "./outlets";
@@ -120,6 +124,9 @@ type NativeAddon = RawNativeAddon & {
   validateAgainstTemplate?: unknown;
   validateContextParams?: unknown;
   checkScopedCapability?: unknown;
+  // P-256 pseudonym point helpers (§9.10.4.A), module-level free functions.
+  p256PseudonymPoint?: unknown;
+  p256SoftwarePseudonymPoint?: unknown;
 };
 
 /**
@@ -160,11 +167,12 @@ interface NativeScpInstance {
  * Routes through the shared `loadNativeAddon` cache in
  * `internal/native.ts` so this module and the bridge factory share a
  * single frozen addon reference. The shared loader throws
- * `TransportError` (`SCP-TRANS-5001`) on platform-package missing or
- * load failure; this wrapper layers an additional runtime check
- * and a stale-addon (no `SCP` class) check, both surfaced as
- * `ValidationError` (`SCP-VALID-7005`) — the public-API code that
- * SDK consumers see when they call `new SCP(...)`.
+ * `ValidationError` (`SCP-VALID-7081`) when the platform package is
+ * missing, which this wrapper rethrows under the same code with the
+ * reinstall instruction SDK consumers see when they call `new SCP(...)`.
+ * An installed addon that failed to load passes through as the loader's
+ * `ValidationError` (`SCP-VALID-7082`), and an addon that loaded without the `SCP`
+ * class throws the same code, so neither is reported as a missing package.
  */
 function loadAddon(): NativeAddon {
   if (typeof process === "undefined" || !process.versions?.node) {
@@ -180,25 +188,10 @@ function loadAddon(): NativeAddon {
   try {
     addon = loadNativeAddon() as NativeAddon;
   } catch (cause) {
-    const underlying = (cause as Error)?.message ?? String(cause);
-    throw new ValidationError(
-      `Native addon failed to load: ${underlying}. ` +
-        "Ensure the matching @limn-works/scp-ts-napi-* platform package is " +
-        "installed, then reinstall with `bun install`.",
-      "SCP-VALID-7005",
-    );
+    throw addonLoadError(cause);
   }
 
-  if (typeof addon.SCP !== "function") {
-    throw new ValidationError(
-      "Native addon loaded but does not export the SCP class — " +
-        "the platform addon was built before the Phase 4 PR 1 multi-instance " +
-        "surface landed. Upgrade the package or rebuild from the current " +
-        "codebase with `cargo build -p scp-ffi-napi`.",
-      "SCP-VALID-7005",
-    );
-  }
-
+  requireAddonExport(addon, "SCP");
   return addon;
 }
 
@@ -219,22 +212,13 @@ function nativeScp(): NativeScpCtor {
  * ADR-048 §1; `SCP` class methods that wrap them route through this
  * accessor instead of `this.#native[name]`.
  *
- * Throws `SCP-VALID-7005` if the addon is unloadable or does not
- * export the named function (e.g., a stale prebuilt addon predating
- * the §1 split).
+ * Throws `SCP-VALID-7081` if no addon is installed. Throws
+ * `SCP-VALID-7082` if the addon is installed and failed to load, and
+ * also if it loaded without the named function (e.g., a stale prebuilt
+ * addon predating the §1 split).
  */
 function nativeFreeFn<T>(name: keyof NativeAddon): T {
-  const addon = loadAddon();
-  const fn = addon[name];
-  if (typeof fn !== "function") {
-    throw new ValidationError(
-      `Native addon does not export the module-level free function "${String(name)}" — ` +
-        "the addon may be stale (predating ADR-048 §1 pure-helper split). " +
-        "Rebuild with `cargo build -p scp-ffi-napi` or upgrade the platform package.",
-      "SCP-VALID-7005",
-    );
-  }
-  return fn as T;
+  return requireAddonExport<T>(loadAddon(), String(name));
 }
 
 // ---------------------------------------------------------------------------
@@ -242,12 +226,72 @@ function nativeFreeFn<T>(name: keyof NativeAddon): T {
 // ---------------------------------------------------------------------------
 
 /**
+ * Maps an error `loadNativeAddon` threw to the error `loadAddon` throws.
+ *
+ * Only the loader's absence error — an `ScpError` carrying
+ * `SCP-VALID-7081`, which the loader throws when the platform package does
+ * not resolve — becomes absence: a `ValidationError` with that code and the
+ * reinstall instruction. Every other `ScpError`, the loader's `SCP-VALID-7082` among
+ * them, is returned unchanged. Any other thrown value is a failure the
+ * loader did not classify, raised while an addon package may well be
+ * installed, so it becomes a `ValidationError` with the load-failure code
+ * `SCP-VALID-7082` and never counts as absence.
+ *
+ * @internal
+ */
+export function addonLoadError(cause: unknown): ScpError {
+  const underlying = (cause as Error)?.message ?? String(cause);
+  if (cause instanceof ScpError && cause.code === NATIVE_ADDON_ABSENT_CODE) {
+    return new ValidationError(
+      `Native addon is not installed: ${underlying}. ` +
+        "Ensure the matching @limn-works/scp-ts-napi-* platform package is " +
+        "installed, then reinstall with `bun install`.",
+      NATIVE_ADDON_ABSENT_CODE,
+    );
+  }
+  if (cause instanceof ScpError) {
+    return cause;
+  }
+  const error = new ValidationError(
+    `Native addon failed to load: ${underlying}.`,
+    NATIVE_ADDON_LOAD_FAILED_CODE,
+  );
+  Object.defineProperty(error, "cause", { value: cause, enumerable: false });
+  return error;
+}
+
+/**
+ * Returns `addon[name]` when it is a function.
+ *
+ * An addon that loaded without an export the SDK calls — the `SCP` class or
+ * an ADR-048 §1 module-level free function — is installed and stale or
+ * partially built, not absent. This function throws the loader's
+ * load-failure code `SCP-VALID-7082`, so no caller mistakes the stale
+ * addon for the absence code `SCP-VALID-7081`.
+ *
+ * @throws {ValidationError} `SCP-VALID-7082` when `addon[name]` is not a function.
+ * @internal
+ */
+export function requireAddonExport<T>(addon: NativeAddon, name: string): T {
+  const value = addon[name];
+  if (typeof value !== "function") {
+    throw new ValidationError(
+      `Native addon loaded but does not export "${name}" — the installed ` +
+        "platform addon is stale or partially built. Rebuild it with " +
+        "`cargo build -p scp-ffi-napi` or upgrade the platform package.",
+      NATIVE_ADDON_LOAD_FAILED_CODE,
+    );
+  }
+  return value as T;
+}
+
+/**
  * Clamps a float-seconds timeout into a millisecond count suitable for
  * the NAPI `shutdown(timeoutMillis)` boundary.
  *
  * @internal
  */
-export function __clampShutdownMillisForTests(timeoutSecs: number): number {
+export function clampShutdownMillis(timeoutSecs: number): number {
   const MAX_MILLIS = Number.MAX_SAFE_INTEGER;
   if (timeoutSecs === Number.POSITIVE_INFINITY) {
     return MAX_MILLIS;
@@ -259,6 +303,35 @@ export function __clampShutdownMillisForTests(timeoutSecs: number): number {
     return MAX_MILLIS;
   }
   return Math.round(timeoutSecs * 1000);
+}
+
+/**
+ * Passes `args` to the native P-256 helper `fn` and returns its result as
+ * the one `Uint8Array` the host owns.
+ *
+ * NAPI `Vec<u8>` parameters and returns are `number[]` in JS. The
+ * `number[]` copies of the arguments, and the `number[]` result once it is
+ * copied into the returned `Uint8Array`, are wiped with `fill(0)`.
+ *
+ * @internal
+ */
+export function __p256HostInvokeForTests(
+  fn: (...a: number[][]) => number[],
+  args: readonly Uint8Array[],
+): Uint8Array {
+  const raw = args.map((a) => Array.from(a));
+  let out: number[] | undefined;
+  try {
+    out = fn(...raw);
+    return Uint8Array.from(out);
+  } catch (err) {
+    throw mapBridgeError(err);
+  } finally {
+    for (const r of raw) {
+      r.fill(0);
+    }
+    out?.fill(0);
+  }
 }
 
 /**
@@ -457,14 +530,6 @@ export interface KeyPackageReservation {
   readonly keyPackagePublic: Uint8Array;
 }
 
-/** A pseudonym a {@link KeyCustodyProvider} derived (spec §9.10.4). */
-export interface PseudonymResult {
-  /** The 33-byte SEC1 compressed P-256 public key. */
-  publicKey: Uint8Array;
-  /** The numeric id of the pseudonym key, usable with `sign` and `getPublicKey`. */
-  keyId: string;
-}
-
 /**
  * Caller-supplied custody backend for {@link SCP.identityCreateWithCustody}.
  *
@@ -476,59 +541,101 @@ export interface PseudonymResult {
  * protocol so all SDKs share an identical contract.
  *
  * Callbacks are invoked synchronously from the native bridge (marshalled onto
- * the Node.js event loop). Key identifiers are opaque, numeric-string handles
- * your implementation assigns in {@link generateKeypair}. Byte values are
- * passed and returned as `Uint8Array`.
+ * the Node.js event loop). Byte values are passed and returned as `Uint8Array`.
+ *
+ * Key identifiers are handles your implementation assigns in
+ * {@link generateKeypair}. Each is the canonical
+ * decimal form of an unsigned 64-bit integer, as `String(n)` writes it for a
+ * `bigint` `n` in `[0, 2^64 - 1]`: ASCII digits only, with no sign, no leading
+ * zero (`"0"` itself is allowed) and no whitespace. The bridge rejects any
+ * other id (`"007"`, `"+7"`, `" 7"`, a UUID) with the custody error
+ * `SCP-CRYPTO-4060`.
+ *
+ * A pseudonym has no private key (spec §9.10.4): your implementation stores no
+ * pseudonym key and signs with none, so `sign`, `getPublicKey` and
+ * `destroyKey` never receive a pseudonym.
+ *
+ * A callback reports failure by throwing. Throw an error whose `code` is
+ * `"SCP-CRYPTO-4006"` (key not found), such as
+ * `new CryptoError(msg, "SCP-CRYPTO-4006")`, for a key id that was destroyed or
+ * never existed; the SDK call then rejects with a `CryptoError` carrying that
+ * code. Any other throw, whatever its code or value, rejects the SDK call with
+ * the custody error `SCP-CRYPTO-4060` carrying the thrown code and message.
+ * Every SDK operation that calls the provider reports these two codes,
+ * including the pseudonym derivation inside `createContext` and the identity
+ * key reads and signatures of identity operations. There are two exceptions:
+ * `SCP-IDENT-1055`, reported when the bytes a {@link derivePseudonym} or
+ * {@link deriveRotatablePseudonym} call returned are not a compressed P-256
+ * point, and `SCP-IDENT-1037`, which
+ * `scpidSign` reports for any custody failure (spec §3.11.4).
+ *
+ * Every callback must be synchronous and return the type its signature names.
+ * A callback that returns a Promise or other thenable, or a value of the wrong
+ * type, fails the SDK call with `SCP-CRYPTO-4060`; the SDK attaches a handler
+ * to a returned thenable, so its rejection is swallowed. No throw, returned
+ * value or rejected thenable reaches the process as an uncaught exception or
+ * an unhandled rejection.
  *
  * Only available on the NAPI (Node.js / Bun) backend — the SDK requires the
  * native addon (ADR-048). The browser tier (`@limn-works/scp-ts-wasm`, ADR-057)
  * runs the full protocol in-tab and does not use this native custody callback.
  */
 export interface KeyCustodyProvider {
-  /** Generate a keypair (`"ed25519"` or `"x25519"`); return its opaque id. */
+  /**
+   * Generate a keypair (`"ed25519"` or `"x25519"`); return its id, a
+   * canonical decimal `u64` string (`SCP-CRYPTO-4060` otherwise).
+   */
   generateKeypair(keyType: string): string;
-  /**
-   * Return the 64-byte signature of `message` under `keyId`. For an identity
-   * key this is Ed25519. For a pseudonym key returned by
-   * {@link derivePseudonym} `message` is a 32-byte digest and the result is
-   * the P-256 prehash ECDSA `r || s` with low s (§9.5); the bridge rejects
-   * any other length and any signature that fails strict verification, for a
-   * pseudonym key this adapter derived and still holds bound; for a handle the
-   * adapter did not bind, the bridge returns the host's bytes unchecked.
-   */
+  /** Return the 64-byte Ed25519 signature of `message` under `keyId`. */
   sign(keyId: string, message: Uint8Array): Uint8Array;
-  /**
-   * Return the public key for `keyId`: 32 Ed25519 bytes for an identity key,
-   * the 33-byte compressed P-256 point for a pseudonym key.
-   */
+  /** Return the 32 public-key bytes of the Ed25519 or X25519 key `keyId`. */
   getPublicKey(keyId: string): Uint8Array;
-  /** Destroy key material for `keyId`; subsequent operations must fail. */
+  /**
+   * Destroy key material for `keyId`; subsequent operations must fail,
+   * including pseudonym derivation under a destroyed identity key, which
+   * throws key-not-found `SCP-CRYPTO-4006` (spec §9.10.4.A).
+   */
   destroyKey(keyId: string): void;
   /** Return the 32-byte X25519 shared secret with `peerPublic`. */
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array;
   /**
-   * Derive the context-scoped P-256 pseudonym of identity key `keyId`
-   * (spec §9.10.4.A). `publicKey` is the 33-byte compressed point and `keyId`
-   * the numeric id of the new pseudonym key. The bridge requires
-   * `getPublicKey(keyId)` to return the same 33 bytes, and fails the
-   * operation with `SCP-IDENT-1055` otherwise. The same (`keyId`,
-   * `contextId`) MUST return the same pseudonym `keyId` on every call, so
-   * re-deriving names one key rather than minting another.
+   * Derive the context-scoped P-256 pseudonym point of identity key `keyId`
+   * (spec §9.10.4, §9.10.4.A) and return its 33 compressed bytes and nothing
+   * else. The bridge fails the operation with `SCP-IDENT-1055` when the bytes
+   * are not a valid compressed P-256 point. Throw key-not-found
+   * (`SCP-CRYPTO-4006`) when `keyId` was destroyed or never existed.
+   *
+   * Canonical recipe (spec §9.10.4, §9.10.4.A; every software host MUST
+   * produce identical bytes; `ikm` is the identity private key material, the
+   * 32-byte Ed25519 seed until the identity key moves to P-256 (SCP-315)):
+   *   1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
+   *   2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
+   *   3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; return the
+   *      compressed point `d·G`. `d` is discarded, never stored.
+   *
+   * The HMAC key is the 32-byte `pseudonym_secret`, never the public key:
+   * public key bytes would be a membership-enumeration oracle (§9.10.4.A).
    */
-  derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult;
+  derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array;
   /**
-   * Derive a rotatable (epoch-versioned) context-scoped pseudonym. Same
-   * contract as {@link derivePseudonym}, but the derivation mixes the
-   * big-endian 64-bit `pseudonymEpoch` and a distinct domain separator so
-   * rotating the epoch yields an unlinkable new keypair (spec §9.10.4.A).
-   * The same (`keyId`, `contextId`, `pseudonymEpoch`) MUST return the same
-   * pseudonym `keyId` on every call.
+   * Derive a rotatable (epoch-versioned) context-scoped pseudonym point
+   * (spec §9.10.4.1). Same return shape and checks as
+   * {@link derivePseudonym}.
+   *
+   * Canonical recipe: steps 1 and 3 of {@link derivePseudonym}, with step 2
+   * replaced by
+   *   `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonymEpoch) || "scp-pseudonym-v2")`
+   * where `BE64` is the 8-byte big-endian epoch. The `"scp-pseudonym-v2"`
+   * separator differs from the v1 `"scp-pseudonym"`, so epoch 0 yields a
+   * pseudonym distinct from the static v1 one, and rotating the epoch yields
+   * an unlinkable new point. The HMAC key is the `pseudonym_secret`, never
+   * the public key.
    */
   deriveRotatablePseudonym(
     keyId: string,
     contextId: Uint8Array,
     pseudonymEpoch: bigint,
-  ): PseudonymResult;
+  ): Uint8Array;
   /**
    * Return the 32 raw Ed25519 private-seed bytes for `keyId`.
    *
@@ -542,6 +649,50 @@ export interface KeyCustodyProvider {
   exportSigningKeyBytes(keyId: string): Uint8Array;
   /** Return `"hardware"`, `"software"`, or `"in_memory"`. */
   custodyType(keyId: string): string;
+}
+
+// ---------------------------------------------------------------------------
+// P-256 custody-host helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the 33-byte SEC1 compressed pseudonym point of a 32-byte §9.10.4
+ * `context_seed` (v1 or v2), for a host that computes the seed itself, such
+ * as inside a keystore.
+ *
+ * The seed is reduced to a scalar under the fixed `SCP-PSEUDONYM-P256-V1`
+ * label (FIPS 186-5 A.2.1) and only the point `d·G` is returned: no scalar
+ * reaches the host.
+ *
+ * @throws {ValidationError} `SCP-VALID-7005` when `contextSeed` is not 32 bytes.
+ */
+export function p256PseudonymPoint(contextSeed: Uint8Array): Uint8Array {
+  return __p256HostInvokeForTests(
+    nativeFreeFn<(...a: number[][]) => number[]>("p256PseudonymPoint"),
+    [contextSeed],
+  );
+}
+
+/**
+ * Returns the 33-byte SEC1 compressed pseudonym point that a software custody
+ * derives from its 32-byte identity key material `ikm` (spec §9.10.4.A):
+ * `pseudonym_secret = HKDF-SHA256(ikm, "scp-pseudonym-secret-v1")`, the v1
+ * context seed when `epoch` is omitted and the v2 seed at `epoch` otherwise,
+ * then the point. No scalar reaches the host.
+ *
+ * @param epoch The rotation epoch, an unsigned 64-bit value.
+ * @throws {ValidationError} `SCP-VALID-7005` when `ikm` is not 32 bytes or
+ *   `epoch` is negative or wider than 64 bits.
+ */
+export function p256SoftwarePseudonymPoint(
+  ikm: Uint8Array,
+  contextId: Uint8Array,
+  epoch?: bigint,
+): Uint8Array {
+  const native = nativeFreeFn<(i: number[], c: number[], e?: bigint) => number[]>(
+    "p256SoftwarePseudonymPoint",
+  );
+  return __p256HostInvokeForTests((i, c) => native(i, c, epoch), [ikm, contextId]);
 }
 
 // ---------------------------------------------------------------------------
@@ -619,7 +770,9 @@ export class SCP {
    * compile error. There is no default backend.
    *
    * @param options Constructor options; `options.storage` is required.
-   * @throws {ValidationError} If no NAPI addon is available — code `SCP-VALID-7005`.
+   * @throws {ValidationError} If no NAPI addon is installed — code `SCP-VALID-7081`.
+   * @throws {ScpError} If the NAPI addon is installed and failed to load, or
+   *   loaded without the `SCP` class — code `SCP-VALID-7082`.
    */
   constructor(options: ScpOptions) {
     // Runtime fail-closed guard (spec §17.6): the TS type makes
@@ -710,10 +863,12 @@ export class SCP {
    * Shuts down the instance with a graceful deadline.
    *
    * @param timeoutSecs Maximum seconds to wait. Defaults to 5.
+   * @throws {StorageError} With `SCP-STORAGE-8005` when the durable store
+   *   still holds its advisory lock after the call.
    */
   async shutdown(timeoutSecs: number = 5): Promise<void> {
     try {
-      const millis = __clampShutdownMillisForTests(timeoutSecs);
+      const millis = clampShutdownMillis(timeoutSecs);
       await this.#native.shutdown(BigInt(millis));
     } catch (err) {
       throw mapBridgeError(err);
@@ -1470,10 +1625,10 @@ export class SCP {
    * THROWS (governed-context invitations are not yet implemented).
    *
    * The invite routes through the actor governance gate, which requires the
-   * inviter to hold the `governance:propose` capability. A normally-created
-   * `SingleAdmin` context grants its admin that capability at genesis, so it
-   * works out of the box; a context with a custom ceiling must grant
-   * `governance:propose` to the inviter.
+   * inviter to hold the `governance:propose` capability. The creator of a
+   * `SingleAdmin` context holds the admin role, which grants every capability
+   * in the context's declared ceiling, so the creator can invite only when
+   * that ceiling includes `governance:propose`.
    *
    * `creatorDid` MUST be a locally-custodied identity; the invite is signed
    * under its `#active` key.
@@ -2598,10 +2753,8 @@ export class SCP {
    * output bytes — or reaches a typed terminal, which rejects as one of the
    * saga errors:
    *
-   * - {@link SagaAbortedError} — a Prepare-phase abort: a PERMANENT rejection
-   *   OR a RETRYABLE transient (rate limit / participant actor unavailable),
-   *   distinguished by the `SCP-SAGA-*` code; carries `retryAfterMs` (`null`,
-   *   never `0`, when no precise back-off exists).
+   * - {@link SagaAbortedError} — the code tells its causes apart; carries
+   *   `retryAfterMs` (`null`, never `0`, when no precise back-off exists).
    * - {@link SagaNeedsRepairError} — Commit retries exhausted; carries the
    *   durable `sagaId` repair handle.
    * - {@link SagaBusyError} — the participant context set overlapped an
@@ -2885,6 +3038,8 @@ export class SCP {
    * the token to any external subject, passing a token addressed to someone else
    * (trust inflation). Pass the agent the token must be addressed to.
    *
+   * Throws {@link "./errors".ContextError} carrying `SCP-CTX-2023` when the context is not active.
+   *
    * @param handle The context handle to validate against.
    * @param token The UCAN token string to validate.
    * @param capability The required capability URI (mandatory on this gate).
@@ -2917,8 +3072,8 @@ export class SCP {
    * {@link CapabilityValidation} of six per-stage booleans (spec §7.2.4,
    * ADR-059). The probe never records the token's nonce, so calling it does
    * not consume the token. Capability/signature/expiry outcomes are reported
-   * via the booleans; only malformed FFI inputs (bad handle / token /
-   * capability) reject.
+   * via the booleans; malformed FFI inputs (bad handle / token / capability)
+   * reject. Throws {@link "./errors".ContextError} carrying `SCP-CTX-2023` when the context is not active.
    *
    * The six booleans cross the FFI already camelCased, so consumers read the
    * per-check breakdown directly and never reverse-engineer *which* check
@@ -2981,6 +3136,10 @@ export class SCP {
     return toCapabilityValidation(raw);
   }
 
+  /**
+   * Mints a UCAN from the context creator to `memberDid`, within the ceiling
+   * the context holds. Throws {@link "./errors".ContextError} carrying `SCP-CTX-2023` when the context is not active.
+   */
   async ucanMint(
     handle: unknown,
     memberDid: string,
@@ -3001,6 +3160,10 @@ export class SCP {
     }
   }
 
+  /**
+   * Delegates a subset of `parentToken`'s capabilities from `delegatorDid` to
+   * `delegateeDid`, within the ceiling the context holds. Throws {@link "./errors".ContextError} carrying `SCP-CTX-2023` when the context is not active.
+   */
   async ucanDelegate(
     handle: unknown,
     delegatorDid: string,
@@ -3023,6 +3186,10 @@ export class SCP {
     }
   }
 
+  /**
+   * Revokes `token` in the context, as its issuer or the context creator.
+   * Throws {@link "./errors".ContextError} carrying `SCP-CTX-2023` when the context is not active.
+   */
   async ucanRevoke(handle: unknown, token: string, revokerDid: string): Promise<void> {
     try {
       await (this.#native.ucanRevoke as (h: unknown, t: string, r: string) => Promise<void>)(
@@ -3524,8 +3691,8 @@ export class SCP {
    *   first. Use {@link participationRecord} directly when the empty-log case
    *   should surface as an error instead.
    *
-   * The capability outcome is non-throwing (it reads booleans); only malformed
-   * FFI inputs (bad context handle / token / capability) propagate as a typed
+   * The capability outcome is non-throwing (it reads booleans); malformed FFI
+   * inputs (bad context handle / token / capability) propagate as a typed
    * {@link "./errors".ScpError}.
    *
    * SECURITY: the behavioral record's `attestationCount` (and any challenge
@@ -3569,8 +3736,9 @@ export class SCP {
       let notRevoked = true;
       let timeBoundsValid = true;
       for (const token of capabilityTokens) {
-        // Read-only diagnostic — does NOT throw on capability outcomes; only
-        // malformed FFI input rejects (and propagates). Pass the subject as the
+        // Read-only diagnostic — does NOT throw on capability outcomes;
+        // malformed FFI input and an inactive context reject (and propagate).
+        // Pass the subject as the
         // presenting agent so the audience check evaluates against the DID under
         // assessment.
         //
@@ -3905,9 +4073,18 @@ export class SCP {
     }
   }
 
-  async mcpClientConnectSse(url: string): Promise<unknown> {
+  /**
+   * Connects an MCP client to an SSE server. `authToken` is sent as
+   * `Authorization: Bearer <token>` on every request; pass `null` only for a
+   * server that runs no bearer check. An SCP SSE server always runs one
+   * (ADR-015). The transport has no TLS, so a token is sent only to a
+   * loopback host.
+   */
+  async mcpClientConnectSse(url: string, authToken: string | null): Promise<unknown> {
     try {
-      return await (this.#native.mcpClientConnectSse as (u: string) => Promise<unknown>)(url);
+      return await (
+        this.#native.mcpClientConnectSse as (u: string, t: string | null) => Promise<unknown>
+      )(url, authToken);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -4433,169 +4610,6 @@ export class SCP {
           t2: number,
         ) => string
       )(lastRelayContact, now, tier1ThresholdSecs, tier2ThresholdSecs);
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  // ───────────────────────────────────────────────────────────────────────
-  // Domain: Bridge
-  // ───────────────────────────────────────────────────────────────────────
-
-  bridgeCreateShadow(
-    bridgeId: string,
-    platformHandle: string,
-    bridgeMode: string,
-    contextId?: string,
-  ): unknown {
-    try {
-      return (
-        this.#native.bridgeCreateShadow as (
-          b: string,
-          p: string,
-          m: string,
-          c: string | undefined,
-        ) => unknown
-      )(bridgeId, platformHandle, bridgeMode, contextId);
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  // ───────────────────────────────────────────────────────────────────────
-  // Domain: Bridge credentials (spec §12.11)
-  //
-  // Per-instance credential store ops. Each routes through `this.#native`
-  // (the NAPI SCP handle) — credentials are isolated to THIS instance's
-  // store (ADR-048 §1). The credential store lives only in scp-runtime.
-  // ───────────────────────────────────────────────────────────────────────
-
-  /** Provisions (stores) an encrypted credential for a bridge instance. */
-  bridgeCredentialProvision(
-    bridgeId: string,
-    credentialType: string,
-    plaintext: Uint8Array | readonly number[],
-    bridgeCredentialKey: Uint8Array | readonly number[],
-  ): BridgeCredential {
-    try {
-      // NAPI marshals Rust `Vec<u8>` as a JS `Array<number>`, not `Uint8Array`;
-      // convert byte inputs before crossing the boundary (cf. `broadcastPublish`).
-      const plaintextArray = ArrayBuffer.isView(plaintext)
-        ? Array.from(plaintext as Uint8Array)
-        : (plaintext as readonly number[]);
-      const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
-        ? Array.from(bridgeCredentialKey as Uint8Array)
-        : (bridgeCredentialKey as readonly number[]);
-      return (
-        this.#native.bridgeCredentialProvision as (
-          b: string,
-          t: string,
-          p: readonly number[],
-          k: readonly number[],
-        ) => BridgeCredential
-      )(bridgeId, credentialType, plaintextArray, keyArray);
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  /** Retrieves and decrypts a credential for a bridge instance. */
-  bridgeCredentialRetrieve(
-    bridgeId: string,
-    credentialType: string,
-    bridgeCredentialKey: Uint8Array | readonly number[],
-  ): Uint8Array {
-    try {
-      const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
-        ? Array.from(bridgeCredentialKey as Uint8Array)
-        : (bridgeCredentialKey as readonly number[]);
-      const raw = (
-        this.#native.bridgeCredentialRetrieve as (
-          b: string,
-          t: string,
-          k: readonly number[],
-        ) => number[]
-      )(bridgeId, credentialType, keyArray);
-      return Uint8Array.from(raw as readonly number[]);
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  /** Rotates (replaces) a credential for a bridge instance. */
-  bridgeCredentialRotate(
-    bridgeId: string,
-    credentialType: string,
-    newPlaintext: Uint8Array | readonly number[],
-    bridgeCredentialKey: Uint8Array | readonly number[],
-  ): BridgeCredential {
-    try {
-      const newPlaintextArray = ArrayBuffer.isView(newPlaintext)
-        ? Array.from(newPlaintext as Uint8Array)
-        : (newPlaintext as readonly number[]);
-      const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
-        ? Array.from(bridgeCredentialKey as Uint8Array)
-        : (bridgeCredentialKey as readonly number[]);
-      return (
-        this.#native.bridgeCredentialRotate as (
-          b: string,
-          t: string,
-          p: readonly number[],
-          k: readonly number[],
-        ) => BridgeCredential
-      )(bridgeId, credentialType, newPlaintextArray, keyArray);
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  /** Revokes all credentials for a bridge instance. */
-  bridgeCredentialRevoke(bridgeId: string): void {
-    try {
-      (this.#native.bridgeCredentialRevoke as (b: string) => void)(bridgeId);
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  /** Lists all credential types stored for a bridge instance. */
-  bridgeCredentialList(bridgeId: string): string[] {
-    try {
-      return (this.#native.bridgeCredentialList as (b: string) => string[])(bridgeId);
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  /** Stores a bridge credential key in the custody boundary. */
-  bridgeCredentialStoreKey(bridgeId: string, key: Uint8Array | readonly number[]): void {
-    try {
-      const keyArray = ArrayBuffer.isView(key)
-        ? Array.from(key as Uint8Array)
-        : (key as readonly number[]);
-      (this.#native.bridgeCredentialStoreKey as (b: string, k: readonly number[]) => void)(
-        bridgeId,
-        keyArray,
-      );
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  /** Retrieves a bridge credential key from the custody boundary. */
-  bridgeCredentialGetKey(bridgeId: string): Uint8Array {
-    try {
-      const raw = (this.#native.bridgeCredentialGetKey as (b: string) => number[])(bridgeId);
-      return Uint8Array.from(raw as readonly number[]);
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  /** Deletes and zeroizes a bridge credential key. */
-  bridgeCredentialDeleteKey(bridgeId: string): void {
-    try {
-      (this.#native.bridgeCredentialDeleteKey as (b: string) => void)(bridgeId);
     } catch (err) {
       throw mapBridgeError(err);
     }

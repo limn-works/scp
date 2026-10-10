@@ -77,8 +77,9 @@ pub const MAX_EPOCH_ADVANCE: u64 = 1000;
 /// Sender keys are used to encrypt messages before MLS group encryption,
 /// enabling per-relationship blocking. See ADR-007.
 ///
-/// Key material is zeroized on drop to prevent sensitive bytes from
-/// persisting in freed memory. Clone is retained for API compatibility
+/// Key material is zeroized on drop, wherever the value lives, a stack slot
+/// included; the wiping global allocator of security model spec §9.15 (freed
+/// heap memory) reaches freed heap blocks only. Clone is retained for API compatibility
 /// (e.g. `SenderKeyStore::get_all`).
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct SenderKey([u8; 32]);
@@ -159,6 +160,11 @@ pub enum SenderKeyError {
     #[error("signing failed: {0}")]
     SigningFailed(String),
 
+    /// A key custody call failed (`KeyCustody`). The bridges report the code
+    /// `scp_ffi_common::error_codes::custody_failure_code` assigns to the failure's kind.
+    #[error(transparent)]
+    Custody(#[from] scp_crypto::CustodyFailure),
+
     /// Ed25519 signature verification failed due to malformed input.
     #[error("verification failed: {0}")]
     VerificationFailed(String),
@@ -175,9 +181,9 @@ pub enum SenderKeyError {
     #[error("HPKE decryption failed: {0}")]
     HpkeDecryptionFailed(String),
 
-    /// A key custody operation failed.
-    #[error("key custody error: {0}")]
-    KeyCustodyError(String),
+    /// Custody returned a wrapping (X25519) public key that is not 32 bytes.
+    #[error("malformed wrapping public key: {0}")]
+    MalformedWrappingPublicKey(String),
 
     /// A sender key request was replayed (duplicate nonce within the expiry window).
     #[error("replayed request: duplicate nonce detected")]

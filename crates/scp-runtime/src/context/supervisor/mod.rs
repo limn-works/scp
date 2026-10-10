@@ -131,6 +131,19 @@ pub mod supervisor;
 #[path = "spawn_from_welcome_tests.rs"]
 mod spawn_from_welcome_tests;
 
+#[cfg(test)]
+impl supervisor::Supervisor {
+    /// Registers `handle` under `context_id` with no actor task behind it, so a
+    /// test holds the receiving half of the mailbox.
+    pub(in crate::context) fn register_actor_handle_for_test(
+        &self,
+        context_id: &str,
+        handle: crate::context::actor::ContextActorHandle,
+    ) {
+        self.actors.insert(context_id.to_owned(), handle);
+    }
+}
+
 pub use handle::SupervisorHandle;
 pub use key_package_actor::{
     KP_MAILBOX_CAPACITY, KP_SEND_TIMEOUT, KeyPackageCommand, KeyPackageStoreActor,
@@ -150,8 +163,8 @@ pub use saga_prepared_state::{
 #[cfg(any(test, feature = "testing"))]
 pub use supervisor::SagaSetReservation;
 pub use supervisor::{
-    ACTOR_MAILBOX_CAPACITY, CrashWindow, CrossContextOutletInvocationRequest, DurableProviders,
-    InviteMemberOutcome, MessageSigner, RestoredContexts, SagaAbortReason,
-    SagaDivergenceRepairRecord, SagaError, SagaInput, SagaOutput, SagaSigningKeys, Supervisor,
-    SupervisorConfig, WelcomeJoinRequest,
+    ACTOR_MAILBOX_CAPACITY, CrashWindow, CrossContextOutletInvocationRequest, DrainWithDeadline,
+    DurableProviders, InviteMemberOutcome, JoinFailure, MessageSigner, RestoredContexts,
+    SagaAbortReason, SagaDivergenceRepairRecord, SagaError, SagaInput, SagaOutput, SagaSigningKeys,
+    Supervisor, SupervisorConfig, WelcomeJoinRequest,
 };

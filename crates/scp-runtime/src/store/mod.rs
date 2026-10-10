@@ -35,7 +35,7 @@ pub mod ucan;
 pub mod wrapping_key;
 
 use serde::{Serialize, de::DeserializeOwned};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use scp_platform::EncryptedStorage;
 use scp_platform::store_value::StoreValueError;
@@ -241,10 +241,9 @@ impl<S: Storage> ProtocolRepository<S> {
 impl<S: Storage> ProtocolRepository<S> {
     /// Returns a reference to the underlying storage backend.
     ///
-    /// Used by [`MlsStorageBridge`](crate::crypto::mls::storage::MlsStorageBridge)
-    /// to perform raw storage operations for `OpenMLS` state persistence.
-    ///
-    /// See spec section 17.9. See SCP-PERSIST-050.
+    /// For callers that need a raw storage operation the domain methods do
+    /// not provide, such as closing the store or building a storage adapter
+    /// over it.
     #[must_use]
     pub const fn storage(&self) -> &S {
         &self.storage
@@ -260,6 +259,27 @@ impl<S: Storage> ProtocolRepository<S> {
         // Delegates to the shared `store_value` helper so the runtime and
         // `scp-identity` produce byte-identical envelopes (spec §17.5).
         Ok(scp_platform::store_value::to_stored_value_bytes(value)?)
+    }
+
+    /// Serializes a value that carries key material into the same
+    /// `StoredValue` envelope bytes as [`Self::serialize`], held in a buffer
+    /// wiped on drop (security model spec §9.15 step 2 and freed heap
+    /// memory).
+    ///
+    /// `T` may be unsized, so a caller holding a `&[u8]` or `&str` secret
+    /// passes it as is instead of copying it into an owned `Vec` or `String`,
+    /// a second copy to wipe; a slice encodes to the same bytes as the
+    /// `Vec` holding it.
+    pub(crate) fn serialize_secret<T: Serialize + ?Sized>(
+        value: &T,
+    ) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        let envelope = scp_platform::store_value::StoredValue {
+            version: scp_platform::store_value::CURRENT_STORE_VERSION,
+            data: value,
+        };
+        rmp_serde::to_vec_named(&envelope)
+            .map(Zeroizing::new)
+            .map_err(|e| StoreError::SerializationFailed(e.to_string()))
     }
 
     /// Deserializes a `StoredValue` envelope from `MessagePack` bytes.
@@ -293,19 +313,16 @@ impl<S: Storage> ProtocolRepository<S> {
     /// Defense-in-depth: prevents sensitive key material from lingering
     /// in memory after the storage write completes. Use this instead of
     /// `store_value` when the serialized data contains cryptographic keys.
-    async fn store_value_zeroize<T: Serialize + Sync>(
+    async fn store_value_zeroize<T: Serialize + Sync + ?Sized>(
         &self,
         key: &str,
         value: &T,
     ) -> Result<(), StoreError> {
-        let mut bytes = Self::serialize(value)?;
-        let result = self
-            .storage
+        let bytes = Self::serialize_secret(value)?;
+        self.storage
             .store(key, &bytes)
             .await
-            .map_err(StoreError::Storage);
-        bytes.zeroize();
-        result
+            .map_err(StoreError::Storage)
     }
 
     /// Loads and deserializes a value from the given key.
@@ -536,6 +553,26 @@ mod tests {
             ProtocolRepository::<scp_platform::in_memory::InMemoryStorage>::deserialize(&bytes)
                 .unwrap();
         assert_eq!(decoded, value);
+    }
+
+    /// A secret passed as a slice (`&[u8]`, `&str`) encodes to exactly the
+    /// bytes its owned copy (`Vec<u8>`, `String`) did, so callers that stopped
+    /// copying the secret into a plain owned value still write and read
+    /// the same stored records.
+    #[test]
+    fn slice_secret_encodes_like_its_owned_copy() {
+        type Repo = ProtocolRepository<scp_platform::in_memory::InMemoryStorage>;
+        let key: Vec<u8> = (0u8..=255).collect();
+        let from_slice = Repo::serialize_secret(key.as_slice()).unwrap();
+        assert_eq!(*from_slice, *Repo::serialize_secret(&key).unwrap());
+        assert_eq!(*from_slice, Repo::serialize(&key).unwrap());
+        let decoded: Vec<u8> = Repo::deserialize(&from_slice).unwrap();
+        assert_eq!(decoded, key);
+
+        let pem =
+            "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIA==\n-----END PRIVATE KEY-----\n";
+        let from_str = Repo::serialize_secret(pem).unwrap();
+        assert_eq!(*from_str, Repo::serialize(&pem.to_owned()).unwrap());
     }
 
     #[test]

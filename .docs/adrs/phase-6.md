@@ -29,13 +29,13 @@ Phase 1-5 ADRs
 
 ## ADR-027: Android Platform Adapter
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-09-27 (SCP-307, the hardware pseudonym secret); 2026-09-27 (the device-attestation binding and the named verifier) — see the amendments below.
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-09-29 (SCP-307, the hardware pseudonym secret); 2026-09-27 (the device-attestation binding and the named verifier) — see the amendments below.
 
 **Amendment (2026-09-10 — every SCP key is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. This ADR's Rationale called hardware-backed Ed25519 at API 33 and above "a direct win over Apple, where Secure Enclave's P-256 limitation forces software key storage". **That paragraph is withdrawn.** The gap it named came from SCP's own curve choice and not from either vendor's hardware: Apple's Secure Enclave performs P-256 operations, Android Keystore has held P-256 keys in the Trusted Execution Environment since API 23, and SCP signed with a curve only one of the two implemented. Under the ruling both adapters hold every SCP signing key in hardware, and ADR-025, the Apple platform adapter, carries the matching amendment. Two further consequences follow for this ADR. The Bouncy Castle software fallback for API levels 26 through 32 has nothing left to fall back from, because Keystore holds a P-256 signing key at every API level this SDK supports; it survives only for key agreement below API 31, which is the first level at which Keystore performs ECDH. And the root member is held by a passkey through the platform's credential provider (`09-security-model.md` §9.7.4.1 item 4), so `AndroidKeyCustody` neither generates nor stores it.
 
-**Amendment (2026-09-27 — SCP-307, the hardware pseudonym secret).** For a Keystore identity key, `pseudonym_secret` is a 256-bit Keystore HMAC-SHA256 key that `generate_keypair` creates beside the identity key, non-exportable and usable without user authentication. The HMAC that yields the §9.10.4 context seed runs inside Keystore: the adapter passes the Keystore key to `Mac.init`, so the secret never enters process memory. Nothing is derived from a signature. The `derivePseudonym` sketch below is superseded on both points: its `// HKDF (software) or TEE-sign (hardware)` comment, and its `SecretKeySpec(pseudonymSecret, ...)`, which would hold the hardware secret as exported bytes. Destroying the identity deletes the secret with it, and a Keystore identity key generated before the secret existed fails pseudonym derivation with `SCP-CRYPTO-4001` (§9.10.4.A).
+**Amendment (2026-09-29 — SCP-307, the hardware pseudonym secret).** For a Keystore identity key, `pseudonym_secret` is a 256-bit Keystore HMAC-SHA256 key that `generate_keypair` creates beside the identity key, non-exportable and usable without user authentication. The HMAC that yields the §9.10.4 context seed runs inside Keystore: the adapter passes the Keystore key to `Mac.init`, so the secret never enters process memory. Nothing is derived from a signature. The `derivePseudonym` sketch below is superseded on four points: its `// HKDF (software) or TEE-sign (hardware)` comment; its `SecretKeySpec(pseudonymSecret, ...)`, which would hold the hardware secret as exported bytes; its `seedToScalar(seed)` call, which names no Kotlin function; and its `PseudonymKeyHandle` return. The adapter turns the seed into the pseudonym point with the UniFFI export `uniffi.scp.p256PseudonymPoint(contextSeed)`, and a Bouncy Castle software identity derives its point with `uniffi.scp.p256SoftwarePseudonymPoint`. `derivePseudonym` returns that 33-byte point and stores no pseudonym key (§9.10.4.A). Destroying the identity deletes the secret before the identity key, so a failed destroy leaves the identity present and a retry deletes both. Derivation confirms that the identity key exists before it uses the secret, and a Keystore identity key generated before the secret existed fails pseudonym derivation with `SCP-CRYPTO-4006` (§9.10.4.A).
 
-**Amendment (2026-09-27 — the Play Integrity request binds the identifier and the context challenge, and the package's verifier vouches for the token).** `09-security-model.md` §9.3.1, reading a device attestation, owns the construction and the reader's procedure, and this ADR carries them into the Android adapter. First, the adapter issues a Standard integrity request whose `requestHash` is the lowercase hexadecimal form of the binding digest, which the Rust core computes and passes as the shipped trait's `challenge`, `D = SHA-256("SCP-DEVICE-ATTESTATION-V1:" ‖ BE32(56) ‖ identifier_text ‖ BE32(n) ‖ context_id ‖ challenge)`, where `identifier_text` is the identifier's `scp:` text form, `context_id` is the UTF-8 bytes of the context's id, and `challenge` is the context's 32-byte `device_attestation_challenge`. That replaces the `Base64(SHA-256(clientDataJSON))` nonce of acceptance criterion 7, which named no identifier. The code block this ADR carried also contradicted its own text: the text names the Standard API, and the code called the Classic API's `IntegrityTokenRequest.builder().setNonce(nonce)`. The code block below now calls the Standard API. Second, no peer can decode a Standard token, because Google decodes one only for the Cloud project linked to the requesting app. The verifier for a package is therefore the party whose Cloud project Google links to it, in practice the app's developer, and a context that weights Play Integrity lists each accepted package with its signing-certificate digest and that verifier's identifier in `ContextSybilPolicy.accepted_android_packages`, which governance sets. The verifier publishes a `PlayIntegrityVerifier` entry in its own service record carrying the package name, its Cloud project number and an HTTPS URL, and the owner sends the token to that URL in one HTTPS `POST` whose JSON request and response §9.3.1 defines byte for byte. The verifier decodes the token, checks `requestHash`, that `requestPackageName` and `appIntegrity.packageName` equal the request's package name, `PLAY_RECOGNIZED`, a single `certificateSha256Digest`, and `MEETS_DEVICE_INTEGRITY`, and signs a verdict under `"SCP-PLAY-INTEGRITY-VERDICT-V1:"` that carries the package name's SHA-256 and the signing certificate's digest. Each reader checks that pair against the context's `accepted_android_packages`. The SDK publishes the token and the verdict together in one `ScpDeviceAttestation` service-record entry, and a reader that cannot verify the verdict returns `Unverifiable` and counts no signal. Third, the assertion path carries the assertion digest `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` and no longer routes through `attest` with an empty device ID, so no assertion token's `requestHash` equals the hexadecimal form of a `D`. Fourth, the SDK builds the adapter for each call with the Cloud project number the verifier's `PlayIntegrityVerifier` entry carries, because the verifier can decode no token requested under another project, and a reader's `Verified` for a Play Integrity entry is trust in that verifier and no platform proof it checks. The context accepts or changes a package's verifier only by a governance action its event log records. The shipped `AndroidDeviceAttestation` still builds the JSON document; story SCP-111 of `.docs/prds/main.json` stands in progress until it changes, and story SCP-316 implements the reader.
+**Amendment (2026-09-27 — the Play Integrity request binds the identifier and the context challenge, and the package's verifier vouches for the token).** `09-security-model.md` §9.3.1, reading a device attestation, owns the construction and the reader's procedure, and this ADR carries them into the Android adapter. First, the adapter issues a Standard integrity request whose `requestHash` is the lowercase hexadecimal form of the binding digest, which the Rust core computes and passes as the shipped trait's `challenge`, `D = SHA-256("SCP-DEVICE-ATTESTATION-V1:" ‖ BE32(56) ‖ identifier_text ‖ BE32(n) ‖ context_id ‖ challenge)`, where `identifier_text` is the identifier's `scp:` text form, `context_id` is the UTF-8 bytes of the context's id, and `challenge` is the context's 32-byte `device_attestation_challenge`. That replaces the `Base64(SHA-256(clientDataJSON))` nonce of acceptance criterion 7, which named no identifier. The code block this ADR carried also contradicted its own text: the text names the Standard API, and the code called the Classic API's `IntegrityTokenRequest.builder().setNonce(nonce)`. The code block below now calls the Standard API. Second, no peer can decode a Standard token, because Google decodes one only for the Cloud project linked to the requesting app. The verifier for a package is therefore the party whose Cloud project Google links to it, in practice the app's developer, and a context that weights Play Integrity lists each accepted package with its signing-certificate digest and that verifier's identifier in `ContextSybilPolicy.accepted_android_packages`, which governance sets. The verifier publishes a `PlayIntegrityVerifier` entry in its own service record carrying the package name, its Cloud project number and an HTTPS URL, and the owner sends the token to that URL in one HTTPS `POST` whose JSON request and response §9.3.1 defines byte for byte. The verifier decodes the token, checks `requestHash`, that `requestPackageName` and `appIntegrity.packageName` equal the request's package name, `PLAY_RECOGNIZED`, a single `certificateSha256Digest`, and `MEETS_DEVICE_INTEGRITY`, and signs a verdict under `"SCP-PLAY-INTEGRITY-VERDICT-V1:"` that carries the package name's SHA-256 and the signing certificate's digest. Each reader checks that pair against the context's `accepted_android_packages`. The SDK publishes the token and the verdict together in one `ScpDeviceAttestation` service-record entry, and a reader that cannot verify the verdict returns `Unverifiable` and counts no signal. Third, the assertion path carries the assertion digest `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` and no longer routes through `attest` with an empty device ID, so no assertion token's `requestHash` equals the hexadecimal form of a `D`. Fourth, the SDK builds the adapter for each call with the Cloud project number the verifier's `PlayIntegrityVerifier` entry carries, because the verifier can decode no token requested under another project, and a reader's `Verified` for a Play Integrity entry is trust in that verifier and no platform proof it checks. The context accepts or changes a package's verifier only by a governance action its event log records. The shipped `AndroidDeviceAttestation` still builds the JSON document; story SCP-111 of `.docs/prds/main.json` stands in progress until it changes, and story SCP-316, still pending, specifies the reader, and no code verifies a device attestation yet.
 
 ### Context
 
@@ -449,7 +449,7 @@ dependencies {
 2. **`AndroidKeyCustody.sign(keyHandle, data)`:**
    - Retrieves `PrivateKeyEntry` from `AndroidKeyStore`, calls `Signature.getInstance("SHA256withECDSA")`, converts the DER output to the 64-byte raw `r || s` form of `09-security-model.md` §9.5, and normalizes `s` into the low half of the group order.
    - Rejects a request to sign under an agreement-only handle with `PlatformError.wrongKeyType`.
-   - Returns `ScpException("SCP-CRYPTO-4001")` if handle not found.
+   - Returns `ScpException("SCP-CRYPTO-4006")` if handle not found.
 
 3. **`AndroidKeyCustody.publicKey(keyHandle)`:**
    - Extracts the P-256 public point from the Keystore certificate and returns the 33-byte SEC1 compressed encoding of `09-security-model.md` §9.5.
@@ -457,7 +457,7 @@ dependencies {
 4. **`AndroidKeyCustody.destroyKey(keyHandle)`:**
    - For hardware handles: calls `KeyStore.deleteEntry("scp.key.${id}")`.
    - For software handles: removes from in-memory map.
-   - Key destruction is verifiable: subsequent `sign()` or `publicKey()` calls return `ScpException("SCP-CRYPTO-4001")`.
+   - Key destruction is verifiable: subsequent `sign()` or `publicKey()` calls return `ScpException("SCP-CRYPTO-4006")`.
 
 5. **`AndroidKeyCustody.dhAgree(keyHandle, peerPublic)`:**
    - Performs P-256 ECDH in `AndroidKeyStore` at API 31+ and through Bouncy Castle below it. Returns the 32-byte x-coordinate of the agreed point.
@@ -465,7 +465,7 @@ dependencies {
 
 6. **`AndroidKeyCustody.derivePseudonym(keyHandle, contextId)`:**
    - Computes `HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`. Derives a P-256 keypair from the first 32 bytes through the seed-to-scalar step of §9.10.4 of the security-model spec.
-   - Returns `PseudonymKeyHandle` with `custodyType = CustodyType.SOFTWARE` (the derived pseudonym keypair is always software-managed, even for a hardware identity key).
+   - Returns the 33-byte compressed pseudonym point (amended 2026-09-29, SCP-307: no pseudonym key or handle exists).
    - **pseudonym_secret definition (IMPORTANT):** The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key — public key bytes are public and would be a membership-enumeration oracle (§9.10.4.A). For a **software** key (Bouncy Castle), `pseudonym_secret = HKDF-SHA256(p256_private_scalar, salt="scp-pseudonym-secret-v1", info="", len=32)`, byte-identical to Rust `derive_pseudonym_secret()`, so software pseudonyms are cross-platform deterministic (pinned by §25.19 vectors). For **hardware** keys (Keystore TEE), private key bytes are non-exportable, so `pseudonym_secret` is an associated 32-byte symmetric key generated inside the TEE at `generate_keypair` — a device-local secret, never `SHA-256` over a signature, because an ECDSA hardware signer draws its own nonce and would yield a different secret on every call (§9.5 of the security-model spec). **Hardware pseudonyms are device-local by design** and are intentionally NOT identical across devices or to the software vectors; cross-device pseudonym identity is not a protocol requirement, since the TEE key never leaves the device. This matches ADR-006 acceptance criterion 6 (§9.10.4.A).
 
 7. **`AndroidDeviceAttestation.attest(challenge, deviceId)`:**
@@ -541,7 +541,7 @@ bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/ 
 
 The UniFFI bridge (ADR-021) generates raw Kotlin bindings from the Rust protocol engine. While functional, the generated surface is not idiomatic Kotlin — it lacks coroutine suspension, `Flow<T>` streams, Android lifecycle awareness, Jetpack Compose integration, and the ergonomic patterns Kotlin developers expect. The Android platform adapter (ADR-027) provides the `KeyCustody`, `PushProvider`, `Storage`, and `DeviceAttestationProvider` implementations injected into the Rust engine via UniFFI callback interfaces.
 
-The Kotlin SDK ergonomics layer wraps the generated bindings to produce an idiomatic Kotlin API that feels native to the platform: `suspend` functions throughout, `Flow<Message>` for streaming, `LifecycleOwner`-aware cleanup, `@Composable`-ready state holders, and `AutoCloseable` resource management. The ergonomics layer is pure Kotlin — zero protocol logic, zero duplication of Rust behavior. This mirrors the ADR-014 (Python SDK) and ADR-026 (Swift SDK) pattern: flat FFI bridge → idiomatic language wrapper.
+The Kotlin SDK ergonomics layer wraps the generated bindings to produce an idiomatic Kotlin API that feels native to the platform: `suspend` functions throughout, `Flow<Message>` for streaming, `LifecycleOwner`-aware cleanup, `@Composable`-ready state holders, and one `suspend` teardown per resource with no `AutoCloseable` (amended; see the `AutoCloseable` bullet under Rationale). The ergonomics layer is pure Kotlin — zero protocol logic, zero duplication of Rust behavior. This mirrors the ADR-014 (Python SDK) and ADR-026 (Swift SDK) pattern: flat FFI bridge → idiomatic language wrapper.
 
 Kotlin 2.x with JVM 11+ is the baseline. The SDK targets both Android (API 26+) and JVM (server-side, tests). Android-specific lifecycle integration is opt-in — the core SDK runs on any JVM without Android dependencies.
 
@@ -569,12 +569,13 @@ Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/
 **Android lifecycle integration:**
 - Android lifecycle integration is implemented via an extension function `Context.asFlow(lifecycleOwner: LifecycleOwner): Flow<Message>` in a separate `scp-kt-android` artifact. This artifact depends on `androidx.lifecycle:lifecycle-runtime-ktx` — a dependency the core SDK does not take on, keeping the JVM artifact Android-free.
 - The extension launches collection in `lifecycleOwner.lifecycleScope` and cancels when the `LifecycleOwner` reaches `DESTROYED`. This prevents resource leaks when an `Activity` or `Fragment` is destroyed while a context subscription is live.
-- `ViewModel`-based usage is the recommended pattern: create `Scp` and `Context` in a `ViewModel`, expose `Flow<Message>` as a `StateFlow<List<Message>>` using `stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())`. The `ViewModel.onCleared()` override calls `context.close()`.
+- `ViewModel`-based usage is the recommended pattern: hold the `SCP` instance and its context handles in a `ViewModel` that extends `ScpViewModel` (amended: ADR-048 removed `Context` from the Kotlin surface), expose `Flow<Message>` as a `StateFlow<List<Message>>` using `stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())`. The `ViewModel.onCleared()` override launches `leave` for every tracked context, and then the held `SCP` instance's `shutdown`, on a scope it never cancels and returns without waiting (amended: `viewModelScope` is already cancelled when `onCleared()` runs, and blocking `onCleared()` on a teardown deadlocks or risks an ANR; see the `AutoCloseable` bullet under Rationale).
 
 **Jetpack Compose integration:**
-- No Compose-specific artifacts or dependencies in the SDK. Compose integration is achieved through standard Kotlin patterns the SDK already provides: `Flow<Message>` collected via `collectAsState()`, and `AutoCloseable` resources managed in `remember { }` blocks with `DisposableEffect` for cleanup.
-- Recommended pattern: `val messages by context.receiveFlow().collectAsState(initial = emptyList())`.
-- Context lifecycle in Compose: `DisposableEffect(contextId) { onDispose { context.close() } }` ensures the context is closed when the composable leaves the composition.
+- The core artifact `works.limn:scp-kt` takes no Compose dependency. `works.limn:scp-kt-android` carries the Compose state holders (SCP-118), and they build on standard Kotlin patterns the SDK already provides: `Flow<Message>` collected via `collectAsState()`, and resources held in `remember { }` blocks whose `DisposableEffect` `onDispose` launches their `suspend` teardown on a scope that disposal never cancels, then returns (amended; see the `AutoCloseable` bullet under Rationale).
+- Recommended pattern: collect a context's messages through `rememberIncomingMessages(hotStreams, contextHandle)` over an `ScpHotStreams`, as the next bullet and the Compose sketch under Implementation show (amended: ADR-048 removed `Context` and its `receiveFlow()` from the Kotlin surface).
+- Hot streams shared across composables (amended): `works.limn:scp-kt-android` exposes hot streams through three public entry points. `ScpHotStreams(bindings, scope, ioDispatcher)` constructs its own `HotStreamFactory` over `bindings` on `ioDispatcher`, which defaults to `Dispatchers.IO`, and its own coordinator on `scope`, and exposes neither. `rememberContextEvents(hotStreams, contextHandle)` and `rememberIncomingMessages(hotStreams, contextHandle)` key each subscription by stream kind and context handle, so no caller chooses a key. An application container, or a ViewModel that every navigation destination shares, holds one `ScpHotStreams` and passes it to every composable that shows a context's streams, so every screen showing one context's stream shares one Rust subscription. The coordinator counts live mounts per key and, when the last mount under a key leaves, releases that subscription on `scope` without blocking `onDispose`; it logs a release that throws instead of propagating it (`.docs/standards/sdk-common.md` §Cleanup error handling). Once every composable that passed an `ScpHotStreams` has left composition, its owner calls that instance's suspend `close()` and then cancels `scope`. `close()` refuses every later start, waits for each running start and for each stop launched before it reached that stop's key, and then calls `HotStreamFactory.stopAll()`, which attempts every release it still holds and logs each failure, so a subscription whose stop a cancelled `scope` skipped, or whose stop `close()` did not wait for, is released too. `close()` runs under `NonCancellable`, so an owner may call it from a cancelled coroutine. The KDoc of `ScpHotStreamCoordinator` in `compose/StateHolders.kt` states which `onStop` lambdas the coordinator drops and how it orders stops, and `.docs/lessons/kotlin/hot-stream-subscription-ownership.md` records the defects this shape prevents.
+- Context lifecycle in Compose: `rememberScpContext(contextHandle, identityHandle) { ctxH, idH -> teardownScope.launch { runCatching { bridge.context.leave(ctxH, idH) }.onFailure { Log.w(TAG, "leave failed after disposal", it) } } }`. When the composable leaves the composition, `ScpContextHolder.dispose()` cancels the holder's scope and then calls that callback, which launches `leave` on `teardownScope`. `teardownScope` outlives the composable and disposal never cancels it, so `onDispose` never blocks the composition thread (amended; see the `AutoCloseable` bullet under Rationale). The launched block logs a `leave` failure instead of throwing it, because an exception escaping a root launch reaches the thread's uncaught-exception handler, which on Android kills the process (`.docs/standards/sdk-common.md` §Cleanup error handling).
 
 **Maven Central publishing:**
 - Published as `works.limn:scp-kt` on Maven Central.
@@ -589,7 +590,17 @@ Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/
 - **`Dispatchers.IO` for all FFI calls:** The UniFFI-generated bindings call into native Rust code via JNA. JNA calls are blocking — they block the calling thread until the Rust function returns. Kotlin's `Dispatchers.IO` is designed for exactly this: a thread pool that accepts blocking calls without starving the coroutine scheduler. Calling FFI on `Dispatchers.Default` (the CPU thread pool) would starve cooperative tasks; calling on `Dispatchers.Main` would block the UI thread. `Dispatchers.IO` is the one correct choice.
 - **`callbackFlow` over raw `Channel` or `StateFlow`:** Message streaming from the Rust engine is callback-driven: the UniFFI callback interface calls `onMessage()` from a Rust thread. `callbackFlow` is the idiomatic Kotlin bridge from callback APIs to `Flow`. It handles back-pressure via channel buffering, propagates cancellation by calling `awaitClose`, and integrates with structured concurrency automatically. `StateFlow` would only expose the latest message (wrong semantics). A raw `Channel` exposed as public API would force callers to manage collection manually (wrong ergonomics).
 - **Lifecycle-in-extension-artifact, not in core:** Android lifecycle (`LifecycleOwner`, `lifecycleScope`) is an Android-only API. Taking this dependency in the core SDK would force JVM targets (server-side, tests) to depend on Android-specific artifacts. Separating it into `scp-kt-android` keeps the core SDK usable on any JVM and keeps the Android extension small and focused.
-- **`AutoCloseable` + explicit `close()` for resource management:** Kotlin/JVM resource management follows the `AutoCloseable` / `use { }` pattern. `Context` implements `AutoCloseable` so callers can use `context.use { }` blocks for automatic cleanup. The explicit `close()` suspend function performs graceful teardown (leave the MLS group, flush the event log, cancel the flow). `AutoCloseable.close()` is the synchronous safety net — it launches a `close()` coroutine and cancels the internal scope. This matches the `deinit` + `close()` pattern in the Swift SDK.
+- **One suspending teardown, and no `AutoCloseable`, for each hand-written type whose teardown crosses the FFI boundary (amended; see below):** Kotlin/JVM resource management follows the `AutoCloseable` / `use { }` pattern, and this ADR originally applied it to `Context`: `context.use { }` for automatic cleanup, with `AutoCloseable.close()` as a synchronous safety net that launched a `close()` coroutine and cancelled the internal scope, matching the `deinit` + `close()` pattern in the Swift SDK. **That rule no longer holds, for the reason stated in the amendment below.** `SCP`, `Relay`, `Node`, and `ScpHotStreams` expose their teardown as one `suspend` function and implement no `AutoCloseable`. The classes UniFFI generates, such as `Scp`, keep the synchronous `close()` UniFFI gives them.
+
+  **Amendment (this ADR stays Decided; this bullet supersedes the rule above).** `AutoCloseable.close()` is synchronous, and `use { }` treats its return as the end of the teardown, so a `close()` whose teardown reaches the Rust engine can keep that promise only by blocking its calling thread. A lifecycle callback that cannot suspend, `ScpViewModel.onCleared()` or the `onDispose` callback a composable passes to `rememberScpContext`, promises no finished teardown, so it launches the `suspend` teardown on a scope that outlives it and returns. `SCP.shutdown(bridge, timeout)` suspends on its bridge's injected `ioDispatcher` through `CoroutineBridge.ffiCallSuspend`, and reaches the Rust engine through the UniFFI-generated `Scp` object. Five other teardowns suspend the same way, but no production class implements the bindings interface each one calls, so today each reaches only a test source set's stub and never the Rust engine: a subscription flow's release, when its collector cancels, runs `withContext` on that dispatcher over `ContextBindings` or `EventContextBindings`; `ScpViewModel`'s `leave` runs through `CoroutineBridge.context` over `ContextBindings`; `Relay.shutdown()` and `Node.shutdown()` run through `CoroutineBridge.ffiCall` over `ServerBindings` (`.docs/standards/sdk-capability-matrix.json` marks every Server operation `"kotlin": false`); and `ScpHotStreams.close()` releases every subscription its `HotStreamFactory` still holds through `HotStreamFactory.stopAll()`, on that factory's injected dispatcher, over `EventContextBindings`. Blocking a caller on a teardown that suspends on an injected `ioDispatcher` fails in two ways:
+  - A caller that injects a `StandardTestDispatcher` parks the one thread that advances that dispatcher's scheduler, so the work the `close()` waits for can never run and `close()` never returns. This repository observed it, as a hang in `ScpViewModel.onCleared()`'s tests.
+  - An Android caller blocks a main thread, which risks an ANR.
+
+  A bounded wait does not rescue the pattern: it still blocks a calling thread, and blocking an Android main thread up to a timeout risks an ANR, so it trades a deadlock for an ANR rather than removing a blocking wait. `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records the observed deadlock and the ANR risk.
+
+  `Context`, the type the superseded rule named, no longer exists on the Kotlin surface — ADR-048 replaced the free-function façade and its `Context` type with per-instance methods on `SCP`. `SCP.shutdown(bridge, timeout)` is `suspend` and takes a `CoroutineBridge`, so a synchronous `close()` could neither obtain that bridge nor honour that deadline. `Relay` and `Node` follow the same rule, so that their teardown already suspends when a production `ServerBindings` implementation lands.
+
+  This changes what a caller writes. The lifecycle invariant in `.docs/standards/sdk-common.md` §Lifecycle invariant (leave contexts, destroy key material, close transports, flush events) is unchanged, and a caller reaches it from a coroutine rather than from a `use { }` block. Each of the three `shutdown` functions sets its shutdown flag inside its bridge call, once its teardown call returns, so a teardown call that throws leaves the object reading as live, and a cancellation the bridge raises after a finished teardown leaves it reading as shut down. `.docs/standards/sdk-common.md` §Resource Lifecycle carries the same rule in its per-language table, and §"Kotlin: why no `Closeable`" states why.
 - **No Compose dependencies in SDK:** Compose APIs (`@Composable`, `State<T>`, `collectAsState()`) require the Compose compiler plugin and runtime. Shipping a Compose dependency in the SDK would force every consumer to adopt Compose or deal with unused transitive dependencies. Compose integration is trivially achieved with standard `Flow.collectAsState()` and `DisposableEffect` — patterns that are Compose-idiomatic without SDK involvement.
 - **`Scp` class (not object/singleton) as top-level entry point:** `Scp` holds per-identity state (the identity handle, the platform adapter). Multiple `Scp` instances in a process are valid (e.g., in tests, or in apps that support account switching). A Kotlin `object` singleton would prevent this. The factory pattern `Scp.create()` is a `companion object` method — idiomatic for async factory construction in Kotlin.
 - **Kotlin 2.x, JVM 11+:** Kotlin 2.x is the current stable release with full coroutines support, improved type inference, and the K2 compiler. JVM 11 is required by Android Gradle Plugin 8+ and covers all modern JVM targets. JVM 11 features (e.g., `List.of()`, `String.isBlank()`) are available; no Java 8 compatibility mode needed.
@@ -684,7 +695,7 @@ tasks.test {
 }
 ```
 
-**`SCP.kt` — top-level entry point:**
+**`SCP.kt` — top-level entry point:** (amended: this sketch's `AutoCloseable` and synchronous `close()` are superseded by the `AutoCloseable` bullet under Rationale)
 
 ```kotlin
 /**
@@ -786,7 +797,7 @@ data class ResolutionOutcome(
 }
 ```
 
-**`Context.kt`:**
+**`Context.kt`:** (amended: this sketch's `AutoCloseable`, its synchronous `close()`, and the release in `awaitClose`'s lambda are superseded by the `AutoCloseable` bullet under Rationale)
 
 ```kotlin
 /**
@@ -988,49 +999,138 @@ fun Context.asLifecycleFlow(
 // ScpViewModel.kt — in works.limn.scp.android package
 
 /**
- * Base ViewModel that manages Scp and Context lifecycle.
- * Extend this to get automatic cleanup when the ViewModel is cleared.
+ * Base ViewModel that leaves every tracked context and shuts down the SCP instance it holds
+ * in scpInstance when the ViewModel is cleared.
  */
 abstract class ScpViewModel : ViewModel() {
 
-    protected var scpInstance: Scp? = null
-    private val activeContexts = mutableListOf<works.limn.scp.Context>()
+    // Set by the subclass, so the constructor keeps zero arguments: a Java subclass calls
+    // super(). scpInstance is the SCP instance onCleared() shuts down; scpBridge is the
+    // bridge its shutdown runs on.
+    protected var scpInstance: SCP? = null
+    protected var scpBridge: CoroutineBridge? = null
 
-    protected fun trackContext(context: works.limn.scp.Context): works.limn.scp.Context {
-        activeContexts.add(context)
+    private val contextsLock = Any()
+    private val activeContexts = mutableListOf<TrackedContext>()
+    private var cleared = false // written and read only under contextsLock
+
+    // viewModelScope is already cancelled when onCleared() runs, so a launch there never
+    // runs. Cleanup gets its own scope, which nothing cancels.
+    private val cleanupJob = SupervisorJob()
+    private val cleanupScope = CoroutineScope(cleanupJob + Dispatchers.Unconfined)
+
+    // Serializes onCleanupFailure across onCleared()'s cleanup coroutine and each coroutine a
+    // post-clear trackContext launches; a Mutex suspends a waiter instead of blocking its thread.
+    private val cleanupFailureLock = Mutex()
+
+    // A context tracked after onCleared() is left at once: Android clears a ViewModel once,
+    // so nothing else would ever leave it.
+    fun trackContext(context: TrackedContext): TrackedContext {
+        val alreadyCleared = synchronized(contextsLock) {
+            if (!cleared) activeContexts.add(context)
+            cleared
+        }
+        if (alreadyCleared) launchLeave(listOf(context))
         return context
     }
 
     override fun onCleared() {
         super.onCleared()
-        viewModelScope.launch {
-            activeContexts.forEach { runCatching { it.leave() } }
-            activeContexts.clear()
-            scpInstance?.close()
-            scpInstance = null
+        val contexts = synchronized(contextsLock) {
+            cleared = true
+            activeContexts.toList().also { activeContexts.clear() }
         }
+        // Dispatch and return: blocking the main thread on a teardown deadlocks or
+        // risks an ANR (see the amended Rationale bullet).
+        launchLeave(contexts, shutdownAfter = true)
+    }
+
+    private fun launchLeave(
+        contexts: List<TrackedContext>,
+        shutdownAfter: Boolean = false,
+    ) {
+        // UNDISPATCHED runs the coroutine on the calling thread up to its first suspension. A
+        // default start, from a caller already inside a Dispatchers.Unconfined coroutine (a
+        // retry from onCleanupFailure), would queue it until that caller suspends, and an
+        // inline bridge's leave would then run after trackContext returns.
+        cleanupScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            for (ctx in contexts) {
+                val failure = runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
+                    .exceptionOrNull() ?: continue
+                // A throwing override must not stop the remaining leaves.
+                cleanupFailureLock.withLock { runCatching { onCleanupFailure(ctx, failure) } }
+                    .onFailure { Log.w("ScpViewModel", "onCleanupFailure threw", it) }
+            }
+            val scp = scpInstance
+            val bridge = scpBridge
+            if (shutdownAfter && scp != null && bridge != null) {
+                // A leave needs the engine that shutdown stops, so shutdown waits for every
+                // other cleanup coroutine: a post-clear trackContext's leave, and a retry an
+                // onCleanupFailure override launched through trackContext. A leave launched
+                // while this loop waits is joined too; one launched after it ends is not.
+                val self = coroutineContext.job
+                while (true) {
+                    val others = cleanupJob.children.filter { it !== self }.toList()
+                    if (others.isEmpty()) break
+                    others.joinAll()
+                }
+                runCatching { scp.shutdown(bridge) }
+                    .onFailure { Log.w("ScpViewModel", "SCP shutdown failed during ViewModel cleanup", it) }
+            }
+        }
+    }
+
+    /**
+     * Called once per context whose leave() threw, with whatever it threw. The default body
+     * logs at warning level (sdk-common.md §Cleanup error handling); an app overrides it to
+     * record, retry, or report a departure that did not land.
+     */
+    protected open fun onCleanupFailure(context: TrackedContext, cause: Throwable) {
+        Log.w("ScpViewModel", "leave failed during ViewModel cleanup", cause)
     }
 }
 ```
 
-**Jetpack Compose integration pattern (no SDK changes required):**
+**Jetpack Compose integration pattern (`works.limn:scp-kt-android` state holders):**
 
 ```kotlin
-// In a composable — no SDK modifications needed; uses standard Flow + Compose APIs
+// In a composable — scp-kt-android's state holders over standard Flow + Compose APIs
 
+// The app's ViewModel owns the scope that leave runs on; nothing cancels that scope.
+class MyContextViewModel : ScpViewModel() {
+    val teardownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+}
+
+// The app container builds one ScpHotStreams, on a scope it never cancels, and passes it to
+// every screen, so every screen showing one context's stream shares one Rust subscription.
+// An owner that does cancel that scope first calls hotStreams.close() from a coroutine, once
+// every screen that passed it has left composition.
 @Composable
-fun ContextScreen(contextId: String) {
+fun ContextScreen(
+    contextHandle: Long,
+    identityHandle: Long,
+    bridge: CoroutineBridge,
+    hotStreams: ScpHotStreams,
+) {
     val viewModel: MyContextViewModel = viewModel()
-    val context = remember(contextId) { viewModel.getContext(contextId) }
 
-    // Collect the Flow as Compose State
-    val messages by context.receiveFlow()
-        .collectAsStateWithLifecycle(initialValue = emptyList<Message>())
-
-    // Cleanup when the composable leaves composition
-    DisposableEffect(contextId) {
-        onDispose { context.close() }
+    // Leaving composition cancels the holder's scope, then launches leave on a scope that
+    // outlives this composable, so onDispose returns without blocking.
+    rememberScpContext(contextHandle, identityHandle) { ctxH, idH ->
+        viewModel.teardownScope.launch {
+            // A leave failure is logged, never thrown: an exception escaping this launch reaches
+            // the thread's uncaught-exception handler, which on Android kills the process.
+            runCatching { bridge.context.leave(ctxH, idH) }
+                .onFailure { Log.w("MyContextScreen", "leave failed after disposal", it) }
+        }
     }
+
+    // Released when the last screen collecting this context's incoming messages through
+    // hotStreams leaves.
+    val incoming by rememberIncomingMessages(hotStreams, contextHandle)
+    // rememberScpEventList keeps the newest 100 messages and discards its list when its flow
+    // changes, so a new contextHandle starts an empty list instead of appending to the old one.
+    val messages = incoming?.let { rememberScpEventList(it).value }.orEmpty()
 
     LazyColumn {
         items(messages) { message ->
@@ -1117,17 +1217,17 @@ dependencies {
 - **ADR-021 (UniFFI Bridge):** The Kotlin SDK wraps the UniFFI-generated `NativeLib.kt`. Every SDK public method calls exactly one UniFFI bridge function. The bridge defines the flat function surface (`identityCreate`, `contextCreate`, etc.), opaque object handles (`IdentityHandle`, `ContextHandle`), value records (`ScpMessage`, `ContextParams`), the `ScpError` sealed class, and the `MessageListener` callback interface.
 - **ADR-027 (Android Platform Adapter):** The `AndroidPlatformAdapter` (implemented in ADR-027) is instantiated by `Scp.create(custody = "platform", platformAdapter = AndroidPlatformAdapter.make(context))` and injected into the Rust engine via UniFFI callback interfaces. The Kotlin SDK `Scp.create()` factory accepts a `PlatformAdapter` parameter; ADR-027 provides the Android-specific implementation.
 - **ADR-006 (Platform Abstraction):** Platform trait definitions (`KeyCustody`, `PushProvider`, `Storage`, `DeviceAttestationProvider`) shape the UniFFI callback interface contracts that the Kotlin platform adapter implements.
-- **ADR-026 (Swift SDK):** Parallel reference. Same flat delegation pattern, same "no logic in the wrapper layer" principle, same FFI bridge → idiomatic language wrapper architecture. Key differences: Kotlin uses `suspend` functions and `Flow<Message>` where Swift uses `async/await` and `AsyncStream<Message>`; Kotlin uses `AutoCloseable` + `close()` where Swift uses `deinit` + `close()`; Kotlin uses `@Observable`-equivalent via `StateFlow` where Swift uses `@Observable` macro.
+- **ADR-026 (Swift SDK):** Parallel reference. Same flat delegation pattern, same "no logic in the wrapper layer" principle, same FFI bridge → idiomatic language wrapper architecture. Key differences: Kotlin uses `suspend` functions and `Flow<Message>` where Swift uses `async/await` and `AsyncStream<Message>`; Kotlin uses one `suspend` teardown and no `AutoCloseable` (amended; see Rationale) where Swift uses `deinit` + `close()`; Kotlin uses `@Observable`-equivalent via `StateFlow` where Swift uses `@Observable` macro.
 - **ADR-014 (Python SDK) / ADR-013 (PyO3 Bridge):** The ergonomics layer pattern — flat FFI bridge → idiomatic language wrapper — is established here and applied to Kotlin. Kotlin SDK mirrors the structural choices (no logic in the wrapper layer, delegation only) and the type category decisions (opaque handles for crypto state, data classes for data).
-- **ADR-022 (TypeScript SDK):** Parallel patterns: `Flow<Message>` (Kotlin) mirrors `AsyncIterable<Message>` (TypeScript); `AutoCloseable.close()` (Kotlin) mirrors `Symbol.asyncDispose` (TypeScript). Conformance test suite is shared.
+- **ADR-022 (TypeScript SDK):** Parallel patterns: `Flow<Message>` (Kotlin) mirrors `AsyncIterable<Message>` (TypeScript); the `suspend` teardown (Kotlin) mirrors `Symbol.asyncDispose` (TypeScript). Conformance test suite is shared.
 
 ### Acceptance Criteria
 
 1. **Module builds for all JVM targets:**
 
    ```bash
-   ./gradlew build
-   ./gradlew test
+   ./gradlew build -Pscp.uniffi.cargoFeatures=testing
+   ./gradlew test -Pscp.uniffi.cargoFeatures=testing
    ```
 
    Both commands exit 0. Zero ktlint violations. Zero detekt findings.
@@ -1156,7 +1256,8 @@ dependencies {
    - `context.send(payload)` delivers an encrypted message (no throw for valid payload and active state).
    - `context.leave()` completes without throwing for a valid active context.
    - After `close()`, `send()` throws `ContextException` with code `"SCP-CTX-2001"`.
-   - `context.use { }` block calls `AutoCloseable.close()` on exit — verified by collecting the flow and asserting it completes after the block exits.
+   - A `Relay.shutdown()` or `Node.shutdown()` whose `ServerBindings` teardown call throws (in `ServerTest`, the test source set's `StubServerBindings`, the only implementer) leaves `isShutdown` false, and one whose caller is cancelled after a finished teardown leaves `isShutdown` true — verified by `ServerTest`. `SCP.shutdown` meets the same two conditions for its internal `isShutdown` flag, verified by `ScpShutdownTest`.
+   - `SCP.shutdown(bridge, timeout)`, `Relay.shutdown()`, and `Node.shutdown()` are `suspend` functions, and none of `SCP`, `Relay`, or `Node` implements `AutoCloseable` (amended; see Rationale).
 
 5. **Message streaming via `Flow<Message>`:**
 
@@ -1178,7 +1279,7 @@ dependencies {
    ```
 
 6. **Dispatcher isolation:**
-   - All `withContext(Dispatchers.IO)` wraps are present on every FFI-calling method. Verified by running all suspend functions from a `Dispatchers.Main`-confined test coroutine and confirming no `BlockingThreadException` is thrown.
+   - SDK code that dispatches a blocking FFI call or a subscription release through `withContext` runs it on an injected `ioDispatcher` that defaults to `Dispatchers.IO` — verified by `ScpHotStreamRemountTest`'s `ScpHotStreams subscribes and releases on its injected dispatcher`, in `scp-kt-android`'s `compose/StateHoldersTest.kt`. It builds an `ScpHotStreams` on a `StandardTestDispatcher` and checks that the event-stream subscribe and unsubscribe of the `HotStreamFactory` that instance constructs run only when that dispatcher runs them, on the thread that advances its scheduler.
    - `receiveFlow()` does not block the calling thread — verified by calling it from a single-threaded test dispatcher and confirming the call returns immediately.
 
 7. **`ScpException` hierarchy:**
@@ -1221,11 +1322,14 @@ dependencies {
 11. **Android lifecycle integration (scp-kt-android):**
     - `context.asLifecycleFlow(lifecycleOwner)` returns a `Flow<Message>` that cancels when the `LifecycleOwner` reaches `DESTROYED`.
     - Verified by creating a `TestLifecycleOwner`, collecting the flow in a test coroutine, moving the owner to `DESTROYED`, and asserting the flow completes.
-    - `ScpViewModel.onCleared()` calls `leave()` on all tracked contexts and `close()` on the `Scp` instance.
+    - `ScpViewModel.onCleared()` launches `leave()` for every tracked context on a scope it never cancels and returns without waiting for those calls (amended; see Rationale). A `leave()` that throws, whatever it throws, does not stop the remaining calls: each throwable goes to `ScpViewModel.onCleanupFailure(context, cause)`, a `protected open` hook whose default body logs at warning level, and a throw from an override is logged and does not stop them either. `onCleanupFailure` calls never overlap: a `Mutex` serializes them across `onCleared()`'s cleanup coroutine and each coroutine that a `trackContext` call after clear launches. An override may therefore update unsynchronized state, although successive calls can run on different threads. ScpViewModelTest verifies the serialization in `onCleanupFailure calls from parallel cleanup coroutines never overlap`. A waiting coroutine suspends rather than blocking its thread: `an inline-bridge failure waits for a running onCleanupFailure and runs on its thread` fails under a blocking lock, because `trackContext` would block the test thread before the running call is released. Each cleanup coroutine starts undispatched on the thread that calls `onCleared()` or `trackContext`, so when `trackContext` leaves a context over a bridge whose I/O dispatcher runs inline, such as `Dispatchers.Unconfined`, that `leave` and its `onCleanupFailure` call run on the calling thread before `trackContext` returns, unless another cleanup coroutine holds the lock; the waiting call then runs later, on the thread that releases it. `an inline leave retried from onCleanupFailure runs before trackContext returns` fails under a default start, which queues a retry launched from inside an unconfined cleanup coroutine until the retrying override returns. `onCleared()` also shuts down the `SCP` instance the ViewModel holds in `scpInstance`, when the subclass has set `scpInstance` and `scpBridge`, on its own cleanup coroutine, after its own `leave()` calls, once no other cleanup coroutine is running. It waits for each coroutine that a `trackContext` call after clear launched, including a retry that an `onCleanupFailure` override launched through `trackContext`. A cleanup coroutine launched after the shutdown starts is not ordered before it.
 
-12. **Jetpack Compose integration (no SDK artifact required):**
-    - `context.receiveFlow().collectAsStateWithLifecycle(initialValue = emptyList())` compiles and recomposes correctly when messages arrive.
-    - `DisposableEffect(contextId) { onDispose { context.close() } }` calls `close()` when the composable leaves the composition — verified with `ComposeContentTestRule`.
+12. **Jetpack Compose integration (`works.limn:scp-kt-android` state holders; `works.limn:scp-kt` takes no Compose dependency):**
+    - The module-internal `rememberScpHotStream`, which `rememberContextEvents` and `rememberIncomingMessages` call, recomposes with the flow its `start` returned — verified in `StateHoldersTest`.
+    - `ScpHotStreams` releases each stream when the last mount of that stream leaves, and a coordinator scope cancelled while a non-cancellable `onStop` runs logs nothing and completes the `Job` of each departure that stop covers normally — verified in `StateHoldersTest.kt` by `ScpHotStreams releases each stream when the last mount of that stream leaves` and `a scope cancelled while a non-cancellable onStop runs reports every onStop as run`. A stop that held no `onStop` logs no skip on a cancelled scope — verified by `a stop that held no onStop reports no skip on a cancelled scope`. `ScpHotStreams` subscribes and releases on the dispatcher it is given — verified by `ScpHotStreams subscribes and releases on its injected dispatcher`. `ScpHotStreams.close()` waits for a stop already launched and releases a subscription whose stop a cancelled scope skipped — verified by `closing ScpHotStreams waits for a launched stop` and `closing ScpHotStreams releases a subscription whose stop a cancelled scope skipped`. A caller that is already cancelled gets the same release — verified by `closing ScpHotStreams from a cancelled caller still waits for a pending stop and releases the rest`. `HotStreamFactory.stopAll()` attempts every release after one throws and logs that failure — verified in `StreamsTest.kt` by `stopAll releases every subscription after one unsubscribe throws`.
+    - When a composable holding `rememberScpContext` leaves the composition, `ScpContextHolder.dispose()` cancels the holder's scope before it calls `onDispose` — verified with `ComposeContentTestRule` by `rememberScpContext disposes scope on cleanup` in `StateHoldersTest`. That scope is therefore already cancelled inside the callback, so the documented pattern launches `leave` on a scope the caller owns and disposal never cancels.
+    - `rememberScpHotStream`'s disposal returns while its `onStop` is still suspended, and a start that reaches its key's mutex after its own mount's stop does not run — verified in `StateHoldersTest.kt`.
+    - A `start` that throws is logged, never reaches the thread's uncaught-exception handler, leaves that mount's `State` null, and still has its `onStop` run on disposal, including a `start` that throws `CancellationException` while its mount is composed — verified in `StateHoldersTest.kt` by `rememberScpHotStream logs a throwing start, keeps State null, and still runs onStop` and `rememberScpHotStream logs a start that throws CancellationException while mounted`.
 
 13. **No logic in Kotlin layer:**
     - Code review: every public SDK method body contains exactly one `NativeLib.*` call (plus `withContext` and error mapping). No branching protocol logic exists in any ergonomics-layer file.
@@ -1233,8 +1337,8 @@ dependencies {
 14. **Test suite passes:**
 
     ```bash
-    ./gradlew test
-    ./gradlew test -Ptarget=android  # Android instrumented tests (requires connected device or emulator)
+    ./gradlew test -Pscp.uniffi.cargoFeatures=testing
+    ./gradlew test -Pscp.uniffi.cargoFeatures=testing -Ptarget=android  # Android instrumented tests (requires connected device or emulator)
     ```
 
     All tests use JUnit 5 (`@Test`, `runTest`). No JUnit 4.
@@ -3543,7 +3647,7 @@ Additionally, the original spec did not define how attestations are published, l
 
 The class distinction is not a new attestation type — it is a sub-classification within `IdentityLink`. This is deliberate. `AttestationType` has stable numeric tags (§7.4.1, `attestation_type_tag`). Adding a new variant would require a new tag and break the existing tag stability guarantee. Instead, the class is derived from the verification method, which is already a field in the wire format. Any consumer can determine the class by inspecting `evidence.method`.
 
-The self-attestation model is acceptable for identity links specifically because issuer == subject. The identity's controller is the only party with incentive to create the attestation, and the only party who can perform the OAuth flow. Falsifying a link provides no protocol benefit: shadow claiming (§3.5.5) verifies the external identity independently, and social graph import only surfaces contacts who genuinely control both identities.
+The self-attestation model is acceptable for identity links specifically because issuer == subject. The identity's controller is the only party with incentive to create the attestation, and the only party who can perform the OAuth flow. Falsifying a link provides no protocol benefit: social graph import only surfaces contacts who genuinely control both identities.
 
 ### Rejected Alternatives
 
@@ -3555,7 +3659,7 @@ The self-attestation model is acceptable for identity links specifically because
 
 ### Security Analysis
 
-**Self-attestation attack surface.** A malicious user could create a Class 1 attestation claiming to have performed OAuth verification without actually doing so. The attestation would have a valid signature. Defense: (a) the claim is "I control external account X" — the only use cases (shadow claiming, social graph import) independently verify the external identity, so a false claim has no effect; (b) the `subject_id` in the proof is meaningless without the external platform recognizing it, limiting social engineering; (c) stale attestations (past renewal interval) are degraded, forcing periodic re-verification.
+**Self-attestation attack surface.** A malicious user could create a Class 1 attestation claiming to have performed OAuth verification without actually doing so. The attestation would have a valid signature. Defense: (a) the claim is "I control external account X" — the only use case (social graph import) independently verifies the external identity, so a false claim has no effect; (b) the `subject_id` in the proof is meaningless without the external platform recognizing it, limiting social engineering; (c) stale attestations (past renewal interval) are degraded, forcing periodic re-verification.
 
 **Reference attestation spoofing.** An attacker publishes a Reference attestation pointing to a URL containing another user's identifier. Defense: Reference attestations carry zero trust until the consumer verifies the proof. The consumer checks that the identifier in the external resource matches the attestation's `issuer`. The attacker cannot place the victim's identifier in the victim's profile.
 

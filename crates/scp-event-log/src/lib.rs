@@ -80,8 +80,8 @@ pub trait EventLogSigner: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an error string if signing fails.
-    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String>;
+    /// Returns a [`scp_crypto::CustodyFailure`] if the key custody call fails.
+    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, scp_crypto::CustodyFailure>;
 }
 
 // ---------------------------------------------------------------------------
@@ -549,9 +549,11 @@ pub enum EventLogError {
     #[error("absence proof requested for event hash that is present in the log")]
     AbsenceProofForPresentEvent,
 
-    /// The signing operation failed during checkpoint generation.
-    #[error("signing failed: {0}")]
-    SigningFailed(String),
+    /// The key custody call that signs a checkpoint failed. The bridges report
+    /// the code `scp_ffi_common::error_codes::custody_failure_code` assigns to the
+    /// failure's kind.
+    #[error(transparent)]
+    Custody(#[from] scp_crypto::CustodyFailure),
 
     /// An `OutletInvokedEvent` whose recorded `chunks_billed` does not match
     /// the value derivable from the manifest root, the sealed chunk sequence,

@@ -12,7 +12,15 @@
 //! [`ContextActorHandle`](crate::context::actor::handle::ContextActorHandle).
 //! Actors cannot reach sibling actors; cross-context work goes through
 //! [`SupervisorHandle::start_saga`]. This is the capability-reduction mechanism:
-//! the inner `Arc<Supervisor>` is private and no accessor exposes it.
+//! the inner reference is private and no accessor exposes it.
+//!
+//! # `Weak<Supervisor>` back-reference
+//!
+//! The handle wraps a `Weak<Supervisor>` (ADR-049 Decision 16, supervisor
+//! task drain): every method upgrades it for one operation and drops the
+//! upgraded `Arc` when the operation ends, so the Supervisor → actor
+//! hierarchy holds no reference cycle (Decision 2). A failed upgrade means every owner dropped the
+//! Supervisor.
 //!
 //! # `&OwnedIdentityDid` parameters
 //!
@@ -32,7 +40,7 @@
 //! field).
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use scp_did::DID;
 use scp_protocol::context::ContextError;
@@ -40,7 +48,6 @@ use scp_protocol::context::builder::ReceiveFloor;
 use scp_protocol::crypto::sender_keys::MergePolicy;
 
 use crate::context::actor::{BoundedReplyError, bounded_reply_await};
-use crate::context::supervisor::floors::FloorAdvanceError;
 use crate::context::supervisor::identity_capability::OwnedIdentityDid;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::context::supervisor::supervisor::{SagaInput, SagaOutput, Supervisor};
@@ -54,12 +61,12 @@ use crate::context::supervisor::supervisor::{SagaInput, SagaOutput, Supervisor};
 ///
 /// **No `ContextActorHandle` accessor.** This is the mechanical contract
 /// that makes "actors cannot reach sibling actors" a type-system
-/// property. The inner `Arc<Supervisor>` field is private; no public
-/// method returns it. Cross-context work MUST go through
+/// property. The inner `Weak<Supervisor>` field is private; no public
+/// method returns it or its upgrade. Cross-context work MUST go through
 /// [`Self::start_saga`].
 #[derive(Clone)]
 pub struct SupervisorHandle {
-    supervisor: Arc<Supervisor>,
+    supervisor: Weak<Supervisor>,
 }
 
 impl SupervisorHandle {
@@ -74,14 +81,52 @@ impl SupervisorHandle {
     // non-per-identity methods below (registry fan-out, saga dispatch,
     // lifecycle bootstrap) are unaffected by this rule.
 
-    /// Wrap an `Arc<Supervisor>`. Visible only to supervisor-module
-    /// code; the supervisor constructs one in
+    /// Wrap a `Weak` reference to the Supervisor (ADR-049 Decision 16).
+    /// Visible only to supervisor-module code; the supervisor constructs one
+    /// in
     /// [`Supervisor::build_actor_deps`](crate::context::supervisor::Supervisor)
     /// at actor-spawn time, and handlers receive the handle via
     /// `ActorDeps` at dispatch time.
     #[must_use]
-    pub(in crate::context::supervisor) const fn wrap(supervisor: Arc<Supervisor>) -> Self {
-        Self { supervisor }
+    pub(in crate::context::supervisor) fn wrap(supervisor: &Arc<Supervisor>) -> Self {
+        Self {
+            supervisor: Arc::downgrade(supervisor),
+        }
+    }
+
+    /// Upgrades the back-reference for one operation.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when every owner has dropped the
+    /// Supervisor.
+    fn upgrade(&self) -> Result<Arc<Supervisor>, ContextError> {
+        self.supervisor.upgrade().ok_or_else(|| {
+            ContextError::SupervisorShutDown(
+                "the actor's supervisor has dropped; no supervisor operation can run".to_owned(),
+            )
+        })
+    }
+
+    /// Spawns `future` onto the Supervisor's task tracker (ADR-049 Decision
+    /// 16). An actor uses this for any detached task that can write through
+    /// the store, so `shutdown_all_contexts` waits for it. A future that holds
+    /// the handle or the actor's dependencies is an indicator of such a task.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped
+    /// or shutdown has begun; the future is dropped without running.
+    pub(in crate::context) fn spawn_tracked<F>(
+        &self,
+        operation: &str,
+        future: F,
+    ) -> Result<tokio::task::JoinHandle<F::Output>, ContextError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.upgrade()?.spawn_tracked(operation, future)
     }
 
     // -----------------------------------------------------------------------
@@ -117,18 +162,21 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
-    /// Propagates [`FloorAdvanceError`] on a non-monotonic or overshooting epoch;
-    /// the live receive seams surface it via `?` and abort the operation (it is
-    /// NEVER log-and-dropped).
+    /// [`ContextError::CryptoFailed`] (converted from
+    /// [`FloorAdvanceError`](crate::context::supervisor::floors::FloorAdvanceError))
+    /// on a non-monotonic or overshooting epoch; the live receive seams surface
+    /// it via `?` and abort the operation (it is NEVER log-and-dropped).
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
     pub(in crate::context) fn check_and_advance_sender_epoch(
         &self,
         ctx: &[u8; 32],
         did: &str,
         epoch: u64,
         max_advance: u64,
-    ) -> Result<(), FloorAdvanceError> {
-        self.supervisor
+    ) -> Result<(), ContextError> {
+        self.upgrade()?
             .check_and_advance_sender_epoch(ctx, did, epoch, max_advance)
+            .map_err(ContextError::from)
     }
 
     /// Advance a per-sender receive-sequence floor in the authoritative registry,
@@ -136,43 +184,53 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
-    /// Propagates [`FloorAdvanceError`] on a non-monotonic or overshooting
-    /// `(epoch, sequence)`; the recv seam surfaces it via `?` (never dropped).
+    /// [`ContextError::CryptoFailed`] (converted from
+    /// [`FloorAdvanceError`](crate::context::supervisor::floors::FloorAdvanceError))
+    /// on a non-monotonic or overshooting `(epoch, sequence)`; the recv seam
+    /// surfaces it via `?` (never dropped). [`ContextError::SupervisorShutDown`]
+    /// when the Supervisor has dropped.
     pub(in crate::context) fn check_and_advance_recv_sequence(
         &self,
         ctx: &[u8; 32],
         did: &str,
         next: ReceiveFloor,
         max_advance: u64,
-    ) -> Result<(), FloorAdvanceError> {
-        self.supervisor
+    ) -> Result<(), ContextError> {
+        self.upgrade()?
             .check_and_advance_recv_sequence(ctx, did, next, max_advance)
+            .map_err(ContextError::from)
     }
 
     /// Read the registry's per-sender epoch floors for `ctx`. See
     /// [`Supervisor::export_sender_key_epochs`].
     ///
-    /// ADR-049 PR-6: the authoritative durable-blob export source (the 6
-    /// production `export_crypto_state` callers).
-    #[must_use]
+    /// ADR-049 PR-6: with [`Self::export_recv_sequence_floors`], the
+    /// authoritative durable-blob export source.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped. A
+    /// caller MUST NOT persist a crypto blob without these floors: an empty
+    /// floor set written durably regresses them.
     pub(in crate::context) fn export_sender_key_epochs(
         &self,
         ctx: &[u8; 32],
-    ) -> Vec<(String, u64)> {
-        self.supervisor.export_sender_key_epochs(ctx)
+    ) -> Result<Vec<(String, u64)>, ContextError> {
+        Ok(self.upgrade()?.export_sender_key_epochs(ctx))
     }
 
-    /// Read the registry's per-sender receive-sequence floors for `ctx`. See
+    /// Read the registry's receive-sequence floors for `ctx`. See
     /// [`Supervisor::export_recv_sequence_floors`].
     ///
-    /// ADR-049 PR-6: the authoritative durable-blob export source (the 6
-    /// production `export_crypto_state` callers).
-    #[must_use]
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped,
+    /// with the same no-persist rule as [`Self::export_sender_key_epochs`].
     pub(in crate::context) fn export_recv_sequence_floors(
         &self,
         ctx: &[u8; 32],
-    ) -> Vec<(String, ReceiveFloor)> {
-        self.supervisor.export_recv_sequence_floors(ctx)
+    ) -> Result<Vec<(String, ReceiveFloor)>, ContextError> {
+        Ok(self.upgrade()?.export_recv_sequence_floors(ctx))
     }
 
     /// Atomically merge BOTH the per-sender epoch floors AND the receive-sequence
@@ -181,8 +239,11 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
-    /// Propagates [`FloorAdvanceError`] on an Inv-3 regression
-    /// ([`MergePolicy::RejectRegression`]) or an overshoot (RejectRegression only).
+    /// [`ContextError::CryptoFailed`] (converted from
+    /// [`FloorAdvanceError`](crate::context::supervisor::floors::FloorAdvanceError))
+    /// on an Inv-3 regression ([`MergePolicy::RejectRegression`]) or an overshoot
+    /// (RejectRegression only). [`ContextError::SupervisorShutDown`] when the
+    /// Supervisor has dropped.
     pub(in crate::context) fn validate_and_merge_all_floors(
         &self,
         ctx: &[u8; 32],
@@ -190,23 +251,41 @@ impl SupervisorHandle {
         recv: Vec<(String, ReceiveFloor)>,
         max_advance: u64,
         policy: MergePolicy,
-    ) -> Result<(), FloorAdvanceError> {
-        self.supervisor
+    ) -> Result<(), ContextError> {
+        self.upgrade()?
             .validate_and_merge_all_floors(ctx, epochs, recv, max_advance, policy)
+            .map_err(ContextError::from)
     }
 
     /// Create-seed the floor registry for `ctx` (insert-if-absent). See
     /// [`Supervisor::seed_context_floors`].
-    pub(in crate::context) fn seed_context_floors(&self, ctx: &[u8; 32]) {
-        self.supervisor.seed_context_floors(ctx);
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub(in crate::context) fn seed_context_floors(
+        &self,
+        ctx: &[u8; 32],
+    ) -> Result<(), ContextError> {
+        self.upgrade()?.seed_context_floors(ctx);
+        Ok(())
     }
 
     /// Permanent-teardown prune of the floor registry entry for `ctx`. See
     /// [`Supervisor::remove_context_floors`] — including the permanent-vs-
     /// transient safety argument. Callers (the terminal close / TTL-expiry /
     /// shutdown paths) invoke this only when the context is permanently gone.
+    ///
+    /// The registry lives in the Supervisor, so when the Supervisor has dropped
+    /// the registry is gone with it and the removal already holds; that case
+    /// logs at debug and returns.
     pub(in crate::context) fn remove_context_floors(&self, ctx: &[u8; 32]) {
-        self.supervisor.remove_context_floors(ctx);
+        match self.upgrade() {
+            Ok(supervisor) => supervisor.remove_context_floors(ctx),
+            Err(e) => {
+                tracing::debug!(error = %e, "remove_context_floors: supervisor dropped, registry already gone");
+            }
+        }
     }
 
     /// Member-granular floor prune of `did` from `ctx`'s registry entry. See
@@ -214,8 +293,17 @@ impl SupervisorHandle {
     /// `remove_context_floors` (keeps siblings + the local scalar; drops only the
     /// departed member's floors under one guard). ADR-049 PR-6: called from every
     /// member-removal seam.
+    ///
+    /// The registry lives in the Supervisor, so when the Supervisor has dropped
+    /// the registry is gone with it and the removal already holds; that case
+    /// logs at debug and returns.
     pub(in crate::context) fn remove_member_floors(&self, ctx: &[u8; 32], did: &str) {
-        self.supervisor.remove_member_floors(ctx, did);
+        match self.upgrade() {
+            Ok(supervisor) => supervisor.remove_member_floors(ctx, did),
+            Err(e) => {
+                tracing::debug!(error = %e, "remove_member_floors: supervisor dropped, registry already gone");
+            }
+        }
     }
 
     /// Permanent-teardown drop of the per-context outlet-stream admission
@@ -224,8 +312,17 @@ impl SupervisorHandle {
     /// [`Supervisor::reap_stream_admission`] for the live-Arc safety
     /// argument. Callers (the terminal close / TTL-expiry paths) invoke this
     /// only when the context is permanently gone.
+    ///
+    /// The registry lives in the Supervisor, so when the Supervisor has dropped
+    /// the registry is gone with it and the removal already holds; that case
+    /// logs at debug and returns.
     pub(in crate::context) fn reap_stream_admission(&self, context_id: &str) {
-        self.supervisor.reap_stream_admission(context_id);
+        match self.upgrade() {
+            Ok(supervisor) => supervisor.reap_stream_admission(context_id),
+            Err(e) => {
+                tracing::debug!(error = %e, "reap_stream_admission: supervisor dropped, registry already gone");
+            }
+        }
     }
 
     /// Start a cross-context saga. The ONLY way for an actor to affect
@@ -236,15 +333,18 @@ impl SupervisorHandle {
     /// Errors propagate from `Supervisor::start_saga` — the saga
     /// terminal/abort mapping.
     pub async fn start_saga(&self, input: SagaInput) -> Result<SagaOutput, ContextError> {
-        self.supervisor.start_saga(input).await
+        self.upgrade()?.start_saga(input).await
     }
 
     /// Snapshot the local-DIDs set. Returned as an `Arc` so callers read
     /// without copying; the snapshot is stable for its lifetime even if
     /// the supervisor rotates the underlying `ArcSwap` mid-read.
-    #[must_use]
-    pub fn local_dids(&self) -> Arc<HashSet<DID>> {
-        self.supervisor.local_dids.load_full()
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub fn local_dids(&self) -> Result<Arc<HashSet<DID>>, ContextError> {
+        Ok(self.upgrade()?.local_dids.load_full())
     }
 
     /// Find the first context where both `member_a` and `member_b` are
@@ -277,15 +377,24 @@ impl SupervisorHandle {
     /// likewise order-unspecified, so "first shared context" carries the
     /// same (non-deterministic across registry mutations) semantics it
     /// always did.
-    pub async fn find_shared_context(&self, member_a: &str, member_b: &str) -> Option<String> {
-        for context_id in self.supervisor.actor_ids() {
-            if self.supervisor.is_member(&context_id, member_a).await
-                && self.supervisor.is_member(&context_id, member_b).await
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub async fn find_shared_context(
+        &self,
+        member_a: &str,
+        member_b: &str,
+    ) -> Result<Option<String>, ContextError> {
+        let supervisor = self.upgrade()?;
+        for context_id in supervisor.actor_ids() {
+            if supervisor.is_member(&context_id, member_a).await
+                && supervisor.is_member(&context_id, member_b).await
             {
-                return Some(context_id);
+                return Ok(Some(context_id));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Dispatch a `TrustRecoveryCommand::RecoverySendNotification`
@@ -328,7 +437,7 @@ impl SupervisorHandle {
             payload: Box::new(payload),
             reply: reply_tx,
         };
-        self.supervisor.dispatch_trust_recovery_command(cmd).await?;
+        self.upgrade()?.dispatch_trust_recovery_command(cmd).await?;
         // Bounded by REPLY_TIMEOUT: the result is load-bearing (propagated
         // via `?` into trust-recovery `recovery_notify_contact`, §9.12) and a
         // wedged/deadlocked actor never terminates (so the watchdog never
@@ -359,20 +468,35 @@ impl SupervisorHandle {
     /// lines 161/230/291). Querying by context ID always returned
     /// `None`. The renamed parameter matches the actual key shape; the
     /// lookup is now correct.
-    #[must_use]
-    pub fn standing_peer(&self, peer_did: &DID) -> Option<DID> {
-        self.supervisor
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub fn standing_peer(&self, peer_did: &DID) -> Result<Option<DID>, ContextError> {
+        Ok(self
+            .upgrade()?
             .standing_contexts
             .load()
             .get(peer_did.as_ref())
-            .cloned()
+            .cloned())
     }
 
-    /// Read-only lifecycle-state probe for `context_id`. Returns `None`
-    /// if no per-context actor is registered (close / TTL does not
+    /// Read-only lifecycle-state probe for `context_id`. Close does not
     /// despawn the actor, so `Some(state)` reflects the live lifecycle
-    /// state — `Active` / `Creating` vs a terminal state — and `None`
-    /// means the actor genuinely does not exist).
+    /// state — `Active` / `Creating` vs a terminal state such as `Closed` —
+    /// and a context the crash watchdog poisoned reads `Some(Poisoned)`
+    /// (ADR-049 §10). A TTL expiry does despawn the actor once its cleanup
+    /// completes and the `Expired` state is durable, so a context whose
+    /// expiry completed reads `None`. While an incomplete expiry is retrying,
+    /// the actor stays registered and reads `Some(Expired)`.
+    ///
+    /// `None` does not mean the context is absent. It covers an id no actor
+    /// serves and also an actor this call could not reach: a busy or
+    /// timed-out actor, and a context mid-respawn or past a failed respawn.
+    /// Read `None` only as "no live `Active` context". A caller whose
+    /// decision turns on absence calls
+    /// [`Supervisor::read_context_state_checked`](crate::context::supervisor::supervisor::Supervisor::read_context_state_checked),
+    /// which reports the unreachable cases as `ActorBusy` and `ActorCrashed`.
     ///
     /// Capability-reduced surface over
     /// [`Supervisor::read_context_state`](crate::context::supervisor::supervisor::Supervisor::read_context_state):
@@ -386,8 +510,8 @@ impl SupervisorHandle {
     pub(crate) async fn read_context_state(
         &self,
         context_id: &str,
-    ) -> Option<scp_protocol::context::ContextState> {
-        self.supervisor.read_context_state(context_id).await
+    ) -> Result<Option<scp_protocol::context::ContextState>, ContextError> {
+        Ok(self.upgrade()?.read_context_state(context_id).await)
     }
 
     // No `SupervisorHandle::standing_context` get-or-create wrapper: that
@@ -401,29 +525,33 @@ impl SupervisorHandle {
     // explicitly avoids.
 
     /// Number of supervisor-tracked standing peers.
-    #[must_use]
-    pub(crate) fn standing_context_count(&self) -> usize {
-        self.supervisor.standing_contexts.load().len()
+    pub(crate) fn standing_context_count(&self) -> Result<usize, ContextError> {
+        Ok(self.upgrade()?.standing_contexts.load().len())
     }
 
     /// Whether `peer_did` is registered as a standing peer.
-    #[must_use]
-    pub(crate) fn has_standing_context(&self, peer_did: &DID) -> bool {
-        self.supervisor
+    pub(crate) fn has_standing_context(&self, peer_did: &DID) -> Result<bool, ContextError> {
+        Ok(self
+            .upgrade()?
             .standing_contexts
             .load()
-            .contains_key(peer_did.as_ref())
+            .contains_key(peer_did.as_ref()))
     }
 
     /// Register `peer_did` in the supervisor standing-context index.
-    pub(crate) async fn register_standing_context(&self, peer_did: DID) {
-        let _guard = self.supervisor.write_lock.lock().await;
-        let snapshot = self.supervisor.standing_contexts.load_full();
+    pub(crate) async fn register_standing_context(
+        &self,
+        peer_did: DID,
+    ) -> Result<(), ContextError> {
+        let supervisor = self.upgrade()?;
+        let _guard = supervisor.write_lock.lock().await;
+        let snapshot = supervisor.standing_contexts.load_full();
         let mut updated: std::collections::HashMap<String, DID> = (*snapshot).clone();
         updated.insert(peer_did.to_string(), peer_did);
-        self.supervisor
+        supervisor
             .standing_contexts
             .store(std::sync::Arc::new(updated));
+        Ok(())
     }
 
     /// Reconnect all standing contexts.
@@ -434,7 +562,7 @@ impl SupervisorHandle {
     /// registry + mailbox (no `contexts` DashMap, no
     /// `per-context-state Mutex`).
     pub(crate) async fn reconnect_all_standing(&self) -> Result<usize, ContextError> {
-        self.supervisor.reconnect_all_standing().await
+        self.upgrade()?.reconnect_all_standing().await
     }
 
     /// Look up this identity's wrapping public key. Returns `None` if
@@ -454,17 +582,17 @@ impl SupervisorHandle {
     /// no `private_interfaces` asymmetry to allow — the mint guarantee is
     /// carried entirely by the `pub(super)` constructor and the private
     /// field, not by any visibility gap here.
-    #[must_use]
     #[allow(dead_code)]
     pub(in crate::context) fn my_wrapping_public_key(
         &self,
         identity: &OwnedIdentityDid,
-    ) -> Option<Arc<Vec<u8>>> {
+    ) -> Result<Option<Arc<Vec<u8>>>, ContextError> {
         let did = identity.as_did();
-        self.supervisor
+        Ok(self
+            .upgrade()?
             .wrapping_keys
             .get(did)
-            .map(|entry| Arc::new(entry.value().load_full().public.to_vec()))
+            .map(|entry| Arc::new(entry.value().load_full().public.to_vec())))
     }
 
     /// Look up this identity's `KeyPackageStoreActor` handle. Returns
@@ -475,17 +603,17 @@ impl SupervisorHandle {
     /// outside `supervisor/`, and the method shares the type's
     /// `pub(in crate::context)` visibility — so no `private_interfaces`
     /// asymmetry exists to allow.
-    #[must_use]
     #[allow(dead_code)]
     pub(in crate::context) fn my_key_package_store(
         &self,
         identity: &OwnedIdentityDid,
-    ) -> Option<KeyPackageStoreHandle> {
+    ) -> Result<Option<KeyPackageStoreHandle>, ContextError> {
         let did = identity.as_did();
-        self.supervisor
+        Ok(self
+            .upgrade()?
             .key_package_stores
             .get(did)
-            .map(|r| r.value().clone())
+            .map(|r| r.value().clone()))
     }
 
     // -----------------------------------------------------------------
@@ -510,7 +638,10 @@ impl SupervisorHandle {
     ///
     /// Returns [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed)
     /// if the broadcast context construction or initial author
-    /// registration fails.
+    /// registration fails, and
+    /// [`ContextCreationError::StateTransition`](scp_protocol::context::builder::ContextCreationError::StateTransition)
+    /// carrying [`ContextError::SupervisorShutDown`] when the Supervisor has
+    /// dropped.
     pub(crate) fn init_broadcast_context(
         &self,
         context_id: &str,
@@ -520,8 +651,11 @@ impl SupervisorHandle {
         Option<scp_protocol::context::broadcast::BroadcastContext>,
         scp_protocol::context::builder::ContextCreationError,
     > {
+        let supervisor = self.upgrade().map_err(|e| {
+            scp_protocol::context::builder::ContextCreationError::StateTransition(e)
+        })?;
         crate::context::manager_methods::init_broadcast_context(
-            &self.supervisor,
+            &supervisor,
             context_id,
             params,
             creator_did,
@@ -534,19 +668,39 @@ impl SupervisorHandle {
     /// Async because the gauge sweep mailboxes each per-context actor for
     /// its receive-buffer length (ADR-049 Phase 2A finalization — DashMap
     /// removal).
-    pub(crate) async fn update_context_gauges(&self) {
-        crate::context::manager_methods::update_context_gauges(&self.supervisor).await;
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub(crate) async fn update_context_gauges(&self) -> Result<(), ContextError> {
+        let supervisor = self.upgrade()?;
+        crate::context::manager_methods::update_context_gauges(&supervisor).await;
+        Ok(())
     }
 
     /// Persist the per-context state and broadcast snapshot for
-    /// `context_id` if persistence is configured. Best-effort —
-    /// errors are logged, not propagated.
+    /// `context_id` if persistence is configured. This method returns no
+    /// error. When the Supervisor has dropped, the persist fails: ADR-049
+    /// Decision 16 item 4 makes that a Class C persist failure, which this
+    /// method logs and counts through `record_persistence_failure`.
     pub(crate) async fn persist_context_and_broadcast(&self, context_id: &str) {
-        crate::context::manager_methods::persist_context_and_broadcast(
-            &self.supervisor,
-            context_id,
-        )
-        .await;
+        match self.upgrade() {
+            Ok(supervisor) => {
+                crate::context::manager_methods::persist_context_and_broadcast(
+                    &supervisor,
+                    context_id,
+                )
+                .await;
+            }
+            Err(e) => {
+                crate::metrics::record_persistence_failure();
+                tracing::warn!(
+                    context_id,
+                    error = %e,
+                    "snapshot persist skipped: the supervisor has dropped"
+                );
+            }
+        }
     }
 
     /// Spawn a per-context [`ContextActor`](crate::context::actor::ContextActor)
@@ -585,7 +739,7 @@ impl SupervisorHandle {
         deps: crate::context::actor::deps::ActorDeps,
         mailbox_capacity: Option<usize>,
     ) -> Result<crate::context::actor::handle::ContextActorHandle, ContextError> {
-        self.supervisor
+        self.upgrade()?
             .spawn_actor_with_state(state, deps, mailbox_capacity)
             .await
     }
@@ -626,11 +780,11 @@ impl SupervisorHandle {
     pub(in crate::context) async fn dispatch_prepare_for_replace(
         &self,
         context_id: &str,
-        mls_state: Vec<u8>,
+        mls_state: zeroize::Zeroizing<Vec<u8>>,
     ) -> Result<(), ContextError> {
         use crate::context::actor::commands::{ContextCommand, LifecycleControlCommand};
 
-        let Some(actor) = self.supervisor.lookup(context_id) else {
+        let Some(actor) = self.upgrade()?.lookup(context_id) else {
             return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
         };
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -698,15 +852,35 @@ impl SupervisorHandle {
     /// `pub(in crate::context)` — reachable by lifecycle bootstrap and by
     /// the actor's own run loop, not by handler bodies under
     /// `actor/handlers/`.
-    pub(in crate::context) async fn despawn_actor(&self, context_id: &str) -> bool {
-        self.supervisor.despawn_actor(context_id).await
+    pub(in crate::context) async fn despawn_actor(
+        &self,
+        context_id: &str,
+    ) -> Result<bool, ContextError> {
+        Ok(self.upgrade()?.despawn_actor(context_id).await)
+    }
+
+    /// Despawn the actor an import is replacing, and mark the gap until the
+    /// replacement registers (ADR-049 §10). See
+    /// [`Supervisor::despawn_for_replace`](crate::context::supervisor::Supervisor::despawn_for_replace).
+    ///
+    /// # Visibility
+    ///
+    /// `pub(in crate::context)` — reachable by the lifecycle import path only.
+    pub(in crate::context) async fn despawn_for_replace(
+        &self,
+        context_id: &str,
+    ) -> Result<bool, ContextError> {
+        Ok(self.upgrade()?.despawn_for_replace(context_id).await)
     }
 
     /// Whether the context is poisoned (ADR-049 §10) — its actor exceeded
     /// the respawn budget and is no longer being respawned. Lock-free read.
-    #[must_use]
-    pub fn is_context_poisoned(&self, context_id: &str) -> bool {
-        self.supervisor.is_context_poisoned(context_id)
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub fn is_context_poisoned(&self, context_id: &str) -> Result<bool, ContextError> {
+        Ok(self.upgrade()?.is_context_poisoned(context_id))
     }
 
     /// Operator recovery action (ADR-049 §10): clear a poisoned context's
@@ -732,7 +906,7 @@ impl SupervisorHandle {
         context_id: &str,
         owning_did: &DID,
     ) -> Result<(), ContextError> {
-        self.supervisor.clear_poison(context_id, owning_did).await
+        self.upgrade()?.clear_poison(context_id, owning_did).await
     }
 
     /// Operator recovery action (ADR-049 §10) for a poisoned per-identity
@@ -752,7 +926,7 @@ impl SupervisorHandle {
     /// [`ContextError::NotInitialized`](scp_protocol::context::ContextError::NotInitialized)
     /// when providers are absent).
     pub async fn clear_kp_poison(&self, identity: &DID) -> Result<(), ContextError> {
-        self.supervisor.clear_kp_poison(identity).await
+        self.upgrade()?.clear_kp_poison(identity).await
     }
 
     // -----------------------------------------------------------------
@@ -782,12 +956,11 @@ impl SupervisorHandle {
     ///
     /// See the actor-resolution surface comment above for why this is the
     /// single sanctioned `ContextActorHandle` yield.
-    #[must_use]
     pub(in crate::context) fn lookup(
         &self,
         context_id: &str,
-    ) -> Option<crate::context::actor::handle::ContextActorHandle> {
-        self.supervisor.lookup(context_id)
+    ) -> Result<Option<crate::context::actor::handle::ContextActorHandle>, ContextError> {
+        Ok(self.upgrade()?.lookup(context_id))
     }
 
     /// Install the per-context TTL timer for `context_id` by mailboxing
@@ -802,11 +975,14 @@ impl SupervisorHandle {
     /// and hold only `&ActorDeps` (no `&mut state`). They delegate timer
     /// installation to the actor through this mailbox dispatch.
     ///
-    /// Best-effort: a `lookup → None` (actor not yet registered) or a
-    /// mailbox-send failure is logged and skipped — arming the TTL deadline
-    /// is a background facility, not part of the create/restore success
-    /// contract. (The actor's own `reconcile_timers` arms the one-shot TTL
-    /// sleep from the recorded `deadline_unix_secs`; ADR-049 finding A3.)
+    /// A `lookup → None` (actor not yet registered) or a mailbox-send
+    /// failure is logged and skipped. (The actor's own `reconcile_timers`
+    /// arms the one-shot TTL sleep from the recorded `deadline_unix_secs`;
+    /// ADR-049 finding A3.)
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
     pub(in crate::context) async fn dispatch_start_ttl_timer(
         &self,
         context_id: &str,
@@ -821,15 +997,15 @@ impl SupervisorHandle {
         // log — so a prior extension survives and a `None`-remaining Active
         // snapshot still re-arms (D1/D2). See `TtlTimerPayload::deadline_override`.
         deadline_override: Option<crate::context::ttl_close_helpers::ConvergentDeadline>,
-    ) {
+    ) -> Result<(), ContextError> {
         use crate::context::actor::commands::{ContextCommand, TtlCloseCommand, TtlTimerPayload};
 
-        let Some(actor) = self.supervisor.lookup(context_id) else {
+        let Some(actor) = self.upgrade()?.lookup(context_id) else {
             tracing::warn!(
                 context_id,
                 "dispatch_start_ttl_timer: no actor registered — TTL timer not installed"
             );
-            return;
+            return Ok(());
         };
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let cmd = ContextCommand::TtlClose(TtlCloseCommand::StartTtlTimer {
@@ -853,7 +1029,7 @@ impl SupervisorHandle {
                 context_id,
                 "dispatch_start_ttl_timer: mailbox send failed — TTL timer not installed"
             );
-            return;
+            return Ok(());
         }
         // Await the install reply so the timer is registered before the
         // bootstrap path returns control to the caller. Bounded by
@@ -883,6 +1059,7 @@ impl SupervisorHandle {
                 );
             }
         }
+        Ok(())
     }
 
     /// Fix-D — dispatch the restore-time streaming crash-recovery sweep to a
@@ -897,14 +1074,14 @@ impl SupervisorHandle {
         &self,
         context_id: &str,
     ) -> Result<usize, scp_protocol::context::ContextError> {
-        self.supervisor
+        self.upgrade()?
             .reconcile_stream_reservations_via_actor(context_id)
             .await
     }
 }
 
 // Explicit non-exposure check: ensure no public method returns
-// `ContextActorHandle` or `Arc<Supervisor>`. This is enforced by the
+// `ContextActorHandle`, `Arc<Supervisor>`, or the inner `Weak<Supervisor>`. This is enforced by the
 // methods above (none do), but the file-level contract is documented
 // here so future edits see the rule.
 //
@@ -928,7 +1105,7 @@ impl SupervisorHandle {
 // not a CI grep-ban.
 
 // Compile-time witness that `SupervisorHandle` is `Send + Sync` — the
-// handle rides inside `ActorDeps`, which is moved into `tokio::spawn`.
+// handle rides inside `ActorDeps`, which is moved into a spawned task.
 const fn _assert_send_sync() {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<SupervisorHandle>();
@@ -993,21 +1170,95 @@ mod tests {
             journal,
             SupervisorConfig::default(),
         ));
-        let handle = SupervisorHandle::wrap(Arc::clone(&sup));
+        let handle = SupervisorHandle::wrap(&sup);
         (sup, handle)
+    }
+
+    /// ADR-049 Decision 16: the handle holds a `Weak<Supervisor>`, so it never
+    /// keeps the Supervisor alive.
+    #[tokio::test]
+    async fn handle_returns_supervisor_shut_down_after_owner_drops() {
+        let (sup, handle) = test_handle();
+        assert!(handle.local_dids().is_ok());
+        drop(sup);
+
+        let shut_down = |r: Result<(), ContextError>| {
+            assert!(
+                matches!(r, Err(ContextError::SupervisorShutDown(_))),
+                "expected SupervisorShutDown, got {r:?}"
+            );
+        };
+        shut_down(handle.local_dids().map(drop));
+        shut_down(handle.lookup("ctx").map(drop));
+        shut_down(handle.export_sender_key_epochs(&[7u8; 32]).map(drop));
+        shut_down(handle.export_recv_sequence_floors(&[7u8; 32]).map(drop));
+        shut_down(handle.seed_context_floors(&[7u8; 32]));
+        shut_down(handle.is_context_poisoned("ctx").map(drop));
+        shut_down(handle.find_shared_context("a", "b").await.map(drop));
+        shut_down(handle.update_context_gauges().await);
+        shut_down(handle.spawn_tracked("probe", async {}).map(drop));
+    }
+
+    /// ADR-049 Decision 16 item 4: the Class C snapshot persist counts a failed
+    /// upgrade as one persistence failure, and counts none against a live
+    /// Supervisor.
+    #[test]
+    fn class_c_snapshot_persist_counts_a_dropped_supervisor_as_a_persist_failure() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let failures = |snapshotter: &metrics_util::debugging::Snapshotter| {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(ck, _, _, v)| match v {
+                    DebugValue::Counter(c)
+                        if ck.key().name() == "scp_persistence_failures_total" =>
+                    {
+                        Some(c)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(0)
+        };
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let (sup, handle) = test_handle();
+                handle.persist_context_and_broadcast("ctx").await;
+                assert_eq!(
+                    failures(&snapshotter),
+                    0,
+                    "a live Supervisor counts no failure"
+                );
+                drop(sup);
+                assert!(handle.local_dids().is_err(), "the Supervisor has dropped");
+                handle.persist_context_and_broadcast("ctx").await;
+                assert_eq!(
+                    failures(&snapshotter),
+                    1,
+                    "a failed upgrade counts one failure"
+                );
+            });
+        });
     }
 
     #[tokio::test]
     async fn local_dids_returns_empty_snapshot_on_fresh_supervisor() {
         let (_sup, handle) = test_handle();
-        assert!(handle.local_dids().is_empty());
+        assert!(handle.local_dids().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn standing_peer_returns_none_when_unknown() {
         let (_sup, handle) = test_handle();
         let unknown = DID("did:example:never-registered".to_owned());
-        assert!(handle.standing_peer(&unknown).is_none());
+        assert!(handle.standing_peer(&unknown).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1015,7 +1266,7 @@ mod tests {
         let (_sup, handle) = test_handle();
         let did = DID("did:example:alice".to_owned());
         let token = OwnedIdentityDid::issue_for_actor(did);
-        assert!(handle.my_wrapping_public_key(&token).is_none());
+        assert!(handle.my_wrapping_public_key(&token).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1029,7 +1280,7 @@ mod tests {
         sup.wrapping_keys
             .insert(did.clone(), ArcSwap::new(Arc::new(kp)));
         let token = OwnedIdentityDid::issue_for_actor(did);
-        let got = handle.my_wrapping_public_key(&token).unwrap();
+        let got = handle.my_wrapping_public_key(&token).unwrap().unwrap();
         assert_eq!(&*got, &vec![0x42u8; 32]);
     }
 
@@ -1038,7 +1289,7 @@ mod tests {
         let (_sup, handle) = test_handle();
         let did = DID("did:example:alice".to_owned());
         let token = OwnedIdentityDid::issue_for_actor(did);
-        assert!(handle.my_key_package_store(&token).is_none());
+        assert!(handle.my_key_package_store(&token).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1070,7 +1321,7 @@ mod tests {
         let (kp_handle, _join) = KeyPackageStoreActor::spawn(did.clone(), deps);
         sup.key_package_stores.insert(did.clone(), kp_handle);
         let token = OwnedIdentityDid::issue_for_actor(did);
-        let got = handle.my_key_package_store(&token);
+        let got = handle.my_key_package_store(&token).unwrap();
         assert!(got.is_some());
         if let Some(h) = got {
             h.send_shutdown().await.unwrap();

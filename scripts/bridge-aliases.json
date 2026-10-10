@@ -2909,6 +2909,34 @@
       "napi": [
         "participation_record"
       ]
+    },
+    {
+      "canonical": "p256_pseudonym_point",
+      "category": "identity",
+      "pyo3": [
+        "py_p256_pseudonym_point",
+        "p256_pseudonym_point"
+      ],
+      "uniffi": [
+        "p256_pseudonym_point"
+      ],
+      "napi": [
+        "p256_pseudonym_point"
+      ]
+    },
+    {
+      "canonical": "p256_software_pseudonym_point",
+      "category": "identity",
+      "pyo3": [
+        "py_p256_software_pseudonym_point",
+        "p256_software_pseudonym_point"
+      ],
+      "uniffi": [
+        "p256_software_pseudonym_point"
+      ],
+      "napi": [
+        "p256_software_pseudonym_point"
+      ]
     }
   ],
   "exemptions": {

@@ -18,13 +18,12 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
-import { createRequire } from "node:module";
-import type { BridgeMode } from "../src/bridge";
 import { ContextError } from "../src/errors";
 import { __getNativeScp, SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 import type { BehavioralRecord, CapabilityRequirement, ParticipationProfile } from "../src/types";
 import { allValid } from "../src/types";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 /**
  * Generates a raw X25519 keypair (32-byte secret + 32-byte public key) for
@@ -55,7 +54,7 @@ type NativeBridge = Awaited<ReturnType<typeof import("../src/internal/bridge").g
 //
 // A small set of stateless helpers deliberately remain as module-level
 // free functions on the raw addon — `discovery_*`, `context_discover`,
-// `bridge_evaluate_trust`, `bridge_register`, `scp_version`. They touch
+// `scp_version`. They touch
 // no bridge state, so they never needed instance-scoping (see the
 // "sub-slice B" comment in `crates/scp-ffi/napi/src/scp.rs`). These calls
 // dispatch through `rawAddon` below rather than through the `SCP` wrapper.
@@ -75,37 +74,25 @@ try {
   // Resolve the SDK bridge factory and probe the SCP class for the
   // Phase 4 surface. The probe SCP is discarded immediately — each test
   // will mint its own.
-  ({ createNativeBridge } = await import("../src/internal/native.js"));
+  const nativeModule = await import("../src/internal/native.js");
+  createNativeBridge = nativeModule.createNativeBridge;
   const probe = new SCP({ storage: { type: "in_memory" } });
   if (typeof (probe as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
-    skipReason = "SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
-    createNativeBridge = null;
-  } else {
-    napiAvailable = true;
+    throw new Error("SCP missing relayStartInMemory — rebuild with the Phase 4 changes");
   }
+  napiAvailable = true;
   // Dispose of the probe so it never leaks state into the per-test
   // instances bootstrapped in `beforeEach` below.
   probe.shutdown(1).catch(() => {});
 
   // Also load the raw addon — it still exports the stateless module-level
-  // helpers (discovery, bridge_evaluate_trust, bridge_register).
-  const req = createRequire(import.meta.url);
-  const platform = process.platform;
-  const arch = process.arch;
-  const platformMap: Record<string, string> = {
-    "linux-x64": "@limn-works/scp-ts-napi-linux-x64-gnu",
-    "linux-arm64": "@limn-works/scp-ts-napi-linux-arm64-gnu",
-    "darwin-x64": "@limn-works/scp-ts-napi-darwin-x64",
-    "darwin-arm64": "@limn-works/scp-ts-napi-darwin-arm64",
-    "win32-x64": "@limn-works/scp-ts-napi-win32-x64-msvc",
-  };
-  const pkg = platformMap[`${platform}-${arch}`];
-  if (pkg !== undefined) {
-    rawAddon = req(pkg) as NativeAddon;
-  }
+  // helpers (discovery). `loadNativeAddon`
+  // is the SDK's one loader: resolving the platform package here instead would let
+  // this file's copy of the platform map drift from the loader's, and this file
+  // would then skip over an addon the loader resolves.
+  rawAddon = nativeModule.loadNativeAddon() as NativeAddon;
 } catch (e: unknown) {
-  const msg = e instanceof Error ? e.message : String(e);
-  skipReason = `Native NAPI bridge not available: ${msg}`;
+  skipReason = skipReasonIfAddonAbsent(e);
 }
 
 // When the bridge is unavailable, define a single test that reports the skip.
@@ -697,6 +684,32 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       await napi.ucanValidate(ctx, token.encoded, fullUri as string, member.did);
     });
 
+    // `contextCreate` rejects params whose ceiling is absent or null with
+    // SCP-VALID-7004 and one whose ceiling is empty with SCP-VALID-7005
+    // (construction.md M2), and creates a context whose
+    // handle carries a non-empty declared ceiling as written. The accepted
+    // case proves the check does not reject every create.
+    test("an omitted or null ceiling rejects with SCP-VALID-7004, an empty one with SCP-VALID-7005", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const cases: [object, RegExp][] = [
+        [{ memoryScope: "ephemeral" }, /SCP-VALID-7004/],
+        [{ ceiling: null }, /SCP-VALID-7004/],
+        [{ ceiling: [] }, /SCP-VALID-7005/],
+      ];
+      for (const [params, code] of cases) {
+        await expect(napi.contextCreate(admin, JSON.stringify(params))).rejects.toThrow(code);
+      }
+
+      // `BridgeContextHandle` does not declare the addon handle's `ceiling`
+      // getter, so the test reads it through a narrowed view.
+      const ceilingOf = (handle: unknown): string[] => (handle as { ceiling: string[] }).ceiling;
+      const declared = await napi.contextCreate(
+        admin,
+        JSON.stringify({ ceiling: ["messages:write"] }),
+      );
+      expect(ceilingOf(declared)).toEqual(["messages:write"]);
+    });
+
     test("rejects validation for an ungranted capability", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
@@ -1053,6 +1066,12 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     test("participation facts match the canonical cross-SDK counts (real SCP method)", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
+      // Event timestamps are whole Unix seconds from the core's system clock,
+      // and a still-open membership interval runs to the latest event timestamp
+      // (§7.3.2). Events milliseconds apart that straddle a second boundary
+      // yield a duration of 1, so the duration is bounded by the whole seconds
+      // the clock crosses during the scenario instead of pinned to 0.
+      const beforeSecs = Math.floor(Date.now() / 1000);
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({
@@ -1100,13 +1119,15 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         }),
         admin.did,
       );
+      const afterSecs = Math.floor(Date.now() / 1000);
 
       const adminRec = await scpInstance.participationRecord(realContextId, admin.did);
       const memberRec = await scpInstance.participationRecord(realContextId, member.did);
 
       // The CANONICAL counts the Python sibling test asserts verbatim. Keys are
       // the deterministic, DID-independent facts (the Merkle root + subject_did
-      // are excluded since they vary per run).
+      // are excluded since they vary per run; the wall-clock participation
+      // duration is bounded separately below).
       const counts = (r: BehavioralRecord) => ({
         governanceActionsAgainst: r.governanceActionsAgainst,
         governanceActionsBy: r.governanceActionsBy,
@@ -1115,7 +1136,6 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         contextCreationCount: r.contextCreationCount,
         roleProgressionCount: r.roleProgressionCount,
         attestationCount: r.attestationCount,
-        participationDurationSecs: r.participationDurationSecs,
       });
       expect(counts(adminRec)).toEqual({
         governanceActionsAgainst: 0,
@@ -1125,7 +1145,6 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         contextCreationCount: 1,
         roleProgressionCount: 0,
         attestationCount: 0,
-        participationDurationSecs: 0,
       });
       expect(counts(memberRec)).toEqual({
         governanceActionsAgainst: 1,
@@ -1135,8 +1154,13 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         contextCreationCount: 0,
         roleProgressionCount: 1,
         attestationCount: 0,
-        participationDurationSecs: 0,
       });
+      // Every event timestamp lies in [beforeSecs, afterSecs], so no membership
+      // interval can exceed the whole seconds elapsed across the scenario.
+      for (const rec of [adminRec, memberRec]) {
+        expect(rec.participationDurationSecs).toBeGreaterThanOrEqual(0);
+        expect(rec.participationDurationSecs).toBeLessThanOrEqual(afterSecs - beforeSecs);
+      }
     });
 
     // `evaluateTrust` must remain usable on a context with NO convergent leaves
@@ -1531,151 +1555,6 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     test("checks chain depth with custom limit", () => {
       expect(napi.provenanceCheckChainDepth(1, 1)).toBe(true);
       expect(napi.provenanceCheckChainDepth(2, 1)).toBe(false);
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // 9. Bridge trust evaluation
-  // ---------------------------------------------------------------------------
-
-  describe("Bridge trust (real NAPI)", () => {
-    // `bridgeEvaluateTrust` and `bridgeRegister` are stateless module-level
-    // helpers on the raw addon — not on the `Scp` class. Post-ADR-048 the
-    // test calls dispatch through `addon` directly. The raw addon returns
-    // camelCase keys (napi-rs `#[napi(object)]` default); the Bridge
-    // wrapper's snake_case normalization no longer applies here so the
-    // assertions below read the camelCase shape.
-    test("evaluates trust for native non-bridged action (highest tier)", () => {
-      const tier = addon.bridgeEvaluateTrust(false, true, "shadow");
-      expect(typeof tier).toBe("number");
-      // Native + non-bridged should be highest trust.
-      expect(tier).toBe(3);
-    });
-
-    test("evaluates trust for shadow bridged action (lowest tier)", () => {
-      const tier = addon.bridgeEvaluateTrust(true, false, "shadow");
-      expect(typeof tier).toBe("number");
-      expect(tier).toBeLessThan(3);
-    });
-
-    test("evaluates trust for claimed bridged action", () => {
-      const tier = addon.bridgeEvaluateTrust(true, false, "claimed");
-      expect(typeof tier).toBe("number");
-      // Claimed should be higher trust than shadow when bridged.
-      const shadowTier = addon.bridgeEvaluateTrust(true, false, "shadow");
-      expect(tier).toBeGreaterThanOrEqual(shadowTier);
-    });
-
-    test("registers a bridge connector", () => {
-      const reg = addon.bridgeRegister(
-        "ctx-bridge-test",
-        "did:key:operator",
-        "did:key:governance",
-        "discord",
-        "relay",
-      );
-      // Raw addon returns camelCase keys.
-      expect(reg.bridgeId).toBeTruthy();
-      expect(reg.operatorDid).toBe("did:key:operator");
-      expect(reg.platform).toBe("discord");
-      expect(reg.mode).toBe("relay");
-      expect(reg.status).toBe("active");
-      expect(reg.contextId).toBe("ctx-bridge-test");
-    });
-
-    test("rejects self-approval (operator === governance)", () => {
-      expect(() =>
-        addon.bridgeRegister(
-          "ctx-self",
-          "did:key:operator",
-          "did:key:operator",
-          "discord",
-          "relay",
-        ),
-      ).toThrow(/approver cannot be the same/);
-    });
-
-    test("creates a shadow identity", () => {
-      const shadow = napi.bridgeCreateShadow("bridge-1", "@discorduser", "relay", "ctx-shadow");
-      expect(shadow.shadow_id).toBeTruthy();
-      expect(shadow.platform_handle).toBe("@discorduser");
-      expect(shadow.bridge_id).toBe("bridge-1");
-      expect(shadow.attributed_role).toBe("observer");
-      // Provenance status should be "Shadow" (Debug format from Rust).
-      expect(shadow.provenance_status).toBeTruthy();
-    });
-
-    test("registers bridges with all four modes", () => {
-      for (const mode of [
-        "relay",
-        "puppet",
-        "api",
-        "cooperative",
-      ] as const satisfies readonly BridgeMode[]) {
-        const reg = addon.bridgeRegister(`ctx-${mode}`, "did:key:op", "did:key:gov", "slack", mode);
-        expect(reg.status).toBe("active");
-      }
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // 9b. Bridge credential store (spec §12.11) — per-instance SCP methods
-  // ---------------------------------------------------------------------------
-
-  describe("Bridge credentials (real NAPI)", () => {
-    const key = new Uint8Array(32).fill(7);
-
-    test("provision -> retrieve -> rotate -> revoke lifecycle", () => {
-      const bridgeId = "bridge-cred-ts-001";
-
-      const provisioned = scpInstance.bridgeCredentialProvision(
-        bridgeId,
-        "ApiKey",
-        new TextEncoder().encode("first-secret"),
-        key,
-      );
-      expect(provisioned.bridgeId).toBe(bridgeId);
-      expect(provisioned.credentialType).toBe("ApiKey");
-      expect(typeof provisioned.createdAt).toBe("number");
-
-      const retrieved = scpInstance.bridgeCredentialRetrieve(bridgeId, "ApiKey", key);
-      expect(new TextDecoder().decode(retrieved)).toBe("first-secret");
-
-      scpInstance.bridgeCredentialRotate(
-        bridgeId,
-        "ApiKey",
-        new TextEncoder().encode("second-secret"),
-        key,
-      );
-      const rotated = scpInstance.bridgeCredentialRetrieve(bridgeId, "ApiKey", key);
-      expect(new TextDecoder().decode(rotated)).toBe("second-secret");
-
-      expect(scpInstance.bridgeCredentialList(bridgeId)).toEqual(["ApiKey"]);
-
-      scpInstance.bridgeCredentialRevoke(bridgeId);
-      expect(() => scpInstance.bridgeCredentialRetrieve(bridgeId, "ApiKey", key)).toThrow();
-    });
-
-    test("credential key store -> get -> delete lifecycle", () => {
-      const bridgeId = "bridge-cred-ts-002";
-
-      scpInstance.bridgeCredentialStoreKey(bridgeId, key);
-      const got = scpInstance.bridgeCredentialGetKey(bridgeId);
-      expect(Array.from(got)).toEqual(Array.from(key));
-
-      scpInstance.bridgeCredentialDeleteKey(bridgeId);
-      expect(() => scpInstance.bridgeCredentialGetKey(bridgeId)).toThrow();
-    });
-
-    test("rejects a non-32-byte credential key", () => {
-      expect(() =>
-        scpInstance.bridgeCredentialProvision(
-          "bridge-cred-ts-003",
-          "ApiKey",
-          new TextEncoder().encode("secret"),
-          new Uint8Array(16),
-        ),
-      ).toThrow();
     });
   });
 

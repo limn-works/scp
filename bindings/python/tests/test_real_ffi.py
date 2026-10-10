@@ -18,8 +18,11 @@ event log, discovery, and provenance through real FFI.
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
+
+from tests.conftest import skip_reason_if_extension_absent
 
 # ---------------------------------------------------------------------------
 # Skip entire module if the native extension is not available
@@ -27,11 +30,8 @@ import pytest
 
 try:
     from scp_sdk import _scp_core  # installed as scp_sdk._scp_core by maturin
-except (ImportError, AttributeError):
-    pytest.skip(
-        "Native _scp_core extension not available — run maturin develop first",
-        allow_module_level=True,
-    )
+except Exception as _exc:
+    pytest.skip(skip_reason_if_extension_absent(_exc), allow_module_level=True)
 
 from scp_sdk import SCP
 from scp_sdk.errors import ValidationError
@@ -933,8 +933,6 @@ class TestProvenance:
 
     async def test_evaluate_quality(self, scp: SCP):
         # ADR-048 §1: pure helper now exposed as a module-level free fn.
-        import _scp_core  # type: ignore[import-not-found]
-
         result = _scp_core.evaluate_provenance_quality(None, "persistent", "active", None)
         assert isinstance(result, int)
         assert 0 <= result <= 3
@@ -965,8 +963,6 @@ class TestProvenance:
 
     async def test_chain_depth(self, scp: SCP):
         # ADR-048 §1: pure helper now exposed as a module-level free fn.
-        import _scp_core  # type: ignore[import-not-found]
-
         assert _scp_core.provenance_check_chain_depth(3, 5)
         assert not _scp_core.provenance_check_chain_depth(6, 5)
 
@@ -1088,6 +1084,12 @@ class TestTrust:
 
         admin = await scp.identity_create(CustodyType.IN_MEMORY)
         member = await scp.identity_create(CustodyType.IN_MEMORY)
+        # Event timestamps are whole Unix seconds from the core's system clock,
+        # and a still-open membership interval runs to the latest event
+        # timestamp (§7.3.2). Events milliseconds apart that straddle a second
+        # boundary yield a duration of 1, so the duration is bounded by the
+        # whole seconds the clock crosses during the scenario.
+        before_secs = int(time.time())
         # The ceiling MUST carry the governance + child-creation capabilities, or
         # the proposer (creator) lacks governance:propose / the child-creation
         # capability and the proposal is permission-denied.
@@ -1143,6 +1145,7 @@ class TestTrust:
             admin.did,
             json.dumps({"CreateChildContext": {"params": child_params}}),
         )
+        after_secs = int(time.time())
 
         admin_record = participation_record(scp, context_id, admin.did)
         member_record = participation_record(scp, context_id, member.did)
@@ -1165,6 +1168,10 @@ class TestTrust:
         # attestation_count is credential-layer (§7.4), never Merkle-anchored.
         assert admin_record.attestation_count_anchored is False
         assert member_record.attestation_count_anchored is False
+        # Every event timestamp lies in [before_secs, after_secs], so no
+        # membership interval can exceed the whole seconds elapsed.
+        for record in (admin_record, member_record):
+            assert 0 <= record.participation_duration_secs <= after_secs - before_secs
         # Real Merkle root over the convergent governance leaves (64 hex chars).
         assert len(admin_record.event_log_root) == 64
         assert admin_record.event_log_root != "0" * 64

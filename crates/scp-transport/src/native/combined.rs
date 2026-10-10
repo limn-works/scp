@@ -145,8 +145,28 @@ impl CombinedNodeStorage {
             .map_err(|e| StorageError::Internal(format!("failed to create directory: {e}")))?;
 
         let db_path = dir.join("node.db");
-        let conn = Connection::open(&db_path)
-            .map_err(|e| StorageError::Internal(format!("failed to open database: {e}")))?;
+        // Refuses, before it opens the file, unless SQLite's page-cache bulk
+        // block is absent and no page-cache buffer has held a page, and then
+        // unless this connection's lookaside pool is off (spec section 17.6).
+        let conn =
+            scp_sqlite_pools::open(&db_path).map_err(|e| StorageError::Internal(e.to_string()))?;
+
+        // `cipher_memory_security` runs alone and is read back before the key
+        // statement, so SQLCipher wipes every block its allocator frees from
+        // then on and a refusal comes before SQLite frees a block holding the
+        // key's hex text; its `malloc` heap is outside the wiping global
+        // allocator. While no code in the process reconfigures SQLite, `1`
+        // shows memory security is on and that SQLCipher is the linked engine.
+        // The key statement's blocks and the decrypted pages reach that
+        // allocator only because SQLite's reuse paths are off (checked by the
+        // open above) (spec §17.6, and §9.15 of the security-model spec, freed
+        // heap memory).
+        conn.execute_batch("PRAGMA cipher_memory_security = ON;")
+            .map_err(|e| {
+                StorageError::Internal(format!("failed to set cipher_memory_security: {e}"))
+            })?;
+        scp_sqlite_pools::require_memory_security(&conn)
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         // Apply SQLCipher encryption key and hardening PRAGMAs.
         // Matches SqliteStorage settings for consistent security posture.
@@ -559,8 +579,8 @@ impl BlobStorage for CombinedNodeStorage {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
             .map_err(|e| StorageError::Internal(format!("count failed: {e}")))?;
-        #[allow(clippy::cast_sign_loss)]
-        Ok(count as usize)
+        usize::try_from(count)
+            .map_err(|e| StorageError::Internal(format!("blob count {count} out of range: {e}")))
     }
 }
 
@@ -594,6 +614,37 @@ mod tests {
         let storage = CombinedNodeStorage::open_with_clock(dir, &key, clock)
             .expect("failed to create test storage");
         (storage, time)
+    }
+
+    /// The constructor's own connection serves nothing from `SQLite`'s
+    /// lookaside pool after its key statement and an insert with bound values
+    /// (spec §17.6, `SQLCipher` configuration).
+    #[test]
+    fn connection_serves_nothing_from_lookaside() {
+        let dir = tempfile::tempdir().expect("tempdir should succeed");
+        let storage =
+            CombinedNodeStorage::open(dir.path(), &[0xAB; 32]).expect("open should succeed");
+        let conn = storage
+            .conn
+            .lock()
+            .expect("connection lock should not be poisoned");
+        conn.execute_batch("CREATE TABLE lookaside_probe (k TEXT NOT NULL, v BLOB NOT NULL)")
+            .expect("probe table should be created");
+        conn.execute(
+            "INSERT INTO lookaside_probe (k, v) VALUES (?1, ?2)",
+            rusqlite::params!["a-key", vec![0x5A_u8; 64]],
+        )
+        .expect("insert should run");
+        let used = scp_sqlite_pools::lookaside_use(&conn).expect("lookaside status should read");
+        drop(conn);
+        assert_eq!(
+            used,
+            scp_sqlite_pools::LookasideUse {
+                slots_high_water: 0,
+                hits: 0
+            },
+            "no lookaside slot may hold the key statement or the bound values"
+        );
     }
 
     fn make_blob_id(data: &[u8]) -> [u8; 32] {

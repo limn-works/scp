@@ -31,7 +31,6 @@ const PY_DISCOVERY: &str = include_str!("../../../../bindings/python/scp_sdk/dis
 const PY_PROVENANCE: &str = include_str!("../../../../bindings/python/scp_sdk/provenance.py");
 const PY_TRUST: &str = include_str!("../../../../bindings/python/scp_sdk/trust.py");
 const PY_SYNC: &str = include_str!("../../../../bindings/python/scp_sdk/sync.py");
-const PY_BRIDGE: &str = include_str!("../../../../bindings/python/scp_sdk/bridge.py");
 const PY_GOVERNANCE: &str = include_str!("../../../../bindings/python/scp_sdk/governance.py");
 // Phase 4 PR 5 (#1549) migrated most per-module Python wrappers onto the
 // `SCP` class in `scp.py`. Include that file so the coverage matrix sees
@@ -51,7 +50,6 @@ const TS_DISCOVERY: &str = include_str!("../../../../bindings/typescript/src/dis
 const TS_PROVENANCE: &str = include_str!("../../../../bindings/typescript/src/provenance.ts");
 const TS_TRUST: &str = include_str!("../../../../bindings/typescript/src/trust.ts");
 const TS_SYNC: &str = include_str!("../../../../bindings/typescript/src/sync.ts");
-const TS_BRIDGE: &str = include_str!("../../../../bindings/typescript/src/bridge.ts");
 // The TypeScript `Bridge` interface — the low-level adapter contract that
 // the SDK's native backend implements and that SCP class methods
 // delegate to. Analogous to Swift's `ScpBindings.swift` (UniFFI-generated)
@@ -82,24 +80,21 @@ const SWIFT_GOVERNANCE: &str =
     include_str!("../../../../bindings/swift/Sources/SCP/Governance.swift");
 // Phase 4 PR 4 migrated many per-module Swift wrappers into methods on the
 // `SCP` class in `Scp.swift` (e.g. `ucanValidate`, `transportStatus`,
-// `syncClassifyOffline`, `identityMigrate`, `bridgeEvaluateTrust`). This
-// file is now the canonical wrapper surface alongside the per-module
-// files above, so include it for the SDK wrapper coverage matrix.
+// `syncClassifyOffline`, `identityMigrate`). This file is now the
+// canonical wrapper surface alongside the per-module files above, so
+// include it for the SDK wrapper coverage matrix.
 const SWIFT_SCP: &str = include_str!("../../../../bindings/swift/Sources/SCP/Scp.swift");
 // UniFFI-generated bindings. Exposes the raw bridge functions
-// (`bridgeRegister`, `bridgeCreateShadow`, `evaluateProvenanceQuality`,
-// etc.) that the hand-written wrappers delegate to. Some operations are
-// currently invoked only via the generated free functions — include this
-// file so the coverage matrix sees them.
+// (`evaluateProvenanceQuality`, etc.) that the hand-written wrappers
+// delegate to. Some operations are currently invoked only via the
+// generated free functions — include this file so the coverage matrix
+// sees them.
 const SWIFT_BINDINGS: &str =
     include_str!("../../../../bindings/swift/Sources/SCP/Internal/ScpBindings.swift");
 
 // Kotlin SDK files
 const KT_IDENTITY: &str =
     include_str!("../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Identity.kt");
-const KT_BRIDGE_CONNECTOR: &str = include_str!(
-    "../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/BridgeConnector.kt"
-);
 const KT_DISCOVERY: &str =
     include_str!("../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Discovery.kt");
 const KT_PROVENANCE: &str =
@@ -141,7 +136,6 @@ fn py_all() -> String {
         PY_PROVENANCE,
         PY_TRUST,
         PY_SYNC,
-        PY_BRIDGE,
         PY_GOVERNANCE,
         PY_SCP,
     ]
@@ -158,7 +152,6 @@ fn ts_all() -> String {
         TS_PROVENANCE,
         TS_TRUST,
         TS_SYNC,
-        TS_BRIDGE,
         TS_BRIDGE_INTERNAL,
     ]
     .join("\n")
@@ -185,7 +178,6 @@ fn swift_all() -> String {
 fn kt_all() -> String {
     [
         KT_IDENTITY,
-        KT_BRIDGE_CONNECTOR,
         KT_DISCOVERY,
         KT_PROVENANCE,
         KT_SYNC,
@@ -644,33 +636,6 @@ fn expected_operations() -> Vec<ExpectedOp> {
             ts_patterns: &["broadcastPublish("],
             swift_patterns: &["broadcastPublish", "BroadcastPublish"],
             kt_patterns: &["fun broadcastPublish("],
-        },
-        // --- Bridge ---
-        ExpectedOp {
-            category: "Bridge",
-            name: "register",
-            py_patterns: &["def register(", "bridge_register"],
-            ts_patterns: &["registerBridge(", "bridgeRegister"],
-            swift_patterns: &["func bridgeRegister("],
-            kt_patterns: &["fun bridgeRegister("],
-        },
-        ExpectedOp {
-            category: "Bridge",
-            name: "evaluate_trust",
-            py_patterns: &["evaluate_trust", "bridge_evaluate_trust"],
-            ts_patterns: &["evaluateBridgeTrust(", "bridgeEvaluateTrust"],
-            // Phase 4 PR 4 renamed `evaluateBridgeTrust` → `bridgeEvaluateTrust`
-            // on the `SCP` class in Scp.swift. Accept both.
-            swift_patterns: &["func evaluateBridgeTrust(", "func bridgeEvaluateTrust("],
-            kt_patterns: &["fun bridgeEvaluateTrust("],
-        },
-        ExpectedOp {
-            category: "Bridge",
-            name: "create_shadow",
-            py_patterns: &["create_shadow", "bridge_create_shadow"],
-            ts_patterns: &["createShadow(", "bridgeCreateShadow"],
-            swift_patterns: &["func bridgeCreateShadow("],
-            kt_patterns: &["fun bridgeCreateShadow("],
         },
     ]
 }
@@ -1191,27 +1156,6 @@ fn swift_sdk_transport_wrappers() {
 }
 
 #[test]
-fn swift_sdk_bridge_wrappers() {
-    let src = swift_all();
-    // Phase 4 PR 4 renamed `evaluateBridgeTrust` → `bridgeEvaluateTrust`
-    // on the `SCP` class in Scp.swift. `bridgeRegister` and
-    // `bridgeCreateShadow` come from the UniFFI-generated bindings in
-    // `Internal/ScpBindings.swift`, which is now included in `swift_all()`.
-    assert!(
-        src.contains("func bridgeRegister("),
-        "Swift SDK missing bridge register wrapper"
-    );
-    assert!(
-        src.contains("func evaluateBridgeTrust(") || src.contains("func bridgeEvaluateTrust("),
-        "Swift SDK missing bridge evaluate_trust wrapper"
-    );
-    assert!(
-        src.contains("func bridgeCreateShadow("),
-        "Swift SDK missing bridge create_shadow wrapper"
-    );
-}
-
-#[test]
 fn kotlin_sdk_identity_wrappers() {
     let src = kt_all();
     assert!(
@@ -1330,23 +1274,6 @@ fn kotlin_sdk_discovery_wrappers() {
     );
 }
 
-#[test]
-fn kotlin_sdk_bridge_wrappers() {
-    let src = kt_all();
-    assert!(
-        src.contains("fun bridgeRegister("),
-        "Kotlin SDK missing bridge register wrapper"
-    );
-    assert!(
-        src.contains("fun bridgeEvaluateTrust("),
-        "Kotlin SDK missing bridge evaluate_trust wrapper"
-    );
-    assert!(
-        src.contains("fun bridgeCreateShadow("),
-        "Kotlin SDK missing bridge create_shadow wrapper"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Cross-SDK completeness matrix
 // ---------------------------------------------------------------------------
@@ -1425,7 +1352,6 @@ fn all_sdk_source_files_are_non_empty() {
         ("Python provenance.py", PY_PROVENANCE),
         ("Python trust.py", PY_TRUST),
         ("Python sync.py", PY_SYNC),
-        ("Python bridge.py", PY_BRIDGE),
         ("Python governance.py", PY_GOVERNANCE),
         ("TypeScript identity.ts", TS_IDENTITY),
         ("TypeScript context.ts", TS_CONTEXT),
@@ -1435,7 +1361,6 @@ fn all_sdk_source_files_are_non_empty() {
         ("TypeScript provenance.ts", TS_PROVENANCE),
         ("TypeScript trust.ts", TS_TRUST),
         ("TypeScript sync.ts", TS_SYNC),
-        ("TypeScript bridge.ts", TS_BRIDGE),
         ("Swift Identity.swift", SWIFT_IDENTITY),
         ("Swift Context.swift", SWIFT_CONTEXT),
         ("Swift Outlets.swift", SWIFT_OUTLETS),
@@ -1447,7 +1372,6 @@ fn all_sdk_source_files_are_non_empty() {
         ("Swift Trust.swift", SWIFT_TRUST),
         ("Swift Governance.swift", SWIFT_GOVERNANCE),
         ("Kotlin Identity.kt", KT_IDENTITY),
-        ("Kotlin BridgeConnector.kt", KT_BRIDGE_CONNECTOR),
         ("Kotlin Discovery.kt", KT_DISCOVERY),
         ("Kotlin Provenance.kt", KT_PROVENANCE),
         ("Kotlin Sync.kt", KT_SYNC),

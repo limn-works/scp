@@ -265,10 +265,7 @@ public extension Context {
     /// output bytes — or reaches a typed terminal, surfaced directly as one of
     /// the generated ``ScpError`` saga cases:
     ///
-    /// - ``ScpError/SagaAborted(msg:code:retryAfterMs:)`` — a Prepare-phase
-    ///   abort: a PERMANENT rejection OR a RETRYABLE transient (rate limit /
-    ///   participant actor unavailable), distinguished by the `SCP-SAGA-*`
-    ///   code. `retryAfterMs` is the limiter's computed back-off, or `nil`
+    /// - ``ScpError/SagaAborted(msg:code:retryAfterMs:)`` — `retryAfterMs` is the limiter's computed back-off, or `nil`
     ///   (never `0`) when no precise back-off instant exists.
     /// - ``ScpError/SagaNeedsRepair(msg:code:sagaId:)`` — Commit retries
     ///   exhausted (a possible divergence); carries the durable `sagaId`
