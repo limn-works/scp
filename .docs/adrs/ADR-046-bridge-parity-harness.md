@@ -205,7 +205,7 @@ A new job in `.github/workflows/ci.yml`:
   `bridge-parity-swift` selects `uniffi-swift`, because each of those two jobs
   supplies the UniFFI artifact and the parity runner its own target needs:
   `bridge-parity-kotlin` downloads the cdylib and the Kotlin bindings that job
-  `kotlin-test` built on Ubuntu and uploaded as artifact `uniffi-kotlin-linux`,
+  `uniffi-cdylib-linux` built on Ubuntu and uploaded as artifact `uniffi-kotlin-linux`,
   and `bridge-parity-swift` downloads the XCFramework that job `xcframework`
   built on macOS.
 - Joins the final `ci` aggregator gate.

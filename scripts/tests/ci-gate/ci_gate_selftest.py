@@ -178,8 +178,8 @@ nothing:
                three paths, one of them the tracked ScpBindings.swift, so the
                checkout always supplied a match and the option could not fail
                the producer when build-xcframework.sh wrote nothing. The
-               kotlin-test upload lists the UniFFI cdylib and the Kotlin
-               bindings, and a build that wrote one of them satisfies the
+               uniffi-cdylib-linux upload lists the UniFFI cdylib and the
+               Kotlin bindings, and a build that wrote one of them satisfies the
                option the same way.
   lint-scope   One crate declared the lint the two rustdoc jobs exist to fire:
                crates/scp-runtime/src/lib.rs carried
@@ -825,6 +825,7 @@ RUST_ONLY_RUNS = {
     "swift-lint": False,
     "typescript-check": True,
     "typescript-wasm-check": False,
+    "uniffi-cdylib-linux": True,
     "xcframework": True,
 } | dict.fromkeys(CODE_JOBS, True)
 DOCS_ONLY_RUNS = dict.fromkeys(RUST_ONLY_RUNS, False)
@@ -845,7 +846,8 @@ PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromke
         "bridge-parity",
         "bridge-parity-kotlin",
         "bridge-parity-swift",
-        # Producer of the UniFFI cdylib bridge-parity-kotlin downloads.
+        # Its `python` clause predates the producer split and is kept so the Kotlin
+        # suite runs on every change it ran on before.
         "kotlin-test",
         "napi-addon",
         "pyo3-module",
@@ -854,6 +856,9 @@ PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromke
         "python-test",
         "python-wheel-build",
         "rust-build-pyo3-production",
+        # Producer of the UniFFI cdylib and Kotlin bindings kotlin-test and
+        # bridge-parity-kotlin download.
+        "uniffi-cdylib-linux",
         "xcframework",
     ),
     True,
@@ -3926,12 +3931,13 @@ def check_dependency_conditions_detect_a_narrowed_producer(doc: dict) -> None:
     """Narrowing one producer's condition by one clause is caught above.
 
     Each (producer, clause) pair below is a producer whose `if:` carries that clause
-    for bridge-parity-kotlin alone: kotlin-test's own tests need `kotlin || rust`, so
-    its `python` clause is the one an edit scoped to the Kotlin lane would drop.
+    for bridge-parity-kotlin alone: uniffi-cdylib-linux's other consumer, kotlin-test,
+    needs only `kotlin || rust` for its own tests, so the `python` clause is the one an
+    edit scoped to the Kotlin lane would drop.
     """
     for producer_id, clause in (
         ("pyo3-module", "outputs.kotlin"),
-        ("kotlin-test", "outputs.python"),
+        ("uniffi-cdylib-linux", "outputs.python"),
     ):
         narrowed = copy.deepcopy(doc)
         producer = narrowed["jobs"][producer_id]
@@ -4733,7 +4739,7 @@ ARTIFACT_KEY_JOB_FILE_INPUTS = {
     "xcframework": (
         ("bindings/swift/build-xcframework.sh", "the script that runs the build"),
     ),
-    "kotlin-test": (
+    "uniffi-cdylib-linux": (
         (
             "scripts/generate-uniffi-kotlin.sh",
             "the script that generates the Kotlin bindings",
@@ -4903,7 +4909,13 @@ def check_artifact_cache_keys(doc: dict) -> None:
     producers = bridge_producers(doc)
     check(
         "ci.yml: the artifact cache check reads all five bridge producers",
-        {"kotlin-test", "napi-addon", "pyo3-module", "pyo3-module-macos", "xcframework"}
+        {
+            "napi-addon",
+            "pyo3-module",
+            "pyo3-module-macos",
+            "uniffi-cdylib-linux",
+            "xcframework",
+        }
         <= set(producers),
         f"found {producers}",
     )
@@ -5211,8 +5223,8 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
 # marker file the job touches before its build under RUNNER_TEMP, the uploaded paths the
 # checkout tracks (a cache hit that leaves a tracked path out cannot be detected,
 # because the checkout supplies it), and whether its verify step rejects a
-# zero-byte output (kotlin-test's two paths are files; the xcframework's include
-# directories).
+# zero-byte output (uniffi-cdylib-linux's two paths are files; the xcframework's
+# include directories).
 MULTI_PATH_PRODUCERS = (
     (
         "xcframework",
@@ -5221,7 +5233,7 @@ MULTI_PATH_PRODUCERS = (
         ("bindings/swift/Sources/SCP/Internal/ScpBindings.swift",),
         False,
     ),
-    ("kotlin-test", "uniffi-kotlin-linux", "uniffi-kotlin-build-start", (), True),
+    ("uniffi-cdylib-linux", "uniffi-kotlin-linux", "uniffi-kotlin-build-start", (), True),
 )
 # Uploaded paths that name a file rather than a directory.
 UPLOADED_FILE_SUFFIXES = (".swift", ".so", ".kt")
@@ -5269,17 +5281,17 @@ def check_multi_path_producers_are_listed(doc: dict) -> None:
         f"got {gaps}",
     )
     mutated = copy.deepcopy(doc)
-    for step in mutated["jobs"]["kotlin-test"]["steps"]:
+    for step in mutated["jobs"]["uniffi-cdylib-linux"]["steps"]:
         if (step.get("with") or {}).get("name") == "uniffi-kotlin-linux":
             step["with"]["path"] = step["with"]["path"].split()[0]
     gaps = multi_path_producer_gaps(mutated)
     check(
-        "kotlin-test uploading one path is reported as extra in the tuple",
+        "uniffi-cdylib-linux uploading one path is reported as extra in the tuple",
         gaps
         == [
             (
-                "kotlin-test is in MULTI_PATH_PRODUCERS and has no upload listing "
-                "several paths"
+                "uniffi-cdylib-linux is in MULTI_PATH_PRODUCERS and has no upload "
+                "listing several paths"
             )
         ],
         f"got {gaps}",
@@ -5306,8 +5318,9 @@ def check_multi_path_outputs_are_verified(
 
     WHY: `if-no-files-found: error` fires only when all listed paths together match
     nothing. The xcframework upload lists the tracked ScpBindings.swift, so the
-    checkout always supplies a match, and a build that writes one of kotlin-test's
-    two paths satisfies the option, so the option alone cannot fail either producer.
+    checkout always supplies a match, and a build that writes one of
+    uniffi-cdylib-linux's two paths satisfies the option, so the option alone cannot
+    fail either producer.
     """
     steps = doc["jobs"][job_id]["steps"]
     upload = next(
@@ -6504,6 +6517,7 @@ def check_push_runs_every_cache_writer(doc: dict) -> None:
         "rust-test-macos",
         "rust-test-optional-features",
         "typescript-wasm-check",
+        "uniffi-cdylib-linux",
         "xcframework",
     ):
         check(f"{job_id} is read as a cache writer", job_id in writers, f"{writers}")

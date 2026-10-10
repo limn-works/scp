@@ -3928,15 +3928,154 @@ jobs:
   # ORs on `rust` for a reason spelled out above python-test: this job builds
   # a UniFFI cdylib and runs a Kotlin suite against it, and that cdylib
   # reaches every Rust workspace crate through scp-core.
-  kotlin-test:
+  # Producer of artifact `uniffi-kotlin-linux`, which kotlin-test and
+  # bridge-parity-kotlin download: the `scp-ffi-uniffi --features testing` cdylib and
+  # the Kotlin bindings uniffi-bindgen generates from it. Building them here, instead of
+  # in kotlin-test, lets bridge-parity-kotlin start when this build ends rather than
+  # when kotlin-test's Android setup and Gradle tests end, and runs it in parallel with
+  # kotlin-test. The Kotlin parity runner stays in bridge-parity-kotlin, so this job
+  # adds nothing ahead of kotlin-test beyond the cargo build kotlin-test ran before.
+  # The condition is the union of its two consumers' conditions: GitHub skips a job
+  # whose `needs` holds a skipped job, so a narrower condition here would skip a
+  # consumer on a change it reads and fail the `ci` aggregator on that skip.
+  uniffi-cdylib-linux:
     needs: changes
-    # This job is also the producer of artifact `uniffi-kotlin-linux`, the UniFFI cdylib
-    # and the Kotlin bindings generated from it, which bridge-parity-kotlin downloads.
-    # Its own tests need `kotlin || rust`; the `python` clause is there because
-    # bridge-parity-kotlin reads `python || kotlin || rust`, and GitHub skips a job whose
-    # `needs` holds a skipped job, so a narrower condition here would skip the Kotlin half
-    # of the parity harness on every change confined to bindings/python and fail the `ci`
-    # aggregator on that skip.
+    if: >-
+      needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.kotlin == 'true' ||
+      needs.changes.outputs.rust == 'true'
+    name: Bridge artifact / UniFFI cdylib + Kotlin bindings (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Free disk space when the runner is short of it
+        run: |
+          # Conditional for the reason job rust-test's copy of this step states in
+          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
+          # AFTER the deletions, so about 85 GB was free before them, against the
+          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
+          # short of and cost between 21 s and 2 min 12 s per job.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+      - uses: actions/checkout@v5
+      - name: Hash the artifact inputs no file glob covers
+        id: artifact-inputs
+        run: |
+          set -euo pipefail
+          job_definition=$(awk -v start="  ${GITHUB_JOB}:" \
+            '$0 == start {found = 1; print; next} found && /^  [^ #]/ {exit} found {print}' \
+            .github/workflows/ci.yml)
+          if [ -z "$job_definition" ]; then
+            echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
+            exit 1
+          fi
+          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ #]/ {exit} found {print}' \
+            .github/workflows/ci.yml)
+          inputs="$RUNNER_TEMP/artifact-inputs"
+          {
+            printf '%s\n' "$job_definition"
+            printf '%s\n' "$workflow_env"
+            git ls-files -- crates
+            echo "image=${ImageOS:?ImageOS is unset}-${ImageVersion:?ImageVersion is unset}"
+            ldd --version 2>&1 | sed -n 1p
+            cc --version | sed -n 1p
+            dpkg-query -W -f='${Version}\n' libssl-dev
+          } > "$inputs"
+          digest=$(shasum -a 256 < "$inputs" | cut -d ' ' -f 1)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      # The key also hashes scripts/generate-uniffi-kotlin.sh, which runs uniffi-bindgen
+      # over the cdylib and so decides the bindings this cache holds.
+      - name: Restore the UniFFI cdylib and Kotlin bindings a run with the same inputs built
+        id: artifact-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            target/debug/libscp_ffi_uniffi.so
+            bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
+          key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'scripts/generate-uniffi-kotlin.sh') }}-${{ steps.artifact-inputs.outputs.digest }}
+      - name: Mark the start of the build
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        run: touch "$RUNNER_TEMP/uniffi-kotlin-build-start"
+      - uses: ./.github/actions/rust-toolchain
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      - name: Build UniFFI native library
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo build -p scp-ffi-uniffi --features testing
+      - name: Generate Kotlin bindings
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        run: ./scripts/generate-uniffi-kotlin.sh --skip-build --features=testing
+      # `if-no-files-found: error` on the upload below fires only when both paths
+      # together match nothing, so a build that wrote one of the two would publish half
+      # an artifact under a green producer. This step fails the producer when either
+      # path is absent or empty or, after a build, was not written by it. On a cache hit
+      # no build ran, so it checks presence alone.
+      # scripts/tests/ci-gate/ci_gate_selftest.py runs it against each path missing and
+      # each path stale.
+      - name: Verify the build wrote every uploaded output
+        env:
+          ARTIFACT_CACHE_HIT: ${{ steps.artifact-cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          marker="$RUNNER_TEMP/uniffi-kotlin-build-start"
+          for output in \
+            target/debug/libscp_ffi_uniffi.so \
+            bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt; do
+            if [ ! -s "$output" ] && [ "${ARTIFACT_CACHE_HIT:-}" = true ]; then
+              echo "::error::the cache restore reported a hit without writing $output"
+              exit 1
+            fi
+            if [ ! -s "$output" ]; then
+              echo "::error::the build exited 0 without writing $output"
+              exit 1
+            fi
+            if [ "${ARTIFACT_CACHE_HIT:-}" = true ]; then
+              continue
+            fi
+            if [ -z "$(find "$output" -newer "$marker" -print -quit)" ]; then
+              echo "::error::$output holds nothing written by this build"
+              exit 1
+            fi
+          done
+      - name: Upload UniFFI cdylib and Kotlin bindings
+        uses: actions/upload-artifact@v4
+        with:
+          # The paths share no directory below the workspace, so upload-artifact takes
+          # the workspace as the artifact root and each consumer restores them by
+          # downloading to `.`.
+          name: uniffi-kotlin-linux
+          path: |
+            target/debug/libscp_ffi_uniffi.so
+            bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
+          retention-days: 30
+          if-no-files-found: error
+      - name: Save the UniFFI cdylib and Kotlin bindings under their input key
+        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            target/debug/libscp_ffi_uniffi.so
+            bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
+          key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
+
+  kotlin-test:
+    # Job uniffi-cdylib-linux builds the UniFFI cdylib and the Kotlin bindings these
+    # tests load and compile against. This job builds no Rust and reads no cargo cache;
+    # it installs the pinned toolchain only for the `cargo metadata` call its Gradle
+    # build makes (see the step before `Run tests`).
+    # Its own tests need `kotlin || rust`. The `python` clause keeps the suite running
+    # on every change it ran on when this job was also the producer.
+    needs: [changes, uniffi-cdylib-linux]
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.kotlin == 'true' ||
@@ -4001,111 +4140,32 @@ jobs:
           echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/android-googlexr-license"
           echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
       - run: sdkmanager "platforms;android-35"
-      - name: Hash the artifact inputs no file glob covers
-        id: artifact-inputs
+      # The artifact root is the workspace (see the upload in uniffi-cdylib-linux), so `.`
+      # restores `target/debug/libscp_ffi_uniffi.so` and the generated `scp.kt` to the
+      # paths the producer wrote them at. A missing artifact fails this step.
+      - name: Download UniFFI cdylib and Kotlin bindings
+        uses: actions/download-artifact@v4
+        with:
+          name: uniffi-kotlin-linux
+          path: .
+      # A download that left either file out or empty fails here, naming the file,
+      # rather than as a Gradle compile error or a JNA load error in a later step.
+      - name: Assert the downloaded cdylib and bindings are present
         run: |
           set -euo pipefail
-          job_definition=$(awk -v start="  ${GITHUB_JOB}:" \
-            '$0 == start {found = 1; print; next} found && /^  [^ #]/ {exit} found {print}' \
-            .github/workflows/ci.yml)
-          if [ -z "$job_definition" ]; then
-            echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
-            exit 1
-          fi
-          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ #]/ {exit} found {print}' \
-            .github/workflows/ci.yml)
-          inputs="$RUNNER_TEMP/artifact-inputs"
-          {
-            printf '%s\n' "$job_definition"
-            printf '%s\n' "$workflow_env"
-            git ls-files -- crates
-            echo "image=${ImageOS:?ImageOS is unset}-${ImageVersion:?ImageVersion is unset}"
-            ldd --version 2>&1 | sed -n 1p
-            cc --version | sed -n 1p
-            dpkg-query -W -f='${Version}\n' libssl-dev
-          } > "$inputs"
-          digest=$(shasum -a 256 < "$inputs" | cut -d ' ' -f 1)
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      # The key also hashes scripts/generate-uniffi-kotlin.sh, which runs uniffi-bindgen
-      # over the cdylib and so decides the bindings this cache holds.
-      - name: Restore the UniFFI cdylib and Kotlin bindings a run with the same inputs built
-        id: artifact-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            target/debug/libscp_ffi_uniffi.so
-            bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
-          key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'scripts/generate-uniffi-kotlin.sh') }}-${{ steps.artifact-inputs.outputs.digest }}
-      - name: Mark the start of the build
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
-        run: touch "$RUNNER_TEMP/uniffi-kotlin-build-start"
-      # Unconditional: on a cache hit `Run tests` still runs `cargo metadata` through
-      # `cargoTargetDir` in bindings/kotlin/scp-kt-android/build.gradle.kts.
-      - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@v2
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
-        with:
-          shared-key: workspace-debug
-          save-if: false
-      - name: Build UniFFI native library
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
-        run: |
-          cargo build -p scp-ffi-uniffi --features testing
-      - name: Generate Kotlin bindings
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
-        run: ./scripts/generate-uniffi-kotlin.sh --skip-build --features=testing
-      # `if-no-files-found: error` on the upload below fires only when both paths
-      # together match nothing, so a build that wrote one of the two would publish half
-      # an artifact under a green producer. This step fails the producer when either
-      # path is absent or empty or, after a build, was not written by it. On a cache hit
-      # no build ran, so it checks presence alone.
-      # scripts/tests/ci-gate/ci_gate_selftest.py runs it against each path missing and
-      # each path stale.
-      - name: Verify the build wrote every uploaded output
-        env:
-          ARTIFACT_CACHE_HIT: ${{ steps.artifact-cache.outputs.cache-hit }}
-        run: |
-          set -euo pipefail
-          marker="$RUNNER_TEMP/uniffi-kotlin-build-start"
           for output in \
             target/debug/libscp_ffi_uniffi.so \
             bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt; do
-            if [ ! -s "$output" ] && [ "${ARTIFACT_CACHE_HIT:-}" = true ]; then
-              echo "::error::the cache restore reported a hit without writing $output"
-              exit 1
-            fi
             if [ ! -s "$output" ]; then
-              echo "::error::the build exited 0 without writing $output"
-              exit 1
-            fi
-            if [ "${ARTIFACT_CACHE_HIT:-}" = true ]; then
-              continue
-            fi
-            if [ -z "$(find "$output" -newer "$marker" -print -quit)" ]; then
-              echo "::error::$output holds nothing written by this build"
+              echo "::error::artifact uniffi-kotlin-linux placed nothing at $output"
               exit 1
             fi
           done
-      - name: Upload UniFFI cdylib and Kotlin bindings
-        uses: actions/upload-artifact@v4
-        with:
-          # The two paths share no directory below the workspace, so upload-artifact
-          # takes the workspace as the artifact root and bridge-parity-kotlin restores
-          # both by downloading to `.`.
-          name: uniffi-kotlin-linux
-          path: |
-            target/debug/libscp_ffi_uniffi.so
-            bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
-          retention-days: 30
-          if-no-files-found: error
-      - name: Save the UniFFI cdylib and Kotlin bindings under their input key
-        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            target/debug/libscp_ffi_uniffi.so
-            bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
-          key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
+      # No cargo build runs here, but `cargoTargetDir` in
+      # bindings/kotlin/scp-kt-android/build.gradle.kts runs `cargo metadata` during
+      # `Run tests`, and RUSTUP_AUTO_INSTALL is "0", so the pinned toolchain must be
+      # installed before it.
+      - uses: ./.github/actions/rust-toolchain
       - uses: gradle/actions/setup-gradle@v4
       - name: Run tests
         working-directory: bindings/kotlin
@@ -4121,11 +4181,11 @@ jobs:
           # `testDebugUnitTest`. Running the bare name `testDebugUnitTest`
           # therefore ran the Android unit tests alone and skipped every
           # `:scp-kt` test — including the real-FFI suites that exercise the
-          # compiled cdylib this job builds or restores above.
+          # compiled cdylib this job downloads above.
           #
           # `-Pscp.uniffi.prebuiltBindings=true` skips `generateUniffiBindings`, which
           # would otherwise rebuild the crate, so these tests compile against the
-          # bindings this job uploads and load the cdylib it uploads.
+          # bindings uniffi-cdylib-linux uploads and load the cdylib it uploads.
           ./gradlew :scp-kt:test :scp-kt-android:testDebugUnitTest -Pscp.uniffi.prebuiltBindings=true
       # Gradle prints no test totals, so a change that moved this suite between jobs or
       # artifacts and lost tests would pass unseen. This step sums the JUnit XML each
@@ -4453,14 +4513,16 @@ jobs:
   # a pre-built UniFFI Kotlin binding tree on top of the Python + Rust
   # stack the parent bridge-parity job already carries.
   bridge-parity-kotlin:
-    # Job pyo3-module builds the PyO3 half of this harness, and job kotlin-test builds
-    # the UniFFI half: the `scp-ffi-uniffi --features testing` cdylib and the Kotlin
-    # bindings generated from it, uploaded together as `uniffi-kotlin-linux`. This job
-    # runs no cargo command, so it installs no Rust toolchain and reads no cargo cache.
+    # Job pyo3-module builds the PyO3 half of this harness, and job uniffi-cdylib-linux
+    # builds the UniFFI half: the `scp-ffi-uniffi --features testing` cdylib and the
+    # Kotlin bindings generated from it, uploaded together as `uniffi-kotlin-linux`.
+    # This job runs no cargo command, so it installs no Rust toolchain and reads no
+    # cargo cache. It builds the Kotlin parity runner itself, in parallel with
+    # kotlin-test, so the runner build stays off the path kotlin-test waits on.
     # The installDist step passes `-Pscp.uniffi.prebuiltBindings=true`, which skips
     # `generateUniffiBindings` in bindings/kotlin/scp-kt/build.gradle.kts; without it
     # that task would rebuild the crate whatever the download placed in `target/debug`.
-    needs: [changes, pyo3-module, kotlin-test]
+    needs: [changes, pyo3-module, uniffi-cdylib-linux]
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.kotlin == 'true' ||
@@ -4483,9 +4545,9 @@ jobs:
         with:
           name: pyo3-module-linux
           path: bindings/python/scp_sdk
-      # The artifact root is the workspace (see the upload in kotlin-test), so `.`
-      # restores `target/debug/libscp_ffi_uniffi.so` and the generated `scp.kt` to the
-      # paths kotlin-test wrote them at. A missing artifact fails this step.
+      # The artifact root is the workspace (see the upload in uniffi-cdylib-linux), so
+      # `.` restores `target/debug/libscp_ffi_uniffi.so` and the generated `scp.kt` to
+      # the paths the producer wrote them at. A missing artifact fails this step.
       - name: Download UniFFI cdylib and Kotlin bindings
         uses: actions/download-artifact@v4
         with:
@@ -4804,6 +4866,7 @@ jobs:
       - typescript-wasm-check
       - scaffold-typescript-web-check
       - kotlin-lint
+      - uniffi-cdylib-linux
       - kotlin-test
       - swift-lint
       - swift-build-test
