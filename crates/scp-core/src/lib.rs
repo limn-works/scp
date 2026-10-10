@@ -267,12 +267,6 @@ pub mod sync {
     pub use scp_runtime::sync::weeks_offline;
 }
 
-pub mod bridge {
-    pub use scp_protocol::bridge::*;
-    pub use scp_runtime::bridge::credentials;
-    pub use scp_runtime::bridge::oauth;
-}
-
 pub mod provenance {
     pub use scp_protocol::provenance::*;
 }

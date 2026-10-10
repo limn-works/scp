@@ -5220,7 +5220,6 @@ dependencies = [
  "tower-http",
  "tower-service",
  "tracing",
- "url",
  "x509-parser 0.16.0",
  "zeroize",
 ]
@@ -5334,7 +5333,6 @@ name = "scp-runtime"
 version = "0.1.0-beta.2"
 dependencies = [
  "aes",
- "aes-gcm",
  "arc-swap",
  "async-trait",
  "base64",
@@ -5343,7 +5341,6 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "futures",
  "hex",
- "hkdf 0.12.4",
  "jsonschema",
  "lru 0.18.2",
  "metrics",

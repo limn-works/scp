@@ -80,7 +80,6 @@ scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2" }
 scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
 async-trait = { workspace = true }
 aes = { workspace = true }
-aes-gcm = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 serde_bytes = { workspace = true }
@@ -90,7 +89,6 @@ z-base-32 = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 x25519-dalek = { workspace = true }
-hkdf = { workspace = true }
 percent-encoding = { workspace = true }
 base64 = { workspace = true }
 bs58 = { workspace = true }
