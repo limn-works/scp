@@ -7,18 +7,23 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { GovernanceError, UnknownGovernanceOutcomeError } from "../src/errors";
+import { __constructScpWithNativeForTests, type SCP } from "../src/scp";
 import type {
   AddressResolution,
   Checkpoint,
   ContextParams,
   DIDDocument,
   Event,
+  GovernanceActionResult,
   Message,
   OutletDefinition,
   ParticipationFact,
   ParticipationProfile,
   ParticipationThreshold,
   Proof,
+  ProposalStatus,
+  RejectionReason,
   RequireParticipation,
   ResolutionPath,
   SiteConfig,
@@ -28,8 +33,12 @@ import type {
 } from "../src/types";
 import {
   Capabilities,
+  checkProposalResponse,
+  governanceActionResultFromBridge,
   outletCall,
   outletQuery,
+  proposalStatusFromBridge,
+  rejectionReasonFromBridge,
   validateAdmission,
   validateBroadcastKeyHex,
   validateSiteConfig,
@@ -657,5 +666,183 @@ describe("validateBroadcastKeyHex", () => {
     expect(() => validateBroadcastKeyHex("")).toThrow(
       "broadcastKeyHex must be exactly 64 hex characters",
     );
+  });
+});
+
+// Names every bridge emits, copied from the name functions in
+// crates/scp-ffi/common/src/governance_result.rs. Listed here as literals so a
+// test reads each name a bridge sends, not the list under test.
+const RUST_ACTION_RESULT_NAMES = [
+  "MemberAdded",
+  "MemberRemoved",
+  "RoleChanged",
+  "OutletRegistered",
+  "OutletRemoved",
+  "CeilingModified",
+  "ContextClosed",
+  "TtlExtended",
+  "PruningPolicyModified",
+  "AdminTransferred",
+  "SignerAdded",
+  "SignerRemoved",
+  "ThresholdModified",
+  "ChildContextCreated",
+  "OutletInterfaceEstablished",
+  "MemberReset",
+  "ConflictResolved",
+  "ContextPromoted",
+  "MemberSuspended",
+  "AccessRevoked",
+  "AccessRestored",
+  "ContentKeysRotated",
+  "GovernanceReconfigured",
+  "SubscriberBanned",
+  "SubscriberUnbanned",
+  "Executed",
+  "MigrationProposed",
+  "MigrationCancelled",
+  "ContextTombstoned",
+];
+const RUST_PROPOSAL_STATUS_NAMES = [
+  "Pending",
+  "Approved",
+  "Rejected",
+  "Expired",
+  "Cancelled",
+  "Invalidated",
+];
+const RUST_REJECTION_REASON_NAMES = [
+  "AdminRejected",
+  "MajorityRejected",
+  "UnanimityBroken",
+  "ApprovalImpossible",
+  "InsufficientParticipation",
+];
+
+function expectGov11040(run: () => unknown, raw?: string): void {
+  let caught: unknown;
+  try {
+    run();
+  } catch (err) {
+    caught = err;
+  }
+  expect(caught).toBeInstanceOf(UnknownGovernanceOutcomeError);
+  expect(caught).toBeInstanceOf(GovernanceError);
+  const err = caught as UnknownGovernanceOutcomeError;
+  expect(err.code).toBe("SCP-GOV-11040");
+  if (raw !== undefined) {
+    expect(err.rawOutcome).toBe(raw);
+  }
+}
+
+describe("governance names from a bridge", () => {
+  it("parses every action result name", () => {
+    for (const name of RUST_ACTION_RESULT_NAMES) {
+      expect(governanceActionResultFromBridge(name)).toBe(name as GovernanceActionResult);
+    }
+  });
+
+  it("parses every proposal status name", () => {
+    for (const name of RUST_PROPOSAL_STATUS_NAMES) {
+      expect(proposalStatusFromBridge(name)).toBe(name as ProposalStatus);
+    }
+  });
+
+  it("parses every rejection reason name", () => {
+    for (const name of RUST_REJECTION_REASON_NAMES) {
+      expect(rejectionReasonFromBridge(name)).toBe(name as RejectionReason);
+    }
+  });
+
+  it("throws SCP-GOV-11040 for a name it does not carry", () => {
+    for (const parse of [
+      governanceActionResultFromBridge,
+      proposalStatusFromBridge,
+      rejectionReasonFromBridge,
+    ]) {
+      for (const raw of ["SomethingThisSdkDoesNotKnow", "", " Executed", "executed"]) {
+        expectGov11040(() => parse(raw), raw);
+      }
+    }
+  });
+});
+
+describe("checkProposalResponse", () => {
+  it("returns a response whose names it knows", () => {
+    for (const body of [
+      { proposal_id: "ab", status: "Approved", execution_result: "RoleChanged" },
+      { proposal_id: "ab", status: "Pending", execution_result: null },
+      { status: "Rejected", reason: "UnanimityBroken", rejector: "did:dht:zA" },
+      { status: "Invalidated", reason: "proposer removed" },
+      { status: "Cancelled" },
+    ]) {
+      const raw = JSON.stringify(body);
+      expect(checkProposalResponse(raw)).toBe(raw);
+    }
+  });
+
+  it("throws SCP-GOV-11040 for a response it cannot read", () => {
+    for (const raw of [
+      JSON.stringify({ status: "Approved", execution_result: "SomethingNew" }),
+      JSON.stringify({ status: "SomethingNew" }),
+      JSON.stringify({ status: "Rejected", reason: "SomethingNew" }),
+      JSON.stringify({ status: "Rejected" }),
+      JSON.stringify({ status: "Invalidated" }),
+      JSON.stringify({ execution_result: "Executed" }),
+      JSON.stringify({ status: "Approved", execution_result: 7 }),
+      "not json",
+      "[]",
+    ]) {
+      expectGov11040(() => checkProposalResponse(raw));
+    }
+  });
+});
+
+describe("SCP governance wrappers", () => {
+  const scpReturning = (method: string, raw: string): SCP =>
+    __constructScpWithNativeForTests({ [method]: async () => raw });
+
+  it("contextExecuteGovernanceAction returns a typed outcome", async () => {
+    const scp = scpReturning("contextExecuteGovernanceAction", "MemberSuspended");
+    expect(await scp.contextExecuteGovernanceAction({}, "ab")).toBe("MemberSuspended");
+  });
+
+  it("contextExecuteGovernanceAction throws SCP-GOV-11040 for an unknown outcome", async () => {
+    const scp = scpReturning("contextExecuteGovernanceAction", "SomethingNew");
+    const err = await scp.contextExecuteGovernanceAction({}, "ab").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UnknownGovernanceOutcomeError);
+    expect((err as UnknownGovernanceOutcomeError).code).toBe("SCP-GOV-11040");
+  });
+
+  it("propose, approve, reject, and withdraw check every name", async () => {
+    const ok = JSON.stringify({ status: "Pending" });
+    const cases: [string, (scp: SCP) => Promise<string>, string][] = [
+      [
+        "contextGovernancePropose",
+        (scp) => scp.contextGovernancePropose({}, "{}", "did:dht:zA"),
+        JSON.stringify({ status: "Approved", execution_result: "SomethingNew" }),
+      ],
+      [
+        "contextGovernanceApprove",
+        (scp) => scp.contextGovernanceApprove({}, "ab", "did:dht:zA"),
+        JSON.stringify({ status: "SomethingNew" }),
+      ],
+      [
+        "contextGovernanceReject",
+        (scp) => scp.contextGovernanceReject({}, "ab", "did:dht:zA"),
+        JSON.stringify({ status: "SomethingNew" }),
+      ],
+      [
+        "contextGovernanceWithdraw",
+        (scp) => scp.contextGovernanceWithdraw({}, "ab", "did:dht:zA"),
+        JSON.stringify({ status: "SomethingNew" }),
+      ],
+    ];
+    for (const [method, call, bad] of cases) {
+      const err = await call(scpReturning(method, bad)).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(UnknownGovernanceOutcomeError);
+      expect((err as UnknownGovernanceOutcomeError).code).toBe("SCP-GOV-11040");
+      expect(await call(scpReturning(method, ok))).toBe(ok);
+    }
   });
 });

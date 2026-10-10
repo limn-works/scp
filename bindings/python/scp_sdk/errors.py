@@ -198,6 +198,31 @@ class GovernanceError(ScpError):
     _default_code: str = "SCP-GOV-11000"
 
 
+class UnknownGovernanceOutcomeError(GovernanceError):
+    """A bridge reported a governance name this SDK version does not enumerate.
+
+    Every bridge names what a governance call did through one shared mapping in
+    ``scp_ffi_common::governance_result``: an action outcome
+    (:class:`~scp_sdk.governance.GovernanceActionResult`), a proposal status
+    (:class:`~scp_sdk.governance.ProposalStatus`), and a rejection reason
+    (:class:`~scp_sdk.governance.RejectionReason`). An SDK older than its bridge
+    reads a name none of those enums carries. This error reports that name
+    instead of substituting a known one, because governance decides
+    authorization and a substituted name would report an action or status the
+    engine never reported.
+
+    Attributes:
+        raw_outcome: The name the bridge reported, or the whole response when
+            the response carried no readable name.
+    """
+
+    _default_code: str = "SCP-GOV-11040"
+
+    def __init__(self, message: str, raw_outcome: str, code: str | None = None) -> None:
+        super().__init__(message, code)
+        self.raw_outcome = raw_outcome
+
+
 class EconomyError(ScpError):
     """Payment, budget, or economic-policy failure (SCP-ECON range, 12000-12999)."""
 
@@ -423,5 +448,6 @@ __all__ = [
     "StreamGap",
     "TransportError",
     "UcanPermissionError",
+    "UnknownGovernanceOutcomeError",
     "ValidationError",
 ]
