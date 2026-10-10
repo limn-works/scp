@@ -111,6 +111,12 @@ pub fn html_escape_event_string(s: &str) -> String {
 #[cfg(feature = "custody")]
 pub mod custody_parse;
 
+// Resolves `$HOME/.scp/keys.bin` and `SCP_KEY_PASSPHRASE` for `"file"`
+// custody, rejecting an unset, empty or relative HOME and an empty passphrase,
+// then opens the key file. See ADR-006 and spec §17.8.
+#[cfg(feature = "custody")]
+pub mod custody_file;
+
 // Shared attestation construction pipeline for all FFI bridges.
 // Requires scp-core + scp-identity (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
