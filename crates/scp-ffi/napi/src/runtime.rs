@@ -14,7 +14,9 @@
 //!   errors until transport is configured. See issue #501.
 //! - `MerkleEventLogProvider` — Persistent Merkle-chained event log backed by
 //!   `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484).
-//! - `NapiBridgePersistence` — In-memory persistence via `DashMap`.
+//! - `ProtocolRepositoryContextBridge` — context-snapshot persistence over the
+//!   SAME storage handle that backs the event log and `DurableProviders`
+//!   (spec §17.6: one chosen backend, derived consumers).
 //!
 //! See issue #388 and `.docs/adrs/phase-4.md` (ADR-022).
 
@@ -213,7 +215,6 @@ pub use scp_ffi_common::bridge_runtime::ProtocolRepoVariant;
 /// their own `OnceLock`s during PR 1 — they move onto this struct in PR 2.
 ///
 /// Constructed via [`NapiBridgeInstance::new_napi`] /
-/// [`NapiBridgeInstance::with_persistence_napi`] /
 /// [`NapiBridgeInstance::with_storage_napi`]. Each `#[napi] Scp` owns an
 /// `Arc<NapiBridgeInstance>` exclusively — there is no process-global
 /// default bridge (the legacy default bridge was deleted in Phase D).
@@ -293,10 +294,8 @@ pub struct NapiBridgeInstance {
     /// `build_supervisor_arc` clones this out (two `Arc` clones, same backend) to
     /// supply `Supervisor::with_providers_and_journal`. The runtime never
     /// defaults storage (spec §17.6 / ADR-049); `None` is the
-    /// storage-before-supervisor fail-closed condition. Note that
-    /// `NapiBridgePersistence` (a `DashMap`) is NOT a `Storage` and therefore can
-    /// never back `mls_storage` — the in-memory backend always comes from the
-    /// `build_event_log_provider` handle.
+    /// storage-before-supervisor fail-closed condition. The in-memory backend
+    /// always comes from the `build_event_log_provider` handle.
     pub(crate) durable_providers: Option<scp_core::context::supervisor::DurableProviders>,
 
     // -----------------------------------------------------------------
@@ -414,49 +413,21 @@ impl NapiBridgeInstance {
             scp_ffi_common::bridge_runtime::build_event_log_provider();
         // The un-swallowed in-memory storage handle backs the supervisor's
         // `mls_storage` view. The SAME store backs the event-log repository
-        // above (spec §17.6 — one chosen backend, derived consumers). This is
-        // the in-memory storage source for `mls_storage` — NOT
-        // `NapiBridgePersistence`, which is a `DashMap` and not a `Storage`.
-        // The durable saga journal and the `mls_storage` view are bound into one
+        // above (spec §17.6 — one chosen backend, derived consumers). The
+        // durable saga journal and the `mls_storage` view are bound into one
         // `DurableProviders` derived from the SAME `Arc`, so they cannot diverge
         // by construction (§17.6 / §17.16).
         let durable_providers = durable_providers_from_handle(storage_handle);
-        let core = CoreFields::new();
-        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
-        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
-        Self {
-            core,
-            ucan_registry: Arc::new(DashMap::new()),
-            released_contexts: std::sync::Mutex::new(HashMap::new()),
-            next_release_generation: std::sync::atomic::AtomicU64::new(0),
-            context_handles: Arc::new(DashMap::new()),
-            identity_registry: Arc::new(DashMap::new()),
-            protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
-            durable_providers: Some(durable_providers),
-            mcp_server_registry: Arc::new(DashMap::new()),
-            mcp_client_registry: Arc::new(DashMap::new()),
-            #[cfg(feature = "testing")]
-            network: std::sync::Mutex::new(None),
-            recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
-            outlet_stream_registry,
-            outlet_streaming_saga_registry,
-        }
-    }
-
-    /// Constructs a new `NapiBridgeInstance` with an explicit
-    /// [`ContextPersistence`] provider.
-    ///
-    /// Used by callers that already have a persistence strategy (typically
-    /// unit tests; production persistence is wired through PR 3's
-    /// [`StorageConfig::InMemory`] path on `NapiBridgeInstance::with_storage_napi`).
-    #[must_use]
-    pub fn with_persistence_napi(persistence: Box<dyn ContextPersistence + Send + Sync>) -> Self {
-        let (_event_log, protocol_repository, storage_handle) =
-            scp_ffi_common::bridge_runtime::build_event_log_provider();
-        // Saga journal + `mls_storage` bound into one `DurableProviders` derived
-        // from one handle (§17.6 / §17.16).
-        let durable_providers = durable_providers_from_handle(storage_handle);
-        let core = CoreFields::with_persistence(persistence);
+        // The context persistence bridges over the SAME repository (spec
+        // §17.6), so every snapshot lands in the chosen backend — the
+        // supervisor never receives a persistence the caller did not choose
+        // (§17.17 `SCP-CAPSEL-8000`).
+        let persistence: Arc<dyn ContextPersistence + Send + Sync> = Arc::new(
+            scp_core::store::context::ProtocolRepositoryContextBridge::new(Arc::clone(
+                &protocol_repository,
+            )),
+        );
+        let core = CoreFields::with_persistence_arc(persistence);
         let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
         let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
@@ -1038,7 +1009,14 @@ pub fn init_supervisor(bi: &NapiBridgeInstance, local_did: &str) {
     ));
     let transport = Box::new(scp_core::context::NotConfiguredTransportProvider);
     let event_log = event_log_provider_from_existing_repo(bi);
-    let persistence = persistence_box_for_init(bi);
+    let Some(persistence) = persistence_box_for_init(bi) else {
+        tracing::error!(
+            "storage-before-supervisor precondition failed — no context persistence on \
+             the bridge instance; refusing to attach a supervisor (fail closed, spec \
+             §17.6 / §17.17)"
+        );
+        return;
+    };
     // Storage-before-supervisor precondition (spec §17.6): the chosen storage
     // must already be erased into the `mls_storage` view. The runtime never
     // defaults storage, so a missing backend fails closed — no supervisor is
@@ -1166,19 +1144,20 @@ fn key_resolver_for(bi: &NapiBridgeInstance) -> scp_core::context::governance::K
         })
 }
 
-/// Returns a `Box<dyn ContextPersistence>` for `ContextManager::with_persistence`.
+/// Returns the supervisor's `Box<dyn ContextPersistence>`: the shared
+/// provider every constructor attaches to `CoreFields::persistence`, built
+/// over the same storage handle as the event log and `DurableProviders`
+/// (spec §17.6), so the supervisor and the `CoreFields` mirror share one
+/// backend.
 ///
-/// Prefers the shared provider attached to `CoreFields::persistence` (the
-/// path taken by `with_storage_napi(StorageConfig::Sqlite)`) so the
-/// manager and the `CoreFields` mirror share a single backend. Falls
-/// back to the legacy in-memory [`NapiBridgePersistence`] when no shared
-/// provider is configured.
-fn persistence_box_for_init(bi: &NapiBridgeInstance) -> Box<dyn ContextPersistence> {
-    if let Some(shared) = bi.core.persistence_arc_clone() {
-        Box::new(ArcContextPersistence::new(shared))
-    } else {
-        Box::new(NapiBridgePersistence::new())
-    }
+/// `None` means no persistence was attached. Every constructor attaches one,
+/// so callers treat `None` as the storage-before-supervisor fail-closed
+/// condition and attach no supervisor; there is no in-process fallback
+/// (§17.17 `SCP-CAPSEL-8000`).
+fn persistence_box_for_init(bi: &NapiBridgeInstance) -> Option<Box<dyn ContextPersistence>> {
+    bi.core
+        .persistence_arc_clone()
+        .map(|shared| Box::new(ArcContextPersistence::new(shared)) as Box<dyn ContextPersistence>)
 }
 
 /// Initializes the given bridge instance's per-instance `Supervisor` with
@@ -1212,7 +1191,14 @@ pub fn init_supervisor_with_local_transport(bi: &NapiBridgeInstance, local_did: 
     ));
     let transport = Box::new(scp_core::context::LocalTransportProvider);
     let event_log = event_log_provider_from_existing_repo(bi);
-    let persistence = persistence_box_for_init(bi);
+    let Some(persistence) = persistence_box_for_init(bi) else {
+        tracing::error!(
+            "storage-before-supervisor precondition failed — no context persistence on \
+             the bridge instance; refusing to attach a supervisor (fail closed, spec \
+             §17.6 / §17.17)"
+        );
+        return;
+    };
     let Some(durable) = bi.durable_providers_ref().cloned() else {
         tracing::error!(
             "init_supervisor_with_local_transport: storage-before-supervisor \
@@ -1277,7 +1263,14 @@ pub fn init_supervisor_with_relay_transport(
     ));
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
     let event_log = event_log_provider_from_existing_repo(bi);
-    let persistence = persistence_box_for_init(bi);
+    let Some(persistence) = persistence_box_for_init(bi) else {
+        tracing::error!(
+            "storage-before-supervisor precondition failed — no context persistence on \
+             the bridge instance; refusing to attach a supervisor (fail closed, spec \
+             §17.6 / §17.17)"
+        );
+        return;
+    };
     let Some(durable) = bi.durable_providers_ref().cloned() else {
         tracing::error!(
             "init_supervisor_with_relay_transport: storage-before-supervisor \
@@ -1413,6 +1406,14 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
         );
         return;
     };
+    let Some(persistence) = persistence_box_for_init(bi) else {
+        tracing::error!(
+            local_did,
+            "init_supervisor_for_test_on: storage-before-supervisor precondition failed — \
+             no context persistence on the bridge instance"
+        );
+        return;
+    };
     let supervisor_arc = build_supervisor_arc(
         Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
             local_did.to_owned(),
@@ -1420,7 +1421,7 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
         )),
         Box::new(scp_core::context::LocalTransportProvider),
         event_log,
-        Box::new(NapiBridgePersistence::new()),
+        persistence,
         durable,
         key_resolver_for(bi),
     );
@@ -2604,66 +2605,6 @@ async fn create_supervisor_context_with_capabilities(
 // with ProtocolRepositoryEventLogBridge persistence (issue #484).
 
 // ---------------------------------------------------------------------------
-// NapiBridgePersistence — in-memory persistence
-// ---------------------------------------------------------------------------
-
-/// In-memory persistence provider for the NAPI bridge.
-///
-/// Stores context snapshots in a `DashMap`. Suitable for
-/// the Node.js/Bun environment where process lifetime matches context
-/// lifetime. Production persistence (`SQLite`) is configured at the
-/// application layer.
-struct NapiBridgePersistence {
-    contexts: DashMap<String, ContextSnapshot>,
-}
-
-impl NapiBridgePersistence {
-    fn new() -> Self {
-        Self {
-            contexts: DashMap::new(),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl ContextPersistence for NapiBridgePersistence {
-    async fn persist_context(
-        &self,
-        context_id: &str,
-        snapshot: &ContextSnapshot,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.contexts
-            .insert(context_id.to_owned(), snapshot.clone());
-        Ok(())
-    }
-
-    async fn load_context(
-        &self,
-        context_id: &str,
-    ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.contexts.get(context_id).map(|v| v.value().clone()))
-    }
-
-    async fn delete_context(
-        &self,
-        context_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.contexts.remove(context_id);
-        Ok(())
-    }
-
-    async fn list_persisted_contexts(
-        &self,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self
-            .contexts
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect())
-    }
-}
-
-// ---------------------------------------------------------------------------
 // ArcContextPersistence — shared-Arc adapter
 // ---------------------------------------------------------------------------
 
@@ -2916,12 +2857,22 @@ mod tests {
     fn test_in_memory_populates_mls_storage_backend() {
         // The dev/in-memory path must populate the durable providers from the
         // un-swallowed in-memory storage handle (spec §17.6 — one chosen
-        // backend, derived consumers). NapiBridgePersistence (a DashMap) is
-        // NOT the source; the build_event_log_provider handle is.
+        // backend, derived consumers): the build_event_log_provider handle.
         let bi = NapiBridgeInstance::new_napi();
         assert!(
             bi.durable_providers_ref().is_some(),
             "in-memory dev path must populate the durable providers"
+        );
+        // The context persistence derives from the same handle, so the
+        // supervisor initializers find one and attach a supervisor.
+        assert!(
+            bi.core.persistence_arc_clone().is_some(),
+            "in-memory dev path must attach the repository-backed context persistence"
+        );
+        init_supervisor(&bi, "did:dht:z6MkNapiInMemoryPersistence");
+        assert!(
+            bi.core.has_supervisor(),
+            "an instance with its context persistence attached must get a supervisor"
         );
     }
 
