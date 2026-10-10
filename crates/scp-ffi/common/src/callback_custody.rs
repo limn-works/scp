@@ -507,9 +507,9 @@ where
 /// the key id is not numeric, the host's `get_public_key` fails, or the
 /// host's answer is refused, the flow destroys the new host key before it
 /// returns the error, and appends a destroy failure other than key-not-found
-/// to the error. The flow leaves the host key in place in two cases. When the
-/// cache already holds the id, the id names a key this adapter holds, so the
-/// flow returns the refusal alone. When the registry lock is poisoned, the
+/// to the error. The flow leaves the host key in place in three cases. When
+/// the cache already holds the id, the id names a key this adapter holds, so
+/// the flow returns the refusal alone. When the registry lock is poisoned, the
 /// cache cannot say whether the id names a held key, so the flow appends that
 /// the key was not destroyed. When the host's `generate_keypair` fails, no key
 /// id exists and nothing is destroyed.
