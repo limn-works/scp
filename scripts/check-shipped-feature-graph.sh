@@ -41,7 +41,11 @@
 # ----------------------------------------------------------
 # For every ARTIFACTS entry, the set of crates its non-dev graph resolves from a
 # LOCAL PATH source is also a SUBSET of a closed list, PERMITTED_CRATES. A local
-# crate the list does not name FAILS this gate until a human adds it.
+# crate the list does not name FAILS this gate until a human adds it. The same
+# check runs, under default features, on every package a SHIPPING_FILES line
+# builds or publishes (`packages_built_by_shipping_files`) that has no
+# default-feature ARTIFACTS entry, so a package the drift check admits as a
+# default-members node still gets its crate set checked.
 #
 # Why the feature dimension alone cannot see such a crate: it compares FEATURE
 # rows, and a crate contributes no row when no feature of it is enabled. A crate
@@ -68,12 +72,7 @@
 # The dimension reads BOTH renderings the feature dimension reads (the
 # `-e features,no-dev` tree and the `-e no-dev --format '{f}|{p}'` tree, each
 # with `--target all`) and checks their union, for the same reason: a cargo
-# release that changes one rendering must not empty the check. The default-members
-# resolution gets no crate dimension, because a bare `cargo build` compiles each
-# member into its own artifact; the per-artifact graph is what links into a
-# shipped binary, and cross-member unification is a FEATURE effect the feature
-# dimension already checks. That resolution reaches test-only members
-# (`scp-relay-mock`, `scp-ffi-napi-test-stubs`) that no ARTIFACTS graph reaches.
+# release that changes one rendering must not empty the check.
 #
 # WHY A CLOSED ⊆-WHITELIST, NOT A DENYLIST
 # ----------------------------------------
@@ -291,11 +290,12 @@ EOF
 # Permitted-production CRATE list (EXPLICIT, closed): the whitelist for the
 # crate dimension the header describes.
 #
-# Every crate an ARTIFACTS graph resolves from a local path source must appear
-# here. `cargo tree` DERIVES each artifact's reached set; this list is the
-# hand-maintained set of what is PERMITTED. Like PERMITTED_ALLOWLIST it is one
-# SUPERSET list covering every ARTIFACTS entry, and run_gate fails on an entry no
-# artifact reaches, so the list cannot drift into naming crates that do not ship.
+# Every crate an ARTIFACTS graph, or the graph of a package a shipping file
+# builds, resolves from a local path source must appear here. `cargo tree`
+# DERIVES each graph's reached set; this list is the hand-maintained set of what
+# is PERMITTED. It is one SUPERSET list covering every checked graph, and
+# run_gate fails on an entry no checked graph reaches, so the list cannot drift
+# into naming crates that do not ship.
 # NULLIFIER_CONTROL_FEATURES's bare crate entry (`scp-testing`) may never appear
 # here; assert_permitted_crates_have_no_nullifier_crate enforces that.
 #
@@ -304,6 +304,7 @@ EOF
 # ---------------------------------------------------------------------------
 PERMITTED_CRATES="$(cat <<'EOF'
 scp-alloc
+scp-client
 scp-clock
 scp-core
 scp-crypto
@@ -942,10 +943,10 @@ assert_every_permitted_crate_is_reached() {
     return 1
   fi
   if unreached="$(check_subset "$permitted" "$(printf '%s' "$union" | sed '/^$/d')")"; then
-    echo "   OK — every PERMITTED_CRATES entry is reached by an ARTIFACTS graph"
+    echo "   OK — every PERMITTED_CRATES entry is reached by a checked graph"
     return 0
   fi
-  echo "   FAIL — PERMITTED_CRATES names crates no ARTIFACTS graph reaches:"
+  echo "   FAIL — PERMITTED_CRATES names crates no checked graph reaches:"
   printf '%s\n' "$unreached" | sed 's/^/       ✗ /'
   echo "   Remove each entry above, or add the artifact that ships it to ARTIFACTS."
   return 1
@@ -1221,7 +1222,31 @@ run_gate() {
     fi
   done
 
-  echo ">> PERMITTED_CRATES hygiene  (every entry reached by at least one artifact)"
+  # Crate dimension for every package a shipping file builds that no
+  # default-feature ARTIFACTS entry already resolved. The drift check admits a
+  # default-members node as gated, so without this a package built by `-p` from
+  # that set would ship with no crate check.
+  local shipped_roots root reached
+  if ! shipped_roots="$(packages_built_by_shipping_files)"; then
+    echo ">> packages built by a shipping file"
+    echo "   FAIL — the shipping files could not be read, so the packages they build"
+    echo "          got no crate check."
+    failures=$((failures + 1))
+  else
+    for root in $(packages_without_default_artifact_entry "$shipped_roots" "$(printf '%s\n' "${ARTIFACTS[@]}")"); do
+      echo ">> $root  (default features; built by a shipping file, no default-feature ARTIFACTS entry)"
+      if reached="$(resolve_crate_set -p "$root")"; then
+        assert_crates_permitted "$reached" "$PERMITTED_CRATES" || failures=$((failures + 1))
+        reached_union="$(printf '%s\n%s' "$reached_union" "$reached")"
+      else
+        echo "   FAIL — the local crate set this package reaches did not resolve"
+        echo "          (cargo failed or a rendering yielded no local crate node)."
+        failures=$((failures + 1))
+      fi
+    done
+  fi
+
+  echo ">> PERMITTED_CRATES hygiene  (every entry reached by at least one checked graph)"
   assert_every_permitted_crate_is_reached "$reached_union" "$PERMITTED_CRATES" \
     || failures=$((failures + 1))
 
@@ -1663,6 +1688,41 @@ packages_built_by_shipping_lines() {
 }
 
 # ---------------------------------------------------------------------------
+# packages_built_by_shipping_files
+#   The one source of "which SCP packages a shipping file builds": half 1 of
+#   assert_shipping_invocations_are_gated and the crate dimension in run_gate
+#   both read it. Returns 1, printing the missing path, when a SHIPPING_FILES
+#   entry does not exist, so an unread file never reads as "builds nothing".
+# ---------------------------------------------------------------------------
+packages_built_by_shipping_files() {
+  local file
+  for file in "${SHIPPING_FILES[@]}"; do
+    if [[ ! -f "$file" ]]; then
+      echo "shipping file '$file' named by SHIPPING_FILES does not exist" >&2
+      return 1
+    fi
+  done
+  packages_built_by_shipping_lines "$(join_continued_lines "$(cat "${SHIPPING_FILES[@]}")")" \
+    "$DECLARED_NON_SHIPPING_PACKAGE_LINES"
+}
+
+# ---------------------------------------------------------------------------
+# packages_without_default_artifact_entry <packages> <artifact-specs>
+#   Pure. Emit each of <packages> for which <artifact-specs> (one `crate|args`
+#   per line, as ARTIFACTS holds them) carries no exact `<package>|` entry. A
+#   shipping line builds its `-p` packages under default features, because
+#   assert_shipping_invocations_are_gated half 2 fails on any undeclared
+#   feature-selection line, so each package emitted here is one whose
+#   default-feature graph no ARTIFACTS entry resolves.
+# ---------------------------------------------------------------------------
+packages_without_default_artifact_entry() {
+  local pkg
+  for pkg in $1; do
+    printf '%s\n' "$2" | grep -xF "$pkg|" >/dev/null || printf '%s\n' "$pkg"
+  done
+}
+
+# ---------------------------------------------------------------------------
 # The wheel's feature selection lives outside the shipping files. maturin reads
 # `features`, `all-features`, and `no-default-features` from the
 # `[tool.maturin]` table of a pyproject.toml and passes them to cargo, so the
@@ -1965,7 +2025,7 @@ $(printf '%s\n' "$dm_tree" | sed -E -n 's/^(scp-[a-z0-9-]+) v[0-9].*/\1/p')"
   # Joined once here, so half 1, half 2, and both stale-declaration checks read
   # the same command the shell runs, whatever line breaks the file spells it with.
   shipping_lines="$(join_continued_lines "$(cat "${SHIPPING_FILES[@]}")")"
-  built_packages="$(packages_built_by_shipping_lines "$shipping_lines" "$DECLARED_NON_SHIPPING_PACKAGE_LINES")"
+  built_packages="$(packages_built_by_shipping_files)"
   for pkg in $built_packages; do
     if ! printf '%s\n' "$gated_packages" | grep -xF "$pkg" >/dev/null; then
       ungated="$ungated $pkg"
@@ -2165,6 +2225,51 @@ run_crate_dimension_fixtures() {
   expect "(crate-hygiene) an empty reached union is REJECTED" "FAIL" "$rc"
   assert_every_permitted_crate_is_reached "$(printf '%s\n' scp-a scp-b scp-c)" "$(printf '%s\n' scp-a scp-b)" >/dev/null; rc=$?
   expect "(crate-hygiene) a list every entry of which is reached is ACCEPTED" "PASS" "$rc"
+
+  # (crate-roots) packages_without_default_artifact_entry picks the shipping-file
+  #     packages whose default-feature graph no ARTIFACTS entry resolves: a
+  #     package with an exact `pkg|` entry is dropped, and a package whose only
+  #     entry selects other features is kept.
+  out="$(packages_without_default_artifact_entry "scp-core scp-ffi scp-client" \
+           "$(printf '%s\n' 'scp-core|' 'scp-ffi|--no-default-features --features server')")"
+  same_string "$out" "$(printf '%s\n' scp-ffi scp-client)"; rc=$?
+  expect "(crate-roots) a package without an exact default-feature ARTIFACTS entry is kept for the crate check" "PASS" "$rc"
+  out="$(packages_without_default_artifact_entry "scp-core" "scp-core|")"
+  same_string "$out" ""; rc=$?
+  expect "(crate-roots) a package with an exact default-feature ARTIFACTS entry is not checked twice" "PASS" "$rc"
+
+  # (crate-roots, shipping files) the one reader of the shipping files fails on
+  #     an unreadable file and, on this tree, sees the published scp-client,
+  #     which no ARTIFACTS entry names.
+  ( SHIPPING_FILES=("no-such-shipping-file.yml"); packages_built_by_shipping_files >/dev/null 2>&1 ); rc=$?
+  expect "(crate-roots, shipping files) a missing shipping file is REJECTED, never read as 'builds nothing'" "FAIL" "$rc"
+  if out="$(packages_built_by_shipping_files)"; then
+    printf '%s\n' "$(packages_without_default_artifact_entry "$out" "$(printf '%s\n' "${ARTIFACTS[@]}")")" \
+      | grep -xF 'scp-client' >/dev/null; rc=$?
+  else
+    rc=1
+  fi
+  expect "(crate-roots, shipping files) scp-client, published by release.yml with no ARTIFACTS entry, gets a crate check" "PASS" "$rc"
+
+  # (crate-roots, real tree) a shipping line that builds the test-only
+  #     default member scp-relay-mock passes the drift check as a default-members
+  #     node; the crate check on that package must REJECT it.
+  local mock_roots mock_crates
+  mock_roots="$(packages_without_default_artifact_entry \
+                  "$(packages_built_by_shipping_lines 'RUN cargo build --release -p scp-relay-mock' '')" \
+                  "$(printf '%s\n' "${ARTIFACTS[@]}")")"
+  same_string "$mock_roots" "scp-relay-mock"; rc=$?
+  expect "(crate-roots, real tree) a -p build of scp-relay-mock is selected for the crate check" "PASS" "$rc"
+  if mock_crates="$(resolve_crate_set -p scp-relay-mock 2>&1)"; then
+    out="$(assert_crates_permitted "$mock_crates" "$PERMITTED_CRATES")"; rc=$?
+    expect "(crate-roots, real tree) scp-relay-mock's crate set is REJECTED against PERMITTED_CRATES" "FAIL" "$rc"
+    contains_text "$out" "✗ scp-relay-mock "; rc=$?
+    expect "(crate-roots, real tree) that rejection names scp-relay-mock" "PASS" "$rc"
+  else
+    echo "   FAIL — (crate-roots, real tree) resolve_crate_set -p scp-relay-mock failed:"
+    printf '%s\n' "$mock_crates" | sed 's/^/       /'
+    fixture_failures=$((fixture_failures + 1))
+  fi
 
   # (crate-nullifier) the exclusion check must fire on a planted list.
   ( fixture_failures=0
@@ -2741,7 +2846,7 @@ main() {
   if run_gate; then
     echo
     echo "G1 PASSED: every shipped artifact's SCP-crate feature set ⊆ this permitted-production allowlist (durability-only + real-backend, zero nullifier exceptions)."
-    echo "G1 PASSED: every shipped artifact's local-path crate set ⊆ PERMITTED_CRATES, and every entry there is reached."
+    echo "G1 PASSED: the local-path crate set of every ARTIFACTS entry and of every package a shipping file builds ⊆ PERMITTED_CRATES, and every entry there is reached."
     exit 0
   fi
   echo
