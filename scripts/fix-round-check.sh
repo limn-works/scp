@@ -668,8 +668,9 @@ PYEOF
 # job builds. Those commands and this list keep the two packages apart because cargo
 # unifies scp-transport's features across every package one invocation builds: a joint
 # command compiles the PostgreSQL and S3 backends into one package through the other
-# package's `cloud-blobs`, and so hides that package's own mis-wired `cloud-blobs`. The `cargo test --doc` and `cargo doc` commands of the
-# `rust-doc` job, and the `cargo doc` command of `.github/workflows/docs.yml`, turn on
+# package's `cloud-blobs`, and so hides that package's own mis-wired `cloud-blobs`. The `cargo test --doc` command of the
+# `rust-doctest` job, the `cargo doc` command of the `rust-doc` job, and the `cargo doc`
+# command of `.github/workflows/docs.yml` turn on
 # `scp-node/cloud-blobs` and `scp-relay/cloud-blobs` together on purpose: rustdoc needs
 # only `postgres_blob.rs` and `s3_blob.rs` compiled, and either package's feature
 # compiles them. No entry here mirrors those three commands.
