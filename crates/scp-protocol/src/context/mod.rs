@@ -54,11 +54,10 @@ pub use metadata::{
 };
 pub use nesting::{compute_ceiling_intersection, validate_child_ttl, validate_nesting_depth};
 pub use params::{
-    BridgeCapability, BridgeDirectionality, BridgeMetadata, Capability, CeilingPolicy, ContextMode,
-    ContextParams, FieldVisibility, GovernanceModel, MemoryScope, MetadataVisibilityPolicy,
-    MigrationSource, OutletRegistration, ProjectionOverride, ProjectionPolicy, ProjectionRule,
-    PromotionPolicy, PublicMetadata, RoleDefinition, RuntimeMetadata, TemplateId,
-    decode_protocol_version, encode_protocol_version,
+    Capability, CeilingPolicy, ContextMode, ContextParams, FieldVisibility, GovernanceModel,
+    MemoryScope, MetadataVisibilityPolicy, MigrationSource, OutletRegistration, ProjectionOverride,
+    ProjectionPolicy, ProjectionRule, PromotionPolicy, PublicMetadata, RoleDefinition,
+    RuntimeMetadata, TemplateId, decode_protocol_version, encode_protocol_version,
 };
 pub use roles::{
     CapabilityCeiling, ContextRoleState, RoleAssignment, RoleError, UcanAttestation, UcanToken,

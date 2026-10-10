@@ -2,13 +2,11 @@
 //!
 //! Implements the `IdentityLinkAttestation` wire format for cryptographically
 //! proving ownership of external platform identities (X/Twitter, GitHub,
-//! Discord, etc.). Attestations enable three critical flows:
+//! Discord, etc.). Attestations enable two critical flows:
 //!
 //! 1. **Social graph import** — resolve platform handles against known
 //!    attestations to discover SCP contacts.
-//! 2. **Shadow identity claiming** — claim bridge-created shadow identities
-//!    by presenting a matching attestation (§3.5.3).
-//! 3. **Cross-platform reputation continuity** — trust judgments follow
+//! 2. **Cross-platform reputation continuity** — trust judgments follow
 //!    a person across platforms via cryptographic proof of identity linkage.
 //!
 //! Each attestation is a self-signed claim that a DID controls a specific
@@ -19,8 +17,7 @@
 //! covers all fields except the `signature` field itself, serialized with
 //! sorted-key encoding per §17.1.
 //!
-//! See spec §3.5.1 (wire format), §3.5.2 (verification protocol),
-//! §3.5.3 (shadow identity claiming).
+//! See spec §3.5.1 (wire format), §3.5.2 (verification protocol).
 
 use std::borrow::Cow;
 
