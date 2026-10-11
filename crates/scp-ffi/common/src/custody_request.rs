@@ -1,19 +1,17 @@
-//! The custody request vocabulary every FFI bridge parses when it creates an
-//! identity (spec `03-identity.md` §3.2.2, `.docs/standards/sdk-common.md`
-//! §Custody request).
+//! The custody request vocabulary of spec `03-identity.md` §3.2.2
+//! (`.docs/standards/sdk-common.md` §Custody request).
 //!
 //! A caller names the backend that holds an identity's private keys with one of
 //! two request values, `encrypted_file` and `os_keystore`. A bridge built with
 //! the `testing` feature also accepts `in_memory`, which is never a peer of the
-//! two values. [`parse_custody_request`] is the one place that maps a request to
-//! a [`CustodyRequest`] or to the code §3.2.2's table gives, so one input yields
-//! one code on the `PyO3`, napi-rs and `UniFFI` bridges.
+//! two values. [`parse_custody_request`] maps a request to a [`CustodyRequest`]
+//! or to the code §3.2.2's table gives.
 //!
 //! The module reads no environment and opens nothing: resolving the
 //! `encrypted_file` inputs is [`crate::custody_file`]'s job, and building the
 //! backend is the bridge's.
 
-use crate::error_codes::{IDENT_1003, IDENT_1005, IDENT_1008, VALID_7005, VALID_7008, VALID_7009};
+use crate::error_codes::{IDENT_1003, IDENT_1005, IDENT_1008, VALID_7005, VALID_7009};
 
 /// The custody values a bridge accepts.
 ///
@@ -82,16 +80,12 @@ pub struct CustodyRequestInput<'a> {
     pub testing_build: bool,
 }
 
-/// A custody request §3.2.2 rejects. Each variant is one row of §3.2.2's table,
-/// plus [`Self::SeedRequiresTestingBuild`] from ADR-048.
+/// A custody request §3.2.2 rejects. Each variant is one row of §3.2.2's table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CustodyRequestError {
     /// A `testing_seed` with any request other than `in_memory`
     /// (`SCP-VALID-7009`).
     SeedWithoutInMemory,
-    /// A `testing_seed` with `in_memory` on a bridge built without the
-    /// `testing` feature (`SCP-VALID-7008`, ADR-048).
-    SeedRequiresTestingBuild,
     /// `os_keystore` with no `KeyCustodyProvider` (`SCP-IDENT-1003`).
     OsKeystoreWithoutProvider,
     /// A `KeyCustodyProvider` with any request other than `os_keystore`
@@ -117,7 +111,6 @@ impl CustodyRequestError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::SeedWithoutInMemory => VALID_7009,
-            Self::SeedRequiresTestingBuild => VALID_7008,
             Self::OsKeystoreWithoutProvider => IDENT_1003,
             Self::ProviderWithOtherRequest { .. } => IDENT_1005,
             Self::InMemoryRequiresTestingBuild => IDENT_1008,
@@ -133,10 +126,6 @@ impl std::fmt::Display for CustodyRequestError {
                 f,
                 "`testing_seed` parameter is only valid for custody \"in_memory\" — \
                  {ACCEPTED_CUSTODY}"
-            ),
-            Self::SeedRequiresTestingBuild => write!(
-                f,
-                "`testing_seed` parameter requires the testing feature — {ACCEPTED_CUSTODY}"
             ),
             Self::OsKeystoreWithoutProvider => write!(
                 f,
@@ -168,14 +157,11 @@ fn bounded_echo(request: &str) -> String {
 /// Maps one identity-creation call's custody request to the backend it names,
 /// or to the rejection spec `03-identity.md` §3.2.2 gives it.
 ///
-/// Every bridge calls this, and nothing else, to read a custody request, so one
-/// input yields one code on every bridge. The rules run in this order, and the
-/// first that matches decides:
+/// The rules run in this order, and the first that matches decides:
 ///
 /// 1. A `testing_seed` with any request other than `in_memory` is
-///    `SCP-VALID-7009`, and with `in_memory` on a non-testing build is
-///    `SCP-VALID-7008` (ADR-048). §3.2.2 requires the seed check before the
-///    request is read.
+///    `SCP-VALID-7009`. §3.2.2 requires the seed check before the request is
+///    read.
 /// 2. `os_keystore` with a provider is [`CustodyRequest::OsKeystore`], and
 ///    without one is `SCP-IDENT-1003`.
 /// 3. A provider with any other request is `SCP-IDENT-1005`.
@@ -202,16 +188,8 @@ pub fn parse_custody_request(
     } = input;
     let parsed = CustodyRequest::lookup(request);
 
-    if seed_present {
-        match parsed {
-            Some(CustodyRequest::InMemory) if !testing_build => {
-                return Err(CustodyRequestError::SeedRequiresTestingBuild);
-            }
-            Some(CustodyRequest::InMemory) => {}
-            Some(CustodyRequest::EncryptedFile | CustodyRequest::OsKeystore) | None => {
-                return Err(CustodyRequestError::SeedWithoutInMemory);
-            }
-        }
+    if seed_present && parsed != Some(CustodyRequest::InMemory) {
+        return Err(CustodyRequestError::SeedWithoutInMemory);
     }
 
     match (parsed, provider_present) {
@@ -305,15 +283,23 @@ mod tests {
         }
     }
 
-    /// ADR-048: a seed with `in_memory` on a shipped build is VALID-7008.
+    /// A seed with `in_memory` passes the seed rule and reaches the later rows:
+    /// on a shipped build it is IDENT-1008, as §3.2.2's `in_memory` row gives,
+    /// and with a provider it is IDENT-1005.
     #[test]
-    fn parse_custody_request_rejects_seed_on_a_shipped_build_with_valid_7008() {
-        for provider in [true, false] {
-            assert_eq!(
-                code_of(input("in_memory", provider, true, false)),
-                Err(VALID_7008)
-            );
-        }
+    fn parse_custody_request_codes_seed_with_in_memory_by_the_later_rows() {
+        assert_eq!(
+            code_of(input("in_memory", false, true, false)),
+            Err(IDENT_1008)
+        );
+        assert_eq!(
+            code_of(input("in_memory", true, true, false)),
+            Err(IDENT_1005)
+        );
+        assert_eq!(
+            code_of(input("in_memory", false, true, true)),
+            Ok(CustodyRequest::InMemory)
+        );
     }
 
     /// Row 2: `os_keystore` with no provider is IDENT-1003 on every build.
@@ -390,8 +376,6 @@ mod tests {
                     for testing in [true, false] {
                         let want = if seed && request != "in_memory" {
                             Err(VALID_7009)
-                        } else if seed && !testing {
-                            Err(VALID_7008)
                         } else if request == "os_keystore" && provider {
                             Ok(CustodyRequest::OsKeystore)
                         } else if request == "os_keystore" {
@@ -418,41 +402,6 @@ mod tests {
         }
     }
 
-    /// The seed rule agrees with `validate::check_testing_seed`, which the
-    /// bridges call today, on every input that rule reads.
-    #[test]
-    fn parse_custody_request_seed_rule_matches_check_testing_seed() {
-        for request in [
-            "encrypted_file",
-            "os_keystore",
-            "in_memory",
-            "platform",
-            "file",
-        ] {
-            for seed in [true, false] {
-                for testing in [true, false] {
-                    let legacy = crate::validate::check_testing_seed(request, seed, testing)
-                        .err()
-                        .map(|(c, _)| c);
-                    let ours = match parse_custody_request(input(request, false, seed, testing)) {
-                        Err(
-                            e @ (CustodyRequestError::SeedWithoutInMemory
-                            | CustodyRequestError::SeedRequiresTestingBuild),
-                        ) => Some(e.code()),
-                        Ok(_)
-                        | Err(
-                            CustodyRequestError::OsKeystoreWithoutProvider
-                            | CustodyRequestError::ProviderWithOtherRequest { .. }
-                            | CustodyRequestError::InMemoryRequiresTestingBuild
-                            | CustodyRequestError::Unrecognized { .. },
-                        ) => None,
-                    };
-                    assert_eq!(ours, legacy, "{request:?} seed={seed} testing={testing}");
-                }
-            }
-        }
-    }
-
     /// Every rejection message names both accepted values through the one
     /// constant.
     #[test]
@@ -461,7 +410,6 @@ mod tests {
         assert!(ACCEPTED_CUSTODY.contains("\"os_keystore\""));
         let rejected = [
             input("encrypted_file", false, true, true),
-            input("in_memory", false, true, false),
             input("os_keystore", false, false, true),
             input("encrypted_file", true, false, true),
             input("in_memory", false, false, false),
@@ -479,7 +427,7 @@ mod tests {
         codes.dedup();
         assert_eq!(
             codes.len(),
-            6,
+            5,
             "each rejection variant is covered: {codes:?}"
         );
     }
