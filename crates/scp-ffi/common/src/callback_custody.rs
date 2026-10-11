@@ -1625,6 +1625,80 @@ mod tests {
     /// with one host lookup, and binds the same operational entry, whichever
     /// runs first. Before this, `dh_agree` and the Ed25519-only operations
     /// returned `KeyNotFound` for a handle `sign` would have resolved.
+    /// An HPKE P-256 agreement hands the host exactly the 65-byte
+    /// uncompressed peer point and returns the host's ECDH x-coordinate,
+    /// which equals `ecdh_p256` from the pinned vector's scalar. A peer of the
+    /// wrong length (32, 33, 64, 66 bytes), off the curve, or `0x00`-led is
+    /// rejected with no `dh_agree` call reaching the host.
+    #[tokio::test]
+    async fn hpke_p256_dh_agree_passes_exactly_the_65_byte_point_to_the_host() {
+        use scp_crypto::p256::{P256PublicKey, ecdh_p256, testing};
+
+        let host = super::fake_host::FakeHost::default();
+        let key_id = host
+            .generate_keypair(KeyType::HpkeP256, KeyRole::Operational)
+            .unwrap();
+        let handle = KeyHandle::new(key_id.parse().unwrap());
+        let registry = CallbackKeyRegistry::new();
+        let host_dh = |id: String, peer: Vec<u8>| {
+            let answer = host.dh_agree(&id, &peer);
+            async move { answer }
+        };
+        let host_lookup = |id: String| {
+            let answer = host.get_public_key(&id);
+            async move { answer }
+        };
+
+        let fixed = P256SecretKey::from_scalar_bytes(
+            &hex::decode(testing::ECDH_VECTOR_SCALAR_I)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let peer = fixed.public_key().to_uncompressed();
+        let shared = dh_agree(&registry, &handle, &peer, host_dh, &host_lookup)
+            .await
+            .unwrap();
+        assert_eq!(host.calls("dh_agree"), 1);
+        assert_eq!(
+            host.last_peer.lock().unwrap().as_deref(),
+            Some(peer.as_slice()),
+            "the host saw exactly the 65-byte point"
+        );
+        let own = P256PublicKey::from_uncompressed(
+            host.get_public_key(&key_id).unwrap().public_key.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(shared.as_bytes(), ecdh_p256(&fixed, &own).as_slice());
+
+        let mut off_curve = peer;
+        off_curve[64] ^= 1;
+        let infinity = [0u8; 65];
+        let rejected: [(&str, Vec<u8>); 6] = [
+            ("32 bytes", peer[1..33].to_vec()),
+            ("33 bytes", fixed.public_key().to_compressed().to_vec()),
+            ("64 bytes", peer[1..].to_vec()),
+            ("66 bytes", [&peer[..], &[0u8][..]].concat()),
+            ("off curve", off_curve.to_vec()),
+            ("0x00-led", infinity.to_vec()),
+        ];
+        for (case, bad) in rejected {
+            let host_dh = |id: String, peer: Vec<u8>| {
+                let answer = host.dh_agree(&id, &peer);
+                async move { answer }
+            };
+            assert!(
+                matches!(
+                    dh_agree(&registry, &handle, &bad, host_dh, &host_lookup).await,
+                    Err(PlatformError::CustodyError(_))
+                ),
+                "{case}"
+            );
+            assert_eq!(host.calls("dh_agree"), 1, "{case} reached the host");
+        }
+    }
+
     #[tokio::test]
     async fn every_entry_point_resolves_an_unregistered_handle() {
         let e = ed(0x71);

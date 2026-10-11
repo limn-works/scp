@@ -1258,6 +1258,47 @@ mod tests {
         ));
     }
 
+    /// Two HPKE P-256 keys on the embedded fake host agree symmetrically,
+    /// and an agreement with the pinned RFC 5903 initiator point equals both
+    /// `ecdh_p256` from the pinned scalar and the pinned point's
+    /// x-coordinate (the fake's private scalar is 1).
+    #[tokio::test]
+    async fn ffi_custody_callback_hpke_p256_dh_agree_is_symmetric_and_matches_the_vector() {
+        use scp_crypto::p256::{P256PublicKey, P256SecretKey, ecdh_p256, testing};
+        let custody = fake_callback_custody_of(c"P256Custody");
+        let a = custody
+            .generate_keypair(KeyType::HpkeP256)
+            .await
+            .expect("generate A");
+        let b = custody
+            .generate_keypair(KeyType::HpkeP256)
+            .await
+            .expect("generate B");
+        let a_pub = custody.public_key(&a).await.expect("A public");
+        let b_pub = custody.public_key(&b).await.expect("B public");
+        let ab = custody.dh_agree(&a, b_pub.as_bytes()).await.expect("A·B");
+        let ba = custody.dh_agree(&b, a_pub.as_bytes()).await.expect("B·A");
+        assert_eq!(ab.as_bytes(), ba.as_bytes());
+
+        let fixed = P256SecretKey::from_scalar_bytes(
+            &hex::decode(testing::ECDH_VECTOR_SCALAR_I)
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes"),
+        )
+        .expect("scalar");
+        let fixed_pub = fixed.public_key().to_uncompressed();
+        assert_eq!(hex::encode(fixed_pub), testing::ECDH_VECTOR_PUBLIC_I);
+        let shared = custody.dh_agree(&a, &fixed_pub).await.expect("A·I");
+        let a_point = P256PublicKey::from_uncompressed(a_pub.as_bytes()).expect("A point");
+        assert_eq!(shared.as_bytes(), ecdh_p256(&fixed, &a_point).as_slice());
+        assert_eq!(
+            hex::encode(shared.as_bytes()),
+            testing::ECDH_VECTOR_PUBLIC_I[2..66],
+            "scalar 1 agrees to the peer's x-coordinate"
+        );
+    }
+
     #[tokio::test]
     async fn ffi_custody_callback_rejects_bad_p256_host_returns() {
         let custody = fake_callback_custody_of(c"BadP256Custody");
