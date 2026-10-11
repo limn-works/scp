@@ -6177,9 +6177,11 @@ impl Supervisor {
                 )));
             }
             let Some((_, handle)) = self.actors.remove(context_id) else {
-                drop(guard);
-                drop(bootstrap_guard);
-                self.finish_discard(context_id).await?;
+                // No actor to wait for: tear down under the locks already
+                // held, so no respawn of the id runs between the registry
+                // check and the snapshot delete.
+                self.finish_discard_locked(context_id, &bootstrap_guard, &guard)
+                    .await?;
                 return Ok(false);
             };
             self.pending_discards.insert(context_id.to_owned());
@@ -6236,8 +6238,24 @@ impl Supervisor {
     /// actor was exiting): the snapshot is that live context's and stays.
     /// [`ContextError::PersistenceFailed`] when the snapshot delete fails.
     async fn finish_discard(&self, context_id: &str) -> Result<(), ContextError> {
-        let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
-        let _guard = self.write_lock.lock().await;
+        let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        let guard = self.write_lock.lock().await;
+        self.finish_discard_locked(context_id, &bootstrap_guard, &guard)
+            .await
+    }
+
+    /// Body of [`Self::finish_discard`], run by a caller that already holds
+    /// `bootstrap_spawn_lock` and `write_lock`; the guard parameters prove it.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::finish_discard`].
+    async fn finish_discard_locked(
+        &self,
+        context_id: &str,
+        _bootstrap_guard: &tokio::sync::MutexGuard<'_, ()>,
+        _write_guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), ContextError> {
         if self.actors.contains_key(context_id) {
             return Err(ContextError::InvalidState(format!(
                 "discard of joined context '{context_id}': an actor was registered for the id \

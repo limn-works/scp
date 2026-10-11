@@ -3701,6 +3701,79 @@ async fn a_respawn_during_a_discard_reads_no_snapshot_and_registers_no_actor() {
     );
 }
 
+/// A discard that finds no actor registered (the slot is empty while the
+/// snapshot remains, as after a poison despawn) and a respawn queued on
+/// `bootstrap_spawn_lock` behind it: the discard deletes the snapshot before
+/// the respawn runs, so the respawn finds no snapshot and registers no actor.
+/// A discard that released the locks between its registry check and its
+/// teardown would let the queued respawn restore the context first, and then
+/// fail with `InvalidState` and keep the snapshot.
+#[tokio::test]
+async fn a_respawn_queued_behind_a_discard_of_an_empty_slot_restores_nothing() {
+    let rec = RecordingPersistence::default();
+    let (result, j) = join_bob(0x74, Some(Box::new(rec.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    let held = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    assert!(
+        j.sup.despawn_actor(&j.ctx_id).await,
+        "the joiner's actor was registered"
+    );
+    await_exit(&held).await;
+    drop(held);
+    assert!(
+        rec.load_context(&j.ctx_id)
+            .await
+            .expect("load never errors")
+            .is_some(),
+        "the snapshot outlives the despawn"
+    );
+
+    // Queue the discard on the lock first, then the respawn behind it
+    // (tokio's Mutex grants waiters in FIFO order).
+    let spawn_guard = j.sup.bootstrap_spawn_lock.lock().await;
+    let sup = Arc::clone(&j.sup);
+    let id = j.ctx_id.clone();
+    let discard = tokio::spawn(async move { sup.discard_joined_context(&id).await });
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    let sup = Arc::clone(&j.sup);
+    let id = j.ctx_id.clone();
+    let respawn = tokio::spawn(async move {
+        sup.respawn_from_snapshot(&id, &DID(BOB_DID.to_owned()))
+            .await
+    });
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    drop(spawn_guard);
+
+    let outcome = discard.await.expect("the discard task does not panic");
+    assert!(
+        matches!(outcome, Ok(false)),
+        "the discard of an empty slot deletes the snapshot, got {outcome:?}"
+    );
+    let respawned = respawn.await.expect("the respawn task does not panic");
+    assert!(
+        respawned.is_err(),
+        "the respawn behind the discard finds no snapshot to restore, got {respawned:?}"
+    );
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_none(),
+        "no actor runs for the discarded context"
+    );
+    assert!(
+        rec.load_context(&j.ctx_id)
+            .await
+            .expect("load never errors")
+            .is_none(),
+        "no snapshot of the discarded context remains"
+    );
+}
+
 /// The crash watchdog respawns only the actor it watched. When another path
 /// removes the crashed actor from the registry before the watchdog takes
 /// `bootstrap_spawn_lock`, as a discard that finished first does, the
