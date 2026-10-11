@@ -218,6 +218,10 @@ const NAPI_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/uc
 // method.
 const PYO3_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/src/trust.rs");
 const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/trust.rs");
+// The shared bridge trust helpers: `verify_attestation_in_context`, the one body
+// every bridge's `trust_verify_attestation` reaches, lives here.
+const FFI_TRUST_STORE_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/common/src/trust_store.rs");
 
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
@@ -255,7 +259,12 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // core `scp_core::trust::check_capability_requirements` call and the production
 // `IdentityDidPublicKeyResolver`. The 2J joiner (+4) and capability-admission
 // (+3) additions are disjoint, so the merged floor is 48 + 4 + 3 = 55.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 55;
+// Raised 55 -> 59 when attestation verification began reading the context's
+// revocation list (§7.4.4 step 5): one assertion pins the shared
+// `verify_attestation_in_context` to the list read and its checker, and one per
+// native bridge pins each `trust_verify_attestation` export to that helper over
+// the instance's own repository.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 59;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -5058,6 +5067,111 @@ fn uniffi_check_capability_requirements_routes_to_core() {
         ),
         "UniFFI check_capability_requirements must call core \
          check_capability_requirements with the production DID resolver"
+    );
+}
+
+// ===========================================================================
+// Attestation verification reads the revocation list (§7.4.4 step 5)
+// ===========================================================================
+//
+// Each native bridge's `trust_verify_attestation` export MUST verify against
+// the instance's revocation list for the caller's context: the export routes
+// through its bridge-local `run_verify_attestation`, which builds the trust
+// bridge over the instance's repository and calls the shared
+// `verify_attestation_in_context`. That helper reads `get_revocation_state` and
+// hands `verify_attestation` a `RevocationMapChecker` over it, so no bridge can
+// verify with an empty list or a checker that names nothing.
+
+/// The shared helper reads the context's revocation list and verifies with a
+/// checker built from it.
+#[test]
+fn verify_attestation_in_context_reads_the_revocation_list() {
+    assert!(
+        fn_body_contains(
+            FFI_TRUST_STORE_SRC,
+            "verify_attestation_in_context",
+            ".get_revocation_state("
+        ) && fn_body_contains(
+            FFI_TRUST_STORE_SRC,
+            "verify_attestation_in_context",
+            "RevocationMapChecker::new("
+        ) && fn_body_contains(
+            FFI_TRUST_STORE_SRC,
+            "verify_attestation_in_context",
+            "verify_attestation("
+        ),
+        "verify_attestation_in_context must read get_revocation_state and verify \
+         with a RevocationMapChecker over that list"
+    );
+}
+
+/// The PyO3 `trust_verify_attestation` export reaches the shared helper over
+/// the instance's storage.
+#[test]
+fn pyo3_trust_verify_attestation_reads_the_instance_revocation_list() {
+    assert!(
+        fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_verify_attestation_impl",
+            "run_verify_attestation("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "run_verify_attestation",
+            "scp_ffi_common::trust_store::verify_attestation_in_context("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "run_verify_attestation",
+            "ProtocolRepositoryTrustBridge::new("
+        ),
+        "PyO3 trust_verify_attestation_impl must verify through \
+         verify_attestation_in_context over the instance's storage"
+    );
+}
+
+/// The NAPI `trust_verify_attestation` export (body in
+/// `trust_verify_attestation_on`) reaches the shared helper over the instance's
+/// repository.
+#[test]
+fn napi_trust_verify_attestation_reads_the_instance_revocation_list() {
+    assert!(
+        fn_body_contains(
+            NAPI_TRUST_SRC,
+            "trust_verify_attestation_on",
+            "run_verify_attestation("
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "run_verify_attestation",
+            "scp_ffi_common::trust_store::verify_attestation_in_context("
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "run_verify_attestation",
+            "ProtocolRepositoryTrustBridge::new("
+        ),
+        "NAPI trust_verify_attestation_on must verify through \
+         verify_attestation_in_context over the instance's repository"
+    );
+}
+
+/// The UniFFI `trust_verify_attestation` method reaches the shared helper over
+/// the instance's repository.
+#[test]
+fn uniffi_trust_verify_attestation_reads_the_instance_revocation_list() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_verify_attestation",
+            "self.inner.protocol_repository()"
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_verify_attestation",
+            "run_verify_attestation("
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "run_verify_attestation",
+            "scp_ffi_common::trust_store::verify_attestation_in_context("
+        ),
+        "UniFFI trust_verify_attestation must verify through \
+         verify_attestation_in_context over the instance's repository"
     );
 }
 

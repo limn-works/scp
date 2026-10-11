@@ -208,9 +208,10 @@ interface IdentityAdvancedBindings {
      * @param attestationJson JSON string of the attestation.
      * @param issuerPublicKeyHex Hex-encoded Ed25519 public key of the issuer.
      * @param referenceProof `"confirmed"` when this caller fetched the class 2
-     *   proof resource `evidence.proof` names and found this issuer's DID in
-     *   it (§3.5.4 Class 2 step 2), `"not_fetched"` when this caller fetched
-     *   nothing. A class 1 (`did_control`) attestation ignores this argument.
+     *   proof resource `evidence.proof` names and found in it what §3.5.4
+     *   Class 2 step 2 requires (this issuer's DID, plus the nonce for
+     *   `signed_post`), `"not_fetched"` when this caller fetched nothing. A
+     *   class 1 (`did_control`) attestation ignores this argument.
      * @return true if valid.
      */
     fun identityVerifyLinkAttestation(
@@ -485,9 +486,10 @@ class IdentityAdvancedBridge internal constructor(
      * @param attestationJson JSON string of the attestation.
      * @param issuerPublicKeyHex Hex-encoded Ed25519 public key of the issuer.
      * @param referenceProof `"confirmed"` when this caller fetched the class 2
-     *   proof resource `evidence.proof` names and found this issuer's DID in
-     *   it (§3.5.4 Class 2 step 2), `"not_fetched"` when this caller fetched
-     *   nothing. A class 1 (`did_control`) attestation ignores this argument.
+     *   proof resource `evidence.proof` names and found in it what §3.5.4
+     *   Class 2 step 2 requires (this issuer's DID, plus the nonce for
+     *   `signed_post`), `"not_fetched"` when this caller fetched nothing. A
+     *   class 1 (`did_control`) attestation ignores this argument.
      * @return true if valid.
      */
     suspend fun verifyLinkAttestation(

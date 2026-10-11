@@ -167,10 +167,10 @@ public extension SCP {
     /// if ``rawJson`` is `nil`.
     ///
     /// `referenceProof` reports what this caller did about a class 2
-    /// (`signed_post` / `dns_record`) proof resource, per §3.5.4 Class 2
-    /// step 2: `"confirmed"` after fetching the resource `evidence.proof`
-    /// names and finding this issuer's DID in it, `"not_fetched"` after
-    /// fetching nothing.
+    /// (`signed_post` / `dns_record`) proof resource, per §3.5.4 Class 2 step
+    /// 2: `"confirmed"` after fetching the resource `evidence.proof` names and
+    /// finding in it what step 2 requires (this issuer's DID, plus the nonce
+    /// for `signed_post`), `"not_fetched"` after fetching nothing.
     func verifyLinkAttestation(
         _ attestation: IdentityAttestation,
         issuerPublicKeyHex: String,

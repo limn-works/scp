@@ -193,8 +193,8 @@ pub const LINK_VERIFY_REQUIRES_INSTANCE: &str = "identity link attestation verif
      both that key and that attestation.";
 
 /// Wire value a caller passes to report that it fetched a class 2 proof
-/// resource and found an issuer's DID in that resource (spec §3.5.4 Class 2
-/// step 2).
+/// resource and found in it what spec §3.5.4 Class 2 step 2 requires: the
+/// issuer's DID, plus the proof's nonce for `signed_post`.
 pub const REFERENCE_PROOF_CONFIRMED: &str = "confirmed";
 
 /// Wire value a caller passes to report that it fetched no class 2 proof
@@ -233,9 +233,9 @@ pub fn parse_reference_proof(
         REFERENCE_PROOF_NOT_FETCHED => Ok(ReferenceProofOutcome::NotFetched),
         other => Err(LinkVerifyError::MalformedArgument(format!(
             "reference_proof must read \"{REFERENCE_PROOF_CONFIRMED}\" when a caller fetched a \
-             class 2 proof resource and found this issuer's DID in it (spec §3.5.4 Class 2 \
-             step 2), or \"{REFERENCE_PROOF_NOT_FETCHED}\" when a caller fetched nothing; got \
-             {other:?}"
+             class 2 proof resource and found in it this issuer's DID, plus the nonce for \
+             signed_post (spec §3.5.4 Class 2 step 2), or \"{REFERENCE_PROOF_NOT_FETCHED}\" \
+             when a caller fetched nothing; got {other:?}"
         ))),
     }
 }
@@ -403,8 +403,8 @@ impl std::error::Error for LinkVerifyError {}
 /// `reference_proof` carries a caller's own class 2 fetch outcome (§3.5.4
 /// Class 2 step 2), which [`parse_reference_proof`] turns into a
 /// [`ReferenceProofOutcome`](scp_core::identity::attestation::ReferenceProofOutcome).
-/// A caller that fetched the resource `evidence.proof` names, and found an
-/// issuer's DID in that resource, passes [`REFERENCE_PROOF_CONFIRMED`] and
+/// A caller that fetched the resource `evidence.proof` names, and found in it
+/// the issuer's DID (plus the nonce for `signed_post`), passes [`REFERENCE_PROOF_CONFIRMED`] and
 /// receives a `true` or a `false`. A caller that fetched nothing passes
 /// [`REFERENCE_PROOF_NOT_FETCHED`] and receives
 /// [`LinkVerifyError::ReferenceProofNotFetched`], because §3.5.4 Class 2 step 3
@@ -879,8 +879,8 @@ mod link_verification_tests {
         assert_eq!(err.error_code(), crate::error_codes::IDENT_1062);
     }
 
-    /// A caller that fetched a class 2 proof resource, and found an issuer's
-    /// DID in it, reports [`REFERENCE_PROOF_CONFIRMED`] and receives a verdict.
+    /// A caller that fetched a class 2 proof resource, and found in it what
+    /// step 2 requires, reports [`REFERENCE_PROOF_CONFIRMED`] and receives a verdict.
     /// Before `reference_proof` reached this flow, every class 2 attestation
     /// raised `SCP-IDENT-1062` through all four SDKs, so no SDK caller could
     /// obtain a `true` for one. Reverting `reference_proof` to a hardcoded

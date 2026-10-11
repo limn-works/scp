@@ -1962,7 +1962,7 @@ public nonisolated struct ChallengeResponse: Codable, Sendable, Equatable {
 
 /// Encodes a single typed attestation envelope
 /// (``CachedAttestationEnvelope``) to the JSON wire shape the bridge
-/// deserializes for ``trustVerifyAttestation(attestation:)``
+/// deserializes for ``SCP/trustVerifyAttestation(contextId:attestation:)``
 /// (`Attestation`) — exactly the shape ``encodeCachedAttestations(_:)``
 /// nests per entry.
 public func encodeAttestationJson(_ attestation: CachedAttestationEnvelope) throws -> String {
@@ -1997,25 +1997,34 @@ public func encodeChallengeResponseJson(_ response: ChallengeResponse) throws ->
 
 // MARK: - Typed challenge-verification wrappers (ADR-058)
 
-/// Verify an attestation's Ed25519 signature, evidence, expiry, and
-/// revocation status (ADR-017, §7.4).
-///
-/// Typed counterpart to the generated
-/// ``trustVerifyAttestation(attestationJson:)`` free function: it serializes
-/// the typed attestation envelope (``CachedAttestationEnvelope``) to the
-/// serde wire shape (ADR-058) and calls the bridge unchanged.
-///
-/// - Parameter attestation: The typed attestation envelope.
-/// - Returns: The structured verification result (`valid` / `chainDepth` /
-///   `errorMessage`).
-/// - Throws: ``ScpError`` on a serialization failure or malformed envelope.
-public func trustVerifyAttestation(
-    attestation: CachedAttestationEnvelope
-) throws -> AttestationVerificationResult {
-    try trustVerifyAttestation(attestationJson: encodeAttestationJson(attestation))
-}
-
 public extension SCP {
+    /// Verify an attestation's Ed25519 signature, evidence, expiry, its own
+    /// revocation status, and this instance's revocation list for
+    /// `contextId` (ADR-017, §7.4.4).
+    ///
+    /// Serializes the typed attestation envelope
+    /// (``CachedAttestationEnvelope``) to the serde wire shape (ADR-058) and
+    /// calls ``Scp/trustVerifyAttestation(contextId:attestationJson:)`` on
+    /// ``inner``.
+    ///
+    /// - Parameters:
+    ///   - contextId: The context whose revocation list is checked.
+    ///   - attestation: The typed attestation envelope.
+    /// - Returns: The structured verification result (`valid` / `chainDepth` /
+    ///   `errorMessage`).
+    /// - Throws: ``ScpError`` on a serialization failure, a malformed context
+    ///   id or envelope, or a revocation list that cannot be read. An
+    ///   unreadable list throws; it never reads as `valid == false`.
+    func trustVerifyAttestation(
+        contextId: String,
+        attestation: CachedAttestationEnvelope
+    ) throws -> AttestationVerificationResult {
+        try inner.trustVerifyAttestation(
+            contextId: contextId,
+            attestationJson: encodeAttestationJson(attestation)
+        )
+    }
+
     /// Verify a challenge response against its original challenge request
     /// (ADR-017, §7.3.4).
     ///

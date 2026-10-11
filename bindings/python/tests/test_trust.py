@@ -1431,16 +1431,16 @@ class TestTrustVerifyTyped:
     def test_verify_attestation_serializes_the_typed_envelope(self) -> None:
         from scp_sdk.trust import trust_verify_attestation
 
-        bridge = MagicMock()
-        bridge.trust_verify_attestation.return_value = {
+        scp = MagicMock()
+        scp._native.trust_verify_attestation.return_value = {
             "valid": False,
             "chain_depth": 0,
             "error": "unresolvable issuer",
         }
-        with patch("scp_sdk.trust._bridge", return_value=bridge):
-            result = trust_verify_attestation(self._envelope())
+        result = trust_verify_attestation(scp, "ctx-1", self._envelope())
         assert result["valid"] is False
-        (wire_json,) = bridge.trust_verify_attestation.call_args[0]
+        context_id, wire_json = scp._native.trust_verify_attestation.call_args[0]
+        assert context_id == "ctx-1"
         assert json.loads(wire_json) == self._envelope()
 
     def test_verify_response_serializes_both_typed_records(self) -> None:
@@ -1455,14 +1455,13 @@ class TestTrustVerifyTyped:
         assert json.loads(challenge_json) == self._challenge()
         assert json.loads(response_json) == self._response()
 
-    def test_verify_attestation_real_bridge_call_through(self) -> None:
+    def test_verify_attestation_real_bridge_call_through(self, scp: Any) -> None:
         """The typed envelope's serialized JSON parses on the REAL Rust
         `Attestation` deserializer: a dummy signature yields a structured
         `valid: False` (verification ran), never a parse error."""
-        _require_native_extension()
         from scp_sdk.trust import trust_verify_attestation
 
-        result = trust_verify_attestation(self._envelope())
+        result = trust_verify_attestation(scp, "ctx-1", self._envelope())
         assert result["valid"] is False
         assert result["error"]
 

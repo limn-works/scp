@@ -789,7 +789,8 @@ pub fn published_signing_keys(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceProofOutcome {
     /// A consumer fetched a resource named by `evidence.proof` and confirmed
-    /// an issuer's DID appears in that resource (§3.5.4 Class 2 step 2).
+    /// it carries what §3.5.4 Class 2 step 2 requires: the issuer's DID, plus
+    /// the proof's nonce for `SignedPost`.
     Confirmed,
 
     /// A consumer performed no fetch. §3.5.4 Class 2 step 3 then leaves an

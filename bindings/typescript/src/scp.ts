@@ -1239,10 +1239,11 @@ export class SCP {
    * `referenceProof` reports what this caller did about a class 2
    * (`signed_post` / `dns_record`) proof resource, per §3.5.4 Class 2 step 2.
    * `"confirmed"` reports that this caller fetched the resource
-   * `evidence.proof` names and found this issuer's DID in it, which yields a
-   * `true` or a `false`. `"not_fetched"` reports that this caller fetched
-   * nothing, which raises `SCP-IDENT-1062` for a class 2 attestation. A class 1
-   * (`did_control`) attestation ignores this argument. Any other string raises
+   * `evidence.proof` names and found in it what step 2 requires (this issuer's
+   * DID, plus the nonce for `signed_post`), which yields a `true` or a `false`.
+   * `"not_fetched"` reports that this caller fetched nothing, which raises
+   * `SCP-IDENT-1062` for a class 2 attestation. A class 1 (`did_control`)
+   * attestation ignores this argument. Any other string raises
    * `SCP-IDENT-1044`.
    *
    * @throws `SCP-IDENT-1044` for a malformed argument, `SCP-IDENT-1060` when an
@@ -3653,16 +3654,19 @@ export class SCP {
   }
 
   /**
-   * Verify an attestation's Ed25519 signature, evidence, expiry, and
-   * revocation status (ADR-017, §7.4).
+   * Verify an attestation's Ed25519 signature, evidence, expiry, its own
+   * revocation status, and this instance's revocation list for `contextId`
+   * (ADR-017, §7.4.4).
    *
    * Takes the typed attestation envelope ({@link CachedAttestationEnvelope})
    * and serializes it to the serde wire shape internally (ADR-058) before
-   * crossing FFI.
+   * crossing FFI. A revocation list that cannot be read throws; it never
+   * reads as `valid: false`.
    */
-  trustVerifyAttestation(attestation: CachedAttestationEnvelope): unknown {
+  trustVerifyAttestation(contextId: string, attestation: CachedAttestationEnvelope): unknown {
     try {
-      return (this.#native.trustVerifyAttestation as (j: string) => unknown)(
+      return (this.#native.trustVerifyAttestation as (c: string, j: string) => unknown)(
+        contextId,
         encodeAttestation(attestation),
       );
     } catch (err) {

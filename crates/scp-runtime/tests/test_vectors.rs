@@ -825,8 +825,17 @@ fn trust_attestation_verify_round_trip_rule_b_ed25519() {
     use scp_clock::TestClock;
     use scp_protocol::trust::TrustError;
     use scp_protocol::trust::attestation::{
-        DidPublicKeyResolver, canonical_attestation_bytes, verify_attestation,
+        AttestationRevocationChecker, DidPublicKeyResolver, canonical_attestation_bytes,
+        verify_attestation,
     };
+
+    /// This vector carries no revocation list, so the list names nothing.
+    struct EmptyRevocationList;
+    impl AttestationRevocationChecker for EmptyRevocationList {
+        fn check_revocation(&self, _id: &str, _issuer: &scp_did::DID) -> Option<u64> {
+            None
+        }
+    }
 
     struct Resolver(Vec<u8>);
     impl DidPublicKeyResolver for Resolver {
@@ -844,12 +853,13 @@ fn trust_attestation_verify_round_trip_rule_b_ed25519() {
     let hash = canonical_attestation_bytes(&signed).unwrap();
     signed.signature = rule_b_ed25519_key.sign(&hash).to_bytes().to_vec();
     let clock = TestClock::new(1_700_000_001);
-    verify_attestation(&signed, &resolver, &clock).expect("signature must verify");
+    verify_attestation(&signed, &resolver, &clock, &EmptyRevocationList)
+        .expect("signature must verify");
 
     let mut tampered = signed;
     tampered.subject = ID_ISSUER.into();
     assert!(
-        verify_attestation(&tampered, &resolver, &clock).is_err(),
+        verify_attestation(&tampered, &resolver, &clock, &EmptyRevocationList).is_err(),
         "a changed subject must invalidate the signature"
     );
 }

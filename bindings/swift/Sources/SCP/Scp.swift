@@ -868,13 +868,14 @@ public extension SCP {
     /// document rather than trusting it.
     ///
     /// `referenceProof` reports what this caller did about a class 2
-    /// (`signed_post` / `dns_record`) proof resource, per §3.5.4 Class 2
-    /// step 2. `"confirmed"` reports that this caller fetched the resource
-    /// `evidence.proof` names and found this issuer's DID in it, which yields
-    /// a `true` or a `false`. `"not_fetched"` reports that this caller fetched
-    /// nothing, which raises `SCP-IDENT-1062` for a class 2 attestation. A
-    /// class 1 (`did_control`) attestation ignores this argument. Any other
-    /// string raises `SCP-IDENT-1044`.
+    /// (`signed_post` / `dns_record`) proof resource, per §3.5.4 Class 2 step
+    /// 2. `"confirmed"` reports that this caller fetched the resource
+    /// `evidence.proof` names and found in it what step 2 requires (this
+    /// issuer's DID, plus the nonce for `signed_post`), which yields a `true`
+    /// or a `false`. `"not_fetched"` reports that this caller fetched nothing,
+    /// which raises `SCP-IDENT-1062` for a class 2 attestation. A class 1
+    /// (`did_control`) attestation ignores this argument. Any other string
+    /// raises `SCP-IDENT-1044`.
     func identityVerifyLinkAttestation(
         attestationJson: String,
         issuerPublicKeyHex: String,
@@ -1290,11 +1291,10 @@ public extension SCP {
         try inner.trustCreateChallenge(targetDid: targetDid)
     }
 
-    // `trustQueryScore` and `trustVerifyAttestation` moved to UniFFI-generated
-    // free top-level functions under ADR-048 §1 + §7 Swift bullet. Call
-    // them directly:
+    // `trustQueryScore` moved to a UniFFI-generated free top-level function
+    // under ADR-048 §1 + §7 Swift bullet. Call it directly:
     //   `try trustQueryScore(did:contextId:)`
-    //   `try trustVerifyAttestation(attestationJson:)`
+    // `trustVerifyAttestation(contextId:attestation:)` lives in Trust.swift.
 
     /// Forwards to ``Scp/trustVerifyResponse`` on ``inner``.
     func trustVerifyResponse(challengeJson: String, responseJson: String) throws -> Bool {
