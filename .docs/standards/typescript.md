@@ -104,18 +104,23 @@ TypeScript fixes no single convention for enum members, so a rule naming none wo
 ```typescript
 // tests/identity.test.ts
 import { describe, expect, it } from "bun:test";
-import { Identity } from "../src/index.js";
+import { type CustodyType, SCP, ValidationError } from "../src/index.js";
+// In-memory custody is a testing-addon affordance outside `CustodyType`
+// (03-identity.md §3.2.2); tests reach it only through this helper.
+import { createInMemoryIdentity } from "./harness-custody";
 
 describe("Identity", () => {
   it("creates an identity with a 32-byte identifier", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const scp = new SCP({ storage: { type: "in_memory" } });
+    const identity = await createInMemoryIdentity(scp);
     // 09-security-model.md §9.7.4.2 R13
     expect(identity.identifier).toHaveLength(32);
   });
 
-  it("rejects invalid custody type", async () => {
-    await expect(Identity.create({ custody: "invalid" }))
-      .rejects.toThrow(IdentityError);
+  it("rejects a custody request outside the vocabulary", async () => {
+    const scp = new SCP({ storage: { type: "in_memory" } });
+    await expect(scp.identityCreate("invalid" as CustodyType))
+      .rejects.toThrow(ValidationError);
   });
 });
 ```

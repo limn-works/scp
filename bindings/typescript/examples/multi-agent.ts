@@ -66,9 +66,9 @@ async function main(): Promise<void> {
   const scp = new SCP({ storage: { type: "in_memory" } });
   try {
     // Create identities for coordinator and two agents.
-    const coordinator = await scp.identityCreate("in_memory");
-    const agentA = await scp.identityCreate("in_memory");
-    const agentB = await scp.identityCreate("in_memory");
+    const coordinator = await scp.identityCreate("encrypted_file");
+    const agentA = await scp.identityCreate("encrypted_file");
+    const agentB = await scp.identityCreate("encrypted_file");
 
     // Coordinator creates the context with agent capabilities.
     const ctx = await scp.contextCreate(

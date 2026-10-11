@@ -13,9 +13,10 @@ import { SCP } from "../src/index";
 async function main(): Promise<void> {
   const scp = new SCP({ storage: { type: "in_memory" } });
   try {
-    // Create two identities (in_memory custody for examples).
-    const alice = await scp.identityCreate("in_memory");
-    const bob = await scp.identityCreate("in_memory");
+    // Create two identities whose keys live in the encrypted key file
+    // $HOME/.scp/keys.bin, sealed under SCP_KEY_PASSPHRASE (spec 03 §3.2.2).
+    const alice = await scp.identityCreate("encrypted_file");
+    const bob = await scp.identityCreate("encrypted_file");
     console.log(`Alice DID: ${alice.did}`);
     console.log(`Bob DID: ${bob.did}`);
 

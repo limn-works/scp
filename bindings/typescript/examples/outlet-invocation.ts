@@ -25,7 +25,7 @@ async function main(): Promise<void> {
     console.log(`Relay listening at ${relay.relayUrl}`);
 
     // 2. Create an identity.
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await scp.identityCreate("encrypted_file");
     console.log(`Identity DID: ${identity.did}`);
 
     // 3. Wire the bridge's transport to the relay.

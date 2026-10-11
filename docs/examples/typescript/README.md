@@ -25,11 +25,11 @@ messaging over a relay, and outlet registration in the SCP TypeScript SDK.
 ## Running the Examples
 
 Each example exports one async function that takes a `KeyCustodyProvider` and
-a storage passphrase. The SDK ships no production key store for Bun or Node:
-its one `CustodyType`, `"in_memory"`, works only with an addon built with the
-`testing` feature, and a shipped addon rejects it with `SCP-IDENT-1008`. Pass a
-provider backed by your own key store, such as an HSM or the operating
-system's keychain:
+a storage passphrase. The SDK's `CustodyType` carries the two custody requests
+of spec `03-identity.md` §3.2.2, `"encrypted_file"` and `"os_keystore"`, and
+`"os_keystore"` reaches a host key store only through a provider passed to
+`identityCreateWithCustody`. Pass a provider backed by your own key store, such
+as an HSM or the operating system's keychain:
 
 ```ts
 import { identityExample } from "./identity";

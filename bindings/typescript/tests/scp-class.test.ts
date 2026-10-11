@@ -17,10 +17,10 @@
  */
 
 import { describe, expect, test } from "bun:test";
-
 import { ValidationError } from "../src/errors";
 import { loadNativeAddon } from "../src/internal/native";
 import { __serializeStorageConfigForTests, clampShutdownMillis, SCP } from "../src/scp";
+import { HARNESS_IN_MEMORY_CUSTODY } from "./harness-custody";
 import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
@@ -181,7 +181,7 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
       return; // addon predates per-instance identity/context — covered in Rust
     }
     expect(scpA.instanceId).not.toBe(scpB.instanceId);
-    const identity = await scpA.identityCreate("in_memory");
+    const identity = await scpA.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
     // contextCreate takes a NapiIdentity handle. Crossing it over to
     // scpB MUST be rejected with SCP-PERM-3030 before any capability
     // or state work runs.

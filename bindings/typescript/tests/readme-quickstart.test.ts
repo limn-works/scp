@@ -9,9 +9,12 @@
  * needed because this package has no `node_modules` entry for itself and no
  * built `dist/` during `bun test`.
  *
- * Both blocks use in-memory storage and `"in_memory"` custody, which only a
- * `testing` addon accepts; every SDK test run builds the addon with that
- * feature.
+ * Both blocks use in-memory storage and `"encrypted_file"` custody (spec
+ * `03-identity.md` §3.2.2). The child runs with `HOME` set to its scratch
+ * directory and a fixed `SCP_KEY_PASSPHRASE`, so the key file it writes,
+ * `$HOME/.scp/keys.bin`, never touches the real home directory. Only a
+ * `testing` addon creates the identity (a shipped one answers
+ * `SCP-IDENT-1059`); every SDK test run builds the addon with that feature.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -29,6 +32,8 @@ const ERROR_HANDLING = "Error Handling";
 const FENCE_OPEN = "```typescript\n";
 const FENCE_CLOSE = "\n```\n";
 const SPECIFIER = '"@limn-works/scp-ts"';
+/** The key-file passphrase the README blocks run under; a test value, not a secret. */
+const README_KEY_PASSPHRASE = "readme-quickstart-test-passphrase";
 
 /**
  * Returns the first `typescript` block after the `## {heading}` line, and
@@ -63,7 +68,7 @@ async function runReadmeBlock(
     await writeFile(script, pointAtSource(extractBlock(await readFile(README, "utf8"), heading)));
     const child = Bun.spawn([process.execPath, "run", script], {
       cwd: dir,
-      env: process.env,
+      env: { ...process.env, HOME: dir, SCP_KEY_PASSPHRASE: README_KEY_PASSPHRASE },
       stdout: "pipe",
       stderr: "pipe",
     });

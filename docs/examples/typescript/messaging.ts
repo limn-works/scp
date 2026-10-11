@@ -6,10 +6,9 @@
  * that Alice sends to it.
  *
  * The creator and the joiner each run their own `SCP` instance with its own
- * database, as two devices would. Each passes its own `KeyCustodyProvider`:
- * the TypeScript SDK ships no production key store, and its one
- * `CustodyType`, `"in_memory"`, works only with an addon built with the
- * `testing` feature.
+ * database, as two devices would. Each passes its own `KeyCustodyProvider`,
+ * which is how the `"os_keystore"` custody request of spec `03-identity.md`
+ * §3.2.2 reaches a host key store.
  *
  * Prerequisites:
  *   bun add @limn-works/scp-ts

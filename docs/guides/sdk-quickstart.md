@@ -147,7 +147,7 @@ dependencies {
 
 Every SCP participant starts by creating a cryptographic identity -- a DID (Decentralized Identifier) backed by Ed25519 keys. The identity is the root of trust for all protocol operations.
 
-Every SDK takes the custody choice as a required argument. Python's key store value is `CustodyType.ENCRYPTED_FILE`; a build without the bridge's `testing` feature has no pre-rotation custody backend and raises `SCP-IDENT-1059` for it. The TypeScript, Swift and Kotlin SDKs ship no key store that `identityCreate` reaches: each one's only custody value, `in_memory`, works only in a build compiled with the `testing` feature, and a shipped build rejects it with `SCP-IDENT-1008`. In those SDKs a production caller implements `KeyCustodyProvider` over its own key store and passes it to `identityCreateWithCustody`.
+Every SDK takes the custody choice as a required argument. Python's key store value is `CustodyType.ENCRYPTED_FILE`; a build without the bridge's `testing` feature has no pre-rotation custody backend and raises `SCP-IDENT-1059` for it. TypeScript's `CustodyType` carries `"encrypted_file"` and `"os_keystore"` and no other value (`03-identity.md` §3.2.2), and a shipped addon answers `"encrypted_file"` with `SCP-IDENT-1059` as Python's build does. The Swift and Kotlin SDKs ship no key store that `identityCreate` reaches: each one's only custody value, `in_memory`, works only in a build compiled with the `testing` feature, and a shipped build rejects it with `SCP-IDENT-1008`. In TypeScript, Swift and Kotlin a production caller implements `KeyCustodyProvider` over its own key store and passes it to `identityCreateWithCustody`.
 
 ### Python
 
@@ -400,10 +400,10 @@ except IdentityError as e:
 import { IdentityError } from "@limn-works/scp-ts";
 
 try {
-  await scp.identityCreate("in_memory");
+  await scp.identityCreate("encrypted_file");
 } catch (e) {
   if (e instanceof IdentityError) {
-    console.error(`[${e.code}] ${e.message}`); // SCP-IDENT-1008 in a shipped build
+    console.error(`[${e.code}] ${e.message}`); // SCP-IDENT-1059 in a shipped build
   }
 }
 ```
