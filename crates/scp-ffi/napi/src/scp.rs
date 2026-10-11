@@ -1059,11 +1059,12 @@ impl Scp {
     /// * `reference_proof` — What this caller did about a class 2
     ///   (`signed_post` / `dns_record`) proof resource, per spec §3.5.4 Class 2
     ///   step 2. `"confirmed"` reports that this caller fetched the resource
-    ///   `evidence.proof` names and found this issuer's DID in it, which yields
-    ///   a `true` or a `false`. `"not_fetched"` reports that this caller
-    ///   fetched nothing, which raises `SCP-IDENT-1062` for a class 2
-    ///   attestation. A class 1 (`did_control`) attestation ignores this
-    ///   argument. Any other string raises `SCP-IDENT-1044`.
+    ///   `evidence.proof` names and found in it what step 2 requires (this
+    ///   issuer's DID, plus the nonce for `signed_post`), which yields a `true`
+    ///   or a `false`. `"not_fetched"` reports that this caller fetched
+    ///   nothing, which raises `SCP-IDENT-1062` for a class 2 attestation. A
+    ///   class 1 (`did_control`) attestation ignores this argument. Any other
+    ///   string raises `SCP-IDENT-1044`.
     ///
     /// # Returns
     ///
@@ -3880,13 +3881,15 @@ impl Scp {
         crate::trust::trust_query_score_on(&self.inner, did, context_id)
     }
 
-    /// Per-instance equivalent of the free-function `trust_verify_attestation`.
+    /// Verifies an attestation, including this instance's revocation list for
+    /// `context_id`.
     #[napi(js_name = "trustVerifyAttestation")]
     pub fn trust_verify_attestation(
         &self,
+        context_id: String,
         attestation_json: String,
     ) -> napi::Result<NapiAttestationVerificationResult> {
-        crate::trust::trust_verify_attestation_on(&self.inner, attestation_json)
+        crate::trust::trust_verify_attestation_on(&self.inner, context_id, attestation_json)
     }
 
     /// Per-instance equivalent of the free-function `trust_create_challenge`.

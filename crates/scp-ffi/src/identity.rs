@@ -1715,11 +1715,12 @@ impl crate::scp::PyScp {
     /// * `reference_proof` — What this caller did about a class 2
     ///   (`signed_post` / `dns_record`) proof resource, per spec §3.5.4 Class 2
     ///   step 2. `"confirmed"` reports that this caller fetched the resource
-    ///   `evidence.proof` names and found this issuer's DID in it, which yields
-    ///   a `True` or a `False`. `"not_fetched"` reports that this caller
-    ///   fetched nothing, which raises `SCP-IDENT-1062` for a class 2
-    ///   attestation. A class 1 (`did_control`) attestation ignores this
-    ///   argument. Any other string raises `SCP-IDENT-1044`.
+    ///   `evidence.proof` names and found in it what step 2 requires (this
+    ///   issuer's DID, plus the nonce for `signed_post`), which yields a `True`
+    ///   or a `False`. `"not_fetched"` reports that this caller fetched
+    ///   nothing, which raises `SCP-IDENT-1062` for a class 2 attestation. A
+    ///   class 1 (`did_control`) attestation ignores this argument. Any other
+    ///   string raises `SCP-IDENT-1044`.
     ///
     /// # Returns
     ///

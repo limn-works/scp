@@ -20,7 +20,7 @@
 //!
 //! See ADR-017 acceptance criteria 9-10 in `.docs/adrs/phase-4.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use scp_clock::Clock;
 use scp_did::DID;
@@ -29,7 +29,7 @@ use scp_event_log::Event;
 use super::attestation::{
     Attestation, AttestationRevocationChecker, AttestorInfo, DidPublicKeyResolver, FreshnessStatus,
     ThresholdCheckInput, ThresholdRequirement, check_attestation_freshness,
-    check_threshold_attestation, verify_attestation, verify_attestation_with_revocation,
+    check_threshold_attestation, verify_attestation,
 };
 use super::challenge::{ChallengeVerification, verify_challenge_verification};
 use super::consequence::ConsequenceRule;
@@ -64,7 +64,13 @@ pub trait TrustProtocolRepository: Send + Sync {
 
     /// Stores an ALREADY-VERIFIED attestation in the cache with a TTL.
     ///
-    /// If an attestation with the same ID already exists, it is replaced.
+    /// An entry replaces only an entry that carries the same issuer AND the same
+    /// attestation id, the pair [`revocation_list_key`] joins. §7.4.1 of
+    /// `.docs/specs/07-trust-validation-and-capabilities.md` binds
+    /// `Attestation.id` to no issuer, so two issuers can carry one id, and an
+    /// implementation that replaced on id alone would let an attacker who mints
+    /// a DID at no cost overwrite an honest issuer's cached attestation by
+    /// signing one that carries its id.
     ///
     /// SECURITY: this is a raw write that performs NO verification — the caller
     /// is asserting the attestation was verified at `entry.verified_at`. It is
@@ -90,7 +96,9 @@ pub trait TrustProtocolRepository: Send + Sync {
     ///
     /// Returns a map whose key [`revocation_list_key`] builds from an issuer DID
     /// plus an attestation id, and whose value reports whether that issuer
-    /// revoked that attestation (true = revoked). A caller MUST build every key
+    /// revoked that attestation (true = revoked). Every record
+    /// [`add_revocations`](Self::add_revocations) writes, the only writer this
+    /// trait offers, reads back as true. A caller MUST build every key
     /// it reads or writes with [`revocation_list_key`]; a bare attestation id is
     /// not a key, because §7.4.1 of
     /// `.docs/specs/07-trust-validation-and-capabilities.md` binds
@@ -101,27 +109,18 @@ pub trait TrustProtocolRepository: Send + Sync {
     /// Returns [`TrustError`] if the store is unavailable.
     fn get_revocation_state(&self, context_id: &str) -> Result<HashMap<String, bool>, TrustError>;
 
-    /// Stores revocation list state for a context.
+    /// Records each entry in `entries` as a revocation for a context, leaving
+    /// every record this call does not name as it was, after pruning the
+    /// records that can no longer change a verification.
     ///
-    /// REPLACES the existing revocation state for the context, so a caller uses
-    /// this only when it owns the whole map. A caller that learned about
-    /// individual revocations uses [`add_revocations`](Self::add_revocations)
-    /// instead. Every key in `state` comes from [`revocation_list_key`].
+    /// Each `list_key` comes from [`revocation_list_key`]. Passing an empty
+    /// slice writes nothing and prunes nothing.
     ///
-    /// # Errors
-    ///
-    /// Returns [`TrustError`] if the store write fails.
-    fn store_revocation_state(
-        &self,
-        context_id: &str,
-        state: &HashMap<String, bool>,
-    ) -> Result<(), TrustError>;
-
-    /// Marks each key in `keys` revoked for a context, leaving every key this
-    /// call does not name as it was.
-    ///
-    /// Each key comes from [`revocation_list_key`]. Passing an empty slice
-    /// writes nothing.
+    /// An implementation applies [`plan_revocation_write`] to its current
+    /// records and `entries` and carries out the plan that function returns:
+    /// it deletes each pruned record and writes each new record. Spec 07
+    /// §7.4.4 states no size bound for the list, so neither the plan nor the
+    /// store refuses a write by count.
     ///
     /// SECURITY (lost update). An implementation MUST NOT lose a revocation that
     /// a concurrent caller on the same context recorded. Reading a whole map,
@@ -135,8 +134,13 @@ pub trait TrustProtocolRepository: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`TrustError`] if the store write fails.
-    fn add_revocations(&self, context_id: &str, keys: &[String]) -> Result<(), TrustError>;
+    /// Returns [`TrustError::StoreError`] if a store read or write fails.
+    fn add_revocations(
+        &self,
+        context_id: &str,
+        entries: &[RevocationEntry],
+        now: u64,
+    ) -> Result<(), TrustError>;
 
     /// Retrieves persisted challenge results for a subject DID within a
     /// context.
@@ -194,24 +198,120 @@ pub fn revocation_list_key(issuer: &DID, attestation_id: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Revocation records
+// ---------------------------------------------------------------------------
+
+/// One revocation a caller asks [`TrustProtocolRepository::add_revocations`]
+/// to record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevocationEntry {
+    /// The key [`revocation_list_key`] built from the revoking issuer and the
+    /// revoked attestation's id.
+    pub list_key: String,
+    /// The revoked attestation's own `expires_at`. Once it passes, step 3 of
+    /// [`verify_attestation`] rejects every copy of that attestation, so the
+    /// record can no longer change a verification and is pruned. `None` means
+    /// the attestation never expires, and its record is never pruned.
+    pub expires_at: Option<u64>,
+}
+
+impl RevocationEntry {
+    /// Builds the entry that records `attestation`'s issuer revoking it.
+    #[must_use]
+    pub fn for_attestation(attestation: &Attestation) -> Self {
+        Self {
+            list_key: revocation_list_key(&attestation.issuer, &attestation.id),
+            expires_at: attestation.expires_at,
+        }
+    }
+
+    /// Reports whether this record can no longer change a verification at
+    /// `now`. Matches step 3 of [`verify_attestation`], which rejects when
+    /// `expires_at < now`.
+    #[must_use]
+    pub fn is_moot(&self, now: u64) -> bool {
+        self.expires_at.is_some_and(|expires_at| expires_at < now)
+    }
+}
+
+/// What [`plan_revocation_write`] tells a store to do.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RevocationWritePlan {
+    /// The list keys of existing records to delete, each moot at `now`.
+    pub prune: Vec<String>,
+    /// The new records to write, each absent from the kept records and listed
+    /// once.
+    pub write: Vec<RevocationEntry>,
+}
+
+/// Decides how one [`TrustProtocolRepository::add_revocations`] call changes a
+/// context's revocation records, so every store applies one rule.
+///
+/// `existing` lists every record the context holds. The plan prunes each
+/// existing record that [`RevocationEntry::is_moot`] reports moot at `now`,
+/// and skips each new entry that is moot, that the kept records already hold,
+/// or that this call already listed. Pruning a moot record loses nothing,
+/// because step 3 of [`verify_attestation`] rejects an expired attestation
+/// before step 5 reads the list. The plan refuses no write by count: spec 07
+/// §7.4.4 states no size bound for the list.
+#[must_use]
+pub fn plan_revocation_write(
+    existing: &[RevocationEntry],
+    entries: &[RevocationEntry],
+    now: u64,
+) -> RevocationWritePlan {
+    let mut plan = RevocationWritePlan::default();
+    if entries.is_empty() {
+        return plan;
+    }
+    let mut held: HashSet<&str> = HashSet::with_capacity(existing.len());
+    for record in existing {
+        if record.is_moot(now) {
+            plan.prune.push(record.list_key.clone());
+        } else {
+            held.insert(record.list_key.as_str());
+        }
+    }
+    for entry in entries {
+        if entry.is_moot(now) || !held.insert(entry.list_key.as_str()) {
+            continue;
+        }
+        plan.write.push(entry.clone());
+    }
+    plan
+}
+
+// ---------------------------------------------------------------------------
 // RevocationMapChecker
 // ---------------------------------------------------------------------------
 
 /// [`AttestationRevocationChecker`] backed by a context's persisted revocation
-/// list — an `issuer + attestation_id -> revoked` map from
-/// [`TrustProtocolRepository::get_revocation_state`], whose keys
-/// [`revocation_list_key`] builds.
+/// list.
 ///
-/// Used by [`AttestationCache::get_verified_attestations`] so the READ path
-/// enforces context revocation, not only the ingest path: a cached attestation
-/// that is later context-revoked is dropped on read (even while still inside its
-/// cache TTL) rather than continuing to inflate trust until TTL expiry.
-struct RevocationMapChecker<'a> {
+/// The list is an `issuer + attestation_id -> revoked` map from
+/// [`TrustProtocolRepository::get_revocation_state`], whose keys
+/// [`revocation_list_key`] builds. Every reader of that list builds this one
+/// checker: the READ path in [`AttestationCache::get_verified_attestations`],
+/// the threshold counts in [`aggregate_trust_input`], and the FFI ingest and
+/// verify helpers. A cached
+/// attestation that is later context-revoked is therefore dropped on read (even
+/// while still inside its cache TTL) rather than continuing to inflate trust
+/// until TTL expiry.
+pub struct RevocationMapChecker<'a, H = std::collections::hash_map::RandomState> {
     /// `revocation_list_key(issuer, attestation_id) -> revoked` for the context.
-    revoked: &'a HashMap<String, bool>,
+    revoked: &'a HashMap<String, bool, H>,
 }
 
-impl AttestationRevocationChecker for RevocationMapChecker<'_> {
+impl<'a, H: std::hash::BuildHasher> RevocationMapChecker<'a, H> {
+    /// Wraps a map that [`TrustProtocolRepository::get_revocation_state`]
+    /// returned.
+    #[must_use]
+    pub const fn new(revoked: &'a HashMap<String, bool, H>) -> Self {
+        Self { revoked }
+    }
+}
+
+impl<H: std::hash::BuildHasher> AttestationRevocationChecker for RevocationMapChecker<'_, H> {
     fn check_revocation(&self, attestation_id: &str, issuer: &DID) -> Option<u64> {
         // The list stores only a boolean per key (no timestamp); report `0` as
         // the revocation time when listed. That value only populates a
@@ -355,7 +455,7 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
         // Build the context revocation checker once; applied to every entry on
         // both the fresh and stale paths so a post-cache revocation is honored.
         let revoked = self.store.get_revocation_state(context_id)?;
-        let revocation_checker = RevocationMapChecker { revoked: &revoked };
+        let revocation_checker = RevocationMapChecker::new(&revoked);
 
         let mut result = Vec::new();
 
@@ -371,13 +471,8 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
                 // parse, no network), so no transient fault can spuriously drop a
                 // valid entry. A future networked/fallible resolver swap MUST
                 // revisit this to separate rejections from infra faults.
-                if verify_attestation_with_revocation(
-                    &entry.attestation,
-                    resolver,
-                    clock,
-                    Some(&revocation_checker),
-                )
-                .is_ok()
+                if verify_attestation(&entry.attestation, resolver, clock, &revocation_checker)
+                    .is_ok()
                 {
                     // Update cache with new verified_at.
                     let refreshed = CachedAttestation {
@@ -407,10 +502,13 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
         Ok(result)
     }
 
-    /// Verifies and caches a new attestation.
+    /// Verifies a new attestation against `revocation_checker` and, if valid,
+    /// stores it in the cache with the current timestamp and configured TTL.
     ///
-    /// Verifies the attestation, and if valid, stores it in the cache with
-    /// the current timestamp and configured TTL.
+    /// An attestation that is validly signed but that `revocation_checker`
+    /// reports revoked is rejected, so it is neither cached nor counted.
+    /// `revocation_checker` is required for the reason [`verify_attestation`]
+    /// requires it.
     ///
     /// # Errors
     ///
@@ -421,42 +519,9 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
         attestation: &Attestation,
         resolver: &impl DidPublicKeyResolver,
         clock: &impl Clock,
+        revocation_checker: &dyn AttestationRevocationChecker,
     ) -> Result<(), TrustError> {
-        verify_attestation(attestation, resolver, clock)?;
-
-        let entry = CachedAttestation {
-            attestation: attestation.clone(),
-            verified_at: clock.now_secs(),
-            ttl_secs: self.ttl_secs,
-        };
-        self.store.store_cached_attestation(context_id, entry)?;
-
-        Ok(())
-    }
-
-    /// Verifies and caches a new attestation, additionally consulting an
-    /// external revocation checker.
-    ///
-    /// Identical to [`verify_and_cache`](Self::verify_and_cache) except the
-    /// supplied [`AttestationRevocationChecker`] is queried during verification
-    /// (via [`verify_attestation_with_revocation`]). An attestation that is
-    /// validly signed but listed in the context's external revocation list is
-    /// rejected, so it is neither cached nor counted. Passing `None` makes this
-    /// behave exactly like `verify_and_cache` (issuer-bound `revocation_status`
-    /// field only).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustError`] if verification or caching fails.
-    pub fn verify_and_cache_with_revocation(
-        &self,
-        context_id: &str,
-        attestation: &Attestation,
-        resolver: &impl DidPublicKeyResolver,
-        clock: &impl Clock,
-        revocation_checker: Option<&dyn AttestationRevocationChecker>,
-    ) -> Result<(), TrustError> {
-        verify_attestation_with_revocation(attestation, resolver, clock, revocation_checker)?;
+        verify_attestation(attestation, resolver, clock, revocation_checker)?;
 
         let entry = CachedAttestation {
             attestation: attestation.clone(),
@@ -617,8 +682,8 @@ where
     //    `get_verified_attestations`: an endorsement revoked after its issuer
     //    signed it must stop counting toward a threshold on the next read.
     let revoked = ctx.cache.store().get_revocation_state(ctx.context_id)?;
-    let revocation_checker = RevocationMapChecker { revoked: &revoked };
-    let threshold_counts = compute_threshold_counts(ctx, Some(&revocation_checker));
+    let revocation_checker = RevocationMapChecker::new(&revoked);
+    let threshold_counts = compute_threshold_counts(ctx, &revocation_checker);
 
     Ok(TrustInput {
         verified_attestations,
@@ -643,7 +708,7 @@ where
 /// the count as raw candidates and never as a pre-approved tally.
 fn compute_threshold_counts<S, R, C>(
     ctx: &AggregationContext<'_, S, R, C>,
-    revocation_checker: Option<&dyn AttestationRevocationChecker>,
+    revocation_checker: &dyn AttestationRevocationChecker,
 ) -> HashMap<AttestationType, (u32, u32)>
 where
     S: TrustProtocolRepository,
@@ -732,7 +797,8 @@ mod tests {
     /// An in-memory implementation of [`TrustProtocolRepository`] for testing.
     struct InMemoryTrustStore {
         attestations: Mutex<HashMap<(String, String), Vec<CachedAttestation>>>,
-        revocations: Mutex<HashMap<String, HashMap<String, bool>>>,
+        /// `list_key -> expires_at` per context.
+        revocations: Mutex<HashMap<String, HashMap<String, Option<u64>>>>,
         challenges: Mutex<HashMap<(String, String), Vec<ChallengeVerification>>>,
     }
 
@@ -778,11 +844,11 @@ mod tests {
             let key = (context_id.to_owned(), entry.attestation.subject.to_string());
             let entries = store.entry(key).or_default();
 
-            // Replace existing entry with same ID, or append.
-            if let Some(pos) = entries
-                .iter()
-                .position(|e| e.attestation.id == entry.attestation.id)
-            {
+            // Replace the entry carrying the same issuer AND id, or append.
+            if let Some(pos) = entries.iter().position(|e| {
+                e.attestation.id == entry.attestation.id
+                    && e.attestation.issuer == entry.attestation.issuer
+            }) {
                 entries[pos] = entry;
             } else {
                 entries.push(entry);
@@ -802,14 +868,20 @@ mod tests {
                     sequence: 0,
                     reason: "lock poisoned".to_owned(),
                 })?;
-            Ok(store.get(context_id).cloned().unwrap_or_default())
+            Ok(store
+                .get(context_id)
+                .map(|records| records.keys().map(|k| (k.clone(), true)).collect())
+                .unwrap_or_default())
         }
 
-        fn store_revocation_state(
+        fn add_revocations(
             &self,
             context_id: &str,
-            state: &HashMap<String, bool>,
+            entries: &[RevocationEntry],
+            now: u64,
         ) -> Result<(), TrustError> {
+            // One guard covers the read, the plan, and the writes, so a
+            // concurrent caller on this context cannot drop what this call adds.
             let mut store = self
                 .revocations
                 .lock()
@@ -817,23 +889,20 @@ mod tests {
                     sequence: 0,
                     reason: "lock poisoned".to_owned(),
                 })?;
-            store.insert(context_id.to_owned(), state.clone());
-            Ok(())
-        }
-
-        fn add_revocations(&self, context_id: &str, keys: &[String]) -> Result<(), TrustError> {
-            // One guard covers the lookup and the inserts, so a concurrent
-            // caller on this context cannot drop what this call adds.
-            let mut store = self
-                .revocations
-                .lock()
-                .map_err(|_| TrustError::InvalidEventData {
-                    sequence: 0,
-                    reason: "lock poisoned".to_owned(),
-                })?;
-            let entry = store.entry(context_id.to_owned()).or_default();
-            for key in keys {
-                entry.insert(key.clone(), true);
+            let records = store.entry(context_id.to_owned()).or_default();
+            let existing: Vec<RevocationEntry> = records
+                .iter()
+                .map(|(list_key, expires_at)| RevocationEntry {
+                    list_key: list_key.clone(),
+                    expires_at: *expires_at,
+                })
+                .collect();
+            let plan = plan_revocation_write(&existing, entries, now);
+            for list_key in &plan.prune {
+                records.remove(list_key);
+            }
+            for entry in plan.write {
+                records.insert(entry.list_key, entry.expires_at);
             }
             Ok(())
         }
@@ -995,13 +1064,14 @@ mod tests {
         revoked: &[(&str, &str)],
     ) -> HashMap<AttestationType, (u32, u32)> {
         let store = InMemoryTrustStore::new();
-        if !revoked.is_empty() {
-            let state: HashMap<String, bool> = revoked
-                .iter()
-                .map(|(issuer, id)| (revocation_list_key(&DID::from(*issuer), id), true))
-                .collect();
-            store.store_revocation_state("ctx-1", &state).unwrap();
-        }
+        let entries: Vec<RevocationEntry> = revoked
+            .iter()
+            .map(|(issuer, id)| RevocationEntry {
+                list_key: revocation_list_key(&DID::from(*issuer), id),
+                expires_at: None,
+            })
+            .collect();
+        store.add_revocations("ctx-1", &entries, 2000).unwrap();
         let cache = AttestationCache::new(store);
         let clock = TestClock::new(2000);
         let events = vec![make_event(
@@ -1193,6 +1263,84 @@ mod tests {
         assert!(cached.is_empty());
     }
 
+    fn entry(list_key: &str, expires_at: Option<u64>) -> RevocationEntry {
+        RevocationEntry {
+            list_key: list_key.to_owned(),
+            expires_at,
+        }
+    }
+
+    /// The plan prunes each record moot at `now` (step 3 rejects its
+    /// attestation first), keeps the rest, and skips a new entry the kept
+    /// records already hold, one listed twice, or one already moot.
+    #[test]
+    fn plan_revocation_write_prunes_moot_records_and_skips_duplicates() {
+        let existing = [
+            entry("old", Some(999)),
+            entry("kept", None),
+            entry("edge", Some(1000)),
+        ];
+        let entries = [
+            entry("kept", None),
+            entry("new", Some(5000)),
+            entry("new", Some(5000)),
+            entry("already-expired", Some(10)),
+        ];
+        let plan = plan_revocation_write(&existing, &entries, 1000);
+        assert_eq!(plan.prune, vec!["old".to_owned()]);
+        assert_eq!(plan.write, vec![entry("new", Some(5000))]);
+    }
+
+    /// The plan refuses no write by count (spec 07 §7.4.4 states no size
+    /// bound): a large list still takes a new record, and a moot record in it
+    /// is still pruned.
+    #[test]
+    fn plan_revocation_write_refuses_no_write_by_count() {
+        let mut large: Vec<RevocationEntry> =
+            (0..4096).map(|i| entry(&format!("k{i}"), None)).collect();
+        large[0].expires_at = Some(5);
+        let fresh: Vec<RevocationEntry> =
+            (0..2048).map(|i| entry(&format!("n{i}"), None)).collect();
+        let plan = plan_revocation_write(&large, &fresh, 1000);
+        assert_eq!(plan.prune, vec!["k0".to_owned()]);
+        assert_eq!(plan.write, fresh);
+
+        // An empty call neither prunes nor writes.
+        let empty = plan_revocation_write(&large, &[], 1000);
+        assert_eq!(empty, RevocationWritePlan::default());
+    }
+
+    /// The test store replaces a cached attestation only on the same issuer
+    /// AND id, the rule `store_cached_attestation` states.
+    #[test]
+    fn two_issuers_with_one_attestation_id_are_two_cache_entries() {
+        let store = InMemoryTrustStore::new();
+        let mut honest =
+            make_attestation("att-shared", "did:key:alice", AttestationType::Endorsement);
+        honest.issuer = "did:key:honest".into();
+        let mut other = honest.clone();
+        other.issuer = "did:key:other".into();
+        for attestation in [honest, other] {
+            store
+                .store_cached_attestation(
+                    "ctx-1",
+                    CachedAttestation {
+                        attestation,
+                        verified_at: 1000,
+                        ttl_secs: 300,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .get_cached_attestations("ctx-1", "did:key:alice")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
     #[test]
     fn store_persists_and_retrieves_revocation_state() {
         let store = InMemoryTrustStore::new();
@@ -1201,16 +1349,21 @@ mod tests {
         let revoked_key = revocation_list_key(&issuer, "att-1");
         let active_key = revocation_list_key(&issuer, "att-2");
 
-        let mut state = HashMap::new();
-        state.insert(revoked_key.clone(), true);
-        state.insert(active_key.clone(), false);
-
-        store.store_revocation_state("ctx-1", &state).unwrap();
+        store
+            .add_revocations(
+                "ctx-1",
+                &[RevocationEntry {
+                    list_key: revoked_key.clone(),
+                    expires_at: None,
+                }],
+                1000,
+            )
+            .unwrap();
 
         let retrieved = store.get_revocation_state("ctx-1").unwrap();
-        assert_eq!(retrieved.len(), 2);
+        assert_eq!(retrieved.len(), 1);
         assert_eq!(retrieved.get(&revoked_key), Some(&true));
-        assert_eq!(retrieved.get(&active_key), Some(&false));
+        assert_eq!(retrieved.get(&active_key), None);
     }
 
     /// SECURITY (key injectivity, issue #2335 finding 13). A caller chooses both

@@ -81,6 +81,7 @@ if TYPE_CHECKING:
         AttestorInfo,
         BehavioralRecord,
         CachedAttestation,
+        CachedAttestationEnvelope,
         CapabilityValidation,
         ChallengeVerification,
         EventLogEntry,
@@ -1347,11 +1348,12 @@ class SCP:
         ``reference_proof`` reports what this caller did about a Class 2
         (``signed_post`` / ``dns_record``) proof resource, per spec §3.5.4
         Class 2 step 2. Pass ``"confirmed"`` after fetching the resource
-        ``evidence.proof`` names and finding this issuer's DID in it, which
-        yields ``True`` or ``False``. Pass ``"not_fetched"`` after fetching
-        nothing, which raises ``SCP-IDENT-1062`` for a Class 2 attestation. A
-        Class 1 (``did_control``) attestation ignores this argument. Any other
-        string raises ``SCP-IDENT-1044``.
+        ``evidence.proof`` names and finding in it what step 2 requires (this
+        issuer's DID, plus the nonce for ``signed_post``), which yields ``True``
+        or ``False``. Pass ``"not_fetched"`` after fetching nothing, which
+        raises ``SCP-IDENT-1062`` for a Class 2 attestation. A Class 1
+        (``did_control``) attestation ignores this argument. Any other string
+        raises ``SCP-IDENT-1044``.
 
         Two conditions raise instead of returning a verdict:
 
@@ -2820,6 +2822,20 @@ class SCP:
             subject_did,
             *wire,
         )
+
+    async def trust_verify_attestation(
+        self,
+        context_id: str,
+        attestation: CachedAttestationEnvelope | dict[str, Any],
+    ) -> dict[str, Any]:
+        """Verify an attestation against this instance's revocation list for
+        ``context_id`` (ADR-017, §7.4.4).
+
+        Delegates to :func:`scp_sdk.trust.trust_verify_attestation`.
+        """
+        from scp_sdk.trust import trust_verify_attestation as _verify
+
+        return await asyncio.to_thread(_verify, self, context_id, attestation)
 
     async def trust_query_score(self, did: str, context_id: str) -> Any:
         """Delegate to ``_scp_core.SCP.trust_query_score``."""

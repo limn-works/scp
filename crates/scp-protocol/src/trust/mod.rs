@@ -24,7 +24,6 @@ pub use admission::{
 pub use attestation::{
     Attestation, AttestationEvidence, DidPublicKeyResolver, IdentityDidPublicKeyResolver,
     RevocationStatus, canonical_attestation_bytes, verify_attestation,
-    verify_attestation_with_revocation,
 };
 pub use capability_uri::{CapabilityUri, CapabilityUriError};
 pub use caveats::{

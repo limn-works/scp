@@ -764,12 +764,12 @@ pub struct EndorsementEvidence<'a> {
     ///
     /// SECURITY (one rule, one answer). `aggregate_trust_input` builds a checker
     /// from a context's persisted revocation list before it computes threshold
-    /// counts, and both paths call `check_threshold_attestation`. A caller that
-    /// passes `None` here therefore gives one endorsement two answers: revoked
-    /// on the aggregation path, and still counting on this Sybil path. Pass the
-    /// same checker a context's revocation list backs. `None` states that a
-    /// caller holds no revocation list at all, which is the only case it covers.
-    pub revocation_checker: Option<&'a dyn AttestationRevocationChecker>,
+    /// counts, and both paths call `check_threshold_attestation`. Pass the same
+    /// checker a context's revocation list backs, so one endorsement never gets
+    /// two answers: revoked on the aggregation path, and still counting on this
+    /// Sybil path. The field is required for the reason `verify_attestation`
+    /// requires it.
+    pub revocation_checker: &'a dyn AttestationRevocationChecker,
 }
 
 /// Evaluates a DID's trust signals against a context's Sybil resistance policy.
@@ -1015,7 +1015,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::trust::attestation::canonical_attestation_bytes;
+    use crate::trust::attestation::{NoOpRevocationChecker, canonical_attestation_bytes};
     use crate::trust::{Attestation, AttestationType, RevocationStatus, TrustError};
 
     fn did(s: &str) -> DID {
@@ -1069,7 +1069,7 @@ mod tests {
                 attestors,
                 resolver: &self.resolver,
                 clock: &self.clock,
-                revocation_checker: None,
+                revocation_checker: &NoOpRevocationChecker,
             }
         }
 
@@ -1084,7 +1084,7 @@ mod tests {
                 attestors,
                 resolver: &self.resolver,
                 clock: &self.clock,
-                revocation_checker: Some(checker),
+                revocation_checker: checker,
             }
         }
     }

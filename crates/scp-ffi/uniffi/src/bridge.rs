@@ -7576,35 +7576,24 @@ pub fn trust_query_score(did: String, context_id: String) -> Result<TrustScoreRe
     })
 }
 
-/// Verifies an attestation's Ed25519 signature, evidence, expiry, and
-/// revocation status.
-///
-/// See ADR-017 Layer 3 (Attestation).
-#[uniffi::export]
-pub fn trust_verify_attestation(
-    attestation_json: String,
-) -> Result<AttestationVerificationResult, ScpError> {
-    let attestation: scp_core::trust::Attestation = serde_json::from_str(&attestation_json)
-        .map_err(|e| ScpError::Validation {
-            msg: format!("failed to parse attestation JSON: {e}"),
-            code: codes::VALID_7012.to_owned(),
-        })?;
-
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_clock::SystemClock;
-
-    match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
-        Ok(()) => Ok(AttestationVerificationResult {
-            valid: true,
-            chain_depth: 1,
-            error_message: String::new(),
-        }),
-        Err(e) => Ok(AttestationVerificationResult {
-            valid: false,
-            chain_depth: 0,
-            error_message: format!("{e}"),
-        }),
-    }
+/// Verifies one attestation against the revocation list in the concrete
+/// backend behind a `ProtocolRepoVariant` arm, with the production DID-key
+/// resolver and clock.
+fn run_verify_attestation<S: scp_platform::traits::Storage + 'static>(
+    repo: &std::sync::Arc<scp_core::store::ProtocolRepository<S>>,
+    context_id: &str,
+    attestation: &scp_core::trust::Attestation,
+) -> Result<scp_ffi_common::trust_store::AttestationVerdict, scp_core::trust::TrustError> {
+    let handle = runtime().handle().clone();
+    let bridge =
+        scp_core::trust::ProtocolRepositoryTrustBridge::new(std::sync::Arc::clone(repo), handle);
+    scp_ffi_common::trust_store::verify_attestation_in_context(
+        &bridge,
+        context_id,
+        attestation,
+        &scp_core::trust::IdentityDidPublicKeyResolver,
+        &scp_clock::SystemClock,
+    )
 }
 
 /// Creates a challenge request for capability verification.
@@ -10090,11 +10079,12 @@ impl Scp {
     /// * `reference_proof` — What this caller did about a class 2
     ///   (`signed_post` / `dns_record`) proof resource, per spec §3.5.4 Class 2
     ///   step 2. `"confirmed"` reports that this caller fetched the resource
-    ///   `evidence.proof` names and found this issuer's DID in it, which yields
-    ///   a `true` or a `false`. `"not_fetched"` reports that this caller
-    ///   fetched nothing, which raises `SCP-IDENT-1062` for a class 2
-    ///   attestation. A class 1 (`did_control`) attestation ignores this
-    ///   argument. Any other string raises `SCP-IDENT-1044`.
+    ///   `evidence.proof` names and found in it what step 2 requires (this
+    ///   issuer's DID, plus the nonce for `signed_post`), which yields a `true`
+    ///   or a `false`. `"not_fetched"` reports that this caller fetched
+    ///   nothing, which raises `SCP-IDENT-1062` for a class 2 attestation. A
+    ///   class 1 (`did_control`) attestation ignores this argument. Any other
+    ///   string raises `SCP-IDENT-1044`.
     ///
     /// # Returns
     ///
@@ -15979,8 +15969,8 @@ impl Scp {
     //
     // Purely stateless helpers (`sync_classify_offline`,
     // `sync_classify_offline_custom`, `sync_get_policy`,
-    // `trust_verify_response`, `trust_verify_attestation`,
-    // `trust_create_challenge`, `verify_participation_requirements`) are
+    // `trust_verify_response`, `trust_create_challenge`,
+    // `verify_participation_requirements`) are
     // exposed as thin delegating methods so SDK callers have a uniform
     // `scp.method(...)` API surface; the bodies simply forward to the free
     // functions.
@@ -16838,6 +16828,55 @@ impl Scp {
                 .map_err(ScpError::from)?;
         }
         crate::server::node_start_local_on(&self.inner, data_dir, identity, passphrase).await
+    }
+
+    /// Verifies an attestation's Ed25519 signature, evidence, expiry, and its
+    /// own revocation status, and checks THIS instance's revocation list for
+    /// `context_id` (§7.4.4). A rejection returns `valid: false` with the
+    /// reason; a revocation list that cannot be read is an error
+    /// (`VALID_7052`), never a verdict. See ADR-017 Layer 3 (Attestation).
+    pub fn trust_verify_attestation(
+        &self,
+        context_id: String,
+        attestation_json: String,
+    ) -> Result<AttestationVerificationResult, ScpError> {
+        use scp_ffi_common::trust_store::AttestationVerdict;
+
+        validate_context_id(&context_id).map_err(|e| ScpError::Validation {
+            msg: e.message,
+            code: codes::VALID_7011.to_owned(),
+        })?;
+        let attestation: scp_core::trust::Attestation = serde_json::from_str(&attestation_json)
+            .map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse attestation JSON: {e}"),
+                code: codes::VALID_7012.to_owned(),
+            })?;
+
+        let verdict = match self.inner.protocol_repository() {
+            crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+                run_verify_attestation(repo, &context_id, &attestation)
+            }
+            crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+                run_verify_attestation(repo, &context_id, &attestation)
+            }
+        }
+        .map_err(|e| ScpError::Validation {
+            msg: e.to_string(),
+            code: codes::VALID_7052.to_owned(),
+        })?;
+
+        Ok(match verdict {
+            AttestationVerdict::Valid => AttestationVerificationResult {
+                valid: true,
+                chain_depth: 1,
+                error_message: String::new(),
+            },
+            AttestationVerdict::Rejected(reason) => AttestationVerificationResult {
+                valid: false,
+                chain_depth: 0,
+                error_message: reason.to_string(),
+            },
+        })
     }
 
     /// Per-instance equivalent of the free-function [`trust_create_challenge`].
@@ -22695,8 +22734,16 @@ mod tests {
 
     #[test]
     fn trust_verify_attestation_rejects_invalid_json_with_code() {
-        let result = trust_verify_attestation("not json".to_owned());
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let result = scp.trust_verify_attestation("ctx-1".to_owned(), "not json".to_owned());
         assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7012);
+    }
+
+    #[test]
+    fn trust_verify_attestation_rejects_malformed_context_with_code() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let result = scp.trust_verify_attestation(String::new(), "{}".to_owned());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7011);
     }
 
     #[test]

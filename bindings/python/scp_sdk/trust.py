@@ -1641,18 +1641,24 @@ class ChallengeResponse(TypedDict):
 
 
 def trust_verify_attestation(
+    scp: SCP,
+    context_id: str,
     attestation: CachedAttestationEnvelope | dict[str, Any],
 ) -> dict[str, Any]:
-    """Verify an attestation's signature, evidence, expiry, and revocation
-    status (ADR-017, §7.4).
+    """Verify an attestation's signature, evidence, expiry, its own revocation
+    status, and the instance's revocation list for ``context_id``
+    (ADR-017, §7.4.4).
 
     Takes the typed attestation envelope
     (:class:`CachedAttestationEnvelope` — the same wire DTO the
     cached-attestation inputs use) and serializes it to the serde wire shape
-    internally (ADR-058) before calling the bridge
-    ``trust_verify_attestation`` free function.
+    internally (ADR-058) before calling the instance's
+    ``trust_verify_attestation`` bridge method. The revocation list lives in
+    the instance's storage, so the call needs the instance and the context.
 
     Args:
+        scp: The :class:`~scp_sdk.SCP` instance whose revocation list is read.
+        context_id: The context whose revocation list is checked.
         attestation: The typed attestation envelope (or a raw
             equivalently-shaped dict).
 
@@ -1662,11 +1668,11 @@ def trust_verify_attestation(
         ``False``).
 
     Raises:
-        ScpError: If the bridge module is not available.
-        ValueError: If the serialized envelope fails bridge deserialization.
+        ScpError: On a malformed context id or attestation, a missing storage
+            provider, or a revocation list that cannot be read. A list that
+            cannot be read raises; it never reads as ``valid: False``.
     """
-    bridge = _bridge()
-    return bridge.trust_verify_attestation(json.dumps(attestation))
+    return scp._native.trust_verify_attestation(context_id, json.dumps(attestation))
 
 
 def trust_verify_response(

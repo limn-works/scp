@@ -2748,11 +2748,12 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * * `reference_proof` — What this caller did about a class 2
      * (`signed_post` / `dns_record`) proof resource, per spec §3.5.4 Class 2
      * step 2. `"confirmed"` reports that this caller fetched the resource
-     * `evidence.proof` names and found this issuer's DID in it, which yields
-     * a `true` or a `false`. `"not_fetched"` reports that this caller
-     * fetched nothing, which raises `SCP-IDENT-1062` for a class 2
-     * attestation. A class 1 (`did_control`) attestation ignores this
-     * argument. Any other string raises `SCP-IDENT-1044`.
+     * `evidence.proof` names and found in it what step 2 requires (this
+     * issuer's DID, plus the nonce for `signed_post`), which yields a `true`
+     * or a `false`. `"not_fetched"` reports that this caller fetched
+     * nothing, which raises `SCP-IDENT-1062` for a class 2 attestation. A
+     * class 1 (`did_control`) attestation ignores this argument. Any other
+     * string raises `SCP-IDENT-1044`.
      *
      * # Returns
      *
@@ -3653,6 +3654,15 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Stateless helper — uses an ephemeral signing key per call.
      */
     func trustCreateChallenge(targetDid: String) throws  -> ChallengeResult
+    
+    /**
+     * Verifies an attestation's Ed25519 signature, evidence, expiry, and its
+     * own revocation status, and checks THIS instance's revocation list for
+     * `context_id` (§7.4.4). A rejection returns `valid: false` with the
+     * reason; a revocation list that cannot be read is an error
+     * (`VALID_7052`), never a verdict. See ADR-017 Layer 3 (Attestation).
+     */
+    func trustVerifyAttestation(contextId: String, attestationJson: String) throws  -> AttestationVerificationResult
     
     /**
      * Per-instance equivalent of the free-function [`trust_verify_response`].
@@ -5658,11 +5668,12 @@ open func identityRemoveLinkAttestation(did: String, attestationId: String) -> B
      * * `reference_proof` — What this caller did about a class 2
      * (`signed_post` / `dns_record`) proof resource, per spec §3.5.4 Class 2
      * step 2. `"confirmed"` reports that this caller fetched the resource
-     * `evidence.proof` names and found this issuer's DID in it, which yields
-     * a `true` or a `false`. `"not_fetched"` reports that this caller
-     * fetched nothing, which raises `SCP-IDENT-1062` for a class 2
-     * attestation. A class 1 (`did_control`) attestation ignores this
-     * argument. Any other string raises `SCP-IDENT-1044`.
+     * `evidence.proof` names and found in it what step 2 requires (this
+     * issuer's DID, plus the nonce for `signed_post`), which yields a `true`
+     * or a `false`. `"not_fetched"` reports that this caller fetched
+     * nothing, which raises `SCP-IDENT-1062` for a class 2 attestation. A
+     * class 1 (`did_control`) attestation ignores this argument. Any other
+     * string raises `SCP-IDENT-1044`.
      *
      * # Returns
      *
@@ -7453,6 +7464,22 @@ open func trustCreateChallenge(targetDid: String)throws  -> ChallengeResult  {
     return try  FfiConverterTypeChallengeResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_method_scp_trust_create_challenge(self.uniffiClonePointer(),
         FfiConverterString.lower(targetDid),$0
+    )
+})
+}
+    
+    /**
+     * Verifies an attestation's Ed25519 signature, evidence, expiry, and its
+     * own revocation status, and checks THIS instance's revocation list for
+     * `context_id` (§7.4.4). A rejection returns `valid: false` with the
+     * reason; a revocation list that cannot be read is an error
+     * (`VALID_7052`), never a verdict. See ADR-017 Layer 3 (Attestation).
+     */
+open func trustVerifyAttestation(contextId: String, attestationJson: String)throws  -> AttestationVerificationResult  {
+    return try  FfiConverterTypeAttestationVerificationResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_trust_verify_attestation(self.uniffiClonePointer(),
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(attestationJson),$0
     )
 })
 }
@@ -17405,19 +17432,6 @@ public func trustQueryScore(did: String, contextId: String)throws  -> TrustScore
 })
 }
 /**
- * Verifies an attestation's Ed25519 signature, evidence, expiry, and
- * revocation status.
- *
- * See ADR-017 Layer 3 (Attestation).
- */
-public func trustVerifyAttestation(attestationJson: String)throws  -> AttestationVerificationResult  {
-    return try  FfiConverterTypeAttestationVerificationResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_trust_verify_attestation(
-        FfiConverterString.lower(attestationJson),$0
-    )
-})
-}
-/**
  * Verifies a challenge response against its original challenge request.
  *
  * See ADR-017 Layer 3 (Challenge-Response).
@@ -17626,9 +17640,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_query_score() != 58685) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_trust_verify_attestation() != 50772) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_verify_response() != 47639) {
@@ -17955,7 +17966,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_link_attestation() != 51771) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_verify_link_attestation() != 22591) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_verify_link_attestation() != 44928) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_instance_id() != 43175) {
@@ -18178,6 +18189,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_create_challenge() != 25481) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_attestation() != 39312) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 16753) {

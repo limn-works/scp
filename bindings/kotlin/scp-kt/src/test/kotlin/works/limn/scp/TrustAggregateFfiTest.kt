@@ -134,6 +134,7 @@ class TrustAggregateFfiTest {
     fun `trustVerifyAttestation - typed envelope reaches the real verifier`() {
         val result =
             scp.trustVerifyAttestation(
+                "ctx-ffi-1",
                 CachedAttestationEnvelope(
                     id = "att-ffi-1",
                     attestationType = "AgentCapability",

@@ -5,8 +5,6 @@
 //!
 //! Pure helpers (no bridge state):
 //!
-//! - [`py_trust_verify_attestation`] — Verify an attestation's signature and
-//!   validity.
 //! - [`py_trust_create_challenge`] — Create a challenge request for capability
 //!   verification.
 //! - [`py_trust_verify_response`] — Verify a challenge response.
@@ -15,6 +13,8 @@
 //!
 //! `SCP` methods (bridge-state accessors):
 //!
+//! - `PyScp::trust_verify_attestation` — Verify an attestation, including
+//!   this instance's revocation list for the context.
 //! - `PyScp::trust_query_score` — Query participation-based trust data for a DID.
 //! - `PyScp::aggregate_trust_input` — Aggregate all trust engine layers into
 //!   a single [`TrustInput`](scp_core::trust::TrustInput) for agent-level
@@ -102,27 +102,31 @@ fn trust_query_score_impl(
 // trust_verify_attestation
 // ---------------------------------------------------------------------------
 
-/// Verifies an attestation's Ed25519 signature, evidence, expiry, and
-/// revocation status.
+/// Verifies one attestation against this instance's revocation list for
+/// `context_id`, on the instance's configured storage.
 ///
-/// Accepts the attestation as a JSON string and returns a dict with:
-/// - `valid` (bool): Whether verification succeeded.
-/// - `chain_depth` (int): 1 for a single attestation (chain depth tracking
-///   requires the full attestation graph, which is deferred to the
-///   attestation store integration).
-/// - `error` (Optional[str]): Error message if verification failed, `None`
-///   if valid.
-///
-/// Uses the production `IdentityDidPublicKeyResolver` for DID key
-/// resolution.
+/// Returns a dict with `valid` (bool), `chain_depth` (int, 1 when valid and 0
+/// otherwise), and `error` (the rejection's message, or `None` when valid). A
+/// rejection is a property of the attestation; a storage fault is not, and
+/// raises instead of reading as `valid: False`.
 ///
 /// # Errors
 ///
-/// Returns `ValidationError` with code `VALID_7012` (matching the UniFFI/NAPI
-/// bridges) if the JSON is malformed or cannot be parsed.
-#[pyfunction]
-#[pyo3(name = "trust_verify_attestation")]
-pub fn py_trust_verify_attestation(py: Python<'_>, attestation_json: &str) -> PyResult<Py<PyDict>> {
+/// `VALID_7011` for a malformed `context_id`, `VALID_7012` for malformed JSON,
+/// `VALID_7005` when this instance has no storage provider (the verification
+/// cannot read a revocation list, so it fails closed), and `VALID_7052` when
+/// the revocation list cannot be read.
+fn trust_verify_attestation_impl(
+    bi: &PyBridgeInstance,
+    py: Python<'_>,
+    context_id: &str,
+    attestation_json: &str,
+) -> PyResult<Py<PyDict>> {
+    use crate::runtime::StorageProvider;
+    use scp_ffi_common::trust_store::AttestationVerdict;
+
+    scp_ffi_common::validate::validate_context_id(context_id)
+        .map_err(|e| coded_validation_error(e.message, codes::VALID_7011))?;
     let attestation: scp_core::trust::Attestation = serde_json::from_str(attestation_json)
         .map_err(|e| {
             coded_validation_error(
@@ -130,25 +134,60 @@ pub fn py_trust_verify_attestation(py: Python<'_>, attestation_json: &str) -> Py
                 codes::VALID_7012,
             )
         })?;
-
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_clock::SystemClock;
+    let provider = crate::runtime::get_storage(bi).map_err(|_| {
+        coded_validation_error(
+            "bridge storage not initialized — attestation verification cannot read \
+             this instance's revocation list (bridge init bug)"
+                .to_owned(),
+            codes::VALID_7005,
+        )
+    })?;
+    let handle = crate::runtime()?.handle().clone();
+    // The store read blocks on the runtime, so it runs without the GIL.
+    let verdict = py.allow_threads(|| match provider {
+        StorageProvider::InMemoryEncrypted(storage) => {
+            run_verify_attestation(Arc::clone(storage), handle, context_id, &attestation)
+        }
+        StorageProvider::Sqlite(storage) => {
+            run_verify_attestation(Arc::clone(storage), handle, context_id, &attestation)
+        }
+    });
+    let verdict = verdict.map_err(|e| coded_validation_error(e.to_string(), codes::VALID_7052))?;
 
     let dict = PyDict::new(py);
-    match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
-        Ok(()) => {
+    match verdict {
+        AttestationVerdict::Valid => {
             dict.set_item("valid", true)?;
             dict.set_item("chain_depth", 1)?;
             dict.set_item("error", py.None())?;
         }
-        Err(e) => {
+        AttestationVerdict::Rejected(reason) => {
             dict.set_item("valid", false)?;
             dict.set_item("chain_depth", 0)?;
-            dict.set_item("error", format!("{e}"))?;
+            dict.set_item("error", reason.to_string())?;
         }
     }
-
     Ok(dict.into())
+}
+
+/// Builds a `ProtocolRepositoryTrustBridge` over the concrete encrypted backend
+/// and verifies one attestation against its revocation list, with the
+/// production DID-key resolver and clock.
+fn run_verify_attestation<S: scp_platform::EncryptedStorage + 'static>(
+    storage: Arc<S>,
+    handle: tokio::runtime::Handle,
+    context_id: &str,
+    attestation: &scp_core::trust::Attestation,
+) -> Result<scp_ffi_common::trust_store::AttestationVerdict, scp_core::trust::TrustError> {
+    let repo = Arc::new(scp_core::store::ProtocolRepository::new(storage));
+    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
+    scp_ffi_common::trust_store::verify_attestation_in_context(
+        &bridge,
+        context_id,
+        attestation,
+        &scp_core::trust::IdentityDidPublicKeyResolver,
+        &scp_clock::SystemClock,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -954,6 +993,27 @@ impl crate::scp::PyScp {
     /// # Errors
     ///
     /// Returns `ScpError` if input validation fails.
+    /// Verifies an attestation's signature, evidence, expiry, its own
+    /// revocation status, and this instance's revocation list for
+    /// `context_id`.
+    ///
+    /// See `trust_verify_attestation_impl` for the result and error codes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError` for malformed input, a missing storage provider, or
+    /// an unreadable revocation list.
+    #[pyo3(name = "trust_verify_attestation")]
+    pub fn trust_verify_attestation(
+        &self,
+        py: Python<'_>,
+        context_id: &str,
+        attestation_json: &str,
+    ) -> PyResult<Py<PyDict>> {
+        let bi = &*self.inner;
+        trust_verify_attestation_impl(bi, py, context_id, attestation_json)
+    }
+
     #[pyo3(name = "trust_query_score")]
     pub fn trust_query_score(
         &self,
@@ -1045,12 +1105,12 @@ impl crate::scp::PyScp {
 ///
 /// Post-migration (Phase 4 PR 4 sub-slice E), stateful trust operations
 /// (`trust_query_score`, `aggregate_trust_input`) are exposed as methods on
-/// `SCP`. Only pure helpers (attestation verification, challenge creation,
-/// response verification, participation requirement verification) remain as
-/// free `#[pyfunction]` exports.
+/// `SCP`, and so is `trust_verify_attestation`, which reads the instance's
+/// revocation list. Only pure helpers (challenge creation, response
+/// verification, participation requirement verification) remain as free
+/// `#[pyfunction]` exports.
 pub fn register_trust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyParticipationRecord>()?;
-    m.add_function(wrap_pyfunction!(py_trust_verify_attestation, m)?)?;
     m.add_function(wrap_pyfunction!(py_trust_create_challenge, m)?)?;
     m.add_function(wrap_pyfunction!(py_trust_verify_response, m)?)?;
     m.add_function(wrap_pyfunction!(py_verify_participation_requirements, m)?)?;
@@ -1121,7 +1181,7 @@ mod tests {
     fn trust_verify_attestation_rejects_invalid_json() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let result = py_trust_verify_attestation(py, "not valid json");
+            let result = default_scp().trust_verify_attestation(py, "ctx-valid", "not valid json");
             assert!(result.is_err());
             let err_str = format!("{}", result.unwrap_err());
             assert!(
