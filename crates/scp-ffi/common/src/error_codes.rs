@@ -57,12 +57,11 @@ pub const IDENT_1001: &str = "SCP-IDENT-1001";
 pub const IDENT_1002: &str = "SCP-IDENT-1002";
 /// Custody request reaches no key store without a `KeyCustodyProvider`.
 ///
-/// The `PyO3` bridge returns this code for `"os_keystore"` with no provider,
-/// through [`crate::custody_request::parse_custody_request`] (spec 03 §3.2.2).
-/// The NAPI bridge returns it for `"platform"` and `"software"`, and the
-/// `UniFFI` bridge for `"platform"`, `"software"` and `"callback"`. A
-/// `testing_seed` passed with any of these strings is reported first, as
-/// [`VALID_7009`].
+/// The `PyO3` and NAPI bridges return this code for `"os_keystore"` with no
+/// provider, through [`crate::custody_request::parse_custody_request`] (spec
+/// 03 §3.2.2). The `UniFFI` bridge returns it for `"platform"`, `"software"`
+/// and `"callback"`. A `testing_seed` passed with any of these strings is
+/// reported first, as [`VALID_7009`].
 pub const IDENT_1003: &str = "SCP-IDENT-1003";
 /// Identity key generation failed.
 pub const IDENT_1004: &str = "SCP-IDENT-1004";

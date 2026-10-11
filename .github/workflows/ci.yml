@@ -2179,15 +2179,15 @@ jobs:
           cargo nextest run --no-tests=fail -p scp-ffi-common \
             -E 'test(ffi_dht_client_is_pkarr_only_in_shipped_build) + test(disabled_node_resolution_returns_ok_none_for_unknown_did)'
           # The same tripwire for scp-ffi-napi. `cargo test -p scp-ffi-napi`
-          # above carries no name filter, so it exits 0 when the bridge's one
-          # `#[cfg(not(feature = "testing"))]` test,
-          # `in_memory_on_a_shipped_build_names_the_accepted_set` (a shipped
-          # build refuses custody "in_memory" with SCP-IDENT-1008, SCP-294),
-          # compiled out. This filter names only that test, so a build that
-          # turned `scp-ffi-napi/testing` on selects zero tests and
-          # `--no-tests=fail` exits 4.
+          # above carries no name filter, so it exits 0 when the bridge's
+          # `#[cfg(not(feature = "testing"))]` tests compiled out. This filter
+          # names only those tests: a shipped build refuses custody
+          # "in_memory" with SCP-IDENT-1008, and refuses "encrypted_file" with
+          # SCP-IDENT-1059 before the key file opens (spec 03 §3.2.2,
+          # ADR-062 §Decision 6). A build that turned `scp-ffi-napi/testing`
+          # on selects zero tests and `--no-tests=fail` exits 4.
           cargo nextest run --no-tests=fail -p scp-ffi-napi --features server --lib \
-            -E 'test(in_memory_on_a_shipped_build_names_the_accepted_set)'
+            -E 'test(in_memory_on_a_shipped_build_rejects_with_ident_1008) + test(encrypted_file_on_a_shipped_build_refuses_with_ident_1059_before_opening)'
 
   # Builds the pyo3 bridge (`scp-ffi`) in its PRODUCTION configuration: default
   # features (`server` on) but WITHOUT `testing`. `build-matrix.yml` builds the

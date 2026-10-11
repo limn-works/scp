@@ -2196,7 +2196,7 @@ mod tests {
                 .as_ref()
                 .expect("in-memory owner retains its DID document");
             let custody = inner
-                .in_memory_custody
+                .custody
                 .as_ref()
                 .expect("in-memory owner retains its custody");
 

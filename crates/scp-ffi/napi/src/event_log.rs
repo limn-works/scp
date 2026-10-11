@@ -464,7 +464,7 @@ pub(crate) fn event_log_checkpoint_on(
     {
         crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
-        let custody = identity.inner.in_memory_custody.as_ref().ok_or_else(|| {
+        let custody = identity.inner.custody.as_ref().ok_or_else(|| {
             napi::Error::from(ScpNapiError::Identity {
                 message: "event log checkpoint requires retained signing custody — this identity \
                       has no retained custody (it was externally loaded)"
@@ -654,7 +654,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // Missing-signing-custody → SCP-IDENT-1017
     //
-    // An identity that retains no custody (externally loaded: `in_memory_custody`
+    // An identity that retains no custody (externally loaded: `custody`
     // is `None`) must reject an event-log checkpoint with the canonical
     // missing-signing-custody code.
     // -----------------------------------------------------------------------
@@ -675,7 +675,7 @@ mod tests {
                 did: "did:dht:z6MkCreatorNoCustody".to_owned(),
                 custody_type: "external".to_owned(),
                 scp_identity: None,
-                in_memory_custody: None,
+                custody: None,
                 document: None,
                 bi: std::sync::Arc::clone(&bi),
                 verifying_key_hex: None,
@@ -720,7 +720,7 @@ mod tests {
                 .expect("context_create should succeed");
             let custody = creator
                 .inner
-                .in_memory_custody
+                .custody
                 .as_ref()
                 .expect("an in-memory identity retains its custody");
             let key = creator

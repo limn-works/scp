@@ -38,7 +38,7 @@ use crate::context::{
     NapiInviteMemberOutcome, NapiKeyPackageReservation, NapiMessage, NapiPublishResult,
     NapiSealedInvitation,
 };
-use crate::error::{ScpNapiError, custody_without_backend, validate_custody_type};
+use crate::error::ScpNapiError;
 use crate::event_log::{NapiCheckpoint, NapiEvent, NapiProof};
 use crate::identity::NapiIdentity;
 use crate::mcp::{
@@ -366,37 +366,41 @@ impl Scp {
     // with the process-wide default bridge it operated on (ADR-048).
     // ====================================================================
 
-    /// Per-instance equivalent of the free-function `identity_create`.
+    /// Creates a new DID identity under this SCP instance whose private keys
+    /// live in the backend `custody` names (spec `03-identity.md` §3.2.2).
     ///
-    /// Creates a new DID identity under this SCP instance, routing through
-    /// `&*self.inner`. Key material, registry writes, and the DID
-    /// resolver are all scoped to this `SCP`.
+    /// `custody` is `"encrypted_file"`, the key file `$HOME/.scp/keys.bin`
+    /// sealed under the passphrase in `SCP_KEY_PASSPHRASE`, or `"in_memory"` on
+    /// a build carrying the `testing` feature. `"os_keystore"` needs a
+    /// `KeyCustodyProvider`, so this entry point answers it with
+    /// `SCP-IDENT-1003`; pass the provider to `identityCreateWithCustody`.
+    /// Every other string is `SCP-VALID-7005`. Key material, registry writes,
+    /// and the DID resolver are all scoped to this `SCP`.
     ///
-    /// When `testing_seed` is supplied (32 bytes), the in-memory custody
-    /// is backed by a deterministic RNG so subsequent `generate_keypair`
-    /// calls produce byte-identical Ed25519 keys across bridges — the
-    /// basis of the cross-bridge parity test (ADR-046). `testing_seed` is
-    /// only valid for `"in_memory"` custody; other custody types reject
-    /// it with `SCP-VALID-7009`.
+    /// When `testing_seed` is supplied (32 bytes), the in-memory custody is
+    /// backed by a deterministic RNG so subsequent `generate_keypair` calls
+    /// produce byte-identical Ed25519 keys across bridges — the basis of the
+    /// cross-bridge parity test (ADR-046). A seed with any custody but
+    /// `"in_memory"` is `SCP-VALID-7009`, reported before the custody string
+    /// is read.
+    ///
+    /// A shipped build has no pre-rotation custody backend, so
+    /// `"encrypted_file"` resolves its inputs (`SCP-VALID-7001` for a bad
+    /// `HOME` or `SCP_KEY_PASSPHRASE`) and then returns `SCP-IDENT-1059` before
+    /// the key file opens (ADR-062 §Decision 6).
     #[napi(js_name = "identityCreate")]
-    // napi-rs requires `async` for the Promise return type. Without the
-    // in-memory-custody backend the only `.await` (the `"in_memory"` arm) is
-    // compiled out, so the bare build sees an await-free async fn.
-    #[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
     pub async fn identity_create(
         &self,
         custody: String,
         testing_seed: Option<napi::bindgen_prelude::Buffer>,
     ) -> napi::Result<crate::identity::NapiIdentity> {
-        #[cfg(feature = "testing")]
-        use crate::identity::NapiIdentityInner;
         use crate::identity::ensure_did_resolver_initialized_on;
 
         // Validate the optional 32-byte `testing_seed` at the FFI boundary
         // so we fail early rather than panicking in
         // `InMemoryKeyCustody::from_seed_bytes`. A length mismatch is
         // `SCP-VALID-7007`; a seed the custody cannot honor is rejected
-        // next by `check_testing_seed`, before the custody string is read.
+        // next by `select_key_custody`, before the custody string is read.
         // The seed bytes feed `Ed25519 SigningKey::from_bytes` inside the
         // custody's RNG, so
         // we wrap the narrowed `[u8; 32]` in `Zeroizing` immediately to
@@ -427,206 +431,47 @@ impl Scp {
                 Some(zeroize::Zeroizing::new(narrowed))
             }
         };
-        scp_ffi_common::validate::check_testing_seed(
+        let selection = crate::custody::select_key_custody(
             &custody,
-            testing_seed_bytes.is_some(),
-            cfg!(feature = "testing"),
+            None,
+            testing_seed_bytes,
+            scp_ffi_common::custody_file::resolve_file_custody_inputs,
         )
-        .map_err(|(code, message)| {
-            NapiError::from(ScpNapiError::Validation {
-                message: message.to_owned(),
-                code: code.to_owned(),
-            })
-        })?;
-        validate_custody_type(&custody).map_err(NapiError::from)?;
+        .map_err(NapiError::from)?;
 
-        let bi = &*self.inner;
-        ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
+        ensure_did_resolver_initialized_on(&self.inner).map_err(NapiError::from)?;
 
-        match custody.as_str() {
-            #[cfg(feature = "testing")]
-            "in_memory" => {
-                use scp_platform::testing::InMemoryKeyCustody;
-
-                // Deref through `Zeroizing<[u8; 32]>` so the wrapper
-                // drops (and wipes) at the end of this scope. The inner
-                // `[u8; 32]` is consumed by value by `from_seed_bytes`
-                // (one unavoidable Copy) and then discarded inside
-                // `StdRng::from_seed`.
-                let in_memory = testing_seed_bytes
-                    .as_ref()
-                    .map_or_else(InMemoryKeyCustody::new, |seed| {
-                        InMemoryKeyCustody::from_seed_bytes(**seed)
-                    });
-                let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
-                    crate::identity::OpaqueInMemoryKeyCustody(in_memory),
-                )));
-                let pre_rotation_custody =
-                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-                let dht = crate::identity::shared_did_method()?;
-                let (scp_identity, document, pre_rotation_handle) = dht
-                    .create(&*key_custody, pre_rotation_custody.as_ref())
-                    .await
-                    .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-                let verifying_key_hex = crate::identity::identity_verifying_key_hex(
-                    &key_custody,
-                    &scp_identity.identity_key,
-                )
-                .await;
-
-                crate::runtime::register_identity(
-                    bi,
-                    &scp_identity.did,
-                    crate::runtime::NapiIdentityEntry {
-                        identity: scp_identity.clone(),
-                        custody: Arc::clone(&key_custody),
-                        document: document.clone(),
-                        identity_link_attestations: Vec::new(),
-                        pre_rotation_handle,
-                        pre_rotation_custody,
-                    },
-                );
-
-                crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody)
-                    .await;
-
-                let handle = crate::identity::NapiIdentity {
-                    inner: Arc::new(NapiIdentityInner {
-                        did: scp_identity.did.clone(),
-                        custody_type: "in_memory".to_owned(),
-                        scp_identity: Some(scp_identity),
-                        in_memory_custody: Some(key_custody),
-                        document: Some(document),
-                        bi: Arc::clone(&self.inner),
-                        verifying_key_hex,
-                        instance_id: bi.instance_id(),
-                        rotation_event_json: None,
-                    }),
-                };
-                crate::increment_handle_count();
-                Ok(handle)
-            }
-            #[cfg(not(feature = "testing"))]
-            "in_memory" => Err(ScpNapiError::Identity {
-                message: format!(
-                    "in_memory custody is not available in this build — {}",
-                    crate::error::ACCEPTED_CUSTODY
-                ),
-                code: codes::IDENT_1008.to_owned(),
-            }
-            .into()),
-            "platform" | "software" => Err(custody_without_backend(&custody).into()),
-            _ => Err(ScpNapiError::Identity {
-                code: codes::IDENT_1005.to_owned(),
-                message: format!(
-                    "internal: unexpected custody type {custody:?} passed validate_custody_type — \
-                     this is a bug in the bridge layer"
-                ),
-            }
-            .into()),
-        }
+        create_identity(Arc::clone(&self.inner), selection, false).await
     }
 
     /// Per-instance equivalent of `identity_create_with_agent_key`.
     ///
-    /// Same as [`Self::identity_create`] but the resulting identity also
-    /// includes an `#agent` verification method in the DID document.
+    /// Same as [`Self::identity_create`] with no `testing_seed`, and the
+    /// resulting identity also includes an `#agent` verification method in
+    /// the DID document.
     #[napi(js_name = "identityCreateWithAgentKey")]
-    // napi-rs requires `async` for the Promise return type. Without the
-    // in-memory-custody backend the only `.await` (the `"in_memory"` arm) is
-    // compiled out, so the bare build sees an await-free async fn.
-    #[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
     pub async fn identity_create_with_agent_key(
         &self,
         custody: String,
     ) -> napi::Result<crate::identity::NapiIdentity> {
-        #[cfg(feature = "testing")]
-        use crate::identity::NapiIdentityInner;
         use crate::identity::ensure_did_resolver_initialized_on;
 
-        validate_custody_type(&custody).map_err(NapiError::from)?;
+        let selection = crate::custody::select_key_custody(
+            &custody,
+            None,
+            None,
+            scp_ffi_common::custody_file::resolve_file_custody_inputs,
+        )
+        .map_err(NapiError::from)?;
 
-        let bi = &*self.inner;
-        ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
+        ensure_did_resolver_initialized_on(&self.inner).map_err(NapiError::from)?;
 
-        match custody.as_str() {
-            #[cfg(feature = "testing")]
-            "in_memory" => {
-                use scp_platform::testing::InMemoryKeyCustody;
-
-                let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
-                    crate::identity::OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
-                )));
-                let pre_rotation_custody =
-                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-                let dht = crate::identity::shared_did_method()?;
-                let (scp_identity, document, pre_rotation_handle) = dht
-                    .create_with_agent_key(&*key_custody, pre_rotation_custody.as_ref())
-                    .await
-                    .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-                let verifying_key_hex = crate::identity::identity_verifying_key_hex(
-                    &key_custody,
-                    &scp_identity.identity_key,
-                )
-                .await;
-
-                crate::runtime::register_identity(
-                    bi,
-                    &scp_identity.did,
-                    crate::runtime::NapiIdentityEntry {
-                        identity: scp_identity.clone(),
-                        custody: Arc::clone(&key_custody),
-                        document: document.clone(),
-                        identity_link_attestations: Vec::new(),
-                        pre_rotation_handle,
-                        pre_rotation_custody,
-                    },
-                );
-
-                crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody)
-                    .await;
-
-                let handle = crate::identity::NapiIdentity {
-                    inner: Arc::new(NapiIdentityInner {
-                        did: scp_identity.did.clone(),
-                        custody_type: "in_memory".to_owned(),
-                        scp_identity: Some(scp_identity),
-                        in_memory_custody: Some(key_custody),
-                        document: Some(document),
-                        bi: Arc::clone(&self.inner),
-                        verifying_key_hex,
-                        instance_id: bi.instance_id(),
-                        rotation_event_json: None,
-                    }),
-                };
-                crate::increment_handle_count();
-                Ok(handle)
-            }
-            #[cfg(not(feature = "testing"))]
-            "in_memory" => Err(ScpNapiError::Identity {
-                message: format!(
-                    "in_memory custody is not available in this build — {}",
-                    crate::error::ACCEPTED_CUSTODY
-                ),
-                code: codes::IDENT_1008.to_owned(),
-            }
-            .into()),
-            "platform" | "software" => Err(custody_without_backend(&custody).into()),
-            _ => Err(ScpNapiError::Identity {
-                code: codes::IDENT_1005.to_owned(),
-                message: format!(
-                    "internal: unexpected custody type {custody:?} passed validate_custody_type — \
-                     this is a bug in the bridge layer"
-                ),
-            }
-            .into()),
-        }
+        create_identity(Arc::clone(&self.inner), selection, true).await
     }
 
     /// Creates a new DID identity whose key material lives in a caller-provided
-    /// custody backend.
+    /// custody backend: custody `"os_keystore"` (spec `03-identity.md`
+    /// §3.2.2), and the resulting handle reports that value.
     ///
     /// `provider` is a JS object implementing the `KeyCustodyProvider` record
     /// (`generateKeypair`, `sign`, `getPublicKey`, `destroyKey`, `dhAgree`,
@@ -675,20 +520,14 @@ impl Scp {
         // `testing`-gated `InMemoryPreRotationCustody` nullifier (ADR-062,
         // capability injection and prove-absent dev backends, §Decision 6). A
         // shipped build of this entry point therefore fails closed with
-        // `codes::IDENT_1059` below rather than minting a pre-rotation key at
-        // all. Sign / Diffie-Hellman /
+        // `codes::IDENT_1059` inside the spawned future (`create_identity`)
+        // rather than minting a pre-rotation key at all. Sign / Diffie-Hellman /
         // pseudonym-derivation operations keep the caller's private keys in
         // custody (never imported into Rust) per ADR-006; the
         // `SigningKeyBytes`-based paths (UCAN mint, SCPID, event-log checkpoint,
         // join-time pseudonym announcement) are the exception — they export the
         // raw seed into Rust (held in `Zeroizing`, wiped on drop), a surface
         // tracked for migration to `KeyCustody::sign`.
-
-        // `NapiIdentityInner` is only named in the `testing`-gated success arm
-        // below; the shipped build fails closed before minting a handle
-        // (ADR-062 §Decision 6).
-        #[cfg(feature = "testing")]
-        use crate::identity::NapiIdentityInner;
         use crate::identity::ensure_did_resolver_initialized_on;
 
         let bi_arc = Arc::clone(&self.inner);
@@ -698,72 +537,17 @@ impl Scp {
         // thread (consuming the non-Send `Function`s). A malformed
         // provider fails fast here, before any DID-creation work.
         let callback = crate::custody::NapiCallbackKeyCustody::from_provider(provider)?;
-        let key_custody = Arc::new(crate::custody::NapiKeyCustody::Callback(callback));
+        // A provider serves exactly custody `os_keystore` (§3.2.2); the
+        // decision still goes through the shared parser.
+        let selection = crate::custody::select_key_custody(
+            scp_ffi_common::custody_request::CustodyRequest::OsKeystore.as_str(),
+            Some(callback),
+            None,
+            scp_ffi_common::custody_file::resolve_file_custody_inputs,
+        )
+        .map_err(NapiError::from)?;
 
-        env.spawn_future(async move {
-            // FAIL CLOSED on a shipped (no-`testing`) build (ADR-062 §Decision
-            // 6, IDENT_1059). This callback-custody path funnels through the
-            // same mandatory pre-rotation commitment as every other create path
-            // (spec §9.7.4.1 item 5(a)); the only `PreRotationCustody` backend is the
-            // severed in-memory nullifier, so production returns a typed error
-            // rather than minting it. Mirrors the `PyO3` reference bridge.
-            #[cfg(not(feature = "testing"))]
-            {
-                let _ = (&bi_arc, &key_custody);
-                Err::<crate::identity::NapiIdentity, NapiError>(NapiError::from(
-                    crate::identity::no_pre_rotation_backend(),
-                ))
-            }
-            #[cfg(feature = "testing")]
-            {
-                let bi = &*bi_arc;
-                let pre_rotation_custody =
-                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-                let dht = crate::identity::shared_did_method()?;
-                let (scp_identity, document, pre_rotation_handle) = dht
-                    .create(&*key_custody, pre_rotation_custody.as_ref())
-                    .await
-                    .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-                let verifying_key_hex = crate::identity::identity_verifying_key_hex(
-                    &key_custody,
-                    &scp_identity.identity_key,
-                )
-                .await;
-
-                crate::runtime::register_identity(
-                    bi,
-                    &scp_identity.did,
-                    crate::runtime::NapiIdentityEntry {
-                        identity: scp_identity.clone(),
-                        custody: Arc::clone(&key_custody),
-                        document: document.clone(),
-                        identity_link_attestations: Vec::new(),
-                        pre_rotation_handle,
-                        pre_rotation_custody,
-                    },
-                );
-
-                crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody)
-                    .await;
-
-                let handle = crate::identity::NapiIdentity {
-                    inner: Arc::new(NapiIdentityInner {
-                        did: scp_identity.did.clone(),
-                        custody_type: "callback".to_owned(),
-                        scp_identity: Some(scp_identity),
-                        in_memory_custody: Some(key_custody),
-                        document: Some(document),
-                        bi: Arc::clone(&bi_arc),
-                        verifying_key_hex,
-                        instance_id: bi.instance_id(),
-                        rotation_event_json: None,
-                    }),
-                };
-                crate::increment_handle_count();
-                Ok(handle)
-            }
-        })
+        env.spawn_future(create_identity(bi_arc, selection, false))
     }
 
     /// Per-instance equivalent of `identity_load`.
@@ -804,7 +588,7 @@ impl Scp {
                     did,
                     custody_type,
                     scp_identity: Some(identity),
-                    in_memory_custody: Some(custody),
+                    custody: Some(custody),
                     document: Some(document),
                     bi: Arc::clone(&self.inner),
                     verifying_key_hex,
@@ -827,7 +611,7 @@ impl Scp {
                 did,
                 custody_type: "external".to_owned(),
                 scp_identity: None,
-                in_memory_custody: None,
+                custody: None,
                 document: Some(document),
                 bi: Arc::clone(&self.inner),
                 verifying_key_hex: None,
@@ -5427,17 +5211,106 @@ mod identity_remove_validation_tests {
     }
 }
 
-/// Every custody-string rejection on this bridge names the strings it accepts,
-/// and none of them sends the caller to `"platform"` or `"software"` (SCP-294).
-#[cfg(test)]
-mod custody_string_message_tests {
-    use super::*;
-    use crate::error::ACCEPTED_CUSTODY;
+/// Creates and registers an identity over the custody `selection` names,
+/// with an `#agent` verification method when `with_agent_key` is set.
+///
+/// Every identity-creating entry point ends here, so each mints the same
+/// registry entry and handle, and the handle's `custodyType` is the request
+/// the custody was built from (spec `03-identity.md` §3.2.2).
+#[cfg(feature = "testing")]
+async fn create_identity(
+    bi_arc: Arc<NapiBridgeInstance>,
+    selection: crate::custody::CustodySelection,
+    with_agent_key: bool,
+) -> napi::Result<crate::identity::NapiIdentity> {
+    use crate::identity::NapiIdentityInner;
 
-    fn create_error(custody: &str) -> String {
+    let key_custody = selection.open().map_err(NapiError::from)?;
+    let bi = &*bi_arc;
+    let pre_rotation_custody = Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+    let dht = crate::identity::shared_did_method()?;
+    let created = if with_agent_key {
+        dht.create_with_agent_key(&*key_custody, pre_rotation_custody.as_ref())
+            .await
+    } else {
+        dht.create(&*key_custody, pre_rotation_custody.as_ref())
+            .await
+    };
+    let (scp_identity, document, pre_rotation_handle) =
+        created.map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+    let verifying_key_hex =
+        crate::identity::identity_verifying_key_hex(&key_custody, &scp_identity.identity_key).await;
+
+    crate::runtime::register_identity(
+        bi,
+        &scp_identity.did,
+        crate::runtime::NapiIdentityEntry {
+            identity: scp_identity.clone(),
+            custody: Arc::clone(&key_custody),
+            document: document.clone(),
+            identity_link_attestations: Vec::new(),
+            pre_rotation_handle,
+            pre_rotation_custody,
+        },
+    );
+
+    crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody).await;
+
+    let handle = crate::identity::NapiIdentity {
+        inner: Arc::new(NapiIdentityInner {
+            did: scp_identity.did.clone(),
+            custody_type: key_custody.custody_type_label().to_owned(),
+            scp_identity: Some(scp_identity),
+            custody: Some(key_custody),
+            document: Some(document),
+            bi: Arc::clone(&bi_arc),
+            verifying_key_hex,
+            instance_id: bi.instance_id(),
+            rotation_event_json: None,
+        }),
+    };
+    crate::increment_handle_count();
+    Ok(handle)
+}
+
+/// A shipped build has no `PreRotationCustody` backend, so every identity
+/// creation fails closed with `SCP-IDENT-1059` before the selected custody
+/// opens (ADR-062 §Decision 6, spec §9.7.4.1 item 5(a)). It returns a ready
+/// future so callers await it exactly as they await the `testing` build's.
+#[cfg(not(feature = "testing"))]
+fn create_identity(
+    _bi_arc: Arc<NapiBridgeInstance>,
+    selection: crate::custody::CustodySelection,
+    _with_agent_key: bool,
+) -> std::future::Ready<napi::Result<crate::identity::NapiIdentity>> {
+    std::future::ready(Err(NapiError::from(selection.refuse_create())))
+}
+
+/// The custody request vocabulary of spec `03-identity.md` §3.2.2 on this
+/// bridge's identity-creating entry points: each accepted value reaches its
+/// backend, and each rejection carries the code §3.2.2's table gives and names
+/// both accepted values.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod custody_request_tests {
+    use super::*;
+    use scp_ffi_common::custody_file::{
+        FileCustodyError, FileCustodyInputs, resolve_file_custody_inputs_from,
+    };
+    use scp_ffi_common::custody_request::ACCEPTED_CUSTODY;
+    use zeroize::Zeroizing;
+
+    const PASSPHRASE: &str = "napi-encrypted-file-test-passphrase";
+
+    /// The error text of a string-custody create call on a fresh instance.
+    fn create_error(custody: &str, seed: Option<Vec<u8>>) -> String {
         let scp = Scp::new_in_memory_for_test();
         crate::runtime()
-            .block_on(scp.identity_create(custody.to_owned(), None))
+            .block_on(scp.identity_create(
+                custody.to_owned(),
+                seed.map(napi::bindgen_prelude::Buffer::from),
+            ))
             .err()
             .map_or_else(
                 || format!("{custody:?} created an identity"),
@@ -5456,74 +5329,215 @@ mod custody_string_message_tests {
             )
     }
 
-    /// A seed paired with `"platform"`, `"software"`, or an unknown string
-    /// reports the seed misuse (`SCP-VALID-7009`) before the custody string
-    /// is read; without a seed the same strings keep their custody codes.
+    /// Resolves `encrypted_file` inputs under `home` without reading the
+    /// process environment, so a test never races another on `HOME`.
+    fn inputs_under(
+        home: &std::path::Path,
+        passphrase: &str,
+    ) -> impl FnOnce() -> Result<FileCustodyInputs, FileCustodyError> {
+        let home = home.as_os_str().to_owned();
+        let passphrase = Zeroizing::new(passphrase.to_owned());
+        move || resolve_file_custody_inputs_from(Some(passphrase), Some(home.as_os_str()))
+    }
+
+    /// Row 1: a seed with any value other than `in_memory` is `SCP-VALID-7009`,
+    /// reported before the custody string is read, so it wins over the code
+    /// the same string carries unseeded.
     #[test]
-    fn seed_misuse_is_reported_before_the_custody_string() {
-        for (custody, unseeded) in [
-            ("platform", codes::IDENT_1003),
-            ("software", codes::IDENT_1003),
-            ("keychain", codes::VALID_7005),
-        ] {
-            let scp = Scp::new_in_memory_for_test();
-            let seeded = crate::runtime()
-                .block_on(scp.identity_create(
-                    custody.to_owned(),
-                    Some(napi::bindgen_prelude::Buffer::from(vec![7u8; 32])),
-                ))
-                .err()
-                .map_or_else(|| "created an identity".to_owned(), |e| e.to_string());
-            assert!(seeded.contains(codes::VALID_7009), "{custody}: {seeded}");
-            let plain = create_error(custody);
-            assert!(plain.contains(unseeded), "{custody}: {plain}");
+    fn a_seed_with_any_value_but_in_memory_rejects_with_valid_7009() {
+        for custody in ["encrypted_file", "os_keystore", "platform", "keychain"] {
+            let msg = create_error(custody, Some(vec![7u8; 32]));
+            assert!(msg.contains(codes::VALID_7009), "{custody}: {msg}");
+            assert!(msg.contains(ACCEPTED_CUSTODY), "{custody}: {msg}");
         }
     }
 
-    /// `"platform"` and `"software"` return `SCP-IDENT-1003` on both string
-    /// create paths, with a message naming the accepted set.
+    /// Row 2: `os_keystore` on a string entry point has no provider, so it is
+    /// `SCP-IDENT-1003` on both, and the message sends the caller to
+    /// `identity_create_with_custody`.
     #[test]
-    fn platform_and_software_reject_with_ident_1003_naming_the_accepted_set() {
-        for custody in ["platform", "software"] {
-            for msg in [create_error(custody), create_with_agent_key_error(custody)] {
-                assert!(msg.contains(codes::IDENT_1003), "{custody}: {msg}");
-                assert!(msg.contains(ACCEPTED_CUSTODY), "{custody}: {msg}");
+    fn os_keystore_without_a_provider_rejects_with_ident_1003() {
+        for msg in [
+            create_error("os_keystore", None),
+            create_with_agent_key_error("os_keystore"),
+        ] {
+            assert!(msg.contains(codes::IDENT_1003), "{msg}");
+            assert!(msg.contains("identity_create_with_custody"), "{msg}");
+            assert!(msg.contains(ACCEPTED_CUSTODY), "{msg}");
+        }
+    }
+
+    /// Row 5: every string outside the vocabulary is `SCP-VALID-7005` on both
+    /// string entry points, the four retired names included.
+    #[test]
+    fn every_other_string_rejects_with_valid_7005() {
+        for custody in ["platform", "software", "file", "callback", "keychain", ""] {
+            for msg in [
+                create_error(custody, None),
+                create_with_agent_key_error(custody),
+            ] {
+                assert!(msg.contains(codes::VALID_7005), "{custody:?}: {msg}");
+                assert!(msg.contains(ACCEPTED_CUSTODY), "{custody:?}: {msg}");
             }
         }
     }
 
-    /// An unknown string returns `SCP-VALID-7005` naming the accepted set,
-    /// which lists neither rejected string as expected.
-    #[test]
-    fn unknown_custody_rejects_with_valid_7005_naming_the_accepted_set() {
-        for msg in [
-            create_error("keychain"),
-            create_with_agent_key_error("keychain"),
-        ] {
-            assert!(msg.contains(codes::VALID_7005), "{msg}");
-            assert!(msg.contains(ACCEPTED_CUSTODY), "{msg}");
-            assert!(
-                !msg.contains("\"platform\"") && !msg.contains("\"software\""),
-                "{msg}"
-            );
-        }
-    }
-
-    /// A shipped build refuses `"in_memory"` with `SCP-IDENT-1008` and names
-    /// the accepted set instead of `"software"` or `"platform"`.
+    /// Row 4: a shipped build answers `in_memory` with `SCP-IDENT-1008`, seeded
+    /// or not.
     #[cfg(not(feature = "testing"))]
     #[test]
-    fn in_memory_on_a_shipped_build_names_the_accepted_set() {
+    fn in_memory_on_a_shipped_build_rejects_with_ident_1008() {
         for msg in [
-            create_error("in_memory"),
+            create_error("in_memory", None),
+            create_error("in_memory", Some(vec![7u8; 32])),
             create_with_agent_key_error("in_memory"),
         ] {
             assert!(msg.contains(codes::IDENT_1008), "{msg}");
             assert!(msg.contains(ACCEPTED_CUSTODY), "{msg}");
-            assert!(
-                !msg.contains("\"platform\"") && !msg.contains("\"software\""),
-                "{msg}"
-            );
         }
+    }
+
+    /// `identity_create` resolves `encrypted_file` from the process
+    /// environment: with `SCP_KEY_PASSPHRASE` unset it is `SCP-VALID-7001`
+    /// naming the variable, on both string entry points, and no key file is
+    /// opened.
+    #[test]
+    fn encrypted_file_without_a_passphrase_rejects_with_valid_7001() {
+        assert!(
+            std::env::var_os("SCP_KEY_PASSPHRASE").is_none(),
+            "unset SCP_KEY_PASSPHRASE to run this test: with it set, identity_create would \
+             open the key file under the real HOME"
+        );
+        for msg in [
+            create_error("encrypted_file", None),
+            create_with_agent_key_error("encrypted_file"),
+        ] {
+            assert!(msg.contains(codes::VALID_7001), "{msg}");
+            assert!(msg.contains("SCP_KEY_PASSPHRASE"), "{msg}");
+        }
+    }
+
+    /// A bad `HOME` for `encrypted_file` is `SCP-VALID-7001` naming `HOME`.
+    #[test]
+    fn encrypted_file_with_an_unset_home_rejects_with_valid_7001() {
+        let Err(err) = crate::custody::select_key_custody("encrypted_file", None, None, || {
+            resolve_file_custody_inputs_from(Some(Zeroizing::new(PASSPHRASE.to_owned())), None)
+        }) else {
+            panic!("an unset HOME must be refused");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains(codes::VALID_7001), "{msg}");
+        assert!(msg.contains("HOME"), "{msg}");
+    }
+
+    /// A testing build creates an `encrypted_file` identity: the key file
+    /// appears at `$HOME/.scp/keys.bin`, the handle and a reload both report
+    /// `encrypted_file`, and the registry holds the identity.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn encrypted_file_creates_an_identity_backed_by_the_key_file() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let scp = Scp::new_in_memory_for_test();
+        let selection = crate::custody::select_key_custody(
+            "encrypted_file",
+            None,
+            None,
+            inputs_under(home.path(), PASSPHRASE),
+        )
+        .expect("encrypted_file selects the key file");
+        let identity = crate::runtime()
+            .block_on(create_identity(Arc::clone(&scp.inner), selection, false))
+            .expect("encrypted_file creates an identity");
+
+        assert_eq!(identity.custody_type(), "encrypted_file");
+        assert!(home.path().join(".scp").join("keys.bin").is_file());
+        let reloaded = crate::runtime()
+            .block_on(scp.identity_load(identity.did()))
+            .expect("the created identity reloads from the registry");
+        assert_eq!(reloaded.custody_type(), "encrypted_file");
+    }
+
+    /// A key file sealed under one passphrase refuses another with
+    /// `SCP-IDENT-1008`.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn encrypted_file_under_a_wrong_passphrase_rejects_with_ident_1008() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let scp = Scp::new_in_memory_for_test();
+        let first = crate::custody::select_key_custody(
+            "encrypted_file",
+            None,
+            None,
+            inputs_under(home.path(), PASSPHRASE),
+        )
+        .expect("encrypted_file selects the key file");
+        crate::runtime()
+            .block_on(create_identity(Arc::clone(&scp.inner), first, false))
+            .expect("the first identity seals the key file");
+
+        let second = crate::custody::select_key_custody(
+            "encrypted_file",
+            None,
+            None,
+            inputs_under(home.path(), "a-different-passphrase"),
+        )
+        .expect("resolution reads no file, so a wrong passphrase resolves");
+        let Err(err) =
+            crate::runtime().block_on(create_identity(Arc::clone(&scp.inner), second, false))
+        else {
+            panic!("a wrong passphrase must be refused");
+        };
+        assert!(err.to_string().contains(codes::IDENT_1008), "{err}");
+    }
+
+    /// A testing build creates an `in_memory` identity on both string entry
+    /// points, and the handle reports `in_memory`.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn in_memory_creates_an_identity_on_a_testing_build() {
+        let scp = Scp::new_in_memory_for_test();
+        let plain = crate::runtime()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("in_memory creates an identity");
+        assert_eq!(plain.custody_type(), "in_memory");
+        let seeded = crate::runtime()
+            .block_on(scp.identity_create(
+                "in_memory".to_owned(),
+                Some(napi::bindgen_prelude::Buffer::from(vec![7u8; 32])),
+            ))
+            .expect("a seeded in_memory creates an identity");
+        assert_eq!(seeded.custody_type(), "in_memory");
+        let agent = crate::runtime()
+            .block_on(scp.identity_create_with_agent_key("in_memory".to_owned()))
+            .expect("in_memory creates an identity with an agent key");
+        assert_eq!(agent.custody_type(), "in_memory");
+        assert!(agent.has_agent_key());
+    }
+
+    /// A shipped build resolves `encrypted_file`, then refuses with the
+    /// shipped `SCP-IDENT-1059` before the key file opens, so the failed call
+    /// leaves no `$HOME/.scp` behind.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn encrypted_file_on_a_shipped_build_refuses_with_ident_1059_before_opening() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let scp = Scp::new_in_memory_for_test();
+        let selection = crate::custody::select_key_custody(
+            "encrypted_file",
+            None,
+            None,
+            inputs_under(home.path(), PASSPHRASE),
+        )
+        .expect("encrypted_file selects the key file");
+        let Err(err) =
+            crate::runtime().block_on(create_identity(Arc::clone(&scp.inner), selection, false))
+        else {
+            panic!("a shipped build must not mint an identity");
+        };
+        assert!(err.to_string().contains(codes::IDENT_1059), "{err}");
+        assert!(
+            !home.path().join(".scp").exists(),
+            "the refused call must not create the key directory"
+        );
     }
 }

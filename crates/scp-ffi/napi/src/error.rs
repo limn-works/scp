@@ -743,38 +743,45 @@ impl From<scp_ffi_common::bridge_instance::HandleAffinityError> for ScpNapiError
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// The custody strings this bridge builds a key custody from, stated in every
-/// custody rejection (SCP-294).
-pub(crate) const ACCEPTED_CUSTODY: &str = "this bridge accepts \"in_memory\" only in a build \
-     carrying the testing feature; inject a KeyCustodyProvider through \
-     identityCreateWithCustody() for any other key store";
-
-/// The error for a custody string that names no key store on this bridge
-/// (`"platform"`, `"software"`): `SCP-IDENT-1003`.
-pub(crate) fn custody_without_backend(custody: &str) -> ScpNapiError {
-    ScpNapiError::Identity {
-        message: format!(
-            "custody type {custody:?} names no key store on this bridge — {ACCEPTED_CUSTODY}"
-        ),
-        code: codes::IDENT_1003.to_owned(),
+impl From<scp_ffi_common::custody_request::CustodyRequestError> for ScpNapiError {
+    /// Maps a custody request spec `03-identity.md` §3.2.2 rejects onto the
+    /// code its table gives. A seed misuse (`SCP-VALID-7009`) and a string
+    /// outside the vocabulary (`SCP-VALID-7005`) are malformed input, so they
+    /// surface as validation errors; a missing or misplaced provider and an
+    /// `in_memory` request on a shipped build name a key store this call
+    /// cannot reach, so they surface as identity errors.
+    fn from(e: scp_ffi_common::custody_request::CustodyRequestError) -> Self {
+        use scp_ffi_common::custody_request::CustodyRequestError as E;
+        let code = e.code().to_owned();
+        let message = e.to_string();
+        match e {
+            E::SeedWithoutInMemory | E::Unrecognized { .. } => Self::Validation { message, code },
+            E::OsKeystoreWithoutProvider
+            | E::ProviderWithOtherRequest { .. }
+            | E::InMemoryRequiresTestingBuild => Self::Identity { message, code },
+        }
     }
 }
 
-/// Parses a custody type string into a string the bridge can match on.
-///
-/// Returns the canonical custody type string or `Err(ScpNapiError::Validation)`.
-pub(crate) fn validate_custody_type(custody: &str) -> Result<&str, ScpNapiError> {
-    match custody {
-        "in_memory" | "platform" | "software" => Ok(custody),
-        // VALID_7005 ("invalid field value") matches the semantic: an
-        // unrecognized enum string is a wrong-value error, not the
-        // malformed/wrong-shape byte input that VALID_7007 is reserved for
-        // (api-design J2, M1). The PyO3 and UniFFI bridges emit the same
-        // code for an unknown custody string.
-        other => Err(ScpNapiError::Validation {
-            message: format!("unknown custody type: {other:?} — {ACCEPTED_CUSTODY}"),
-            code: codes::VALID_7005.to_owned(),
-        }),
+impl From<&scp_ffi_common::custody_file::FileCustodyError> for ScpNapiError {
+    /// Maps a custody `"encrypted_file"` input failure onto the codes
+    /// `.docs/standards/sdk-common.md` §Custody request lists, as the `PyO3`
+    /// bridge does: an unset, empty or relative environment variable is
+    /// something the caller sets (`SCP-VALID-7001`); a key directory or key
+    /// file this process cannot open is something the caller repairs or
+    /// restores (`SCP-IDENT-1008`).
+    fn from(e: &scp_ffi_common::custody_file::FileCustodyError) -> Self {
+        use scp_ffi_common::custody_file::FileCustodyError as E;
+        match e {
+            E::HomeUnset | E::HomeNotAbsolute { .. } | E::PassphraseUnset => Self::Validation {
+                message: e.to_string(),
+                code: codes::VALID_7001.to_owned(),
+            },
+            E::DirectoryCreate { .. } | E::Open { .. } => Self::Identity {
+                message: e.to_string(),
+                code: codes::IDENT_1008.to_owned(),
+            },
+        }
     }
 }
 

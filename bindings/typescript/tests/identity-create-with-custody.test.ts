@@ -191,7 +191,7 @@ if (!scpAvailable) {
         const provider = new CryptoKeychain();
         const identity = await scp.identityCreateWithCustody(provider);
         expect(identity.did).toMatch(/^did:dht:/);
-        expect(identity.custodyType).toBe("callback");
+        expect(identity.custodyType).toBe("os_keystore");
       } finally {
         await scp.shutdown(1000).catch(() => {});
       }
