@@ -12,6 +12,7 @@
 package works.limn.scp.android.platform
 
 import kotlinx.coroutines.test.runTest
+import android.content.SharedPreferences
 import org.bouncycastle.crypto.AsymmetricCipherKeyPair
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
@@ -45,6 +46,45 @@ private suspend fun cryptoError(block: suspend () -> Unit): BridgeException.Cryp
     fail("expected uniffi.scp.ScpException.Crypto")
 }
 
+/**
+ * [SharedPreferences] over [inner] whose editor fails every write to a key starting with
+ * [failPrefix]: `commit()` returns false when [throwOnWrite] is unset, and `putString` throws
+ * [IllegalStateException] when it is set. An editor holding no such write commits to [inner].
+ */
+private class FailingPrefs(
+    private val inner: SharedPreferences,
+    private val failPrefix: String,
+    private val throwOnWrite: Boolean,
+) : SharedPreferences by inner {
+    override fun edit(): SharedPreferences.Editor = FailingEditor(inner.edit())
+
+    private inner class FailingEditor(
+        private val delegate: SharedPreferences.Editor,
+    ) : SharedPreferences.Editor by delegate {
+        private var failing = false
+
+        override fun putString(key: String?, value: String?): SharedPreferences.Editor {
+            if (key != null && key.startsWith(failPrefix)) {
+                check(!throwOnWrite) { "write to $key refused" }
+                failing = true
+            }
+            delegate.putString(key, value)
+            return this
+        }
+
+        override fun remove(key: String?): SharedPreferences.Editor {
+            delegate.remove(key)
+            return this
+        }
+
+        override fun commit(): Boolean = !failing && delegate.commit()
+
+        override fun apply() {
+            commit()
+        }
+    }
+}
+
 class UniffiKeyCustodyTest {
     private lateinit var prefs: InMemorySharedPreferences
     private lateinit var custody: AndroidKeyCustody
@@ -63,9 +103,12 @@ class UniffiKeyCustodyTest {
     private fun installSeed(seed: ByteArray, role: KeyRole? = KeyRole.IDENTITY): String {
         val privateParams = Ed25519PrivateKeyParameters(seed, 0)
         val keyId = "18446744073709551557"
-        custody.softwareKeys[keyId] = AsymmetricCipherKeyPair(privateParams.generatePublicKey(), privateParams)
-        custody.softwareKeyTypes[keyId] = KeyType.ED25519
-        if (role != null) custody.keyRoles.record(keyId, role, persist = false)
+        val install = {
+            custody.softwareKeys[keyId] = AsymmetricCipherKeyPair(privateParams.generatePublicKey(), privateParams)
+            custody.softwareKeyTypes[keyId] = KeyType.ED25519
+            KeyHandle(id = keyId, custodyType = CustodyType.SOFTWARE)
+        }
+        if (role != null) custody.keyRoles.mint(keyId, role, persist = false, install) else install()
         return keyId
     }
 
@@ -253,6 +296,43 @@ class UniffiKeyCustodyTest {
             val restored = UniffiKeyCustody(AndroidKeyCustody(prefs))
             assertEquals(CustodyKeyRole.IDENTITY, restored.getPublicKey(id).role)
             assertArrayEquals(provider.getPublicKey(id).publicKey, restored.getPublicKey(id).publicKey)
+        }
+    }
+
+    @Test
+    fun `an Ed25519 key's role is on disk before generateKeypair returns`() {
+        runTest {
+            val id = provider.generateKeypair(CustodyKeyType.ED25519, CustodyKeyRole.IDENTITY)
+            assertEquals("IDENTITY", prefs.getString("scp.role.$id", null))
+            assertTrue(prefs.contains("scp.ed25519.$id"))
+        }
+    }
+
+    @Test
+    fun `a role write that does not commit fails closed and leaves no key`() {
+        runTest {
+            val failing = AndroidKeyCustody(FailingPrefs(prefs, "scp.role.", throwOnWrite = false))
+            val error = cryptoError {
+                UniffiKeyCustody(failing).generateKeypair(CustodyKeyType.ED25519, CustodyKeyRole.IDENTITY)
+            }
+            assertEquals("SCP-CRYPTO-4060", error.code)
+            assertTrue(failing.softwareKeys.isEmpty())
+            assertTrue(prefs.all.isEmpty(), "left behind: ${prefs.all.keys}")
+        }
+    }
+
+    @Test
+    fun `a seed write that throws leaves neither the key nor its role`() {
+        runTest {
+            val failing = AndroidKeyCustody(FailingPrefs(prefs, "scp.ed25519.", throwOnWrite = true))
+            val error = cryptoError {
+                UniffiKeyCustody(failing).generateKeypair(CustodyKeyType.ED25519, CustodyKeyRole.IDENTITY)
+            }
+            assertEquals("SCP-CRYPTO-4060", error.code)
+            assertTrue(error.cause is IllegalStateException)
+            assertTrue(failing.softwareKeys.isEmpty())
+            assertTrue(failing.softwareKeyTypes.isEmpty())
+            assertTrue(prefs.all.isEmpty(), "left behind: ${prefs.all.keys}")
         }
     }
 

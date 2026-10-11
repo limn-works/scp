@@ -16,9 +16,11 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * The [KeyRole] of every key an [AndroidKeyCustody] holds.
  *
- * Roles of persisted keys are written to [prefs] under `scp.role.<keyId>` with `apply()`, and
- * restored when the instance is constructed. A key with no recorded role has none: [roleOf]
- * returns `null` and the caller fails closed, so no role is ever guessed.
+ * A key gets its role only through [mint] and loses it only through [forget], so no key is
+ * created without its role. Roles of persisted keys are written to [prefs] under
+ * `scp.role.<keyId>` with `commit()`, and restored when the instance is constructed. A key with
+ * no recorded role has none: [roleOf] returns `null` and the caller fails closed, so no role is
+ * ever guessed.
  *
  * @param prefs The same preferences [AndroidKeyCustody] persists software Ed25519 seeds in.
  */
@@ -34,10 +36,33 @@ internal class KeyRoles(private val prefs: SharedPreferences) {
             }
     }
 
-    /** Records [role] for [keyId], persisting it when the key itself outlives the process. */
-    fun record(keyId: String, role: KeyRole, persist: Boolean) {
+    /**
+     * Records [role] for [keyId], then runs [generate], which creates the key and leaves nothing
+     * behind when it throws. When [persist] is set (the key itself outlives the process), the
+     * role reaches [prefs] through `commit()` before [generate] runs, so a key on disk always
+     * has its role on disk. When [generate] throws, the role is removed again and the exception
+     * propagates.
+     *
+     * @throws ScpException with code `SCP-CRYPTO-4060` when [prefs] does not commit the role;
+     *   [generate] has not run.
+     */
+    @Suppress("TooGenericExceptionCaught") // any failure must remove the role it recorded
+    fun mint(keyId: String, role: KeyRole, persist: Boolean, generate: () -> KeyHandle): KeyHandle {
         roles[keyId] = role
-        if (persist) prefs.edit().putString("$PREFS_KEY_PREFIX$keyId", role.name).apply()
+        try {
+            if (persist) commitOrThrow(keyId) { it.putString("$PREFS_KEY_PREFIX$keyId", role.name) }
+            return generate()
+        } catch (e: Throwable) {
+            roles.remove(keyId)
+            if (persist) {
+                try {
+                    prefs.edit().remove("$PREFS_KEY_PREFIX$keyId").commit()
+                } catch (cleanup: Exception) {
+                    e.addSuppressed(cleanup)
+                }
+            }
+            throw e
+        }
     }
 
     /** The role recorded for [keyId], or `null` when none is. */
@@ -46,10 +71,22 @@ internal class KeyRoles(private val prefs: SharedPreferences) {
     /** Whether a role is recorded for [keyId]. */
     fun contains(keyId: String): Boolean = roles.containsKey(keyId)
 
-    /** Removes the role recorded for [keyId], in memory and in [prefs]. */
+    /**
+     * Removes the role recorded for [keyId], in memory and in [prefs] through `commit()`. The
+     * caller has already destroyed the key, so a removal [prefs] does not commit leaves a role
+     * for an absent key, which no member reads: each resolves the key before its role.
+     */
     fun forget(keyId: String) {
         roles.remove(keyId)
-        prefs.edit().remove("$PREFS_KEY_PREFIX$keyId").apply()
+        prefs.edit().remove("$PREFS_KEY_PREFIX$keyId").commit()
+    }
+
+    private fun commitOrThrow(keyId: String, change: (SharedPreferences.Editor) -> Unit) {
+        val editor = prefs.edit()
+        change(editor)
+        if (!editor.commit()) {
+            throw ScpException("Could not write the role of key $keyId", "SCP-CRYPTO-4060")
+        }
     }
 
     private companion object {

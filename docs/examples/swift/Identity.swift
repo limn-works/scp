@@ -7,7 +7,8 @@
 /// reaches; the doc comment on ``CustodyType`` states how a shipped build
 /// answers each case. A production caller passes ``AppleKeyCustody``, the
 /// SDK's ``KeyCustodyProvider`` over the Keychain, to
-/// `identityCreateWithCustody`.
+/// `identityCreateWithCustody`. A shipped build refuses that call with
+/// `SCP-IDENT-1059`, as it refuses every identity creation.
 ///
 /// Prerequisites:
 ///   - Add the SCP Swift package to your project

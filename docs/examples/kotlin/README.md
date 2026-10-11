@@ -34,7 +34,9 @@ context lifecycle, messaging, and tool invocation.
 Each example is one top-level function that your app calls. Every example that
 creates an identity takes a `uniffi.scp.KeyCustodyProvider`, the provider that
 the `os_keystore` custody request reaches (spec section 3.2.2); the KDoc on
-`works.limn.scp.CustodyType` states how a shipped build answers each entry.
+`works.limn.scp.CustodyType` states how a shipped build answers each entry,
+and a shipped build refuses every identity creation, `identityCreateWithCustody`
+included, with `SCP-IDENT-1059`.
 On Android, `scp-kt-android` ships that provider over Android Keystore:
 `UniffiKeyCustody` wraps an `AndroidKeyCustody`. On another JVM, implement
 `uniffi.scp.KeyCustodyProvider` over your own key store.

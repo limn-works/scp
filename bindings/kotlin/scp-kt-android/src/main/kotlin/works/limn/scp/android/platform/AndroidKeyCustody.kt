@@ -250,9 +250,11 @@ class AndroidKeyCustody internal constructor(
 
     /**
      * Generates a [keyType] keypair under a fresh decimal `ULong` id (see the class KDoc) and
-     * records [role] for the key's lifetime, persisted when the key is an Ed25519 key.
+     * records [role] for the key's lifetime through [KeyRoles.mint], persisted before the key
+     * is created when the key is an Ed25519 key. A failure leaves neither the key nor its role.
      *
-     * @throws ScpException with code `SCP-CRYPTO-4060` if every drawn id is taken.
+     * @throws ScpException with code `SCP-CRYPTO-4060` if every drawn id is taken or the role
+     *   cannot be written.
      */
     internal fun generateKeypair(keyType: KeyType, role: KeyRole): KeyHandle {
         val keyId = generateSequence { SecureRandom().nextLong().toULong().toString() }
@@ -262,14 +264,14 @@ class AndroidKeyCustody internal constructor(
                     !(keystoreEd25519 && keystore.containsAlias("scp.key.$id"))
             }
             ?: throw ScpException("No free key id after $MINT_ATTEMPTS draws", "SCP-CRYPTO-4060")
-        val handle = when {
-            keystoreEd25519 && keyType == KeyType.ED25519 -> keystore.generateIdentity(keyId)
-            keyType == KeyType.ED25519 -> softwareKeyOps.generateEd25519(keyId)
-            // X25519 wrapping keys are always software-managed
-            else -> softwareKeyOps.generateX25519(keyId)
+        return keyRoles.mint(keyId, role, persist = keyType == KeyType.ED25519) {
+            when {
+                keystoreEd25519 && keyType == KeyType.ED25519 -> keystore.generateIdentity(keyId)
+                keyType == KeyType.ED25519 -> softwareKeyOps.generateEd25519(keyId)
+                // X25519 wrapping keys are always software-managed
+                else -> softwareKeyOps.generateX25519(keyId)
+            }
         }
-        keyRoles.record(keyId, role, persist = keyType == KeyType.ED25519)
-        return handle
     }
 
     /**
@@ -768,8 +770,8 @@ internal class SoftwareKeyOps(
      * Generates a software-backed Ed25519 keypair using Bouncy Castle.
      *
      * Used as fallback on API 26-32 where Android Keystore does not support EdDSA.
-     * The key pair is stored in [softwareKeys], tracked in [softwareKeyTypes], and
-     * the private key seed is written to [encryptedPrefs] with `apply()`, so it survives
+     * The private key seed is written to [encryptedPrefs] with `apply()`, and then the key pair
+     * is stored in [softwareKeys] and tracked in [softwareKeyTypes]. The seed survives
      * process death once the queued write reaches disk and is lost when the process dies
      * first (ADR-027).
      *
@@ -781,11 +783,11 @@ internal class SoftwareKeyOps(
         val keyPair = Ed25519KeyPairGenerator().apply {
             init(Ed25519KeyGenerationParameters(SecureRandom()))
         }.generateKeyPair()
+        // Persist the 32-byte Ed25519 private key seed to EncryptedSharedPreferences before the
+        // maps name the key, so a failed write leaves no key behind.
+        persistEd25519Key(keyId, keyPair)
         softwareKeys[keyId] = keyPair
         softwareKeyTypes[keyId] = KeyType.ED25519
-
-        // Persist the 32-byte Ed25519 private key seed to EncryptedSharedPreferences
-        persistEd25519Key(keyId, keyPair)
 
         return KeyHandle(id = keyId, custodyType = CustodyType.SOFTWARE)
     }
