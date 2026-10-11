@@ -38,7 +38,7 @@ use crate::context::{
     NapiInviteMemberOutcome, NapiKeyPackageReservation, NapiMessage, NapiPublishResult,
     NapiSealedInvitation,
 };
-use crate::error::{ScpNapiError, validate_custody_type};
+use crate::error::{ScpNapiError, custody_without_backend, validate_custody_type};
 use crate::event_log::{NapiCheckpoint, NapiEvent, NapiProof};
 use crate::identity::NapiIdentity;
 use crate::mcp::{
@@ -392,14 +392,13 @@ impl Scp {
         use crate::identity::NapiIdentityInner;
         use crate::identity::ensure_did_resolver_initialized_on;
 
-        validate_custody_type(&custody).map_err(NapiError::from)?;
-
         // Validate the optional 32-byte `testing_seed` at the FFI boundary
         // so we fail early rather than panicking in
         // `InMemoryKeyCustody::from_seed_bytes`. A length mismatch is
-        // `SCP-VALID-7007`; a seed paired with a non-InMemory custody
-        // surfaces later as `SCP-VALID-7009`. The seed bytes feed
-        // `Ed25519 SigningKey::from_bytes` inside the custody's RNG, so
+        // `SCP-VALID-7007`; a seed the custody cannot honor is rejected
+        // next by `check_testing_seed`, before the custody string is read.
+        // The seed bytes feed `Ed25519 SigningKey::from_bytes` inside the
+        // custody's RNG, so
         // we wrap the narrowed `[u8; 32]` in `Zeroizing` immediately to
         // wipe them when dropped rather than leaving them on the stack.
         //
@@ -428,6 +427,18 @@ impl Scp {
                 Some(zeroize::Zeroizing::new(narrowed))
             }
         };
+        scp_ffi_common::validate::check_testing_seed(
+            &custody,
+            testing_seed_bytes.is_some(),
+            cfg!(feature = "testing"),
+        )
+        .map_err(|(code, message)| {
+            NapiError::from(ScpNapiError::Validation {
+                message: message.to_owned(),
+                code: code.to_owned(),
+            })
+        })?;
+        validate_custody_type(&custody).map_err(NapiError::from)?;
 
         let bi = &*self.inner;
         ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
@@ -497,46 +508,15 @@ impl Scp {
                 Ok(handle)
             }
             #[cfg(not(feature = "testing"))]
-            "in_memory" => {
-                // Mirrors PyO3 `parse_custody_with_seed`
-                // (cfg(not(testing))): a `testing_seed` is
-                // a parity-harness affordance gated on the
-                // `testing` feature, so surface it as
-                // SCP-VALID-7008 ("testing-only feature requires feature
-                // flag") ahead of the generic custody-unavailable error.
-                if testing_seed_bytes.is_some() {
-                    return Err(NapiError::from(ScpNapiError::Validation {
-                        message: "`testing_seed` parameter requires the testing feature".to_owned(),
-                        code: codes::VALID_7008.to_owned(),
-                    }));
-                }
-                Err(ScpNapiError::Identity {
-                    message: "in_memory custody is not available in this build -- use \
-                              \"software\" or \"platform\" custody for production key storage"
-                        .to_owned(),
-                    code: codes::IDENT_1008.to_owned(),
-                }
-                .into())
+            "in_memory" => Err(ScpNapiError::Identity {
+                message: format!(
+                    "in_memory custody is not available in this build — {}",
+                    crate::error::ACCEPTED_CUSTODY
+                ),
+                code: codes::IDENT_1008.to_owned(),
             }
-            "platform" | "software" => {
-                if testing_seed_bytes.is_some() {
-                    return Err(NapiError::from(ScpNapiError::Validation {
-                        message: "`testing_seed` parameter is only valid for custody=\"in_memory\""
-                            .to_owned(),
-                        code: codes::VALID_7009.to_owned(),
-                    }));
-                }
-                Err(ScpNapiError::Identity {
-                    message: format!(
-                        "custody type {custody:?} requires a wired platform \
-                         KeyCustodyProvider — use the KeyCustodyProvider callback \
-                         interface to inject Secure Enclave (iOS) or Android \
-                         Keystore (Android) backed custody"
-                    ),
-                    code: codes::IDENT_1003.to_owned(),
-                }
-                .into())
-            }
+            .into()),
+            "platform" | "software" => Err(custody_without_backend(&custody).into()),
             _ => Err(ScpNapiError::Identity {
                 code: codes::IDENT_1005.to_owned(),
                 message: format!(
@@ -626,22 +606,14 @@ impl Scp {
             }
             #[cfg(not(feature = "testing"))]
             "in_memory" => Err(ScpNapiError::Identity {
-                message: "in_memory custody is not available in this build -- use \
-                          \"software\" or \"platform\" custody for production key storage"
-                    .to_owned(),
+                message: format!(
+                    "in_memory custody is not available in this build — {}",
+                    crate::error::ACCEPTED_CUSTODY
+                ),
                 code: codes::IDENT_1008.to_owned(),
             }
             .into()),
-            "platform" | "software" => Err(ScpNapiError::Identity {
-                message: format!(
-                    "custody type {custody:?} requires a wired platform \
-                     KeyCustodyProvider — use the KeyCustodyProvider callback \
-                     interface to inject Secure Enclave (iOS) or Android \
-                     Keystore (Android) backed custody"
-                ),
-                code: codes::IDENT_1003.to_owned(),
-            }
-            .into()),
+            "platform" | "software" => Err(custody_without_backend(&custody).into()),
             _ => Err(ScpNapiError::Identity {
                 code: codes::IDENT_1005.to_owned(),
                 message: format!(
@@ -5447,5 +5419,107 @@ mod identity_remove_validation_tests {
                 .expect("valid DID must not be rejected by identity_remove_if_present"),
             "removing an unregistered DID must report false"
         );
+    }
+}
+
+/// Every custody-string rejection on this bridge names the strings it accepts,
+/// and none of them sends the caller to `"platform"` or `"software"` (SCP-294).
+#[cfg(test)]
+mod custody_string_message_tests {
+    use super::*;
+    use crate::error::ACCEPTED_CUSTODY;
+
+    fn create_error(custody: &str) -> String {
+        let scp = Scp::new_in_memory_for_test();
+        crate::runtime()
+            .block_on(scp.identity_create(custody.to_owned(), None))
+            .err()
+            .map_or_else(
+                || format!("{custody:?} created an identity"),
+                |e| e.to_string(),
+            )
+    }
+
+    fn create_with_agent_key_error(custody: &str) -> String {
+        let scp = Scp::new_in_memory_for_test();
+        crate::runtime()
+            .block_on(scp.identity_create_with_agent_key(custody.to_owned()))
+            .err()
+            .map_or_else(
+                || format!("{custody:?} created an identity"),
+                |e| e.to_string(),
+            )
+    }
+
+    /// A seed paired with `"platform"`, `"software"`, or an unknown string
+    /// reports the seed misuse (`SCP-VALID-7009`) before the custody string
+    /// is read, as the `PyO3` and `UniFFI` bridges do; without a seed the
+    /// same strings keep their custody codes.
+    #[test]
+    fn seed_misuse_is_reported_before_the_custody_string() {
+        for (custody, unseeded) in [
+            ("platform", codes::IDENT_1003),
+            ("software", codes::IDENT_1003),
+            ("keychain", codes::VALID_7005),
+        ] {
+            let scp = Scp::new_in_memory_for_test();
+            let seeded = crate::runtime()
+                .block_on(scp.identity_create(
+                    custody.to_owned(),
+                    Some(napi::bindgen_prelude::Buffer::from(vec![7u8; 32])),
+                ))
+                .err()
+                .map_or_else(|| "created an identity".to_owned(), |e| e.to_string());
+            assert!(seeded.contains(codes::VALID_7009), "{custody}: {seeded}");
+            let plain = create_error(custody);
+            assert!(plain.contains(unseeded), "{custody}: {plain}");
+        }
+    }
+
+    /// `"platform"` and `"software"` return `SCP-IDENT-1003` on both string
+    /// create paths, with a message naming the accepted set.
+    #[test]
+    fn platform_and_software_reject_with_ident_1003_naming_the_accepted_set() {
+        for custody in ["platform", "software"] {
+            for msg in [create_error(custody), create_with_agent_key_error(custody)] {
+                assert!(msg.contains(codes::IDENT_1003), "{custody}: {msg}");
+                assert!(msg.contains(ACCEPTED_CUSTODY), "{custody}: {msg}");
+            }
+        }
+    }
+
+    /// An unknown string returns `SCP-VALID-7005` naming the accepted set,
+    /// which lists neither rejected string as expected.
+    #[test]
+    fn unknown_custody_rejects_with_valid_7005_naming_the_accepted_set() {
+        for msg in [
+            create_error("keychain"),
+            create_with_agent_key_error("keychain"),
+        ] {
+            assert!(msg.contains(codes::VALID_7005), "{msg}");
+            assert!(msg.contains(ACCEPTED_CUSTODY), "{msg}");
+            assert!(
+                !msg.contains("\"platform\"") && !msg.contains("\"software\""),
+                "{msg}"
+            );
+        }
+    }
+
+    /// A shipped build refuses `"in_memory"` with `SCP-IDENT-1008` and names
+    /// the accepted set instead of `"software"` or `"platform"`.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn in_memory_on_a_shipped_build_names_the_accepted_set() {
+        for msg in [
+            create_error("in_memory"),
+            create_with_agent_key_error("in_memory"),
+        ] {
+            assert!(msg.contains(codes::IDENT_1008), "{msg}");
+            assert!(msg.contains(ACCEPTED_CUSTODY), "{msg}");
+            assert!(
+                !msg.contains("\"platform\"") && !msg.contains("\"software\""),
+                "{msg}"
+            );
+        }
     }
 }

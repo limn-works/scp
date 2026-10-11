@@ -743,6 +743,25 @@ impl From<scp_ffi_common::bridge_instance::HandleAffinityError> for ScpNapiError
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The custody strings this bridge builds a key custody from, stated in every
+/// custody rejection so the three bridges name their accepted sets the same way
+/// (SCP-294).
+pub(crate) const ACCEPTED_CUSTODY: &str = "this bridge accepts \"in_memory\" only in a build \
+     carrying the testing feature; inject a KeyCustodyProvider through \
+     identityCreateWithCustody() for any other key store";
+
+/// The error for a custody string that names no key store on this bridge
+/// (`"platform"`, `"software"`): `SCP-IDENT-1003`, as on the `PyO3` and
+/// `UniFFI` bridges.
+pub(crate) fn custody_without_backend(custody: &str) -> ScpNapiError {
+    ScpNapiError::Identity {
+        message: format!(
+            "custody type {custody:?} names no key store on this bridge — {ACCEPTED_CUSTODY}"
+        ),
+        code: codes::IDENT_1003.to_owned(),
+    }
+}
+
 /// Parses a custody type string into a string the bridge can match on.
 ///
 /// Returns the canonical custody type string or `Err(ScpNapiError::Validation)`.
@@ -752,13 +771,10 @@ pub(crate) fn validate_custody_type(custody: &str) -> Result<&str, ScpNapiError>
         // VALID_7005 ("invalid field value") matches the semantic: an
         // unrecognized enum string is a wrong-value error, not the
         // malformed/wrong-shape byte input that VALID_7007 is reserved for
-        // (api-design J2, M1). PyO3's `parse_custody_inner` emits the
-        // same class of error (VALID_7001 via `ScpPyError::validation`),
-        // both distinct from the narrower 7007.
+        // (api-design J2, M1). The PyO3 and UniFFI bridges emit the same
+        // code for an unknown custody string.
         other => Err(ScpNapiError::Validation {
-            message: format!(
-                "unknown custody type: {other:?} — expected \"in_memory\", \"platform\", or \"software\""
-            ),
+            message: format!("unknown custody type: {other:?} — {ACCEPTED_CUSTODY}"),
             code: codes::VALID_7005.to_owned(),
         }),
     }

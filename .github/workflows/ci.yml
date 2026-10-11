@@ -2139,6 +2139,16 @@ jobs:
           # one for every package that has them.
           cargo nextest run --no-tests=fail -p scp-ffi-common \
             -E 'test(ffi_dht_client_is_pkarr_only_in_shipped_build) + test(disabled_node_resolution_returns_ok_none_for_unknown_did)'
+          # The same tripwire for scp-ffi-napi. `cargo test -p scp-ffi-napi`
+          # above carries no name filter, so it exits 0 when the bridge's one
+          # `#[cfg(not(feature = "testing"))]` test,
+          # `in_memory_on_a_shipped_build_names_the_accepted_set` (a shipped
+          # build refuses custody "in_memory" with SCP-IDENT-1008, SCP-294),
+          # compiled out. This filter names only that test, so a build that
+          # turned `scp-ffi-napi/testing` on selects zero tests and
+          # `--no-tests=fail` exits 4.
+          cargo nextest run --no-tests=fail -p scp-ffi-napi --features server --lib \
+            -E 'test(in_memory_on_a_shipped_build_names_the_accepted_set)'
 
   # Builds the pyo3 bridge (`scp-ffi`) in its PRODUCTION configuration: default
   # features (`server` on) but WITHOUT `testing`. `build-matrix.yml` builds the
@@ -2225,7 +2235,7 @@ jobs:
           # `std::env::set_var` calls on, and `--no-tests=fail` exits 4 rather
           # than 0 if a feature flip selects zero tests.
           cargo nextest run --no-tests=fail -p scp-ffi --features server --lib \
-            -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed)'
+            -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed) + test(parse_custody_rejects_in_memory_on_a_shipped_build_naming_the_accepted_set)'
       - name: Check the PyPI wheel's features vendor OpenSSL on non-Apple targets only
         run: |
           # `crates/scp-platform/Cargo.toml` declares the libsqlite3-sys edge that
