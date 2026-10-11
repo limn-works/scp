@@ -41,8 +41,8 @@ async fn publish_fails_closed_when_the_dht_does_not_answer() {
     match result {
         Err(DhtError::DhtPublishFailed(message)) => {
             assert!(
-                !message.is_empty(),
-                "the fail-closed DHT publish error must carry a diagnostic message"
+                message.contains("timed out"),
+                "the publish must fail through the timeout arm, not another failure; got {message:?}"
             );
         }
         Err(other) => panic!("expected DhtError::DhtPublishFailed, got {other:?}"),

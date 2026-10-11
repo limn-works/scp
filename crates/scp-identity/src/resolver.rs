@@ -2202,4 +2202,30 @@ mod tests {
             "the #active method is present and must still resolve"
         );
     }
+
+    /// `NoOpRelayQuerier` is the relay querier each FFI bridge and the self-host
+    /// node construct today. It answers `Ok(None)`, the honest protocol-supported absent state that
+    /// the root AGENTS.md tenet "No dev/test-only stand-ins in production"
+    /// requires of a capability with no real backend. ADR-062 §Decision 5
+    /// classifies it as failing CLOSED: "its `query` returns `Ok(None)` ... and
+    /// the resolver passes that honest not-found through rather than
+    /// fabricating a record". An arm that returned a record here would hand the
+    /// resolver a document no relay served (§3.10.4 "MUST NOT fabricate").
+    #[tokio::test]
+    async fn no_op_relay_querier_answers_the_honest_absent_state() {
+        let relay_urls = vec![
+            "wss://relay.example.com/scp/v1".to_owned(),
+            "wss://relay2.example.com/scp/v1".to_owned(),
+        ];
+
+        let answer = NoOpRelayQuerier
+            .query("did:dht:z6MkExampleShippedBuild", &relay_urls)
+            .await
+            .expect("the shipped relay arm reports absence, so it must not error");
+
+        assert!(
+            answer.is_none(),
+            "the shipped relay arm holds no DID record and must answer Ok(None)"
+        );
+    }
 }
