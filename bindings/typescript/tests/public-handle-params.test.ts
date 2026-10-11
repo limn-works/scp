@@ -6,8 +6,9 @@
  * The test reads `src/scp.ts` with the TypeScript compiler API and resolves
  * each parameter's type with the type checker, so an alias that erases to
  * `unknown` (`type NativeMcpServerHandle = unknown`) fails the same way a
- * literal `unknown` does. A parameter fails when its name says it carries a
- * handle and its type is `unknown`, `any`, absent, or a raw bridge handle type.
+ * literal `unknown` does. Any parameter of a public method fails, whatever its
+ * name, when its type is `unknown`, `any`, absent, or a raw bridge handle
+ * type, unless `ALLOWED_UNTYPED` names it with a reason.
  *
  * ADR-052 (unified construction pattern, `.docs/adrs/phase-2.md`) asks for one
  * shape across every binding; Swift and Kotlin take `ContextHandle` and
@@ -22,11 +23,15 @@ import ts from "typescript";
 const SCP_SOURCE = fileURLToPath(new URL("../src/scp.ts", import.meta.url));
 
 /**
- * The parameter names that carry a handle. The criterion is "the parameter
- * passes a handle the SDK hands out"; these names are the indicators the
- * structural test can read.
+ * Public parameters allowed an `unknown` type, keyed `method.param`, each with
+ * the reason it carries no handle.
  */
-const HANDLE_PARAM = /^(handle|context|identity|manager|server|client)$|(Handle|Context|Identity)$/;
+const ALLOWED_UNTYPED: ReadonlyMap<string, string> = new Map([
+  [
+    "mcpServerCreate.config",
+    "a JSON-serializable server config the bridge parses and validates, not a handle",
+  ],
+]);
 
 /** Raw bridge handle types that must never appear on a public parameter. */
 const RAW_HANDLE_TYPE = /\b(Bridge\w*Handle|Native\w*Handle|Napi\w+)\b/;
@@ -46,8 +51,11 @@ function isPublicMethod(member: ts.ClassElement): member is ts.MethodDeclaration
   return (modifiers & (ts.ModifierFlags.Private | ts.ModifierFlags.Protected)) === 0;
 }
 
-/** Returns every handle parameter of a public `SCP` method that violates the rule. */
-export function findHandleParamViolations(sourcePath: string): readonly Violation[] {
+/** Returns every parameter of a public `SCP` method that violates the rule. */
+export function findHandleParamViolations(
+  sourcePath: string,
+  allowed: ReadonlyMap<string, string> = ALLOWED_UNTYPED,
+): readonly Violation[] {
   const program = ts.createProgram([sourcePath], {
     strict: true,
     target: ts.ScriptTarget.ESNext,
@@ -55,7 +63,7 @@ export function findHandleParamViolations(sourcePath: string): readonly Violatio
     moduleResolution: ts.ModuleResolutionKind.Bundler,
     noEmit: true,
     skipLibCheck: true,
-    types: [],
+    types: ["bun"],
   });
   const checker = program.getTypeChecker();
   const source = program.getSourceFile(sourcePath);
@@ -72,7 +80,7 @@ export function findHandleParamViolations(sourcePath: string): readonly Violatio
     const method = member.name.getText();
     for (const param of member.parameters) {
       const name = param.name.getText();
-      if (!HANDLE_PARAM.test(name)) continue;
+      if (allowed.has(`${method}.${name}`)) continue;
       const annotation = param.type?.getText() ?? "<none>";
       const resolved = checker.getTypeAtLocation(param);
       const erased = (resolved.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0;
@@ -85,7 +93,7 @@ export function findHandleParamViolations(sourcePath: string): readonly Violatio
 }
 
 describe("public SCP handle parameters", () => {
-  test("no public SCP method takes a handle typed unknown, any, or a raw bridge type", () => {
+  test("no public SCP method takes a parameter typed unknown, any, or a raw bridge type", () => {
     const violations = findHandleParamViolations(SCP_SOURCE);
     expect(violations.map((v) => `${v.method}(${v.param}: ${v.type})`)).toEqual([]);
   });
@@ -126,17 +134,22 @@ describe("public SCP handle parameters", () => {
         "  #privateOk(handle: unknown): void {}",
         "  _internalOk(handle: unknown): void {}",
         "  okString(identityDid: string): void {}",
+        "  nodeSend(node: unknown, payload: any): void {}",
+        "  allowedConfig(config: unknown): void {}",
         "}",
         "interface BridgeContextHandle { contextId: string }",
       ].join("\n"),
     );
     try {
-      const found = findHandleParamViolations(probe).map((v) => `${v.method}.${v.param}`);
+      const allowed = new Map([["allowedConfig.config", "probe allowlist entry"]]);
+      const found = findHandleParamViolations(probe, allowed).map((v) => `${v.method}.${v.param}`);
       expect(found).toEqual([
         "contextSend.handle",
         "mcpServerStop.server",
         "contextLeave.context",
         "contextJoin.context",
+        "nodeSend.node",
+        "nodeSend.payload",
       ]);
     } finally {
       ts.sys.deleteFile?.(probe);
