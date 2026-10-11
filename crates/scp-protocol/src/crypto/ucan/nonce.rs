@@ -491,7 +491,7 @@ impl<C: Clock> NonceTracker<C> {
 /// `validate_spending_ucan_signed`.
 ///
 /// Without this impl, callers would have to maintain a separate
-/// [`super::validate::InMemoryNonceTracker`] alongside the production
+/// `InMemoryNonceTracker` alongside the production
 /// tracker — that is the bug the C1 finding describes (a fabricated
 /// spending UCAN's nonce was never checked against the per-context
 /// tracker because no shared trait existed). The impl forwards directly to

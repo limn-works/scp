@@ -248,7 +248,7 @@ pub struct DualLayerResolver<
     R: MultiRelayQuerier,
     D: DhtClient,
     C: Clock = SystemClock,
-    H: HealingPublisher = NoOpHealer,
+    H: HealingPublisher = NoHealing,
 > {
     relay_querier: Arc<R>,
     dht_client: Arc<D>,
@@ -262,30 +262,39 @@ pub struct DualLayerResolver<
     healing_publisher: Option<Arc<H>>,
 }
 
-/// A no-op healing publisher used as the default type parameter.
+/// The healing-publisher type parameter for a resolver built without healing.
 ///
-/// This exists only to provide a concrete default for the `H` type parameter
-/// on [`DualLayerResolver`] so that existing construction sites that do not
-/// need healing remain unchanged.
-pub struct NoOpHealer;
+/// Uninhabited by construction: a resolver without healing stores
+/// `healing_publisher: None`, and no value of this type exists, so no caller can
+/// hand [`DualLayerResolver`] a publisher that reports a successful republish
+/// without publishing anything (§17.17 forbids such a nullifier on a shipped
+/// path).
+#[derive(Clone)]
+pub enum NoHealing {}
 
 #[allow(clippy::manual_async_fn)]
-impl HealingPublisher for NoOpHealer {
+impl HealingPublisher for NoHealing {
+    // `NoHealing` is uninhabited, so no `&NoHealing` exists at run time and this
+    // body is unreachable. The zero-arm `match` on a by-value `NoHealing` makes
+    // the impl total without fabricating a success value a caller would read as
+    // a completed republish; matching the clone, not `*self`, dereferences no
+    // reference to an uninhabited type.
     fn heal(
         &self,
         _did: &str,
         _stale_layer: &StaleLayer,
         _record: &DidRecordV1,
     ) -> impl Future<Output = Result<(), IdentityError>> + Send {
-        async { Ok(()) }
+        async move { match self.clone() {} }
     }
 }
 
-/// A no-op relay querier that always returns `Ok(None)`.
+/// A relay querier for a node with no relay layer: every query returns
+/// `Ok(None)`.
 ///
-/// Used when no production relay querier is available (e.g., before transport
-/// setup). The `DualLayerResolver` falls back to DHT-only resolution when the
-/// relay layer returns `None`.
+/// It fails closed (ADR-062 §Decision 5): `Ok(None)` is the honest absent
+/// state, which the composer reads as "this layer contributed nothing". It never
+/// fabricates a record, so a DID resolves only from a layer that holds one.
 pub struct NoOpRelayQuerier;
 
 #[allow(clippy::manual_async_fn)]
@@ -913,13 +922,13 @@ mod tests {
     }
 
     /// An in-memory relay querier for testing with configurable delays.
-    struct InMemoryRelayQuerier {
+    struct DelayedMultiRelayQuerier {
         records: Mutex<std::collections::HashMap<String, RelayRecord>>,
         delay: Duration,
         should_fail: Mutex<bool>,
     }
 
-    impl InMemoryRelayQuerier {
+    impl DelayedMultiRelayQuerier {
         fn with_delay(delay: Duration) -> Self {
             Self {
                 records: Mutex::new(std::collections::HashMap::new()),
@@ -939,7 +948,7 @@ mod tests {
         }
     }
 
-    impl MultiRelayQuerier for InMemoryRelayQuerier {
+    impl MultiRelayQuerier for DelayedMultiRelayQuerier {
         fn query(
             &self,
             did: &str,
@@ -1048,7 +1057,9 @@ mod tests {
         let (value, signature) = sign_document(&signing_key, &doc, 1);
         let public_key = signing_key.verifying_key();
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         relay
             .insert(
                 &did,
@@ -1097,7 +1108,9 @@ mod tests {
         let public_key = signing_key.verifying_key();
 
         // Relay has no document stored.
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
 
         let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
         dht.inner
@@ -1135,7 +1148,9 @@ mod tests {
         let (value_v2, sig_v2) = sign_document(&signing_key, &doc_v2, 5);
 
         // Relay returns seq=5 (higher) with short delay.
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         relay
             .insert(
                 &did,
@@ -1185,7 +1200,9 @@ mod tests {
         let (value_v5, sig_v5) = sign_document(&signing_key, &doc_v5, 5);
 
         // Relay returns seq=1 (lower), fast (10ms).
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         relay
             .insert(
                 &did,
@@ -1227,7 +1244,9 @@ mod tests {
         let (value, signature) = sign_document(&signing_key, &doc, 1);
         let public_key = signing_key.verifying_key();
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         relay.set_should_fail(true).await;
 
         let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
@@ -1256,7 +1275,9 @@ mod tests {
         let (signing_key, did, doc) = make_test_identity();
         let (value, signature) = sign_document(&signing_key, &doc, 1);
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         relay
             .insert(
                 &did,
@@ -1296,7 +1317,9 @@ mod tests {
         // Both layers fail. Should return Ok(None).
         let (_signing_key, did, _doc) = make_test_identity();
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         relay.set_should_fail(true).await;
 
         let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
@@ -1319,7 +1342,9 @@ mod tests {
         // Neither layer has the document (no records stored). Should return Ok(None).
         let (_signing_key, did, _doc) = make_test_identity();
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
 
         let clock = Arc::new(TestClock::new(1_000_000));
@@ -1345,7 +1370,7 @@ mod tests {
         cache.insert(&did, doc.clone(), 3).await;
 
         // Both layers have 5s delay — should never be reached.
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_secs(5)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_secs(5)));
         let dht = Arc::new(DelayedDhtClient::new(Duration::from_secs(5)));
 
         let resolver = make_resolver(relay, dht, cache);
@@ -1368,7 +1393,9 @@ mod tests {
         let (value, signature) = sign_document(&signing_key, &doc, 2);
         let public_key = signing_key.verifying_key();
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
         dht.inner
             .publish(public_key.as_bytes(), &signature, &value, 2)
@@ -1463,7 +1490,9 @@ mod tests {
         let mut corrupt_sig = signature;
         corrupt_sig[0] ^= 0xFF;
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         relay
             .insert(
                 &did,
@@ -1519,7 +1548,9 @@ mod tests {
         clock.advance(8 * 24 * 60 * 60); // 8 days > 7-day inactive TTL
 
         // Both layers return seq=1 (stale).
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         relay
             .insert(
                 &did,
@@ -1570,7 +1601,9 @@ mod tests {
         let doc_v7 = DidDocument::new(&did, public_key.as_bytes(), &[70u8; 32], &[71u8; 32]);
         let (value_v7, sig_v7) = sign_document(&signing_key, &doc_v7, 7);
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         let dht = Arc::new(DelayedDhtClient::new(Duration::from_millis(10)));
         dht.inner
             .publish(public_key.as_bytes(), &sig_v7, &value_v7, 7)
@@ -1746,7 +1779,9 @@ mod tests {
         let doc_v1 = DidDocument::new(&did, public_key.as_bytes(), &[2u8; 32], &[3u8; 32]);
         let (value_v1, sig_v1) = sign_document(&signing_key, &doc_v1, 1);
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         relay
             .insert(
                 &did,
@@ -1811,7 +1846,9 @@ mod tests {
         let doc_v5 = DidDocument::new(&did, public_key.as_bytes(), &[20u8; 32], &[30u8; 32]);
         let (value_v5, sig_v5) = sign_document(&signing_key, &doc_v5, 5);
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         relay
             .insert(
                 &did,
@@ -1877,7 +1914,9 @@ mod tests {
         let (value, signature) = sign_document(&signing_key, &doc, 3);
         let public_key = signing_key.verifying_key();
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         relay
             .insert(
                 &did,
@@ -1926,7 +1965,9 @@ mod tests {
         let (signing_key, did, doc) = make_test_identity();
         let (value, signature) = sign_document(&signing_key, &doc, 3);
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         relay
             .insert(
                 &did,
@@ -1975,7 +2016,9 @@ mod tests {
         let doc_v1 = DidDocument::new(&did, public_key.as_bytes(), &[2u8; 32], &[3u8; 32]);
         let (value_v1, sig_v1) = sign_document(&signing_key, &doc_v1, 1);
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         relay
             .insert(
                 &did,
@@ -2037,7 +2080,9 @@ mod tests {
         let doc_v1 = DidDocument::new(&did, public_key.as_bytes(), &[2u8; 32], &[3u8; 32]);
         let (value_v1, sig_v1) = sign_document(&signing_key, &doc_v1, 1);
 
-        let relay = Arc::new(InMemoryRelayQuerier::with_delay(Duration::from_millis(10)));
+        let relay = Arc::new(DelayedMultiRelayQuerier::with_delay(Duration::from_millis(
+            10,
+        )));
         relay
             .insert(
                 &did,
