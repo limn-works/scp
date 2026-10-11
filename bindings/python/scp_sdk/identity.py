@@ -33,6 +33,7 @@ from scp_sdk.errors import ValidationError
 from scp_sdk.types import CustodyType
 
 if TYPE_CHECKING:
+    from scp_sdk._scp_core import PyIdentity
     from scp_sdk.scp import SCP
 
 
@@ -122,7 +123,7 @@ class Identity:
         Users should not call this directly — use the ``scp.identity_*``
         factory methods.
         """
-        self._raw_handle = handle
+        self._raw_handle: PyIdentity = handle
         self.rotation_event_json = rotation_event_json
 
     @classmethod

@@ -72,7 +72,7 @@ async def main() -> None:
                 print(f"Outlet invocation result: {exc}")
 
             # 6. Cleanup.
-            await scp.context_close(ctx._raw_handle, identity.did)
+            await scp.context_close(ctx, identity.did)
             print("Context closed")
         finally:
             await relay.shutdown()

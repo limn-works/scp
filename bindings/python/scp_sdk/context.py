@@ -36,6 +36,7 @@ from scp_sdk._extension import native_module
 from scp_sdk.errors import ContextError, ValidationError
 
 if TYPE_CHECKING:
+    from scp_sdk._scp_core import PyContextHandle
     from scp_sdk.outlets import Outlets
     from scp_sdk.scp import SCP
 
@@ -535,7 +536,7 @@ class Context:
         native bridge). Factory methods pass it; a bare ``Context(handle)`` for
         pure handle inspection may omit it.
         """
-        self._raw_handle = handle
+        self._raw_handle: PyContextHandle = handle
         self.identity_did = identity_did
         self._scp = scp
 

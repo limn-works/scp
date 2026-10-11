@@ -3345,6 +3345,18 @@ jobs:
           # Parity tests require Bun/Kotlin/Swift runners that are not
           # available in this job — they run in dedicated parity jobs below.
           PYTHONPATH=. pytest tests/ -v -m "not parity"
+      # The examples call the public SCP methods, which take the SDK's Context and
+      # Identity objects. Context._raw_handle and Identity._raw_handle carry the
+      # native stub types, so an example that passes one where a method expects
+      # the object fails here with an arg-type error instead of raising
+      # SCP-VALID-7005 for the first reader who runs it. `--follow-imports=silent`
+      # checks the examples against scp_sdk's types without reporting scp_sdk's
+      # own errors, which this step does not gate.
+      - name: Type-check the SDK examples
+        run: |
+          source .venv/bin/activate
+          cd bindings/python
+          mypy --follow-imports=silent examples
       # `cd bindings/python` above resolves `tests/` to `bindings/python/tests/`,
       # so this step runs no pytest suite that lives elsewhere in this
       # repository. Five such suites exist. Three of them, under `scripts/`, run

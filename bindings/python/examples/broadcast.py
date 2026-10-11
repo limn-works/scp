@@ -46,23 +46,23 @@ async def main() -> None:
 
         try:
             # 4. Subscriber joins.
-            await scp.context_join(ctx._raw_handle, subscriber.did)
+            await scp.context_join(ctx, subscriber.did)
             print("Subscriber joined")
 
             # 5. Publisher sends a broadcast message.
             payload = b"Breaking news: SCP protocol is live!"
-            await scp.context_send(ctx._raw_handle, publisher.did, payload)
+            await scp.context_send(ctx, publisher.did, payload)
             print("Publisher sent broadcast")
 
             # 6. Subscriber receives the broadcast.
-            receiver = await scp.context_receive(ctx._raw_handle)
+            receiver = await scp.context_receive(ctx)
             async for msg in receiver:
                 print(f"Subscriber received: {msg.payload!r}")
                 break
 
             # 7. Cleanup.
-            await scp.context_leave(ctx._raw_handle, subscriber.did)
-            await scp.context_close(ctx._raw_handle, publisher.did)
+            await scp.context_leave(ctx, subscriber.did)
+            await scp.context_close(ctx, publisher.did)
         finally:
             await relay.shutdown()
 

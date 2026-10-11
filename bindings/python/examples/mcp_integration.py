@@ -81,7 +81,7 @@ async def main() -> None:
 
         await scp.mcp_client_disconnect(client)
         await scp.mcp_server_stop(server)
-        await scp.context_close(ctx._raw_handle, identity.did)
+        await scp.context_close(ctx, identity.did)
 
 
 if __name__ == "__main__":

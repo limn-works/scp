@@ -51,7 +51,7 @@ async def main() -> None:
         try:
             # 4. Create a second identity and have them join.
             member = await scp.identity_create(CustodyType.IN_MEMORY)
-            await scp.context_join(ctx._raw_handle, member.did)
+            await scp.context_join(ctx, member.did)
             print(f"Member {member.did} joined")
 
             # 5. Admin proposes a governance action to change the member's role.
@@ -66,9 +66,7 @@ async def main() -> None:
                     },
                 }
             )
-            propose_result = json.loads(
-                await scp.governance_propose(ctx._raw_handle, admin.did, action)
-            )
+            propose_result = json.loads(await scp.governance_propose(ctx, admin.did, action))
             proposal_id = propose_result["proposal_id"]
             print(f"Proposed + executed governance action: {proposal_id}")
 
@@ -80,13 +78,13 @@ async def main() -> None:
             # propose above already executed this proposal, so a direct execute
             # now demonstrates the runtime's replay guard.
             try:
-                await scp.governance_execute(ctx._raw_handle, proposal_id)
+                await scp.governance_execute(ctx, proposal_id)
             except Exception as replay:  # illustrative
                 print(f"Re-executing an applied proposal is rejected: {replay}")
 
             # 6. Cleanup.
-            await scp.context_leave(ctx._raw_handle, member.did)
-            await scp.context_close(ctx._raw_handle, admin.did)
+            await scp.context_leave(ctx, member.did)
+            await scp.context_close(ctx, admin.did)
         finally:
             await relay.shutdown()
 

@@ -6,7 +6,7 @@ Python conventions, toolchain, and CI for the SCP Python SDK. References `sdk-co
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| Python | 3.10+ | Minimum supported version, the `requires-python` floor in `bindings/python/pyproject.toml`; the published wheels cover CPython 3.10-3.13. `match` and `X \| Y` union syntax (3.10) are available. PEP 695 type parameter syntax and `type X` statements (3.12) are not: write type aliases as `X: TypeAlias = ...`. ruff (`target-version = "py310"`), which CI runs, rejects syntax newer than 3.10 but not standard-library names newer than 3.10 (`typing.Self`, `tomllib`); mypy (`python_version = "3.10"`) rejects both, and no CI job runs it. |
+| Python | 3.10+ | Minimum supported version, the `requires-python` floor in `bindings/python/pyproject.toml`; the published wheels cover CPython 3.10-3.13. `match` and `X \| Y` union syntax (3.10) are available. PEP 695 type parameter syntax and `type X` statements (3.12) are not: write type aliases as `X: TypeAlias = ...`. ruff (`target-version = "py310"`), which CI runs, rejects syntax newer than 3.10 but not standard-library names newer than 3.10 (`typing.Self`, `tomllib`); mypy (`python_version = "3.10"`) rejects both; CI runs it over `bindings/python/examples` only, in the `Python / test` job. |
 | maturin | latest | Build tool for PyO3 Rust extension |
 | ruff | latest | Linter + formatter (replaces flake8, isort, black) |
 | mypy | latest | Static type checker (`--strict` mode) |

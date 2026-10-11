@@ -37,23 +37,23 @@ async def main() -> None:
         print(f"Context ID: {ctx.context_id}")
 
         # Bob joins the context.
-        await scp.context_join(ctx._raw_handle, bob.did)
+        await scp.context_join(ctx, bob.did)
         print(f"Bob joined: {bob.did}")
 
         # Alice sends a message.
-        await scp.context_send(ctx._raw_handle, alice.did, b"Hello Bob, this is Alice")
+        await scp.context_send(ctx, alice.did, b"Hello Bob, this is Alice")
 
         # Bob receives it.
-        receiver = await scp.context_receive(ctx._raw_handle)
+        receiver = await scp.context_receive(ctx)
         async for msg in receiver:
             print(f"Bob received from {msg.sender_did}: {msg.payload!r}")
             break
 
         # Bob leaves.
-        await scp.context_leave(ctx._raw_handle, bob.did)
+        await scp.context_leave(ctx, bob.did)
 
         # Alice closes the context.
-        await scp.context_close(ctx._raw_handle, alice.did)
+        await scp.context_close(ctx, alice.did)
 
 
 if __name__ == "__main__":

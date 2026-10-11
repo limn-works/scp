@@ -344,7 +344,15 @@ EXTENSION_LEAF = "_scp_core"
 #: and hands the failure to ``reject_load_failure``, which tells a load failure
 #: apart from an absence. This mapping is the whole permission: a file it does
 #: not name, and a second import inside a file it does name, are both offenders.
-PERMITTED_EXTENSION_IMPORTS = {"__init__.py": 1, "_extension.py": 1}
+# `context.py` and `identity.py` each import one stub type under
+# `if TYPE_CHECKING:` to annotate `_raw_handle`. That import never runs, so it
+# cannot swallow a load failure.
+PERMITTED_EXTENSION_IMPORTS = {
+    "__init__.py": 1,
+    "_extension.py": 1,
+    "context.py": 1,
+    "identity.py": 1,
+}
 
 
 def _count_extension_imports(source: str) -> int:

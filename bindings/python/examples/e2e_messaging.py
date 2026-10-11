@@ -46,25 +46,25 @@ async def main() -> None:
 
         try:
             # 4. Bob joins the context.
-            await scp.context_join(ctx._raw_handle, bob.did)
+            await scp.context_join(ctx, bob.did)
             print(f"Bob joined: {bob.did}")
 
             # 5. Alice sends a message.
             plaintext = b"Hello Bob, this message is E2E encrypted via MLS"
-            await scp.context_send(ctx._raw_handle, alice.did, plaintext)
+            await scp.context_send(ctx, alice.did, plaintext)
             print("Alice sent message")
 
             # 6. Bob receives the message.
-            receiver = await scp.context_receive(ctx._raw_handle)
+            receiver = await scp.context_receive(ctx)
             async for msg in receiver:
                 print(f"Bob received from {msg.sender_did}: {msg.payload!r}")
                 break
 
             # 7. Cleanup.
-            await scp.context_leave(ctx._raw_handle, bob.did)
+            await scp.context_leave(ctx, bob.did)
             print("Bob left the context")
 
-            await scp.context_close(ctx._raw_handle, alice.did)
+            await scp.context_close(ctx, alice.did)
             print("Context closed")
         finally:
             await relay.shutdown()
