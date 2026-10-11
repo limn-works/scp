@@ -24,7 +24,6 @@ bun run start
 
 ## Next Steps
 
-- Replace `"in_memory"` custody with `"platform"` for production
 - Add tool registration with `defineToolDefinition()`
 - Connect to a relay with `Transport.connect()` for real networking
-- See `docs/examples/typescript/` for more detailed examples
+- See `bindings/typescript/examples/` for more detailed examples

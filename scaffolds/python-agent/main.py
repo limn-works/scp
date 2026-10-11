@@ -5,8 +5,6 @@ Creates a DID identity, opens an encrypted context, and sends a message.
 Usage:
     pip install -e ../../bindings/python
     python main.py
-
-Replace in_memory custody with platform custody for production use.
 """
 
 import asyncio

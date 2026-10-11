@@ -25,8 +25,7 @@ python main.py
 
 ## Next Steps
 
-- Replace `"in_memory"` custody with `"platform"` for production key storage
 - Add a second participant with `ctx.join(other_identity)`
 - Register tools with `ToolDefinition` and invoke them with `ctx.invoke()`
 - Connect to a relay with `connect_relay()` for real transport
-- See `docs/examples/python/` for more detailed examples
+- See `bindings/python/examples/` for more detailed examples

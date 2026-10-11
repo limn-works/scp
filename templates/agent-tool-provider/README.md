@@ -217,7 +217,6 @@ Test vectors are optional but recommended -- they document expected behavior and
 
 ## Next Steps
 
-- Replace `"in_memory"` custody with `"platform"` for production key storage
 - Connect to a relay with `connect_relay()` for networked transport
 - Use `session_create()`/`session_invoke()` for multi-turn tool workflows
 - Add a second participant and use `delegate()` to issue scoped UCAN tokens

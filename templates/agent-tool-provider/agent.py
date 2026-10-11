@@ -259,7 +259,7 @@ async def run_agent(*, enable_mcp: bool = False, mcp_transport: str = "stdio") -
             context's tools to external MCP-compatible models.
         mcp_transport: MCP transport mode (``"stdio"`` or ``"sse"``).
     """
-    # 1. Create identity with in-memory custody (swap to "platform" for prod).
+    # 1. Create identity with in-memory custody.
     identity = await Identity.create(custody="in_memory")
     logger.info("Created identity: %s", identity.did)
 
