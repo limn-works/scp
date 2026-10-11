@@ -210,9 +210,9 @@ impl BroadcastReservationId {
 
 /// State the actor holds between the two phases of a broadcast publish.
 ///
-/// Phase 1 ([`reserve_broadcast_publish`]) reserves the broadcast
-/// sequence and records everything the seal will need so phase 2
-/// ([`apply_broadcast_publish`]) is deterministic — the apply seals with
+/// Phase 1 (`broadcast_helpers::reserve_broadcast_publish`) reserves the
+/// broadcast sequence and records everything the seal will need so phase 2
+/// (`broadcast_helpers::apply_broadcast_publish`) is deterministic — the apply seals with
 /// the EXACT `reserved_sequence`, `timestamp`, and `nonce` the caller
 /// signed, so the signature remains valid. The `payload` itself is not
 /// signed (the signing payload binds only a `None`-provenance hash), so
@@ -221,9 +221,6 @@ impl BroadcastReservationId {
 /// Held in [`PerContextState::pending_broadcast_publishes`]. If the apply
 /// never arrives the reservation is rolled back (the reserved sequence is
 /// returned to the author's counter when it is still the head).
-///
-/// [`reserve_broadcast_publish`]: crate::context::broadcast_helpers::reserve_broadcast_publish
-/// [`apply_broadcast_publish`]: crate::context::broadcast_helpers::apply_broadcast_publish
 #[derive(Debug, Clone)]
 pub struct PendingBroadcastPublish {
     /// Author DID this reservation belongs to.
@@ -572,7 +569,7 @@ pub struct ContextCryptoState {
     /// production path today: the live sender-key `(epoch, sequence)`
     /// receive handling has been relocated off the former provider onto
     /// the actor-owned [`ContextCryptoState`], performed by
-    /// [`ContextCryptoState::open`](crate::context::actor::state::ContextCryptoState::open).
+    /// `ContextCryptoState::open`.
     pub recv_sequence_tracker: HashMap<String, (u64, u64)>,
 
     /// One-shot fault-injection seam (#2148 F1 / ADR-049 §15(c)), re-homed onto
@@ -896,8 +893,8 @@ impl ContextModeState {
 ///
 /// `saga_pending` holds [`SagaPreparedState`], which deliberately implements
 /// no `Clone` / `Serialize` (the §9.4.3 bearer-leak barrier), and
-/// `xctx_nonce_dedup` is a [`NonceDedup`] cache. So [`Self::snapshot`] /
-/// [`Self::restore`] project through the sanctioned mirrors
+/// `xctx_nonce_dedup` is a [`NonceDedup`] cache. So `Self::snapshot` /
+/// `Self::restore` project through the sanctioned mirrors
 /// ([`SagaPreparedStateSnapshot`](crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot),
 /// [`NonceDedup::entries`] / [`NonceDedup::from_entries_with_ttl`]); the three
 /// committed/reservation witnesses are `Clone` and snapshot by clone.
@@ -1116,7 +1113,7 @@ pub struct ClassSState {
 /// The live sub-struct cannot derive `Clone` (its `saga_pending` holds the
 /// non-`Clone` §9.4.3 bearer-barrier [`SagaPreparedState`], and
 /// `xctx_nonce_dedup` is a cache). This snapshot captures each field through
-/// its sanctioned mirror so [`ClassSState::restore`] can rebuild a value-stable
+/// its sanctioned mirror so `ClassSState::restore` can rebuild a value-stable
 /// copy. Used only for the in-memory snapshot/restore round-trip — the on-disk
 /// [`ContextSnapshot`](crate::context::state::ContextSnapshot) format is
 /// unchanged (these fields continue to serialize as their existing flat
@@ -1507,7 +1504,7 @@ pub struct PerContextState {
     /// `caller_did` + `outlet_registration_id` (the confused-deputy defense). The
     /// store doubles as the delegation-chain `ProofResolver` for that
     /// validation. Empty until a gated outlet interface is established; the
-    /// freshness/replay state ([`ClassSState::xctx_nonce_dedup`]) and this store
+    /// freshness/replay state (`ClassSState::xctx_nonce_dedup`) and this store
     /// both live where the authorization decision is made — on B's actor.
     ///
     /// Not part of the Class-S snapshot: it is reconstructable interface state
@@ -1571,7 +1568,7 @@ fn empty_role_state_for_test() -> ContextRoleState {
 
 impl PerContextState {
     /// Read-only view of the staged cross-context saga slot
-    /// ([`ClassSState::saga_pending`]). A `pub` accessor (the field itself is
+    /// (`ClassSState::saga_pending`). A `pub` accessor (the field itself is
     /// `pub(crate)` on the Class-S sub-struct) so the SDK-visible shape
     /// integration test can witness the slot without naming the crate-internal
     /// sub-struct path.

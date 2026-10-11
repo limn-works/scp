@@ -57,7 +57,7 @@ pub fn make_wrapping_key_extension(public_key: &[u8; P256_WRAPPING_KEY_SIZE]) ->
 ///
 /// Returns `None` if the extension is not present. A present payload passes
 /// §9.5 point validation
-/// ([`P256Point`](scp_protocol::crypto::hpke::p256::P256Point)):
+/// ([`P256Point`]):
 /// exactly 65 bytes, led by `0x04`, on the curve.
 ///
 /// # Errors

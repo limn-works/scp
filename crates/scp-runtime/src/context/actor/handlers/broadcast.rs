@@ -1,15 +1,15 @@
 //! Broadcast handlers — see
-//! [`BroadcastCommand`](crate::context::actor::commands::BroadcastCommand)
+//! [`BroadcastCommand`]
 //! and plan §"Broadcast contexts".
 //!
 //! # Phase 2A.5 -- actor-shape dispatch
 //!
-//! The handler's primary entry point [`dispatch`] takes
+//! The handler's primary entry point `dispatch` takes
 //! `(&mut PerContextState, &ActorDeps, BroadcastCommand)` and routes
-//! non-publish variants through [`crate::context::broadcast_helpers`].
+//! non-publish variants through `crate::context::broadcast_helpers`.
 //! Every valid context has a registered per-context actor, so a command
 //! that finds no actor is replied to with a typed
-//! [`ContextError::ContextNotRegistered`](scp_protocol::context::ContextError::ContextNotRegistered)
+//! [`ContextError::ContextNotRegistered`]
 //! by the supervisor's no-actor fallback.
 //!
 //! # Publish + key-custody plumbing (two-phase reservation)

@@ -65,8 +65,7 @@
 //! Prerequisite 1 records: there are still two clocks. The paths:
 //!
 //! - `KeyPackageIn::validate` on the add side: [`crate::group::add_member`],
-//!   [`crate::group::key_package_in_did`],
-//!   [`crate::group::key_package_in_wrapping_key`], and the runtime backend's
+//!   [`crate::group::key_package_in_did`], and the runtime backend's
 //!   `validate_key_package` in `scp-runtime` (`crypto/mls/production_backend.rs`
 //!   and `crypto/mls/provider.rs`). SCP brackets openmls's check there with
 //!   [`validate_key_package_lifetime_for_add`], in addition to openmls's check

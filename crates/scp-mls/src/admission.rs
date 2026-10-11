@@ -4,14 +4,14 @@
 //! openmls validates signatures, capabilities and its own `Lifetime` view.
 //! SCP adds the rules openmls cannot know:
 //!
-//! - **Added leaf** ([`admit_added_leaf`]), in order:
+//! - **Added leaf** (`admit_added_leaf`), in order:
 //!   1. the `KeyPackage` `Lifetime` passes the check for the caller's role
-//!      ([`LifetimeCheck`]): the adder reads its injected clock, and a
+//!      (`LifetimeCheck`): the adder reads its injected clock, and a
 //!      receiver checks the range alone and reads no clock (security-model
 //!      spec §9.7.1);
 //!   2. the leaf credential parses to an SCP DID;
 //!   3. the leaf carries a valid `0xFF01` wrapping key;
-//!   4. on the tree **after** the Commit ([`admit_staged_commit`]), every leaf
+//!   4. on the tree **after** the Commit (`admit_staged_commit`), every leaf
 //!      the DID holds carries the same `0xFF01`, and the DID holds at most
 //!      [`MAX_LEAVES_PER_DID`] leaves. The Commit's Removes, Update proposals
 //!      and `UpdatePath` are applied first, so a Remove frees a DID's key and
@@ -28,7 +28,7 @@
 //!
 //! openmls 0.8.1 gives no public accessor for a remote leaf's extensions
 //! (`MlsGroup::public_group` is crate-private and `Member` carries none), so
-//! [`tree_leaves`] reads them from the exported ratchet tree, whose node list
+//! `tree_leaves` reads them from the exported ratchet tree, whose node list
 //! is a public serde type.
 
 use openmls::prelude::*;

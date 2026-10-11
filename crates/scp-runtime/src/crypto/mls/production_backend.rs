@@ -1,4 +1,4 @@
-//! Production [`MlsBackend`](super::backend::MlsBackend) implementation.
+//! Production [`MlsBackend`] implementation.
 //!
 //! Introduced by commit 4 of the actor-per-context refactor (ADR-049 §6).
 //!
@@ -15,10 +15,9 @@
 //!
 //! # Signer-state serialization
 //!
-//! `generate_key_package` returns an opaque [`SignerState`](
-//! super::backend::SignerState) that the caller later passes back to
+//! `generate_key_package` returns an opaque [`SignerState`] that the caller later passes back to
 //! `join_from_welcome`. The serialization format is MessagePack-encoded
-//! [`SerializedSigner`] — the byte layout is private to this module and is
+//! `SerializedSigner` — the byte layout is private to this module and is
 //! not a stable interoperability surface. Callers MUST NOT parse the bytes.
 
 use std::sync::{Arc, OnceLock};

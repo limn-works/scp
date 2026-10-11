@@ -78,7 +78,7 @@ pub const ACTOR_MAILBOX_CAPACITY: usize = 256;
 /// this type makes the variant un-constructible outside this module: the seal's
 /// single field is PRIVATE, so no `CrossContextSagaSeal { .. }` literal is
 /// possible outside `supervisor.rs`, and the only constructor
-/// ([`Self::new`]) is module-private. A cross-context outlet invocation can
+/// (`Self::new`) is module-private. A cross-context outlet invocation can
 /// therefore only be started via
 /// [`Supervisor::start_cross_context_outlet_invocation_saga`] — the sole entry
 /// point that supplies the supervisor-side executor + signing keys. The variant
@@ -100,11 +100,11 @@ impl CrossContextSagaSeal {
     }
 }
 
-/// Witness that [`Supervisor::restore_all_contexts`] ran — the §17.16.4
+/// Witness that `Supervisor::restore_all_contexts` ran — the §17.16.4
 /// "restore, THEN reconcile" startup ordering, encoded in the TYPE SYSTEM.
 ///
 /// [`Supervisor::replay_unresolved_sagas`] takes `&RestoredContexts`, and the
-/// ONLY way to obtain one is to first call [`Supervisor::restore_all_contexts`]
+/// ONLY way to obtain one is to first call `Supervisor::restore_all_contexts`
 /// (which returns it). So a `restore_on_startup` that tried to replay BEFORE
 /// restore would have no token to pass — it would not COMPILE. This makes the
 /// crash-recovery ordering unbreakable by construction rather than enforced only
@@ -114,7 +114,7 @@ impl CrossContextSagaSeal {
 /// The construction discipline mirrors [`CrossContextSagaSeal`] and ADR-049 §5's
 /// `OwnedIdentityDid`. Construction is SEALED: the `ids` field is PRIVATE (no
 /// `RestoredContexts { ids: .. }` literal outside this module) and the only
-/// production constructor ([`Self::new`]) is module-private. There is NO
+/// production constructor (`Self::new`) is module-private. There is NO
 /// `Default` impl (a derived `Default::default()` would be a public, zero-arg
 /// constructor reachable from any crate — a forge that mints an empty witness
 /// and voids the ordering guarantee), and no `Clone`. So no external crate can
@@ -259,8 +259,8 @@ pub enum SagaInput {
     /// concurrency slot (ADR-049 §3a(b)), and reaches `Committed` ASYNC at
     /// seal-close off the mailbox. This variant exists so the dedicated entry
     /// can compute the participant-context-set reservation via
-    /// [`saga_participant_context_set`] with the SAME discipline as the unary
-    /// saga; it is never dispatched through [`Supervisor::run_saga`].
+    /// `saga_participant_context_set` with the SAME discipline as the unary
+    /// saga; it is never dispatched through `Supervisor::run_saga`.
     CrossContextStreamingOutletInvocation {
         /// Calling context.
         caller_context_id: [u8; 32],
@@ -788,7 +788,7 @@ struct CommittedSagaArtifacts {
 /// side committed, the saga id, the nonce, and the committed-side event id.
 ///
 /// In-memory it is a fast read cache, but it is ALSO durably journaled (see
-/// [`Supervisor::record_supervisor_repair`]): each record is appended to the
+/// `Supervisor::record_supervisor_repair`): each record is appended to the
 /// supervisor's saga journal as the `evidence` of a `NeedsRepair`
 /// [`JournalEntry`], so a supervisor restart REHYDRATES it from the journal
 /// rather than losing the unreachable-leg divergence account — preserving the
@@ -862,7 +862,7 @@ fn build_outlet_stream_pump_semaphore(requested: u32) -> Arc<tokio::sync::Semaph
 /// Supervisor configuration (per-node tunables). Saga phase timeouts and
 /// respawn-budget windows are still derived from code constants
 /// (`Supervisor::LIFECYCLE_TIMEOUT`, the function-local `PHASE_TIMEOUT`, and
-/// the module-level [`CRASH_WINDOW_MS`]) rather than this struct.
+/// the module-level `CRASH_WINDOW_MS`) rather than this struct.
 #[derive(Clone, Debug)]
 pub struct SupervisorConfig {
     /// Node-level ceiling on the number of outlet stream pumps that may run
@@ -906,7 +906,7 @@ const CRASH_DEQUE_CAP: usize = CRASH_POISON_THRESHOLD;
 /// Per-context crash-count window (ADR-049 §10 — actor respawn budget).
 ///
 /// Tracks the wall-clock-millisecond timestamps of recent actor crashes
-/// in a sliding [`CRASH_WINDOW_MS`] window. When [`CRASH_POISON_THRESHOLD`]
+/// in a sliding `CRASH_WINDOW_MS` window. When `CRASH_POISON_THRESHOLD`
 /// crashes land inside the window the context is *poisoned*: the
 /// supervisor stops respawning its actor (no infinite crash-respawn loop)
 /// until an operator clears the poison.
@@ -1606,7 +1606,7 @@ pub struct WelcomeJoinRequest {
 #[derive(Debug, Clone, Copy)]
 pub struct SagaSigningKeys<'a> {
     /// The target context's Active Signing Key. Signs the
-    /// [`CrossContextOutletReceipt`](scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt)
+    /// [`CrossContextOutletReceipt`]
     /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`.
     pub target: &'a ed25519_dalek::SigningKey,
     /// The caller context's Active Signing Key. Signs the CALLER-side divergence
@@ -1703,7 +1703,7 @@ pub struct StreamingSagaHandle {
 /// binds the two together: [`Self::signing_key_id`] is derived from the same
 /// variant that carries the key, so the stamp and the key are one source of
 /// truth. The single stamp+sign site
-/// ([`build_encrypted_envelope_actor`](crate::context::messaging_helpers::build_encrypted_envelope_actor))
+/// (`build_encrypted_envelope_actor`)
 /// takes the `MessageSigner` directly.
 #[derive(Clone, Copy)]
 pub enum MessageSigner<'a> {
@@ -1741,7 +1741,7 @@ impl<'a> MessageSigner<'a> {
 /// Plain struct — not an actor. See module-level docs for rationale.
 ///
 /// The write path (any mutation of `actors`, `standing_contexts`,
-/// `local_dids`, or `wrapping_keys`) acquires [`Self::write_lock`] first,
+/// `local_dids`, or `wrapping_keys`) acquires `Self::write_lock` first,
 /// then does the `DashMap::insert` / `ArcSwap::store`, then drops the
 /// lock. This prevents lost writes from concurrent `ArcSwap::store`
 /// operations (which are atomic in isolation but not when the caller
@@ -1974,7 +1974,7 @@ pub struct Supervisor {
     /// at [`Self::start_saga`] entry: if ANY id in the new set is already
     /// present, the new saga's set OVERLAPS an in-flight saga and the start
     /// returns
-    /// [`ContextError::ActorBusy`](scp_protocol::context::ContextError::ActorBusy)
+    /// [`ContextError::ActorBusy`]
     /// with a `SagaBusy` reason; otherwise the whole set is inserted and the
     /// FSM runs. Two sagas with DISJOINT sets never contend and run
     /// concurrently — replacing the prior supervisor-wide `AtomicBool` so one
@@ -2115,7 +2115,7 @@ pub struct Supervisor {
 /// by construction.)
 ///
 /// The inner fields are private and the only consumer is the `pub(crate)`
-/// [`Self::into_parts`], so no out-of-crate caller (FFI bridge, node) can
+/// `Self::into_parts`, so no out-of-crate caller (FFI bridge, node) can
 /// decompose the pair and re-pair the halves with divergent backends — they can
 /// only pass the whole `DurableProviders` to the supervisor constructor.
 ///
@@ -2377,7 +2377,7 @@ impl Supervisor {
         }
     }
 
-    /// Arms the one-shot [`Self::force_welcome_export_failure_once`] seam: the
+    /// Arms the one-shot `Self::force_welcome_export_failure_once` seam: the
     /// NEXT spawn-from-Welcome step-3b crypto durability check treats the actor
     /// export as NON-durable and clears the flag (ADR-049 PR-7 /
     /// SCP-CRYPTOMOVE-001).
@@ -2414,7 +2414,7 @@ impl Supervisor {
     }
 
     /// Test-only constructor: builds a supervisor over the given providers with
-    /// the no-op saga journal ([`NoOpSagaJournal`]), so the saga coordinator
+    /// the no-op saga journal (`NoOpSagaJournal`), so the saga coordinator
     /// runs but never durably journals.
     ///
     /// Compiled only under `test` or the `testing` feature. A shipped build
@@ -2819,7 +2819,7 @@ impl Supervisor {
     }
 
     /// Cheap reference to the supervisor's
-    /// [`KeyResolver`](scp_protocol::context::governance::KeyResolver).
+    /// [`KeyResolver`].
     /// Returns `None` if [`Self::with_providers_and_journal`] was not used.
     #[must_use]
     pub(crate) fn key_resolver_ref(&self) -> Option<&KeyResolver> {
@@ -2856,7 +2856,7 @@ impl Supervisor {
     /// drive the outbound webhook dispatcher (spec §12.10.5).
     ///
     /// Message payloads on the channel are stripped of plaintext before sending
-    /// (see [`crate::context::state::strip_event_payload`]) — subscribers
+    /// (see `crate::context::state::strip_event_payload`) — subscribers
     /// observe metadata only, never decrypted content.
     ///
     /// # Delivery scope
@@ -2938,14 +2938,36 @@ impl Supervisor {
     // wrapping key, so restoring a context never changes it.
     // -------------------------------------------------------------------
 
-    /// Clear every per-identity wrapping keypair. Used by the
-    /// shutdown helper so a fresh
-    /// [`Self::with_providers_and_journal`] observes empty per-identity state.
-    /// Wrapping-key secrets zeroize on drop via the
+    /// Clear every per-identity wrapping keypair. Used by the shutdown helper,
+    /// after it closes the spawn gate, so no wrapping secret stays resident
+    /// past shutdown. Wrapping-key secrets zeroize on drop via the
     /// `Zeroizing<[u8;32]>` field on
-    /// [`WrappingKeyPair`](crate::crypto::wrapping::WrappingKeyPair).
-    pub(crate) fn clear_wrapping_keys(&self) {
+    /// [`WrappingKeyPair`].
+    ///
+    /// `_write` is the held [`Self::write_lock`] guard. The only insert,
+    /// [`Self::insert_wrapping_key`], checks the gate under that same lock, so
+    /// an insert either precedes this clear or sees the closed gate and is
+    /// refused: no load in flight at shutdown re-inserts a pair afterwards.
+    pub(crate) fn clear_wrapping_keys(&self, _write: &tokio::sync::MutexGuard<'_, ()>) {
         self.wrapping_keys.clear();
+    }
+
+    /// The only insert into `wrapping_keys`. Refuses with
+    /// [`ContextError::SupervisorShutDown`] once the spawn gate is closed, so
+    /// together with [`Self::clear_wrapping_keys`] (which takes the same
+    /// [`Self::write_lock`], held here as `_write`) no wrapping secret enters
+    /// the map after shutdown has begun. A refused `slot` drops, zeroizing its
+    /// secret.
+    fn insert_wrapping_key(
+        &self,
+        _write: &tokio::sync::MutexGuard<'_, ()>,
+        identity: &DID,
+        slot: &Arc<ArcSwap<WrappingKeyPair>>,
+    ) -> Result<(), ContextError> {
+        self.refuse_if_shut_down("wrapping keypair load")?;
+        self.wrapping_keys
+            .insert(identity.clone(), Arc::clone(slot));
+        Ok(())
     }
 
     /// Returns `identity`'s wrapping-key slot, loading it from durable storage
@@ -2965,14 +2987,17 @@ impl Supervisor {
     /// - [`ContextError::CryptoFailed`] if the stored value is not a valid
     ///   scalar; the stored value is left as it is and no pair is generated
     ///   over it.
+    /// - [`ContextError::SupervisorShutDown`] once shutdown has begun, whether
+    ///   the gate closes before the call or while it loads.
     pub(crate) async fn ensure_wrapping_key(
         &self,
         identity: &DID,
     ) -> Result<Arc<ArcSwap<WrappingKeyPair>>, ContextError> {
+        self.refuse_if_shut_down("wrapping keypair lookup")?;
         if let Some(slot) = self.wrapping_keys.get(identity) {
             return Ok(Arc::clone(slot.value()));
         }
-        let _guard = self.write_lock.lock().await;
+        let guard = self.write_lock.lock().await;
         if let Some(slot) = self.wrapping_keys.get(identity) {
             return Ok(Arc::clone(slot.value()));
         }
@@ -2992,14 +3017,14 @@ impl Supervisor {
             pair
         };
         let slot = Arc::new(ArcSwap::from_pointee(pair));
-        self.wrapping_keys
-            .insert(identity.clone(), Arc::clone(&slot));
+        self.insert_wrapping_key(&guard, identity, &slot)?;
+        drop(guard);
         Ok(slot)
     }
 
     /// Returns `identity`'s current 65-byte wrapping public key, the value it
     /// publishes as the `0xFF01` leaf extension (spec 09 §9.16.1). Loads or
-    /// generates the pair exactly as [`Self::ensure_wrapping_key`] does.
+    /// generates the pair exactly as `Self::ensure_wrapping_key` does.
     ///
     /// A bridge that mints a KeyPackage outside the KeyPackage store attaches
     /// this key, so the leaf it adds advertises the key whose secret this
@@ -3007,7 +3032,7 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::ensure_wrapping_key`].
+    /// The errors of `Self::ensure_wrapping_key`.
     pub async fn wrapping_public_key(&self, identity: &DID) -> Result<[u8; 65], ContextError> {
         Ok(*self.ensure_wrapping_key(identity).await?.load().public())
     }
@@ -3312,7 +3337,7 @@ impl Supervisor {
     ///   context-id and delegates directly to the event-log provider —
     ///   no per-context state is involved.
     /// - When no actor is registered for the variant's `context_id`,
-    ///   [`Self::dispatch_queries_direct`] emits the variant's legacy
+    ///   `Self::dispatch_queries_direct` emits the variant's legacy
     ///   default (e.g. `MemberCount::Ok(None)`, `IsMember::Ok(false)`)
     ///   or surfaces `ContextError::ContextNotRegistered` directly on
     ///   the variant's oneshot, preserving the "context unknown = soft
@@ -3376,18 +3401,18 @@ impl Supervisor {
     /// actor's mailbox (ADR-049 commit 8 / plan row 8).
     ///
     /// Routes the command through the per-context actor's mailbox via
-    /// [`Self::dispatch_via_mailbox`]. The actor's `run()` loop pulls
+    /// `Self::dispatch_via_mailbox`. The actor's `run()` loop pulls
     /// the command and dispatches it via the actor-shape `dispatch(state,
     /// deps, cmd)` entry point, which exercises the actor-owned
     /// [`SendSequenceTracker`](crate::context::actor::SendSequenceTracker)
     /// directly. The handler wraps every transport/MLS call in
     /// [`tokio::time::timeout`] with a 30-second budget; a timeout maps
-    /// to [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout).
+    /// to [`ContextError::TransportTimeout`].
     ///
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
+    ///   [`Supervisor`] has
     ///   been attached yet — the caller must call
     ///   [`Self::with_providers_and_journal`] first.
     /// - [`ContextError::ContextNotRegistered`] if no actor has been
@@ -3424,9 +3449,9 @@ impl Supervisor {
     ///
     /// - **Bootstrap variants** (`CreateContext`, `ImportContext`,
     ///   `RestoreContext`) always route through
-    ///   [`Self::dispatch_lifecycle_direct`], which delegates to the
+    ///   `Self::dispatch_lifecycle_direct`, which delegates to the
     ///   actor-shape helpers in
-    ///   [`crate::context::lifecycle_helpers`]. These helpers
+    ///   `crate::context::lifecycle_helpers`. These helpers
     ///   construct fresh `PerContextState` and spawn the per-context
     ///   actor as part of the bootstrap handshake (the actor owns the
     ///   state; there is no legacy `contexts` `DashMap` write).
@@ -3437,12 +3462,12 @@ impl Supervisor {
     ///   through the per-context actor's mailbox into the actor-shape
     ///   `handlers::lifecycle::dispatch`. If no actor is registered for
     ///   the target context, the call falls through to
-    ///   [`Self::dispatch_lifecycle_direct`] which surfaces
+    ///   `Self::dispatch_lifecycle_direct` which surfaces
     ///   `ContextError::ContextNotRegistered` on the reply oneshot.
     ///
     /// Each variant wraps its delegated body in `tokio::time::timeout`
     /// with a 30s budget, maps a timeout to
-    /// [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout),
+    /// [`ContextError::TransportTimeout`],
     /// and relays the typed reply on the variant's oneshot.
     ///
     /// # Errors
@@ -3994,10 +4019,10 @@ impl Supervisor {
     /// actor's mailbox (ADR-049 commit 9 / plan row 9).
     ///
     /// Routes the command through the per-context actor's mailbox via
-    /// [`Self::dispatch_via_mailbox`]. The actor's `run()` loop pulls the
+    /// `Self::dispatch_via_mailbox`. The actor's `run()` loop pulls the
     /// command and dispatches it via the actor-shape `dispatch(state,
     /// deps, cmd)` entry point. The handler wraps delegated
-    /// [`Supervisor`](crate::context::supervisor::Supervisor) calls in
+    /// [`Supervisor`] calls in
     /// [`tokio::time::timeout`] with a 30s budget, and relays the typed
     /// result through the variant's oneshot.
     ///
@@ -4011,7 +4036,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
+    ///   [`Supervisor`] has
     ///   been attached yet.
     pub async fn dispatch_ttl_close_command(
         &self,
@@ -4040,11 +4065,11 @@ impl Supervisor {
     /// (ADR-049 §15 / plan row 10).
     ///
     /// Contract (byte-identical to the legacy
-    /// [`Supervisor`](crate::context::supervisor::Supervisor)
+    /// [`Supervisor`]
     /// governance methods it replaces):
     ///
     /// Routes every per-context variant through the per-context actor's
-    /// mailbox via [`Self::dispatch_via_mailbox`]. The actor's `run()`
+    /// mailbox via `Self::dispatch_via_mailbox`. The actor's `run()`
     /// loop pulls the command, dispatches it through the actor-shape
     /// `dispatch(state, deps, cmd)` entry point, and writes the typed
     /// reply on the command's embedded oneshot. Sweep / timeout-task
@@ -4055,7 +4080,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
+    ///   [`Supervisor`] has
     ///   been attached yet.
     /// - [`ContextError::ContextNotRegistered`] if no actor has been
     ///   spawned for the command's target context_id. Every production
@@ -4098,8 +4123,8 @@ impl Supervisor {
     ///
     /// Same shape as [`Self::dispatch_governance_command`]. The
     /// economy handler only exposes the single public-surface method
-    /// on [`Supervisor`](crate::context::supervisor::Supervisor),
-    /// [`verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts);
+    /// on [`Supervisor`],
+    /// `verify_payment_receipts`;
     /// internal helpers (`authorize_paid_action`, `complete_paid_action`,
     /// `void_paid_action`) remain on the manager's private surface
     /// and are exercised through the messaging path.
@@ -4107,7 +4132,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
+    ///   [`Supervisor`] has
     ///   been attached yet.
     pub async fn dispatch_economy_command(
         &self,
@@ -4262,7 +4287,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
+    ///   [`Supervisor`] has
     ///   been attached yet.
     pub async fn dispatch_trust_recovery_command(
         self: &Arc<Self>,
@@ -5612,15 +5637,15 @@ impl Supervisor {
 
     /// Test fixture: poisons `context_id` the way the crash watchdog does, so a
     /// caller can observe a poisoned context without crashing an actor
-    /// [`CRASH_POISON_THRESHOLD`] times.
+    /// `CRASH_POISON_THRESHOLD` times.
     ///
-    /// The fixture records [`CRASH_POISON_THRESHOLD`] crashes at one instant
+    /// The fixture records `CRASH_POISON_THRESHOLD` crashes at one instant
     /// in the context's [`CrashWindow`], which sets the sticky `poisoned` flag,
     /// and then despawns the actor, which is the state the watchdog leaves
     /// behind once it stops respawning (ADR-049 §10). After this call
     /// [`Self::read_context_state`] reports
     /// [`ContextState::Poisoned`](scp_protocol::context::ContextState::Poisoned)
-    /// and [`Self::lookup`] finds no actor. A context with no actor poisons the
+    /// and `Self::lookup` finds no actor. A context with no actor poisons the
     /// same way, because the watchdog's poison flag lives in `crash_windows`
     /// and not on the actor.
     ///
@@ -5646,7 +5671,7 @@ impl Supervisor {
     ///
     /// The fixture sets the transient respawn marker in the context's
     /// [`CrashWindow`] and despawns the actor, and never re-registers one.
-    /// After this call [`Self::lookup`] finds no actor and
+    /// After this call `Self::lookup` finds no actor and
     /// [`Self::read_context_state_checked`] reports
     /// [`ContextError::ActorCrashed`].
     ///
@@ -5669,8 +5694,8 @@ impl Supervisor {
     ///
     /// The fixture sets the failed-respawn flag in the context's
     /// [`CrashWindow`], records no crash against the respawn budget, and
-    /// despawns the actor. After this call [`Self::lookup`] finds no actor,
-    /// [`Self::is_context_poisoned`] reports `false`, and
+    /// despawns the actor. After this call `Self::lookup` finds no actor,
+    /// `Self::is_context_poisoned` reports `false`, and
     /// [`Self::read_context_state_checked`] reports
     /// [`ContextError::ActorCrashed`].
     ///
@@ -5695,7 +5720,7 @@ impl Supervisor {
     /// [`ContextError::ActorBusy`], which is the outcome a saturated mailbox
     /// produces once
     /// [`SEND_TIMEOUT`](crate::context::actor::SEND_TIMEOUT) elapses. After
-    /// this call [`Self::lookup`] finds an actor for the id,
+    /// this call `Self::lookup` finds an actor for the id,
     /// [`Self::read_context_state_checked`] reports
     /// [`ContextError::ActorBusy`], and [`Self::read_context_state`] reports
     /// `None`.
@@ -5829,8 +5854,8 @@ impl Supervisor {
     }
 
     /// Despawn the actor registered for `context_id`, removing the
-    /// entry from [`Self::actors`] under the supervisor's
-    /// [`Self::write_lock`] so a concurrent re-registration cannot
+    /// entry from `Self::actors` under the supervisor's
+    /// `Self::write_lock` so a concurrent re-registration cannot
     /// race the removal.
     ///
     /// The removed [`ContextActorHandle`] is dropped at the end of
@@ -5844,11 +5869,11 @@ impl Supervisor {
     /// # Visibility
     ///
     /// `pub` — exposed through
-    /// [`SupervisorHandle::despawn_actor`](crate::context::supervisor::handle::SupervisorHandle::despawn_actor)
+    /// `SupervisorHandle::despawn_actor`
     /// so lifecycle bootstrap (`import_context`) can perform the
     /// despawn-then-respawn dance without holding `&Supervisor`
     /// directly. Called directly (on `&Supervisor`) by
-    /// [`crate::context::lifecycle_helpers::shutdown_all_contexts`] to
+    /// `crate::context::lifecycle_helpers::shutdown_all_contexts` to
     /// remove each actor's handle after `ShutdownSelf`, so the inbox
     /// closes and the actor task exits rather than lingering as a
     /// zombie. Also called by the FFI bridges as the COMPENSATING teardown
@@ -5963,7 +5988,7 @@ impl Supervisor {
     ///
     /// The actor's exit-wait error (the teardown then finishes in the tracked
     /// task), the error from finishing the teardown
-    /// ([`Self::finish_discard`]), or [`ContextError::ActorBusy`] when an
+    /// (`Self::finish_discard`), or [`ContextError::ActorBusy`] when an
     /// earlier discard of the id has not finished its teardown.
     pub async fn discard_joined_context(
         self: &Arc<Self>,
@@ -6170,7 +6195,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
+    ///   [`Supervisor`] has
     ///   been attached yet.
     pub async fn dispatch_standing_command(
         self: &Arc<Self>,
@@ -6304,7 +6329,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
+    ///   [`Supervisor`] has
     ///   been attached yet.
     pub(in crate::context) async fn dispatch_outlets_command(
         &self,
@@ -6620,7 +6645,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
+    ///   [`Supervisor`] has
     ///   been attached yet.
     pub async fn dispatch_broadcast_command(
         &self,
@@ -6656,7 +6681,7 @@ impl Supervisor {
     /// - **Non-publish variants** (`Subscribe`, `Unsubscribe`, `Block`,
     ///   `Unblock`, key request, queries) have a per-context owner and a
     ///   `context_id` surfaced by
-    ///   [`Self::broadcast_command_context_id`]. They route through the
+    ///   `Self::broadcast_command_context_id`. They route through the
     ///   per-context actor mailbox.
     /// - **Publish variants** are intentionally returned as `None` from
     ///   `broadcast_command_context_id`, fall through the mailbox check,
@@ -6668,7 +6693,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
+    ///   [`Supervisor`] has
     ///   been attached yet.
     pub async fn dispatch_broadcast_command_with_custody<C: scp_platform::KeyCustody>(
         &self,
@@ -6885,7 +6910,7 @@ impl Supervisor {
     /// Committing → Committed | Aborting → Aborted | NeedsRepair` state
     /// machine with journal durability. Each phase transition is
     /// persisted to the
-    /// [`SagaJournal`](crate::context::supervisor::saga_journal::SagaJournal)
+    /// [`SagaJournal`]
     /// before the next phase begins; crash recovery replays unresolved
     /// entries on supervisor startup via
     /// [`Self::replay_unresolved_sagas`].
@@ -6898,7 +6923,7 @@ impl Supervisor {
     /// `saga_participant_context_set`); a second `start_saga` whose set is
     /// **disjoint** runs concurrently, while one whose set **overlaps**
     /// (shares ≥1 context) returns
-    /// [`ContextError::ActorBusy`](scp_protocol::context::ContextError::ActorBusy)
+    /// [`ContextError::ActorBusy`]
     /// with a `SagaBusy` reason. The reservation (`reserved_saga_contexts`)
     /// is held by an RAII guard for the saga's lifetime and released on
     /// EVERY terminal — Committed, Aborted, AND NeedsRepair — plus
@@ -6960,7 +6985,7 @@ impl Supervisor {
     ///
     /// `signing_keys` carries the two Active Signing Keys named by role
     /// ([`SagaSigningKeys`]): `target` signs the
-    /// [`CrossContextOutletReceipt`](scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt)
+    /// [`CrossContextOutletReceipt`]
     /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`;
     /// `caller` signs the CALLER-side divergence marker on `NeedsRepair`. Each
     /// side signs its own marker into its own log. The named fields make a
@@ -7205,16 +7230,16 @@ impl Supervisor {
     /// [`Self::start_cross_context_outlet_invocation_saga`]: it runs the SAME
     /// authorize-before-reserve gates + the SAME `{caller, target}` per-set
     /// reservation (ADR-049 §3a), but it does NOT drive the generic synchronous
-    /// [`Self::run_saga`] FSM (which holds its reservation to a terminal). A
+    /// `Self::run_saga` FSM (which holds its reservation to a terminal). A
     /// streaming saga has no Prepare-A (the invoker pays via B's stream escrow,
     /// §5.4.5 "Cross-context economy" — NOT a caller-side reservation), so this
     /// driver runs Prepare-B (streaming) → the Commit-transition, then returns a
     /// [`StreamingSagaHandle`] PROMPTLY (AC1) while an off-mailbox seal task
-    /// ([`run_streaming_saga_seal_task`](crate::context::outlets::invoke::run_streaming_saga_seal_task))
+    /// (`run_streaming_saga_seal_task`)
     /// pumps the durable frontier capture + the seal-close.
     ///
     /// At the Commit-transition it: opens B's pump via the shared
-    /// [`Self::open_outlet_stream_phase1`] helper in SAGA MODE (`settlement_sink =
+    /// `Self::open_outlet_stream_phase1` helper in SAGA MODE (`settlement_sink =
     /// None` AND `invoked_event_sink = None` — the seal settles from the durable
     /// ledger and records B's `OutletInvoked` itself, so the pump must do
     /// NEITHER, else B double-records); RELEASES the concurrency slot (AC2 —
@@ -8200,7 +8225,7 @@ impl Supervisor {
     /// loads the current unresolved set from the journal.
     ///
     /// **Ordering encoded in the type system (§17.16.4).** The `restored:
-    /// &RestoredContexts` parameter is a WITNESS that [`Self::restore_all_contexts`]
+    /// &RestoredContexts` parameter is a WITNESS that `Self::restore_all_contexts`
     /// already ran: a [`RestoredContexts`] can only be minted by that restore, so
     /// a caller cannot replay BEFORE restoring — there would be no token to pass.
     /// This is the PRIMARY enforcement of the restore-then-replay order (the
@@ -8208,7 +8233,7 @@ impl Supervisor {
     /// is defense-in-depth). The recovery sweep consults the witness's restored
     /// set for an observability span field; the per-entry caller-residency /
     /// deletion decisions read durable persistence directly
-    /// ([`Self::caller_context_deleted_from_persistence`]).
+    /// (`Self::caller_context_deleted_from_persistence`).
     ///
     /// **Visibility (`pub`, intentional).** Kept `pub` — not `pub(crate)` —
     /// because the saga FSM + crash-recovery integration suites
@@ -11119,7 +11144,7 @@ impl Supervisor {
     /// Runs the two startup sweeps in the order §17.16.4 requires —
     /// **restore, THEN reconcile**:
     ///
-    /// 1. [`Self::restore_all_contexts`] — rehydrate every persisted `Active`
+    /// 1. `Self::restore_all_contexts` — rehydrate every persisted `Active`
     ///    context's actor from the persistence provider, so every participant a
     ///    recovery arm must drive is RESIDENT.
     /// 2. [`Self::replay_unresolved_sagas`] — sweep the durable saga journal and
@@ -11127,7 +11152,7 @@ impl Supervisor {
     ///
     /// **Restore MUST precede replay.** Every saga-recovery arm that has to
     /// reach a live actor — the cross-context caller whose LOCAL-economy
-    /// reversal is re-driven (see [`Self::recover_preparing_b_entry`]), and a
+    /// reversal is re-driven (see `Self::recover_preparing_b_entry`), and a
     /// Commit-in-progress re-send to all participants — needs that actor
     /// resident; NO arm needs the inverse (observing a participant *before* it
     /// is restored). Restoring first makes the caller resident, so the
@@ -11723,11 +11748,11 @@ impl Supervisor {
     ///
     /// Unlike the other query passthroughs, this does NOT route through
     /// [`Self::dispatch_query`]: that method falls through to
-    /// [`Self::dispatch_queries_direct`] (which fabricates the legacy
+    /// `Self::dispatch_queries_direct` (which fabricates the legacy
     /// unknown-context default) when no actor is registered. The standing
     /// get-or-create path needs to distinguish "actor exists and is in
     /// state X" from "no actor at all", so this helper does the
-    /// [`Self::lookup`] explicitly: a missing actor resolves to `None`
+    /// `Self::lookup` explicitly: a missing actor resolves to `None`
     /// (no mailbox, no reply), and a present actor's mailbox reply is
     /// surfaced as `Some(state)`.
     ///
@@ -11913,7 +11938,7 @@ impl Supervisor {
     ///    actor-shape [`lifecycle_helpers::create_context`](crate::context::lifecycle_helpers::create_context)
     ///    (membership, roles, governance, owned-state actor spawn), with
     ///    `local_did` as creator — mirroring the
-    ///    [`LifecycleCommand::CreateContext`](crate::context::actor::commands::LifecycleCommand::CreateContext)
+    ///    [`LifecycleCommand::CreateContext`]
     ///    deps build in [`Self::dispatch_lifecycle_direct`].
     /// 4. TOCTOU: a concurrent caller may have created the context
     ///    between the step-2 check and the step-3 create. On create
@@ -13098,7 +13123,7 @@ impl Supervisor {
     /// bridges sync → async exactly like
     /// [`Self::shutdown_all_contexts_sync`]: it inspects the ambient
     /// runtime and either `blocking`-bridges into the async
-    /// [`Self::try_consume_hard_rate_limit`] actor-mailbox path, or
+    /// `Self::try_consume_hard_rate_limit` actor-mailbox path, or
     /// spawns a dedicated current-thread runtime when neither
     /// `blocking_lock` nor `block_in_place` is safe (current-thread
     /// runtime regime). No DashMap is touched — the actor owns the
@@ -13752,7 +13777,7 @@ impl Supervisor {
     /// Invoke a outlet under the full economy pipeline (actor model).
     ///
     /// Orchestrates the three-phase split through
-    /// [`crate::context::outlets_helpers::invoke_outlet_with_economy`]: the
+    /// `crate::context::outlets_helpers::invoke_outlet_with_economy`: the
     /// economy reserve (Phase 1) and settle (Phase 3) run inside the
     /// per-context actor on owned state via the
     /// [`OutletsCommand::ReserveOutletEconomy`] / [`OutletsCommand::SettleOutletEconomy`]
@@ -13841,18 +13866,18 @@ impl Supervisor {
     ///
     /// Threads the reserve → off-mailbox pump → settle bracket:
     ///
-    /// 1. **Reserve (mailbox).** [`Self::reserve_outlet_stream_economy_via_actor`]
+    /// 1. **Reserve (mailbox).** `Self::reserve_outlet_stream_economy_via_actor`
     ///    runs the open-time economy reserve INSIDE the per-context actor on
     ///    owned Class-S state (hard-rate + velocity + `cost_per_chunk ×
     ///    estimated_chunk_count` escrow debit + seq-authority-B allocation),
-    ///    returning the `Send` [`StreamEconomyReservation`](crate::context::outlets_helpers::StreamEconomyReservation).
+    ///    returning the `Send` `StreamEconomyReservation`.
     /// 2. **Pump (off-mailbox).** [`dispatch::open_stream_session`](crate::context::outlets::dispatch::open_stream_session)
     ///    runs here, supervisor-side, driving the non-`Send` executor with the
     ///    reservation's `handle` + `role_state` snapshots (NOT caller-supplied —
     ///    the reserve snapshots them in-actor for a consistent lifecycle +
     ///    membership view), the actor-owned counter store, the per-context
     ///    admission tracker, and the node-level pump semaphore.
-    /// 3. **Settle (mailbox).** The [`ActorStreamSettlementSink`](crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink)
+    /// 3. **Settle (mailbox).** The `ActorStreamSettlementSink`
     ///    fires from the pump's terminal-chunk block back onto the actor mailbox
     ///    to refund the unspent escrow, release the unspent cumulative counter
     ///    reserve, and capture the §19.15.5 `PaymentReceipt`.
@@ -13864,7 +13889,7 @@ impl Supervisor {
     /// rolls back only the admission slot / pump permit / counter it consumed.
     /// So this orchestrator guards the debited hold with a
     /// [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)
-    /// backed by a [`SpawnerEscrowRefundSink`]:
+    /// backed by a `SpawnerEscrowRefundSink`:
     /// on a successful open the ticket is `consume`d (the pump's close-time
     /// settlement now owns the unspent-portion refund); on ANY rejection the
     /// ticket's `Drop` reverses the full hold via
@@ -13890,7 +13915,7 @@ impl Supervisor {
     /// reverse-mapped into the open-time
     /// [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection)
     /// taxonomy via
-    /// [`reserve_error_to_open_rejection`](crate::context::outlets_helpers::reserve_error_to_open_rejection)
+    /// `reserve_error_to_open_rejection`
     /// and returned as `Rejected`; any rejection `open_stream_session` returns
     /// propagates as `Rejected`.
     #[allow(clippy::too_many_arguments)]
@@ -14287,7 +14312,7 @@ impl Supervisor {
     /// (SCP-OUT-036).
     ///
     /// Resolves the RECEIVING context A's shared event-log provider and drives
-    /// [`invoke_outlet_cross_context`](crate::context::outlets::invoke::invoke_outlet_cross_context),
+    /// `invoke_outlet_cross_context`,
     /// which opens the outlet stream in the OPERATING context B, forwards each
     /// operator-signed chunk to the shared-member invoker IN-PROCESS as
     /// PLAINTEXT (§6.2.0 — the invoker is a member of BOTH contexts, mirroring
@@ -14411,7 +14436,7 @@ impl Supervisor {
     /// fails, and
     /// [`ContextCreationError::StateTransition`](scp_protocol::context::builder::ContextCreationError::StateTransition)
     /// wrapping
-    /// [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)
+    /// [`ContextError::CeilingRequired`]
     /// when `params.ceiling` is empty (construction.md M2); the context is
     /// not created. A dropped reply channel maps to
     /// [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed).
@@ -14479,9 +14504,9 @@ impl Supervisor {
     ///
     /// - Propagates any error from resolving the identity's
     ///   `KeyPackageStoreActor` (e.g.
-    ///   [`ContextError::NotInitialized`](scp_protocol::context::ContextError::NotInitialized)
+    ///   [`ContextError::NotInitialized`]
     ///   when providers are absent, or a poisoned-KP-actor sticky error).
-    /// - [`ContextError::ActorBusy`](scp_protocol::context::ContextError::ActorBusy)
+    /// - [`ContextError::ActorBusy`]
     ///   if the KeyPackage actor's mailbox is full or its reply channel drops.
     /// - [`ContextError::CreationFailed`] if the pool is still empty after a
     ///   replenish (no KP available to reserve).
@@ -14517,7 +14542,7 @@ impl Supervisor {
     ///    (spawn-from-Welcome builds Encrypted mode and rejects Broadcast), so a
     ///    Broadcast context is refused here.
     /// 2. Resolves the invitee's `#active` verifying key via the
-    ///    [`key_resolver`](Self::key_resolver_ref) and maps it to X25519 (RFC
+    ///    `key_resolver` and maps it to X25519 (RFC
     ///    7748) as the HPKE recipient key.
     /// 3. Only a `SingleAdmin` context is supported (a voting model returns
     ///    `Err(ContextError::InvalidState)` up front — no proposal, no add —
@@ -14928,7 +14953,7 @@ impl Supervisor {
     /// node's handles". This entrypoint makes the joiner a real, send-capable
     /// participant.
     ///
-    /// It is the join-side counterpart of [`crate::context::lifecycle_helpers::create_context`],
+    /// It is the join-side counterpart of `crate::context::lifecycle_helpers::create_context`,
     /// modeled as a special case of `restore`/`spawn_actor_with_state` **seeded
     /// from Welcome-derived state**:
     ///
@@ -15852,7 +15877,7 @@ impl Supervisor {
     /// propagates
     /// [`ContextCreationError`](scp_protocol::context::builder::ContextCreationError)
     /// from [`Self::create_context`], including the
-    /// [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)
+    /// [`ContextError::CeilingRequired`]
     /// rejection of an empty ceiling.
     pub async fn create(
         self: &Arc<Self>,
@@ -15964,7 +15989,7 @@ impl Supervisor {
     /// reply. Dispatch is mailbox-only: the command routes through the
     /// per-context actor mailbox, and when no actor is registered for the
     /// target context the call returns a lookup-miss
-    /// [`ContextError`](scp_protocol::context::ContextError) on the reply
+    /// [`ContextError`] on the reply
     /// oneshot rather than mutating supervisor state directly.
     ///
     /// # Errors
@@ -16219,7 +16244,7 @@ impl Supervisor {
     /// via the actor mailbox — test-only (ADR-049 PR-7 / SCP-CRYPTOMOVE-001).
     ///
     /// The steady-state ANSWER half moved off the provider onto
-    /// [`ContextCryptoState::handle_sender_key_request`](crate::context::actor::state::ContextCryptoState::handle_sender_key_request);
+    /// `ContextCryptoState::handle_sender_key_request`;
     /// a taken (actor-owned) context can no longer answer through the emptied
     /// provider. This routes the answer to the actor by `context_id` and returns
     /// the ephemeral-sealed response (`Some`) or `None` for a blocked requester.
@@ -16316,7 +16341,7 @@ impl Supervisor {
     /// # Non-mutating receive-state invariant (§9)
     ///
     /// The actor handler drives ONLY
-    /// [`ContextCryptoState::open`](crate::context::actor::state::ContextCryptoState::open)
+    /// `ContextCryptoState::open`
     /// — a PURE decrypt that surfaces `env.receive_floor` but runs NONE of the
     /// receive-side anti-replay enforcement (`check_and_advance_recv_sequence`,
     /// the Class-M floor registry, `nonce_dedup`, epoch advance) that lives at
@@ -17118,7 +17143,7 @@ struct SagaReserveReject {
 /// RAII release for a saga's per-participant-context-set reservation
 /// (ADR-049 §3a, spec §5.15.4). Holds the exact set of context IDs THIS
 /// saga reserved; on drop it synchronously re-locks
-/// [`Supervisor::reserved_saga_contexts`] and removes precisely those ids.
+/// `Supervisor::reserved_saga_contexts` and removes precisely those ids.
 ///
 /// Drop fires on EVERY terminal path out of [`Supervisor::start_saga`] —
 /// Committed, Aborted, and NeedsRepair — AND on a panic-unwind through the
@@ -18177,6 +18202,79 @@ mod tests {
                 .as_deref(),
             Some(bytes.as_slice()),
             "the stored value is not overwritten"
+        );
+    }
+
+    /// After shutdown, `wrapping_public_key` refuses with `SupervisorShutDown`
+    /// and loads no secret back into the map, though the identity's pair is
+    /// still in storage.
+    #[tokio::test]
+    async fn wrapping_public_key_refuses_after_shutdown_and_loads_no_secret() {
+        let sup = supervisor_with_providers();
+        let did = DID("did:example:wrap-after-shutdown".to_owned());
+        sup.wrapping_public_key(&did).await.unwrap();
+        sup.shutdown_all_contexts().await;
+        assert!(sup.wrapping_keys.is_empty(), "shutdown clears the map");
+
+        let err = sup.wrapping_public_key(&did).await.unwrap_err();
+        assert!(
+            matches!(err, ContextError::SupervisorShutDown(_)),
+            "{err:?}"
+        );
+        assert!(
+            sup.wrapping_keys.is_empty(),
+            "no wrapping secret is resident after shutdown"
+        );
+    }
+
+    /// After shutdown, resolving an identity's KeyPackage store refuses with
+    /// `SupervisorShutDown` and leaves no wrapping secret in the map.
+    #[tokio::test]
+    async fn key_package_store_refuses_after_shutdown_and_loads_no_secret() {
+        let sup = supervisor_with_providers();
+        let did = DID("did:example:kp-after-shutdown".to_owned());
+        sup.shutdown_all_contexts().await;
+
+        let res = sup.key_package_store_for(&did).await.map(|_| ());
+        assert!(
+            matches!(res, Err(ContextError::SupervisorShutDown(_))),
+            "{res:?}"
+        );
+        assert!(
+            sup.wrapping_keys.is_empty(),
+            "no wrapping secret is resident after shutdown"
+        );
+    }
+
+    /// A load that passed the entry check before shutdown and waits on
+    /// `write_lock` while shutdown closes the gate and clears the map is
+    /// refused at its insert: it re-inserts no secret after the clear.
+    #[tokio::test]
+    async fn a_load_in_flight_at_shutdown_inserts_no_secret_after_the_clear() {
+        let sup = supervisor_with_providers();
+        let did = DID("did:example:wrap-in-flight".to_owned());
+        let guard = sup.write_lock.lock().await;
+        let load = tokio::spawn({
+            let sup = Arc::clone(&sup);
+            let did = did.clone();
+            async move { sup.ensure_wrapping_key(&did).await.map(|_| ()) }
+        });
+        // The current-thread runtime runs the load until it blocks on the
+        // held `write_lock`, past its entry gate check.
+        tokio::task::yield_now().await;
+        assert!(!load.is_finished(), "the load waits on write_lock");
+        sup.close_spawn_gate();
+        sup.clear_wrapping_keys(&guard);
+        drop(guard);
+
+        let err = load.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, ContextError::SupervisorShutDown(_)),
+            "{err:?}"
+        );
+        assert!(
+            sup.wrapping_keys.is_empty(),
+            "the in-flight load re-inserts no secret after the clear"
         );
     }
 

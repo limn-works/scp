@@ -25,7 +25,7 @@
 //! # `&OwnedIdentityDid` parameters
 //!
 //! Methods that touch per-identity state take `&OwnedIdentityDid`, not
-//! `&DID`. [`OwnedIdentityDid`](super::identity_capability::OwnedIdentityDid)
+//! `&DID`. `OwnedIdentityDid`
 //! is `pub(in crate::context)` — the SAME name-visibility as these
 //! methods — so naming the type is not what gates these calls. The mint
 //! guarantee rides on two narrower mechanisms: the `pub(super)`
@@ -360,7 +360,7 @@ impl SupervisorHandle {
     ///
     /// # Implementation
     ///
-    /// Fan-out over the actor registry: [`Supervisor::actor_ids`] yields
+    /// Fan-out over the actor registry: `Supervisor::actor_ids` yields
     /// a lock-free snapshot of every registered context id, and for each
     /// id the membership predicate is read through the per-context actor
     /// mailbox via [`Supervisor::is_member`]. The first context where
@@ -902,7 +902,7 @@ impl SupervisorHandle {
     /// operator-facing capability) rather than on any per-context dispatch
     /// path, so ordinary context callers cannot un-poison a context — only
     /// an operator action (or a process restart that re-runs
-    /// [`crate::context::lifecycle_helpers::restore_all_contexts`]) can.
+    /// `crate::context::lifecycle_helpers::restore_all_contexts`) can.
     ///
     /// `owning_did` scopes the rebuilt [`ActorDeps`](crate::context::actor::deps::ActorDeps);
     /// callers pass the local DID performing the recovery.
@@ -910,7 +910,7 @@ impl SupervisorHandle {
     /// # Errors
     ///
     /// Surfaces any error from the respawn (e.g.
-    /// [`ContextError::ActorCrashed`](scp_protocol::context::ContextError::ActorCrashed)
+    /// [`ContextError::ActorCrashed`]
     /// when no snapshot exists to rehydrate).
     pub async fn clear_poison(
         &self,
@@ -934,7 +934,7 @@ impl SupervisorHandle {
     /// # Errors
     ///
     /// Surfaces any error from the re-resolve (e.g.
-    /// [`ContextError::NotInitialized`](scp_protocol::context::ContextError::NotInitialized)
+    /// [`ContextError::NotInitialized`]
     /// when providers are absent).
     pub async fn clear_kp_poison(&self, identity: &DID) -> Result<(), ContextError> {
         self.upgrade()?.clear_kp_poison(identity).await

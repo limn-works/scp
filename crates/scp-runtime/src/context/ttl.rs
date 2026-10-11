@@ -222,7 +222,7 @@ impl TtlExpiryResult {
     /// destroy keys. No step is marked complete; the descriptive error records
     /// why the expiry did nothing.
     ///
-    /// [`handle_ttl_expiry`](crate::context::ttl_close_helpers::handle_ttl_expiry)
+    /// `handle_ttl_expiry`
     /// returns this WITHOUT emitting any `Expired` / `ExpiryFailed` event and
     /// after clearing the stale cached deadline, so the actor neither despawns
     /// nor retry-loops — the FSM is left untouched (`Active`).
@@ -608,12 +608,12 @@ pub async fn finalize_close(
 
 /// Single-call TTL-expiry COMPOSITION.
 ///
-/// Runs the terminal phase ([`apply_ttl_terminal_transition`]) and, if it
-/// transitioned, the bounded-I/O phase ([`finish_ttl_expiry_io`]) back-to-back,
+/// Runs the terminal phase (`apply_ttl_terminal_transition`) and, if it
+/// transitioned, the bounded-I/O phase (`finish_ttl_expiry_io`) back-to-back,
 /// returning a structured result.
 ///
 /// This is NOT the live automatic-expiry path and it is NOT dead code. The live
-/// actor path ([`crate::context::ttl_close_helpers::handle_ttl_expiry`]) drives
+/// actor path (`crate::context::ttl_close_helpers::handle_ttl_expiry`) drives
 /// the two phases SEPARATELY so the fail-closed persist of the terminal
 /// `Expired` state runs OUTSIDE the relay/event-log transport timeout (SEC-1).
 /// This function is the convenient whole-in-one form, and is exercised by this
@@ -975,7 +975,7 @@ impl TtlExpiryResult {
 /// ADR-049 finding A3: the TTL timer is an ACTOR-OWNED arm — this type no
 /// longer spawns or holds a background task. It carries the convergent expiry
 /// `deadline_unix_secs` (recorded by
-/// [`ttl_close_helpers::start_ttl_timer`](crate::context::ttl_close_helpers))
+/// `ttl_close_helpers::start_ttl_timer`)
 /// plus the clock used to compute remaining TTL for persistence snapshots. The
 /// `ContextActor` `run()` loop reconciles a one-shot `sleep` against this
 /// deadline and runs the expiry pipeline on wake.
@@ -1088,7 +1088,7 @@ impl TtlExtension {
     /// non-deterministic order): every member recording the `TtlExtended` leaf
     /// (§5.10.1 step 5) from the same consent tally serialises the identical
     /// `consenting_members` field. Used by
-    /// [`reset_ttl_timer`](crate::context::ttl_close_helpers::reset_ttl_timer)
+    /// `reset_ttl_timer`
     /// to attribute the activation to the members who consented.
     #[must_use]
     pub fn consented_dids(&self) -> Vec<String> {

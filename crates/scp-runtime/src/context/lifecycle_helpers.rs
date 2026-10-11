@@ -4,8 +4,8 @@
 //! # Purpose
 //!
 //! This module hosts lifecycle-domain helpers that operate on actor-owned
-//! [`PerContextState`](crate::context::state::PerContextState) and
-//! capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
+//! [`PerContextState`] and
+//! capability-reduced [`ActorDeps`].
 //! Phase 2A finalization deleted the legacy `&Supervisor` lock-and-call
 //! bodies (and the shim fallback); every lifecycle command now runs
 //! through these actor-shape helpers.
@@ -1575,11 +1575,11 @@ fn rollback_join_economy_ticket(
 /// # Errors
 ///
 /// - [`ContextCreationError::StateTransition`] wrapping
-///   [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)
+///   [`ContextError::CeilingRequired`]
 ///   with [`CeilingDeclaration::Empty`](scp_protocol::context::CeilingDeclaration::Empty)
 ///   when `params.ceiling` is empty, before any context state exists.
 /// - [`ContextCreationError::StateTransition`] wrapping
-///   [`ContextError::VersionIncompatible`](scp_protocol::context::ContextError::VersionIncompatible)
+///   [`ContextError::VersionIncompatible`]
 ///   when the running SDK does not satisfy `params.min_protocol_version`.
 /// - [`ContextCreationError::InvalidCeilingCategory`] when a ceiling entry
 ///   breaks the ceiling-entry grammar (spec §5.3.1.1).
@@ -3844,18 +3844,19 @@ async fn shutdown_sweep(supervisor: &crate::context::supervisor::Supervisor) -> 
     // Supervisor-level state clear. Acquired under the write_lock once
     // for the standing_contexts + local_dids stores so a concurrent
     // reader observes a coherent shutdown rather than a partially-
-    // cleared registry.
+    // cleared registry. The wrapping keys clear under the same guard: a
+    // wrapping-key load in flight inserts only under it, after re-checking
+    // the gate closed above, so none re-inserts a secret after this clear.
     {
-        let _guard = supervisor.write_lock.lock().await;
+        let guard = supervisor.write_lock.lock().await;
         supervisor
             .standing_contexts_ref()
             .store(std::sync::Arc::new(HashMap::new()));
         supervisor
             .local_dids_ref()
             .store(std::sync::Arc::new(HashSet::new()));
+        supervisor.clear_wrapping_keys(&guard);
     }
-
-    supervisor.clear_wrapping_keys();
 
     // TTL / governance timers are ACTOR-OWNED arms (ADR-049 finding A3) and
     // end with their actor's task. Every other supervisor-held task (actor
@@ -3893,7 +3894,7 @@ const SYNC_SHUTDOWN_DRAIN_BOUND: std::time::Duration = std::time::Duration::from
 ///
 /// # Errors
 ///
-/// [`ContextError::InvalidState`](scp_protocol::context::ContextError::InvalidState)
+/// [`ContextError::InvalidState`]
 /// when called outside a tokio runtime: nothing was shut down and nothing was
 /// drained, so the caller must not close the storage backend. The same error
 /// when the tracker drain has not finished within

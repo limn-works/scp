@@ -33,7 +33,7 @@
 //!    signer-state stays inside the actor (`reserved` map). `ConfirmConsume`
 //!    carries the `welcome_bytes`, looks up the reserved signer-state
 //!    internally, and calls
-//!    [`MlsBackend::join_from_welcome`](crate::crypto::mls::backend::MlsBackend::join_from_welcome)
+//!    [`MlsBackend::join_from_welcome`]
 //!    itself, returning the JOIN RESULT (the joined group bytes) — never the
 //!    raw signer-state. There is therefore no held-bytes copy a caller could
 //!    replay, and no zeroization-across-channel gap.
@@ -65,7 +65,7 @@
 //!    `scripts/check-deleted-primitives.sh` rejects its reintroduction.
 //!
 //! The KP private signer-state lives ENTIRELY inside the opaque
-//! [`SignerState`](crate::crypto::mls::backend::SignerState) blob returned by
+//! [`SignerState`] blob returned by
 //! [`MlsBackend::generate_key_package`] (a fresh isolated OpenMLS provider per
 //! KP, serialized) — it is NOT written to any shared OpenMLS keystore. The
 //! actor (in memory) and the durable KP record (at rest) are the only homes
@@ -748,7 +748,7 @@ pub(in crate::context) struct KeyPackageStoreDeps {
 /// Handlers run on the single mailbox loop, so all `&mut self` mutations are
 /// serialized — there are no internal locks. Private signer-state bytes are
 /// wrapped in [`Zeroizing`] so they zero on drop, and they NEVER cross the
-/// reply channel (the join is fused into [`Self::handle_confirm`]).
+/// reply channel (the join is fused into `Self::handle_confirm`).
 pub struct KeyPackageStoreActor {
     /// The identity this actor owns the pool for.
     identity: DID,

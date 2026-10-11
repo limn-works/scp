@@ -9,8 +9,8 @@
 //! # Purpose
 //!
 //! This module hosts broadcast-domain helpers that operate on actor-owned
-//! [`PerContextState`](crate::context::actor::state::PerContextState) and
-//! capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
+//! [`PerContextState`] and
+//! capability-reduced [`ActorDeps`].
 //! The pre-migration `&Supervisor` lock-and-call bodies have been removed
 //! (Phase 2A finalization); this module is the sole home for these helpers.
 //!

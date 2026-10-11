@@ -194,7 +194,7 @@ pub struct ActorDeps {
     /// DIDs controlled by the local node/SDK. `ArcSwap` for lock-free
     /// reads on every `deliver_incoming` (resolve local member).
     /// Sourced from
-    /// [`crate::context::supervisor::Supervisor::local_dids`]: the
+    /// `crate::context::supervisor::Supervisor::local_dids`: the
     /// actor model hoists this set to the supervisor (it was a
     /// per-manager `RwLock<HashSet<DID>>` before the actor refactor)
     /// so every actor shares the same snapshot without each one

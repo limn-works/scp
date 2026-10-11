@@ -1,16 +1,16 @@
 //! Lifecycle handlers — see
-//! [`LifecycleCommand`](crate::context::actor::commands::LifecycleCommand)
+//! [`LifecycleCommand`]
 //! and ADR-049 Phase 2A.9 (`lifecycle` domain migration).
 //!
 //! # Single dispatch entry point
 //!
-//! - [`dispatch`] — actor-shape entry point. Takes `(&mut state,
+//! - `dispatch` — actor-shape entry point. Takes `(&mut state,
 //!   &deps, cmd)` and routes to actor-shape helpers in
-//!   [`crate::context::lifecycle_helpers`] for per-context variants
+//!   `crate::context::lifecycle_helpers` for per-context variants
 //!   (Join / Leave / Close / Export), and to actor-shape helpers in
-//!   [`crate::context::queries_helpers`] for access-key variants
+//!   `crate::context::queries_helpers` for access-key variants
 //!   (Generate / Revoke / Restore). Used from the actor's
-//!   [`dispatch_state`](crate::context::actor::ContextActor::dispatch_state)
+//!   `dispatch_state`
 //!   loop.
 //!
 //! Bootstrap variants (`CreateContext`, `ImportContext`, `RestoreContext`)
@@ -18,7 +18,7 @@
 //! per-context actor that does not yet exist. They are handled by
 //! [`Supervisor::dispatch_lifecycle_direct`](crate::context::supervisor::supervisor::Supervisor)
 //! which delegates to the actor-shape bootstrap helpers in
-//! [`crate::context::lifecycle_helpers`]. If a bootstrap variant
+//! `crate::context::lifecycle_helpers`. If a bootstrap variant
 //! reaches this actor-shape dispatch (because an actor is already
 //! registered for the target context_id — a re-create attempt), the
 //! handler surfaces `ContextError::InvalidState` on the reply oneshot.

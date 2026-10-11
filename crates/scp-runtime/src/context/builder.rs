@@ -9,7 +9,7 @@
 //!
 //! External dependencies (transport, event log) are injected via traits
 //! ([`ContextTransportProvider`], [`ContextEventLogProvider`]). The crypto
-//! layer is the concrete [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory)
+//! layer is the concrete [`NodeMlsFactory`]
 //! — the old `ContextCryptoProvider` trait was deleted in ADR-049 §15;
 //! the builder names the concrete type directly.
 

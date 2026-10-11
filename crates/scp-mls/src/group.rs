@@ -265,7 +265,7 @@ impl ScpMlsGroup {
     /// pending the key-to-WebCrypto move that unifies the key boundary.
     ///
     /// The private scalar NEVER leaves this method: it is extracted with
-    /// [`extract_p256_scalar`], fed to the derivation as the 32-byte ikm, and
+    /// `extract_p256_scalar`, fed to the derivation as the 32-byte ikm, and
     /// dropped (zeroized) here. Only the
     /// resulting routing id (a routing address, not a secret) is returned.
     ///
@@ -279,7 +279,7 @@ impl ScpMlsGroup {
     ///
     /// Returns [`MlsError::GroupDestroyed`] if the group (and thus the signer) has
     /// been destroyed, or [`MlsError::PseudonymDerivationFailed`] if the signer
-    /// fails [`extract_p256_scalar`] (a fail-closed guard against a non-P-256 or
+    /// fails `extract_p256_scalar` (a fail-closed guard against a non-P-256 or
     /// malformed signer; SCP groups are P-256-only per [`SCP_CIPHERSUITE`]).
     pub fn derive_pseudonym(&self, context_id: &[u8]) -> Result<[u8; 32], MlsError> {
         let signer = self.signer_key_pair()?;
@@ -1259,7 +1259,7 @@ fn generate_key_package_inner(
     // `Lifetime::default()` → `Lifetime::new()`, which reads openmls's INTERNAL
     // clock — under the wasm `js` feature `web_time::SystemTime`, an
     // attacker-overridable `Date.now()`. Generation is fully routed. The add paths
-    // (add_member / key_package_in_did / key_package_in_wrapping_key) re-validate
+    // (add_member / key_package_in_did) re-validate
     // accepted `Lifetime`s against the injected clock with the add-side minimum,
     // a received Add (Commit or Proposal) is checked for range only, against no
     // clock, and

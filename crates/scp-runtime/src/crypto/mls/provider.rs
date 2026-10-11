@@ -1,7 +1,7 @@
 //! Production `NodeMlsFactory` implementation backed by `OpenMLS`.
 //!
 //! [`NodeMlsFactory`] bridges the historical inherent API to the actor-era
-//! [`MlsBackend`](super::backend::MlsBackend) primitives. HPKE calls go
+//! [`MlsBackend`] primitives. HPKE calls go
 //! straight to `scp_protocol::crypto::hpke::p256`.
 //!
 //! #2148 (ADR-049 birth-into-actor) — provider per-context-state DISSOLUTION.
@@ -13,7 +13,7 @@
 //! parameter. The birth constructors
 //! ([`NodeMlsFactory::create_mls_group_with_context`],
 //! [`NodeMlsFactory::install_joined_group`]) and the restore seam
-//! ([`NodeMlsFactory::build_restored_owned`]) return
+//! (`NodeMlsFactory::build_restored_owned`) return
 //! [`OwnedMlsCryptoState`] the CREATE / WELCOME / restore caller seeds onto the
 //! spawning actor's `PerContextState` — the actor is the sole per-context crypto
 //! authority. Removing the shared maps closes the #2167 cross-map TOCTOU by
@@ -25,7 +25,7 @@
 //! datapath is lock-free).
 //!
 //! Inline `OpenMLS` calls in primitive paths route through the injected
-//! [`MlsBackend`](super::backend::MlsBackend) so test harnesses can substitute
+//! [`MlsBackend`] so test harnesses can substitute
 //! a fail-injecting backend via [`NodeMlsFactory::with_backends`].
 //!
 //! See ADR-001 for the MLS wrapper design and ADR-007 for sender keys; ADR-049
@@ -241,10 +241,10 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
 /// This is the boundary payload between the provider and the actor. The
 /// provider births it DIRECTLY — [`NodeMlsFactory::create_mls_group_with_context`]
 /// (CREATE), [`NodeMlsFactory::install_joined_group`] (WELCOME), and
-/// [`NodeMlsFactory::build_restored_owned`] (restore / respawn / import) each
+/// `NodeMlsFactory::build_restored_owned` (restore / respawn / import) each
 /// assemble one and return it — and the CREATE / WELCOME / restore caller seeds
 /// it onto the spawning actor's `PerContextState` via
-/// [`seed_encrypted_crypto_from_owned`](crate::context::actor::state::PerContextState::seed_encrypted_crypto_from_owned).
+/// `seed_encrypted_crypto_from_owned`.
 /// The provider holds NO per-context state: there is no `contexts` map, no
 /// insert-then-take round-trip, and no cross-map check-then-insert to race
 /// (#2167 TOCTOU is impossible by construction — the supervisor registry's
@@ -276,7 +276,7 @@ pub struct OwnedMlsCryptoState {
     /// Sender-key epoch counter.
     pub sender_key_epoch: u64,
     /// Send-side sequence counter for this birth/restore payload. A fresh
-    /// birth mints it at `0` (via [`OwnedMlsCryptoState::fresh_birth`],
+    /// birth mints it at `0` (via `OwnedMlsCryptoState::fresh_birth`,
     /// used by `create_mls_group_with_context` / `install_joined_group`);
     /// the restore seam (`build_restored_owned`) carries the persisted
     /// high-water value. There is NO provider `take` — the CREATE / WELCOME /
@@ -359,7 +359,7 @@ impl OwnedMlsCryptoState {
 
 /// Per-context Class-M floors reconstructed from a persisted snapshot.
 ///
-/// Returned by [`NodeMlsFactory::build_restored_owned`](crate::crypto::mls::provider::NodeMlsFactory::build_restored_owned) for the caller to
+/// Returned by `NodeMlsFactory::build_restored_owned` for the caller to
 /// merge into the authoritative Supervisor-owned floor registry (ADR-049 PR-6).
 ///
 /// `restore_crypto_state` installs the MLS group + sender-key MATERIAL into the
@@ -578,7 +578,7 @@ impl NodeMlsFactory {
     /// joiner (because the group carries `0xFF02`, `OpenMLS` (`valn0502`) rejects
     /// any Add whose leaf does not declare `0xFF02` support — pooled key packages
     /// MUST be generated via the context-params path, see
-    /// [`MlsBackend::generate_key_package`](super::backend::MlsBackend::generate_key_package)) —
+    /// [`MlsBackend::generate_key_package`]) —
     /// mints the local sender key via [`generate_sender_key`], and assembles the
     /// [`OwnedMlsCryptoState`] payload DIRECTLY. It touches NO shared provider
     /// map (there is none): `builder::create_context` hands the returned payload

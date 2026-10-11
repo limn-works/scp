@@ -1,13 +1,13 @@
 //! Messaging handlers — hot-path send + deliver over per-context state.
 //!
-//! See [`MessagingCommand`](crate::context::actor::commands::MessagingCommand)
+//! See [`MessagingCommand`]
 //! and plan §"Submodule organization" / row 8 of the commit ladder.
 //!
 //! # Phase 2A.7 — actor-shape dispatch
 //!
-//! The handler's sole entry point [`dispatch`] takes
+//! The handler's sole entry point `dispatch` takes
 //! `(&mut ClassSCell, &ActorDeps, MessagingCommand)` and routes every
-//! variant through [`crate::context::messaging_helpers`] (the
+//! variant through `crate::context::messaging_helpers` (the
 //! actor-shape messaging helpers). The migration-window shim entry
 //! point (`dispatch_from_shim`) and the `messaging_helpers_legacy`
 //! module it routed through were deleted in Phase 2A finalization —
@@ -18,7 +18,7 @@
 //!
 //! `state.send_tracker` is the actor-owned RAII rollback mechanism for
 //! sequence reservations
-//! ([`SequenceReservation`](crate::context::actor::SequenceReservation)).
+//! ([`SequenceReservation`]).
 //! The wire sequence is still driven by
 //! `MembershipState::next_sequence_number` inside the helper body —
 //! `send_tracker` runs in parallel and rolls back on early `?`

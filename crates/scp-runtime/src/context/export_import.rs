@@ -233,7 +233,7 @@ pub struct ContextExport {
     /// verification-method key (ADR-039).
     ///
     /// For [`ExportScope::Public`] exports the signature is computed over the
-    /// stripped snapshot (after [`strip_snapshot_for_public`]); a verifier must
+    /// stripped snapshot (after `strip_snapshot_for_public`); a verifier must
     /// recompute the hash over the bytes it actually received.
     #[serde(with = "serde_bytes")]
     pub snapshot_signature: [u8; 64],
@@ -331,7 +331,7 @@ impl ContextExport {
     /// `subscribers` rosters `BTreeMap`s), so they serialize in content-sorted
     /// order by construction with no canonicalizer to forget.
     ///
-    /// Producer ([`create_export`]) and verifier
+    /// Producer (`create_export`) and verifier
     /// ([`validate_export_for_import`]) both call this method, so they always
     /// agree on the digest. Because the digest is computed over the *current*
     /// contents of `self.snapshot`, a `Public` export (whose snapshot has

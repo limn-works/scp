@@ -9,8 +9,10 @@
 //! panic, so a decoder assertion on peer bytes in any later version is a typed
 //! error in every build profile, in every workspace that builds this crate.
 //!
-//! On wasm32 (`panic = "abort"`) nothing is caught; the browser SDK ships a
-//! release build, where the assertion is compiled out.
+//! On wasm32 (`panic = "abort"`) nothing is caught. `tls_codec` 0.5 has no
+//! assertion to catch there: a hostile length header returns
+//! `InvalidVectorLength` in every profile and on every target, so the
+//! `catch_unwind` stays only as defense in depth against a later decoder.
 //!
 //! No other module may call `tls_deserialize` on these types;
 //! `scripts/check-deleted-primitives.sh` enforces it.
