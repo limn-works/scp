@@ -34,7 +34,7 @@ testing = [
 # signature checks on host returns. Deliberately NOT folded into
 # `resolvers`: these are pure byte/string ops far lighter than the resolver
 # stack. The feature also compiles the custody_file module, which resolves and
-# opens the `"file"` custody key file through `FileKeyCustody` (spec §17.8), a
+# opens the `"encrypted_file"` custody key file (spec 03 §3.2.2) through `FileKeyCustody` (spec §17.8), a
 # production backend that `scp-platform/file` compiles.
 #
 # `scp-platform?/file` uses the `?` form because the plain `scp-platform/file`

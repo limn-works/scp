@@ -5,6 +5,10 @@
 //! - **`validate`** — Input validation (always available, no external deps).
 //!   Used by all FFI bridges (`PyO3`, napi-rs, `UniFFI`).
 //!
+//! - **`custody_request`** — The custody request vocabulary of spec 03
+//!   §3.2.2 (always available, no external deps): one parser every bridge
+//!   calls to read the custody string an identity-creation call passes.
+//!
 //! - **`petname_helpers`** (behind `resolvers` feature) — Shared petname/handle/
 //!   address-resolution helpers: JSON serialization, `HandleTarget` parsing,
 //!   `HandleEntry` conversion, `HandleQuerier` impl, global singletons.
@@ -15,6 +19,7 @@
 //!
 //! See §3.10.10, §9.5, §7.4.1, §22.3.1, §22.4, §22.8 in `.docs/specs/`.
 
+pub mod custody_request;
 pub mod error_codes;
 pub mod outlet_id;
 pub mod p256_host;
@@ -117,9 +122,9 @@ pub mod custody_parse;
 #[cfg(feature = "custody")]
 pub mod callback_custody;
 
-// Resolves `$HOME/.scp/keys.bin` and `SCP_KEY_PASSPHRASE` for `"file"`
-// custody, rejecting an unset, empty or relative HOME and an empty passphrase,
-// then opens the key file. See ADR-006 and spec §17.8.
+// Resolves `$HOME/.scp/keys.bin` and `SCP_KEY_PASSPHRASE` for
+// `"encrypted_file"` custody (spec 03 §3.2.2), rejecting an unset, empty or
+// relative HOME and an empty passphrase, then opens the key file. See ADR-006 and spec §17.8.
 #[cfg(feature = "custody")]
 pub mod custody_file;
 
