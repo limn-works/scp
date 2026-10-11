@@ -517,6 +517,9 @@ fn s3_prefix(raw: Option<OsString>) -> Result<String, StartupError> {
 /// default is `blobs/` when it is unset. The doc comment of [`backend_choice_from_env`] lists each
 /// backend's config variables.
 ///
+/// Each arm logs `using <backend> blob storage` only after its store opens, so
+/// a relay that fails to open its store never logs a backend it does not have.
+///
 /// # Backend availability
 ///
 /// Backend arms are compiled only when the corresponding feature is enabled
@@ -548,32 +551,36 @@ pub async fn storage_from_env(choice: BackendChoice) -> Result<BlobStorageBacken
         #[cfg(feature = "sqlite-blob")]
         BackendChoice::Sqlite => {
             let path = storage_path("sqlite", env::var_os(STORAGE_PATH_VAR))?;
+            let store =
+                BlobStorageBackend::sqlite(&path).map_err(|error| StartupError::StoreOpen {
+                    backend: "sqlite",
+                    error,
+                })?;
             tracing::info!(path = %path.display(), "using sqlite blob storage");
-            BlobStorageBackend::sqlite(&path).map_err(|error| StartupError::StoreOpen {
-                backend: "sqlite",
-                error,
-            })
+            Ok(store)
         }
         #[cfg(feature = "redb-blob")]
         BackendChoice::Redb => {
             let path = storage_path("redb", env::var_os(STORAGE_PATH_VAR))?;
+            let store =
+                BlobStorageBackend::redb(&path).map_err(|error| StartupError::StoreOpen {
+                    backend: "redb",
+                    error,
+                })?;
             tracing::info!(path = %path.display(), "using redb blob storage");
-            BlobStorageBackend::redb(&path).map_err(|error| StartupError::StoreOpen {
-                backend: "redb",
-                error,
-            })
+            Ok(store)
         }
         #[cfg(feature = "postgres-blob")]
         BackendChoice::Postgres => {
             const URL_VAR: &str = "SCP_RELAY_DATABASE_URL";
             let url = required_value("postgres", URL_VAR, env::var_os(URL_VAR))?;
-            tracing::info!("using postgres blob storage");
             let store = crate::native::postgres_blob::PostgresBlobStore::open(&url)
                 .await
                 .map_err(|error| StartupError::StoreOpen {
                     backend: "postgres",
                     error,
                 })?;
+            tracing::info!("using postgres blob storage");
             Ok(BlobStorageBackend::Postgres(store))
         }
         #[cfg(feature = "s3-blob")]
@@ -581,13 +588,13 @@ pub async fn storage_from_env(choice: BackendChoice) -> Result<BlobStorageBacken
             const BUCKET_VAR: &str = "SCP_RELAY_S3_BUCKET";
             let bucket = required_value("s3", BUCKET_VAR, env::var_os(BUCKET_VAR))?;
             let prefix = s3_prefix(env::var_os("SCP_RELAY_S3_PREFIX"))?;
-            tracing::info!(bucket = %bucket, prefix = %prefix, "using s3 blob storage");
             let store = crate::native::s3_blob::S3BlobStore::open(&bucket, &prefix)
                 .await
                 .map_err(|error| StartupError::StoreOpen {
                     backend: "s3",
                     error,
                 })?;
+            tracing::info!(bucket = %bucket, prefix = %prefix, "using s3 blob storage");
             Ok(BlobStorageBackend::S3(store))
         }
         BackendChoice::Memory => {

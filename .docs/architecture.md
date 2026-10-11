@@ -1022,6 +1022,29 @@ Go, C#, and Java SDKs are not currently implemented. The scaffolding directories
 
 ## 4. Build Phases
 
+### 4.0 Definition: Functioning Network
+
+The per-phase Build and Test lists below divide the work into phases. This section states the end-to-end criterion those phases build toward.
+
+A functioning SCP network means two or more nodes can:
+
+1. Start and discover each other via relay
+2. Create and resolve identities (with device attestation where available)
+3. Create contexts with governance policies
+4. Join/leave contexts with MLS-backed encryption
+5. Exchange encrypted messages end-to-end through SDK bindings
+6. Enforce governance mechanically (ceiling, promotion, roles, UCAN)
+7. Persist all state across restarts
+8. Discover contexts, agents, and capabilities
+9. Operate broadcast contexts with per-author sender keys
+10. Block/unblock members with sender key denial + state destruction
+11. Recover from key compromise
+12. Sync after offline periods
+
+Every capability above must work through at least one SDK binding (Python).
+
+The definition above is copied unchanged from the "Definition: Functioning Network" section of the production-readiness execution plan, whose current-state section is dated 2026-03-08. No other tracked file stated the definition. The rest of that plan tracked the production-readiness backlog issue by issue, so the change that deleted the plan moved this definition here. `git log --diff-filter=D --name-only -- '.docs/prod-readiness-*'` finds the commit that deleted the plan.
+
 ### Phase 1: Crypto Proof
 
 **Goal:** Prove the crypto stack works. Two Rust processes exchange encrypted messages through a local SCP relay.

@@ -294,9 +294,10 @@ pub(crate) async fn ucan_validate_on(
             })?;
 
     // Build proof resolver from optional proof tokens.
-    // Uses compute_cid (SHA-256 of encoded JWT) — NOT compute_revocation_cid
-    // (which hashes the parsed payload). The CID must match what is stored in
-    // the proof chain's `prf` field references.
+    // build_proof_resolver keys each proof by compute_cid, the `bafyrei`-prefixed
+    // SHA-256 of the encoded JWT, because the proof chain's `prf` field stores
+    // that form. compute_revocation_cid hashes the same string and returns the
+    // hex digest without the prefix.
     let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
 
     let context_id = handle.context_id();
@@ -808,8 +809,11 @@ pub(crate) fn build_proof_resolver(
     if let Some(tokens) = proof_tokens {
         for encoded in tokens {
             let token = parse_ucan(encoded).map_err(ScpNapiError::from)?;
-            // Use compute_cid (SHA-256 of encoded JWT string) — NOT
-            // compute_revocation_cid (SHA-256 of JSON-serialized payload).
+            // compute_cid and compute_revocation_cid both hash the encoded JWT
+            // string. compute_cid prefixes the 64 hex characters with
+            // `bafyrei`, and compute_revocation_cid returns them bare. A
+            // proof-chain key is the `bafyrei` form, so this call uses
+            // compute_cid.
             let cid = scp_core::crypto::ucan::mint::compute_cid(&token);
             proofs.insert(cid, token);
         }

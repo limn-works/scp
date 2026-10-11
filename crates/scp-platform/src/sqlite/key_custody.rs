@@ -156,8 +156,11 @@ impl SqliteKeyCustody {
         let mut records = HashMap::new();
         let mut max_id: u64 = 0;
 
-        // Load the persisted handle counter. An absent counter is a fresh
-        // store; a counter of any other length is corruption, never zero.
+        // Load the persisted handle counter. An absent counter means no key was
+        // ever allocated. A counter of any length but 8 is corruption: reading
+        // it as 0 would let the counter fall back to the highest surviving ID,
+        // reissuing the handle of a key destroyed after it, so it fails closed
+        // like every other corrupt record below.
         let persisted_next_id = match storage.retrieve(COUNTER_KEY).await? {
             None => 0,
             Some(data) => {
@@ -912,6 +915,72 @@ mod tests {
             let second_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
             assert!(second_handle.id() > first_handle.id());
         }
+    }
+
+    // Construction fails closed on a corrupt persisted record (§17.17.1
+    // SCP-CAPSEL-8001 of `.docs/specs/17-persistence-and-storage.md`):
+    // `SqliteKeyCustody::new` returns `PlatformError::StorageError` and no
+    // custody object.
+
+    /// Opens storage in `dir`, writes `value` at `key`, and returns what
+    /// `SqliteKeyCustody::new` makes of the store afterwards.
+    async fn open_after_writing(
+        dir: &Path,
+        key: &str,
+        value: &[u8],
+    ) -> Result<SqliteKeyCustody, PlatformError> {
+        let db_key = [0x42u8; 32];
+        {
+            let storage = SqliteStorage::new(dir, &db_key).unwrap();
+            storage.store(key, value).await.unwrap();
+        }
+        let storage = SqliteStorage::new(dir, &db_key).unwrap();
+        SqliteKeyCustody::new(storage).await
+    }
+
+    fn expect_storage_error(result: Result<SqliteKeyCustody, PlatformError>, needle: &str) {
+        match result {
+            Err(PlatformError::StorageError(msg)) => assert!(
+                msg.contains(needle),
+                "the error must contain {needle:?}: {msg}"
+            ),
+            Err(other) => panic!("expected PlatformError::StorageError, got {other:?}"),
+            Ok(_) => panic!(
+                "SqliteKeyCustody::new must fail closed on a corrupt record \
+                 (spec §17.17.1 SCP-CAPSEL-8001)"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_on_a_key_record_of_wrong_length_fails_closed_with_storage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = format!("{KEY_PREFIX}1");
+        let result = open_after_writing(dir.path(), &record, &[KEY_TYPE_ED25519; 12]).await;
+        expect_storage_error(result, "invalid length");
+    }
+
+    #[tokio::test]
+    async fn new_on_a_key_record_of_unknown_type_fails_closed_with_storage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = format!("{KEY_PREFIX}1");
+        // A full-length row with a valid role byte, so the type byte is what
+        // the load refuses.
+        let mut value = vec![0xEEu8, KeyRole::Operational.to_byte()];
+        value.extend_from_slice(&[0x07u8; 32]);
+        assert_eq!(value.len(), ROW_LEN);
+        let result = open_after_writing(dir.path(), &record, &value).await;
+        expect_storage_error(result, "unknown type");
+    }
+
+    /// A handle counter of the wrong length is refused rather than read as 0.
+    /// Read as 0, the counter would restart above the highest surviving key
+    /// and reissue the handle of any key destroyed after it.
+    #[tokio::test]
+    async fn new_on_a_handle_counter_of_wrong_length_fails_closed_with_storage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = open_after_writing(dir.path(), COUNTER_KEY, &[0x05u8; 3]).await;
+        expect_storage_error(result, "handle counter has invalid length 3");
     }
 
     #[tokio::test]

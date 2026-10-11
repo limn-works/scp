@@ -50,7 +50,7 @@ These are interleaved within the same sections, sometimes within the same paragr
 - ADRs mix protocol-level decisions with implementation-level decisions (crate layout, trait design, feature flags)
 
 **Conflicts and Inconsistencies:**
-1. **BlobStore naming:** Spec §16/17 uses "BlobStore" trait with "BlobStoreError"; code uses "BlobStorage" with "StorageError". The protocol spec should define the abstract interface; the naming in code is an implementation choice.
+1. ~~**BlobStore naming:** Spec §16/17 uses "BlobStore" trait with "BlobStoreError"; code uses "BlobStorage" with "StorageError". The protocol spec should define the abstract interface; the naming in code is an implementation choice.~~ ✅ **Resolved.** §16 and §17 name the trait `BlobStorage` and its error `StorageError`, the names `crates/scp-transport/src/native/storage.rs` declares, and the in-memory adapter `InMemoryBlobStorage`. The concrete adapter names `SqliteBlobStore`, `RedbBlobStore`, `PostgresBlobStore`, and `S3BlobStore` stay, because each names a struct that exists under that name.
 2. **BlobStore::store signature:** Spec says store() computes blob_id internally; code's BlobStorage::store() receives blob_id from the caller. Protocol spec must define which is normative.
 3. **Handles field:** Spec §22.6.1 added a "handles" field to .well-known/scp, but this was written after SCP-143 (.well-known/scp story) was marked done. The spec is ahead of the implementation. Protocol spec should include it.
 4. **Handle query parameter:** Spec §22.9.1 added a "handle" query parameter to scp:// URIs, but SCP-142 (scp:// URI story) was already done. Same situation — spec is ahead.
@@ -704,7 +704,7 @@ JSON files, one per category, structured as:
 
 7. **Language-neutral test vectors.** See §6 of this plan.
 
-8. **BlobStore interface normalization.** Spec says "BlobStore" with `store()` computing blob_id; code says "BlobStorage" with caller-provided blob_id. Protocol spec must define one canonical interface.
+8. **BlobStore interface normalization.** Spec says "BlobStore" with `store()` computing blob_id; code says "BlobStorage" with caller-provided blob_id. Protocol spec must define one canonical interface. The naming half is resolved (§1.3 item 1); the `store()` half stays open (§1.3 item 2).
 
 ### 7.3 Desirable Gaps (P2 — strengthens the spec)
 

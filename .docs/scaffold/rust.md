@@ -184,7 +184,7 @@ redb = "2"
 | `tracing` | 0.1.x | all crates | Structured logging |
 | `axum` | latest | scp-mcp | HTTP server (MCP SSE transport) |
 | `jsonschema` | latest | scp-core | JSON Schema validation (tool schemas) |
-| `async-trait` | latest | scp-transport, scp-testing | Async trait support (BlobStore, TransportAdapter) |
+| `async-trait` | latest | scp-transport, scp-testing | Async trait support (BlobStorage, TransportAdapter) |
 | `proptest` | 1.x | all crates (dev) | Property-based testing |
 | `scp-testing` | path | all crates (dev) | Network simulation harness, trait conformance macros (§16) |
 | `pyo3` | 0.23+ | crates/scp-ffi/pyo3 | Python FFI |

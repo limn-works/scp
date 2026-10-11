@@ -181,6 +181,21 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [[test]]
+name = "blob_storage_fail_closed"
+path = "tests/blob_storage_fail_closed.rs"
+required-features = ["sqlite-blob", "redb-blob"]
+
+[[test]]
+name = "s3_blob_fail_closed"
+path = "tests/s3_blob_fail_closed.rs"
+required-features = ["s3-blob"]
+
+[[test]]
+name = "postgres_blob_fail_closed"
+path = "tests/postgres_blob_fail_closed.rs"
+required-features = ["postgres-blob"]
+
+[[test]]
 name = "combined_conformance"
 path = "tests/combined_conformance.rs"
 required-features = ["combined"]
