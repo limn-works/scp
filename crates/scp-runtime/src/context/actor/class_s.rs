@@ -287,9 +287,8 @@ use std::ops::Deref;
 use super::deps::ActorDeps;
 use super::sequence::SendSequenceTracker;
 use super::state::{
-    BroadcastReservationId, ClassSState, ContextEventLog, ContextLifecycleState, ContextModeState,
-    ContextRouting, PendingBroadcastPublish, PerContextState, RecvSequenceTracker,
-    WelcomeProcessing,
+    ClassSState, ContextEventLog, ContextLifecycleState, ContextModeState, ContextRouting,
+    PerContextState, RecvSequenceTracker, WelcomeProcessing,
 };
 use crate::context::ContextHandle;
 use crate::context::governance::timeout::DeadlockDetectionState;
@@ -620,8 +619,6 @@ pub(crate) struct ClassCMut<'a> {
     /// §6.2.4). Interface state repopulated when the outlet interface is
     /// re-established — explicitly NOT the Class-S freshness/replay witness.
     xctx_ucan_proofs: &'a mut InMemoryProofResolver,
-    /// `&mut` to the in-flight broadcast-publish reservations (Class-C).
-    pending_broadcast_publishes: &'a mut HashMap<BroadcastReservationId, PendingBroadcastPublish>,
     /// `&mut` to the multi-step Welcome scratchpad (Class-C / structural).
     welcome_scratchpad: &'a mut Option<WelcomeProcessing>,
     /// `&mut` to the actor-internal lifecycle state (Class-C / structural).
@@ -2160,7 +2157,7 @@ impl<'a> ConsequenceStateSplit<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `emit_event`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_class_c_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`, `consequence_split`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `emit_event`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_class_c_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`, `consequence_split`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> ClassCMut<'a> {
     /// Wrap a borrowed [`PerContextState`] by DESTRUCTURING it into the disjoint
@@ -2212,7 +2209,6 @@ impl<'a> ClassCMut<'a> {
             send_tracker,
             recv_tracker,
             xctx_ucan_proofs,
-            pending_broadcast_publishes,
             welcome_scratchpad,
             lifecycle_state,
             mode,
@@ -2246,7 +2242,6 @@ impl<'a> ClassCMut<'a> {
             send_tracker,
             recv_tracker,
             xctx_ucan_proofs,
-            pending_broadcast_publishes,
             welcome_scratchpad,
             lifecycle_state,
             mode,
@@ -2550,15 +2545,6 @@ impl<'a> ClassCMut<'a> {
     /// (`class_s.xctx_nonce_dedup`), so best-effort rollback is acceptable.
     pub(crate) const fn xctx_ucan_proofs_mut(&mut self) -> &mut InMemoryProofResolver {
         self.xctx_ucan_proofs
-    }
-
-    /// `&mut` access to the in-flight broadcast-publish reservations (Class-C).
-    /// Best-effort rollback acceptable; an unapplied reservation rolls its
-    /// sequence back by design.
-    pub(crate) const fn pending_broadcast_publishes_mut(
-        &mut self,
-    ) -> &mut HashMap<BroadcastReservationId, PendingBroadcastPublish> {
-        self.pending_broadcast_publishes
     }
 
     /// `&mut` access to the multi-step Welcome scratchpad (Class-C / structural).

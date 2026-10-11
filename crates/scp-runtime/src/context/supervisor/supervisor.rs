@@ -6647,384 +6647,58 @@ impl Supervisor {
     }
 
     /// Reply to a [`BroadcastCommand`] whose target context has no
-    /// registered actor.
-    ///
-    /// Per-context variants (subscribe/unsubscribe/block/unblock/key
-    /// request/queries) get a typed [`ContextError::ContextNotRegistered`]
-    /// on their reply oneshot. The custody-bound publish variants and the
-    /// two-phase reserve/apply/release variants keep their own typed
-    /// replies (these never reach a per-context actor through this
-    /// no-custody router).
-    fn reply_broadcast_not_registered(cmd: BroadcastCommand) -> Outcome<()> {
+    /// registered actor, with the poison-aware lookup-miss error
+    /// ([`Self::lookup_miss_error`]): `ContextPoisoned` or `ActorCrashed`
+    /// when the context's crash window says so, `ContextNotRegistered`
+    /// otherwise.
+    fn reply_broadcast_lookup_miss(&self, cmd: BroadcastCommand) -> Outcome<()> {
+        let ctx_id = Self::broadcast_command_context_id(&cmd).to_owned();
+        let err = self.lookup_miss_error(&ctx_id, ctx_id.clone());
         match cmd {
-            BroadcastCommand::SubscribeBroadcast { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::SubscribeBroadcast { reply, .. } => reply_lookup_miss(reply, err),
+            BroadcastCommand::UnsubscribeBroadcast { reply, .. } => reply_lookup_miss(reply, err),
+            BroadcastCommand::PublishBroadcast { reply, .. }
+            | BroadcastCommand::PublishBroadcastContent { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::UnsubscribeBroadcast { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::BlockBroadcastSubscriber { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::BlockBroadcastSubscriber { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::UnblockBroadcastSubscriber { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::UnblockBroadcastSubscriber { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::HandleBroadcastKeyRequest { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::HandleBroadcastKeyRequest {
-                context_id, reply, ..
-            } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::BroadcastSubscriberCount { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::BroadcastSubscriberCount { context_id, reply } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            BroadcastCommand::IsBroadcastSubscriber {
-                context_id, reply, ..
-            } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            BroadcastCommand::BroadcastAdmission { context_id, reply } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            // Publish variants require a `KeyCustody` reference that cannot
-            // cross the actor mailbox — route through
-            // `dispatch_broadcast_command_with_custody`. Reaching here means
-            // a caller took the wrong path; surface a typed error.
-            BroadcastCommand::PublishBroadcast { reply, .. } => {
-                const MSG: &str = "BroadcastCommand::PublishBroadcast requires a KeyCustody \
-                     reference; route through \
-                     Supervisor::dispatch_broadcast_command_with_custody (generic over custody)";
-                let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
-                Outcome::err(ContextError::InvalidState(MSG.to_owned()))
-            }
-            BroadcastCommand::PublishBroadcastContent { reply, .. } => {
-                const MSG: &str = "BroadcastCommand::PublishBroadcastContent requires a KeyCustody \
-                     reference; route through \
-                     Supervisor::dispatch_broadcast_command_with_custody (generic over custody)";
-                let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
-                Outcome::err(ContextError::InvalidState(MSG.to_owned()))
-            }
-            // Two-phase publish requires a per-context actor (the
-            // reservation lives in actor-owned state). No actor → typed
-            // not-registered.
-            BroadcastCommand::ReserveBroadcastPublish { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            BroadcastCommand::ApplyBroadcastPublish { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            // No actor → no reservation could have been issued. Idempotent
-            // release: reply Ok so an abort path never errors spuriously.
-            BroadcastCommand::ReleaseBroadcastReservation { reply, .. } => {
-                let _ = reply.send(Ok(()));
-                Outcome::ok(())
-            }
-            // Test-only seed seam — context must exist.
+            BroadcastCommand::IsBroadcastSubscriber { reply, .. } => reply_lookup_miss(reply, err),
+            BroadcastCommand::BroadcastAdmission { reply, .. } => reply_lookup_miss(reply, err),
             #[cfg(feature = "testing")]
-            BroadcastCommand::SeedBroadcastAuthor {
-                context_id, reply, ..
-            } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
+            BroadcastCommand::SeedBroadcastAuthor { reply, .. } => reply_lookup_miss(reply, err),
         }
     }
 
-    /// Dispatch a [`BroadcastCommand`] for every non-publish variant.
+    /// Dispatch a [`BroadcastCommand`] through the target context's actor
+    /// mailbox.
     ///
-    /// Publish variants require a
-    /// [`KeyCustody`](scp_platform::KeyCustody) reference that cannot
-    /// cross the actor mailbox (RPITIT trait, not `dyn`-safe); use
-    /// [`Self::dispatch_broadcast_command_with_custody`] for publish.
+    /// The publish variants carry the author's `CommandSigner` and sign
+    /// inside the actor turn (ADR-049 Decision 7a).
     ///
     /// # Errors
     ///
-    /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`] has
-    ///   been attached yet.
+    /// - [`ContextError::ChannelClosed`] or a mailbox error when the actor
+    ///   is registered but cannot take the command. An absent, poisoned or
+    ///   crashed actor is reported on the command's reply channel.
     pub async fn dispatch_broadcast_command(
         &self,
         cmd: BroadcastCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // Try the actor mailbox first. Post-Step-B every valid context
-        // has a registered actor, so the per-context broadcast handlers
-        // run on the actor. Reaching the fallback means no actor is
-        // registered for the target context — surface a typed
-        // `ContextNotRegistered` on the command's reply oneshot.
-        if let Some(ctx_id) = Self::broadcast_command_context_id(&cmd)
-            && let Some(actor) = self.lookup(ctx_id)
-        {
+        if let Some(actor) = self.lookup(Self::broadcast_command_context_id(&cmd)) {
             return Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(cmd)).await;
         }
-        Ok(Self::reply_broadcast_not_registered(cmd))
-    }
-
-    /// Dispatch a [`BroadcastCommand`] with an explicit key custody
-    /// reference (ADR-049 §15 / plan row 11).
-    ///
-    /// # Why a custody-generic shim still exists
-    ///
-    /// [`KeyCustody`](scp_platform::KeyCustody) is an RPITIT trait whose
-    /// methods return `impl Future` — it is not `dyn`-safe, so a custody
-    /// reference cannot be erased and shipped across the actor mailbox.
-    /// The publish variants (`PublishBroadcast`, `PublishBroadcastContent`)
-    /// need the caller's custody to derive the sender key, and so they
-    /// remain on this generic shim path for the foreseeable future.
-    ///
-    /// # Routing
-    ///
-    /// - **Non-publish variants** (`Subscribe`, `Unsubscribe`, `Block`,
-    ///   `Unblock`, key request, queries) have a per-context owner and a
-    ///   `context_id` surfaced by
-    ///   `Self::broadcast_command_context_id`. They route through the
-    ///   per-context actor mailbox.
-    /// - **Publish variants** are intentionally returned as `None` from
-    ///   `broadcast_command_context_id`, fall through the mailbox check,
-    ///   and dispatch on the custody-generic shim below.
-    ///
-    /// This split is permanent: only the publish path needs custody; the
-    /// rest is identical to [`Self::dispatch_broadcast_command`].
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`] has
-    ///   been attached yet.
-    pub async fn dispatch_broadcast_command_with_custody<C: scp_platform::KeyCustody>(
-        &self,
-        cmd: BroadcastCommand,
-        custody: &C,
-    ) -> Result<Outcome<()>, ContextError> {
-        // Publish variants drive the two-phase reservation flow: the
-        // actor reserves the sequence (phase 1), the supervisor signs
-        // with the caller's custody OUTSIDE the actor, then the actor
-        // seals (phase 2). The custody never crosses the mailbox; both
-        // mailbox phases are custody-free. This removes the legacy
-        // DashMap read the single-phase shim used.
-        match cmd {
-            BroadcastCommand::PublishBroadcast { payload, reply } => {
-                let p = *payload;
-                self.publish_broadcast_two_phase(
-                    p.context_id,
-                    p.author_did,
-                    p.payload,
-                    &p.signing_key_handle,
-                    custody,
-                    reply,
-                )
-                .await
-            }
-            BroadcastCommand::PublishBroadcastContent { payload, reply } => {
-                let p = *payload;
-                let payload_bytes =
-                    match scp_protocol::context::broadcast_content::serialize_broadcast_content(
-                        &p.content,
-                    ) {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            let msg = format!("content serialization failed: {e}");
-                            let _ = reply.send(Err(ContextError::CryptoFailed(msg.clone())));
-                            return Ok(Outcome::err(ContextError::CryptoFailed(msg)));
-                        }
-                    };
-                self.publish_broadcast_two_phase(
-                    p.context_id,
-                    p.author_did,
-                    payload_bytes,
-                    &p.signing_key_handle,
-                    custody,
-                    reply,
-                )
-                .await
-            }
-            // Non-publish variants are custody-free and route straight
-            // through the per-context actor mailbox.
-            other => {
-                if let Some(ctx_id) = Self::broadcast_command_context_id(&other)
-                    && let Some(actor) = self.lookup(ctx_id)
-                {
-                    return Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(other))
-                        .await;
-                }
-                // No registered actor — surface a typed not-registered
-                // error on the command's reply oneshot. (Publish variants
-                // are handled above and never reach here; non-publish
-                // variants need no custody.)
-                Ok(Self::reply_broadcast_not_registered(other))
-            }
-        }
-    }
-
-    /// Drive the two-phase broadcast publish across the actor mailbox.
-    ///
-    /// Phase 1 (`ReserveBroadcastPublish`) and phase 2
-    /// (`ApplyBroadcastPublish`) are custody-free mailbox commands; the
-    /// signing happens here, between them, with the caller's custody.
-    /// A reservation that cannot be applied (no actor, signing failure,
-    /// apply failure) is released via `ReleaseBroadcastReservation` so
-    /// the reserved sequence is not burned. The final
-    /// [`BroadcastEnvelope`](scp_protocol::crypto::sender_keys::BroadcastEnvelope)
-    /// (or error) is forwarded to the caller's `reply` channel.
-    async fn publish_broadcast_two_phase<C: scp_platform::KeyCustody>(
-        &self,
-        context_id: String,
-        author_did: DID,
-        payload: Vec<u8>,
-        signing_key_handle: &scp_platform::KeyHandle,
-        custody: &C,
-        reply: crate::context::actor::commands::PublishBroadcastReply,
-    ) -> Result<Outcome<()>, ContextError> {
-        use crate::context::actor::commands::{
-            ApplyBroadcastPublishPayload, ReserveBroadcastPublishPayload,
-        };
-
-        // Resolve the actor up front. Publish requires a registered
-        // per-context actor (the reservation lives in actor-owned state). On a
-        // miss, route through `lookup_miss_error` so a poisoned / silently-
-        // dead context surfaces the dedicated poison error rather than a
-        // misleading `ContextNotRegistered` (ADR-049 §10). The error is built
-        // twice (reply + outcome sketch) because `ContextError` is not
-        // `Clone`; both calls observe the same poison index.
-        let Some(actor) = self.lookup(&context_id) else {
-            let _ = reply.send(Err(self.lookup_miss_error(&context_id, context_id.clone())));
-            return Ok(Outcome::err(
-                self.lookup_miss_error(&context_id, context_id.clone()),
-            ));
-        };
-
-        // Phase 1 — reserve the sequence and get the signing payload.
-        let (reserve_tx, reserve_rx) = tokio::sync::oneshot::channel();
-        let reserve_cmd = BroadcastCommand::ReserveBroadcastPublish {
-            payload: Box::new(ReserveBroadcastPublishPayload {
-                context_id: context_id.clone(),
-                author_did: author_did.clone(),
-            }),
-            reply: reserve_tx,
-        };
-        Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(reserve_cmd)).await?;
-        let reservation = match bounded_reply_await(reserve_rx).await {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(e)) => {
-                // Operation-level error already typed by the handler;
-                // forward to the caller. The dispatch itself succeeded.
-                let _ = reply.send(Err(e));
-                return Ok(Outcome::ok_mutated(()));
-            }
-            Err(_) => {
-                let msg = "broadcast reserve reply channel closed".to_owned();
-                let _ = reply.send(Err(ContextError::InvalidState(msg.clone())));
-                return Ok(Outcome::err(ContextError::InvalidState(msg)));
-            }
-        };
-
-        // Sign OUTSIDE the actor with the caller's custody.
-        let signature = match custody
-            .sign(signing_key_handle, &reservation.signing_payload)
-            .await
-        {
-            Ok(sig) => sig.as_bytes().to_vec(),
-            Err(e) => {
-                // Signing failed — release the reservation so the
-                // sequence is reusable, then surface the error.
-                self.release_broadcast_reservation(&actor, context_id, reservation.reservation_id)
-                    .await;
-                let _ = reply.send(Err(ContextError::Custody((&e).into())));
-                return Ok(Outcome::ok_mutated(()));
-            }
-        };
-
-        // Phase 2 — apply the reservation with the signature.
-        let (apply_tx, apply_rx) = tokio::sync::oneshot::channel();
-        let apply_cmd = BroadcastCommand::ApplyBroadcastPublish {
-            payload: Box::new(ApplyBroadcastPublishPayload {
-                context_id: context_id.clone(),
-                reservation_id: reservation.reservation_id.clone(),
-                signature,
-                payload,
-            }),
-            reply: apply_tx,
-        };
-        Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(apply_cmd)).await?;
-        match bounded_reply_await(apply_rx).await {
-            Ok(Ok(envelope)) => {
-                let _ = reply.send(Ok(envelope));
-                Ok(Outcome::ok_mutated(()))
-            }
-            Ok(Err(e)) => {
-                // Apply itself released the reservation on its error
-                // paths; nothing more to do here.
-                let _ = reply.send(Err(e));
-                Ok(Outcome::ok_mutated(()))
-            }
-            Err(_) => {
-                // Apply reply channel closed without a result — release
-                // defensively in case the reservation is still live.
-                self.release_broadcast_reservation(&actor, context_id, reservation.reservation_id)
-                    .await;
-                let msg = "broadcast apply reply channel closed".to_owned();
-                let _ = reply.send(Err(ContextError::InvalidState(msg.clone())));
-                Ok(Outcome::err(ContextError::InvalidState(msg)))
-            }
-        }
-    }
-
-    /// Send a best-effort `ReleaseBroadcastReservation` to the actor so a
-    /// reservation that will never be applied does not burn its sequence.
-    /// Errors are swallowed — the snapshot floor is the crash-safe
-    /// backstop; this is the in-process fast path.
-    async fn release_broadcast_reservation(
-        &self,
-        actor: &ContextActorHandle,
-        context_id: String,
-        reservation_id: crate::context::actor::state::BroadcastReservationId,
-    ) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = BroadcastCommand::ReleaseBroadcastReservation {
-            payload: Box::new(
-                crate::context::actor::commands::ReleaseBroadcastReservationPayload {
-                    context_id,
-                    reservation_id,
-                },
-            ),
-            reply: tx,
-        };
-        if Self::dispatch_via_mailbox(actor, ContextCommand::Broadcast(cmd))
-            .await
-            .is_ok()
-        {
-            let _ = bounded_reply_await(rx).await;
-        }
+        Ok(self.reply_broadcast_lookup_miss(cmd))
     }
 
     /// Start a cross-context saga. See plan §"Cross-context saga
@@ -15962,7 +15636,6 @@ impl Supervisor {
                 // Fix-D streaming reservation recovery: a fresh joiner carries none.
                 stream_reservations: HashMap::new(),
             },
-            pending_broadcast_publishes: HashMap::new(),
             // Transient join-handshake state; the fused join already consumed
             // it, so a fresh joiner state carries none.
             welcome_scratchpad: None,
@@ -17024,43 +16697,26 @@ impl Supervisor {
         }
     }
 
-    /// Extract the target context_id from a [`BroadcastCommand`].
-    /// Publish variants are deliberately excluded because they require
-    /// the custody-generic shim path.
-    fn broadcast_command_context_id(cmd: &BroadcastCommand) -> Option<&str> {
+    /// Extract the target context_id from a [`BroadcastCommand`]. Every
+    /// variant names its context.
+    fn broadcast_command_context_id(cmd: &BroadcastCommand) -> &str {
         match cmd {
-            BroadcastCommand::SubscribeBroadcast { payload, .. } => {
-                Some(payload.context_id.as_str())
-            }
-            BroadcastCommand::UnsubscribeBroadcast { payload, .. } => {
-                Some(payload.context_id.as_str())
+            BroadcastCommand::SubscribeBroadcast { payload, .. } => payload.context_id.as_str(),
+            BroadcastCommand::UnsubscribeBroadcast { payload, .. } => payload.context_id.as_str(),
+            BroadcastCommand::PublishBroadcast { payload, .. } => payload.context_id.as_str(),
+            BroadcastCommand::PublishBroadcastContent { payload, .. } => {
+                payload.context_id.as_str()
             }
             BroadcastCommand::BlockBroadcastSubscriber { payload, .. }
             | BroadcastCommand::UnblockBroadcastSubscriber { payload, .. } => {
-                Some(payload.context_id.as_str())
+                payload.context_id.as_str()
             }
             BroadcastCommand::HandleBroadcastKeyRequest { context_id, .. }
             | BroadcastCommand::BroadcastSubscriberCount { context_id, .. }
             | BroadcastCommand::IsBroadcastSubscriber { context_id, .. }
-            | BroadcastCommand::BroadcastAdmission { context_id, .. } => Some(context_id.as_str()),
-            // Two-phase publish is custody-free — both phases route
-            // through the per-context actor mailbox.
-            BroadcastCommand::ReserveBroadcastPublish { payload, .. } => {
-                Some(payload.context_id.as_str())
-            }
-            BroadcastCommand::ApplyBroadcastPublish { payload, .. } => {
-                Some(payload.context_id.as_str())
-            }
-            BroadcastCommand::ReleaseBroadcastReservation { payload, .. } => {
-                Some(payload.context_id.as_str())
-            }
-            // Test-only seed seam — routed to the per-context actor.
+            | BroadcastCommand::BroadcastAdmission { context_id, .. } => context_id.as_str(),
             #[cfg(feature = "testing")]
-            BroadcastCommand::SeedBroadcastAuthor { context_id, .. } => Some(context_id.as_str()),
-            // PublishBroadcast / PublishBroadcastContent need
-            // KeyCustody on the shim, so they have no string target for
-            // this custody-free router.
-            _ => None,
+            BroadcastCommand::SeedBroadcastAuthor { context_id, .. } => context_id.as_str(),
         }
     }
 
@@ -17225,6 +16881,17 @@ impl Supervisor {
 /// `outcome_error_sketch` pattern used in `handlers::*`. Kept in
 /// `supervisor.rs` to scope the helper to the standing-direct dispatch
 /// path; the actor handlers each carry their own equivalent sketch.
+/// Sends `err` on a broadcast command's reply channel and returns the
+/// matching error outcome.
+fn reply_lookup_miss<T>(
+    reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+    err: ContextError,
+) -> Outcome<()> {
+    let sketch = standing_outcome_error_sketch(&err);
+    let _ = reply.send(Err(err));
+    Outcome::err(sketch)
+}
+
 fn standing_outcome_error_sketch(err: &ContextError) -> ContextError {
     match err {
         ContextError::TransportTimeout(msg) => ContextError::TransportTimeout(msg.clone()),
@@ -23403,32 +23070,28 @@ mod tests {
             .expect("a recovered identity resolves a live handle");
     }
 
-    /// Two concurrent broadcast publishes reserve DISTINCT sequences
-    /// through the actor mailbox.
-    ///
-    /// This is the end-to-end witness for the two-phase reservation
-    /// guarantee (ADR-049 §SequenceReservation): both `ReserveBroadcastPublish`
-    /// commands ride the per-context actor mailbox and are serialized by
-    /// the actor's command loop, so even when both are issued before
-    /// either applies, the reserved sequences never collide. The
-    /// single-phase shim could not close this hazard because a concurrent
-    /// publish could read the same `next_sequence` between snapshot and
-    /// seal.
+    /// Two publishes through `dispatch_broadcast_command` each sign inside
+    /// the actor turn with the payload's `CommandSigner`, take consecutive
+    /// sequences, and produce envelopes whose signatures verify against the
+    /// signer's key.
     #[tokio::test]
-    async fn concurrent_reserve_broadcast_publish_yields_distinct_sequences() {
-        use crate::context::actor::commands::ReserveBroadcastPublishPayload;
+    async fn publish_broadcast_dispatches_through_mailbox() {
+        use crate::context::actor::commands::PublishBroadcastPayload;
+        use crate::context::actor::signer::CommandSigner;
 
         let supervisor_arc = supervisor_with_providers();
-        let deps = test_actor_deps(&supervisor_arc).await;
+        let mut deps = test_actor_deps(&supervisor_arc).await;
+        // The test supervisor's transport refuses sends; publish delivers
+        // the sealed envelope, so this actor gets one that accepts them.
+        deps.transport = Arc::new(crate::context::builder::LocalTransportProvider);
 
         let ctx_id_bytes = [0xC0u8; 32];
         let ctx_key = hex::encode(ctx_id_bytes);
         let author = DID("did:example:author".to_owned());
 
-        // Build a broadcast-mode state with the author registered (so
-        // `can_write` passes) and present in membership (so the apply
-        // phase's per-sender sequence assignment can resolve). Transition
-        // the handle to Active so `require_active` passes.
+        // A broadcast-mode state with the author registered (so the
+        // reservation passes) and present in membership (so the seal's
+        // per-sender sequence resolves), in the Active state.
         let mut state = crate::context::actor::state::PerContextState::new_for_test_broadcast(
             ctx_id_bytes,
             1_700_000_000,
@@ -23454,48 +23117,73 @@ mod tests {
             .spawn_actor_with_state(state, deps, None)
             .await
             .expect("spawn_actor_with_state: fresh context id registers");
-        assert!(supervisor_arc.lookup(&ctx_key).is_some());
 
-        // Issue two reservations back-to-back via the mailbox.
-        let reserve = |author: DID| {
-            let ctx_key = ctx_key.clone();
-            let supervisor_arc = Arc::clone(&supervisor_arc);
-            async move {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let cmd = BroadcastCommand::ReserveBroadcastPublish {
-                    payload: Box::new(ReserveBroadcastPublishPayload {
-                        context_id: ctx_key,
-                        author_did: author,
-                    }),
-                    reply: tx,
-                };
-                if let Some(actor) = supervisor_arc.lookup(
-                    Supervisor::broadcast_command_context_id(&cmd)
-                        .expect("publish carries a context id"),
-                ) {
-                    Supervisor::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(cmd))
-                        .await
-                        .expect("mailbox dispatch succeeds");
-                }
-                rx.await.expect("reserve reply").expect("reserve succeeds")
-            }
-        };
+        let signer =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]));
+        let verifying_key = signer.verifying_key().expect("Ed25519 signer");
 
-        let r1 = reserve(author.clone()).await;
-        let r2 = reserve(author.clone()).await;
+        let mut envelopes = Vec::new();
+        for body in [b"first".as_slice(), b"second".as_slice()] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::PublishBroadcast {
+                payload: Box::new(PublishBroadcastPayload {
+                    context_id: ctx_key.clone(),
+                    author_did: author.clone(),
+                    payload: body.to_vec(),
+                    signer: signer.clone(),
+                }),
+                reply: tx,
+            };
+            supervisor_arc
+                .dispatch_broadcast_command(cmd)
+                .await
+                .expect("mailbox dispatch succeeds");
+            envelopes.push(rx.await.expect("publish reply").expect("publish succeeds"));
+        }
 
-        assert_ne!(
-            r1.reservation_id, r2.reservation_id,
-            "each reservation gets a unique id",
+        assert_eq!(
+            envelopes[1].sequence,
+            envelopes[0].sequence + 1,
+            "the mailbox serializes publishes onto consecutive sequences",
         );
+        for envelope in &envelopes {
+            crate::context::broadcast_helpers::check_envelope_signed_by(envelope, &verifying_key)
+                .expect("each envelope verifies under the custody key");
+        }
 
-        // Both reservations are live in actor-owned state; release them to
-        // confirm the actor accepts the release mailbox command. The core
-        // assertion is that the two reservations are distinct — proven by
-        // the distinct ids and by the protocol-layer
-        // `concurrent_reservations_get_distinct_sequences` test that pins
-        // the sequence values themselves.
         handle.send_shutdown().await.expect("handle is live");
+    }
+
+    /// A broadcast command for a context with no registered actor replies
+    /// `ContextNotRegistered` on its own channel, publish included.
+    #[tokio::test]
+    async fn publish_broadcast_without_actor_replies_not_registered() {
+        use crate::context::actor::commands::PublishBroadcastPayload;
+        use crate::context::actor::signer::CommandSigner;
+
+        let supervisor_arc = supervisor_with_providers();
+        let ctx_key = hex::encode([0xC1u8; 32]);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::PublishBroadcast {
+            payload: Box::new(PublishBroadcastPayload {
+                context_id: ctx_key.clone(),
+                author_did: DID("did:example:author".to_owned()),
+                payload: b"x".to_vec(),
+                signer: CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(
+                    &[0x42; 32],
+                )),
+            }),
+            reply: tx,
+        };
+        let outcome = supervisor_arc
+            .dispatch_broadcast_command(cmd)
+            .await
+            .expect("an absent actor is reported on the reply channel");
+        assert!(outcome.result.is_err(), "the outcome carries the miss");
+        match rx.await.expect("publish reply") {
+            Err(ContextError::ContextNotRegistered(id)) => assert_eq!(id, ctx_key),
+            other => panic!("expected ContextNotRegistered, got {other:?}"),
+        }
     }
 
     // =================================================================

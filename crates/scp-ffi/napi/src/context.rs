@@ -2971,10 +2971,11 @@ pub(crate) async fn broadcast_publish_on(
         })
     })?;
 
-    // Route through the ADR-049 broadcast dispatch surface with custody.
-    // Publish requires the custody-bearing variant because the
-    // `KeyCustody` trait is not dyn-safe and cannot cross the actor
-    // mailbox.
+    // The publish signs inside the actor turn through this signer (ADR-049
+    // Decision 7a); the private key stays in custody.
+    let signer = scp_ffi_common::signer::identity_command_signer(Arc::clone(custody), signing_key)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     let sup = crate::runtime::supervisor(bi)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cmd = BroadcastCommand::PublishBroadcast {
@@ -2982,11 +2983,11 @@ pub(crate) async fn broadcast_publish_on(
             context_id,
             author_did,
             payload,
-            signing_key_handle: signing_key,
+            signer,
         }),
         reply: tx,
     };
-    sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
+    sup.dispatch_broadcast_command(cmd)
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     rx.await
@@ -3116,7 +3117,11 @@ pub(crate) async fn broadcast_publish_asset_on(
         })
     })?;
 
-    // Route through the ADR-049 commit-11 broadcast shim with custody.
+    // The publish signs inside the actor turn through this signer (ADR-049
+    // Decision 7a); the private key stays in custody.
+    let signer = scp_ffi_common::signer::identity_command_signer(Arc::clone(custody), signing_key)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     let sup = crate::runtime::supervisor(bi)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cmd = BroadcastCommand::PublishBroadcastContent {
@@ -3124,11 +3129,11 @@ pub(crate) async fn broadcast_publish_asset_on(
             context_id,
             author_did: author_did_val,
             content,
-            signing_key_handle: signing_key,
+            signer,
         }),
         reply: tx,
     };
-    sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
+    sup.dispatch_broadcast_command(cmd)
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     let envelope = rx
@@ -3217,8 +3222,11 @@ pub(crate) async fn broadcast_publish_assets_on(
         })
     })?;
 
-    // Route each asset through the ADR-049 commit-11 broadcast shim
-    // with custody.
+    // The publish signs inside the actor turn through this signer (ADR-049
+    // Decision 7a); the private key stays in custody.
+    let signer = scp_ffi_common::signer::identity_command_signer(Arc::clone(custody), signing_key)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     let sup = crate::runtime::supervisor(bi)?;
     let mut results = Vec::with_capacity(assets.len());
     for asset in assets {
@@ -3254,11 +3262,11 @@ pub(crate) async fn broadcast_publish_assets_on(
                 context_id: context_id.clone(),
                 author_did: author_did_val.clone(),
                 content,
-                signing_key_handle: signing_key,
+                signer: signer.clone(),
             }),
             reply: tx,
         };
-        sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
+        sup.dispatch_broadcast_command(cmd)
             .await
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let envelope = rx

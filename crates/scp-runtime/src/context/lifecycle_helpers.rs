@@ -1860,7 +1860,6 @@ pub async fn create_context(
             // Fix-D streaming reservation recovery records: fresh on create.
             stream_reservations: HashMap::new(),
         },
-        pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
         event_log: None,
@@ -2844,7 +2843,6 @@ pub async fn import_context(
             // Fix-D streaming reservation recovery records: fresh on create.
             stream_reservations: HashMap::new(),
         },
-        pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
         event_log: None,
@@ -3518,7 +3516,6 @@ pub async fn restore_context(
             // node public export strips this map (invoker economy is local).
             stream_reservations: ctx_snapshot.stream_reservations,
         },
-        pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
         event_log: None,

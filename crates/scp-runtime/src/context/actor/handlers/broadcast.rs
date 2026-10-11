@@ -12,24 +12,16 @@
 //! [`ContextError::ContextNotRegistered`]
 //! by the supervisor's no-actor fallback.
 //!
-//! # Publish + key-custody plumbing (two-phase reservation)
+//! # Publish signing (ADR-049 Decision 7a)
 //!
-//! The publish entry points in `broadcast_helpers` take
-//! `custody: &impl KeyCustody`. Because
-//! [`KeyCustody`](scp_platform::KeyCustody) uses RPITIT (not
-//! `dyn`-safe), the actor mailbox cannot carry a custody reference
-//! directly — and the actor must not hold `&mut PerContextState` across
-//! an arbitrary-duration host-language `custody.sign().await`. Publish is
-//! therefore split into two custody-free mailbox commands plus a release:
-//! [`BroadcastCommand::ReserveBroadcastPublish`] reserves the sequence and
-//! returns the signing-payload digest; the supervisor signs OUTSIDE the
-//! actor with the caller's custody (see
-//! [`Supervisor::dispatch_broadcast_command_with_custody`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command_with_custody));
-//! [`BroadcastCommand::ApplyBroadcastPublish`] seals the reserved
-//! sequence. A reservation that is never applied is rolled back via
-//! [`BroadcastCommand::ReleaseBroadcastReservation`]. Each mailbox phase
-//! holds `&mut PerContextState` only briefly, and concurrent publishes
-//! each reserve a distinct sequence.
+//! [`BroadcastCommand::PublishBroadcast`] and
+//! [`BroadcastCommand::PublishBroadcastContent`] carry the author's
+//! `CommandSigner`. The handler reserves the author's broadcast sequence,
+//! signs the broadcast signing payload through `sign_bounded`, and seals in
+//! one actor turn, under [`SIGNING_HANDLER_TIMEOUT`]. A refused or timed-out
+//! sign rolls the reservation back in the same turn, and the mailbox
+//! serializes publishes, so two publishes never share a sequence. A publish
+//! stalls its own context for up to `SIGN_TIMEOUT` while custody answers.
 
 use std::time::Duration;
 
@@ -42,14 +34,14 @@ use tokio::sync::oneshot;
 
 use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::commands::{
-    ApplyBroadcastPublishPayload, BlockBroadcastSubscriberReply, BroadcastAdmissionReply,
-    BroadcastBlockPayload, BroadcastCommand, HandleBroadcastKeyRequestReply, PublishBroadcastReply,
-    ReleaseBroadcastReservationPayload, ReserveBroadcastPublishPayload,
-    ReserveBroadcastPublishReply, SubscribeBroadcastPayload, SubscribeBroadcastReply,
-    UnsubscribeBroadcastPayload, UnsubscribeBroadcastReply,
+    BlockBroadcastSubscriberReply, BroadcastAdmissionReply, BroadcastBlockPayload,
+    BroadcastCommand, HandleBroadcastKeyRequestReply, PublishBroadcastReply,
+    SubscribeBroadcastPayload, SubscribeBroadcastReply, UnsubscribeBroadcastPayload,
+    UnsubscribeBroadcastReply,
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
+use crate::context::actor::signer::{CommandSigner, SIGNING_HANDLER_TIMEOUT};
 use crate::context::economy_logic::{ContextRevocationChecker, KeyResolverDidResolver};
 
 /// Per-call transport budget for broadcast handlers.
@@ -57,13 +49,8 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Dispatch a [`BroadcastCommand`] against actor-owned cell and deps.
 ///
-/// The single-shot `PublishBroadcast` / `PublishBroadcastContent`
-/// variants require a key custody reference which cannot cross the actor
-/// mailbox; this entry point rejects them with a typed error directing
-/// the caller to the two-phase reserve/apply path. The custody-free
-/// `ReserveBroadcastPublish` / `ApplyBroadcastPublish` /
-/// `ReleaseBroadcastReservation` variants ARE handled here against
-/// actor-owned cell.
+/// The publish variants sign through the payload's `CommandSigner` inside
+/// this turn (ADR-049 Decision 7a); see the module docs.
 pub(crate) async fn dispatch(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
@@ -119,26 +106,30 @@ async fn dispatch_inner(
         BroadcastCommand::BroadcastAdmission { context_id, reply } => {
             handle_broadcast_admission(cell, &context_id, reply).await
         }
-        BroadcastCommand::PublishBroadcast { reply, .. } => {
-            const MSG: &str = "BroadcastCommand::PublishBroadcast requires a KeyCustody reference; \
-                 route through Supervisor::dispatch_broadcast_command_with_custody (generic over custody)";
-            let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
-            Outcome::err(ContextError::InvalidState(MSG.to_owned()))
+        BroadcastCommand::PublishBroadcast { payload, reply } => {
+            let p = *payload;
+            let publish = PublishRequest {
+                context_id: &p.context_id,
+                author_did: &p.author_did,
+                payload: Ok(p.payload),
+                signer: &p.signer,
+            };
+            handle_publish_broadcast(cell, deps, publish, reply).await
         }
-        BroadcastCommand::PublishBroadcastContent { reply, .. } => {
-            const MSG: &str = "BroadcastCommand::PublishBroadcastContent requires a KeyCustody reference; \
-                 route through Supervisor::dispatch_broadcast_command_with_custody (generic over custody)";
-            let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
-            Outcome::err(ContextError::InvalidState(MSG.to_owned()))
-        }
-        BroadcastCommand::ReserveBroadcastPublish { payload, reply } => {
-            handle_reserve_broadcast_publish(cell, deps, *payload, reply).await
-        }
-        BroadcastCommand::ApplyBroadcastPublish { payload, reply } => {
-            handle_apply_broadcast_publish(cell, deps, *payload, reply).await
-        }
-        BroadcastCommand::ReleaseBroadcastReservation { payload, reply } => {
-            handle_release_broadcast_reservation(cell, *payload, reply)
+        BroadcastCommand::PublishBroadcastContent { payload, reply } => {
+            let p = *payload;
+            let bytes =
+                scp_protocol::context::broadcast_content::serialize_broadcast_content(&p.content)
+                    .map_err(|e| {
+                        ContextError::CryptoFailed(format!("content serialization failed: {e}"))
+                    });
+            let publish = PublishRequest {
+                context_id: &p.context_id,
+                author_did: &p.author_did,
+                payload: bytes,
+                signer: &p.signer,
+            };
+            handle_publish_broadcast(cell, deps, publish, reply).await
         }
         #[cfg(feature = "testing")]
         BroadcastCommand::SeedBroadcastAuthor {
@@ -491,61 +482,46 @@ async fn handle_broadcast_admission(
     outcome
 }
 
-async fn handle_reserve_broadcast_publish(
-    cell: &mut ClassSCell,
-    deps: &ActorDeps,
-    p: ReserveBroadcastPublishPayload,
-    reply: ReserveBroadcastPublishReply,
-) -> Outcome<()> {
-    let context_id = p.context_id.clone();
-
-    let reserve_fut = async {
-        crate::context::broadcast_helpers::reserve_broadcast_publish(cell, deps, &p.author_did)
-    };
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reserve_fut).await {
-        // Reservation mutates actor cell (consumes the sequence), so the
-        // outcome is `mutated` even on the happy path — the apply or a
-        // later release reconciles it.
-        Ok(Ok(out)) => (Outcome::ok_mutated(()), Ok(out)),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err_mutated(sketch), Err(e))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "reserve_broadcast_publish exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
+/// One publish request, as the two publish variants deliver it.
+struct PublishRequest<'a> {
+    context_id: &'a str,
+    author_did: &'a scp_did::DID,
+    /// The plaintext, or the error serializing `BroadcastContent` produced.
+    payload: Result<Vec<u8>, ContextError>,
+    signer: &'a CommandSigner,
 }
 
-async fn handle_apply_broadcast_publish(
+/// Publishes in one actor turn through
+/// [`publish_broadcast_in_turn`](crate::context::broadcast_helpers::publish_broadcast_in_turn),
+/// under [`SIGNING_HANDLER_TIMEOUT`] so a stalled custody fails with
+/// `SCP-CRYPTO-4061` before the turn budget expires. Reports `mutated` on
+/// every publish attempt, because a sealed publish consumes the sequence and
+/// a failed one has reserved and rolled it back.
+async fn handle_publish_broadcast(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
-    p: ApplyBroadcastPublishPayload,
+    request: PublishRequest<'_>,
     reply: PublishBroadcastReply,
 ) -> Outcome<()> {
-    let context_id = p.context_id.clone();
-
-    let apply_fut = async {
-        crate::context::broadcast_helpers::apply_broadcast_publish(
-            cell,
-            deps,
-            &p.context_id,
-            &p.reservation_id,
-            &p.signature,
-            &p.payload,
-        )
-        .await
+    let payload = match request.payload {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let sketch = outcome_error_sketch(&e);
+            let _ = reply.send(Err(e));
+            return Outcome::err(sketch);
+        }
     };
 
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, apply_fut).await {
+    let publish = crate::context::broadcast_helpers::publish_broadcast_in_turn(
+        cell,
+        deps,
+        request.context_id,
+        request.author_did,
+        &payload,
+        request.signer,
+    );
+    let (outcome, reply_result) = match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, publish).await
+    {
         Ok(Ok(env)) => (Outcome::ok_mutated(()), Ok(env)),
         Ok(Err(e)) => {
             let sketch = outcome_error_sketch(&e);
@@ -553,7 +529,8 @@ async fn handle_apply_broadcast_publish(
         }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
-                "apply_broadcast_publish exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                "publish_broadcast exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {}",
+                request.context_id
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))
@@ -562,18 +539,6 @@ async fn handle_apply_broadcast_publish(
 
     let _ = reply.send(reply_result);
     outcome
-}
-
-fn handle_release_broadcast_reservation(
-    cell: &mut ClassSCell,
-    p: ReleaseBroadcastReservationPayload,
-    reply: oneshot::Sender<Result<(), ContextError>>,
-) -> Outcome<()> {
-    let ReleaseBroadcastReservationPayload { reservation_id, .. } = p;
-    crate::context::broadcast_helpers::release_broadcast_reservation(cell, &reservation_id);
-    let _ = reply.send(Ok(()));
-    // Releasing rolls the reserved sequence back — that is a mutation.
-    Outcome::ok_mutated(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3257,6 +3222,231 @@ mod tests {
                 matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
                 "got {sketch:?}"
             );
+        }
+    }
+
+    // -- Publish in one actor turn (ADR-049 Decision 7a) -----------------------
+
+    mod publish_in_turn {
+        use super::*;
+        use crate::context::actor::commands::PublishBroadcastPayload;
+        use crate::context::actor::signer::SIGN_TIMEOUT;
+        use scp_crypto::{CustodyFailure, CustodyFailureKind, DynScpSigner, SigAlg, SignFuture};
+
+        /// A signer that answers every sign with a fixed outcome: a custody
+        /// refusal of `refusal`, or never when `refusal` is `None`.
+        struct ScriptedSigner {
+            alg: SigAlg,
+            refusal: Option<CustodyFailureKind>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl DynScpSigner for ScriptedSigner {
+            fn algorithm(&self) -> SigAlg {
+                self.alg
+            }
+
+            fn public_key(&self) -> Vec<u8> {
+                vec![0; 32]
+            }
+
+            fn sign_boxed<'a>(&'a self, _digest: &'a [u8; 32]) -> SignFuture<'a> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                match self.refusal {
+                    Some(kind) => Box::pin(async move {
+                        Err(scp_crypto::SignError::Custody(CustodyFailure {
+                            kind,
+                            detail: "refused".to_owned(),
+                        }))
+                    }),
+                    None => Box::pin(std::future::pending()),
+                }
+            }
+        }
+
+        fn scripted(
+            alg: SigAlg,
+            refusal: Option<CustodyFailureKind>,
+        ) -> (CommandSigner, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let signer = CommandSigner::new(Arc::new(ScriptedSigner {
+                alg,
+                refusal,
+                calls: Arc::clone(&calls),
+            }));
+            (signer, calls)
+        }
+
+        /// Deps whose transport accepts every send, so a sealed publish
+        /// completes.
+        async fn publishing_deps() -> ActorDeps {
+            let (mut deps, _appends) = build_deps().await;
+            deps.transport = Arc::new(crate::context::builder::LocalTransportProvider);
+            deps
+        }
+
+        fn next_sequence(cell: &ClassSCell, author: &str) -> u64 {
+            cell.broadcast_context
+                .as_ref()
+                .expect("broadcast context")
+                .publish_metadata(author)
+                .expect("author metadata")
+                .next_sequence
+        }
+
+        async fn publish(
+            cell: &mut ClassSCell,
+            deps: &ActorDeps,
+            ctx_hex: &str,
+            author: &str,
+            signer: &CommandSigner,
+        ) -> Result<scp_protocol::crypto::sender_keys::BroadcastEnvelope, ContextError> {
+            let (tx, rx) = oneshot::channel();
+            let cmd = BroadcastCommand::PublishBroadcast {
+                payload: Box::new(PublishBroadcastPayload {
+                    context_id: ctx_hex.to_owned(),
+                    author_did: DID(author.to_owned()),
+                    payload: b"hello".to_vec(),
+                    signer: signer.clone(),
+                }),
+                reply: tx,
+            };
+            let _outcome = dispatch(cell, deps, cmd).await;
+            rx.await.expect("reply delivered")
+        }
+
+        #[tokio::test]
+        async fn publish_signs_in_turn_and_envelope_verifies() {
+            let deps = publishing_deps().await;
+            let (mut cell, ctx_hex) =
+                build_broadcast_cell_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+            let signer = CommandSigner::local_ed25519(creator_key());
+            let before = next_sequence(&cell, CREATOR_DID);
+
+            let envelope = publish(&mut cell, &deps, &ctx_hex, CREATOR_DID, &signer)
+                .await
+                .expect("publish succeeds");
+
+            assert_eq!(
+                envelope.sequence, before,
+                "the envelope carries the reserved sequence"
+            );
+            assert_eq!(next_sequence(&cell, CREATOR_DID), before + 1);
+            crate::context::broadcast_helpers::check_envelope_signed_by(
+                &envelope,
+                &creator_key().verifying_key(),
+            )
+            .expect("the envelope verifies under the creator's key");
+        }
+
+        #[tokio::test]
+        async fn publish_custody_refusal_rolls_back_sequence() {
+            let deps = publishing_deps().await;
+            let (mut cell, ctx_hex) =
+                build_broadcast_cell_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+            let (signer, calls) = scripted(SigAlg::Ed25519, Some(CustodyFailureKind::KeyNotFound));
+            let before = next_sequence(&cell, CREATOR_DID);
+
+            let err = publish(&mut cell, &deps, &ctx_hex, CREATOR_DID, &signer)
+                .await
+                .expect_err("a refused sign fails the publish");
+
+            assert!(
+                matches!(
+                    err,
+                    ContextError::Custody(CustodyFailure {
+                        kind: CustodyFailureKind::KeyNotFound,
+                        ..
+                    })
+                ),
+                "custody's own kind reaches the caller, got {err:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                next_sequence(&cell, CREATOR_DID),
+                before,
+                "the reserved sequence is rolled back"
+            );
+
+            // The rolled-back sequence is reused by the next publish.
+            let envelope = publish(
+                &mut cell,
+                &deps,
+                &ctx_hex,
+                CREATOR_DID,
+                &CommandSigner::local_ed25519(creator_key()),
+            )
+            .await
+            .expect("publish after the refusal succeeds");
+            assert_eq!(envelope.sequence, before, "no sequence gap after a refusal");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn publish_sign_timeout_rolls_back_sequence() {
+            let deps = publishing_deps().await;
+            let (mut cell, ctx_hex) =
+                build_broadcast_cell_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+            let (signer, calls) = scripted(SigAlg::Ed25519, None);
+            let before = next_sequence(&cell, CREATOR_DID);
+
+            let started = tokio::time::Instant::now();
+            let err = publish(&mut cell, &deps, &ctx_hex, CREATOR_DID, &signer)
+                .await
+                .expect_err("a stalled sign fails the publish");
+
+            assert!(
+                matches!(
+                    err,
+                    ContextError::Custody(CustodyFailure {
+                        kind: CustodyFailureKind::TimedOut,
+                        ..
+                    })
+                ),
+                "a stalled custody fails with SCP-CRYPTO-4061, got {err:?}"
+            );
+            assert!(started.elapsed() >= SIGN_TIMEOUT);
+            assert!(started.elapsed() < SIGNING_HANDLER_TIMEOUT);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                next_sequence(&cell, CREATOR_DID),
+                before,
+                "the reserved sequence is rolled back"
+            );
+        }
+
+        #[tokio::test]
+        async fn publish_rejects_non_ed25519_signer_before_reserving() {
+            let deps = publishing_deps().await;
+            let (mut cell, ctx_hex) =
+                build_broadcast_cell_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+            let (signer, calls) = scripted(SigAlg::EcdsaP256Sha256, None);
+            let before = next_sequence(&cell, CREATOR_DID);
+
+            let err = publish(&mut cell, &deps, &ctx_hex, CREATOR_DID, &signer)
+                .await
+                .expect_err("a P-256 signer cannot sign a broadcast envelope");
+
+            assert!(matches!(err, ContextError::CryptoFailed(_)), "got {err:?}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "custody is never asked");
+            assert_eq!(next_sequence(&cell, CREATOR_DID), before);
+        }
+
+        #[tokio::test]
+        async fn publish_by_non_author_fails_without_signing() {
+            let deps = publishing_deps().await;
+            let (mut cell, ctx_hex) =
+                build_broadcast_cell_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+            let (signer, calls) = scripted(SigAlg::Ed25519, None);
+
+            let err = publish(&mut cell, &deps, &ctx_hex, SUBSCRIBER_DID, &signer)
+                .await
+                .expect_err("a non-author cannot publish");
+
+            assert!(
+                !matches!(err, ContextError::Custody(_)),
+                "the author check runs before the sign, got {err:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "custody is never asked");
         }
     }
 }

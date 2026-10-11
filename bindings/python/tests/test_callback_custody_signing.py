@@ -126,6 +126,24 @@ async def test_context_send_signs_through_a_python_provider(scp) -> None:
 
 
 @pytest.mark.asyncio
+async def test_broadcast_publish_signs_through_a_python_provider(scp) -> None:
+    """A broadcast publish signs its envelope inside the actor turn through
+    the provider's ``sign`` (ADR-049 Decision 7a), within the deadline."""
+    provider = _SlowSignKeychain()
+    identity = await scp.identity_create_with_custody(provider)
+    await scp.configure_local_transport(identity.did)
+    ctx = await scp.context_create(identity.did, _BROADCAST_PARAMS)
+    before = provider.sign_calls
+
+    await asyncio.wait_for(
+        scp.broadcast_publish(ctx, identity.did, b"python-signed publish"),
+        timeout=_DEADLINE_S,
+    )
+
+    assert provider.sign_calls > before, "the publish never reached the provider's sign"
+
+
+@pytest.mark.asyncio
 async def test_non_signing_call_proceeds_while_another_thread_signs(scp) -> None:
     """Thread A proposes; its ``sign`` sleeps in Python. Thread B, started once
     A is inside ``sign``, reads the member count. Both finish within the

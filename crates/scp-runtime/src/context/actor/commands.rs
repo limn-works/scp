@@ -1545,14 +1545,6 @@ pub type UnsubscribeBroadcastReply =
 pub type PublishBroadcastReply =
     oneshot::Sender<Result<scp_protocol::crypto::sender_keys::BroadcastEnvelope, ContextError>>;
 
-/// Reply-channel type alias for [`BroadcastCommand::ReserveBroadcastPublish`]
-/// (phase 1 of the two-phase publish path). Returns the reservation id plus
-/// the signing-payload digest the caller must sign. Factored out to satisfy
-/// `clippy::type_complexity`.
-pub type ReserveBroadcastPublishReply = oneshot::Sender<
-    Result<crate::context::broadcast_helpers::BroadcastPublishReservationOutcome, ContextError>,
->;
-
 /// Reply-channel type alias for
 /// [`BroadcastCommand::BlockBroadcastSubscriber`]. Factored out to satisfy
 /// `clippy::type_complexity`.
@@ -1606,27 +1598,10 @@ pub struct UnsubscribeBroadcastPayload {
 /// Payload for [`BroadcastCommand::PublishBroadcast`]. Boxed for
 /// variant-size uniformity — payload `Vec<u8>` may be large.
 ///
-/// # KeyCustody plumbing
-///
-/// Signing a broadcast envelope needs the caller's
-/// [`KeyCustody`](scp_platform::KeyCustody) backend; the trait uses
-/// RPITIT and is NOT `dyn`-safe, so it cannot cross the actor mailbox.
-/// Instead:
-///
-/// - The command carries only the
-///   [`KeyHandle`](scp_platform::KeyHandle) (an opaque reference that
-///   IS `Send + Sync + Clone`).
-/// - The custody-generic entry point
-///   [`Supervisor::dispatch_broadcast_command_with_custody`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command_with_custody)
-///   drives the two-phase publish path: the actor reserves the
-///   sequence via
-///   `broadcast_helpers::reserve_broadcast_publish`
-///   and returns the signing-payload digest, the supervisor signs with
-///   the caller's custody OUTSIDE the actor, then the actor seals via
-///   `broadcast_helpers::apply_broadcast_publish`.
-/// - Dispatching this variant directly on the actor mailbox is
-///   rejected with a typed error pointing at the custody-generic
-///   entry point (see `handlers/broadcast.rs`).
+/// The payload carries the author's `CommandSigner` (ADR-049 Decision 7a).
+/// The handler reserves the author's broadcast sequence, signs the 32-byte
+/// broadcast signing payload through `sign_bounded`, and seals in one actor
+/// turn. A failed sign rolls the reservation back in the same turn.
 pub struct PublishBroadcastPayload {
     /// Context identifier string.
     pub context_id: String,
@@ -1634,14 +1609,12 @@ pub struct PublishBroadcastPayload {
     pub author_did: scp_did::DID,
     /// Plaintext payload bytes.
     pub payload: Vec<u8>,
-    /// Handle to the author's signing key inside the caller's custody
-    /// backend. The key bytes themselves never cross the mailbox — see
-    /// the struct-level docs for the custody plumbing contract.
-    pub signing_key_handle: scp_platform::KeyHandle,
+    /// The author's signer, an Ed25519 signer over the author's custody key.
+    pub signer: crate::context::actor::signer::CommandSigner,
 }
 
-/// Payload for [`BroadcastCommand::PublishBroadcastContent`]. See
-/// [`PublishBroadcastPayload`] for the custody plumbing rationale.
+/// Payload for [`BroadcastCommand::PublishBroadcastContent`]. Signs and
+/// seals in one actor turn, as [`PublishBroadcastPayload`] does.
 pub struct PublishBroadcastContentPayload {
     /// Context identifier string.
     pub context_id: String,
@@ -1649,47 +1622,8 @@ pub struct PublishBroadcastContentPayload {
     pub author_did: scp_did::DID,
     /// Structured broadcast content.
     pub content: scp_protocol::context::BroadcastContent,
-    /// Handle to the author's signing key inside the caller's custody
-    /// backend.
-    pub signing_key_handle: scp_platform::KeyHandle,
-}
-
-/// Payload for [`BroadcastCommand::ReserveBroadcastPublish`] — phase 1 of
-/// the two-phase publish path (ADR-049 §SequenceReservation). Custody-free:
-/// the actor reserves the broadcast sequence and returns the signing-payload
-/// digest; the caller signs it OUTSIDE the actor and applies the reservation
-/// via [`BroadcastCommand::ApplyBroadcastPublish`].
-pub struct ReserveBroadcastPublishPayload {
-    /// Context identifier string.
-    pub context_id: String,
-    /// Author DID (registered in the broadcast context).
-    pub author_did: scp_did::DID,
-}
-
-/// Payload for [`BroadcastCommand::ApplyBroadcastPublish`] — phase 2 of the
-/// two-phase publish path. Carries the caller-produced signature plus the
-/// reservation id and the plaintext payload. Custody-free: signing already
-/// happened outside the actor.
-pub struct ApplyBroadcastPublishPayload {
-    /// Context identifier string.
-    pub context_id: String,
-    /// Reservation id returned by phase 1.
-    pub reservation_id: crate::context::actor::state::BroadcastReservationId,
-    /// Ed25519 signature (64 bytes) over the phase-1 signing payload.
-    pub signature: Vec<u8>,
-    /// Plaintext payload bytes to seal.
-    pub payload: Vec<u8>,
-}
-
-/// Payload for [`BroadcastCommand::ReleaseBroadcastReservation`] — abort of
-/// a two-phase publish whose apply will never arrive (the caller's signing
-/// failed, or the caller is aborting). Releases the reserved sequence so it
-/// is not burned. Custody-free.
-pub struct ReleaseBroadcastReservationPayload {
-    /// Context identifier string.
-    pub context_id: String,
-    /// Reservation id returned by phase 1.
-    pub reservation_id: crate::context::actor::state::BroadcastReservationId,
+    /// The author's signer, an Ed25519 signer over the author's custody key.
+    pub signer: crate::context::actor::signer::CommandSigner,
 }
 
 /// Payload for
@@ -1708,19 +1642,13 @@ pub struct BroadcastBlockPayload {
 /// See [`ContextCommand::Broadcast`]. Real variants cover every public
 /// method on `crate::context::broadcast_helpers`.
 ///
-/// # Key-custody handoff
+/// # Publish signing
 ///
-/// `PublishBroadcast` / `PublishBroadcastContent` each require the
-/// caller's [`KeyCustody`](scp_platform::KeyCustody) backend to sign the
-/// broadcast envelope — the custody trait uses RPITIT and cannot cross
-/// an actor mailbox. The variants store only the
-/// [`KeyHandle`](scp_platform::KeyHandle) and are dispatched through
-/// the custody-generic
-/// [`Supervisor::dispatch_broadcast_command_with_custody`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command_with_custody),
-/// which drives the custody-free two-phase
-/// `ReserveBroadcastPublish` / `ApplyBroadcastPublish` mailbox commands
-/// and signs with the caller's custody between the two phases, outside
-/// the actor.
+/// `PublishBroadcast` / `PublishBroadcastContent` carry the author's
+/// `CommandSigner` (ADR-049 Decision 7a) and ride the per-context actor
+/// mailbox like every other variant. The handler reserves the sequence,
+/// signs through `sign_bounded`, and seals in one actor turn, rolling the
+/// reservation back when the sign or the seal fails.
 pub enum BroadcastCommand {
     /// Subscribe a DID to a broadcast context. Mirrors
     /// `broadcast_helpers::subscribe_broadcast`.
@@ -1751,11 +1679,9 @@ pub enum BroadcastCommand {
         reply: UnsubscribeBroadcastReply,
     },
 
-    /// Publish raw bytes to a broadcast context. Dispatched via the
-    /// custody-generic supervisor path, which drives the two-phase
-    /// `broadcast_helpers::reserve_broadcast_publish`
-    /// / `broadcast_helpers::apply_broadcast_publish`
-    /// pair — see the enum-level key-custody handoff docs.
+    /// Publish raw bytes to a broadcast context. Reserves, signs through
+    /// the payload's `CommandSigner`, and seals in one actor turn via
+    /// `broadcast_helpers::publish_broadcast_in_turn`.
     PublishBroadcast {
         /// Boxed owned payload.
         payload: Box<PublishBroadcastPayload>,
@@ -1764,49 +1690,13 @@ pub enum BroadcastCommand {
     },
 
     /// Publish structured [`BroadcastContent`](scp_protocol::context::broadcast_content::BroadcastContent)
-    /// to a broadcast context. Serializes the content, then follows the
-    /// same custody-generic two-phase
-    /// `broadcast_helpers::reserve_broadcast_publish`
-    /// / `broadcast_helpers::apply_broadcast_publish`
-    /// path as [`Self::PublishBroadcast`].
+    /// to a broadcast context. Serializes the content, then publishes it in
+    /// one actor turn as [`Self::PublishBroadcast`] does.
     PublishBroadcastContent {
         /// Boxed owned payload.
         payload: Box<PublishBroadcastContentPayload>,
         /// Oneshot reply channel. See [`PublishBroadcastReply`].
         reply: PublishBroadcastReply,
-    },
-
-    /// Phase 1 of the two-phase publish path (ADR-049
-    /// §SequenceReservation). Reserve the broadcast sequence and return
-    /// the signing-payload digest. Custody-free — the caller signs
-    /// outside the actor. Routed through the per-context actor mailbox.
-    ReserveBroadcastPublish {
-        /// Boxed owned payload.
-        payload: Box<ReserveBroadcastPublishPayload>,
-        /// Oneshot reply channel. See [`ReserveBroadcastPublishReply`].
-        reply: ReserveBroadcastPublishReply,
-    },
-
-    /// Phase 2 of the two-phase publish path. Seal the reserved sequence
-    /// with the caller-produced signature, emit the event, send on the
-    /// transport, and append to the event log. Custody-free. Routed
-    /// through the per-context actor mailbox.
-    ApplyBroadcastPublish {
-        /// Boxed owned payload.
-        payload: Box<ApplyBroadcastPublishPayload>,
-        /// Oneshot reply channel. See [`PublishBroadcastReply`].
-        reply: PublishBroadcastReply,
-    },
-
-    /// Abort a two-phase publish whose apply will never arrive (signing
-    /// failed, or the caller is aborting). Releases the reserved sequence
-    /// so it is not burned. Custody-free. Routed through the per-context
-    /// actor mailbox.
-    ReleaseBroadcastReservation {
-        /// Boxed owned payload.
-        payload: Box<ReleaseBroadcastReservationPayload>,
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
     /// Block a subscriber from receiving future broadcasts from a

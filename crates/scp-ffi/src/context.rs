@@ -4992,12 +4992,9 @@ impl crate::scp::PyScp {
         let context_id = handle.context_id.clone();
         let author_did_owned = author_did.to_owned();
 
-        // Clone the custody handle out of the registry guard before the wait,
-        // so a GIL-released wait never holds the identity map's shard lock.
-        let (custody, signing_key_handle) =
-            crate::runtime::with_identity(bi, &author_did_owned, |entry| {
-                Ok((entry.custody.clone(), entry.identity.active_signing_key))
-            })?;
+        // The publish signs inside the actor turn through the author's
+        // `#active` signer (ADR-049 Decision 7a).
+        let signer = resolve_signer(py, bi, &author_did_owned)?;
         let did: scp_did::DID = author_did_owned.into();
 
         crate::actor_wait::block_on_released(py, async move {
@@ -5007,11 +5004,11 @@ impl crate::scp::PyScp {
                     context_id,
                     author_did: did,
                     payload,
-                    signing_key_handle,
+                    signer,
                 }),
                 reply: tx,
             };
-            sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
+            sup.dispatch_broadcast_command(cmd)
                 .await
                 .map_err(crate::error::ScpPyError::from)?;
             rx.await
@@ -5081,12 +5078,9 @@ impl crate::scp::PyScp {
             str::to_owned,
         ));
 
-        // Clone the custody handle out of the registry guard before the wait,
-        // so a GIL-released wait never holds the identity map's shard lock.
-        let (custody, signing_key_handle) =
-            crate::runtime::with_identity(bi, &author_did_owned, |entry| {
-                Ok((entry.custody.clone(), entry.identity.active_signing_key))
-            })?;
+        // The publish signs inside the actor turn through the author's
+        // `#active` signer (ADR-049 Decision 7a).
+        let signer = resolve_signer(py, bi, &author_did_owned)?;
         let did: scp_did::DID = author_did_owned.into();
 
         // Validate and construct BroadcastContent.
@@ -5120,11 +5114,11 @@ impl crate::scp::PyScp {
                     context_id,
                     author_did: did,
                     content,
-                    signing_key_handle,
+                    signer,
                 }),
                 reply: tx,
             };
-            sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
+            sup.dispatch_broadcast_command(cmd)
                 .await
                 .map_err(crate::error::ScpPyError::from)?;
             let envelope = rx
@@ -5218,12 +5212,9 @@ impl crate::scp::PyScp {
             return Err(PyRuntimeError::new_err(format!("invalid deploy_id: {e}")));
         }
 
-        // Clone the custody handle out of the registry guard before the wait,
-        // so a GIL-released wait never holds the identity map's shard lock.
-        let (custody, signing_key_handle) =
-            crate::runtime::with_identity(bi, &author_did_owned, |entry| {
-                Ok((entry.custody.clone(), entry.identity.active_signing_key))
-            })?;
+        // The publish signs inside the actor turn through the author's
+        // `#active` signer (ADR-049 Decision 7a).
+        let signer = resolve_signer(py, bi, &author_did_owned)?;
         let did: scp_did::DID = author_did_owned.into();
         let deploy_id_batch = deploy_id_owned.clone();
 
@@ -5255,11 +5246,11 @@ impl crate::scp::PyScp {
                         context_id: context_id.clone(),
                         author_did: did.clone(),
                         content,
-                        signing_key_handle,
+                        signer: signer.clone(),
                     }),
                     reply: tx,
                 };
-                sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
+                sup.dispatch_broadcast_command(cmd)
                     .await
                     .map_err(crate::error::ScpPyError::from)?;
                 let envelope = rx

@@ -12321,7 +12321,23 @@ impl Scp {
                             .to_owned(),
                         code: codes::IDENT_1017.to_owned(),
                     })?;
-                let signing_key_handle = core_id.active_signing_key;
+                // The publish signs inside the actor turn through this signer (ADR-049
+                // Decision 7a); the private key stays in custody.
+                let custody = identity
+                    .custody
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Identity {
+                        msg: "broadcast publish requires retained signing custody — use \
+                          identity_create_with_custody() to inject a platform custody provider"
+                            .to_owned(),
+                        code: codes::IDENT_1017.to_owned(),
+                    })?;
+                let signer = scp_ffi_common::signer::identity_command_signer(
+                    Arc::clone(custody),
+                    core_id.active_signing_key,
+                )
+                .await
+                .map_err(ScpError::from)?;
 
                 let sup = bi.context_manager_or_error()?;
 
@@ -12329,74 +12345,25 @@ impl Scp {
                     BroadcastCommand, PublishBroadcastPayload,
                 };
 
-                // Dispatch to the correct custody path (callback > in-memory).
-                match identity.custody.as_deref() {
-                    Some(UniffiKeyCustody::Callback(cb)) => {
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        let cmd = BroadcastCommand::PublishBroadcast {
-                            payload: Box::new(PublishBroadcastPayload {
-                                context_id: handle.context_id.clone(),
-                                author_did: did,
-                                payload,
-                                signing_key_handle,
-                            }),
-                            reply: tx,
-                        };
-                        sup.dispatch_broadcast_command_with_custody(cmd, cb.as_ref())
-                            .await
-                            .map_err(ScpError::from)?;
-                        rx.await
-                            .map_err(|e| ScpError::Context {
-                                msg: format!("publish_broadcast shim reply dropped: {e}"),
-                                code: codes::CTX_2035.to_owned(),
-                            })?
-                            .map_err(ScpError::from)?;
-                    }
-                    #[cfg(feature = "testing")]
-                    Some(UniffiKeyCustody::InMemory(imc)) => {
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        let cmd = BroadcastCommand::PublishBroadcast {
-                            payload: Box::new(PublishBroadcastPayload {
-                                context_id: handle.context_id.clone(),
-                                author_did: did,
-                                payload,
-                                signing_key_handle,
-                            }),
-                            reply: tx,
-                        };
-                        sup.dispatch_broadcast_command_with_custody(cmd, &imc.0)
-                            .await
-                            .map_err(ScpError::from)?;
-                        rx.await
-                            .map_err(|e| ScpError::Context {
-                                msg: format!("publish_broadcast shim reply dropped: {e}"),
-                                code: codes::CTX_2035.to_owned(),
-                            })?
-                            .map_err(ScpError::from)?;
-                    }
-                    #[cfg(feature = "testing")]
-                    None => {
-                        return Err(ScpError::Identity {
-                            msg: "broadcast publish requires retained signing custody — this \
-                                          identity has no retained custody (it was externally \
-                                          loaded). Use identity_create(\"in_memory\") or \
-                                          identity_create_with_custody()"
-                                .to_owned(),
-                            code: codes::IDENT_1017.to_owned(),
-                        });
-                    }
-                    #[cfg(not(feature = "testing"))]
-                    None => {
-                        let _ = (signing_key_handle, payload, did);
-                        return Err(ScpError::Identity {
-                            msg: "broadcast publish requires retained signing custody — use \
-                                      identity_create_with_custody() to inject a platform \
-                                      custody provider"
-                                .to_owned(),
-                            code: codes::IDENT_1017.to_owned(),
-                        });
-                    }
-                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = BroadcastCommand::PublishBroadcast {
+                    payload: Box::new(PublishBroadcastPayload {
+                        context_id: handle.context_id.clone(),
+                        author_did: did,
+                        payload,
+                        signer,
+                    }),
+                    reply: tx,
+                };
+                sup.dispatch_broadcast_command(cmd)
+                    .await
+                    .map_err(ScpError::from)?;
+                rx.await
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("publish_broadcast shim reply dropped: {e}"),
+                        code: codes::CTX_2035.to_owned(),
+                    })?
+                    .map_err(ScpError::from)?;
 
                 Ok(())
             })
@@ -12445,7 +12412,23 @@ impl Scp {
                             .to_owned(),
                         code: codes::IDENT_1017.to_owned(),
                     })?;
-                let signing_key_handle = core_id.active_signing_key;
+                // The publish signs inside the actor turn through this signer (ADR-049
+                // Decision 7a); the private key stays in custody.
+                let custody = identity
+                    .custody
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Identity {
+                        msg: "broadcast publish requires retained signing custody — use \
+                          identity_create_with_custody() to inject a platform custody provider"
+                            .to_owned(),
+                        code: codes::IDENT_1017.to_owned(),
+                    })?;
+                let signer = scp_ffi_common::signer::identity_command_signer(
+                    Arc::clone(custody),
+                    core_id.active_signing_key,
+                )
+                .await
+                .map_err(ScpError::from)?;
 
                 let sup = bi.context_manager_or_error()?;
 
@@ -12505,74 +12488,26 @@ impl Scp {
                     BroadcastCommand, PublishBroadcastContentPayload,
                 };
 
-                // Dispatch to the correct custody path (callback > in-memory).
-                let envelope = match identity.custody.as_deref() {
-                    Some(UniffiKeyCustody::Callback(cb)) => {
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        let cmd = BroadcastCommand::PublishBroadcastContent {
-                            payload: Box::new(PublishBroadcastContentPayload {
-                                context_id: handle.context_id.clone(),
-                                author_did: did,
-                                content,
-                                signing_key_handle,
-                            }),
-                            reply: tx,
-                        };
-                        sup.dispatch_broadcast_command_with_custody(cmd, cb.as_ref())
-                            .await
-                            .map_err(ScpError::from)?;
-                        rx.await
-                            .map_err(|e| ScpError::Context {
-                                msg: format!("publish_broadcast_content shim reply dropped: {e}"),
-                                code: codes::CTX_2043.to_owned(),
-                            })?
-                            .map_err(ScpError::from)?
-                    }
-                    #[cfg(feature = "testing")]
-                    Some(UniffiKeyCustody::InMemory(imc)) => {
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        let cmd = BroadcastCommand::PublishBroadcastContent {
-                            payload: Box::new(PublishBroadcastContentPayload {
-                                context_id: handle.context_id.clone(),
-                                author_did: did,
-                                content,
-                                signing_key_handle,
-                            }),
-                            reply: tx,
-                        };
-                        sup.dispatch_broadcast_command_with_custody(cmd, &imc.0)
-                            .await
-                            .map_err(ScpError::from)?;
-                        rx.await
-                            .map_err(|e| ScpError::Context {
-                                msg: format!("publish_broadcast_content shim reply dropped: {e}"),
-                                code: codes::CTX_2043.to_owned(),
-                            })?
-                            .map_err(ScpError::from)?
-                    }
-                    #[cfg(feature = "testing")]
-                    None => {
-                        return Err(ScpError::Identity {
-                            msg: "broadcast publish asset requires retained signing custody — \
-                                      this identity has no retained custody (it was externally \
-                                      loaded). Use identity_create(\"in_memory\") or \
-                                      identity_create_with_custody()"
-                                .to_owned(),
-                            code: codes::IDENT_1017.to_owned(),
-                        });
-                    }
-                    #[cfg(not(feature = "testing"))]
-                    None => {
-                        let _ = (content, signing_key_handle, did);
-                        return Err(ScpError::Identity {
-                            msg: "broadcast publish asset requires retained signing custody — use \
-                                  identity_create_with_custody() to inject a platform \
-                                  custody provider"
-                                .to_owned(),
-                            code: codes::IDENT_1017.to_owned(),
-                        });
-                    }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = BroadcastCommand::PublishBroadcastContent {
+                    payload: Box::new(PublishBroadcastContentPayload {
+                        context_id: handle.context_id.clone(),
+                        author_did: did,
+                        content,
+                        signer,
+                    }),
+                    reply: tx,
                 };
+                sup.dispatch_broadcast_command(cmd)
+                    .await
+                    .map_err(ScpError::from)?;
+                let envelope = rx
+                    .await
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("publish_broadcast_content shim reply dropped: {e}"),
+                        code: codes::CTX_2043.to_owned(),
+                    })?
+                    .map_err(ScpError::from)?;
 
                 let envelope_bytes =
                     rmp_serde::to_vec_named(&envelope).map_err(|e| ScpError::Context {
@@ -12646,7 +12581,23 @@ impl Scp {
                             .to_owned(),
                         code: codes::IDENT_1017.to_owned(),
                     })?;
-                let signing_key_handle = core_id.active_signing_key;
+                // The publish signs inside the actor turn through this signer (ADR-049
+                // Decision 7a); the private key stays in custody.
+                let custody = identity
+                    .custody
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Identity {
+                        msg: "broadcast publish requires retained signing custody — use \
+                          identity_create_with_custody() to inject a platform custody provider"
+                            .to_owned(),
+                        code: codes::IDENT_1017.to_owned(),
+                    })?;
+                let signer = scp_ffi_common::signer::identity_command_signer(
+                    Arc::clone(custody),
+                    core_id.active_signing_key,
+                )
+                .await
+                .map_err(ScpError::from)?;
 
                 let sup = bi.context_manager_or_error()?;
 
@@ -12705,76 +12656,26 @@ impl Scp {
                         body: asset.body,
                     };
 
-                    let envelope = match identity.custody.as_deref() {
-                        Some(UniffiKeyCustody::Callback(cb)) => {
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            let cmd = BroadcastCommand::PublishBroadcastContent {
-                                payload: Box::new(PublishBroadcastContentPayload {
-                                    context_id: handle.context_id.clone(),
-                                    author_did: did.clone(),
-                                    content,
-                                    signing_key_handle,
-                                }),
-                                reply: tx,
-                            };
-                            sup.dispatch_broadcast_command_with_custody(cmd, cb.as_ref())
-                                .await
-                                .map_err(ScpError::from)?;
-                            rx.await
-                                .map_err(|e| ScpError::Context {
-                                    msg: format!(
-                                        "publish_broadcast_content shim reply dropped: {e}"
-                                    ),
-                                    code: codes::CTX_2043.to_owned(),
-                                })?
-                                .map_err(ScpError::from)?
-                        }
-                        #[cfg(feature = "testing")]
-                        Some(UniffiKeyCustody::InMemory(imc)) => {
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            let cmd = BroadcastCommand::PublishBroadcastContent {
-                                payload: Box::new(PublishBroadcastContentPayload {
-                                    context_id: handle.context_id.clone(),
-                                    author_did: did.clone(),
-                                    content,
-                                    signing_key_handle,
-                                }),
-                                reply: tx,
-                            };
-                            sup.dispatch_broadcast_command_with_custody(cmd, &imc.0)
-                                .await
-                                .map_err(ScpError::from)?;
-                            rx.await
-                                .map_err(|e| ScpError::Context {
-                                    msg: format!(
-                                        "publish_broadcast_content shim reply dropped: {e}"
-                                    ),
-                                    code: codes::CTX_2043.to_owned(),
-                                })?
-                                .map_err(ScpError::from)?
-                        }
-                        #[cfg(feature = "testing")]
-                        None => {
-                            return Err(ScpError::Identity {
-                                msg: "broadcast publish assets requires retained signing \
-                                          custody — this identity has no retained custody (it was \
-                                          externally loaded)"
-                                    .to_owned(),
-                                code: codes::IDENT_1017.to_owned(),
-                            });
-                        }
-                        #[cfg(not(feature = "testing"))]
-                        None => {
-                            let _ = (content, signing_key_handle, &did);
-                            return Err(ScpError::Identity {
-                                msg: "broadcast publish assets requires retained signing custody \
-                                      — this identity has no retained custody (it was externally \
-                                      loaded)"
-                                    .to_owned(),
-                                code: codes::IDENT_1017.to_owned(),
-                            });
-                        }
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let cmd = BroadcastCommand::PublishBroadcastContent {
+                        payload: Box::new(PublishBroadcastContentPayload {
+                            context_id: handle.context_id.clone(),
+                            author_did: did.clone(),
+                            content,
+                            signer: signer.clone(),
+                        }),
+                        reply: tx,
                     };
+                    sup.dispatch_broadcast_command(cmd)
+                        .await
+                        .map_err(ScpError::from)?;
+                    let envelope = rx
+                        .await
+                        .map_err(|e| ScpError::Context {
+                            msg: format!("publish_broadcast_content shim reply dropped: {e}"),
+                            code: codes::CTX_2043.to_owned(),
+                        })?
+                        .map_err(ScpError::from)?;
 
                     let envelope_bytes =
                         rmp_serde::to_vec_named(&envelope).map_err(|e| ScpError::Context {
