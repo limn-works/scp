@@ -38,20 +38,38 @@ class CustodyType(enum.Enum):
     No SDK method defaults custody: the caller names the key store, and a call
     that passes none raises ``IdentityError`` carrying ``SCP-IDENT-1116``
     before any bridge call (SCP-294).
+
+    The bridge raises its own exceptions as native ``_scp_core`` classes whose
+    message opens with the code:
+
+    - ``ValidationError`` with ``SCP-VALID-7005`` for a string outside the
+      vocabulary.
+    - ``IdentityError`` with ``SCP-IDENT-1003`` for ``OS_KEYSTORE`` without a
+      provider.
+    - ``IdentityError`` with ``SCP-IDENT-1008`` for ``IN_MEMORY`` on a build
+      without the bridge's ``testing`` feature.
+    - ``ValidationError`` with ``SCP-VALID-7001`` for ``ENCRYPTED_FILE`` when
+      ``HOME`` is unset, empty or relative, or ``SCP_KEY_PASSPHRASE`` is unset
+      or empty.
+
+    A build without the ``testing`` feature has no pre-rotation custody
+    backend, so an identity-creating call that passes these checks raises
+    ``IdentityError`` with ``SCP-IDENT-1059`` (ADR-062 Decision 6), a call to
+    :meth:`scp_sdk.SCP.identity_create_with_custody` included.  Only a
+    ``testing`` build opens the key file, and it raises ``SCP-IDENT-1008`` when
+    it cannot create ``$HOME/.scp`` or open the key file.
     """
 
     #: ``FileKeyCustody``: an encrypted key file at ``$HOME/.scp/keys.bin``
     #: (Argon2id key derivation, AES-256-GCM), sealed under the passphrase in
-    #: ``SCP_KEY_PASSPHRASE``.  The bridge raises ``SCP-VALID-7001`` when
-    #: ``HOME`` is unset, empty or relative, or the passphrase is unset or empty,
-    #: and ``SCP-IDENT-1008`` when it cannot create ``$HOME/.scp`` or open the
-    #: key file.
+    #: ``SCP_KEY_PASSPHRASE``.  The class docstring lists the errors the bridge
+    #: raises for it on each build.
     ENCRYPTED_FILE = "encrypted_file"
     #: The host operating system's key store, reached only through a
     #: :class:`scp_sdk.scp.KeyCustodyProvider` passed to
-    #: :meth:`scp_sdk.SCP.identity_create_with_custody`, which reports this
-    #: value.  It promises no hardware backing.  Passed to ``identity_create``
-    #: without a provider, the bridge raises ``SCP-IDENT-1003``.
+    #: :meth:`scp_sdk.SCP.identity_create_with_custody`.  It promises no
+    #: hardware backing.  The class docstring lists the errors the bridge raises
+    #: for it on each build.
     OS_KEYSTORE = "os_keystore"
     #: An in-memory key store that loses every key when the process exits.  The
     #: bridge builds it only in a build carrying its ``testing`` feature; a

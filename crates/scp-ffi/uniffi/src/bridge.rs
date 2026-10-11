@@ -7327,8 +7327,7 @@ fn bridge_params_to_core(
 }
 
 /// The custody strings this bridge builds a key custody from, stated in every
-/// custody rejection so the three bridges name their accepted sets the same way
-/// (SCP-294).
+/// custody rejection (SCP-294).
 pub(crate) const ACCEPTED_CUSTODY: &str = "this bridge accepts \"in_memory\" only in a build \
      carrying the testing feature; inject a KeyCustodyProvider through \
      identity_create_with_custody() for any other key store";
@@ -7346,7 +7345,7 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
         // nullifier, which the `testing` feature severs from production
         // (ADR-062 §Decision 6). A shipped build REJECTS the string at the
         // boundary with a helpful "not available in this build" error rather
-        // than admitting it and failing deeper. Mirrors PyO3 `parse_custody_inner`.
+        // than admitting it and failing deeper.
         #[cfg(feature = "testing")]
         "in_memory" => Ok(CustodyMethod::InMemory),
         #[cfg(not(feature = "testing"))]

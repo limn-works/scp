@@ -1024,16 +1024,8 @@ class SCP:
         :raises ValidationError: ``SCP-VALID-7005`` when ``custody`` is not a
             :class:`~scp_sdk.types.CustodyType` or string.
 
-        The bridge's own exceptions reach the caller unchanged, as native
-        ``_scp_core`` classes whose message opens with the code (spec 03
-        section 3.2.2): ``_scp_core.ValidationError`` with ``SCP-VALID-7005``
-        for a string outside the vocabulary, or ``SCP-VALID-7001`` when
-        ``ENCRYPTED_FILE`` finds ``HOME`` or ``SCP_KEY_PASSPHRASE`` unusable;
-        ``_scp_core.IdentityError`` with ``SCP-IDENT-1003`` for
-        ``OS_KEYSTORE``, which needs the provider
-        :meth:`identity_create_with_custody` takes, or ``SCP-IDENT-1008`` for
-        ``IN_MEMORY`` on a build without the bridge's ``testing`` feature and
-        when ``ENCRYPTED_FILE`` cannot open the key file.
+        The bridge's own exceptions reach the caller unchanged;
+        :class:`~scp_sdk.types.CustodyType` lists them for each build.
         """
 
         custody_str = _custody_string("identity_create", custody)
@@ -1052,16 +1044,8 @@ class SCP:
         :raises ValidationError: ``SCP-VALID-7005`` when ``custody`` is not a
             :class:`~scp_sdk.types.CustodyType` or string.
 
-        The bridge's own exceptions reach the caller unchanged, as native
-        ``_scp_core`` classes whose message opens with the code (spec 03
-        section 3.2.2): ``_scp_core.ValidationError`` with ``SCP-VALID-7005``
-        for a string outside the vocabulary, or ``SCP-VALID-7001`` when
-        ``ENCRYPTED_FILE`` finds ``HOME`` or ``SCP_KEY_PASSPHRASE`` unusable;
-        ``_scp_core.IdentityError`` with ``SCP-IDENT-1003`` for
-        ``OS_KEYSTORE``, which needs the provider
-        :meth:`identity_create_with_custody` takes, or ``SCP-IDENT-1008`` for
-        ``IN_MEMORY`` on a build without the bridge's ``testing`` feature and
-        when ``ENCRYPTED_FILE`` cannot open the key file.
+        The bridge's own exceptions reach the caller unchanged;
+        :class:`~scp_sdk.types.CustodyType` lists them for each build.
         """
 
         custody_str = _custody_string("identity_create_with_agent_key", custody)
@@ -1078,7 +1062,9 @@ class SCP:
         crosses into the Rust core (ADR-006). This is the
         :attr:`~scp_sdk.types.CustodyType.OS_KEYSTORE` request of spec 03
         section 3.2.2, and the identity's
-        :attr:`~scp_sdk.Identity.custody_type` reports it.
+        :attr:`~scp_sdk.Identity.custody_type` reports it. A build without the
+        bridge's ``testing`` feature raises ``IdentityError`` with
+        ``SCP-IDENT-1059`` (:class:`~scp_sdk.types.CustodyType`).
 
         The blocking bridge call runs in :func:`asyncio.to_thread` so the
         provider's (potentially blocking) keystore operations do not stall the
