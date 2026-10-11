@@ -4,9 +4,11 @@
 /// opens an encrypted context.
 ///
 /// The Swift SDK ships no key store that `identityCreate(custody:)` reaches in
-/// a shipped build: its one `CustodyType`, `.inMemory`, works only in a build
-/// compiled with the `testing` feature, and a shipped build rejects it with
-/// `SCP-IDENT-1008`. Implement `makeKeyCustodyProvider()` over your app's key
+/// a shipped build: a build without the bridge's `testing` feature has no
+/// pre-rotation custody backend and throws `SCP-IDENT-1059` for
+/// `CustodyType.encryptedFile`, and `CustodyType.osKeystore` needs the
+/// provider that `identityCreateWithCustody(provider:)` takes
+/// (`SCP-IDENT-1003`). Implement `makeKeyCustodyProvider()` over your app's key
 /// store before running.
 
 import Foundation

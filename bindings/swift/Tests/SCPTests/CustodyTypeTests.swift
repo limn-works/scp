@@ -34,7 +34,9 @@ private func errorCode(_ body: () async throws -> Identity) async -> String {
 /// `.docs/standards/construction.md`, consequential choices are enums).
 ///
 /// The tests run against the `testing` XCFramework (`build-xcframework.sh
-/// --dev`), which admits `in_memory` and opens the encrypted key file.
+/// --dev`), which admits `in_memory` and opens the encrypted key file. Tests
+/// reach `in_memory` through `TestHarnessCustody.swift`, because
+/// `CustodyType` has no case for it.
 final class CustodyTypeTests: XCTestCase {
     // Implicitly unwrapped because XCTest `setUp` initializes it before any
     // test method runs.
@@ -53,8 +55,8 @@ final class CustodyTypeTests: XCTestCase {
     }
 
     /// Reads the accepted set from the bridge's own `SCP-VALID-7005`
-    /// rejection of "platform". The two request cases must be exactly that
-    /// set; `inMemory` is the testing affordance on top of it.
+    /// rejection of "platform". `CustodyType`'s cases must be exactly that
+    /// set, in the same order, with no third case (spec section 3.2.2).
     func testRequestCasesAreExactlyTheBridgeAcceptedStrings() async throws {
         do {
             _ = try await scp.inner.identityCreate(custody: "platform", testingSeed: nil)
@@ -62,9 +64,10 @@ final class CustodyTypeTests: XCTestCase {
         } catch let ScpError.Validation(msg, code) {
             XCTAssertEqual(code, "SCP-VALID-7005")
             let accepted = try XCTUnwrap(acceptedCustodyStrings(inRejection: msg), msg)
-            XCTAssertEqual([CustodyType.encryptedFile, .osKeystore].map(\.rawValue), accepted)
+            XCTAssertEqual(CustodyType.allCases.map(\.rawValue), accepted)
         }
-        XCTAssertEqual(CustodyType.allCases, [.encryptedFile, .osKeystore, .inMemory])
+        XCTAssertEqual(CustodyType.allCases, [.encryptedFile, .osKeystore])
+        XCTAssertNil(CustodyType(rawValue: harnessInMemoryCustody))
     }
 
     func testAcceptedCustodyStringsParsesEveryQuotedString() {
@@ -113,11 +116,11 @@ final class CustodyTypeTests: XCTestCase {
         XCTAssertEqual(agent, "SCP-IDENT-1003")
     }
 
-    /// A testing seed with any case other than `inMemory` is `SCP-VALID-7009`,
+    /// A testing seed with either `CustodyType` case is `SCP-VALID-7009`,
     /// checked before the custody value is read.
-    func testSeedWithoutInMemoryIsValid7009() async {
+    func testSeedWithACustodyTypeCaseIsValid7009() async {
         let seed = Data(repeating: 7, count: 32)
-        for custody in [CustodyType.encryptedFile, .osKeystore] {
+        for custody in CustodyType.allCases {
             let code = await errorCode {
                 try await self.scp.identityCreate(custody: custody, testingSeed: seed)
             }
@@ -125,14 +128,24 @@ final class CustodyTypeTests: XCTestCase {
         }
     }
 
-    /// `inMemory` creates an identity through both methods on the testing
-    /// build, and the handle reports the request value.
-    func testInMemoryCreatesAnIdentity() async throws {
-        let identity = try await scp.identityCreate(custody: .inMemory)
+    /// The harness's raw `in_memory` string creates an identity through both
+    /// bridge methods on the testing build, and the handle reports the
+    /// request value. The same seed yields the same verifying key, so the
+    /// helper passes the seed through.
+    func testHarnessInMemoryCreatesAnIdentity() async throws {
+        let identity = try await createInMemoryIdentity(scp)
         XCTAssertEqual(identity.custodyType(), "in_memory")
         XCTAssertFalse(identity.verifyingKey()?.isEmpty ?? true)
-        let agent = try await scp.identityCreateWithAgentKey(custody: .inMemory)
+        let agent = try await createInMemoryIdentityWithAgentKey(scp)
         XCTAssertEqual(agent.custodyType(), "in_memory")
+
+        let seed = Data(repeating: 9, count: 32)
+        let first = try await createInMemoryIdentity(scp, seed: seed)
+        let other = try SCP(storage: .inMemory)
+        let second = try await createInMemoryIdentity(other, seed: seed)
+        try await other.shutdown(timeoutMillis: 1000)
+        XCTAssertEqual(first.verifyingKey(), second.verifyingKey())
+        XCTAssertNotNil(first.verifyingKey())
     }
 
     /// `encryptedFile` opens `$HOME/.scp/keys.bin` under `SCP_KEY_PASSPHRASE`

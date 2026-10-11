@@ -769,10 +769,12 @@ public extension SCP {
     /// `SCP-IDENT-1003`, because only a `KeyCustodyProvider` reaches the host
     /// key store; pass one to ``identityCreateWithCustody(provider:)``.
     ///
-    /// `testingSeed` is a testing-only parameter for the ADR-046
-    /// cross-bridge parity harness; pass `nil` from production callers
-    /// (the `testing` in-memory path uses OS RNG when
-    /// `testingSeed` is `nil`).
+    /// `testingSeed` is the ADR-046 cross-bridge parity seed (ADR-048);
+    /// production callers pass `nil`. The bridge checks it before the custody
+    /// value and answers a non-nil seed with either ``CustodyType`` case with
+    /// `SCP-VALID-7009` (spec section 3.2.2), because only the testing-build
+    /// in-memory key store takes a seed, and a test reaches that store outside
+    /// ``CustodyType``.
     func identityCreate(custody: CustodyType, testingSeed: Data? = nil) async throws -> Identity {
         try await inner.identityCreate(custody: custody.rawValue, testingSeed: testingSeed)
     }

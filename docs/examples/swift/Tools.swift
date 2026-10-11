@@ -5,8 +5,8 @@
 /// minting the UCAN token a caller presents to invoke it.
 ///
 /// The operator's identity comes from a caller-supplied
-/// ``KeyCustodyProvider``. ``CustodyType/inMemory`` works only in a build
-/// compiled with the `testing` feature.
+/// ``KeyCustodyProvider``, the `os_keystore` custody request of spec section
+/// 3.2.2.
 ///
 /// Prerequisites:
 ///   - Add the SCP Swift package to your project

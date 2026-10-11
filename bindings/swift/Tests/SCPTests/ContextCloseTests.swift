@@ -46,7 +46,7 @@ final class ContextCloseTests: XCTestCase {
     /// The supervisor actor this handle names is `Active`, so the bridge
     /// dispatches the close and `close()` records `.closed`.
     func testCloseFromAPoisonedCachedStateReachesTheBridge() async throws {
-        let creator = try await scp.identityCreate(custody: .inMemory)
+        let creator = try await createInMemoryIdentity(scp)
         let context = try await Context.create(
             scp: scp,
             identity: creator,
@@ -70,7 +70,7 @@ final class ContextCloseTests: XCTestCase {
     /// bridge refuses a close in that state, so a second bridge call would
     /// throw.
     func testSecondCloseStaysIdempotent() async throws {
-        let creator = try await scp.identityCreate(custody: .inMemory)
+        let creator = try await createInMemoryIdentity(scp)
         let context = try await Context.create(
             scp: scp,
             identity: creator,
