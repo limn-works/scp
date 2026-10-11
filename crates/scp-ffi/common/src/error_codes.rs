@@ -746,6 +746,12 @@ pub const CRYPTO_4059: &str = "SCP-CRYPTO-4059";
 ///
 /// [`custody_failure_code`] decides which custody failures carry this code.
 pub const CRYPTO_4060: &str = "SCP-CRYPTO-4060";
+/// Key custody timeout: a custody sign did not answer within the ADR-049
+/// Decision 7a signing budget ([`CustodyFailureKind::TimedOut`](scp_crypto::CustodyFailureKind::TimedOut)).
+///
+/// Not a transport timeout: an unanswered biometric prompt or host callback is
+/// not a retryable network fault.
+pub const CRYPTO_4061: &str = "SCP-CRYPTO-4061";
 
 // -------------------------------------------------------------------------
 // Transport (SCP-TRANS- 5000--5999)
@@ -1426,7 +1432,8 @@ pub const SAGA_13066: &str = "SCP-SAGA-13066";
 /// One mapping for the `PyO3`, napi-rs and `UniFFI` bridges: key-not-found is
 /// [`CRYPTO_4006`], a rejected host pseudonym is [`IDENT_1055`], a closed
 /// custody store is [`STORAGE_8006`], a custody store whose directory lock is
-/// still held is [`STORAGE_8005`], and any other custody failure is
+/// still held is [`STORAGE_8005`], a custody sign past the ADR-049 Decision 7a
+/// budget is [`CRYPTO_4061`], and any other custody failure is
 /// [`CRYPTO_4060`].
 #[must_use]
 pub const fn custody_failure_code(e: &scp_crypto::CustodyFailure) -> &'static str {
@@ -1435,6 +1442,7 @@ pub const fn custody_failure_code(e: &scp_crypto::CustodyFailure) -> &'static st
         scp_crypto::CustodyFailureKind::PseudonymRejected => IDENT_1055,
         scp_crypto::CustodyFailureKind::StorageClosed => STORAGE_8006,
         scp_crypto::CustodyFailureKind::StorageLockHeld => STORAGE_8005,
+        scp_crypto::CustodyFailureKind::TimedOut => CRYPTO_4061,
         scp_crypto::CustodyFailureKind::Failed => CRYPTO_4060,
     }
 }

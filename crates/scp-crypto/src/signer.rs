@@ -313,6 +313,7 @@ mod tests {
             CustodyFailureKind::PseudonymRejected,
             CustodyFailureKind::StorageClosed,
             CustodyFailureKind::StorageLockHeld,
+            CustodyFailureKind::TimedOut,
             CustodyFailureKind::Failed,
         ] {
             let signer: Box<dyn DynScpSigner> = Box::new(RefusingSigner(kind));

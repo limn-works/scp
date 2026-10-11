@@ -1827,6 +1827,7 @@ impl ScpError {
             scp_crypto::CustodyFailureKind::StorageClosed
             | scp_crypto::CustodyFailureKind::StorageLockHeld => Self::Validation { msg, code },
             scp_crypto::CustodyFailureKind::KeyNotFound
+            | scp_crypto::CustodyFailureKind::TimedOut
             | scp_crypto::CustodyFailureKind::Failed => Self::Crypto { msg, code },
         }
     }
@@ -1877,6 +1878,7 @@ impl From<scp_platform::PlatformError> for ScpError {
             | scp_crypto::CustodyFailureKind::StorageLockHeld => e.to_string(),
             scp_crypto::CustodyFailureKind::KeyNotFound
             | scp_crypto::CustodyFailureKind::PseudonymRejected
+            | scp_crypto::CustodyFailureKind::TimedOut
             | scp_crypto::CustodyFailureKind::Failed => {
                 format!("platform key operation failed: {e} — check key custody configuration")
             }

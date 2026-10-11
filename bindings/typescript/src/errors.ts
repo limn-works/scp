@@ -104,7 +104,8 @@ export class CryptoError extends ScpError {
  * key id it was given. The native bridge reads the thrown error's `code`
  * (`"SCP-CRYPTO-4006"`) and reports a typed key-not-found; any other throw is
  * a custody error (`SCP-CRYPTO-4060`). A provider may equally throw any error
- * with that `code`.
+ * with that `code`. A custody sign the provider does not answer within the
+ * runtime's signing budget fails with the custody timeout `SCP-CRYPTO-4061`.
  */
 export class KeyNotFoundError extends CryptoError {
   constructor(message = "key not found") {

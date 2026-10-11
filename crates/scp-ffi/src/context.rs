@@ -9328,6 +9328,7 @@ mod tests {
                 scp_crypto::CustodyFailureKind::KeyNotFound,
                 codes::CRYPTO_4006,
             ),
+            (scp_crypto::CustodyFailureKind::TimedOut, codes::CRYPTO_4061),
             (scp_crypto::CustodyFailureKind::Failed, codes::CRYPTO_4060),
         ] {
             let failure = scp_crypto::CustodyFailure {

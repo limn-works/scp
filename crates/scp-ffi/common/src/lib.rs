@@ -166,6 +166,11 @@ pub mod outlet_stream_credit;
 #[cfg(feature = "resolvers")]
 pub mod streaming_saga;
 
+// The bridges' one way to build the `CommandSigner` a runtime command carries
+// (ADR-049 Decision 7a). Requires scp-core + scp-platform (behind `resolvers`).
+#[cfg(feature = "resolvers")]
+pub mod signer;
+
 // Shared context-parameter builder for all FFI bridges.
 // Requires scp-core (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
