@@ -55,13 +55,14 @@ pub const IDENT_1000: &str = "SCP-IDENT-1000";
 pub const IDENT_1001: &str = "SCP-IDENT-1001";
 /// Identity not found.
 pub const IDENT_1002: &str = "SCP-IDENT-1002";
-/// Custody request reaches no key store without a `KeyCustodyProvider`.
+/// `"os_keystore"` custody requested with no `KeyCustodyProvider` (spec 03
+/// §3.2.2).
 ///
-/// The `PyO3` and NAPI bridges return this code for `"os_keystore"` with no
-/// provider, through [`crate::custody_request::parse_custody_request`] (spec
-/// 03 §3.2.2). The `UniFFI` bridge returns it for `"platform"`, `"software"`
-/// and `"callback"`. A `testing_seed` passed with any of these strings is
-/// reported first, as [`VALID_7009`].
+/// The `PyO3`, NAPI and `UniFFI` bridges return this code only for
+/// `"os_keystore"` with no provider, through
+/// [`crate::custody_request::parse_custody_request`]; the caller passes the
+/// provider through `identity_create_with_custody`. A `testing_seed` passed
+/// with the request is reported first, as [`VALID_7009`].
 pub const IDENT_1003: &str = "SCP-IDENT-1003";
 /// Identity key generation failed.
 pub const IDENT_1004: &str = "SCP-IDENT-1004";
@@ -909,19 +910,20 @@ pub const VALID_7006: &str = "SCP-VALID-7006";
 pub const VALID_7007: &str = "SCP-VALID-7007";
 /// Testing-only feature requires the `testing` feature flag.
 ///
-/// Returned by FFI entry points when a caller supplies a parity-harness
-/// affordance (`testing_seed` on `identity_create`, `signed_at_override`
-/// on `scpid_sign`) in a build that was NOT compiled with the `testing`
-/// feature enabled. These are ADR-046 cross-bridge parity-harness
-/// inputs, not production APIs — production bundles reject them with
-/// this code.
+/// Returned by `scpid_sign` when a caller supplies `signed_at_override`, an
+/// ADR-046 cross-bridge parity-harness input rather than a production API,
+/// in a build that was NOT compiled with the `testing` feature enabled.
+///
+/// A `testing_seed` on `identity_create` does not use this code: spec 03
+/// §3.2.2 answers a seed with `"in_memory"` on such a build with
+/// [`IDENT_1008`], through [`crate::custody_request::parse_custody_request`].
 pub const VALID_7008: &str = "SCP-VALID-7008";
 /// Seed requires `InMemoryKeyCustody`.
 ///
 /// Returned when a caller passes a deterministic parity-harness `seed`
 /// together with a custody type other than `"in_memory"`. Seeded
 /// determinism is only meaningful for the in-process `InMemoryKeyCustody`
-/// backend — platform/software/file custody all produce keys outside the
+/// backend — `encrypted_file` and `os_keystore` custody produce keys outside the
 /// seeded RNG, so accepting a seed with them would silently lie about
 /// reproducibility.
 pub const VALID_7009: &str = "SCP-VALID-7009";

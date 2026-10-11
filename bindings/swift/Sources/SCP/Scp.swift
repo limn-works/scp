@@ -764,8 +764,10 @@ public extension SCP {
     /// `custody.rawValue`.
     ///
     /// `custody` is required and typed (``CustodyType``): the caller names the
-    /// key store, and the compiler rejects a custody value the UniFFI bridge
-    /// refuses.
+    /// key store, and the compiler rejects a string outside the custody request
+    /// vocabulary (spec section 3.2.2). ``CustodyType/osKeystore`` throws
+    /// `SCP-IDENT-1003`, because only a `KeyCustodyProvider` reaches the host
+    /// key store; pass one to ``identityCreateWithCustody(provider:)``.
     ///
     /// `testingSeed` is a testing-only parameter for the ADR-046
     /// cross-bridge parity harness; pass `nil` from production callers
@@ -784,13 +786,17 @@ public extension SCP {
     /// `custody.rawValue`.
     ///
     /// `custody` is required and typed (``CustodyType``): the caller names the
-    /// key store, and the compiler rejects a custody value the UniFFI bridge
-    /// refuses.
+    /// key store, and the compiler rejects a string outside the custody request
+    /// vocabulary (spec section 3.2.2). ``CustodyType/osKeystore`` throws
+    /// `SCP-IDENT-1003`, because only a `KeyCustodyProvider` reaches the host
+    /// key store.
     func identityCreateWithAgentKey(custody: CustodyType) async throws -> Identity {
         try await inner.identityCreateWithAgentKey(custody: custody.rawValue)
     }
 
-    /// Forwards to ``Scp/identityCreateWithCustody`` on ``inner``.
+    /// Forwards to ``Scp/identityCreateWithCustody`` on ``inner``: the
+    /// `os_keystore` custody request (spec section 3.2.2). The identity it
+    /// returns reports `"os_keystore"` from `custodyType()`.
     func identityCreateWithCustody(provider: KeyCustodyProvider) async throws -> Identity {
         try await inner.identityCreateWithCustody(provider: provider)
     }

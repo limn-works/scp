@@ -608,23 +608,17 @@ fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity
         code: codes::IDENT_1011.to_owned(),
     })?;
 
-    let custody = match id.custody.as_deref() {
-        Some(crate::bridge::UniffiKeyCustody::InMemory(custody)) => custody,
-        Some(crate::bridge::UniffiKeyCustody::Callback(_)) | None => {
-            return Err(ScpError::Identity {
-                msg: "identity does not have in-memory custody — only in-memory custody \
-              identities can be used for node startup in this build"
-                    .to_owned(),
-                code: codes::IDENT_1012.to_owned(),
-            });
-        }
-    };
+    // Every custody backend signs through the enum's `KeyCustody` dispatch, so
+    // the node takes whichever custody created the identity. An identity with
+    // no custody (one `identity_load` built over external custody) cannot sign.
+    let custody = id.custody.as_ref().ok_or_else(|| ScpError::Identity {
+        msg: "identity holds no key custody — only identities created via \
+              identity_create or identity_create_with_custody can be used for \
+              node startup"
+            .to_owned(),
+        code: codes::IDENT_1012.to_owned(),
+    })?;
 
-    // Hand-rolled sign_fn because `OpaqueInMemoryKeyCustody` does not
-    // implement `KeyCustody` (it wraps `InMemoryKeyCustody` in `.0`).
-    // `ConcreteDidMethod::make_sign_fn` requires `Arc<K: KeyCustody>`,
-    // so we delegate to the inner `.0` field directly. Same pattern as
-    // `make_dht_with_signer` in bridge.rs.
     let custody_clone = Arc::clone(custody);
     let sign_fn: Arc<
         dyn Fn(
@@ -638,10 +632,10 @@ fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity
         let kc = Arc::clone(&custody_clone);
         Box::pin(async move {
             let handle = scp_platform::traits::KeyHandle::new(key_id);
-            let sig =
-                kc.0.sign(&handle, &data)
-                    .await
-                    .map_err(IdentityError::Platform)?;
+            let sig = kc
+                .sign(&handle, &data)
+                .await
+                .map_err(IdentityError::Platform)?;
             Ok(sig.into_bytes())
         })
     });

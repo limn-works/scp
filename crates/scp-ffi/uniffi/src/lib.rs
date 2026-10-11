@@ -756,11 +756,93 @@ pub trait DeviceAttestationProvider: Send + Sync {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Runs a test case in a child process with its own environment, so no test
+/// mutates the environment of a process whose other threads may read it.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod test_env {
+    use std::ffi::OsStr;
+
+    /// The variable that carries the case name into the child process.
+    const CASE_VAR: &str = "SCP_UNIFFI_TEST_ENV_CASE";
+
+    /// The case this process runs, or `None` in the parent test process.
+    pub fn child_case() -> Option<String> {
+        std::env::var(CASE_VAR).ok()
+    }
+
+    /// Re-runs the test `test_fn` of module `module` (pass `module_path!()`)
+    /// in a fresh process of this test binary with `CASE_VAR` set to `case`,
+    /// each `(name, Some(value))` variable set and each `(name, None)` removed.
+    /// Panics unless the child ran exactly that one test and it passed.
+    pub fn run_case(module: &str, test_fn: &str, case: &str, vars: &[(&str, Option<&OsStr>)]) {
+        let module = module.split_once("::").map_or("", |(_, rest)| rest);
+        let name = format!("{module}::{test_fn}");
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.args([name.as_str(), "--exact", "--test-threads=1"])
+            .env(CASE_VAR, case);
+        for (var, value) in vars {
+            match value {
+                Some(value) => cmd.env(var, value),
+                None => cmd.env_remove(var),
+            };
+        }
+        let out = cmd.output().expect("spawn the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // libtest exits 0 when the filter matches no test, so require the
+        // count of tests that ran as well as the exit status.
+        assert!(
+            out.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "case {case} of {name} did not pass in its child process:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use scp_ffi_common::error_codes as codes;
+
+    /// `test_env::run_case` passes for a case that ran and passed.
+    #[test]
+    fn run_case_passes_when_the_child_case_passes() {
+        if test_env::child_case().is_some() {
+            return;
+        }
+        test_env::run_case(
+            module_path!(),
+            "run_case_passes_when_the_child_case_passes",
+            "noop",
+            &[],
+        );
+    }
+
+    /// `test_env::run_case` fails for a test name no test carries, because
+    /// libtest exits 0 when its filter matches nothing.
+    #[test]
+    #[should_panic(expected = "did not pass in its child process")]
+    fn run_case_fails_when_no_test_matches() {
+        test_env::run_case(module_path!(), "no_test_has_this_name", "noop", &[]);
+    }
+
+    /// `test_env::run_case` fails when the child case fails. The child exits
+    /// nonzero rather than panicking, because `should_panic` would turn a
+    /// panic in the child into a pass.
+    #[test]
+    #[should_panic(expected = "did not pass in its child process")]
+    fn run_case_fails_when_the_child_case_fails() {
+        if test_env::child_case().is_some() {
+            std::process::exit(1);
+        }
+        test_env::run_case(
+            module_path!(),
+            "run_case_fails_when_the_child_case_fails",
+            "fail",
+            &[],
+        );
+    }
 
     /// Returns a fresh `Scp` instance for tests. Phase 4 PR 4 demolition
     /// (#1549) deleted the free-function façade.
@@ -811,93 +893,219 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 4);
     }
 
-    /// `"callback"`, `"platform"`, and `"software"` name a host key store that
-    /// no custody string reaches, so every build rejects them at parse time
-    /// with `SCP-IDENT-1003` and a message naming the accepted set (SCP-294).
-    /// `"in_memory"` names the `InMemoryKeyCustody` nullifier, so its arm is
-    /// asserted per build configuration below.
-    #[test]
-    fn parse_custody_method_rejects_host_custody_strings_with_ident_1003() {
-        use crate::bridge::{ACCEPTED_CUSTODY, parse_custody_method};
+    /// Runs one identity-creation entry point and returns the code and message
+    /// of the error it answers with, or a marker string when it succeeds.
+    fn create_outcome(
+        result: Result<std::sync::Arc<bridge::Identity>, ScpError>,
+    ) -> (String, String) {
+        match result {
+            Err(ScpError::Identity { code, msg } | ScpError::Validation { code, msg }) => {
+                (code, msg)
+            }
+            Err(other) => (String::new(), format!("{other:?}")),
+            Ok(_) => (String::new(), "created an identity".to_owned()),
+        }
+    }
 
-        for custody in ["callback", "platform", "software"] {
-            let outcome = match parse_custody_method(custody) {
-                Err(ScpError::Identity { code, msg }) => (code, msg),
-                other => (String::new(), format!("{other:?}")),
-            };
-            assert_eq!(
-                outcome.0,
-                scp_ffi_common::error_codes::IDENT_1003,
-                "{custody}: {}",
-                outcome.1
-            );
-            assert!(
-                outcome.1.contains(ACCEPTED_CUSTODY),
-                "{custody}: {}",
-                outcome.1
-            );
+    /// Every build answers each rejected custody request with the code spec 03
+    /// §3.2.2 gives it, on both entry points that take a custody string, and
+    /// every rejection message names the accepted values: `"os_keystore"`
+    /// without a provider is `SCP-IDENT-1003`, and a legacy or unknown string
+    /// is `SCP-VALID-7005`.
+    #[test]
+    fn custody_requests_are_rejected_with_their_spec_codes() {
+        use scp_ffi_common::custody_request::ACCEPTED_CUSTODY;
+        use scp_ffi_common::error_codes::{IDENT_1003, VALID_7005};
+
+        let rt = runtime();
+        for (custody, want) in [
+            ("os_keystore", IDENT_1003),
+            ("callback", VALID_7005),
+            ("platform", VALID_7005),
+            ("software", VALID_7005),
+            ("file", VALID_7005),
+            ("unknown", VALID_7005),
+        ] {
+            let scp = scp_test();
+            for (entry, outcome) in [
+                (
+                    "identity_create",
+                    create_outcome(rt.block_on(scp.identity_create(custody.to_owned(), None))),
+                ),
+                (
+                    "identity_create_with_agent_key",
+                    create_outcome(
+                        rt.block_on(scp.identity_create_with_agent_key(custody.to_owned())),
+                    ),
+                ),
+            ] {
+                assert_eq!(outcome.0, want, "{entry}({custody}): {}", outcome.1);
+                assert!(
+                    outcome.1.contains(ACCEPTED_CUSTODY),
+                    "{entry}({custody}): {}",
+                    outcome.1
+                );
+            }
         }
     }
 
     /// A `testing` build admits `"in_memory"`, because that feature is the sole
     /// activation path for the `InMemoryKeyCustody` nullifier backing it
     /// (ADR-062, capability injection and prove-absent dev backends,
-    /// §Decision 6).
+    /// §Decision 6). The handle reports the request value it answers.
     #[cfg(feature = "testing")]
     #[test]
-    fn parse_custody_method_accepts_in_memory_under_testing() {
-        use crate::bridge::parse_custody_method;
-
-        assert!(matches!(
-            parse_custody_method("in_memory"),
-            Ok(bridge::CustodyMethod::InMemory)
-        ));
+    fn identity_create_accepts_in_memory_under_testing() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("in_memory custody on a testing build");
+        assert_eq!(identity.custody_type(), "in_memory");
+        let seeded = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), Some(vec![7u8; 32])))
+            .expect("seeded in_memory custody on a testing build");
+        assert_eq!(seeded.custody_type(), "in_memory");
+        let agent = rt
+            .block_on(scp.identity_create_with_agent_key("in_memory".to_owned()))
+            .expect("in_memory agent-key identity on a testing build");
+        assert_eq!(agent.custody_type(), "in_memory");
     }
 
     /// A shipped (no-`testing`) build rejects `"in_memory"` at the boundary with
-    /// `SCP-IDENT-1008` rather than admitting a custody kind whose only backing
-    /// implementation the feature severs. This is the shipped half of the
-    /// severance. Job rust-build-uniffi-production names this test in its `-E`
-    /// filter and runs it against `--features server`, which is the
-    /// configuration a released Swift/Kotlin SDK compiles.
+    /// `SCP-IDENT-1008`, on both entry points that take a custody string, rather
+    /// than admitting a custody kind whose only backing implementation the
+    /// feature severs. This is the shipped half of the severance. Job
+    /// rust-build-uniffi-production names this test in its `-E` filter and runs
+    /// it against `--features server`, which is the configuration a released
+    /// Swift/Kotlin SDK compiles.
     #[cfg(not(feature = "testing"))]
     #[test]
-    fn parse_custody_method_rejects_in_memory_on_a_shipped_build() {
-        use crate::bridge::{ACCEPTED_CUSTODY, parse_custody_method};
+    fn identity_create_entry_points_reject_in_memory_on_a_shipped_build() {
+        use scp_ffi_common::custody_request::ACCEPTED_CUSTODY;
 
-        match parse_custody_method("in_memory") {
-            Err(ScpError::Identity { code, msg }) => {
-                assert_eq!(
-                    code,
-                    scp_ffi_common::error_codes::IDENT_1008,
-                    "expected the custody-unavailable code SCP-IDENT-1008, got code \
-                     {code} with message: {msg}"
-                );
-                assert!(msg.contains(ACCEPTED_CUSTODY), "{msg}");
-                assert!(!msg.contains("\"platform\""), "{msg}");
-            }
-            other => panic!("a shipped build must reject \"in_memory\" custody, got: {other:?}"),
+        let rt = runtime();
+        let scp = scp_test();
+        for (entry, outcome) in [
+            (
+                "identity_create",
+                create_outcome(rt.block_on(scp.identity_create("in_memory".to_owned(), None))),
+            ),
+            (
+                "identity_create_with_agent_key",
+                create_outcome(
+                    rt.block_on(scp.identity_create_with_agent_key("in_memory".to_owned())),
+                ),
+            ),
+        ] {
+            assert_eq!(
+                outcome.0,
+                scp_ffi_common::error_codes::IDENT_1008,
+                "{entry}: expected the custody-unavailable code SCP-IDENT-1008: {}",
+                outcome.1
+            );
+            assert!(
+                outcome.1.contains(ACCEPTED_CUSTODY),
+                "{entry}: {}",
+                outcome.1
+            );
         }
     }
 
-    /// An unknown string returns `SCP-VALID-7005` naming the accepted set,
-    /// which lists no rejected string as expected.
+    /// `"encrypted_file"` on a `testing` build opens `$HOME/.scp/keys.bin`
+    /// under `SCP_KEY_PASSPHRASE` and mints the identity over it, on both entry
+    /// points that take a custody string. A bad variable is `SCP-VALID-7001`,
+    /// and a key directory or key file this process cannot open is
+    /// `SCP-IDENT-1008` (`.docs/standards/sdk-common.md` §Custody request).
+    ///
+    /// Each case runs in a child process that `test_env::run_case` starts with
+    /// its own `HOME` and `SCP_KEY_PASSPHRASE`, so this test sets no
+    /// environment variable in a process where other tests run. The cases run
+    /// in order, because the wrong-passphrase case reads the key file the
+    /// first case sealed.
+    #[cfg(feature = "testing")]
     #[test]
-    fn parse_custody_method_rejects_unknown_value() {
-        use crate::bridge::{ACCEPTED_CUSTODY, parse_custody_method};
+    fn identity_create_with_encrypted_file_custody_opens_the_key_file() {
+        use scp_ffi_common::error_codes::{IDENT_1008, VALID_7001};
+        use std::ffi::OsStr;
 
-        let outcome = match parse_custody_method("unknown") {
-            Err(ScpError::Validation { code, msg }) => (code, msg),
-            other => (String::new(), format!("{other:?}")),
-        };
-        assert_eq!(
-            outcome.0,
-            scp_ffi_common::error_codes::VALID_7005,
-            "{}",
-            outcome.1
+        if let Some(case) = test_env::child_case() {
+            // (uses identity_create_with_agent_key, expected code or None for success)
+            let (agent_key, want) = match case.as_str() {
+                "create" => (false, None),
+                "agent key" => (true, None),
+                "wrong passphrase" | "HOME names a file" => (false, Some(IDENT_1008)),
+                "relative HOME" => (false, Some(VALID_7001)),
+                "unset passphrase" => (true, Some(VALID_7001)),
+                other => panic!("unknown case {other}"),
+            };
+            let rt = runtime();
+            let scp = scp_test();
+            let result = if agent_key {
+                rt.block_on(scp.identity_create_with_agent_key("encrypted_file".to_owned()))
+            } else {
+                rt.block_on(scp.identity_create("encrypted_file".to_owned(), None))
+            };
+            match want {
+                None => {
+                    let identity = result.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+                    assert_eq!(identity.custody_type(), "encrypted_file", "{case}");
+                    assert!(identity.did().starts_with("did:dht:"), "{case}");
+                }
+                Some(want) => {
+                    let outcome = create_outcome(result);
+                    assert_eq!(outcome.0, want, "{case}: {}", outcome.1);
+                }
+            }
+            return;
+        }
+
+        let base = tempfile::tempdir().expect("tempdir");
+        let home_create = base.path().join("create");
+        let home_agent = base.path().join("agent");
+        let home_is_a_file = base.path().join("plain-file");
+        std::fs::write(&home_is_a_file, b"not a directory").expect("write plain file");
+        let passphrase = OsStr::new("encrypted-file-test-passphrase");
+        let cases: [(&str, &OsStr, Option<&OsStr>); 6] = [
+            ("create", home_create.as_os_str(), Some(passphrase)),
+            ("agent key", home_agent.as_os_str(), Some(passphrase)),
+            (
+                "wrong passphrase",
+                home_create.as_os_str(),
+                Some(OsStr::new("a-different-passphrase")),
+            ),
+            (
+                "HOME names a file",
+                home_is_a_file.as_os_str(),
+                Some(passphrase),
+            ),
+            (
+                "relative HOME",
+                OsStr::new("relative-home"),
+                Some(passphrase),
+            ),
+            ("unset passphrase", home_create.as_os_str(), None),
+        ];
+        for (case, home, passphrase) in cases {
+            test_env::run_case(
+                module_path!(),
+                "identity_create_with_encrypted_file_custody_opens_the_key_file",
+                case,
+                &[("HOME", Some(home)), ("SCP_KEY_PASSPHRASE", passphrase)],
+            );
+        }
+        for home in [&home_create, &home_agent] {
+            let key_file = home.join(".scp").join("keys.bin");
+            assert!(
+                key_file.is_file(),
+                "a create must make {}",
+                key_file.display()
+            );
+        }
+        assert!(
+            !std::path::Path::new("relative-home").exists(),
+            "a refused relative HOME must create no directory under the working directory"
         );
-        assert!(outcome.1.contains(ACCEPTED_CUSTODY), "{}", outcome.1);
-        assert!(!outcome.1.contains("\"platform\""), "{}", outcome.1);
     }
 
     #[test]

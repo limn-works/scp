@@ -33,9 +33,8 @@ context lifecycle, messaging, and tool invocation.
 
 Each example is one top-level function that your app calls. Every example that
 creates an identity takes a `uniffi.scp.KeyCustodyProvider`. The SDK ships no
-key store that `identityCreate(custody)` reaches in a shipped build: its one
-`CustodyType`, `IN_MEMORY`, works only in a build compiled with the `testing`
-feature, and a shipped build rejects it with `SCP-IDENT-1008`.
+key store that `identityCreate(custody)` reaches in a shipped build; the KDoc
+on `works.limn.scp.CustodyType` states how a shipped build answers each entry.
 `AndroidKeyCustody` implements a different interface,
 `works.limn.scp.android.platform.KeyCustodyProvider`, so it cannot be passed
 here. Implement `uniffi.scp.KeyCustodyProvider` over your own key store:

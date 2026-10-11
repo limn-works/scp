@@ -8,32 +8,64 @@ import Foundation
 
 /// The custody choice a caller passes to
 /// ``SCP/identityCreate(custody:testingSeed:)`` and
-/// ``SCP/identityCreateWithAgentKey(custody:)`` (spec section 3.2).
+/// ``SCP/identityCreateWithAgentKey(custody:)``: the custody request
+/// vocabulary of spec section 3.2.2.
 ///
-/// Its cases are exactly the custody strings the UniFFI bridge accepts
-/// (`parse_custody_method` in `crates/scp-ffi/uniffi/src/bridge.rs`), so the
-/// compiler rejects a custody value the bridge would refuse. Neither method
-/// gives the parameter a default: which key store holds a private key decides
-/// who can reach that key, so the caller states it.
+/// Neither method gives the parameter a default: which key store holds a
+/// private key decides who can reach that key, so the caller states it. The
+/// UniFFI bridge answers every value through one parser
+/// (`scp_ffi_common::custody_request`), so each case gets the same answer on
+/// every bridge:
 ///
-/// No case reaches Apple Keychain, the Secure Enclave, or any other host key
-/// store. A caller reaches one by injecting a `KeyCustodyProvider` through
-/// ``SCP/identityCreateWithCustody(provider:)``.
+/// - ``encryptedFile`` creates the identity over the encrypted key file.
+/// - ``osKeystore`` names the host key store, which only a `KeyCustodyProvider`
+///   reaches, so both methods answer it with `SCP-IDENT-1003`. Pass the
+///   provider to ``SCP/identityCreateWithCustody(provider:)``; the identity it
+///   returns reports `"os_keystore"` from `custodyType()`.
+/// - ``inMemory`` is a test affordance that a shipped build answers with
+///   `SCP-IDENT-1008`.
+///
+/// A shipped build also refuses every identity creation with `SCP-IDENT-1059`
+/// until a production pre-rotation custody backend exists (ADR-062
+/// §Decision 6).
 ///
 /// The Kotlin SDK's `works.limn.scp.CustodyType` carries the same cases. This
 /// type is a pure Swift type and conflicts with no UniFFI-generated type.
 ///
 /// ## Provenance
 ///
-/// - Spec section 3.2 (Key Custody)
+/// - Spec section 3.2.2 (Custody request vocabulary)
+/// - `.docs/standards/sdk-common.md` §Custody request
 /// - `.docs/standards/construction.md` (consequential choices are enums;
 ///   required choices are required)
 /// - SCP-294 in `.docs/prds/http-features.json`
 public nonisolated enum CustodyType: String, Sendable, CaseIterable {
+    /// The encrypted key file at `$HOME/.scp/keys.bin`, sealed with
+    /// Argon2id and AES-256-GCM under the passphrase in the
+    /// `SCP_KEY_PASSPHRASE` environment variable (spec section 17.8).
+    ///
+    /// An unset, empty or relative `HOME`, or an unset or empty
+    /// `SCP_KEY_PASSPHRASE`, is `SCP-VALID-7001`. A key directory or key file
+    /// the process cannot open, including one sealed under another passphrase,
+    /// is `SCP-IDENT-1008`.
+    case encryptedFile = "encrypted_file"
+
+    /// The host operating system's key store, reached only through a
+    /// `KeyCustodyProvider`.
+    ///
+    /// ``SCP/identityCreate(custody:testingSeed:)`` and
+    /// ``SCP/identityCreateWithAgentKey(custody:)`` take no provider, so they
+    /// answer this case with `SCP-IDENT-1003`; pass the provider to
+    /// ``SCP/identityCreateWithCustody(provider:)``. The value promises that
+    /// the keys sit in the host's store and that every use of them goes
+    /// through the provider. It promises no hardware backing: the Secure
+    /// Enclave performs P-256 operations and no others (ADR-025).
+    case osKeystore = "os_keystore"
+
     /// An in-memory key store that loses every key when the process exits.
     ///
     /// The UniFFI bridge builds it only under its `testing` feature; a shipped
-    /// build answers it with `SCP-IDENT-1008` and builds no other key store.
+    /// build answers it with `SCP-IDENT-1008`.
     case inMemory = "in_memory"
 }
 

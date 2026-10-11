@@ -814,9 +814,10 @@ public protocol IdentityProtocol: AnyObject, Sendable {
     func addAgentKey() async throws  -> Identity
     
     /**
-     * Returns the custody method string for this identity.
-     *
-     * One of: `"in_memory"`, `"callback"`, `"external"`.
+     * Returns the custody request value this identity was created with
+     * (spec `03-identity.md` §3.2.2): `"encrypted_file"` or `"os_keystore"`,
+     * `"in_memory"` on a `testing` build, or `"external"` for an identity
+     * loaded by DID string without local key material.
      */
     func custodyType()  -> String
     
@@ -1041,9 +1042,10 @@ open func addAgentKey()async throws  -> Identity  {
 }
     
     /**
-     * Returns the custody method string for this identity.
-     *
-     * One of: `"in_memory"`, `"callback"`, `"external"`.
+     * Returns the custody request value this identity was created with
+     * (spec `03-identity.md` §3.2.2): `"encrypted_file"` or `"os_keystore"`,
+     * `"in_memory"` on a `testing` build, or `"external"` for an identity
+     * loaded by DID string without local key material.
      */
 open func custodyType() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -2579,6 +2581,14 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * initialization, handle `instance_id` stamping) is scoped to this
      * `SCP`.
      *
+     * `custody` is a custody request value of spec `03-identity.md` §3.2.2:
+     * `"encrypted_file"` (the key file at `$HOME/.scp/keys.bin`, sealed under
+     * `SCP_KEY_PASSPHRASE`), or `"in_memory"` on a `testing` build.
+     * `"os_keystore"` needs a `KeyCustodyProvider`, so this method answers it
+     * with `SCP-IDENT-1003` and the caller uses
+     * [`Self::identity_create_with_custody`]. Every other string is
+     * `SCP-VALID-7005`.
+     *
      * When `testing_seed` is supplied (32 bytes), the in-memory custody
      * is backed by a deterministic RNG so subsequent `generate_keypair`
      * calls produce byte-identical Ed25519 keys across bridges — the
@@ -2604,9 +2614,10 @@ public protocol ScpProtocol: AnyObject, Sendable {
     /**
      * Per-instance equivalent of the free-function `identity_create_with_agent_key`.
      *
-     * Creates a new SCP identity with an agent signing key. Routes through
-     * `&*self.inner` so the returned `Identity`'s `instance_id` is stamped
-     * against this `SCP`.
+     * Creates a new SCP identity with an agent signing key. `custody` takes
+     * the values [`Self::identity_create`] takes, with the same codes (spec
+     * `03-identity.md` §3.2.2). Routes through `&*self.inner` so the returned
+     * `Identity`'s `instance_id` is stamped against this `SCP`.
      */
     func identityCreateWithAgentKey(custody: String) async throws  -> Identity
     
@@ -2615,7 +2626,9 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `identity_create_with_custody`.
      *
      * Creates a new SCP identity under this instance using an injected
-     * [`KeyCustodyProvider`](crate::KeyCustodyProvider). Routes through
+     * [`KeyCustodyProvider`](crate::KeyCustodyProvider): the `os_keystore`
+     * custody request of spec `03-identity.md` §3.2.2. The handle's
+     * `custody_type()` reports `"os_keystore"`. Routes through
      * `&*self.inner` — the handle's `instance_id` is stamped against this
      * `SCP` so cross-instance misuse is rejected.
      *
@@ -5369,6 +5382,14 @@ open func identityAttestDevice(identity: Identity)async throws  -> String  {
      * initialization, handle `instance_id` stamping) is scoped to this
      * `SCP`.
      *
+     * `custody` is a custody request value of spec `03-identity.md` §3.2.2:
+     * `"encrypted_file"` (the key file at `$HOME/.scp/keys.bin`, sealed under
+     * `SCP_KEY_PASSPHRASE`), or `"in_memory"` on a `testing` build.
+     * `"os_keystore"` needs a `KeyCustodyProvider`, so this method answers it
+     * with `SCP-IDENT-1003` and the caller uses
+     * [`Self::identity_create_with_custody`]. Every other string is
+     * `SCP-VALID-7005`.
+     *
      * When `testing_seed` is supplied (32 bytes), the in-memory custody
      * is backed by a deterministic RNG so subsequent `generate_keypair`
      * calls produce byte-identical Ed25519 keys across bridges — the
@@ -5424,9 +5445,10 @@ open func identityCreateLinkAttestation(identity: Identity, platform: String, ha
     /**
      * Per-instance equivalent of the free-function `identity_create_with_agent_key`.
      *
-     * Creates a new SCP identity with an agent signing key. Routes through
-     * `&*self.inner` so the returned `Identity`'s `instance_id` is stamped
-     * against this `SCP`.
+     * Creates a new SCP identity with an agent signing key. `custody` takes
+     * the values [`Self::identity_create`] takes, with the same codes (spec
+     * `03-identity.md` §3.2.2). Routes through `&*self.inner` so the returned
+     * `Identity`'s `instance_id` is stamped against this `SCP`.
      */
 open func identityCreateWithAgentKey(custody: String)async throws  -> Identity  {
     return
@@ -5450,7 +5472,9 @@ open func identityCreateWithAgentKey(custody: String)async throws  -> Identity  
      * `identity_create_with_custody`.
      *
      * Creates a new SCP identity under this instance using an injected
-     * [`KeyCustodyProvider`](crate::KeyCustodyProvider). Routes through
+     * [`KeyCustodyProvider`](crate::KeyCustodyProvider): the `os_keystore`
+     * custody request of spec `03-identity.md` §3.2.2. The handle's
+     * `custody_type()` reports `"os_keystore"`. Routes through
      * `&*self.inner` — the handle's `instance_id` is stamped against this
      * `SCP` so cross-instance misuse is rejected.
      *
@@ -13210,25 +13234,34 @@ extension CustodyKeyType: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
- * The custody method used to protect an identity's private key.
+ * The backend that holds an identity's private keys, as the identity's
+ * handle reports it (spec `03-identity.md` §3.2.2).
  *
- * See ADR-006 (Platform Abstraction) and `scp_platform::CustodyType`.
+ * The first three variants are the custody request values of §3.2.2;
+ * [`Identity::custody_type`] returns each one's request string.
  */
 
 public enum CustodyMethod {
     
     /**
-     * Key material stored in memory only (testing / in-process).
+     * `encrypted_file`: `FileKeyCustody`, the Argon2id plus AES-256-GCM key
+     * file at `$HOME/.scp/keys.bin`, sealed under `SCP_KEY_PASSPHRASE`
+     * (spec §17.8).
+     */
+    case encryptedFile
+    /**
+     * `os_keystore`: the host key store, reached only through the
+     * `KeyCustodyProvider` passed to `identity_create_with_custody`. A
+     * provider could front a store other than the operating system's, and
+     * the handle still reports `os_keystore`, the value the caller requested.
+     */
+    case osKeystore
+    /**
+     * `in_memory`: the testing-build affordance, never a peer of the two
+     * request values. A bridge built without the `testing` feature answers
+     * the request with `SCP-IDENT-1008` and never reports this variant.
      */
     case inMemory
-    /**
-     * Key material held by a host `KeyCustodyProvider` (Secure Enclave,
-     * Android Keystore, or any other host key store) injected through
-     * `identity_create_with_custody`. No custody string selects it:
-     * `identity_create` answers `"callback"`, `"platform"`, and
-     * `"software"` with `SCP-IDENT-1003` (SCP-294).
-     */
-    case callback
     /**
      * Identity loaded by DID string without local key material.
      *
@@ -13253,11 +13286,13 @@ public struct FfiConverterTypeCustodyMethod: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .inMemory
+        case 1: return .encryptedFile
         
-        case 2: return .callback
+        case 2: return .osKeystore
         
-        case 3: return .external
+        case 3: return .inMemory
+        
+        case 4: return .external
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -13267,16 +13302,20 @@ public struct FfiConverterTypeCustodyMethod: FfiConverterRustBuffer {
         switch value {
         
         
-        case .inMemory:
+        case .encryptedFile:
             writeInt(&buf, Int32(1))
         
         
-        case .callback:
+        case .osKeystore:
             writeInt(&buf, Int32(2))
         
         
-        case .external:
+        case .inMemory:
             writeInt(&buf, Int32(3))
+        
+        
+        case .external:
+            writeInt(&buf, Int32(4))
         
         }
     }
@@ -17666,7 +17705,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_add_agent_key() != 23309) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_identity_custody_type() != 16200) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_custody_type() != 11101) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_did() != 6016) {
@@ -17930,16 +17969,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_attest_device() != 36607) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 30085) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 14616) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_link_attestation() != 29874) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_with_agent_key() != 20413) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_with_agent_key() != 53250) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_with_custody() != 35310) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_with_custody() != 65486) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_execute_custody_migration() != 23068) {
