@@ -84,16 +84,23 @@ pub trait SequenceStore: Send + Sync {
 
 /// In-memory [`SequenceStore`] for testing.
 ///
+/// Compiled only under `cfg(test)` or the `testing` feature: it forgets every
+/// sequence number on restart, so it is an in-memory backend the root
+/// AGENTS.md tenet "No dev/test-only stand-ins in production" keeps off every
+/// shipped path.
+///
 /// Stores sequence numbers in a `HashMap` behind a `tokio::sync::Mutex`.
 /// Not suitable for production (no persistence across restarts).
 ///
 /// Construct via [`Default`] (`InMemorySequenceStore::default()`); it carries
 /// no configuration, so a bespoke `new()` would be redundant.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 pub struct InMemorySequenceStore {
     sequences: tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl SequenceStore for InMemorySequenceStore {
     fn load(
         &self,

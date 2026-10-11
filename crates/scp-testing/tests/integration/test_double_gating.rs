@@ -29,6 +29,10 @@ use std::path::{Path, PathBuf};
 /// covers. `NoOpContextPersistence` reports every context snapshot as stored
 /// and stores nothing, so a restart restores no context. `NoOpSagaJournal`
 /// journals no saga, so crash recovery replays nothing.
+/// `InMemorySequenceStore` forgets every DID sequence number on restart, so a
+/// node can republish at a sequence a resolver already saw.
+/// `InMemoryRelayQuerier` answers DID queries from a local map in place of a
+/// relay.
 const GATED_DOUBLES: &[&str] = &[
     "InMemoryFfiTrustStore",
     "InMemoryViolationStore",
@@ -38,6 +42,8 @@ const GATED_DOUBLES: &[&str] = &[
     "InMemoryCaveatResolver",
     "NoOpContextPersistence",
     "NoOpSagaJournal",
+    "InMemorySequenceStore",
+    "InMemoryRelayQuerier",
 ];
 
 /// True when a cfg predicate holds only if `test` or `feature = "testing"` holds.

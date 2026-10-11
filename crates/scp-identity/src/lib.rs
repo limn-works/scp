@@ -43,10 +43,12 @@ pub mod resolver;
 
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use config::{CreatedIdentity, Identity, IdentityConfig, NoPersistence};
+#[cfg(any(test, feature = "testing"))]
+pub use dht::InMemorySequenceStore;
 pub use dht::{
-    DidDht, InMemorySequenceStore, MigrationOutcome, MigrationPartialState, MigrationResumePhase,
-    PostResolveHook, SequenceStore, did_from_ed25519_public_key, extract_public_key,
-    verify_migration, verify_self_certification,
+    DidDht, MigrationOutcome, MigrationPartialState, MigrationResumePhase, PostResolveHook,
+    SequenceStore, did_from_ed25519_public_key, extract_public_key, verify_migration,
+    verify_self_certification,
 };
 pub use relay_querier::RealMultiRelayQuerier;
 pub use republish::RepublishManager;
@@ -55,13 +57,14 @@ pub use republish::RepublishManager;
 // root-exporting only some of them would push consumers back to module paths
 // for the rest — the drift that let a production site re-inline the
 // composition.
+#[cfg(any(test, feature = "testing"))]
+pub use resolution::InMemoryRelayQuerier;
 pub use resolution::{
-    InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, did_key_routing_id,
-    did_record_routing_id, did_routing_id,
+    RelayQuerier, RelayQueryRecord, did_key_routing_id, did_record_routing_id, did_routing_id,
 };
 pub use resolver::{
     DidResolver, DualLayerHealingPublisher, DualLayerResolver, HealingPublisher, MultiRelayQuerier,
-    NoOpHealer, NoOpRelayQuerier, ResolutionSource, ResolvedDidDocument, StaleLayer,
+    NoHealing, NoOpRelayQuerier, ResolutionSource, ResolvedDidDocument, StaleLayer,
 };
 
 use serde::{Deserialize, Serialize};
@@ -269,7 +272,7 @@ pub enum IdentityError {
 
     /// A relay querier has no live connection to the specified relay URL.
     ///
-    /// Returned by `TransportRelayQuerier` (Slice 011b) when the relay
+    /// Returned by `TransportRelayQuerier` (SCP-RELAYRES-002) when the relay
     /// connection pool does not hold an active connection to the requested
     /// relay URL and cannot establish one in time. Callers (`RealMultiRelayQuerier`)
     /// treat this as a soft failure and advance to the next relay in priority

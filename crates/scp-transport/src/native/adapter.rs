@@ -374,6 +374,14 @@ impl NativeRelayAdapter {
         self.heartbeat_monitor.is_some()
     }
 
+    /// Returns whether the underlying client still holds a live connection.
+    ///
+    /// It turns `false` once the client's reader task observes the socket
+    /// close, end of stream, or a read error.
+    pub async fn is_connected(&self) -> bool {
+        self.client.is_connected().await
+    }
+
     /// Test-only handle to the underlying [`HeartbeatMonitor`], so tests can
     /// drive deterministic [`check_suppression`](HeartbeatMonitor::check_suppression)
     /// against the same monitor that [`record_heartbeat_received`](Self::record_heartbeat_received)
