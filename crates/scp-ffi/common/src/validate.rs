@@ -1858,7 +1858,7 @@ mod tests {
     #[test]
     fn check_testing_seed_codes_every_input() {
         use crate::error_codes::{VALID_7008, VALID_7009};
-        let cases: [(&str, bool, bool, Option<&str>); 10] = [
+        let cases: [(&str, bool, bool, Option<&str>); 11] = [
             ("in_memory", false, true, None),
             ("in_memory", false, false, None),
             ("platform", false, false, None),
@@ -1867,7 +1867,8 @@ mod tests {
             ("platform", true, true, Some(VALID_7009)),
             ("platform", true, false, Some(VALID_7009)),
             ("software", true, true, Some(VALID_7009)),
-            ("file", true, false, Some(VALID_7009)),
+            ("encrypted_file", true, false, Some(VALID_7009)),
+            ("os_keystore", true, true, Some(VALID_7009)),
             ("keychain", true, true, Some(VALID_7009)),
         ];
         for (custody, seed, testing, want) in cases {

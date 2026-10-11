@@ -5,6 +5,9 @@
 //! - **`validate`** — Input validation (always available, no external deps).
 //!   Used by all FFI bridges (`PyO3`, napi-rs, `UniFFI`).
 //!
+//! - **`custody_request`** — The custody request parser of spec 03 §3.2.2
+//!   (always available, no external deps).
+//!
 //! - **`petname_helpers`** (behind `resolvers` feature) — Shared petname/handle/
 //!   address-resolution helpers: JSON serialization, `HandleTarget` parsing,
 //!   `HandleEntry` conversion, `HandleQuerier` impl, global singletons.
@@ -15,6 +18,7 @@
 //!
 //! See §3.10.10, §9.5, §7.4.1, §22.3.1, §22.4, §22.8 in `.docs/specs/`.
 
+pub mod custody_request;
 pub mod error_codes;
 pub mod outlet_id;
 pub mod p256_host;
