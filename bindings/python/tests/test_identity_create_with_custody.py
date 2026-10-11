@@ -6,12 +6,12 @@ bridge drives ``DidDht::create`` against it (signing the DID document via the
 provider's ``sign`` callback), and the resulting :class:`Identity` carries a
 ``did:dht:`` value plus the provider-derived verifying key.
 
-The provider is backed by a compact, dependency-free Ed25519 (RFC 8032)
-implementation so the test runs against the stdlib alone — the CI Python
-interpreter has neither PyNaCl nor ``cryptography`` installed. The numbers are
-real Ed25519 keys: ``DidDht::create`` self-certifies the document, so a fake
-signature would fail document validation. This proves the full delegation
-contract (generate → public_key → sign), not just argument plumbing.
+The provider's Ed25519 keys come from a compact pure-Python RFC 8032
+implementation, and its ``hpke-p256`` keys (the identity wrapping key) from
+``cryptography``'s ``SECP256R1`` ECDH, a test dependency. The numbers are real
+keys: ``DidDht::create`` self-certifies the document, so a fake signature
+would fail document validation. This proves the full delegation contract
+(generate → public_key → sign), not just argument plumbing.
 
 Requires the native extension built with ``testing``::
 
@@ -24,6 +24,8 @@ import hashlib
 from typing import Literal
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from scp_sdk import (
     CustodyKeyRole,
@@ -123,8 +125,38 @@ def ed25519_sign(sk: bytes, msg: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 
+# RFC 5903 §8.1, the ECDH vector ``scp_crypto::p256::testing`` pins as
+# ``ECDH_VECTOR_*``: the initiator scalar, both public points, and the shared
+# x-coordinate.
+ECDH_VECTOR_SCALAR_I = "c88f01f510d9ac3f70a292daa2316de544e9aab8afe84049c62a9c57862d1433"
+ECDH_VECTOR_PUBLIC_I = (
+    "04dad0b65394221cf9b051e1feca5787d098dfe637fc90b9ef945d0c3772581180"
+    "5271a0461cdb8252d61f1c456fa3e59ab1f45b33accf5f58389e0577b8990bb3"
+)
+ECDH_VECTOR_PUBLIC_R = (
+    "04d12dfb5289c8d4f81208b70270398c342296970a0bccb74c736fc7554494bf63"
+    "56fbf3ca366cc23e8157854c13c58d6aac23f046ada30f8353e74f33039872ab"
+)
+ECDH_VECTOR_SHARED_X = "d6840f6b42f6edafd13116e0e12565202fef8e9ece7dce03812464d04b9442de"
+
+
+def _uncompressed(key: ec.EllipticCurvePublicKey) -> bytes:
+    return key.public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+    )
+
+
+def _p256_agree(private: ec.EllipticCurvePrivateKey, peer_public: bytes) -> bytes:
+    """The 32-byte x-coordinate with a 65-byte uncompressed peer point."""
+    peer = bytes(peer_public)
+    if len(peer) != 65 or peer[0] != 0x04:
+        raise ValueError(f"hpke-p256 peer must be a 65-byte uncompressed point, got {len(peer)}")
+    point = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), peer)
+    return private.exchange(ec.ECDH(), point)
+
+
 class _FakeKeychain:
-    """In-memory :class:`KeyCustodyProvider` backed by real Ed25519 keys.
+    """In-memory :class:`KeyCustodyProvider` backed by real Ed25519 and P-256 keys.
 
     Stands in for a platform keystore. Key ids are numeric strings; the seed
     bytes never leave this object except via ``export_signing_key_bytes`` /
@@ -145,6 +177,8 @@ class _FakeKeychain:
         # Ed25519 pseudonym shape, which the bridge must reject (§9.10.4).
         self._fault = fault
         self._seeds: dict[str, bytes] = {}
+        # HPKE P-256 keys (the identity wrapping key).
+        self._hpke: dict[str, ec.EllipticCurvePrivateKey] = {}
         # Every (identity key id, context) a derivation received.
         self.derive_calls: list[tuple[str, bytes]] = []
         # Key id -> the role generate_keypair minted it in.
@@ -152,9 +186,14 @@ class _FakeKeychain:
         self._next = 1
 
     def generate_keypair(self, key_type: CustodyKeyType, role: CustodyKeyRole) -> str:
+        if key_type not in ("ed25519", "hpke-p256"):
+            raise ValueError(f"this keychain holds ed25519 and hpke-p256 keys, not {key_type}")
         kid = str(self._next)
         self._next += 1
         self._roles[kid] = role
+        if key_type == "hpke-p256":
+            self._hpke[kid] = ec.generate_private_key(ec.SECP256R1())
+            return kid
         # Deterministic-per-id seed keeps the test reproducible while still
         # producing a valid Ed25519 key.
         self._seeds[kid] = hashlib.sha256(b"scp-test-custody/" + kid.encode()).digest()
@@ -164,6 +203,12 @@ class _FakeKeychain:
         return ed25519_sign(self._seeds[key_id], bytes(message))
 
     def get_public_key(self, key_id: str) -> CustodyPublicKey:
+        if key_id in self._hpke:
+            return CustodyPublicKey(
+                key_type="hpke-p256",
+                public_key=_uncompressed(self._hpke[key_id].public_key()),
+                role=self._roles[key_id],
+            )
         if key_id not in self._seeds:
             raise KeyNotFoundError(f"unknown key id: {key_id}")
         return CustodyPublicKey(
@@ -174,12 +219,15 @@ class _FakeKeychain:
 
     def destroy_key(self, key_id: str) -> None:
         self._seeds.pop(key_id, None)
+        self._hpke.pop(key_id, None)
         self._roles.pop(key_id, None)
 
     def dh_agree(self, key_id: str, peer_public: bytes) -> bytes:
-        # Not exercised by identity_create_with_custody; a deterministic
-        # stand-in keeps the protocol surface complete.
-        return hashlib.sha256(self._seeds[key_id] + bytes(peer_public)).digest()
+        if key_id in self._hpke:
+            return _p256_agree(self._hpke[key_id], peer_public)
+        if key_id in self._seeds:
+            raise ValueError(f"key {key_id} is ed25519; it cannot agree")
+        raise KeyNotFoundError(f"unknown key id: {key_id}")
 
     def _point(self, key_id: str, context_id: bytes, epoch: int | None = None) -> bytes:
         # The SDK's software helper derives the point from the Ed25519
@@ -215,6 +263,42 @@ class _FakeKeychain:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_fake_keychain_hpke_p256_agrees_symmetrically_and_matches_the_vector() -> None:
+    """The keychain's hpke-p256 keys are real P-256 (RFC 5903 §8.1 vector)."""
+    keychain = _FakeKeychain()
+    a = keychain.generate_keypair("hpke-p256", "operational")
+    b = keychain.generate_keypair("hpke-p256", "operational")
+    a_pub = keychain.get_public_key(a)
+    b_pub = keychain.get_public_key(b)
+    assert a_pub.key_type == "hpke-p256"
+    assert len(a_pub.public_key) == 65
+    assert keychain.dh_agree(a, b_pub.public_key) == keychain.dh_agree(b, a_pub.public_key)
+
+    fixed = ec.derive_private_key(int(ECDH_VECTOR_SCALAR_I, 16), ec.SECP256R1())
+    assert _uncompressed(fixed.public_key()).hex() == ECDH_VECTOR_PUBLIC_I
+    assert _p256_agree(fixed, bytes.fromhex(ECDH_VECTOR_PUBLIC_R)).hex() == ECDH_VECTOR_SHARED_X
+    # The keychain's agreement with the vector's point is the one the
+    # vector's scalar computes against the keychain's point.
+    assert keychain.dh_agree(a, bytes.fromhex(ECDH_VECTOR_PUBLIC_I)) == _p256_agree(
+        fixed, a_pub.public_key
+    )
+
+
+def test_fake_keychain_hpke_p256_refuses_bad_peers_and_ed25519_keys() -> None:
+    keychain = _FakeKeychain()
+    a = keychain.generate_keypair("hpke-p256", "operational")
+    point = bytes.fromhex(ECDH_VECTOR_PUBLIC_I)
+    off_curve = point[:64] + bytes([point[64] ^ 1])
+    for bad in (point[1:33], point[1:], point + b"\x00", off_curve, bytes(65)):
+        with pytest.raises(ValueError):
+            keychain.dh_agree(a, bad)
+    ed = keychain.generate_keypair("ed25519", "identity")
+    with pytest.raises(ValueError):
+        keychain.dh_agree(ed, point)
+    with pytest.raises(ValueError):
+        keychain.generate_keypair("x25519", "operational")
 
 
 @pytest.mark.asyncio

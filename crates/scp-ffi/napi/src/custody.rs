@@ -1168,6 +1168,101 @@ mod tests {
             .expect("ephemeral seed via enum");
         assert_eq!(seed.len(), 32);
     }
+
+    /// HPKE P-256 `dh_agree` through the enum's `InMemory` arm, the custody a
+    /// testing identity's wrapping key lives in:
+    /// (a) two handles agree symmetrically, and each agreement equals
+    ///     `ecdh_p256` from the pinned vector's scalar against the handle's
+    ///     public point;
+    /// (b) peers of 32, 33, 64 and 66 bytes are rejected;
+    /// (c) an off-curve 65-byte point and a `0x00`-led one are rejected;
+    /// (d) an Ed25519 or X25519 handle with a 65-byte peer is rejected, and so
+    ///     is the HPKE handle with a 32-byte peer.
+    #[tokio::test]
+    async fn napi_key_custody_in_memory_hpke_p256_dh_agree() {
+        use scp_crypto::p256::{P256PublicKey, P256SecretKey, ecdh_p256, testing};
+
+        let custody = NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(
+            InMemoryKeyCustody::new(),
+        )));
+        let a = custody
+            .generate_keypair(KeyType::HpkeP256)
+            .await
+            .expect("generate A");
+        let b = custody
+            .generate_keypair(KeyType::HpkeP256)
+            .await
+            .expect("generate B");
+        let a_pub = custody.public_key(&a).await.expect("A public");
+        let b_pub = custody.public_key(&b).await.expect("B public");
+        assert_eq!(a_pub.as_bytes().len(), 65);
+        assert_eq!(b_pub.as_bytes().len(), 65);
+
+        // (a) symmetry, and agreement with the pinned vector's scalar.
+        let ab = custody.dh_agree(&a, b_pub.as_bytes()).await.expect("A·B");
+        let ba = custody.dh_agree(&b, a_pub.as_bytes()).await.expect("B·A");
+        assert_eq!(ab.as_bytes(), ba.as_bytes());
+        let fixed = P256SecretKey::from_scalar_bytes(
+            &hex::decode(testing::ECDH_VECTOR_SCALAR_I)
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes"),
+        )
+        .expect("scalar");
+        let fixed_pub = fixed.public_key().to_uncompressed();
+        assert_eq!(hex::encode(fixed_pub), testing::ECDH_VECTOR_PUBLIC_I);
+        let a_fixed = custody.dh_agree(&a, &fixed_pub).await.expect("A·I");
+        let a_point = P256PublicKey::from_uncompressed(a_pub.as_bytes()).expect("A point");
+        assert_eq!(a_fixed.as_bytes(), ecdh_p256(&fixed, &a_point).as_slice());
+
+        // (b) wrong peer lengths.
+        let compressed = fixed.public_key().to_compressed();
+        let wrong_lengths: [(&str, Vec<u8>); 4] = [
+            ("32", fixed_pub[1..33].to_vec()),
+            ("33", compressed.to_vec()),
+            ("64", fixed_pub[1..].to_vec()),
+            ("66", [&fixed_pub[..], &[0u8][..]].concat()),
+        ];
+        for (len, peer) in wrong_lengths {
+            assert!(
+                matches!(
+                    custody.dh_agree(&a, &peer).await,
+                    Err(PlatformError::CustodyError(_))
+                ),
+                "{len}-byte peer"
+            );
+        }
+
+        // (c) off-curve and 0x00-led points.
+        let mut off_curve = fixed_pub;
+        off_curve[64] ^= 1;
+        let infinity = [0u8; 65];
+        for (case, peer) in [("off curve", off_curve), ("0x00-led", infinity)] {
+            assert!(
+                matches!(
+                    custody.dh_agree(&a, &peer).await,
+                    Err(PlatformError::CustodyError(_))
+                ),
+                "{case}"
+            );
+        }
+
+        // (d) key type and peer length must match.
+        let ed = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("Ed25519");
+        let x = custody
+            .generate_keypair(KeyType::X25519)
+            .await
+            .expect("X25519");
+        assert!(custody.dh_agree(&ed, &fixed_pub).await.is_err(), "Ed25519");
+        assert!(custody.dh_agree(&x, &fixed_pub).await.is_err(), "X25519");
+        assert!(
+            custody.dh_agree(&a, &[7u8; 32]).await.is_err(),
+            "HPKE handle, 32-byte peer"
+        );
+    }
 }
 
 /// The adapter itself ([`CallbackAdapter`]) over a software host that stands
