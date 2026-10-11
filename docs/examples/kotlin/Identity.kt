@@ -4,12 +4,12 @@
  * Demonstrates creating a new SCP identity using did:dht,
  * inspecting the resulting DID document, and resolving it.
  *
- * The Kotlin SDK ships no production key store that `identityCreate(custody)`
- * reaches: its one [works.limn.scp.CustodyType], `IN_MEMORY`, works only in a
- * build compiled with the `testing` feature, and a shipped build rejects it
- * with `SCP-IDENT-1008`. A production caller implements
- * [uniffi.scp.KeyCustodyProvider] over its own key store and passes it to
- * `identityCreateWithCustody`.
+ * [works.limn.scp.CustodyType] names the custody request of spec section
+ * 3.2.2. `identityCreate(custody)` answers `OS_KEYSTORE` with `SCP-IDENT-1003`,
+ * because only a [uniffi.scp.KeyCustodyProvider] reaches the host key store,
+ * and `IN_MEMORY` works only in a build compiled with the `testing` feature.
+ * This example implements the provider over the caller's own key store and
+ * passes it to `identityCreateWithCustody`.
  *
  * Prerequisites:
  *   implementation("works.limn:scp-kt:0.1.0")

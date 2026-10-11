@@ -1250,7 +1250,10 @@ class SCP internal constructor(
      * [CustodyType.rawValue].
      *
      * [custody] is required and typed: the caller names the key store, and
-     * the compiler rejects a custody value the UniFFI bridge refuses.
+     * the compiler rejects a string outside the custody request vocabulary
+     * (spec section 3.2.2). [CustodyType.OS_KEYSTORE] throws `SCP-IDENT-1003`,
+     * because only a `KeyCustodyProvider` reaches the host key store; pass one
+     * to [identityCreateWithCustody].
      *
      * [testingSeed] is a testing-only parameter for the ADR-046
      * cross-bridge parity harness; pass `null` from production callers
@@ -1285,14 +1288,20 @@ class SCP internal constructor(
      * [CustodyType.rawValue].
      *
      * [custody] is required and typed: the caller names the key store, and
-     * the compiler rejects a custody value the UniFFI bridge refuses.
+     * the compiler rejects a string outside the custody request vocabulary
+     * (spec section 3.2.2). [CustodyType.OS_KEYSTORE] throws `SCP-IDENT-1003`,
+     * because only a `KeyCustodyProvider` reaches the host key store.
      */
     suspend fun identityCreateWithAgentKey(custody: CustodyType): Identity =
         inner.identityCreateWithAgentKey(
             custody = custody.rawValue,
         )
 
-    /** Forwards to [NativeScp.identityCreateWithCustody] on [inner]. */
+    /**
+     * Forwards to [NativeScp.identityCreateWithCustody] on [inner]: the
+     * `os_keystore` custody request (spec section 3.2.2). The identity it
+     * returns reports `"os_keystore"` from `custodyType()`.
+     */
     suspend fun identityCreateWithCustody(provider: KeyCustodyProvider): Identity =
         inner.identityCreateWithCustody(
             provider = provider,

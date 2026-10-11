@@ -129,8 +129,10 @@ interface IdentityBindings {
      * @param custody A [works.limn.scp.CustodyType.rawValue]; [IdentityBridge.create]
      *   is the typed entry point.
      * @return Opaque identity handle for use in subsequent operations.
-     * @throws BridgeException with `SCP-IDENT-1008` if `"in_memory"` is requested
-     *   but the `testing` feature is not enabled.
+     * @throws BridgeException with the code spec section 3.2.2 gives a rejected
+     *   request: `SCP-IDENT-1003` for `"os_keystore"`, which needs a
+     *   `KeyCustodyProvider`; `SCP-IDENT-1008` for `"in_memory"` when the
+     *   `testing` feature is not enabled; `SCP-VALID-7005` for any other string.
      */
     fun identityCreate(custody: String): Long
 

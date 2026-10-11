@@ -811,93 +811,227 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 4);
     }
 
-    /// `"callback"`, `"platform"`, and `"software"` name a host key store that
-    /// no custody string reaches, so every build rejects them at parse time
-    /// with `SCP-IDENT-1003` and a message naming the accepted set (SCP-294).
-    /// `"in_memory"` names the `InMemoryKeyCustody` nullifier, so its arm is
-    /// asserted per build configuration below.
-    #[test]
-    fn parse_custody_method_rejects_host_custody_strings_with_ident_1003() {
-        use crate::bridge::{ACCEPTED_CUSTODY, parse_custody_method};
+    /// Runs one identity-creation entry point and returns the code and message
+    /// of the error it answers with, or a marker string when it succeeds.
+    fn create_outcome(
+        result: Result<std::sync::Arc<bridge::Identity>, ScpError>,
+    ) -> (String, String) {
+        match result {
+            Err(ScpError::Identity { code, msg } | ScpError::Validation { code, msg }) => {
+                (code, msg)
+            }
+            Err(other) => (String::new(), format!("{other:?}")),
+            Ok(_) => (String::new(), "created an identity".to_owned()),
+        }
+    }
 
-        for custody in ["callback", "platform", "software"] {
-            let outcome = match parse_custody_method(custody) {
-                Err(ScpError::Identity { code, msg }) => (code, msg),
-                other => (String::new(), format!("{other:?}")),
-            };
-            assert_eq!(
-                outcome.0,
-                scp_ffi_common::error_codes::IDENT_1003,
-                "{custody}: {}",
-                outcome.1
-            );
-            assert!(
-                outcome.1.contains(ACCEPTED_CUSTODY),
-                "{custody}: {}",
-                outcome.1
-            );
+    /// Every build answers each rejected custody request with the code spec 03
+    /// §3.2.2 gives it, on both entry points that take a custody string, and
+    /// every rejection message names the accepted values: `"os_keystore"`
+    /// without a provider is `SCP-IDENT-1003`, and a legacy or unknown string
+    /// is `SCP-VALID-7005`.
+    #[test]
+    fn custody_requests_are_rejected_with_their_spec_codes() {
+        use scp_ffi_common::custody_request::ACCEPTED_CUSTODY;
+        use scp_ffi_common::error_codes::{IDENT_1003, VALID_7005};
+
+        let rt = runtime();
+        for (custody, want) in [
+            ("os_keystore", IDENT_1003),
+            ("callback", VALID_7005),
+            ("platform", VALID_7005),
+            ("software", VALID_7005),
+            ("file", VALID_7005),
+            ("unknown", VALID_7005),
+        ] {
+            let scp = scp_test();
+            for (entry, outcome) in [
+                (
+                    "identity_create",
+                    create_outcome(rt.block_on(scp.identity_create(custody.to_owned(), None))),
+                ),
+                (
+                    "identity_create_with_agent_key",
+                    create_outcome(
+                        rt.block_on(scp.identity_create_with_agent_key(custody.to_owned())),
+                    ),
+                ),
+            ] {
+                assert_eq!(outcome.0, want, "{entry}({custody}): {}", outcome.1);
+                assert!(
+                    outcome.1.contains(ACCEPTED_CUSTODY),
+                    "{entry}({custody}): {}",
+                    outcome.1
+                );
+            }
         }
     }
 
     /// A `testing` build admits `"in_memory"`, because that feature is the sole
     /// activation path for the `InMemoryKeyCustody` nullifier backing it
     /// (ADR-062, capability injection and prove-absent dev backends,
-    /// §Decision 6).
+    /// §Decision 6). The handle reports the request value it answers.
     #[cfg(feature = "testing")]
     #[test]
-    fn parse_custody_method_accepts_in_memory_under_testing() {
-        use crate::bridge::parse_custody_method;
-
-        assert!(matches!(
-            parse_custody_method("in_memory"),
-            Ok(bridge::CustodyMethod::InMemory)
-        ));
+    fn identity_create_accepts_in_memory_under_testing() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("in_memory custody on a testing build");
+        assert_eq!(identity.custody_type(), "in_memory");
+        let seeded = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), Some(vec![7u8; 32])))
+            .expect("seeded in_memory custody on a testing build");
+        assert_eq!(seeded.custody_type(), "in_memory");
+        let agent = rt
+            .block_on(scp.identity_create_with_agent_key("in_memory".to_owned()))
+            .expect("in_memory agent-key identity on a testing build");
+        assert_eq!(agent.custody_type(), "in_memory");
     }
 
     /// A shipped (no-`testing`) build rejects `"in_memory"` at the boundary with
-    /// `SCP-IDENT-1008` rather than admitting a custody kind whose only backing
-    /// implementation the feature severs. This is the shipped half of the
-    /// severance. Job rust-build-uniffi-production names this test in its `-E`
-    /// filter and runs it against `--features server`, which is the
-    /// configuration a released Swift/Kotlin SDK compiles.
+    /// `SCP-IDENT-1008`, on both entry points that take a custody string, rather
+    /// than admitting a custody kind whose only backing implementation the
+    /// feature severs. This is the shipped half of the severance. Job
+    /// rust-build-uniffi-production names this test in its `-E` filter and runs
+    /// it against `--features server`, which is the configuration a released
+    /// Swift/Kotlin SDK compiles.
     #[cfg(not(feature = "testing"))]
     #[test]
     fn parse_custody_method_rejects_in_memory_on_a_shipped_build() {
-        use crate::bridge::{ACCEPTED_CUSTODY, parse_custody_method};
+        use scp_ffi_common::custody_request::ACCEPTED_CUSTODY;
 
-        match parse_custody_method("in_memory") {
-            Err(ScpError::Identity { code, msg }) => {
-                assert_eq!(
-                    code,
-                    scp_ffi_common::error_codes::IDENT_1008,
-                    "expected the custody-unavailable code SCP-IDENT-1008, got code \
-                     {code} with message: {msg}"
-                );
-                assert!(msg.contains(ACCEPTED_CUSTODY), "{msg}");
-                assert!(!msg.contains("\"platform\""), "{msg}");
-            }
-            other => panic!("a shipped build must reject \"in_memory\" custody, got: {other:?}"),
+        let rt = runtime();
+        let scp = scp_test();
+        for (entry, outcome) in [
+            (
+                "identity_create",
+                create_outcome(rt.block_on(scp.identity_create("in_memory".to_owned(), None))),
+            ),
+            (
+                "identity_create_with_agent_key",
+                create_outcome(
+                    rt.block_on(scp.identity_create_with_agent_key("in_memory".to_owned())),
+                ),
+            ),
+        ] {
+            assert_eq!(
+                outcome.0,
+                scp_ffi_common::error_codes::IDENT_1008,
+                "{entry}: expected the custody-unavailable code SCP-IDENT-1008: {}",
+                outcome.1
+            );
+            assert!(
+                outcome.1.contains(ACCEPTED_CUSTODY),
+                "{entry}: {}",
+                outcome.1
+            );
         }
     }
 
-    /// An unknown string returns `SCP-VALID-7005` naming the accepted set,
-    /// which lists no rejected string as expected.
+    /// `"encrypted_file"` on a `testing` build opens `$HOME/.scp/keys.bin`
+    /// under `SCP_KEY_PASSPHRASE` and mints the identity over it, on both entry
+    /// points that take a custody string. A bad variable is `SCP-VALID-7001`,
+    /// and a key directory or key file this process cannot open is
+    /// `SCP-IDENT-1008` (`.docs/standards/sdk-common.md` §Custody request).
+    ///
+    /// The test mutates `HOME` and `SCP_KEY_PASSPHRASE`, so every case runs in
+    /// this one function and the variables are restored before the assertions.
+    /// No other test in this binary reads either variable.
+    #[cfg(feature = "testing")]
     #[test]
-    fn parse_custody_method_rejects_unknown_value() {
-        use crate::bridge::{ACCEPTED_CUSTODY, parse_custody_method};
+    fn identity_create_with_encrypted_file_custody_opens_the_key_file() {
+        use scp_ffi_common::error_codes::{IDENT_1008, VALID_7001};
 
-        let outcome = match parse_custody_method("unknown") {
-            Err(ScpError::Validation { code, msg }) => (code, msg),
-            other => (String::new(), format!("{other:?}")),
-        };
-        assert_eq!(
-            outcome.0,
-            scp_ffi_common::error_codes::VALID_7005,
-            "{}",
-            outcome.1
+        let rt = runtime();
+        let scp = scp_test();
+        let base = tempfile::tempdir().expect("tempdir");
+        let home_create = base.path().join("create");
+        let home_agent = base.path().join("agent");
+        let home_is_a_file = base.path().join("plain-file");
+        std::fs::write(&home_is_a_file, b"not a directory").expect("write plain file");
+        let saved_home = std::env::var_os("HOME");
+        let saved_passphrase = std::env::var_os("SCP_KEY_PASSPHRASE");
+
+        let mut created = Vec::new();
+        let mut rejected = Vec::new();
+        // SAFETY: nextest runs each test in its own process, and no other test
+        // in this binary reads HOME or SCP_KEY_PASSPHRASE; both are restored
+        // below before any assertion can panic.
+        unsafe {
+            std::env::set_var("SCP_KEY_PASSPHRASE", "encrypted-file-test-passphrase");
+            std::env::set_var("HOME", &home_create);
+            created.push((
+                "identity_create",
+                home_create.clone(),
+                rt.block_on(scp.identity_create("encrypted_file".to_owned(), None)),
+            ));
+            std::env::set_var("HOME", &home_agent);
+            created.push((
+                "identity_create_with_agent_key",
+                home_agent,
+                rt.block_on(scp.identity_create_with_agent_key("encrypted_file".to_owned())),
+            ));
+
+            // A wrong passphrase over the key file the first create sealed.
+            std::env::set_var("HOME", &home_create);
+            std::env::set_var("SCP_KEY_PASSPHRASE", "a-different-passphrase");
+            rejected.push((
+                "wrong passphrase",
+                IDENT_1008,
+                rt.block_on(scp.identity_create("encrypted_file".to_owned(), None)),
+            ));
+            // `$HOME/.scp` cannot be created under a regular file.
+            std::env::set_var("HOME", &home_is_a_file);
+            rejected.push((
+                "HOME names a file",
+                IDENT_1008,
+                rt.block_on(scp.identity_create("encrypted_file".to_owned(), None)),
+            ));
+            std::env::set_var("HOME", "relative-home");
+            rejected.push((
+                "relative HOME",
+                VALID_7001,
+                rt.block_on(scp.identity_create("encrypted_file".to_owned(), None)),
+            ));
+            std::env::set_var("HOME", &home_create);
+            std::env::remove_var("SCP_KEY_PASSPHRASE");
+            rejected.push((
+                "unset passphrase",
+                VALID_7001,
+                rt.block_on(scp.identity_create_with_agent_key("encrypted_file".to_owned())),
+            ));
+
+            match &saved_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+            match &saved_passphrase {
+                Some(passphrase) => std::env::set_var("SCP_KEY_PASSPHRASE", passphrase),
+                None => std::env::remove_var("SCP_KEY_PASSPHRASE"),
+            }
+        }
+
+        for (entry, home, result) in created {
+            let identity = result.unwrap_or_else(|e| panic!("{entry}(encrypted_file): {e:?}"));
+            assert_eq!(identity.custody_type(), "encrypted_file", "{entry}");
+            assert!(identity.did().starts_with("did:dht:"), "{entry}");
+            let key_file = home.join(".scp").join("keys.bin");
+            assert!(
+                key_file.is_file(),
+                "{entry} must create {}",
+                key_file.display()
+            );
+        }
+        for (case, want, result) in rejected {
+            let outcome = create_outcome(result);
+            assert_eq!(outcome.0, want, "{case}: {}", outcome.1);
+        }
+        assert!(
+            !std::path::Path::new("relative-home").exists(),
+            "a refused relative HOME must create no directory under the working directory"
         );
-        assert!(outcome.1.contains(ACCEPTED_CUSTODY), "{}", outcome.1);
-        assert!(!outcome.1.contains("\"platform\""), "{}", outcome.1);
     }
 
     #[test]
