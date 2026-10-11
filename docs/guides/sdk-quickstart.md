@@ -147,7 +147,7 @@ dependencies {
 
 Every SCP participant starts by creating a cryptographic identity -- a DID (Decentralized Identifier) backed by Ed25519 keys. The identity is the root of trust for all protocol operations.
 
-Every SDK takes the custody choice as a required argument. Python ships one production key store, `CustodyType.FILE`. The TypeScript, Swift and Kotlin SDKs ship none that `identityCreate` reaches: each one's only custody value, `in_memory`, works only in a build compiled with the `testing` feature, and a shipped build rejects it with `SCP-IDENT-1008`. In those SDKs a production caller implements `KeyCustodyProvider` over its own key store and passes it to `identityCreateWithCustody`.
+Every SDK takes the custody choice as a required argument. Python ships one production key store, `CustodyType.ENCRYPTED_FILE`. The TypeScript, Swift and Kotlin SDKs ship none that `identityCreate` reaches: each one's only custody value, `in_memory`, works only in a build compiled with the `testing` feature, and a shipped build rejects it with `SCP-IDENT-1008`. In those SDKs a production caller implements `KeyCustodyProvider` over its own key store and passes it to `identityCreateWithCustody`.
 
 ### Python
 
@@ -157,9 +157,9 @@ from scp_sdk import SCP, CustodyType
 
 async def main():
     async with SCP({"type": "sqlite", "path": "./scp-data", "passphrase": "change me"}) as scp:
-        # CustodyType.FILE keeps the keys in $HOME/.scp/keys.bin, encrypted under
-        # the SCP_KEY_PASSPHRASE environment variable.
-        identity = await scp.identity_create(CustodyType.FILE)
+        # CustodyType.ENCRYPTED_FILE keeps the keys in $HOME/.scp/keys.bin, encrypted
+        # under the SCP_KEY_PASSPHRASE environment variable.
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
         print(f"DID: {identity.did}")
 
 asyncio.run(main())

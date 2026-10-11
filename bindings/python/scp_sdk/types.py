@@ -25,25 +25,34 @@ from scp_sdk.errors import UnknownGovernanceOutcomeError
 
 
 class CustodyType(enum.Enum):
-    """The custody string an identity-creating :class:`scp_sdk.SCP` method sends
-    to the PyO3 bridge (spec section 3.2, key custody).
+    """The custody request value of spec 03 section 3.2.2: the backend that holds
+    a new identity's private keys.
 
-    The members are exactly the custody strings the PyO3 bridge builds a key
-    store from, and the bridge answers every other string with a typed error
-    (``SCP-IDENT-1003`` or ``SCP-VALID-7005``).  No custody string reaches Apple
-    Keychain or Android Keystore; pass a :class:`scp_sdk.scp.KeyCustodyProvider`
-    to :meth:`scp_sdk.SCP.identity_create_with_custody` for any other key store.
+    :meth:`scp_sdk.SCP.identity_create` and
+    :meth:`scp_sdk.SCP.identity_create_with_agent_key` send the value to the
+    PyO3 bridge, and :attr:`scp_sdk.Identity.custody_type` reports the value an
+    identity was created with.  The bridge answers every string outside the
+    vocabulary, ``"platform"``, ``"software"``, ``"file"`` and ``"callback"``
+    included, with ``SCP-VALID-7005``, and falls back to no other backend.
 
     No SDK method defaults custody: the caller names the key store, and a call
     that passes none raises ``IdentityError`` carrying ``SCP-IDENT-1116``
     before any bridge call (SCP-294).
     """
 
-    #: An encrypted key file at ``$HOME/.scp/keys.bin`` (``FileKeyCustody``:
-    #: Argon2id key derivation, AES-256-GCM).  The bridge reads the passphrase
-    #: from ``SCP_KEY_PASSPHRASE`` and raises ``SCP-VALID-7001`` when it is unset
-    #: or empty.
-    FILE = "file"
+    #: ``FileKeyCustody``: an encrypted key file at ``$HOME/.scp/keys.bin``
+    #: (Argon2id key derivation, AES-256-GCM), sealed under the passphrase in
+    #: ``SCP_KEY_PASSPHRASE``.  The bridge raises ``SCP-VALID-7001`` when
+    #: ``HOME`` is unset, empty or relative, or the passphrase is unset or empty,
+    #: and ``SCP-IDENT-1008`` when it cannot create ``$HOME/.scp`` or open the
+    #: key file.
+    ENCRYPTED_FILE = "encrypted_file"
+    #: The host operating system's key store, reached only through a
+    #: :class:`scp_sdk.scp.KeyCustodyProvider` passed to
+    #: :meth:`scp_sdk.SCP.identity_create_with_custody`, which reports this
+    #: value.  It promises no hardware backing.  Passed to ``identity_create``
+    #: without a provider, the bridge raises ``SCP-IDENT-1003``.
+    OS_KEYSTORE = "os_keystore"
     #: An in-memory key store that loses every key when the process exits.  The
     #: bridge builds it only in a build carrying its ``testing`` feature; a
     #: shipped build raises ``SCP-IDENT-1008``.
