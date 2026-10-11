@@ -755,34 +755,25 @@ fn parse_custody(custody: &str) -> Result<CustodySelection, ScpPyError> {
 /// `InMemoryKeyCustody::from_seed_bytes` when the selection opens, making
 /// every subsequent `generate_keypair` call deterministic.
 ///
-/// A non-`None` seed on any custody type other than `"in_memory"` is a
-/// validation error (`SCP-VALID-7009`) — seeded determinism is only
-/// meaningful for the in-process testing custody.
-#[cfg(feature = "testing")]
+/// A seed the custody cannot honor is rejected by
+/// [`scp_ffi_common::validate::check_testing_seed`] before the custody string
+/// is read, as on the napi-rs and `UniFFI` bridges.
 fn parse_custody_with_seed(
     custody: &str,
     testing_seed: Option<zeroize::Zeroizing<[u8; 32]>>,
 ) -> Result<CustodySelection, ScpPyError> {
-    match custody {
-        "in_memory" => Ok(CustodySelection::InMemory(testing_seed)),
-        _ if testing_seed.is_some() => Err(ScpPyError::ValidationError {
-            message: "`testing_seed` parameter is only valid for custody=\"in_memory\"".to_owned(),
-            code: scp_ffi_common::error_codes::VALID_7009.to_owned(),
-        }),
-        other => parse_custody_inner(other),
-    }
-}
-
-#[cfg(not(feature = "testing"))]
-fn parse_custody_with_seed(
-    custody: &str,
-    testing_seed: Option<zeroize::Zeroizing<[u8; 32]>>,
-) -> Result<CustodySelection, ScpPyError> {
-    if testing_seed.is_some() {
-        return Err(ScpPyError::ValidationError {
-            message: "`testing_seed` parameter requires the testing feature".to_owned(),
-            code: scp_ffi_common::error_codes::VALID_7008.to_owned(),
-        });
+    scp_ffi_common::validate::check_testing_seed(
+        custody,
+        testing_seed.is_some(),
+        cfg!(feature = "testing"),
+    )
+    .map_err(|(code, message)| ScpPyError::ValidationError {
+        message: message.to_owned(),
+        code: code.to_owned(),
+    })?;
+    #[cfg(feature = "testing")]
+    if custody == "in_memory" {
+        return Ok(CustodySelection::InMemory(testing_seed));
     }
     parse_custody_inner(custody)
 }
@@ -3254,9 +3245,9 @@ mod custody_string_tests {
         assert!(!message.contains("\"platform\""), "{message}");
     }
 
-    /// A seed paired with `"platform"` still reports the seed misuse first
-    /// (`SCP-VALID-7009`), as it did before `"platform"` was rejected.
-    #[cfg(feature = "testing")]
+    /// A seed paired with `"platform"` reports the seed misuse first
+    /// (`SCP-VALID-7009`) in every build, as the napi-rs and `UniFFI`
+    /// bridges do.
     #[test]
     fn parse_custody_with_seed_reports_seed_misuse_before_platform() {
         let seed = Some(zeroize::Zeroizing::new([7u8; 32]));

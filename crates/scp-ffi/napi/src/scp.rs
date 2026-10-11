@@ -392,14 +392,13 @@ impl Scp {
         use crate::identity::NapiIdentityInner;
         use crate::identity::ensure_did_resolver_initialized_on;
 
-        validate_custody_type(&custody).map_err(NapiError::from)?;
-
         // Validate the optional 32-byte `testing_seed` at the FFI boundary
         // so we fail early rather than panicking in
         // `InMemoryKeyCustody::from_seed_bytes`. A length mismatch is
-        // `SCP-VALID-7007`; a seed paired with a non-InMemory custody
-        // surfaces later as `SCP-VALID-7009`. The seed bytes feed
-        // `Ed25519 SigningKey::from_bytes` inside the custody's RNG, so
+        // `SCP-VALID-7007`; a seed the custody cannot honor is rejected
+        // next by `check_testing_seed`, before the custody string is read.
+        // The seed bytes feed `Ed25519 SigningKey::from_bytes` inside the
+        // custody's RNG, so
         // we wrap the narrowed `[u8; 32]` in `Zeroizing` immediately to
         // wipe them when dropped rather than leaving them on the stack.
         //
@@ -428,6 +427,18 @@ impl Scp {
                 Some(zeroize::Zeroizing::new(narrowed))
             }
         };
+        scp_ffi_common::validate::check_testing_seed(
+            &custody,
+            testing_seed_bytes.is_some(),
+            cfg!(feature = "testing"),
+        )
+        .map_err(|(code, message)| {
+            NapiError::from(ScpNapiError::Validation {
+                message: message.to_owned(),
+                code: code.to_owned(),
+            })
+        })?;
+        validate_custody_type(&custody).map_err(NapiError::from)?;
 
         let bi = &*self.inner;
         ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
@@ -497,38 +508,15 @@ impl Scp {
                 Ok(handle)
             }
             #[cfg(not(feature = "testing"))]
-            "in_memory" => {
-                // Mirrors PyO3 `parse_custody_with_seed`
-                // (cfg(not(testing))): a `testing_seed` is
-                // a parity-harness affordance gated on the
-                // `testing` feature, so surface it as
-                // SCP-VALID-7008 ("testing-only feature requires feature
-                // flag") ahead of the generic custody-unavailable error.
-                if testing_seed_bytes.is_some() {
-                    return Err(NapiError::from(ScpNapiError::Validation {
-                        message: "`testing_seed` parameter requires the testing feature".to_owned(),
-                        code: codes::VALID_7008.to_owned(),
-                    }));
-                }
-                Err(ScpNapiError::Identity {
-                    message: format!(
-                        "in_memory custody is not available in this build — {}",
-                        crate::error::ACCEPTED_CUSTODY
-                    ),
-                    code: codes::IDENT_1008.to_owned(),
-                }
-                .into())
+            "in_memory" => Err(ScpNapiError::Identity {
+                message: format!(
+                    "in_memory custody is not available in this build — {}",
+                    crate::error::ACCEPTED_CUSTODY
+                ),
+                code: codes::IDENT_1008.to_owned(),
             }
-            "platform" | "software" => {
-                if testing_seed_bytes.is_some() {
-                    return Err(NapiError::from(ScpNapiError::Validation {
-                        message: "`testing_seed` parameter is only valid for custody=\"in_memory\""
-                            .to_owned(),
-                        code: codes::VALID_7009.to_owned(),
-                    }));
-                }
-                Err(custody_without_backend(&custody).into())
-            }
+            .into()),
+            "platform" | "software" => Err(custody_without_backend(&custody).into()),
             _ => Err(ScpNapiError::Identity {
                 code: codes::IDENT_1005.to_owned(),
                 message: format!(
@@ -5461,6 +5449,31 @@ mod custody_string_message_tests {
                 || format!("{custody:?} created an identity"),
                 |e| e.to_string(),
             )
+    }
+
+    /// A seed paired with `"platform"`, `"software"`, or an unknown string
+    /// reports the seed misuse (`SCP-VALID-7009`) before the custody string
+    /// is read, as the `PyO3` and `UniFFI` bridges do; without a seed the
+    /// same strings keep their custody codes.
+    #[test]
+    fn seed_misuse_is_reported_before_the_custody_string() {
+        for (custody, unseeded) in [
+            ("platform", codes::IDENT_1003),
+            ("software", codes::IDENT_1003),
+            ("keychain", codes::VALID_7005),
+        ] {
+            let scp = Scp::new_in_memory_for_test();
+            let seeded = crate::runtime()
+                .block_on(scp.identity_create(
+                    custody.to_owned(),
+                    Some(napi::bindgen_prelude::Buffer::from(vec![7u8; 32])),
+                ))
+                .err()
+                .map_or_else(|| "created an identity".to_owned(), |e| e.to_string());
+            assert!(seeded.contains(codes::VALID_7009), "{custody}: {seeded}");
+            let plain = create_error(custody);
+            assert!(plain.contains(unseeded), "{custody}: {plain}");
+        }
     }
 
     /// `"platform"` and `"software"` return `SCP-IDENT-1003` on both string

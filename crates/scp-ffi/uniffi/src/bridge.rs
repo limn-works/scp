@@ -7308,8 +7308,8 @@ pub(crate) const ACCEPTED_CUSTODY: &str = "this bridge accepts \"in_memory\" onl
 ///
 /// Only `"in_memory"` parses, and only in a `testing` build. `"callback"`,
 /// `"platform"`, and `"software"` name a host key store that a string cannot
-/// reach, so they return `SCP-IDENT-1003` here, before any seed or resolver is
-/// read; every other string returns `SCP-VALID-7005`.
+/// reach, so they return `SCP-IDENT-1003`; every other string returns
+/// `SCP-VALID-7005`.
 pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpError> {
     match custody {
         // `"in_memory"` custody is a dev/test affordance gated on the `testing`
@@ -9589,14 +9589,13 @@ impl Scp {
     /// is backed by a deterministic RNG so subsequent `generate_keypair`
     /// calls produce byte-identical Ed25519 keys across bridges — the
     /// basis of the cross-bridge parity test (ADR-046). `testing_seed`
-    /// is only valid for `"in_memory"` custody, and every other custody
-    /// string returns an error before the seed is read.
+    /// is only valid for `"in_memory"` custody; other custody types
+    /// reject it with `SCP-VALID-7009` before the custody string is read.
     pub async fn identity_create(
         &self,
         custody: String,
         testing_seed: Option<Vec<u8>>,
     ) -> Result<Arc<Identity>, ScpError> {
-        let custody_method = parse_custody_method(&custody)?;
         let bi = Arc::clone(&self.inner);
 
         // Validate the optional 32-byte `testing_seed` at the FFI
@@ -9605,8 +9604,9 @@ impl Scp {
         // forbids fixed-size arrays, so the wire type stays
         // `Option<Vec<u8>>`; we immediately narrow to `[u8; 32]` via
         // `TryFrom` and surface a length mismatch as `SCP-VALID-7007`.
-        // `parse_custody_method` admits only `"in_memory"`, so no other
-        // custody type reaches the seed. Wrap the narrowed array in
+        // A seed the custody cannot honor is rejected next by
+        // `check_testing_seed`, before the custody string is read, as on
+        // the PyO3 and NAPI bridges. Wrap the narrowed array in
         // `Zeroizing` so the seed bytes are wiped when dropped — they
         // feed `Ed25519 SigningKey::from_bytes` inside the custody's
         // RNG.
@@ -9630,6 +9630,16 @@ impl Scp {
                 Some(zeroize::Zeroizing::new(narrowed))
             }
         };
+        scp_ffi_common::validate::check_testing_seed(
+            &custody,
+            testing_seed_bytes.is_some(),
+            cfg!(feature = "testing"),
+        )
+        .map_err(|(code, msg)| ScpError::Validation {
+            msg: msg.to_owned(),
+            code: code.to_owned(),
+        })?;
+        let custody_method = parse_custody_method(&custody)?;
 
         runtime()
             .spawn(async move {
@@ -9641,20 +9651,8 @@ impl Scp {
                         #[cfg(not(feature = "testing"))]
                         {
                             let _ = &bi;
-                            // Mirrors PyO3 `parse_custody_with_seed`
-                            // (cfg(not(testing))):
-                            // `testing_seed` is a parity-harness affordance
-                            // gated on the `testing` feature,
-                            // so surface it as SCP-VALID-7008 ahead of the
-                            // generic custody-unavailable error.
-                            if testing_seed_bytes.is_some() {
-                                return Err(ScpError::Validation {
-                                    msg: "`testing_seed` parameter requires the \
-                                          testing feature"
-                                        .to_owned(),
-                                    code: codes::VALID_7008.to_owned(),
-                                });
-                            }
+                            // `check_testing_seed` has already refused a seed
+                            // here with SCP-VALID-7008.
                             Err(ScpError::Identity {
                                 msg: format!(
                                     "\"in_memory\" custody is not available in this build — \
@@ -28847,25 +28845,26 @@ mod tests {
         assert_eq!(identity.custody_type(), "callback");
     }
 
-    /// `identity_create` rejects `"platform"` and `"software"` at parse time
-    /// with `SCP-IDENT-1003`, before it reads a `testing_seed` (SCP-294).
+    /// `identity_create` rejects `"platform"` and `"software"` with
+    /// `SCP-IDENT-1003` (SCP-294), and a seed paired with either with
+    /// `SCP-VALID-7009` first, as the PyO3 and NAPI bridges do.
     #[test]
-    fn identity_create_rejects_host_custody_strings_before_the_seed() {
+    fn identity_create_rejects_host_custody_strings_after_the_seed() {
         for custody in ["platform", "software"] {
-            for seed in [None, Some(vec![7u8; 32])] {
+            for (seed, want) in [
+                (None, codes::IDENT_1003),
+                (Some(vec![7u8; 32]), codes::VALID_7009),
+            ] {
                 let outcome = match runtime()
                     .block_on(scp_test().identity_create(custody.to_owned(), seed.clone()))
                 {
-                    Err(ScpError::Identity { code, msg }) => (code, msg),
+                    Err(ScpError::Identity { code, msg } | ScpError::Validation { code, msg }) => {
+                        (code, msg)
+                    }
                     Err(other) => (String::new(), format!("{other:?}")),
                     Ok(_) => (String::new(), "created an identity".to_owned()),
                 };
-                assert_eq!(
-                    outcome.0,
-                    codes::IDENT_1003,
-                    "{custody} {seed:?}: {}",
-                    outcome.1
-                );
+                assert_eq!(outcome.0, want, "{custody} {seed:?}: {}", outcome.1);
             }
         }
     }
