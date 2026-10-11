@@ -98,7 +98,8 @@ pub enum VerificationMethod {
     /// object `{ "provider", "subject", "issued_at" }` signed by the
     /// attesting SDK. Verifier validates the JWT against the platform's JWKS.
     ///
-    /// Supported platforms: Google, Apple, GitHub, Discord.
+    /// Supported platforms: the §3.5.1 registry rows that name `Oauth`
+    /// (see [`registry_verification_method`]).
     /// Renewal: 30 days.
     Oauth,
 
@@ -109,7 +110,8 @@ pub enum VerificationMethod {
     /// fetches the post via the platform's official API and confirms it
     /// contains the DID and nonce authored by the claimed handle.
     ///
-    /// Supported platforms: X/Twitter, Mastodon, Bluesky, Reddit.
+    /// Supported platforms: the §3.5.1 registry rows that name `SignedPost`
+    /// (see [`registry_verification_method`]).
     /// Renewal: 90 days.
     SignedPost,
 
@@ -199,6 +201,44 @@ impl VerificationMethod {
             Self::SignedPost | Self::DnsRecord => AttestationClass::Reference,
         }
     }
+}
+
+/// Returns the verification method the §3.5.1 provider registry names for
+/// `platform`, or `None` when the registry lists no such platform.
+///
+/// The registry is closed ("New providers are added by spec amendment only"),
+/// and each row names one method, so a platform fixes its method: an
+/// attester cannot pick `oauth` for a platform the registry verifies through a
+/// `SignedPost`, which would move a Class 2 attestation into Class 1 and skip
+/// the proof fetch §3.5.4 requires. Mastodon's registry value is
+/// `mastodon:<instance>`; the bare `mastodon` that
+/// [`scp_did::attestation::IdentityLinkPlatform`] serializes is accepted too.
+#[must_use]
+pub fn registry_verification_method(platform: &str) -> Option<VerificationMethod> {
+    use scp_did::attestation::IdentityLinkPlatform as Platform;
+    let parsed = match platform.strip_prefix("mastodon:") {
+        Some("") => return None,
+        Some(_) => Platform::Mastodon,
+        None => platform.parse::<Platform>().ok()?,
+    };
+    // Exhaustive, so a platform added to the registry enum fails to compile
+    // until it names its §3.5.1 method here.
+    Some(match parsed {
+        Platform::Github
+        | Platform::X
+        | Platform::Reddit
+        | Platform::Bluesky
+        | Platform::Mastodon
+        | Platform::Npm
+        | Platform::Pypi => VerificationMethod::SignedPost,
+        Platform::Google
+        | Platform::Apple
+        | Platform::Microsoft
+        | Platform::Linkedin
+        | Platform::Discord => VerificationMethod::Oauth,
+        Platform::Telegram | Platform::Steam => VerificationMethod::ChallengeResponse,
+        Platform::Dns | Platform::WellKnown => VerificationMethod::DnsRecord,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -941,6 +981,36 @@ pub enum IdentityLinkVerifyError {
         /// Wire-format name of a verification method (§3.5.2).
         method: &'static str,
     },
+
+    /// `evidence.method` differs from the method the §3.5.1 provider registry
+    /// names for `claim.platform`, or `claim.platform` is absent from that
+    /// closed registry and `evidence.method` is not `challenge_response` (the
+    /// one method §3.5.1 lets a verifier pair with a platform value of its
+    /// own choosing).
+    #[error(
+        "evidence method {method} is not the method the spec §3.5.1 registry names for \
+         platform {platform:?} (registry method: {registered:?})"
+    )]
+    MethodNotRegisteredForPlatform {
+        /// `claim.platform` an attestation carries.
+        platform: String,
+        /// Wire-format name of `evidence.method`.
+        method: &'static str,
+        /// Wire-format name of the registry's method, or `None` when the
+        /// registry lists no such platform.
+        registered: Option<&'static str>,
+    },
+
+    /// `evidence.method` is `challenge_response`. §3.5.1 verifies one by
+    /// checking `response_signature` over `challenge` under the subject's
+    /// `#active` key and checking that `verifier_did` names "a known, trusted
+    /// verifier". No verifier trust list exists for this function to read, so
+    /// it refuses the method rather than report a link it did not verify.
+    #[error(
+        "challenge_response attestations cannot be verified: spec §3.5.1 requires a \
+         trusted-verifier check that has no implementation"
+    )]
+    ChallengeResponseUnverifiable,
 }
 
 /// Inputs [`verify_identity_link_attestation`] needs, as one flat record.
@@ -979,7 +1049,9 @@ pub struct IdentityLinkVerifyInput<'a> {
 /// # Checks, in order
 ///
 /// 1. **Structure** — [`IdentityLinkAttestation::validate_structure`] must
-///    report no errors.
+///    report no errors, and `evidence.method` must be the method
+///    [`registry_verification_method`] returns for `claim.platform` (an
+///    unregistered platform admits only `challenge_response`).
 /// 2. **Document binding** — `issuer_document.id` must equal
 ///    `attestation.issuer`. Without this comparison a caller could hand over
 ///    any document and satisfy step 3 with a key from an unrelated identity.
@@ -995,8 +1067,11 @@ pub struct IdentityLinkVerifyInput<'a> {
 /// 7. **Future-dated timestamps (§9.14)** — `issued_at` and
 ///    `evidence.verified_at` must not sit more than
 ///    [`MAX_IDENTITY_LINK_CLOCK_SKEW_SECS`] beyond `now_secs`.
-/// 8. **Class 2 proof (§3.5.4 Class 2 steps 2–3)** — a `SignedPost` or
-///    `DnsRecord` attestation needs [`ReferenceProofOutcome::Confirmed`].
+/// 8. **Method proof** — a `SignedPost` or `DnsRecord` attestation needs
+///    [`ReferenceProofOutcome::Confirmed`] (§3.5.4 Class 2 steps 2–3); an
+///    `Oauth` attestation needs nothing further (§3.5.4 Class 1 step 6); a
+///    `ChallengeResponse` attestation is refused with
+///    [`IdentityLinkVerifyError::ChallengeResponseUnverifiable`].
 /// 9. **Freshness (§3.5.4 step 5)** — evidence older than a method's renewal
 ///    interval yields [`IdentityLinkFreshness::Stale`], which is a degraded
 ///    pass, not a rejection.
@@ -1032,6 +1107,17 @@ pub fn verify_identity_link_attestation(
         return Err(IdentityLinkVerifyError::StructurallyInvalid(
             structural_errors.join("; "),
         ));
+    }
+    let method = attestation.evidence.method;
+    let registered = registry_verification_method(&attestation.claim.platform);
+    // An unregistered platform admits only `challenge_response`, the one
+    // method §3.5.1 lets a verifier pair with a platform value it chooses.
+    if registered.unwrap_or(VerificationMethod::ChallengeResponse) != method {
+        return Err(IdentityLinkVerifyError::MethodNotRegisteredForPlatform {
+            platform: attestation.claim.platform.clone(),
+            method: method.as_str(),
+            registered: registered.map(VerificationMethod::as_str),
+        });
     }
 
     // --- 2. Document binding. A document for anyone other than an issuer
@@ -1100,13 +1186,20 @@ pub fn verify_identity_link_attestation(
         });
     }
 
-    // --- 8. Class 2 proof resource (§3.5.4 Class 2 steps 2–3).
-    if attestation.evidence.method.attestation_class() == AttestationClass::Reference
-        && input.reference_proof == ReferenceProofOutcome::NotFetched
-    {
-        return Err(IdentityLinkVerifyError::ReferenceProofUnverified {
-            method: attestation.evidence.method.as_str(),
-        });
+    // --- 8. Method proof. Exhaustive, so a new method fails to compile until
+    // it names the proof check it needs.
+    match method {
+        VerificationMethod::SignedPost | VerificationMethod::DnsRecord => {
+            if input.reference_proof == ReferenceProofOutcome::NotFetched {
+                return Err(IdentityLinkVerifyError::ReferenceProofUnverified {
+                    method: method.as_str(),
+                });
+            }
+        }
+        VerificationMethod::Oauth => {}
+        VerificationMethod::ChallengeResponse => {
+            return Err(IdentityLinkVerifyError::ChallengeResponseUnverifiable);
+        }
     }
 
     // --- 9. Freshness (§3.5.4 step 5) — degrade, never reject.
@@ -1564,7 +1657,7 @@ mod tests {
         // Encode DID from verifying key bytes
         let did_str = format!("did:dht:z6Mk{}", hex::encode(verifying_key.as_bytes()));
         let issuer = did(&did_str);
-        let platform = "github.com";
+        let platform = "google.com";
         let handle = "alice";
         let issued_at = 1_700_000_000_000_u64;
 
@@ -1582,7 +1675,7 @@ mod tests {
             ),
             evidence: AttestationEvidence {
                 method: VerificationMethod::Oauth,
-                proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
+                proof: r#"{"type":"oauth_verified","provider":"google.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
                 verified_at: 1_700_000_000_000,
                 verifier_did: None,
             },
@@ -1973,6 +2066,30 @@ mod tests {
     /// fresh unless a test moves this forward.
     const SEAM_NOW: u64 = 1_700_000_000_000;
 
+    /// Re-signs [`make_signed_attestation`]'s attestation under `sk` with
+    /// `platform` and `method` in place of its own, recomputing the id that
+    /// `validate_structure` checks.
+    fn rebind_signed(
+        sk: &ed25519_dalek::SigningKey,
+        platform: &str,
+        method: VerificationMethod,
+    ) -> IdentityLinkAttestation {
+        use ed25519_dalek::Signer;
+
+        let mut attestation = make_signed_attestation(sk);
+        platform.clone_into(&mut attestation.claim.platform);
+        attestation.id = IdentityLinkAttestation::compute_id(
+            &attestation.issuer,
+            platform,
+            &attestation.claim.platform_handle,
+            attestation.issued_at,
+        );
+        attestation.evidence.method = method;
+        let canonical = attestation.canonical_signing_bytes().unwrap();
+        attestation.signature = sk.sign(&canonical).to_bytes().to_vec();
+        attestation
+    }
+
     /// Builds a DID document for `did_str` publishing `active_key` at
     /// `#active`, and `agent_key` at `#agent` when supplied.
     fn seam_document(
@@ -2151,13 +2268,8 @@ mod tests {
 
     #[test]
     fn seam_rejects_a_class_2_attestation_whose_proof_nobody_fetched() {
-        use ed25519_dalek::Signer;
-
         let sk = test_signing_key(0xAA);
-        let mut attestation = make_signed_attestation(&sk);
-        attestation.evidence.method = VerificationMethod::SignedPost;
-        let canonical = attestation.canonical_signing_bytes().unwrap();
-        attestation.signature = sk.sign(&canonical).to_bytes().to_vec();
+        let attestation = rebind_signed(&sk, "github.com", VerificationMethod::SignedPost);
 
         let doc = seam_document(
             (*attestation.issuer).as_ref(),
@@ -2175,13 +2287,8 @@ mod tests {
 
     #[test]
     fn seam_accepts_a_class_2_attestation_whose_proof_a_consumer_confirmed() {
-        use ed25519_dalek::Signer;
-
         let sk = test_signing_key(0xAA);
-        let mut attestation = make_signed_attestation(&sk);
-        attestation.evidence.method = VerificationMethod::SignedPost;
-        let canonical = attestation.canonical_signing_bytes().unwrap();
-        attestation.signature = sk.sign(&canonical).to_bytes().to_vec();
+        let attestation = rebind_signed(&sk, "github.com", VerificationMethod::SignedPost);
 
         let doc = seam_document(
             (*attestation.issuer).as_ref(),
@@ -2197,6 +2304,125 @@ mod tests {
         })
         .expect("a confirmed reference proof must pass");
         assert_eq!(verified.freshness, IdentityLinkFreshness::Fresh);
+    }
+
+    /// Runs the seam on `attestation` with the proof reported `Confirmed`, so
+    /// only the registry binding and the per-method check can reject it.
+    fn run_confirmed(
+        sk: &ed25519_dalek::SigningKey,
+        attestation: &IdentityLinkAttestation,
+    ) -> Result<IdentityLinkVerified, IdentityLinkVerifyError> {
+        let doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &sk.verifying_key().to_bytes(),
+            None,
+        );
+        verify_identity_link_attestation(&IdentityLinkVerifyInput {
+            attestation,
+            issuer_document: &doc,
+            now_secs: SEAM_NOW,
+            reference_proof: ReferenceProofOutcome::Confirmed,
+        })
+    }
+
+    #[test]
+    fn registry_names_one_method_for_each_spec_platform_row() {
+        use VerificationMethod::{ChallengeResponse, DnsRecord, Oauth, SignedPost};
+        // §3.5.1 provider registry, row by row.
+        let rows = [
+            ("github.com", SignedPost),
+            ("x.com", SignedPost),
+            ("google.com", Oauth),
+            ("apple.com", Oauth),
+            ("microsoft.com", Oauth),
+            ("linkedin.com", Oauth),
+            ("discord.com", Oauth),
+            ("reddit.com", SignedPost),
+            ("bluesky.com", SignedPost),
+            ("mastodon:mastodon.social", SignedPost),
+            ("telegram.com", ChallengeResponse),
+            ("npm", SignedPost),
+            ("pypi", SignedPost),
+            ("steam", ChallengeResponse),
+            ("well-known", DnsRecord),
+            ("dns", DnsRecord),
+        ];
+        for (platform, method) in rows {
+            assert_eq!(
+                registry_verification_method(platform),
+                Some(method),
+                "{platform}"
+            );
+        }
+        assert_eq!(registry_verification_method("mastodon:"), None);
+        assert_eq!(registry_verification_method("example.org"), None);
+    }
+
+    /// Regression pin: an attester used to pick `oauth` for a Class 2
+    /// platform, which skipped check 8's proof fetch.
+    #[test]
+    fn seam_rejects_a_method_the_registry_does_not_name_for_the_platform() {
+        let sk = test_signing_key(0xAA);
+        let attestation = rebind_signed(&sk, "github.com", VerificationMethod::Oauth);
+        let doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &sk.verifying_key().to_bytes(),
+            None,
+        );
+        assert_eq!(
+            run_seam(&attestation, &doc, SEAM_NOW),
+            Err(IdentityLinkVerifyError::MethodNotRegisteredForPlatform {
+                platform: "github.com".to_owned(),
+                method: "oauth",
+                registered: Some("signed_post"),
+            })
+        );
+    }
+
+    #[test]
+    fn seam_rejects_an_unregistered_platform_under_a_registry_method() {
+        let sk = test_signing_key(0xAA);
+        let attestation = rebind_signed(&sk, "example.org", VerificationMethod::Oauth);
+        assert_eq!(
+            run_confirmed(&sk, &attestation),
+            Err(IdentityLinkVerifyError::MethodNotRegisteredForPlatform {
+                platform: "example.org".to_owned(),
+                method: "oauth",
+                registered: None,
+            })
+        );
+    }
+
+    #[test]
+    fn seam_accepts_each_registry_method_other_than_challenge_response() {
+        let sk = test_signing_key(0xAA);
+        for (platform, method) in [
+            ("google.com", VerificationMethod::Oauth),
+            ("mastodon:mastodon.social", VerificationMethod::SignedPost),
+            ("dns", VerificationMethod::DnsRecord),
+        ] {
+            let attestation = rebind_signed(&sk, platform, method);
+            assert!(
+                run_confirmed(&sk, &attestation).is_ok(),
+                "{platform} with {method:?} must verify"
+            );
+        }
+    }
+
+    /// Spec 3.5.1 requires a trusted-verifier check no component implements,
+    /// so a `challenge_response` attestation is refused on a registry
+    /// platform and on a verifier-chosen platform alike.
+    #[test]
+    fn seam_refuses_challenge_response() {
+        let sk = test_signing_key(0xAA);
+        for platform in ["telegram.com", "ctx-verifier.example"] {
+            let attestation = rebind_signed(&sk, platform, VerificationMethod::ChallengeResponse);
+            assert_eq!(
+                run_confirmed(&sk, &attestation),
+                Err(IdentityLinkVerifyError::ChallengeResponseUnverifiable),
+                "{platform}"
+            );
+        }
     }
 
     #[test]

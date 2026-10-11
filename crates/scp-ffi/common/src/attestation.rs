@@ -616,11 +616,17 @@ mod link_verification_tests {
     }
 
     /// Mints a signed attestation under `signer`, naming `did_str` as issuer
-    /// and subject, with `method` as its verification method.
+    /// and subject, with `method` as its verification method and a platform
+    /// the spec §3.5.1 registry verifies through `method`.
     fn mint(did_str: &str, signer: &SigningKey, method: &str) -> IdentityLinkAttestation {
+        let platform = match method {
+            "oauth" => "google.com",
+            "dns_record" => "dns",
+            other => panic!("no fixture platform for method {other}"),
+        };
         let built = build_unsigned_attestation(
             did_str,
-            "github.com".to_owned(),
+            platform.to_owned(),
             "alice".to_owned(),
             r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
             method,
@@ -702,6 +708,40 @@ mod link_verification_tests {
         let key_hex = hex::encode(active.verifying_key().to_bytes());
         assert!(
             run(
+                &resolver,
+                &attestation,
+                &key_hex,
+                REFERENCE_PROOF_NOT_FETCHED
+            )
+            .unwrap()
+        );
+    }
+
+    /// An attester picking `oauth` for `github.com`, which the spec §3.5.1
+    /// registry verifies through a `SignedPost`, used to skip the class 2
+    /// proof gate and verify `true` with nothing fetched.
+    #[test]
+    fn rejects_a_method_the_registry_does_not_name_for_the_platform() {
+        let active = signing_key(0xAA);
+        let built = build_unsigned_attestation(
+            DID,
+            "github.com".to_owned(),
+            "alice".to_owned(),
+            r#"{"provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
+            "oauth",
+            None,
+        )
+        .unwrap();
+        let mut attestation = built.attestation;
+        attestation.signature = active.sign(&built.canonical_bytes).to_bytes().to_vec();
+        let resolver = FixedResolver(Some(document(
+            DID,
+            &active.verifying_key().to_bytes(),
+            None,
+        )));
+        let key_hex = hex::encode(active.verifying_key().to_bytes());
+        assert!(
+            !run(
                 &resolver,
                 &attestation,
                 &key_hex,
