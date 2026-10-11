@@ -7,7 +7,7 @@
 //! expansion.
 //!
 //! Sender key distribution is sealed/opened with RFC 9180 HPKE via the shared
-//! [`crate::crypto::hpke`] core; the `build_hpke_info`/`build_hpke_aad`
+//! [`crate::crypto::hpke::p256`] suite; the `build_hpke_info`/`build_hpke_aad`
 //! helpers below supply the §9.16.2 domain-separated `info`/`aad`.
 //!
 //! Async signing operations that depend on `KeyCustody` remain in

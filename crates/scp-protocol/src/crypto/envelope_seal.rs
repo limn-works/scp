@@ -1,14 +1,15 @@
 //! RFC 9180 HPKE envelope seal/open for arbitrary-length payloads.
 //!
 //! Used for invitation bundle and join response encryption (spec §5.12.3.1),
-//! over the shared [`crate::crypto::hpke`] core (RFC 9180 Base mode, §9.5).
+//! over the crate-private X25519 suite of the shared [`crate::crypto::hpke`]
+//! core (RFC 9180 Base mode).
 //! The invitation-specific `info`/`aad` domain separators distinguish these
 //! ciphertexts from sender-key, access-key, broadcast-key, and private-state
 //! HPKE.
 
 use sha2::{Digest, Sha256};
 
-use crate::crypto::hpke;
+use crate::crypto::hpke::legacy_x25519;
 
 /// Errors from envelope seal/open operations.
 #[derive(Debug, thiserror::Error)]
@@ -122,7 +123,7 @@ pub fn hpke_seal_invitation(
     let info = build_invitation_info(context_id, creator_did);
     let aad = build_invitation_aad(context_id, creator_did);
 
-    let (enc, ct) = hpke::seal(recipient_x25519_pub, &info, &aad, plaintext)
+    let (enc, ct) = legacy_x25519::seal(recipient_x25519_pub, &info, &aad, plaintext)
         .map_err(|e| EnvelopeSealError::SealFailed(e.to_string()))?;
 
     Ok((ct, enc))
@@ -147,7 +148,7 @@ pub fn hpke_open_invitation(
     let info = build_invitation_info(context_id, creator_did);
     let aad = build_invitation_aad(context_id, creator_did);
 
-    hpke::open(local_x25519_secret, ephemeral_pub, &info, &aad, sealed)
+    legacy_x25519::open(local_x25519_secret, ephemeral_pub, &info, &aad, sealed)
         .map_err(|e| EnvelopeSealError::OpenFailed(e.to_string()))
 }
 
@@ -195,7 +196,7 @@ pub fn hpke_open_invitation_with_external_dh(
     let info = build_invitation_info(context_id, creator_did);
     let aad = build_invitation_aad(context_id, creator_did);
 
-    hpke::custody::open_with_external_dh(dh, recipient_pk, enc, &info, &aad, sealed)
+    legacy_x25519::custody::open_with_external_dh(dh, recipient_pk, enc, &info, &aad, sealed)
         .map_err(|e| EnvelopeSealError::OpenFailed(e.to_string()))
 }
 

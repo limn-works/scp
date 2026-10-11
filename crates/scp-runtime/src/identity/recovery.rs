@@ -792,7 +792,8 @@ fn build_psk_hpke_info(did: &str, purpose: &[u8]) -> Vec<u8> {
 /// the `purpose` string (`"psk-rotate"` for rotation re-wraps); `aad` is empty.
 fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32], did: &str) -> Option<Vec<u8>> {
     let info = build_psk_hpke_info(did, PSK_PURPOSE_ROTATE);
-    let (enc, ct) = scp_protocol::crypto::hpke::seal(device_pk, &info, &[], psk).ok()?;
+    let (enc, ct) =
+        scp_protocol::crypto::hpke::wrap_psk_for_device_x25519(device_pk, &info, psk).ok()?;
 
     let mut wrapped = Vec::with_capacity(WRAPPED_PSK_LEN);
     wrapped.extend_from_slice(&enc);
@@ -2673,10 +2674,10 @@ mod tests {
     //
     // These verify the PRODUCTION wrap path (`wrap_psk_for_device`, called by
     // `rotate_psk`). The device-side open counterpart is exercised here by
-    // calling `scp_protocol::crypto::hpke::open` directly against the wrapped
+    // calling `scp_protocol::crypto::hpke::open_psk_for_device_x25519` against the wrapped
     // wire (`enc(32) || ct(48)`), reconstructing the §3.7.2 `info` via the
     // shared `build_psk_hpke_info` helper that the production wrap also uses.
-    // Opening through `hpke::open` keeps every negative ciphertext-level: a
+    // Opening through that HPKE open keeps every negative ciphertext-level: a
     // real AEAD verification failure, not a builder-string comparison.
     // -----------------------------------------------------------------------
 
@@ -2698,7 +2699,8 @@ mod tests {
         // uses, so the test cannot drift from the wrap's info construction.
         let info = super::build_psk_hpke_info(did, super::PSK_PURPOSE_ROTATE);
         let plaintext = zeroize::Zeroizing::new(
-            scp_protocol::crypto::hpke::open(device_sk, &enc, &info, &[], ct).ok()?,
+            scp_protocol::crypto::hpke::open_psk_for_device_x25519(device_sk, &enc, &info, ct)
+                .ok()?,
         );
         plaintext.as_slice().try_into().ok()
     }
@@ -2740,7 +2742,7 @@ mod tests {
         let psk = [0x42u8; 32];
         let did = "did:dht:zPskTest";
 
-        // Production wrap → device-side open via hpke::open must recover the PSK.
+        // Production wrap → device-side open via open_psk_for_device_x25519 must recover the PSK.
         let wrapped =
             super::wrap_psk_for_device(&psk, device_public.as_bytes(), did).expect("wrap failed");
 
