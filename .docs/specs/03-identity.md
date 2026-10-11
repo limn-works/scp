@@ -708,7 +708,7 @@ The resolution protocol runs seven steps.
 6. **Optionally read cosigned heads as evidence**, by querying `SHA-256("scp:wit:" ‖ identifier_bytes)`; a resolver that skips it returns the same key state (`09-security-model.md` §9.7.4.3).
 7. **Derive the key state** from the latest state-carrying event at or before the adopted head (`09-security-model.md` §9.7.4.2 R8) and cache it under the §9.10.7 caching policy. Resolution yields key state, and the service record settles under its own rules at its own address (§3.10.13).
 
-**Two relays serving heads of one chain at one sequence** are compared event by event over each event's preimage digest, never over the chain bytes and never over the framing. Where every position's digests agree the two records are one chain, whether or not their bytes match, because §9.5 admits a hardware signer that draws its own nonce and two encodings of one event are then ordinary. Where the digests differ at any position the two heads are divergent events at one sequence, and step 4 settles them. KERI identifies an event by its digest in the same way, under `spec-body` §SAID fields.
+**Two relays serving heads of one chain at one sequence** are compared event by event over each event's preimage digest, never over the chain bytes and never over the framing. Where every position's digests agree the two records are one chain, whether or not their bytes match, because §9.5 admits a hardware signer and a platform signer that each draw their own nonce, and two encodings of one event are then ordinary. Where the digests differ at any position the two heads are divergent events at one sequence, and step 4 settles them. KERI identifies an event by its digest in the same way, under `spec-body` §SAID fields.
 
 **Where every relay fails**, a cached key state under seven days old is returned as a `Confirmed` verdict carrying the cached head, with `HeadProvenance` unchanged and no relays reached; otherwise resolution fails with `IdentityError::NoRelayReachable` (§3.10.10). `Confirmed` is the verdict because the cached head is a head the party already adopted and re-adopts, which is what that verdict means everywhere else in `09-security-model.md` §9.7.4.2 R14. **The resolver MUST NOT fabricate a key state.** A relay that does not answer within the per-relay timeout is a failure for that attempt, and the resolver falls through to the others rather than retrying it synchronously.
 
@@ -1437,7 +1437,7 @@ signed_bytes = SHA-256(
     || BE32(len(audience))         || audience          // audience URI, UTF-8
     || signed_at as u64 BE                              // 8 bytes, big-endian
 )
-signature = P256_ECDSA_sign(private_key, signed_bytes)   // RFC 6979 nonce, low-s
+signature = P256_ECDSA_sign(private_key, signed_bytes)   // nonce and low-s per §9.5
 ```
 
 **SCPID signed content field order:**

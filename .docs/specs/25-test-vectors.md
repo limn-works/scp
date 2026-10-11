@@ -14,7 +14,7 @@ The script uses nothing outside the Python standard library, and it self-gates b
 
 **Identifier strings in the fixtures.** Where a signed or hashed structure takes a fixture party's identifier as UTF-8 bytes, the vectors print it in the `scp:` text form that Vector 57 of §25.29 pins: `"scp:"` followed by the lowercase, unpadded RFC 4648 base32 of the 32-byte identifier, 56 characters in all, so each such field carries the length prefix `BE32(56)` or the MessagePack header `0xd9 0x38`. Each fixture party's 32-byte identifier is `SHA-256("SCP test vector identifier <role>")` over the ASCII label, with one role per party, following the precedent of §25.9. The 23 roles, each `<role>` exactly as the label spells it, are `a`, `agent`, `alice`, `announcing member`, `app`, `b`, `bob`, `carol`, `dave`, `event-log actor`, `hpke member`, `hpke sender`, `issuer`, `leaf attester`, `m`, `new member`, `other member`, `proposer`, `pseudonymized member`, `sender`, `subject`, `sync member`, `voter`. A fixture identifier is bound to no key: the vectors that carry one pin a preimage, not a binding between an identifier and the key that signs it. The rule covers the fixture parties only: Vector 52's signed export preimage carries the literal snapshot string `"creator_did":"<scp-identifier:creator>"`, which is not an identifier in the `scp:` form, and Vectors 41 through 57 are unchanged by it.
 
-**What a signature covers.** Every SCP signature here is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 reaches it. The vectors run RFC 6979 with `h1` set to that same digest, because §9.5 fixes RFC 6979 with SHA-256 for a software signer and states no value for `h1` under a prehashed digest. An implementation that hashes the digest a second time reproduces none of the signature bytes below.
+**What a signature covers.** Every SCP signature here is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 reaches it. The vectors run RFC 6979 with `h1` set to that same digest, because §9.5 fixes RFC 6979 with SHA-256 for a software signer other than a platform signer and states no value for `h1` under a prehashed digest. An implementation that hashes the digest a second time reproduces none of the signature bytes below.
 
 ## 25.2 Reference Key Material
 
@@ -177,7 +177,7 @@ Verification vector:
 
 Implementations MUST produce identical canonical hash bytes. The SHA-256 of those bytes is the value the P-256 key signs.
 
-**What an implementation matches.** A software signer that derives its nonce under RFC 6979 with SHA-256 (§9.5) reproduces the signature bytes above exactly, because RFC 6979 removes the nonce as a source of variation. A hardware signer — a Secure Enclave, a passkey authenticator, an HSM, a smartcard — draws a random nonce and therefore produces different `r` and `s` for this same preimage on every call. §9.5 states that such a signer conforms. A conformance check for a hardware signer therefore verifies its signature against the signer's public key and MUST NOT compare bytes against the value printed here. The verification vector above is the check that binds both signer classes.
+**What an implementation matches.** A software signer that derives its nonce under RFC 6979 with SHA-256 (§9.5) reproduces the signature bytes above exactly, because RFC 6979 removes the nonce as a source of variation. A hardware signer — a Secure Enclave, a passkey authenticator, an HSM, a smartcard — draws a random nonce and therefore produces different `r` and `s` for this same preimage on every call. A platform signer — Android Keystore, or CryptoKit on an Apple platform without a Secure Enclave — draws its nonce from the operating system's random source and produces different bytes in the same way. §9.5 states that both signers conform. A conformance check for a hardware signer or a platform signer therefore verifies its signature against the signer's public key and MUST NOT compare bytes against the value printed here. The verification vector above is the check that binds every signer class.
 
 ### Vector 6: InnerEnvelope with Provenance
 
@@ -512,7 +512,7 @@ RFC 6962 tree::root over the 9 leaves:
   0xd161de08f68888a0b13e7fb03e8bbc25758701ab247beb7b6bc2232c87971500
 ```
 
-**Only a software signer reproduces these leaves.** Each leaf hashes the event's signature bytes, so the leaf hash inherits the RFC 6979 determinism of the signature. A hardware signer produces a different signature for the same canonical hash and therefore a different leaf and a different root, which is correct behavior and not a conformance failure. A conformance check for such a signer verifies each event's signature against the signer's public key and compares the root only against a tree it built from its own events.
+**Only an RFC 6979 signer reproduces these leaves.** Each leaf hashes the event's signature bytes, so the leaf hash inherits the RFC 6979 determinism of the signature. A hardware signer or a platform signer (§9.5) produces a different signature for the same canonical hash and therefore a different leaf and a different root, which is correct behavior and not a conformance failure. A conformance check for such a signer verifies each event's signature against the signer's public key and compares the root only against a tree it built from its own events.
 
 ### Vector 33: Checkpoint Root KAT (§23.16.1)
 
@@ -785,7 +785,7 @@ Verification vector:
   verdict:    accept
 ```
 
-A software signer under RFC 6979 reproduces those signature bytes; a hardware signer produces different bytes over the same canonical hash and is checked against the verification vector instead (§25.4 states that rule). Before 2026-09-10 this vector printed no hash at all and told the reader to compute one from the Rust reference implementation, so it pinned nothing an independent implementer could check.
+A software signer under RFC 6979 reproduces those signature bytes; a hardware signer or a platform signer (§9.5) produces different bytes over the same canonical hash and is checked against the verification vector instead (§25.4 states that rule). Before 2026-09-10 this vector printed no hash at all and told the reader to compute one from the Rust reference implementation, so it pinned nothing an independent implementer could check.
 
 ## 25.14 Pseudonymization Vectors (§24.3.5)
 
@@ -887,7 +887,7 @@ To verify an implementation against these test vectors:
 
 4. **Hash verification.** Compute SHA-256 of each canonical byte sequence. Compare against the expected hash the vector prints.
 
-5. **Signature verification.** For signed structures, verify the printed 64-byte signature against the reference public key and the canonical hash, and confirm the verifier rejects the same signature with `s` replaced by `n − s` (§9.5's low-`s` rule). Then sign the canonical hash with your own signer and **verify the signature your signer produced against the same public key and the same hash**; a hardware signer's conformance check is that verification and never a comparison against the printed bytes. **Confirm as part of it that your signer emitted the low form** (§9.5), because a substrate that returns the high form leaves that conversion to the code around it. A **software** signer MUST additionally reproduce the printed bytes exactly, because §9.5 requires it to derive the nonce under RFC 6979 with SHA-256 over that same digest.
+5. **Signature verification.** For signed structures, verify the printed 64-byte signature against the reference public key and the canonical hash, and confirm the verifier rejects the same signature with `s` replaced by `n − s` (§9.5's low-`s` rule). Then sign the canonical hash with your own signer and **verify the signature your signer produced against the same public key and the same hash**; a hardware signer's or a platform signer's conformance check is that verification and never a comparison against the printed bytes. **Confirm as part of it that your signer emitted the low form** (§9.5), because a substrate that returns the high form leaves that conversion to the code around it. A **software** signer other than a platform signer MUST additionally reproduce the printed bytes exactly, because §9.5 requires it to derive the nonce under RFC 6979 with SHA-256 over that same digest.
 
 5a. **Point validation.** Confirm your parser applies §9.5's point-validation criterion to every wire-read point before that point reaches any signature verification and any key agreement. §25.2's three reference public keys are the positive cases; negate the y-coordinate of the tertiary key's uncompressed form and flip its final byte to obtain an off-curve negative case.
 
@@ -1239,7 +1239,7 @@ Verification vector:
   verdict:    accept
 ```
 
-A software signer under RFC 6979 reproduces these exact signature bytes on every run; a hardware signer produces different bytes and is checked against the verification vector instead (§25.4). Note the extension body omits the domain separator (present only in the signed preimage) and shares the eight fields byte-for-byte with the preimage's post-domain portion.
+A software signer under RFC 6979 reproduces these exact signature bytes on every run; a hardware signer or a platform signer (§9.5) produces different bytes and is checked against the verification vector instead (§25.4). Note the extension body omits the domain separator (present only in the signed preimage) and shares the eight fields byte-for-byte with the preimage's post-domain portion.
 
 ## 25.24 Outlet Registration V2 Vectors (§5.4.1)
 
