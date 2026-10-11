@@ -7,7 +7,7 @@ import Foundation
 // MARK: - CustodyType
 
 /// The custody choice a caller passes to
-/// ``SCP/identityCreate(custody:testingSeed:)`` and
+/// ``SCP/identityCreate(custody:)`` and
 /// ``SCP/identityCreateWithAgentKey(custody:)``: the custody request
 /// vocabulary of spec section 3.2.2.
 ///
@@ -56,7 +56,7 @@ public nonisolated enum CustodyType: String, Sendable, CaseIterable {
     /// The host operating system's key store, reached only through a
     /// `KeyCustodyProvider`.
     ///
-    /// ``SCP/identityCreate(custody:testingSeed:)`` and
+    /// ``SCP/identityCreate(custody:)`` and
     /// ``SCP/identityCreateWithAgentKey(custody:)`` take no provider, so they
     /// answer this case with `SCP-IDENT-1003`; pass the provider to
     /// ``SCP/identityCreateWithCustody(provider:)``. The value promises that
