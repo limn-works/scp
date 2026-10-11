@@ -193,24 +193,20 @@ impl<S: Storage> ProtocolRepository<S> {
     }
 
     /// Records each entry in `entries` as a revocation for a context, after
-    /// pruning the records that are moot at `now`, under the cap that
-    /// `scp_protocol::trust::aggregate::plan_revocation_write` enforces.
+    /// pruning the records that are moot at `now`, by the plan
+    /// `scp_protocol::trust::aggregate::plan_revocation_write` returns.
     ///
     /// SECURITY (lost update). Each record is written under its own storage
     /// key, so no write carries a stale copy of another key, and two concurrent
-    /// callers that record different revocations both keep their record. The
-    /// cap is checked against a listing a concurrent caller can outdate, so
-    /// concurrent callers can overshoot the cap by at most the records they add
-    /// together; this repository exposes no transaction and no compare-and-set
-    /// that could close that window. A prune deletes only a record whose
+    /// callers that record different revocations both keep their record. A
+    /// prune deletes only a record whose
     /// attestation has expired, which a concurrent caller can at most rewrite
     /// with the same content, and which no verification can need.
     ///
     /// # Errors
     ///
-    /// Returns [`TrustError::RevocationListFull`] when the cap refuses the
-    /// write (nothing is written or pruned), and [`TrustError::StoreError`] if
-    /// key sanitization, serialization, or storage fails.
+    /// Returns [`TrustError::StoreError`] if key sanitization, serialization,
+    /// or storage fails.
     pub async fn add_trust_revocations(
         &self,
         context_id: &str,
@@ -224,7 +220,7 @@ impl<S: Storage> ProtocolRepository<S> {
             .load_trust_revocation_records(context_id)
             .await
             .map_err(map_store_error)?;
-        let plan = plan_revocation_write(context_id, &existing, entries, now)?;
+        let plan = plan_revocation_write(&existing, entries, now);
         for list_key in &plan.prune {
             let key = revocation_entry_key(context_id, list_key).map_err(map_store_error)?;
             self.storage()
@@ -755,45 +751,6 @@ mod tests {
         );
         assert!(loaded.contains_key("9:did:key:a:att-forever"));
         assert!(loaded.contains_key("9:did:key:a:att-new"));
-    }
-
-    /// A write that would take a context past the cap writes nothing and
-    /// returns the typed `RevocationListFull`, so caller input cannot grow the
-    /// list without bound.
-    #[tokio::test]
-    async fn add_trust_revocations_refuses_a_write_past_the_cap() {
-        use scp_protocol::trust::aggregate::MAX_REVOCATION_RECORDS_PER_CONTEXT;
-        let store = new_store();
-        let fill: Vec<RevocationEntry> = (0..MAX_REVOCATION_RECORDS_PER_CONTEXT)
-            .map(|i| rev(&format!("9:did:key:a:att-{i}")))
-            .collect();
-        store
-            .add_trust_revocations("ctx-cap", &fill, 1000)
-            .await
-            .unwrap();
-
-        let err = store
-            .add_trust_revocations("ctx-cap", &[rev("9:did:key:a:att-over")], 1000)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                TrustError::RevocationListFull { context_id, cap }
-                    if context_id == "ctx-cap" && *cap == MAX_REVOCATION_RECORDS_PER_CONTEXT
-            ),
-            "expected RevocationListFull, got {err:?}"
-        );
-        let loaded = store.load_trust_revocation_state("ctx-cap").await.unwrap();
-        assert_eq!(loaded.len(), MAX_REVOCATION_RECORDS_PER_CONTEXT);
-        assert!(!loaded.contains_key("9:did:key:a:att-over"));
-
-        // Re-recording a revocation the list already holds adds nothing, so
-        // the cap does not refuse it.
-        store
-            .add_trust_revocations("ctx-cap", &[rev("9:did:key:a:att-0")], 1000)
-            .await
-            .unwrap();
     }
 
     /// SECURITY (lost update, issue #2335 bug-catcher item 8). Two callers on

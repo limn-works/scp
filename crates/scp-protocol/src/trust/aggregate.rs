@@ -116,17 +116,11 @@ pub trait TrustProtocolRepository: Send + Sync {
     /// Each `list_key` comes from [`revocation_list_key`]. Passing an empty
     /// slice writes nothing and prunes nothing.
     ///
-    /// SECURITY (bounded growth). A caller hands this method revocations it
-    /// learned from caller-supplied attestations, and an attacker who derives a
-    /// DID from a fresh keypair signs a self-revoking attestation at the cost of
-    /// one signature, so an unbounded list grows at that price and every later
-    /// verification in the context reads the whole list. An implementation
-    /// therefore applies [`plan_revocation_write`] to its current records and
-    /// `entries` and carries out the plan that function returns: it deletes
-    /// each pruned record, writes each new record, and returns the
-    /// [`TrustError::RevocationListFull`] that function returns, writing
-    /// nothing, when the context would hold more than
-    /// [`MAX_REVOCATION_RECORDS_PER_CONTEXT`] records.
+    /// An implementation applies [`plan_revocation_write`] to its current
+    /// records and `entries` and carries out the plan that function returns:
+    /// it deletes each pruned record and writes each new record. Spec 07
+    /// §7.4.4 states no size bound for the list, so neither the plan nor the
+    /// store refuses a write by count.
     ///
     /// SECURITY (lost update). An implementation MUST NOT lose a revocation that
     /// a concurrent caller on the same context recorded. Reading a whole map,
@@ -137,15 +131,10 @@ pub trait TrustProtocolRepository: Send + Sync {
     /// holds one lock across its own read and write (which serializes callers
     /// inside one process only), or writes each key independently so no write
     /// carries a stale copy of another key (which holds across processes too).
-    /// An implementation of the second kind checks the cap against a read that
-    /// a concurrent caller can outdate, so concurrent callers can overshoot the
-    /// cap by at most the records they add together; the cap still bounds what
-    /// any one call adds.
     ///
     /// # Errors
     ///
-    /// Returns [`TrustError::RevocationListFull`] when the cap refuses the
-    /// write, and [`TrustError::StoreError`] if a store read or write fails.
+    /// Returns [`TrustError::StoreError`] if a store read or write fails.
     fn add_revocations(
         &self,
         context_id: &str,
@@ -209,17 +198,8 @@ pub fn revocation_list_key(issuer: &DID, attestation_id: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Bounded revocation records
+// Revocation records
 // ---------------------------------------------------------------------------
-
-/// The most revocation records one context's list holds.
-///
-/// Every verification in a context reads that context's whole list, so this
-/// cap bounds both the durable storage an attacker can claim and the work each
-/// later verification pays for it. A record whose attestation has expired is
-/// pruned before the cap is checked, because step 3 of [`verify_attestation`]
-/// rejects an expired attestation before step 5 reads the list.
-pub const MAX_REVOCATION_RECORDS_PER_CONTEXT: usize = 1024;
 
 /// One revocation a caller asks [`TrustProtocolRepository::add_revocations`]
 /// to record.
@@ -269,23 +249,20 @@ pub struct RevocationWritePlan {
 ///
 /// `existing` lists every record the context holds. The plan prunes each
 /// existing record that [`RevocationEntry::is_moot`] reports moot at `now`,
-/// skips each new entry the kept records already hold or this call already
-/// listed, and refuses the whole call when the kept records plus the new ones
-/// would exceed [`MAX_REVOCATION_RECORDS_PER_CONTEXT`].
-///
-/// # Errors
-///
-/// Returns [`TrustError::RevocationListFull`] when the kept records plus the
-/// new ones exceed the cap.
+/// and skips each new entry that is moot, that the kept records already hold,
+/// or that this call already listed. Pruning a moot record loses nothing,
+/// because step 3 of [`verify_attestation`] rejects an expired attestation
+/// before step 5 reads the list. The plan refuses no write by count: spec 07
+/// §7.4.4 states no size bound for the list.
+#[must_use]
 pub fn plan_revocation_write(
-    context_id: &str,
     existing: &[RevocationEntry],
     entries: &[RevocationEntry],
     now: u64,
-) -> Result<RevocationWritePlan, TrustError> {
+) -> RevocationWritePlan {
     let mut plan = RevocationWritePlan::default();
     if entries.is_empty() {
-        return Ok(plan);
+        return plan;
     }
     let mut held: HashSet<&str> = HashSet::with_capacity(existing.len());
     for record in existing {
@@ -295,21 +272,13 @@ pub fn plan_revocation_write(
             held.insert(record.list_key.as_str());
         }
     }
-    let kept = held.len();
     for entry in entries {
         if entry.is_moot(now) || !held.insert(entry.list_key.as_str()) {
             continue;
         }
         plan.write.push(entry.clone());
     }
-    let total = kept.saturating_add(plan.write.len());
-    if total > MAX_REVOCATION_RECORDS_PER_CONTEXT {
-        return Err(TrustError::RevocationListFull {
-            context_id: context_id.to_owned(),
-            cap: MAX_REVOCATION_RECORDS_PER_CONTEXT,
-        });
-    }
-    Ok(plan)
+    plan
 }
 
 // ---------------------------------------------------------------------------
@@ -928,7 +897,7 @@ mod tests {
                     expires_at: *expires_at,
                 })
                 .collect();
-            let plan = plan_revocation_write(context_id, &existing, entries, now)?;
+            let plan = plan_revocation_write(&existing, entries, now);
             for list_key in &plan.prune {
                 records.remove(list_key);
             }
@@ -1317,35 +1286,27 @@ mod tests {
             entry("new", Some(5000)),
             entry("already-expired", Some(10)),
         ];
-        let plan = plan_revocation_write("ctx", &existing, &entries, 1000).unwrap();
+        let plan = plan_revocation_write(&existing, &entries, 1000);
         assert_eq!(plan.prune, vec!["old".to_owned()]);
         assert_eq!(plan.write, vec![entry("new", Some(5000))]);
     }
 
-    /// A call that would take a context past the cap is refused whole, and
-    /// pruning moot records first frees room for it.
+    /// The plan refuses no write by count (spec 07 §7.4.4 states no size
+    /// bound): a large list still takes a new record, and a moot record in it
+    /// is still pruned.
     #[test]
-    fn plan_revocation_write_refuses_past_the_cap_after_pruning() {
-        let full: Vec<RevocationEntry> = (0..MAX_REVOCATION_RECORDS_PER_CONTEXT)
-            .map(|i| entry(&format!("k{i}"), None))
-            .collect();
-        let err =
-            plan_revocation_write("ctx-full", &full, &[entry("over", None)], 1000).unwrap_err();
-        assert!(
-            matches!(&err, TrustError::RevocationListFull { context_id, cap }
-                if context_id == "ctx-full" && *cap == MAX_REVOCATION_RECORDS_PER_CONTEXT),
-            "expected RevocationListFull, got {err:?}"
-        );
-
-        let mut with_moot = full;
-        with_moot[0].expires_at = Some(5);
-        let plan =
-            plan_revocation_write("ctx-full", &with_moot, &[entry("over", None)], 1000).unwrap();
+    fn plan_revocation_write_refuses_no_write_by_count() {
+        let mut large: Vec<RevocationEntry> =
+            (0..4096).map(|i| entry(&format!("k{i}"), None)).collect();
+        large[0].expires_at = Some(5);
+        let fresh: Vec<RevocationEntry> =
+            (0..2048).map(|i| entry(&format!("n{i}"), None)).collect();
+        let plan = plan_revocation_write(&large, &fresh, 1000);
         assert_eq!(plan.prune, vec!["k0".to_owned()]);
-        assert_eq!(plan.write, vec![entry("over", None)]);
+        assert_eq!(plan.write, fresh);
 
         // An empty call neither prunes nor writes.
-        let empty = plan_revocation_write("ctx-full", &with_moot, &[], 1000).unwrap();
+        let empty = plan_revocation_write(&large, &[], 1000);
         assert_eq!(empty, RevocationWritePlan::default());
     }
 

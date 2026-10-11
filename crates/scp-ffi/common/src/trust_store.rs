@@ -135,7 +135,7 @@ impl TrustProtocolRepository for InMemoryFfiTrustStore {
                 expires_at: *expires_at,
             })
             .collect();
-        let plan = plan_revocation_write(context_id, &existing, entries, now)?;
+        let plan = plan_revocation_write(&existing, entries, now);
         for list_key in &plan.prune {
             records.remove(list_key);
         }
@@ -292,14 +292,9 @@ const fn is_issuer_signed_revocation(err: &TrustError, attestation: &Attestation
 /// call. A failed write is an INFRA fault and propagates, matching how this
 /// helper treats a failed `get_revocation_state`.
 ///
-/// SECURITY (bounded growth). Every entry this helper records came from a
-/// caller, so `add_revocations` prunes records whose attestation has expired
-/// and refuses, with [`TrustError::RevocationListFull`], a write that would
-/// take a context past
-/// [`MAX_REVOCATION_RECORDS_PER_CONTEXT`](scp_core::trust::aggregate::MAX_REVOCATION_RECORDS_PER_CONTEXT).
-/// That error sits outside [`is_verification_rejection`], so it aborts this
-/// call with nothing cached, and the caller learns that a revocation the batch
-/// carried was not recorded rather than seeing its batch counted.
+/// Every entry this helper records came from a caller; `add_revocations`
+/// prunes the records whose attestation has expired and refuses no write by
+/// count, because spec 07 §7.4.4 states no size bound for the list.
 ///
 /// SECURITY (concurrent ingest). Keys reach a store only through
 /// `add_revocations`, which adds the keys it names and leaves every unexpired
@@ -2238,51 +2233,6 @@ mod tests {
         assert!(
             matches!(&err, TrustError::StoreError { reason } if reason == "revocation-state read failed"),
             "expected the store's read fault, got {err:?}"
-        );
-    }
-
-    /// A batch whose revocation would take a full list past its cap aborts
-    /// with the typed `RevocationListFull`, caches nothing, and leaves the list
-    /// as it was.
-    #[test]
-    fn ingest_into_a_full_revocation_list_fails_with_a_typed_error() {
-        use scp_core::trust::aggregate::MAX_REVOCATION_RECORDS_PER_CONTEXT;
-        let context_id = "ctx-full-list";
-        let subject_did =
-            "did:key:6666666666666666666666666666666666666666666666666666666666666611";
-        let store = SharedFfiStore::new();
-        let fill: Vec<RevocationEntry> = (0..MAX_REVOCATION_RECORDS_PER_CONTEXT)
-            .map(|i| rev(&format!("9:did:key:x:att-{i}")))
-            .collect();
-        store.add_revocations(context_id, &fill, 1000).unwrap();
-
-        let revoking_key = ed25519_dalek::SigningKey::from_bytes(&[101u8; 32]);
-        let other_key = ed25519_dalek::SigningKey::from_bytes(&[103u8; 32]);
-        let revoked_copy =
-            make_genuinely_signed_revoked("att-over-cap", subject_did, &revoking_key);
-        let cacheable = make_genuinely_signed("att-cacheable", subject_did, &other_key);
-
-        let err = verified_attestations(
-            store.clone(),
-            context_id,
-            subject_did,
-            vec![fresh_entry(revoked_copy), fresh_entry(cacheable)],
-        )
-        .unwrap_err();
-        assert!(
-            matches!(&err, TrustError::RevocationListFull { cap, .. } if *cap == MAX_REVOCATION_RECORDS_PER_CONTEXT),
-            "expected RevocationListFull, got {err:?}"
-        );
-        assert!(
-            store
-                .get_cached_attestations(context_id, subject_did)
-                .unwrap()
-                .is_empty(),
-            "a refused revocation write must leave nothing cached"
-        );
-        assert_eq!(
-            store.get_revocation_state(context_id).unwrap().len(),
-            MAX_REVOCATION_RECORDS_PER_CONTEXT
         );
     }
 }

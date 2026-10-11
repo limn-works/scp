@@ -384,21 +384,6 @@ pub enum TrustError {
         /// Human-readable description of the storage failure.
         reason: String,
     },
-
-    /// A context's revocation list already holds as many unexpired records as
-    /// `MAX_REVOCATION_RECORDS_PER_CONTEXT` allows, so the write that would
-    /// exceed it wrote nothing.
-    ///
-    /// Not a verification rejection: the attestation that carried the
-    /// revocation was not judged, and the caller learns that its revocation was
-    /// not recorded.
-    #[error("revocation list for context {context_id} is full ({cap} unexpired records)")]
-    RevocationListFull {
-        /// The context whose list is full.
-        context_id: String,
-        /// The cap the write would have exceeded.
-        cap: usize,
-    },
 }
 
 // ---------------------------------------------------------------------------
