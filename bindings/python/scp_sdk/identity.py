@@ -29,6 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from scp_sdk._extension import native_module
 from scp_sdk.errors import ValidationError
 from scp_sdk.types import CustodyType
 
@@ -121,8 +122,16 @@ class Identity:
         """Wrap a ``PyIdentity`` bridge handle.
 
         Users should not call this directly — use the ``scp.identity_*``
-        factory methods.
+        factory methods. Raises :class:`~scp_sdk.errors.ValidationError`
+        (``SCP-VALID-7005``) unless ``handle`` is the extension's ``PyIdentity``.
         """
+        native_class = native_module().PyIdentity
+        if not isinstance(handle, native_class):
+            raise ValidationError(
+                "Identity(): handle must be a native PyIdentity, got "
+                f"{type(handle).__module__}.{type(handle).__qualname__}",
+                "SCP-VALID-7005",
+            )
         self._raw_handle: PyIdentity = handle
         self.rotation_event_json = rotation_event_json
 

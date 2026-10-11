@@ -28,18 +28,11 @@ import pytest
 
 from scp_sdk.context import Context, Membership
 from scp_sdk.types import Message
+from tests._native_doubles import native_context_handle
 
 # ---------------------------------------------------------------------------
 # Helpers — minimal bridge mocks
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class _MockHandle:
-    """Mock for the opaque bridge context handle."""
-
-    context_id: str = "ctx-test-abc123"
-    state: str = "active"
 
 
 @dataclass
@@ -66,12 +59,12 @@ def _make_scp(native_mock: MagicMock | None = None) -> MagicMock:
 
 
 def _make_context(
-    handle: _MockHandle | None = None,
+    handle: MagicMock | None = None,
     identity_did: str = "did:dht:z6MkAlice",
 ) -> Context:
     """Construct a Context wrapper with a mock handle for testing."""
     return Context(
-        handle=handle or _MockHandle(),
+        handle=handle or native_context_handle(),
         identity_did=identity_did,
     )
 
@@ -118,7 +111,7 @@ class TestContextHandleProperties:
         assert isinstance(ctx.state, str)
 
     def test_state_reflects_handle_changes(self) -> None:
-        handle = _MockHandle(state="creating")
+        handle = native_context_handle(state="creating")
         ctx = _make_context(handle=handle)
         assert ctx.state == "creating"
         handle.state = "active"
@@ -128,7 +121,7 @@ class TestContextHandleProperties:
 
     def test_all_lifecycle_states(self) -> None:
         for state in ("creating", "active", "closing", "closed", "expired"):
-            handle = _MockHandle(state=state)
+            handle = native_context_handle(state=state)
             ctx = _make_context(handle=handle)
             assert ctx.state == state
 
@@ -141,7 +134,7 @@ class TestContextHandleProperties:
 
     def test_raw_handle_exposed(self) -> None:
         """Context wrapper exposes the opaque handle under ``_raw_handle``."""
-        handle = _MockHandle()
+        handle = native_context_handle()
         ctx = _make_context(handle=handle)
         assert ctx._raw_handle is handle
 
@@ -162,7 +155,7 @@ class TestScpContextCreate:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_create.return_value = _MockHandle()
+        native.context_create.return_value = native_context_handle()
         scp = _make_scp(native)
 
         ctx = await SCP.context_create(scp, "did:dht:z6MkAlice", {"ceiling": ["messages:read"]})
@@ -175,7 +168,7 @@ class TestScpContextCreate:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_create.return_value = _MockHandle()
+        native.context_create.return_value = native_context_handle()
         scp = _make_scp(native)
 
         params = {
@@ -203,7 +196,7 @@ class TestScpContextCreate:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_create.return_value = _MockHandle()
+        native.context_create.return_value = native_context_handle()
         scp = _make_scp(native)
 
         await SCP.context_create(
@@ -219,7 +212,7 @@ class TestScpContextCreate:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_create.return_value = _MockHandle()
+        native.context_create.return_value = native_context_handle()
         scp = _make_scp(native)
 
         await SCP.context_create(scp, "did:dht:z6MkAlice", {"ceiling": [], "mode": "broadcast"})
@@ -229,7 +222,7 @@ class TestScpContextCreate:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_create.return_value = _MockHandle()
+        native.context_create.return_value = native_context_handle()
         scp = _make_scp(native)
 
         await SCP.context_create(
@@ -241,7 +234,7 @@ class TestScpContextCreate:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_create.return_value = _MockHandle()
+        native.context_create.return_value = native_context_handle()
         scp = _make_scp(native)
 
         await SCP.context_create(
@@ -253,7 +246,7 @@ class TestScpContextCreate:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_create.return_value = _MockHandle()
+        native.context_create.return_value = native_context_handle()
         scp = _make_scp(native)
 
         ep_json = '{"locked": false, "cost_schedule": {}}'
@@ -271,7 +264,7 @@ class TestScpContextCreate:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_create.return_value = _MockHandle()
+        native.context_create.return_value = native_context_handle()
         scp = _make_scp(native)
 
         config = {"allow_automatic_access_revocation": True}
@@ -290,7 +283,7 @@ class TestScpContextCreate:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_create.return_value = _MockHandle()
+        native.context_create.return_value = native_context_handle()
         scp = _make_scp(native)
 
         await SCP.context_create(
@@ -305,7 +298,7 @@ class TestScpContextCreate:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_create.return_value = _MockHandle()
+        native.context_create.return_value = native_context_handle()
         scp = _make_scp(native)
 
         await SCP.context_create(
@@ -320,7 +313,7 @@ class TestScpContextCreate:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_create.return_value = _MockHandle()
+        native.context_create.return_value = native_context_handle()
         scp = _make_scp(native)
 
         await SCP.context_create(
@@ -333,7 +326,7 @@ class TestScpContextCreate:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_create.return_value = _MockHandle()
+        native.context_create.return_value = native_context_handle()
         scp = _make_scp(native)
 
         await SCP.context_create(scp, "did:dht:z6MkAlice", {"ceiling": [], "roles": {}})
@@ -344,7 +337,7 @@ class TestScpContextCreate:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_create.return_value = _MockHandle()
+        native.context_create.return_value = native_context_handle()
         scp = _make_scp(native)
 
         await SCP.context_create(scp, "did:dht:z6MkAlice", {"ceiling": [], "outlets": []})

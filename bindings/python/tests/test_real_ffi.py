@@ -34,7 +34,7 @@ except Exception as _exc:
     pytest.skip(skip_reason_if_extension_absent(_exc), allow_module_level=True)
 
 from scp_sdk import SCP, Context
-from scp_sdk.errors import ValidationError
+from scp_sdk.errors import ContextError, ScpError, ValidationError
 from scp_sdk.types import CustodyType
 
 # ---------------------------------------------------------------------------
@@ -443,6 +443,50 @@ class TestContext:
             assert "SCP-CTX-2093" not in str(exc), (
                 f"valid export must not fail signature verification: {exc}"
             )
+
+    async def test_sdk_context_import_returns_the_context_id_string(self, scp: SCP):
+        """``SCP.context_import`` returns the imported context's ID as a ``str``,
+        the value the bridge returns and the Swift, Kotlin, and TypeScript SDKs
+        return, not a :class:`Context` wrapped around that string."""
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        ctx = await scp.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read", "context:close"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        data = scp._native.context_export(ctx.context_id)
+        # Closing drops the live context, so the import is not refused with
+        # "context already exists".
+        await scp.context_close(ctx, alice.did)
+
+        imported = await scp.context_import(bytes(data), alice.did)
+
+        assert type(imported) is str
+        assert imported == ctx.context_id
+
+    async def test_sdk_context_import_raises_a_typed_error_for_bad_input(self, scp: SCP):
+        """A malformed export and a re-import of a live context both reach the
+        caller as an ``ScpError``, not a bare bridge ``ValueError`` or
+        ``RuntimeError``."""
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        with pytest.raises(ScpError):
+            await scp.context_import(b"not a context export", alice.did)
+
+        ctx = await scp.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read", "context:close"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        data = scp._native.context_export(ctx.context_id)
+        with pytest.raises(ContextError) as excinfo:
+            await scp.context_import(bytes(data), alice.did)
+        assert excinfo.value.code == "SCP-CTX-2001"
 
     async def test_import_rejects_tampered_export(self, scp: SCP):
         """Spec §23.16.8 / ADR-050: a forged export (a signed snapshot byte

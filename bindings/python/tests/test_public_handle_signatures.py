@@ -24,6 +24,7 @@ import pytest
 import scp_sdk.scp as scp_module
 from scp_sdk import SCP, Context, FullStackNode, Identity, McpClient, McpServer
 from scp_sdk.errors import ValidationError
+from tests._native_doubles import native_context_handle, native_identity
 
 #: Parameter names that carry a handle on a public ``SCP`` method.
 HANDLE_PARAMETER_NAMES = frozenset(
@@ -94,11 +95,23 @@ def test_the_signature_scan_reaches_the_known_handle_methods() -> None:
 def _scp_with_mock_native() -> SCP:
     scp = SCP.__new__(SCP)
     scp._native = MagicMock()
+    # Identity accepts only a PyIdentity, so the identity methods that wrap the
+    # bridge's return get a PyIdentity double back.
+    scp._native.identity_rotate_key.return_value = native_identity()
+    scp._native.identity_add_agent_key.return_value = native_identity()
     return scp
 
 
 class _RawNativeHandle:
     """Stands in for a native ``PyContextHandle`` / ``PyIdentity`` passed directly."""
+
+
+# Context and Identity accept only the extension's handle classes, so their
+# cases wrap a specced double; the other wrappers take any native object.
+_NATIVE_DOUBLES: dict[type, Callable[[], object]] = {
+    Context: native_context_handle,
+    Identity: native_identity,
+}
 
 
 # (method, argument builder, wrapper class, native method name)
@@ -127,7 +140,7 @@ async def test_the_sdk_object_reaches_the_bridge_as_its_native_handle(
     method: str, args: Callable[[object], tuple[Any, ...]], wrapper: type, native: str
 ) -> None:
     scp = _scp_with_mock_native()
-    raw = _RawNativeHandle()
+    raw = _NATIVE_DOUBLES.get(wrapper, _RawNativeHandle)()
     await getattr(scp, method)(*args(wrapper(raw)))
     called = getattr(scp._native, native)
     called.assert_called_once()
@@ -160,7 +173,7 @@ async def test_a_raw_handle_or_wrong_type_raises_valid_7005_before_the_bridge(
 async def test_a_context_passed_where_an_identity_belongs_raises_valid_7005() -> None:
     scp = _scp_with_mock_native()
     with pytest.raises(ValidationError) as excinfo:
-        await scp.identity_rotate_key(Context(_RawNativeHandle()))  # type: ignore[arg-type]
+        await scp.identity_rotate_key(Context(native_context_handle()))  # type: ignore[arg-type]
     assert excinfo.value.code == "SCP-VALID-7005"
     scp._native.identity_rotate_key.assert_not_called()
 
@@ -173,3 +186,37 @@ async def test_fullstack_create_node_returns_a_full_stack_node() -> None:
     node = await scp.fullstack_create_node("did:dht:z6MkNode")
     assert isinstance(node, FullStackNode)
     assert node.did == "did:dht:z6MkNode"
+
+
+@pytest.mark.parametrize(
+    ("wrapper", "handle"),
+    [
+        (Context, "some-str"),
+        (Context, _RawNativeHandle()),
+        (Context, native_identity()),
+        (Identity, "did:dht:z6MkAlice"),
+        (Identity, _RawNativeHandle()),
+        (Identity, native_context_handle()),
+    ],
+    ids=[
+        "context-from-str",
+        "context-from-other-object",
+        "context-from-identity-handle",
+        "identity-from-str",
+        "identity-from-other-object",
+        "identity-from-context-handle",
+    ],
+)
+def test_a_wrapper_built_around_anything_but_its_native_handle_raises_valid_7005(
+    wrapper: type, handle: object
+) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        wrapper(handle)
+    assert excinfo.value.code == "SCP-VALID-7005"
+    assert f"{wrapper.__name__}(): handle must be a native" in str(excinfo.value)
+
+
+def test_a_wrapper_accepts_its_native_handle() -> None:
+    """Positive control for the constructor check above."""
+    assert Context(native_context_handle(context_id="ctx-1")).context_id == "ctx-1"
+    assert Identity(native_identity(did="did:dht:z6MkBob")).did == "did:dht:z6MkBob"

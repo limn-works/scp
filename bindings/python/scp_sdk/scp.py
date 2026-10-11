@@ -1421,19 +1421,28 @@ class SCP:
         native_handle = _unwrap_handle(handle, Context, "context_handle_ttl_expiry", "handle")
         return await asyncio.to_thread(self._native.context_handle_ttl_expiry, native_handle)
 
-    async def context_import(self, data: Any, importer_did: str) -> Context | None:
-        """Delegate to ``_scp_core.SCP.context_import`` (returns :class:`Context`).
+    async def context_import(self, data: bytes, importer_did: str) -> str:
+        """Import a signed context export and return the imported context's ID.
 
-        ``importer_did`` is the DID of the identity importing the context; the
-        bridge derives that identity's per-context pseudonym routing ID
-        (§9.10.4) so the importer fans out under its own routing ID rather than
-        inheriting the exporter's local-instance pseudonym.
+        Delegates to ``_scp_core.SCP.context_import``, which returns the
+        context ID string, the same value the Swift, Kotlin, and TypeScript
+        SDKs return. ``importer_did`` is the DID of the identity importing the
+        context; the bridge derives that identity's per-context pseudonym
+        routing ID (§9.10.4) so the importer fans out under its own routing ID
+        rather than inheriting the exporter's local-instance pseudonym.
+
+        Raises :class:`~scp_sdk.errors.ScpError` (the subclass the bridge
+        error's code selects) when the export is malformed, its signature
+        fails verification, or the context already exists.
         """
 
-        raw = await asyncio.to_thread(self._native.context_import, data, importer_did)
-        if raw is None:
-            return None
-        return Context(raw, identity_did=importer_did, scp=self)
+        try:
+            context_id: str = await asyncio.to_thread(
+                self._native.context_import, data, importer_did
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
+        return context_id
 
     async def context_is_member(self, handle: Context, did: str) -> Any:
         """Delegate to ``_scp_core.SCP.context_is_member``."""

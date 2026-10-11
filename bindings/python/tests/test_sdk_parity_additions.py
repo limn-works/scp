@@ -23,6 +23,7 @@ import pytest
 
 from scp_sdk import SCP, Identity, discovery
 from scp_sdk.errors import ScpError
+from tests._native_doubles import native_identity
 
 
 def test_discover_contexts_dispatches_and_wraps_results_as_dicts() -> None:
@@ -81,7 +82,7 @@ async def test_identity_migrate_propagates_scperror() -> None:
     )
 
     with pytest.raises(ScpError, match="custody migration failed"):
-        await scp.identity_migrate(Identity(MagicMock()))
+        await scp.identity_migrate(Identity(native_identity()))
 
 
 @pytest.mark.asyncio

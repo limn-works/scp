@@ -43,6 +43,7 @@ from scp_sdk.outlets import (
     Outlets,
     OutletStreamChunk,
 )
+from tests._native_doubles import native_context_handle
 
 # ---------------------------------------------------------------------------
 # Wire-shape chunk builders (match §5.4.5 OutletStreamChunk serialization).
@@ -193,7 +194,7 @@ def _make_ctx(
     identity_did: str = "did:dht:caller",
 ) -> Context:
     scp = SimpleNamespace(_native=native)
-    raw_handle = SimpleNamespace(context_id=context_id, state="active")
+    raw_handle = native_context_handle(context_id=context_id)
     return Context(raw_handle, identity_did=identity_did, scp=scp)
 
 
@@ -276,7 +277,7 @@ class TestOutletsAccessor:
     def test_context_without_scp_raises(self) -> None:
         from scp_sdk.errors import ContextError
 
-        raw_handle = SimpleNamespace(context_id="ctx-x", state="active")
+        raw_handle = native_context_handle(context_id="ctx-x")
         bare = Context(raw_handle, identity_did="did:dht:x")
         with pytest.raises(ContextError):
             _ = bare.outlets

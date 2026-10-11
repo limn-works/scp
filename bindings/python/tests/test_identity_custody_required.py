@@ -19,6 +19,7 @@ import pytest
 from scp_sdk.errors import IdentityError, ValidationError
 from scp_sdk.scp import CUSTODY_REQUIRED_CODE, SCP
 from scp_sdk.types import CustodyType
+from tests._native_doubles import native_identity
 
 METHODS = ("identity_create", "identity_create_with_agent_key", "identity_create_with_custody")
 
@@ -35,6 +36,10 @@ SDK_ROOT = Path(__file__).resolve().parents[1]
 def _scp_with_mock_native() -> tuple[SCP, MagicMock]:
     scp = SCP.__new__(SCP)
     native = MagicMock()
+    # The factories wrap the bridge's return in Identity, which accepts only a
+    # PyIdentity, so the mocked bridge returns a PyIdentity double.
+    native.identity_create.return_value = native_identity()
+    native.identity_create_with_agent_key.return_value = native_identity()
     scp._native = native
     return scp, native
 

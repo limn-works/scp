@@ -23,7 +23,6 @@ See ``.docs/adrs/ADR-049-actor-per-context.md`` §9 (Deferred Work 1) and
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -34,19 +33,12 @@ from scp_sdk.scp import (
     Sealed,
     SealedInvitation,
 )
+from tests._native_doubles import native_context_handle
 from tests.conftest import skip_reason_if_extension_absent
 
 # ---------------------------------------------------------------------------
 # Helpers — minimal bridge mocks (mirrors tests/test_context.py)
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class _MockHandle:
-    """Mock for the opaque bridge context handle."""
-
-    context_id: str = "ctx-test-abc123"
-    state: str = "active"
 
 
 def _make_scp(native_mock: MagicMock | None = None) -> MagicMock:
@@ -140,7 +132,7 @@ class TestContextJoinFromWelcomeDelegation:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_join_from_welcome.return_value = _MockHandle()
+        native.context_join_from_welcome.return_value = native_context_handle()
         scp = _make_scp(native)
         sealed = _sealed()
 
@@ -165,7 +157,7 @@ class TestContextJoinFromWelcomeDelegation:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.context_join_from_welcome.return_value = _MockHandle()
+        native.context_join_from_welcome.return_value = native_context_handle()
         scp = _make_scp(native)
 
         with patch("scp_sdk.scp._to_native_sealed", side_effect=lambda s: s):

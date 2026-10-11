@@ -529,13 +529,23 @@ class Context:
 
         Users should not call this directly. Use
         :meth:`scp_sdk.SCP.context_create`,
-        :meth:`scp_sdk.SCP.context_import`, or related factories.
+        :meth:`scp_sdk.SCP.context_join_from_welcome`, or related factories.
+
+        Raises :class:`~scp_sdk.errors.ValidationError` (``SCP-VALID-7005``)
+        unless ``handle`` is the extension's ``PyContextHandle``.
 
         ``scp`` is the owning :class:`scp_sdk.SCP` instance; it backs the
         :attr:`outlets` accessor (whose control plane dispatches to the SCP
         native bridge). Factory methods pass it; a bare ``Context(handle)`` for
         pure handle inspection may omit it.
         """
+        native_class = native_module().PyContextHandle
+        if not isinstance(handle, native_class):
+            raise ValidationError(
+                "Context(): handle must be a native PyContextHandle, got "
+                f"{type(handle).__module__}.{type(handle).__qualname__}",
+                "SCP-VALID-7005",
+            )
         self._raw_handle: PyContextHandle = handle
         self.identity_did = identity_did
         self._scp = scp
