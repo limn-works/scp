@@ -222,7 +222,7 @@ impl TtlExpiryResult {
     /// destroy keys. No step is marked complete; the descriptive error records
     /// why the expiry did nothing.
     ///
-    /// [`handle_ttl_expiry`](crate::context::ttl_close_helpers::handle_ttl_expiry)
+    /// `handle_ttl_expiry`
     /// returns this WITHOUT emitting any `Expired` / `ExpiryFailed` event and
     /// after clearing the stale cached deadline, so the actor neither despawns
     /// nor retry-loops — the FSM is left untouched (`Active`).
@@ -608,12 +608,12 @@ pub async fn finalize_close(
 
 /// Single-call TTL-expiry COMPOSITION.
 ///
-/// Runs the terminal phase ([`apply_ttl_terminal_transition`]) and, if it
-/// transitioned, the bounded-I/O phase ([`finish_ttl_expiry_io`]) back-to-back,
+/// Runs the terminal phase (`apply_ttl_terminal_transition`) and, if it
+/// transitioned, the bounded-I/O phase (`finish_ttl_expiry_io`) back-to-back,
 /// returning a structured result.
 ///
 /// This is NOT the live automatic-expiry path and it is NOT dead code. The live
-/// actor path ([`crate::context::ttl_close_helpers::handle_ttl_expiry`]) drives
+/// actor path (`crate::context::ttl_close_helpers::handle_ttl_expiry`) drives
 /// the two phases SEPARATELY so the fail-closed persist of the terminal
 /// `Expired` state runs OUTSIDE the relay/event-log transport timeout (SEC-1).
 /// This function is the convenient whole-in-one form, and is exercised by this
@@ -975,7 +975,7 @@ impl TtlExpiryResult {
 /// ADR-049 finding A3: the TTL timer is an ACTOR-OWNED arm — this type no
 /// longer spawns or holds a background task. It carries the convergent expiry
 /// `deadline_unix_secs` (recorded by
-/// [`ttl_close_helpers::start_ttl_timer`](crate::context::ttl_close_helpers))
+/// `ttl_close_helpers::start_ttl_timer`)
 /// plus the clock used to compute remaining TTL for persistence snapshots. The
 /// `ContextActor` `run()` loop reconciles a one-shot `sleep` against this
 /// deadline and runs the expiry pipeline on wake.
@@ -1088,7 +1088,7 @@ impl TtlExtension {
     /// non-deterministic order): every member recording the `TtlExtended` leaf
     /// (§5.10.1 step 5) from the same consent tally serialises the identical
     /// `consenting_members` field. Used by
-    /// [`reset_ttl_timer`](crate::context::ttl_close_helpers::reset_ttl_timer)
+    /// `reset_ttl_timer`
     /// to attribute the activation to the members who consented.
     #[must_use]
     pub fn consented_dids(&self) -> Vec<String> {
@@ -1173,17 +1173,6 @@ mod tests {
     use std::time::Duration;
 
     use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-
-    /// Test DID used by the real [`NodeMlsFactory`] in test bodies.
-    ///
-    /// The prior `MockCrypto` / `FailingMlsCrypto` / `TransientFailCrypto`
-    /// scaffolds are deleted along with the `ContextCryptoProvider`
-    /// trait in ADR-049 §15. Success-path tests now build a
-    /// real [`NodeMlsFactory::new(TEST_DID.to_owned())`]; tests that
-    /// asserted mock trackers (`mls_destroyed` counts, sender-key-destroyed
-    /// counts) or fail-injection semantics are `#[ignore]`d pending
-    /// `MlsBackend`-level fail-injection in ADR-049 §15.
-    const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
     // #2148 (ADR-049 birth-into-actor): `mk_crypto` was DELETED — the production
     // TTL/close paths no longer take a crypto provider (key destruction runs on
@@ -1803,34 +1792,6 @@ mod tests {
         assert_eq!(ext.active_consent_count(&active), 2);
         assert!(!ext.is_unanimous_active(&active));
         assert_eq!(ext.active_remaining(&active), 1);
-    }
-
-    // ADR-049 §15: backend-injection seam landed via
-    // `NodeMlsFactory::with_backends`. Pre-existing tests that
-    // asserted `MockCrypto` tracker behaviour (mls_destroyed counters,
-    // sender-key-destroyed counters, fail-injection retry semantics)
-    // are now expressed by passing a fail-injecting
-    // `Arc<dyn MlsBackend>` into `with_backends`. The smoke below
-    // confirms the seam exists; functional fail-injection tests live
-    // next to the production-backend tests in
-    // `crate::crypto::mls::production_backend`.
-    #[test]
-    fn ttl_fail_injection_uses_backend_injection() {
-        use crate::crypto::hpke_backend::ProductionHpkeBackend;
-        use crate::crypto::mls::production_backend::ProductionMlsBackend;
-        use crate::crypto::mls::provider::NodeMlsFactory;
-        use std::sync::Arc;
-
-        let provider = NodeMlsFactory::with_backends(
-            TEST_DID.to_owned(),
-            Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
-                scp_clock::SystemClock,
-            ))),
-            Arc::new(ProductionHpkeBackend::new()),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        );
-        let _mls = provider.mls_backend();
-        let _hpke = provider.hpke_backend();
     }
 
     // Unused trait/type imports from the pre-ADR-049 §15 test scaffolding

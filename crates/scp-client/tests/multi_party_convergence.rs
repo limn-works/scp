@@ -588,14 +588,14 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     // raw `scp-mls` group (a dev-dependency) — exactly the wire bytes a hostile or
     // out-of-scope committer could put on the wire — while BOB is a real
     // `ScpClient` whose `receive_message` is the unit under test.
-    use openmls::prelude::{BasicCredential, KeyPackageIn};
+    use openmls::prelude::BasicCredential;
     use scp_did::SigningKeyId;
     use scp_mls::group::{
-        add_member, add_member_with_convergent_timestamp, create_group,
-        generate_key_package_with_wrapping_key, remove_member,
+        add_member, add_member_with_convergent_timestamp, create_group, generate_key_package,
+        remove_member,
     };
     use scp_mls::{ScpCredential, SignatureKeyPair};
-    use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
+    use tls_codec::Serialize as TlsSerialize;
 
     // The raw Alice group and Bob's client share a real-time base so every
     // KeyPackage `Lifetime` stays valid against openmls's internal (real) clock
@@ -605,7 +605,12 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     let base = SystemClock.now_secs();
     let alice_cred = ScpCredential::new(ALICE_DID.to_owned(), None, SigningKeyId::Active)
         .expect("alice credential");
-    let mut alice_group = create_group(&alice_cred, &SystemClock).expect("Alice's raw MLS group");
+    let mut alice_group = create_group(
+        &alice_cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+        &SystemClock,
+    )
+    .expect("Alice's raw MLS group");
 
     let relay = Relay::new();
     let mut bob = relay.new_party(BOB_DID, BOB_OFFSET);
@@ -617,7 +622,7 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
         .client
         .generate_key_package_for_join(CTX)
         .expect("Bob key package");
-    let bob_kp_in = KeyPackageIn::tls_deserialize(&mut &*bob_kp_bytes).expect("bob kp deserialize");
+    let bob_kp_in = scp_mls::wire::parse_key_package_in(&bob_kp_bytes).expect("bob kp deserialize");
     let add_bob = add_member(&mut alice_group, bob_kp_in, &SystemClock).expect("Alice adds Bob");
     let bob_welcome = add_bob
         .welcome
@@ -639,11 +644,13 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     // Carol's KeyPackage must publish a wrapping key, or Bob's add-Carol receive
     // is rejected pre-merge (ADR-057 sender-key distribution INVARIANT 3) before it
     // can reach the remove scenario.
+    let (carol_wrapping_public, _carol_wrapping_secret) =
+        scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
     let (carol_bundle, _carol_signer, _carol_provider): (_, SignatureKeyPair, _) =
-        generate_key_package_with_wrapping_key(&carol_cred, Some(&[0xCC_u8; 32]), &SystemClock)
+        generate_key_package(&carol_cred, carol_wrapping_public.as_bytes(), &SystemClock)
             .expect("carol key package");
-    let carol_kp_in = KeyPackageIn::tls_deserialize(
-        &mut &*carol_bundle
+    let carol_kp_in = scp_mls::wire::parse_key_package_in(
+        &carol_bundle
             .key_package()
             .tls_serialize_detached()
             .expect("carol kp bytes"),
@@ -689,7 +696,8 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
         })
         .map(|m| m.index)
         .expect("Carol's leaf index");
-    let remove_carol = remove_member(&mut alice_group, carol_leaf).expect("Alice removes Carol");
+    let remove_carol =
+        remove_member(&mut alice_group, carol_leaf, &SystemClock).expect("Alice removes Carol");
     let remove_carol_commit = remove_carol
         .commit
         .tls_serialize_detached()

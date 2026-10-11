@@ -13,7 +13,8 @@
 //! `validate_and_merge_*` twins — are **DELETED**. Production now:
 //!
 //! - GATES fail-closed on this registry at the live receive seams
-//!   (`decrypt_and_dispatch`'s recv + remote-epoch arms and the local-rotation
+//!   (`deliver_incoming`'s recv floor, after the inner envelope verifies,
+//!   `decrypt_and_dispatch`'s remote-epoch arm, and the local-rotation
 //!   `mirror_forward_local_sender_epoch`), each `check_and_advance_*(..)?`;
 //! - SOURCES the durable-blob floors FROM this registry (`export_*`) at every
 //!   `export_crypto_state` caller; and
@@ -63,8 +64,9 @@ pub(in crate::context::supervisor) struct ContextFloors {
     /// keyed by `local_did`. This coexistence is safe ONLY because `local_did`
     /// never appears as a remote sender in its own recv path, so the receive-side
     /// overshoot ceiling (which reads `sender_epochs[remote_did]`) never reads the
-    /// local scalar. This is LOAD-BEARING and asserted at the recv seam
-    /// (`debug_assert_ne!(sender_did, local_did)` in `decrypt_and_dispatch`). A
+    /// local scalar. This is LOAD-BEARING and enforced at the recv seam:
+    /// `decrypt_and_dispatch` rejects an application message whose MLS sender is
+    /// `local_did`. A
     /// violation is fail-safe on the SECURITY axis: co-mingling the (typically
     /// higher) local scalar into `sender_epochs[local_did]` would only RAISE the
     /// receive-side epoch CEILING for the local DID — an over-PERMIT on the
@@ -85,7 +87,7 @@ pub(in crate::context::supervisor) struct ContextFloors {
 /// Rejection reason from a floor-advance gate.
 ///
 /// Fail-closed at the authoritative seams (ADR-049 PR-6): the live receive seams
-/// (`decrypt_and_dispatch`) and the restore/import guard surface these via
+/// (`deliver_incoming`, `decrypt_and_dispatch`) and the restore/import guard surface these via
 /// `check_and_advance_*(..)?` / `validate_and_merge_*(..)` and map them to
 /// [`ContextError::CryptoFailed`] through the `From` impl below — a rejection
 /// aborts the operation, it is never logged-and-dropped.
@@ -183,7 +185,8 @@ impl std::fmt::Display for FloorAdvanceError {
 impl std::error::Error for FloorAdvanceError {}
 
 /// Live receive-gating rejection → context error, WIRED at the ADR-049 PR-6
-/// fail-closed seams: `decrypt_and_dispatch`'s recv + remote-epoch arms and the
+/// fail-closed seams: `deliver_incoming`'s recv floor, `decrypt_and_dispatch`'s
+/// remote-epoch arm, and the
 /// local-rotation `mirror_forward_local_sender_epoch` call `check_and_advance_*(..)?`,
 /// and the restore/import guard calls `validate_and_merge_all_floors(..)`, all
 /// surfacing a [`ContextError`] through this `From`.

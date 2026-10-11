@@ -99,14 +99,20 @@ async fn drive_actor(
 ) -> (Vec<u8>, u64, usize, Vec<u8>) {
     let cred = test_credential(name);
     let mut grp = backend
-        .create_group(&cred, None)
+        .create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+        )
         .await
         .expect("create_group");
 
     // Add a second member so we have a real epoch advance.
     let other_cred = test_credential(&format!("{name}-bob"));
     let kp = backend
-        .generate_key_package(&other_cred, None)
+        .generate_key_package(
+            &other_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&other_cred.did),
+        )
         .await
         .expect("generate_kp");
     let _added = backend

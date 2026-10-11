@@ -744,7 +744,21 @@ fn malformed_key_package_add_member_is_rejected_without_mutation() {
         "a rejected wrong-type KeyPackage must leave the adder's state UNCHANGED"
     );
 
-    // (c) An empty buffer (degenerate truncation).
+    // (c) A KeyPackage prefix (version 1, ciphersuite 2) whose `init_key` length
+    // header has length-of-length 3 (0xC0), which MLS forbids: rejected as an
+    // error, never a panic, in every build profile.
+    let bad_header = [0x00u8, 0x01, 0x00, 0x02, 0xC0, 0, 0, 0, 0, 0, 0, 0];
+    assert!(
+        alice.client.add_member(CTX, &bad_header).is_err(),
+        "a vector header with length-of-length 3 is rejected"
+    );
+    assert_eq!(
+        StateSnapshot::capture(&alice.client, CTX),
+        before,
+        "a rejected bad-header KeyPackage must leave the adder's state UNCHANGED"
+    );
+
+    // (d) An empty buffer (degenerate truncation).
     assert!(
         alice.client.add_member(CTX, &[]).is_err(),
         "an empty KeyPackage is rejected"

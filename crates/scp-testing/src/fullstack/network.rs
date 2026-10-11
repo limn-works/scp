@@ -3,8 +3,7 @@
 //! [`FullStackNetwork`] creates [`FullStackNode`]s that share a common
 //! [`KeyExchange`] (for sealed-invitation / access-key / sender-key bootstrap
 //! bytes) and a node registry (so the creator side can reach a joiner's
-//! supervisor to reserve its own MLS `KeyPackage` and publish its wrapping keypair
-//! during `add_member`).
+//! supervisor to reserve its own MLS `KeyPackage` during `add_member`).
 //!
 //! Every node in one network resolves its `#active` verifying key through a
 //! single deterministic [`KeyResolver`] the network owns: it maps each DID to
@@ -74,13 +73,13 @@ impl FullStackNetwork {
         ));
         let node = FullStackNode::new(
             did_value,
-            Arc::clone(&crypto),
+            crypto,
             Self::resolver(),
             Arc::clone(&self.registry),
         );
-        // Register the node's shared handles AFTER it is built (its `manager`
-        // now exists) so the creator side can reserve this node's own
-        // KeyPackage and publish its wrapping keypair when inviting it.
+        // Register the node's supervisor AFTER it is built (its `manager` now
+        // exists) so the creator side can reserve this node's own KeyPackage
+        // when inviting it.
         self.registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -88,7 +87,6 @@ impl FullStackNetwork {
                 did.to_owned(),
                 NodeShared {
                     manager: Arc::clone(&node.manager),
-                    crypto,
                 },
             );
         node

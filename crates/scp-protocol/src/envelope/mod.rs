@@ -201,10 +201,6 @@ pub enum EnvelopeError {
     #[error("sender key decryption failed: {0}")]
     SenderKeyDecryptionFailed(String),
 
-    /// The sender is not a member of the MLS group.
-    #[error("unknown sender: {0}")]
-    UnknownSender(String),
-
     /// The envelope timestamp is too far in the future (§9.8.2(c)).
     #[error(
         "timestamp in future: envelope={envelope_timestamp}, local={local_time}, \

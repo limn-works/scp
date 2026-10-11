@@ -21,7 +21,7 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use scp_mls::InMemoryMlsProvider;
 use scp_mls::group::SCP_CIPHERSUITE;
-use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
+use tls_codec::Serialize as TlsSerializeTrait;
 
 /// Every label `openmls_memory_storage` 0.6.0 (`src/lib.rs`) prefixes to a
 /// storage key with no draft feature enabled. A key is `label ||
@@ -104,7 +104,7 @@ fn histogram<P: ListKeys>(provider: &P) -> Histogram {
 /// Decodes the wire bytes of `message` as a received message.
 fn received(message: &MlsMessageOut) -> MlsMessageIn {
     let bytes = message.tls_serialize_detached().unwrap();
-    MlsMessageIn::tls_deserialize(&mut bytes.as_slice()).unwrap()
+    scp_mls::wire::parse_mls_message_in(&bytes).unwrap()
 }
 
 struct Member<P> {

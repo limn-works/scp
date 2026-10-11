@@ -1,15 +1,15 @@
 //! Broadcast handlers — see
-//! [`BroadcastCommand`](crate::context::actor::commands::BroadcastCommand)
+//! [`BroadcastCommand`]
 //! and plan §"Broadcast contexts".
 //!
 //! # Phase 2A.5 -- actor-shape dispatch
 //!
-//! The handler's primary entry point [`dispatch`] takes
+//! The handler's primary entry point `dispatch` takes
 //! `(&mut PerContextState, &ActorDeps, BroadcastCommand)` and routes
-//! non-publish variants through [`crate::context::broadcast_helpers`].
+//! non-publish variants through `crate::context::broadcast_helpers`.
 //! Every valid context has a registered per-context actor, so a command
 //! that finds no actor is replied to with a typed
-//! [`ContextError::ContextNotRegistered`](scp_protocol::context::ContextError::ContextNotRegistered)
+//! [`ContextError::ContextNotRegistered`]
 //! by the supervisor's no-actor fallback.
 //!
 //! # Publish + key-custody plumbing (two-phase reservation)
@@ -392,7 +392,7 @@ async fn handle_handle_broadcast_key_request(
     context_id: &str,
     author_did: &scp_did::DID,
     requester_did: &scp_did::DID,
-    wrapping_pubkey: [u8; 32],
+    wrapping_pubkey: scp_protocol::crypto::hpke::p256::P256Point,
     reply: HandleBroadcastKeyRequestReply,
 ) -> Outcome<()> {
     let key_req_fut = async {
@@ -1650,8 +1650,7 @@ mod tests {
 
         // Baseline: BEFORE the ban, the creator (an author) IS granted a key —
         // proving the ban is what flips the outcome, not some other check.
-        let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let pubkey = x25519_dalek::PublicKey::from(&secret).to_bytes();
+        let (pubkey, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
         assert!(
             matches!(
                 crate::context::broadcast_helpers::handle_broadcast_key_request(

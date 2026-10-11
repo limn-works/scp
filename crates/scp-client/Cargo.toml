@@ -39,8 +39,8 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 scp-relay-client = { path = "../scp-relay-client", version = "=0.1.0-beta.2" }
 
 # openmls is needed directly for the wire (de)serialization of KeyPackages and
-# MLS messages at the driver boundary (KeyPackageIn::tls_deserialize and
-# friends); scp-mls exposes its op surface in terms of these openmls types.
+# MLS messages at the driver boundary (decoding goes through `scp_mls::wire`);
+# scp-mls exposes its op surface in terms of these openmls types.
 # `js` is declared in the wasm32 section below, and `libcrux-provider` nowhere — see the
 # note on the same dependency in crates/scp-mls/Cargo.toml.
 openmls = { workspace = true }
@@ -68,8 +68,13 @@ uuid = { version = "1", features = ["v4", "js"] }
 
 [dev-dependencies]
 scp-did = { path = "../scp-did", features = ["testing"] }
+# Deterministic valid P-256 wrapping keys for test groups and KeyPackages.
+scp-crypto = { path = "../scp-crypto", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
 scp-mls = { path = "../scp-mls", features = ["testing"] }
+# Decodes a snapshot blob to a generic MessagePack value so a test can rewrite
+# one field's encoding (the wrapping-key length check at decode).
+rmpv = { workspace = true }
 # The single-sourced faithful in-memory relay mock (the fidelity anchor for the
 # transport-slice integration tests). Dev-only: it ships nothing, so the ADR-057
 # wasm fence's shipped-dependency graph is unaffected (absent from `cargo tree

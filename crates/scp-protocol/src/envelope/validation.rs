@@ -13,7 +13,7 @@
 //!   timeout expires (§9.8.5).
 //!
 //! These checks run after MLS decryption and inner signature verification
-//! (i.e., after `open_envelope` succeeds), before delivering the
+//! (after the context actor's `verify_and_unwrap` succeeds), before delivering the
 //! message to the application layer.
 
 use std::collections::{BTreeMap, HashMap};
@@ -608,7 +608,7 @@ impl ReorderBuffer {
 /// inner envelope.
 ///
 /// This is the primary entry point for receive-path validation. Call after
-/// `open_envelope` succeeds and before delivering to the application
+/// the context actor's `verify_and_unwrap` succeeds and before delivering to the application
 /// layer.
 ///
 /// # Arguments

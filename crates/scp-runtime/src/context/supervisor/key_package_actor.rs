@@ -33,7 +33,7 @@
 //!    signer-state stays inside the actor (`reserved` map). `ConfirmConsume`
 //!    carries the `welcome_bytes`, looks up the reserved signer-state
 //!    internally, and calls
-//!    [`MlsBackend::join_from_welcome`](crate::crypto::mls::backend::MlsBackend::join_from_welcome)
+//!    [`MlsBackend::join_from_welcome`]
 //!    itself, returning the JOIN RESULT (the joined group bytes) — never the
 //!    raw signer-state. There is therefore no held-bytes copy a caller could
 //!    replay, and no zeroization-across-channel gap.
@@ -65,7 +65,7 @@
 //!    `scripts/check-deleted-primitives.sh` rejects its reintroduction.
 //!
 //! The KP private signer-state lives ENTIRELY inside the opaque
-//! [`SignerState`](crate::crypto::mls::backend::SignerState) blob returned by
+//! [`SignerState`] blob returned by
 //! [`MlsBackend::generate_key_package`] (a fresh isolated OpenMLS provider per
 //! KP, serialized) — it is NOT written to any shared OpenMLS keystore. The
 //! actor (in memory) and the durable KP record (at rest) are the only homes
@@ -112,6 +112,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+
 use scp_clock::Clock;
 use scp_did::DID;
 use scp_protocol::context::ContextError;
@@ -123,6 +125,7 @@ use zeroize::Zeroizing;
 use crate::context::builder::ContextTransportProvider;
 use crate::crypto::mls::backend::{MlsBackend, SignerState};
 use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
+use crate::crypto::wrapping::WrappingKeyPair;
 use scp_did::SigningKeyId;
 use scp_mls::credential::ScpCredential;
 use scp_mls::error::MlsError;
@@ -730,8 +733,10 @@ pub(in crate::context) struct KeyPackageStoreDeps {
     pub transport: Arc<dyn ContextTransportProvider>,
     /// Wall-clock source for reservation timestamps.
     pub clock: Arc<dyn Clock>,
-    /// Optional wrapping pubkey published in each generated KP's leaf node.
-    pub wrapping_pubkey: Option<[u8; 32]>,
+    /// The owning identity's wrapping-key slot (spec 09 §9.16.1), shared with
+    /// the supervisor. Read at each KeyPackage generation, so a KeyPackage
+    /// always publishes the identity's current key in `0xFF01`.
+    pub wrapping_key: Arc<ArcSwap<WrappingKeyPair>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -743,7 +748,7 @@ pub(in crate::context) struct KeyPackageStoreDeps {
 /// Handlers run on the single mailbox loop, so all `&mut self` mutations are
 /// serialized — there are no internal locks. Private signer-state bytes are
 /// wrapped in [`Zeroizing`] so they zero on drop, and they NEVER cross the
-/// reply channel (the join is fused into [`Self::handle_confirm`]).
+/// reply channel (the join is fused into `Self::handle_confirm`).
 pub struct KeyPackageStoreActor {
     /// The identity this actor owns the pool for.
     identity: DID,
@@ -751,8 +756,9 @@ pub struct KeyPackageStoreActor {
     /// `None` only on a malformed-DID wiring bug, in which case replenish
     /// fail-closes rather than pooling inert KPs.
     credential: Option<ScpCredential>,
-    /// Optional wrapping pubkey published in each KP leaf node (§9.16.1).
-    wrapping_pubkey: Option<[u8; 32]>,
+    /// The owning identity's wrapping-key slot (§9.16.1), read at each
+    /// KeyPackage generation.
+    wrapping_key: Arc<ArcSwap<WrappingKeyPair>>,
     /// MLS primitives backend — the replenish source + fused-join executor.
     mls: Arc<dyn MlsBackend>,
     /// Durable KV for the Class-S reservation journal + KP records.
@@ -823,7 +829,7 @@ impl KeyPackageStoreActor {
         let actor = Self {
             identity,
             credential,
-            wrapping_pubkey: deps.wrapping_pubkey,
+            wrapping_key: deps.wrapping_key,
             mls: deps.mls,
             mls_storage: deps.mls_storage,
             transport: deps.transport,
@@ -1804,9 +1810,12 @@ impl KeyPackageStoreActor {
         let mut generated = 0usize;
         let mut first_err: Option<ContextError> = None;
         for _ in 0..deficit {
+            // Read the identity's current key per KeyPackage (load → copy →
+            // drop), so a rotation is published by the next one generated.
+            let wrapping_public_key = *self.wrapping_key.load().public();
             match self
                 .mls
-                .generate_key_package(&credential, self.wrapping_pubkey.as_ref())
+                .generate_key_package(&credential, &wrapping_public_key)
                 .await
             {
                 Ok(generated_kp) => {
