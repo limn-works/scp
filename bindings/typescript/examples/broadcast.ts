@@ -46,12 +46,12 @@ async function main(): Promise<void> {
     console.log(`Broadcast context created: ${ctx.contextId}`);
 
     // 5. Subscriber joins.
-    await scp.contextJoin(ctx._rawHandle, subscriber.did, null);
+    await scp.contextJoin(ctx, subscriber.did, null);
     console.log("Subscriber joined");
 
     // 6. Subscribe on the relay before publishing.
     let received: Uint8Array | null = null;
-    await scp.contextSubscribe(ctx._rawHandle, subscriber.did, (raw) => {
+    await scp.contextSubscribe(ctx, subscriber.did, (raw) => {
       const msg = raw as { payload?: number[] | Uint8Array };
       if (msg?.payload !== undefined) {
         received = msg.payload instanceof Uint8Array ? msg.payload : new Uint8Array(msg.payload);
@@ -60,7 +60,7 @@ async function main(): Promise<void> {
 
     // 7. Publisher sends a broadcast message.
     const payload = new TextEncoder().encode("Breaking news: SCP protocol is live!");
-    await scp.contextSend(ctx._rawHandle, publisher.did, payload, null);
+    await scp.contextSend(ctx, publisher.did, payload, null);
     console.log("Publisher sent broadcast");
 
     // 8. Give the subscription a chance to flush, then report.
@@ -70,7 +70,7 @@ async function main(): Promise<void> {
     }
 
     // 9. Cleanup.
-    await scp.contextClose(ctx._rawHandle, publisher.did);
+    await scp.contextClose(ctx, publisher.did);
     console.log("Context closed");
   } finally {
     if (relay !== null) {

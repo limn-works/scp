@@ -45,12 +45,12 @@ async function main(): Promise<void> {
     console.log(`Context created: ${ctx.contextId}`);
 
     // 5. Bob joins the context.
-    await scp.contextJoin(ctx._rawHandle, bob.did, null);
+    await scp.contextJoin(ctx, bob.did, null);
     console.log("Bob joined the context");
 
     // 6. Subscribe Bob before Alice sends.
     let received: { senderDid: string; payload: Uint8Array } | null = null;
-    await scp.contextSubscribe(ctx._rawHandle, bob.did, (raw) => {
+    await scp.contextSubscribe(ctx, bob.did, (raw) => {
       const msg = raw as { senderDid?: string; payload?: number[] | Uint8Array };
       if (msg?.senderDid !== undefined && msg.payload !== undefined) {
         const bytes = msg.payload instanceof Uint8Array ? msg.payload : new Uint8Array(msg.payload);
@@ -62,7 +62,7 @@ async function main(): Promise<void> {
     const plaintext = new TextEncoder().encode(
       "Hello Bob, this message is E2E encrypted via MLS",
     );
-    await scp.contextSend(ctx._rawHandle, alice.did, plaintext, null);
+    await scp.contextSend(ctx, alice.did, plaintext, null);
     console.log("Alice sent message");
 
     // 8. Give the subscription a chance to flush, then report.
@@ -73,10 +73,10 @@ async function main(): Promise<void> {
     }
 
     // 9. Cleanup.
-    await scp.contextLeave(ctx._rawHandle, bob.did);
+    await scp.contextLeave(ctx, bob.did);
     console.log("Bob left the context");
 
-    await scp.contextClose(ctx._rawHandle, alice.did);
+    await scp.contextClose(ctx, alice.did);
     console.log("Context closed");
   } finally {
     if (relay !== null) {

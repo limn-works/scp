@@ -77,16 +77,16 @@ async function main(): Promise<void> {
     // ---- Step 3: Add Bob to the context ----
     step(3, "Add Bob to context");
 
-    await scp.contextJoin(ctx._rawHandle, bob.did, null);
+    await scp.contextJoin(ctx, bob.did, null);
     console.log("Bob joined the context.");
 
     // ---- Step 4: Verify membership ----
     step(4, "Verify membership");
 
-    const aliceIsMember = await scp.contextIsMember(ctx._rawHandle, alice.did);
-    const bobIsMember = await scp.contextIsMember(ctx._rawHandle, bob.did);
-    const memberCount = await scp.contextMemberCount(ctx._rawHandle);
-    const memberDids = await scp.contextMemberDids(ctx._rawHandle);
+    const aliceIsMember = await scp.contextIsMember(ctx, alice.did);
+    const bobIsMember = await scp.contextIsMember(ctx, bob.did);
+    const memberCount = await scp.contextMemberCount(ctx);
+    const memberDids = await scp.contextMemberDids(ctx);
 
     console.log(`Alice is member: ${aliceIsMember}`);
     console.log(`Bob   is member: ${bobIsMember}`);
@@ -103,21 +103,21 @@ async function main(): Promise<void> {
     // Execution takes only the proposal id — the executor and consequence
     // subject are resolved from the tracked proposal's proposer.
     const proposeResult = await scp.contextGovernancePropose(
-      ctx._rawHandle,
+      ctx,
       changeBobRole,
       alice.did,
     );
     const proposalIdHex = JSON.parse(proposeResult).proposal_id as string;
-    const govResult = await scp.contextExecuteGovernanceAction(ctx._rawHandle, proposalIdHex);
+    const govResult = await scp.contextExecuteGovernanceAction(ctx, proposalIdHex);
     console.log(`Governance result: ${govResult}`);
 
-    const bobRole = await scp.contextMemberRole(ctx._rawHandle, bob.did);
+    const bobRole = await scp.contextMemberRole(ctx, bob.did);
     console.log(`Bob's new role:  ${bobRole}`);
 
     // ---- Cleanup ----
     step(6, "Cleanup");
 
-    await scp.contextClose(ctx._rawHandle, alice.did);
+    await scp.contextClose(ctx, alice.did);
     console.log("Context closed.");
 
     console.log("\nDemo complete.");

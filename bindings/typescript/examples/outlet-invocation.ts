@@ -70,17 +70,17 @@ async function main(): Promise<void> {
     console.log(`Context created: ${ctx.contextId}`);
 
     // 6. Register the outlet.
-    const outletId = await scp.outletRegister(ctx._rawHandle, weatherOutlet);
+    const outletId = await scp.outletRegister(ctx, weatherOutlet);
     console.log(`Registered outlet: ${outletId}`);
 
     // 7. Mint a UCAN token for outlet invocation.
-    const ucan = (await scp.ucanMint(ctx._rawHandle, identity.did, ["outlet_call:*"])) as UcanToken;
+    const ucan = (await scp.ucanMint(ctx, identity.did, ["outlet_call:*"])) as UcanToken;
     console.log(`UCAN minted: ${ucan.id}`);
 
     // 8. Invoke the outlet with the UCAN token.
     try {
       const result = await scp.outletInvoke(
-        ctx._rawHandle,
+        ctx,
         "weather",
         JSON.stringify({ city: "Berlin" }),
         identity.did,
@@ -92,7 +92,7 @@ async function main(): Promise<void> {
     }
 
     // 9. Cleanup.
-    await scp.contextClose(ctx._rawHandle, identity.did);
+    await scp.contextClose(ctx, identity.did);
     console.log("Context closed");
   } finally {
     if (relay !== null) {
