@@ -27,7 +27,7 @@ async def main() -> None:
         }
     ) as scp:
         # 1. Create a DID identity whose keys live in the passphrase-sealed key file.
-        identity = await scp.identity_create(CustodyType.FILE)
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
         print(f"Created identity: {identity.did}")
 
         # 2. Create an encrypted context with messaging capabilities.

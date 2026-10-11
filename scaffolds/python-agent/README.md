@@ -21,7 +21,7 @@ python main.py
 ## What This Does
 
 1. Opens one `SCP` instance over a SQLCipher database in `$HOME/.scp/python-agent`
-2. Creates a `did:dht` identity with `CustodyType.FILE`, which keeps the keys in
+2. Creates a `did:dht` identity with `CustodyType.ENCRYPTED_FILE`, which keeps the keys in
    `$HOME/.scp/keys.bin`, sealed under `SCP_KEY_PASSPHRASE`
 3. Opens an encrypted single-admin context
 4. Shuts the instance down when the `async with` block exits

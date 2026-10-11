@@ -25,7 +25,7 @@ python agent.py --mcp                 # also start an MCP server (stdio)
 
 Every call is a method on one `SCP` instance, which the `async with` block shuts down on exit.
 
-1. **Identity creation** -- `identity_create(CustodyType.FILE)` creates a `did:dht` identity whose keys live in `$HOME/.scp/keys.bin`, sealed under `SCP_KEY_PASSPHRASE`. `CustodyType.IN_MEMORY` works only in a build compiled with the `testing` feature; a shipped build rejects it with `SCP-IDENT-1008`.
+1. **Identity creation** -- `identity_create(CustodyType.ENCRYPTED_FILE)` creates a `did:dht` identity whose keys live in `$HOME/.scp/keys.bin`, sealed under `SCP_KEY_PASSPHRASE`. `CustodyType.IN_MEMORY` works only in a build compiled with the `testing` feature; a shipped build rejects it with `SCP-IDENT-1008`.
 2. **Context creation** -- `context_create` opens an encrypted context with `outlet:register` and `outlet:query:*` in the ceiling.
 3. **Outlet registration** -- `outlet_register` registers two outlets (`calculator`, `search`) with JSON Schema input and output definitions and test vectors, and returns each outlet's id.
 4. **Handler attachment** -- `mcp_register_outlet_handler(context_id, outlet_id, handler)` attaches a Python callable to each outlet. When the outlet is invoked, the handler receives the validated JSON input as a dict and returns a dict.

@@ -86,7 +86,7 @@ async def start_node(node: SCP, relay_url: str) -> str:
     supervisor starts on the first context and binds the transport it finds
     then.
     """
-    identity = await node.identity_create(CustodyType.FILE)
+    identity = await node.identity_create(CustodyType.ENCRYPTED_FILE)
     print(f"Identity: {identity.did}")
     await node.configure_relay_transport(relay_url, identity.did)
     await node.transport_connect(relay_url)

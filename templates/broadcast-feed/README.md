@@ -40,7 +40,7 @@ pip install -e ../../bindings/python
 pip install cryptography
 ```
 
-Both scripts keep keys in `$HOME/.scp/keys.bin` (`CustodyType.FILE`) and each opens its own SQLCipher database under `$HOME/.scp/`. Set these in each terminal:
+Both scripts keep keys in `$HOME/.scp/keys.bin` (`CustodyType.ENCRYPTED_FILE`) and each opens its own SQLCipher database under `$HOME/.scp/`. Set these in each terminal:
 
 ```bash
 export SCP_KEY_PASSPHRASE=...      # seals $HOME/.scp/keys.bin

@@ -8,7 +8,7 @@ A browser chat client is not included yet. In-browser SCP is a real in-tab parti
 
 The client performs the following protocol flow:
 
-1. **Create an identity** whose keys live in `$HOME/.scp/keys.bin` (`identity_create(CustodyType.FILE)`), and attach the relay transport (`configure_relay_transport`, `transport_connect`).
+1. **Create an identity** whose keys live in `$HOME/.scp/keys.bin` (`identity_create(CustodyType.ENCRYPTED_FILE)`), and attach the relay transport (`configure_relay_transport`, `transport_connect`).
 2. **Create** an encrypted context (`context_create`), or **reserve** a single-use KeyPackage to be invited with (`reserve_key_package`).
 3. **Invite and join**: the creator seals an invitation to the joiner's KeyPackage (`invite_member`), and the joiner opens it (`context_join_from_welcome`).
 4. **Send messages** from user input (`context_send`), retrying while the peer's routing announcement has not yet arrived (`SCP-CTX-2095`).

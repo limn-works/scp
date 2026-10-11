@@ -48,7 +48,7 @@ def node_storage(name: str) -> StorageConfig:
 async def main() -> None:
     async with SCP(storage=node_storage("tools-example")) as scp:
         # 1. Create an identity for the outlet operator.
-        operator = await scp.identity_create(CustodyType.FILE)
+        operator = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
         print(f"Operator DID: {operator.did}")
 
         # 2. Create a context whose ceiling allows registering and invoking Query outlets.

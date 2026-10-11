@@ -65,7 +65,7 @@ async def run_subscriber() -> None:
     """Run the subscriber lifecycle."""
     async with SCP(storage=node_storage("broadcast-feed-subscriber")) as node:
         # 1. Create the subscriber identity.
-        subscriber = await node.identity_create(CustodyType.FILE)
+        subscriber = await node.identity_create(CustodyType.ENCRYPTED_FILE)
 
         # 2. Generate the wrapping key the publisher seals its key to.
         wrapping_public, wrapping_secret = generate_wrapping_key()

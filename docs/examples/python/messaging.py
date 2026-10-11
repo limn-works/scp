@@ -83,8 +83,8 @@ async def main() -> None:
         SCP(storage=node_storage("messaging-example-bob")) as bob_node,
     ):
         # 1. Each side creates its identity in its own node.
-        alice = await alice_node.identity_create(CustodyType.FILE)
-        bob = await bob_node.identity_create(CustodyType.FILE)
+        alice = await alice_node.identity_create(CustodyType.ENCRYPTED_FILE)
+        bob = await bob_node.identity_create(CustodyType.ENCRYPTED_FILE)
         print(f"Alice: {alice.did}")
         print(f"Bob:   {bob.did}")
 

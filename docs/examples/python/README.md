@@ -25,7 +25,7 @@ messaging over a relay, and outlet registration in the SCP Python SDK.
    ```
 
 4. **Set two passphrases.** Each example keeps its keys in the encrypted key file
-   `$HOME/.scp/keys.bin` (`CustodyType.FILE`) and its state in a SQLCipher
+   `$HOME/.scp/keys.bin` (`CustodyType.ENCRYPTED_FILE`) and its state in a SQLCipher
    database under `$HOME/.scp/`:
    ```bash
    export SCP_KEY_PASSPHRASE=...      # seals the key file; unset raises SCP-VALID-7001
@@ -71,7 +71,9 @@ failing with `SCP-CTX-2095` (#2856).
 - **One `SCP` instance per node**: every operation is a method on `SCP`. Use
   `async with SCP(storage=...)` so the instance shuts down on exit.
 - **Custody is required**: `identity_create` takes a `CustodyType` and has no
-  default. `CustodyType.FILE` is the custody a shipped build offers.
+  default. `CustodyType.ENCRYPTED_FILE` keeps keys in the encrypted key file; a
+  build without the bridge's `testing` feature has no pre-rotation custody
+  backend and raises `SCP-IDENT-1059` for it.
   `CustodyType.IN_MEMORY` works only in a build compiled with the `testing`
   feature; a shipped build rejects it with `SCP-IDENT-1008`. To hold keys in
   your own store, pass a `KeyCustodyProvider` to `identity_create_with_custody`.
