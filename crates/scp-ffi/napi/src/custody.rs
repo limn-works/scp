@@ -14,7 +14,10 @@
 //! - `InMemory` — test/dev in-memory custody (feature-gated), wrapped in
 //!   [`OpaqueInMemoryKeyCustody`] for redacted `Debug`.
 //! - `Callback` — caller-provided custody backed by JS callbacks
-//!   ([`NapiCallbackKeyCustody`]), used by `identityCreateWithCustody`.
+//!   ([`NapiCallbackKeyCustody`]), used by `identityCreateWithCustody`: custody
+//!   `"os_keystore"` (spec `03-identity.md` §3.2.2).
+//! - `File` — the encrypted key file [`FileKeyCustody`]: custody
+//!   `"encrypted_file"`.
 
 use std::fmt;
 
@@ -22,12 +25,18 @@ use napi::bindgen_prelude::Function;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use scp_ffi_common::callback_custody::{self as flow, CallbackKeyRegistry, HostPublicKey};
+use scp_ffi_common::custody_file::{FileCustodyError, FileCustodyInputs};
+use scp_ffi_common::custody_request::{
+    CustodyRequest, CustodyRequestError, CustodyRequestInput, parse_custody_request,
+};
 use scp_platform::error::PlatformError;
+use scp_platform::file::FileKeyCustody;
 use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyRole, KeyType, Pseudonym, PublicKey, SharedSecret,
     Signature,
 };
 
+use crate::error::ScpNapiError;
 #[cfg(feature = "testing")]
 use crate::identity::OpaqueInMemoryKeyCustody;
 
@@ -921,8 +930,26 @@ pub(crate) enum NapiKeyCustody {
     /// Boxed so the enum stays the size of the callback variant.
     #[cfg(feature = "testing")]
     InMemory(Box<OpaqueInMemoryKeyCustody>),
-    /// Caller-provided custody backed by JS callbacks.
+    /// Caller-provided custody backed by JS callbacks: custody
+    /// `"os_keystore"` (spec `03-identity.md` §3.2.2).
+    #[cfg_attr(
+        not(feature = "testing"),
+        expect(
+            dead_code,
+            reason = "a shipped build creates no identity (SCP-IDENT-1059, ADR-062 §Decision 6), so it never opens this custody"
+        )
+    )]
     Callback(NapiCallbackKeyCustody),
+    /// The encrypted key file at `$HOME/.scp/keys.bin`: custody
+    /// `"encrypted_file"` (spec `03-identity.md` §3.2.2, spec §17.8).
+    #[cfg_attr(
+        not(feature = "testing"),
+        expect(
+            dead_code,
+            reason = "a shipped build creates no identity (SCP-IDENT-1059, ADR-062 §Decision 6), so it never opens this custody"
+        )
+    )]
+    File(FileKeyCustody),
 }
 
 impl fmt::Debug for NapiKeyCustody {
@@ -931,25 +958,33 @@ impl fmt::Debug for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(_) => f.write_str("NapiKeyCustody::InMemory([redacted])"),
             Self::Callback(_) => f.write_str("NapiKeyCustody::Callback([js])"),
+            Self::File(_) => f.write_str("NapiKeyCustody::File([redacted])"),
         }
     }
 }
 
 impl NapiKeyCustody {
-    /// Returns the custody-type label for handle reporting (`"in_memory"` for
-    /// the in-memory test backend, `"callback"` for caller-provided callback
-    /// custody).
+    /// The custody request this custody was built from, which an identity
+    /// handle's custody accessor reports (spec `03-identity.md` §3.2.2):
+    /// `encrypted_file` for the key file, `os_keystore` for a caller's
+    /// `KeyCustodyProvider`, and `in_memory` for the testing-build backend.
     ///
     /// This is a cheap, sync variant discriminator — distinct from the async
     /// [`KeyCustody::custody_type`] trait method, which reports the
     /// per-key-handle [`CustodyType`] (hardware/software/in-memory) the
     /// underlying provider declares.
-    pub(crate) const fn custody_type_label(&self) -> &'static str {
+    pub(crate) const fn request(&self) -> CustodyRequest {
         match self {
             #[cfg(feature = "testing")]
-            Self::InMemory(_) => "in_memory",
-            Self::Callback(_) => "callback",
+            Self::InMemory(_) => CustodyRequest::InMemory,
+            Self::Callback(_) => CustodyRequest::OsKeystore,
+            Self::File(_) => CustodyRequest::EncryptedFile,
         }
+    }
+
+    /// The request string [`Self::request`] names, for handle reporting.
+    pub(crate) const fn custody_type_label(&self) -> &'static str {
+        self.request().as_str()
     }
 
     /// Exports the raw Ed25519 signing key for the given handle, dispatching
@@ -969,6 +1004,7 @@ impl NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.export_ed25519_signing_key(handle).await,
             Self::Callback(kc) => kc.export_ed25519_signing_key(handle).await,
+            Self::File(kc) => kc.export_ed25519_signing_key(handle).await,
         }
     }
 }
@@ -979,6 +1015,7 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.generate_keypair(key_type).await,
             Self::Callback(kc) => kc.generate_keypair(key_type).await,
+            Self::File(kc) => kc.generate_keypair(key_type).await,
         }
     }
 
@@ -987,6 +1024,7 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.generate_identity_keypair().await,
             Self::Callback(kc) => kc.generate_identity_keypair().await,
+            Self::File(kc) => kc.generate_identity_keypair().await,
         }
     }
 
@@ -995,6 +1033,7 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.sign(key, data).await,
             Self::Callback(kc) => kc.sign(key, data).await,
+            Self::File(kc) => kc.sign(key, data).await,
         }
     }
 
@@ -1003,6 +1042,7 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.public_key(key).await,
             Self::Callback(kc) => kc.public_key(key).await,
+            Self::File(kc) => kc.public_key(key).await,
         }
     }
 
@@ -1011,6 +1051,7 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.destroy_key(key).await,
             Self::Callback(kc) => kc.destroy_key(key).await,
+            Self::File(kc) => kc.destroy_key(key).await,
         }
     }
 
@@ -1023,6 +1064,7 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.dh_agree(key, peer_public).await,
             Self::Callback(kc) => kc.dh_agree(key, peer_public).await,
+            Self::File(kc) => kc.dh_agree(key, peer_public).await,
         }
     }
 
@@ -1035,6 +1077,7 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.derive_pseudonym(key, context_id).await,
             Self::Callback(kc) => kc.derive_pseudonym(key, context_id).await,
+            Self::File(kc) => kc.derive_pseudonym(key, context_id).await,
         }
     }
 
@@ -1051,6 +1094,10 @@ impl KeyCustody for NapiKeyCustody {
                     .await
             }
             Self::Callback(kc) => {
+                kc.derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
+                    .await
+            }
+            Self::File(kc) => {
                 kc.derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
                     .await
             }
@@ -1072,6 +1119,10 @@ impl KeyCustody for NapiKeyCustody {
                 kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
                     .await
             }
+            Self::File(kc) => {
+                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
+                    .await
+            }
         }
     }
 
@@ -1080,6 +1131,7 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.custody_type(key),
             Self::Callback(kc) => kc.custody_type(key),
+            Self::File(kc) => kc.custody_type(key),
         }
     }
 
@@ -1090,6 +1142,7 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.generate_ephemeral_ed25519_seed().await,
             Self::Callback(kc) => kc.generate_ephemeral_ed25519_seed().await,
+            Self::File(kc) => kc.generate_ephemeral_ed25519_seed().await,
         }
     }
 
@@ -1101,7 +1154,142 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.import_ed25519_signing_key(seed).await,
             Self::Callback(kc) => kc.import_ed25519_signing_key(seed).await,
+            Self::File(kc) => kc.import_ed25519_signing_key(seed).await,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Custody selection — spec 03-identity.md §3.2.2
+// ---------------------------------------------------------------------------
+
+/// The key custody one identity-creating call selected, resolved from its
+/// custody request, provider and `testing_seed` before any directory or key
+/// file is touched.
+///
+/// [`select_key_custody`] builds it; `CustodySelection::open` opens it on a
+/// `testing` build, and `CustodySelection::refuse_create` refuses identity
+/// creation on a shipped build, which has no `PreRotationCustody` backend
+/// (ADR-062 §Decision 6).
+pub(crate) enum CustodySelection {
+    /// `in_memory`, optionally seeded for the cross-bridge parity harness
+    /// (ADR-046). A testing-build affordance (§3.2.2).
+    #[cfg(feature = "testing")]
+    InMemory(Option<zeroize::Zeroizing<[u8; 32]>>),
+    /// `encrypted_file`: the key file and passphrase, resolved but not opened.
+    #[cfg_attr(
+        not(feature = "testing"),
+        expect(
+            dead_code,
+            reason = "a shipped build creates no identity (SCP-IDENT-1059, ADR-062 §Decision 6), so it never opens this custody"
+        )
+    )]
+    EncryptedFile(FileCustodyInputs),
+    /// `os_keystore`: the caller's `KeyCustodyProvider`, already promoted to
+    /// threadsafe functions on the JS thread.
+    #[cfg_attr(
+        not(feature = "testing"),
+        expect(
+            dead_code,
+            reason = "a shipped build creates no identity (SCP-IDENT-1059, ADR-062 §Decision 6), so it never opens this custody"
+        )
+    )]
+    OsKeystore(NapiCallbackKeyCustody),
+}
+
+/// Maps one identity-creating call to the custody it selects (spec
+/// `03-identity.md` §3.2.2).
+///
+/// Every custody decision goes through
+/// [`scp_ffi_common::custody_request::parse_custody_request`], so this bridge
+/// returns the code §3.2.2's table gives for each input, the seed check first.
+/// For `encrypted_file`, `resolve_file` reads `$HOME` and `SCP_KEY_PASSPHRASE`
+/// and touches no file; production callers pass
+/// [`scp_ffi_common::custody_file::resolve_file_custody_inputs`].
+///
+/// # Errors
+///
+/// Returns the [`ScpNapiError`] for the §3.2.2 rejection the request breaks
+/// (`SCP-VALID-7009`, `SCP-IDENT-1003`, `SCP-IDENT-1005`, `SCP-IDENT-1008`,
+/// `SCP-VALID-7005`), or, for `encrypted_file`, `SCP-VALID-7001` when
+/// `resolve_file` rejects an environment variable.
+pub(crate) fn select_key_custody(
+    request: &str,
+    provider: Option<NapiCallbackKeyCustody>,
+    testing_seed: Option<zeroize::Zeroizing<[u8; 32]>>,
+    resolve_file: impl FnOnce() -> Result<FileCustodyInputs, FileCustodyError>,
+) -> Result<CustodySelection, ScpNapiError> {
+    let parsed = parse_custody_request(CustodyRequestInput {
+        request,
+        provider_present: provider.is_some(),
+        seed_present: testing_seed.is_some(),
+        testing_build: cfg!(feature = "testing"),
+    })?;
+    match parsed {
+        // The parser returns `OsKeystore` only when a provider was passed.
+        CustodyRequest::OsKeystore => provider
+            .map(CustodySelection::OsKeystore)
+            .ok_or_else(|| CustodyRequestError::OsKeystoreWithoutProvider.into()),
+        CustodyRequest::EncryptedFile => resolve_file()
+            .map(CustodySelection::EncryptedFile)
+            .map_err(|e| ScpNapiError::from(&e)),
+        // On a `testing` build the seed, if any, travels to `open`.
+        #[cfg(feature = "testing")]
+        CustodyRequest::InMemory => Ok(CustodySelection::InMemory(testing_seed)),
+        // A shipped build has no in-memory custody. The parser already
+        // answered `in_memory` with `SCP-IDENT-1008` on this build, and this
+        // arm returns the same typed rejection, so no input reaches a key
+        // store the build lacks.
+        #[cfg(not(feature = "testing"))]
+        CustodyRequest::InMemory => {
+            drop(testing_seed);
+            Err(CustodyRequestError::InMemoryRequiresTestingBuild.into())
+        }
+    }
+}
+
+impl CustodySelection {
+    /// Opens the selected custody for identity creation. A `testing` build
+    /// mints the in-memory pre-rotation custody next, so it opens here.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SCP-IDENT-1008` when `encrypted_file`'s key directory cannot
+    /// be created or `FileKeyCustody` rejects the key file.
+    #[cfg(feature = "testing")]
+    pub(crate) fn open(self) -> Result<std::sync::Arc<NapiKeyCustody>, ScpNapiError> {
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let custody = match self {
+            // Deref through `Zeroizing<[u8; 32]>` so the wrapper wipes the
+            // seed when it drops; `from_seed_bytes` takes one unavoidable copy
+            // by value into its RNG.
+            Self::InMemory(seed) => {
+                let in_memory = seed.as_ref().map_or_else(InMemoryKeyCustody::new, |seed| {
+                    InMemoryKeyCustody::from_seed_bytes(**seed)
+                });
+                NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(in_memory)))
+            }
+            Self::EncryptedFile(inputs) => {
+                NapiKeyCustody::File(inputs.open().map_err(|e| ScpNapiError::from(&e))?)
+            }
+            Self::OsKeystore(callback) => NapiKeyCustody::Callback(callback),
+        };
+        Ok(std::sync::Arc::new(custody))
+    }
+
+    /// Refuses identity creation on a shipped build with `SCP-IDENT-1059`
+    /// (ADR-062 §Decision 6), before anything opens.
+    ///
+    /// Every identity commits a pre-rotation commitment at creation (spec
+    /// §9.7.4.1 item 5(a)), and a shipped build has no `PreRotationCustody`
+    /// backend. Refusing before `encrypted_file` opens keeps a failed call
+    /// from leaving `$HOME/.scp/keys.bin` sealed under whatever passphrase was
+    /// set, as the `PyO3` bridge's `open_custody_for_create` does.
+    #[cfg(not(feature = "testing"))]
+    pub(crate) fn refuse_create(self) -> ScpNapiError {
+        drop(self);
+        crate::identity::no_pre_rotation_backend()
     }
 }
 

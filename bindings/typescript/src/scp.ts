@@ -131,8 +131,9 @@ export const CUSTODY_REQUIRED_CODE = "SCP-IDENT-1116";
 
 /** Remedy for a method whose custody argument is a {@link CustodyType}. */
 const CUSTODY_VALUE_REMEDY =
-  'pass "in_memory" (an addon built with the bridge\'s testing feature only), or call ' +
-  "identityCreateWithCustody() with a KeyCustodyProvider for any other key store";
+  'pass "encrypted_file" (an encrypted key file at $HOME/.scp/keys.bin, sealed under ' +
+  "SCP_KEY_PASSPHRASE), or call identityCreateWithCustody() with a KeyCustodyProvider for " +
+  '"os_keystore" (the host key store)';
 
 /** Remedy for a method whose custody argument is a {@link KeyCustodyProvider}. */
 const CUSTODY_PROVIDER_REMEDY =
@@ -1066,7 +1067,16 @@ export class SCP {
    *
    * @throws IdentityError `SCP-IDENT-1116` when `custody` is `undefined` or
    *   `null`, before any bridge call.
-   * @throws ValidationError `SCP-VALID-7005` when `custody` is not a string.
+   * @throws ValidationError `SCP-VALID-7005` when `custody` is not a string,
+   *   or names no custody request.
+   * @throws IdentityError `SCP-IDENT-1003` for `"os_keystore"`, which needs
+   *   the provider {@link SCP.identityCreateWithCustody} takes.
+   * @throws ValidationError `SCP-VALID-7001` for `"encrypted_file"` when `HOME`
+   *   or `SCP_KEY_PASSPHRASE` is unset, empty, or (for `HOME`) relative.
+   * @throws IdentityError `SCP-IDENT-1008` for `"encrypted_file"` when the key
+   *   file does not open, and for `"in_memory"` on a shipped addon.
+   * @throws IdentityError `SCP-IDENT-1059` on a shipped addon, which has no
+   *   pre-rotation custody backend.
    */
   async identityCreate(custody: CustodyType): Promise<Identity> {
     requireCustody("identityCreate", custody);
@@ -1083,7 +1093,10 @@ export class SCP {
    *
    * @throws IdentityError `SCP-IDENT-1116` when `custody` is `undefined` or
    *   `null`, before any bridge call.
-   * @throws ValidationError `SCP-VALID-7005` when `custody` is not a string.
+   * @throws ValidationError `SCP-VALID-7005` when `custody` is not a string,
+   *   or names no custody request.
+   * @throws The other errors {@link SCP.identityCreate} throws, for the same
+   *   custody values.
    */
   async identityCreateWithAgentKey(custody: CustodyType): Promise<Identity> {
     requireCustody("identityCreateWithAgentKey", custody);
@@ -1098,7 +1111,9 @@ export class SCP {
   }
 
   /**
-   * Create a DID whose key material lives in a caller-provided custody backend.
+   * Create a DID whose key material lives in a caller-provided custody backend:
+   * custody `"os_keystore"` (spec `03-identity.md` §3.2.2), which the returned
+   * identity's `custodyType` reports.
    *
    * `provider` is any object implementing {@link KeyCustodyProvider} — the
    * private key material never crosses into the native core (ADR-006). Use this
