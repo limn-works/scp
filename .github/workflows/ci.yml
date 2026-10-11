@@ -2322,6 +2322,8 @@ jobs:
       - uses: actions/checkout@v5
       - uses: taiki-e/install-action@nextest
       - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
@@ -2330,6 +2332,18 @@ jobs:
         run: |
           # Default features = production: `server` on, no `testing`.
           cargo build -p scp-ffi-uniffi --features server
+      - name: Lint and test every uniffi target in production config
+        run: |
+          # Every other clippy and test lane enables `scp-ffi-uniffi/testing`, so a
+          # test helper that only a `testing`-gated test constructs is dead code
+          # in this configuration and no lane reported it, and a test that needs
+          # `testing` but carries no gate failed here unseen. The step below
+          # names only selected tests; these two commands lint and run every
+          # target the shipped configuration compiles.
+          # `check_shipped_config_full_runs` in
+          # scripts/tests/ci-gate/ci_gate_selftest.py fails when either goes.
+          cargo clippy -p scp-ffi-uniffi --all-targets --features server -- -D warnings
+          cargo test -p scp-ffi-uniffi --features server
       - name: Shipped uniffi fail-closed assertion
         run: |
           # The four `#[cfg(not(feature = "testing"))]` assertions this bridge
