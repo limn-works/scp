@@ -46,7 +46,7 @@ async function main(): Promise<void> {
       },
       operator: identity.did,
     });
-    await scp.outletRegister(ctx._rawHandle, outlet);
+    await scp.outletRegister(ctx, outlet);
 
     // Start an MCP server exposing context outlets on stdio.
     const server = await scp.mcpServerCreate({
@@ -109,7 +109,7 @@ async function main(): Promise<void> {
       await scp.mcpServerStop(server);
     }
 
-    await scp.contextClose(ctx._rawHandle, identity.did);
+    await scp.contextClose(ctx, identity.did);
   } finally {
     await scp.shutdown(5);
   }

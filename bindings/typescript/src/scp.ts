@@ -31,13 +31,14 @@
  * `SCP-VALID-7005`.
  */
 
-// Deferred imports of opaque classes. The classes import `SCP` for
-// typing, so importing them eagerly here creates a module cycle at
-// evaluation time. Using type-only imports keeps the SCP module
-// standalone at runtime — the handle-wrapping helpers call
-// `_fromHandle` statics which are resolved lazily inside the SCP
-// methods via dynamic `import()` calls.
-import type { Context } from "./context";
+// The handle classes (`Context`, `Identity`, `McpServer`, `McpClient`,
+// `TransportManager`) are value imports: every public method checks its
+// handle argument synchronously with the class's private-field brand check
+// before any bridge call. `context.ts` imports `__getNativeScp` from this
+// module, so the two modules form an import cycle; it is safe because
+// neither module touches the other's exports while it evaluates, only
+// inside function bodies. The `server.ts` classes stay lazily imported.
+import { Context } from "./context";
 import type { PaymentReceiptVerificationResult } from "./economy";
 import {
   ContextError,
@@ -47,8 +48,13 @@ import {
   ScpError,
   ValidationError,
 } from "./errors";
-import type { CustodyType, Identity } from "./identity";
-import { type BridgeContextHandle, getBridge, toCapabilityValidation } from "./internal/bridge";
+import { type CustodyType, Identity } from "./identity";
+import {
+  type BridgeContextHandle,
+  type BridgeIdentityHandle,
+  getBridge,
+  toCapabilityValidation,
+} from "./internal/bridge";
 import { toNativeCustodyProvider } from "./internal/custody-adapter";
 import {
   loadNativeAddon,
@@ -57,10 +63,12 @@ import {
   type NativeAddon as RawNativeAddon,
 } from "./internal/native";
 import { assertTestEnvironment } from "./internal/test-guard";
+import { McpClient, McpServer } from "./mcp";
 import type { StreamingSagaNative, StreamingSagaOptions } from "./outlets";
 import { StreamingSagaHandle } from "./outlets";
 import { decodeProvenanceRecord, type ProvenanceRecord } from "./provenance";
 import type { Node, Relay } from "./server";
+import { TransportManager } from "./transport";
 import type {
   AttestationType,
   AttestorInfo,
@@ -153,6 +161,67 @@ function requireCustody(method: string, custody: unknown): void {
       "SCP-VALID-7005",
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Handle arguments
+// ---------------------------------------------------------------------------
+
+/** Names what a caller passed in place of a handle, for the error message. */
+function describeArgument(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value !== "object") return typeof value;
+  const name = (value as { constructor?: { name?: unknown } }).constructor?.name;
+  return typeof name === "string" && name !== "" ? `an object of class ${name}` : "an object";
+}
+
+/**
+ * The typed error a public `SCP` method throws when a handle argument is not
+ * the SDK object the SDK returned. A raw native handle (a `Context`'s private
+ * `_rawHandle`, say) fails here too: the methods take the SDK object only.
+ */
+function invalidHandleError(
+  method: string,
+  param: string,
+  expected: string,
+  value: unknown,
+): ValidationError {
+  return new ValidationError(
+    `${method}() ${param} must be a ${expected} this SDK returned; got ${describeArgument(value)}`,
+    "SCP-VALID-7005",
+  );
+}
+
+/** Returns the bridge handle of a `Context`, or throws `SCP-VALID-7005`. */
+function contextHandle(method: string, param: string, value: unknown): BridgeContextHandle {
+  if (!Context._isContext(value)) throw invalidHandleError(method, param, "Context", value);
+  return value._rawHandle;
+}
+
+/** Returns the bridge handle of an `Identity`, or throws `SCP-VALID-7005`. */
+function identityHandle(method: string, param: string, value: unknown): BridgeIdentityHandle {
+  if (!Identity._isIdentity(value)) throw invalidHandleError(method, param, "Identity", value);
+  return value._rawHandle;
+}
+
+/** Returns the bridge handle of a `TransportManager`, or throws `SCP-VALID-7005`. */
+function transportManagerHandle(method: string, param: string, value: unknown): unknown {
+  if (!TransportManager._isTransportManager(value)) {
+    throw invalidHandleError(method, param, "TransportManager", value);
+  }
+  return value._rawHandle;
+}
+
+/** Returns the bridge handle of an `McpServer`, or throws `SCP-VALID-7005`. */
+function mcpServerHandle(method: string, param: string, value: unknown): unknown {
+  if (!McpServer._isMcpServer(value)) throw invalidHandleError(method, param, "McpServer", value);
+  return value._rawHandle;
+}
+
+/** Returns the bridge handle of an `McpClient`, or throws `SCP-VALID-7005`. */
+function mcpClientHandle(method: string, param: string, value: unknown): unknown {
+  if (!McpClient._isMcpClient(value)) throw invalidHandleError(method, param, "McpClient", value);
+  return value._rawHandle;
 }
 
 /**
@@ -1003,8 +1072,7 @@ export class SCP {
     requireCustody("identityCreate", custody);
     try {
       const raw = await (this.#native.identityCreate as (c: string) => Promise<unknown>)(custody);
-      const { Identity: IdentityCls } = await import("./identity");
-      return IdentityCls._fromHandle(this, raw);
+      return Identity._fromHandle(this, raw);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -1023,8 +1091,7 @@ export class SCP {
       const raw = await (
         this.#native.identityCreateWithAgentKey as (c: string) => Promise<unknown>
       )(custody);
-      const { Identity: IdentityCls } = await import("./identity");
-      return IdentityCls._fromHandle(this, raw);
+      return Identity._fromHandle(this, raw);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -1079,8 +1146,7 @@ export class SCP {
       const raw = await (
         this.#native.identityCreateWithCustody as (p: typeof adapter) => Promise<unknown>
       )(adapter);
-      const { Identity: IdentityCls } = await import("./identity");
-      return IdentityCls._fromHandle(this, raw);
+      return Identity._fromHandle(this, raw);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -1089,8 +1155,7 @@ export class SCP {
   async identityLoad(did: string): Promise<Identity> {
     try {
       const raw = await (this.#native.identityLoad as (d: string) => Promise<unknown>)(did);
-      const { Identity: IdentityCls } = await import("./identity");
-      return IdentityCls._fromHandle(this, raw);
+      return Identity._fromHandle(this, raw);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -1114,11 +1179,11 @@ export class SCP {
    * @returns The updated {@link Identity} (same DID, new key).
    */
   async identityRotateKey(identity: Identity): Promise<Identity> {
+    const rawIdentity = identityHandle("identityRotateKey", "identity", identity);
     try {
       const bridge = await getBridge(this);
-      const raw = await bridge.identityRotateKey(identity._rawHandle);
-      const { Identity: IdentityCls } = await import("./identity");
-      return IdentityCls._fromHandle(this, raw);
+      const raw = await bridge.identityRotateKey(rawIdentity);
+      return Identity._fromHandle(this, raw);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -1143,11 +1208,11 @@ export class SCP {
    * @returns The migrated {@link Identity} with a NEW DID.
    */
   async identityMigrate(identity: Identity): Promise<Identity> {
+    const rawIdentity = identityHandle("identityMigrate", "identity", identity);
     try {
       const bridge = await getBridge(this);
-      const raw = await bridge.identityMigrate(identity._rawHandle);
-      const { Identity: IdentityCls } = await import("./identity");
-      return IdentityCls._fromHandle(this, raw);
+      const raw = await bridge.identityMigrate(rawIdentity);
+      return Identity._fromHandle(this, raw);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -1162,11 +1227,11 @@ export class SCP {
    * @returns The updated {@link Identity}.
    */
   async identityAddAgentKey(identity: Identity): Promise<Identity> {
+    const rawIdentity = identityHandle("identityAddAgentKey", "identity", identity);
     try {
       const bridge = await getBridge(this);
-      const raw = await bridge.identityAddAgentKey(identity._rawHandle);
-      const { Identity: IdentityCls } = await import("./identity");
-      return IdentityCls._fromHandle(this, raw);
+      const raw = await bridge.identityAddAgentKey(rawIdentity);
+      return Identity._fromHandle(this, raw);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -1180,11 +1245,11 @@ export class SCP {
    * @returns The updated {@link Identity}.
    */
   async identityRotateAgentKey(identity: Identity): Promise<Identity> {
+    const rawIdentity = identityHandle("identityRotateAgentKey", "identity", identity);
     try {
       const bridge = await getBridge(this);
-      const raw = await bridge.identityRotateAgentKey(identity._rawHandle);
-      const { Identity: IdentityCls } = await import("./identity");
-      return IdentityCls._fromHandle(this, raw);
+      const raw = await bridge.identityRotateAgentKey(rawIdentity);
+      return Identity._fromHandle(this, raw);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -1198,11 +1263,11 @@ export class SCP {
    * @returns The updated {@link Identity}.
    */
   async identityRemoveAgentKey(identity: Identity): Promise<Identity> {
+    const rawIdentity = identityHandle("identityRemoveAgentKey", "identity", identity);
     try {
       const bridge = await getBridge(this);
-      const raw = await bridge.identityRemoveAgentKey(identity._rawHandle);
-      const { Identity: IdentityCls } = await import("./identity");
-      return IdentityCls._fromHandle(this, raw);
+      const raw = await bridge.identityRemoveAgentKey(rawIdentity);
+      return Identity._fromHandle(this, raw);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -1632,12 +1697,12 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   async contextCreate(identity: Identity, paramsJson: string): Promise<Context> {
+    const rawIdentity = identityHandle("contextCreate", "identity", identity);
     try {
       const raw = await (
         this.#native.contextCreate as (id: unknown, p: string) => Promise<unknown>
-      )(identity._rawHandle, paramsJson);
-      const { Context: ContextCls } = await import("./context");
-      return ContextCls._fromHandle(this, raw as never, identity.did);
+      )(rawIdentity, paramsJson);
+      return Context._fromHandle(this, raw as never, identity.did);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -1742,8 +1807,7 @@ export class SCP {
         r: string,
       ) => Promise<unknown>
     )(owningDid, nativeSealed, reservationId);
-    const { Context: ContextCls } = await import("./context");
-    return ContextCls._fromHandle(this, raw as never, owningDid);
+    return Context._fromHandle(this, raw as never, owningDid);
   }
 
   /**
@@ -1834,10 +1898,11 @@ export class SCP {
   }
 
   async contextJoin(
-    handle: unknown,
+    context: Context,
     identityDid: string,
     spendingUcanJwt?: string | null,
   ): Promise<void> {
+    const handle = contextHandle("contextJoin", "context", context);
     try {
       await (
         this.#native.contextJoin as (h: unknown, d: string, s: string | null) => Promise<void>
@@ -1856,10 +1921,11 @@ export class SCP {
    * feature; never present in production builds.
    */
   async contextSeedPeerPseudonym(
-    handle: unknown,
+    context: Context,
     peerDid: string,
     pseudonym: Uint8Array | Buffer,
   ): Promise<void> {
+    const handle = contextHandle("contextSeedPeerPseudonym", "context", context);
     try {
       await (
         this.#native.contextSeedPeerPseudonym as (
@@ -1873,7 +1939,8 @@ export class SCP {
     }
   }
 
-  async contextLeave(handle: unknown, identityDid: string): Promise<void> {
+  async contextLeave(context: Context, identityDid: string): Promise<void> {
+    const handle = contextHandle("contextLeave", "context", context);
     try {
       await (this.#native.contextLeave as (h: unknown, d: string) => Promise<void>)(
         handle,
@@ -1884,7 +1951,8 @@ export class SCP {
     }
   }
 
-  async contextClose(handle: unknown, identityDid: string): Promise<void> {
+  async contextClose(context: Context, identityDid: string): Promise<void> {
+    const handle = contextHandle("contextClose", "context", context);
     try {
       await (this.#native.contextClose as (h: unknown, d: string) => Promise<void>)(
         handle,
@@ -1905,28 +1973,25 @@ export class SCP {
    * delivered. A lone-member send is a no-op; broadcast contexts are unaffected.
    */
   async contextSend(
-    handle: unknown,
+    context: Context,
     identityDid: string,
     payload: Uint8Array | readonly number[],
     spendingUcanJwt?: string | null,
   ): Promise<void> {
+    const handle = contextHandle("contextSend", "context", context);
     const payloadUint8 = ArrayBuffer.isView(payload)
       ? (payload as Uint8Array)
       : new Uint8Array(payload as readonly number[]);
     const bridge = await getBridge(this);
-    return bridge.contextSend(
-      handle as BridgeContextHandle,
-      identityDid,
-      payloadUint8,
-      spendingUcanJwt ?? null,
-    );
+    return bridge.contextSend(handle, identityDid, payloadUint8, spendingUcanJwt ?? null);
   }
 
   async contextSubscribe(
-    handle: unknown,
+    context: Context,
     identityDid: string,
     onMessage: (message: unknown) => void,
   ): Promise<void> {
+    const handle = contextHandle("contextSubscribe", "context", context);
     try {
       await (
         this.#native.contextSubscribe as (
@@ -1940,7 +2005,8 @@ export class SCP {
     }
   }
 
-  contextCancelSubscription(handle: unknown): void {
+  contextCancelSubscription(context: Context): void {
+    const handle = contextHandle("contextCancelSubscription", "context", context);
     try {
       (this.#native.contextCancelSubscription as (h: unknown) => void)(handle);
     } catch (err) {
@@ -1948,12 +2014,14 @@ export class SCP {
     }
   }
 
-  async contextMemberCount(handle: unknown): Promise<number> {
+  async contextMemberCount(context: Context): Promise<number> {
+    const handle = contextHandle("contextMemberCount", "context", context);
     const bridge = await getBridge(this);
-    return (await bridge.contextMemberCount(handle as BridgeContextHandle)) ?? 0;
+    return (await bridge.contextMemberCount(handle)) ?? 0;
   }
 
-  async contextIsMember(handle: unknown, did: string): Promise<boolean> {
+  async contextIsMember(context: Context, did: string): Promise<boolean> {
+    const handle = contextHandle("contextIsMember", "context", context);
     try {
       return await (this.#native.contextIsMember as (h: unknown, d: string) => Promise<boolean>)(
         handle,
@@ -1964,7 +2032,8 @@ export class SCP {
     }
   }
 
-  async contextMemberDids(handle: unknown): Promise<readonly string[]> {
+  async contextMemberDids(context: Context): Promise<readonly string[]> {
+    const handle = contextHandle("contextMemberDids", "context", context);
     try {
       return await (this.#native.contextMemberDids as (h: unknown) => Promise<readonly string[]>)(
         handle,
@@ -1980,7 +2049,8 @@ export class SCP {
    * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when the bridge
    *   reports a role name {@link memberRoleFromBridge} cannot parse.
    */
-  async contextMemberRole(handle: unknown, did: string): Promise<MemberRole | null> {
+  async contextMemberRole(context: Context, did: string): Promise<MemberRole | null> {
+    const handle = contextHandle("contextMemberRole", "context", context);
     let raw: string | null;
     try {
       raw = await (
@@ -1993,7 +2063,8 @@ export class SCP {
     return memberRoleFromBridge(raw);
   }
 
-  async contextDrainEvents(handle: unknown): Promise<readonly string[]> {
+  async contextDrainEvents(context: Context): Promise<readonly string[]> {
+    const handle = contextHandle("contextDrainEvents", "context", context);
     try {
       return await (this.#native.contextDrainEvents as (h: unknown) => Promise<readonly string[]>)(
         handle,
@@ -2019,7 +2090,8 @@ export class SCP {
     }
   }
 
-  async contextTombstoneMigrated(handle: unknown): Promise<void> {
+  async contextTombstoneMigrated(context: Context): Promise<void> {
+    const handle = contextHandle("contextTombstoneMigrated", "context", context);
     try {
       await (this.#native.contextTombstoneMigrated as (h: unknown) => Promise<void>)(handle);
     } catch (err) {
@@ -2027,7 +2099,8 @@ export class SCP {
     }
   }
 
-  async contextMigrationState(handle: unknown): Promise<string | null> {
+  async contextMigrationState(context: Context): Promise<string | null> {
+    const handle = contextHandle("contextMigrationState", "context", context);
     try {
       return await (this.#native.contextMigrationState as (h: unknown) => Promise<string | null>)(
         handle,
@@ -2037,7 +2110,8 @@ export class SCP {
     }
   }
 
-  async contextExport(handle: unknown): Promise<Uint8Array> {
+  async contextExport(context: Context): Promise<Uint8Array> {
+    const handle = contextHandle("contextExport", "context", context);
     try {
       const raw = await (
         this.#native.contextExport as (h: unknown) => Promise<Uint8Array | Buffer>
@@ -2074,7 +2148,8 @@ export class SCP {
     }
   }
 
-  contextSetEconomicPolicy(handle: unknown, policyJson: string): void {
+  contextSetEconomicPolicy(context: Context, policyJson: string): void {
+    const handle = contextHandle("contextSetEconomicPolicy", "context", context);
     try {
       (this.#native.contextSetEconomicPolicy as (h: unknown, p: string) => void)(
         handle,
@@ -2085,7 +2160,8 @@ export class SCP {
     }
   }
 
-  contextGetEconomicPolicy(handle: unknown): string | null {
+  contextGetEconomicPolicy(context: Context): string | null {
+    const handle = contextHandle("contextGetEconomicPolicy", "context", context);
     try {
       return (this.#native.contextGetEconomicPolicy as (h: unknown) => string | null)(handle);
     } catch (err) {
@@ -2133,7 +2209,8 @@ export class SCP {
     }
   }
 
-  async contextBroadcastSubscriberCount(handle: unknown): Promise<number | null> {
+  async contextBroadcastSubscriberCount(context: Context): Promise<number | null> {
+    const handle = contextHandle("contextBroadcastSubscriberCount", "context", context);
     try {
       return await (
         this.#native.contextBroadcastSubscriberCount as (h: unknown) => Promise<number | null>
@@ -2143,7 +2220,8 @@ export class SCP {
     }
   }
 
-  async contextIsBroadcastSubscriber(handle: unknown, did: string): Promise<boolean> {
+  async contextIsBroadcastSubscriber(context: Context, did: string): Promise<boolean> {
+    const handle = contextHandle("contextIsBroadcastSubscriber", "context", context);
     try {
       return await (
         this.#native.contextIsBroadcastSubscriber as (h: unknown, d: string) => Promise<boolean>
@@ -2153,7 +2231,8 @@ export class SCP {
     }
   }
 
-  async contextBroadcastAdmission(handle: unknown): Promise<string | null> {
+  async contextBroadcastAdmission(context: Context): Promise<string | null> {
+    const handle = contextHandle("contextBroadcastAdmission", "context", context);
     try {
       return await (
         this.#native.contextBroadcastAdmission as (h: unknown) => Promise<string | null>
@@ -2172,10 +2251,11 @@ export class SCP {
    * It is unused for an OPEN context.
    */
   async broadcastSubscribe(
-    handle: unknown,
+    context: Context,
     subscriberDid: string,
     messagesReadUcanJwt?: string,
   ): Promise<void> {
+    const handle = contextHandle("broadcastSubscribe", "context", context);
     try {
       await (
         this.#native.broadcastSubscribe as (h: unknown, d: string, u?: string) => Promise<void>
@@ -2186,10 +2266,11 @@ export class SCP {
   }
 
   async broadcastUnsubscribe(
-    handle: unknown,
+    context: Context,
     subscriberDid: string,
     rotateKeys?: boolean,
   ): Promise<void> {
+    const handle = contextHandle("broadcastUnsubscribe", "context", context);
     try {
       await (
         this.#native.broadcastUnsubscribe as (
@@ -2204,10 +2285,11 @@ export class SCP {
   }
 
   async broadcastPublish(
-    handle: unknown,
+    context: Context,
     authorDid: string,
     payload: Uint8Array | readonly number[],
   ): Promise<void> {
+    const handle = contextHandle("broadcastPublish", "context", context);
     try {
       const payloadArray = ArrayBuffer.isView(payload)
         ? Array.from(payload as Uint8Array)
@@ -2225,11 +2307,12 @@ export class SCP {
   }
 
   async broadcastPublishAsset(
-    handle: unknown,
+    context: Context,
     authorDid: string,
     asset: { path: string; contentType: string; body: readonly number[] },
     deployId?: string | null,
   ): Promise<unknown> {
+    const handle = contextHandle("broadcastPublishAsset", "context", context);
     try {
       return await (
         this.#native.broadcastPublishAsset as (
@@ -2245,11 +2328,12 @@ export class SCP {
   }
 
   async broadcastPublishAssets(
-    handle: unknown,
+    context: Context,
     authorDid: string,
     assets: readonly { path: string; contentType: string; body: readonly number[] }[],
     deployId?: string | null,
   ): Promise<unknown> {
+    const handle = contextHandle("broadcastPublishAssets", "context", context);
     try {
       return await (
         this.#native.broadcastPublishAssets as (
@@ -2265,10 +2349,11 @@ export class SCP {
   }
 
   async broadcastBlockSubscriber(
-    handle: unknown,
+    context: Context,
     subscriberDid: string,
     blockerDid: string,
   ): Promise<void> {
+    const handle = contextHandle("broadcastBlockSubscriber", "context", context);
     try {
       await (
         this.#native.broadcastBlockSubscriber as (h: unknown, s: string, b: string) => Promise<void>
@@ -2279,10 +2364,11 @@ export class SCP {
   }
 
   async broadcastUnblockSubscriber(
-    handle: unknown,
+    context: Context,
     subscriberDid: string,
     unblockerDid: string,
   ): Promise<void> {
+    const handle = contextHandle("broadcastUnblockSubscriber", "context", context);
     try {
       await (
         this.#native.broadcastUnblockSubscriber as (
@@ -2314,11 +2400,12 @@ export class SCP {
    *   public key.
    */
   async broadcastHandleKeyRequest(
-    handle: unknown,
+    context: Context,
     authorDid: string,
     requesterDid: string,
     wrappingPubkey: Uint8Array,
   ): Promise<string | null> {
+    const handle = contextHandle("broadcastHandleKeyRequest", "context", context);
     try {
       // NAPI Vec<u8> IN params map to number[] in JS, not Uint8Array.
       const wrappingArray = Array.from(wrappingPubkey) as unknown as number[];
@@ -2387,9 +2474,10 @@ export class SCP {
    *   reports an outcome this SDK version does not name.
    */
   async contextExecuteGovernanceAction(
-    handle: unknown,
+    context: Context,
     proposalIdHex: string,
   ): Promise<GovernanceActionResult> {
+    const handle = contextHandle("contextExecuteGovernanceAction", "context", context);
     let raw: string;
     try {
       raw = await (
@@ -2414,13 +2502,14 @@ export class SCP {
    *   names a status, reason, or outcome this SDK version does not name.
    */
   async contextGovernancePropose(
-    handle: unknown,
+    context: Context,
     actionJson: string,
     proposerDid: string,
   ): Promise<string> {
+    const handle = contextHandle("contextGovernancePropose", "context", context);
     const bridge = await getBridge(this);
     return checkProposalResponse(
-      await bridge.contextGovernancePropose(handle as BridgeContextHandle, actionJson, proposerDid),
+      await bridge.contextGovernancePropose(handle, actionJson, proposerDid),
     );
   }
 
@@ -2433,10 +2522,11 @@ export class SCP {
    *   names a status or reason this SDK version does not name.
    */
   async contextGovernanceApprove(
-    handle: unknown,
+    context: Context,
     proposalIdHex: string,
     voterDid: string,
   ): Promise<string> {
+    const handle = contextHandle("contextGovernanceApprove", "context", context);
     let raw: string;
     try {
       raw = await (
@@ -2461,10 +2551,11 @@ export class SCP {
    *   names a status or reason this SDK version does not name.
    */
   async contextGovernanceReject(
-    handle: unknown,
+    context: Context,
     proposalIdHex: string,
     voterDid: string,
   ): Promise<string> {
+    const handle = contextHandle("contextGovernanceReject", "context", context);
     let raw: string;
     try {
       raw = await (
@@ -2489,10 +2580,11 @@ export class SCP {
    *   names a status or reason this SDK version does not name.
    */
   async contextGovernanceWithdraw(
-    handle: unknown,
+    context: Context,
     proposalIdHex: string,
     voterDid: string,
   ): Promise<string> {
+    const handle = contextHandle("contextGovernanceWithdraw", "context", context);
     let raw: string;
     try {
       raw = await (
@@ -2508,7 +2600,8 @@ export class SCP {
     return checkProposalResponse(raw);
   }
 
-  async contextGovernanceGetProposal(handle: unknown, proposalIdHex: string): Promise<string> {
+  async contextGovernanceGetProposal(context: Context, proposalIdHex: string): Promise<string> {
+    const handle = contextHandle("contextGovernanceGetProposal", "context", context);
     try {
       return await (
         this.#native.contextGovernanceGetProposal as (h: unknown, p: string) => Promise<string>
@@ -2518,7 +2611,8 @@ export class SCP {
     }
   }
 
-  async contextGovernanceListProposals(handle: unknown): Promise<string> {
+  async contextGovernanceListProposals(context: Context): Promise<string> {
+    const handle = contextHandle("contextGovernanceListProposals", "context", context);
     try {
       return await (this.#native.contextGovernanceListProposals as (h: unknown) => Promise<string>)(
         handle,
@@ -2529,9 +2623,10 @@ export class SCP {
   }
 
   async contextApplyPendingCeilingModification(
-    handle: unknown,
+    context: Context,
     currentTimestamp: number,
   ): Promise<boolean> {
+    const handle = contextHandle("contextApplyPendingCeilingModification", "context", context);
     try {
       return await (
         this.#native.contextApplyPendingCeilingModification as (
@@ -2544,7 +2639,8 @@ export class SCP {
     }
   }
 
-  async contextFinalizeClose(handle: unknown): Promise<void> {
+  async contextFinalizeClose(context: Context): Promise<void> {
+    const handle = contextHandle("contextFinalizeClose", "context", context);
     try {
       await (this.#native.contextFinalizeClose as (h: unknown) => Promise<void>)(handle);
     } catch (err) {
@@ -2553,7 +2649,7 @@ export class SCP {
   }
 
   async contextCreateGovernanceCheckpoint(
-    handle: unknown,
+    context: Context,
     checkpointSeq: number,
     merkleRootHex: string,
     eventCount: number,
@@ -2562,6 +2658,7 @@ export class SCP {
     creatorDid: string,
     creatorSignatureHex: string,
   ): Promise<string> {
+    const handle = contextHandle("contextCreateGovernanceCheckpoint", "context", context);
     try {
       return await (
         this.#native.contextCreateGovernanceCheckpoint as (
@@ -2590,11 +2687,12 @@ export class SCP {
   }
 
   async contextAddCheckpointCosignature(
-    handle: unknown,
+    context: Context,
     checkpointJson: string,
     signerDid: string,
     signatureHex: string,
   ): Promise<string> {
+    const handle = contextHandle("contextAddCheckpointCosignature", "context", context);
     try {
       return await (
         this.#native.contextAddCheckpointCosignature as (
@@ -2613,7 +2711,8 @@ export class SCP {
   // Domain: TTL / Migration
   // ───────────────────────────────────────────────────────────────────────
 
-  async contextHandleTtlExpiry(handle: unknown): Promise<void> {
+  async contextHandleTtlExpiry(context: Context): Promise<void> {
+    const handle = contextHandle("contextHandleTtlExpiry", "context", context);
     try {
       await (this.#native.contextHandleTtlExpiry as (h: unknown) => Promise<void>)(handle);
     } catch (err) {
@@ -2622,10 +2721,11 @@ export class SCP {
   }
 
   async contextProposeTtlExtension(
-    handle: unknown,
+    context: Context,
     proposerDid: string,
     extensionSecs: number,
   ): Promise<boolean> {
+    const handle = contextHandle("contextProposeTtlExtension", "context", context);
     try {
       return await (
         this.#native.contextProposeTtlExtension as (
@@ -2639,7 +2739,8 @@ export class SCP {
     }
   }
 
-  async contextResetTtlTimer(handle: unknown, newDurationSecs: number): Promise<void> {
+  async contextResetTtlTimer(context: Context, newDurationSecs: number): Promise<void> {
+    const handle = contextHandle("contextResetTtlTimer", "context", context);
     try {
       await (this.#native.contextResetTtlTimer as (h: unknown, s: number) => Promise<void>)(
         handle,
@@ -2836,7 +2937,8 @@ export class SCP {
   // Domain: Outlet
   // ───────────────────────────────────────────────────────────────────────
 
-  async outletRegister(handle: unknown, definition: OutletDefinition): Promise<string> {
+  async outletRegister(context: Context, definition: OutletDefinition): Promise<string> {
+    const handle = contextHandle("outletRegister", "context", context);
     try {
       // `#native` is the raw napi addon, whose `NapiOutletDefinition` uses
       // different field names than the public `OutletDefinition` (JSON-string
@@ -2872,7 +2974,7 @@ export class SCP {
   }
 
   async outletInvoke(
-    handle: unknown,
+    context: Context,
     outletId: string,
     inputJson: string,
     identityDid: string,
@@ -2880,9 +2982,10 @@ export class SCP {
     proofTokens?: readonly string[],
     spendingUcanJwt?: string,
   ): Promise<string> {
+    const handle = contextHandle("outletInvoke", "context", context);
     const bridge = await getBridge(this);
     return bridge.outletInvoke(
-      handle as BridgeContextHandle,
+      handle,
       outletId,
       inputJson,
       identityDid,
@@ -2892,7 +2995,8 @@ export class SCP {
     );
   }
 
-  async outletVerify(handle: unknown, outletId: string): Promise<unknown> {
+  async outletVerify(context: Context, outletId: string): Promise<unknown> {
+    const handle = contextHandle("outletVerify", "context", context);
     return await (this.#native.outletVerify as (h: unknown, t: string) => Promise<unknown>)(
       handle,
       outletId,
@@ -2900,8 +3004,8 @@ export class SCP {
   }
 
   async outletInvokeCrossContext(
-    sourceHandle: unknown,
-    targetHandle: unknown,
+    sourceContext: Context,
+    targetContext: Context,
     outletId: string,
     inputJson: string,
     invokerDid: string,
@@ -2909,6 +3013,8 @@ export class SCP {
     chainDepth: number,
     proofTokens?: readonly string[],
   ): Promise<string> {
+    const sourceHandle = contextHandle("outletInvokeCrossContext", "sourceContext", sourceContext);
+    const targetHandle = contextHandle("outletInvokeCrossContext", "targetContext", targetContext);
     try {
       return await (
         this.#native.outletInvokeCrossContext as (
@@ -2959,8 +3065,8 @@ export class SCP {
    * See spec §6.2.4 and ADR-049 §3a.
    */
   async outletInvokeCrossContextSaga(
-    sourceHandle: unknown,
-    targetHandle: unknown,
+    sourceContext: Context,
+    targetContext: Context,
     callerDid: string,
     outletRegistrationId: string,
     inputJson: string,
@@ -2969,6 +3075,16 @@ export class SCP {
     chainDepth: number,
     ucanProofId?: string,
   ): Promise<SagaResult> {
+    const sourceHandle = contextHandle(
+      "outletInvokeCrossContextSaga",
+      "sourceContext",
+      sourceContext,
+    );
+    const targetHandle = contextHandle(
+      "outletInvokeCrossContextSaga",
+      "targetContext",
+      targetContext,
+    );
     if (typeof timestampMs !== "bigint" || timestampMs < 0n) {
       throw new ValidationError(
         `timestampMs must be a non-negative bigint, got ${String(timestampMs)}`,
@@ -3139,11 +3255,12 @@ export class SCP {
   }
 
   async outletSessionCreate(
-    handle: unknown,
+    context: Context,
     outletId: string,
     sourceContextId: string,
     ttlSeconds?: number,
   ): Promise<string> {
+    const handle = contextHandle("outletSessionCreate", "context", context);
     try {
       return await (
         this.#native.outletSessionCreate as (
@@ -3159,13 +3276,14 @@ export class SCP {
   }
 
   async outletSessionInvoke(
-    handle: unknown,
+    context: Context,
     sessionId: string,
     inputJson: string,
     invokerDid: string,
     ucanToken: string,
     proofTokens?: readonly string[],
   ): Promise<string> {
+    const handle = contextHandle("outletSessionInvoke", "context", context);
     return await (
       this.#native.outletSessionInvoke as (
         h: unknown,
@@ -3178,7 +3296,8 @@ export class SCP {
     )(handle, sessionId, inputJson, invokerDid, ucanToken, proofTokens);
   }
 
-  async outletSessionClose(handle: unknown, sessionId: string): Promise<void> {
+  async outletSessionClose(context: Context, sessionId: string): Promise<void> {
+    const handle = contextHandle("outletSessionClose", "context", context);
     await (this.#native.outletSessionClose as (h: unknown, sid: string) => Promise<void>)(
       handle,
       sessionId,
@@ -3186,11 +3305,12 @@ export class SCP {
   }
 
   async outletInterfaceExpose(
-    handle: unknown,
+    context: Context,
     outletId: string,
     targetContextId: string,
     rateLimitJson?: string,
   ): Promise<string> {
+    const handle = contextHandle("outletInterfaceExpose", "context", context);
     return await (
       this.#native.outletInterfaceExpose as (
         h: unknown,
@@ -3201,13 +3321,15 @@ export class SCP {
     )(handle, outletId, targetContextId, rateLimitJson);
   }
 
-  async outletInterfaceAccept(handle: unknown, interfaceJson: string): Promise<string> {
+  async outletInterfaceAccept(context: Context, interfaceJson: string): Promise<string> {
+    const handle = contextHandle("outletInterfaceAccept", "context", context);
     return await (
       this.#native.outletInterfaceAccept as (h: unknown, ij: string) => Promise<string>
     )(handle, interfaceJson);
   }
 
-  async outletInterfaceRevoke(handle: unknown, interfaceIdHex: string): Promise<string> {
+  async outletInterfaceRevoke(context: Context, interfaceIdHex: string): Promise<string> {
+    const handle = contextHandle("outletInterfaceRevoke", "context", context);
     return await (
       this.#native.outletInterfaceRevoke as (h: unknown, id: string) => Promise<string>
     )(handle, interfaceIdHex);
@@ -3231,7 +3353,7 @@ export class SCP {
    *
    * Throws {@link "./errors".ContextError} carrying `SCP-CTX-2023` when the context is not active.
    *
-   * @param handle The context handle to validate against.
+   * @param context The context handle to validate against.
    * @param token The UCAN token string to validate.
    * @param capability The required capability URI (mandatory on this gate).
    * @param presentingAgentDid The DID the token must be addressed to. Required —
@@ -3239,20 +3361,15 @@ export class SCP {
    * @param proofTokens Optional delegation-chain proof tokens.
    */
   async ucanValidate(
-    handle: unknown,
+    context: Context,
     token: string,
     capability: string,
     presentingAgentDid: string,
     proofTokens?: readonly string[],
   ): Promise<void> {
+    const handle = contextHandle("ucanValidate", "context", context);
     const bridge = await getBridge(this);
-    return bridge.ucanValidate(
-      handle as BridgeContextHandle,
-      token,
-      capability,
-      presentingAgentDid,
-      proofTokens,
-    );
+    return bridge.ucanValidate(handle, token, capability, presentingAgentDid, proofTokens);
   }
 
   /**
@@ -3284,7 +3401,7 @@ export class SCP {
    * trust. It precedes `capability` in the signature because it is mandatory
    * while `capability` is optional.
    *
-   * @param handle The context handle to evaluate against.
+   * @param context The context handle to evaluate against.
    * @param token The UCAN token string to evaluate.
    * @param presentingAgentDid The DID under assessment — the agent the token
    *   must be addressed to. Required; an absent or empty value is rejected by
@@ -3297,12 +3414,13 @@ export class SCP {
    * @param proofTokens Optional delegation-chain proof tokens.
    */
   async ucanEvaluate(
-    handle: unknown,
+    context: Context,
     token: string,
     presentingAgentDid: string,
     capability?: string | null,
     proofTokens?: readonly string[],
   ): Promise<CapabilityValidation> {
+    const handle = contextHandle("ucanEvaluate", "context", context);
     // Route the native dispatch through the single error chokepoint
     // (`mapBridgeError`) so a raw NAPI throw or rejection surfaces as a
     // typed `ScpError` keyed on its `[SCP-CAT-NNNN]` code, per ADR-059
@@ -3332,11 +3450,12 @@ export class SCP {
    * the context holds. Throws {@link "./errors".ContextError} carrying `SCP-CTX-2023` when the context is not active.
    */
   async ucanMint(
-    handle: unknown,
+    context: Context,
     memberDid: string,
     capabilities: readonly string[],
     proofs?: readonly string[],
   ): Promise<unknown> {
+    const handle = contextHandle("ucanMint", "context", context);
     try {
       return await (
         this.#native.ucanMint as (
@@ -3356,12 +3475,13 @@ export class SCP {
    * `delegateeDid`, within the ceiling the context holds. Throws {@link "./errors".ContextError} carrying `SCP-CTX-2023` when the context is not active.
    */
   async ucanDelegate(
-    handle: unknown,
+    context: Context,
     delegatorDid: string,
     delegateeDid: string,
     parentToken: string,
     capabilities: readonly string[],
   ): Promise<unknown> {
+    const handle = contextHandle("ucanDelegate", "context", context);
     try {
       return await (
         this.#native.ucanDelegate as (
@@ -3381,7 +3501,8 @@ export class SCP {
    * Revokes `token` in the context, as its issuer or the context creator.
    * Throws {@link "./errors".ContextError} carrying `SCP-CTX-2023` when the context is not active.
    */
-  async ucanRevoke(handle: unknown, token: string, revokerDid: string): Promise<void> {
+  async ucanRevoke(context: Context, token: string, revokerDid: string): Promise<void> {
+    const handle = contextHandle("ucanRevoke", "context", context);
     try {
       await (this.#native.ucanRevoke as (h: unknown, t: string, r: string) => Promise<void>)(
         handle,
@@ -3397,7 +3518,8 @@ export class SCP {
   // Domain: Event log
   // ───────────────────────────────────────────────────────────────────────
 
-  async eventLogQuery(handle: unknown, filterJson?: string): Promise<readonly unknown[]> {
+  async eventLogQuery(context: Context, filterJson?: string): Promise<readonly unknown[]> {
+    const handle = contextHandle("eventLogQuery", "context", context);
     try {
       return await (
         this.#native.eventLogQuery as (
@@ -3410,7 +3532,8 @@ export class SCP {
     }
   }
 
-  async eventLogVerify(handle: unknown, claimJson: string): Promise<unknown> {
+  async eventLogVerify(context: Context, claimJson: string): Promise<unknown> {
+    const handle = contextHandle("eventLogVerify", "context", context);
     try {
       return await (this.#native.eventLogVerify as (h: unknown, c: string) => Promise<unknown>)(
         handle,
@@ -3421,11 +3544,13 @@ export class SCP {
     }
   }
 
-  eventLogCheckpoint(handle: unknown, identity: Identity, epoch: number): unknown {
+  eventLogCheckpoint(context: Context, identity: Identity, epoch: number): unknown {
+    const handle = contextHandle("eventLogCheckpoint", "context", context);
+    const rawIdentity = identityHandle("eventLogCheckpoint", "identity", identity);
     try {
       return (this.#native.eventLogCheckpoint as (h: unknown, i: unknown, e: number) => unknown)(
         handle,
-        identity._rawHandle,
+        rawIdentity,
         epoch,
       );
     } catch (err) {
@@ -3433,7 +3558,8 @@ export class SCP {
     }
   }
 
-  eventLogCheckpointByDid(handle: unknown, did: string, epoch: number): unknown {
+  eventLogCheckpointByDid(context: Context, did: string, epoch: number): unknown {
+    const handle = contextHandle("eventLogCheckpointByDid", "context", context);
     try {
       return (
         this.#native.eventLogCheckpointByDid as (h: unknown, d: string, e: number) => unknown
@@ -3447,25 +3573,30 @@ export class SCP {
   // Domain: Transport
   // ───────────────────────────────────────────────────────────────────────
 
-  async transportConnect(relayUrl: string): Promise<unknown> {
+  async transportConnect(relayUrl: string): Promise<TransportManager> {
     try {
-      return await (this.#native.transportConnect as (u: string) => Promise<unknown>)(relayUrl);
+      const raw = await (this.#native.transportConnect as (u: string) => Promise<unknown>)(
+        relayUrl,
+      );
+      return TransportManager._fromHandle(raw);
     } catch (err) {
       throw mapBridgeError(err);
     }
   }
 
-  async transportStatus(manager: unknown): Promise<unknown> {
+  async transportStatus(manager: TransportManager): Promise<unknown> {
+    const handle = transportManagerHandle("transportStatus", "manager", manager);
     try {
-      return await (this.#native.transportStatus as (m: unknown) => Promise<unknown>)(manager);
+      return await (this.#native.transportStatus as (m: unknown) => Promise<unknown>)(handle);
     } catch (err) {
       throw mapBridgeError(err);
     }
   }
 
-  async transportDisconnect(manager: unknown): Promise<void> {
+  async transportDisconnect(manager: TransportManager): Promise<void> {
+    const handle = transportManagerHandle("transportDisconnect", "manager", manager);
     try {
-      await (this.#native.transportDisconnect as (m: unknown) => Promise<void>)(manager);
+      await (this.#native.transportDisconnect as (m: unknown) => Promise<void>)(handle);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -3893,20 +4024,21 @@ export class SCP {
    * threshold/independence path (§7.3.5) for Sybil resistance.
    *
    * The evaluation is labeled with — and the Layer-2 lookup is keyed by — the
-   * context the `handle` resolves to (`handle.contextId`), so the result is
-   * never silently mislabeled. There is no separate context-id argument
-   * (matching the Swift and Kotlin SDKs, which resolve from the handle).
+   * context id the `context`'s bridge handle carries, so the result is never
+   * silently mislabeled. There is no separate context-id argument (matching
+   * the Swift and Kotlin SDKs, which resolve from the `ContextHandle`).
    *
-   * @param handle The context handle to evaluate within.
+   * @param context The context to evaluate within.
    * @param subjectDid The DID of the participant being evaluated.
    * @param capabilityTokens Optional UCAN token strings to evaluate for Layer 1.
    * @returns A structured {@link TrustEvaluation} with Layers 1 and 2 populated.
    */
   async evaluateTrust(
-    handle: unknown,
+    context: Context,
     subjectDid: string,
     capabilityTokens?: readonly string[],
   ): Promise<TrustEvaluation> {
+    const handle = contextHandle("evaluateTrust", "context", context);
     // Layer 1: AND-combine the structured per-stage booleans across tokens.
     // Start from the all-true identity element of the boolean AND when at least
     // one token is present; with no tokens, every field stays false (the
@@ -3941,7 +4073,7 @@ export class SCP {
         // grant-match the caller never asked for. See ADR-059 / spec §7.2.4:
         // the diagnostic's challenge capability is optional, and omitting it
         // means intrinsic-validity.
-        const perToken = await this.ucanEvaluate(handle, token, subjectDid);
+        const perToken = await this.ucanEvaluate(context, token, subjectDid);
         tokensValid &&= perToken.tokensValid;
         signaturesValid &&= perToken.signaturesValid;
         withinCeiling &&= perToken.withinCeiling;
@@ -3988,7 +4120,7 @@ export class SCP {
     // (matching Swift/Kotlin, which read `handle.contextId()`), so both the
     // Layer-2 lookup and the returned label come from the one authoritative
     // source and can never disagree.
-    const resolvedContextId = (handle as { readonly contextId: string }).contextId;
+    const resolvedContextId = handle.contextId;
     let behavioralRecord: BehavioralRecord;
     try {
       behavioralRecord = await this.participationRecord(resolvedContextId, subjectDid);
@@ -4229,15 +4361,17 @@ export class SCP {
   // Domain: MCP
   // ───────────────────────────────────────────────────────────────────────
 
-  async mcpServerCreate(config: unknown): Promise<unknown> {
+  async mcpServerCreate(config: unknown): Promise<McpServer> {
     try {
-      return await (this.#native.mcpServerCreate as (c: unknown) => Promise<unknown>)(config);
+      const raw = await (this.#native.mcpServerCreate as (c: unknown) => Promise<unknown>)(config);
+      return McpServer._fromHandle(raw);
     } catch (err) {
       throw mapBridgeError(err);
     }
   }
 
-  async mcpServerStop(handle: unknown): Promise<void> {
+  async mcpServerStop(server: McpServer): Promise<void> {
+    const handle = mcpServerHandle("mcpServerStop", "server", server);
     try {
       await (this.#native.mcpServerStop as (h: unknown) => Promise<void>)(handle);
     } catch (err) {
@@ -4254,11 +4388,12 @@ export class SCP {
    * call {@link mcpConfigureStdioAllowlist} first; use
    * {@link mcpGetStdioAllowlist} to inspect the current state.
    */
-  async mcpClientConnectStdio(command: readonly string[]): Promise<unknown> {
+  async mcpClientConnectStdio(command: readonly string[]): Promise<McpClient> {
     try {
-      return await (
+      const raw = await (
         this.#native.mcpClientConnectStdio as (c: readonly string[]) => Promise<unknown>
       )(command);
+      return McpClient._fromHandle(raw);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -4271,17 +4406,19 @@ export class SCP {
    * (ADR-015). The transport has no TLS, so a token is sent only to a
    * loopback host.
    */
-  async mcpClientConnectSse(url: string, authToken: string | null): Promise<unknown> {
+  async mcpClientConnectSse(url: string, authToken: string | null): Promise<McpClient> {
     try {
-      return await (
+      const raw = await (
         this.#native.mcpClientConnectSse as (u: string, t: string | null) => Promise<unknown>
       )(url, authToken);
+      return McpClient._fromHandle(raw);
     } catch (err) {
       throw mapBridgeError(err);
     }
   }
 
-  async mcpClientDisconnect(handle: unknown): Promise<void> {
+  async mcpClientDisconnect(client: McpClient): Promise<void> {
+    const handle = mcpClientHandle("mcpClientDisconnect", "client", client);
     try {
       await (this.#native.mcpClientDisconnect as (h: unknown) => Promise<void>)(handle);
     } catch (err) {
@@ -4289,7 +4426,8 @@ export class SCP {
     }
   }
 
-  async mcpClientListTools(handle: unknown): Promise<readonly unknown[]> {
+  async mcpClientListTools(client: McpClient): Promise<readonly unknown[]> {
+    const handle = mcpClientHandle("mcpClientListTools", "client", client);
     try {
       return await (this.#native.mcpClientListTools as (h: unknown) => Promise<readonly unknown[]>)(
         handle,
@@ -4300,12 +4438,13 @@ export class SCP {
   }
 
   async mcpClientInvoke(
-    handle: unknown,
+    client: McpClient,
     outletName: string,
     inputJson: string,
     contextId: string,
     invokerDid: string,
   ): Promise<unknown> {
+    const handle = mcpClientHandle("mcpClientInvoke", "client", client);
     try {
       return await (
         this.#native.mcpClientInvoke as (
@@ -4368,144 +4507,6 @@ export class SCP {
   mcpGetStdioAllowlist(): McpAllowlistState {
     try {
       return (this.#native.mcpGetStdioAllowlist as () => McpAllowlistState)();
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  // ───────────────────────────────────────────────────────────────────────
-  // Domain: Fullstack (E2E test harness)
-  // ───────────────────────────────────────────────────────────────────────
-
-  fullstackCreateNode(did: string): unknown {
-    try {
-      return (this.#native.fullstackCreateNode as (d: string) => unknown)(did);
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  fullstackResetNetwork(): void {
-    try {
-      (this.#native.fullstackResetNetwork as () => void)();
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  fullstackCreateContext(node: unknown, contextId: string, ceilingJson: string): string {
-    try {
-      return (this.#native.fullstackCreateContext as (n: unknown, c: string, j: string) => string)(
-        node,
-        contextId,
-        ceilingJson,
-      );
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  fullstackAddMember(node: unknown, contextId: string, memberDid: string): void {
-    try {
-      (this.#native.fullstackAddMember as (n: unknown, c: string, m: string) => void)(
-        node,
-        contextId,
-        memberDid,
-      );
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  fullstackJoinFromWelcome(node: unknown, contextId: string): void {
-    try {
-      (this.#native.fullstackJoinFromWelcome as (n: unknown, c: string) => void)(node, contextId);
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  fullstackSyncSenderKeys(nodeA: unknown, nodeB: unknown, contextId: string): void {
-    try {
-      (this.#native.fullstackSyncSenderKeys as (a: unknown, b: unknown, c: string) => void)(
-        nodeA,
-        nodeB,
-        contextId,
-      );
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  fullstackSendMessage(node: unknown, contextId: string, payload: Uint8Array | Buffer): Uint8Array {
-    try {
-      const raw = (
-        this.#native.fullstackSendMessage as (
-          n: unknown,
-          c: string,
-          p: Uint8Array | Buffer,
-        ) => Uint8Array | Buffer
-      )(node, contextId, payload);
-      return new Uint8Array(raw);
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  fullstackDecryptMessage(
-    node: unknown,
-    contextId: string,
-    ciphertext: Uint8Array | Buffer,
-    senderDid: string,
-  ): Uint8Array {
-    try {
-      const raw = (
-        this.#native.fullstackDecryptMessage as (
-          n: unknown,
-          c: string,
-          ct: Uint8Array | Buffer,
-          s: string,
-        ) => Uint8Array | Buffer
-      )(node, contextId, ciphertext, senderDid);
-      return new Uint8Array(raw);
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  fullstackRemoveMember(node: unknown, contextId: string, memberDid: string): void {
-    try {
-      (this.#native.fullstackRemoveMember as (n: unknown, c: string, m: string) => void)(
-        node,
-        contextId,
-        memberDid,
-      );
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  /**
-   * Test-only: seed a peer's per-context pseudonym routing ID (§9.10.4) into a
-   * full-stack node's supervisor, simulating a delivered pseudonym
-   * announcement so multi-member encrypted sends do not fail closed with
-   * `SCP-CTX-2095`.
-   */
-  fullstackSeedPeerPseudonym(
-    node: unknown,
-    contextId: string,
-    peerDid: string,
-    pseudonym: Uint8Array | Buffer,
-  ): void {
-    try {
-      (
-        this.#native.fullstackSeedPeerPseudonym as (
-          n: unknown,
-          c: string,
-          p: string,
-          ps: Uint8Array | Buffer,
-        ) => void
-      )(node, contextId, peerDid, pseudonym);
     } catch (err) {
       throw mapBridgeError(err);
     }

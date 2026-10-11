@@ -46,6 +46,7 @@ import {
   validateBroadcastKeyHex,
   validateSiteConfig,
 } from "../src/types";
+import { mockContext } from "./mock-bridge";
 
 describe("Capability strings", () => {
   it("exposes canonical outlet capability constants", () => {
@@ -807,12 +808,16 @@ describe("SCP governance wrappers", () => {
 
   it("contextExecuteGovernanceAction returns a typed outcome", async () => {
     const scp = scpReturning("contextExecuteGovernanceAction", "MemberSuspended");
-    expect(await scp.contextExecuteGovernanceAction({}, "ab")).toBe("MemberSuspended");
+    expect(await scp.contextExecuteGovernanceAction(mockContext(scp), "ab")).toBe(
+      "MemberSuspended",
+    );
   });
 
   it("contextExecuteGovernanceAction throws SCP-GOV-11040 for an unknown outcome", async () => {
     const scp = scpReturning("contextExecuteGovernanceAction", "SomethingNew");
-    const err = await scp.contextExecuteGovernanceAction({}, "ab").catch((e: unknown) => e);
+    const err = await scp
+      .contextExecuteGovernanceAction(mockContext(scp), "ab")
+      .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(UnknownGovernanceOutcomeError);
     expect((err as UnknownGovernanceOutcomeError).code).toBe("SCP-GOV-11040");
   });
@@ -822,22 +827,22 @@ describe("SCP governance wrappers", () => {
     const cases: [string, (scp: SCP) => Promise<string>, string][] = [
       [
         "contextGovernancePropose",
-        (scp) => scp.contextGovernancePropose({}, "{}", "did:dht:zA"),
+        (scp) => scp.contextGovernancePropose(mockContext(scp), "{}", "did:dht:zA"),
         JSON.stringify({ status: "Approved", execution_result: "SomethingNew" }),
       ],
       [
         "contextGovernanceApprove",
-        (scp) => scp.contextGovernanceApprove({}, "ab", "did:dht:zA"),
+        (scp) => scp.contextGovernanceApprove(mockContext(scp), "ab", "did:dht:zA"),
         JSON.stringify({ status: "SomethingNew" }),
       ],
       [
         "contextGovernanceReject",
-        (scp) => scp.contextGovernanceReject({}, "ab", "did:dht:zA"),
+        (scp) => scp.contextGovernanceReject(mockContext(scp), "ab", "did:dht:zA"),
         JSON.stringify({ status: "SomethingNew" }),
       ],
       [
         "contextGovernanceWithdraw",
-        (scp) => scp.contextGovernanceWithdraw({}, "ab", "did:dht:zA"),
+        (scp) => scp.contextGovernanceWithdraw(mockContext(scp), "ab", "did:dht:zA"),
         JSON.stringify({ status: "SomethingNew" }),
       ],
     ];
@@ -894,24 +899,26 @@ describe("memberRoleFromBridge", () => {
 describe("SCP.contextMemberRole", () => {
   const scpReturning = (raw: string | null): SCP =>
     __constructScpWithNativeForTests({ contextMemberRole: async () => raw });
+  const roleFor = (raw: string | null) => {
+    const scp = scpReturning(raw);
+    return scp.contextMemberRole(mockContext(scp), "did:dht:zA");
+  };
 
   it("returns the parsed role", async () => {
-    expect(await scpReturning("author").contextMemberRole({}, "did:dht:zA")).toBe("Author");
-    expect(await scpReturning("subscriber").contextMemberRole({}, "did:dht:zA")).toBe("Subscriber");
-    expect(await scpReturning("night-shift-reviewer").contextMemberRole({}, "did:dht:zA")).toEqual({
+    expect(await roleFor("author")).toBe("Author");
+    expect(await roleFor("subscriber")).toBe("Subscriber");
+    expect(await roleFor("night-shift-reviewer")).toEqual({
       kind: "Custom",
       name: "night-shift-reviewer",
     });
   });
 
   it("returns null for a non-member", async () => {
-    expect(await scpReturning(null).contextMemberRole({}, "did:dht:zA")).toBeNull();
+    expect(await roleFor(null)).toBeNull();
   });
 
   it("throws SCP-GOV-11040 for a malformed role name", async () => {
-    const err = await scpReturning("Admin")
-      .contextMemberRole({}, "did:dht:zA")
-      .catch((e: unknown) => e);
+    const err = await roleFor("Admin").catch((e: unknown) => e);
     expect(err).toBeInstanceOf(UnknownGovernanceOutcomeError);
     expect((err as UnknownGovernanceOutcomeError).code).toBe("SCP-GOV-11040");
   });

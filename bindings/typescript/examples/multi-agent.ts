@@ -17,7 +17,7 @@ async function runAgent(
   identity: Identity,
   ctx: Context,
 ): Promise<void> {
-  await scp.contextJoin(ctx._rawHandle, identity.did, null);
+  await scp.contextJoin(ctx, identity.did, null);
   console.log(`[${name}] Joined context ${ctx.contextId}`);
 
   // Collect up to two inbound messages per agent. Subscription callbacks
@@ -28,7 +28,7 @@ async function runAgent(
     resolveDone = r;
   });
   let received = 0;
-  await scp.contextSubscribe(ctx._rawHandle, identity.did, (raw) => {
+  await scp.contextSubscribe(ctx, identity.did, (raw) => {
     const msg = raw as { senderDid?: string; payload?: number[] | Uint8Array };
     if (msg?.senderDid !== undefined && msg.payload !== undefined) {
       const bytes = msg.payload instanceof Uint8Array ? msg.payload : new Uint8Array(msg.payload);
@@ -44,7 +44,7 @@ async function runAgent(
   });
 
   await scp.contextSend(
-    ctx._rawHandle,
+    ctx,
     identity.did,
     new TextEncoder().encode(`[${name}] reporting in`),
     null,
@@ -57,8 +57,8 @@ async function runAgent(
     new Promise<void>((resolve) => setTimeout(resolve, 500)),
   ]);
 
-  scp.contextCancelSubscription(ctx._rawHandle);
-  await scp.contextLeave(ctx._rawHandle, identity.did);
+  scp.contextCancelSubscription(ctx);
+  await scp.contextLeave(ctx, identity.did);
   console.log(`[${name}] Left context`);
 }
 
@@ -92,8 +92,8 @@ async function main(): Promise<void> {
     console.log(`Context created: ${ctx.contextId}`);
 
     // Mint UCANs for each agent (capability delegation).
-    await scp.ucanMint(ctx._rawHandle, agentA.did, ["messages:write", "messages:read"]);
-    await scp.ucanMint(ctx._rawHandle, agentB.did, ["messages:write", "messages:read"]);
+    await scp.ucanMint(ctx, agentA.did, ["messages:write", "messages:read"]);
+    await scp.ucanMint(ctx, agentB.did, ["messages:write", "messages:read"]);
 
     // Run agents concurrently.
     await Promise.all([
@@ -101,7 +101,7 @@ async function main(): Promise<void> {
       runAgent("Agent-B", scp, agentB, ctx),
     ]);
 
-    await scp.contextClose(ctx._rawHandle, coordinator.did);
+    await scp.contextClose(ctx, coordinator.did);
   } finally {
     await scp.shutdown(5);
   }

@@ -31,12 +31,12 @@ async function main(): Promise<void> {
     );
     console.log(`Context ID: ${ctx.contextId}`);
 
-    await scp.contextJoin(ctx._rawHandle, bob.did, null);
+    await scp.contextJoin(ctx, bob.did, null);
 
     // Subscribe Bob to incoming messages BEFORE Alice sends so we don't
     // race the first payload.
     let received: { senderDid: string; payload: Uint8Array } | null = null;
-    await scp.contextSubscribe(ctx._rawHandle, bob.did, (raw) => {
+    await scp.contextSubscribe(ctx, bob.did, (raw) => {
       const msg = raw as { senderDid?: string; payload?: number[] | Uint8Array };
       if (msg?.senderDid !== undefined && msg.payload !== undefined) {
         const bytes = msg.payload instanceof Uint8Array ? msg.payload : new Uint8Array(msg.payload);
@@ -46,7 +46,7 @@ async function main(): Promise<void> {
 
     // Alice sends a message.
     await scp.contextSend(
-      ctx._rawHandle,
+      ctx,
       alice.did,
       new TextEncoder().encode("Hello Bob, this is Alice"),
       null,
@@ -60,8 +60,8 @@ async function main(): Promise<void> {
     }
 
     // Leave and close.
-    await scp.contextLeave(ctx._rawHandle, bob.did);
-    await scp.contextClose(ctx._rawHandle, alice.did);
+    await scp.contextLeave(ctx, bob.did);
+    await scp.contextClose(ctx, alice.did);
   } finally {
     // Graceful bridge shutdown — drains in-flight tasks within 5 seconds.
     await scp.shutdown(5);

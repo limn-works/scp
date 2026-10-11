@@ -14,6 +14,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import type { Context } from "../src/context";
 import {
   OutletError,
   SagaAbortedError,
@@ -24,7 +25,7 @@ import {
 import { defineOutletDefinition } from "../src/outlets";
 import type { SCP } from "../src/scp";
 import type { SagaResult } from "../src/types";
-import { type MockNativeScp, mountMockScp } from "./mock-bridge";
+import { type MockNativeScp, mockContext, mountMockScp } from "./mock-bridge";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -252,7 +253,7 @@ describe("scp.outletInvokeCrossContext", () => {
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
 
-    const outletId = await scp.outletRegister(targetHandle._rawHandle, {
+    const outletId = await scp.outletRegister(targetHandle, {
       name: "calculator",
       description: "Adds numbers",
       kind: "action",
@@ -262,8 +263,8 @@ describe("scp.outletInvokeCrossContext", () => {
     });
 
     const outputJson = await scp.outletInvokeCrossContext(
-      sourceHandle._rawHandle,
-      targetHandle._rawHandle,
+      sourceHandle,
+      targetHandle,
       outletId,
       '{"a": 1}',
       identity.did,
@@ -282,8 +283,8 @@ describe("scp.outletInvokeCrossContext", () => {
 
     await expect(
       scp.outletInvokeCrossContext(
-        sourceHandle._rawHandle,
-        targetHandle._rawHandle,
+        sourceHandle,
+        targetHandle,
         "outlet-test",
         "{}",
         identity.did,
@@ -298,7 +299,7 @@ describe("scp.outletInvokeCrossContext", () => {
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
 
-    const outletId = await scp.outletRegister(targetHandle._rawHandle, {
+    const outletId = await scp.outletRegister(targetHandle, {
       name: "deep-outlet",
       description: "Deep chain outlet",
       kind: "action",
@@ -308,8 +309,8 @@ describe("scp.outletInvokeCrossContext", () => {
     });
 
     const outputJson = await scp.outletInvokeCrossContext(
-      sourceHandle._rawHandle,
-      targetHandle._rawHandle,
+      sourceHandle,
+      targetHandle,
       outletId,
       "{}",
       identity.did,
@@ -327,8 +328,8 @@ describe("scp.outletInvokeCrossContext", () => {
 
     await expect(
       scp.outletInvokeCrossContext(
-        sourceHandle._rawHandle,
-        targetHandle._rawHandle,
+        sourceHandle,
+        targetHandle,
         "outlet-test",
         "{}",
         identity.did,
@@ -345,8 +346,8 @@ describe("scp.outletInvokeCrossContext", () => {
 
     await expect(
       scp.outletInvokeCrossContext(
-        sourceHandle._rawHandle,
-        targetHandle._rawHandle,
+        sourceHandle,
+        targetHandle,
         "outlet-test",
         "{}",
         identity.did,
@@ -361,12 +362,12 @@ describe("scp.outletInvokeCrossContext", () => {
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
 
-    await scp.contextClose(sourceHandle._rawHandle, identity.did);
+    await scp.contextClose(sourceHandle, identity.did);
 
     await expect(
       scp.outletInvokeCrossContext(
-        sourceHandle._rawHandle,
-        targetHandle._rawHandle,
+        sourceHandle,
+        targetHandle,
         "outlet-test",
         "{}",
         identity.did,
@@ -381,12 +382,12 @@ describe("scp.outletInvokeCrossContext", () => {
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
 
-    await scp.contextClose(targetHandle._rawHandle, identity.did);
+    await scp.contextClose(targetHandle, identity.did);
 
     await expect(
       scp.outletInvokeCrossContext(
-        sourceHandle._rawHandle,
-        targetHandle._rawHandle,
+        sourceHandle,
+        targetHandle,
         "outlet-test",
         "{}",
         identity.did,
@@ -420,24 +421,22 @@ describe("scp.outletInvokeCrossContextSaga", () => {
   });
 
   /** Creates source + target context handles and returns the dispatch args. */
-  async function handles(): Promise<{ did: string; source: unknown; target: unknown }> {
+  async function handles(): Promise<{ did: string; source: Context; target: Context }> {
     const identity = await scp.identityCreate("in_memory");
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
-    return { did: identity.did, source: sourceHandle._rawHandle, target: targetHandle._rawHandle };
+    return { did: identity.did, source: sourceHandle, target: targetHandle };
   }
 
   /** Invokes the saga with all-valid args, overriding only what a test cares about. */
   async function invoke(overrides: {
-    source?: unknown;
-    target?: unknown;
     timestampMs?: bigint;
     chainDepth?: number;
   }): Promise<SagaResult> {
     const { did, source, target } = await handles();
     return await scp.outletInvokeCrossContextSaga(
-      overrides.source ?? source,
-      overrides.target ?? target,
+      source,
+      target,
       did,
       "outlet-reg-1",
       '{"a":1}',
@@ -489,9 +488,9 @@ describe("scp.outletInvokeCrossContextSaga", () => {
   it("forwards all nine arguments to the native saga op in order", async () => {
     native.__stub("outletInvokeCrossContextSaga", async () => ({ sagaId: "ok" }));
 
-    // Opaque sentinel handles — the wrapper forwards them verbatim.
-    const source = { __h: "SRC" };
-    const target = { __h: "TGT" };
+    // Distinct contexts — the wrapper forwards their raw handles verbatim.
+    const source = mockContext(scp, "SRC");
+    const target = mockContext(scp, "TGT");
     // Distinct discriminating values for the four same-typed string params so a
     // positional swap (caller/outlet-reg/input/nonce) is caught, not masked by a
     // shared literal.
@@ -517,8 +516,8 @@ describe("scp.outletInvokeCrossContextSaga", () => {
     const call = native.__lastCall("outletInvokeCrossContextSaga");
     expect(call).toBeDefined();
     expect(call?.args).toEqual([
-      source,
-      target,
+      source._rawHandle,
+      target._rawHandle,
       callerDid,
       outletRegistrationId,
       inputJson,
@@ -647,7 +646,7 @@ describe("scp.outletSessionCreate", () => {
   it("creates a session and returns a session ID", async () => {
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, "{}");
-    const outletId = await scp.outletRegister(handle._rawHandle, {
+    const outletId = await scp.outletRegister(handle, {
       name: "stateful-outlet",
       description: "A stateful outlet",
       kind: "action",
@@ -656,7 +655,7 @@ describe("scp.outletSessionCreate", () => {
       operator: identity.did,
     });
 
-    const sessionId = await scp.outletSessionCreate(handle._rawHandle, outletId, "source-ctx-1");
+    const sessionId = await scp.outletSessionCreate(handle, outletId, "source-ctx-1");
     expect(typeof sessionId).toBe("string");
     expect(sessionId.length).toBeGreaterThan(0);
   });
@@ -664,7 +663,7 @@ describe("scp.outletSessionCreate", () => {
   it("creates a session with TTL", async () => {
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, "{}");
-    const outletId = await scp.outletRegister(handle._rawHandle, {
+    const outletId = await scp.outletRegister(handle, {
       name: "ttl-outlet",
       description: "TTL outlet",
       kind: "action",
@@ -673,12 +672,7 @@ describe("scp.outletSessionCreate", () => {
       operator: identity.did,
     });
 
-    const sessionId = await scp.outletSessionCreate(
-      handle._rawHandle,
-      outletId,
-      "source-ctx-1",
-      300,
-    );
+    const sessionId = await scp.outletSessionCreate(handle, outletId, "source-ctx-1", 300);
     expect(typeof sessionId).toBe("string");
   });
 
@@ -687,7 +681,7 @@ describe("scp.outletSessionCreate", () => {
     const handle = await scp.contextCreate(identity, "{}");
 
     await expect(
-      scp.outletSessionCreate(handle._rawHandle, "outlet-test", "source-ctx-1", -1),
+      scp.outletSessionCreate(handle, "outlet-test", "source-ctx-1", -1),
     ).rejects.toThrow(/SCP-VALID-7003/);
   });
 
@@ -696,7 +690,7 @@ describe("scp.outletSessionCreate", () => {
     const handle = await scp.contextCreate(identity, "{}");
 
     await expect(
-      scp.outletSessionCreate(handle._rawHandle, "outlet-test", "source-ctx-1", 1.5),
+      scp.outletSessionCreate(handle, "outlet-test", "source-ctx-1", 1.5),
     ).rejects.toThrow(/SCP-VALID-7003/);
   });
 });
@@ -719,7 +713,7 @@ describe("scp.outletSessionInvoke", () => {
   it("invokes an outlet within a session and returns result with call-count provenance", async () => {
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, "{}");
-    const outletId = await scp.outletRegister(handle._rawHandle, {
+    const outletId = await scp.outletRegister(handle, {
       name: "session-outlet",
       description: "A session outlet",
       kind: "action",
@@ -728,9 +722,9 @@ describe("scp.outletSessionInvoke", () => {
       operator: identity.did,
     });
 
-    const sessionId = await scp.outletSessionCreate(handle._rawHandle, outletId, "source-ctx-1");
+    const sessionId = await scp.outletSessionCreate(handle, outletId, "source-ctx-1");
     const outputJson = await scp.outletSessionInvoke(
-      handle._rawHandle,
+      handle,
       sessionId,
       '{"x": 42}',
       identity.did,
@@ -751,7 +745,7 @@ describe("scp.outletSessionInvoke", () => {
   it("increments call count across invocations", async () => {
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, "{}");
-    const outletId = await scp.outletRegister(handle._rawHandle, {
+    const outletId = await scp.outletRegister(handle, {
       name: "counter-outlet",
       description: "Counts calls",
       kind: "action",
@@ -760,11 +754,11 @@ describe("scp.outletSessionInvoke", () => {
       operator: identity.did,
     });
 
-    const sessionId = await scp.outletSessionCreate(handle._rawHandle, outletId, "source-ctx-1");
+    const sessionId = await scp.outletSessionCreate(handle, outletId, "source-ctx-1");
 
-    await scp.outletSessionInvoke(handle._rawHandle, sessionId, "{}", identity.did, "token");
+    await scp.outletSessionInvoke(handle, sessionId, "{}", identity.did, "token");
     const outputJson = await scp.outletSessionInvoke(
-      handle._rawHandle,
+      handle,
       sessionId,
       "{}",
       identity.did,
@@ -793,7 +787,7 @@ describe("scp.outletSessionClose", () => {
   it("closes a session successfully", async () => {
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, "{}");
-    const outletId = await scp.outletRegister(handle._rawHandle, {
+    const outletId = await scp.outletRegister(handle, {
       name: "closable-outlet",
       description: "Can be closed",
       kind: "action",
@@ -802,11 +796,11 @@ describe("scp.outletSessionClose", () => {
       operator: identity.did,
     });
 
-    const sessionId = await scp.outletSessionCreate(handle._rawHandle, outletId, "source-ctx-1");
-    await scp.outletSessionClose(handle._rawHandle, sessionId);
+    const sessionId = await scp.outletSessionCreate(handle, outletId, "source-ctx-1");
+    await scp.outletSessionClose(handle, sessionId);
 
     await expect(
-      scp.outletSessionInvoke(handle._rawHandle, sessionId, "{}", identity.did, "token"),
+      scp.outletSessionInvoke(handle, sessionId, "{}", identity.did, "token"),
     ).rejects.toThrow(/SCP-OUTLET-6018/);
   });
 
@@ -814,7 +808,7 @@ describe("scp.outletSessionClose", () => {
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, "{}");
 
-    await expect(scp.outletSessionClose(handle._rawHandle, "nonexistent-session")).rejects.toThrow(
+    await expect(scp.outletSessionClose(handle, "nonexistent-session")).rejects.toThrow(
       /SCP-OUTLET-6021/,
     );
   });

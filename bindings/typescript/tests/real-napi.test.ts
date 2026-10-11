@@ -17,7 +17,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Context } from "../src/context";
 import { ContextError } from "../src/errors";
+import type { BridgeContextHandle } from "../src/internal/bridge";
 import { __getNativeScp, SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 import type { BehavioralRecord, CapabilityRequirement, ParticipationProfile } from "../src/types";
@@ -862,7 +864,11 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
       const good = await napi.ucanMint(ctx, member.did, ["messages:read"]);
 
-      const result = await scpInstance.evaluateTrust(ctx, member.did, [good.encoded]);
+      const result = await scpInstance.evaluateTrust(
+        Context._fromHandle(scpInstance, ctx, admin.did),
+        member.did,
+        [good.encoded],
+      );
       // No grant-match challenge: a fresh, well-signed, in-ceiling token is
       // intrinsically valid on every stage.
       expect(result.capabilityValidation.tokensValid).toBe(true);
@@ -891,7 +897,11 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const parts = good.encoded.split(".");
       const forged = `${parts[0]}.${parts[1]}.${"A".repeat((parts[2] as string).length)}`;
 
-      const result = await scpInstance.evaluateTrust(ctx, member.did, [good.encoded, forged]);
+      const result = await scpInstance.evaluateTrust(
+        Context._fromHandle(scpInstance, ctx, admin.did),
+        member.did,
+        [good.encoded, forged],
+      );
       // Intrinsic validity per token, AND-combined: the good token passes every
       // stage; the forged one fails signatures — so the AND is false there while
       // tokensValid (both parse) stays true.
@@ -1052,7 +1062,10 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
       // evaluateTrust (handle-resolved contextId) RECEIVES the SAME record the
       // direct op returns — no client-side recomputation, no divergence.
-      const evaluated = await scpInstance.evaluateTrust(ctx, admin.did);
+      const evaluated = await scpInstance.evaluateTrust(
+        Context._fromHandle(scpInstance, ctx, admin.did),
+        admin.did,
+      );
       expect(evaluated.behavioralRecord).toEqual(adminRecord);
     });
 
@@ -1194,7 +1207,10 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
       // evaluateTrust on the same empty context (no Layer-1 tokens, so only the
       // Layer-2 empty-log fold is exercised) → graceful zeroed record.
-      const result = await scpInstance.evaluateTrust(emptyHandle, member.did);
+      const result = await scpInstance.evaluateTrust(
+        Context._fromHandle(scpInstance, emptyHandle as unknown as BridgeContextHandle, member.did),
+        member.did,
+      );
       const record = result.behavioralRecord;
       expect(record.subjectDid).toBe(member.did);
       expect(record.participationDurationSecs).toBe(0);
@@ -1232,13 +1248,21 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
       // Evaluate trust for Carol (a DIFFERENT subject than the token audience):
       // the audience check fails, so the structural-checks field is false.
-      const mismatch = await scpInstance.evaluateTrust(ctx, carol.did, [tokenForBob.encoded]);
+      const mismatch = await scpInstance.evaluateTrust(
+        Context._fromHandle(scpInstance, ctx, admin.did),
+        carol.did,
+        [tokenForBob.encoded],
+      );
       expect(mismatch.capabilityValidation.signaturesValid).toBe(false);
 
       // Control: evaluating the SAME token for its true audience (Bob) passes
       // the audience check — proving the false above is the mismatch, not an
       // unrelated failure.
-      const control = await scpInstance.evaluateTrust(ctx, bob.did, [tokenForBob.encoded]);
+      const control = await scpInstance.evaluateTrust(
+        Context._fromHandle(scpInstance, ctx, admin.did),
+        bob.did,
+        [tokenForBob.encoded],
+      );
       expect(control.capabilityValidation.signaturesValid).toBe(true);
     });
 

@@ -53,6 +53,8 @@
  * finding M-1 for the strict-by-default rationale.
  */
 
+import { Context } from "../src/context";
+import type { BridgeContextHandle } from "../src/internal/bridge";
 import { __constructScpWithNativeForTests, type SCP } from "../src/scp";
 
 // ---------------------------------------------------------------------------
@@ -402,3 +404,20 @@ export function mountMockScp(mockNativeScp?: MockNativeScp): {
 // supported mock path is `mountMockScp` which mounts the mock via
 // `__constructScpWithNativeForTests` at construction time so every class
 // method sees it.
+
+/**
+ * Builds a real {@link Context} around a fake raw handle, for tests whose
+ * native bridge is a mock that never reads the handle. The public `SCP`
+ * methods accept only a `Context` the SDK constructed, so a bare `{}` or a
+ * `{ contextId }` literal no longer reaches the mock; this helper constructs
+ * one through the same `Context._fromHandle` path `SCP.contextCreate` uses.
+ * The mock receives `ctx._rawHandle`, which is the `{ contextId }` object
+ * built here.
+ */
+export function mockContext(
+  scp: SCP,
+  contextId = "ctx-mock",
+  identityDid = "did:dht:z6MkMock",
+): Context {
+  return Context._fromHandle(scp, { contextId } as unknown as BridgeContextHandle, identityDid);
+}

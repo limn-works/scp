@@ -49,7 +49,7 @@ async function main(): Promise<void> {
 
     // 5. Create a second identity and have them join.
     const member = await scp.identityCreate("in_memory");
-    await scp.contextJoin(ctx._rawHandle, member.did, null);
+    await scp.contextJoin(ctx, member.did, null);
     console.log(`Member ${member.did} joined`);
 
     // 6. Admin proposes a governance action to change the member's role, then
@@ -61,7 +61,7 @@ async function main(): Promise<void> {
         ChangeRole: { did: member.did, new_role: "moderator" },
       });
       const proposeResult = await scp.contextGovernancePropose(
-        ctx._rawHandle,
+        ctx,
         action,
         admin.did,
       );
@@ -69,7 +69,7 @@ async function main(): Promise<void> {
       console.log(`Proposal created: ${proposalIdHex}`);
 
       const result = await scp.contextExecuteGovernanceAction(
-        ctx._rawHandle,
+        ctx,
         proposalIdHex,
       );
       console.log("Governance action result:", result);
@@ -78,7 +78,7 @@ async function main(): Promise<void> {
     }
 
     // 7. Cleanup.
-    await scp.contextClose(ctx._rawHandle, admin.did);
+    await scp.contextClose(ctx, admin.did);
     console.log("Context closed");
   } finally {
     if (relay !== null) {

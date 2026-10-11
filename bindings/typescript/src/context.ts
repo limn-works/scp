@@ -294,8 +294,8 @@ export class Context {
   /** The unique identifier for this context. */
   readonly contextId: string;
 
-  /** @internal Opaque bridge handle — not part of the public API. */
-  readonly _rawHandle: BridgeContextHandle;
+  /** The opaque bridge handle; private, so callers pass the `Context` itself. */
+  readonly #rawHandle: BridgeContextHandle;
 
   /** The DID of the identity that created/joined this context. */
   readonly identityDid: string;
@@ -314,9 +314,14 @@ export class Context {
     scp: SCP | null,
   ) {
     this.contextId = contextId;
-    this._rawHandle = rawHandle;
+    this.#rawHandle = rawHandle;
     this.identityDid = identityDid;
     this.#scp = scp;
+  }
+
+  /** @internal Opaque bridge handle — not part of the public API. */
+  get _rawHandle(): BridgeContextHandle {
+    return this.#rawHandle;
   }
 
   /**
@@ -325,13 +330,25 @@ export class Context {
    * The `scp` parameter is retained so the {@link outlets} accessor can
    * dispatch the §5.4.5 streaming ops to the owning SCP native bridge
    * (SCP-OUT-038); it is otherwise unused (all other lifecycle operations
-   * live as `SCP` methods that take `ctx._rawHandle`).
+   * live as `SCP` methods that take the `Context`).
    *
    * @internal Phase 4 PR 4 (#1549, ADR-048) — used by `SCP.contextCreate`
    *   and related forwarders.
    */
   static _fromHandle(scp: SCP, raw: BridgeContextHandle, identityDid: string): Context {
     return new Context(raw.contextId, raw, identityDid, scp);
+  }
+
+  /**
+   * Reports whether `value` is a `Context` this SDK constructed. The check
+   * reads a private field, so an object that copies a `Context`'s public
+   * fields, or one built from `Context.prototype`, does not pass.
+   *
+   * @internal Used by the `SCP` methods to reject a wrong argument with
+   *   `SCP-VALID-7005` before any bridge call.
+   */
+  static _isContext(value: unknown): value is Context {
+    return typeof value === "object" && value !== null && #scp in value;
   }
 
   /**
@@ -355,7 +372,7 @@ export class Context {
       );
     }
     const native = __getNativeScp(this.#scp) as unknown as OutletStreamNative;
-    return new Outlets(native, this._rawHandle, this.identityDid);
+    return new Outlets(native, this.#rawHandle, this.identityDid);
   }
 }
 
