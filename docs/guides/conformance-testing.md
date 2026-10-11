@@ -174,7 +174,7 @@ The `scp_testing::conformance::blob_store::test_helpers` module provides:
 crates/scp-testing/src/blob_store_tests.rs                -- InMemoryBlobStorage
 crates/scp-transport/tests/sqlite_blob_conformance.rs      -- SqliteBlobStore
 crates/scp-transport/tests/redb_blob_conformance.rs        -- RedbBlobStore
-crates/scp-transport/tests/local_cache_conformance.rs      -- LocalCacheBlobStore
+crates/scp-transport/tests/local_cache_conformance.rs      -- LocalBlobCache
 crates/scp-transport/tests/combined_conformance.rs         -- combined storage + blob store
 ```
 

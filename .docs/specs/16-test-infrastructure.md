@@ -1275,7 +1275,7 @@ macro_rules! push_conformance {
 /// Usage:
 /// ```rust
 /// #[cfg(test)]
-/// blob_store_conformance!(|| InMemoryBlobStore::new(clock.clone()));
+/// blob_store_conformance!(|| InMemoryBlobStorage::new(clock.clone()));
 /// ```
 #[macro_export]
 macro_rules! blob_store_conformance {

@@ -632,13 +632,13 @@ base_dir/
         00000000000000000001  # serialized event
 ```
 
-## 17.7 First-Party BlobStore Adapters (Relay/Server)
+## 17.7 First-Party BlobStorage Adapters (Relay/Server)
 
-Relay blob storage is a provider capability governed by the general capability-selection principle (§17.17): the backend selection is mandatory and fails closed (SCP-CAPSEL-8000/8001), the runtime never defaults it (SCP-CAPSEL-8002), and `InMemoryBlobStore` is a durability-only development arm (SCP-CAPSEL-8010/8011) — explicitly selectable, never a default or fallback, never the sole reachable arm in a shipped relay.
+Relay blob storage is a provider capability governed by the general capability-selection principle (§17.17): the backend selection is mandatory and fails closed (SCP-CAPSEL-8000/8001), the runtime never defaults it (SCP-CAPSEL-8002), and `InMemoryBlobStorage` is a durability-only development arm (SCP-CAPSEL-8010/8011) — explicitly selectable, never a default or fallback, never the sole reachable arm in a shipped relay.
 
 | Adapter | Backend | Good for | Ships in |
 |---------|---------|----------|----------|
-| `InMemoryBlobStore` | `HashMap` + secondary index | Testing, dev | Phase 1 (exists) |
+| `InMemoryBlobStorage` | `HashMap` + secondary index | Testing, dev | Phase 1 (exists) |
 | `SqliteBlobStore` | `rusqlite` | Personal relays, agent workstations, small deployments | Phase 2 |
 | `RedbBlobStore` | redb (pure Rust B-tree DB) | Medium relays, embedded scenarios | Phase 2 |
 | `PostgresBlobStore` | `sqlx` + PostgreSQL | Production/enterprise relays | Phase 5 |
@@ -866,7 +866,7 @@ storage_conformance!(|| MyCustomStorage::new());
 
 The conformance suite tests: store/retrieve roundtrip, missing key returns None, delete removes, list_keys with prefix filtering, list_keys returns sorted results, delete_prefix removes all matching keys, exists returns true/false correctly, and concurrent access safety.
 
-### Custom BlobStore Adapters
+### Custom BlobStorage Adapters
 
 Implement the 5 required async methods of the `BlobStorage` trait (`store`, `get`, `query`, `delete`, `purge_expired`). The 2 streaming methods (`store_streaming`, `get_streaming`) have default implementations that delegate to the `Vec<u8>` methods — override them only if your backend benefits from avoiding full materialization (see §17.7.1). Run the `blob_store_conformance!()` macro.
 

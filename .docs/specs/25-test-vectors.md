@@ -207,7 +207,7 @@ Verification vector:
   verdict:    accept
 ```
 
-## 25.5 Vote Signing Vectors (§6.4 [no such section])
+## 25.5 Vote Signing Vectors (§9.5.2)
 
 Domain: `"SCP-VOTE-V1:"`
 
@@ -623,7 +623,7 @@ Fingerprint:
 
 An implementation that concatenates the caller's own block first computes two different values for one honest pair and raises §9.11's maximum-severity MITM alert against an honest counterparty.
 
-## 25.11 Proposal ID Vectors (§6.4 [no such section])
+## 25.11 Proposal ID Vectors (§9.5.2)
 
 Domain: `"SCP-PROPOSAL-V1:"`
 
