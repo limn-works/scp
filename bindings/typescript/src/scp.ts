@@ -121,11 +121,19 @@ const NO_PARTICIPATION_FACTS_CODE = "SCP-CTX-2076";
  */
 export const CUSTODY_REQUIRED_CODE = "SCP-IDENT-1116";
 
-function custodyRequiredError(method: string): IdentityError {
+/** Remedy for a method whose custody argument is a {@link CustodyType}. */
+const CUSTODY_VALUE_REMEDY =
+  'pass "in_memory" (an addon built with the bridge\'s testing feature only), or call ' +
+  "identityCreateWithCustody() with a KeyCustodyProvider for any other key store";
+
+/** Remedy for a method whose custody argument is a {@link KeyCustodyProvider}. */
+const CUSTODY_PROVIDER_REMEDY =
+  "pass a KeyCustodyProvider, or call identityCreate() with a CustodyType " +
+  "to use a key store this SDK builds";
+
+function custodyRequiredError(method: string, remedy: string): IdentityError {
   return new IdentityError(
-    `${method}() requires a custody argument and this SDK names no default key store: ` +
-      'pass "in_memory" (an addon built with the bridge\'s testing feature only), or call ' +
-      "identityCreateWithCustody() with a KeyCustodyProvider for any other key store",
+    `${method}() requires a custody argument and this SDK names no default key store: ${remedy}`,
     CUSTODY_REQUIRED_CODE,
   );
 }
@@ -137,7 +145,7 @@ function custodyRequiredError(method: string): IdentityError {
  */
 function requireCustody(method: string, custody: unknown): void {
   if (custody === undefined || custody === null) {
-    throw custodyRequiredError(method);
+    throw custodyRequiredError(method, CUSTODY_VALUE_REMEDY);
   }
   if (typeof custody !== "string") {
     throw new ValidationError(
@@ -925,7 +933,7 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   /**
-   * Create a DID whose keys live in the key store `custody` names.
+   * Create an identity whose keys live in the key store `custody` names.
    *
    * `custody` is required and carries no default: which key store holds a
    * private key decides who can reach that key, so this SDK picks none for the
@@ -947,7 +955,7 @@ export class SCP {
   }
 
   /**
-   * Same as {@link SCP.identityCreate}, and the DID also carries an agent key.
+   * Same as {@link SCP.identityCreate}, and the identity also carries an agent key.
    *
    * @throws IdentityError `SCP-IDENT-1116` when `custody` is `undefined` or
    *   `null`, before any bridge call.
@@ -984,7 +992,7 @@ export class SCP {
    */
   async identityCreateWithCustody(provider: KeyCustodyProvider): Promise<Identity> {
     if (provider === undefined || provider === null) {
-      throw custodyRequiredError("identityCreateWithCustody");
+      throw custodyRequiredError("identityCreateWithCustody", CUSTODY_PROVIDER_REMEDY);
     }
     // Validate provider completeness up front. The byte-converting adapter
     // below always supplies all nine closures, so a provider missing a method

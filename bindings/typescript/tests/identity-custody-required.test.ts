@@ -18,6 +18,16 @@ const METHODS = [
 ] as const;
 type Method = (typeof METHODS)[number];
 
+/**
+ * The remedy each method's SCP-IDENT-1116 message must open with: the argument
+ * that method takes, never the other method's argument.
+ */
+const REMEDIES: Record<Method, string> = {
+  identityCreate: 'pass "in_memory"',
+  identityCreateWithAgentKey: 'pass "in_memory"',
+  identityCreateWithCustody: "pass a KeyCustodyProvider",
+};
+
 /** Calls `method` the way an untyped JavaScript caller would. */
 function callUntyped(scp: SCP, method: Method, ...args: unknown[]): Promise<unknown> {
   const fn = (scp as unknown as Record<Method, (...a: unknown[]) => Promise<unknown>>)[method];
@@ -54,7 +64,12 @@ describe("identity-creating methods require custody", () => {
 
         expect(err).toBeInstanceOf(IdentityError);
         expect((err as IdentityError).code).toBe("SCP-IDENT-1116");
-        expect((err as IdentityError).message).toContain(method);
+        const message = (err as IdentityError).message;
+        expect(message.startsWith(`${method}() requires a custody argument`)).toBe(true);
+        expect(message).toContain(`store: ${REMEDIES[method]}`);
+        for (const other of new Set(Object.values(REMEDIES))) {
+          if (other !== REMEDIES[method]) expect(message).not.toContain(other);
+        }
         expect(native.__calls(method)).toHaveLength(0);
       });
     }

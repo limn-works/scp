@@ -494,12 +494,23 @@ CustodyArg: TypeAlias = "CustodyType | Literal['file', 'in_memory']"
 CUSTODY_REQUIRED_CODE = "SCP-IDENT-1116"
 
 
-def _custody_required_error(method: str) -> IdentityError:
+#: Remedy for a method whose custody argument is a :data:`CustodyArg`.
+_CUSTODY_VALUE_REMEDY = (
+    "pass CustodyType.FILE (an encrypted key file) or CustodyType.IN_MEMORY "
+    "(a build carrying the bridge's testing feature only), or call "
+    "identity_create_with_custody() with a KeyCustodyProvider for any other key store"
+)
+
+#: Remedy for a method whose custody argument is a :class:`KeyCustodyProvider`.
+_CUSTODY_PROVIDER_REMEDY = (
+    "pass a KeyCustodyProvider, or call identity_create() with a CustodyType "
+    "to use a key store this SDK builds"
+)
+
+
+def _custody_required_error(method: str, remedy: str) -> IdentityError:
     return IdentityError(
-        f"{method}() requires a custody argument and this SDK names no default key "
-        "store: pass CustodyType.FILE (an encrypted key file) or CustodyType.IN_MEMORY "
-        "(a build carrying the bridge's testing feature only), or call "
-        "identity_create_with_custody() with a KeyCustodyProvider for any other key store",
+        f"{method}() requires a custody argument and this SDK names no default key store: {remedy}",
         CUSTODY_REQUIRED_CODE,
     )
 
@@ -526,25 +537,32 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 
-def _requires_custody(fn: Callable[_P, Awaitable[_R]]) -> Callable[_P, Awaitable[_R]]:
+def _requires_custody(
+    remedy: str,
+) -> Callable[[Callable[_P, Awaitable[_R]]], Callable[_P, Awaitable[_R]]]:
     """Raise ``SCP-IDENT-1116`` when the caller passes no custody, before ``fn`` runs.
 
-    ``fn`` is a method whose second parameter names the custody. The wrapper
-    keeps ``fn``'s signature for a type checker, which rejects the omission;
-    an untyped caller that omits the custody or passes ``None`` reaches the
+    ``fn`` is a method whose second parameter names the custody, and
+    ``remedy`` tells the caller what to pass there. The wrapper keeps
+    ``fn``'s signature for a type checker, which rejects the omission; an
+    untyped caller that omits the custody or passes ``None`` reaches the
     wrapper and gets ``SCP-IDENT-1116`` instead of Python's ``TypeError``,
     before any bridge call (SCP-294).
     """
-    custody_param = fn.__code__.co_varnames[1]
 
-    @functools.wraps(fn)
-    async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-        custody = args[1] if len(args) > 1 else kwargs.get(custody_param)
-        if custody is None:
-            raise _custody_required_error(fn.__name__)
-        return await fn(*args, **kwargs)
+    def decorate(fn: Callable[_P, Awaitable[_R]]) -> Callable[_P, Awaitable[_R]]:
+        custody_param = fn.__code__.co_varnames[1]
 
-    return wrapper
+        @functools.wraps(fn)
+        async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            custody = args[1] if len(args) > 1 else kwargs.get(custody_param)
+            if custody is None:
+                raise _custody_required_error(fn.__name__, remedy)
+            return await fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorate
 
 
 class SCP:
@@ -894,9 +912,9 @@ class SCP:
             )
         return await asyncio.to_thread(self._native.identity_attest_device, identity_did)
 
-    @_requires_custody
+    @_requires_custody(_CUSTODY_VALUE_REMEDY)
     async def identity_create(self, custody: CustodyArg) -> Any:
-        """Create a DID whose keys live in the key store ``custody`` names.
+        """Create an identity whose keys live in the key store ``custody`` names.
 
         Delegate to ``_scp_core.SCP.identity_create`` and return an
         :class:`Identity`. ``custody`` is required and carries no default:
@@ -915,7 +933,7 @@ class SCP:
         raw = await asyncio.to_thread(self._native.identity_create, custody_str)
         return Identity(raw)
 
-    @_requires_custody
+    @_requires_custody(_CUSTODY_VALUE_REMEDY)
     async def identity_create_with_agent_key(self, custody: CustodyArg) -> Any:
         """Delegate to ``_scp_core.SCP.identity_create_with_agent_key``.
 
@@ -933,7 +951,7 @@ class SCP:
         raw = await asyncio.to_thread(self._native.identity_create_with_agent_key, custody_str)
         return Identity(raw)
 
-    @_requires_custody
+    @_requires_custody(_CUSTODY_PROVIDER_REMEDY)
     async def identity_create_with_custody(self, provider: KeyCustodyProvider) -> Any:
         """Create a DID whose key material lives in a caller-provided custody.
 

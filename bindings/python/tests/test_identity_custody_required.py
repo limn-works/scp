@@ -21,6 +21,14 @@ from scp_sdk.scp import CUSTODY_REQUIRED_CODE, SCP
 from scp_sdk.types import CustodyType
 
 METHODS = ("identity_create", "identity_create_with_agent_key", "identity_create_with_custody")
+
+#: The remedy each method's SCP-IDENT-1116 message must open with: the
+#: argument that method takes, never the other method's argument.
+REMEDIES = {
+    "identity_create": "pass CustodyType.FILE",
+    "identity_create_with_agent_key": "pass CustodyType.FILE",
+    "identity_create_with_custody": "pass a KeyCustodyProvider",
+}
 SDK_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -51,7 +59,11 @@ async def test_absent_custody_raises_ident_1116_before_any_bridge_call(
         await getattr(scp, method)(*args)
 
     assert excinfo.value.code == "SCP-IDENT-1116"
-    assert method in excinfo.value.message
+    message = excinfo.value.message
+    assert message.startswith(f"{method}() requires a custody argument")
+    assert f"store: {REMEDIES[method]}" in message
+    for other in set(REMEDIES.values()) - {REMEDIES[method]}:
+        assert other not in message
     getattr(native, method).assert_not_called()
 
 
