@@ -39,7 +39,7 @@ export SCP_KEY_PASSPHRASE=...      # seals $HOME/.scp/keys.bin
 export SCP_STORAGE_PASSPHRASE=...  # encrypts the SQLCipher database
 ```
 
-`CustodyType.IN_MEMORY` works only in a build compiled with the `testing` feature; a shipped build rejects it with `SCP-IDENT-1008`.
+A build without the bridge's `testing` feature has no pre-rotation custody backend and raises `SCP-IDENT-1059` for `CustodyType.ENCRYPTED_FILE`.
 
 Run the commands below from `templates/chat/python`.
 

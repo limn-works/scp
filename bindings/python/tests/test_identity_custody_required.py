@@ -21,6 +21,7 @@ from scp_sdk.errors import IdentityError, ValidationError
 from scp_sdk.scp import CUSTODY_REQUIRED_CODE, SCP
 from scp_sdk.types import CustodyType
 from tests._native_doubles import native_identity
+from tests.harness_custody import create_in_memory_identity
 
 METHODS = ("identity_create", "identity_create_with_agent_key", "identity_create_with_custody")
 
@@ -49,14 +50,11 @@ def test_code_is_ident_1116() -> None:
     assert CUSTODY_REQUIRED_CODE == "SCP-IDENT-1116"
 
 
-def test_custody_type_carries_the_request_vocabulary() -> None:
-    # Spec 03 section 3.2.2's two request values, plus the testing-build
-    # affordance in_memory.
-    assert {member.value for member in CustodyType} == {
-        "encrypted_file",
-        "os_keystore",
-        "in_memory",
-    }
+def test_custody_type_carries_the_two_request_values_and_nothing_else() -> None:
+    # Spec 03 section 3.2.2: an SDK's custody type carries encrypted_file and
+    # os_keystore and no other member; the testing-build affordance in_memory
+    # stays outside it.
+    assert {member.value for member in CustodyType} == {"encrypted_file", "os_keystore"}
     assert CustodyType.ENCRYPTED_FILE.value == "encrypted_file"
     assert CustodyType.OS_KEYSTORE.value == "os_keystore"
 
@@ -100,7 +98,6 @@ async def test_non_string_custody_raises_valid_7005_before_any_bridge_call(metho
     [
         (CustodyType.ENCRYPTED_FILE, "encrypted_file"),
         (CustodyType.OS_KEYSTORE, "os_keystore"),
-        (CustodyType.IN_MEMORY, "in_memory"),
         ("encrypted_file", "encrypted_file"),
     ],
 )
@@ -180,10 +177,12 @@ async def test_encrypted_file_creates_an_identity_reporting_encrypted_file(
 
 
 @pytest.mark.asyncio
-async def test_in_memory_creates_an_identity_reporting_in_memory(scp: SCP) -> None:
-    identity = await scp.identity_create(CustodyType.IN_MEMORY)
+async def test_in_memory_harness_creates_an_identity_reporting_the_raw_string(scp: SCP) -> None:
+    # No CustodyType member names in_memory, so Identity.custody_type returns
+    # the raw string the testing bridge reports.
+    identity = await create_in_memory_identity(scp)
 
-    assert identity.custody_type is CustodyType.IN_MEMORY
+    assert identity.custody_type == "in_memory"
 
 
 @pytest.mark.asyncio

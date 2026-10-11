@@ -388,10 +388,11 @@ All SDKs provide structured errors with machine-readable error codes. Error code
 ```python
 from scp_sdk import IdentityError
 
+custody = None  # for example, a setting nobody filled in
 try:
-    await scp.identity_create(CustodyType.IN_MEMORY)
+    await scp.identity_create(custody)
 except IdentityError as e:
-    print(f"[{e.code}] {e}")  # SCP-IDENT-1008 in a shipped build
+    print(f"[{e.code}] {e}")  # SCP-IDENT-1116: no custody named
 ```
 
 ### TypeScript

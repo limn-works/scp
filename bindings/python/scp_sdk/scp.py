@@ -584,7 +584,7 @@ def _to_invite_outcome(raw: Any) -> InviteMemberOutcome:
 #: The custody argument an identity-creating method takes: a
 #: :class:`~scp_sdk.types.CustodyType` member or the request value it carries
 #: (spec 03 section 3.2.2).
-CustodyArg: TypeAlias = "CustodyType | Literal['encrypted_file', 'os_keystore', 'in_memory']"
+CustodyArg: TypeAlias = "CustodyType | Literal['encrypted_file', 'os_keystore']"
 
 #: Code raised when an identity-creating method receives no custody argument.
 CUSTODY_REQUIRED_CODE = "SCP-IDENT-1116"
@@ -624,8 +624,7 @@ def _custody_string(method: str, custody: object) -> str:
         return custody
     raise ValidationError(
         f"{method}() custody must be a CustodyType or one of 'encrypted_file', "
-        f"'os_keystore', 'in_memory'; "
-        f"got {type(custody).__name__}",
+        f"'os_keystore'; got {type(custody).__name__}",
         "SCP-VALID-7005",
     )
 

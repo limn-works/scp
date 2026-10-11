@@ -35,6 +35,9 @@ class CustodyType(enum.Enum):
     vocabulary, ``"platform"``, ``"software"``, ``"file"`` and ``"callback"``
     included, with ``SCP-VALID-7005``, and falls back to no other backend.
 
+    The type has two members, ``ENCRYPTED_FILE`` and ``OS_KEYSTORE``, and no
+    other (spec 03 section 3.2.2).
+
     No SDK method defaults custody: the caller names the key store, and a call
     that passes none raises ``IdentityError`` carrying ``SCP-IDENT-1116``
     before any bridge call (SCP-294).
@@ -46,8 +49,6 @@ class CustodyType(enum.Enum):
       vocabulary.
     - ``IdentityError`` with ``SCP-IDENT-1003`` for ``OS_KEYSTORE`` without a
       provider.
-    - ``IdentityError`` with ``SCP-IDENT-1008`` for ``IN_MEMORY`` on a build
-      without the bridge's ``testing`` feature.
     - ``ValidationError`` with ``SCP-VALID-7001`` for ``ENCRYPTED_FILE`` when
       ``HOME`` is unset, empty or relative, or ``SCP_KEY_PASSPHRASE`` is unset
       or empty.
@@ -71,10 +72,6 @@ class CustodyType(enum.Enum):
     #: hardware backing.  The class docstring lists the errors the bridge raises
     #: for it on each build.
     OS_KEYSTORE = "os_keystore"
-    #: An in-memory key store that loses every key when the process exits.  The
-    #: bridge builds it only in a build carrying its ``testing`` feature; a
-    #: shipped build raises ``SCP-IDENT-1008``.
-    IN_MEMORY = "in_memory"
 
 
 class ContextMode(enum.Enum):

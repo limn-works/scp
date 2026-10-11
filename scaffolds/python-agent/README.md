@@ -26,8 +26,8 @@ python main.py
 3. Opens an encrypted single-admin context
 4. Shuts the instance down when the `async with` block exits
 
-`CustodyType.IN_MEMORY` works only in a build compiled with the `testing`
-feature; a shipped build rejects it with `SCP-IDENT-1008`.
+A build without the bridge's `testing` feature has no pre-rotation custody
+backend and raises `SCP-IDENT-1059` for `CustodyType.ENCRYPTED_FILE`.
 
 ## Next Steps
 

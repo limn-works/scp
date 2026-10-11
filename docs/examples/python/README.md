@@ -73,10 +73,9 @@ failing with `SCP-CTX-2095` (#2856).
 - **Custody is required**: `identity_create` takes a `CustodyType` and has no
   default. `CustodyType.ENCRYPTED_FILE` keeps keys in the encrypted key file; a
   build without the bridge's `testing` feature has no pre-rotation custody
-  backend and raises `SCP-IDENT-1059` for it.
-  `CustodyType.IN_MEMORY` works only in a build compiled with the `testing`
-  feature; a shipped build rejects it with `SCP-IDENT-1008`. To hold keys in
-  your own store, pass a `KeyCustodyProvider` to `identity_create_with_custody`.
+  backend and raises `SCP-IDENT-1059` for it. To hold keys in the host's key
+  store, pass a `KeyCustodyProvider` to `identity_create_with_custody`
+  (`CustodyType.OS_KEYSTORE`).
 - **Enum types**: use `CustodyType`, `Capability`, `MemoryScope` and `OutletKind`
   in place of raw strings.
 - **UCAN authorization**: invoking a Query outlet requires a UCAN token that

@@ -7,9 +7,10 @@ unable to run fails here. The child process is the reader's shell: each block
 ends in ``asyncio.run(main())``, which cannot run inside the event loop
 pytest-asyncio owns.
 
-Both blocks use in-memory storage, and the quick start uses
-``CustodyType.IN_MEMORY``; only a ``testing`` build accepts them, and every SDK
-test run builds the extension with that feature.
+Both blocks use in-memory storage, which only a ``testing`` build accepts, and
+every SDK test run builds the extension with that feature. The quick start uses
+``CustodyType.ENCRYPTED_FILE``, so the child runs with ``HOME`` set to the test's
+scratch directory and ``SCP_KEY_PASSPHRASE`` set, and the key file lands there.
 """
 
 from __future__ import annotations
@@ -56,6 +57,8 @@ def run_readme_block(heading: str, tmp_path: Path) -> subprocess.CompletedProces
     script = tmp_path / "readme_block.py"
     script.write_text(extract_block(_README.read_text(), heading))
     env = dict(os.environ)
+    env["HOME"] = str(tmp_path)
+    env["SCP_KEY_PASSPHRASE"] = "readme-quickstart-test-passphrase"
     env["PYTHONPATH"] = os.pathsep.join(
         [str(_PACKAGE_ROOT), *filter(None, [env.get("PYTHONPATH")])]
     )
@@ -88,6 +91,7 @@ def test_readme_quickstart_runs(tmp_path: Path) -> None:
     assert "DID: did:" in result.stdout, f"no DID in output: {result.stdout!r}"
     assert "Context: " in result.stdout, f"no context in output: {result.stdout!r}"
     assert "(active)" in result.stdout, f"the context is not active: {result.stdout!r}"
+    assert (tmp_path / ".scp" / "keys.bin").is_file(), "the encrypted key file was not written"
 
 
 def test_readme_error_handling_catches_the_typed_error(tmp_path: Path) -> None:
