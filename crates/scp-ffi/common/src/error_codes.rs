@@ -55,13 +55,12 @@ pub const IDENT_1000: &str = "SCP-IDENT-1000";
 pub const IDENT_1001: &str = "SCP-IDENT-1001";
 /// Identity not found.
 pub const IDENT_1002: &str = "SCP-IDENT-1002";
-/// Identity already exists.
+/// Custody string reaches no key store on this bridge (SCP-294).
 ///
-/// Also the code every bridge returns when a caller names a custody string
-/// that reaches no key store on that bridge (SCP-294): `"platform"` on all
-/// three bridges, `"software"` on the NAPI and `UniFFI` bridges, and
-/// `"callback"` on the `UniFFI` bridge. A `testing_seed` passed with such a
-/// string is reported first, as [`VALID_7009`].
+/// Every bridge returns this code when a caller names such a string:
+/// `"platform"` on all three bridges, `"software"` on the NAPI and `UniFFI`
+/// bridges, and `"callback"` on the `UniFFI` bridge. A `testing_seed` passed
+/// with such a string is reported first, as [`VALID_7009`].
 pub const IDENT_1003: &str = "SCP-IDENT-1003";
 /// Identity key generation failed.
 pub const IDENT_1004: &str = "SCP-IDENT-1004";
