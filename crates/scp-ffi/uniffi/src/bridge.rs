@@ -29184,9 +29184,13 @@ mod tests {
     enum HostFault {
         None,
         /// `derive_pseudonym` returns the 32-byte Ed25519 key of a legacy host.
+        /// Only tests that mint an identity reach a pseudonym derivation, and
+        /// minting needs `testing` (a shipped build has no pre-rotation backend).
+        #[cfg(feature = "testing")]
         Legacy32,
         /// `derive_pseudonym` returns the §25.19 Vector 30 v1 point, whatever
         /// the identity, as a host holding the Vector 30 identity would.
+        #[cfg(feature = "testing")]
         Vector30,
         /// `sign` fails with the generic `SCP-CRYPTO-4001`, which is not the
         /// key-not-found code.
@@ -29197,6 +29201,7 @@ mod tests {
 
     /// The §25.19 Vector 30 v1 point (`context_id` = "context-alpha"), copied
     /// verbatim from the spec.
+    #[cfg(feature = "testing")]
     const VECTOR_30_V1_POINT: &str =
         "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72";
 
@@ -29241,6 +29246,7 @@ mod tests {
                 epoch,
             ));
             let sk = self.key_for(key_id)?;
+            #[cfg(feature = "testing")]
             match self.fault {
                 HostFault::Legacy32 => return Ok(sk.verifying_key().to_bytes().to_vec()),
                 HostFault::Vector30 => {

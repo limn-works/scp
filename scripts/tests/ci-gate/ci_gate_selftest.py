@@ -8363,6 +8363,96 @@ def run_filter_source(inputs: Inputs) -> None:
     check_filter_key_agreement_detects_a_rename(documents)
 
 
+# CRITERION: each job here lints and tests EVERY target of each package paired
+# with it in a build that leaves that package's `testing` feature off: one
+# `cargo clippy` over `--all-targets` that denies warnings, and one `cargo
+# test`/`cargo nextest run` carrying no name filter. Every other clippy and
+# test lane enables `testing`, and the filtered commands
+# check_shipped_build_assertions_run reads select a handful of tests by name,
+# so a test helper only `testing`-gated tests construct (dead code in this
+# configuration, which `-D warnings` rejects) and a test needing `testing`
+# that carries no gate both reached main with every lane green.
+SHIPPED_CONFIG_FULL_RUN_LANES = {
+    "rust-build-uniffi-production": {"scp-ffi-uniffi"},
+}
+
+
+def shipped_config_full_run_gaps(job: dict, package: str) -> list[str]:
+    """Return what `job` lacks of a full lint and test run over `package` with
+    `testing` off; an empty list means it has both.
+    """
+
+    def testing_off(tokens: list[str]) -> bool:
+        return (
+            command_covers_package(tokens, package)
+            and not command_enables_testing(tokens, package)
+            and command_unifies_testing(tokens, package) is None
+        )
+
+    lints = tests = False
+    for step in job.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        for line in logical_lines(step.get("run") or ""):
+            tokens = split_command(line)
+            if line.startswith("cargo clippy ") and testing_off(tokens):
+                after = tokens[tokens.index("--") + 1 :] if "--" in tokens else []
+                denies = any(
+                    after[i : i + 2] == ["-D", "warnings"] for i in range(len(after))
+                )
+                lints = lints or ("--all-targets" in tokens and denies)
+    for tokens in cargo_test_commands(job):
+        unfiltered = not ({"-E", "--filter-expr"} & set(tokens)) and not (
+            positional_filters(" ".join(tokens))
+        )
+        tests = tests or (unfiltered and testing_off(tokens))
+    gaps = []
+    if not lints:
+        gaps.append(
+            f"no `cargo clippy -p {package} --all-targets … -- -D warnings` with "
+            f"`testing` off"
+        )
+    if not tests:
+        gaps.append(f"no unfiltered `cargo test -p {package}` with `testing` off")
+    return gaps
+
+
+def check_shipped_config_full_runs(jobs: dict) -> None:
+    """Each SHIPPED_CONFIG_FULL_RUN_LANES job lints and tests every target of
+    its packages with `testing` off. The criterion sits at the table.
+    """
+    # A case that must fail: a job running only the build and a filtered
+    # nextest command, the shape job rust-build-uniffi-production had when a
+    # dead test helper and an ungated `testing` test reached main.
+    filtered_only = {
+        "steps": [
+            {"run": "cargo build -p scp-ffi-uniffi --features server"},
+            {
+                "run": "cargo nextest run --no-tests=fail -p scp-ffi-uniffi "
+                "--features server --lib -E 'test(one)'"
+            },
+            {
+                "run": "cargo clippy -p scp-ffi-uniffi --all-targets "
+                "--features scp-ffi-uniffi/testing -- -D warnings"
+            },
+        ]
+    }
+    check(
+        "a lane with only a filtered test run and a `testing` clippy has two gaps",
+        len(shipped_config_full_run_gaps(filtered_only, "scp-ffi-uniffi")) == 2,
+        f"returned {shipped_config_full_run_gaps(filtered_only, 'scp-ffi-uniffi')}",
+    )
+    for job_id, packages in sorted(SHIPPED_CONFIG_FULL_RUN_LANES.items()):
+        for package in sorted(packages):
+            # Looked up by key so a renamed job raises rather than passing.
+            gaps = shipped_config_full_run_gaps(jobs[job_id], package)
+            check(
+                f"{job_id} lints and tests every {package} target with `testing` off",
+                not gaps,
+                "; ".join(gaps),
+            )
+
+
 def run_shipped_config(inputs: Inputs) -> None:
     jobs = inputs.jobs
     print(
@@ -8373,6 +8463,7 @@ def run_shipped_config(inputs: Inputs) -> None:
     check_testing_unification_readers()
     check_shipped_build_assertions_run(jobs)
     check_shipped_assertion_tripwires(jobs)
+    check_shipped_config_full_runs(jobs)
 
 
 def run_zero_test(inputs: Inputs) -> None:
