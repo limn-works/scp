@@ -889,29 +889,6 @@
             }
         }
 
-        /// The ids of every SCP key item whose cached public key is
-        /// `publicKey`, read from the Keychain attributes alone.
-        private func keyIds(cachingPublicKey publicKey: Data) -> [String] {
-            let query: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecReturnAttributes as String: true,
-                kSecMatchLimit as String: kSecMatchLimitAll
-            ]
-            var result: AnyObject?
-            guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-                  let items = result as? [[String: Any]]
-            else { return [] }
-            let cached = publicKey.base64EncodedString()
-            return items.compactMap { attrs in
-                guard let account = attrs[kSecAttrAccount as String] as? String,
-                      account.hasPrefix("scp.key."),
-                      let label = attrs[kSecAttrLabel as String] as? String,
-                      label.contains(cached)
-                else { return nil }
-                return String(account.dropFirst("scp.key.".count))
-            }
-        }
-
         /// The adapter itself is the provider: `identityCreateWithCustody`
         /// mints the identity key through it, and the key it reports is the
         /// one the Keychain holds in the identity role.
@@ -921,7 +898,7 @@
             let identity = try await scp.identityCreateWithCustody(provider: adapter)
             #expect(identity.custodyType() == "os_keystore")
             let verifyingKey = try hexToData(#require(identity.verifyingKey()))
-            let matches = keyIds(cachingPublicKey: verifyingKey)
+            let matches = try adapter.keyIds(cachingPublicKey: verifyingKey)
             #expect(matches.count == 1, "exactly one Keychain item holds the identity key")
             for keyId in matches {
                 let reported = try await provider.getPublicKey(keyId: keyId)
@@ -931,6 +908,28 @@
                 try await provider.destroyKey(keyId: keyId)
             }
             try await scp.shutdown(timeoutMillis: 1000)
+        }
+
+        /// The JSON label escapes `/` as `\/`, so a lookup that matched the
+        /// label text missed every key whose base64 form holds a `/`.
+        @Test("keyIds finds a key whose base64 public key contains a slash")
+        func keyIdsFindsSlashBearingKey() async throws {
+            var minted: [String] = []
+            var target: (keyId: String, publicKey: Data)?
+            for _ in 0 ..< 64 where target == nil {
+                let keyId = try await provider.generateKeypair(keyType: .ed25519, role: .operational)
+                minted.append(keyId)
+                let publicKey = try await provider.getPublicKey(keyId: keyId).publicKey
+                if publicKey.base64EncodedString().contains("/") {
+                    target = (keyId, publicKey)
+                }
+            }
+            let found = try #require(target, "64 random keys all lacked a slash in base64")
+            #expect(try adapter.keyIds(cachingPublicKey: found.publicKey) == [found.keyId])
+            for keyId in minted {
+                try await provider.destroyKey(keyId: keyId)
+            }
+            #expect(try adapter.keyIds(cachingPublicKey: found.publicKey).isEmpty)
         }
 
         @Test("custodyType reports unknown for an id the Keychain does not hold under a biometric policy")

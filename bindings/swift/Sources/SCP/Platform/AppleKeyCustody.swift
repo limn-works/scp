@@ -202,6 +202,8 @@ private nonisolated enum KeyRole: String {
 /// - `kSecAttrAccount`: `"scp.key.<id>"` where `<id>` is the key id.
 /// - `kSecAttrLabel`: JSON-encoded ``KeyMetadata`` (type, role and cached
 ///   public key).
+/// - `kSecAttrGeneric`: the raw public key bytes, so a key is found by its
+///   public key with an exact-match query.
 /// - `kSecAttrAccessGroup`: `"\(appIdentifierPrefix).dev.limn.scp"`.
 /// - `kSecAttrAccessible`: `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`.
 /// - `kSecValueData`: 32-byte raw private key bytes.
@@ -268,8 +270,11 @@ public final class AppleKeyCustody: Sendable {
 
     /// Returns the `kSecAttrAccount` value for a key handle.
     private nonisolated func account(for handle: String) -> String {
-        "scp.key.\(handle)"
+        Self.accountPrefix + handle
     }
+
+    /// The `kSecAttrAccount` prefix every SCP key item carries.
+    private nonisolated static let accountPrefix = "scp.key."
 
     // MARK: - Initialization
 
@@ -307,14 +312,70 @@ public final class AppleKeyCustody: Sendable {
     /// All operations (add, fetch, delete) start from this base and extend it
     /// with operation-specific keys.
     private nonisolated func baseQuery(for handle: String) -> [String: Any] {
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: account(for: handle)
-        ]
+        var query = itemQuery()
+        query[kSecAttrAccount as String] = account(for: handle)
+        return query
+    }
+
+    /// The class and access group every SCP key item is stored under.
+    private nonisolated func itemQuery() -> [String: Any] {
+        var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword]
         if let group = accessGroup {
             query[kSecAttrAccessGroup as String] = group
         }
         return query
+    }
+
+    /// Decodes the ``KeyMetadata`` label from a Keychain attribute dictionary.
+    private nonisolated static func metadata(from attrs: [String: Any]) -> KeyMetadata? {
+        guard
+            let labelString = attrs[kSecAttrLabel as String] as? String,
+            let labelData = labelString.data(using: .utf8)
+        else { return nil }
+        return try? JSONDecoder().decode(KeyMetadata.self, from: labelData)
+    }
+
+    /// The ids of every key item this adapter holds whose cached public key
+    /// is `publicKey`.
+    ///
+    /// Matches `kSecAttrGeneric`, which generation sets to the public key,
+    /// so the Keychain answers an exact-match query instead of enumerating
+    /// every item; an unfiltered `kSecMatchLimitAll` search on the macOS
+    /// file keychain ends early when another thread deletes an item mid-scan.
+    /// Each match is confirmed against the public key in its decoded
+    /// ``KeyMetadata`` label. Reads attributes only, so a biometric-gated
+    /// item raises no prompt.
+    ///
+    /// - Throws: ``PlatformError/keychainError(_:)`` for any Keychain failure
+    ///   other than finding no items.
+    nonisolated func keyIds(cachingPublicKey publicKey: Data) throws -> [String] {
+        var query = itemQuery()
+        query[kSecAttrGeneric as String] = publicKey as CFData
+        query[kSecReturnAttributes as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitAll
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        switch status {
+        case errSecSuccess:
+            break
+        case errSecItemNotFound:
+            return []
+        default:
+            throw PlatformError.keychainError(status)
+        }
+        guard let items = result as? [[String: Any]] else {
+            throw PlatformError.custodyError("Keychain returned no attribute list")
+        }
+        return items.compactMap { attrs in
+            guard
+                let account = attrs[kSecAttrAccount as String] as? String,
+                account.hasPrefix(Self.accountPrefix),
+                let cached = Self.metadata(from: attrs)?.publicKeyBase64,
+                Data(base64Encoded: cached) == publicKey
+            else { return nil }
+            return String(account.dropFirst(Self.accountPrefix.count))
+        }
     }
 
     /// Reads the full ``KeyMetadata`` for `handle` from Keychain attributes.
@@ -333,9 +394,7 @@ public final class AppleKeyCustody: Sendable {
         case errSecSuccess:
             guard
                 let attrs = result as? [String: Any],
-                let labelString = attrs[kSecAttrLabel as String] as? String,
-                let labelData = labelString.data(using: .utf8),
-                let metadata = try? JSONDecoder().decode(KeyMetadata.self, from: labelData)
+                let metadata = Self.metadata(from: attrs)
             else {
                 throw PlatformError.custodyError(
                     "Could not decode key metadata for handle '\(handle)'"
@@ -500,6 +559,7 @@ public final class AppleKeyCustody: Sendable {
 
         var query = baseQuery(for: handle)
         query[kSecAttrLabel as String] = metadataLabel
+        query[kSecAttrGeneric as String] = publicKeyBytes as CFData
         query[kSecValueData as String] = bytes as CFData
         query[kSecAttrDescription as String] = policyTag
 
