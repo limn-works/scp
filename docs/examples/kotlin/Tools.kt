@@ -1,116 +1,127 @@
 /**
- * Tool registration and invocation within a context.
+ * Outlet registration, verification, and UCAN minting within a context.
  *
- * Demonstrates defining a tool with a JSON schema, registering it
- * in a context, invoking it, and verifying test vectors.
+ * Demonstrates defining an outlet with JSON schemas and test vectors,
+ * registering it in a context, verifying it against those vectors, and
+ * minting the UCAN token a caller presents to invoke it.
+ *
+ * The operator's identity comes from a caller-supplied [KeyCustodyProvider].
+ * `CustodyType.IN_MEMORY` works only in a build compiled with the `testing`
+ * feature.
  *
  * Prerequisites:
  *   implementation("works.limn:scp-kt:0.1.0")
  *
  * Usage:
- *   ./gradlew run --args="tools"
+ *   toolsExample(myProvider, File(context.filesDir, "scp-tools"), passphrase)
  */
 
 package works.limn.scp.examples
 
 import kotlinx.coroutines.runBlocking
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonArray
-import kotlinx.serialization.json.putJsonObject
-import works.limn.scp.CustodyType
-import works.limn.scp.bridge.CoroutineBridge
+import uniffi.scp.CeilingPolicy
+import uniffi.scp.ContextMode
+import uniffi.scp.ContextParams
+import uniffi.scp.GovernanceModel
+import uniffi.scp.KeyCustodyProvider
+import uniffi.scp.MemoryScope
+import uniffi.scp.OutletDefinition
+import uniffi.scp.OutletKind
+import works.limn.scp.SCP
+import java.io.File
 
-fun toolsExample(bridge: CoroutineBridge) = runBlocking {
-    // 1. Create an identity for the tool operator.
-    val operatorHandle = bridge.identity.create(CustodyType.IN_MEMORY)
-    println("Operator handle: $operatorHandle")
+fun toolsExample(
+    provider: KeyCustodyProvider,
+    storageDir: File,
+    storagePassphrase: String,
+) = runBlocking {
+    val scp = SCP.withSqlite(storageDir, storagePassphrase)
 
-    // 2. Create a context with tool capabilities.
-    val paramsJson = buildJsonObject {
-        putJsonArray("ceiling") {
-            add(JsonPrimitive("messages:read"))
-            add(JsonPrimitive("messages:write"))
-            add(JsonPrimitive("tool:register"))
-            add(JsonPrimitive("tool:invoke_all"))
-        }
-    }.toString()
+    // 1. Create an identity for the outlet operator.
+    val operator = scp.identityCreateWithCustody(provider)
+    println("Operator DID: ${operator.did()}")
 
-    val contextHandle = bridge.context.create(operatorHandle, paramsJson)
-    println("Context handle: $contextHandle")
+    // 2. Create a context whose ceiling allows registering and calling outlets.
+    val params =
+        ContextParams(
+            mode = ContextMode.ENCRYPTED,
+            ceiling = listOf("messages:read", "outlet:register", "outlet:call:*"),
+            ceilingPolicy = CeilingPolicy.IMMUTABLE,
+            governance = GovernanceModel.SINGLE_ADMIN,
+            memoryScope = MemoryScope.EPHEMERAL,
+            ttlSeconds = 0uL,
+            promotable = false,
+            minProtocolVersion = 0.toUShort(),
+            maxChainDepth = null,
+            maxNestingDepth = null,
+            sessionCap = null,
+            economicPolicy = null,
+            consequenceRulesJson = null,
+            consequenceConfigJson = null,
+        )
+    val handle = scp.contextCreate(operator, params)
+    println("Context: ${handle.contextId()}")
 
-    // 3. Define a calculator tool as JSON.
-    //    The Kotlin SDK passes tool definitions as JSON strings through
-    //    the FFI bridge. The Rust side validates the schema.
-    val definitionJson = buildJsonObject {
-        put("name", "calculator")
-        put("description", "A simple arithmetic calculator")
-        putJsonObject("input_schema") {
-            put("type", "object")
-            putJsonObject("properties") {
-                putJsonObject("a") { put("type", "number") }
-                putJsonObject("b") { put("type", "number") }
-                putJsonObject("op") {
-                    put("type", "string")
-                    putJsonArray("enum") {
-                        add(JsonPrimitive("add"))
-                        add(JsonPrimitive("sub"))
-                        add(JsonPrimitive("mul"))
-                    }
+    // 3. Define a calculator outlet with JSON schemas and test vectors.
+    val calculator =
+        OutletDefinition(
+            name = "calculator",
+            description = "A simple arithmetic calculator",
+            kind = OutletKind.QUERY,
+            inputSchemaJson =
+                """
+                {
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "number"},
+                        "b": {"type": "number"},
+                        "op": {"type": "string", "enum": ["add", "sub", "mul"]}
+                    },
+                    "required": ["a", "b", "op"]
                 }
-            }
-            putJsonArray("required") {
-                add(JsonPrimitive("a"))
-                add(JsonPrimitive("b"))
-                add(JsonPrimitive("op"))
-            }
-        }
-        putJsonObject("output_schema") {
-            put("type", "object")
-            putJsonObject("properties") {
-                putJsonObject("result") { put("type", "number") }
-            }
-            putJsonArray("required") { add(JsonPrimitive("result")) }
-        }
-    }.toString()
+                """.trimIndent(),
+            outputSchemaJson =
+                """
+                {
+                    "type": "object",
+                    "properties": {"result": {"type": "number"}},
+                    "required": ["result"]
+                }
+                """.trimIndent(),
+            operatorDid = operator.did(),
+            testVectorsJson =
+                """
+                [
+                    {"input": {"a": 2, "b": 3, "op": "add"}, "expected_output": {"result": 5}, "description": "2 + 3 = 5"},
+                    {"input": {"a": 7, "b": 3, "op": "mul"}, "expected_output": {"result": 21}, "description": "7 * 3 = 21"}
+                ]
+                """.trimIndent(),
+            implementationHash = null,
+            cost = null,
+        )
 
-    println("\nTool defined: calculator")
+    // 4. Register the outlet. The returned id names it in every later call.
+    val outletId = scp.outletRegister(handle, calculator)
+    println("\nOutlet registered: $outletId")
 
-    // 4. Register the tool in the context.
-    val toolId = bridge.tools.register(contextHandle, definitionJson)
-    println("  Registered with ID: $toolId")
+    // 5. Verify the outlet against its test vectors.
+    val verification = scp.outletVerify(handle, outletId)
+    println("  Verification passed: ${verification.passed}")
+    verification.failures.forEach { println("    - $it") }
 
-    // 5. Verify the tool against test vectors.
-    //    The verify function checks that the tool's implementation
-    //    matches its declared input/output schemas.
-    val verifyInput = """{"a": 2, "b": 3, "op": "add"}"""
-    val verifyOutput = """{"result": 5}"""
-    val passed = bridge.tools.verify(toolId, verifyInput, verifyOutput)
-    println("  Verification passed: $passed")
+    // 6. Mint a UCAN token that authorizes calling this one outlet.
+    val token =
+        scp.ucanMint(
+            handle = handle,
+            memberDid = operator.did(),
+            capabilities = listOf("outlet:call:$outletId"),
+            proofs = null,
+        )
+    println("\nUCAN minted: ${token.tokenId()}")
+    println("  Capabilities: ${token.capabilities()}")
 
-    // 6. Invoke the tool.
-    //    Input is passed as a JSON string. The result is returned
-    //    as a JSON string.
-    val inputJson = """{"a": 7, "b": 3, "op": "mul"}"""
-    println("\nInvoking calculator with: $inputJson")
-
-    val resultJson = bridge.tools.invoke(contextHandle, toolId, inputJson)
-    println("  Result: $resultJson")
-
-    // 7. UCAN authorization for tool invocation.
-    //    In production, tool invocation requires a valid UCAN token
-    //    with tool_invoke:* or tool_invoke:{tool_id} capability.
-    //
-    //    val ucanToken = bridge.ucan.mint(
-    //        operatorHandle,
-    //        memberDid,
-    //        """["tool_invoke:*"]"""
-    //    )
-    //
-    //    See spec section 7.2 for UCAN enforcement rules.
-
-    // 8. Clean up.
-    bridge.context.close(contextHandle)
-    println("\nTool operations complete.")
+    // SCP.shutdown takes a CoroutineBridge, and the SDK ships no NativeBindings
+    // implementation to build one with, so this example cannot shut the
+    // instance down. The finalizer logs a warning when the JVM collects it.
+    println("\nOutlet operations complete.")
 }

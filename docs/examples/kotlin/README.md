@@ -31,51 +31,51 @@ context lifecycle, messaging, and tool invocation.
 
 ## Running the Examples
 
-```bash
-# Ensure JAVA_HOME is set
-eval "$(mise env)"
+Each example is one top-level function that your app calls. Every example that
+creates an identity takes a `uniffi.scp.KeyCustodyProvider`. The SDK ships no
+key store that `identityCreate(custody)` reaches in a shipped build: its one
+`CustodyType`, `IN_MEMORY`, works only in a build compiled with the `testing`
+feature, and a shipped build rejects it with `SCP-IDENT-1008`.
+`AndroidKeyCustody` implements a different interface,
+`works.limn.scp.android.platform.KeyCustodyProvider`, so it cannot be passed
+here. Implement `uniffi.scp.KeyCustodyProvider` over your own key store:
 
-# Identity creation and DID document inspection
-./gradlew run --args="identity"
-
-# Context creation and lifecycle management
-./gradlew run --args="context"
-
-# Two-party message exchange
-./gradlew run --args="messaging"
-
-# Tool registration and invocation
-./gradlew run --args="tools"
+```kotlin
+identityExample(myProvider, File(filesDir, "scp-identity"), passphrase)
+contextExample(aliceProvider, bobProvider, filesDir, passphrase)
+toolsExample(myProvider, File(filesDir, "scp-tools"), passphrase)
 ```
+
+`messagingExample` takes two nodes, two identities and two context handles that
+the invite-and-join handshake in `contextExample` produces, plus a relay URL.
+
+No example calls `SCP.shutdown`. It takes a `CoroutineBridge`, and the SDK ships
+no `NativeBindings` implementation to build one with.
 
 ## Examples
 
 | File | Description |
 |------|-------------|
-| `Identity.kt` | Create identity, resolve DID, agent key management, device attestation |
-| `Context.kt` | Create context, configure capabilities, join/leave, membership queries |
-| `Messaging.kt` | Two-party message exchange with Flow-based streaming |
-| `Tools.kt` | Define tools with JSON schemas, register, verify, invoke |
+| `Identity.kt` | Create identity, resolve DID, agent key management |
+| `Context.kt` | Create a context, reserve a KeyPackage, invite a member, join from the sealed invitation, read members, close |
+| `Messaging.kt` | Two-party message exchange over a relay, received through a `MessageListener` |
+| `Tools.kt` | Define an outlet with JSON schemas and test vectors, register it, verify it, mint a UCAN |
 
 ## Key Patterns
 
-- **Coroutine bridge**: All FFI calls are suspend functions dispatched on `Dispatchers.IO`.
-- **Opaque handles**: Identity and context are represented as `Long` handles in the bridge layer.
-- **JSON parameters**: Structured data (context params, tool definitions) passed as JSON strings.
-- **Flow streaming**: Messages delivered via cold `Flow<String>` or hot `SharedFlow<String>`.
-- **Type-safe enums**: enum classes such as `CustodyType` for typed parameters.
-- **Cancellation**: `CancellationHandle` propagates coroutine cancellation to Rust.
+- **One `SCP` instance per node**: every operation is a `suspend` method on
+  `SCP`, built with `SCP.withSqlite(dir, passphrase)`.
+- **Opaque handles**: `uniffi.scp.Identity` and `uniffi.scp.ContextHandle` are the
+  references every identity and context method takes.
+- **Typed records**: `ContextParams` and `OutletDefinition` are UniFFI records.
+  Every `ContextParams` field is required.
+- **MessageListener**: callback interface for receiving messages through
+  `contextSubscribe`.
 
 ## Architecture Notes
 
-The Kotlin SDK uses a `CoroutineBridge` as the single dispatch gateway for all FFI calls.
-Domain-specific bridges (`IdentityBridge`, `ContextBridge`, `ToolBridge`, etc.) group related
-operations. Every SDK method delegates through the bridge to exactly one UniFFI function --
-zero protocol logic lives in the Kotlin layer.
-
-Streaming uses two patterns:
-- **Cold Flow** (`ColdMessageFlow`): Single collector, natural backpressure.
-- **Hot SharedFlow** (`HotStreamFactory`): Multiple collectors, 64-item buffer, `DROP_OLDEST`.
+`SCP` forwards each call to the generated UniFFI `Scp` object. Zero protocol logic
+lives in the Kotlin layer.
 
 ## SDK Reference
 

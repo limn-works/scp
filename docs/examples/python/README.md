@@ -1,7 +1,7 @@
 # SCP Python SDK Examples
 
-Demonstrates the core operations of the SCP Python SDK: identity management,
-context lifecycle, messaging, and tool invocation.
+Demonstrates identity creation, the context invite-and-join handshake, and
+outlet registration in the SCP Python SDK.
 
 ## Prerequisites
 
@@ -24,6 +24,14 @@ context lifecycle, messaging, and tool invocation.
    (cd bindings/python && pip install maturin && maturin develop --release)
    ```
 
+4. **Set two passphrases.** Each example keeps its keys in the encrypted key file
+   `$HOME/.scp/keys.bin` (`CustodyType.FILE`) and its state in a SQLCipher
+   database under `$HOME/.scp/`:
+   ```bash
+   export SCP_KEY_PASSPHRASE=...      # seals the key file; unset raises SCP-VALID-7001
+   export SCP_STORAGE_PASSPHRASE=...  # derives each database key
+   ```
+
 ## Running the Examples
 
 Each example is a standalone async script. From the repository root:
@@ -34,13 +42,10 @@ cd docs/examples/python
 # Identity creation and DID document inspection
 python identity.py
 
-# Context creation and lifecycle management
+# Context creation, invitation, and join
 python context.py
 
-# Two-party message exchange
-python messaging.py
-
-# Tool registration and invocation
+# Outlet registration, verification, and UCAN minting
 python tools.py
 ```
 
@@ -49,17 +54,27 @@ python tools.py
 | File | Description |
 |------|-------------|
 | `identity.py` | Create identity, resolve DID, inspect document, agent key management |
-| `context.py` | Create context, configure capabilities, join/leave, membership queries |
-| `messaging.py` | Two-party message exchange with async receive iterator |
-| `tools.py` | Define tools with JSON schemas, UCAN-authorized invocation, stateful sessions |
+| `context.py` | Create a context, reserve a KeyPackage, invite a member, join from the sealed invitation |
+| `tools.py` | Define an outlet with JSON schemas and test vectors, register it, verify it, mint a UCAN |
+
+No example sends or receives messages. Every `SCP` method that does, such as
+`context_send` and `context_receive`, takes the context's bridge handle, and the
+`Context` object `context_create` returns exposes that handle only through a
+private attribute.
 
 ## Key Patterns
 
-- **Async-first**: All SDK operations are `async def`. Use `asyncio.run()` in scripts.
-- **Context manager**: `Context` supports `async with` for automatic cleanup.
-- **Enum types**: Use `CustodyType`, `Capability`, `ContextMode`, `MemoryScope` for type safety.
-- **UCAN authorization**: Tool invocation requires a valid UCAN token (spec section 7.2).
-- **Receive iterator**: `ctx.receive()` returns an `AsyncIterator[Message]` with bounded buffering.
+- **One `SCP` instance per node**: every operation is a method on `SCP`. Use
+  `async with SCP(storage=...)` so the instance shuts down on exit.
+- **Custody is required**: `identity_create` takes a `CustodyType` and has no
+  default. `CustodyType.FILE` is the custody a shipped build offers.
+  `CustodyType.IN_MEMORY` works only in a build compiled with the `testing`
+  feature; a shipped build rejects it with `SCP-IDENT-1008`. To hold keys in
+  your own store, pass a `KeyCustodyProvider` to `identity_create_with_custody`.
+- **Enum types**: use `CustodyType`, `Capability`, `MemoryScope` and `OutletKind`
+  in place of raw strings.
+- **UCAN authorization**: calling an outlet requires a UCAN token that grants
+  `outlet:call:<outlet id>`.
 
 ## SDK Reference
 

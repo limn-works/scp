@@ -686,6 +686,7 @@ DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
 # NOT_ON_PUSH_FILTER_JOBS.
 CODE_JOBS = (
     "ci-workflow-selftest",
+    "examples-typecheck",
     "fail-closed-pre-rotation",
     "fix-round-check-selftest",
     "protocol-deps",
@@ -756,6 +757,7 @@ NOT_ON_PUSH_FILTER_JOBS = (
     "bridge-parity-swift",
     "ci-workflow-selftest",
     "docker-image",
+    "examples-typecheck",
     "fail-closed-pre-rotation",
     "protocol-deps",
     "python-lint",

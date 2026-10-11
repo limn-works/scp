@@ -909,7 +909,10 @@ run_step format cargo fmt --all -- --check
 # `scripts/check-doc-includes.py` joined after that: the `doc-includes` job of
 # `.github/workflows/ci.yml` runs it, and it reads only `.docs/` with the standard library.
 # `scripts/check-vendored-openssl-scope.sh` joined with the `vendored-openssl-scope` job,
-# under the cargo exception above.
+# under the cargo exception above. `scripts/check-examples-typecheck.sh` joined with the
+# `examples-typecheck` job: it runs mypy and the TypeScript compiler over the Python and
+# TypeScript sites under `docs/examples/`, `scaffolds/` and `templates/`, compiles no
+# crate, and needs `bun install` run in `bindings/typescript` first.
 GATES=(
     scripts/check-agent-verdict-criterion.sh
     scripts/check-block-in-place.py
@@ -922,6 +925,7 @@ GATES=(
     scripts/check-doc-citations.py
     scripts/check-doc-includes.py
     scripts/check-error-codes.sh
+    scripts/check-examples-typecheck.sh
     scripts/check-handle-affinity.sh
     scripts/check-handler-no-panic.sh
     scripts/check-no-bridge-globals.sh

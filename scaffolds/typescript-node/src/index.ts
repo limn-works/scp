@@ -1,34 +1,46 @@
 /**
  * Minimal SCP agent in Node.js/Bun.
  *
- * Creates a DID identity, opens an encrypted context, and sends a message.
- * Uses the NAPI native addon for full performance.
+ * Creates a DID identity and opens an encrypted context, through the NAPI
+ * native addon.
+ *
+ * The TypeScript SDK ships no production key store: its one custody string,
+ * `"in_memory"`, works only with an addon built with the `testing` feature,
+ * and a shipped addon rejects it with `SCP-IDENT-1008`. `runAgent` therefore
+ * takes a `KeyCustodyProvider` that your application implements over its own
+ * key store.
  *
  * Usage:
- *   bun run src/index.ts
+ *   import { runAgent } from "./index";
+ *   await runAgent(myProvider, process.env.SCP_STORAGE_PASSPHRASE);
  */
 
-import { Context, Identity } from "@limn-works/scp-ts";
+import { type ContextParams, type KeyCustodyProvider, SCP } from "@limn-works/scp-ts";
 
-async function main(): Promise<void> {
-  // 1. Create a DID identity with in-memory key custody.
-  const identity = await Identity.create({ custody: "in_memory" });
-  console.log(`Created identity: ${identity.did}`);
-
-  // 2. Create an encrypted context with messaging capabilities.
-  const ctx = await Context.create(identity, {
-    ceiling: ["messages:read", "messages:write", "role:assign", "member:invite"],
-    memoryScope: "ephemeral",
+export async function runAgent(
+  provider: KeyCustodyProvider,
+  storagePassphrase: string,
+): Promise<void> {
+  const scp = new SCP({
+    storage: { type: "sqlite", path: "./scp-data", passphrase: storagePassphrase },
   });
-  console.log(`Created context: ${ctx.contextId}`);
+  try {
+    // 1. Create a DID identity whose keys the provider holds.
+    const identity = await scp.identityCreateWithCustody(provider);
+    console.log(`Created identity: ${identity.did}`);
 
-  // 3. Send a message.
-  await ctx.send("Hello, SCP!");
-  console.log("  Message sent.");
+    // 2. Create an encrypted context with messaging capabilities.
+    const params: ContextParams = {
+      ceiling: ["messages:read", "messages:write", "role:assign", "member:invite"],
+      memoryScope: "ephemeral",
+      mode: "Encrypted",
+      governance: "single_admin",
+    };
+    const ctx = await scp.contextCreate(identity, JSON.stringify(params));
+    console.log(`Created context: ${ctx.contextId}`);
 
-  // 4. Clean up.
-  await ctx.leave();
-  console.log("\nAgent complete.");
+    console.log("\nAgent complete.");
+  } finally {
+    await scp.shutdown();
+  }
 }
-
-main().catch(console.error);

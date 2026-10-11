@@ -1,103 +1,74 @@
 /**
- * Two-participant message exchange.
+ * Two-party message exchange within a context.
  *
- * Demonstrates creating a context, adding a second participant,
- * and exchanging messages between them. Shows how Flow-based
- * streaming delivers messages using Kotlin coroutines.
+ * Demonstrates sending a message from one member and receiving it in
+ * another member's node through a [MessageListener].
+ *
+ * Alice and Bob each run their own [SCP] instance, and both reach each other
+ * through the relay at `relayUrl`. Bob must already be a member of the
+ * context: `contextExample` shows the invite-and-join handshake that produces
+ * `aliceHandle` and `bobHandle`.
  *
  * Prerequisites:
  *   implementation("works.limn:scp-kt:0.1.0")
  *
  * Usage:
- *   ./gradlew run --args="messaging"
+ *   messagingExample(aliceNode, alice, aliceHandle, bobNode, bob, bobHandle, "wss://relay.example")
  */
 
 package works.limn.scp.examples
 
-import kotlinx.coroutines.flow.take
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.putJsonArray
-import works.limn.scp.CustodyType
-import works.limn.scp.bridge.CoroutineBridge
+import uniffi.scp.ContextHandle
+import uniffi.scp.Identity
+import uniffi.scp.Message
+import uniffi.scp.MessageListener
+import uniffi.scp.ScpException
+import works.limn.scp.SCP
 
-fun messagingExample(bridge: CoroutineBridge) = runBlocking {
-    // 1. Create two identities.
-    val aliceHandle = bridge.identity.create(CustodyType.IN_MEMORY)
-    val bobHandle = bridge.identity.create(CustodyType.IN_MEMORY)
-    println("Alice handle: $aliceHandle")
-    println("Bob handle:   $bobHandle")
-
-    // 2. Alice creates a context with messaging capabilities.
-    val paramsJson = buildJsonObject {
-        putJsonArray("ceiling") {
-            add(JsonPrimitive("messages:read"))
-            add(JsonPrimitive("messages:write"))
-            add(JsonPrimitive("member:invite"))
-            add(JsonPrimitive("member:remove"))
-        }
-    }.toString()
-
-    val contextHandle = bridge.context.create(aliceHandle, paramsJson)
-    println("\nContext handle: $contextHandle")
-
-    // 3. Bob joins the context.
-    val bobCtxHandle = bridge.context.join(bobHandle, "chat-demo")
-    println("Bob joined the context.")
-
-    val members = bridge.membership.memberDids(contextHandle)
-    println("Members: $members")
-
-    // 4. Alice sends a message.
-    bridge.context.send(contextHandle, "Hello Bob!".toByteArray())
-    println("\nAlice: Hello Bob!")
-
-    // 5. Bob sends a reply.
-    bridge.context.send(contextHandle, "Hi Alice!".toByteArray())
-    println("Bob: Hi Alice!")
-
-    // 6. Subscribe to incoming messages via Flow.
-    //    The SDK provides two streaming patterns:
-    //
-    //    a) Cold Flow (ColdMessageFlow) -- single collector, backpressure:
-    //       val flow = bridge.context.subscribe(contextHandle)
-    //       flow.collect { messageJson ->
-    //           println("Received: $messageJson")
-    //       }
-    //
-    //    b) Hot SharedFlow (HotStreamFactory) -- multiple collectors, DROP_OLDEST:
-    //       val sharedFlow = factory.incomingMessages(contextHandle)
-    //       sharedFlow.collect { messageJson ->
-    //           println("Received: $messageJson")
-    //       }
-    //
-    //    Cold flows are lazy (no work until collected).
-    //    Hot flows have a 64-item buffer with DROP_OLDEST overflow.
-    //
-    //    Here we demonstrate subscribing and taking a few messages:
-    val subscription = bridge.context.subscribe(contextHandle)
-    val collectorJob = launch {
-        subscription.take(2).collect { messageJson ->
-            println("  Received: $messageJson")
-        }
+/** Prints each message the context delivers to Bob's node. */
+class PrintingListener : MessageListener {
+    override fun onMessage(message: Message) {
+        println("[${message.senderDid}] ${message.payload.decodeToString()}")
     }
 
-    // Wait for the collector to finish.
-    collectorJob.join()
-    println("\n(Messages consumed)")
+    override fun onError(error: ScpException) {
+        println("Stream error: $error")
+    }
 
-    // 7. Bob leaves the context.
-    bridge.context.leave(bobCtxHandle)
+    override fun onComplete() {
+        println("Stream complete.")
+    }
+}
+
+@Suppress("LongParameterList")
+fun messagingExample(
+    aliceNode: SCP,
+    alice: Identity,
+    aliceHandle: ContextHandle,
+    bobNode: SCP,
+    bob: Identity,
+    bobHandle: ContextHandle,
+    relayUrl: String,
+) = runBlocking {
+    // 1. Point each node at the relay that carries the context's traffic.
+    aliceNode.configureRelayTransport(relayUrl, alice.did())
+    bobNode.configureRelayTransport(relayUrl, bob.did())
+
+    // 2. Bob subscribes. The listener runs once per delivered message.
+    bobNode.contextSubscribe(bobHandle, PrintingListener())
+
+    // 3. Alice sends a message. A context without an economic policy needs
+    //    no spending UCAN.
+    aliceNode.contextSend(aliceHandle, alice, "Hello Bob!".toByteArray(), spendingUcanJwt = null)
+    println("Alice: Hello Bob!")
+
+    // 4. Bob replies.
+    bobNode.contextSend(bobHandle, bob, "Hi Alice!".toByteArray(), spendingUcanJwt = null)
+    println("Bob: Hi Alice!")
+
+    // 5. Bob leaves. His stream completes.
+    bobNode.contextLeave(bobHandle, bob)
     println("\nBob left the context.")
-
-    val remaining = bridge.membership.memberDids(contextHandle)
-    println("Remaining members: $remaining")
-
-    // 8. Clean up.
-    bridge.context.close(contextHandle)
-    println("Context closed.")
-
-    println("\nMessage exchange complete.")
+    println("Message exchange complete.")
 }

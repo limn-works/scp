@@ -1,80 +1,81 @@
-/// Two-participant message exchange.
+/// Two-party message exchange within a context.
 ///
-/// Demonstrates creating a context, adding a second participant,
-/// and exchanging messages between them. Shows the UniFFI bridge
-/// functions for context operations and message delivery.
+/// Demonstrates sending a message from one member and receiving it in
+/// another member's node through a ``MessageListener``.
+///
+/// Alice and Bob each run their own `SCP` instance, and both reach each
+/// other through the relay at `relayURL`. Bob must already be a member of
+/// the context: `ContextExample` shows the invite-and-join handshake that
+/// produces `aliceHandle` and `bobHandle`.
 ///
 /// Prerequisites:
 ///   - Add the SCP Swift package to your project
 ///   - import SCP
 ///
 /// Usage:
-///   swift run Messaging
+///   try await MessagingExample.run(
+///       aliceNode: aliceNode, alice: alice, aliceHandle: aliceHandle,
+///       bobNode: bobNode, bob: bob, bobHandle: bobHandle,
+///       relayURL: "wss://relay.example")
 
 import Foundation
 import SCP
 
-@main
-struct MessagingExample {
-    static func main() async throws {
-        // 1. Create two identities.
-        let alice = try await createIdentity(custody: "in_memory")
-        let bob = try await createIdentity(custody: "in_memory")
-        print("Alice: \(alice.did())")
-        print("Bob:   \(bob.did())")
+/// Prints each message the context delivers to Bob's node.
+final class PrintingListener: MessageListener, @unchecked Sendable {
+    func onMessage(message: Message) {
+        let text = String(data: message.payload, encoding: .utf8) ?? "<binary>"
+        print("[\(message.senderDid)] \(text)")
+    }
 
-        // 2. Alice creates a context with messaging capabilities.
-        let params = ContextParams(
-            ceiling: [
-                "messages:read",
-                "messages:write",
-                "member:invite",
-                "member:remove",
-            ],
-            governance: .singleAdmin,
-            memoryScope: .full,
-            ttlSeconds: 0,
-            promotable: false,
-            minProtocolVersion: 0
+    func onError(error: ScpError) {
+        print("Stream error: \(error)")
+    }
+
+    func onComplete() {
+        print("Stream complete.")
+    }
+}
+
+enum MessagingExample {
+    static func run(
+        aliceNode: SCP,
+        alice: Identity,
+        aliceHandle: ContextHandle,
+        bobNode: SCP,
+        bob: Identity,
+        bobHandle: ContextHandle,
+        relayURL: String
+    ) async throws {
+        // 1. Point each node at the relay that carries the context's traffic.
+        try await aliceNode.configureRelayTransport(relayUrl: relayURL, localDid: alice.did())
+        try await bobNode.configureRelayTransport(relayUrl: relayURL, localDid: bob.did())
+
+        // 2. Bob subscribes. The listener runs once per delivered message.
+        try await bobNode.contextSubscribe(handle: bobHandle, listener: PrintingListener())
+
+        // 3. Alice sends a message. A context without an economic policy
+        //    needs no spending UCAN.
+        try await aliceNode.contextSend(
+            handle: aliceHandle,
+            identity: alice,
+            payload: Data("Hello Bob!".utf8),
+            spendingUcanJwt: nil
         )
+        print("Alice: Hello Bob!")
 
-        let handle = try await contextCreate(identity: alice, params: params)
-        print("\nContext: \(handle.contextId())")
-
-        // 3. Bob joins the context.
-        try await contextJoin(handle: handle, identity: bob)
-        print("Bob joined the context.")
-
-        // 4. Alice sends a message.
-        let msg1 = "Hello Bob!".data(using: .utf8)!
-        try await contextSend(handle: handle, identity: alice, payload: msg1)
-        print("\nAlice: Hello Bob!")
-
-        // 5. Bob sends a reply.
-        let msg2 = "Hi Alice!".data(using: .utf8)!
-        try await contextSend(handle: handle, identity: bob, payload: msg2)
+        // 4. Bob replies.
+        try await bobNode.contextSend(
+            handle: bobHandle,
+            identity: bob,
+            payload: Data("Hi Alice!".utf8),
+            spendingUcanJwt: nil
+        )
         print("Bob: Hi Alice!")
 
-        // 6. Consume messages via a MessageListener.
-        //    In a real application, implement the MessageListener protocol:
-        //
-        //    class ChatListener: MessageListener {
-        //        func onMessage(message: Message) {
-        //            let text = String(data: message.payload, encoding: .utf8) ?? "<binary>"
-        //            print("[\(message.senderDid)] \(text)")
-        //        }
-        //        func onError(error: ScpError) { print("Error: \(error)") }
-        //        func onComplete() { print("Stream complete.") }
-        //    }
-        //    try await contextSubscribe(handle: handle, listener: ChatListener())
-        //
-        //    Messages are delivered via the UniFFI callback interface.
-        //    The stream finishes when the context is closed or left.
-        print("\n(Message stream ready for consumption)")
-
-        // 7. Clean up.
-        try await contextLeave(handle: handle, identity: alice)
-        print("\nLeft the context.")
+        // 5. Bob leaves. His stream completes.
+        try await bobNode.contextLeave(handle: bobHandle, identity: bob)
+        print("\nBob left the context.")
         print("Message exchange complete.")
     }
 }

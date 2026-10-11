@@ -1,57 +1,66 @@
 /**
  * Minimal SCP Android app entry point.
  *
- * Creates a DID identity, opens an encrypted context, and sends a message.
- * Uses in-memory custody for demonstration — replace with Keystore custody
- * for production Android apps.
+ * Creates a DID identity through a caller-supplied key custody provider and
+ * opens an encrypted context.
+ *
+ * The Kotlin SDK ships no key store that `identityCreate(custody)` reaches in
+ * a shipped build: its one `CustodyType`, `IN_MEMORY`, works only in a build
+ * compiled with the `testing` feature, and a shipped build rejects it with
+ * `SCP-IDENT-1008`. Implement [makeKeyCustodyProvider] over your app's key
+ * store before running.
  */
 package com.example.scpapp
 
 import kotlinx.coroutines.runBlocking
-import works.limn.scp.CustodyType
-import works.limn.scp.bridge.CoroutineBridge
+import uniffi.scp.CeilingPolicy
+import uniffi.scp.ContextMode
+import uniffi.scp.ContextParams
+import uniffi.scp.GovernanceModel
+import uniffi.scp.KeyCustodyProvider
+import uniffi.scp.MemoryScope
+import works.limn.scp.SCP
+import java.io.File
 
-fun main() = runBlocking {
-    // In a real Android app, initialize CoroutineBridge with NativeBindings
-    // loaded from the UniFFI-generated shared library.
-    //
-    // val bindings = loadNativeBindings()
-    // val bridge = CoroutineBridge(bindings)
+/** Returns the [KeyCustodyProvider] over your app's key store. */
+fun makeKeyCustodyProvider(): KeyCustodyProvider =
+    throw UnsupportedOperationException("implement makeKeyCustodyProvider over your app's key store")
 
-    println("SCP Android Scaffold")
-    println("====================")
-    println()
-    println("To run this scaffold in a real Android app:")
-    println("1. Add the scp-kt dependency to build.gradle.kts")
-    println("2. Load the native library: System.loadLibrary(\"scp_ffi_uniffi\")")
-    println("3. Initialize CoroutineBridge with NativeBindings")
-    println("4. Use bridge.identity.create() to create a DID")
-    println("5. Use bridge.context.create() to open a context")
-    println("6. Use bridge.context.send() to send messages")
-    println()
+fun main() =
+    runBlocking {
+        val passphrase =
+            System.getenv("SCP_STORAGE_PASSPHRASE")
+                ?: error("SCP_STORAGE_PASSPHRASE is not set")
+        val scp = SCP.withSqlite(File("scp-data"), passphrase)
 
-    // Demonstration of the API surface (requires native library):
-    //
-    // val bridge = CoroutineBridge(nativeBindings)
-    //
-    // // 1. Create identity with Keystore custody
-    // val identityHandle = bridge.identity.create(CustodyType.PLATFORM)
-    //
-    // // 2. Create an encrypted context
-    // val paramsJson = """
-    //     {
-    //         "ceiling": ["messages:read", "messages:write"],
-    //         "memory_scope": "ephemeral",
-    //         "governance": "single_admin"
-    //     }
-    // """.trimIndent()
-    // val contextHandle = bridge.context.create(identityHandle, paramsJson)
-    //
-    // // 3. Send a message
-    // bridge.context.send(contextHandle, "Hello from Android!".toByteArray())
-    //
-    // // 4. Clean up
-    // bridge.context.leave(contextHandle)
+        // 1. Create a DID identity whose keys the provider holds.
+        val identity = scp.identityCreateWithCustody(makeKeyCustodyProvider())
+        println("Created identity: ${identity.did()}")
 
-    println("Scaffold complete.")
-}
+        // 2. Create an encrypted single-admin context.
+        val params =
+            ContextParams(
+                mode = ContextMode.ENCRYPTED,
+                ceiling = listOf("messages:read", "messages:write"),
+                ceilingPolicy = CeilingPolicy.IMMUTABLE,
+                governance = GovernanceModel.SINGLE_ADMIN,
+                memoryScope = MemoryScope.EPHEMERAL,
+                ttlSeconds = 0uL,
+                promotable = false,
+                minProtocolVersion = 0.toUShort(),
+                maxChainDepth = null,
+                maxNestingDepth = null,
+                sessionCap = null,
+                economicPolicy = null,
+                consequenceRulesJson = null,
+                consequenceConfigJson = null,
+            )
+        val handle = scp.contextCreate(identity, params)
+        println("Created context: ${handle.contextId()}")
+
+        // 3. Close the context. SCP.shutdown takes a CoroutineBridge, and the
+        //    SDK ships no NativeBindings implementation to build one with, so
+        //    the scaffold cannot shut the instance down.
+        scp.contextClose(handle, identity)
+        println("Scaffold complete.")
+    }
