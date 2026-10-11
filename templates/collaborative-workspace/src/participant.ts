@@ -6,54 +6,76 @@
  */
 
 import {
+  Capabilities,
+  type BuiltInRole,
   type Context,
-  Identity,
+  type Identity,
+  type KeyCustodyProvider,
   type MemberRole,
-  mintUcan,
-  type UcanToken,
+  type SCP,
 } from "@limn-works/scp-ts";
+
+// ---------------------------------------------------------------------------
+// Result narrowing
+// ---------------------------------------------------------------------------
+
+/**
+ * Read a string field from a native result object, rejecting any other shape.
+ * `ucanMint` and `ucanDelegate` type their results as `unknown`.
+ */
+export function stringField(value: unknown, name: string): string {
+  if (typeof value !== "object" || value === null || !(name in value)) {
+    throw new TypeError(`result has no ${name} field`);
+  }
+  const field = (value as Record<string, unknown>)[name];
+  if (typeof field !== "string") throw new TypeError(`${name} is not a string`);
+  return field;
+}
+
+/** Render a role for logs: a built-in role's name or a custom role's name. */
+export function roleName(role: MemberRole | null): string {
+  if (role === null) return "none";
+  return typeof role === "string" ? role : role.name;
+}
 
 // ---------------------------------------------------------------------------
 // Role capability mapping
 // ---------------------------------------------------------------------------
 
-/** Capabilities granted to each built-in role. */
-const ROLE_CAPABILITIES: Readonly<Record<string, readonly string[]>> = {
-  Admin: [
-    "messages:read",
-    "messages:write",
-    "role:assign",
-    "member:invite",
-    "member:remove",
-    "outlet:register",
-    "outlet:call:*",
-    "governance:propose",
-    "governance:vote",
-  ],
-  Moderator: [
-    "messages:read",
-    "messages:write",
-    "member:invite",
-    "outlet:call:*",
-    "governance:propose",
-    "governance:vote",
-  ],
-  Member: [
-    "messages:read",
-    "messages:write",
-    "outlet:call:*",
-  ],
-  Observer: [
-    "messages:read",
-  ],
-};
+/** The roles this workspace assigns. Each is a protocol-defined role. */
+export type WorkspaceRole = Extract<BuiltInRole, "Admin" | "Moderator" | "Member" | "Observer">;
 
 /**
- * Returns the capability set for a given role name. Falls back to Observer
- * capabilities for unrecognized roles.
+ * Capabilities this workspace puts in each role's UCAN token. Each set is a
+ * subset of the workspace ceiling.
  */
-export function capabilitiesForRole(role: string): readonly string[] {
-  return ROLE_CAPABILITIES[role] ?? ROLE_CAPABILITIES.Observer ?? [];
+const ROLE_CAPABILITIES: Readonly<Record<WorkspaceRole, readonly string[]>> = {
+  Admin: [
+    Capabilities.MESSAGES_READ,
+    Capabilities.MESSAGES_WRITE,
+    Capabilities.ROLE_ASSIGN,
+    Capabilities.MEMBER_INVITE,
+    Capabilities.MEMBER_REMOVE,
+    Capabilities.OUTLET_REGISTER,
+    Capabilities.OUTLET_QUERY_ALL,
+    Capabilities.GOVERNANCE_PROPOSE,
+    Capabilities.GOVERNANCE_VOTE,
+  ],
+  Moderator: [
+    Capabilities.MESSAGES_READ,
+    Capabilities.MESSAGES_WRITE,
+    Capabilities.MEMBER_INVITE,
+    Capabilities.OUTLET_QUERY_ALL,
+    Capabilities.GOVERNANCE_PROPOSE,
+    Capabilities.GOVERNANCE_VOTE,
+  ],
+  Member: [Capabilities.MESSAGES_READ, Capabilities.MESSAGES_WRITE, Capabilities.OUTLET_QUERY_ALL],
+  Observer: [Capabilities.MESSAGES_READ],
+};
+
+/** Returns the token capability set for a workspace role. */
+export function capabilitiesForRole(role: WorkspaceRole): readonly string[] {
+  return ROLE_CAPABILITIES[role];
 }
 
 // ---------------------------------------------------------------------------
@@ -65,9 +87,9 @@ export interface Participant {
   /** The participant's SCP identity. */
   readonly identity: Identity;
   /** Role assigned within the workspace context. */
-  readonly role: MemberRole;
-  /** UCAN token scoped to the participant's role capabilities. */
-  readonly token: UcanToken;
+  readonly role: WorkspaceRole;
+  /** Encoded UCAN token scoped to the participant's role capabilities. */
+  readonly token: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -75,38 +97,49 @@ export interface Participant {
 // ---------------------------------------------------------------------------
 
 /**
- * Creates a new participant identity, adds them to the context with
- * the given role via governance, and mints a role-scoped UCAN token.
+ * Propose a governance action as `proposerDid`. Under `single_admin`
+ * governance an admin's proposal executes in the same call.
+ */
+async function govern(scp: SCP, ctx: Context, proposerDid: string, action: object): Promise<void> {
+  await scp.contextGovernancePropose(ctx, JSON.stringify(action), proposerDid);
+}
+
+/**
+ * Creates a new participant identity, adds it to the context, assigns the
+ * given role through governance, and mints a role-scoped UCAN token.
  *
  * The admin identity must be the context creator (or an admin member)
  * so that the governance action and UCAN mint succeed.
  *
+ * @param scp - The SCP instance that hosts the workspace.
  * @param ctx - The workspace context to join.
- * @param role - The role to assign (Admin, Moderator, Member, Observer).
- * @param adminIdentity - An admin identity authorized to add members.
+ * @param custody - The key store that holds the new identity's keys.
+ * @param role - The role to assign (Moderator, Member, Observer).
+ * @param admin - An admin identity authorized to assign roles.
  * @returns A fully initialized Participant.
  */
 export async function addParticipant(
+  scp: SCP,
   ctx: Context,
-  role: MemberRole,
-  adminIdentity: Identity,
+  custody: KeyCustodyProvider,
+  role: WorkspaceRole,
+  admin: Identity,
 ): Promise<Participant> {
   // 1. Create a fresh identity for this participant.
-  const identity = await Identity.create({ custody: "in_memory" });
+  const identity = await scp.identityCreateWithCustody(custody);
 
-  // 2. Add the participant to the context via governance.
-  //    For SingleAdmin contexts this executes immediately.
-  const addAction = JSON.stringify({
-    AddMember: {
-      did: identity.did,
-      role,
-    },
+  // 2. Add the participant to the context, then assign its role. Bridges
+  //    report a built-in role by its lowercase name.
+  await scp.contextJoin(ctx, identity.did);
+  await govern(scp, ctx, admin.did, {
+    ChangeRole: { did: identity.did, new_role: role.toLowerCase() },
   });
-  await ctx.executeGovernanceAction(addAction);
 
   // 3. Mint a UCAN token scoped to the participant's role capabilities.
-  const capabilities = capabilitiesForRole(role);
-  const token = await mintUcan(ctx, identity.did, capabilities);
+  const token = stringField(
+    await scp.ucanMint(ctx, identity.did, capabilitiesForRole(role)),
+    "encoded",
+  );
 
   return { identity, role, token };
 }
@@ -114,50 +147,52 @@ export async function addParticipant(
 /**
  * Removes a participant from the context via governance.
  *
+ * @param scp - The SCP instance that hosts the workspace.
  * @param ctx - The workspace context.
+ * @param admin - An admin identity authorized to remove members.
  * @param participant - The participant to remove.
  * @param reason - Optional removal reason for the audit log.
  */
 export async function removeParticipant(
+  scp: SCP,
   ctx: Context,
+  admin: Identity,
   participant: Participant,
   reason?: string,
 ): Promise<void> {
-  const removeAction = JSON.stringify({
-    RemoveMember: {
-      did: participant.identity.did,
-      reason: reason ?? null,
-    },
+  await govern(scp, ctx, admin.did, {
+    RemoveMember: { did: participant.identity.did, reason: reason ?? null },
   });
-  await ctx.executeGovernanceAction(removeAction);
 }
 
 /**
  * Changes a participant's role via governance and mints a new UCAN
  * token matching the updated role capabilities.
  *
+ * @param scp - The SCP instance that hosts the workspace.
  * @param ctx - The workspace context.
+ * @param admin - An admin identity authorized to assign roles.
  * @param participant - The participant whose role is changing.
  * @param newRole - The new role to assign.
  * @returns An updated Participant with the new role and token.
  */
 export async function changeParticipantRole(
+  scp: SCP,
   ctx: Context,
+  admin: Identity,
   participant: Participant,
-  newRole: MemberRole,
+  newRole: WorkspaceRole,
 ): Promise<Participant> {
   // 1. Execute the role change via governance.
-  const changeAction = JSON.stringify({
-    ChangeRole: {
-      did: participant.identity.did,
-      new_role: newRole,
-    },
+  await govern(scp, ctx, admin.did, {
+    ChangeRole: { did: participant.identity.did, new_role: newRole.toLowerCase() },
   });
-  await ctx.executeGovernanceAction(changeAction);
 
   // 2. Mint a new token with the updated role's capabilities.
-  const capabilities = capabilitiesForRole(newRole);
-  const token = await mintUcan(ctx, participant.identity.did, capabilities);
+  const token = stringField(
+    await scp.ucanMint(ctx, participant.identity.did, capabilitiesForRole(newRole)),
+    "encoded",
+  );
 
   return { identity: participant.identity, role: newRole, token };
 }
@@ -165,17 +200,18 @@ export async function changeParticipantRole(
 /**
  * Lists all member DIDs and their roles in the context.
  *
+ * @param scp - The SCP instance that hosts the workspace.
  * @param ctx - The workspace context.
  * @returns An array of { did, role } pairs.
  */
 export async function listMembers(
+  scp: SCP,
   ctx: Context,
 ): Promise<readonly { did: string; role: MemberRole | null }[]> {
-  const dids = await ctx.memberDids();
+  const dids = await scp.contextMemberDids(ctx);
   const members: { did: string; role: MemberRole | null }[] = [];
   for (const did of dids) {
-    const role = await ctx.memberRole(did);
-    members.push({ did, role });
+    members.push({ did, role: await scp.contextMemberRole(ctx, did) });
   }
   return members;
 }

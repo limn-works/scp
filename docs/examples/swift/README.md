@@ -24,48 +24,56 @@ context lifecycle, messaging, and tool invocation.
 
 ## Running the Examples
 
-Each example has a `@main` entry point:
+Each example is an `enum` with one `static func run` that your app calls. Every
+example that creates an identity takes a `KeyCustodyProvider`. The SDK ships no
+key store that `identityCreate(custody:)` reaches in a shipped build: its one
+`CustodyType`, `.inMemory`, works only in a build compiled with the `testing`
+feature, and a shipped build rejects it with `SCP-IDENT-1008`. Implement
+`KeyCustodyProvider` over your own key store and pass it in:
 
-```bash
-# Identity creation and DID document inspection
-swift run Identity
-
-# Context creation and lifecycle management
-swift run Context
-
-# Two-party message exchange
-swift run Messaging
-
-# Tool registration and invocation
-swift run Tools
+```swift
+let passphrase = "..."  // from the user or your app's keychain item
+try await IdentityExample.run(provider: myProvider, storagePassphrase: passphrase)
+try await ContextExample.run(
+    aliceProvider: aliceProvider, bobProvider: bobProvider, storagePassphrase: passphrase)
+try await MessagingExample.run(
+    aliceProvider: aliceProvider, bobProvider: bobProvider,
+    relayURL: "wss://relay.example.com", storagePassphrase: passphrase)
+try await ToolsExample.run(provider: myProvider, storagePassphrase: passphrase)
 ```
+
+`MessagingExample.run` needs a relay both nodes reach. Each node attaches the
+relay with `configureRelayTransport` before it creates or joins a context; the
+first context binds the transport the node has then, and a later call attaches
+nothing.
 
 ## Examples
 
 | File | Description |
 |------|-------------|
 | `Identity.swift` | Create identity, resolve DID, inspect document, agent key management |
-| `Context.swift` | Create context, configure capabilities, join/leave, send messages |
-| `Messaging.swift` | Two-party message exchange with `MessageListener` receive |
-| `Tools.swift` | Define tools with JSON schemas, register, verify, invoke, stateful sessions |
+| `Context.swift` | Create a context, reserve a KeyPackage, invite a member, join from the sealed invitation, read members, close |
+| `Messaging.swift` | Two-party message exchange over a relay, received through a `MessageListener` |
+| `Tools.swift` | Define an outlet with JSON schemas and test vectors, register it, verify it, mint a UCAN |
 
 ## Key Patterns
 
-- **UniFFI bridge functions**: Context operations use generated functions (`contextCreate`, `contextSend`, `contextJoin`, etc.) that delegate to Rust.
-- **ContextHandle**: Opaque handle to Rust context state, returned by `contextCreate`.
-- **ContextParams**: UniFFI-generated struct configuring governance, memory scope, TTL, and capability ceiling.
-- **MessageListener**: Callback protocol for receiving messages via `contextSubscribe`.
-- **Injectable bridge**: SDK wrapper layer uses `*Bridge` enums for testability.
-- **Structured concurrency**: All operations are `async throws` using Swift concurrency.
-- **Free functions**: Identity operations use top-level functions (`createIdentity`, `resolveIdentity`, etc.).
-- **Resource cleanup**: Call `contextClose(handle:identity:)` when done with a context.
+- **One `SCP` instance per node**: every operation is a method on `SCP`, built
+  with `SCP.withStorage(sqliteDir:passphrase:)`. Call `shutdown()` when done.
+- **ContextHandle**: opaque handle to Rust context state, returned by
+  `contextCreate` and `contextJoinFromWelcome`. Every context method takes it.
+- **ContextParams**: UniFFI-generated struct configuring mode, ceiling,
+  governance, memory scope, TTL and limits. Every field is required.
+- **MessageListener**: callback protocol for receiving messages through
+  `contextSubscribe`.
+- **Structured concurrency**: operations are `async throws`.
+- **Resource cleanup**: call `contextClose(handle:identity:)` to close a context
+  for every member, or `contextLeave(handle:identity:)` to leave it.
 
 ## Architecture Notes
 
 The Swift SDK is a thin delegation layer over UniFFI-generated bindings. Every public method
-calls exactly one UniFFI bridge function -- zero protocol logic lives in Swift. The injectable
-bridge pattern (`*Bridge` enum with typealias closures and static defaults) enables unit testing
-without the native Rust library.
+calls exactly one UniFFI bridge function -- zero protocol logic lives in Swift.
 
 ## SDK Reference
 

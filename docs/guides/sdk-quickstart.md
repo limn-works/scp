@@ -2,15 +2,15 @@
 
 ## Overview
 
-SCP provides language SDKs for Rust, Python, TypeScript, Swift, and Kotlin. All five SDKs expose the same protocol operations -- create an identity, create a context, send and receive messages -- through idiomatic language APIs. The Rust core (`crates/scp-core/`) implements all protocol logic; the other four SDKs are thin wrappers over FFI bridges that delegate every operation to Rust.
+SCP provides language SDKs for Rust, Python, TypeScript, Swift, and Kotlin. The Rust core (`crates/scp-core/`) implements all protocol logic; the Python, TypeScript, Swift and Kotlin SDKs are thin wrappers over FFI bridges that delegate every operation to Rust, each through one `SCP` instance whose methods are the whole public API. The code in sections 3 to 6 covers those four SDKs. A Rust program depends on the workspace crates directly.
 
 | Language | Package | FFI Bridge | Import |
 |----------|---------|-----------|--------|
 | **Rust** | `scp-core` (workspace crate) | N/A (native) | `use scp_core::*;` |
-| **Python** | `scp-python` | PyO3 (`crates/scp-ffi/src/`) | `from scp_sdk import Identity, Context` |
-| **TypeScript** | `@limn-works/scp-ts` | NAPI (server, in-process); browser = in-tab wasm client (`@limn-works/scp-ts-wasm`, ADR-057) | `import { Identity, Context } from "@limn-works/scp-ts"` |
+| **Python** | `scp-python` | PyO3 (`crates/scp-ffi/src/`) | `from scp_sdk import SCP, CustodyType` |
+| **TypeScript** | `@limn-works/scp-ts` | NAPI (server, in-process); browser = in-tab wasm client (`@limn-works/scp-ts-wasm`, ADR-057) | `import { SCP } from "@limn-works/scp-ts"` |
 | **Swift** | `SCP` (Swift Package) | UniFFI (`crates/scp-ffi/uniffi/`) | `import SCP` |
-| **Kotlin** | `works.limn:scp-kt` | UniFFI (`crates/scp-ffi/uniffi/`) | `import works.limn.scp.*` |
+| **Kotlin** | `works.limn:scp-kt` | UniFFI (`crates/scp-ffi/uniffi/`) | `import works.limn.scp.SCP` |
 
 **Contents:**
 1. [Prerequisites](#1-prerequisites)
@@ -147,31 +147,7 @@ dependencies {
 
 Every SCP participant starts by creating a cryptographic identity -- a DID (Decentralized Identifier) backed by Ed25519 keys. The identity is the root of trust for all protocol operations.
 
-### Rust
-
-```rust
-use std::sync::Arc;
-use scp_identity::{DidDht, ScpIdentity};
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
-use scp_platform::traits::KeyType;
-
-// Create platform adapters (use SqliteKeyCustody for production)
-let custody = Arc::new(InMemoryKeyCustody::new());
-let storage = Arc::new(InMemoryStorage::new());
-
-// Generate an Ed25519 signing keypair
-let key_handle = custody.generate_keypair(KeyType::Ed25519).await?;
-let public_key = custody.public_key(&key_handle).await?;
-
-// Create an SCP identity with the generated key
-let identity = ScpIdentity {
-    did: format!("did:dht:z6Mk{}", hex::encode(&public_key.as_bytes()[..16])),
-    signing_key: key_handle,
-    active_key: None,
-    agent_key: None,
-};
-println!("DID: {}", identity.did);
-```
+Every SDK takes the custody choice as a required argument. Python ships one production key store, `CustodyType.FILE`. The TypeScript, Swift and Kotlin SDKs ship none that `identityCreate` reaches: each one's only custody value, `in_memory`, works only in a build compiled with the `testing` feature, and a shipped build rejects it with `SCP-IDENT-1008`. In those SDKs a production caller implements `KeyCustodyProvider` over its own key store and passes it to `identityCreateWithCustody`.
 
 ### Python
 
@@ -180,11 +156,11 @@ import asyncio
 from scp_sdk import SCP, CustodyType
 
 async def main():
-    scp = SCP({"type": "sqlite", "path": "./scp-data", "passphrase": "change me"})
-    # CustodyType.FILE keeps the keys in $HOME/.scp/keys.bin, encrypted under
-    # the SCP_KEY_PASSPHRASE environment variable.
-    identity = await scp.identity_create(CustodyType.FILE)
-    print(f"DID: {identity.did}")
+    async with SCP({"type": "sqlite", "path": "./scp-data", "passphrase": "change me"}) as scp:
+        # CustodyType.FILE keeps the keys in $HOME/.scp/keys.bin, encrypted under
+        # the SCP_KEY_PASSPHRASE environment variable.
+        identity = await scp.identity_create(CustodyType.FILE)
+        print(f"DID: {identity.did}")
 
 asyncio.run(main())
 ```
@@ -192,13 +168,12 @@ asyncio.run(main())
 ### TypeScript
 
 ```typescript
-import { SCP } from "@limn-works/scp-ts";
+import { type KeyCustodyProvider, SCP } from "@limn-works/scp-ts";
 
-const scp = new SCP({ storage: { type: "in_memory" } });
-// "in_memory" is the one custody string this bridge builds a key store from, in
-// an addon built with its testing feature; pass a KeyCustodyProvider to
-// identityCreateWithCustody() for any other key store.
-const identity = await scp.identityCreate("in_memory");
+declare const provider: KeyCustodyProvider; // your key store
+
+const scp = new SCP({ storage: { type: "sqlite", path: "./scp-data", passphrase: "change me" } });
+const identity = await scp.identityCreateWithCustody(provider);
 console.log(`DID: ${identity.did}`);
 ```
 
@@ -207,21 +182,22 @@ console.log(`DID: ${identity.did}`);
 ```swift
 import SCP
 
-let identity = try await createIdentity(custody: "platform")
+let provider: KeyCustodyProvider = MyKeyStore()  // your key store
+let scp = try SCP.withStorage(sqliteDir: storageDir, passphrase: "change me")
+let identity = try await scp.identityCreateWithCustody(provider: provider)
 print("DID: \(identity.did())")
 ```
 
 ### Kotlin
 
 ```kotlin
-import works.limn.scp.CustodyType
-import works.limn.scp.bridge.CoroutineBridge
+import uniffi.scp.KeyCustodyProvider
+import works.limn.scp.SCP
 
-suspend fun main() {
-    // CoroutineBridge wraps all FFI calls on Dispatchers.IO
-    val bridge: CoroutineBridge = // ... construct with NativeBindings
-    val identityHandle = bridge.identity.create(CustodyType.PLATFORM)
-    println("Identity handle: $identityHandle")
+suspend fun createIdentity(provider: KeyCustodyProvider, storageDir: java.io.File) {
+    val scp = SCP.withSqlite(storageDir, "change me")
+    val identity = scp.identityCreateWithCustody(provider)
+    println("DID: ${identity.did()}")
 }
 ```
 
@@ -231,86 +207,90 @@ suspend fun main() {
 
 A context is a bounded, encrypted interaction space. All SCP communication happens within contexts. Contexts are governed by parameters that define capabilities (ceiling), lifetime (TTL), and governance rules.
 
-### Rust
-
-```rust
-use scp_core::context::{Capability, ContextMode, ContextParams};
-use scp_core::context::manager::ContextManager;
-
-let params = ContextParams {
-    mode: ContextMode::Encrypted,
-    ceiling: vec![
-        Capability::MessagesRead,
-        Capability::MessagesWrite,
-        Capability::MemberInvite,
-    ],
-    ..ContextParams::default()
-};
-
-// ContextManager coordinates context lifecycle.
-// Built with crypto, transport, and event-log providers.
-let handle = manager
-    .create_context("my-context".to_owned(), params, alice.clone())
-    .await?;
-println!("Context ID: {}", handle.context_id());
-```
-
 ### Python
 
 ```python
-from scp_sdk import Capability, Context, CustodyType, MemoryScope
+from scp_sdk import Capability, MemoryScope
 
-ctx = await Context.create(
-    creator=identity,
-    ceiling=[Capability.MESSAGES_READ, Capability.MESSAGES_WRITE, Capability.MEMBER_INVITE],
-    memory_scope=MemoryScope.FULL,
-    governance="single_admin",
-    ttl=3600.0,
+ctx = await scp.context_create(
+    identity.did,
+    {
+        "ceiling": [
+            Capability.MESSAGES_READ.value,
+            Capability.MESSAGES_WRITE.value,
+            Capability.MEMBER_INVITE.value,
+        ],
+        "memory_scope": MemoryScope.FULL.value,
+        "governance": "single_admin",
+    },
 )
+print(f"Context ID: {ctx.context_id}")
 ```
 
 ### TypeScript
 
 ```typescript
-const ctx = await Context.create(identity, {
+import type { ContextParams } from "@limn-works/scp-ts";
+
+const params: ContextParams = {
   ceiling: ["messages:read", "messages:write", "member:invite"],
   mode: "Encrypted",
   governance: "single_admin",
-});
+};
+const ctx = await scp.contextCreate(identity, JSON.stringify(params));
+console.log(`Context ID: ${ctx.contextId}`);
 ```
 
 ### Swift
 
 ```swift
 let params = ContextParams(
+    mode: .encrypted,
     ceiling: ["messages:read", "messages:write", "member:invite"],
+    ceilingPolicy: .immutable,
     governance: .singleAdmin,
     memoryScope: .full,
     ttlSeconds: 3600,
     promotable: false,
-    minProtocolVersion: 0
+    minProtocolVersion: 0,
+    maxChainDepth: nil,
+    maxNestingDepth: nil,
+    sessionCap: nil,
+    economicPolicy: nil,
+    consequenceRulesJson: nil,
+    consequenceConfigJson: nil
 )
-let handle = try await contextCreate(identity: identity, params: params)
+let handle = try await scp.contextCreate(identity: identity, params: params)
 print("Context ID: \(handle.contextId())")
 ```
 
 ### Kotlin
 
 ```kotlin
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.putJsonArray
+import uniffi.scp.CeilingPolicy
+import uniffi.scp.ContextMode
+import uniffi.scp.ContextParams
+import uniffi.scp.GovernanceModel
+import uniffi.scp.MemoryScope
 
-val paramsJson = buildJsonObject {
-    putJsonArray("ceiling") {
-        add(JsonPrimitive("messages:read"))
-        add(JsonPrimitive("messages:write"))
-        add(JsonPrimitive("member:invite"))
-    }
-    put("governance", JsonPrimitive("single_admin"))
-}.toString()
-
-val contextHandle = bridge.context.create(identityHandle, paramsJson)
+val params = ContextParams(
+    mode = ContextMode.ENCRYPTED,
+    ceiling = listOf("messages:read", "messages:write", "member:invite"),
+    ceilingPolicy = CeilingPolicy.IMMUTABLE,
+    governance = GovernanceModel.SINGLE_ADMIN,
+    memoryScope = MemoryScope.FULL,
+    ttlSeconds = 3600uL,
+    promotable = false,
+    minProtocolVersion = 0.toUShort(),
+    maxChainDepth = null,
+    maxNestingDepth = null,
+    sessionCap = null,
+    economicPolicy = null,
+    consequenceRulesJson = null,
+    consequenceConfigJson = null,
+)
+val handle = scp.contextCreate(identity, params)
+println("Context ID: ${handle.contextId()}")
 ```
 
 ---
@@ -319,49 +299,45 @@ val contextHandle = bridge.context.create(identityHandle, paramsJson)
 
 Messages are MLS-encrypted, signed with the sender's identity, and tagged with provenance metadata. The SDK handles encryption, signing, and envelope construction transparently.
 
-### Rust
+A message reaches another member's node over a relay. Each node attaches the relay with `configure_relay_transport` (`configureRelayTransport` in the other SDKs) before it creates or joins its first context: that context starts the node's context supervisor, which binds the transport the node has then, and a later call attaches nothing. A send to a member whose routing announcement has not yet arrived fails with `SCP-CTX-2095` and is rolled back, so it is safe to retry. The `messaging` example for each SDK runs the full flow on two nodes: relay, create, invite, join, send, receive.
 
-```rust
-// Send a message via the ContextManager
-manager
-    .send_message(&handle, &alice, b"Hello from SCP", None)
-    .await?;
-
-// Drain events to see what happened
-let events = manager.drain_events("my-context").await;
-for event in &events {
-    println!("Event: {:?}", event);
-}
-```
+The Python SDK does not yet subscribe a context to the relay, so a Python node receives nothing its peer sends, and its sends to a remote member keep failing with `SCP-CTX-2095` (#2856).
 
 ### Python
 
 ```python
+# Before the first context_create or context_join_from_welcome on this node:
+await scp.configure_relay_transport("wss://relay.example.com", identity.did)
+await scp.transport_connect("wss://relay.example.com")
+
 # Send
-await ctx.send(b"Hello from SCP", identity=identity)
+await scp.context_send(ctx, identity.did, "Hello from SCP")
 
 # Receive
-receiver = await ctx.receive()
+receiver = await scp.context_receive(ctx)
 async for msg in receiver:
-    print(f"{msg.sender_did}: {msg.content}")
-    break
+    print(msg.sender_did, msg.payload.decode())
 
-await ctx.close(identity)
+await scp.context_leave(ctx, identity.did)
 ```
 
 ### TypeScript
 
 ```typescript
+// Before the first contextCreate or contextJoinFromWelcome on this node:
+await scp.configureRelayTransport("wss://relay.example.com", identity.did);
+await scp.transportConnect("wss://relay.example.com");
+
+// Receive: the callback runs once per delivered message.
+await scp.contextSubscribe(ctx, identity.did, (message) => {
+  console.log(message);
+});
+
 // Send
-await ctx.send(new TextEncoder().encode("Hello from SCP"));
+await scp.contextSend(ctx, identity.did, new TextEncoder().encode("Hello from SCP"));
 
-// Receive
-for await (const msg of ctx.receive()) {
-  console.log(`${msg.senderDid}: ${msg.content}`);
-  break;
-}
-
-await ctx.close();
+scp.contextCancelSubscription(ctx);
+await scp.contextLeave(ctx, identity.did);
 ```
 
 ### Swift
@@ -369,34 +345,34 @@ await ctx.close();
 ```swift
 // Send
 let payload = Data("Hello from SCP".utf8)
-try await contextSend(handle: handle, identity: identity, payload: payload)
+try await scp.contextSend(handle: handle, identity: identity, payload: payload, spendingUcanJwt: nil)
 
 // Receive via MessageListener callback
-// class MyListener: MessageListener {
+// final class MyListener: MessageListener {
 //     func onMessage(message: Message) { ... }
 //     func onError(error: ScpError) { ... }
 //     func onComplete() { ... }
 // }
-// try await contextSubscribe(handle: handle, listener: MyListener())
+// try await scp.contextSubscribe(handle: handle, listener: MyListener())
 
-try await contextClose(handle: handle, identity: identity)
+try await scp.contextClose(handle: handle, identity: identity)
 ```
 
 ### Kotlin
 
 ```kotlin
-import kotlinx.coroutines.flow.take
-
 // Send
-bridge.context.send(contextHandle, identityHandle, "Hello from SCP".toByteArray())
+scp.contextSend(handle, identity, "Hello from SCP".toByteArray(), spendingUcanJwt = null)
 
-// Receive via Flow
-val subscription = bridge.context.subscribe(contextHandle)
-subscription.take(1).collect { messageJson ->
-    println("Received: $messageJson")
-}
+// Receive via MessageListener callback
+// class MyListener : MessageListener {
+//     override fun onMessage(message: Message) { ... }
+//     override fun onError(error: ScpException) { ... }
+//     override fun onComplete() { ... }
+// }
+// scp.contextSubscribe(handle, MyListener())
 
-bridge.context.close(contextHandle, identityHandle)
+scp.contextClose(handle, identity)
 ```
 
 ---
@@ -405,39 +381,27 @@ bridge.context.close(contextHandle, identityHandle)
 
 All SDKs provide structured errors with machine-readable error codes. Error codes follow the `SCP-<PREFIX>-<NUMBER>` convention defined in `.docs/standards/sdk-common.md`.
 
-### Rust
-
-```rust
-use scp_core::error::ScpError;
-
-match ctx.send(payload).await {
-    Ok(_) => println!("sent"),
-    Err(ScpError::Context(e)) => eprintln!("[{}] {}", e.code(), e),
-    Err(e) => eprintln!("unexpected: {e}"),
-}
-```
-
 ### Python
 
 ```python
-from scp_sdk import ScpError, ContextError
+from scp_sdk import IdentityError
 
 try:
-    await ctx.send(b"data")
-except ContextError as e:
-    print(f"[{e.code}] {e}")
+    await scp.identity_create(CustodyType.IN_MEMORY)
+except IdentityError as e:
+    print(f"[{e.code}] {e}")  # SCP-IDENT-1008 in a shipped build
 ```
 
 ### TypeScript
 
 ```typescript
-import { ScpError, ContextError } from "@limn-works/scp-ts";
+import { IdentityError } from "@limn-works/scp-ts";
 
 try {
-  await ctx.send(payload);
+  await scp.identityCreate("in_memory");
 } catch (e) {
-  if (e instanceof ContextError) {
-    console.error(`[${e.code}] ${e.message}`);
+  if (e instanceof IdentityError) {
+    console.error(`[${e.code}] ${e.message}`); // SCP-IDENT-1008 in a shipped build
   }
 }
 ```
@@ -446,7 +410,7 @@ try {
 
 ```swift
 do {
-    try await contextSend(handle: handle, identity: identity, payload: Data("data".utf8))
+    try await scp.contextSend(handle: handle, identity: identity, payload: Data("data".utf8), spendingUcanJwt: nil)
 } catch ScpError.Context(let msg, let code) {
     print("[\(code)] \(msg)")
 }
@@ -455,12 +419,12 @@ do {
 ### Kotlin
 
 ```kotlin
-import works.limn.scp.bridge.BridgeException
+import uniffi.scp.ScpException
 
 try {
-    bridge.context.send(contextHandle, identityHandle, payload)
-} catch (e: BridgeException) {
-    println("[${e.code}] ${e.message}")
+    scp.contextSend(handle, identity, payload, spendingUcanJwt = null)
+} catch (e: ScpException.Context) {
+    println("[${e.code}] ${e.msg}")
 }
 ```
 
@@ -486,14 +450,14 @@ The full API surface -- every operation across all subsystems -- is sketched in 
 
 ### Examples
 
-Each SDK ships runnable examples in its `examples/` directory:
+Runnable examples for each SDK sit in `docs/examples/`:
 
 | Example | Python | TypeScript | Swift | Kotlin |
 |---------|--------|-----------|-------|--------|
-| Basic messaging | `basic_messaging.py` | `basic-messaging.ts` | `BasicMessaging.swift` | `BasicMessaging.kt` |
-| Tool invocation | `tool_invocation.py` | `tool-invocation.ts` | `ToolInvocation.swift` | `ToolInvocation.kt` |
-| MCP integration | `mcp_integration.py` | `mcp-integration.ts` | `McpIntegration.swift` | `McpIntegration.kt` |
-| Multi-agent coordination | `multi_agent.py` | `multi-agent.ts` | `MultiAgent.swift` | `MultiAgent.kt` |
+| Identity | `identity.py` | `identity.ts` | `Identity.swift` | `Identity.kt` |
+| Context and invite-and-join | `context.py` | `context.ts` | `Context.swift` | `Context.kt` |
+| Messaging | `messaging.py` | `messaging.ts` | `Messaging.swift` | `Messaging.kt` |
+| Outlets and UCAN | `tools.py` | `tools.ts` | `Tools.swift` | `Tools.kt` |
 
 ### Type stubs and IDE support
 

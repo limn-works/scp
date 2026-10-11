@@ -4,7 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "bun run src/index.ts"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@limn-works/scp-ts": "0.1.0"

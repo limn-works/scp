@@ -1,52 +1,76 @@
-"""Tool registration and invocation within a context.
+"""Outlet registration, verification, and UCAN minting within a context.
 
-Demonstrates defining a tool with a JSON schema, registering it
-in a context, and invoking it with UCAN authorization. Also shows
-cross-context tool invocation and stateful tool sessions.
+Demonstrates defining an outlet with JSON schemas and test vectors,
+registering it in a context, verifying it against those vectors, and
+minting the UCAN token a caller presents to invoke it.
 
 Prerequisites:
     pip install scp-sdk
     # or: maturin develop --release (from bindings/python/)
+    export SCP_KEY_PASSPHRASE=...      # seals $HOME/.scp/keys.bin
+    export SCP_STORAGE_PASSPHRASE=...  # encrypts the SQLCipher database
 
 Usage:
     python tools.py
 """
 
 import asyncio
+import os
+from pathlib import Path
 
 from scp_sdk import (
+    SCP,
     Capability,
-    Context,
     CustodyType,
-    Identity,
-    ToolDefinition,
+    MemoryScope,
+    OutletDefinition,
+    OutletKind,
+    StorageConfig,
     TestVector,
 )
-from scp_sdk.tools import session_create, session_invoke, session_close
-from scp_sdk.ucan import mint
+
+
+def node_storage(name: str) -> StorageConfig:
+    """Return SQLCipher storage at ``$HOME/.scp/<name>``.
+
+    ``SCP_STORAGE_PASSPHRASE`` derives the database key. An unset variable
+    raises ``KeyError`` here, before any database opens.
+    """
+    path = Path.home() / ".scp" / name
+    path.mkdir(parents=True, exist_ok=True)
+    return {
+        "type": "sqlite",
+        "path": str(path),
+        "passphrase": os.environ["SCP_STORAGE_PASSPHRASE"],
+    }
 
 
 async def main() -> None:
-    # 1. Create an identity for the tool operator.
-    operator = await Identity.create(custody=CustodyType.IN_MEMORY)
-    print(f"Operator DID: {operator.did}")
+    async with SCP(storage=node_storage("tools-example")) as scp:
+        # 1. Create an identity for the outlet operator.
+        operator = await scp.identity_create(CustodyType.FILE)
+        print(f"Operator DID: {operator.did}")
 
-    # 2. Create a context with tool capabilities.
-    async with await Context.create(
-        creator=operator,
-        ceiling=[
-            Capability.MESSAGES_READ,
-            Capability.MESSAGES_WRITE,
-            Capability.TOOL_REGISTER,
-            Capability.TOOL_INVOKE_ALL,
-        ],
-    ) as ctx:
+        # 2. Create a context whose ceiling allows registering and invoking Query outlets.
+        ctx = await scp.context_create(
+            operator.did,
+            {
+                "ceiling": [
+                    Capability.MESSAGES_READ.value,
+                    Capability.OUTLET_REGISTER.value,
+                    Capability.OUTLET_QUERY_ALL.value,
+                ],
+                "memory_scope": MemoryScope.EPHEMERAL.value,
+                "governance": "single_admin",
+            },
+        )
         print(f"Context: {ctx.context_id}")
 
-        # 3. Define a calculator tool with JSON schemas.
-        calculator = ToolDefinition(
+        # 3. Define a calculator outlet with JSON schemas and test vectors.
+        calculator = OutletDefinition(
             name="calculator",
             description="A simple arithmetic calculator",
+            kind=OutletKind.Query,
             input_schema={
                 "type": "object",
                 "properties": {
@@ -58,9 +82,7 @@ async def main() -> None:
             },
             output_schema={
                 "type": "object",
-                "properties": {
-                    "result": {"type": "number"},
-                },
+                "properties": {"result": {"type": "number"}},
                 "required": ["result"],
             },
             operator=operator.did,
@@ -77,59 +99,25 @@ async def main() -> None:
                 ),
             ],
         )
-        print(f"\nTool defined: {calculator.name}")
-        print(f"  Description: {calculator.description}")
-        print(f"  Test vectors: {len(calculator.test_vectors)}")
 
-        # 4. Mint a UCAN token authorizing tool invocation.
-        #    The token grants tool_invoke:* capability for this context.
-        ucan_token = await mint(
-            audience=operator.did,
-            capabilities=["tool_invoke:*"],
-            context=ctx.context_id,
+        # 4. Register the outlet. The returned id names it in every later call.
+        outlet_id = await scp.outlet_register(ctx.context_id, calculator)
+        print(f"\nOutlet registered: {outlet_id}")
+
+        # 5. Verify the outlet against its test vectors.
+        verification = await scp.outlet_verify(ctx.context_id, outlet_id)
+        print(f"  Verification passed: {verification.passed}")
+
+        # 6. Mint a UCAN token that authorizes invoking this one Query outlet.
+        token = await scp.ucan_mint(
+            ctx.context_id,
+            operator.did,
+            [Capability.outlet_query(outlet_id)],
         )
-        print(f"\nUCAN minted: {ucan_token.token_id}")
+        print(f"\nUCAN minted: {token.token_id}")
+        print(f"  Capabilities: {token.capabilities}")
 
-        # 5. Invoke the tool.
-        #    In a real application, the context would have the tool
-        #    registered server-side. Here we show the invocation pattern.
-        result = await ctx.invoke(
-            tool="calculator",
-            input={"a": 7, "b": 3, "op": "mul"},
-            ucan_token=ucan_token.token_id,
-            identity=operator,
-        )
-        print(f"\nInvoked calculator: 7 * 3")
-        print(f"  Result: {result}")
-
-        # 6. Stateful tool sessions (spec section 6.2.1).
-        #    Sessions enable multi-turn workflows with state preservation.
-        session_id = await session_create(
-            context_id=ctx.context_id,
-            tool_id="calculator",
-            source_context_id=ctx.context_id,
-            ttl_seconds=300,  # 5-minute session
-        )
-        print(f"\nSession created: {session_id}")
-
-        # Invoke within the session (state is carried forward).
-        session_result = await session_invoke(
-            context_id=ctx.context_id,
-            session_id=session_id,
-            input={"a": 10, "b": 5, "op": "sub"},
-            invoker_did=operator.did,
-            ucan_token=ucan_token.token_id,
-        )
-        print(f"  Session invoke: 10 - 5 = {session_result}")
-
-        # Close the session.
-        await session_close(
-            context_id=ctx.context_id,
-            session_id=session_id,
-        )
-        print("  Session closed.")
-
-    print("\nTool operations complete.")
+    print("\nOutlet operations complete.")
 
 
 if __name__ == "__main__":

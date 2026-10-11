@@ -1,7 +1,7 @@
 # SCP TypeScript SDK Examples
 
-Demonstrates the core operations of the SCP TypeScript SDK: identity management,
-context lifecycle, messaging, and tool invocation.
+Demonstrates identity creation, the context invite-and-join handshake,
+messaging over a relay, and outlet registration in the SCP TypeScript SDK.
 
 ## Prerequisites
 
@@ -24,39 +24,50 @@ context lifecycle, messaging, and tool invocation.
 
 ## Running the Examples
 
-Each example is a standalone TypeScript script:
+Each example exports one async function that takes a `KeyCustodyProvider` and
+a storage passphrase. The SDK ships no production key store for Bun or Node:
+its one `CustodyType`, `"in_memory"`, works only with an addon built with the
+`testing` feature, and a shipped addon rejects it with `SCP-IDENT-1008`. Pass a
+provider backed by your own key store, such as an HSM or the operating
+system's keychain:
 
-```bash
-# Identity creation and DID document inspection
-bun run identity.ts
+```ts
+import { identityExample } from "./identity";
+import { contextExample } from "./context";
+import { messagingExample } from "./messaging";
+import { toolsExample } from "./tools";
 
-# Context creation and lifecycle management
-bun run context.ts
+const passphrase = process.env.SCP_STORAGE_PASSPHRASE;
+if (!passphrase) throw new Error("set SCP_STORAGE_PASSPHRASE");
 
-# Two-party message exchange
-bun run messaging.ts
-
-# Tool registration and invocation
-bun run tools.ts
+await identityExample(myProvider, passphrase);
+await contextExample(aliceProvider, bobProvider, passphrase);
+await messagingExample(aliceProvider, bobProvider, "wss://relay.example.com", passphrase);
+await toolsExample(operatorProvider, passphrase);
 ```
+
+`messagingExample` runs two `SCP` instances that must both reach the relay at
+the URL it is given.
 
 ## Examples
 
 | File | Description |
 |------|-------------|
 | `identity.ts` | Create identity, resolve DID, inspect document, agent key management |
-| `context.ts` | Create context, configure capabilities, join/leave, membership queries |
-| `messaging.ts` | Two-party message exchange with `AsyncIterable` receive |
-| `tools.ts` | Define tools with `defineToolDefinition`, UCAN-authorized invocation |
+| `context.ts` | Create a context, reserve a KeyPackage, invite a member, join from the sealed invitation |
+| `messaging.ts` | Two nodes on one relay: invite, join, subscribe, send a message, receive it, leave |
+| `tools.ts` | Define a query outlet, register and verify it, mint a scoped UCAN, invoke the outlet |
+
 
 ## Key Patterns
 
 - **Server in-process**: On Bun/Node the SDK runs the protocol engine in-process via the napi-rs native addon. In the browser the full protocol runs in-tab via the sibling wasm tier `@limn-works/scp-ts-wasm`, keys on-device (ADR-057); a remote custodial thin client is an optional mode.
-- **AsyncDisposable**: `Context` implements `Symbol.asyncDispose` for `await using` cleanup.
-- **Typed params**: Use `ContextParams`, `ToolDefinition`, `Message` types for safety.
-- **UCAN authorization**: Tool invocation requires a valid UCAN token (spec section 7.2).
-- **Receive generator**: `ctx.receive()` returns `AsyncIterable<Message>` for streaming.
-- **Error hierarchy**: `ScpError`, `ContextError`, `ToolError`, `IdentityError`, etc.
+- **One `SCP` instance per node**: every operation is a method on `SCP`. Call
+  `shutdown()` in a `finally` block.
+- **Typed params**: build a `ContextParams` object and pass `JSON.stringify(params)`
+  to `contextCreate`.
+- **Error hierarchy**: `ScpError`, `ContextError`, `IdentityError`, and the other
+  subclasses carry an `SCP-*` code.
 
 ## SDK Reference
 

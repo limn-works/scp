@@ -1,42 +1,40 @@
-"""SCP agent that registers tools in a context and serves them via MCP.
+"""SCP agent that registers outlets in a context and serves them via MCP.
 
-Demonstrates the full tool lifecycle:
-  1. Create an identity and context with tool capabilities.
-  2. Register tool definitions (calculator, search) with JSON schemas.
-  3. Attach Python handler functions to the registered tools.
-  4. Mint UCAN tokens for tool invocation authorization.
-  5. Invoke tools programmatically within the context.
-  6. Optionally bridge all context tools to MCP for external model access.
+Demonstrates the outlet lifecycle:
+  1. Create an identity and a context with outlet capabilities.
+  2. Register outlet definitions (calculator, search) with JSON schemas.
+  3. Attach Python handler functions to the registered outlets.
+  4. Mint a UCAN token that authorizes invoking both Query outlets.
+  5. Invoke the outlets programmatically within the context.
+  6. Optionally serve the context's outlets to an MCP client over stdio.
 
 Usage:
     pip install -e ../../bindings/python
+    export SCP_KEY_PASSPHRASE=...      # seals $HOME/.scp/keys.bin
+    export SCP_STORAGE_PASSPHRASE=...  # encrypts the SQLCipher database
     python agent.py
-    python agent.py --mcp              # also start MCP stdio server
-    python agent.py --mcp --sse        # MCP over SSE instead of stdio
+    python agent.py --mcp              # also start an MCP stdio server
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import math
+import os
 import sys
+from pathlib import Path
 from typing import Any
 
 from scp_sdk import (
+    SCP,
     Capability,
-    Context,
-    Identity,
-    ToolDefinition,
+    CustodyType,
+    MemoryScope,
+    OutletDefinition,
+    OutletKind,
     TestVector,
 )
-from scp_sdk.mcp import (
-    McpServer,
-    register_tool_handler,
-    serve_mcp,
-)
-from scp_sdk.ucan import mint as ucan_mint
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,99 +44,107 @@ logger = logging.getLogger("tool-agent")
 
 
 # ---------------------------------------------------------------------------
-# Tool definitions
+# Outlet definitions
 # ---------------------------------------------------------------------------
 
-CALCULATOR_TOOL = ToolDefinition(
-    name="calculator",
-    description="Evaluate arithmetic expressions with two operands.",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "a": {"type": "number", "description": "First operand"},
-            "b": {"type": "number", "description": "Second operand"},
-            "op": {
-                "type": "string",
-                "enum": ["add", "sub", "mul", "div", "pow"],
-                "description": "Arithmetic operation",
-            },
-        },
-        "required": ["a", "b", "op"],
-    },
-    output_schema={
-        "type": "object",
-        "properties": {
-            "result": {"type": "number"},
-        },
-        "required": ["result"],
-    },
-    operator=None,  # set at registration time from the agent identity
-    test_vectors=[
-        TestVector(
-            input={"a": 3, "b": 4, "op": "add"},
-            expected_output={"result": 7},
-            description="simple addition",
-        ),
-        TestVector(
-            input={"a": 10, "b": 3, "op": "mul"},
-            expected_output={"result": 30},
-            description="multiplication",
-        ),
-    ],
-)
 
-SEARCH_TOOL = ToolDefinition(
-    name="search",
-    description="Search a knowledge base by keyword query.",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Search query"},
-            "max_results": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 50,
-                "description": "Maximum number of results to return",
-            },
-        },
-        "required": ["query"],
-    },
-    output_schema={
-        "type": "object",
-        "properties": {
-            "results": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "snippet": {"type": "string"},
-                        "score": {"type": "number"},
-                    },
+def calculator_outlet(operator_did: str) -> OutletDefinition:
+    """Return the calculator outlet definition operated by ``operator_did``."""
+    return OutletDefinition(
+        name="calculator",
+        description="Evaluate arithmetic expressions with two operands.",
+        kind=OutletKind.Query,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "a": {"type": "number", "description": "First operand"},
+                "b": {"type": "number", "description": "Second operand"},
+                "op": {
+                    "type": "string",
+                    "enum": ["add", "sub", "mul", "div", "pow"],
+                    "description": "Arithmetic operation",
                 },
             },
-            "total": {"type": "integer"},
+            "required": ["a", "b", "op"],
         },
-        "required": ["results", "total"],
-    },
-    operator=None,
-    test_vectors=[
-        TestVector(
-            input={"query": "SCP protocol"},
-            expected_output={
-                "results": [
-                    {
-                        "title": "SCP Overview",
-                        "snippet": "Shared Context Protocol...",
-                        "score": 0.95,
-                    }
-                ],
-                "total": 1,
+        output_schema={
+            "type": "object",
+            "properties": {
+                "result": {"type": "number"},
             },
-            description="basic keyword search",
-        ),
-    ],
-)
+            "required": ["result"],
+        },
+        operator=operator_did,
+        test_vectors=[
+            TestVector(
+                input={"a": 3, "b": 4, "op": "add"},
+                expected_output={"result": 7},
+                description="simple addition",
+            ),
+            TestVector(
+                input={"a": 10, "b": 3, "op": "mul"},
+                expected_output={"result": 30},
+                description="multiplication",
+            ),
+        ],
+    )
+
+
+def search_outlet(operator_did: str) -> OutletDefinition:
+    """Return the search outlet definition operated by ``operator_did``."""
+    return OutletDefinition(
+        name="search",
+        description="Search a knowledge base by keyword query.",
+        kind=OutletKind.Query,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "description": "Maximum number of results to return",
+                },
+            },
+            "required": ["query"],
+        },
+        output_schema={
+            "type": "object",
+            "properties": {
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "snippet": {"type": "string"},
+                            "score": {"type": "number"},
+                        },
+                    },
+                },
+                "total": {"type": "integer"},
+            },
+            "required": ["results", "total"],
+        },
+        operator=operator_did,
+        test_vectors=[
+            TestVector(
+                input={"query": "SCP protocol"},
+                expected_output={
+                    "results": [
+                        {
+                            "title": "SCP Overview",
+                            "snippet": "Shared Context Protocol...",
+                            "score": 0.95,
+                        }
+                    ],
+                    "total": 1,
+                },
+                description="basic keyword search",
+            ),
+        ],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -251,139 +257,121 @@ def handle_search(input_data: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def run_agent(*, enable_mcp: bool = False, mcp_transport: str = "stdio") -> None:
-    """Run the tool-provider agent.
+async def run_agent(*, enable_mcp: bool = False) -> None:
+    """Run the outlet-provider agent.
 
     Args:
-        enable_mcp: When ``True``, start an MCP server exposing the
-            context's tools to external MCP-compatible models.
-        mcp_transport: MCP transport mode (``"stdio"`` or ``"sse"``).
+        enable_mcp: When ``True``, serve the context's outlets to an
+            MCP client over stdio until the client disconnects.
     """
-    # 1. Create identity with in-memory custody (swap to "platform" for prod).
-    identity = await Identity.create(custody="in_memory")
-    logger.info("Created identity: %s", identity.did)
+    storage_dir = Path.home() / ".scp" / "agent-tool-provider"
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    async with SCP(
+        storage={
+            "type": "sqlite",
+            "path": str(storage_dir),
+            "passphrase": os.environ["SCP_STORAGE_PASSPHRASE"],
+        }
+    ) as scp:
+        # 1. Create an identity whose keys live in the passphrase-sealed key file.
+        identity = await scp.identity_create(CustodyType.FILE)
+        logger.info("Created identity: %s", identity.did)
 
-    # 2. Create context with tool + messaging capabilities.
-    async with await Context.create(
-        creator=identity,
-        ceiling=[
-            Capability.OUTLET_REGISTER,
-            Capability.OUTLET_CALL_ALL,
-            Capability.MESSAGES_READ,
-            Capability.MESSAGES_WRITE,
-        ],
-        memory_scope="ephemeral",
-    ) as ctx:
+        # 2. Create a context with outlet and messaging capabilities.
+        ctx = await scp.context_create(
+            identity.did,
+            {
+                "ceiling": [
+                    Capability.OUTLET_REGISTER.value,
+                    Capability.OUTLET_QUERY_ALL.value,
+                    Capability.MESSAGES_READ.value,
+                    Capability.MESSAGES_WRITE.value,
+                ],
+                "memory_scope": MemoryScope.EPHEMERAL.value,
+                "governance": "single_admin",
+            },
+        )
         logger.info("Created context: %s (state=%s)", ctx.context_id, ctx.state)
 
-        # 3. Set operator DID on tool definitions and register them.
-        CALCULATOR_TOOL.operator = identity.did
-        SEARCH_TOOL.operator = identity.did
-
-        # Register tools in the context via invoke (the bridge registers
-        # tools when the context is created with tools, or tools can be
-        # registered individually through the context handle).
-        logger.info("Registering tools in context...")
-        tools = [CALCULATOR_TOOL, SEARCH_TOOL]
-        for tool in tools:
-            logger.info("  Registered: %s -- %s", tool.name, tool.description)
-
-        # 4. Attach handler functions so tool invocations execute Python code.
-        register_tool_handler(ctx, "calculator", handle_calculator)
-        register_tool_handler(ctx, "search", handle_search)
-        logger.info("Tool handlers attached")
-
-        # 5. Mint a UCAN token authorizing tool invocations.
-        #    In production, tokens are scoped per-outlet; here we grant
-        #    OutletCallAll for demo convenience.
-        token = await ucan_mint(
-            audience=identity.did,
-            capabilities=["outlet_call:*"],
-            context=ctx.context_id,
+        # 3. Register both outlets. Each call returns the outlet id that every
+        #    later call names.
+        calculator_id = await scp.outlet_register(
+            ctx.context_id, calculator_outlet(identity.did)
+        )
+        search_id = await scp.outlet_register(
+            ctx.context_id, search_outlet(identity.did)
         )
         logger.info(
-            "Minted UCAN token: %s (expires=%s)", token.token_id, token.expires_at
+            "Registered outlets: calculator=%s search=%s", calculator_id, search_id
         )
 
-        # 6. Invoke tools programmatically.
-        logger.info("\n--- Calculator invocations ---")
-
-        calc_result = await ctx.invoke(
-            "calculator",
-            {"a": 7, "b": 3, "op": "mul"},
-            token.token_id,
-            identity=identity,
+        # 4. Attach the handler functions that run when an outlet is invoked.
+        await scp.mcp_register_outlet_handler(
+            ctx.context_id, calculator_id, handle_calculator
         )
-        logger.info("  7 * 3 = %s", calc_result.get("result"))
+        await scp.mcp_register_outlet_handler(ctx.context_id, search_id, handle_search)
+        logger.info("Outlet handlers attached")
 
-        calc_result = await ctx.invoke(
-            "calculator",
-            {"a": 100, "b": 37, "op": "sub"},
-            token.token_id,
-            identity=identity,
+        # 5. Mint a UCAN token that authorizes invoking these two Query outlets.
+        token = await scp.ucan_mint(
+            ctx.context_id,
+            identity.did,
+            [
+                Capability.outlet_query(calculator_id),
+                Capability.outlet_query(search_id),
+            ],
         )
-        logger.info("  100 - 37 = %s", calc_result.get("result"))
+        logger.info("Minted UCAN token: %s", token.token_id)
 
-        calc_result = await ctx.invoke(
-            "calculator",
-            {"a": 2, "b": 10, "op": "pow"},
-            token.token_id,
-            identity=identity,
-        )
-        logger.info("  2 ^ 10 = %s", calc_result.get("result"))
+        # 6. Invoke the outlets programmatically.
+        logger.info("--- Calculator invocations ---")
+        for a, b, op, label in (
+            (7, 3, "mul", "7 * 3"),
+            (100, 37, "sub", "100 - 37"),
+            (2, 10, "pow", "2 ^ 10"),
+        ):
+            calc_result = await scp.outlet_invoke(
+                ctx.context_id,
+                calculator_id,
+                {"a": a, "b": b, "op": op},
+                identity.did,
+                token.encoded,
+            )
+            logger.info("  %s = %s", label, calc_result.get("result"))
 
-        logger.info("\n--- Search invocations ---")
-
-        search_result = await ctx.invoke(
-            "search",
+        logger.info("--- Search invocations ---")
+        for search_input in (
             {"query": "encryption MLS"},
-            token.token_id,
-            identity=identity,
-        )
-        logger.info("  'encryption MLS': %d results", search_result.get("total", 0))
-        for hit in search_result.get("results", []):
-            logger.info("    %.2f  %s", hit["score"], hit["title"])
-
-        search_result = await ctx.invoke(
-            "search",
             {"query": "UCAN capability authorization", "max_results": 3},
-            token.token_id,
-            identity=identity,
-        )
-        logger.info(
-            "  'UCAN capability authorization': %d results",
-            search_result.get("total", 0),
-        )
-        for hit in search_result.get("results", []):
-            logger.info("    %.2f  %s", hit["score"], hit["title"])
+        ):
+            search_result = await scp.outlet_invoke(
+                ctx.context_id,
+                search_id,
+                search_input,
+                identity.did,
+                token.encoded,
+            )
+            logger.info(
+                "  %r: %d results", search_input["query"], search_result.get("total", 0)
+            )
+            for hit in search_result.get("results", []):
+                logger.info("    %.2f  %s", hit["score"], hit["title"])
 
-        # 7. Optionally start MCP server to bridge tools externally.
+        # 7. Optionally serve the context's outlets to an MCP client over stdio.
         if enable_mcp:
-            logger.info("\n--- Starting MCP server (transport=%s) ---", mcp_transport)
-            async with await serve_mcp(
-                identity=identity,
-                contexts=[ctx],
-                transport=mcp_transport,
-            ) as server:
-                logger.info(
-                    "MCP server running: %d context(s), transport=%s",
-                    len(server.contexts),
-                    server.transport,
-                )
-                logger.info(
-                    "Tools exposed via MCP: %s",
-                    [t.name for t in tools],
-                )
-                logger.info("Press Ctrl+C to stop.")
-
-                # Keep the agent alive until interrupted.
-                try:
-                    while True:
-                        await asyncio.sleep(1)
-                except KeyboardInterrupt:
-                    logger.info("Shutting down MCP server...")
+            logger.info("--- Starting MCP server (transport=stdio) ---")
+            server = await scp.mcp_serve(
+                identity.did, [ctx.context_id], "stdio", token.encoded
+            )
+            try:
+                # Returns when the MCP client closes stdin.
+                await scp.mcp_server_wait(server)
+            finally:
+                await scp.mcp_server_stop(server)
         else:
-            logger.info("\nTool invocations complete. Pass --mcp to start MCP server.")
+            logger.info(
+                "Outlet invocations complete. Pass --mcp to start an MCP server."
+            )
 
     logger.info("Agent complete.")
 
@@ -395,10 +383,7 @@ async def run_agent(*, enable_mcp: bool = False, mcp_transport: str = "stdio") -
 
 def cli() -> None:
     """Parse arguments and run the agent."""
-    enable_mcp = "--mcp" in sys.argv
-    use_sse = "--sse" in sys.argv
-    transport = "sse" if use_sse else "stdio"
-    asyncio.run(run_agent(enable_mcp=enable_mcp, mcp_transport=transport))
+    asyncio.run(run_agent(enable_mcp="--mcp" in sys.argv))
 
 
 if __name__ == "__main__":

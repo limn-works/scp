@@ -1,139 +1,103 @@
 """SCP broadcast feed subscriber.
 
-Joins an existing broadcast context and receives published content.
 Demonstrates the subscriber side of the broadcast pattern: creating an
-identity, subscribing to the feed, requesting the author's broadcast key,
-and consuming messages from the async receive stream.
+identity, generating the wrapping key a publisher seals its broadcast key
+to, and opening the sealed key the publisher returns (spec section 5.14.2).
+
+Key requests have no network path yet, so this script prints its DID and
+wrapping key for the publisher, then reads the sealed key the publisher
+printed. The wrapping secret never leaves this process.
 
 Usage:
     pip install -e ../../bindings/python
+    export SCP_KEY_PASSPHRASE=...      # seals $HOME/.scp/keys.bin
+    export SCP_STORAGE_PASSPHRASE=...  # encrypts the SQLCipher database
 
-    # Get the context ID from the publisher's output, then:
-    python subscriber.py <context_id>
+    python subscriber.py
+    # Pass the printed DID and wrapping key to feed.py, then paste the
+    # sealed key it prints here.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
+from pathlib import Path
 
-from scp_sdk import Context, Identity, Message, connect_relay
-from scp_sdk.types import ContextMode
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from scp_sdk import SCP, CustodyType, StorageConfig
 
-
-RELAY_URL = "wss://relay.example.com"
-
-
-async def create_subscriber() -> Identity:
-    """Create a subscriber identity with in-memory custody."""
-    identity = await Identity.create(custody="in_memory")
-    print(f"Subscriber DID: {identity.did}")
-    return identity
+BROADCAST_KEY_BYTES = 32
 
 
-async def join_feed(subscriber: Identity, context_id: str) -> Context:
-    """Join an existing broadcast feed context.
+def node_storage(name: str) -> StorageConfig:
+    """Return SQLCipher storage at ``$HOME/.scp/<name>``.
 
-    The subscriber joins the context and registers for broadcast key
-    distribution. In open broadcast contexts (public-broadcast template),
-    registration is DID-authenticated -- no admin-issued UCAN is required
-    (spec section 5.14.4).
+    ``SCP_STORAGE_PASSPHRASE`` derives the database key. An unset variable
+    raises ``KeyError`` here, before any database opens.
     """
-    # Create a Context handle for the existing broadcast context.
-    # In production, the context_id and relay info come from discovery
-    # (spec section 5.14.11) -- shared via URI, .well-known/scp, or
-    # context registration.
-    ctx = await Context.create(
-        creator=subscriber,
-        ceiling=[],
-        mode=ContextMode.BROADCAST,
-        governance="single_admin",
-        memory_scope="full",
+    path = Path.home() / ".scp" / name
+    path.mkdir(parents=True, exist_ok=True)
+    return {
+        "type": "sqlite",
+        "path": str(path),
+        "passphrase": os.environ["SCP_STORAGE_PASSPHRASE"],
+    }
+
+
+def generate_wrapping_key() -> tuple[bytes, bytes]:
+    """Return a DHKEM(P-256) key pair as ``(public_point, secret_scalar)``.
+
+    The public half is the 65-byte uncompressed point a publisher seals to;
+    the secret half is the 32-byte big-endian scalar that opens the seal.
+    """
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_point = private_key.public_key().public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
     )
-
-    # Join the broadcast context as a subscriber.
-    membership = await ctx.join(subscriber)
-    print(f"Joined feed: {context_id}")
-    print(f"  Role: {membership.role}")
-    print(f"  Context: {membership.context_id}")
-
-    # Register as a broadcast subscriber. This triggers the pull-based
-    # key distribution protocol -- the author's SDK will respond with
-    # the current broadcast key (spec section 5.14.3).
-    await ctx.broadcast_subscribe(subscriber.did)
-    print(f"  Subscribed to broadcasts")
-
-    return ctx
+    secret = private_key.private_numbers().private_value.to_bytes(32, "big")
+    return public_point, secret
 
 
-async def receive_messages(ctx: Context, subscriber: Identity) -> None:
-    """Consume messages from the broadcast feed.
-
-    Messages arrive via the async receive stream. Each message is a
-    BroadcastEnvelope (spec section 5.14.5) that has been decrypted
-    using the cached author broadcast key.
-
-    The receive iterator is backed by a bounded buffer (default 1,000
-    events) with oldest-drop overflow semantics.
-    """
-    print("\nListening for broadcasts (Ctrl+C to stop)...")
-    stream = await ctx.receive()
-
-    async for message in stream:
-        content = (
-            message.content.decode("utf-8")
-            if isinstance(message.content, bytes)
-            else message.content
-        )
-        print(f"  [{message.sender_did[:20]}...] {content}")
-
-
-async def check_subscription(ctx: Context, subscriber: Identity) -> None:
-    """Verify subscription status."""
-    is_sub = await ctx.broadcast_is_subscriber(subscriber.did)
-    print(f"  Subscription active: {is_sub}")
-
-    count = await ctx.broadcast_subscriber_count()
-    print(f"  Total subscribers: {count}")
-
-
-async def run_subscriber(context_id: str) -> None:
+async def run_subscriber() -> None:
     """Run the subscriber lifecycle."""
-    # 1. Create subscriber identity.
-    subscriber = await create_subscriber()
+    async with SCP(storage=node_storage("broadcast-feed-subscriber")) as node:
+        # 1. Create the subscriber identity.
+        subscriber = await node.identity_create(CustodyType.FILE)
 
-    # 2. Connect to relay.
-    transport = await connect_relay(RELAY_URL)
-    print(f"Connected to relay: {RELAY_URL}")
+        # 2. Generate the wrapping key the publisher seals its key to.
+        wrapping_public, wrapping_secret = generate_wrapping_key()
 
-    # 3. Join the broadcast feed.
-    feed = await join_feed(subscriber, context_id)
+        print("--- Pass these to the publisher ---")
+        print(f"  --subscriber {subscriber.did}")
+        print(f"  --wrapping-key {wrapping_public.hex()}")
+        print("--- ---")
 
-    async with feed:
-        # 4. Verify subscription.
-        await check_subscription(feed, subscriber)
+        # 3. Read the sealed key the publisher printed. An empty line or EOF
+        #    stops the script without a key.
+        print("\nPaste the sealed key from the publisher, then press Enter:")
+        loop = asyncio.get_running_loop()
+        sealed = (await loop.run_in_executor(None, sys.stdin.readline)).strip()
+        if not sealed:
+            raise SystemExit("No sealed key received.")
 
-        # 5. Receive messages until interrupted or feed closes.
-        try:
-            await receive_messages(feed, subscriber)
-        except KeyboardInterrupt:
-            print("\nStopping...")
+        # 4. Open the sealed key. A seal made for another wrapping key, or a
+        #    tampered one, raises instead of returning a key.
+        broadcast_key = await node.broadcast_open_key(sealed, wrapping_secret)
+        if len(broadcast_key) != BROADCAST_KEY_BYTES:
+            raise RuntimeError(
+                f"broadcast key is {len(broadcast_key)} bytes, expected 32"
+            )
+        print(f"\nOpened the author's {len(broadcast_key)}-byte broadcast key.")
 
-    print("Left feed.")
+    print("Subscriber stopped.")
 
 
 def main() -> None:
     """Entry point for the broadcast subscriber."""
-    if len(sys.argv) < 2:
-        print("Usage: python subscriber.py <context_id>", file=sys.stderr)
-        print(
-            "\nGet the context ID from the publisher's output (python feed.py).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    context_id = sys.argv[1]
-    asyncio.run(run_subscriber(context_id))
+    asyncio.run(run_subscriber())
 
 
 if __name__ == "__main__":

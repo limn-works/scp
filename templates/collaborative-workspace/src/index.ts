@@ -5,26 +5,30 @@
  * - Identity creation and agent key binding (ADR-039)
  * - Governed context with role-based capabilities
  * - Adding participants with different roles (Admin, Moderator, Member, Observer)
- * - Shared tool registration with capability-gated invocation
- * - Governance proposals and voting (threshold model)
+ * - Shared outlet registration with capability-gated invocation
+ * - Governance proposals under single-admin governance
  * - UCAN delegation for scoped authorization
  * - Trust evaluation from the event log
  * - Event log auditing with Merkle proofs
  *
+ * One SCP instance hosts every participant, as a team server hosting its
+ * members' agents would. The TypeScript SDK ships no production key store,
+ * so the caller passes the `KeyCustodyProvider` that holds every
+ * participant's keys; the SDK's one `CustodyType`, `"in_memory"`, works only
+ * with an addon built with the `testing` feature.
+ *
  * Usage:
- *   bun run src/index.ts
+ *   import { runWorkspace } from "./src/index";
+ *   await runWorkspace(custody, relayUrl, process.env.SCP_STORAGE_PASSPHRASE);
  */
 
 import {
-  Context,
+  Capabilities,
   type ContextParams,
-  defineToolDefinition,
-  delegateUcan,
-  evaluateTrust,
-  EventLog,
-  Identity,
-  mintUcan,
-  validateUcan,
+  defineOutletDefinition,
+  type KeyCustodyProvider,
+  outletQuery,
+  SCP,
 } from "@limn-works/scp-ts";
 
 import {
@@ -32,6 +36,8 @@ import {
   changeParticipantRole,
   listMembers,
   removeParticipant,
+  roleName,
+  stringField,
 } from "./participant";
 
 // ---------------------------------------------------------------------------
@@ -40,37 +46,19 @@ import {
 
 /** Capabilities forming the workspace ceiling -- the maximum grantable set. */
 const WORKSPACE_CEILING: readonly string[] = [
-  "messages:read",
-  "messages:write",
-  "role:assign",
-  "member:invite",
-  "member:remove",
-  "outlet:register",
-  "outlet:call:*",
-  "governance:propose",
-  "governance:vote",
+  Capabilities.MESSAGES_READ,
+  Capabilities.MESSAGES_WRITE,
+  Capabilities.ROLE_ASSIGN,
+  Capabilities.MEMBER_INVITE,
+  Capabilities.MEMBER_REMOVE,
+  Capabilities.OUTLET_REGISTER,
+  Capabilities.OUTLET_QUERY_ALL,
+  Capabilities.GOVERNANCE_PROPOSE,
+  Capabilities.GOVERNANCE_VOTE,
 ];
 
-/** Role definitions mapping role names to their capability subsets. */
-const WORKSPACE_ROLES: Readonly<Record<string, readonly string[]>> = {
-  Admin: [...WORKSPACE_CEILING],
-  Moderator: [
-    "messages:read",
-    "messages:write",
-    "member:invite",
-    "outlet:call:*",
-    "governance:propose",
-    "governance:vote",
-  ],
-  Member: [
-    "messages:read",
-    "messages:write",
-    "outlet:call:*",
-  ],
-  Observer: [
-    "messages:read",
-  ],
-};
+/** Workspace lifetime before governance must extend it. */
+const WORKSPACE_TTL_SECS = 86_400;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -90,306 +78,267 @@ function divider(title: string): void {
 // Main workflow
 // ---------------------------------------------------------------------------
 
-async function main(): Promise<void> {
-  // =========================================================================
-  // 1. Create admin identity
-  // =========================================================================
-  divider("1. Admin Identity");
-
-  const admin = await Identity.createWithAgentKey({ custody: "in_memory" });
-  log("identity", `Admin DID: ${admin.did}`);
-  log("identity", `Custody: ${admin.custodyType}`);
-
-  // =========================================================================
-  // 2. Create governed workspace context
-  // =========================================================================
-  divider("2. Workspace Context");
-
-  const contextParams: ContextParams = {
-    ceiling: [...WORKSPACE_CEILING],
-    roles: { ...WORKSPACE_ROLES },
-    memoryScope: "full",
-    governance: "single_admin",
-    mode: "Encrypted",
-    ceilingPolicy: "governed",
-    ttl: 86400, // 24 hours
-  };
-
-  const ctx = await Context.create(admin, contextParams);
-  log("context", `Context ID: ${ctx.contextId}`);
-
-  const memberCount = await ctx.memberCount();
-  log("context", `Initial members: ${memberCount}`);
-
-  // =========================================================================
-  // 3. Register shared tools
-  // =========================================================================
-  divider("3. Tool Registration");
-
-  // A summarization tool available to Members and above.
-  const summarizeTool = defineToolDefinition({
-    name: "summarize",
-    description: "Summarizes the conversation history in the workspace",
-    inputSchema: {
-      type: "object",
-      properties: {
-        maxLength: { type: "number", description: "Maximum summary length in characters" },
-        format: { type: "string", enum: ["bullet", "paragraph", "outline"] },
-      },
-      required: ["maxLength"],
-    },
-    outputSchema: {
-      type: "object",
-      properties: {
-        summary: { type: "string" },
-        messageCount: { type: "number" },
-      },
-      required: ["summary", "messageCount"],
-    },
-    operator: admin.did,
-    testVectors: [
-      {
-        input: { maxLength: 100, format: "bullet" },
-        expectedOutput: { summary: "- Test summary", messageCount: 0 },
-        description: "Empty workspace returns zero-message summary",
-      },
-    ],
+export async function runWorkspace(
+  custody: KeyCustodyProvider,
+  relayUrl: string,
+  storagePassphrase: string,
+): Promise<void> {
+  const scp = new SCP({
+    storage: { type: "sqlite", path: "./scp-workspace", passphrase: storagePassphrase },
   });
+  try {
+    // =======================================================================
+    // 1. Create admin identity
+    // =======================================================================
+    divider("1. Admin Identity");
 
-  const summarizeToolId = await ctx.registerTool(summarizeTool);
-  log("tools", `Registered 'summarize' tool: ${summarizeToolId}`);
+    const created = await scp.identityCreateWithCustody(custody);
+    const admin = await scp.identityAddAgentKey(created);
+    log("identity", `Admin DID: ${admin.did}`);
 
-  // A code-review tool restricted to Moderator+ roles.
-  const reviewTool = defineToolDefinition({
-    name: "code-review",
-    description: "Performs automated code review on submitted patches",
-    inputSchema: {
-      type: "object",
-      properties: {
-        diff: { type: "string", description: "Unified diff to review" },
-        language: { type: "string", description: "Programming language" },
+    // Attach the relay transport before the first context: the context
+    // supervisor starts on the first context and binds the transport it
+    // finds then.
+    await scp.configureRelayTransport(relayUrl, admin.did);
+    log("identity", `Relay transport: ${relayUrl}`);
+
+    // =======================================================================
+    // 2. Create governed workspace context
+    // =======================================================================
+    divider("2. Workspace Context");
+
+    const contextParams: ContextParams = {
+      ceiling: [...WORKSPACE_CEILING],
+      memoryScope: "full",
+      governance: "single_admin",
+      mode: "Encrypted",
+      ceilingPolicy: "governed",
+      ttl: WORKSPACE_TTL_SECS,
+    };
+
+    const ctx = await scp.contextCreate(admin, JSON.stringify(contextParams));
+    log("context", `Context ID: ${ctx.contextId}`);
+    log("context", `Initial members: ${await scp.contextMemberCount(ctx)}`);
+
+    // =======================================================================
+    // 3. Register shared outlets
+    // =======================================================================
+    divider("3. Outlet Registration");
+
+    // A summarization outlet available to Members and above.
+    const summarizeOutlet = defineOutletDefinition({
+      name: "summarize",
+      description: "Summarizes the conversation history in the workspace",
+      kind: "query",
+      inputSchema: {
+        type: "object",
+        properties: {
+          maxLength: { type: "number", description: "Maximum summary length in characters" },
+          format: { type: "string", enum: ["bullet", "paragraph", "outline"] },
+        },
+        required: ["maxLength"],
       },
-      required: ["diff"],
-    },
-    outputSchema: {
-      type: "object",
-      properties: {
-        findings: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              severity: { type: "string" },
-              message: { type: "string" },
-              line: { type: "number" },
+      outputSchema: {
+        type: "object",
+        properties: {
+          summary: { type: "string" },
+          messageCount: { type: "number" },
+        },
+        required: ["summary", "messageCount"],
+      },
+      operator: admin.did,
+      testVectors: [
+        {
+          input: { maxLength: 100, format: "bullet" },
+          expectedOutput: { summary: "- Test summary", messageCount: 0 },
+          description: "Empty workspace returns zero-message summary",
+        },
+      ],
+    });
+
+    const summarizeId = await scp.outletRegister(ctx, summarizeOutlet);
+    log("outlets", `Registered 'summarize' outlet: ${summarizeId}`);
+
+    // A code-review outlet.
+    const reviewOutlet = defineOutletDefinition({
+      name: "code-review",
+      description: "Performs automated code review on submitted patches",
+      kind: "query",
+      inputSchema: {
+        type: "object",
+        properties: {
+          diff: { type: "string", description: "Unified diff to review" },
+          language: { type: "string", description: "Programming language" },
+        },
+        required: ["diff"],
+      },
+      outputSchema: {
+        type: "object",
+        properties: {
+          findings: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                severity: { type: "string" },
+                message: { type: "string" },
+                line: { type: "number" },
+              },
             },
           },
+          approved: { type: "boolean" },
         },
-        approved: { type: "boolean" },
+        required: ["findings", "approved"],
       },
-      required: ["findings", "approved"],
-    },
-    operator: admin.did,
-  });
+      operator: admin.did,
+    });
 
-  const reviewToolId = await ctx.registerTool(reviewTool);
-  log("tools", `Registered 'code-review' tool: ${reviewToolId}`);
+    const reviewId = await scp.outletRegister(ctx, reviewOutlet);
+    log("outlets", `Registered 'code-review' outlet: ${reviewId}`);
 
-  // Verify tool integrity against test vectors.
-  const verifyResult = await ctx.verifyTool(summarizeToolId);
-  log("tools", `Tool verification passed: ${verifyResult.passed}`);
+    // Verify outlet integrity against its test vectors.
+    const verification = await scp.outletVerify(ctx, summarizeId);
+    log("outlets", `Outlet verification: ${JSON.stringify(verification)}`);
 
-  // =========================================================================
-  // 4. Add participants with different roles
-  // =========================================================================
-  divider("4. Participant Management");
+    // =======================================================================
+    // 4. Add participants with different roles
+    // =======================================================================
+    divider("4. Participant Management");
 
-  // Add a moderator.
-  const moderator = await addParticipant(ctx, "Moderator", admin);
-  log("members", `Moderator joined: ${moderator.identity.did}`);
-  log("members", `  Role: ${moderator.role}`);
-  log("members", `  Token capabilities: ${moderator.token.capabilities.join(", ")}`);
+    const moderator = await addParticipant(scp, ctx, custody, "Moderator", admin);
+    log("members", `Moderator joined: ${moderator.identity.did}`);
 
-  // Add a regular member.
-  const member = await addParticipant(ctx, "Member", admin);
-  log("members", `Member joined: ${member.identity.did}`);
-  log("members", `  Role: ${member.role}`);
+    const member = await addParticipant(scp, ctx, custody, "Member", admin);
+    log("members", `Member joined: ${member.identity.did}`);
 
-  // Add an observer (read-only).
-  const observer = await addParticipant(ctx, "Observer", admin);
-  log("members", `Observer joined: ${observer.identity.did}`);
-  log("members", `  Role: ${observer.role}`);
+    const observer = await addParticipant(scp, ctx, custody, "Observer", admin);
+    log("members", `Observer joined: ${observer.identity.did}`);
 
-  // List all members and roles.
-  const members = await listMembers(ctx);
-  log("members", `Total members: ${members.length}`);
-  for (const m of members) {
-    log("members", `  ${m.did} -> ${m.role}`);
+    const members = await listMembers(scp, ctx);
+    log("members", `Total members: ${members.length}`);
+    for (const m of members) {
+      log("members", `  ${m.did} -> ${roleName(m.role)}`);
+    }
+
+    // =======================================================================
+    // 5. Capability-based authorization
+    // =======================================================================
+    divider("5. Capability-Based Authorization");
+
+    // Mint a token scoped to the one outlet the member may call.
+    const summarizeCapability = outletQuery(summarizeId);
+    const memberOutletToken = stringField(
+      await scp.ucanMint(ctx, member.identity.did, [summarizeCapability]),
+      "encoded",
+    );
+    log("ucan", "Minted summarize token for member");
+
+    // Validate the token against the required capability.
+    await scp.ucanValidate(ctx, memberOutletToken, summarizeCapability, member.identity.did);
+    log("ucan", "Token validated for summarize invocation");
+
+    // Delegate a subset of the moderator's capabilities to the member.
+    const delegated = await scp.ucanDelegate(
+      ctx,
+      moderator.identity.did,
+      member.identity.did,
+      moderator.token,
+      [Capabilities.MESSAGES_READ, Capabilities.MESSAGES_WRITE],
+    );
+    log("ucan", `Delegated token from moderator to member: ${stringField(delegated, "id")}`);
+
+    // Invoke the summarize outlet as the member. Awaiting the handle drains
+    // the stream to its aggregated result.
+    const summary = await ctx.outlets.invoke(
+      summarizeId,
+      { maxLength: 200, format: "paragraph" },
+      { ucanToken: memberOutletToken, callerDid: member.identity.did },
+    );
+    log("outlets", `Outlet output: ${JSON.stringify(summary.value)}`);
+
+    // =======================================================================
+    // 6. Messaging
+    // =======================================================================
+    divider("6. Messaging");
+
+    const encoder = new TextEncoder();
+    await scp.contextSend(ctx, admin.did, encoder.encode("Welcome to the collaborative workspace!"));
+    log("messages", "Admin sent welcome message");
+
+    await scp.contextSend(
+      ctx,
+      moderator.identity.did,
+      encoder.encode("Moderator checking in. Ready to review."),
+    );
+    log("messages", "Moderator sent message");
+
+    // =======================================================================
+    // 7. Governance
+    // =======================================================================
+    divider("7. Governance");
+
+    // Under single_admin governance, the admin's proposals execute at once.
+    const promoted = await changeParticipantRole(scp, ctx, admin, member, "Moderator");
+    log("governance", `Promoted ${promoted.identity.did} to ${promoted.role}`);
+
+    const updatedRole = await scp.contextMemberRole(ctx, promoted.identity.did);
+    log("governance", `Verified role: ${roleName(updatedRole)}`);
+
+    // Propose extending the TTL by 12 hours.
+    const extended = await scp.contextProposeTtlExtension(ctx, admin.did, 43_200);
+    log("governance", `TTL extension executed: ${extended}`);
+
+    // List all proposals.
+    const proposals = await scp.contextGovernanceListProposals(ctx);
+    log("governance", `All proposals: ${proposals}`);
+
+    // =======================================================================
+    // 8. Trust evaluation
+    // =======================================================================
+    divider("8. Trust Evaluation");
+
+    const trust = await scp.evaluateTrust(ctx, moderator.identity.did);
+    log("trust", "Trust evaluation for moderator:");
+    log("trust", `  Subject: ${trust.subjectDid}`);
+    log("trust", `  Context: ${trust.contextId}`);
+    log("trust", `  Governance actions by: ${trust.behavioralRecord.governanceActionsBy}`);
+    log("trust", `  Outlet invocations: ${trust.behavioralRecord.outletInvocationCount}`);
+    log("trust", `  Attestations: ${trust.attestations.length}`);
+
+    // =======================================================================
+    // 9. Event log audit
+    // =======================================================================
+    divider("9. Event Log Audit");
+
+    const events = await scp.eventLogQuery(ctx);
+    log("events", `Total events: ${events.length}`);
+
+    const checkpoint = await scp.eventLogCheckpoint(ctx, admin, 0);
+    log("events", `Checkpoint root: ${stringField(checkpoint, "merkleRoot")}`);
+
+    if (events.length > 0) {
+      const proof = await scp.eventLogVerify(
+        ctx,
+        JSON.stringify({ type: "inclusion", leaf_index: 0 }),
+      );
+      log("events", `First event inclusion proof: ${JSON.stringify(proof)}`);
+    }
+
+    // =======================================================================
+    // 10. Cleanup
+    // =======================================================================
+    divider("10. Cleanup");
+
+    await removeParticipant(scp, ctx, admin, observer, "Workspace complete");
+    log("cleanup", `Removed observer: ${observer.identity.did}`);
+    log("cleanup", `Final member count: ${await scp.contextMemberCount(ctx)}`);
+
+    // Close the context (terminates for all members).
+    await scp.contextClose(ctx, admin.did);
+    log("cleanup", "Workspace context closed");
+
+    console.log("\nCollaborative workspace demo complete.");
+  } finally {
+    await scp.shutdown();
   }
-
-  // =========================================================================
-  // 5. Capability-based authorization
-  // =========================================================================
-  divider("5. Capability-Based Authorization");
-
-  // Mint a scoped token for tool invocation.
-  const memberToolToken = await mintUcan(
-    ctx,
-    member.identity.did,
-    ["outlet:call:*", `outlet:call:${summarizeToolId}`],
-  );
-  log("ucan", `Minted tool token for member: ${memberToolToken.id}`);
-
-  // Validate the token against the required capability.
-  await validateUcan(ctx, memberToolToken.encoded, `outlet:call:${summarizeToolId}`);
-  log("ucan", "Token validated for summarize tool invocation");
-
-  // Delegate a subset of the moderator's capabilities to the member.
-  const delegatedToken = await delegateUcan(
-    ctx,
-    moderator.token,
-    moderator.identity.did,
-    member.identity.did,
-    ["messages:read", "messages:write"],
-  );
-  log("ucan", `Delegated token from moderator to member: ${delegatedToken.id}`);
-  log("ucan", `  Delegated capabilities: ${delegatedToken.capabilities.join(", ")}`);
-
-  // Invoke the summarize tool with the member's scoped token.
-  const toolOutput = await ctx.invokeTool(
-    summarizeToolId,
-    { maxLength: 200, format: "paragraph" },
-    member.identity,
-    memberToolToken.encoded,
-  );
-  log("tools", `Tool output: ${JSON.stringify(toolOutput)}`);
-
-  // =========================================================================
-  // 6. Messaging
-  // =========================================================================
-  divider("6. Messaging");
-
-  await ctx.send("Welcome to the collaborative workspace!");
-  log("messages", "Admin sent welcome message");
-
-  // Join the context as the moderator and send a message.
-  await ctx.join(moderator.identity);
-  await ctx.send("Moderator checking in. Ready to review.");
-  log("messages", "Moderator sent message");
-
-  // =========================================================================
-  // 7. Governance: propose and vote
-  // =========================================================================
-  divider("7. Governance");
-
-  // --- Single-admin governance: immediate execution ---
-
-  // Promote the member to Moderator via governance.
-  const promotedMember = await changeParticipantRole(ctx, member, "Moderator");
-  log("governance", `Promoted ${promotedMember.identity.did} to ${promotedMember.role}`);
-
-  // Verify the role change took effect.
-  const updatedRole = await ctx.memberRole(promotedMember.identity.did);
-  log("governance", `Verified role: ${updatedRole}`);
-
-  // --- Demonstrate the proposal lifecycle ---
-  // Even under single_admin, the proposal/vote API works (auto-approved).
-
-  // Propose extending the TTL by 12 hours.
-  const extendAction = JSON.stringify({
-    ExtendTtl: { additional_secs: 43200 },
-  });
-  const proposalResult = await ctx.proposeGovernanceAction(extendAction);
-  log("governance", `TTL extension proposal: ${proposalResult}`);
-
-  // Parse the proposal result to get the proposal ID.
-  const proposalData = JSON.parse(proposalResult) as {
-    proposal_id: string;
-    status: string;
-  };
-  log("governance", `  Proposal ID: ${proposalData.proposal_id}`);
-  log("governance", `  Status: ${proposalData.status}`);
-
-  // List all proposals.
-  const proposals = await ctx.listGovernanceProposals();
-  log("governance", `All proposals: ${proposals}`);
-
-  // Propose modifying the ceiling to add a new capability.
-  const ceilingAction = JSON.stringify({
-    ModifyCeiling: {
-      new_ceiling: [...WORKSPACE_CEILING, "analytics:read"],
-    },
-  });
-  const ceilingProposal = await ctx.proposeGovernanceAction(ceilingAction);
-  log("governance", `Ceiling modification proposal: ${ceilingProposal}`);
-
-  // =========================================================================
-  // 8. Trust evaluation
-  // =========================================================================
-  divider("8. Trust Evaluation");
-
-  // Evaluate trust for the moderator based on their event log activity.
-  const trustEval = await evaluateTrust(ctx, moderator.identity.did);
-  log("trust", `Trust evaluation for moderator:`);
-  log("trust", `  Subject: ${trustEval.subjectDid}`);
-  log("trust", `  Context: ${trustEval.contextId}`);
-  log("trust", `  Participation count: ${trustEval.behavioralRecord.participationCount}`);
-  log("trust", `  Governance actions by: ${trustEval.behavioralRecord.governanceActionsBy}`);
-  log("trust", `  Attestations: ${trustEval.attestations.length}`);
-
-  // =========================================================================
-  // 9. Event log audit
-  // =========================================================================
-  divider("9. Event Log Audit");
-
-  const eventLog = new EventLog(ctx);
-
-  // Query all events.
-  const allEvents = await eventLog.query();
-  log("events", `Total events: ${allEvents.length}`);
-  for (const event of allEvents.slice(0, 5)) {
-    log("events", `  [${event.sequence}] ${event.eventType} by ${event.actorDid}`);
-  }
-  if (allEvents.length > 5) {
-    log("events", `  ... and ${allEvents.length - 5} more`);
-  }
-
-  // Query governance-specific events.
-  const govEvents = await eventLog.query({ eventType: "GovernanceAction" });
-  log("events", `Governance events: ${govEvents.length}`);
-
-  // Create a Merkle checkpoint for the current state.
-  const checkpoint = await eventLog.checkpoint();
-  log("events", `Checkpoint root: ${checkpoint.root}`);
-  log("events", `Checkpoint event count: ${checkpoint.eventCount}`);
-
-  // Verify inclusion of the first event.
-  if (allEvents.length > 0) {
-    const proof = await eventLog.verify({ type: "inclusion", leafIndex: 0 });
-    log("events", `First event inclusion proof verified: ${proof.verified}`);
-  }
-
-  // =========================================================================
-  // 10. Cleanup
-  // =========================================================================
-  divider("10. Cleanup");
-
-  // Remove the observer.
-  await removeParticipant(ctx, observer, "Workspace complete");
-  log("cleanup", `Removed observer: ${observer.identity.did}`);
-
-  // Final member count.
-  const finalCount = await ctx.memberCount();
-  log("cleanup", `Final member count: ${finalCount}`);
-
-  // Close the context (terminates for all members).
-  await ctx.close();
-  log("cleanup", "Workspace context closed");
-
-  console.log("\nCollaborative workspace demo complete.");
 }
-
-main().catch((error: unknown) => {
-  console.error("Fatal error:", error);
-  process.exit(1);
-});
