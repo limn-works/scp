@@ -135,6 +135,12 @@ tasks.test {
     // `cargo build -p scp-ffi-uniffi` or
     // `./scripts/generate-uniffi-kotlin.sh` (which builds the lib) first.
     jvmArgumentProviders.add(JnaLibraryPath(cargoTargetDir))
+
+    // `ReadmeQuickStartTest` compares its compiled copy with the Quick Start block
+    // in `bindings/kotlin/README.md`, which it reads at run time. Declare the file
+    // as an input so an edit to the README alone reruns the test instead of
+    // leaving the task UP-TO-DATE.
+    inputs.file(rootProject.file("README.md")).withPathSensitivity(PathSensitivity.RELATIVE)
 }
 
 // Prints the `-Djna.library.path` argument `JnaLibraryPath` gives the test JVM. The
