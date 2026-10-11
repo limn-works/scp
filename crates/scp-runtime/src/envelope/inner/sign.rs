@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use scp_platform::traits::{KeyCustody, KeyHandle};
 
 use super::{InnerEnvelope, InnerEnvelopeParams, SCP_INNER_ENVELOPE_VERSION};
+use crate::context::actor::signer::{CommandSigner, sign_bounded};
+use scp_protocol::context::ContextError;
 use scp_protocol::envelope::EnvelopeError;
 
 // These functions are in the inner envelope module.
@@ -21,6 +23,56 @@ use scp_protocol::envelope::padding::pad_to_bucket;
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
+
+/// The hashes an inner envelope commits to, computed before any signature.
+struct InnerEnvelopeDigest {
+    payload: [u8; 32],
+    provenance: [u8; 32],
+    canonical: [u8; 32],
+}
+
+/// Steps 1-3 of construction: `payload_hash = SHA-256(payload)` over the
+/// original plaintext, the provenance hash (`SHA-256(0x00)` when absent), and
+/// the §13.2.1 canonical hash the signature covers.
+fn inner_envelope_digest(
+    params: &InnerEnvelopeParams<'_>,
+) -> Result<InnerEnvelopeDigest, EnvelopeError> {
+    let payload_hash: [u8; 32] = Sha256::digest(params.payload).into();
+    let provenance_hash = compute_provenance_hash(params.provenance.as_ref())?;
+    let canonical_hash = compute_canonical_hash(params, &payload_hash, &provenance_hash)?;
+    Ok(InnerEnvelopeDigest {
+        payload: payload_hash,
+        provenance: provenance_hash,
+        canonical: canonical_hash,
+    })
+}
+
+/// Steps 5-6 of construction: pads the payload to its bucket and assembles
+/// the envelope around `signature`.
+fn assemble_inner_envelope(
+    params: &InnerEnvelopeParams<'_>,
+    digest: &InnerEnvelopeDigest,
+    signature: [u8; 64],
+) -> Result<InnerEnvelope, EnvelopeError> {
+    let padded_payload = pad_to_bucket(params.payload)?;
+    Ok(InnerEnvelope {
+        version: SCP_INNER_ENVELOPE_VERSION,
+        context_id: params.context_id.to_owned(),
+        sender_did: params.sender_did.to_owned(),
+        epoch: params.epoch,
+        generation: params.generation,
+        sequence: params.sequence,
+        timestamp: params.timestamp,
+        message_type: params.message_type,
+        payload_hash: digest.payload,
+        payload: padded_payload,
+        provenance: params.provenance.clone(),
+        provenance_hash: digest.provenance,
+        signing_key_id: params.signing_key_id,
+        signature,
+        extensions: HashMap::new(),
+    })
+}
 
 /// Creates an inner envelope with a signed, padded payload.
 ///
@@ -45,112 +97,63 @@ pub async fn create_inner_envelope(
     key_custody: &impl KeyCustody,
     signing_key: &KeyHandle,
 ) -> Result<InnerEnvelope, EnvelopeError> {
-    // 1. Hash original plaintext.
-    let payload_hash: [u8; 32] = Sha256::digest(params.payload).into();
-
-    // 2. Hash provenance.
-    let provenance_hash: [u8; 32] = compute_provenance_hash(params.provenance.as_ref())?;
-
-    // 3. Compute canonical hash for signing.
-    let canonical_hash = compute_canonical_hash(params, &payload_hash, &provenance_hash)?;
-
-    // 4. Sign the canonical hash.
+    let digest = inner_envelope_digest(params)?;
     let signature = key_custody
-        .sign(signing_key, &canonical_hash)
+        .sign(signing_key, &digest.canonical)
         .await
         .map_err(|e| EnvelopeError::Custody(e.into()))?;
-
-    // 5. Pad payload to bucket boundary.
-    let padded_payload = pad_to_bucket(params.payload)?;
-
-    // 6. Build and return the envelope.
     let sig_bytes: [u8; 64] = signature
         .into_bytes()
         .try_into()
         .map_err(|_| EnvelopeError::SigningFailed("Ed25519 signature must be 64 bytes".into()))?;
-
-    Ok(InnerEnvelope {
-        version: SCP_INNER_ENVELOPE_VERSION,
-        context_id: params.context_id.to_owned(),
-        sender_did: params.sender_did.to_owned(),
-        epoch: params.epoch,
-        generation: params.generation,
-        sequence: params.sequence,
-        timestamp: params.timestamp,
-        message_type: params.message_type,
-        payload_hash,
-        payload: padded_payload,
-        provenance: params.provenance.clone(),
-        provenance_hash,
-        signing_key_id: params.signing_key_id,
-        signature: sig_bytes,
-        extensions: HashMap::new(),
-    })
+    assemble_inner_envelope(params, &digest, sig_bytes)
 }
 
-// ---------------------------------------------------------------------------
-// Sync variant: sign with raw Ed25519 key
-// ---------------------------------------------------------------------------
+/// Creates an inner envelope signed through the command's
+/// [`CommandSigner`] (ADR-049 Decision 7a), the runtime send path's
+/// constructor.
+///
+/// The canonical hash is computed first, then signed through
+/// [`sign_bounded`] within the custody budget, then the envelope is
+/// assembled. The signer's persona must match `params.signing_key_id`;
+/// [`MessageSigner`](crate::context::supervisor::MessageSigner) pairs them.
+///
+/// # Errors
+///
+/// - [`ContextError::Custody`] when custody refuses the sign or does not
+///   answer within the budget (`TimedOut`, `SCP-CRYPTO-4061`).
+/// - [`ContextError::CryptoFailed`] when provenance serialization fails, the
+///   payload exceeds the largest bucket, or the signer fails otherwise.
+pub(crate) async fn create_inner_envelope_signed(
+    params: &InnerEnvelopeParams<'_>,
+    signer: &CommandSigner,
+) -> Result<InnerEnvelope, ContextError> {
+    let digest =
+        inner_envelope_digest(params).map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+    let signature = sign_bounded(signer, &digest.canonical).await?;
+    assemble_inner_envelope(params, &digest, signature)
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))
+}
 
 /// Creates an inner envelope signed with a raw Ed25519 signing key.
 ///
-/// Sync variant of [`create_inner_envelope`] for use in
-/// `ContextManager::send_message` where the signing key is available
-/// directly (not behind a `KeyCustody` abstraction).
-///
-/// # Processing order
-///
-/// 1. Compute `payload_hash = SHA-256(payload)`.
-/// 2. Compute `provenance_hash`.
-/// 3. Compute canonical hash.
-/// 4. Sign with the provided `signing_key`.
-/// 5. Pad payload to bucket boundary.
-/// 6. Return the complete inner envelope.
+/// Test-only: production signs through [`create_inner_envelope_signed`] or
+/// [`create_inner_envelope`], and the actor holds no key material (ADR-049
+/// Decision 7a). Tests and fuzz targets use this to build fixtures.
 ///
 /// # Errors
 ///
 /// Returns [`EnvelopeError::SerializationFailed`] if provenance serialization fails.
 /// Returns [`EnvelopeError::PayloadTooLarge`] if the payload exceeds the maximum
 /// bucket size.
+#[cfg(any(test, feature = "testing"))]
 pub fn create_inner_envelope_raw(
     params: &InnerEnvelopeParams<'_>,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<InnerEnvelope, EnvelopeError> {
-    // 1. Hash original plaintext.
-    let payload_hash: [u8; 32] = Sha256::digest(params.payload).into();
-
-    // 2. Hash provenance.
-    let provenance_hash: [u8; 32] = compute_provenance_hash(params.provenance.as_ref())?;
-
-    // 3. Compute canonical hash for signing.
-    let canonical_hash = compute_canonical_hash(params, &payload_hash, &provenance_hash)?;
-
-    // 4. Sign the canonical hash.
-    let signature = ed25519_dalek::Signer::sign(signing_key, &canonical_hash);
-
-    // 5. Pad payload to bucket boundary.
-    let padded_payload = pad_to_bucket(params.payload)?;
-
-    // 6. Build and return the envelope.
-    let sig_bytes: [u8; 64] = signature.to_bytes();
-
-    Ok(InnerEnvelope {
-        version: SCP_INNER_ENVELOPE_VERSION,
-        context_id: params.context_id.to_owned(),
-        sender_did: params.sender_did.to_owned(),
-        epoch: params.epoch,
-        generation: params.generation,
-        sequence: params.sequence,
-        timestamp: params.timestamp,
-        message_type: params.message_type,
-        payload_hash,
-        payload: padded_payload,
-        provenance: params.provenance.clone(),
-        provenance_hash,
-        signing_key_id: params.signing_key_id,
-        signature: sig_bytes,
-        extensions: HashMap::new(),
-    })
+    let digest = inner_envelope_digest(params)?;
+    let signature = ed25519_dalek::Signer::sign(signing_key, &digest.canonical).to_bytes();
+    assemble_inner_envelope(params, &digest, signature)
 }
 
 #[cfg(test)]
@@ -1472,6 +1475,43 @@ mod tests {
         assert!(
             still_valid,
             "extensions must not affect signature verification"
+        );
+    }
+
+    /// The signer path and the raw-key fixture path produce the same envelope
+    /// signature over the same canonical hash, and it verifies against the
+    /// signer's public key: moving the sign behind `CommandSigner` (ADR-049
+    /// Decision 7a) changes no signed byte.
+    #[tokio::test]
+    async fn inner_envelope_signed_matches_raw() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let signer = CommandSigner::local_ed25519(key.clone());
+        let params = InnerEnvelopeParams {
+            version: SCP_INNER_ENVELOPE_VERSION,
+            context_id: "ctx-1",
+            sender_did: "did:dht:alice",
+            epoch: 3,
+            generation: 7,
+            sequence: 11,
+            timestamp: 1_700_000_000,
+            message_type: MessageType::Content,
+            payload: b"signer path equals raw path",
+            provenance: Some(Provenance {
+                source: "test-outlet".into(),
+                upstream_hash: Some("abc123".into()),
+            }),
+            signing_key_id: SigningKeyId::Active,
+        };
+        let via_signer = create_inner_envelope_signed(&params, &signer)
+            .await
+            .unwrap();
+        let raw = create_inner_envelope_raw(&params, &key).unwrap();
+        assert_eq!(via_signer.signature, raw.signature);
+        assert_eq!(via_signer.payload_hash, raw.payload_hash);
+        assert_eq!(via_signer.provenance_hash, raw.provenance_hash);
+        assert!(
+            verify_inner_signature(&via_signer, &signer.public_key()).unwrap(),
+            "the signer-path envelope must verify against the signer's key"
         );
     }
 }

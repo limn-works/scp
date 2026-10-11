@@ -1816,9 +1816,18 @@ pub(crate) fn resolve_signer(
 ///   returns `SCP-IDENT-1023`; it NEVER falls back to `#active` (that would let
 ///   an `#agent`-intended send be silently attributed to the human).
 ///
+/// The signer signs through custody (ADR-049 Decision 7a); no key is exported.
 /// The custody `Arc` and key handle are cloned OUT of the `with_identity`
-/// closure before the blocking export, mirroring [`resolve_signing_key`] so no
-/// `DashMap` shard guard is held across the async export (#1940).
+/// closure before the signer is built, so no `DashMap` shard guard is held
+/// across the await.
+///
+/// # Errors
+///
+/// - `SCP-IDENT-1023` when `persona` is `#agent` and the identity has no agent
+///   key, and the registry's typed identity error when `identity_did` is not
+///   registered.
+/// - The custody's error through [`ScpPyError::from`](crate::error::ScpPyError)
+///   when the signer cannot be built; a destroyed key is `SCP-CRYPTO-4006`.
 fn resolve_message_signer(
     py: Python<'_>,
     bi: &crate::runtime::PyBridgeInstance,
@@ -1839,14 +1848,14 @@ fn resolve_message_signer(
             })?,
         };
         Ok((entry.custody.clone(), handle))
-    })
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let key = crate::actor_wait::block_on_released(py, async move {
-        custody.export_ed25519_signing_key(&handle).await
-    })?
-    .map_err(|e| PyRuntimeError::new_err(format!("failed to export signing key for send: {e}")))?;
+    })?;
+    let signer = crate::actor_wait::block_on_released(
+        py,
+        scp_ffi_common::signer::identity_command_signer(custody, handle),
+    )?
+    .map_err(crate::error::ScpPyError::from)?;
     Ok(scp_ffi_common::persona::ResolvedMessageSigner::new(
-        key, persona,
+        signer, persona,
     ))
 }
 
@@ -2707,13 +2716,13 @@ impl crate::scp::PyScp {
         // contexts this is a no-op (no recipients), but on restored/imported
         // contexts with existing members the announcement is needed.
         if local_pseudonym.is_some()
-            && let Ok(sk) = resolve_signing_key(py, bi, identity_did)
+            && let Ok(sk) = resolve_signer(py, bi, identity_did)
         {
             let sup = crate::runtime::supervisor(bi)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let sup = sup.clone();
             use scp_core::context::actor::commands::{
-                MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
+                MessagingCommand, SendPseudonymAnnouncementPayload,
             };
             let sender_did = scp_did::DID(identity_did.to_owned());
             let core_params = build_core_context_params(&handle.params)?;
@@ -2725,7 +2734,7 @@ impl crate::scp::PyScp {
                         context_id: ann_ctx_id.clone(),
                         params: core_params,
                         sender_did,
-                        signing_key: SigningKeyBytes::from_signing_key(&sk),
+                        signer: sk,
                     }),
                     reply: tx,
                 };
@@ -2909,10 +2918,10 @@ impl crate::scp::PyScp {
 
             // §9.10.4: Send pseudonym announcement to inform existing members.
             if local_pseudonym.is_some()
-                && let Ok(sk) = resolve_signing_key(py, bi, identity_did)
+                && let Ok(sk) = resolve_signer(py, bi, identity_did)
             {
                 use scp_core::context::actor::commands::{
-                    MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
+                    MessagingCommand, SendPseudonymAnnouncementPayload,
                 };
                 let sender_did = scp_did::DID(member_did.clone());
                 let ann_ctx_id = context_id.clone();
@@ -2924,7 +2933,7 @@ impl crate::scp::PyScp {
                             context_id: ann_ctx_id.clone(),
                             params: core_params,
                             sender_did,
-                            signing_key: SigningKeyBytes::from_signing_key(&sk),
+                            signer: sk,
                         }),
                         reply: tx,
                     };
@@ -3890,10 +3899,10 @@ impl crate::scp::PyScp {
             imported_core_params.mode,
             scp_core::context::params::ContextMode::Broadcast
         );
-        // Resolve the importer's signing key for the post-import announcement
+        // Resolve the importer's signer for the post-import announcement
         // (best-effort — a missing key just skips the announcement, which peers
         // recover on the importer's next explicit announcement).
-        let announce_signing_key = resolve_signing_key(py, bi, importer_did).ok();
+        let announce_signing_key = resolve_signer(py, bi, importer_did).ok();
         let context_id_for_announce = context_id.clone();
 
         let admitted_at = std::time::Instant::now();
@@ -3916,7 +3925,7 @@ impl crate::scp::PyScp {
             // stay stale and app-data fan-out would miss the importer entirely.
             if !imported_is_broadcast && let Some(sk) = announce_signing_key {
                 use scp_core::context::actor::commands::{
-                    MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
+                    MessagingCommand, SendPseudonymAnnouncementPayload,
                 };
                 let sender_did = scp_did::DID(importer_did.to_owned());
                 let ann_ctx_id = context_id_for_announce.clone();
@@ -3926,7 +3935,7 @@ impl crate::scp::PyScp {
                         context_id: ann_ctx_id.clone(),
                         params: imported_core_params,
                         sender_did,
-                        signing_key: SigningKeyBytes::from_signing_key(&sk),
+                        signer: sk,
                     }),
                     reply: atx,
                 };
@@ -5650,13 +5659,10 @@ impl crate::scp::PyScp {
             )
         })?;
 
-        // Resolve the local member's Ed25519 signing key (used to sign the
-        // Phase-3 consistency checkpoint). Private key never crosses FFI
-        // beyond this in-process driver call. The 32-byte seed is held in
-        // `Zeroizing` so it is wiped when this call returns rather than
-        // lingering on the stack/heap.
-        let signing_key = resolve_signing_key(py, bi, identity_did)?;
-        let signing_key_bytes = zeroize::Zeroizing::new(signing_key.to_bytes());
+        // Resolve the local member's custody-backed signer (used to sign the
+        // Phase-3 consistency checkpoint); the private key stays in custody
+        // (ADR-049 Decision 7a).
+        let signer = resolve_signer(py, bi, identity_did)?;
 
         let contacts = last_relay_contacts.unwrap_or_default();
         let now = scp_clock::SystemClock.now_secs();
@@ -5667,7 +5673,7 @@ impl crate::scp::PyScp {
                 &transport,
                 sup,
                 scp_did::DID(identity_did.to_owned()),
-                signing_key_bytes,
+                signer,
                 context_ids,
                 contacts,
                 now,
@@ -10616,8 +10622,8 @@ class SignOnlyCustody:
                 scp_did::SigningKeyId::Agent
             );
             assert_eq!(
-                signer.message_signer().key().to_bytes(),
-                agent_key.to_bytes(),
+                signer.message_signer().signer().public_key(),
+                agent_key.verifying_key().to_bytes(),
                 "#agent persona MUST resolve the agent key, never the active key"
             );
 
@@ -10627,8 +10633,8 @@ class SignOnlyCustody:
             assert_eq!(signer.persona(), scp_did::SigningKeyId::Active);
             assert!(matches!(signer.message_signer(), MessageSigner::Active(_)));
             assert_eq!(
-                signer.message_signer().key().to_bytes(),
-                active_key.to_bytes()
+                signer.message_signer().signer().public_key(),
+                active_key.verifying_key().to_bytes()
             );
         });
     }
@@ -10656,8 +10662,8 @@ class SignOnlyCustody:
             let signer =
                 resolve_message_signer(py, &bi, &did, scp_did::SigningKeyId::Active).unwrap();
             assert_eq!(
-                signer.message_signer().key().to_bytes(),
-                active_key.to_bytes()
+                signer.message_signer().signer().public_key(),
+                active_key.verifying_key().to_bytes()
             );
         });
     }

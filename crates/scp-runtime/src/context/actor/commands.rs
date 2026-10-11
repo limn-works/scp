@@ -146,16 +146,15 @@ pub struct SendMessagePayload {
     pub sender_did: scp_did::DID,
     /// Plaintext payload to encrypt and send.
     pub payload: Vec<u8>,
-    /// Sender's Ed25519 signing key. `None` is rejected by the
-    /// encrypted path — the inner envelope cannot be signed without
-    /// it. Wrapped in [`SigningKeyBytes`] so the private key bytes
-    /// zeroize on drop.
-    pub signing_key: Option<SigningKeyBytes>,
+    /// The sender's signer (ADR-049 Decision 7a). The handler signs the
+    /// inner envelope (or the broadcast envelope) through it in the send
+    /// turn; the key stays in custody.
+    pub signer: crate::context::actor::signer::CommandSigner,
     /// Which verification method this message is signed under
     /// (`#active` or `#agent`, ADR-039). Stamped into the inner
     /// envelope's `signing_key_id` so the recipient resolves the
-    /// matching public key from the sender's DID document. Must agree
-    /// with the key material in `signing_key`.
+    /// matching public key from the sender's DID document. Set together
+    /// with `signer` from one [`MessageSigner`](crate::context::supervisor::MessageSigner).
     pub signing_key_id: scp_did::SigningKeyId,
     /// Optional cross-context provenance metadata — attaches a
     /// signed `DataProvenance` envelope to the inner message.
@@ -592,18 +591,17 @@ pub enum MessagingCommand {
     /// Used by the reconnection driver's Phase 3 (`event_log_sync`) at the
     /// FFI/SDK layer: the driver builds its local checkpoint, sends it to
     /// peers via the send path, and compares peer checkpoints against local
-    /// state. The caller supplies `sender_did` + `signing_key` exactly as
-    /// the application send path does (the signing key is not actor-owned
-    /// state — it lives at the FFI boundary).
+    /// state. The caller supplies `sender_did` + `signer` exactly as the
+    /// application send path does (the actor holds no key material, ADR-049
+    /// Decision 7a).
     BuildLocalCheckpoint {
         /// Context identifier.
         context_id: String,
         /// Checkpoint author DID (a locally-controlled member).
         sender_did: scp_did::DID,
-        /// Author's Ed25519 signing key. Wrapped in [`SigningKeyBytes`]
-        /// so the private key zeroes on drop (mirrors the
-        /// [`SendMessagePayload`] pattern).
-        signing_key: SigningKeyBytes,
+        /// The author's signer; the checkpoint is signed through it in the
+        /// handler's turn.
+        signer: crate::context::actor::signer::CommandSigner,
         /// Oneshot reply channel carrying the freshly-built signed
         /// checkpoint.
         reply: BuildLocalCheckpointReply,
@@ -644,10 +642,10 @@ pub enum MessagingCommand {
     /// which routes an EMPTY-payload [`MessageType::Heartbeat`](scp_protocol::envelope::inner::MessageType::Heartbeat)
     /// envelope through the regular encrypt-and-send path. Driven by the
     /// bridge/SDK subscribe-path scheduler (the §9.9.2 "the SDK sends
-    /// heartbeats" boundary): the caller supplies `sender_did` + `signing_key`
+    /// heartbeats" boundary): the caller supplies `sender_did` + `signer`
     /// per-call exactly like [`SendMessage`](Self::SendMessage) and
     /// [`BuildLocalCheckpoint`](Self::BuildLocalCheckpoint), because the
-    /// signing key is NOT actor-owned state — it lives at the FFI boundary.
+    /// actor holds no key material (ADR-049 Decision 7a).
     /// Routing the send through the actor serializes it with the context's
     /// other sends.
     ///
@@ -660,10 +658,9 @@ pub enum MessagingCommand {
         context_id: String,
         /// Heartbeat author DID (a locally-controlled member).
         sender_did: scp_did::DID,
-        /// Author's Ed25519 signing key. Wrapped in [`SigningKeyBytes`] so
-        /// the private key zeroes on drop (mirrors the
-        /// [`SendMessagePayload`] pattern).
-        signing_key: SigningKeyBytes,
+        /// The author's signer; the heartbeat envelope is signed through it
+        /// in the handler's turn.
+        signer: crate::context::actor::signer::CommandSigner,
         /// Oneshot reply channel. `Ok(())` on success; transport error if
         /// every fan-out send fails.
         reply: oneshot::Sender<Result<(), ContextError>>,
@@ -697,10 +694,9 @@ pub struct SendPseudonymAnnouncementPayload {
     pub params: scp_protocol::context::params::ContextParams,
     /// Sender DID (the announcing member).
     pub sender_did: scp_did::DID,
-    /// Sender's Ed25519 signing key. Wrapped in [`SigningKeyBytes`] so
-    /// the private key zeroes on drop (mirrors the
-    /// [`SendMessagePayload`] pattern).
-    pub signing_key: SigningKeyBytes,
+    /// The sender's signer; the announcement is signed through it in the
+    /// handler's turn.
+    pub signer: crate::context::actor::signer::CommandSigner,
 }
 
 /// Owned Ed25519 signing key bytes used inside
@@ -1981,7 +1977,7 @@ pub struct CreateGovernanceCheckpointPayload {
 
 /// Payload for [`TrustRecoveryCommand::RecoverySendNotification`].
 /// Boxed so the outer variant payload stays pointer-sized. Owns the
-/// payload bytes and the signing key so the command can cross the
+/// payload bytes and the signer so the command can cross the
 /// actor mailbox without lifetime juggling.
 pub struct RecoverySendNotificationPayload {
     /// Context identifier string.
@@ -1994,9 +1990,9 @@ pub struct RecoverySendNotificationPayload {
     /// revocation, 2 = key-package rotation, 3 = PSK rotation, 4 =
     /// contact notification — see spec §9.12).
     pub sequence: u64,
-    /// Sender's Ed25519 signing key. Wrapped in [`SigningKeyBytes`] so
-    /// the private key zeroes on drop.
-    pub signing_key: SigningKeyBytes,
+    /// The sender's signer; the notification envelope is signed through it
+    /// in the handler's turn.
+    pub signer: crate::context::actor::signer::CommandSigner,
 }
 
 /// Payload for [`TrustRecoveryCommand::RecoveryNotifyContact`]. Boxed
@@ -2008,8 +2004,9 @@ pub struct RecoveryNotifyContactPayload {
     pub contact_did: String,
     /// Opaque recovery-notification payload bytes.
     pub payload: Vec<u8>,
-    /// Recovering DID's signing key (zeroized on drop).
-    pub signing_key: SigningKeyBytes,
+    /// The recovering DID's signer; the notification is signed through it
+    /// in the handler's turn.
+    pub signer: crate::context::actor::signer::CommandSigner,
 }
 
 /// See [`ContextCommand::TrustRecovery`]. Real variants land in commit

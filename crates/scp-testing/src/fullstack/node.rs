@@ -873,12 +873,14 @@ impl FullStackNode {
         handle: &ContextHandle,
         payload: &[u8],
     ) -> Result<(), ContextError> {
+        let signer =
+            scp_core::context::actor::CommandSigner::local_ed25519(self.signing_key.clone());
         self.manager
             .send_message(
                 handle,
                 &self.did,
                 payload,
-                MessageSigner::Active(&self.signing_key),
+                MessageSigner::Active(&signer),
                 None,
                 None,
             )
@@ -895,7 +897,11 @@ impl FullStackNode {
     /// Propagates [`ContextError`] from the supervisor.
     pub async fn send_heartbeat(&self, context_id: &str) -> Result<(), ContextError> {
         self.manager
-            .send_heartbeat(context_id, &self.did, &self.signing_key)
+            .send_heartbeat(
+                context_id,
+                &self.did,
+                &scp_core::context::actor::CommandSigner::local_ed25519(self.signing_key.clone()),
+            )
             .await
     }
 

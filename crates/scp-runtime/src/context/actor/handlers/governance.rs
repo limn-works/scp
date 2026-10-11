@@ -20,6 +20,10 @@
 //! every transport and storage call inside a handler wraps
 //! [`tokio::time::timeout`] with a 30-second budget; a timeout maps to
 //! [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout).
+//! The propose, vote, approve, and reject turns sign through custody
+//! (ADR-049 Decision 7a) and run under [`SIGNING_HANDLER_TIMEOUT`] instead, so
+//! a stalled custody fails the sign with `SCP-CRYPTO-4061` before the turn
+//! budget expires.
 //!
 //! # Read vs. mutate classification
 //!
@@ -45,6 +49,7 @@ use crate::context::actor::commands::{
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
+use crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
 
 /// Per-call transport budget for governance handlers. Plan
 /// §"Transport timeouts inside actor handlers": 30 seconds.
@@ -430,8 +435,11 @@ async fn handle_propose_governance_action_actor(
         .await
     };
 
-    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, propose_fut))
-        .await
+    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(
+        SIGNING_HANDLER_TIMEOUT,
+        propose_fut,
+    ))
+    .await
     {
         Ok(Ok(tuple)) => (Outcome::ok_mutated(()), Ok(tuple)),
         Ok(Err(e)) => {
@@ -440,7 +448,7 @@ async fn handle_propose_governance_action_actor(
         }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
-                "propose_governance_action exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                "propose_governance_action exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))
@@ -479,8 +487,11 @@ async fn handle_propose_governance_action_checked_actor(
         .await
     };
 
-    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, propose_fut))
-        .await
+    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(
+        SIGNING_HANDLER_TIMEOUT,
+        propose_fut,
+    ))
+    .await
     {
         Ok(Ok(outcome_val)) => (Outcome::ok_mutated(()), Ok(outcome_val)),
         Ok(Err(e)) => {
@@ -489,7 +500,7 @@ async fn handle_propose_governance_action_checked_actor(
         }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
-                "propose_governance_action_checked exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                "propose_governance_action_checked exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))
@@ -536,21 +547,25 @@ async fn handle_vote_on_proposal_actor(
         .await
     };
 
-    let (outcome, reply_result) =
-        match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, vote_fut)).await {
-            Ok(Ok(tuple)) => (Outcome::ok_mutated(()), Ok(tuple)),
-            Ok(Err(e)) => {
-                let sketch = outcome_error_sketch(&e);
-                (Outcome::err_mutated(sketch), Err(e))
-            }
-            Err(_elapsed) => {
-                let err = ContextError::TransportTimeout(format!(
-                    "vote_on_proposal exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-                ));
-                let sketch = outcome_error_sketch(&err);
-                (Outcome::err_mutated(sketch), Err(err))
-            }
-        };
+    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(
+        SIGNING_HANDLER_TIMEOUT,
+        vote_fut,
+    ))
+    .await
+    {
+        Ok(Ok(tuple)) => (Outcome::ok_mutated(()), Ok(tuple)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "vote_on_proposal exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
 
     let _ = reply.send(reply_result);
     outcome
@@ -582,8 +597,11 @@ async fn handle_approve_governance_proposal_actor(
         .await
     };
 
-    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, approve_fut))
-        .await
+    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(
+        SIGNING_HANDLER_TIMEOUT,
+        approve_fut,
+    ))
+    .await
     {
         Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok(status)),
         Ok(Err(e)) => {
@@ -592,7 +610,7 @@ async fn handle_approve_governance_proposal_actor(
         }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
-                "approve_governance_proposal exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                "approve_governance_proposal exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))
@@ -629,8 +647,11 @@ async fn handle_reject_governance_proposal_actor(
         .await
     };
 
-    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, reject_fut))
-        .await
+    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(
+        SIGNING_HANDLER_TIMEOUT,
+        reject_fut,
+    ))
+    .await
     {
         Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok(status)),
         Ok(Err(e)) => {
@@ -639,7 +660,7 @@ async fn handle_reject_governance_proposal_actor(
         }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
-                "reject_governance_proposal exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                "reject_governance_proposal exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))
@@ -1469,7 +1490,7 @@ mod consequence_fail_closed_tests {
         // internal keying does, not via the raw `SHA-256(ctx_str)` primitive.
         let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_str);
 
-        // Free (non-paid) send: no token, no signing key, not broadcast.
+        // Free (non-paid) send: no token, a local test signer, not broadcast.
         let result = crate::context::messaging_helpers::finalize_send(
             &mut cell,
             &deps,
@@ -1478,7 +1499,9 @@ mod consequence_fail_closed_tests {
             &DID(SUBJECT.to_owned()),
             0,
             b"payload",
-            None,
+            &crate::context::actor::signer::CommandSigner::local_ed25519(
+                ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
+            ),
             None,
             false,
         )

@@ -830,7 +830,7 @@ fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32], did: &str) -> Optio
 /// ```rust,ignore
 /// let backend = ProductionRecoveryBackend::new(
 ///     supervisor.clone(),
-///     post_rotation_signing_key,
+///     post_rotation_signer,
 /// );
 /// ```
 ///
@@ -849,12 +849,13 @@ fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32], did: &str) -> Optio
 pub struct ProductionRecoveryBackend {
     /// The supervisor that owns crypto, transport, and event log providers.
     manager: Arc<crate::context::supervisor::Supervisor>,
-    /// The signing key for the recovering identity (post-rotation).
+    /// The signer for the recovering identity (post-rotation), backed by its
+    /// custody (ADR-049 Decision 7a).
     ///
     /// Recovery notifications must be signed by the real key so receivers can
     /// verify them against the sender's public key. An ephemeral key would
     /// produce signatures that don't match.
-    signing_key: ed25519_dalek::SigningKey,
+    signer: crate::context::actor::signer::CommandSigner,
 }
 
 impl ProductionRecoveryBackend {
@@ -865,18 +866,15 @@ impl ProductionRecoveryBackend {
     /// * `manager` — The context manager for the local node. Must be shared
     ///   via `Arc` because the orchestrator may run concurrently with other
     ///   context operations.
-    /// * `signing_key` — The post-rotation signing key for the recovering
-    ///   identity. Recovery notifications are signed with this key so
-    ///   receivers can verify them against the sender's public key.
+    /// * `signer` — The post-rotation signer for the recovering identity.
+    ///   Recovery notifications are signed through it so receivers can
+    ///   verify them against the sender's public key.
     #[must_use]
     pub const fn new(
         manager: Arc<crate::context::supervisor::Supervisor>,
-        signing_key: ed25519_dalek::SigningKey,
+        signer: crate::context::actor::signer::CommandSigner,
     ) -> Self {
-        Self {
-            manager,
-            signing_key,
-        }
+        Self { manager, signer }
     }
 
     /// Maps a dispatch-level [`ContextError`](scp_protocol::context::ContextError)
@@ -947,11 +945,10 @@ impl ProductionRecoveryBackend {
     /// through the trust-recovery mailbox and awaits its reply.
     ///
     /// Wraps the shared payload construction (context, sender DID,
-    /// sequence, signing key) used by every recovery step that sends a
+    /// sequence, signer) used by every recovery step that sends a
     /// notification to an already-known context (spec §9.12 steps 2–4,
-    /// 6). The signing key is copied into the boxed payload via
-    /// [`SigningKeyBytes::from_signing_key`](crate::context::actor::commands::SigningKeyBytes::from_signing_key) so it zeroizes on drop while
-    /// the command is in flight.
+    /// 6). The payload carries a clone of the backend's signer; no key
+    /// material crosses the mailbox.
     async fn dispatch_recovery_send_notification(
         &self,
         context_id: &str,
@@ -960,7 +957,7 @@ impl ProductionRecoveryBackend {
         sequence: u64,
     ) -> Result<(), scp_protocol::context::ContextError> {
         use crate::context::actor::commands::{
-            RecoverySendNotificationPayload, SigningKeyBytes, TrustRecoveryCommand,
+            RecoverySendNotificationPayload, TrustRecoveryCommand,
         };
 
         let send_payload = Box::new(RecoverySendNotificationPayload {
@@ -968,7 +965,7 @@ impl ProductionRecoveryBackend {
             sender_did: sender_did.to_owned(),
             payload: payload.to_vec(),
             sequence,
-            signing_key: SigningKeyBytes::from_signing_key(&self.signing_key),
+            signer: self.signer.clone(),
         });
         self.dispatch_trust_recovery(|reply| TrustRecoveryCommand::RecoverySendNotification {
             payload: send_payload,
@@ -1217,14 +1214,14 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             let send_result = self
                 .dispatch_trust_recovery(|reply| {
                     use crate::context::actor::commands::{
-                        RecoveryNotifyContactPayload, SigningKeyBytes, TrustRecoveryCommand,
+                        RecoveryNotifyContactPayload, TrustRecoveryCommand,
                     };
                     TrustRecoveryCommand::RecoveryNotifyContact {
                         payload: Box::new(RecoveryNotifyContactPayload {
                             recovering_did: did_str.to_owned(),
                             contact_did: contact_did_str.to_owned(),
                             payload: payload.clone(),
-                            signing_key: SigningKeyBytes::from_signing_key(&self.signing_key),
+                            signer: self.signer.clone(),
                         }),
                         reply,
                     }
@@ -1352,8 +1349,10 @@ mod tests {
     }
 
     /// Returns a deterministic test signing key for `ProductionRecoveryBackend`.
-    fn test_signing_key() -> ed25519_dalek::SigningKey {
-        ed25519_dalek::SigningKey::from_bytes(&[42u8; 32])
+    fn test_signing_key() -> crate::context::actor::signer::CommandSigner {
+        crate::context::actor::signer::CommandSigner::local_ed25519(
+            ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]),
+        )
     }
 
     // -----------------------------------------------------------------------

@@ -96,6 +96,35 @@ async def test_governance_propose_signs_through_a_python_provider(scp) -> None:
     assert provider.sign_calls > before, "the proposal never reached the provider's sign"
 
 
+# A lone member's send into an encrypted context addresses no one and signs
+# nothing (§9.10.4), so the send test uses a broadcast context, where every
+# send carries a signed broadcast envelope. The loopback transport delivers the
+# envelope without a relay.
+_BROADCAST_PARAMS = {
+    "ceiling": ["messages:read", "messages:write"],
+    "memory_scope": "full",
+    "mode": "broadcast",
+}
+
+
+@pytest.mark.asyncio
+async def test_context_send_signs_through_a_python_provider(scp) -> None:
+    """A provider whose ``sign`` runs in Python signs a broadcast send's
+    envelope within the deadline."""
+    provider = _SlowSignKeychain()
+    identity = await scp.identity_create_with_custody(provider)
+    await scp.configure_local_transport(identity.did)
+    ctx = await scp.context_create(identity.did, _BROADCAST_PARAMS)
+    before = provider.sign_calls
+
+    await asyncio.wait_for(
+        scp.context_send(ctx, identity.did, b"python-signed send"),
+        timeout=_DEADLINE_S,
+    )
+
+    assert provider.sign_calls > before, "the send never reached the provider's sign"
+
+
 @pytest.mark.asyncio
 async def test_non_signing_call_proceeds_while_another_thread_signs(scp) -> None:
     """Thread A proposes; its ``sign`` sleeps in Python. Thread B, started once

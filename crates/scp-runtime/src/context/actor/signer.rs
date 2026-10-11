@@ -22,6 +22,23 @@ use scp_protocol::context::ContextError;
 /// [`CustodyFailureKind::TimedOut`].
 pub const SIGN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The turn budget of an actor handler that signs through [`sign_bounded`]:
+/// the 30-second handler work budget plus [`SIGN_TIMEOUT`].
+///
+/// A plain 30-second handler budget would expire with the signing budget, so a
+/// stalled custody would surface as the handler's `TransportTimeout` instead of
+/// [`CustodyFailureKind::TimedOut`]. With this budget a single stalled sign
+/// always fails first, as `SCP-CRYPTO-4061`. A turn whose several signs each
+/// answer within [`SIGN_TIMEOUT`] but together outlast this budget still
+/// reports the handler timeout. The budget stays below the caller's
+/// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT), so the handler's
+/// typed error reaches the caller before the caller stops waiting.
+pub const SIGNING_HANDLER_TIMEOUT: Duration = Duration::from_secs(30 + SIGN_TIMEOUT.as_secs());
+
+const _: () = assert!(SIGNING_HANDLER_TIMEOUT.as_secs() > SIGN_TIMEOUT.as_secs());
+const _: () =
+    assert!(SIGNING_HANDLER_TIMEOUT.as_secs() < crate::context::actor::REPLY_TIMEOUT.as_secs());
+
 /// The signer a runtime command carries into the actor turn.
 ///
 /// Cloning shares the underlying signer. `Debug` prints only the algorithm

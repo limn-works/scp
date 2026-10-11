@@ -586,53 +586,39 @@ async fn derive_member_pseudonym_required(
 ///
 /// Best effort by design: the announcement is an optimisation that peers
 /// recover from on the announcer's next explicit announcement, and a
-/// sign-only custody (a Secure Enclave key that cannot export raw signing
-/// bytes) must still create and join contexts. So a failed export or
-/// dispatch skips the announcement, but is logged at `warn` with its error,
-/// never discarded silently. Never panics.
+/// failed signer build or dispatch skips the announcement, but is logged at
+/// `warn` with its error, never discarded silently. The announcement signs
+/// through custody (ADR-049 Decision 7a). Never panics.
 async fn announce_pseudonym_best_effort(
     sup: &scp_core::context::supervisor::Supervisor,
     identity: &Identity,
     context_id: &str,
     params: scp_core::context::ContextParams,
 ) {
-    let Some(ref ik) = identity.core_id else {
+    // A DID-only handle (no retained key material or custody) has nothing to
+    // announce with.
+    if identity.core_id.is_none() || identity.custody.is_none() {
         return;
-    };
-    let exported = match identity.custody.as_deref() {
-        Some(UniffiKeyCustody::Callback(cb)) => {
-            cb.export_ed25519_signing_key(&ik.active_signing_key).await
-        }
-        #[cfg(feature = "testing")]
-        Some(UniffiKeyCustody::InMemory(custody)) => {
-            custody
-                .0
-                .export_ed25519_signing_key(&ik.active_signing_key)
-                .await
-        }
-        None => return,
-    };
-    let sk = match exported {
-        Ok(sk) => sk,
+    }
+    let signer = match resolve_identity_signer(identity).await {
+        Ok(signer) => signer,
         Err(e) => {
             tracing::warn!(
                 context_id,
                 error = %e,
-                "pseudonym announcement skipped: the active signing key cannot be exported"
+                "pseudonym announcement skipped: the active signer cannot be built"
             );
             return;
         }
     };
-    use scp_core::context::actor::commands::{
-        MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
-    };
+    use scp_core::context::actor::commands::{MessagingCommand, SendPseudonymAnnouncementPayload};
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cmd = MessagingCommand::SendPseudonymAnnouncement {
         payload: Box::new(SendPseudonymAnnouncementPayload {
             context_id: context_id.to_owned(),
             params,
             sender_did: scp_did::DID(identity.did.clone()),
-            signing_key: SigningKeyBytes::from_signing_key(&sk),
+            signer,
         }),
         reply: tx,
     };
@@ -1844,22 +1830,6 @@ impl ScpError {
             _ => Self::Context {
                 msg,
                 code: codes::CTX_2027.to_owned(),
-            },
-        }
-    }
-
-    /// A failed inner-envelope signing: a custody failure keeps its custody
-    /// code ([`Self::custody_failure`]), and any other envelope failure is
-    /// `SCP-CRYPTO-4001`.
-    pub(crate) fn inner_envelope_error(e: &scp_core::envelope::EnvelopeError) -> Self {
-        let msg = format!("inner envelope signing failed: {e}");
-        match e {
-            scp_core::envelope::EnvelopeError::Custody(failure) => {
-                Self::custody_failure(msg, failure)
-            }
-            _ => Self::Crypto {
-                msg,
-                code: codes::CRYPTO_4001.to_owned(),
             },
         }
     }
@@ -6678,49 +6648,6 @@ async fn event_log_checkpoint_by_did_impl(
 ///
 /// Exports through the handle's single retained `custody`. Returns
 /// `ScpError::Context` if the handle holds no custody or no key handle.
-/// Resolves the raw Ed25519 signing key from an `Identity`'s retained
-/// custody (platform callback OR in-memory). Used by `context_reconnect`
-/// to sign the Phase-3 consistency checkpoint. The export path mirrors
-/// `announce_pseudonym_best_effort` but surfaces a typed error rather than
-/// swallowing a missing key.
-async fn resolve_identity_signing_key(
-    identity: &Identity,
-) -> Result<ed25519_dalek::SigningKey, ScpError> {
-    let core_id = identity
-        .core_id
-        .as_ref()
-        .ok_or_else(|| ScpError::Identity {
-            msg: "identity has no retained key material — reconnect requires a \
-              real local signing key to sign the consistency checkpoint"
-                .to_owned(),
-            code: codes::IDENT_1054.to_owned(),
-        })?;
-    let key_handle = core_id.active_signing_key;
-
-    match identity.custody.as_deref() {
-        Some(UniffiKeyCustody::Callback(cb)) => cb
-            .export_ed25519_signing_key(&key_handle)
-            .await
-            .map_err(|e| ScpError::Context {
-                msg: format!("failed to export signing key from platform custody: {e}"),
-                code: codes::CTX_2040.to_owned(),
-            }),
-        #[cfg(feature = "testing")]
-        Some(UniffiKeyCustody::InMemory(imc)) => imc
-            .0
-            .export_ed25519_signing_key(&key_handle)
-            .await
-            .map_err(|e| ScpError::Context {
-                msg: format!("failed to export signing key from in-memory custody: {e}"),
-                code: codes::CTX_2040.to_owned(),
-            }),
-        None => Err(ScpError::Identity {
-            msg: "identity has no usable custody backend for reconnect signing".to_owned(),
-            code: codes::IDENT_1054.to_owned(),
-        }),
-    }
-}
-
 /// Builds the `#active` [`CommandSigner`](scp_core::context::actor::CommandSigner)
 /// over an `Identity`'s retained custody (ADR-049 Decision 7a). The private
 /// key stays in custody.
@@ -6823,91 +6750,35 @@ pub(crate) async fn resolve_uniffi_signing_key(
     }
 }
 
-/// Exports the raw Ed25519 signing key for a key handle via the SENDER
-/// IDENTITY's OWN retained custody (platform/callback custody first, then —
-/// only under `testing` — the in-memory dev custody), mirroring the resolution
-/// order of [`resolve_uniffi_signing_key`] but sourcing custody from the
-/// identity that owns the key rather than the context handle.
-///
-/// The `#agent` send path uses this so the agent key handle and the custody it
-/// is exported through come from the SAME identity — mirroring the `PyO3`
-/// reference `resolve_message_signer`, which reads both from one registry entry.
-/// Exporting through the context handle's custody could export the wrong
-/// identity's key when the two differ (fail-closed at the receiver, but a latent
-/// correctness bug that bites when RFC #2242 activates the agent path).
-async fn export_uniffi_key_via_identity_custody(
-    identity: &Identity,
-    key_handle: &KeyHandle,
-) -> Result<ed25519_dalek::SigningKey, ScpError> {
-    match identity.custody.as_deref() {
-        Some(UniffiKeyCustody::Callback(cb)) => cb
-            .export_ed25519_signing_key(key_handle)
-            .await
-            .map_err(|e| ScpError::Context {
-                msg: format!("failed to export agent signing key from platform custody: {e}"),
-                code: codes::CTX_2040.to_owned(),
-            }),
-        #[cfg(feature = "testing")]
-        Some(UniffiKeyCustody::InMemory(imc)) => imc
-            .0
-            .export_ed25519_signing_key(key_handle)
-            .await
-            .map_err(|e| ScpError::Context {
-                msg: format!("failed to export agent signing key from in-memory custody: {e}"),
-                code: codes::CTX_2040.to_owned(),
-            }),
-        None => Err(ScpError::Identity {
-            msg: format!(
-                "identity '{}' has an agent key but no usable custody backend to export it — \
-             cannot send under #agent",
-                identity.did
-            ),
-            code: codes::IDENT_1023.to_owned(),
-        }),
-    }
-}
-
 /// Resolves the [`ResolvedMessageSigner`](scp_ffi_common::persona::ResolvedMessageSigner)
 /// for a **message send** under the requested persona (ADR-039 Enforcement-Stack
-/// Layer 2).
+/// Layer 2). The signer signs through custody (ADR-049 Decision 7a); no key is
+/// exported.
 ///
 /// Selects BOTH the key handle and the persona so the `#active`/`#agent` stamp
 /// and the signing key are chosen together and cannot diverge:
 /// - [`SigningKeyId::Active`](scp_did::SigningKeyId::Active) → the handle's
-///   retained active signing key (byte-identical to [`resolve_uniffi_signing_key`],
-///   so the default send path is unchanged). A failure there is remapped to a
-///   send-specific `SCP-CRYPTO-4001` rather than propagating the
-///   governance-worded `SCP-CTX-2040` from [`resolve_uniffi_signing_key`].
+///   retained active signing key, through [`resolve_uniffi_signer`].
 /// - [`SigningKeyId::Agent`](scp_did::SigningKeyId::Agent) → the sender
-///   identity's agent signing key (from its retained [`ScpIdentity`]), exported
-///   via the sender identity's OWN retained custody (same source as the key
-///   handle — see [`export_uniffi_key_via_identity_custody`]). **Fail-closed**
-///   with `SCP-IDENT-1023` when the identity has no retained key material or no
-///   agent key — NEVER falls back to `#active`.
+///   identity's agent signing key, signed through the sender identity's OWN
+///   retained custody, so the key handle and the custody that holds it come
+///   from the same identity. **Fail-closed** with `SCP-IDENT-1023` when the
+///   identity has no retained key material, no agent key, or no custody —
+///   NEVER falls back to `#active`.
+///
+/// # Errors
+///
+/// - `SCP-CTX-2040` when the handle carries no custody or no active key
+///   (`#active`); `SCP-IDENT-1023` as above (`#agent`).
+/// - The custody's own code through `ScpError::from(PlatformError)` when the
+///   signer cannot be built; a destroyed key is `SCP-CRYPTO-4006`.
 async fn resolve_uniffi_message_signer(
     handle: &ContextHandle,
     identity: &Identity,
     persona: scp_did::SigningKeyId,
 ) -> Result<scp_ffi_common::persona::ResolvedMessageSigner, ScpError> {
-    let key = match persona {
-        scp_did::SigningKeyId::Active => {
-            resolve_uniffi_signing_key(handle).await.map_err(|e| {
-                // Preserve the underlying custody-export diagnostic before
-                // collapsing to the send-specific SCP-CRYPTO-4001 (the returned
-                // code is intentionally unchanged — only the otherwise-lost
-                // detail is logged).
-                tracing::warn!(
-                    error = %e,
-                    "send #active signing-key resolution failed; returning SCP-CRYPTO-4001"
-                );
-                ScpError::Crypto {
-                    msg: "signing key required for send: could not resolve the sender's \
-                          #active signing key from retained custody"
-                        .to_owned(),
-                    code: codes::CRYPTO_4001.to_owned(),
-                }
-            })?
-        }
+    let signer = match persona {
+        scp_did::SigningKeyId::Active => resolve_uniffi_signer(handle).await?,
         scp_did::SigningKeyId::Agent => {
             let core_id = identity
                 .core_id
@@ -6929,11 +6800,24 @@ async fn resolve_uniffi_message_signer(
                     ),
                     code: codes::IDENT_1023.to_owned(),
                 })?;
-            export_uniffi_key_via_identity_custody(identity, &agent_handle).await?
+            let custody = identity
+                .custody
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    msg: format!(
+                        "identity '{}' has an agent key but no usable custody backend to \
+                         sign with it — cannot send under #agent",
+                        identity.did
+                    ),
+                    code: codes::IDENT_1023.to_owned(),
+                })?;
+            scp_ffi_common::signer::identity_command_signer(Arc::clone(custody), agent_handle)
+                .await
+                .map_err(ScpError::from)?
         }
     };
     Ok(scp_ffi_common::persona::ResolvedMessageSigner::new(
-        key, persona,
+        signer, persona,
     ))
 }
 
@@ -11341,58 +11225,10 @@ impl Scp {
                 })
                 .await?;
 
-                // Validate inner envelope signing via the retained KeyCustody
-                // (SCP-214 criterion 6). This ensures the identity's mandatory
-                // `#active` signing key can produce a valid Ed25519 signature
-                // before delegating to the ContextManager. This is a discarded
-                // custody smoke-test on the baseline operational key (identity
-                // plumbing), NOT the wire persona — the persona actually stamped
-                // on the message is chosen below via the ADR-039 persona-source
-                // seam and validated for the chosen persona by
-                // `resolve_uniffi_message_signer` (fail-closed on `#agent` with
-                // no agent key).
-                if let Some(core_id) = identity.core_id.as_ref() {
-                    let context_id = handle.context_id.clone();
-                    let sender_did_str = identity.did.clone();
-                    let now_ms = scp_clock::SystemClock.now_millis();
-
-                    let params = scp_core::envelope::InnerEnvelopeParams {
-                        version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
-                        context_id: &context_id,
-                        sender_did: &sender_did_str,
-                        epoch: 0,
-                        generation: 0,
-                        sequence: 0,
-                        timestamp: now_ms,
-                        message_type: scp_core::envelope::MessageType::Content,
-                        payload: &payload,
-                        provenance: None,
-                        signing_key_id: scp_did::SigningKeyId::Active,
-                    };
-
-                    match handle.custody.as_deref() {
-                        Some(UniffiKeyCustody::Callback(cb)) => {
-                            scp_core::envelope::create_inner_envelope(
-                                &params,
-                                cb.as_ref(),
-                                &core_id.active_signing_key,
-                            )
-                            .await
-                            .map_err(|e| ScpError::inner_envelope_error(&e))?;
-                        }
-                        #[cfg(feature = "testing")]
-                        Some(UniffiKeyCustody::InMemory(imc)) => {
-                            scp_core::envelope::create_inner_envelope(
-                                &params,
-                                &imc.0,
-                                &core_id.active_signing_key,
-                            )
-                            .await
-                            .map_err(|e| ScpError::inner_envelope_error(&e))?;
-                        }
-                        None => {}
-                    }
-                }
+                // The message's inner envelope is signed through the retained
+                // custody in the actor turn (SCP-214 criterion 6; ADR-049
+                // Decision 7a), so no separate custody check signs here: a
+                // second sign would prompt a biometric custody twice per send.
 
                 // ADR-039 Enforcement-Stack Layer 2: consult the per-instance
                 // persona-source seam to choose the send persona (default
@@ -13279,20 +13115,15 @@ impl Scp {
                 code: codes::TRANS_5010.to_owned(),
             })?;
 
-        // Resolve the local member's Ed25519 signing key from the identity's
-        // retained custody (used to sign the Phase-3 consistency checkpoint).
-        // Private key never crosses FFI beyond this in-process driver call.
-        // The 32-byte seed is held in `Zeroizing` so it is wiped after the
-        // driver call, on the stack as well as the heap; the wiping global
-        // allocator reaches freed heap blocks only (security model spec §9.15).
-        let signing_key = resolve_identity_signing_key(&identity).await?;
-        let signing_key_bytes = zeroize::Zeroizing::new(signing_key.to_bytes());
+        // The Phase-3 consistency checkpoint signs through the identity's
+        // retained custody (ADR-049 Decision 7a); no key is exported.
+        let signer = resolve_identity_signer(&identity).await?;
 
         let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
             &transport,
             supervisor,
             scp_did::DID(identity.did.clone()),
-            signing_key_bytes,
+            signer,
             context_ids,
             last_relay_contacts,
             scp_clock::Clock::now_secs(&scp_clock::SystemClock),
@@ -23473,8 +23304,8 @@ mod tests {
             scp_did::SigningKeyId::Agent
         );
         assert_eq!(
-            signer.message_signer().key().to_bytes(),
-            agent_key.to_bytes(),
+            signer.message_signer().signer().public_key(),
+            agent_key.verifying_key().to_bytes(),
             "#agent persona MUST resolve the agent key, never the active key"
         );
 
@@ -23486,8 +23317,8 @@ mod tests {
         assert_eq!(signer.persona(), scp_did::SigningKeyId::Active);
         assert!(matches!(signer.message_signer(), MessageSigner::Active(_)));
         assert_eq!(
-            signer.message_signer().key().to_bytes(),
-            active_key.to_bytes()
+            signer.message_signer().signer().public_key(),
+            active_key.verifying_key().to_bytes()
         );
     }
 
@@ -23521,8 +23352,8 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(
-            signer.message_signer().key().to_bytes(),
-            active_key.to_bytes()
+            signer.message_signer().signer().public_key(),
+            active_key.verifying_key().to_bytes()
         );
     }
 
@@ -23608,11 +23439,11 @@ mod tests {
                      resolver sourcing custody from the context handle (custody_B) would fail",
                 );
         assert_eq!(
-            signer.message_signer().key().to_bytes(),
-            agent_key.to_bytes(),
-            "#agent MUST export the agent key through the sender identity's own custody \
-             (custody_A); sourcing from the context handle's custody_B would export the wrong \
-             key or fail closed"
+            signer.message_signer().signer().public_key(),
+            agent_key.verifying_key().to_bytes(),
+            "#agent MUST sign with the agent key through the sender identity's own custody \
+             (custody_A); sourcing from the context handle's custody_B would sign with the \
+             wrong key or fail closed"
         );
     }
 
@@ -32827,6 +32658,31 @@ mod tests {
                 .await
                 .expect("a sign-only custody proposes through CommandSigner");
             assert_governance_executed(&result, "RegisterOutlet");
+        }
+
+        /// ADR-049 Decision 7a: a send signs its inner envelope through
+        /// custody, so a host custody whose raw key cannot be exported
+        /// (`ProdLikeCustody` keeps the trait's `export_signing_key_bytes`
+        /// refusal) still sends.
+        #[tokio::test]
+        async fn context_send_signs_through_sign_only_custody() {
+            let scp = scp_test();
+            let bi = Arc::clone(&scp.inner);
+            install_seedable_resolver(&bi);
+            let identity = scp
+                .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
+                .await
+                .expect("identity_create_with_custody");
+            let handle = scp
+                .context_create(
+                    Arc::clone(&identity),
+                    saga_context_params(&["governance:propose", "messages:write"]),
+                )
+                .await
+                .expect("context_create");
+            scp.context_send(handle, identity, b"sign-only send".to_vec(), None)
+                .await
+                .expect("a sign-only custody sends through CommandSigner");
         }
 
         /// A proposer whose `#active` key custody no longer holds fails

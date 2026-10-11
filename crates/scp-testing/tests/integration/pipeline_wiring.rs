@@ -1728,9 +1728,13 @@ fn encrypt_path_calls_create_outer_envelope_or_seal() {
 #[test]
 fn encrypt_path_calls_create_inner_envelope() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "send_message", "create_inner_envelope_raw")
-            || fn_body_contains(MANAGER_SRC, "build_inner_wire", "create_inner_envelope_raw"),
-        "send path must call create_inner_envelope_raw"
+        fn_body_contains(MANAGER_SRC, "send_message", "create_inner_envelope_signed")
+            || fn_body_contains(
+                MANAGER_SRC,
+                "build_inner_wire",
+                "create_inner_envelope_signed"
+            ),
+        "send path must call create_inner_envelope_signed"
     );
 }
 

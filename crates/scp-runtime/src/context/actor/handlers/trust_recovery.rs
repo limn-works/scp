@@ -36,6 +36,7 @@ use crate::context::actor::commands::{
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
+use crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
 
 /// Per-call transport budget for trust-recovery handlers. Plan
 /// §"Transport timeouts inside actor handlers": 30 seconds.
@@ -244,7 +245,6 @@ async fn handle_recovery_send_notification(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let context_id = p.context_id.clone();
-    let signing_key = p.signing_key.to_signing_key();
 
     let send_fut = async {
         crate::context::trust_recovery_helpers::recovery_send_notification(
@@ -254,12 +254,16 @@ async fn handle_recovery_send_notification(
             &p.sender_did,
             &p.payload,
             p.sequence,
-            &signing_key,
+            &p.signer,
         )
         .await
     };
 
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {
+    // The notification signs in this turn (ADR-049 Decision 7a), so the turn
+    // runs under the signing budget and a stalled custody fails as 4061.
+    let (outcome, reply_result) = match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, send_fut)
+        .await
+    {
         Ok(Ok(())) => (Outcome::ok(()), Ok(())),
         Ok(Err(e)) => {
             let sketch = outcome_error_sketch(&e);
@@ -267,7 +271,7 @@ async fn handle_recovery_send_notification(
         }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
-                "recovery_send_notification exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                "recovery_send_notification exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err(sketch), Err(err))
@@ -294,7 +298,6 @@ async fn handle_recovery_notify_contact(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let recovering_did = p.recovering_did.clone();
-    let signing_key = p.signing_key.to_signing_key();
 
     let notify_fut = crate::context::trust_recovery_helpers::recovery_notify_contact(
         cell,
@@ -302,10 +305,14 @@ async fn handle_recovery_notify_contact(
         &p.recovering_did,
         &p.contact_did,
         &p.payload,
-        &signing_key,
+        &p.signer,
     );
 
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, notify_fut).await {
+    // The dispatched notification signs in the shared context's turn, so this
+    // turn waits under the signing budget too.
+    let (outcome, reply_result) = match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, notify_fut)
+        .await
+    {
         Ok(Ok(())) => (Outcome::ok(()), Ok(())),
         Ok(Err(e)) => {
             let sketch = outcome_error_sketch(&e);
@@ -313,7 +320,7 @@ async fn handle_recovery_notify_contact(
         }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
-                "recovery_notify_contact exceeded {HANDLER_TIMEOUT:?} budget for recovering_did {recovering_did}"
+                "recovery_notify_contact exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for recovering_did {recovering_did}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err(sketch), Err(err))

@@ -479,7 +479,9 @@ async fn revoke_write_access_full_blocks_publishing() {
             &handle,
             &dave(),
             b"should fail",
-            MessageSigner::Active(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                signing_key_for_did(&dave()),
+            )),
             None,
             None,
         )
@@ -533,7 +535,9 @@ async fn revoke_write_access_future_only() {
             &handle,
             &dave(),
             b"future message",
-            MessageSigner::Active(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                signing_key_for_did(&dave()),
+            )),
             None,
             None,
         )
@@ -611,7 +615,9 @@ async fn restore_write_access_forward_only() {
             &handle,
             &dave(),
             b"after restore",
-            MessageSigner::Active(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                signing_key_for_did(&dave()),
+            )),
             None,
             None,
         )
@@ -1288,7 +1294,9 @@ async fn full_content_access_lifecycle() {
             &handle,
             &dave(),
             b"blocked",
-            MessageSigner::Active(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                signing_key_for_did(&dave()),
+            )),
             None,
             None,
         )
@@ -1319,7 +1327,9 @@ async fn full_content_access_lifecycle() {
             &handle,
             &dave(),
             b"restored",
-            MessageSigner::Active(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                signing_key_for_did(&dave()),
+            )),
             None,
             None,
         )

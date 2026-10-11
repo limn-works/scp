@@ -254,7 +254,9 @@ async fn encrypted_send_fans_out_to_peer_registry_not_shared_rid() {
             &handle,
             &alice(),
             b"hello",
-            MessageSigner::Active(&sk_alice),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                sk_alice.clone(),
+            )),
             None,
             None,
         )
@@ -322,7 +324,9 @@ async fn multi_member_empty_registry_send_errors_and_rolls_back() {
             &handle,
             &alice(),
             b"hello",
-            MessageSigner::Active(&sk_alice),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                sk_alice.clone(),
+            )),
             None,
             None,
         )
@@ -349,7 +353,9 @@ async fn multi_member_empty_registry_send_errors_and_rolls_back() {
             &handle,
             &alice(),
             b"hello-again",
-            MessageSigner::Active(&sk_alice),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                sk_alice.clone(),
+            )),
             None,
             None,
         )
@@ -392,7 +398,9 @@ async fn lone_member_encrypted_send_is_noop_no_charge_no_event() {
             &handle,
             &alice(),
             b"hello-nobody",
-            MessageSigner::Active(&sk_alice),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                sk_alice.clone(),
+            )),
             None,
             None,
         )
@@ -456,7 +464,9 @@ async fn lone_member_encrypted_send_is_noop_no_charge_no_event() {
             &handle,
             &alice(),
             b"hello-bob",
-            MessageSigner::Active(&sk_alice),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                sk_alice.clone(),
+            )),
             None,
             None,
         )

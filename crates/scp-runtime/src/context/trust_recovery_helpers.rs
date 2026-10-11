@@ -367,7 +367,7 @@ pub async fn recovery_send_notification(
     sender_did: &str,
     payload: &[u8],
     sequence: u64,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &crate::context::actor::signer::CommandSigner,
 ) -> Result<(), ContextError> {
     let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -393,8 +393,9 @@ pub async fn recovery_send_notification(
         signing_key_id: scp_did::SigningKeyId::Active,
     };
 
-    let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signing_key)
-        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+    // ADR-049 Decision 7a: signed through custody within the signing budget,
+    // before any send-tracker state is touched.
+    let inner = crate::envelope::inner::sign::create_inner_envelope_signed(&params, signer).await?;
 
     // Use domain-separated routing ID for relay routing, distinct from the
     // chokepoint-resolved 32-byte digest `context_id_bytes` (per ADR-056,
@@ -485,9 +486,9 @@ pub async fn recovery_notify_contact(
     recovering_did: &str,
     contact_did: &str,
     payload: &[u8],
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &crate::context::actor::signer::CommandSigner,
 ) -> Result<(), ContextError> {
-    use crate::context::actor::commands::{RecoverySendNotificationPayload, SigningKeyBytes};
+    use crate::context::actor::commands::RecoverySendNotificationPayload;
 
     let shared_context_id = deps
         .supervisor
@@ -502,7 +503,7 @@ pub async fn recovery_notify_contact(
                 sender_did: recovering_did.to_owned(),
                 payload: payload.to_vec(),
                 sequence: 4,
-                signing_key: SigningKeyBytes::from_signing_key(signing_key),
+                signer: signer.clone(),
             };
             deps.supervisor
                 .dispatch_recovery_send_notification(send_payload)

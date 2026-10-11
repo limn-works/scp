@@ -2840,8 +2840,8 @@ mod tests {
     /// sentinel — NOT the relay-derivable `context_routing_id`. A relay
     /// deserializing the single envelope layer therefore reads no shared
     /// correlator off a pseudonym-addressed app-data blob.
-    #[test]
-    fn app_data_envelope_routing_id_is_zeroed_not_context_rid() {
+    #[tokio::test]
+    async fn app_data_envelope_routing_id_is_zeroed_not_context_rid() {
         let ctx_str = "ctx-app-data-zeroed-rid";
         let (mut alice_actor, _bob_actor, _ctx_id, alice_did) =
             setup_two_party_for_ctx_string(ctx_str);
@@ -2861,12 +2861,15 @@ mod tests {
             ctx_str,
             &sender,
             b"hello app data",
-            crate::context::supervisor::MessageSigner::Active(&signing_key),
+            crate::context::supervisor::MessageSigner::Active(
+                &crate::context::actor::signer::CommandSigner::local_ed25519(signing_key),
+            ),
             &recipients,
             0,
             None,
             scp_protocol::envelope::inner::MessageType::Content,
         )
+        .await
         .unwrap();
 
         let decoded = scp_protocol::envelope::outer::OuterEnvelope::from_bytes(&wire).unwrap();
@@ -2887,8 +2890,8 @@ mod tests {
     /// send -> `open()` roundtrip still decrypts correctly, because the
     /// receiver routes on the transport key and MLS-decrypts the blob; it
     /// never reads the outer `routing_id` for app-data.
-    #[test]
-    fn app_data_roundtrip_decrypts_with_zeroed_routing_id() {
+    #[tokio::test]
+    async fn app_data_roundtrip_decrypts_with_zeroed_routing_id() {
         let ctx_str = "ctx-app-data-roundtrip";
         let (mut alice_actor, mut bob_actor, _ctx_id, alice_did) =
             setup_two_party_for_ctx_string(ctx_str);
@@ -2906,12 +2909,15 @@ mod tests {
             ctx_str,
             &sender,
             b"roundtrip payload",
-            crate::context::supervisor::MessageSigner::Active(&signing_key),
+            crate::context::supervisor::MessageSigner::Active(
+                &crate::context::actor::signer::CommandSigner::local_ed25519(signing_key),
+            ),
             &recipients,
             0,
             None,
             scp_protocol::envelope::inner::MessageType::Content,
         )
+        .await
         .unwrap();
 
         // Sanity: the field really is zeroed on the wire.

@@ -535,6 +535,26 @@ fn governance_propose_signs_through_sign_only_custody() {
     });
 }
 
+/// ADR-049 Decision 7a: a send signs its inner envelope through custody, so a
+/// custody that refuses raw key export still sends, and the host is never
+/// asked for its key.
+#[test]
+fn context_send_signs_through_sign_only_custody() {
+    Python::with_gil(|py| {
+        let (scp, owner, handle) = single_admin_owner_and_context(py);
+        let host = install_sign_only_governance_custody(py, scp.bridge_instance(), &owner);
+        let payload = pyo3::types::PyBytes::new(py, b"sign-only send");
+        scp.context_send(py, &handle, &owner, payload.as_any(), None)
+            .expect("a sign-only custody sends through CommandSigner");
+        let export_calls = host
+            .bind(py)
+            .getattr("export_calls")
+            .and_then(|n| n.extract::<usize>())
+            .unwrap();
+        assert_eq!(export_calls, 0, "the raw key is never requested");
+    });
+}
+
 /// A proposer whose `#active` key custody no longer holds fails
 /// `governance_propose` with `SCP-CRYPTO-4006` when the signer is built.
 #[test]

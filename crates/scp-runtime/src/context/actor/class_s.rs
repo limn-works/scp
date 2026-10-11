@@ -6143,8 +6143,8 @@ impl ClassSCell
 
         // Drive the PRODUCTION paid send. `Some(nonce_token)` models the burned
         // spending-nonce obligation (the exact stand-in the production send-path
-        // fail-closed tests use). `signing_key = None` skips checkpoint creation;
-        // the consequence path runs regardless.
+        // fail-closed tests use). The send signs any due checkpoint through a
+        // local test signer; the consequence path runs regardless.
         let paid = crate::context::messaging_helpers::finalize_send(
             &mut cell,
             &deps,
@@ -6153,7 +6153,9 @@ impl ClassSCell
             &sender,
             0,
             b"paid-with-suspension",
-            None,
+            &crate::context::actor::signer::CommandSigner::local_ed25519(
+                ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
+            ),
             Some(ClassSCommitToken::new_for_test(&ctx)),
             /* is_broadcast = */ false,
         )

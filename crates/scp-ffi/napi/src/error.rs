@@ -671,22 +671,6 @@ impl ScpNapiError {
             },
         }
     }
-
-    /// A failed inner-envelope signing: a custody failure keeps its custody
-    /// code ([`Self::custody_failure`]), and any other envelope failure is
-    /// `SCP-CRYPTO-4001`.
-    pub(crate) fn inner_envelope_error(e: &scp_core::envelope::EnvelopeError) -> Self {
-        let message = format!("inner envelope signing failed: {e}");
-        match e {
-            scp_core::envelope::EnvelopeError::Custody(failure) => {
-                Self::custody_failure(message, failure)
-            }
-            _ => Self::Crypto {
-                message,
-                code: codes::CRYPTO_4001.to_owned(),
-            },
-        }
-    }
 }
 
 impl From<scp_platform::PlatformError> for ScpNapiError {

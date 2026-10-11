@@ -584,7 +584,44 @@ pub async fn close_context(
 // 5. close_context_with_key (per-context)
 // ---------------------------------------------------------------------------
 
-/// Closes a context with an optional signing key for final checkpoint
+/// Builds and signs the final checkpoint a close records (§9.9.3). A refused
+/// or timed-out sign is logged and yields `None`: the close transition has
+/// already committed and must persist.
+async fn final_close_checkpoint(
+    broadcast_context_is_none: bool,
+    mls_epoch: u64,
+    deps: &ActorDeps,
+    context_id: &str,
+    initiator_did: &DID,
+    signer: &crate::context::actor::signer::CommandSigner,
+) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
+    // Takes the cell's two scalars, not `&ClassSCell`: the cell is not
+    // `Sync`, and a reference to it held across the sign's await would make
+    // the close future `!Send`.
+    match crate::context::queries_helpers::build_checkpoint(
+        context_id,
+        broadcast_context_is_none,
+        mls_epoch,
+        initiator_did,
+        signer,
+        deps.clock.now_secs(),
+        deps.event_log.as_ref(),
+    )
+    .await
+    {
+        Ok(cp) => Some(cp),
+        Err(e) => {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "final checkpoint not created on close: signing failed (§9.9.3)"
+            );
+            None
+        }
+    }
+}
+
+/// Closes a context with an optional signer for final checkpoint
 /// generation (§9.9.3).
 ///
 /// Multi-admin contexts (any governance model other than `SingleAdmin`)
@@ -603,7 +640,7 @@ pub async fn close_context_with_key(
     deps: &ActorDeps,
     handle: &ContextHandle,
     initiator_did: &DID,
-    signing_key: Option<&ed25519_dalek::SigningKey>,
+    signer: Option<&crate::context::actor::signer::CommandSigner>,
 ) -> Result<CloseResult, ContextError> {
     let context_id = handle.context_id().to_owned();
 
@@ -650,6 +687,32 @@ pub async fn close_context_with_key(
         deps.clock.now_secs(),
     )
     .await?;
+
+    // Final checkpoint before close (§9.9.3): capture the terminal event log
+    // state, including the `ContextClosing` leaf just appended, so equivocation
+    // detection covers the full context lifetime. It is built and signed HERE,
+    // before the synchronous Class-S combinator below, because signing awaits
+    // custody (ADR-049 Decision 7a). The epoch is read before the broadcast
+    // teardown, so a broadcast context's checkpoint carries no epoch
+    // (§23.16.1). Best-effort: the close transition above has already
+    // committed and must persist, so a refused or timed-out sign skips the
+    // checkpoint (logged) rather than aborting the close.
+    let final_checkpoint = match signer {
+        None => None,
+        Some(signer) => {
+            let broadcast_context_is_none = cell.broadcast_context.is_none();
+            let mls_epoch = cell.epoch.mls_epoch;
+            final_close_checkpoint(
+                broadcast_context_is_none,
+                mls_epoch,
+                deps,
+                &context_id,
+                initiator_did,
+                signer,
+            )
+            .await
+        }
+    };
 
     // ADR-049 §9 Class S: the lifecycle close transition is security-critical
     // (a closed context must not silently re-open on a crash) — STRUCTURAL
@@ -704,25 +767,14 @@ pub async fn close_context_with_key(
         // on context close (#1530).
         state.governance.decay_participation();
 
-        // Final checkpoint before close (§9.9.3): force-create a checkpoint
-        // to capture the terminal event log state. This ensures
-        // equivocation detection covers the full context lifetime.
-        // Best-effort: skip if no signing key is available.
-        if let Some(sk) = signing_key {
-            let now = deps.clock.now_secs();
-            let broadcast_context_is_none = state.broadcast_context.is_none();
-            let mls_epoch = state.epoch.mls_epoch;
+        // Record the final checkpoint signed above (§9.9.3).
+        if let Some(cp) = final_checkpoint {
             let cp = crate::context::queries_helpers::force_create_checkpoint_fields(
                 &context_id,
-                broadcast_context_is_none,
-                mls_epoch,
                 &mut state.checkpoint_events_since,
                 &mut state.checkpoint_last_time_secs,
                 &mut state.checkpoints,
-                initiator_did,
-                sk,
-                now,
-                deps.event_log.as_ref(),
+                cp,
             );
             tracing::debug!(
                 context_id = %context_id,
@@ -5240,7 +5292,9 @@ mod restore_reconcile_tests {
             &sender,
             reserved,
             b"payload",
-            None,
+            &crate::context::actor::signer::CommandSigner::local_ed25519(
+                ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
+            ),
             None,  // no spending-nonce token (free send) — keeps best-effort persist
             false, // is_broadcast
         )

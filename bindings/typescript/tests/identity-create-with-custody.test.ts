@@ -348,5 +348,25 @@ if (!scpAvailable) {
         await scp.shutdown(1000).catch(() => {});
       }
     });
+
+    // ADR-049 Decision 7a: a send signs its inner envelope through
+    // `KeyCustody::sign`, so a custody that refuses raw key export still sends.
+    test("sign-only (no raw-key-export) custody can still send", async () => {
+      const scp = new SCP({ storage: { type: "in_memory" } });
+      try {
+        const identity = await scp.identityCreateWithCustody(new SignOnlyKeychain());
+        const ctx = await scp.contextCreate(
+          identity,
+          JSON.stringify({
+            ceiling: ["messages:read", "messages:write"],
+            memoryScope: "ephemeral",
+            governance: "single_admin",
+          }),
+        );
+        await scp.contextSend(ctx, identity.did, new TextEncoder().encode("sign-only send"));
+      } finally {
+        await scp.shutdown(1000).catch(() => {});
+      }
+    });
   });
 }

@@ -239,7 +239,9 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
             &send_handle,
             &alice(),
             plaintext,
-            MessageSigner::Active(&signing_key_for_did(&alice())),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                signing_key_for_did(&alice()),
+            )),
             None,
             None,
         )

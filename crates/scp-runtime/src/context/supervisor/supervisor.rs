@@ -1691,34 +1691,37 @@ pub struct StreamingSagaHandle {
 // MessageSigner (ADR-039)
 // ---------------------------------------------------------------------------
 
-/// Pairs the signing key with its verification method so the persona stamped on
+/// Pairs the signer with its verification method so the persona stamped on
 /// the wire cannot disagree with the key that signed. Every send path requires a
-/// key, so this is non-optional.
+/// signer, so this is non-optional.
 ///
 /// ADR-039 — the inner envelope's `signing_key_id` (`#active` / `#agent`)
 /// selects which DID-document verification method the recipient resolves to
-/// check the signature. Carrying the key and its persona as two independent
+/// check the signature. Carrying the signer and its persona as two independent
 /// arguments let a caller stamp `#agent` while signing with the `#active` key
 /// (or vice versa), producing a message the recipient cannot verify. This enum
 /// binds the two together: [`Self::signing_key_id`] is derived from the same
-/// variant that carries the key, so the stamp and the key are one source of
+/// variant that carries the signer, so the stamp and the key are one source of
 /// truth. The single stamp+sign site
 /// (`build_encrypted_envelope_actor`)
-/// takes the `MessageSigner` directly.
+/// takes the `MessageSigner` directly. The signer is a [`CommandSigner`]
+/// (ADR-049 Decision 7a): the key stays in custody.
+///
+/// [`CommandSigner`]: crate::context::actor::signer::CommandSigner
 #[derive(Clone, Copy)]
 pub enum MessageSigner<'a> {
     /// Sign under the human `#active` verification method.
-    Active(&'a ed25519_dalek::SigningKey),
+    Active(&'a crate::context::actor::signer::CommandSigner),
     /// Sign under the autonomous `#agent` verification method (ADR-039).
-    Agent(&'a ed25519_dalek::SigningKey),
+    Agent(&'a crate::context::actor::signer::CommandSigner),
 }
 
 impl<'a> MessageSigner<'a> {
-    /// The Ed25519 signing key, regardless of persona.
+    /// The signer, regardless of persona.
     #[must_use]
-    pub const fn key(&self) -> &'a ed25519_dalek::SigningKey {
+    pub const fn signer(&self) -> &'a crate::context::actor::signer::CommandSigner {
         match self {
-            Self::Active(k) | Self::Agent(k) => k,
+            Self::Active(s) | Self::Agent(s) => s,
         }
     }
 
@@ -4386,10 +4389,10 @@ impl Supervisor {
         recovering_did: &str,
         contact_did: &str,
         payload: &[u8],
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<(), ContextError> {
         use crate::context::actor::commands::{
-            RecoverySendNotificationPayload, SigningKeyBytes, TrustRecoveryCommand,
+            RecoverySendNotificationPayload, TrustRecoveryCommand,
         };
 
         // Lock-free actor-registry fan-out: the first context where BOTH
@@ -4412,7 +4415,7 @@ impl Supervisor {
                     sender_did: recovering_did.to_owned(),
                     payload: payload.to_vec(),
                     sequence: 4,
-                    signing_key: SigningKeyBytes::from_signing_key(signing_key),
+                    signer: signer.clone(),
                 };
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let cmd = TrustRecoveryCommand::RecoverySendNotification {
@@ -4442,10 +4445,11 @@ impl Supervisor {
     /// Mirrors the standing/queries/lifecycle direct precedents.
     /// `RecoveryNotifyContact` is intrinsically cross-context (it carries
     /// no `context_id`, so it always reaches this path): its arm wraps
-    /// the actor-native [`Self::recovery_notify_contact`] fan-out in a
-    /// 30s timeout matching the actor-handler shape (plan §"Transport
-    /// timeouts inside actor handlers") and relays the typed reply on the
-    /// variant's oneshot.
+    /// the actor-native [`Self::recovery_notify_contact`] fan-out in the
+    /// signing handler budget
+    /// ([`SIGNING_HANDLER_TIMEOUT`](crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT)),
+    /// because the dispatched notification signs in the shared context's turn,
+    /// and relays the typed reply on the variant's oneshot.
     ///
     /// The per-context variants reach this path only for a context with
     /// no registered actor. Post-Step-B every valid *registered* context
@@ -4470,17 +4474,17 @@ impl Supervisor {
         self: &Arc<Self>,
         cmd: TrustRecoveryCommand,
     ) -> Outcome<()> {
-        const TRUST_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const TRUST_RECOVERY_TIMEOUT: std::time::Duration =
+            crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
 
         match cmd {
             TrustRecoveryCommand::RecoveryNotifyContact { payload, reply } => {
                 let recovering_did = payload.recovering_did.clone();
-                let signing_key = payload.signing_key.to_signing_key();
                 let notify_fut = self.recovery_notify_contact(
                     &payload.recovering_did,
                     &payload.contact_did,
                     &payload.payload,
-                    &signing_key,
+                    &payload.signer,
                 );
                 let (outcome, reply_result) = match tokio::time::timeout(
                     TRUST_RECOVERY_TIMEOUT,
@@ -4547,14 +4551,13 @@ impl Supervisor {
             // provider seal produced (best-effort no-op). See
             // `recovery_send_notification_direct` for the full contract.
             TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
-                let signing_key = payload.signing_key.to_signing_key();
                 let send_result = self
                     .recovery_send_notification_direct(
                         &payload.context_id,
                         &payload.sender_did,
                         &payload.payload,
                         payload.sequence,
-                        &signing_key,
+                        &payload.signer,
                     )
                     .await;
                 match send_result {
@@ -4640,17 +4643,17 @@ impl Supervisor {
         sender_did: &str,
         payload: &[u8],
         sequence: u64,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ContextError>> + Send + 'a>>
     {
         use crate::context::actor::commands::{
-            ContextCommand, RecoverySendNotificationPayload, SigningKeyBytes, TrustRecoveryCommand,
+            ContextCommand, RecoverySendNotificationPayload, TrustRecoveryCommand,
         };
 
         let context_id = context_id.to_owned();
         let sender_did = sender_did.to_owned();
         let payload = payload.to_vec();
-        let signing_key = signing_key.clone();
+        let signer = signer.clone();
 
         Box::pin(async move {
             // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) lazy-spawn seal: the per-context
@@ -4714,7 +4717,7 @@ impl Supervisor {
                 sender_did,
                 payload,
                 sequence,
-                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+                signer,
             };
             let cmd =
                 ContextCommand::TrustRecovery(TrustRecoveryCommand::RecoverySendNotification {
@@ -12452,26 +12455,26 @@ impl Supervisor {
     /// through the actor mailbox via [`Self::dispatch_command`].
     ///
     /// Used by the reconnection driver's Phase 3 (`event_log_sync`): the
-    /// caller supplies its locally-controlled `sender_did` + `signing_key`
+    /// caller supplies its locally-controlled `sender_did` + `signer`
     /// exactly as the application send path does.
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] from the handler;
-    /// [`ContextError::TransportFailed`] if the reply channel is dropped.
+    /// Propagates [`ContextError`] from the handler, including
+    /// [`ContextError::Custody`] when the checkpoint sign is refused or times
+    /// out (`SCP-CRYPTO-4061`); [`ContextError::TransportFailed`] if the reply
+    /// channel is dropped.
     pub async fn build_local_checkpoint(
         &self,
         context_id: &str,
         sender_did: &DID,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::BuildLocalCheckpoint {
             context_id: context_id.to_owned(),
             sender_did: sender_did.clone(),
-            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                signing_key,
-            ),
+            signer: signer.clone(),
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
@@ -12488,8 +12491,8 @@ impl Supervisor {
     ///
     /// Driven by the bridge/SDK subscribe-path periodic scheduler (the
     /// §9.9.2 "the SDK sends heartbeats" boundary): the caller supplies its
-    /// locally-controlled `sender_did` + `signing_key` exactly as the
-    /// application send path does — the signing key is not actor-owned state.
+    /// locally-controlled `sender_did` + `signer` exactly as the
+    /// application send path does — the actor holds no key material.
     /// The heartbeat carries an empty payload; its only purpose is to give
     /// peers a liveness beacon for suppression detection.
     ///
@@ -12503,15 +12506,13 @@ impl Supervisor {
         &self,
         context_id: &str,
         sender_did: &DID,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<(), ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::SendHeartbeat {
             context_id: context_id.to_owned(),
             sender_did: sender_did.clone(),
-            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                signing_key,
-            ),
+            signer: signer.clone(),
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
@@ -16100,15 +16101,15 @@ impl Supervisor {
     /// Encrypts and broadcasts a payload through the context's MLS
     /// group via the actor mailbox.
     ///
-    /// `signer` ([`MessageSigner`]) pairs the Ed25519 signing key with the
+    /// `signer` ([`MessageSigner`]) pairs the custody-backed signer with the
     /// verification method it is signed under (ADR-039):
     /// [`MessageSigner::Active`] for human-originated sends,
     /// [`MessageSigner::Agent`] for agent-autonomous sends. The persona is
     /// stamped into the inner envelope's `signing_key_id` from the same enum
-    /// variant that carries the key, so the recipient resolves the matching
+    /// variant that carries the signer, so the recipient resolves the matching
     /// public key (`#active` / `#agent`) from the sender's DID document and the
     /// stamp can never disagree with the key that signed. Every send path
-    /// requires a key, so the signer is non-optional.
+    /// requires a signer, so it is non-optional.
     ///
     /// Every per-context method on `Supervisor` builds a typed
     /// `ContextCommand` carrying an embedded reply oneshot, enqueues it
@@ -16138,7 +16139,7 @@ impl Supervisor {
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     ) -> Result<(), ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        // Single construction point: both `signing_key` and `signing_key_id`
+        // Single construction point: both `signer` and `signing_key_id`
         // are derived from the one `MessageSigner` so the persona stamped on the
         // wire cannot diverge from the key that signs (ADR-039). The owned
         // payload keeps two fields to cross the actor mailbox, but they are set
@@ -16149,9 +16150,7 @@ impl Supervisor {
             params: handle.params().clone(),
             sender_did: sender_did.clone(),
             payload: payload.to_vec(),
-            signing_key: Some(
-                crate::context::actor::commands::SigningKeyBytes::from_signing_key(signer.key()),
-            ),
+            signer: signer.signer().clone(),
             signing_key_id: signer.signing_key_id(),
             source_provenance: source_provenance.cloned(),
             spending_ucan: spending_ucan.cloned(),
@@ -25649,23 +25648,30 @@ mod tests {
                 Self::BOB.to_owned(),
                 self.bob_access_key.clone(),
             )]);
-            crate::context::messaging_helpers::build_encrypted_envelope_actor(
-                &clock,
-                self.alice_state
-                    .mode
-                    .crypto_mut()
-                    .expect("encrypted context"),
-                Self::ALICE,
-                ctx_str,
-                &DID::from(claimed_sender),
-                payload,
-                crate::context::supervisor::MessageSigner::Active(signing_key),
-                &recipients,
-                aad_sequence,
-                None,
-                scp_protocol::envelope::inner::MessageType::Content,
-            )
-            .expect("alice seals the application message")
+            let signer =
+                crate::context::actor::signer::CommandSigner::local_ed25519(signing_key.clone());
+            let crypto = self
+                .alice_state
+                .mode
+                .crypto_mut()
+                .expect("encrypted context");
+            self.rt
+                .block_on(
+                    crate::context::messaging_helpers::build_encrypted_envelope_actor(
+                        &clock,
+                        crypto,
+                        Self::ALICE,
+                        ctx_str,
+                        &DID::from(claimed_sender),
+                        payload,
+                        crate::context::supervisor::MessageSigner::Active(&signer),
+                        &recipients,
+                        aad_sequence,
+                        None,
+                        scp_protocol::envelope::inner::MessageType::Content,
+                    ),
+                )
+                .expect("alice seals the application message")
         }
 
         /// Alice's correctly signed inner envelope for `payload` at sender
@@ -25681,20 +25687,22 @@ mod tests {
                 Self::BOB.to_owned(),
                 self.bob_access_key.clone(),
             )]);
-            crate::context::messaging_helpers::build_inner_wire(
-                &clock,
-                ctx_str,
-                &DID::from(Self::ALICE),
-                payload,
-                crate::context::supervisor::MessageSigner::Active(
-                    &crate::crypto::mls::two_party_test_support::alice_signing_key(),
-                ),
-                &recipients,
-                aad_sequence,
-                None,
-                scp_protocol::envelope::inner::MessageType::Content,
-            )
-            .expect("alice builds the inner envelope")
+            let signer = crate::context::actor::signer::CommandSigner::local_ed25519(
+                crate::crypto::mls::two_party_test_support::alice_signing_key(),
+            );
+            self.rt
+                .block_on(crate::context::messaging_helpers::build_inner_wire(
+                    &clock,
+                    ctx_str,
+                    &DID::from(Self::ALICE),
+                    payload,
+                    crate::context::supervisor::MessageSigner::Active(&signer),
+                    &recipients,
+                    aad_sequence,
+                    None,
+                    scp_protocol::envelope::inner::MessageType::Content,
+                ))
+                .expect("alice builds the inner envelope")
         }
 
         /// Seals `inner` through Alice's production sender-key and MLS seal at
@@ -26029,7 +26037,7 @@ mod tests {
     #[test]
     fn send_heartbeat_handler_reports_mutated() {
         use crate::context::actor::class_s::ClassSCell;
-        use crate::context::actor::commands::{MessagingCommand, SigningKeyBytes};
+        use crate::context::actor::commands::MessagingCommand;
         use scp_protocol::context::ContextState;
         use scp_protocol::context::roles::Capability;
 
@@ -26081,8 +26089,8 @@ mod tests {
             let heartbeat = MessagingCommand::SendHeartbeat {
                 context_id: ctx_str.to_owned(),
                 sender_did: DID::from(ALICE),
-                signing_key: SigningKeyBytes::from_signing_key(
-                    &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+                signer: crate::context::actor::signer::CommandSigner::local_ed25519(
+                    crate::crypto::mls::two_party_test_support::alice_signing_key(),
                 ),
                 reply: htx,
             };
@@ -26103,6 +26111,109 @@ mod tests {
                  generation — the handler MUST report mutated (ADR-049 §9 HIGH-1)"
             );
             hrx.await.expect("heartbeat reply").expect("heartbeat ok");
+        });
+    }
+
+    /// ADR-049 Decision 7a: a custody that never answers fails a signing
+    /// handler's turn with a custody failure of kind `TimedOut`
+    /// (`SCP-CRYPTO-4061`), not the handler's `TransportTimeout`. The handler
+    /// budget (`SIGNING_HANDLER_TIMEOUT`) outlasts the sign budget
+    /// (`SIGN_TIMEOUT`), so the sign budget always fires first.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn stalled_custody_fails_signing_handler_with_custody_timeout() {
+        use crate::context::actor::class_s::ClassSCell;
+        use crate::context::actor::commands::MessagingCommand;
+        use crate::context::actor::signer::{CommandSigner, SIGN_TIMEOUT};
+        use scp_crypto::{CustodyFailure, CustodyFailureKind, DynScpSigner, SigAlg, SignFuture};
+        use scp_protocol::context::ContextState;
+        use scp_protocol::context::roles::Capability;
+
+        /// A signer whose sign never completes, standing in for an
+        /// unanswered biometric prompt.
+        struct StalledSigner(Vec<u8>);
+
+        impl DynScpSigner for StalledSigner {
+            fn algorithm(&self) -> SigAlg {
+                SigAlg::Ed25519
+            }
+
+            fn public_key(&self) -> Vec<u8> {
+                self.0.clone()
+            }
+
+            fn sign_boxed<'a>(&'a self, _digest: &'a [u8; 32]) -> SignFuture<'a> {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        const ALICE: &str = "did:dht:z6MkAliceStalledAliceStalledAliceStall1";
+        const BOB: &str = "did:dht:z6MkBobStalledBobStalledBobStalledBobSt1";
+        let ctx_str = "stalled-custody-handler-timeout";
+
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_provider: alice_crypto,
+            mut alice_state,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+
+        let alice_sup = supervisor_with_crypto(Arc::clone(&alice_crypto));
+        let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, drives async dispatch from a sync #[test]; not a production async bridge
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let alice_deps = rt
+            .block_on(alice_sup.build_actor_deps(&DID::from(ALICE)))
+            .expect("build alice's actor deps");
+
+        alice_state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("transition test handle to Active");
+        alice_state
+            .membership
+            .add_member(DID::from(ALICE), "member".to_owned(), Vec::new());
+        alice_state.members.insert(DID::from(ALICE));
+        alice_state.role_state.members.insert(ALICE.to_owned());
+        alice_state.role_state.member_capabilities.insert(
+            ALICE.to_owned(),
+            std::collections::HashSet::from([Capability::MessagesWrite]),
+        );
+        let mut cell = ClassSCell::new(alice_state);
+        let public_key = crate::crypto::mls::two_party_test_support::alice_signing_key()
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+
+        rt.block_on(async {
+            let (htx, hrx) = tokio::sync::oneshot::channel();
+            let heartbeat = MessagingCommand::SendHeartbeat {
+                context_id: ctx_str.to_owned(),
+                sender_did: DID::from(ALICE),
+                signer: CommandSigner::new(Arc::new(StalledSigner(public_key))),
+                reply: htx,
+            };
+            let started = tokio::time::Instant::now();
+            let outcome = crate::context::actor::handlers::messaging::dispatch(
+                &mut cell,
+                &alice_deps,
+                heartbeat,
+            )
+            .await;
+            assert!(outcome.result.is_err(), "a stalled sign must fail the turn");
+            assert!(started.elapsed() >= SIGN_TIMEOUT);
+            let result = hrx.await.expect("heartbeat reply");
+            assert!(
+                matches!(
+                    &result,
+                    Err(ContextError::Custody(CustodyFailure {
+                        kind: CustodyFailureKind::TimedOut,
+                        ..
+                    }))
+                ),
+                "a stalled custody must surface as TimedOut (SCP-CRYPTO-4061), got {result:?}"
+            );
         });
     }
 
@@ -26377,7 +26488,9 @@ mod tests {
             .expect("create the real 64-hex context under the digest");
         assert_eq!(created.context_id(), context_id);
 
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        let signing_key = crate::context::actor::signer::CommandSigner::local_ed25519(
+            ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]),
+        );
         let result = sup
             .recovery_send_notification_direct(
                 &context_id,
@@ -28449,7 +28562,9 @@ mod tests {
             .handle
             .transition_to(&crate::context::ContextState::Active)
             .unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        let signing_key = crate::context::actor::signer::CommandSigner::local_ed25519(
+            ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]),
+        );
 
         // `finalize_send` is actor-shape (ADR-049 §9): it takes the owning
         // `ClassSCell` so it can drive the Class-S fail-closed persist (via the
@@ -28466,7 +28581,7 @@ mod tests {
             &sender,
             0,
             b"paid",
-            Some(&signing_key),
+            &signing_key,
             // Paid send: a deferred spending-nonce token whose fail-closed
             // commit drives the persist (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
@@ -28489,7 +28604,7 @@ mod tests {
             &sender,
             1,
             b"free",
-            Some(&signing_key),
+            &signing_key,
             // Free send: no token (previously the `false` bool) — keeps the
             // best-effort persist, un-regressed.
             None,
@@ -29148,7 +29263,9 @@ mod tests {
                 seed_entries,
             );
         let deps = test_actor_deps(&sup).await;
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]);
+        let signing_key = crate::context::actor::signer::CommandSigner::local_ed25519(
+            ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]),
+        );
         // `finalize_send` is actor-shape (ADR-049 §9): wrap the state in the
         // owning `ClassSCell` for the call, then reclaim it via `into_inner` to
         // hand off to `spawn_actor_with_state`.
@@ -29161,7 +29278,7 @@ mod tests {
             &sender,
             0,
             b"paid-send",
-            Some(&signing_key),
+            &signing_key,
             // Paid send: deferred token whose fail-closed commit persists the
             // consumed nonce (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
@@ -29601,7 +29718,9 @@ mod tests {
             .handle
             .transition_to(&crate::context::ContextState::Active)
             .unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]);
+        let signing_key = crate::context::actor::signer::CommandSigner::local_ed25519(
+            ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]),
+        );
 
         // Baseline: the sender's sequence counter before any reservation.
         let baseline = state
@@ -29634,7 +29753,7 @@ mod tests {
             &sender,
             reserved,
             b"paid",
-            Some(&signing_key),
+            &signing_key,
             // Paid send: deferred token whose fail-closed commit fails here,
             // driving the sequence-rollback path (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),

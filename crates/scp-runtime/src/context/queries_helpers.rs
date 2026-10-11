@@ -96,6 +96,7 @@ use zeroize::Zeroizing;
 
 use crate::context::actor::class_s::ClassCMut;
 use crate::context::actor::deps::ActorDeps;
+use crate::context::actor::signer::{CommandSigner, sign_bounded};
 use crate::context::actor::state::PerContextState;
 use crate::context::builder::ContextEventLogProvider;
 use crate::context::state::{self, CommitFaultMarker, EpochState, PendingCommit};
@@ -565,33 +566,23 @@ pub fn velocity_for_test(state: &PerContextState, member_did: &DID, now_secs: u6
 // Checkpoint operations (§9.9.3, ADR-011 AC-8) — actor-shape entries
 // ===========================================================================
 
-/// Unconditionally creates a consistency checkpoint regardless of
-/// whether the event/time thresholds have been reached. Takes per-field
-/// references so callers may pass disjoint sub-borrows of the unified
-/// [`PerContextState`] (ADR-049 §Decision 1).
-#[allow(clippy::too_many_arguments)]
+/// Records an already-signed consistency checkpoint (from
+/// [`build_checkpoint`]) as the context's newest, regardless of whether the
+/// event/time thresholds have been reached. Takes per-field references so
+/// callers may pass disjoint sub-borrows of the unified [`PerContextState`]
+/// (ADR-049 §Decision 1).
+///
+/// The checkpoint is built and signed before this call because signing awaits
+/// custody (ADR-049 Decision 7a) and the close path records it inside a
+/// synchronous Class-S combinator closure.
 pub fn force_create_checkpoint_fields(
     context_id: &str,
-    broadcast_context_is_none: bool,
-    mls_epoch: u64,
     checkpoint_events_since: &mut u64,
     checkpoint_last_time_secs: &mut u64,
     checkpoints: &mut Vec<scp_event_log::checkpoint::ConsistencyCheckpoint>,
-    sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
-    now: u64,
-    event_log: &dyn ContextEventLogProvider,
+    cp: scp_event_log::checkpoint::ConsistencyCheckpoint,
 ) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
-    let cp = build_checkpoint(
-        context_id,
-        broadcast_context_is_none,
-        mls_epoch,
-        sender_did,
-        signing_key,
-        now,
-        event_log,
-    );
-
+    let now = cp.timestamp;
     *checkpoint_events_since = 0;
     *checkpoint_last_time_secs = now;
     checkpoints.push(cp.clone());
@@ -619,26 +610,34 @@ pub fn force_create_checkpoint_fields(
 /// the actor handler drive this with no whole `&mut PerContextState`.
 /// `broadcast_context_is_none` and `mls_epoch` are read by the caller from the
 /// view (their borrows released) before this call. Returns the built checkpoint.
+///
+/// The checkpoint is signed through `signer` (ADR-049 Decision 7a) before any
+/// checkpoint field is touched, so a failed sign leaves the view unchanged.
+///
+/// # Errors
+///
+/// Any error [`build_checkpoint`] returns.
 #[allow(clippy::too_many_arguments)]
-pub fn force_create_checkpoint_view(
-    view: &mut ClassCMut,
+pub async fn force_create_checkpoint_view(
+    view: &mut ClassCMut<'_>,
     context_id: &str,
     broadcast_context_is_none: bool,
     mls_epoch: u64,
     sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &CommandSigner,
     now: u64,
     event_log: &dyn ContextEventLogProvider,
-) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError> {
     let cp = build_checkpoint(
         context_id,
         broadcast_context_is_none,
         mls_epoch,
         sender_did,
-        signing_key,
+        signer,
         now,
         event_log,
-    );
+    )
+    .await?;
 
     // Sequential per-field view accessors: each `&mut` borrow ends before the
     // next, so no whole `&mut PerContextState` (nor a 3-field simultaneous
@@ -659,7 +658,7 @@ pub fn force_create_checkpoint_view(
         "forced final checkpoint on context close (§9.9.3)"
     );
 
-    cp
+    Ok(cp)
 }
 
 /// Creates a consistency checkpoint when due (§9.9.3 thresholds) via a
@@ -675,17 +674,25 @@ pub fn force_create_checkpoint_view(
 /// a 3-field simultaneous borrow). `broadcast_context_is_none` and `mls_epoch`
 /// are read by the caller from the view (their borrows released) before this
 /// call. Returns the built checkpoint when one was due, else `None`.
+///
+/// The checkpoint is signed through `signer` (ADR-049 Decision 7a) before any
+/// checkpoint field is touched, so a failed sign leaves the thresholds armed
+/// and the next send retries.
+///
+/// # Errors
+///
+/// Any error [`build_checkpoint`] returns.
 #[allow(clippy::too_many_arguments)]
-pub fn create_checkpoint_if_due_view(
-    view: &mut ClassCMut,
+pub async fn create_checkpoint_if_due_view(
+    view: &mut ClassCMut<'_>,
     context_id: &str,
     broadcast_context_is_none: bool,
     mls_epoch: u64,
     sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &CommandSigner,
     now: u64,
     event_log: &dyn ContextEventLogProvider,
-) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
+) -> Result<Option<scp_event_log::checkpoint::ConsistencyCheckpoint>, ContextError> {
     let events_since = *view.checkpoint_events_since_mut();
     let last_time = *view.checkpoint_last_time_secs_mut();
     let events_due = events_since >= 50;
@@ -694,7 +701,7 @@ pub fn create_checkpoint_if_due_view(
     let time_due = events_since > 0 && now.saturating_sub(last_time) >= 600;
 
     if !events_due && !time_due {
-        return None;
+        return Ok(None);
     }
 
     let cp = build_checkpoint(
@@ -702,10 +709,11 @@ pub fn create_checkpoint_if_due_view(
         broadcast_context_is_none,
         mls_epoch,
         sender_did,
-        signing_key,
+        signer,
         now,
         event_log,
-    );
+    )
+    .await?;
 
     // Sequential per-field view accessors: each `&mut` borrow ends before the
     // next, so no whole `&mut PerContextState` (nor a 3-field simultaneous
@@ -726,20 +734,29 @@ pub fn create_checkpoint_if_due_view(
         "consistency checkpoint created (§9.9.3)"
     );
 
-    Some(cp)
+    Ok(Some(cp))
 }
 
-/// Builds a signed checkpoint from the current event log. Pure function
-/// over the field slice the §9.9.3 canonical-hash inputs require.
-fn build_checkpoint(
+/// Builds a signed checkpoint from the current event log over the field slice
+/// the §9.9.3 canonical-hash inputs require.
+///
+/// The `SCP-CHECKPOINT-V1:` canonical hash is computed first, then signed
+/// through `signer` within the custody budget (ADR-049 Decision 7a).
+///
+/// # Errors
+///
+/// - [`ContextError::Custody`] when custody refuses the sign or does not
+///   answer within the budget (`TimedOut`, `SCP-CRYPTO-4061`).
+/// - [`ContextError::CryptoFailed`] when the canonical hash is not 32 bytes.
+pub async fn build_checkpoint(
     context_id: &str,
     broadcast_context_is_none: bool,
     mls_epoch: u64,
     sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &CommandSigner,
     now: u64,
     event_log: &dyn ContextEventLogProvider,
-) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError> {
     let context_id_bytes = state::context_id_to_bytes(context_id);
     let merkle_root = event_log
         .event_log_merkle_root(&context_id_bytes)
@@ -767,17 +784,23 @@ fn build_checkpoint(
         now,
     );
 
-    let signature = ed25519_dalek::Signer::sign(signing_key, &canonical_hash);
+    let digest = <[u8; 32]>::try_from(canonical_hash.as_slice()).map_err(|_| {
+        ContextError::CryptoFailed(format!(
+            "checkpoint canonical hash is {} bytes, expected 32",
+            canonical_hash.len()
+        ))
+    })?;
+    let signature = sign_bounded(signer, &digest).await?;
 
-    scp_event_log::checkpoint::ConsistencyCheckpoint {
+    Ok(scp_event_log::checkpoint::ConsistencyCheckpoint {
         context_id: context_id.to_owned(),
         sender_did: sender_did.clone(),
         event_count,
         merkle_root,
         epoch,
         timestamp: now,
-        signature: signature.to_bytes().to_vec(),
-    }
+        signature: signature.to_vec(),
+    })
 }
 
 /// Fail-closed authenticity gate for a remote checkpoint: the sender must
@@ -1488,5 +1511,101 @@ mod equivocation_dedup_tests {
             seen_len_after, cap,
             "the set must stay capped — the over-cap divergence is emitted but not inserted"
         );
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_signer_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use scp_did::DID;
+
+    use super::build_checkpoint;
+    use crate::context::actor::signer::CommandSigner;
+
+    /// Event-log provider with a fixed Merkle root and an empty entry list,
+    /// so the checkpoint fields are known in advance.
+    struct FixedRootEventLog;
+
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for FixedRootEventLog {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        fn event_log_entries(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(Some(Vec::new()))
+        }
+
+        fn event_log_merkle_root(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Ok([7u8; 32])
+        }
+    }
+
+    /// A checkpoint signed through `CommandSigner` (ADR-049 Decision 7a)
+    /// carries the signature a raw Ed25519 sign over the same
+    /// `SCP-CHECKPOINT-V1:` canonical hash produces, and it verifies against
+    /// the signer's key.
+    #[tokio::test]
+    async fn checkpoint_signed_via_signer_matches_raw() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x24; 32]);
+        let signer = CommandSigner::local_ed25519(key.clone());
+        let sender = DID("did:dht:alice".to_owned());
+        let now = 1_700_000_123;
+
+        let checkpoint = build_checkpoint(
+            "ctx-checkpoint",
+            true,
+            4,
+            &sender,
+            &signer,
+            now,
+            &FixedRootEventLog,
+        )
+        .await
+        .unwrap();
+
+        let canonical = scp_event_log::checkpoint::compute_checkpoint_canonical_hash(
+            "ctx-checkpoint",
+            sender.as_ref(),
+            0,
+            &[7u8; 32],
+            Some(4),
+            now,
+        );
+        let raw = ed25519_dalek::Signer::sign(&key, &canonical).to_bytes();
+        assert_eq!(checkpoint.signature, raw.to_vec());
+        assert_eq!(checkpoint.merkle_root, [7u8; 32]);
+        assert_eq!(checkpoint.epoch, Some(4));
+        scp_event_log::checkpoint::verify_checkpoint_signature(&checkpoint, &key.verifying_key())
+            .expect("the signer-path checkpoint must verify against the signer's key");
     }
 }

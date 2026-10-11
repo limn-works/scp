@@ -282,7 +282,7 @@ fn vector_5_minimal_inner_envelope() {
     )
     .unwrap();
     assert_eq!(
-        hex::encode(&hash),
+        hex::encode(hash),
         "cdc77fc58cb85548ba41ba1f5f074182a6af339847af091bf33020eb9fefab59"
     );
     assert_spec_preimage(
@@ -293,7 +293,7 @@ fn vector_5_minimal_inner_envelope() {
     );
     assert_reference_signature(
         "vector 5",
-        &hash.try_into().unwrap(),
+        &hash,
         "e497dc3efd4154502252aefe673479166c0550d7b85255caa9dacab08178eb2109bb6c4226340c1bed189e7c5c187ae54f484dd174954a6debd301823116bf46",
     );
 }
@@ -307,7 +307,7 @@ fn vector_6_inner_envelope_with_provenance() {
     )
     .unwrap();
     assert_eq!(
-        hex::encode(&hash),
+        hex::encode(hash),
         "dfb243d4574dec6c798782906e381ed875f18b9b2b14a8bd87d0b2e8df1e1c1b"
     );
     assert_spec_preimage(
@@ -318,7 +318,7 @@ fn vector_6_inner_envelope_with_provenance() {
     );
     assert_reference_signature(
         "vector 6",
-        &hash.try_into().unwrap(),
+        &hash,
         "5a52a4b0e87965a109a82439cd905eae241543be579e42d963713feae3f312406c2b0fdc15deaf5d3d40b41990f147c4c63cd702e16d2e656386bcf922a97203",
     );
 }

@@ -810,7 +810,9 @@ async fn tier3_governance_revoke_write_access_broadcast() {
             &handle,
             &author_did(),
             b"blocked message",
-            MessageSigner::Active(&signing_key_for_did(&author_did())),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                signing_key_for_did(&author_did()),
+            )),
             None,
             None,
         )
@@ -865,7 +867,9 @@ async fn tier3_governance_revoke_write_access_broadcast() {
             &handle,
             &author_did(),
             b"restored message",
-            MessageSigner::Active(&signing_key_for_did(&author_did())),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                signing_key_for_did(&author_did()),
+            )),
             None,
             None,
         )
@@ -1536,7 +1540,9 @@ async fn governance_tier_stacking_via_context_manager() {
             &handle,
             &dave(),
             b"should fail",
-            MessageSigner::Active(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                signing_key_for_did(&dave()),
+            )),
             None,
             None,
         )
@@ -1564,7 +1570,9 @@ async fn governance_tier_stacking_via_context_manager() {
             &handle,
             &dave(),
             b"still blocked",
-            MessageSigner::Active(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                signing_key_for_did(&dave()),
+            )),
             None,
             None,
         )
@@ -1590,7 +1598,9 @@ async fn governance_tier_stacking_via_context_manager() {
             &handle,
             &dave(),
             b"success",
-            MessageSigner::Active(&signing_key_for_did(&dave())),
+            MessageSigner::Active(&scp_runtime::context::actor::CommandSigner::local_ed25519(
+                signing_key_for_did(&dave()),
+            )),
             None,
             None,
         )

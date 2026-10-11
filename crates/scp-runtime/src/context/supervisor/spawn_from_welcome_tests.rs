@@ -3946,7 +3946,9 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
             &handle,
             &bob,
             b"joiner send after welcome (\xc2\xa79b)",
-            MessageSigner::Active(&bob_signing_key()),
+            MessageSigner::Active(&crate::context::actor::CommandSigner::local_ed25519(
+                bob_signing_key(),
+            )),
             None,
             None,
         )
