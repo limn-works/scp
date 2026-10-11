@@ -1150,7 +1150,22 @@ jobs:
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          FIX_ROUND_CHECK_EVIDENCE_DIR: ${{runner.temp}}/fix-round-check-evidence
         run: bash scripts/tests/fix-round-check/run-tests.sh
+      # The suite deletes its working directory on exit, so the runner output a
+      # failed case read survives only in the copy the step above writes to
+      # FIX_ROUND_CHECK_EVIDENCE_DIR. That directory sits outside the checkout,
+      # because case 3 runs the gates over the checkout and a gate rejects an
+      # unrouted file at its root. The expression carries no spaces because the
+      # ci-gate selftest splits an upload `path` on whitespace. No job downloads
+      # this artifact.
+      - name: Upload the runner output the cases read
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fix-round-check-evidence
+          path: ${{runner.temp}}/fix-round-check-evidence
+          retention-days: 7
 
   # ── Mutable shared process-global enforcement (ADR-048, #1549 Phase 4) ──
   # Forward-prevention gates that forbid the DEFAULT_BRIDGE_INSTANCE pattern

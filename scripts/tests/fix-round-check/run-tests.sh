@@ -28,6 +28,11 @@
 #     next covered three steps and not the gates step, which left a mutation deleting
 #     `FAILED=1` from the gate-failure branch passing every assertion here.
 #
+#     Case 6 also asserts that the detail a failed assertion prints names every gate the
+#     run reported as failing and carries that gate's own output. A case 3 failure on a
+#     pull request once printed only the run's last lines, which were NOT CHECKED lines,
+#     and named no gate.
+#
 #   * THE DERIVATION. Naming no crate makes the script read which files this branch
 #     changed and compile the crates that own them, and cases 1, 2, 3, 4, 5 and 6 each name
 #     one, so none of them reaches that code. Cases 7, 8 and 9 run the script with no
@@ -256,7 +261,22 @@ fi
 
 FAILURES=0
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+
+# When FIX_ROUND_CHECK_EVIDENCE_DIR names a directory, copy every output file the cases
+# read into it before $WORK is deleted: each run's out.txt, rc.txt and cargo.log, and each
+# case's log, at the path each had under $WORK. The fixture repositories stay behind. The
+# `fix-round-check-selftest` job of `.github/workflows/ci.yml` sets the variable and
+# uploads the directory when this suite fails, because a failed case's runner output is
+# otherwise gone the moment this script exits.
+keep_evidence() {
+    local dest=${FIX_ROUND_CHECK_EVIDENCE_DIR:-} f
+    [[ -n $dest ]] || return 0
+    mkdir -p "$dest" || return 0
+    while IFS= read -r f; do
+        mkdir -p "$dest/$(dirname "$f")" && cp "$WORK/$f" "$dest/$f"
+    done < <(cd "$WORK" && find . -type f \( -name out.txt -o -name rc.txt -o -name cargo.log -o -name 'case-*.log' \) -print)
+}
+trap 'keep_evidence; rm -rf "$WORK"' EXIT
 
 # Build a stub directory for one case.
 #
@@ -500,6 +520,52 @@ report() {
     fi
 }
 
+# Print every gate one run of `scripts/fix-round-check.sh` reported as failing, each with
+# the output that gate printed, read out of that run's combined output in $1.
+#
+# The runner's gate loop prints `  FAILED <path>` and then everything that gate wrote, and
+# prints `  TIMED OUT after 300s <path>`, `  MISSING <path>` and `  UNCLASSIFIED <path>`
+# as single lines. A block ends at the next of those lines or at the summary line. A block
+# longer than 60 lines keeps its first 15 and its last 45, because a gate prints what it
+# checked before the line that says what it rejected.
+#
+# A failure message that printed only the run's last lines named no gate: on a pull request
+# the NOT CHECKED lines filled that whole tail when case 3 exited 1, and the harness
+# deletes $WORK on exit, so the log was the only evidence and it held none.
+failed_gate_blocks() {
+    awk -v max=60 -v head=15 '
+        function flush(   i) {
+            if (!open) return
+            while (n > 0 && buf[n] ~ /^[[:space:]]*$/) n--
+            if (n <= max) {
+                for (i = 1; i <= n; i++) print buf[i]
+            } else {
+                for (i = 1; i <= head; i++) print buf[i]
+                printf "    [%d lines of gate output omitted]\n", n - max
+                for (i = n - (max - head) + 1; i <= n; i++) print buf[i]
+            }
+            open = 0
+            n = 0
+        }
+        /^  FAILED scripts\// { flush(); print; open = 1; next }
+        /^  (TIMED OUT after [0-9]+s|MISSING|UNCLASSIFIED) scripts\// { flush(); print; next }
+        /^fix-round-check: crates / { flush(); next }
+        open { buf[++n] = $0 }
+        END { flush() }
+    ' "$1"
+}
+
+# The detail a failed assertion prints about one run of `scripts/fix-round-check.sh`: every
+# failing gate's block from `failed_gate_blocks`, then the last $1 lines of the output in $2.
+output_tail() {
+    local lines=$1 file=$2 blocks
+    blocks=$(failed_gate_blocks "$file")
+    if [[ -n $blocks ]]; then
+        printf 'gates this run reported as failing, each with its own output:\n%s\noutput tail:\n' "$blocks"
+    fi
+    tail -n "$lines" "$file"
+}
+
 printf 'fix-round-check tests (pin %s)\n' "$PIN_CHANNEL"
 
 case_1() {
@@ -535,7 +601,7 @@ fi
 if grep -q 'compile FAILED' "$WORK/failing-compile/out.txt"; then
     report "case 2 names the compile step as failed" 0 ""
 else
-    report "case 2 names the compile step as failed" 1 "the summary holds no 'compile FAILED': $(tail -n 3 "$WORK/failing-compile/out.txt")"
+    report "case 2 names the compile step as failed" 1 "the summary holds no 'compile FAILED': $(output_tail 3 "$WORK/failing-compile/out.txt")"
 fi
 if grep -q '^check ' "$WORK/failing-compile/cargo.log"; then
     report "case 2 ran cargo check" 0 ""
@@ -551,17 +617,17 @@ rc=$(cat "$WORK/passing/rc.txt")
 if [[ $rc -eq 0 ]]; then
     report "case 3 exits 0 when every step passes" 0 ""
 else
-    report "case 3 exits 0 when every step passes" 1 "the script exited $rc; output tail: $(tail -n 6 "$WORK/passing/out.txt")"
+    report "case 3 exits 0 when every step passes" 1 "the script exited $rc; output tail: $(output_tail 6 "$WORK/passing/out.txt")"
 fi
 if grep -q 'compile ok' "$WORK/passing/out.txt"; then
     report "case 3 names the compile step as passing" 0 ""
 else
-    report "case 3 names the compile step as passing" 1 "the summary holds no 'compile ok': $(tail -n 3 "$WORK/passing/out.txt")"
+    report "case 3 names the compile step as passing" 1 "the summary holds no 'compile ok': $(output_tail 3 "$WORK/passing/out.txt")"
 fi
 if grep -q 'format ok' "$WORK/passing/out.txt"; then
     report "case 3 names the format step as passing" 0 ""
 else
-    report "case 3 names the format step as passing" 1 "the summary holds no 'format ok': $(tail -n 3 "$WORK/passing/out.txt")"
+    report "case 3 names the format step as passing" 1 "the summary holds no 'format ok': $(output_tail 3 "$WORK/passing/out.txt")"
 fi
 # The expected count is read out of the runner's own GATES array rather than written here,
 # so this assertion reports a gate the array lost. Writing the literal would let a deletion
@@ -571,7 +637,7 @@ GATE_COUNT=$(gate_paths | wc -l | tr -d ' ')
 if grep -q "gates $GATE_COUNT/$GATE_COUNT passed" "$WORK/passing/out.txt"; then
     report "case 3 ran all $GATE_COUNT gates against this repository" 0 ""
 else
-    report "case 3 ran all $GATE_COUNT gates against this repository" 1 "the summary holds no 'gates $GATE_COUNT/$GATE_COUNT passed': $(tail -n 3 "$WORK/passing/out.txt")"
+    report "case 3 ran all $GATE_COUNT gates against this repository" 1 "the summary holds no 'gates $GATE_COUNT/$GATE_COUNT passed': $(output_tail 3 "$WORK/passing/out.txt")"
 fi
 }
 
@@ -593,12 +659,12 @@ fi
 if grep -q 'format FAILED' "$WORK/failing-format/out.txt"; then
     report "case 5 names the format step as failed" 0 ""
 else
-    report "case 5 names the format step as failed" 1 "the summary holds no 'format FAILED': $(tail -n 3 "$WORK/failing-format/out.txt")"
+    report "case 5 names the format step as failed" 1 "the summary holds no 'format FAILED': $(output_tail 3 "$WORK/failing-format/out.txt")"
 fi
 if grep -q 'compile ok' "$WORK/failing-format/out.txt"; then
     report "case 5 leaves the passing compile step reported as passing" 0 ""
 else
-    report "case 5 leaves the passing compile step reported as passing" 1 "the summary holds no 'compile ok': $(tail -n 3 "$WORK/failing-format/out.txt")"
+    report "case 5 leaves the passing compile step reported as passing" 1 "the summary holds no 'compile ok': $(output_tail 3 "$WORK/failing-format/out.txt")"
 fi
 }
 
@@ -619,12 +685,12 @@ fi
 if grep -qE 'gates [0-9]+/[0-9]+ passed, [0-9]+ FAILED' "$WORK/failing-gate/out.txt"; then
     report "case 6 counts the failing gates in the summary" 0 ""
 else
-    report "case 6 counts the failing gates in the summary" 1 "the summary holds no gate-failure count: $(tail -n 3 "$WORK/failing-gate/out.txt")"
+    report "case 6 counts the failing gates in the summary" 1 "the summary holds no gate-failure count: $(output_tail 3 "$WORK/failing-gate/out.txt")"
 fi
 if grep -q 'compile ok' "$WORK/failing-gate/out.txt"; then
     report "case 6 leaves the compile step reported as passing" 0 ""
 else
-    report "case 6 leaves the compile step reported as passing" 1 "the summary holds no 'compile ok': $(tail -n 3 "$WORK/failing-gate/out.txt")"
+    report "case 6 leaves the compile step reported as passing" 1 "the summary holds no 'compile ok': $(output_tail 3 "$WORK/failing-gate/out.txt")"
 fi
 # The stub python3.12 refuses `-P -c 'import tomllib'` like every other call, so the
 # preflight names the interpreter as the reason the owner gate fails. Deleting that
@@ -633,6 +699,28 @@ if grep -qF 'python3.12 is not on PATH or cannot import tomllib, which scripts/c
     report "case 6 names python3.12 without tomllib as the cause of the owner gate's failure" 0 ""
 else
     report "case 6 names python3.12 without tomllib as the cause of the owner gate's failure" 1 "the output holds no tomllib preflight line"
+fi
+# The detail every failed assertion in this file prints names each gate the run reported
+# as failing and carries that gate's own output. The run's last three lines are NOT CHECKED
+# lines and name no gate, so a detail cut back to `tail` fails both assertions below.
+DETAIL6=$(output_tail 3 "$WORK/failing-gate/out.txt")
+FAILED_GATES6=$(grep -E '^  (FAILED|TIMED OUT after [0-9]+s|MISSING|UNCLASSIFIED) scripts/' "$WORK/failing-gate/out.txt")
+UNNAMED6=""
+while IFS= read -r g; do
+    [[ -n $g ]] || continue
+    grep -qxF -- "$g" <<< "$DETAIL6" || UNNAMED6+=" [$g]"
+done <<< "$FAILED_GATES6"
+if [[ -n $FAILED_GATES6 && -z $UNNAMED6 ]]; then
+    report "case 6 failure detail names every gate the run reported as failing" 0 ""
+elif [[ -z $FAILED_GATES6 ]]; then
+    report "case 6 failure detail names every gate the run reported as failing" 1 "the run printed no FAILED gate line, so this assertion has nothing to check"
+else
+    report "case 6 failure detail names every gate the run reported as failing" 1 "the detail omits:$UNNAMED6"
+fi
+if grep -qF 'stub python3.12 refusing to run' <<< "$DETAIL6"; then
+    report "case 6 failure detail carries a failing gate's own output" 0 ""
+else
+    report "case 6 failure detail carries a failing gate's own output" 1 "the detail holds no line the stub python3.12 printed: $DETAIL6"
 fi
 }
 
@@ -674,12 +762,12 @@ rc=$(cat "$FIXTURE7.harness/rc.txt")
 if [[ $rc -eq 0 ]]; then
     report "case 7 exits 0 when the derived crates compile" 0 ""
 else
-    report "case 7 exits 0 when the derived crates compile" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE7.harness/out.txt")"
+    report "case 7 exits 0 when the derived crates compile" 1 "the script exited $rc; output tail: $(output_tail 6 "$FIXTURE7.harness/out.txt")"
 fi
 if grep -qF 'crates scp-clock scp-ffi-napi (derived from the files this branch changed)' "$FIXTURE7.harness/out.txt"; then
     report "case 7 derives both edited crates and neither of the two it did not edit" 0 ""
 else
-    report "case 7 derives both edited crates and neither of the two it did not edit" 1 "the summary names another crate set: $(tail -n 3 "$FIXTURE7.harness/out.txt")"
+    report "case 7 derives both edited crates and neither of the two it did not edit" 1 "the summary names another crate set: $(output_tail 3 "$FIXTURE7.harness/out.txt")"
 fi
 if grep -qF 'check -p scp-clock -p scp-ffi-napi --all-targets --features scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant' "$FIXTURE7.harness/cargo.log"; then
     report "case 7 compiles the derived crates with the features they own" 0 ""
@@ -719,7 +807,7 @@ fi
 if grep -qF 'holds no merge base between HEAD and origin/main' "$FIXTURE8.harness/out.txt"; then
     report "case 8 names the ref it could not read" 0 ""
 else
-    report "case 8 names the ref it could not read" 1 "the output never names the missing merge base: $(tail -n 3 "$FIXTURE8.harness/out.txt")"
+    report "case 8 names the ref it could not read" 1 "the output never names the missing merge base: $(output_tail 3 "$FIXTURE8.harness/out.txt")"
 fi
 }
 
@@ -740,17 +828,17 @@ rc=$(cat "$FIXTURE9.harness/rc.txt")
 if [[ $rc -eq 0 ]]; then
     report "case 9 exits 0 when the branch changed no crate source" 0 ""
 else
-    report "case 9 exits 0 when the branch changed no crate source" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE9.harness/out.txt")"
+    report "case 9 exits 0 when the branch changed no crate source" 1 "the script exited $rc; output tail: $(output_tail 6 "$FIXTURE9.harness/out.txt")"
 fi
 if grep -qF 'crates none (derived from the files this branch changed)' "$FIXTURE9.harness/out.txt"; then
     report "case 9 names the empty crate set in its summary" 0 ""
 else
-    report "case 9 names the empty crate set in its summary" 1 "the summary names another crate set: $(tail -n 3 "$FIXTURE9.harness/out.txt")"
+    report "case 9 names the empty crate set in its summary" 1 "the summary names another crate set: $(output_tail 3 "$FIXTURE9.harness/out.txt")"
 fi
 if grep -qF 'compile: this branch changed no file inside a workspace crate' "$FIXTURE9.harness/out.txt"; then
     report "case 9 reports the compile step as skipped rather than as run" 0 ""
 else
-    report "case 9 reports the compile step as skipped rather than as run" 1 "the summary holds no skip reason: $(tail -n 3 "$FIXTURE9.harness/out.txt")"
+    report "case 9 reports the compile step as skipped rather than as run" 1 "the summary holds no skip reason: $(output_tail 3 "$FIXTURE9.harness/out.txt")"
 fi
 if grep -q '^check ' "$FIXTURE9.harness/cargo.log" 2>/dev/null; then
     report "case 9 starts no cargo check" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE9.harness/cargo.log")"
@@ -782,12 +870,12 @@ fi
 if grep -qF "MISSING $MISSING_GATE" "$FIXTURE10.harness/out.txt"; then
     report "case 10 names the absent gate" 0 ""
 else
-    report "case 10 names the absent gate" 1 "the output never names $MISSING_GATE: $(tail -n 3 "$FIXTURE10.harness/out.txt")"
+    report "case 10 names the absent gate" 1 "the output never names $MISSING_GATE: $(output_tail 3 "$FIXTURE10.harness/out.txt")"
 fi
 if grep -qE 'gates [0-9]+/[0-9]+ passed, 1 FAILED' "$FIXTURE10.harness/out.txt"; then
     report "case 10 counts the absent gate as a failure rather than dropping it" 0 ""
 else
-    report "case 10 counts the absent gate as a failure rather than dropping it" 1 "the summary holds no gate-failure count: $(tail -n 3 "$FIXTURE10.harness/out.txt")"
+    report "case 10 counts the absent gate as a failure rather than dropping it" 1 "the summary holds no gate-failure count: $(output_tail 3 "$FIXTURE10.harness/out.txt")"
 fi
 }
 
@@ -809,14 +897,14 @@ fixture_commit "$FIXTURE11" Cargo.toml
 run_fixture "$FIXTURE11"
 rc=$(cat "$FIXTURE11.harness/rc.txt")
 if [[ $rc -eq 0 ]]; then
-    report "case 11 exits non-zero when the branch changed only a workspace-wide input" 1 "the script exited 0; output tail: $(tail -n 6 "$FIXTURE11.harness/out.txt")"
+    report "case 11 exits non-zero when the branch changed only a workspace-wide input" 1 "the script exited 0; output tail: $(output_tail 6 "$FIXTURE11.harness/out.txt")"
 else
     report "case 11 exits non-zero when the branch changed only a workspace-wide input" 0 ""
 fi
 if grep -qF 'which every workspace member compiles against' "$FIXTURE11.harness/out.txt"; then
     report "case 11 names the file no narrowed cargo check covers" 0 ""
 else
-    report "case 11 names the file no narrowed cargo check covers" 1 "the output never says why it compiled nothing: $(tail -n 3 "$FIXTURE11.harness/out.txt")"
+    report "case 11 names the file no narrowed cargo check covers" 1 "the output never says why it compiled nothing: $(output_tail 3 "$FIXTURE11.harness/out.txt")"
 fi
 if grep -q '^check ' "$FIXTURE11.harness/cargo.log" 2>/dev/null; then
     report "case 11 starts no cargo check it cannot narrow" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE11.harness/cargo.log")"
@@ -843,17 +931,17 @@ rc=$(cat "$FIXTURE12.harness/rc.txt")
 if [[ $rc -eq 0 ]]; then
     report "case 12 exits 0 when the branch changed a binding source alone" 0 ""
 else
-    report "case 12 exits 0 when the branch changed a binding source alone" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE12.harness/out.txt")"
+    report "case 12 exits 0 when the branch changed a binding source alone" 1 "the script exited $rc; output tail: $(output_tail 6 "$FIXTURE12.harness/out.txt")"
 fi
 if grep -qF 'NOT CHECKED — 1 file(s) under bindings/python/' "$FIXTURE12.harness/out.txt"; then
     report "case 12 names the directory it read no file of" 0 ""
 else
-    report "case 12 names the directory it read no file of" 1 "the output holds no NOT CHECKED line for bindings/python/: $(tail -n 4 "$FIXTURE12.harness/out.txt")"
+    report "case 12 names the directory it read no file of" 1 "the output holds no NOT CHECKED line for bindings/python/: $(output_tail 4 "$FIXTURE12.harness/out.txt")"
 fi
 if grep -qF 'ruff and pytest, which the python-lint and python-test jobs' "$FIXTURE12.harness/out.txt"; then
     report "case 12 names the programs and the CI jobs that run them" 0 ""
 else
-    report "case 12 names the programs and the CI jobs that run them" 1 "the NOT CHECKED line names no program: $(tail -n 4 "$FIXTURE12.harness/out.txt")"
+    report "case 12 names the programs and the CI jobs that run them" 1 "the NOT CHECKED line names no program: $(output_tail 4 "$FIXTURE12.harness/out.txt")"
 fi
 }
 
@@ -878,7 +966,7 @@ rc=$(cat "$FIXTURE13.harness/rc.txt")
 if [[ $rc -eq 0 ]]; then
     report "case 13 exits 0 when every scp-transport compile passes" 0 ""
 else
-    report "case 13 exits 0 when every scp-transport compile passes" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE13.harness/out.txt")"
+    report "case 13 exits 0 when every scp-transport compile passes" 1 "the script exited $rc; output tail: $(output_tail 6 "$FIXTURE13.harness/out.txt")"
 fi
 if grep -qF 'check -p scp-transport --all-targets --features quic,http3,udp,coap' "$FIXTURE13.harness/cargo.log"; then
     report "case 13 compiles the optional transports the workspace command never activates" 0 ""
@@ -934,7 +1022,7 @@ rc=$(cat "$FIXTURE13B.harness/rc.txt")
 if [[ $rc -eq 0 ]]; then
     report "case 13b exits 0 when the cloud-blobs compiles pass" 0 ""
 else
-    report "case 13b exits 0 when the cloud-blobs compiles pass" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE13B.harness/out.txt")"
+    report "case 13b exits 0 when the cloud-blobs compiles pass" 1 "the script exited $rc; output tail: $(output_tail 6 "$FIXTURE13B.harness/out.txt")"
 fi
 for expected in \
     'check -p scp-node --all-targets --features cloud-blobs,testing' \
@@ -988,17 +1076,17 @@ rc=$(cat "$FIXTURE14.harness/rc.txt")
 if [[ $rc -eq 0 ]]; then
     report "case 14 exits 0 on an uncommitted edit that compiles" 0 ""
 else
-    report "case 14 exits 0 on an uncommitted edit that compiles" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE14.harness/out.txt")"
+    report "case 14 exits 0 on an uncommitted edit that compiles" 1 "the script exited $rc; output tail: $(output_tail 6 "$FIXTURE14.harness/out.txt")"
 fi
 if grep -qF 'NOT CHECKED — the 1 uncommitted path(s) in this working tree' "$FIXTURE14.harness/out.txt"; then
     report "case 14 counts the uncommitted paths one gate did not read" 0 ""
 else
-    report "case 14 counts the uncommitted paths one gate did not read" 1 "the output holds no NOT CHECKED line for the working tree: $(tail -n 4 "$FIXTURE14.harness/out.txt")"
+    report "case 14 counts the uncommitted paths one gate did not read" 1 "the output holds no NOT CHECKED line for the working tree: $(output_tail 4 "$FIXTURE14.harness/out.txt")"
 fi
 if grep -qF 'scripts/check-cross-layer.sh decides from git diff' "$FIXTURE14.harness/out.txt"; then
     report "case 14 names the gate and the range it decides from" 0 ""
 else
-    report "case 14 names the gate and the range it decides from" 1 "the NOT CHECKED line names no gate: $(tail -n 4 "$FIXTURE14.harness/out.txt")"
+    report "case 14 names the gate and the range it decides from" 1 "the NOT CHECKED line names no gate: $(output_tail 4 "$FIXTURE14.harness/out.txt")"
 fi
 }
 
@@ -1024,12 +1112,12 @@ rc=$(cat "$HARNESS15/rc.txt")
 if [[ $rc -eq 0 ]]; then
     report "case 15 exits 0 when the crate the caller named compiles" 0 ""
 else
-    report "case 15 exits 0 when the crate the caller named compiles" 1 "the script exited $rc; output tail: $(tail -n 6 "$HARNESS15/out.txt")"
+    report "case 15 exits 0 when the crate the caller named compiles" 1 "the script exited $rc; output tail: $(output_tail 6 "$HARNESS15/out.txt")"
 fi
 if grep -qF 'NOT CHECKED — scp-ffi-napi: this branch changed files these packages own' "$HARNESS15/out.txt"; then
     report "case 15 names the package the caller's crate set left out" 0 ""
 else
-    report "case 15 names the package the caller's crate set left out" 1 "the output holds no NOT CHECKED line for scp-ffi-napi: $(tail -n 4 "$HARNESS15/out.txt")"
+    report "case 15 names the package the caller's crate set left out" 1 "the output holds no NOT CHECKED line for scp-ffi-napi: $(output_tail 4 "$HARNESS15/out.txt")"
 fi
 if grep -qF 'check -p scp-clock --all-targets' "$HARNESS15/cargo.log"; then
     report "case 15 compiles the crate set the caller asked for and no other" 0 ""
@@ -1056,12 +1144,12 @@ run_fixture "$FIXTURE16"
 if grep -qF 'NOT CHECKED — scp-clock against wasm32-unknown-unknown' "$FIXTURE16.harness/out.txt"; then
     report "case 16 names the package it compiled for the host target alone" 0 ""
 else
-    report "case 16 names the package it compiled for the host target alone" 1 "the output holds no NOT CHECKED line for wasm32-unknown-unknown: $(tail -n 5 "$FIXTURE16.harness/out.txt")"
+    report "case 16 names the package it compiled for the host target alone" 1 "the output holds no NOT CHECKED line for wasm32-unknown-unknown: $(output_tail 5 "$FIXTURE16.harness/out.txt")"
 fi
 if grep -qF 'wasm-protocol job' "$FIXTURE16.harness/out.txt"; then
     report "case 16 names the CI job that compiles for that target" 0 ""
 else
-    report "case 16 names the CI job that compiles for that target" 1 "the NOT CHECKED line names no job: $(tail -n 5 "$FIXTURE16.harness/out.txt")"
+    report "case 16 names the CI job that compiles for that target" 1 "the NOT CHECKED line names no job: $(output_tail 5 "$FIXTURE16.harness/out.txt")"
 fi
 if grep -qF -- '--target wasm32-unknown-unknown' "$FIXTURE16.harness/cargo.log"; then
     report "case 16 starts no wasm compile of its own" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE16.harness/cargo.log")"
@@ -1092,17 +1180,17 @@ rc=$(cat "$FIXTURE17.harness/rc.txt")
 if [[ $rc -eq 0 ]]; then
     report "case 17 exits 0 when the branch changed a workflow file alone" 0 ""
 else
-    report "case 17 exits 0 when the branch changed a workflow file alone" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE17.harness/out.txt")"
+    report "case 17 exits 0 when the branch changed a workflow file alone" 1 "the script exited $rc; output tail: $(output_tail 6 "$FIXTURE17.harness/out.txt")"
 fi
 if grep -qF 'NOT CHECKED — 1 file(s) under .github/' "$FIXTURE17.harness/out.txt"; then
     report "case 17 names the workflow directory it ran no suite over" 0 ""
 else
-    report "case 17 names the workflow directory it ran no suite over" 1 "the output holds no NOT CHECKED line for .github/: $(tail -n 5 "$FIXTURE17.harness/out.txt")"
+    report "case 17 names the workflow directory it ran no suite over" 1 "the output holds no NOT CHECKED line for .github/: $(output_tail 5 "$FIXTURE17.harness/out.txt")"
 fi
 if grep -qF 'ci-workflow-selftest job' "$FIXTURE17.harness/out.txt"; then
     report "case 17 names the suites and the CI job that runs them" 0 ""
 else
-    report "case 17 names the suites and the CI job that runs them" 1 "the NOT CHECKED line names no job: $(tail -n 5 "$FIXTURE17.harness/out.txt")"
+    report "case 17 names the suites and the CI job that runs them" 1 "the NOT CHECKED line names no job: $(output_tail 5 "$FIXTURE17.harness/out.txt")"
 fi
 }
 
@@ -1131,12 +1219,12 @@ rc=$(cat "$FIXTURE18.harness/rc.txt")
 if [[ $rc -eq 0 ]]; then
     report "case 18 exits 0 when both sides of a committed rename compile" 0 ""
 else
-    report "case 18 exits 0 when both sides of a committed rename compile" 1 "the script exited $rc; output tail: $(tail -n 6 "$FIXTURE18.harness/out.txt")"
+    report "case 18 exits 0 when both sides of a committed rename compile" 1 "the script exited $rc; output tail: $(output_tail 6 "$FIXTURE18.harness/out.txt")"
 fi
 if grep -qF 'crates scp-clock scp-ffi (derived from the files this branch changed)' "$FIXTURE18.harness/out.txt"; then
     report "case 18 derives the crate a committed rename moved the file out of" 0 ""
 else
-    report "case 18 derives the crate a committed rename moved the file out of" 1 "the summary names another crate set: $(tail -n 3 "$FIXTURE18.harness/out.txt")"
+    report "case 18 derives the crate a committed rename moved the file out of" 1 "the summary names another crate set: $(output_tail 3 "$FIXTURE18.harness/out.txt")"
 fi
 if grep -qF 'check -p scp-clock -p scp-ffi --all-targets' "$FIXTURE18.harness/cargo.log"; then
     report "case 18 compiles both sides of the move" 0 ""
@@ -1158,7 +1246,7 @@ run_fixture "$FIXTURE19"
 if grep -qF 'crates scp-clock scp-ffi (derived from the files this branch changed)' "$FIXTURE19.harness/out.txt"; then
     report "case 19 derives the crate a staged rename moved the file out of" 0 ""
 else
-    report "case 19 derives the crate a staged rename moved the file out of" 1 "the summary names another crate set: $(tail -n 3 "$FIXTURE19.harness/out.txt")"
+    report "case 19 derives the crate a staged rename moved the file out of" 1 "the summary names another crate set: $(output_tail 3 "$FIXTURE19.harness/out.txt")"
 fi
 }
 
@@ -1180,14 +1268,14 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$FIXTURE20/scripts/check-brand-new-rul
 run_fixture "$FIXTURE20"
 rc=$(cat "$FIXTURE20.harness/rc.txt")
 if [[ $rc -eq 0 ]]; then
-    report "case 20 exits non-zero on a check script neither array names" 1 "the script exited 0; output tail: $(tail -n 6 "$FIXTURE20.harness/out.txt")"
+    report "case 20 exits non-zero on a check script neither array names" 1 "the script exited 0; output tail: $(output_tail 6 "$FIXTURE20.harness/out.txt")"
 else
     report "case 20 exits non-zero on a check script neither array names" 0 ""
 fi
 if grep -qF 'UNCLASSIFIED scripts/check-brand-new-rule.sh' "$FIXTURE20.harness/out.txt"; then
     report "case 20 names the gate it neither ran nor excused" 0 ""
 else
-    report "case 20 names the gate it neither ran nor excused" 1 "the output never names the unclassified gate: $(tail -n 5 "$FIXTURE20.harness/out.txt")"
+    report "case 20 names the gate it neither ran nor excused" 1 "the output never names the unclassified gate: $(output_tail 5 "$FIXTURE20.harness/out.txt")"
 fi
 }
 
@@ -1264,7 +1352,7 @@ run_fixture "$FIXTURE22"
 if grep -qF 'NOT CHECKED — the features a sibling manifest activates on scp-clock' "$FIXTURE22.harness/out.txt"; then
     report "case 22 names the feature set it could not read" 0 ""
 else
-    report "case 22 names the feature set it could not read" 1 "the output holds no NOT CHECKED line for the sibling feature set: $(tail -n 5 "$FIXTURE22.harness/out.txt")"
+    report "case 22 names the feature set it could not read" 1 "the output holds no NOT CHECKED line for the sibling feature set: $(output_tail 5 "$FIXTURE22.harness/out.txt")"
 fi
 
 # Case 22's metadata answer holds no package list, so the run cannot tell which compiled
@@ -1272,12 +1360,12 @@ fi
 if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh assertion 1 over the example targets that compile scp-clock (this run could not read their targets' "$FIXTURE22.harness/out.txt"; then
     report "case 22 names the examples gate over every package when it cannot read targets" 0 ""
 else
-    report "case 22 names the examples gate over every package when it cannot read targets" 1 "the output holds no qualified NOT CHECKED line for scripts/check-examples-compile.sh: $(tail -n 6 "$FIXTURE22.harness/out.txt")"
+    report "case 22 names the examples gate over every package when it cannot read targets" 1 "the output holds no qualified NOT CHECKED line for scripts/check-examples-compile.sh: $(output_tail 6 "$FIXTURE22.harness/out.txt")"
 fi
 if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh assertion 1 source scan over scp-clock (this run could not read their targets' "$FIXTURE22.harness/out.txt"; then
     report "case 22 names the examples source scan over every package when it cannot read targets" 0 ""
 else
-    report "case 22 names the examples source scan over every package when it cannot read targets" 1 "the output holds no qualified source-scan line for scripts/check-examples-compile.sh: $(tail -n 6 "$FIXTURE22.harness/out.txt")"
+    report "case 22 names the examples source scan over every package when it cannot read targets" 1 "the output holds no qualified source-scan line for scripts/check-examples-compile.sh: $(output_tail 6 "$FIXTURE22.harness/out.txt")"
 fi
 }
 
@@ -1322,7 +1410,7 @@ PATH="$HARNESS22B/bin:$PATH" bash "$FIXTURE22B/scripts/fix-round-check.sh" > "$H
 if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh assertion 1 over the example targets that compile scp-clock, scp-transport:' "$HARNESS22B/out.txt"; then
     report "case 22b names the examples gate over the packages an example compiles" 0 ""
 else
-    report "case 22b names the examples gate over the packages an example compiles" 1 "the output holds no NOT CHECKED line naming scp-clock and scp-transport alone: $(tail -n 6 "$HARNESS22B/out.txt")"
+    report "case 22b names the examples gate over the packages an example compiles" 1 "the output holds no NOT CHECKED line naming scp-clock and scp-transport alone: $(output_tail 6 "$HARNESS22B/out.txt")"
 fi
 if grep -F 'check-examples-compile.sh assertion 1 over the example targets that compile' "$HARNESS22B/out.txt" | grep -qF 'scp-ffi'; then
     report "case 22b names no package that no example compiles" 1 "$(grep -F 'check-examples-compile.sh' "$HARNESS22B/out.txt")"
@@ -1396,7 +1484,7 @@ run_fixture "$FIXTURE22C"
 if grep -qF "NOT CHECKED — scripts/check-examples-compile.sh over this repository's workspace: this branch changed that gate" "$FIXTURE22C.harness/out.txt"; then
     report "case 22c names the examples gate an edit left unrun" 0 ""
 else
-    report "case 22c names the examples gate an edit left unrun" 1 "the output holds no NOT CHECKED line for the edited gate: $(tail -n 6 "$FIXTURE22C.harness/out.txt")"
+    report "case 22c names the examples gate an edit left unrun" 1 "the output holds no NOT CHECKED line for the edited gate: $(output_tail 6 "$FIXTURE22C.harness/out.txt")"
 fi
 if grep -qE 'NOT CHECKED — scripts/check-examples-compile\.sh assertion [12] ' "$FIXTURE22C.harness/out.txt"; then
     report "case 22c prints no examples-gate assertion line on a run that compiled no crate" 1 "$(grep -F 'check-examples-compile.sh assertion' "$FIXTURE22C.harness/out.txt")"
@@ -1431,7 +1519,7 @@ if ! sed -n '/^GATES_NOT_RUN=(/,/^)/p' "$FIXTURE22E/scripts/fix-round-check.sh" 
 elif grep -qF "NOT CHECKED — scripts/check-fixture-unstarted.sh over this repository's workspace: this branch changed that gate, and this run never starts it" "$FIXTURE22E.harness/out.txt"; then
     report "case 22c names any unstarted GATES_NOT_RUN gate an edit left unrun" 0 ""
 else
-    report "case 22c names any unstarted GATES_NOT_RUN gate an edit left unrun" 1 "the output holds no NOT CHECKED line for the edited fixture gate: $(tail -n 8 "$FIXTURE22E.harness/out.txt")"
+    report "case 22c names any unstarted GATES_NOT_RUN gate an edit left unrun" 1 "the output holds no NOT CHECKED line for the edited fixture gate: $(output_tail 8 "$FIXTURE22E.harness/out.txt")"
 fi
 if grep -qF 'NOT CHECKED — scripts/check-resolved-rustc.sh over this repository' "$FIXTURE22E.harness/out.txt"; then
     report "case 22c claims no unrun edit for the toolchain precondition the run starts" 1 "$(grep -F 'check-resolved-rustc.sh over this repository' "$FIXTURE22E.harness/out.txt")"
@@ -1582,12 +1670,12 @@ rc=$(cat "$HARNESS24/rc.txt")
 if [[ $rc -eq 0 ]]; then
     report "case 24 exits 0, which is why the note below is the only signal" 0 ""
 else
-    report "case 24 exits 0, which is why the note below is the only signal" 1 "the script exited $rc; output tail: $(tail -n 6 "$HARNESS24/out.txt")"
+    report "case 24 exits 0, which is why the note below is the only signal" 1 "the script exited $rc; output tail: $(output_tail 6 "$HARNESS24/out.txt")"
 fi
 if grep -qF 'NOT CHECKED — scripts/check-cross-layer.sh, for the whole of this run' "$HARNESS24/out.txt"; then
     report "case 24 names the gate whose pass covers no line of the branch" 0 ""
 else
-    report "case 24 names the gate whose pass covers no line of the branch" 1 "the output holds no NOT CHECKED line for scripts/check-cross-layer.sh: $(tail -n 6 "$HARNESS24/out.txt")"
+    report "case 24 names the gate whose pass covers no line of the branch" 1 "the output holds no NOT CHECKED line for scripts/check-cross-layer.sh: $(output_tail 6 "$HARNESS24/out.txt")"
 fi
 if grep -qF 'check -p scp-clock --all-targets' "$HARNESS24/cargo.log"; then
     report "case 24 compiles the crate the caller named although the ref is missing" 0 ""
