@@ -8,7 +8,8 @@
 //! - [`p256`]: the P-256 primitives (§9.5).
 //! - [`pseudonym`]: the software-custody pseudonym derivation (§9.10.4).
 //! - [`custody`]: the typed [`CustodyFailure`] a failed custody call carries.
-//! - [`signer`]: the curve-neutral [`ScpSigner`] trait.
+//! - [`signer`]: the curve-neutral [`ScpSigner`] trait and its object-safe
+//!   form [`DynScpSigner`].
 
 pub mod custody;
 pub mod p256;
@@ -16,7 +17,9 @@ pub mod pseudonym;
 pub mod signer;
 
 pub use custody::{CustodyFailure, CustodyFailureKind};
-pub use signer::{ScpSigner, SigAlg, SignError};
+#[cfg(any(test, feature = "testing"))]
+pub use signer::LocalEd25519Signer;
+pub use signer::{DynScpSigner, ScpSigner, SigAlg, SignError, SignFuture};
 
 /// Verifies an Ed25519 signature against a public key and message bytes.
 ///
