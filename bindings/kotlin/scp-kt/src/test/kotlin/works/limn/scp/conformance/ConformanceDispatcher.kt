@@ -7,6 +7,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import works.limn.scp.CustodyType
 import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.CoroutineBridge
 
@@ -59,12 +60,18 @@ class ConformanceDispatcher(
             else -> mapOf("error" to "unsupported_operation")
         }
 
-    private suspend fun dispatchIdentityCreate(input: Map<String, String>): Map<String, String> =
-        catchBridge {
-            val custody = input["custody"] ?: "in_memory"
+    // A fixture's custody string reaches the bridge only through `CustodyType`,
+    // as an SDK caller's does, so an absent custody or one with no entry
+    // ("platform", "software") never reaches the bindings.
+    private suspend fun dispatchIdentityCreate(input: Map<String, String>): Map<String, String> {
+        val custody =
+            input["custody"]?.let { CustodyType.fromRawValue(it) }
+                ?: return mapOf("error" to "unsupported_custody")
+        return catchBridge {
             val handle = bridge.identity.create(custody)
-            mapOf("handle" to handle.toString(), "custody_type" to custody)
+            mapOf("handle" to handle.toString(), "custody_type" to custody.rawValue)
         }
+    }
 
     private suspend fun dispatchIdentityLoad(input: Map<String, String>): Map<String, String> =
         catchBridge {

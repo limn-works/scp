@@ -15,8 +15,6 @@ import { Identity } from "@limn-works/scp-ts";
 
 async function main(): Promise<void> {
   // 1. Create a new identity with in-memory key custody.
-  //    In production, use "platform" for secure key storage
-  //    (Keychain on iOS/macOS, Keystore on Android).
   const alice = await Identity.create({ custody: "in_memory" });
 
   console.log(`DID: ${alice.did}`);

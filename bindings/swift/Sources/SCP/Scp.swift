@@ -760,16 +760,19 @@ public extension SCP {
         try await inner.identityAttestDevice(identity: identity)
     }
 
-    /// Forwards to ``Scp/identityCreate`` on ``inner``.
+    /// Forwards to ``Scp/identityCreate`` on ``inner``, sending
+    /// `custody.rawValue`.
+    ///
+    /// `custody` is required and typed (``CustodyType``): the caller names the
+    /// key store, and the compiler rejects a custody value the UniFFI bridge
+    /// refuses.
     ///
     /// `testingSeed` is a testing-only parameter for the ADR-046
     /// cross-bridge parity harness; pass `nil` from production callers
     /// (the `testing` in-memory path uses OS RNG when
-    /// `testingSeed` is `nil`). A non-`nil` `testingSeed` is only valid
-    /// for `custody == "in_memory"`; other custody types reject it with
-    /// `SCP-VALID-7009`.
-    func identityCreate(custody: String, testingSeed: Data? = nil) async throws -> Identity {
-        try await inner.identityCreate(custody: custody, testingSeed: testingSeed)
+    /// `testingSeed` is `nil`).
+    func identityCreate(custody: CustodyType, testingSeed: Data? = nil) async throws -> Identity {
+        try await inner.identityCreate(custody: custody.rawValue, testingSeed: testingSeed)
     }
 
     /// Forwards to ``Scp/identityCreateLinkAttestation`` on ``inner``.
@@ -777,9 +780,14 @@ public extension SCP {
         try await inner.identityCreateLinkAttestation(identity: identity, platform: platform, handle: handle, proof: proof, verificationMethod: verificationMethod, platformId: platformId)
     }
 
-    /// Forwards to ``Scp/identityCreateWithAgentKey`` on ``inner``.
-    func identityCreateWithAgentKey(custody: String) async throws -> Identity {
-        try await inner.identityCreateWithAgentKey(custody: custody)
+    /// Forwards to ``Scp/identityCreateWithAgentKey`` on ``inner``, sending
+    /// `custody.rawValue`.
+    ///
+    /// `custody` is required and typed (``CustodyType``): the caller names the
+    /// key store, and the compiler rejects a custody value the UniFFI bridge
+    /// refuses.
+    func identityCreateWithAgentKey(custody: CustodyType) async throws -> Identity {
+        try await inner.identityCreateWithAgentKey(custody: custody.rawValue)
     }
 
     /// Forwards to ``Scp/identityCreateWithCustody`` on ``inner``.

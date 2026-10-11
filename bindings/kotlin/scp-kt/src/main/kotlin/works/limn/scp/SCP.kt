@@ -773,7 +773,7 @@ class SCP internal constructor(
      * ```kotlin
      * // Step 1 (joiner): reserve a single-use KeyPackage under the joiner's
      * // own locally-custodied identity.
-     * val joiner = scp.identityCreate(custody = "in_memory")
+     * val joiner = scp.identityCreate(custody = CustodyType.IN_MEMORY)
      * val reservation = scp.reserveKeyPackage(joiner)
      *
      * // Hand reservation.keyPackagePublic to the creator out of band. The
@@ -1246,18 +1246,20 @@ class SCP internal constructor(
     suspend fun identityAttestDevice(identity: Identity): String = inner.identityAttestDevice(identity = identity)
 
     /**
-     * Forwards to [NativeScp.identityCreate] on [inner].
+     * Forwards to [NativeScp.identityCreate] on [inner], sending
+     * [CustodyType.rawValue].
+     *
+     * [custody] is required and typed: the caller names the key store, and
+     * the compiler rejects a custody value the UniFFI bridge refuses.
      *
      * [testingSeed] is a testing-only parameter for the ADR-046
      * cross-bridge parity harness; pass `null` from production callers
-     * (in-memory custody uses OS RNG when [testingSeed] is `null`). A
-     * non-`null` [testingSeed] is only valid for `custody == "in_memory"`;
-     * other custody types reject it with `SCP-VALID-7009`.
+     * (in-memory custody uses OS RNG when [testingSeed] is `null`).
      */
     suspend fun identityCreate(
-        custody: String,
+        custody: CustodyType,
         testingSeed: ByteArray? = null,
-    ): Identity = inner.identityCreate(custody = custody, testingSeed = testingSeed)
+    ): Identity = inner.identityCreate(custody = custody.rawValue, testingSeed = testingSeed)
 
     /** Forwards to [NativeScp.identityCreateLinkAttestation] on [inner]. */
     @Suppress("LongParameterList")
@@ -1278,10 +1280,16 @@ class SCP internal constructor(
             platformId = platformId,
         )
 
-    /** Forwards to [NativeScp.identityCreateWithAgentKey] on [inner]. */
-    suspend fun identityCreateWithAgentKey(custody: String): Identity =
+    /**
+     * Forwards to [NativeScp.identityCreateWithAgentKey] on [inner], sending
+     * [CustodyType.rawValue].
+     *
+     * [custody] is required and typed: the caller names the key store, and
+     * the compiler rejects a custody value the UniFFI bridge refuses.
+     */
+    suspend fun identityCreateWithAgentKey(custody: CustodyType): Identity =
         inner.identityCreateWithAgentKey(
-            custody = custody,
+            custody = custody.rawValue,
         )
 
     /** Forwards to [NativeScp.identityCreateWithCustody] on [inner]. */

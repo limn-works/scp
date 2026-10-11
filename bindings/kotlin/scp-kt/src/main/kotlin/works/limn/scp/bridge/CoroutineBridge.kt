@@ -126,13 +126,11 @@ interface IdentityBindings {
      * Generates a new `did:dht` identity backed by the given custody type.
      * The returned handle retains key material for the identity's lifetime.
      *
-     * @param custody Key custody method: `"in_memory"` (dev/test only, feature-gated),
-     *   `"platform"` (Secure Enclave / Android Keystore), or `"software"`.
+     * @param custody A [works.limn.scp.CustodyType.rawValue]; [IdentityBridge.create]
+     *   is the typed entry point.
      * @return Opaque identity handle for use in subsequent operations.
      * @throws BridgeException with `SCP-IDENT-1008` if `"in_memory"` is requested
-     *   but the `testing` feature is not enabled, or with
-     *   `SCP-IDENT-1003` if `"platform"`/`"software"` is requested without a
-     *   wired `KeyCustodyProvider`.
+     *   but the `testing` feature is not enabled.
      */
     fun identityCreate(custody: String): Long
 
@@ -1500,22 +1498,13 @@ class IdentityBridge internal constructor(
     /**
      * Create a new identity with the specified custody method.
      *
-     * @param custody Key custody method.
+     * @param custody Required key custody choice; it has no default, so the
+     *   caller names the key store (see [works.limn.scp.CustodyType]).
      * @return Opaque identity handle for use in subsequent operations.
      */
     suspend fun create(custody: works.limn.scp.CustodyType): Long {
         return bridge.ffiCall { bindings.identityCreate(custody.rawValue) }
     }
-
-    /**
-     * Create a new identity with the specified custody method.
-     *
-     * Overload accepting a raw string for backward compatibility.
-     *
-     * @param custody Key custody method: "platform", "in_memory", or "software".
-     * @return Opaque identity handle for use in subsequent operations.
-     */
-    suspend fun create(custody: String): Long = bridge.ffiCall { bindings.identityCreate(custody) }
 
     /**
      * Load an existing identity from storage by DID.

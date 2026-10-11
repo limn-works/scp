@@ -6,26 +6,35 @@ import Foundation
 
 // MARK: - CustodyType
 
-/// Key custody method for identity key management (spec section 3.2).
+/// The custody choice a caller passes to
+/// ``SCP/identityCreate(custody:testingSeed:)`` and
+/// ``SCP/identityCreateWithAgentKey(custody:)`` (spec section 3.2).
 ///
-/// Determines where cryptographic keys are stored and managed.
-/// The `rawValue` matches the wire-format string expected by the FFI bridge.
+/// Its cases are exactly the custody strings the UniFFI bridge accepts
+/// (`parse_custody_method` in `crates/scp-ffi/uniffi/src/bridge.rs`), so the
+/// compiler rejects a custody value the bridge would refuse. Neither method
+/// gives the parameter a default: which key store holds a private key decides
+/// who can reach that key, so the caller states it.
 ///
-/// This type is a pure Swift convenience type. It does not conflict with any
-/// UniFFI-generated type.
+/// No case reaches Apple Keychain, the Secure Enclave, or any other host key
+/// store. A caller reaches one by injecting a `KeyCustodyProvider` through
+/// ``SCP/identityCreateWithCustody(provider:)``.
+///
+/// The Kotlin SDK's `works.limn.scp.CustodyType` carries the same cases. This
+/// type is a pure Swift type and conflicts with no UniFFI-generated type.
 ///
 /// ## Provenance
 ///
 /// - Spec section 3.2 (Key Custody)
+/// - `.docs/standards/construction.md` (consequential choices are enums;
+///   required choices are required)
+/// - SCP-294 in `.docs/prds/http-features.json`
 public nonisolated enum CustodyType: String, Sendable, CaseIterable {
-    /// Platform-native secure storage (Keychain on macOS/iOS, Keystore
-    /// on Android, credential manager on Windows/Linux). Default.
-    case platform
-    /// Ephemeral in-memory key store, suitable for testing or short-lived
-    /// agents. Keys are lost on process exit.
+    /// An in-memory key store that loses every key when the process exits.
+    ///
+    /// The UniFFI bridge builds it only under its `testing` feature; a shipped
+    /// build answers it with `SCP-IDENT-1008` and builds no other key store.
     case inMemory = "in_memory"
-    /// Software-backed file-based key store with passphrase protection.
-    case software
 }
 
 // MARK: - Capability

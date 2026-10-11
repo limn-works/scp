@@ -97,8 +97,8 @@ class BroadcastKeyRequestRealFfiTest {
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {
-                val author = scp.identityCreate(custody = "in_memory")
-                val subscriber = scp.identityCreate(custody = "in_memory")
+                val author = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+                val subscriber = scp.identityCreate(custody = CustodyType.IN_MEMORY)
                 val handle = scp.contextCreate(author, broadcastParams())
                 scp.broadcastSubscribe(handle, subscriber.did())
 

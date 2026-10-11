@@ -25,30 +25,28 @@ from scp_sdk.errors import UnknownGovernanceOutcomeError
 
 
 class CustodyType(enum.Enum):
-    """Key custody method for identity key management (spec section 3.2).
+    """The custody string an identity-creating :class:`scp_sdk.SCP` method sends
+    to the PyO3 bridge (spec section 3.2, key custody).
 
-    Determines where cryptographic keys are stored and managed.
-    Mirrors ``scp_core::identity::CustodyType``.
+    The members are exactly the custody strings the PyO3 bridge builds a key
+    store from, and the bridge answers every other string with a typed error
+    (``SCP-IDENT-1003`` or ``SCP-VALID-7005``).  No custody string reaches Apple
+    Keychain or Android Keystore; pass a :class:`scp_sdk.scp.KeyCustodyProvider`
+    to :meth:`scp_sdk.SCP.identity_create_with_custody` for any other key store.
 
-    The bridge layer accepts both ``"file"`` and ``"platform"`` for
-    file-backed custody (:attr:`FILE` and :attr:`PLATFORM` respectively).
-    ``"platform"`` is a backward-compatible alias — both resolve to
-    ``FileKeyCustody`` (Argon2id + AES-256-GCM encrypted key file at
-    ``$HOME/.scp/keys.bin``).  Prefer :attr:`FILE` for new code.
-
-    See SCP-294a.
+    No SDK method defaults custody: the caller names the key store, and a call
+    that passes none raises ``IdentityError`` carrying ``SCP-IDENT-1116``
+    before any bridge call (SCP-294).
     """
 
-    #: Encrypted file-backed key custody (Argon2id + AES-256-GCM).
-    #: Canonical name for what was previously called ``"platform"``.
-    #: Requires the ``SCP_KEY_PASSPHRASE`` environment variable.
+    #: An encrypted key file at ``$HOME/.scp/keys.bin`` (``FileKeyCustody``:
+    #: Argon2id key derivation, AES-256-GCM).  The bridge reads the passphrase
+    #: from ``SCP_KEY_PASSPHRASE`` and raises ``SCP-VALID-7001`` when it is unset
+    #: or empty.
     FILE = "file"
-    #: Backward-compatible alias for :attr:`FILE`.  Both resolve to
-    #: ``FileKeyCustody`` in the bridge layer.  Prefer :attr:`FILE`
-    #: for new code.
-    PLATFORM = "platform"
-    #: Ephemeral in-memory key store, suitable for testing or short-lived
-    #: agents.  Keys are lost on process exit.
+    #: An in-memory key store that loses every key when the process exits.  The
+    #: bridge builds it only in a build carrying its ``testing`` feature; a
+    #: shipped build raises ``SCP-IDENT-1008``.
     IN_MEMORY = "in_memory"
 
 
