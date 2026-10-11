@@ -36,6 +36,13 @@ pub enum MlsError {
     #[error("key package generation failed: {0}")]
     KeyPackageGenerationFailed(String),
 
+    /// An attested `KeyPackage` build produced a leaf whose signature key,
+    /// encryption key, init key or lifetime differs from the attestation's,
+    /// so `openmls` drew its randomness in an order the attested mint did not
+    /// replay (§9.7.1). The `KeyPackage` is discarded.
+    #[error("attested key package build did not reproduce the attested leaf keys")]
+    KeyPackageMintNonDeterministic,
+
     /// Failed to process a Welcome message when joining a group.
     #[error("welcome processing failed: {0}")]
     WelcomeProcessingFailed(String),

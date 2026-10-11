@@ -864,6 +864,114 @@ pub fn scp_capabilities_with_keypackage_attestation() -> Capabilities {
     )
 }
 
+/// Builds [`Capabilities`] declaring `0xFF01`, `0xFF02` and `0xFF03`.
+///
+/// Those are every SCP `LeafNode` extension type a context-group leaf needs:
+/// `scp_wrapping_key` (`0xFF01`), the SCP context parameters (`0xFF02`), and
+/// `scp_keypackage_attestation` (`0xFF03`).
+///
+/// An attested `KeyPackage` that joins a context group must declare all
+/// three, because the group's context extension requires `0xFF02` of every
+/// member and the leaf carries `0xFF01` and `0xFF03` (`valn0107`).
+#[must_use]
+pub fn scp_capabilities_with_context_params_and_attestation() -> Capabilities {
+    Capabilities::new(
+        None, // default versions
+        None, // default ciphersuites
+        Some(&[
+            ExtensionType::Unknown(crate::wrapping_extension::SCP_WRAPPING_KEY_EXTENSION_TYPE),
+            ExtensionType::Unknown(scp_protocol::context::SCP_CONTEXT_EXTENSION_TYPE_ID),
+            ExtensionType::Unknown(SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE),
+        ]),
+        None, // default proposals
+        None, // default credentials
+    )
+}
+
+/// The facts a `KeyPackage`'s leaf states, in the form §9.7.1 verifies.
+///
+/// They are the SCP credential, the four 65-byte P-256 public keys, the
+/// lifetime window, and the `0xFF03` attestation when the leaf carries one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyPackageLeafFacts {
+    /// The leaf's SCP credential, parsed from its `BasicCredential` identity.
+    pub credential: ScpCredential,
+    /// The leaf `signature_key`.
+    pub signature_key: [u8; 65],
+    /// The leaf ratchet-tree `encryption_key`.
+    pub encryption_key: [u8; 65],
+    /// The `KeyPackage` `init_key`.
+    pub init_key: [u8; 65],
+    /// The `0xFF01` `wrapping_key`, or `None` when the leaf carries none.
+    pub wrapping_key: Option<[u8; 65]>,
+    /// The `KeyPackage` lifetime's `not_before`, in Unix seconds.
+    pub not_before: u64,
+    /// The `KeyPackage` lifetime's `not_after`, in Unix seconds.
+    pub not_after: u64,
+    /// The `0xFF03` attestation, or `None` when the leaf carries none.
+    pub attestation: Option<KeyPackageAttestation>,
+}
+
+/// Reads the [`KeyPackageLeafFacts`] of `key_package`.
+///
+/// It reads but does not verify: it checks only that each key is a 65-byte
+/// point and that the credential and the two SCP extensions parse. Pass the
+/// result to [`verify_attestation`].
+///
+/// # Errors
+///
+/// - [`MlsError::InvalidCredential`] if the leaf credential is not a
+///   `BasicCredential`, or its identity is not an SCP credential.
+/// - [`MlsError::ExtensionError`] if a leaf key is not 65 bytes, the
+///   encryption key does not re-encode, or the `0xFF01` or `0xFF03` extension
+///   is malformed.
+pub fn leaf_facts(key_package: &KeyPackage) -> Result<KeyPackageLeafFacts, MlsError> {
+    let leaf = key_package.leaf_node();
+    let basic = BasicCredential::try_from(leaf.credential().clone())
+        .map_err(|e| MlsError::InvalidCredential(format!("leaf credential: {e}")))?;
+    let credential = ScpCredential::from_bytes(basic.identity())?;
+    let lifetime = key_package.life_time();
+    Ok(KeyPackageLeafFacts {
+        credential,
+        signature_key: leaf_public_key(leaf.signature_key().as_slice())?,
+        encryption_key: leaf_encryption_key(leaf.encryption_key())?,
+        init_key: leaf_public_key(key_package.hpke_init_key().as_slice())?,
+        wrapping_key: crate::wrapping_extension::extract_wrapping_key(leaf.extensions())?
+            .map(|point| *point.as_bytes()),
+        not_before: lifetime.not_before(),
+        not_after: lifetime.not_after(),
+        attestation: KeyPackageAttestation::extract_attestation(leaf.extensions())?,
+    })
+}
+
+/// Copies a leaf public key into a 65-byte uncompressed P-256 point.
+///
+/// # Errors
+///
+/// [`MlsError::ExtensionError`] if `bytes` is not 65 bytes long.
+pub(crate) fn leaf_public_key(bytes: &[u8]) -> Result<[u8; 65], MlsError> {
+    <[u8; 65]>::try_from(bytes).map_err(|_| {
+        ext_err(format!(
+            "leaf public key is {} bytes, expected 65",
+            bytes.len()
+        ))
+    })
+}
+
+/// Reads the bytes of a leaf `encryption_key`.
+///
+/// `openmls` 0.9.0 exposes no byte accessor for an `EncryptionKey`, so this
+/// re-encodes it: its TLS encoding is the key as one variable-length vector.
+fn leaf_encryption_key(key: &openmls::treesync::EncryptionKey) -> Result<[u8; 65], MlsError> {
+    use tls_codec::{DeserializeBytes as _, Serialize as _};
+    let encoded = key
+        .tls_serialize_detached()
+        .map_err(|e| ext_err(format!("leaf encryption key encode: {e}")))?;
+    let bytes = tls_codec::VLBytes::tls_deserialize_exact_bytes(&encoded)
+        .map_err(|e| ext_err(format!("leaf encryption key decode: {e}")))?;
+    leaf_public_key(bytes.as_slice())
+}
+
 /// Constructs an [`MlsError::ExtensionError`] with the given message.
 fn ext_err(msg: impl Into<String>) -> MlsError {
     MlsError::ExtensionError(msg.into())
