@@ -238,10 +238,11 @@ async fn seed_owner_document_into_resolver(
         .core_document
         .as_ref()
         .expect("in-memory owner retains its DID document");
-    let custody = owner_identity
-        .in_memory_custody
-        .as_ref()
-        .expect("in-memory owner retains its custody");
+    let Some(crate::bridge::UniffiKeyCustody::InMemory(custody)) =
+        owner_identity.custody.as_deref()
+    else {
+        panic!("in-memory owner retains its custody");
+    };
 
     let doc_json = document.to_json().expect("document serializes to JSON");
     let value = doc_json.as_bytes();
