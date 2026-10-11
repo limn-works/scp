@@ -26,11 +26,14 @@ Key properties:
 
 ### Prerequisites
 
-Install the SCP Python SDK from the repository root:
+Install the SCP Python SDK from source. The build needs a Rust toolchain, a C compiler, and, on Linux and Windows, a full perl (plus make on Linux) for the OpenSSL the build compiles; `bindings/python/README.md` §Requirements has the details. From the repository root:
 
 ```bash
+cd templates/broadcast-feed
 pip install -e ../../bindings/python
 ```
+
+Run the commands below from `templates/broadcast-feed`.
 
 ### Start the publisher
 

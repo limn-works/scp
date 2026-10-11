@@ -225,29 +225,7 @@ class Identity private constructor(private val handle: IdentityHandle) {
 
 ## Resource Management
 
-Use `AutoCloseable` interface and `use { }` blocks:
-
-```kotlin
-class Context : AutoCloseable {
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-    override fun close() {
-        scope.launch { leave() }
-        scope.cancel()
-        handle.let { ffi.ContextFree(it) }
-    }
-
-    suspend fun closeGracefully() {
-        leave()
-        handle.let { ffi.ContextFree(it) }
-    }
-}
-
-// Usage
-Context.create(params).use { ctx ->
-    ctx.send(payload)
-}
-```
+`SCP`, `Relay`, `Node` (`scp-kt`), and `ScpHotStreams` (`scp-kt-android`) each expose their teardown as one `suspend` function, `SCP.shutdown(bridge, timeout)`, `Relay.shutdown()`, `Node.shutdown()`, and `ScpHotStreams.close()`, and implement no `AutoCloseable` or `Closeable`, so no `use { }` block applies to them. `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" states why.
 
 ## Maven Central Publishing
 

@@ -267,7 +267,7 @@ impl KeyPackageAttestation {
     /// This is NOT a signable input: the signature is computed over
     /// [`signing_hash`](Self::signing_hash), never over this body.
     ///
-    /// Infallible: as with [`signing_preimage`](Self::signing_preimage), the
+    /// Infallible: as with `signing_preimage`, the
     /// shared builder cannot error for these bounded fields, so
     /// `unwrap_or_default` never panics.
     #[must_use]
@@ -1350,10 +1350,12 @@ mod tests {
     fn rand_key() -> [u8; LEAF_PUBLIC_KEY_SIZE] {
         let mut seed = [0u8; 32];
         OsRng.fill_bytes(&mut seed);
-        scp_crypto::p256::P256SigningKey::from_seed(b"attestation-test", &seed)
-            .unwrap()
-            .public_key()
-            .to_uncompressed()
+        scp_crypto::p256::P256SecretKey::from_seed(
+            scp_crypto::p256::SeedLabel::TestVectorKey,
+            &seed,
+        )
+        .public_key()
+        .to_uncompressed()
     }
 
     /// Signs `att` in place under `signer`, over its §9.5.1 `signing_hash()`
@@ -1737,10 +1739,12 @@ mod resolution_seam_tests {
     fn fresh_leaf() -> [u8; LEAF_PUBLIC_KEY_SIZE] {
         let mut seed = [0u8; 32];
         rand::RngCore::fill_bytes(&mut OsRng, &mut seed);
-        scp_crypto::p256::P256SigningKey::from_seed(b"attestation-seam-test", &seed)
-            .unwrap()
-            .public_key()
-            .to_uncompressed()
+        scp_crypto::p256::P256SecretKey::from_seed(
+            scp_crypto::p256::SeedLabel::TestVectorKey,
+            &seed,
+        )
+        .public_key()
+        .to_uncompressed()
     }
 
     /// Whether the fixture models an Add (`KeyPackage`, distinct `init_key`) or an

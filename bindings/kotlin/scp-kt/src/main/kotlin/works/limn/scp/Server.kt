@@ -2,14 +2,15 @@
 //
 // Wraps server-related UniFFI bridge functions as suspend functions with
 // proper dispatcher assignment per ADR-028. Provides Relay and Node types
-// that expose relay URL, DID, and shutdown operations as AutoCloseable
-// resources with proper lifecycle methods.
+// that expose relay URL, DID, and one suspending `shutdown()` each. Neither
+// type implements AutoCloseable: a synchronous `close()` would have to block a
+// calling thread on a coroutine whose dispatcher neither type controls. See
+// `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
 //
 // Provenance: crates/scp-ffi-common/src/server.rs, crates/scp-ffi/uniffi/src/server.rs
 
 package works.limn.scp
 
-import kotlinx.coroutines.runBlocking
 import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.CoroutineBridge
 
@@ -223,14 +224,32 @@ internal data class NodeInfo(
  * Opaque handle to a running SCP relay server.
  *
  * Created via [Relay.Companion.startInMemory] or [Relay.Companion.startLocal].
- * The relay accepts WebSocket connections at [relayUrl] and can be gracefully
- * stopped via [shutdown] or [close] (for `use` blocks).
+ * A relay accepts WebSocket connections at [relayUrl], and [shutdown] stops it.
  *
- * Implements [AutoCloseable] so it can be used with Kotlin's `use` extension:
+ * [shutdown] is this type's only stop path, and it suspends. An earlier revision
+ * also implemented [AutoCloseable] with `close()` running
+ * `runBlocking(Dispatchers.Default) { shutdown() }`, so that a caller could write
+ * `use {}`. That shape breaks a rule this repository holds — a non-suspend method
+ * must not block its calling thread waiting on a coroutine whose dispatcher it
+ * does not control — because [shutdown] routes through `CoroutineBridge.ffiCall`,
+ * which suspends on a bridge's injected `ioDispatcher`. A caller injecting a
+ * `StandardTestDispatcher` would park the one thread that advances that
+ * dispatcher's scheduler and never return, the deadlock `ScpViewModel.onCleared()`
+ * hit in its tests; an Android caller would block a main thread, which risks an
+ * ANR. See `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
+ *
+ * A `finally` block runs [shutdown] under `NonCancellable`: a `finally` block
+ * usually runs because its coroutine was cancelled, and in a cancelled coroutine
+ * the bridge's `withContext(ioDispatcher)` throws `CancellationException` before
+ * the FFI call starts, so a bare `relay.shutdown()` there tears nothing down.
+ *
  * ```kotlin
- * Relay.startInMemory().use { relay ->
+ * val relay = Relay.startInMemory(bridge)
+ * try {
  *     println(relay.relayUrl)
- * } // shutdown() called automatically
+ * } finally {
+ *     withContext(NonCancellable) { relay.shutdown() }
+ * }
  * ```
  */
 class Relay internal constructor(
@@ -240,11 +259,11 @@ class Relay internal constructor(
     val relayPort: Int,
     private val bridge: ServerBridge,
     internal val handleJson: String,
-) : AutoCloseable {
-    /** `true` if [shutdown] has already been called. */
+) {
+    /** `true` once a [shutdown] call's FFI teardown has returned without throwing. */
     @Volatile
     var isShutdown: Boolean = false
-        private set
+        internal set
 
     /**
      * Signals the relay server to stop accepting new connections.
@@ -252,24 +271,11 @@ class Relay internal constructor(
      * In-flight connection handlers drain naturally. Idempotent.
      */
     suspend fun shutdown() {
-        try {
-            bridge.shutdownRelay(this)
-        } finally {
-            isShutdown = true
-        }
-    }
-
-    /**
-     * Synchronous [AutoCloseable] cleanup that delegates to [shutdown].
-     *
-     * Blocks the calling thread until shutdown completes. Prefer [shutdown]
-     * from a coroutine scope; this exists for `use {}` block support.
-     *
-     * Uses [kotlinx.coroutines.Dispatchers.Default] to avoid deadlocking
-     * when called from a thread that already holds the event loop.
-     */
-    override fun close() {
-        runBlocking(kotlinx.coroutines.Dispatchers.Default) { shutdown() }
+        // [ServerBridge.shutdownRelay] records shutdown as soon as the FFI call returns, inside its
+        // bridge block: an engine failure throws first and leaves this relay live and worth a
+        // second [shutdown], while a cancellation the bridge raises after a finished teardown
+        // cannot leave it recorded live.
+        bridge.shutdownRelay(this)
     }
 
     override fun toString(): String = "Relay(url=$relayUrl, relayPort=$relayPort)"
@@ -301,15 +307,25 @@ class Relay internal constructor(
  * Opaque handle to a running SCP application node.
  *
  * Created via [Node.Companion.startInMemory] or [Node.Companion.startLocal].
- * The node includes a running relay server, a generated DID identity, and
+ * A node includes a running relay server, a generated DID identity, and
  * (optionally) persistent storage.
  *
- * Implements [AutoCloseable] so it can be used with Kotlin's `use` extension:
+ * [shutdown] is this type's only stop path, and it suspends, for a reason
+ * [Relay] states in full: an earlier `close()` ran
+ * `runBlocking(Dispatchers.Default) { shutdown() }`, which blocks a calling
+ * thread on a coroutine whose dispatcher this type does not control. A
+ * `finally` block runs [shutdown] under `NonCancellable`, for the reason [Relay]
+ * states: in a cancelled coroutine a bare `node.shutdown()` throws
+ * `CancellationException` before the FFI call starts and tears nothing down.
+ *
  * ```kotlin
- * Node.startInMemory().use { node ->
+ * val node = Node.startInMemory(bridge)
+ * try {
  *     println(node.relayUrl)
  *     println(node.did)
- * } // shutdown() called automatically
+ * } finally {
+ *     withContext(NonCancellable) { node.shutdown() }
+ * }
  * ```
  */
 class Node internal constructor(
@@ -321,11 +337,11 @@ class Node internal constructor(
     val did: String,
     private val bridge: ServerBridge,
     internal val handleJson: String,
-) : AutoCloseable {
-    /** `true` if [shutdown] has already been called. */
+) {
+    /** `true` once a [shutdown] call's FFI teardown has returned without throwing. */
     @Volatile
     var isShutdown: Boolean = false
-        private set
+        internal set
 
     /**
      * Signals the node to stop (relay + background tasks).
@@ -333,24 +349,11 @@ class Node internal constructor(
      * In-flight connection handlers drain naturally. Idempotent.
      */
     suspend fun shutdown() {
-        try {
-            bridge.shutdownNode(this)
-        } finally {
-            isShutdown = true
-        }
-    }
-
-    /**
-     * Synchronous [AutoCloseable] cleanup that delegates to [shutdown].
-     *
-     * Blocks the calling thread until shutdown completes. Prefer [shutdown]
-     * from a coroutine scope; this exists for `use {}` block support.
-     *
-     * Uses [kotlinx.coroutines.Dispatchers.Default] to avoid deadlocking
-     * when called from a thread that already holds the event loop.
-     */
-    override fun close() {
-        runBlocking(kotlinx.coroutines.Dispatchers.Default) { shutdown() }
+        // [ServerBridge.shutdownNode] records shutdown as soon as the FFI call returns, inside its
+        // bridge block: an engine failure throws first and leaves this node live and worth a
+        // second [shutdown], while a cancellation the bridge raises after a finished teardown
+        // cannot leave it recorded live.
+        bridge.shutdownNode(this)
     }
 
     // HTTP server lifecycle
@@ -625,23 +628,27 @@ class ServerBridge internal constructor(
         }
 
     /**
-     * Shuts down a running relay. Idempotent.
+     * Shuts down a running relay. Idempotent. Sets [Relay.isShutdown] inside the bridge call once the
+     * FFI shutdown returns.
      *
      * @param relay The relay to shut down.
      */
     internal suspend fun shutdownRelay(relay: Relay) =
         bridge.ffiCall {
             bindings.relayShutdown(relay.handleJson)
+            relay.isShutdown = true
         }
 
     /**
-     * Shuts down a running node (relay + background tasks). Idempotent.
+     * Shuts down a running node (relay + background tasks). Idempotent. Sets [Node.isShutdown]
+     * inside the bridge call once the FFI shutdown returns.
      *
      * @param node The node to shut down.
      */
     internal suspend fun shutdownNode(node: Node) =
         bridge.ffiCall {
             bindings.nodeShutdown(node.handleJson)
+            node.isShutdown = true
         }
 
     // HTTP server lifecycle

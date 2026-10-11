@@ -15,6 +15,9 @@ name = "scp-node"
 path = "src/main.rs"
 
 [dependencies]
+# Links the wiping global allocator every shipped artifact installs
+# (09-security-model.md §9.15, freed heap memory).
+scp-alloc = { path = "../scp-alloc", version = "=0.1.0-beta.2" }
 scp-core = { path = "../scp-core", version = "=0.1.0-beta.2" }
 scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
 scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
@@ -81,7 +84,6 @@ percent-encoding = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
-url = "2"
 x509-parser = "0.16"
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }

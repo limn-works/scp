@@ -442,6 +442,10 @@ public extension ContextParams {
     /// strings — it removes the round-trip through hand-rolled JSON and gives
     /// callers compile-time checks against the discriminated unions.
     ///
+    /// `ceiling` is forwarded as written. An empty list makes the create fail
+    /// with `ScpError.Validation` code `SCP-VALID-7005` (construction.md M2);
+    /// no default ceiling replaces it.
+    ///
     /// - Throws: `EncodingError` if a typed value cannot be serialized.
     init(
         mode: ContextMode,

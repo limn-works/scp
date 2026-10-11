@@ -23,7 +23,7 @@ Gradle wrapper — it borrows the one under `bindings/kotlin/`:
 
 ```sh
 cd bindings/python/tests/bridge_parity/helpers/kotlin_bridge_runner
-../../../../../../bindings/kotlin/gradlew -p . installDist
+../../../../../../bindings/kotlin/gradlew -p . installDist -Pscp.uniffi.cargoFeatures=testing
 ```
 
 This produces `build/install/kotlin-bridge-runner/bin/kotlin-bridge-runner`

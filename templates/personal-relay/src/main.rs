@@ -12,6 +12,10 @@
 
 mod config;
 
+// Links the one `#[global_allocator]`, which wipes every heap block before
+// freeing it (09-security-model.md §9.15, freed heap memory).
+use scp_alloc as _;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;

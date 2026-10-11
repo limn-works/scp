@@ -63,7 +63,7 @@ eval "$(mise env)"
 - **Opaque handles**: Identity and context are represented as `Long` handles in the bridge layer.
 - **JSON parameters**: Structured data (context params, tool definitions) passed as JSON strings.
 - **Flow streaming**: Messages delivered via cold `Flow<String>` or hot `SharedFlow<String>`.
-- **Type-safe enums**: `CustodyType`, `BridgeMode`, `ShadowStatus` for typed parameters.
+- **Type-safe enums**: enum classes such as `CustodyType` for typed parameters.
 - **Cancellation**: `CancellationHandle` propagates coroutine cancellation to Rust.
 
 ## Architecture Notes

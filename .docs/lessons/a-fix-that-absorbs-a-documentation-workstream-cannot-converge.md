@@ -1,0 +1,190 @@
+# A Fix That Absorbs a Documentation Workstream Cannot Converge
+
+A fix that made one example compile on a shipped build grew to 1,204 inserted lines
+across 37 files. Nineteen review rounds later the branch was still producing findings, and
+in the nineteenth round a reviewer falsified three claims that the two newest commits had
+added. Deleting most of the sentences about subsystems the branch never modified ended the
+loop that fixing individual sentences could not. Outside the example the branch fixed
+(`crates/scp-node/examples/website.rs` and its `README.md`) and the run-mode check it added
+to `crates/scp-node/src/main.rs` (`conflicting_modes`), each passage that stayed either
+documents a surface the branch changed or replaced a false sentence: a claim that a backend
+succeeds, a claim about a value or behavior the code does not have, or a documented command
+that exits 1 with no reason given, which reads as a promise that the command works. Many of
+them explain a fail-closed backend the branch never modified: `NoPreRotationBackend` on
+identity creation, or the unconfigured custody-migration backend. By file, each with the
+sentence it replaced:
+
+- `crates/scp-ffi/src/identity.rs`: the rustdoc of `identity_execute_custody_migration`,
+  which had said its backend succeeds.
+- `crates/scp-node/src/main.rs`:
+  - item 1 of the module doc, the rustdoc of `run_full_node_persistent`, and the
+    `SCP_NODE_DOMAIN` line of the help text, which presented the full node as the
+    production default with no word of its exit 1;
+  - item 3 of the module doc, the `--ephemeral` lines of the `parse_args` rustdoc and the
+    help text, and the warning `run_full_node_ephemeral` prints, which documented
+    `--ephemeral` with no word of a shipped build's exit 1, and whose warning pointed an
+    operator at the persistent mode for production;
+  - item 4 of the module doc and the `--self-host` line of the help text, which documented
+    `--self-host` with no word of a shipped build's exit 1 on a storage directory that holds
+    no identity;
+  - the `--self-host`, `--site-dir` and `-h` lines of the `parse_args` rustdoc, a list of
+    accepted flags that left out three flags `parse_cli_from` parses;
+  - the reason in the `--ephemeral` refusal message, which told the operator to run the
+    persistent full node, a command that exits 1;
+  - the comments on the `DhtMode::Disabled` arm of `run_full_node_persistent` and in
+    `parse_dht_mode_or_exit`, the rustdoc of `run_self_host` and its DHT-mode comment, the
+    rustdoc of `self_host_banner`, and the self-host banner test, which named `memory` as
+    the self-host no-publish value that a shipped binary rejects, and called the `Disabled`
+    arm unreachable;
+  - `unavailable_mode` and its test, which refuse `--ephemeral` on a shipped build before
+    the `--health` probe, because `scp-node --ephemeral --health` had probed
+    `SCP_NODE_BIND_ADDR` and exited 0 where five sentences promised exit 1;
+  - the comment in `run_node_with`, which called `DhtMode::Production` advisory with no
+    runtime effect.
+- `docs/guides/relay-operations.md`:
+  - the modes sentence, which counted three modes; the Identity and Use case cells of the
+    full-node row and the Mode cell of the ephemeral row in the modes table; and the
+    comments on the full-node and ephemeral commands below it, which presented both as
+    commands that run;
+  - the `SCP_NODE_DHT_MODE` row, which offered `memory`, a value a shipped binary rejects,
+    and did not name `disabled`;
+  - the OPTIONS block: the `--ephemeral` line, which had no word of its exit 1, and the
+    `--self-host` and `--site-dir` lines, which the block left out; the `--self-host` line
+    also states its exit 1;
+  - the identity bullet in §6, which called the identity persistent across restarts;
+  - in Production deployment, the paragraph that marks a `testing` build as
+    development-only, storage-key step 1, and the paragraph on why a shipped full node
+    exits 1, which replaced the claims that the node generates its key on first run and
+    reloads its identity on later runs;
+  - in Development deployment, the rewritten recipe, which had run `--ephemeral` on a
+    shipped binary with `SCP_NODE_DHT_MODE=memory`, and the three paragraphs after it: that
+    ephemeral mode ignores `SCP_NODE_DHT_MODE`, that a shipped binary exits 1 on
+    `--ephemeral` and on two mode flags, and that a `testing` full node publishes the host's
+    address to the Mainline DHT, which warns about the recipe the branch rewrote;
+  - the comment on the §7 self-signed recipe and the "Do not drop `--ephemeral`" paragraph
+    after it, because the recipe had run the full node, which exits 1;
+  - the §8 logging recipe, which moved from the full node to `--relay-only`, and its
+    comment, which says why;
+  - the health-probe paragraph in §8, which documents the run-mode check the branch added
+    and the shipped build's `--ephemeral` refusal ahead of the probe.
+- `crates/scp-node/src/self_host.rs`: the rustdoc of the module, `host_site`,
+  `host_site_until` and `HostSiteError::NodeBuild`, which called the example runnable and
+  had no word of the `NoPreRotationBackend` failure on a directory that holds no identity;
+  `NodeBuild` now carries the typed `NodeError`, a surface the branch changed. Also the
+  `DhtMode::Disabled` rustdoc and log line, which said DID resolution runs where the relay
+  layer `host_site` wires is a `NoOpRelayQuerier` that answers from the cache alone.
+- The DHT-mode comments in `crates/scp-node/src/config.rs`, `crates/scp-node/src/lib.rs`,
+  `crates/scp-ffi/common/src/server.rs`, `crates/scp-testing/src/helpers.rs`,
+  `crates/scp-testing/tests/integration/node.rs`, and the scp-node tests `self_host.rs`,
+  `host_site.rs`, `integration.rs`, `quic_cross_transport.rs` and `quic_listener.rs`, which
+  called `DhtMode::Production` advisory in P1, said a publishing reach requires it, or
+  named `DhtMode::Memory` as the default and as equally valid. Production makes the start
+  publish and fail if that publish fails, and `NodeConfig::defaults` sets `Disabled`. The
+  three `config.rs` tests named `*_dht_memory_*` became `*_dht_disabled_*` for the same
+  reason.
+- The citations of spec §9.7.4.1 in `crates/scp-identity/src/config.rs`,
+  `crates/scp-identity/src/lib.rs`, `crates/scp-node/src/lib.rs`,
+  `crates/scp-ffi/common/src/error_codes.rs`, `crates/scp-ffi/src/identity.rs` (a rustdoc
+  and a comment), `crates/scp-ffi/napi/src/identity.rs`,
+  `crates/scp-ffi/napi/src/scp.rs` and `crates/scp-ffi/uniffi/src/bridge.rs`, which cited
+  the section as "§3" for mandatory pre-rotation and credited the whole section with
+  recovery from `#0` compromise; they now cite item 5(a) for the mandatory commitment and
+  item 4 for the reveal that recovers a root compromise.
+- `.docs/guides/deploying-an-scp-website.md`: the opening paragraph on why each recipe
+  fails on a shipped build.
+- `.docs/guides/self-hosting-a-website-on-scp.md`: the parenthetical in the `host_site`
+  running-log entry on why the example command exits 1.
+
+The rule below admits them, because each one corrects a false sentence or documents a
+surface the branch changed, rather than explaining a subsystem the branch only reads.
+
+## The Rule
+
+**A change may document the surface it modifies, and may replace a false sentence on any
+surface. It may not add explanation of a subsystem it only reads.** A sentence that claims
+a fail-closed backend succeeds, or that documents a command without saying it fails, is
+false wherever it sits, and correcting it on sight is in scope. When a fix needs to explain
+adjacent behavior, state the mechanism the fix depends on and stop. Explaining that
+mechanism across every bridge and SDK is a separate workstream, and adopting it silently
+converts a reviewable fix into an unreviewable one.
+
+The test: for each sentence added, does the branch change the code the sentence describes,
+or does the sentence replace one that was false? When the answer is no to both, the
+sentence is out of scope. When it is no to both for most of the diff, the branch has
+absorbed someone else's work.
+
+## What happened
+
+The task was a security fix: bump `rustls-webpki` past three certificate-validation
+advisories, delete their `deny.toml` ignore entries, and stop one example from needing a
+test-only feature to compile. Pull request #2382, which cleared the Rust 1.98.0 clippy
+lints and named the Rust version in one file, took the `rustls-webpki` bump and the three
+`deny.toml` deletions into main first. This branch then rebased onto that commit, so the
+branch carries no line of the `rustls-webpki` fix. A later commit added different advisory
+work: `deny.toml` sets `unsound = "all"`, ignores RUSTSEC-2026-0253 (an `lru`
+advisory) for the copy `mainline` requires, and bans any other `lru` below 0.18.2.
+`Cargo.lock` bumps `anyhow` and `event-listener`, moves `spin` off the yanked 0.9.8 to
+0.9.9 on the `flume` and `lazy_static` edges, and bumps `aws-sdk-s3` with about
+twenty crates in its dependency tree past `lru` 0.12.5, so RUSTSEC-2026-0002, the second
+`lru` advisory, needs no ignore. The example fix required one true sentence about why a shipped build
+cannot create an identity.
+
+That one sentence became thirty. Each round a reviewer found a surface where the same
+explanation was missing, or wrong, or scoped differently, and each fix added surfaces.
+The identity fail-closed behavior belongs to the ADR-062 severing workstream. This branch
+never modified it. At its widest the branch described it on ten bridge and SDK doc
+comments, four SDK methods, two operator guides, and an error-code registry.
+
+## Universals about provenance are the specific trap
+
+The sentences that kept failing all had one shape: a claim about **who** could have
+produced a state.
+
+> the reload branch fires only against a directory a `testing` build already seeded
+
+A reviewer falsified it by writing an external consumer crate on default features, calling
+`DidMethod::create` with its own `PreRotationCustody`, and minting a real `did:dht:`
+identity. `PreRotationCustody` is public and unsealed, and `DidMethod::create` takes
+`&impl PreRotationCustody`, so any consumer can seed that directory. Three rounds
+falsified three spellings of this same claim, each time by construction rather than by
+reading.
+
+**State the precondition, never the provenance.** The durable form names what must be true
+of the state:
+
+> the reload branch needs a directory that already holds an identity record, and a custody
+> holding that record's key handles
+
+That sentence survives a consumer who seeds the directory, because it never claimed nobody
+could. It is also the more useful sentence: a reader wanting the reload branch to work now
+knows what to arrange.
+
+A `publish = false` manifest key does not narrow the claim either — a path dependency
+ignores it, which is how the falsifying consumer compiled against a bridge-internal crate.
+
+## Why the review loop could not catch this
+
+Every round's findings were real, and fixing each one was correct in isolation. The loop
+failed because the findings were *symptoms of the scope*, not of the sentences. A reviewer
+asked to attack an artifact reports what is wrong with the artifact; it takes a different
+question — should this artifact be here at all — to end the loop.
+
+`.claude/agents/README.md` §Review rules names the signal for enforcement: "When more
+than about three review passes on one artifact each surface a new spelling of the same
+bypass, the approach does not converge: stop and reframe it." That rule speaks of a gate's
+bypasses. This lesson extends it to documentation: more than about three passes that each
+surface a new false sentence of the same kind means the scope is wrong, and the answer is
+to reframe rather than grind. Nineteen rounds is not a thorough review. It is a
+missed signal, and the cost was 700 lines that had to be removed anyway.
+
+## How to apply
+
+- Before adding explanatory prose to a surface, check whether the branch changes that
+  surface. When it does not, the prose belongs to whoever owns that surface, unless it
+  replaces a sentence there that is false.
+- When a fix seems to require explaining a subsystem on many surfaces, that requirement is
+  the evidence the subsystem's documentation is a workstream. File it; do not adopt it.
+- Write preconditions on state. A sentence claiming what only some build could have done
+  is falsifiable by anyone who writes a consumer, and public unsealed traits mean someone
+  can.
+- Count review rounds on one artifact. Three rounds of new spellings is the stop signal.

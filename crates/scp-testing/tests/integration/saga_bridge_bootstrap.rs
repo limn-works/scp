@@ -153,7 +153,7 @@ fn bridge_supervisor(
         Box::new(LocalTransportProvider) as Box<dyn ContextTransportProvider>,
         Box::new(NoOpEventLog) as Box<dyn ContextEventLogProvider>,
         key_resolver,
-        Some(Box::new(SharedPersistenceArc(persistence))),
+        Box::new(SharedPersistenceArc(persistence)),
         None,
         None,
         None,
@@ -225,6 +225,7 @@ async fn bridge_restore_entry_runs_restore_and_replay_legs() {
         // lives in the shared OpenMLS storage and the restore leg reinstates it.
         let params = ContextParams {
             mode: ContextMode::Encrypted,
+            ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
         sup1.create_context(ctx_id.to_owned(), params, DID::from(creator_did), None)

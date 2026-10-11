@@ -38,6 +38,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { SCP } from "../src/scp";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // Stable 32-byte SQLCipher key. The specific value does not matter;
 // only that the same key is reused across the two SCP constructions
@@ -57,18 +58,17 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   }
 }
 
-// Best-effort detection of whether the NAPI addon is available. We
-// attempt a cheap `new SCP({ storage: { type: "in_memory" } })` inside a try/catch — if the addon is
-// structurally unavailable we'll get a `SCP-VALID-7005` ValidationError
-// and skip the whole suite. This keeps the test file runnable in
-// environments without the native addon (e.g. an unsupported platform)
-// without hard-failing.
+// Detects whether the NAPI addon is installed. A cheap
+// `new SCP({ storage: { type: "in_memory" } })` runs inside a try/catch, and
+// `skipReasonIfAddonAbsent` skips the suite only when no addon is installed
+// for this platform. Every other construction failure fails the file.
 function napiAvailable(): boolean {
   try {
     const probe = new SCP({ storage: { type: "in_memory" } });
     probe.shutdown(1).catch(() => {});
     return true;
-  } catch {
+  } catch (e: unknown) {
+    skipReasonIfAddonAbsent(e);
     return false;
   }
 }

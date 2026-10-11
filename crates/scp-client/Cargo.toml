@@ -44,7 +44,7 @@ scp-relay-client = { path = "../scp-relay-client", version = "=0.1.0-beta.2" }
 # `js` is declared in the wasm32 section below, and `libcrux-provider` nowhere — see the
 # note on the same dependency in crates/scp-mls/Cargo.toml.
 openmls = { workspace = true }
-tls_codec = "0.4"
+tls_codec = "0.5"
 
 # MessagePack is the codebase's name-tagged, width-/endianness-independent wire
 # form (ADR-057, §17.5). The driver serializes each context's participant
@@ -52,7 +52,7 @@ tls_codec = "0.4"
 # native and a wasm32 build round-trip byte-compatibly.
 serde = { workspace = true }
 rmp-serde = { workspace = true }
-zeroize = { workspace = true }
+zeroize = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 
 # wasm32 backends: mirror scp-mls/Cargo.toml so the driver compiles to wasm32.

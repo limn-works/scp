@@ -26,6 +26,9 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import works.limn.scp.stream.assertReleaseLeavesCollectorFree
+import works.limn.scp.stream.captureLogs
+import java.util.logging.Level
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -531,24 +534,107 @@ class CoroutineBridgeTest {
             }
 
         @Test
-        fun `contextSubscribe flow cancellation calls awaitClose`() =
+        fun `contextSubscribe releases its subscription when take ends collection after one message`() =
             runTest(ioDispatcher) {
                 stubBindings.contextSubscribeResult = 100L
 
                 val flow = bridge.context.subscribe(42L)
+                val messages = mutableListOf<String>()
 
                 val job =
                     launch {
-                        flow.take(1).toList()
+                        flow.take(1).toList().also { messages.addAll(it) }
                     }
 
                 advanceUntilIdle()
+                assertFalse(stubBindings.contextUnsubscribeCalled)
 
                 stubBindings.lastMessageCallback?.onMessage("""{"text":"hello"}""")
 
                 advanceUntilIdle()
                 job.join()
+
+                assertEquals(listOf("""{"text":"hello"}"""), messages)
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
             }
+
+        @Test
+        fun `contextSubscribe releases a subscription whose collector was cancelled during subscribe`() =
+            runTest(ioDispatcher) {
+                stubBindings.contextSubscribeResult = 100L
+                // An FFI dispatcher other than the collector's, so withContext hands
+                // contextSubscribe's result back through a dispatch, where a cancelled caller
+                // would drop it.
+                val flow =
+                    CoroutineBridge(
+                        nativeBindings = stubBindings,
+                        ioDispatcher = StandardTestDispatcher(testScheduler),
+                        cpuDispatcher = cpuDispatcher,
+                    ).context.subscribe(42L)
+                lateinit var collecting: Job
+                // This stub cancels the collector while contextSubscribe is on a stack, after
+                // a Rust engine would have opened the subscription.
+                stubBindings.onSubscribe = { collecting.cancel() }
+
+                collecting = launch { flow.collect {} }
+                advanceUntilIdle()
+
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
+            }
+
+        @Test
+        fun `contextSubscribe logs a release that throws and its collector ends cancelled`() =
+            runTest(ioDispatcher) {
+                stubBindings.contextSubscribeResult = 100L
+                val failure = IllegalStateException("subscription 100 already torn down")
+                stubBindings.onUnsubscribe = { throw failure }
+                val flow = bridge.context.subscribe(42L)
+
+                // A release that rethrew would fail this job with the stub's exception instead
+                // of cancelling it. The completion cause recorded below tells the two apart:
+                // a failed job completes with the stub's exception, a cancelled one with a
+                // CancellationException. runTest's scope would also fail on that exception.
+                lateinit var collecting: Job
+                var completionCause: Throwable? = null
+                val records =
+                    captureLogs(ContextBridge::class.java.name) {
+                        collecting = launch { flow.collect {} }
+                        collecting.invokeOnCompletion { completionCause = it }
+                        advanceUntilIdle()
+                        collecting.cancelAndJoin()
+                    }
+
+                val cause = completionCause
+                assertTrue(cause is CancellationException, "collector completed with $cause")
+                assertFalse(generateSequence<Throwable>(cause) { it.cause }.any { it === failure })
+                assertEquals(1, records.size)
+                assertEquals(Level.WARNING, records[0].level)
+                assertEquals(failure.message, records[0].thrown?.message)
+                assertTrue(records[0].message.startsWith("ContextBridge.subscribe: releasing subscription 100 "))
+            }
+
+        @Test
+        fun `contextSubscribe releases its subscription without parking the collector thread`() {
+            stubBindings.contextSubscribeResult = 100L
+
+            assertReleaseLeavesCollectorFree(
+                openFlow = { ffiDispatcher ->
+                    CoroutineBridge(
+                        nativeBindings = stubBindings,
+                        ioDispatcher = ffiDispatcher,
+                        cpuDispatcher = cpuDispatcher,
+                    ).context.subscribe(42L)
+                },
+                installHooks = { onSubscribe, onUnsubscribe ->
+                    stubBindings.onSubscribe = onSubscribe
+                    stubBindings.onUnsubscribe = onUnsubscribe
+                },
+            )
+
+            assertEquals(100L, stubBindings.lastUnsubscribeHandle)
+        }
     }
 
     // -------------------------------------------------------------------
@@ -582,7 +668,7 @@ class CoroutineBridgeTest {
             }
 
         @Test
-        fun `contextSubscribe flow closes on error`() =
+        fun `contextSubscribe flow closes on error and releases its subscription`() =
             runTest(ioDispatcher) {
                 stubBindings.contextSubscribeResult = 100L
 
@@ -604,10 +690,12 @@ class CoroutineBridgeTest {
                 val exception = result.exceptionOrNull()
                 assertTrue(exception is BridgeException)
                 assertEquals("SCP-CTX-2001", (exception as BridgeException).code)
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
             }
 
         @Test
-        fun `contextSubscribe flow completes on onComplete`() =
+        fun `contextSubscribe flow completes on onComplete and releases its subscription`() =
             runTest(ioDispatcher) {
                 stubBindings.contextSubscribeResult = 100L
 
@@ -627,6 +715,8 @@ class CoroutineBridgeTest {
 
                 assertEquals(1, messages.size)
                 assertEquals("""{"seq":1}""", messages[0])
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
             }
     }
 
@@ -1046,15 +1136,23 @@ class StubNativeBindings : NativeBindings {
         contextSendCalled = true
     }
 
+    /** Runs inside [contextSubscribe], where a Rust engine would be opening a stream. */
+    var onSubscribe: (() -> Unit)? = null
+
+    /** Runs inside [contextUnsubscribe], where a Rust engine would be closing a stream. */
+    var onUnsubscribe: (() -> Unit)? = null
+
     override fun contextSubscribe(
         contextHandle: Long,
         callback: MessageCallback,
     ): Long {
         lastMessageCallback = callback
+        onSubscribe?.invoke()
         return contextSubscribeResult
     }
 
     override fun contextUnsubscribe(subscriptionHandle: Long) {
+        onUnsubscribe?.invoke()
         contextUnsubscribeCalled = true
         lastUnsubscribeHandle = subscriptionHandle
     }

@@ -11,7 +11,8 @@
 //!   [`ToolsCallParams`], [`ToolsCallResult`], [`ToolDefinition`].
 //! - **MCP resource messages:** [`ResourcesListParams`],
 //!   [`ResourcesListResult`], [`ResourcesReadParams`],
-//!   [`ResourcesReadResult`], [`ResourcesSubscribeParams`].
+//!   [`ResourcesReadResult`], [`ResourcesSubscribeParams`],
+//!   [`ResourcesUnsubscribeParams`].
 //! - **Standard error codes** for JSON-RPC and MCP-specific errors.
 //!
 //! All types derive `Serialize` and `Deserialize` via `serde_json`.
@@ -61,6 +62,9 @@ pub const CAPABILITY_DENIED: i64 = -32005;
 
 /// Tool execution failed.
 pub const TOOL_EXECUTION_ERROR: i64 = -32006;
+
+/// The server cannot perform the operation, whatever capability the caller holds.
+pub const CAPABILITY_UNSUPPORTED: i64 = -32007;
 
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 request ID
@@ -223,8 +227,52 @@ pub const METHOD_RESOURCES_READ: &str = "resources/read";
 /// MCP method: `resources/subscribe` -- subscribe to resource updates.
 pub const METHOD_RESOURCES_SUBSCRIBE: &str = "resources/subscribe";
 
+/// MCP method: `resources/unsubscribe` -- cancel a resource subscription.
+pub const METHOD_RESOURCES_UNSUBSCRIBE: &str = "resources/unsubscribe";
+
+/// MCP notification: `notifications/resources/updated` -- a subscribed
+/// resource changed.
+///
+/// Sent by the server to clients that hold a subscription for the named URI
+/// (established via [`METHOD_RESOURCES_SUBSCRIBE`]). Carries only the `uri`;
+/// the client re-reads the resource with [`METHOD_RESOURCES_READ`] to obtain
+/// the new contents.
+pub const METHOD_RESOURCES_UPDATED: &str = "notifications/resources/updated";
+
 /// MCP notification: `notifications/tools/list_changed` -- tool list updated.
 pub const METHOD_TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
+
+/// MCP notification: `notifications/resources/list_changed` -- the resources
+/// this agent may read may have changed, so the client re-lists them.
+///
+/// The server compares the agent's served contexts, readable resource kinds and
+/// tool view after each `tools/call` that reaches the outlet invocation (a call
+/// refused earlier changes nothing, so it runs no comparison) and after each
+/// runtime `ContextEvent` in the membership, capability and lifecycle class
+/// (a join, a departure, a read or write revocation or restoration, a
+/// capability suspension, an executed governance action, a ceiling change, a
+/// consequence, a migration start, a tombstone, a close, an expiry). It sends
+/// this notice when that comparison finds a change, a `tools/call` that spent
+/// the agent's token included; when that comparison cannot read the agent's
+/// view of a served context (its tools, or whether one of its resources is
+/// readable), to a client that holds a recorded view of that context, listed
+/// in this session, or subscribes to its `tools` resource; when it cannot read
+/// which contexts it serves, for a context that a list or subscribe response
+/// or an earlier event found served; and when the event pump lagged and
+/// resynchronizes. A join or leave
+/// is one such change, not the only one. Any other `ContextEvent` (a block, an
+/// access-key revocation or restoration, a message, a data-plane event) runs
+/// no comparison, so it sends this notice only when the server cannot read
+/// which contexts it serves, and only for such a context. For any other
+/// context a failed read sends nothing.
+///
+/// A change that no compared `ContextEvent` reports and no `tools/call` causes
+/// sends no notice: the agent token reaching its expiry, its nonce passing the
+/// five-minute freshness window of ADR-016 Step 9, a caveat time box closing, a
+/// revocation of that token, and an outlet registration or removal.
+/// The client sees such a change at its next list, as a refused call, or
+/// through the notice that the next comparison for that context sends.
+pub const METHOD_RESOURCES_LIST_CHANGED: &str = "notifications/resources/list_changed";
 
 // ---------------------------------------------------------------------------
 // MCP lifecycle messages
@@ -329,6 +377,10 @@ pub struct ResourceServerCapability {
     /// Whether the server supports resource subscriptions.
     #[serde(default)]
     pub subscribe: bool,
+
+    /// Whether the server may send `notifications/resources/list_changed`.
+    #[serde(default, rename = "listChanged")]
+    pub list_changed: bool,
 }
 
 /// Information about the MCP server.
@@ -542,6 +594,13 @@ pub struct ResourcesSubscribeParams {
     pub uri: String,
 }
 
+/// Parameters for `resources/unsubscribe`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourcesUnsubscribeParams {
+    /// The URI of the resource to stop receiving updates for.
+    pub uri: String,
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -723,7 +782,10 @@ mod tests {
             protocol_version: "2024-11-05".to_owned(),
             capabilities: ServerCapabilities {
                 tools: Some(ToolServerCapability { list_changed: true }),
-                resources: Some(ResourceServerCapability { subscribe: true }),
+                resources: Some(ResourceServerCapability {
+                    subscribe: true,
+                    list_changed: true,
+                }),
             },
             server_info: ServerInfo {
                 name: "scp-mcp".to_owned(),
@@ -975,6 +1037,7 @@ mod tests {
             TOOL_NOT_FOUND,
             CAPABILITY_DENIED,
             TOOL_EXECUTION_ERROR,
+            CAPABILITY_UNSUPPORTED,
         ];
         for code in mcp_codes {
             assert!(

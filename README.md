@@ -89,7 +89,7 @@ Any client connects to any conforming relay. Transport is fully abstracted behin
 Install these manually (one-time):
 
 1. **Homebrew** — https://brew.sh
-2. **mise** — `brew install mise` ([mise.jdx.dev](https://mise.jdx.dev))
+2. **mise** 2026.9.15 or newer — `brew install mise` ([mise.jdx.dev](https://mise.jdx.dev)). `.mise.toml` sets `min_version = "2026.9.15"`, so an older mise exits with an error in this repository. mise 2026.2.22 resolved the `npm:@napi-rs/cli = "latest"` entry by running `npm view`, and `npm` is a mise shim, so each call started mise again until about 10,000 processes filled the process table. `.mise.toml` also sets `[settings.npm] package_manager = "bun"`, so mise installs `npm:` tools through bun.
 3. **rustup** — `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` ([rustup.rs](https://rustup.rs)). rustup installs Rust, and mise installs everything else. rustup reads the toolchain file of whichever directory a cargo command runs in, so the workspace compiles on the version `rust-toolchain.toml` names and `fuzz/` compiles on the nightly `fuzz/rust-toolchain.toml` names, with no version written anywhere else. mise would export one `RUSTUP_TOOLCHAIN` for the whole repository, which overrides both files, so `.mise.toml` names no Rust version. A `RUSTUP_TOOLCHAIN` reaching your shell from any other source overrides both files too: run `bash scripts/check-resolved-rustc.sh`, which names the variable and the compiler it selected, and run `mise tool rust` to see which configuration file mise read a Rust version from. mise loads a configuration file from every ancestor directory, so a git worktree created inside this repository also reads the checkout's `.mise.toml`.
 4. **Xcode Command Line Tools** — `xcode-select --install`
 
@@ -142,15 +142,23 @@ SCP provides two binary entrypoints for local development and testing:
 
 #### From source
 
+Both binaries require `SCP_RELAY_STORAGE_BACKEND`, and the `sqlite` and `redb`
+backends also require an absolute `SCP_RELAY_STORAGE_PATH`. Neither variable has
+a default: a binary that reads either one unset or empty prints an error and
+exits 1 (persistence spec §17.7, SCP-CAPSEL-8000).
+
 ```sh
 # Bare relay — listens on 0.0.0.0:9000
-cargo run --release -p scp-relay
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH="$PWD/scp-relay.db" \
+  cargo run --release -p scp-relay
 
 # Full application node — requires SCP_NODE_DOMAIN
-SCP_NODE_DOMAIN=localhost cargo run --release -p scp-node
+SCP_NODE_DOMAIN=localhost SCP_RELAY_STORAGE_BACKEND=sqlite \
+  SCP_RELAY_STORAGE_PATH="$PWD/scp-node-relay.db" cargo run --release -p scp-node
 
 # Relay-only mode via scp-node
-cargo run --release -p scp-node -- --relay-only
+SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH="$PWD/scp-relay.db" \
+  cargo run --release -p scp-node -- --relay-only
 ```
 
 #### With Docker
@@ -187,6 +195,8 @@ scp-node --health
 
 | Variable | Default | Description |
 |---|---|---|
+| `SCP_RELAY_STORAGE_BACKEND` | none (required) | Blob storage backend: `sqlite`, `redb`, `postgres`, `s3` (the last two need `--features cloud-blobs`), or `memory`. Unset or empty exits 1 |
+| `SCP_RELAY_STORAGE_PATH` | none (required for `sqlite` and `redb`) | Absolute path of the database file. Unset, empty, or relative exits 1 |
 | `SCP_RELAY_BIND_ADDR` | `0.0.0.0:9000` | Listen address |
 | `SCP_RELAY_MAX_BLOB_SIZE` | `262144` | Max blob size (bytes) |
 | `SCP_RELAY_MAX_BLOB_TTL` | `604800` | Max blob TTL (seconds) |
@@ -195,6 +205,9 @@ scp-node --health
 | `SCP_RELAY_RATE_LIMIT` | `100` | Publishes/sec/IP |
 | `SCP_RELAY_LOG_FORMAT` | `pretty` | `pretty` or `json` |
 | `SCP_RELAY_LOG_LEVEL` | `info` | Default log level (`RUST_LOG` takes precedence) |
+
+A variable in this table that is set to a value that does not parse makes the
+binary exit 1; the default applies only when the variable is unset.
 
 **Node-only configuration** (`scp-node` in full mode):
 

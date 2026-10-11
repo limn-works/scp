@@ -21,25 +21,27 @@ resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-t
 # activated (via the `server` feature): the server.rs auto-generate path calls
 # the testing-gated `ApplicationNode::dev`. The `?` keeps testing usable without
 # `server`. Never in a default/non-testing list (ADR-062 §Decision 1).
-# `scp-core?/testing` makes the testing-gated `FfiCredentialStore::InMemory`
-# arm (which names `scp_core::bridge::credentials::InMemoryCredentialStore`,
-# itself `#[cfg(any(test, feature = "testing"))]`) self-consistent whenever this
-# crate's own `testing` is enabled (ADR-062 §Decision 5, SCP-CAPINJECT-009).
 testing = [
     "resolvers",
-    "scp-core?/testing",
     "scp-did/testing",
     "scp-dht/testing",
     "scp-node?/testing",
 ]
 # Shared callback-custody byte/string parsing helpers (custody_parse module).
 # Requires only scp-platform for the typed return values (KeyHandle,
-# PseudonymKeypair, PublicKey, PlatformError), and ed25519-dalek for strict
-# signature checks on host returns (scp-crypto, for the P-256 point, is an
-# unconditional dependency). Deliberately NOT folded into
+# Pseudonym, PublicKey, PlatformError); scp-crypto, for the P-256 host
+# helpers and the custody failure kind; and ed25519-dalek for strict
+# signature checks on host returns. Deliberately NOT folded into
 # `resolvers`: these are pure byte/string ops far lighter than the resolver
-# stack.
-custody = ["dep:scp-platform", "dep:ed25519-dalek"]
+# stack. The feature also compiles the custody_file module, which resolves and
+# opens the `"file"` custody key file through `FileKeyCustody` (spec §17.8), a
+# production backend that `scp-platform/file` compiles.
+#
+# `scp-platform?/file` uses the `?` form because the plain `scp-platform/file`
+# form makes Cargo mint an implicit feature named `scp-platform`, which the
+# shipped-feature-graph gate rejects as a feature its allowlist does not name.
+# `dep:scp-platform` on the same line already enables the dependency.
+custody = ["dep:scp-platform", "scp-platform?/file", "dep:ed25519-dalek"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
 # Requires scp-transport (relay), scp-node (application node), scp-platform, and
 # tokio. `start_node_local` opens no protocol store: it receives a caller's
@@ -60,8 +62,8 @@ custody = ["dep:scp-platform", "dep:ed25519-dalek"]
 # shipped build instead of running a nullifier-backed node. No test-harness
 # platform edge is present, transitively or otherwise — G1 proves it.
 # `resolvers` is listed because `server.rs` names `scp_core::context::supervisor::Supervisor`
-# (in `wire_and_supervise_context_events`) and `crate::bridge_instance::CoreFields`
-# (in `register_node`), and both live behind `resolvers`. That edge held before
+# and `crate::bridge_instance::CoreFields` (in `register_node`), and both live
+# behind `resolvers`. That edge held before
 # this line existed only because `resolvers` is a default feature; declaring it
 # makes `--no-default-features --features server` compile rather than fail on a
 # missing `scp-core` dep. It resolves no new feature anywhere, because every
@@ -137,6 +139,11 @@ scp-crypto = { path = "../../scp-crypto", features = ["testing"] }
 # The crate's own tests (resolvers.rs, dht_capability_injection.rs) construct
 # `InMemoryDhtClient`; activate `scp-dht/testing` for this crate's test build.
 scp-dht = { path = "../../scp-dht", features = ["testing"] }
+# The `bridge_instance.rs` unit tests construct `InMemoryPersistence`, which
+# scp-runtime compiles only under `test` or its `testing` feature. This edge
+# turns on `scp-core/testing` for this crate's own test build only, so no
+# shipped artifact resolves it (`scripts/check-shipped-feature-graph.sh`).
+scp-core = { path = "../../scp-core", features = ["testing"] }
 # `test-util` enables tokio's paused-clock test harness (time::pause/advance,
 # #[tokio::test(start_paused = true)]) — not pulled in by the optional runtime
 # `tokio` dep's "full" features, which intentionally excludes it.

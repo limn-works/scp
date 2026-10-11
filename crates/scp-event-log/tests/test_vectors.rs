@@ -284,7 +284,7 @@ fn different_event_order_produces_different_root() {
 // without the Ed25519 signature check.
 // ---------------------------------------------------------------------------
 
-use scp_crypto::p256::{P256SigningKey, sign_prehash_rfc6979, verify_prehash_strict};
+use scp_crypto::p256::{P256SecretKey, SeedLabel, sign_prehash_rfc6979, verify_prehash_strict};
 use scp_crypto::{CustodyFailure, CustodyFailureKind};
 use scp_event_log::tree::{self, compute_event_canonical_hash};
 use scp_event_log::{
@@ -327,9 +327,10 @@ const EXPECTED_LEAVES: [&str; 9] = [
 /// §25.8 Vector 32 root, which Vector 33 reuses as the checkpoint root.
 const EXPECTED_ROOT: &str = "d161de08f68888a0b13e7fb03e8bbc25758701ab247beb7b6bc2232c87971500";
 
-fn reference_key() -> P256SigningKey {
+fn reference_key() -> P256SecretKey {
+    assert_eq!(SeedLabel::TestVectorKey.as_bytes(), TEST_VECTOR_KEY_LABEL);
     let seed: [u8; 32] = hex::decode(REFERENCE_SEED_1).unwrap().try_into().unwrap();
-    P256SigningKey::from_seed(TEST_VECTOR_KEY_LABEL, &seed).unwrap()
+    P256SecretKey::from_seed(SeedLabel::TestVectorKey, &seed)
 }
 
 fn prehash(digest: &[u8]) -> [u8; 32] {
@@ -339,7 +340,7 @@ fn prehash(digest: &[u8]) -> [u8; 32] {
 /// Signs checkpoints with the §25.2 reference key over the 32-byte canonical
 /// hash `generate_checkpoint` passes it. Slice S12 replaces this with the
 /// production P-256 signer.
-struct ReferenceKeySigner(P256SigningKey);
+struct ReferenceKeySigner(P256SecretKey);
 
 #[async_trait::async_trait]
 impl EventLogSigner for ReferenceKeySigner {

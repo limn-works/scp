@@ -6,5 +6,6 @@
 pub use scp_ffi_common::{
     BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationAuthorizer,
     BridgeRevocationChecker, BridgeRevocationDistributor, BridgeRevocationEventLogger,
-    DidRotatedEvent, DispatchDidResolver, IdentityBackedDidResolver, ResolutionError,
+    DidRotatedEvent, DispatchDidResolver, IdentityBackedDidResolver, OutletGrantNonceTracker,
+    ResolutionError,
 };

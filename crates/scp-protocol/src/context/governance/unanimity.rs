@@ -312,12 +312,7 @@ impl GovernanceEngine for UnanimityEngine {
         context: &GovernanceContext,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), GovernanceError> {
-        // Only voters can propose.
-        if !self.is_voter(proposer) {
-            return Err(GovernanceError::NotEligible(
-                "proposer is not in the voter set".to_owned(),
-            ));
-        }
+        self.check_proposer(proposer)?;
 
         // RFC 8785 JCS canonical serialization for cross-implementation
         // deterministic proposal ID computation (§9.5.2). JCS (not
@@ -407,6 +402,17 @@ impl GovernanceEngine for UnanimityEngine {
         );
 
         Ok((proposal, events))
+    }
+
+    fn check_proposer(&self, proposer: &DID) -> Result<(), GovernanceError> {
+        // Only voters can propose.
+        if self.is_voter(proposer) {
+            Ok(())
+        } else {
+            Err(GovernanceError::NotEligible(
+                "proposer is not in the voter set".to_owned(),
+            ))
+        }
     }
 
     fn approve(

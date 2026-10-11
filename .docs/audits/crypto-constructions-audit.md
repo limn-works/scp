@@ -12,6 +12,9 @@
 > X25519 — was replaced on 2026-08-30 by ADR-063, the inception-derived key-event-log identity
 > substrate, and Alec settled the curve on 2026-09-10 as ECDSA on NIST P-256
 > (`.docs/specs/09-security-model.md` §9.5).
+>
+> **Annotation, 2026-10-04.** This annotation adds the `**Resolution (later)**` line on
+> CRYPTO-33 and, like the one above, edits no finding text, severity tally, or summary line.
 
 # SCP Cryptographic Specification Audit
 
@@ -262,6 +265,7 @@ The most serious category of findings involves underspecified constructions wher
 - **What's missing**: The spec uses the word "destroyed" and "deleted" extensively for key material (old epoch keys, consumed KeyPackages, sender keys on block, access keys on revocation) but never specifies the technical requirement for zeroization. Zeroization means overwriting key material bytes with zeros before deallocation, preventing recovery from memory dumps, swap files, or core dumps. The spec should mandate: (1) all key material types implement zeroize-on-drop; (2) key material must not be copied to non-zeroizing buffers; (3) debug/display implementations must not log key material. Without these requirements, "destroyed" is operationally meaningless -- `drop()` or `free()` does not clear memory.
 - **Security impact**: Key material that is "destroyed" by deallocation without zeroization can be recovered from process memory, swap files, crash dumps, or hibernation images. This directly undermines forward secrecy claims.
 - **Severity**: LOW
+- **Resolution (later)**: Accepted and fixed for deallocation; this line does not check proposed mandates (1) to (3). `09-security-model.md` §9.15, freed heap memory, requires every shipped binary and cdylib to install a global allocator that overwrites each heap block with zeros before freeing it, requires every SQLCipher connection to set `PRAGMA cipher_memory_security = ON`, and lists the copies neither wipe reaches, swap files, crash dumps, and hibernation images among them. Alec chose that design on 2026-10-04 on issue #2636, which asked how SCP wipes freed heap memory that held secrets.
 
 ---
 

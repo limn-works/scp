@@ -379,10 +379,12 @@ mod tests {
 
     /// A fresh 65-byte uncompressed P-256 point for a leaf key position.
     fn fresh_leaf() -> [u8; 65] {
-        scp_crypto::p256::P256SigningKey::from_seed(b"attestation-verification-test", &fresh_pub())
-            .unwrap()
-            .public_key()
-            .to_uncompressed()
+        scp_crypto::p256::P256SecretKey::from_seed(
+            scp_crypto::p256::SeedLabel::TestVectorKey,
+            &fresh_pub(),
+        )
+        .public_key()
+        .to_uncompressed()
     }
 
     fn did_doc_with_active(active_key: &[u8; 32]) -> DidDocument {

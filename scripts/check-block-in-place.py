@@ -48,10 +48,6 @@ SCOPE
 ---------------------------------------------------------------------------
 All `.rs` files under `crates/scp-*/src/` EXCEPT:
 
-  - `crates/scp-runtime/src/crypto/mls/storage.rs` — OpenMLS upstream
-    `StorageProvider` trait is sync; the adapter uses `spawn_blocking`
-    per op but retains `block_in_place` at one shim boundary. Allowed
-    wholesale.
   - `crates/scp-ffi/**` — PyO3 / UniFFI / NAPI sync bindings require a
     sync-async bridge at the FFI boundary. Whole directory excluded.
 
@@ -162,9 +158,7 @@ FIXTURE_FILE = REPO_ROOT / "scripts" / "tests" / "block-in-place-fixture.rs"
 
 # Scope: `crates/scp-*/src/` except these exact paths / prefixes.
 # Paths are relative to REPO_ROOT and use forward slashes on all platforms.
-EXCLUDED_FILES = {
-    "crates/scp-runtime/src/crypto/mls/storage.rs",
-}
+EXCLUDED_FILES: set[str] = set()
 EXCLUDED_PREFIXES = ("crates/scp-ffi/",)
 
 # Directive: single-line inline allow-list.

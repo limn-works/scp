@@ -356,7 +356,7 @@ fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
 /// clone of Bob's crypto provider (so a test can assert on the installed group).
 ///
 /// `persistence` is threaded straight through: pass `None` for the happy path
-/// (a `NoopContextPersistence` default that always succeeds) or a failing
+/// (a `NoOpContextPersistence` default that always succeeds) or a failing
 /// double for the crash-safety test.
 fn bob_supervisor(
     persistence: Option<Box<dyn ContextPersistence>>,
@@ -497,20 +497,30 @@ async fn run_join_with(
         committed,
         request_params,
         request_ctx_id,
-        false,
+        None,
     )
     .await
 }
 
-/// [`run_join_with`], and when `destroy_active` is set, Bob's custody destroys
-/// his `#active` key after the bundle is sealed to it and before the spawn.
+/// When a join test makes Bob's custody lose his `#active` key.
+#[derive(Clone, Copy)]
+enum ActiveKeyLoss {
+    /// After the bundle is sealed to the key and before the spawn, so the
+    /// spawn's KEM agreement is key-not-found.
+    BeforeSpawn,
+    /// Inside the spawn, right after the KEM agreement used the key, so the
+    /// spawn's read of the `#active` public key is key-not-found.
+    AfterAgree,
+}
+
+/// [`run_join_with`], with Bob's custody losing his `#active` key at `loss`.
 async fn run_join_with_active_key(
     seed: u8,
     persistence: Option<Box<dyn ContextPersistence>>,
     committed: Option<ContextParams>,
     request_params: ContextParams,
     request_ctx_id: Option<String>,
-    destroy_active: bool,
+    loss: Option<ActiveKeyLoss>,
 ) -> (
     Result<crate::context::ContextHandle, crate::context::ContextError>,
     Joined,
@@ -573,16 +583,24 @@ async fn run_join_with_active_key(
         &DID::from(ALICE_DID),
         reservation_id,
     );
-    if destroy_active {
+    if matches!(loss, Some(ActiveKeyLoss::BeforeSpawn)) {
         bob_custody
             .destroy_key(&bob_handle)
             .await
             .expect("bob's custody destroys his #active key");
     }
 
-    let result = sup
-        .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
-        .await;
+    let result = if matches!(loss, Some(ActiveKeyLoss::AfterAgree)) {
+        let custody = crate::crypto::key_loss_custody::KeyLossCustody {
+            inner: bob_custody,
+            loss: crate::crypto::key_loss_custody::KeyLoss::AfterEd25519Agree,
+        };
+        sup.spawn_actor_from_welcome(bob, &custody, &bob_handle, req)
+            .await
+    } else {
+        sup.spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
+            .await
+    };
     (
         result,
         Joined {
@@ -625,7 +643,7 @@ async fn spawn_from_welcome_carries_a_destroyed_active_key_as_custody_key_not_fo
         Some(joiner_params()),
         joiner_params(),
         None,
-        true,
+        Some(ActiveKeyLoss::BeforeSpawn),
     )
     .await;
     // `assert!` rather than `panic!`: `check-handler-no-panic.sh` reads file
@@ -638,6 +656,32 @@ async fn spawn_from_welcome_carries_a_destroyed_active_key_as_custody_key_not_fo
     assert!(
         failure.is_some_and(scp_crypto::CustodyFailure::is_key_not_found),
         "a join under a destroyed #active key must fail with ContextError::Custody key-not-found, got {:?}",
+        result.as_ref().err()
+    );
+}
+
+/// A joiner whose custody loses the `#active` key between the KEM agreement
+/// and the read of its public key fails that read with the typed custody
+/// failure, so every bridge reports `SCP-CRYPTO-4006` there too.
+#[tokio::test]
+async fn spawn_from_welcome_carries_an_active_key_lost_after_agreement_as_custody_key_not_found() {
+    let (result, _j) = run_join_with_active_key(
+        0x5f,
+        None,
+        Some(joiner_params()),
+        joiner_params(),
+        None,
+        Some(ActiveKeyLoss::AfterAgree),
+    )
+    .await;
+    // `assert!` rather than `panic!`, as in the test above.
+    let failure = match &result {
+        Err(crate::context::ContextError::Custody(failure)) => Some(failure),
+        _ => None,
+    };
+    assert!(
+        failure.is_some_and(scp_crypto::CustodyFailure::is_key_not_found),
+        "a join whose #active key is lost after the KEM agreement must fail with ContextError::Custody key-not-found, got {:?}",
         result.as_ref().err()
     );
 }
@@ -1333,6 +1377,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
         mode: ContextMode::Broadcast,
         // Broadcast contexts only support `MemoryScope::Full`.
         memory_scope: scp_protocol::context::params::MemoryScope::Full,
+        ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
         ..ContextParams::default()
     };
     sup.create_context(
@@ -1447,12 +1492,12 @@ fn welcome_snapshot_crypto_durability_predicate_fails_closed_on_empty_or_error()
 
     // A populated crypto blob is durable — the spawn may proceed.
     assert!(
-        welcome_snapshot_crypto_is_durable(&Ok(vec![0x01, 0x02, 0x03])),
+        welcome_snapshot_crypto_is_durable(&Ok(zeroize::Zeroizing::new(vec![0x01, 0x02, 0x03]))),
         "a non-empty crypto export is durable"
     );
     // An EMPTY blob is the keyless-snapshot signal — NOT durable, fail closed.
     assert!(
-        !welcome_snapshot_crypto_is_durable(&Ok(Vec::new())),
+        !welcome_snapshot_crypto_is_durable(&Ok(zeroize::Zeroizing::default())),
         "an empty crypto export must fail closed (a joiner cannot reconnect-derive)"
     );
     // An ERRORED export is likewise not durable — fail closed.
@@ -3175,7 +3220,11 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
     );
 
     // --- COMPLETE teardown (the FFI compensating path). ---
-    let removed = j.sup.discard_joined_context(&j.ctx_id).await;
+    let removed = j
+        .sup
+        .discard_joined_context(&j.ctx_id)
+        .await
+        .expect("the discard stops the actor and deletes the snapshot");
     assert!(
         removed,
         "discard_joined_context reports it removed the live actor handle"
@@ -3225,6 +3274,257 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
         !j.sup.floors.contains_key(&j.ctx_bytes),
         "the registry floor entry is pruned on permanent teardown — no leak"
     );
+}
+
+/// A [`RecordingPersistence`] whose `persist_context`, once armed, signals
+/// `entered` and then waits for a permit from `gate` before it writes, so a
+/// test can hold an actor's write in flight.
+#[derive(Clone)]
+struct GatedPersistence {
+    inner: RecordingPersistence,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    gate: Arc<tokio::sync::Semaphore>,
+    entered: Arc<tokio::sync::Notify>,
+}
+
+impl GatedPersistence {
+    fn new() -> Self {
+        Self {
+            inner: RecordingPersistence::default(),
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            entered: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Holds every later `persist_context` at the gate.
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Lets every held and later `persist_context` through.
+    fn release(&self) {
+        self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.gate
+            .add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+    }
+
+    async fn has_snapshot(&self, context_id: &str) -> bool {
+        self.inner
+            .load_context(context_id)
+            .await
+            .expect("load never errors")
+            .is_some()
+    }
+
+    /// Waits, in paused test time, for the snapshot of `context_id` to be
+    /// deleted, and fails the test if it is still there after 60 s.
+    async fn await_deleted(&self, context_id: &str) {
+        for _ in 0..600 {
+            if !self.has_snapshot(context_id).await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            !self.has_snapshot(context_id).await,
+            "a snapshot of the discarded context remains after its actor exited"
+        );
+    }
+}
+
+#[async_trait::async_trait]
+impl ContextPersistence for GatedPersistence {
+    async fn persist_context(
+        &self,
+        context_id: &str,
+        snapshot: &crate::context::state::ContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.gate.acquire().await?.forget();
+        }
+        self.inner.persist_context(context_id, snapshot).await
+    }
+    async fn load_context(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Option<crate::context::state::ContextSnapshot>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.inner.load_context(context_id).await
+    }
+    async fn delete_context(
+        &self,
+        context_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.delete_context(context_id).await
+    }
+    async fn list_persisted_contexts(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_persisted_contexts().await
+    }
+}
+
+/// Waits until the actor behind `held` has exited, so its last write has
+/// landed before a test reads the store.
+async fn await_exit(held: &crate::context::actor::handle::ContextActorHandle) {
+    held.stop_and_await_exit_unbounded().await;
+}
+
+/// A clone of the actor handle held outside the registry (a bridge's cached
+/// handle) keeps the actor running past the registry removal, and the actor's
+/// post-loop drain persists its state after it acknowledges `Shutdown`. The
+/// discard must wait for the actor's exit, not for the ack, before it deletes
+/// the snapshot; otherwise the drain writes the snapshot back, a restart
+/// resurrects the context, and Precheck D refuses a fresh re-join.
+///
+/// The drain's write is held at a gate, so the ack has arrived and the write
+/// has not landed: the discard must still be waiting there, and once the write
+/// is let through the snapshot must end up deleted.
+#[tokio::test]
+async fn discard_joined_context_deletes_after_the_actors_last_write() {
+    let gated = GatedPersistence::new();
+    let (result, j) = join_bob(0x6e, Some(Box::new(gated.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    let held = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    gated.arm();
+
+    let sup = Arc::clone(&j.sup);
+    let id = j.ctx_id.clone();
+    let discard = tokio::spawn(async move { sup.discard_joined_context(&id).await });
+    gated.entered.notified().await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !discard.is_finished(),
+        "the discard waits for the actor's exit while its last write is in flight"
+    );
+
+    gated.release();
+    let removed = discard
+        .await
+        .expect("the discard task does not panic")
+        .expect("the discard stops the actor and deletes the snapshot");
+    assert!(removed, "the discard removed the live actor handle");
+    drop(held);
+    assert!(
+        !gated.has_snapshot(&j.ctx_id).await,
+        "no write from the discarded actor may land after the snapshot delete"
+    );
+}
+
+/// An actor that does not exit within the reply bound, because its last write
+/// after the `Shutdown` ack is stuck, makes the discard return a typed error.
+/// The snapshot must stay until the actor exits, and be deleted after its
+/// last write: deleting it at once would let that write leave a `Closed`
+/// snapshot behind, which Precheck D then holds against every re-join. A
+/// second discard of the id meanwhile is refused and deletes nothing.
+#[tokio::test]
+async fn a_timed_out_discard_deletes_the_snapshot_after_the_stuck_last_write() {
+    let gated = GatedPersistence::new();
+    let (result, j) = join_bob(0x6f, Some(Box::new(gated.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    let held = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    gated.arm();
+    tokio::time::pause();
+
+    let error = j
+        .sup
+        .discard_joined_context(&j.ctx_id)
+        .await
+        .expect_err("the exit wait times out while the last write is stuck");
+    assert!(
+        matches!(error, crate::context::ContextError::ActorBusy(_)),
+        "the caller gets the typed exit-wait error, got {error:?}"
+    );
+    assert!(
+        gated.has_snapshot(&j.ctx_id).await,
+        "the join's snapshot stays while the discarded actor can still write"
+    );
+    let again = j
+        .sup
+        .discard_joined_context(&j.ctx_id)
+        .await
+        .expect_err("a second discard is refused while the first one waits for the exit");
+    assert!(
+        matches!(again, crate::context::ContextError::ActorBusy(_)),
+        "the second discard gets the typed pending error, got {again:?}"
+    );
+    assert!(
+        gated.has_snapshot(&j.ctx_id).await,
+        "a second discard leaves the snapshot to the first one's teardown"
+    );
+
+    gated.release();
+    await_exit(&held).await;
+    gated.await_deleted(&j.ctx_id).await;
+}
+
+/// A discard whose `Shutdown` finds the mailbox full never queues it, so the
+/// actor runs on and writes its live state once the mailbox drains. The
+/// discard returns a typed error and must still stop the actor and delete the
+/// snapshot after its last write; otherwise the context resurrects `Active`
+/// on restart.
+#[tokio::test]
+async fn a_discard_that_finds_a_full_mailbox_deletes_the_snapshot_after_the_last_write() {
+    let gated = GatedPersistence::new();
+    let (result, j) = join_bob(0x70, Some(Box::new(gated.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    let held = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    gated.arm();
+    tokio::time::pause();
+
+    // `Pause` marks the actor dirty, so its coalesce arm persists, and the
+    // gate holds the actor inside that write.
+    held.send_pause()
+        .await
+        .expect("the actor acknowledges Pause");
+    gated.entered.notified().await;
+    let fillers: Vec<_> = (0..super::ACTOR_MAILBOX_CAPACITY)
+        .map(|_| {
+            let filler = held.clone();
+            tokio::spawn(async move {
+                let _reply = filler.send_persist_sync().await;
+            })
+        })
+        .collect();
+    for _ in 0..(4 * super::ACTOR_MAILBOX_CAPACITY) {
+        tokio::task::yield_now().await;
+    }
+
+    let error = j
+        .sup
+        .discard_joined_context(&j.ctx_id)
+        .await
+        .expect_err("the Shutdown send times out on the full mailbox");
+    assert!(
+        matches!(error, crate::context::ContextError::ActorBusy(_)),
+        "the caller gets the typed exit-wait error, got {error:?}"
+    );
+    assert!(
+        gated.has_snapshot(&j.ctx_id).await,
+        "the join's snapshot stays while the discarded actor can still write"
+    );
+
+    gated.release();
+    for filler in fillers {
+        filler.await.expect("a filler task does not panic");
+    }
+    await_exit(&held).await;
+    gated.await_deleted(&j.ctx_id).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -3422,9 +3722,10 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
 ///
 /// Application messages ride a per-sender AEAD layer on top of the MLS group key,
 /// so for the creator (Alice) to open a joiner's (Bob's) application traffic she
-/// must first hold Bob's sender key. A Welcome-joiner cannot PUSH its key (a push
-/// seals to each incumbent's STABLE `0xFF01` wrapping key, which openmls 0.8.1
-/// does not expose from a joined group, ADR-057), so incumbents PULL it (§9.16.2).
+/// must first hold Bob's sender key. A Welcome-joiner does not PUSH its key (a
+/// push seals to each incumbent's STABLE `0xFF01` wrapping key, and
+/// [`scp_mls::extract_member_wrapping_key`] returns only the local member's
+/// key; its rustdoc says why), so incumbents PULL it (§9.16.2).
 /// The pull answer originally gated membership on the `member_wrapping_keys` cache
 /// — EMPTY for a joiner — and rejected every incumbent's request as "from a
 /// non-member", leaving the joiner RECEIVE-ONLY. The fix reads membership from the

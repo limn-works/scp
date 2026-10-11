@@ -126,9 +126,10 @@ impl NatStrategy for FailingNatStrategy {
 ///
 /// Uses in-memory backends and the default `TlsMode::SelfSigned` (the same
 /// self-signed certificate [`SucceedingTlsProvider`] produces on a `Domain`
-/// reach). `Domain` is a publishing reach, so `DhtMode::Production` satisfies
-/// the M2 validator (advisory — nothing is published with the in-memory DHT
-/// client). Drive it with `Node::start_for_testing(test_node_config()).await`.
+/// reach). The config opts into `DhtMode::Production` (M2 accepts `Disabled`
+/// for every `Reach`, `Domain` included), which makes `Node::start` publish
+/// through the in-memory `did_method` and fail the start if that publish fails.
+/// Drive it with `Node::start_for_testing(test_node_config()).await`.
 #[must_use]
 pub fn test_node_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
     let custody = Arc::new(InMemoryKeyCustody::new());
@@ -154,8 +155,9 @@ pub fn test_node_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemory
 /// flat-config equivalent of the former no-domain builder).
 ///
 /// The provided [`ReachabilityTier`] determines how the node advertises itself
-/// (`UPnP`, STUN, or Bridge), supplied via `NatSlot::Custom`. `NatTraversal` is
-/// a publishing reach, so `DhtMode::Production` satisfies the M2 validator.
+/// (`UPnP`, STUN, or Bridge), supplied via `NatSlot::Custom`. The config opts
+/// into `DhtMode::Production` (M2 accepts `Disabled` for every `Reach`,
+/// `NatTraversal` included).
 /// Drive it with `Node::start_for_testing(test_no_domain_node_config(tier))`.
 #[must_use]
 pub fn test_no_domain_node_config(

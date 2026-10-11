@@ -1,0 +1,1136 @@
+{
+ "workspace_root": "@ROOT@",
+ "workspace_members": [
+  "scp-client",
+  "scp-client-wasm",
+  "scp-clock",
+  "scp-core",
+  "scp-crypto",
+  "scp-dht",
+  "scp-did",
+  "scp-event-log",
+  "scp-ffi",
+  "scp-ffi-common",
+  "scp-ffi-napi",
+  "scp-ffi-napi-test-stubs",
+  "scp-ffi-uniffi",
+  "scp-identity",
+  "scp-mcp",
+  "scp-media",
+  "scp-mls",
+  "scp-node",
+  "scp-platform",
+  "scp-protocol",
+  "scp-relay",
+  "scp-relay-client",
+  "scp-relay-mock",
+  "scp-runtime",
+  "scp-testing",
+  "scp-transport"
+ ],
+ "packages": [
+  {
+   "name": "scp-client",
+   "id": "scp-client",
+   "manifest_path": "@ROOT@/crates/scp-client/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-crypto",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-crypto"
+    },
+    {
+     "name": "scp-did",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-did",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-event-log",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-event-log"
+    },
+    {
+     "name": "scp-mls",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-mls"
+    },
+    {
+     "name": "scp-mls",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-mls"
+    },
+    {
+     "name": "scp-protocol",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-protocol"
+    },
+    {
+     "name": "scp-protocol",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-protocol"
+    },
+    {
+     "name": "scp-relay-client",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-relay-client"
+    },
+    {
+     "name": "scp-relay-mock",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-relay-mock"
+    }
+   ]
+  },
+  {
+   "name": "scp-client-wasm",
+   "id": "scp-client-wasm",
+   "manifest_path": "@ROOT@/crates/scp-client-wasm/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-client",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-client"
+    },
+    {
+     "name": "scp-client",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-client"
+    },
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-crypto",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-crypto"
+    },
+    {
+     "name": "scp-did",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-did",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-event-log",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-event-log"
+    },
+    {
+     "name": "scp-mls",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-mls"
+    },
+    {
+     "name": "scp-protocol",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-protocol"
+    },
+    {
+     "name": "scp-relay-client",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-relay-client"
+    },
+    {
+     "name": "scp-relay-mock",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-relay-mock"
+    }
+   ]
+  },
+  {
+   "name": "scp-clock",
+   "id": "scp-clock",
+   "manifest_path": "@ROOT@/crates/scp-clock/Cargo.toml",
+   "dependencies": []
+  },
+  {
+   "name": "scp-core",
+   "id": "scp-core",
+   "manifest_path": "@ROOT@/crates/scp-core/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-mls",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-mls"
+    },
+    {
+     "name": "scp-protocol",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-protocol"
+    },
+    {
+     "name": "scp-runtime",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-runtime"
+    }
+   ]
+  },
+  {
+   "name": "scp-crypto",
+   "id": "scp-crypto",
+   "manifest_path": "@ROOT@/crates/scp-crypto/Cargo.toml",
+   "dependencies": []
+  },
+  {
+   "name": "scp-dht",
+   "id": "scp-dht",
+   "manifest_path": "@ROOT@/crates/scp-dht/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-dht",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-dht"
+    }
+   ]
+  },
+  {
+   "name": "scp-did",
+   "id": "scp-did",
+   "manifest_path": "@ROOT@/crates/scp-did/Cargo.toml",
+   "dependencies": []
+  },
+  {
+   "name": "scp-event-log",
+   "id": "scp-event-log",
+   "manifest_path": "@ROOT@/crates/scp-event-log/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-crypto",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-crypto"
+    },
+    {
+     "name": "scp-did",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-did"
+    }
+   ]
+  },
+  {
+   "name": "scp-ffi",
+   "id": "scp-ffi",
+   "manifest_path": "@ROOT@/crates/scp-ffi/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-core",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-core"
+    },
+    {
+     "name": "scp-dht",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-dht",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-did",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-event-log",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-event-log"
+    },
+    {
+     "name": "scp-ffi-common",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-ffi/common"
+    },
+    {
+     "name": "scp-ffi-common",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-ffi/common"
+    },
+    {
+     "name": "scp-identity",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-identity"
+    },
+    {
+     "name": "scp-mcp",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-mcp"
+    },
+    {
+     "name": "scp-media",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-media"
+    },
+    {
+     "name": "scp-node",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-node"
+    },
+    {
+     "name": "scp-platform",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-platform",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-testing",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-testing"
+    },
+    {
+     "name": "scp-transport",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-transport"
+    }
+   ]
+  },
+  {
+   "name": "scp-ffi-common",
+   "id": "scp-ffi-common",
+   "manifest_path": "@ROOT@/crates/scp-ffi/common/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-core",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-core"
+    },
+    {
+     "name": "scp-dht",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-dht",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-did",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-event-log",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-event-log"
+    },
+    {
+     "name": "scp-event-log",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-event-log"
+    },
+    {
+     "name": "scp-identity",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-identity"
+    },
+    {
+     "name": "scp-identity",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-identity"
+    },
+    {
+     "name": "scp-mcp",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-mcp"
+    },
+    {
+     "name": "scp-node",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-node"
+    },
+    {
+     "name": "scp-platform",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-platform",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-protocol",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-protocol"
+    },
+    {
+     "name": "scp-transport",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-transport"
+    }
+   ]
+  },
+  {
+   "name": "scp-ffi-napi",
+   "id": "scp-ffi-napi",
+   "manifest_path": "@ROOT@/crates/scp-ffi/napi/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-core",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-core"
+    },
+    {
+     "name": "scp-dht",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-dht",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-did",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-event-log",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-event-log"
+    },
+    {
+     "name": "scp-ffi-common",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-ffi/common"
+    },
+    {
+     "name": "scp-ffi-common",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-ffi/common"
+    },
+    {
+     "name": "scp-ffi-napi-test-stubs",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-ffi/napi-test-stubs"
+    },
+    {
+     "name": "scp-identity",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-identity"
+    },
+    {
+     "name": "scp-mcp",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-mcp"
+    },
+    {
+     "name": "scp-media",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-media"
+    },
+    {
+     "name": "scp-node",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-node"
+    },
+    {
+     "name": "scp-platform",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-testing",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-testing"
+    },
+    {
+     "name": "scp-transport",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-transport"
+    }
+   ]
+  },
+  {
+   "name": "scp-ffi-napi-test-stubs",
+   "id": "scp-ffi-napi-test-stubs",
+   "manifest_path": "@ROOT@/crates/scp-ffi/napi-test-stubs/Cargo.toml",
+   "dependencies": []
+  },
+  {
+   "name": "scp-ffi-uniffi",
+   "id": "scp-ffi-uniffi",
+   "manifest_path": "@ROOT@/crates/scp-ffi/uniffi/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-core",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-core"
+    },
+    {
+     "name": "scp-dht",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-dht",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-did",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-event-log",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-event-log"
+    },
+    {
+     "name": "scp-ffi-common",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-ffi/common"
+    },
+    {
+     "name": "scp-ffi-common",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-ffi/common"
+    },
+    {
+     "name": "scp-identity",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-identity"
+    },
+    {
+     "name": "scp-mcp",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-mcp"
+    },
+    {
+     "name": "scp-media",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-media"
+    },
+    {
+     "name": "scp-node",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-node"
+    },
+    {
+     "name": "scp-platform",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-platform",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-transport",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-transport"
+    }
+   ]
+  },
+  {
+   "name": "scp-identity",
+   "id": "scp-identity",
+   "manifest_path": "@ROOT@/crates/scp-identity/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-dht",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-dht",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-did",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-platform",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-platform",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-protocol",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-protocol"
+    }
+   ]
+  },
+  {
+   "name": "scp-mcp",
+   "id": "scp-mcp",
+   "manifest_path": "@ROOT@/crates/scp-mcp/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-core",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-core"
+    }
+   ]
+  },
+  {
+   "name": "scp-media",
+   "id": "scp-media",
+   "manifest_path": "@ROOT@/crates/scp-media/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-core",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-core"
+    },
+    {
+     "name": "scp-did",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-identity",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-identity"
+    }
+   ]
+  },
+  {
+   "name": "scp-mls",
+   "id": "scp-mls",
+   "manifest_path": "@ROOT@/crates/scp-mls/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-crypto",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-crypto"
+    },
+    {
+     "name": "scp-did",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-did",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-protocol",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-protocol"
+    },
+    {
+     "name": "scp-protocol",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-protocol"
+    }
+   ]
+  },
+  {
+   "name": "scp-node",
+   "id": "scp-node",
+   "manifest_path": "@ROOT@/crates/scp-node/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-core",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-core"
+    },
+    {
+     "name": "scp-core",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-core"
+    },
+    {
+     "name": "scp-crypto",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-crypto"
+    },
+    {
+     "name": "scp-dht",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-dht",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-did",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-identity",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-identity"
+    },
+    {
+     "name": "scp-platform",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-platform",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-relay-client",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-relay-client"
+    },
+    {
+     "name": "scp-transport",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-transport"
+    }
+   ]
+  },
+  {
+   "name": "scp-platform",
+   "id": "scp-platform",
+   "manifest_path": "@ROOT@/crates/scp-platform/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-crypto",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-crypto"
+    },
+    {
+     "name": "scp-testing",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-testing"
+    }
+   ]
+  },
+  {
+   "name": "scp-protocol",
+   "id": "scp-protocol",
+   "manifest_path": "@ROOT@/crates/scp-protocol/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-crypto",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-crypto"
+    },
+    {
+     "name": "scp-did",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-did",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-event-log",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-event-log"
+    },
+    {
+     "name": "scp-event-log",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-event-log"
+    }
+   ]
+  },
+  {
+   "name": "scp-relay",
+   "id": "scp-relay",
+   "manifest_path": "@ROOT@/crates/scp-relay/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-transport",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-transport"
+    }
+   ]
+  },
+  {
+   "name": "scp-relay-client",
+   "id": "scp-relay-client",
+   "manifest_path": "@ROOT@/crates/scp-relay-client/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-protocol",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-protocol"
+    }
+   ]
+  },
+  {
+   "name": "scp-relay-mock",
+   "id": "scp-relay-mock",
+   "manifest_path": "@ROOT@/crates/scp-relay-mock/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-client",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-client"
+    },
+    {
+     "name": "scp-protocol",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-protocol"
+    },
+    {
+     "name": "scp-relay-client",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-relay-client"
+    }
+   ]
+  },
+  {
+   "name": "scp-runtime",
+   "id": "scp-runtime",
+   "manifest_path": "@ROOT@/crates/scp-runtime/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-crypto",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-crypto"
+    },
+    {
+     "name": "scp-dht",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-dht",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-did",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-event-log",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-event-log"
+    },
+    {
+     "name": "scp-event-log",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-event-log"
+    },
+    {
+     "name": "scp-identity",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-identity"
+    },
+    {
+     "name": "scp-identity",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-identity"
+    },
+    {
+     "name": "scp-media",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-media"
+    },
+    {
+     "name": "scp-mls",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-mls"
+    },
+    {
+     "name": "scp-mls",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-mls"
+    },
+    {
+     "name": "scp-platform",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-platform",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-protocol",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-protocol"
+    },
+    {
+     "name": "scp-protocol",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-protocol"
+    },
+    {
+     "name": "scp-testing",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-testing"
+    }
+   ]
+  },
+  {
+   "name": "scp-testing",
+   "id": "scp-testing",
+   "manifest_path": "@ROOT@/crates/scp-testing/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-clock",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-core",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-core"
+    },
+    {
+     "name": "scp-core",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-core"
+    },
+    {
+     "name": "scp-dht",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-dht",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-did",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-event-log",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-event-log"
+    },
+    {
+     "name": "scp-ffi-common",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-ffi/common"
+    },
+    {
+     "name": "scp-identity",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-identity"
+    },
+    {
+     "name": "scp-identity",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-identity"
+    },
+    {
+     "name": "scp-node",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-node"
+    },
+    {
+     "name": "scp-node",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-node"
+    },
+    {
+     "name": "scp-platform",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-platform",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-protocol",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-protocol"
+    },
+    {
+     "name": "scp-protocol",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-protocol"
+    },
+    {
+     "name": "scp-relay-client",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-relay-client"
+    },
+    {
+     "name": "scp-runtime",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-runtime"
+    },
+    {
+     "name": "scp-testing",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-testing"
+    },
+    {
+     "name": "scp-transport",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-transport"
+    },
+    {
+     "name": "scp-transport",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-transport"
+    }
+   ]
+  },
+  {
+   "name": "scp-transport",
+   "id": "scp-transport",
+   "manifest_path": "@ROOT@/crates/scp-transport/Cargo.toml",
+   "dependencies": [
+    {
+     "name": "scp-clock",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-clock"
+    },
+    {
+     "name": "scp-core",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-core"
+    },
+    {
+     "name": "scp-core",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-core"
+    },
+    {
+     "name": "scp-dht",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-dht"
+    },
+    {
+     "name": "scp-did",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-did"
+    },
+    {
+     "name": "scp-identity",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-identity"
+    },
+    {
+     "name": "scp-platform",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-platform",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-platform"
+    },
+    {
+     "name": "scp-protocol",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-protocol"
+    },
+    {
+     "name": "scp-relay-client",
+     "kind": null,
+     "path": "@ROOT@/crates/scp-relay-client"
+    },
+    {
+     "name": "scp-testing",
+     "kind": "dev",
+     "path": "@ROOT@/crates/scp-testing"
+    }
+   ]
+  }
+ ]
+}

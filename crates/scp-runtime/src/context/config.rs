@@ -69,11 +69,18 @@ pub enum ContextCreation {
     /// Create the context from explicit parameters (advanced path).
     ///
     /// No template ID is attached. The caller specifies every governance-
-    /// relevant parameter directly. `ceiling` is required (M2 per-variant):
-    /// there is no over-broad default capability ceiling.
+    /// relevant parameter directly. `ceiling` is required and non-empty (M2
+    /// per-variant): there is no over-broad default capability ceiling, and
+    /// [`Supervisor::create`](crate::context::supervisor::Supervisor::create)
+    /// rejects an empty one with
+    /// [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired),
+    /// as does every other create path. The check sits in the crate-private
+    /// `lifecycle_helpers::create_context`, which every create path reaches,
+    /// and again in the Phase 1 validation of the crate-private step that
+    /// builds the MLS group.
     Explicit {
         /// Capability ceiling — the maximum set of capabilities any participant
-        /// can hold. Required (M2): no over-broad default.
+        /// can hold. Required and non-empty (M2): no over-broad default.
         ceiling: Vec<Capability>,
         /// Role definitions, each a subset of the ceiling.
         roles: Vec<RoleDefinition>,

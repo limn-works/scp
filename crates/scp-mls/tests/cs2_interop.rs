@@ -12,12 +12,11 @@ use openmls::prelude::{Ciphersuite, KeyPackageIn, SignatureScheme};
 use scp_clock::SystemClock;
 use scp_crypto::p256::testing::uncompressed_point_for;
 use scp_did::SigningKeyId;
-use scp_mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
-use scp_mls::epoch_grace::EpochGraceStore;
-use scp_mls::ratchet::{process_commit, serialize_mls_message};
+use scp_mls::encrypt::{decrypt, decrypt_with_sender_did, encrypt, serialize_ciphertext};
+use scp_mls::ratchet::serialize_mls_message;
 use scp_mls::{
-    ScpCredential, ScpMlsGroup, add_member, create_group, generate_key_package, join_group,
-    remove_member,
+    DecryptedContent, ScpCredential, ScpMlsGroup, add_member, create_group, generate_key_package,
+    join_group, remove_member,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -67,6 +66,14 @@ fn assert_cs2(group: &ScpMlsGroup) -> TestResult {
     Ok(())
 }
 
+/// Processes and merges a Commit another member sent.
+fn merge_commit(group: &mut ScpMlsGroup, commit_bytes: &[u8]) -> TestResult {
+    match decrypt_with_sender_did(group, commit_bytes)? {
+        DecryptedContent::Commit { .. } => Ok(()),
+        other => Err(format!("expected a Commit, got {other:?}").into()),
+    }
+}
+
 fn send(group: &mut ScpMlsGroup, text: &[u8]) -> TestResult<Vec<u8>> {
     Ok(serialize_ciphertext(&encrypt(group, text)?)?)
 }
@@ -81,18 +88,12 @@ fn three_members_interoperate_on_cs2() -> TestResult {
 
     let (b_kp, b_signer, b_provider) = key_package(B)?;
     let add_b = add_member(&mut a, b_kp, &SystemClock)?;
-    let mut b = join_group(&add_b.welcome, b_provider, b_signer)?;
+    let mut b = join_group(&add_b.welcome, b_provider, b_signer, &SystemClock)?;
 
     let (c_kp, c_signer, c_provider) = key_package(C)?;
     let add_c = add_member(&mut a, c_kp, &SystemClock)?;
-    let mut b_grace = EpochGraceStore::new();
-    process_commit(
-        &mut b,
-        &serialize_mls_message(&add_c.commit)?,
-        &mut b_grace,
-        &SystemClock,
-    )?;
-    let mut c = join_group(&add_c.welcome, c_provider, c_signer)?;
+    merge_commit(&mut b, &serialize_mls_message(&add_c.commit)?)?;
+    let mut c = join_group(&add_c.welcome, c_provider, c_signer, &SystemClock)?;
 
     for group in [&a, &b, &c] {
         assert_cs2(group)?;
@@ -110,11 +111,10 @@ fn three_members_interoperate_on_cs2() -> TestResult {
     let c_leaf = c.own_leaf_index()?;
     let removal = remove_member(&mut a, c_leaf, &SystemClock)?;
     let removal_bytes = serialize_mls_message(&removal.commit)?;
-    process_commit(&mut b, &removal_bytes, &mut b_grace, &SystemClock)?;
+    merge_commit(&mut b, &removal_bytes)?;
     // C processes its own removal too, so the final assertion shows that C
     // is out of the group, not merely one epoch behind.
-    let mut c_grace = EpochGraceStore::new();
-    process_commit(&mut c, &removal_bytes, &mut c_grace, &SystemClock)?;
+    merge_commit(&mut c, &removal_bytes)?;
     assert!(
         !c.inner()?.is_active(),
         "C must be inactive after its removal"

@@ -5,11 +5,16 @@
 # commit stages differs from the copy a merged-in head carries, or, on a commit that is not a
 # merge, when the commit stages a Rust file at all. A merge that brings in a branch's Rust
 # unchanged runs neither step, because that branch's CI already ran both over those files.
+# The lint step also runs for a changed non-Rust path the clippy scope script selects, which
+# `scripts/tests/pre-commit-clippy-scope/run-tests.sh` covers; no path these cases change
+# meets that condition.
 #
-# Each case builds a throwaway repository in `mktemp -d`, copies the real hook into it, and
-# commits through that hook. `cargo` and `python3.12` are stubs on PATH that record their
-# arguments and exit 0, so no case compiles anything; the case reads the record to learn
-# which steps ran. `scripts/check-resolved-rustc.sh` and `scripts/check-protocol-deps.sh`
+# Each case builds a throwaway repository in `mktemp -d`, copies the real hook and the real
+# `scripts/pre-commit-clippy-scope.py` into it, and commits through that hook. `cargo` and
+# `python3.12` are stubs on PATH that record their arguments and exit 0, so no case
+# compiles anything; the case reads the record to learn which steps ran. The `python3.12`
+# stub runs the real interpreter for the scope script, and the `cargo` stub answers
+# `cargo metadata` with one workspace member in the fixture's `src/` directory. `scripts/check-resolved-rustc.sh` and `scripts/check-protocol-deps.sh`
 # in the fixture are stubs that record the same way, so each case can also assert that the
 # toolchain check ran on every commit.
 set -euo pipefail
@@ -27,15 +32,30 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OB
 
 STUBS="$WORK/bin"
 LOG="$WORK/calls.log"
+SCOPE="$(cd "$(dirname "$0")/../.." && pwd)/pre-commit-clippy-scope.py"
+REAL_PYTHON="$(command -v python3.12)"
 mkdir -p "$STUBS"
-for tool in cargo python3.12; do
-    cat > "$STUBS/$tool" <<EOF
+# The hook's clippy scope script asks `cargo metadata` for the member graph. The stub
+# answers with one workspace member in `src/`, so a changed `.rs` file there selects that
+# member and `docs/notes.md` selects nothing, and the stub runs the real interpreter for that script only.
+cat > "$STUBS/cargo" <<EOF
 #!/usr/bin/env bash
-echo "$tool \$*" >> "$LOG"
+echo "cargo \$*" >> "$LOG"
+if [ "\${1:-}" = metadata ]; then
+  root="\$(pwd -P)"
+  printf '{"workspace_root":"%s","workspace_members":["fixture"],"packages":[{"name":"fixture","id":"fixture","manifest_path":"%s/src/Cargo.toml","dependencies":[]}]}\n' "\$root" "\$root"
+fi
 exit 0
 EOF
-    chmod +x "$STUBS/$tool"
-done
+cat > "$STUBS/python3.12" <<EOF
+#!/usr/bin/env bash
+echo "python3.12 \$*" >> "$LOG"
+if [ "\${1:-}" = scripts/pre-commit-clippy-scope.py ]; then
+  exec "$REAL_PYTHON" "\$@"
+fi
+exit 0
+EOF
+chmod +x "$STUBS/cargo" "$STUBS/python3.12"
 export PATH="$STUBS:$PATH"
 
 g() { git -c commit.gpgsign=false -c core.hooksPath=scripts/hooks "$@"; }
@@ -49,6 +69,7 @@ new_repo() {
     git config user.name "pre-commit-merge test"
     git config user.email "test@example.invalid"
     cp "$HOOK" scripts/hooks/pre-commit
+    cp "$SCOPE" scripts/pre-commit-clippy-scope.py
     chmod +x scripts/hooks/pre-commit
     for stub in check-resolved-rustc.sh check-protocol-deps.sh; do
         printf '#!/usr/bin/env bash\necho "%s" >> "%s"\nexit 0\n' "$stub" "$LOG" > "scripts/$stub"
@@ -136,6 +157,24 @@ git add docs/notes.md
 : > "$LOG"
 g commit -q -m "plain docs commit" >/dev/null
 assert_steps "plain commit staging no .rs file skips the Rust lint" no
+
+# Case 6: `MERGE_HEAD` names an object the repository does not hold, so `git diff` fails
+# while the hook lists the changed paths. The hook must exit nonzero at that point, before
+# the toolchain check, instead of reading an empty list and running on.
+new_repo "$WORK/case6"
+echo '# notes, bad merge head' > docs/notes.md
+git add docs/notes.md
+printf '%s\n' 0123456789abcdef0123456789abcdef01234567 > "$(git rev-parse --git-path MERGE_HEAD)"
+: > "$LOG"
+if bash scripts/hooks/pre-commit >/dev/null 2>&1; then status=0; else status=$?; fi
+if [[ "$status" -ne 0 ]] && ! command grep -q '^check-resolved-rustc.sh' "$LOG"; then
+    echo "  ok    a git diff failure while listing changed paths stops the hook (exit ${status})"
+    PASSED=$((PASSED + 1))
+else
+    echo "  FAIL  a git diff failure while listing changed paths stops the hook (exit ${status}, want nonzero before the toolchain check)"
+    sed 's/^/          /' "$LOG" 2>/dev/null || true
+    FAILED=$((FAILED + 1))
+fi
 
 echo ""
 echo "passed: ${PASSED}  failed: ${FAILED}"

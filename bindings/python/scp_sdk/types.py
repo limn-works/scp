@@ -2,8 +2,7 @@
 
 Contains dataclasses and enums used across multiple SDK modules:
 ``Message``, ``Provenance``, ``Capability``, ``CustodyType``,
-``BridgeMode``, ``ShadowStatus``, ``ContextMode``,
-``CeilingPolicy``, ``PromotionPolicy``, ``MemoryScope``,
+``ContextMode``, ``CeilingPolicy``, ``PromotionPolicy``, ``MemoryScope``,
 ``SourceType``, ``DiscoveryMethod``, and ``ProvenanceQuality``.
 
 All types mirror their Rust counterparts in ``scp-core`` and carry full
@@ -15,7 +14,10 @@ conventions.
 from __future__ import annotations
 
 import enum
+import re
 from dataclasses import dataclass, field
+
+from scp_sdk.errors import UnknownGovernanceOutcomeError
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -48,38 +50,6 @@ class CustodyType(enum.Enum):
     #: Ephemeral in-memory key store, suitable for testing or short-lived
     #: agents.  Keys are lost on process exit.
     IN_MEMORY = "in_memory"
-
-
-class BridgeMode(enum.Enum):
-    """Bridge operating mode (spec section 12.2).
-
-    Determines how a bridge connector relays messages between an
-    external platform and an SCP context.
-    Mirrors ``scp_core::bridge::BridgeMode``.
-    """
-
-    #: Messages forwarded verbatim.  Bridge is a transparent pipe.
-    RELAY = "relay"
-    #: Bridge controls external-side identity and can act on behalf
-    #: of participants.
-    PUPPET = "puppet"
-    #: Bridge exposes a programmatic API rather than a chat interface.
-    API = "api"
-    #: Both SCP and external participants have equal agency.
-    COOPERATIVE = "cooperative"
-
-
-class ShadowStatus(enum.Enum):
-    """Shadow identity provenance status (spec section 12.2).
-
-    Indicates how a bridged participant's identity was established.
-    Used for trust evaluation.
-    """
-
-    #: Identity is a shadow -- no verified link to external identity.
-    SHADOW = "shadow"
-    #: External participant has completed an identity claim verification.
-    CLAIMED = "claimed"
 
 
 class ContextMode(enum.Enum):
@@ -182,10 +152,33 @@ class ProvenanceQuality(enum.Enum):
     PERSISTENT_VERIFIABLE = 3
 
 
-class MemberRole(enum.Enum):
-    """Role assigned to a member within a context (spec section 5.5).
+#: A custom role name ``validate_role_name`` in
+#: ``crates/scp-protocol/src/context/roles.rs`` admits: 1 to 64 bytes of
+#: lowercase ASCII letters, digits, hyphens, and underscores, neither starting
+#: nor ending with a hyphen or underscore.
+_CUSTOM_ROLE_NAME = re.compile(r"[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?")
 
-    Mirrors ``scp_core::context::roles::Role``.
+
+@dataclass(frozen=True)
+class CustomRole:
+    """A role a context's governance defined (spec section 5.5).
+
+    Attributes:
+        name: The role's name as governance defined it, for example
+            ``"night-shift-reviewer"``.
+    """
+
+    name: str
+
+
+class MemberRole(enum.Enum):
+    """A protocol-defined role a member holds within a context (spec section 5.5).
+
+    The six members carry the six names ``RESERVED_ROLE_NAMES`` in
+    ``crates/scp-protocol/src/context/roles.rs`` reserves. No custom role may
+    take any of them, so a member holding one of these names holds the
+    protocol-defined role of that name. :meth:`from_bridge` reports every other
+    role as a :class:`CustomRole` carrying its name.
     """
 
     #: Context administrator with full governance capabilities.
@@ -196,22 +189,34 @@ class MemberRole(enum.Enum):
     MEMBER = "Member"
     #: Read-only observer with no write capabilities.
     OBSERVER = "Observer"
-    #: Custom role defined by context governance.
-    CUSTOM = "Custom"
+    #: Broadcast author: writes messages and holds the outlet capabilities.
+    AUTHOR = "Author"
+    #: Broadcast subscriber: the role a broadcast subscribe assigns; reads only.
+    SUBSCRIBER = "Subscriber"
 
     @classmethod
-    def from_bridge(cls, raw: str) -> MemberRole:
-        """Parse a bridge-layer role string into a :class:`MemberRole`.
+    def from_bridge(cls, raw: str) -> MemberRole | CustomRole:
+        """Parse a bridge-layer role name.
 
-        The bridge returns a Rust debug representation. This method
-        normalises known variants and falls back to :attr:`CUSTOM` for
-        unrecognised strings.
+        Every bridge reports ``RoleAssignment.role_name``, which stores a
+        built-in role in lowercase (``"author"``) and a custom role under the
+        name governance gave it. Matching is exact.
+
+        Raises:
+            UnknownGovernanceOutcomeError: ``raw`` is neither a built-in role
+                name nor a name ``validate_role_name`` admits for a custom
+                role (code ``SCP-GOV-11040``).
         """
-        normalised = raw.strip().strip('"')
         for member in cls:
-            if normalised == member.value or normalised.lower() == member.value.lower():
+            if raw == member.value.lower():
                 return member
-        return cls.CUSTOM
+        if _CUSTOM_ROLE_NAME.fullmatch(raw) is None:
+            msg = (
+                f"bridge reported role name {raw!r}, which is neither a built-in "
+                "nor a valid custom role name"
+            )
+            raise UnknownGovernanceOutcomeError(msg, raw_outcome=raw)
+        return CustomRole(name=raw)
 
 
 class Capability(enum.Enum):
@@ -245,7 +250,6 @@ class Capability(enum.Enum):
     CONTEXT_CLOSE = "context:close"
     CHILD_CONTEXT_CREATE = "context:child:create"
     OUTLET_INTERFACE = "outlet:interface"
-    BRIDGING = "bridging"
     MEDIA_VOICE = "media:voice"
     MEDIA_VIDEO = "media:video"
     MEDIA_SCREEN_SHARE = "media:screen_share"
@@ -351,11 +355,11 @@ class Message:
 
 
 __all__ = [
-    "BridgeMode",
     "Capability",
     "CeilingPolicy",
     "ContextMode",
     "CustodyType",
+    "CustomRole",
     "DiscoveryMethod",
     "MemberRole",
     "MemoryScope",
@@ -363,6 +367,5 @@ __all__ = [
     "PromotionPolicy",
     "Provenance",
     "ProvenanceQuality",
-    "ShadowStatus",
     "SourceType",
 ]

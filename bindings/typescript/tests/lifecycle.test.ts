@@ -15,20 +15,19 @@
 
 import { describe, expect, it } from "bun:test";
 import { SCP } from "../src/scp";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
-// Best-effort detection of whether the NAPI addon is available. We
-// attempt a cheap `new SCP({ storage: { type: "in_memory" } })` inside a try/catch — if the addon is
-// structurally unavailable (missing platform optionalDependency), the
-// native bridge loader throws a `TransportError` and we skip. This
-// keeps the test file runnable in environments where the native addon
-// is not published locally (developer machine without a pre-built
-// platform package) without hard-failing the suite.
+// Detects whether the NAPI addon is installed. A cheap
+// `new SCP({ storage: { type: "in_memory" } })` runs inside a try/catch, and
+// `skipReasonIfAddonAbsent` skips the suite only when no addon is installed
+// for this platform. Every other construction failure fails the file.
 function napiAvailable(): boolean {
   try {
     const probe = new SCP({ storage: { type: "in_memory" } });
     probe.shutdown(1).catch(() => {});
     return true;
-  } catch {
+  } catch (e: unknown) {
+    skipReasonIfAddonAbsent(e);
     return false;
   }
 }

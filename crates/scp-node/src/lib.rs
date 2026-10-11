@@ -11,8 +11,6 @@
 
 #![forbid(unsafe_code)]
 
-pub mod bridge_auth;
-pub mod bridge_handlers;
 pub mod config;
 pub mod dev_api;
 pub mod dns_provider;
@@ -23,7 +21,6 @@ mod published_state;
 mod republish;
 pub mod self_host;
 pub mod tls;
-pub mod webhook;
 mod well_known;
 
 use std::collections::HashMap;
@@ -54,14 +51,14 @@ pub(crate) use published_state::{
 #[cfg(test)]
 pub(crate) use published_state::{DidPublisher, PublishAuthorization};
 
-pub use http::BroadcastContext;
+pub use http::{BoundApplicationNode, BroadcastContext};
 pub use projection::{
     DeployManifest, DeployManifestEntry, PathEntry, ProjectedContext, SiteConfig,
 };
 pub use self_host::{
     Asset, DeploySiteParams, HostSiteConfig, HostSiteError, HostSiteReady, SelfHostDeployer,
-    SelfHostError, colocated_document_vm_key_resolver, content_type_for, deploy_site,
-    embedded_assets, host_site, host_site_until, routing_id_hex,
+    SelfHostError, StorageLocationError, colocated_document_vm_key_resolver, content_type_for,
+    deploy_site, embedded_assets, host_site, host_site_until, routing_id_hex,
 };
 
 // `IdentitySource` / `ExplicitIdentity` now live in `config` (ADR-052 Phase
@@ -131,20 +128,20 @@ pub const DEFAULT_PROJECTION_RATE_LIMIT: u32 = 60;
 /// [`Full`](PublicSurface::Full) protocol surface. The `--self-host`
 /// website-hosting mode serves the restricted [`SelfHost`](PublicSurface::SelfHost)
 /// surface so the public bind exposes only the read-only website projection
-/// and never the relay upgrade or bridge routes (§10.12.8).
+/// and never the relay upgrade (§10.12.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicSurface {
     /// Full protocol surface: `.well-known/scp`, the `/scp/v1` relay
-    /// WebSocket upgrade, broadcast projection (`/scp/broadcast/*`), the
-    /// bridge routes (`/v1/scp/bridge/*`), ACME challenges, and the
-    /// virtual-host fallback. Used by every run mode except `--self-host`.
+    /// WebSocket upgrade, broadcast projection (`/scp/broadcast/*`), ACME
+    /// challenges, and the virtual-host fallback. Used by every run mode
+    /// except `--self-host`.
     Full,
     /// Restricted website surface for `--self-host`: `.well-known/scp`, the
     /// broadcast projection endpoints (`/scp/broadcast/*`, including
     /// `/feed`, `/messages`, and `/site`), and the virtual-host fallback —
-    /// and nothing else. The relay upgrade/bridge (`/scp/v1`) and the bridge
-    /// routes (`/v1/scp/bridge/*`) are NOT mounted, so an anonymous internet
-    /// client cannot reach the node's relay or bridge through the public bind.
+    /// and nothing else. The relay upgrade/bridge (`/scp/v1`) is NOT mounted,
+    /// so an anonymous internet client cannot reach the node's relay or bridge
+    /// through the public bind.
     SelfHost,
 }
 
@@ -436,55 +433,6 @@ impl<S: Storage> ApplicationNode<S> {
         self.state.live_state.get().relay_url
     }
 
-    /// Returns a clonable handle to this node's outbound webhook dispatcher.
-    ///
-    /// The dispatcher fans context events out to registered bridge webhook
-    /// endpoints (spec §12.2.1, §12.10.5). It is fed by two producers:
-    ///
-    /// 1. The inbound HTTP relay endpoint (`POST /v1/scp/bridge/webhook`),
-    ///    which reconciles platform-originated events.
-    /// 2. The local `Supervisor` event channel, wired via
-    ///    [`wire_context_events`](Self::wire_context_events).
-    #[must_use]
-    pub fn webhook_dispatcher(&self) -> Arc<crate::webhook::WebhookDispatcher> {
-        self.state.bridge_state.webhook_dispatcher()
-    }
-
-    /// Spawns a background task that forwards local `Supervisor` events to
-    /// this node's [`WebhookDispatcher`](crate::webhook::WebhookDispatcher).
-    ///
-    /// This is the production wire for SCP-to-platform webhook delivery
-    /// (§12.10.5): when a context the node hosts emits an event (message
-    /// received/sent, member joined/left, governance action), the event is
-    /// translated and dispatched to every registered webhook target matching
-    /// that context.
-    ///
-    /// The caller supplies a fresh broadcast receiver obtained from
-    /// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events).
-    /// The returned [`JoinHandle`](tokio::task::JoinHandle) owns the consumer
-    /// task; the caller MUST retain or supervise it so the task is aborted on
-    /// shutdown (otherwise it runs until the `Supervisor` — and therefore the
-    /// broadcast sender — is dropped, which closes the channel and stops the
-    /// consumer cleanly).
-    ///
-    /// # Fail-safe
-    ///
-    /// Webhook delivery is best-effort. A slow or unreachable webhook endpoint
-    /// cannot block or crash context operations: the broadcast channel drops
-    /// the oldest events for lagging consumers (logged, never panics), and the
-    /// dispatcher performs HTTP I/O on its own spawned tasks with bounded
-    /// retries.
-    #[must_use]
-    pub fn wire_context_events(
-        &self,
-        events: tokio::sync::broadcast::Receiver<(
-            String,
-            scp_core::context::membership::ContextEvent,
-        )>,
-    ) -> tokio::task::JoinHandle<()> {
-        crate::webhook::spawn_event_consumer(events, self.webhook_dispatcher())
-    }
-
     /// Returns the TLS certificate resolver for ACME hot-reload.
     ///
     /// Returns `Some` in domain mode when TLS is active, `None` in
@@ -576,16 +524,22 @@ impl<S: Storage> ApplicationNode<S> {
     /// listener (if running) to stop accepting new connections. In-flight
     /// connection handlers drain naturally -- they are not cancelled.
     ///
-    /// The tier re-evaluation task is stopped **and joined**: on a multi-thread
-    /// runtime this blocks until that task's future has been dropped, which
-    /// releases the `DidMethod`/`KeyCustody` `Arc` clones the republish path
-    /// captured. That makes teardown deterministic — after `shutdown()` returns,
-    /// the custody backend's `SqliteStorage` advisory lock is free, so a caller
+    /// The tier re-evaluation task is stopped. When the node was built on a
+    /// multi-thread runtime and the caller is off any runtime or on a
+    /// multi-thread worker, this blocks, up to a deadline, on the task's
+    /// `JoinHandle`, which tokio completes only after the task's future has been
+    /// dropped. When the join completes, the `DidMethod`/`KeyCustody` `Arc`
+    /// clones the republish path captured are released before this returns, so
+    /// the custody backend's `SqliteStorage` advisory lock is free and a caller
     /// can immediately re-open the same storage path (e.g. a node restart over a
-    /// persisted identity) without racing the background task's teardown. Absent
-    /// this join the task could still hold the custody handle for a short,
-    /// nondeterministic window after `shutdown()` returned, intermittently
-    /// failing the next open with an advisory-lock conflict. See
+    /// persisted identity) without racing the background task's teardown. At
+    /// the deadline the task is aborted instead. If the runtime is shutting
+    /// down, the wait can end before the task's future drops; that case is
+    /// logged at warn. A caller on a `current_thread` runtime gets only an
+    /// abort.
+    /// Absent the join the task could still hold the custody
+    /// handle for a short, nondeterministic window after `shutdown()` returned,
+    /// intermittently failing the next open with an advisory-lock conflict. See
     /// [`TierReEvalHandle::stop_and_wait`].
     ///
     /// See SCP-245: "Ensure graceful shutdown of dev API listener alongside
@@ -633,13 +587,13 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// [`PublicSurface::Full`] exposes the complete protocol surface:
     /// `.well-known/scp`, the `/scp/v1` relay WebSocket upgrade, the broadcast
-    /// projection endpoints (`/scp/broadcast/*`), the bridge routes
-    /// (`/v1/scp/bridge/*`), ACME challenges, and the virtual-host fallback.
+    /// projection endpoints (`/scp/broadcast/*`), ACME challenges, and the
+    /// virtual-host fallback.
     ///
     /// [`PublicSurface::SelfHost`] exposes ONLY the read-only website surface:
     /// `.well-known/scp`, the broadcast projection endpoints, and the
-    /// virtual-host fallback. The relay upgrade/bridge (`/scp/v1`) and the
-    /// bridge routes (`/v1/scp/bridge/*`) are deliberately NOT mounted — in
+    /// virtual-host fallback. The relay upgrade/bridge (`/scp/v1`) is
+    /// deliberately NOT mounted — in
     /// self-host mode the node's loopback relay is reached in-process over
     /// `127.0.0.1` and must never be exposed to anonymous internet clients on
     /// the public bind (§10.12.8; exposing `/scp/v1` would let an anonymous
@@ -660,19 +614,7 @@ impl<S: Storage> ApplicationNode<S> {
         match surface {
             PublicSurface::Full => {
                 let relay_rt = http::relay_router(Arc::clone(&self.state));
-                let (bridge, bridge_webhook) = http::build_bridge_routers(
-                    &self.state.bridge_state,
-                    self.state.bridge_lookup.as_ref(),
-                );
-                http::build_merged_router(
-                    app_router,
-                    well_known,
-                    relay_rt,
-                    projection,
-                    bridge,
-                    bridge_webhook,
-                    &self.state,
-                )
+                http::build_merged_router(app_router, well_known, relay_rt, projection, &self.state)
             }
             PublicSurface::SelfHost => {
                 http::build_self_host_router(app_router, well_known, projection, &self.state)
@@ -788,8 +730,8 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// [`PublicSurface::SelfHost`] mounts ONLY the read-only website
     /// projection surface (`.well-known/scp`, `/scp/broadcast/*`, and the
-    /// virtual-host fallback) — the relay upgrade (`/scp/v1`) and bridge
-    /// routes (`/v1/scp/bridge/*`) are not exposed on the background listener
+    /// virtual-host fallback) — the relay upgrade (`/scp/v1`) is not exposed
+    /// on the background listener
     /// (§10.12.8). All other behavior (no TLS, no dev API, double-serve
     /// prevention, shutdown via the node's cancellation token) is identical to
     /// [`serve_background`](Self::serve_background).
@@ -835,6 +777,60 @@ impl<S: Storage> ApplicationNode<S> {
         surface: PublicSurface,
         tls_config: Option<Arc<rustls::ServerConfig>>,
     ) -> Result<SocketAddr, NodeError> {
+        self.claim_background_serve()?;
+
+        let addr = bind_addr.unwrap_or(DEFAULT_BACKGROUND_HTTP_BIND_ADDR);
+
+        // Security: warn when binding a *plaintext* listener to a non-loopback
+        // address. When a TLS config is present (self-host self-signed cert),
+        // traffic is encrypted, so the "unencrypted" warning would be wrong.
+        if !addr.ip().is_loopback() && tls_config.is_none() {
+            tracing::warn!(
+                bind_addr = %addr,
+                "serve_background binding to non-loopback address — \
+                 HTTP traffic is unencrypted (no TLS) and will be \
+                 accessible from the network"
+            );
+        }
+
+        // Bind the TCP listener before spawning so we can report errors
+        // and the bound address synchronously.
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+            // Reset serving flag on bind failure.
+            self.serving.store(false, Ordering::SeqCst);
+            NodeError::Serve(format!(
+                "failed to bind background HTTP server on {addr}: {e}"
+            ))
+        })?;
+        self.spawn_background_server(listener, surface, tls_config)
+            .await
+    }
+
+    /// Serves the public surface in the background on a listener the caller
+    /// already bound, returning the listener's local address.
+    ///
+    /// [`crate::self_host::host_site_until`] binds its public listener before it
+    /// builds the node, so a `port` of 0 resolves to the OS-assigned port that
+    /// the node's configuration, NAT mapping, and ready signal all report.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::serve_background_with_surface_tls`], except that no
+    /// bind happens here.
+    pub(crate) async fn serve_background_on_listener(
+        &self,
+        listener: tokio::net::TcpListener,
+        surface: PublicSurface,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+    ) -> Result<SocketAddr, NodeError> {
+        self.claim_background_serve()?;
+        self.spawn_background_server(listener, surface, tls_config)
+            .await
+    }
+
+    /// Rejects a background serve on a shut-down node and claims the
+    /// single-serve flag. The caller resets the flag on a later failure.
+    fn claim_background_serve(&self) -> Result<(), NodeError> {
         // Reject if the node has already been shut down — the cancellation
         // token is already cancelled so the server would exit immediately.
         if self.state.shutdown_token.is_cancelled() {
@@ -854,34 +850,22 @@ impl<S: Storage> ApplicationNode<S> {
             ));
         }
 
-        let addr = bind_addr.unwrap_or(DEFAULT_BACKGROUND_HTTP_BIND_ADDR);
+        Ok(())
+    }
 
-        // Security: warn when binding a *plaintext* listener to a non-loopback
-        // address. When a TLS config is present (self-host self-signed cert),
-        // traffic is encrypted, so the "unencrypted" warning would be wrong.
-        if !addr.ip().is_loopback() && tls_config.is_none() {
-            tracing::warn!(
-                bind_addr = %addr,
-                "serve_background binding to non-loopback address — \
-                 HTTP traffic is unencrypted (no TLS) and will be \
-                 accessible from the network"
-            );
-        }
-
+    /// Spawns the background server on a bound listener. The caller holds the
+    /// single-serve flag; it is reset if the local address cannot be read.
+    async fn spawn_background_server(
+        &self,
+        listener: tokio::net::TcpListener,
+        surface: PublicSurface,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+    ) -> Result<SocketAddr, NodeError> {
         let shutdown_token = self.state.shutdown_token.clone();
 
         // Build the merged router for the requested public surface.
         let merged = self.build_scp_router_with_surface(axum::Router::new(), surface);
 
-        // Bind the TCP listener before spawning so we can report errors
-        // and the bound address synchronously.
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-            // Reset serving flag on bind failure.
-            self.serving.store(false, Ordering::SeqCst);
-            NodeError::Serve(format!(
-                "failed to bind background HTTP server on {addr}: {e}"
-            ))
-        })?;
         let local_addr = listener.local_addr().map_err(|e| {
             self.serving.store(false, Ordering::SeqCst);
             NodeError::Serve(format!("failed to get local address: {e}"))
@@ -1676,9 +1660,10 @@ impl
         // Migrated to the ADR-052 flat-config front door (Phase B-P2). The
         // dropped `.tls_provider(SelfSignedTlsProvider::new("localhost"))` is
         // reproduced by the default `TlsMode::SelfSigned`, which installs a
-        // byte-identical self-signed provider for the `Domain` reach. `Domain`
-        // is a publishing reach, so M2 requires `DhtMode::Production`
-        // (advisory in P1 — the in-memory DHT client publishes nothing).
+        // byte-identical self-signed provider for the `Domain` reach. This
+        // node opts into `DhtMode::Production` (M2 accepts `Disabled` for every
+        // `Reach`, `Domain` included), which makes `Node::start` publish
+        // through `did_method` and fail the start if that publish fails.
         //
         // Storage goes through a production `Node::start` front door: an
         // ephemeral `InMemoryStorage` is wrapped in `EncryptingAdapter` under a
@@ -2219,26 +2204,44 @@ const TIER_REEVALUATION_INTERVAL: Duration = Duration::from_mins(30);
 /// network change events. When the tier changes, it updates the DID
 /// document with the new relay address and logs at INFO level (§10.12.1).
 struct TierReEvalHandle {
-    /// Handle to the background task. Retained so the task is not detached
-    /// and can be awaited for clean shutdown if needed.
-    task: tokio::task::JoinHandle<()>,
+    /// Tokio completes a `JoinHandle` only after the task's future has been
+    /// dropped, on every exit path (normal return, cancellation, panic, abort).
+    /// Awaiting it therefore blocks until every `Arc` the future captured,
+    /// including the `DidMethod`/`KeyCustody` clones held by the republish path,
+    /// has been released.
+    ///
+    /// A value the future owns is no such witness: a sender moved into a local
+    /// of the task body drops when the body returns, before the runtime drops
+    /// the future and its captures, so a waiter on it can wake while the custody
+    /// handle is still held.
+    ///
+    /// Behind a `std::sync::Mutex` so it is takeable through the shared `&self`
+    /// shutdown path; `None` after the first stop-and-wait or abort, so a second
+    /// call is a no-op.
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Cancellation token: send `true` to stop the background task.
     cancel_tx: tokio::sync::watch::Sender<bool>,
-    /// Completion signal for deterministic teardown.
+    /// The runtime the task was spawned onto, captured at spawn.
     ///
-    /// The spawned task moves the paired [`oneshot::Sender`](tokio::sync::oneshot::Sender)
-    /// into its future; the sender is dropped only when that future is dropped
-    /// (i.e. when the task has fully unwound after cancellation). Awaiting this
-    /// receiver therefore blocks until the task future — and every `Arc` it
-    /// captured, including the `DidMethod`/`KeyCustody` clones held by the
-    /// republish path — has been released. This is what makes
-    /// [`shutdown`](ApplicationNode::shutdown) deterministically drop the
-    /// custody handle (and its `SqliteStorage` advisory lock) before the caller
-    /// re-opens the same storage path, e.g. on a node restart. Behind a
-    /// `std::sync::Mutex` so it is takeable through the shared `&self` shutdown
-    /// path; `None` after the first stop-and-wait so a second call is a no-op.
-    done_rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// [`stop_and_wait`](Self::stop_and_wait) joins through this handle rather
+    /// than through [`Handle::try_current`](tokio::runtime::Handle::try_current),
+    /// which describes the CALLER's thread: the FFI bridges call
+    /// `ApplicationNode::shutdown` from host threads that never entered the
+    /// node's runtime (the reason `SelfDidRepublishing::runtime` in
+    /// `republish.rs` gives).
+    runtime: tokio::runtime::Handle,
+    /// How long [`stop_and_wait`](Self::stop_and_wait) waits for the task to
+    /// end before it aborts the task and returns.
+    /// [`TIER_TASK_STOP_DEADLINE`] in production.
+    stop_deadline: Duration,
 }
+
+/// The bound on [`TierReEvalHandle::stop_and_wait`]'s wait for the tier task.
+///
+/// The task reads its cancel signal only between re-evaluations, so a
+/// re-evaluation already in flight at shutdown (NAT probing, then the DID
+/// document publish) runs on until it finishes or this deadline passes.
+const TIER_TASK_STOP_DEADLINE: Duration = Duration::from_secs(5);
 
 impl TierReEvalHandle {
     /// Signals the background re-evaluation task to stop, WITHOUT waiting for it
@@ -2247,78 +2250,108 @@ impl TierReEvalHandle {
     /// Fire-and-forget cancel signal. Used by the unit tests in this module to
     /// tear down a directly-spawned task once their assertions are done; the
     /// production teardown path ([`ApplicationNode::shutdown`]) uses
-    /// [`stop_and_wait`](Self::stop_and_wait) instead, which additionally joins
-    /// the task so its captured `Arc`s are released deterministically.
+    /// [`stop_and_wait`](Self::stop_and_wait) instead.
     #[cfg(test)]
     fn stop(&self) {
         let _ = self.cancel_tx.send(true);
     }
 
-    /// Signals the background task to stop and blocks until its future — and
-    /// every `Arc` it captured — has been dropped.
+    /// Signals the background task to stop.
     ///
-    /// On a multi-thread runtime this bridges the sync→async boundary with
-    /// [`tokio::task::block_in_place`] + [`Handle::block_on`](tokio::runtime::Handle::block_on),
-    /// awaiting the completion oneshot so teardown is deterministic. The cancel
-    /// signal makes the task return promptly (it is parked in a `select!` that
-    /// includes the cancel watch), so the wait is bounded by the task's current
-    /// poll, not by the 30-minute re-evaluation interval.
+    /// The task runs on the stored [`runtime`](Self::runtime). When that runtime
+    /// is multi-thread, its workers drive the task while this thread waits up to
+    /// [`stop_deadline`](Self::stop_deadline) for the `JoinHandle` to resolve; a
+    /// caller on a multi-thread worker waits inside
+    /// [`tokio::task::block_in_place`]. At the deadline the task is aborted and
+    /// this returns without waiting further, so the task's captures can outlive
+    /// the return, e.g. when the task is blocked on a host-language custody
+    /// callback that needs the thread this caller holds (the GIL, the JS main
+    /// thread). If the runtime is shutting down, the wait can end before the
+    /// task's future drops; that case is logged at warn.
     ///
-    /// `block_in_place` PANICS on a `current_thread` runtime and is unavailable
-    /// outside a runtime, so both are handled by falling back to a best-effort
-    /// `abort()` + cancel signal — exactly the prior fire-and-forget behaviour,
-    /// only reached on runtimes where a synchronous join is impossible.
-    /// Idempotent: the completion receiver is consumed on the first call, so a
-    /// second invocation only re-sends the (harmless) cancel signal.
+    /// A caller on a `current_thread` runtime gets a best-effort `abort()` +
+    /// cancel signal instead: `block_in_place` panics there, and waiting without
+    /// it would stall every task that runtime drives. A stored
+    /// `current_thread` runtime gets the same abort, because its task advances
+    /// only while that runtime's owner thread drives it, and the owner may be the
+    /// thread waiting on this call.
+    /// Idempotent: the `JoinHandle` is consumed on the first call, so a second
+    /// invocation only re-sends the (harmless) cancel signal.
     fn stop_and_wait(&self) {
         let _ = self.cancel_tx.send(true);
-        let Some(done_rx) = self
-            .done_rx
+        let Some(task) = self.take_task() else {
+            return;
+        };
+        let multi_thread = tokio::runtime::RuntimeFlavor::MultiThread;
+        let caller = tokio::runtime::Handle::try_current().ok();
+        if self.runtime.runtime_flavor() != multi_thread
+            || caller
+                .as_ref()
+                .is_some_and(|current| current.runtime_flavor() != multi_thread)
+        {
+            task.abort();
+            return;
+        }
+        // The JoinHandle resolves only after the runtime has dropped the task
+        // future, so the future's captured `Arc`s are gone when it resolves. A
+        // forwarder on the task's runtime relays the result over a std channel,
+        // so the wait needs no timer and no `block_on`. If the runtime has shut
+        // down, the forwarder is dropped unrun and `recv_timeout` returns
+        // `Disconnected` at once.
+        let abort = task.abort_handle();
+        let (joined_tx, joined_rx) = std::sync::mpsc::sync_channel(1);
+        drop(self.runtime.spawn(async move {
+            let _ = joined_tx.send(task.await);
+        }));
+        let wait = || joined_rx.recv_timeout(self.stop_deadline);
+        let joined = if caller.is_some() {
+            tokio::task::block_in_place(wait) // ci-allow: block-on: multi-thread worker waits, bounded by stop_deadline, for the tier task's captured custody Arc to drop before shutdown() returns
+        } else {
+            wait()
+        };
+        match joined {
+            Ok(Err(e)) if e.is_panic() => {
+                // The future is dropped either way, but a panic in the task is
+                // a defect to surface.
+                tracing::error!(error = %e, "tier re-evaluation task panicked");
+            }
+            // A cancelled join: only runtime shutdown can cancel the task once
+            // its handle is taken, and that drops the future too.
+            Ok(Ok(()) | Err(_)) => {}
+            // The forwarder was dropped without sending, which runtime shutdown
+            // can do before it drops the tier task's future.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::warn!(
+                    "tier re-evaluation task join was not observed: its runtime dropped the join forwarder"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                abort.abort();
+                tracing::warn!(
+                    deadline = ?self.stop_deadline,
+                    "tier re-evaluation task did not stop by the deadline; aborted it"
+                );
+            }
+        }
+    }
+
+    /// Takes the task's `JoinHandle`, leaving `None` so later calls are no-ops.
+    fn take_task(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.task
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
-        else {
-            // Already waited once; the task future has already been awaited to
-            // completion (or a prior fallback aborted it). Nothing to join.
-            return;
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                // Bridge the sync `shutdown(&self)` surface to the async task
-                // join so the custody `Arc` (and its advisory lock) is released
-                // before this returns. Multi-thread runtime only — the flavor is
-                // checked above; current_thread / no-runtime fall back to abort
-                // below instead of panicking.
-                tokio::task::block_in_place(|| {
-                    // Awaiting the completion oneshot resolves (with `Err` —
-                    // the sender was dropped, not sent) exactly when the task
-                    // future is dropped. That is the signal we need: the
-                    // future's captured `Arc`s are gone.
-                    let _ = handle.block_on(done_rx); // ci-allow: block-on: awaits the tier-task completion oneshot so the captured DidMethod/custody Arcs drop before shutdown() returns
-                }); // ci-allow: block-on: deterministic node teardown — multi-thread-checked sync→async join releasing the custody Arc before storage re-open
-            }
-            _ => {
-                // A current_thread runtime cannot `block_in_place`, and outside
-                // a runtime there is nothing to drive the join. Fall back to a
-                // best-effort abort so the task is still torn down (its future
-                // is dropped on the next runtime turn), matching the prior
-                // fire-and-forget semantics on these runtimes.
-                self.task.abort();
-            }
-        }
     }
 }
 
 impl Drop for TierReEvalHandle {
     fn drop(&mut self) {
-        // Send the cancel signal so the task exits cleanly. If send fails
-        // (already sent), abort as a safety net to prevent busy-spin when the
-        // watch sender is dropped without sending `true`. `shutdown()` already
-        // calls `stop_and_wait()`, so by the time a node is dropped the task is
-        // typically gone; this remains the backstop for nodes dropped without
-        // an explicit shutdown.
-        if self.cancel_tx.send(true).is_err() {
-            self.task.abort();
+        // Backstop for a node dropped without an explicit `shutdown()`: dropping
+        // a `JoinHandle` detaches the task rather than stopping it, so abort it.
+        // After `stop_and_wait()` the handle is already taken and this is a
+        // no-op.
+        if let Some(task) = self.take_task() {
+            task.abort();
         }
     }
 }
@@ -2536,18 +2569,10 @@ fn spawn_tier_reevaluation(
     reevaluation_interval: Duration,
 ) -> TierReEvalHandle {
     let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
-    // Completion signal: the sender is moved into the task future and never
-    // `send`s — it serves purely as a drop witness. When the future is dropped
-    // (after cancellation unwinds the loop), `_done_tx` drops too, closing the
-    // oneshot. `stop_and_wait` awaits the receiver, which resolves at exactly
-    // that moment, guaranteeing every `Arc` the future captured (the
-    // `publisher`/`DidMethod`/custody clones) is released before teardown
-    // returns. See `TierReEvalHandle::done_rx`.
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    // Teardown joins this task's `JoinHandle`, which completes only after the
+    // runtime has dropped the future and the `publisher`/`DidMethod`/custody
+    // clones it captured. See `TierReEvalHandle::task`.
     let task = tokio::spawn(async move {
-        // Held for the lifetime of the task future; dropped with it. The `move`
-        // closure captures it even though it is never read.
-        let _done_tx = done_tx;
         loop {
             let trigger_reason = tokio::select! {
                 () = tokio::time::sleep(reevaluation_interval) => {
@@ -2615,9 +2640,10 @@ fn spawn_tier_reevaluation(
         }
     });
     TierReEvalHandle {
-        task,
+        task: std::sync::Mutex::new(Some(task)),
         cancel_tx,
-        done_rx: std::sync::Mutex::new(Some(done_rx)),
+        runtime: tokio::runtime::Handle::current(),
+        stop_deadline: TIER_TASK_STOP_DEADLINE,
     }
 }
 
@@ -2639,7 +2665,7 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             custody,
             did_method,
         } => {
-            // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3), which
+            // Pre-rotation is mandatory at creation (spec §9.7.4.1 item 5(a)), which
             // requires a `PreRotationCustody` backend. The only implementation
             // is the test-harness `InMemoryPreRotationCustody` nullifier.
             #[cfg(feature = "testing")]
@@ -2655,8 +2681,8 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
                     did = %identity.did,
                     "identity created without a persistent PreRotationCustody — migration \
                      (Layer-2 DID rotation) will be impossible until the builder API is \
-                     widened to accept a real backend. Recovery from `#0` compromise via \
-                     spec §9.7.4.1 is unreachable for this identity."
+                     widened to accept a real backend. The reveal that spec §9.7.4.1 item 4 \
+                     says recovers a root compromise is unreachable for this identity."
                 );
                 Ok((identity, document, did_method))
             }
@@ -2844,7 +2870,7 @@ pub(crate) async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: 
             } else {
                 // 3. Generate a new identity and persist it.
                 //
-                // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3),
+                // Pre-rotation is mandatory at creation (spec §9.7.4.1 item 5(a)),
                 // which requires a `PreRotationCustody` backend. The only
                 // implementation is the test-harness `InMemoryPreRotationCustody`.
                 #[cfg(feature = "testing")]
@@ -2861,8 +2887,8 @@ pub(crate) async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: 
                         did = %identity.did,
                         "persisted identity created without a persistent PreRotationCustody — \
                          migration (Layer-2 DID rotation) will be impossible after process \
-                         restart. Recovery from `#0` compromise via spec §9.7.4.1 is unreachable \
-                         for this identity until the builder API is widened to accept a real \
+                         restart. The reveal that spec §9.7.4.1 item 4 says recovers a root \
+                         compromise is unreachable for this identity until the builder API is widened to accept a real \
                          backend."
                     );
                     let persisted = PersistedIdentity {
@@ -3262,16 +3288,6 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         "application node started (domain mode, TLS active)"
     );
 
-    // Build the production bridge auth lookup, hydrating from storage.
-    // The audience URL is the HTTPS base URL for this node (spec 12.10.2).
-    let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
-        Arc::clone(&storage),
-        format!("https://{domain}"),
-    ));
-    if let Err(e) = bridge_lookup.load_from_storage().await {
-        tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
-    }
-
     // Start this node's self-DID republish cycle (ADR-003 §2). Below every
     // fallible step in this builder, so no `?` leaves arms to tear down.
     let republish = start_node_republish_cycle(&did_method, &live_state).await;
@@ -3302,8 +3318,6 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         acme_challenges,
         hostname_index: tokio::sync::RwLock::new(HashMap::new()),
         default_site_routing_id: std::sync::RwLock::new(None),
-        bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
-        bridge_lookup: Some(bridge_lookup),
         #[cfg(feature = "quic")]
         publish_rate_limiter,
         #[cfg(feature = "quic")]
@@ -3627,23 +3641,6 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         ))
     };
 
-    // Bridge auth lookup — audience is the relay URL in no-domain mode (spec
-    // 12.10.2). Deliberately a SNAPSHOT, not a clone of the slot: the audience is
-    // this node's stable JWT-validation identity, not its reachability address.
-    // `load_from_storage` persists it once (`bridge/config/audience`) and never
-    // overwrites it, so it is already pinned across restarts — and making it
-    // follow a NAT tier change would silently invalidate every bridge credential
-    // an operator had already minted against the old value. The domain builder
-    // makes the same distinction visible: there the audience is
-    // `https://<domain>`, which is not the relay URL at all.
-    let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
-        Arc::clone(&storage),
-        live_state.get().relay_url,
-    ));
-    if let Err(e) = bridge_lookup.load_from_storage().await {
-        tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
-    }
-
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
         live_state: live_state.clone(),
@@ -3670,8 +3667,6 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         acme_challenges: None,
         hostname_index: tokio::sync::RwLock::new(HashMap::new()),
         default_site_routing_id: std::sync::RwLock::new(None),
-        bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
-        bridge_lookup: Some(bridge_lookup),
         // No-domain mode is plaintext `ws://` (no cert), so QUIC is not served (§10.14.3).
         #[cfg(feature = "quic")]
         publish_rate_limiter,
@@ -3789,7 +3784,7 @@ impl KeyCustody for NoOpCustody {
         _handle: &scp_platform::KeyHandle,
         _context_id: &[u8],
     ) -> impl std::future::Future<
-        Output = Result<scp_platform::PseudonymKeypair, scp_platform::PlatformError>,
+        Output = Result<scp_platform::Pseudonym, scp_platform::PlatformError>,
     > + Send {
         std::future::ready(Err(scp_platform::PlatformError::StorageError(
             "NoOpCustody: not configured".to_owned(),
@@ -3802,7 +3797,7 @@ impl KeyCustody for NoOpCustody {
         _context_id: &[u8],
         _pseudonym_epoch: u64,
     ) -> impl std::future::Future<
-        Output = Result<scp_platform::PseudonymKeypair, scp_platform::PlatformError>,
+        Output = Result<scp_platform::Pseudonym, scp_platform::PlatformError>,
     > + Send {
         std::future::ready(Err(scp_platform::PlatformError::StorageError(
             "NoOpCustody: not configured".to_owned(),
@@ -4076,8 +4071,10 @@ mod tests {
 
     /// Builds a domain-mode `NodeConfig` for `test.example.com` with a
     /// succeeding self-signed TLS provider and a fresh generated identity.
-    /// `Reach::Domain` is a publishing reach, so `DhtMode::Production` is set
-    /// (M2); the in-memory `TestDidDht` publishes nothing offline.
+    /// The config opts into `DhtMode::Production` (M2 accepts `Disabled` for
+    /// every `Reach`, `Reach::Domain` included), so `Node::start` publishes the
+    /// identity document to the in-memory `TestDidDht`, which receives it in
+    /// process and never reaches live Mainline.
     fn domain_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
@@ -4325,18 +4322,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_listening_before_did_publish() {
+    async fn relay_binds_before_did_publish() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        // Create a DID method that verifies the relay is listening when
-        // publish() is called.
-        struct RelayCheckDidMethod {
+        // A DID method that records whether `publish()` was called.
+        struct PublishRecorder {
             inner: TestDidDht,
-            relay_was_listening_at_publish: Arc<AtomicBool>,
-            bind_addr: SocketAddr,
+            published: Arc<AtomicBool>,
         }
 
-        impl DidMethod for RelayCheckDidMethod {
+        impl DidMethod for PublishRecorder {
             /// These doubles observe what the builders publish; none of them
             /// keeps a record alive, so the keep-alive client is the fail-closed
             /// `DisabledDhtClient` rather than one that would report a false
@@ -4371,17 +4366,8 @@ mod tests {
             ) -> impl std::future::Future<
                 Output = Result<scp_identity::republish::RepublishEntry, IdentityError>,
             > + Send {
-                // Probe the relay bind address to see if it's listening.
-                let addr = self.bind_addr;
-                let flag = Arc::clone(&self.relay_was_listening_at_publish);
-                let inner = &self.inner;
-                async move {
-                    // Attempt a TCP connection to the relay's bound port.
-                    if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                        flag.store(true, Ordering::SeqCst);
-                    }
-                    inner.publish(identity, document).await
-                }
+                self.published.store(true, Ordering::SeqCst);
+                self.inner.publish(identity, document)
             }
 
             fn resolve(
@@ -4403,47 +4389,63 @@ mod tests {
             }
         }
 
-        // We need to know the bind address ahead of time so the DID method
-        // can probe it.  Bind to port 0 and let the OS pick a port — but the
-        // relay picks the port, so we pre-bind a listener, record its address,
-        // then drop it and hand the same address to the config.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bind_addr = listener.local_addr().unwrap();
-        drop(listener); // free the port for the relay
-
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let relay_was_listening = Arc::new(AtomicBool::new(false));
-
-        let check_method = Arc::new(RelayCheckDidMethod {
-            inner: make_test_dht(&custody),
-            relay_was_listening_at_publish: Arc::clone(&relay_was_listening),
-            bind_addr,
-        });
-
-        let _node = Node::start_for_testing(NodeConfig {
-            bind_addr: Some(bind_addr),
-            dht: DhtMode::Production,
-            tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
-                domain: "relay-order.example.com".to_owned(),
-            })),
-            ..NodeConfig::defaults(
-                Reach::Domain {
+        // Starts a domain node whose relay binds `bind_addr`, publishing through
+        // a recorder. Returns the start result and whether `publish()` ran.
+        async fn start_recording(bind_addr: SocketAddr) -> (Result<(), NodeError>, bool) {
+            let custody = Arc::new(InMemoryKeyCustody::new());
+            let published = Arc::new(AtomicBool::new(false));
+            let recorder = Arc::new(PublishRecorder {
+                inner: make_test_dht(&custody),
+                published: Arc::clone(&published),
+            });
+            let result = Node::start_for_testing(NodeConfig {
+                bind_addr: Some(bind_addr),
+                dht: DhtMode::Production,
+                tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
                     domain: "relay-order.example.com".to_owned(),
-                },
-                IdentitySource::Generate {
-                    custody,
-                    did_method: check_method,
-                },
-                InMemoryStorage::new(),
-                BlobStorageBackend::in_memory(),
-            )
-        })
-        .await
-        .unwrap();
+                })),
+                ..NodeConfig::defaults(
+                    Reach::Domain {
+                        domain: "relay-order.example.com".to_owned(),
+                    },
+                    IdentitySource::Generate {
+                        custody,
+                        did_method: recorder,
+                    },
+                    InMemoryStorage::new(),
+                    BlobStorageBackend::in_memory(),
+                )
+            })
+            .await
+            .map(drop);
+            (result, published.load(Ordering::SeqCst))
+        }
 
+        // The ordering proof: hold the relay's address for the whole start, so
+        // the relay bind fails. If the start published before binding the
+        // relay, `publish()` would already have run when the bind failed.
+        // Holding the listener (never dropping it before the start) leaves no
+        // window for another socket to take the port.
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let held_addr = held.local_addr().unwrap();
+        let (result, published) = start_recording(held_addr).await;
         assert!(
-            relay_was_listening.load(Ordering::SeqCst),
-            "relay must be listening BEFORE DID document is published"
+            result.is_err(),
+            "a relay whose address is held must fail the start"
+        );
+        assert!(
+            !published,
+            "the relay must bind BEFORE the DID document is published"
+        );
+        drop(held);
+
+        // Control: with a free relay address the same start publishes, so the
+        // recorder observes `publish()` and the assertion above is not vacuous.
+        let (result, published) = start_recording(SocketAddr::from(([127, 0, 0, 1], 0))).await;
+        result.expect("a node whose relay can bind must start");
+        assert!(
+            published,
+            "a started domain node must publish its DID document"
         );
     }
 
@@ -4489,8 +4491,9 @@ mod tests {
     }
 
     /// Builds a no-domain (`Reach::NatTraversal`) `NodeConfig` whose NAT probe
-    /// is a `MockNatStrategy` returning `tier` (no real STUN). `NatTraversal` is a
-    /// publishing reach → `DhtMode::Production` (M2).
+    /// is a `MockNatStrategy` returning `tier` (no real STUN). The config opts
+    /// into `DhtMode::Production` (M2 accepts `Disabled` for every `Reach`,
+    /// `NatTraversal` included).
     fn no_domain_config(
         tier: ReachabilityTier,
     ) -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
@@ -6331,6 +6334,426 @@ mod tests {
         );
 
         handle.stop();
+    }
+
+    /// `DidPublisher` double whose `Drop` takes a deliberate delay before
+    /// recording that it ran. The tier task's captured `NodePublisher` is the
+    /// only owner, so the flag flips only once the task future has been dropped
+    /// and that drop has finished — the moment `stop_and_wait` must wait for.
+    /// The drop then sends on `drop_tx`, so a test whose task is aborted
+    /// rather than joined can wait for the drop without polling the flag.
+    struct SlowDropPublisher {
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        drop_tx: std::sync::mpsc::Sender<()>,
+    }
+
+    /// Long enough that a waiter woken before the task future is dropped
+    /// observes the flag still unset.
+    const SLOW_DROP_DELAY: Duration = Duration::from_millis(300);
+
+    impl Drop for SlowDropPublisher {
+        fn drop(&mut self) {
+            std::thread::sleep(SLOW_DROP_DELAY);
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.drop_tx.send(());
+        }
+    }
+
+    impl DidPublisher for SlowDropPublisher {
+        fn publish<'a>(
+            &'a self,
+            _auth: PublishAuthorization,
+            _identity: &'a ScpIdentity,
+            _document: &'a DidDocument,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Option<scp_identity::republish::RepublishEntry>, NodeError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    /// NAT strategy that reports it was entered, then panics, so a test can
+    /// drive the tier task down its panic path at a known point.
+    struct PanickingNatStrategy {
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl NatStrategy for PanickingNatStrategy {
+        fn select_tier(
+            &self,
+            _relay_port: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>> + Send + '_>,
+        > {
+            let entered = self
+                .entered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(tx) = entered {
+                let _ = tx.send(());
+            }
+            panic!("tier re-evaluation test double panics on purpose");
+        }
+    }
+
+    fn slow_drop_tier_task(
+        strategy: Arc<dyn NatStrategy>,
+        interval: Duration,
+    ) -> (
+        TierReEvalHandle,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (drop_tx, drop_rx) = std::sync::mpsc::channel();
+        let publisher = Arc::new(SlowDropPublisher {
+            dropped: Arc::clone(&dropped),
+            drop_tx,
+        });
+        let document = DidDocument {
+            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+            id: "did:dht:slowdrop".to_owned(),
+            verification_method: vec![],
+            authentication: vec![],
+            assertion_method: vec![],
+            also_known_as: vec![],
+            service: vec![],
+        };
+        let handle = spawn_tier_reevaluation(
+            strategy,
+            None,
+            NodePublisher::from_dyn(publisher as Arc<dyn DidPublisher>),
+            ScpIdentity {
+                identity_key: scp_platform::KeyHandle::new(1),
+                active_signing_key: scp_platform::KeyHandle::new(2),
+                agent_signing_key: None,
+                pre_rotation_commitment: [0u8; 32],
+                did: "did:dht:slowdrop".to_owned(),
+            },
+            LiveSlot::new(NodePublishedState {
+                document,
+                relay_url: "ws://198.51.100.7:32891/scp/v1".to_owned(),
+                record: None,
+            }),
+            32891,
+            None,
+            interval,
+        );
+        (handle, dropped, drop_rx)
+    }
+
+    /// `stop_and_wait` returns only after the cancelled task's future, and the
+    /// publisher it captured, has been dropped. A waiter woken any earlier lets
+    /// a node restart reopen custody storage while the old task still holds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn stop_and_wait_returns_after_cancelled_task_drops_its_captures() {
+        let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        }]));
+        let (handle, dropped, _) = slow_drop_tier_task(strategy, Duration::from_hours(1));
+
+        handle.stop_and_wait();
+
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "stop_and_wait returned before the tier task's captured publisher was dropped"
+        );
+    }
+
+    /// The same guarantee on the panic path: a task that panicked has its future
+    /// dropped by the runtime, and `stop_and_wait` waits for that drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn stop_and_wait_returns_after_panicked_task_drops_its_captures() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let strategy = Arc::new(PanickingNatStrategy {
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+        });
+        let (handle, dropped, _) = slow_drop_tier_task(strategy, Duration::from_millis(1));
+
+        entered_rx
+            .await
+            .expect("tier task reaches the panicking strategy");
+        handle.stop_and_wait();
+
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "stop_and_wait returned before the panicked tier task's captured publisher was dropped"
+        );
+    }
+
+    /// A caller running in a task on the node's own one-worker runtime holds
+    /// that worker, so it must hand the worker off while it waits; otherwise
+    /// neither the tier task nor the join forwarder can run before the deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn stop_and_wait_on_a_runtime_worker_returns_after_task_drops_its_captures() {
+        let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        }]));
+        let (handle, dropped, _) = slow_drop_tier_task(strategy, Duration::from_hours(1));
+
+        tokio::spawn(async move { handle.stop_and_wait() })
+            .await
+            .expect("stop_and_wait does not panic on a runtime worker");
+
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "stop_and_wait on a runtime worker returned before the tier task's captured publisher was dropped"
+        );
+    }
+
+    /// The FFI bridges' shape: the node's task runs on a multi-thread runtime,
+    /// and `stop_and_wait` is called from a host thread that never entered any
+    /// runtime. It must still return only after the task's captures dropped.
+    #[test]
+    fn stop_and_wait_off_runtime_returns_after_task_drops_its_captures() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime builds");
+        let (handle, dropped, _) = {
+            let _entered = runtime.enter();
+            let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
+                external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+            }]));
+            slow_drop_tier_task(strategy, Duration::from_hours(1))
+        };
+
+        let warnings = std::thread::spawn(move || {
+            let warnings = Arc::new(WarnCounter::default());
+            tracing::subscriber::with_default(Arc::clone(&warnings), || handle.stop_and_wait());
+            warnings.count()
+        })
+        .join()
+        .expect("stop_and_wait does not panic off-runtime");
+
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "stop_and_wait returned before the tier task's captured publisher was dropped"
+        );
+        assert_eq!(warnings, 0, "a completed join logged a warning");
+    }
+
+    /// Counts the WARN events emitted on the thread it is the default
+    /// subscriber for.
+    #[derive(Default)]
+    struct WarnCounter(std::sync::atomic::AtomicUsize);
+
+    impl WarnCounter {
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Once the task's runtime has shut down, the join forwarder is dropped
+    /// without sending, so `stop_and_wait` never observes a join. It must log
+    /// that at warn rather than return as if the join had completed.
+    #[test]
+    fn stop_and_wait_logs_a_warning_when_its_runtime_has_shut_down() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime builds");
+        let (handle, _, _) = {
+            let _entered = runtime.enter();
+            let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
+                external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+            }]));
+            slow_drop_tier_task(strategy, Duration::from_hours(1))
+        };
+        drop(runtime);
+        let warnings = Arc::new(WarnCounter::default());
+
+        tracing::subscriber::with_default(Arc::clone(&warnings), || handle.stop_and_wait());
+
+        assert_eq!(
+            warnings.count(),
+            1,
+            "stop_and_wait did not log the unobserved join"
+        );
+    }
+
+    /// NAT strategy that reports it was entered, then never completes, so the
+    /// tier task sits in an in-flight re-evaluation that never reads its cancel
+    /// signal.
+    struct StuckNatStrategy {
+        entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+
+    impl NatStrategy for StuckNatStrategy {
+        fn select_tier(
+            &self,
+            _relay_port: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>> + Send + '_>,
+        > {
+            let entered = self
+                .entered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(tx) = entered {
+                let _ = tx.send(());
+            }
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// A task stuck inside a re-evaluation never sees the cancel signal. An
+    /// off-runtime caller (the FFI bridges' shape) must still get control back, not
+    /// block forever, and the deadline's abort must drop the task's captures.
+    #[test]
+    fn stop_and_wait_off_runtime_returns_and_drops_captures_of_a_stuck_task() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime builds");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (mut handle, _, drop_rx) = {
+            let _entered = runtime.enter();
+            let strategy = Arc::new(StuckNatStrategy {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+            });
+            slow_drop_tier_task(strategy, Duration::from_millis(1))
+        };
+        handle.stop_deadline = Duration::from_millis(100);
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("tier task enters the stuck re-evaluation");
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            handle.stop_and_wait();
+            let _ = returned_tx.send(());
+        });
+
+        returned_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("stop_and_wait did not return within 30 s on a stuck task");
+        drop_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the stuck tier task's captured publisher was not dropped after the deadline");
+    }
+
+    /// A node dropped without `shutdown()` drops its `TierReEvalHandle`.
+    /// Dropping a `JoinHandle` only detaches its task, so `Drop` must abort a
+    /// task stuck in a re-evaluation, dropping its captures.
+    #[test]
+    fn dropping_the_handle_aborts_a_stuck_task() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime builds");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (handle, _, drop_rx) = {
+            let _entered = runtime.enter();
+            let strategy = Arc::new(StuckNatStrategy {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+            });
+            slow_drop_tier_task(strategy, Duration::from_millis(1))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("tier task enters the stuck re-evaluation");
+
+        drop(handle);
+
+        drop_rx.recv_timeout(Duration::from_secs(30)).expect(
+            "the stuck tier task's captured publisher was not dropped after its handle dropped",
+        );
+    }
+
+    /// A `current_thread` caller cannot block: with the task on a multi-thread
+    /// runtime, `stop_and_wait` called inside a `current_thread` runtime must
+    /// return instead of panicking in `block_in_place`, and its abort must drop
+    /// the captures of a task stuck in a re-evaluation.
+    #[test]
+    fn stop_and_wait_from_current_thread_caller_aborts_a_stuck_task() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime builds");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (handle, _, drop_rx) = {
+            let _entered = runtime.enter();
+            let strategy = Arc::new(StuckNatStrategy {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+            });
+            slow_drop_tier_task(strategy, Duration::from_millis(1))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("tier task enters the stuck re-evaluation");
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime builds");
+
+        caller.block_on(async { handle.stop_and_wait() }); // ci-allow: block-on: test enters a current_thread runtime to call stop_and_wait from its context
+
+        drop_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the stuck tier task's captured publisher was not dropped after the abort");
+    }
+
+    /// A task spawned on a `current_thread` runtime advances only while that
+    /// runtime's owner drives it. Here the owner is blocked waiting on the
+    /// caller thread, so `stop_and_wait` must return rather than block on a join
+    /// nothing will drive.
+    #[test]
+    fn stop_and_wait_on_current_thread_runtime_task_returns() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime builds");
+        let (mut handle, _, _) = {
+            let _entered = runtime.enter();
+            let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
+                external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+            }]));
+            slow_drop_tier_task(strategy, Duration::from_hours(1))
+        };
+        // Far above the 30 s receive bound below, so a wait on the undriven
+        // join cannot end at the deadline in time to pass.
+        handle.stop_deadline = Duration::from_hours(1);
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            handle.stop_and_wait();
+            let _ = returned_tx.send(());
+        });
+
+        returned_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("stop_and_wait did not return within 30 s; it blocked on an undriven join");
     }
 
     #[tokio::test]

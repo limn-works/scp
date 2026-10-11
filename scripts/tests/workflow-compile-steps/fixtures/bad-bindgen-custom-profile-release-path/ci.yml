@@ -1,0 +1,13 @@
+# A bindgen `cargo run` under the custom `ci-bridge` profile writes
+# target/<triple>/ci-bridge, so a `--library` left under target/<triple>/release reads
+# a directory this command does not write.
+name: Bad
+on: push
+jobs:
+  swift:
+    runs-on: macos-26
+    steps:
+      - run: |
+          cargo run --profile ci-bridge --target aarch64-apple-darwin -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
+            --library target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib \
+            --language swift

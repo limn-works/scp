@@ -42,11 +42,10 @@ pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 // build_sender_header, parse_sender_header, and SENDER_HEADER_SIZE are wire-format
 // internals used by crypto providers — access via encrypt:: submodule directly.
 pub use key_protocol_verify::{
-    BlockNotification, BridgeShadowKeyParams, HandleRequestParams, NONCE_DEDUP_CAPACITY,
-    NONCE_EXPIRY_SECS, NonceDedup, RotateForBlockParams, RotateForBlockResult,
-    SenderKeyDistributionMessage, SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyResponse,
-    expand_block_list, generate_wrapping_keypair, handle_bridge_shadow_key_request,
-    hpke_open_sender_key, hpke_seal_sender_key, list_shadow_sender_key_dids,
+    BlockNotification, HandleRequestParams, NONCE_DEDUP_CAPACITY, NONCE_EXPIRY_SECS, NonceDedup,
+    RotateForBlockParams, RotateForBlockResult, SenderKeyDistributionMessage,
+    SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyResponse, expand_block_list,
+    generate_wrapping_keypair, hpke_open_sender_key, hpke_seal_sender_key,
     validate_block_notification_freshness, validate_sender_key_request_freshness,
     verify_block_notification, verify_epoch_advance, verify_sender_key_request,
 };
@@ -77,8 +76,9 @@ pub const MAX_EPOCH_ADVANCE: u64 = 1000;
 /// Sender keys are used to encrypt messages before MLS group encryption,
 /// enabling per-relationship blocking. See ADR-007.
 ///
-/// Key material is zeroized on drop to prevent sensitive bytes from
-/// persisting in freed memory. Clone is retained for API compatibility
+/// Key material is zeroized on drop, wherever the value lives, a stack slot
+/// included; the wiping global allocator of security model spec §9.15 (freed
+/// heap memory) reaches freed heap blocks only. Clone is retained for API compatibility
 /// (e.g. `SenderKeyStore::get_all`).
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct SenderKey([u8; 32]);
@@ -159,8 +159,8 @@ pub enum SenderKeyError {
     #[error("signing failed: {0}")]
     SigningFailed(String),
 
-    /// A key custody call failed (`KeyCustody`). The bridges report
-    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise.
+    /// A key custody call failed (`KeyCustody`). The bridges report the code
+    /// `scp_ffi_common::error_codes::custody_failure_code` assigns to the failure's kind.
     #[error(transparent)]
     Custody(#[from] scp_crypto::CustodyFailure),
 

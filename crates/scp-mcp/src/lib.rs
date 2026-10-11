@@ -84,5 +84,6 @@ pub mod namespace;
 pub mod protocol;
 pub mod server;
 pub mod sse;
+pub mod sse_client;
 pub mod stdio;
 pub mod translator;

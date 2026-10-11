@@ -158,7 +158,7 @@ The in-memory `NonceTracker` remains the primary, synchronised replay defense on
 
 ## 17.4 ProtocolRepository
 
-`ProtocolRepository` is a concrete generic struct in `scp-core/store/` that wraps a `Storage` implementation and provides typed domain methods. These are NOT trait methods — adapters do not implement them. `ProtocolRepository` is the primary interface between protocol logic and persistent storage, with two documented exceptions (see below). The type parameter `S` is the concrete storage backend. The `Storage` trait uses RPITIT (return-position `impl Trait` in traits) and is not dyn-compatible, so `ProtocolRepository` is generic rather than using `Arc<dyn Storage>`.
+`ProtocolRepository` is a concrete generic struct in `scp-core/store/` that wraps a `Storage` implementation and provides typed domain methods. These are NOT trait methods — adapters do not implement them. `ProtocolRepository` is the primary interface between protocol logic and persistent storage, with one documented exception (see below). The type parameter `S` is the concrete storage backend. The `Storage` trait uses RPITIT (return-position `impl Trait` in traits) and is not dyn-compatible, so `ProtocolRepository` is generic rather than using `Arc<dyn Storage>`.
 
 ```rust
 /// scp-core/src/store/mod.rs
@@ -294,11 +294,9 @@ impl<S: Storage> ProtocolRepository<S> {
 
 Every `ProtocolRepository` method translates to one or two `Storage` trait calls using the key convention from section 17.3. There is no query optimizer, no batch API, no transaction boundary beyond what `delete_prefix` provides. If performance profiling reveals hot paths, batch writes can be added to `Storage` as an optional method with a default implementation that loops (Phase 6).
 
-**Exceptions to `ProtocolRepository` as the single interface.** Two subsystems access `Storage` directly rather than through `ProtocolRepository` domain methods:
+**Exception to `ProtocolRepository` as the single interface.** One subsystem accesses `Storage` directly rather than through `ProtocolRepository` domain methods:
 
-1. **MLS bridge (§17.9).** `MlsStorageBridge` accesses raw `Storage` because OpenMLS owns the storage contract and the `StorageProvider` trait dictates serialization format. Wrapping values in `StoredValue` envelopes would break OpenMLS deserialization on read-back.
-
-2. **Identity bootstrap persistence.** `ApplicationNode` reads/writes the `scp/identity` key via `Storage` directly because identity bootstrap is a pre-DID operation — the identity must be loaded before any DID is known, before contexts exist, and before `ProtocolRepository` domain methods can be used (since they are keyed by DID or context_id). This is infrastructure-level metadata, not protocol state. The value is still wrapped in a `StoredValue` version envelope and serialized with MessagePack, consistent with §17.5.
+1. **Identity bootstrap persistence.** `ApplicationNode` reads/writes the `scp/identity` key via `Storage` directly because identity bootstrap is a pre-DID operation — the identity must be loaded before any DID is known, before contexts exist, and before `ProtocolRepository` domain methods can be used (since they are keyed by DID or context_id). This is infrastructure-level metadata, not protocol state. The value is still wrapped in a `StoredValue` version envelope and serialized with MessagePack, consistent with §17.5.
 
 ### Module Structure
 
@@ -504,7 +502,7 @@ derived_key = hex_encode(argon2id(...))        // 64 hex characters, passed via 
 
 A single Argon2id parameterization across the entire codebase is REQUIRED. The passphrase-mode SQLCipher key derivation and the `FileKeyCustody` passphrase-to-wrapping-key derivation MUST share one parameter source; implementations MUST NOT define a second, divergent Argon2id parameter set. The derived 32-byte key feeds the same SQLCipher PRAGMA-key path as raw-key mode (identical `cipher_page_size`, `kdf_iter`, HMAC, and KDF PRAGMAs below).
 
-The passphrase and every intermediate buffer carrying it (and the derived key) MUST be held in zeroizing memory and cleared on drop.
+The passphrase and every intermediate buffer carrying it (and the derived key) MUST be held in zeroizing memory and cleared on drop. The allocator that §9.15 of the security-model spec requires (freed heap memory) also wipes each buffer a dependency frees during the derivation, and the requirement above still binds every buffer SCP owns.
 
 #### Salt Persistence
 
@@ -534,6 +532,23 @@ Only the first-initialization case — no `scp.db` and no `scp.salt` — generat
 // (`'<derived_key>'`) would instead treat the 64 hex characters as a passphrase
 // and PBKDF2-stretch them — a redundant second KDF over already-derived key
 // material. Raw-key syntax avoids that double-KDF.
+//
+// `conn` comes from an open that has already run the compile-option,
+// page-cache buffer probe, and lookaside checks below.
+
+// Step 1: the memory-security pragma, in a statement of its own.
+conn.execute_batch("PRAGMA cipher_memory_security = ON;")?;
+
+// Step 2: the readback, before the key statement. Anything other than the
+// single value `1` (a plain SQLite returns no row) refuses the open.
+let on: Option<String> = conn
+    .query_row("PRAGMA cipher_memory_security;", [], |row| row.get(0))
+    .optional()?;
+if on.as_deref() != Some("1") {
+    return Err(StorageError::MemorySecurityOff);
+}
+
+// Step 3: the key batch.
 conn.execute_batch("
     PRAGMA key = \"x'<derived_key>'\";
     PRAGMA cipher_page_size = 4096;
@@ -542,6 +557,41 @@ conn.execute_batch("
     PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;
 ")?;
 ```
+
+Every SQLCipher connection that opens a database SCP stores data in MUST set `PRAGMA cipher_memory_security = ON`, which makes SQLCipher wipe memory it frees. Each constructor MUST run the pragma in a statement of its own, then read `PRAGMA cipher_memory_security` back, and MUST fail with its typed storage error unless the query returns the single value `1`, all before the `PRAGMA key` statement runs; a constructor whose connection runs no key statement does both before any statement that reads a page. SQLCipher wipes only blocks freed after the pragma takes effect, so a block that held the key's hex text and was freed while the key statement ran stays readable when the key statement comes first, and a refusal made after the key statement comes after SQLite has already freed such a block unwiped. A plain SQLite returns no row for the pragma, so the readback also proves that SQLCipher is the linked engine. SQLCipher, its embedded SQLite, and SQLCipher's crypto provider (OpenSSL, or CommonCrypto on Apple targets) allocate with the C library's `malloc`, which the wiping global allocator of §9.15 of the security-model spec (freed heap memory) never sees, so the pragma is the only wipe that reaches SQLCipher's freed memory. The pragma wipes only blocks that SQLCipher's allocator frees, and two SQLite pools reuse their slots without freeing them through that allocator. The per-connection lookaside pool keeps a parsed key, statement text, or a bound value in a slot until the connection closes. The page cache's bulk block, allocated once per cache, keeps the decrypted plaintext of a page that a rollback, truncation, or cache shrink dropped. A page-cache buffer that a process hands SQLite with `sqlite3_config(SQLITE_CONFIG_PAGECACHE, buf, sz, n)` before SQLite starts does the same: SQLite serves pages from its slots and returns a freed slot to its own free list without calling `sqlite3_free`. Every such connection therefore MUST run with both pools off and with no page held in a page-cache buffer slot:
+
+- **Page-cache bulk block.** SQLite allocates a page-cache bulk block only when it was compiled without `SQLITE_ENABLE_MEMORY_MANAGEMENT`; with that option every page cache shares one page group, and SQLite allocates no bulk block. Each constructor therefore calls `sqlite3_compileoption_used("ENABLE_MEMORY_MANAGEMENT")` before the connection's first statement, and refuses to open unless it returns 1 for the linked SQLite.
+- **Lookaside.** Each constructor calls `sqlite3_db_config(db, SQLITE_DBCONFIG_LOOKASIDE, NULL, 0, 0)` on its connection before the connection's first statement. The call returns `SQLITE_BUSY` while any slot is in use, so `SQLITE_OK` proves the pool is off.
+- **Page-cache buffer.** Before it opens its connection, each constructor opens a throwaway in-memory connection, sets its page size with `PRAGMA page_size = 512`, runs one statement on it that writes a page, closes it, and calls `sqlite3_status64(SQLITE_STATUS_PAGECACHE_USED, &current, &high_water, 0)`. SQLite counts a page-cache buffer slot in that status only while a slot is checked out, and the high-water mark keeps the largest count since SQLite started, so a configured buffer has served the throwaway connection by then and a high-water mark of 0 shows that no buffer slot has held a page in this process. The check runs before the constructor's own connection opens because opening a connection already checks a buffer slot out, and the connection's first statement reads the database's pages into slots; a check made after either would leave that connection's pages in slots that return to SQLite's free list unwiped. SQLite asks a page-cache buffer only for blocks of at least one page of the asking connection's page size: a cached page with its header, or a scratch block of one page or of one page plus 8 bytes. 512 bytes is the smallest page size SQLite allows, and the throwaway connection's statement asks for a 512-byte scratch page. It therefore draws a slot from every buffer whose slots could serve any connection, unless every slot is already in use, and then the high-water mark is already above 0. A buffer whose slots are smaller than 512 bytes passes the check and never holds a page. The constructor keeps no state between calls and fails when the high-water mark is above 0.
+
+A constructor whose compile-option check does not return 1 MUST fail with its typed storage error and open no connection. A constructor whose lookaside call does not return `SQLITE_OK` MUST close the connection before any statement runs on it and fail with its typed storage error. A constructor whose page-cache buffer high-water mark is above 0 MUST fail with its typed storage error before it opens its connection.
+
+The throwaway in-memory connection of the page-cache buffer check is the one SQLCipher connection these requirements exempt: it sets no key and no pragma, and its lookaside pool stays on. It opens no database SCP stores data in and holds no data, so no block it frees and no slot it leaves holds a secret.
+
+The readback and the three checks read SQLite's state, and code in the same process can change that state. While no code in the process reconfigures SQLite, the readback proves that the pragma is on and the three checks prove that the linked SQLite allocates no bulk block, that the connection has no lookaside pool, and that no page-cache buffer slot has held a page in this process. Code in the same process that reconfigures SQLite, by any call, is one limit of all four. Its forms include:
+
+- installing a custom page cache with `sqlite3_config(SQLITE_CONFIG_PCACHE2, ...)` before SQLite starts, which SQLite offers no way to read back;
+- calling `sqlite3_shutdown` and then `sqlite3_config(SQLITE_CONFIG_MALLOC, ...)` with an allocator that does not wipe: SQLCipher installs its wiping allocator wrapper only once per process, so after that reconfiguration freed blocks go unwiped while the readback still returns `1`;
+- resetting the `SQLITE_STATUS_PAGECACHE_USED` high-water mark with `sqlite3_status(SQLITE_STATUS_PAGECACHE_USED, &current, &high_water, 1)`, after which a buffer that has held pages reads 0;
+- calling `sqlite3_shutdown` and then installing a page-cache buffer with `SQLITE_CONFIG_PAGECACHE` or a custom page cache with `SQLITE_CONFIG_PCACHE2` after a constructor's page-cache buffer check and before its open, after which the constructor's connection keeps its pages in that buffer or cache although the check read 0.
+
+§9.15 lists the copies that neither wipe reaches, memory SQLCipher's crypto provider obtains from `malloc` among them.
+
+### One Opener per Durable Directory
+
+A `SqliteStorage` takes an exclusive advisory file lock on `{dir}/scp.db.lock` before it opens `{dir}/scp.db`, and it holds that lock until it releases its database connection. The lock admits one opener, meaning one `SqliteStorage`, per directory (red-hat finding RED-1002). A writer is any task that holds a reference to the store through which the task can write, whichever owner spawned the task. The tasks in a Supervisor's hierarchy (ADR-049, the actor-per-context concurrency model, Decision 16), such as context actors, key-package actors, and supervisor background tasks, and the tasks of a node that an SDK instance started on its own store are writers today; that list names indicators, and the reference decides membership.
+
+The following requirements bind every opener and every owner of a `SqliteStorage` directory:
+
+- **One opener per directory.** An open of a directory whose lock another `SqliteStorage` holds, in the same process or in another process, MUST fail with a typed lock-still-held error and MUST NOT open the database. The opener MUST NOT wait for the lock, and it MUST NOT fall back to another backend (see Storage Selection Fails Closed above).
+- **Release after the Supervisor drain.** A store MUST release its lock and its database connection only after every writer in a Supervisor's hierarchy has exited. An SDK instance shutdown (ADR-048, SCP as a first-class multi-instance SDK object, §5) and a bridge storage close MUST NOT release the lock while any such writer can still write.
+- **Reopen after a completed shutdown succeeds on the first attempt.** When a shutdown reports that every writer in a Supervisor's hierarchy exited before its deadline and the store released its connection, an open of the same directory in the same process MUST succeed on its first attempt. A caller MUST NOT need retries, sleeps, or polling to reopen the directory.
+- **A closed store refuses operations.** After a store releases its connection, every operation on that store handle MUST fail with a typed closed-store error. A closed store MUST NOT reopen its database implicitly.
+- **A timed-out shutdown keeps the lock.** When the bounded shutdown wait of ADR-048 §5 expires before every writer in a Supervisor's hierarchy exits, the bridge returns `ShutdownOutcome::TimedOut`. The drain continues past the deadline, and when the last writer in the Supervisor's hierarchy exits, the bridge closes the store, and a close that succeeds releases the lock. Until the store releases its lock, an open of the same directory in the same process fails with the typed lock-still-held error, so no moment exists at which two openers hold one directory.
+- **A panicked drain keeps the lock.** When the Supervisor drain panics, before or after the deadline, the bridge does not close the store, and the store keeps its lock until the last reference to the store drops. Until then, an open of the same directory in the same process fails with the typed lock-still-held error.
+- **A refused close keeps the lock.** When SQLite refuses to release a store's connection, the store keeps its connection and its lock. An open of the same directory in the same process then fails with the typed lock-still-held error.
+
+ADR-049, the actor-per-context concurrency model, Decision 16 records how the runtime makes every writer in a Supervisor's hierarchy exit before shutdown returns.
 
 ### Browser Clients Run Storage In-Process
 
@@ -581,13 +631,13 @@ base_dir/
         00000000000000000001  # serialized event
 ```
 
-## 17.7 First-Party BlobStore Adapters (Relay/Server)
+## 17.7 First-Party BlobStorage Adapters (Relay/Server)
 
-Relay blob storage is a provider capability governed by the general capability-selection principle (§17.17): the backend selection is mandatory and fails closed (SCP-CAPSEL-8000/8001), the runtime never defaults it (SCP-CAPSEL-8002), and `InMemoryBlobStore` is a durability-only development arm (SCP-CAPSEL-8010/8011) — explicitly selectable, never a default or fallback, never the sole reachable arm in a shipped relay.
+Relay blob storage is a provider capability governed by the general capability-selection principle (§17.17): the backend selection is mandatory and fails closed (SCP-CAPSEL-8000/8001), the runtime never defaults it (SCP-CAPSEL-8002), and `InMemoryBlobStorage` is a durability-only development arm (SCP-CAPSEL-8010/8011) — explicitly selectable, never a default or fallback, never the sole reachable arm in a shipped relay.
 
 | Adapter | Backend | Good for | Ships in |
 |---------|---------|----------|----------|
-| `InMemoryBlobStore` | `HashMap` + secondary index | Testing, dev | Phase 1 (exists) |
+| `InMemoryBlobStorage` | `HashMap` + secondary index | Testing, dev | Phase 1 (exists) |
 | `SqliteBlobStore` | `rusqlite` | Personal relays, agent workstations, small deployments | Phase 2 |
 | `RedbBlobStore` | redb (pure Rust B-tree DB) | Medium relays, embedded scenarios | Phase 2 |
 | `PostgresBlobStore` | `sqlx` + PostgreSQL | Production/enterprise relays | Phase 5 |
@@ -690,84 +740,71 @@ output_len = 32                      // 32-byte derived key
 salt       = per-file 16-byte salt   // generated once, persisted with the custody file
 ```
 
-The Argon2id output is not used as a key itself. HKDF-SHA256 over it, with no salt, derives two 32-byte subkeys (L = 32) under distinct info labels: `scp/file-key-custody/v4/entry-aead` is the AES-256-GCM key for each entry, and `scp/file-key-custody/v4/file-mac` is an HMAC-SHA256 key. The file ends with an HMAC-SHA256 tag over every byte before it. An implementation MUST refuse a file whose length is not exactly the header, plus `entry_count` entries, plus the 32-byte tag, and MUST refuse a file whose tag does not verify, on open and on every later read. The tag stops an entry from being removed, appended or replayed, and stops the entry count from being changed. It does not stop the whole file being rolled back to an earlier version.
+### FileKeyCustody Key-File Format
 
-**The key file is a header, `entry_count` entries, and a tag, at these fixed widths.** The format version is `0x04`; an implementation MUST refuse any other version. Integers are unsigned.
+A `FileKeyCustody` file holds a header followed by zero or more fixed-width encrypted entries. Version `0x02` is current:
 
-| Field | Offset | Width (bytes) | Encoding |
-|-------|--------|---------------|----------|
-| `version` | 0 | 1 | `0x04` |
-| `argon2id_salt` | 1 | 16 | the per-file salt above |
-| `entry_count` | 17 | 4 | little-endian |
-| entries | 21 | `entry_count` × 62 | the entry layout below, in index order from 0 |
-| `file_tag` | 21 + 62 × `entry_count` | 32 | HMAC-SHA256 under the `v4/file-mac` subkey over every byte before it |
+```
+version:      u8         (1 byte, 0x02)
+argon2id_salt:[u8; 16]   (16 bytes, generated once at creation)
+commitment:   [u8; 32]   (32 bytes, HMAC-SHA-256)
+file_hmac:    [u8; 32]   (32 bytes, HMAC-SHA-256)
+entry_count:  u32 LE     (4 bytes)
+entry[i]:     key_type u8 | role u8 | entry_id [u8; 16] | nonce [u8; 12] | ciphertext+tag [u8; 48]
 
-Each entry is 62 bytes:
+key_type:     0x01 = Ed25519, 0x02 = X25519, 0x03 = P-256 signing, 0x04 = P-256 HPKE
+role:         0x00 = operational, 0x01 = identity
+```
 
-| Field | Offset in entry | Width (bytes) | Encoding |
-|-------|-----------------|---------------|----------|
-| `key_type` | 0 | 1 | `0x01` Ed25519, `0x02` X25519, `0x03` P-256 signing, `0x04` P-256 HPKE |
-| `role` | 1 | 1 | `0x00` operational, `0x01` identity |
-| `nonce` | 2 | 12 | AES-256-GCM nonce, unique per entry write |
-| `ciphertext` | 14 | 32 | the 32-byte private key under the `v4/entry-aead` subkey; a P-256 key is its big-endian scalar |
-| `aead_tag` | 46 | 16 | the AES-256-GCM tag |
+Each entry is 78 bytes. `ciphertext` is the 32-byte private key wrapped under AES-256-GCM; a P-256 key (`0x03` or `0x04`) is stored as its big-endian scalar, and an implementation MUST refuse a decrypted P-256 scalar that is zero or not below the group order `n`. Only an entry whose role byte is `0x01` may be a pseudonym-derivation source (`09-security-model.md` §9.10.4.A).
 
-Each entry's AES-256-GCM associated data is 7 bytes:
+**Key separation.** One Argon2id derivation, with the parameters the previous subsection fixes, over a caller's passphrase and `argon2id_salt` produces a 32-byte root secret. Three HMAC-SHA-256 invocations keyed by that root secret expand it under three labels: `scp-file-key-custody/v2/wrap` yields the AES-256-GCM key that wraps each stored private key, `scp-file-key-custody/v2/mac` yields the file HMAC key, and `scp-file-key-custody/v2/commit` yields the stored `commitment`. The three labels MUST differ. Each output is a pseudorandom function of that root secret and its own label, so storing `commitment` in cleartext reveals nothing about either key. Construction MUST reject an empty passphrase before it creates or reads a file, because Argon2id over an empty passphrase yields a key that anyone who reads the salt can derive.
 
-| Field | Offset | Width (bytes) | Encoding |
-|-------|--------|---------------|----------|
-| `version` | 0 | 1 | `0x04` |
-| `key_type` | 1 | 1 | the entry's `key_type` byte |
-| `role` | 2 | 1 | the entry's `role` byte |
-| `entry_index` | 3 | 4 | the entry's zero-based position, big-endian |
+**SCP-CAPSEL-8001 at construction.** Opening an existing file MUST check both header values before returning a custody object, and MUST report them as two distinct conditions:
 
-Because the associated data binds the type, the role and the position, an implementation that flips an entry's type or role byte, or moves an entry to another index, fails decryption instead of reinterpreting the key. Only an entry whose role byte is `0x01` may be a pseudonym-derivation source (`09-security-model.md` §9.10.4.A). An implementation MUST refuse a decrypted P-256 scalar that is zero or not below the group order `n`. Removing an entry re-encrypts every entry whose index shifts.
+1. A stored `commitment` that differs from the one a caller's passphrase produces means those two passphrases differ. Construction MUST return an error naming a wrong passphrase. This check answers for a file holding zero entries, where no stored key exists to test a passphrase against.
+2. A `file_hmac` that does not match, computed over every byte of that file except `file_hmac` itself (version, salt, commitment, entry count, and every entry in order), means that file changed after custody wrote it. Construction MUST return an error naming an integrity failure, because an operator answers it by restoring a backup rather than by retyping a passphrase.
+
+A file whose length differs from `85 + 78 × entry_count` bytes (the 85-byte header plus one 78-byte entry per counted entry) fails as an integrity failure too. Authenticating `entry_count` and every entry makes two attacks detectable: splicing one file's header onto another file's entries, and rewriting `entry_count` to zero to hide stored keys. Every write path (creation, append, and the rewrite that key destruction performs) MUST recompute `file_hmac` before it writes.
+
+**Every read, not construction alone.** An implementation MUST verify `file_hmac` on every read of that file, not once at construction. Verifying once leaves two conditions undetected in a process that already holds an open custody object. A writer who removes an entry, truncates the file, or rewrites `entry_count` changes which keys that file holds, and a read that checks nothing reports whatever survived that write as custody's whole contents. A later append or key destruction then reads bytes it never authenticated and recomputes `file_hmac` over them, which hands a modified file a valid tag under the victim's own MAC key.
+
+**Per-entry binding.** Every entry carries a 16-byte `entry_id` that an implementation draws from a cryptographic random source when it appends that entry, whose first eight bytes differ from those of every `entry_id` the file already holds, and that no later write changes. An implementation MUST derive the handle it returns to a caller from that `entry_id`, so that one entry carries one handle in every custody object over the file and after every reopen; `FileKeyCustody` uses the first eight bytes of `entry_id`, read little-endian, as the handle's `u64`, and construction MUST return an error when two entries derive one handle. An implementation MUST locate an entry by comparing `entry_id` rather than by indexing on a position, and MUST pass `key_type ‖ role ‖ entry_id` (18 bytes) as AES-256-GCM associated data when it encrypts that entry, where `key_type` and `role` are that entry's stored bytes. A read path MUST read the stored `key_type` byte and compare it against the key type a caller's handle names before it decrypts anything, and MUST return an error naming both types when the two differ. A read path MUST likewise compare the stored `role` byte against the role a caller's handle names, and MUST return an error naming both roles when the two differ. An implementation MUST return an error when no entry in the file carries the `entry_id` a caller's handle names, because that key left custody. A rewrite that moves an entry to another position MUST copy that entry verbatim, because the associated data covers no position.
+
+Binding a handle to a position instead hands a caller another caller's key. Two custody objects can sit over one file: two processes can open one path, and an SDK that constructs one custody object per identity over one key file puts two objects in one process. Removing an entry moves every entry after it down one position, so a handle that the second custody object minted before the removal names the entry that slid into its recorded position. The stored `key_type` byte equals what that handle expects whenever both entries hold the same key type, and re-encrypting a moved entry under its new position makes positional associated data match as well, so AES-256-GCM accepts a key its caller never designated and signing returns a signature under it. A destruction followed by an append reuses a position the same way, and so does a restore of an older copy of the file followed by an append. A constructor that numbers handles by position when it opens the file does the same to every handle a caller persisted across a restart.
+
+**One writer at a time.** An implementation MUST hold an exclusive advisory lock, which excludes other processes as well as other objects inside one process, from the read that starts a read-modify-write of a key file through the write that ends that sequence. Append, key destruction, and key import (whose duplicate scan reads the file before it decides to append) are each one such sequence. The lock lives on a sibling file, the key file's path with `.lock` appended, because every write replaces the key file by rename and a lock on the replaced inode would stop excluding a writer that opened the path after the rename. An in-process mutex does not satisfy this requirement: two custody objects that both start a read-modify-write read one entry count, each append an entry at that count, and the later write replaces the earlier one, so one generated private key never reaches disk while both callers read success. An implementation MUST bound its wait for that lock and MUST return an error naming lock contention when the wait expires, because a holder in a stopped process keeps the lock indefinitely; `FileKeyCustody` waits 10 seconds and then writes nothing.
+
+**Creation and versions.** Creating a file MUST use an exclusive create (`O_EXCL` or a platform equivalent), so two processes creating one path never both succeed and one never overwrites another's keys. A constructor that loses that race opens the existing file; when that file is still zero-length because the winner is deriving its key, `FileKeyCustody` waits up to 10 seconds for the header and then returns an error. An implementation reading a version other than `0x02` MUST reject that file by version rather than open it.
+
+**What a passphrase commitment and a file HMAC do not catch.** Both values live inside the file they authenticate, so both roll back with it. An attacker who copies a key file, waits for an operator to destroy a compromised key, and restores that copy presents a file whose commitment matches the operator's passphrase and whose HMAC matches its own bytes; construction accepts it and a destroyed key is back in service. Detecting a rollback needs monotonic state outside that file, which this format does not carry, so an operator who destroys a key MUST treat a restorable copy of a key file as live key material.
 
 ## 17.9 OpenMLS StorageProvider Bridge
 
-OpenMLS requires a `StorageProvider` trait implementation for persisting MLS group state (tree nodes, key schedules, proposals, etc.). `MlsStorageBridge` wraps `ProtocolRepository` and delegates to the `mls/{context_id}/...` key prefix.
+OpenMLS requires a `StorageProvider` implementation for the MLS group state it keeps (tree nodes, key schedules, proposals, HPKE private keys). Every live SCP provider is `scp_mls::InMemoryMlsProvider`, and its `StorageProvider` is `scp_mls::InMemoryMlsStorage`, which holds that state in memory. §17.9.1 persists the state as one snapshot blob.
 
 ```rust
-/// scp-core/src/crypto/mls/storage.rs
+/// scp-mls/src/provider.rs
 
-pub struct MlsStorageBridge<S: Storage> {
-    store: Arc<ProtocolRepository<S>>,
-    context_id: ContextId,
+pub struct InMemoryMlsStorage {
+    memory: openmls_memory_storage::MemoryStorage,
 }
 
-impl<S: Storage> MlsStorageBridge<S> {
-    pub fn new(store: Arc<ProtocolRepository<S>>, context_id: ContextId) -> Self;
-}
-
-impl<S: Storage> openmls_traits::storage::StorageProvider for MlsStorageBridge<S> {
-    // All methods delegate to self.store.storage with key prefix "mls/{context_id}/..."
-    // OpenMLS key types are serialized via MessagePack before storage.
-    // This is a mechanical mapping — no protocol logic.
+impl StorageProvider<CURRENT_VERSION> for InMemoryMlsStorage {
+    type Error = InMemoryMlsStorageError;
+    // Every method except write_signature_key_pair delegates to `memory`.
+    // write_signature_key_pair stores nothing and returns
+    // InMemoryMlsStorageError::SignerStorageForbidden.
 }
 ```
 
-**Key prefix mapping:** OpenMLS storage types map to sub-prefixes under `mls/{context_id}/`:
+**The provider refuses to store the MLS signer.** `InMemoryMlsStorage::write_signature_key_pair` writes nothing and returns `InMemoryMlsStorageError::SignerStorageForbidden`, and `SignatureKeyPair::store` reaches that method, so it fails the same way. Every OpenMLS operation SCP calls takes the signer as an argument, and OpenMLS never reads a stored `SignatureKeyPair` back. A stored copy would therefore only be a second copy of the private key, and §17.9.1 would carry that copy into every snapshot. The `disallowed-methods` lint in `.clippy.toml` and `crates/scp-runtime/clippy.toml` rejects both calls in SCP's crates at compile time. The refusal covers a call the lint does not see, such as one compiled only for wasm32 or one made inside a dependency.
 
-```
-mls/{context_id}/group_state
-mls/{context_id}/tree/{leaf_index}
-mls/{context_id}/key_schedule/{epoch}
-mls/{context_id}/proposal/{hash}
-mls/{context_id}/key_package/{hash}
-mls/{context_id}/encryption_key/{epoch}/{generation}
-```
-
-The exact sub-prefix structure follows OpenMLS's `StorageProvider` method signatures. The bridge is a thin translation layer — it adds no behavior beyond key construction and serialization.
-
-**Why this bypasses `ProtocolRepository` domain methods.** Every other domain area stores data through typed `ProtocolRepository` methods that apply `StoredValue` version envelopes. The MLS bridge is one of two documented exceptions that access raw `Storage` directly (the other is identity bootstrap persistence — see §17.4). This is intentional:
-
-- **OpenMLS owns the storage contract.** The `StorageProvider` trait dictates what gets stored, key structure, and serialization format. Wrapping values in `StoredValue` envelopes would break OpenMLS deserialization on read-back.
-- **The bridge is the domain layer.** It constructs namespaced keys, validates context IDs via `sanitize_key_component`, and handles serialization. ProtocolRepository wrapper methods would be pure indirection.
-- **Migration is OpenMLS's concern.** MLS state serialization is governed by the OpenMLS version, not SCP's `StoredValue` versioning. Format changes across OpenMLS upgrades follow OpenMLS's own compatibility guarantees.
+`InMemoryMlsProvider` zeroizes every stored value when it drops, and it draws OpenMLS's `rand()` randomness from the operating system on every request (security model spec §9.15).
 
 ### 17.9.1 MLS Crypto State Snapshot
 
-`MlsStorageBridge` (§17.9) implements the OpenMLS `StorageProvider` trait for fine-grained per-item persistence under the `mls/{context_id}/...` key prefix. A complete MLS crypto context also includes state that lives outside the OpenMLS `StorageProvider` contract:
+`InMemoryMlsProvider` (§17.9) holds the state OpenMLS keeps through its `StorageProvider` trait. A complete MLS crypto context also includes state that lives outside the OpenMLS `StorageProvider` contract:
 
 - **Sender keys and sender key store** — per-member symmetric keys for the sender key layer (ADR-001, §23)
 - **MLS signer** (`SignatureKeyPair`) — P-256 signing credential used by OpenMLS under RFC 9420 ciphersuite 2
@@ -778,16 +815,15 @@ Per ADR-049, this state is owned by the per-context actor (`PerContextState.mode
 
 Two inherent operations on the encrypted-mode state handle snapshot serialization atomically:
 
-- **`export_crypto_state(context_id) -> Vec<u8>`** — Serializes the full crypto state for a context into an opaque `MlsCryptoSnapshot` blob (MessagePack). This includes the OpenMLS in-memory storage entries, the signer, sender keys, member wrapping public keys, and epoch metadata. The member's own DHKEM(P-256) wrapping keypair is per identity (`09-security-model.md` §9.16.1), is stored once under `wrapping_key/{did}`, and is not part of any context snapshot. Sensitive key material (signer bytes, sender keys, MLS storage entries) is zeroized from the intermediate snapshot struct immediately after serialization.
+- **`export_crypto_state(context_id) -> Vec<u8>`** — Serializes the full crypto state for a context into an opaque `MlsCryptoSnapshot` blob (MessagePack). This includes the OpenMLS in-memory storage entries, the signer, sender keys, member wrapping public keys, and epoch metadata. The member's own DHKEM(P-256) wrapping keypair is per identity (`09-security-model.md` §9.16.1), is stored once under `wrapping_key/{did}`, and is not part of any context snapshot. Sensitive key material (signer bytes, sender keys, MLS storage entries) is zeroized from the intermediate snapshot struct immediately after serialization. The allocator that §9.15 of the security-model spec requires (freed heap memory) wipes each intermediate buffer the serializer frees, including the old block that each growth of the output buffer frees.
 
-- **`restore_crypto_state(context_id, data) -> Result<()>`** — Deserializes the snapshot blob and reconstructs the full crypto state: rebuilds the `InMemoryMlsProvider` with persisted storage entries, loads the MLS group via `MlsGroup::load`, restores the signer to OpenMLS's key store, and reconstructs the sender key store and member wrapping public keys. Restoring a context never writes the member's own wrapping keypair. Intermediate buffers are zeroized after deserialization via `drain()` and explicit `zeroize()` calls.
+- **`restore_crypto_state(context_id, data) -> Result<()>`** — Deserializes the snapshot blob and reconstructs the full crypto state: rebuilds the `InMemoryMlsProvider` with persisted storage entries, loads the MLS group via `MlsGroup::load`, restores the signer beside the group (never into OpenMLS's key store, because every OpenMLS operation that signs takes the signer as an argument and OpenMLS never reads a stored `SignatureKeyPair` back, so a stored copy would only be a second copy of the private key), and reconstructs the sender key store and member wrapping public keys. Restoring a context never writes the member's own wrapping keypair. Intermediate buffers are zeroized after deserialization via `drain()` and explicit `zeroize()` calls.
 
 The snapshot blob is stored in `ContextSnapshot.mls_crypto_state` and persisted alongside the rest of the context state in `context/{context_id}/full_snapshot`. On context restoration, the blob is restored before the per-context actor resumes so that its MLS group and sender keys are available for subsequent encrypt/decrypt operations.
 
-**Relationship to `MlsStorageBridge`.** The blob snapshot is the **sole active** persistence mechanism for MLS crypto state in the current implementation. The actor-local OpenMLS provider uses in-memory storage at runtime; `MlsStorageBridge` (§17.9) remains implemented but is **not wired into the runtime crypto provider path**. It exists as infrastructure for future fine-grained persistence if needed.
+**Signer entries are refused at capture and restore.** OpenMLS's in-memory storage files a stored signer under the `SignatureKeyPair` label. Capture (`scp_mls::snapshot::capture_signer_and_storage`) fails with `MlsError::SignerStorageForbidden` when any provider storage key carries that label, and it returns no entries. Restore rebuilds every provider through `InMemoryMlsProvider::from_storage_entries`, which checks every key of the blob before it inserts one. On a signer-labelled key it fails with `MlsError::SignerStorageForbidden`, and it inserts nothing. The refused entries stay in the blob's wiping buffer, which zeroizes them when it drops. A signer entry that reaches a provider through a crafted blob, or through a call the §17.9 refusal does not see, therefore makes capture or restore fail, and it never re-enters a provider.
 
-- **The blob snapshot** (active) captures the complete crypto provider state atomically — both the OpenMLS-managed portion (group state, tree nodes, key schedules) and the SCP-managed portion (sender keys, member wrapping public keys, signer) — as a single unit. On restore, it re-populates the in-memory structures that OpenMLS operates against.
-- **`MlsStorageBridge`** (not currently instantiated) provides the OpenMLS `StorageProvider` trait implementation for fine-grained, per-item MLS storage. If activated in a future iteration, it would allow OpenMLS to persist individual items incrementally rather than relying on full-state snapshots.
+**The blob snapshot is the only persistence mechanism for MLS crypto state.** It captures the OpenMLS-managed portion (group state, tree nodes, key schedules) and the SCP-managed portion (sender keys, member wrapping public keys, signer) as a single unit. On restore, it re-populates the in-memory structures that OpenMLS operates against.
 
 The snapshot approach ensures atomicity: all crypto state is persisted and restored as a single unit. Without it, a crash between persisting MLS state and persisting sender key state would leave the context in an inconsistent state where MLS decryption succeeds but sender key decryption fails (or vice versa).
 
@@ -831,7 +867,7 @@ storage_conformance!(|| MyCustomStorage::new());
 
 The conformance suite tests: store/retrieve roundtrip, missing key returns None, delete removes, list_keys with prefix filtering, list_keys returns sorted results, delete_prefix removes all matching keys, exists returns true/false correctly, and concurrent access safety.
 
-### Custom BlobStore Adapters
+### Custom BlobStorage Adapters
 
 Implement the 5 required async methods of the `BlobStorage` trait (`store`, `get`, `query`, `delete`, `purge_expired`). The 2 streaming methods (`store_streaming`, `get_streaming`) have default implementations that delegate to the `Vec<u8>` methods — override them only if your backend benefits from avoiding full materialization (see §17.7.1). Run the `blob_store_conformance!()` macro.
 
@@ -920,8 +956,6 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 | `sender_key_roundtrip` | Store sender key, load, verify key matches |
 | `key_state_cache_roundtrip` | Cache key state, load, verify matches |
 | `relay_score_list` | Store scores for 3 relays, list all, verify all returned |
-| `mls_group_state_roundtrip` | Create MLS group, persist via `MlsStorageBridge` (§17.9), reload, verify group state matches |
-| `mls_state_isolated_per_context` | Two contexts with MLS groups via `MlsStorageBridge`, verify state does not leak between contexts |
 
 ## 17.14 Phase Integration
 
@@ -929,7 +963,7 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 
 - `InMemoryStorage` implements all 6 `Storage` methods including `delete_prefix` and `exists`
 - Skeleton `ProtocolRepository` with context state, membership, and nonce methods
-- `MlsStorageBridge` skeleton (OpenMLS `StorageProvider` implementation)
+- `InMemoryMlsProvider` (OpenMLS `StorageProvider` implementation that refuses to store the MLS signer, §17.9)
 - `storage_conformance!()` macro covers all 6 methods, ordering, and concurrency
 - `InMemoryStorage` passes full conformance suite
 
@@ -1035,7 +1069,7 @@ For each unresolved saga:
 
 ## 17.17 Capability Selection Is Mandatory, Fails Closed, and Never Defaults
 
-Storage (§17.6) is one instance of a rule that governs **every provider capability** in SCP. A *provider capability* is any pluggable dependency the system resolves to a concrete implementation at construction time and that carries a runtime "which implementation?" choice: client storage (§17.6), relay blob storage (§17.7), identity resolution (`03-identity.md` §3.10), the witness per-subject store (§17.17.4), credential storage, key custody (§17.8), device attestation, and the relay querier are the current set. Each such capability falls under the normative rule stated here.
+Storage (§17.6) is one instance of a rule that governs **every provider capability** in SCP. A *provider capability* is any pluggable dependency the system resolves to a concrete implementation at construction time and that carries a runtime "which implementation?" choice: client storage (§17.6), relay blob storage (§17.7), identity resolution (`03-identity.md` §3.10), the witness per-subject store (§17.17.4), key custody (§17.8), device attestation, and the relay querier are the current set. Each such capability falls under the normative rule stated here.
 
 §17.6 ("First-Party Storage Adapters") is the **first and canonical instance** of this rule. The sub-rules it states for storage — *Storage Selection Is Mandatory*, *Storage Selection Fails Closed*, *The Runtime Never Defaults Storage*, and *In-Memory Storage Is Dev/Test-Only* — are the storage specialization of the general requirements below. Storage got this discipline first; every other provider capability is held to the same standard.
 
@@ -1053,7 +1087,7 @@ These three requirements are exactly the three §17.6 states for storage, lifted
 
 ### 17.17.2 Security Classification of Development Arms
 
-Many capabilities ship a development/in-memory arm — an implementation intended for testing, CI, or local development. Every such arm MUST be classified, and its classification decides how — and whether — it may exist in a shipped production artifact. The classification is **mandatory before the capability ships**: every provider capability enumerated in §17.17 (client storage, relay blob storage, identity resolution, the witness per-subject store, credential storage, key custody, device attestation, relay querier) MUST have its development arm classified as durability-only or nullifier before that capability is present on any shipped path. A capability shipping with an *unclassified* development arm — one whose classification has never been recorded, so no one has decided whether it is a nullifier — is itself a violation of this section, independent of what the arm later turns out to be: the absence of a classification is a decision not made, which SCP-CAPSEL-8000's "no silent selection" forbids at the classification level.
+Many capabilities ship a development/in-memory arm — an implementation intended for testing, CI, or local development. Every such arm MUST be classified, and its classification decides how — and whether — it may exist in a shipped production artifact. The classification is **mandatory before the capability ships**: every provider capability enumerated in §17.17 (client storage, relay blob storage, identity resolution, the witness per-subject store, key custody, device attestation, relay querier) MUST have its development arm classified as durability-only or nullifier before that capability is present on any shipped path. A capability shipping with an *unclassified* development arm — one whose classification has never been recorded, so no one has decided whether it is a nullifier — is itself a violation of this section, independent of what the arm later turns out to be: the absence of a classification is a decision not made, which SCP-CAPSEL-8000's "no silent selection" forbids at the classification level.
 
 **SCP-CAPSEL-8010 — Every development arm carries exactly one of two classifications.** A capability's in-memory/development arm is either:
 

@@ -617,7 +617,7 @@ mod tests {
     /// A response whose `enc` is a valid P-256 point, so `open` reaches
     /// both custody calls. The sealed key is never opened by these tests.
     fn response_with_valid_enc() -> SenderKeyResponse {
-        let secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         SenderKeyResponse {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,

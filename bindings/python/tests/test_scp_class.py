@@ -29,13 +29,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests.conftest import skip_reason_if_extension_absent
+
 try:
     from scp_sdk import _scp_core
-except (ImportError, AttributeError):
-    pytest.skip(
-        "Native _scp_core extension not available — run maturin develop first",
-        allow_module_level=True,
-    )
+except Exception as _exc:
+    pytest.skip(skip_reason_if_extension_absent(_exc), allow_module_level=True)
 
 from scp_sdk.scp import SCP as WrapperSCP
 
@@ -120,7 +119,7 @@ def test_suspend_resume_shutdown_lifecycle() -> None:
 
 
 def test_shutdown_is_idempotent() -> None:
-    """A second `shutdown()` call is a documented no-op."""
+    """A second `shutdown()` on an in-memory instance does not raise."""
     scp = SCP({"type": "in_memory"})
     scp.shutdown(1000)
     scp.shutdown(1000)  # Must not raise.
@@ -443,3 +442,71 @@ def test_wrapper_with_storage_sqlite_passes_config_through() -> None:
         wrapper = WrapperSCP(storage=sqlite_cfg)
     mock_cls.with_storage.assert_called_once_with(sqlite_cfg)
     assert wrapper.instance_id == 42
+
+
+_STORE_HELD_MSG = "[SCP-STORAGE-8005] Storage error: shutdown left the durable store open"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_translates_store_held_error_to_storage_error() -> None:
+    """A native SCP-STORAGE-8005 from `shutdown` surfaces as `scp_sdk.StorageError`."""
+    from scp_sdk.errors import StorageError
+
+    wrapper, mock_native = _make_wrapper_with_mock()
+    mock_native.shutdown.side_effect = RuntimeError(_STORE_HELD_MSG)
+    with pytest.raises(StorageError) as info:
+        await wrapper.shutdown(timeout=0.05)
+    assert info.value.code == "SCP-STORAGE-8005"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_success_raises_nothing() -> None:
+    """A native `shutdown` that returns normally raises nothing at the SDK."""
+    wrapper, mock_native = _make_wrapper_with_mock()
+    mock_native.shutdown.return_value = None
+    await wrapper.shutdown(timeout=0.05)
+    mock_native.shutdown.assert_called_once_with(50)
+
+
+def test_sync_exit_raises_storage_error_when_body_succeeded() -> None:
+    """`__exit__` with no body exception raises the translated 8005."""
+    from scp_sdk.errors import StorageError
+
+    wrapper, mock_native = _make_wrapper_with_mock()
+    mock_native.shutdown.side_effect = RuntimeError(_STORE_HELD_MSG)
+    with pytest.raises(StorageError):
+        wrapper.__exit__(None, None, None)
+
+
+def test_sync_exit_keeps_body_exception_when_shutdown_fails() -> None:
+    """A failing shutdown on `with` exit does not replace the body's exception."""
+    wrapper, mock_native = _make_wrapper_with_mock()
+    mock_native.shutdown.side_effect = RuntimeError(_STORE_HELD_MSG)
+    body_exc = KeyError("body failure")
+    with pytest.raises(KeyError) as info:
+        with wrapper:
+            raise body_exc
+    assert info.value is body_exc
+
+
+@pytest.mark.asyncio
+async def test_async_exit_raises_storage_error_when_body_succeeded() -> None:
+    """`__aexit__` with no body exception raises the translated 8005."""
+    from scp_sdk.errors import StorageError
+
+    wrapper, mock_native = _make_wrapper_with_mock()
+    mock_native.shutdown.side_effect = RuntimeError(_STORE_HELD_MSG)
+    with pytest.raises(StorageError):
+        await wrapper.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_async_exit_keeps_body_exception_when_shutdown_fails() -> None:
+    """A failing shutdown on `async with` exit does not replace the body's exception."""
+    wrapper, mock_native = _make_wrapper_with_mock()
+    mock_native.shutdown.side_effect = RuntimeError(_STORE_HELD_MSG)
+    body_exc = KeyError("body failure")
+    with pytest.raises(KeyError) as info:
+        async with wrapper:
+            raise body_exc
+    assert info.value is body_exc

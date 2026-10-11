@@ -1,26 +1,32 @@
 // ApplePushProvider — APNs push notification registration with opaque silent-push payloads.
 //
-// This file implements the ``PushProvider`` callback interface (defined in
-// `crates/scp-ffi/uniffi/src/lib.rs`) for Apple platforms (iOS 17+, macOS 14+).
+// This file holds the APNs push adapter for Apple platforms (iOS 17+, macOS 14+).
+// ADR-025, the Apple platform adapter, requires this adapter to conform to the
+// UniFFI `PushProvider` callback interface in `crates/scp-ffi/uniffi/src/lib.rs`.
+// The shipped actor does not conform yet (ADR-025 acceptance criterion 4).
 //
 // ## Architecture
 //
-// `ApplePushProvider` is a Swift actor that bridges the asynchronous APNs token
-// delivery lifecycle into the synchronous UniFFI callback interface. It is one of
-// the four platform providers assembled by ``ApplePlatformAdapter`` (ADR-025) and
-// injected into the Rust engine at SDK initialisation.
+// `ApplePushProvider` is a Swift actor that turns the AppDelegate callbacks that
+// deliver an APNs token into one `async` call. ADR-025 has an `ApplePlatformAdapter`
+// assemble the four platform providers and inject them into the Rust engine at SDK
+// initialisation. No `ApplePlatformAdapter` exists yet, so no code injects this
+// actor into the Rust engine.
 //
 // ## APNs Payload Opacity (§10.7)
 //
 // The relay sends **only** `{"aps": {"content-available": 1}}` — a silent push.
-// No context ID, sender DID, message preview, or any other metadata may appear
-// in the payload. Silent push wakes the app in the background; the SCP engine
-// then connects to its relay set and pulls all pending encrypted envelopes.
+// §10.7: "Push payloads MUST contain a wake signal and nothing else. No context
+// ID, no sender identifier, no message preview, no metadata of any kind."
+// Silent push wakes the app in the background. §10.7 then has the device
+// connect to its relays and pull pending encrypted envelopes; no Rust code
+// calls `handleNotification(payload:)` yet, so nothing performs that pull today.
 // Apple learns only that the device received a notification at a specific time.
 //
-// `handleNotification(payload:)` **enforces** this invariant on receipt: payloads
-// containing any field other than `aps.content-available` are rejected with
-// ``PushError/opaquePayloadViolation``.
+// `handleNotification(payload:)` **enforces** this invariant on receipt: a JSON
+// object whose bytes differ from `{"aps":{"content-available":1}}` by anything but
+// whitespace outside string literals is rejected with ``PushError/opaquePayloadViolation``.
+// ADR-025 criterion 4 names this payload for APNs.
 //
 // ## Token Registration Lifecycle
 //
@@ -88,8 +94,14 @@
 
     /// Actor-isolated APNs push notification provider for the SCP Rust engine.
     ///
-    /// Conforms to the UniFFI-generated `PushProvider` protocol so that it can be
-    /// injected into the engine via the callback interface bridge (ADR-021).
+    /// ADR-025 in `.docs/adrs/phase-5.md` requires this actor to conform to the
+    /// UniFFI-generated `PushProvider` protocol (ADR-021), and this actor does
+    /// not conform yet: that protocol names its registration method
+    /// `registerPush()` and declares `ScpError` as its error type, while this
+    /// actor names it `register()` and throws `PushError`. UniFFI panics on the
+    /// Rust side when a callback throws a type the callback does not declare,
+    /// so the conformance has to translate each `PushError` to an `ScpError`.
+    /// Acceptance criterion 4 of ADR-025 records this gap.
     ///
     /// ## AppDelegate Integration
     ///
@@ -107,7 +119,7 @@
     /// Usage:
     /// ```swift
     /// let pushProvider = ApplePushProvider()
-    /// // Pass to SCP engine via ApplePlatformAdapter
+    /// let token = try await pushProvider.register()
     /// ```
     public actor ApplePushProvider {
         // MARK: Internal state
@@ -118,14 +130,51 @@
         /// or ``registrationDidFail(_:)``. After consumption it is set back to `nil`.
         private var tokenContinuation: CheckedContinuation<Data, Error>?
 
+        /// Asks the platform to start APNs registration. ``register()`` schedules
+        /// it on the main actor and then suspends without waiting for it to run,
+        /// so the call can run after ``hasPendingRegistration`` becomes `true`.
+        private let requestRemoteNotifications: @MainActor @Sendable () -> Void
+
+        /// The wake signal ``handleNotification(payload:)`` returns for every
+        /// payload it accepts: the UTF-8 bytes of `{"aps":{"content-available":1}}`.
+        ///
+        /// The method returns this constant, not the received bytes, because
+        /// accepted bytes can still carry whitespace the relay chose.
+        static let wakeSignal = Data(#"{"aps":{"content-available":1}}"#.utf8)
+
+        /// `true` while a ``register()`` call is suspended waiting for
+        /// ``tokenDidRegister(_:)`` or ``registrationDidFail(_:)``.
+        var hasPendingRegistration: Bool {
+            tokenContinuation != nil
+        }
+
         // MARK: Initialiser
 
-        /// Creates a new `ApplePushProvider`.
+        /// Creates a new `ApplePushProvider` that registers through the shared
+        /// application's `registerForRemoteNotifications()`.
         ///
-        /// Typically called once by ``ApplePlatformAdapter/make()``.
-        public init() {}
+        /// ADR-025 has `ApplePlatformAdapter.make()` call this initialiser once.
+        /// That factory does not exist yet.
+        public init() {
+            requestRemoteNotifications = {
+                #if canImport(UIKit)
+                    UIApplication.shared.registerForRemoteNotifications()
+                #elseif canImport(AppKit)
+                    NSApplication.shared.registerForRemoteNotifications()
+                #endif
+            }
+        }
 
-        // MARK: PushProvider implementation
+        /// Creates an `ApplePushProvider` that calls `requestRemoteNotifications`
+        /// in place of the shared application's `registerForRemoteNotifications()`.
+        /// A `swift test` host holds no APNs entitlement, so the callback tests
+        /// pass a closure that does nothing, suspend ``register()``, and drive
+        /// the AppDelegate callbacks themselves.
+        init(requestRemoteNotifications: @escaping @MainActor @Sendable () -> Void) {
+            self.requestRemoteNotifications = requestRemoteNotifications
+        }
+
+        // MARK: APNs registration and payload handling
 
         /// Register for APNs push notifications and return the device token bytes.
         ///
@@ -134,9 +183,8 @@
         /// ``tokenDidRegister(_:)`` / ``registrationDidFail(_:)``. Races a 30-second
         /// timeout so callers are never blocked indefinitely.
         ///
-        /// - Returns: The raw APNs device token bytes (typically 32 bytes). The caller
-        ///   (the SCP Rust engine via UniFFI) converts these bytes to the hex string
-        ///   that is forwarded to the relay as a `PushToken`.
+        /// - Returns: The raw APNs device token bytes (typically 32 bytes). No Rust
+        ///   code calls this method yet.
         ///
         /// - Throws:
         ///   - ``PushError/registrationAlreadyInProgress`` if a concurrent call is
@@ -148,13 +196,11 @@
                 throw PushError.registrationAlreadyInProgress
             }
 
-            // Trigger registration on the main thread before suspending.
+            // Schedule registration on the main actor. The main actor runs it
+            // whenever it gets to it, which can be after this call suspends.
+            let request = requestRemoteNotifications
             Task { @MainActor in
-                #if canImport(UIKit)
-                    UIApplication.shared.registerForRemoteNotifications()
-                #elseif canImport(AppKit)
-                    NSApplication.shared.registerForRemoteNotifications()
-                #endif
+                request()
             }
 
             // Start a 30-second timeout that calls back into the actor on expiry.
@@ -193,29 +239,31 @@
 
         /// Handle an incoming APNs silent push notification.
         ///
-        /// Validates that `payload` is the strictly opaque `{"aps": {"content-available": 1}}`
-        /// format required by §10.7. Any additional field in the payload — at the top level
-        /// or nested inside `aps` — is rejected with ``PushError/opaquePayloadViolation``.
+        /// Validates that `payload` is the opaque `{"aps": {"content-available": 1}}` payload
+        /// ADR-025 criterion 4 names for APNs, which meets §10.7: "Push payloads MUST
+        /// contain a wake signal and nothing else. No context ID, no sender identifier,
+        /// no message preview, no metadata of any kind." Any
+        /// additional field in the payload — at the top level or nested inside `aps`,
+        /// including one carried by a repeated key — is rejected with
+        /// ``PushError/opaquePayloadViolation``.
         ///
-        /// When the payload is valid, the method returns the raw payload bytes as the wake
-        /// signal. The SCP engine uses the wake signal to trigger a relay pull for pending
-        /// encrypted envelopes. No context ID, sender DID, or message count is extracted
-        /// from the payload — there is nothing to extract.
+        /// When the payload is valid, the method returns ``wakeSignal``, a fixed byte
+        /// string, and never the received bytes, so a caller receives no byte the relay
+        /// chose. No Rust code calls this method yet.
         ///
         /// - Parameter payload: The raw JSON bytes delivered by APNs.
-        /// - Returns: The raw `payload` bytes as the wake signal, passed opaquely to the
-        ///   SCP engine.
+        /// - Returns: ``wakeSignal``, the UTF-8 bytes of `{"aps":{"content-available":1}}`.
         ///
         /// - Throws:
         ///   - ``PushError/invalidPayload(_:)`` if the bytes cannot be parsed as JSON or the
         ///     top-level structure is not a dictionary.
-        ///   - ``PushError/opaquePayloadViolation(_:)`` if the payload contains any field
-        ///     other than `aps.content-available`.
+        ///   - ``PushError/opaquePayloadViolation(_:)`` if the payload exceeds 4096 bytes,
+        ///     or is a JSON object whose bytes differ from `{"aps":{"content-available":1}}`
+        ///     by anything but JSON whitespace outside string literals: any other field, a repeated
+        ///     key, or any `content-available` value other than the token `1`.
         public func handleNotification(payload: Data) throws -> Data {
             try validateOpaquePayload(payload)
-            // The payload bytes are returned as the wake signal. The content is opaque —
-            // the engine fetches pending envelopes from the relay upon receipt.
-            return payload
+            return Self.wakeSignal
         }
 
         // MARK: AppDelegate callbacks
@@ -273,17 +321,40 @@
         /// {"aps": {"content-available": 1}}
         /// ```
         ///
-        /// Validation rules (all must pass):
-        /// 1. The payload parses as a JSON object.
-        /// 2. The top-level object has **exactly one** key: `"aps"`.
-        /// 3. The `aps` value is a JSON object with **exactly one** key:
-        ///    `"content-available"`.
-        /// 4. The `content-available` value is the integer `1`.
+        /// Validation rules, in the order they run:
+        /// 1. The payload is at most 4096 bytes, the APNs maximum.
+        /// 2. The payload parses as JSON, and its root is a JSON object.
+        /// 3. The payload bytes, with JSON whitespace (space, tab, line feed,
+        ///    carriage return) removed outside string literals, equal
+        ///    ``wakeSignal``.
+        ///
+        /// Rules 1 and 3 together decide which payload is accepted: rule 3
+        /// decides among payloads of at most 4096 bytes, and rule 1 rejects a
+        /// payload rule 3 would accept when whitespace outside its string literals
+        /// takes it past 4096 bytes. Rule 3 reads the received
+        /// bytes, not the dictionary `JSONSerialization` builds, because
+        /// `JSONSerialization` keeps one value for a key the object repeats: a
+        /// second `aps` or `content-available` member carrying a context ID
+        /// parses to the permitted object. Rule 3 rejects that payload, and any
+        /// other field, a boolean, a fraction such as `1.0` or `1.5`, an escaped
+        /// key, or any value other than the token `1`, because none of them
+        /// reduces to ``wakeSignal``. Rule 3 keeps whitespace inside a string
+        /// literal, so the key `"a ps"` stays distinct from `"aps"`. It finds
+        /// string literals by toggling on each `"` byte; an escaped quote would
+        /// throw that count off, but its backslash is never removed and
+        /// ``wakeSignal`` holds no backslash, so such a payload never matches.
+        ///
+        /// Every payload rule 3 accepts is ``wakeSignal`` with whitespace
+        /// outside its string literals, which is a JSON object, so rule 2 rejects no
+        /// payload rule 3 would accept. Rule 2 decides only which error a
+        /// caller receives: ``PushError/invalidPayload(_:)`` for bytes that are
+        /// not a JSON object, ``PushError/opaquePayloadViolation(_:)`` for a
+        /// JSON object other than the permitted one.
         ///
         /// - Parameter payload: Raw JSON bytes to validate.
         /// - Throws: ``PushError/invalidPayload(_:)`` or ``PushError/opaquePayloadViolation(_:)``.
         private func validateOpaquePayload(_ payload: Data) throws {
-            // APNs payload limit is 4 KB for standard push; reject oversized payloads early.
+            // Rule 1: APNs payload limit is 4 KB for standard push; reject oversized payloads early.
             let maxPayloadBytes = 4096
             guard payload.count <= maxPayloadBytes else {
                 throw PushError.opaquePayloadViolation(
@@ -291,50 +362,32 @@
                 )
             }
 
-            // Deserialise JSON.
+            // Rule 2: the bytes are a JSON object.
             let json: Any
             do {
                 json = try JSONSerialization.jsonObject(with: payload, options: [])
             } catch {
                 throw PushError.invalidPayload(error.localizedDescription)
             }
-
-            guard let topLevel = json as? [String: Any] else {
+            guard json is [String: Any] else {
                 throw PushError.invalidPayload("payload root is not a JSON object")
             }
 
-            // Rule 2: exactly one top-level key — "aps".
-            guard topLevel.count == 1, let aps = topLevel["aps"] else {
-                let keys = topLevel.keys.sorted().joined(separator: ", ")
-                throw PushError.opaquePayloadViolation(
-                    "top-level object must contain only \"aps\" but found: [\(keys)]"
-                )
+            // Rule 3: the received bytes, whitespace outside string literals
+            // removed, are the permitted payload.
+            var stripped = Data(capacity: payload.count)
+            var inString = false
+            for byte in payload {
+                if byte == 0x22 {
+                    inString.toggle()
+                } else if !inString, byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D {
+                    continue
+                }
+                stripped.append(byte)
             }
-
-            guard let apsDict = aps as? [String: Any] else {
-                throw PushError.opaquePayloadViolation("\"aps\" value is not a JSON object")
-            }
-
-            // Rule 3: exactly one key inside "aps" — "content-available".
-            guard apsDict.count == 1, let contentAvailable = apsDict["content-available"] else {
-                let keys = apsDict.keys.sorted().joined(separator: ", ")
+            guard stripped == Self.wakeSignal else {
                 throw PushError.opaquePayloadViolation(
-                    "\"aps\" object must contain only \"content-available\" but found: [\(keys)]"
-                )
-            }
-
-            // Rule 4: content-available must be the integer 1 (not boolean true).
-            // JSONSerialization bridges both JSON numbers and JSON booleans to NSNumber.
-            // __NSCFBoolean is a NSNumber subclass; NSNumber(boolValue: true).intValue == 1,
-            // so intValue alone incorrectly accepts boolean true.
-            // CFGetTypeID disambiguates: CFBooleanGetTypeID() ≠ CFNumberGetTypeID().
-            guard
-                let number = contentAvailable as? NSNumber,
-                CFGetTypeID(number) == CFNumberGetTypeID(),
-                number.intValue == 1
-            else {
-                throw PushError.opaquePayloadViolation(
-                    "\"content-available\" must be integer 1 (not boolean true or other value), got \(contentAvailable)"
+                    "payload bytes differ from {\"aps\":{\"content-available\":1}} by more than whitespace outside string literals"
                 )
             }
         }

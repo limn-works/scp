@@ -48,7 +48,7 @@ build-backend = "maturin"
 [project]
 name = "scp-python"
 description = "Shared Context Protocol SDK — identity, encryption, contexts, tools for AI agents"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 # license = TBD
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -66,10 +66,15 @@ mcp = []  # MCP server dependencies (if any beyond stdlib)
 [tool.maturin]
 python-source = "."
 module-name = "scp_sdk._scp_core"
-features = ["pyo3/extension-module"]
+# Features of `scp-ffi`, the package `manifest-path` names. `extension-module`
+# forwards `pyo3/extension-module`; `vendored-openssl` compiles OpenSSL into the
+# Linux and Windows wheels' SQLCipher (the comment on this table in
+# `bindings/python/pyproject.toml` says why and what a macOS build uses).
+features = ["extension-module", "vendored-openssl"]
+manifest-path = "../../crates/scp-ffi/Cargo.toml"
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
@@ -93,7 +98,7 @@ known-first-party = ["scp_sdk"]
 
 [tool.mypy]
 strict = true
-python_version = "3.12"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

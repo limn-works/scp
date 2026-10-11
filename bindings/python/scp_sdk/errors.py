@@ -89,21 +89,18 @@ class CryptoError(ScpError):
     _default_code: str = "SCP-CRYPTO-4000"
 
 
-# The custody-provider protocol's typed not-found. A ``KeyCustodyProvider``
-# raises ``KeyNotFoundError`` when it holds no key for the key id it was given;
-# the native bridge recognises the class and reports ``KeyNotFound``
-# (``SCP-CRYPTO-4006``), as it does any exception whose ``code`` is
-# ``SCP-CRYPTO-4006``, while any other exception a provider raises is a custody
-# error. The class is the bridge's own, so the match is by type, never by
-# message text.
-try:
-    from scp_sdk._scp_core import KeyNotFoundError
-except ImportError:  # pure-Python / mocked tests: no bridge to hand it to
+class KeyNotFoundError(CryptoError):
+    """A ``KeyCustodyProvider`` has no key for the given key id.
 
-    class KeyNotFoundError(CryptoError):  # type: ignore[no-redef]
-        """A ``KeyCustodyProvider`` has no key for the given key id."""
+    The custody-provider protocol's typed not-found: a provider raises it when
+    it holds no key for the key id it was given. The native bridge reads the
+    exception's ``code``, ``SCP-CRYPTO-4006``, and reports ``KeyNotFound``, as
+    it does for any exception carrying that code; any other exception a
+    provider raises is a custody error. The match is by code, never by message
+    text.
+    """
 
-        _default_code: str = "SCP-CRYPTO-4006"
+    _default_code: str = "SCP-CRYPTO-4006"
 
 
 class TransportError(ScpError):
@@ -215,6 +212,33 @@ class GovernanceError(ScpError):
     _default_code: str = "SCP-GOV-11000"
 
 
+class UnknownGovernanceOutcomeError(GovernanceError):
+    """A bridge reported a governance name this SDK version does not enumerate.
+
+    Every bridge names what a governance call did through one shared mapping in
+    ``scp_ffi_common::governance_result``: an action outcome
+    (:class:`~scp_sdk.governance.GovernanceActionResult`), a proposal status
+    (:class:`~scp_sdk.governance.ProposalStatus`), and a rejection reason
+    (:class:`~scp_sdk.governance.RejectionReason`). An SDK older than its bridge
+    reads a name none of those enums carries. :meth:`~scp_sdk.types.MemberRole.from_bridge`
+    raises it too, for a role name that is neither built in nor a name
+    ``validate_role_name`` admits for a custom role. This error reports that name
+    instead of substituting a known one, because governance decides
+    authorization and a substituted name would report an action or status the
+    engine never reported.
+
+    Attributes:
+        raw_outcome: The name the bridge reported, or the whole response when
+            the response carried no readable name.
+    """
+
+    _default_code: str = "SCP-GOV-11040"
+
+    def __init__(self, message: str, raw_outcome: str, code: str | None = None) -> None:
+        super().__init__(message, code)
+        self.raw_outcome = raw_outcome
+
+
 class EconomyError(ScpError):
     """Payment, budget, or economic-policy failure (SCP-ECON range, 12000-12999)."""
 
@@ -235,12 +259,12 @@ class EconomyError(ScpError):
 
 
 class SagaAbortedError(OutletError):
-    """A §6.2.4 saga aborted at a Prepare phase (authorization, freshness,
-    rate limit, co-residency, or a transiently-unavailable participant actor).
+    """A §6.2.4 saga that ended in an ``Aborted`` terminal, with the code
+    ``decompose_saga_error`` (crates/scp-ffi/common/src/saga_errors.rs) gives it.
 
     An ``Aborted`` terminal may be a PERMANENT rejection the caller must not
     blindly retry, OR a RETRYABLE transient (rate limit / participant-actor
-    unavailable); the two are distinguished by the ``SCP-SAGA-*`` code.
+    unavailable).
 
     Attributes:
         retry_after_ms: Rate-limit back-off hint in milliseconds when the
@@ -311,7 +335,7 @@ def _saga_terminal_from_bridge(exc: BaseException) -> ScpError | None:
     Dispatches on the bridge exception's class *name* (so a mocked bridge
     works without the native extension) and reads the structured terminal
     datum positionally from ``exc.args`` — ``args[0]`` is the message,
-    ``args[1]`` the ``SCP-SAGA-13xxx`` code, and ``args[2]`` the typed
+    ``args[1]`` the code, and ``args[2]`` the typed
     datum (``retry_after_ms`` / ``saga_id`` / ``contended_context``). The
     datum is read STRUCTURALLY, never parsed from the message string.
 
@@ -440,5 +464,6 @@ __all__ = [
     "StreamGap",
     "TransportError",
     "UcanPermissionError",
+    "UnknownGovernanceOutcomeError",
     "ValidationError",
 ]

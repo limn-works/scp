@@ -577,45 +577,7 @@ impl crate::scp::PyScp {
 /// class still requires manual registration here.
 pub fn register_testing(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFullStackNode>()?;
-    m.add_function(wrap_pyfunction!(testing_pseudonym_routing_id_from_seed, m)?)?;
     Ok(())
-}
-
-/// Test-only: the §9.10.4 routing id the bridge derives for a software-custody
-/// identity whose Ed25519 seed is `seed`, in `context_id`.
-///
-/// Imports `seed` into an in-memory custody as the identity key and runs the
-/// bridge's own member-pseudonym derivation step
-/// (`context::pseudonym_routing_id_on`), so a Python KAT can compare the
-/// production bridge output against a §25.19 routing id.
-///
-/// # Errors
-///
-/// `SCP-VALID-7005` when `seed` is not 32 bytes; `SCP-IDENT-1055` when the
-/// derivation fails.
-#[pyfunction]
-pub fn testing_pseudonym_routing_id_from_seed(
-    seed: Vec<u8>,
-    context_id: &str,
-) -> PyResult<Vec<u8>> {
-    let seed: zeroize::Zeroizing<[u8; 32]> =
-        zeroize::Zeroizing::new(seed.as_slice().try_into().map_err(|_| {
-            PyErr::from(crate::error::ScpPyError::ValidationError {
-                message: format!("seed must be 32 bytes, got {}", seed.len()),
-                code: scp_ffi_common::error_codes::VALID_7005.to_owned(),
-            })
-        })?);
-    let rt = crate::runtime()?;
-    use scp_platform::KeyCustody;
-    let in_memory = scp_platform::testing::InMemoryKeyCustody::new();
-    // The identity role (§9.10.4.A): only an identity key derives.
-    let identity_key = rt
-        .block_on(in_memory.import_ed25519_signing_key(&seed))
-        .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
-    let custody = crate::custody::FfiKeyCustody::InMemory(in_memory);
-    crate::context::pseudonym_routing_id_on(rt, &custody, identity_key, context_id)
-        .map(|id| id.to_vec())
-        .map_err(PyErr::from)
 }
 
 // ---------------------------------------------------------------------------

@@ -35,7 +35,7 @@
 //! - [`payment_adapter_conformance!`] — 8 tests for `PaymentAdapter`
 //!   (spec section 19.2.6).
 //! - [`transport_conformance!`] — 6 tests for `TransportAdapter` (ADR-005).
-//! - [`key_custody_conformance!`] — 10 tests for `KeyCustody` (ADR-006).
+//! - [`key_custody_conformance!`] — 13 tests for `KeyCustody` (ADR-006).
 //! - [`attestation_conformance!`] — 2 tests for `DeviceAttestation` (ADR-006).
 //! - [`push_conformance!`] — 2 tests for `Push` (ADR-006).
 //!
@@ -44,7 +44,7 @@
 //! Run via `cargo test -p scp-testing`. Suites cover identity, agent binding,
 //! context lifecycle, broadcast, governance, capabilities, encryption,
 //! transport, node, economics, trust, discovery, content access, compromise
-//! recovery, bridge cooperative, and attack scenarios.
+//! recovery, and attack scenarios.
 //!
 //! # Running tests
 //!

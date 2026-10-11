@@ -40,8 +40,8 @@ env:
 
 jobs:
   # ── The nightly every job below compiles on ────────────────────────────────
-  # `fuzz/rust-toolchain.toml` names it, records why it is a dated nightly, and records
-  # what unpins it. This job reads the channel out of that file and no other step in this
+  # `fuzz/rust-toolchain.toml` names it and records why it is a dated nightly. This job
+  # reads the channel out of that file and no other step in this
   # workflow repeats it, so the file and the workflow cannot disagree.
   #
   # Every job reaches the value through `dtolnay/rust-toolchain@master` plus a
@@ -152,6 +152,15 @@ jobs:
             dict: msgpack_export.dict
             max_len: 1048576
             time: 300
+          # ADR-057 §Prereq-4: a tampered or malformed MLS ciphertext must yield a
+          # typed error, never a panic. No dictionary: the input is raw MLS wire
+          # ciphertext and the target self-generates a valid frame to tamper. It
+          # runs with cargo-fuzz's default debug assertions and overflow checks,
+          # like every leg here, so it also covers the panic sites a release
+          # build drops.
+          - target: fuzz_mls_decrypt
+            max_len: 8192
+            time: 300
     steps:
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -159,7 +168,7 @@ jobs:
       - uses: actions/checkout@v5
 
       # `fuzz/rust-toolchain.toml` names this channel and records why it is a dated
-      # nightly and what unpins it.
+      # nightly.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.toolchain.outputs.channel }}
@@ -173,19 +182,14 @@ jobs:
       # entries, one per matrix leg, each a separate copy of the same compiled
       # dependencies, and every one on `refs/heads/main`, where GitHub's least-recently-
       # used eviction reads them as fresher than the ci.yml entries every pull request
-      # needs. Two groups replace the eighteen, named by what a job writes:
+      # needs. One group replaces the eighteen:
       #
       #   fuzz-run      `fuzz/target/<host triple>/release`, compiled by `cargo fuzz run`
       #                 with cargo-fuzz's default RUSTFLAGS (AddressSanitizer, coverage,
       #                 `-Cdebug-assertions`, `-Coverflow-checks`). Every leg of
-      #                 fuzz-nightly and of fuzz-weekly. The writer is fuzz-nightly's
-      #                 `fuzz_outer_envelope` leg; every other leg reads.
-      #   fuzz-run-opt  the same directory, compiled by `cargo fuzz run -O`, whose
-      #                 RUSTFLAGS drop the assertion flags. Cargo writes both flag sets to
-      #                 the same file names and rebuilds every artifact whose fingerprint
-      #                 disagrees, so a job in one group restoring the other group's entry
-      #                 would recompile everything it restored. fuzz-mls-decrypt alone,
-      #                 which writes it.
+      #                 fuzz-nightly and of fuzz-weekly builds with those flags. The
+      #                 writer is fuzz-nightly's `fuzz_outer_envelope` leg; every other
+      #                 leg reads.
       #
       # Neither group is ci.yml's `fuzz` group: that job runs `cargo check` under the dev
       # profile into `fuzz/target/debug`, a directory cargo shares nothing with.
@@ -216,7 +220,7 @@ jobs:
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             -- \
-            -dict=fuzz/dicts/${{ matrix.dict }} \
+            ${{ matrix.dict && format('-dict=fuzz/dicts/{0}', matrix.dict) || '' }} \
             -max_total_time=${{ github.event.inputs.fuzz_time || matrix.time }} \
             -max_len=${{ matrix.max_len }} \
             -rss_limit_mb=2048 \
@@ -246,102 +250,6 @@ jobs:
           path: fuzz/artifacts/${{ matrix.target }}/
           retention-days: 90
 
-  # ── MLS decrypt-path panic safety (ADR-057 §Prereq-4, #1444) ─────────────
-  # Separate job because this target MUST run with `-O` (release,
-  # debug-assertions OFF). It validates the SHIPPED RELEASE decrypt path, where
-  # openmls's `debug_assert!` ("Ciphertext decryption failed") is compiled out
-  # and a tampered ciphertext yields a typed `Err` instead of a panic. The
-  # standard Tier matrices run WITHOUT `-O`, so cargo-fuzz injects
-  # `-Cdebug-assertions` and that assert would false-crash on every tampered
-  # input — which is exactly why this target cannot live in those matrices. No
-  # dictionary: the input is raw MLS wire ciphertext and the target
-  # self-generates a valid frame to tamper.
-  fuzz-mls-decrypt:
-    name: Fuzz / fuzz_mls_decrypt (release, debug-assertions off)
-    needs: toolchain
-    runs-on: ubuntu-latest
-    # Selected from `fuzz_time` for a reason spelled out above fuzz-nightly.
-    # Each arm states its option divided by 60, plus 25 minutes covering
-    # checkout, a nightly toolchain, `cargo install cargo-fuzz`, and a release
-    # build. A final arm yields 30, matching both option "300" and a scheduled
-    # run, since step "Run fuzzer (release, debug-assertions off)" falls back to
-    # 300 seconds when no input arrives.
-    timeout-minutes: >-
-      ${{ github.event.inputs.fuzz_time == '7200' && 145 ||
-      github.event.inputs.fuzz_time == '3600' && 85 ||
-      github.event.inputs.fuzz_time == '1800' && 55 ||
-      github.event.inputs.fuzz_time == '900' && 40 ||
-      30 }}
-    if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
-    steps:
-      - name: Free disk space
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-
-      - uses: actions/checkout@v5
-
-      # `fuzz/rust-toolchain.toml` names this channel and records why it is a dated
-      # nightly and what unpins it.
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ needs.toolchain.outputs.channel }}
-
-      - name: Install cargo-fuzz
-        run: cargo +${{ needs.toolchain.outputs.channel }} install cargo-fuzz --locked
-
-      # Group `fuzz-run-opt`: this job alone, because its `-O` changes the RUSTFLAGS
-      # (see the group comment on job fuzz-nightly). This job writes the group.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "fuzz -> target"
-          shared-key: fuzz-run-opt
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Restore corpus cache
-        uses: actions/cache/restore@v4
-        with:
-          path: fuzz/corpus/fuzz_mls_decrypt
-          key: corpus-fuzz_mls_decrypt-${{ github.run_id }}
-          restore-keys: corpus-fuzz_mls_decrypt-
-
-      - name: Run fuzzer (release, debug-assertions off)
-        # `-O` is LOAD-BEARING: it builds the release profile with
-        # debug-assertions OFF (the shipped path). Dropping it would re-arm
-        # openmls's decrypt `debug_assert!` and turn every tampered input into a
-        # false crash.
-        run: |
-          cargo +${{ needs.toolchain.outputs.channel }} fuzz run fuzz_mls_decrypt -O \
-            --fuzz-dir fuzz \
-            fuzz/corpus/fuzz_mls_decrypt \
-            -- \
-            -max_total_time=${{ github.event.inputs.fuzz_time || '300' }} \
-            -max_len=8192 \
-            -rss_limit_mb=2048 \
-            -timeout=30 \
-            -detect_leaks=0
-
-      - name: Minimize corpus
-        if: always()
-        run: |
-          cargo +${{ needs.toolchain.outputs.channel }} fuzz cmin fuzz_mls_decrypt -O \
-            --fuzz-dir fuzz \
-            fuzz/corpus/fuzz_mls_decrypt \
-            || true
-
-      - name: Save corpus cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: fuzz/corpus/fuzz_mls_decrypt
-          key: corpus-fuzz_mls_decrypt-${{ github.run_id }}
-
-      - name: Upload crash artifacts
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-crash-fuzz_mls_decrypt-${{ github.run_id }}
-          path: fuzz/artifacts/fuzz_mls_decrypt/
-          retention-days: 90
-
   # ── Weekly deep-fuzz: Tier 1 targets, 2 hours each ────────────────────────
   # Runs at 00:00 UTC every Saturday, or on workflow_dispatch. Only Tier 1
   # targets (highest trust-boundary exposure). Longer time budget surfaces
@@ -364,7 +272,7 @@ jobs:
     name: Deep Fuzz / ${{ matrix.target }}
     needs: toolchain
     runs-on: ubuntu-latest
-    # Fixed, unlike two jobs above, because step "Run deep fuzzer" hardcodes
+    # Fixed, unlike fuzz-nightly above, because step "Run deep fuzzer" hardcodes
     # `-max_total_time=7200` and never reads `fuzz_time`. 120 minutes of fuzzing
     # plus 60 for checkout, a nightly toolchain, `cargo install cargo-fuzz`, and
     # a combined ASan plus UBSan build.
@@ -399,7 +307,7 @@ jobs:
       - uses: actions/checkout@v5
 
       # `fuzz/rust-toolchain.toml` names this channel and records why it is a dated
-      # nightly and what unpins it.
+      # nightly.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.toolchain.outputs.channel }}
@@ -409,7 +317,7 @@ jobs:
 
       # Reads group `fuzz-run`, which fuzz-nightly writes every night (see the group
       # comment on that job). Every leg here reads and none writes: the six targets
-      # this job fuzzes are six of the eleven fuzz-nightly builds with the same flags.
+      # this job fuzzes are six of the twelve fuzz-nightly builds with the same flags.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz -> target"

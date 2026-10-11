@@ -4,17 +4,29 @@
 //!
 //! 1. **Full node** (default): Starts an [`ApplicationNode`] with DID identity,
 //!    relay, and HTTP server (`.well-known/scp` + WebSocket upgrade). Uses
-//!    persistent `SQLite` storage by default (`SQLCipher` encrypted).
+//!    persistent `SQLite` storage by default (`SQLCipher` encrypted), and asks
+//!    for a newly generated identity on every run, so a shipped build logs
+//!    `no production pre-rotation custody backend available`
+//!    (`IdentityError::NoPreRotationBackend`) and exits 1.
 //! 2. **Relay-only** (`--relay-only`): Runs a bare [`RelayServer`], identical
 //!    to the standalone `scp-relay` binary.
-//! 3. **Ephemeral** (`--ephemeral`): Runs a full node with all in-memory
-//!    subsystems — nothing persists across restarts.
+//! 3. **Ephemeral** (`--ephemeral`, `testing` builds only): Runs a full node
+//!    with all in-memory subsystems — nothing persists across restarts. A
+//!    shipped build exits 1 on `--ephemeral`.
 //! 4. **Self-host** (`--self-host`): Hosts a static website entirely on SCP
 //!    (no DNS name required) — opens an inbound public port, publishes the host's
 //!    IP to the DHT by default, and serves the site over self-signed HTTPS by default
-//!    (`SCP_NODE_SELF_HOST_PLAINTEXT=1` for plain HTTP).
+//!    (`SCP_NODE_SELF_HOST_PLAINTEXT=1` for plain HTTP). A shipped build
+//!    starts only from a storage directory that already holds an identity;
+//!    given a directory that holds none it logs `self-host mode failed` with
+//!    `no production pre-rotation custody backend available`
+//!    (`IdentityError::NoPreRotationBackend`) and exits 1.
 //!
 //! Configuration is read from CLI flags and environment variables.
+
+// Links the one `#[global_allocator]`, which wipes every heap block before
+// freeing it (09-security-model.md §9.15, freed heap memory).
+use scp_alloc as _;
 
 use std::env;
 use std::net::SocketAddr;
@@ -61,9 +73,13 @@ struct CliConfig {
 /// Accepts:
 ///   `--relay-only`       — relay-only mode
 ///   `--health`           — TCP health probe
-///   `--ephemeral`        — all in-memory subsystems
-///   `--storage-path <p>` — `SQLite` database directory
-///   `--help`             — print usage and exit
+///   `--ephemeral`        — all in-memory subsystems (`testing` builds only;
+///                          a shipped build exits 1)
+///   `--self-host`        — host a static site on SCP (also `SCP_NODE_SELF_HOST`)
+///   `--site-dir <p>`     — static site directory for `--self-host` (also
+///                          `SCP_NODE_SITE_DIR`)
+///   `--storage-path <p>` — `SQLite` database directory (also `SCP_STORAGE_PATH`)
+///   `--help`, `-h`       — print usage and exit
 fn parse_args() -> CliConfig {
     let args: Vec<String> = env::args().collect();
 
@@ -126,6 +142,52 @@ fn parse_cli_from(
     }
 }
 
+/// Returns the error to print when the configuration selects more than one run
+/// mode, or `None` when it selects at most one.
+///
+/// `--relay-only`, `--self-host` (or `SCP_NODE_SELF_HOST`), and `--ephemeral`
+/// each select a run mode, and [`main`] dispatches on the first one it finds.
+/// Without this check a second mode flag is silently ignored: a shipped binary
+/// given `--self-host --ephemeral` would run a DHT-publishing self-host node
+/// instead of refusing `--ephemeral`. Two mode flags therefore fail closed
+/// (`.docs/prds/self-host-binary.json` SHB-001, the exactly-one-run-mode
+/// acceptance criterion).
+fn conflicting_modes(config: &CliConfig) -> Option<String> {
+    let selected: Vec<&str> = [
+        (config.relay_only, "--relay-only"),
+        (config.self_host, "--self-host (or SCP_NODE_SELF_HOST)"),
+        (config.ephemeral, "--ephemeral"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    (selected.len() > 1).then(|| {
+        format!(
+            "ERROR: {} each select a run mode; select exactly one.",
+            selected.join(" and ")
+        )
+    })
+}
+
+/// The refusal a shipped build prints for `--ephemeral`.
+const EPHEMERAL_UNAVAILABLE: &str = "ERROR: --ephemeral is a test-harness mode (in-memory DHT/custody) and is not \
+     available in this build. A shipped build creates no identity in any mode \
+     (no production pre-rotation custody backend available): the persistent full \
+     node exits 1 on every run, and \
+     --self-host starts only from a storage directory that already holds an \
+     identity. Build with --features testing to run --ephemeral.";
+
+/// Returns the refusal to print when the configuration selects a run mode this
+/// build does not compile, or `None` otherwise. `ephemeral_compiled` is
+/// `cfg!(feature = "testing")` in [`main`].
+///
+/// [`main`] calls this before the `--health` probe, so a shipped build exits 1
+/// on `--ephemeral --health` instead of probing `SCP_NODE_BIND_ADDR` for a mode
+/// it cannot run (ADR-062 §Decision 1).
+fn unavailable_mode(config: &CliConfig, ephemeral_compiled: bool) -> Option<&'static str> {
+    (config.ephemeral && !ephemeral_compiled).then_some(EPHEMERAL_UNAVAILABLE)
+}
+
 /// Prints usage information and exits with code 0.
 fn print_help() -> ! {
     eprintln!(
@@ -137,13 +199,18 @@ USAGE:
 
 OPTIONS:
     --relay-only            Run as a bare relay server only (no identity, no HTTP)
-    --ephemeral             Use in-memory storage for all subsystems (no persistence)
+    --ephemeral             Use in-memory storage for all subsystems (no persistence).
+                            Testing builds only: a shipped binary exits 1
     --self-host             Host a static site entirely on SCP (no DNS name required).
                             Opens an inbound port to the PUBLIC INTERNET and
                             publishes the host's IP to the DHT by default
                             (`SCP_NODE_DHT_MODE=disabled` skips publication).
                             Self-signed HTTPS by default (SCP_NODE_SELF_HOST_PLAINTEXT=1
                             for plain HTTP). See the loud startup banner for the full warning.
+                            A shipped binary starts only from a storage directory that
+                            already holds an identity; otherwise it logs 'self-host mode
+                            failed' ('no production pre-rotation custody backend
+                            available') and exits 1
     --site-dir <PATH>       Directory of static files to host in --self-host mode
                             (must contain index.html). Default: embedded site.
                             Also configurable via SCP_NODE_SITE_DIR env var
@@ -154,7 +221,9 @@ OPTIONS:
 
 ENVIRONMENT VARIABLES:
     SCP_NODE_DOMAIN             Domain for full node mode (required unless --relay-only
-                               or --self-host)
+                               or --self-host). Full node mode is the default; a
+                               shipped binary's full node logs 'no production
+                               pre-rotation custody backend available' and exits 1
     SCP_NODE_SELF_HOST         Set to '1' to enable self-host mode (same as --self-host)
     SCP_NODE_SITE_DIR          Static site directory for self-host mode (same as --site-dir)
     SCP_NODE_SELF_HOST_PORT    HTTP/site port for self-host mode (default: 8443)
@@ -180,10 +249,13 @@ ENVIRONMENT VARIABLES:
     SCP_STORAGE_KEY             Hex-encoded 32-byte SQLCipher encryption key
                                 (auto-generated and stored if not set)
     SCP_RELAY_BIND_ADDR         Relay bind address (default: 0.0.0.0:9000)
-    SCP_RELAY_STORAGE_BACKEND   Blob storage backend for relay: sqlite (default), redb,
-                                postgres, s3 (both need scp-transport's postgres-blob/s3-blob,
-                                which --features cloud-blobs enables), memory
-    SCP_RELAY_STORAGE_PATH      Path for sqlite/redb blob storage (default: ./scp-relay.db)
+    SCP_RELAY_STORAGE_BACKEND   Blob storage backend for relay: sqlite, redb, postgres, s3
+                                (both need scp-transport's postgres-blob/s3-blob, which
+                                --features cloud-blobs enables), memory. Required in
+                                --relay-only and full node mode: no default, and an unset
+                                or empty value exits 1
+    SCP_RELAY_STORAGE_PATH      Absolute path for sqlite/redb blob storage (required for
+                                those backends: no default, and a relative path exits 1)
     SCP_RELAY_DATABASE_URL      PostgreSQL connection URL (required when backend=postgres)
     SCP_RELAY_S3_BUCKET         S3 bucket name (required when backend=s3)
     SCP_RELAY_S3_PREFIX         S3 key prefix (default: blobs/)
@@ -204,6 +276,20 @@ ENVIRONMENT VARIABLES:
 // ---------------------------------------------------------------------------
 
 // `env_or` is provided by `scp_transport::startup::env_or`.
+
+/// Returns the value inside `result`, or prints its [`startup::StartupError`]
+/// to stderr and exits 1.
+///
+/// The `startup` library returns every failure to this binary, and this
+/// function is where a failure becomes an exit code. The error goes to stderr
+/// because tracing may not be installed yet.
+fn or_exit<T>(result: Result<T, startup::StartupError>) -> T {
+    result.unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        tracing::error!(error = %e, "startup failed");
+        std::process::exit(1);
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Storage path resolution
@@ -275,8 +361,8 @@ const CLOUD_BLOBS_FEATURE: &str = "cloud-blobs";
 
 /// Runs a bare relay server (same as `scp-relay` binary).
 async fn run_relay_only() {
-    let backend = startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE);
-    let config = startup::relay_config_from_env();
+    let backend = or_exit(startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE));
+    let config = or_exit(startup::relay_config_from_env());
     tracing::info!(
         bind_addr = %config.bind_addr,
         max_blob_size = config.max_blob_size,
@@ -284,7 +370,8 @@ async fn run_relay_only() {
         "starting scp-node in relay-only mode"
     );
 
-    let storage = Arc::new(startup::storage_from_env(backend).await);
+    let storage = Arc::new(or_exit(startup::storage_from_env(backend).await));
+    let shutdown = or_exit(startup::shutdown_signal());
     let server = RelayServer::new(config, storage);
 
     let (handle, local_addr) = match server.start().await {
@@ -297,7 +384,7 @@ async fn run_relay_only() {
 
     tracing::info!(addr = %local_addr, "relay listening");
 
-    startup::shutdown_signal().await;
+    shutdown.await;
 
     tracing::info!("shutdown signal received, stopping relay");
     handle.shutdown();
@@ -365,7 +452,7 @@ async fn run_full_node_ephemeral() {
     eprintln!(
         "WARNING: Ephemeral mode — ALL subsystems use in-memory implementations.\n\
          Private keys, storage, and DID documents will be LOST on restart.\n\
-         Use persistent mode (default, without --ephemeral) for production."
+         This mode exists only in testing builds; a shipped build refuses --ephemeral."
     );
     tracing::warn!(
         "using InMemoryKeyCustody — private keys exist only in memory and are \
@@ -433,7 +520,7 @@ fn open_sqlite_or_exit(dir: &std::path::Path, key: &Zeroizing<[u8; 32]>) -> Sqli
 /// that single handle is shared by every root-DB consumer (the BEP44 sequence
 /// store AND the `ApplicationNode` builder). Opening a second `SqliteStorage`
 /// against the same root directory while this one is alive fails with an
-/// advisory-lock conflict (os error 35) — see `SqliteStorage::new`. Sharing the
+/// advisory-lock conflict — see `SqliteStorage::new`. Sharing the
 /// one handle via `Arc::clone` (which implements [`Storage`]/[`EncryptedStorage`]
 /// through the blanket `Arc<T>` impls) keeps exactly one lock holder.
 async fn init_persistent_storage(
@@ -475,14 +562,24 @@ fn validate_storage_path_or_exit(dir: &std::path::Path) {
     }
 }
 
-/// Runs the full node with persistent `SQLite` storage (production default).
+/// Runs the full node with persistent `SQLite` storage (the default mode). A
+/// shipped build logs `no production pre-rotation custody backend available`
+/// (`IdentityError::NoPreRotationBackend`) and exits 1, because the node asks for
+/// a newly generated identity on every run.
 async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // Parse the blob backend before anything below creates the storage
     // directory, the storage key, or a store, so a backend this build cannot
     // serve exits with nothing left on disk.
-    let backend = startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE);
+    let backend = or_exit(startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE));
     let domain = require_domain();
     let http_addr = node_http_addr();
+
+    // Persistent mode: the durable blob backend the operator named in
+    // `SCP_RELAY_STORAGE_BACKEND` (no default), configured by
+    // `SCP_RELAY_STORAGE_PATH` — the same explicit selection relay-only mode
+    // makes (SCP-CAPINJECT-010). It opens before the node storage directory and
+    // key exist, so a missing or relative blob path exits with neither created.
+    let blob_storage = or_exit(startup::storage_from_env(backend).await);
 
     // Validate the storage path upfront before attempting to open databases.
     let resolved_path = resolve_storage_path_or_exit(storage_path);
@@ -492,7 +589,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // the single root `SqliteStorage` handle it opens (held alive via
     // `node_storage_arc`) is the ONLY root handle and is reused for both the BEP44
     // sequence store and the node builder. Reopening the root DB while that handle
-    // is alive would fail with an advisory-lock conflict (os error 35).
+    // is alive would fail with an advisory-lock conflict.
     let (storage_dir, _storage_key, node_storage_arc, custody) =
         init_persistent_storage(storage_path).await;
 
@@ -514,9 +611,9 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // Explicit parse: a typo (e.g. "memroy") must NOT silently fall through to
     // the production DHT, which would publish the host's address to the network.
     match parse_dht_mode_or_exit() {
-        // `parse_dht_mode_or_exit` never returns `Disabled` for the full relay
-        // node (it exits with guidance to use `--self-host`); this arm exists
-        // only to keep the match exhaustive and fails closed if ever reached.
+        // `parse_dht_mode_or_exit` returns `Disabled` for `SCP_NODE_DHT_MODE=disabled`,
+        // which only `--self-host` honours; the full relay node must publish its
+        // DID, so this arm exits with guidance to use `--self-host`.
         scp_node::DhtMode::Disabled => {
             tracing::error!(
                 "DhtMode::Disabled is not a full-relay-node mode — the node must publish its DID. \
@@ -536,18 +633,14 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 sequence_store,
             );
             // Reuse the single root handle (shared via `Arc`) rather than reopening,
-            // which would conflict on the advisory lock (os error 35).
+            // which would conflict on the advisory lock.
             run_node_with(
                 domain,
                 http_addr,
                 custody,
                 did_method,
                 Arc::clone(&node_storage_arc),
-                // Persistent mode: operator-configured durable blob backend
-                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
-                // `SCP_RELAY_STORAGE_PATH` — the same explicit selection
-                // relay-only mode makes (SCP-CAPINJECT-010).
-                startup::storage_from_env(backend).await,
+                blob_storage,
             )
             .await;
         }
@@ -568,17 +661,14 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 }
             };
             // Reuse the single root handle (shared via `Arc`) rather than reopening,
-            // which would conflict on the advisory lock (os error 35).
+            // which would conflict on the advisory lock.
             run_node_with(
                 domain,
                 http_addr,
                 custody,
                 did_method,
                 Arc::clone(&node_storage_arc),
-                // Persistent mode: operator-configured durable blob backend
-                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
-                // `SCP_RELAY_STORAGE_PATH` (SCP-CAPINJECT-010).
-                startup::storage_from_env(backend).await,
+                blob_storage,
             )
             .await;
         }
@@ -597,8 +687,8 @@ fn parse_dht_mode_or_exit() -> scp_node::DhtMode {
     // nullifier) is a test-harness value compiled only under `testing`. The
     // non-publishing `DhtMode::Disabled` value belongs to the `--self-host`
     // path (`host_site`), which resolves via the relay layer without publishing;
-    // a relay node with no published DID cannot be found, so it is not offered
-    // here. (The library-level `NodeConfig`/`HostSiteConfig::defaults` fail-safe
+    // a relay node with no published DID cannot be found, so the full node
+    // rejects it in its own match. (The library-level `NodeConfig`/`HostSiteConfig::defaults` fail-safe
     // is `Disabled` per ADR-062 §Decision 1; this binary default is the operator
     // running a public server.)
     let raw = env::var("SCP_NODE_DHT_MODE").unwrap_or_else(|_| "production".into());
@@ -650,7 +740,7 @@ fn parse_dht_mode_or_exit() -> scp_node::DhtMode {
 /// describes the cleartext exposure instead.
 ///
 /// `publishes_dht` reflects whether `SCP_NODE_DHT_MODE` resolves to `production`
-/// (publish) vs `memory` (no publish). Under `memory` the host's address is NOT
+/// (publish) vs `disabled` (no publish). Under `disabled` the host's address is NOT
 /// published to the DHT, so the IP<->DID disclosure line is replaced with a line
 /// stating the node is reachable but not DHT-discoverable.
 fn self_host_banner(port: u16, plaintext: bool, publishes_dht: bool) -> String {
@@ -742,7 +832,9 @@ fn fixed_store_backend_conflict(flag: &str, store: &str, selected: Option<&str>)
     let cloud = match startup::BackendChoice::parse(value) {
         Ok(choice) => choice.is_cloud(),
         Err(startup::BackendSelectionError::NotCompiled { .. }) => true,
-        Err(startup::BackendSelectionError::Unknown { .. }) => false,
+        Err(
+            startup::BackendSelectionError::Unknown { .. } | startup::BackendSelectionError::Unset,
+        ) => false,
     };
     if !cloud {
         return None;
@@ -783,19 +875,19 @@ const EPHEMERAL_STORE: &str = "in memory";
 /// Opens an inbound TCP port to the public internet (via NAT-PMP/UPnP when the
 /// `upnp` feature is built). Whether the host's address is published to the
 /// Mainline DHT is governed independently by `SCP_NODE_DHT_MODE`:
-/// `production` (the default) publishes; `memory` does NOT publish — the node is
+/// `production` (the default) publishes; `disabled` does NOT publish — the node is
 /// still reachable on the opened port, the address is just not DHT-discoverable
-/// (share it out-of-band). `memory` is valid with NAT probing on or off. See the
+/// (share it out-of-band). `disabled` is valid with NAT probing on or off. See the
 /// startup banner.
 async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
     exit_on_ignored_cloud_backend("--self-host", SELF_HOST_STORE);
-    let port: u16 = startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16);
+    let port: u16 = or_exit(startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16));
     let plaintext = self_host_plaintext();
     let skip_nat = self_host_skip_nat();
 
-    // -- DHT mode: production pkarr by default; memory for "reachable but not
+    // -- DHT mode: production pkarr by default; disabled for "reachable but not
     //    DHT-discoverable" hosting. Parsed BEFORE the banner so the banner can
-    //    state the actual disclosure posture (memory = address NOT published). --
+    //    state the actual disclosure posture (disabled = address NOT published). --
     let dht_mode = parse_dht_mode_or_exit();
     let publishes_dht = matches!(dht_mode, scp_node::DhtMode::Production);
 
@@ -815,20 +907,20 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
         "self-host mode enabled — opening inbound port to the public internet"
     );
 
-    let refresh_secs: u64 = startup::env_or(
+    let refresh_secs: u64 = or_exit(startup::env_or(
         "SCP_NODE_SELF_HOST_REFRESH_SECS",
         // The default refresh interval is reach-independent; read it off a
         // throwaway `defaults(...)` (there is no whole-struct `Default` — M4).
         scp_node::HostSiteConfig::defaults(Reach::Local)
             .refresh_interval
             .as_secs(),
-    )
+    ))
     .max(1);
 
-    let projection_rate_limit: u32 = startup::env_or(
+    let projection_rate_limit: u32 = or_exit(startup::env_or(
         "SCP_NODE_PROJECTION_RATE_LIMIT",
         scp_node::DEFAULT_PROJECTION_RATE_LIMIT,
-    );
+    ));
 
     // -- Lower the binary's `plaintext` / `skip_nat` booleans onto the
     //    construction-pattern enums (ADR-052 M1): `plaintext` → `TlsMode`,
@@ -862,7 +954,8 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
         })),
     };
 
-    if let Err(e) = scp_node::host_site_until(config, startup::shutdown_signal()).await {
+    let shutdown = or_exit(startup::shutdown_signal());
+    if let Err(e) = scp_node::host_site_until(config, shutdown).await {
         tracing::error!(error = %e, "self-host mode failed");
         std::process::exit(1);
     }
@@ -926,9 +1019,13 @@ fn require_domain() -> String {
     }
 }
 
-/// Reads the HTTP bind address from env or returns the default.
+/// Reads the HTTP bind address from env, returns the default when it is unset,
+/// and exits 1 when it does not parse.
 fn node_http_addr() -> SocketAddr {
-    startup::env_or("SCP_NODE_BIND_ADDR", SocketAddr::from(([0, 0, 0, 0], 9000)))
+    or_exit(startup::env_or(
+        "SCP_NODE_BIND_ADDR",
+        SocketAddr::from(([0, 0, 0, 0], 9000)),
+    ))
 }
 
 /// Reads the comma-separated `SCP_NODE_DHT_GATEWAYS` env var into a list of
@@ -976,18 +1073,18 @@ async fn run_node_with<
     // and would break ephemeral mode's all-in-memory contract). Ephemeral mode
     // passes `ephemeral_blob_backend()` (in-memory, no persistence, env-ignoring);
     // persistent mode passes `startup::storage_from_env(backend)` (durable, honors
-    // env). `startup::backend_choice_from_env` chose `backend`, and it defaults to
-    // SQLite.
+    // env). `startup::backend_choice_from_env` chose `backend` from
+    // `SCP_RELAY_STORAGE_BACKEND`, which has no default.
     blob_storage: BlobStorageBackend,
 ) {
     let use_self_signed = env_flag_is_truthy(env::var("SCP_NODE_TLS_SELF_SIGNED").ok().as_deref());
 
     let use_dns_provider = env_flag_is_truthy(env::var("SCP_NODE_DNS_PROVIDER").ok().as_deref());
 
-    let projection_rate: u32 = startup::env_or(
+    let projection_rate: u32 = or_exit(startup::env_or(
         "SCP_NODE_PROJECTION_RATE_LIMIT",
         scp_node::DEFAULT_PROJECTION_RATE_LIMIT,
-    );
+    ));
 
     // Decide TLS + DNS provider from the two env booleans BEFORE building the
     // config (ADR-052 Phase B-P2). The three TLS arms map exactly onto the
@@ -1040,10 +1137,12 @@ async fn run_node_with<
         (TlsMode::Acme { email: None }, None)
     };
 
-    // `Domain` is a publishing reach, so M2 requires `DhtMode::Production`
-    // (advisory in P1 — dropped before lowering, so no runtime behavior
-    // change). `run_node_with` is generic over `S: EncryptedStorage`, so the
-    // production `Node::start` (not `start_for_testing`) is the correct entry.
+    // `Domain` is a publishing reach: `DhtMode::Production` makes `Node::start`
+    // publish through `did_method` and fail the start if that publish fails.
+    // The caller's DHT mode already chose `did_method` (the Pkarr client, or
+    // the in-memory client in a `testing` build). `run_node_with` is generic
+    // over `S: EncryptedStorage`, so the production `Node::start` (not
+    // `start_for_testing`) is the correct entry.
     let node = match Node::start(NodeConfig {
         tls,
         dns_provider,
@@ -1086,7 +1185,8 @@ async fn run_node_with<
     // Install Prometheus metrics recorder and add /metrics endpoint (#1467).
     let metrics_router = install_metrics_recorder();
 
-    if let Err(e) = node.serve(metrics_router, startup::shutdown_signal()).await {
+    let shutdown = or_exit(startup::shutdown_signal());
+    if let Err(e) = node.serve(metrics_router, shutdown).await {
         tracing::error!(error = %e, "application node exited with error");
         std::process::exit(1);
     }
@@ -1142,30 +1242,42 @@ async fn main() {
         print_help();
     }
 
+    if let Some(error) = conflicting_modes(&config) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+
+    if let Some(error) = unavailable_mode(&config, cfg!(feature = "testing")) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+
     // --health: probe the appropriate bind address and exit.
     if config.health {
         let addr: SocketAddr = if config.relay_only {
-            startup::env_or(
+            or_exit(startup::env_or(
                 "SCP_RELAY_BIND_ADDR",
                 SocketAddr::from(([127, 0, 0, 1], 9000)),
-            )
+            ))
         } else if config.self_host {
             // Self-host binds the site listener on SCP_NODE_SELF_HOST_PORT
             // (default 8443), NOT SCP_NODE_BIND_ADDR. Probe that port on
             // loopback so `--health` matches the port `--self-host` opens.
-            let port: u16 = startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16);
+            let port: u16 = or_exit(startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16));
             SocketAddr::from(([127, 0, 0, 1], port))
         } else {
-            startup::env_or(
+            or_exit(startup::env_or(
                 "SCP_NODE_BIND_ADDR",
                 SocketAddr::from(([127, 0, 0, 1], 9000)),
-            )
+            ))
         };
-        startup::health_check(addr).await;
-        return;
+        if startup::health_check(addr).await {
+            return;
+        }
+        std::process::exit(1);
     }
 
-    startup::init_tracing();
+    or_exit(startup::init_tracing());
 
     if config.relay_only {
         run_relay_only().await;
@@ -1175,16 +1287,13 @@ async fn main() {
         // Ephemeral mode wires in-memory subsystems (incl. the §17.17.3 in-memory
         // DHT nullifier), so it is compiled only under the `testing` feature
         // (ADR-062 §Decision 1). A shipped binary reached with `--ephemeral`
-        // fails closed rather than silently running a nullifier-backed node.
+        // fails closed at `unavailable_mode` above, before the `--health`
+        // probe; this arm refuses again rather than fall through to exit 0.
         #[cfg(feature = "testing")]
         run_full_node_ephemeral().await;
         #[cfg(not(feature = "testing"))]
         {
-            eprintln!(
-                "ERROR: --ephemeral is a test-harness mode (in-memory DHT/custody) and is not \
-                 available in this build. Run without --ephemeral for a persistent node, or set \
-                 SCP_NODE_DHT_MODE=disabled for a non-publishing node."
-            );
+            eprintln!("{EPHEMERAL_UNAVAILABLE}");
             std::process::exit(1);
         }
     } else {
@@ -1218,7 +1327,7 @@ mod tests {
                 );
             }
             assert_eq!(fixed_store_backend_conflict(flag, store, None), None);
-            for value in ["sqlite", "redb", "memory", "banana"] {
+            for value in ["sqlite", "redb", "memory", "banana", "", " "] {
                 assert_eq!(
                     fixed_store_backend_conflict(flag, store, Some(value)),
                     None,
@@ -1232,7 +1341,7 @@ mod tests {
     /// in-memory blob backend — no persistence, env overrides ignored. This pins
     /// the ephemeral caller's boundary selection so it cannot silently regress to
     /// a durable / env-driven backend (`startup::storage_from_env` on the choice
-    /// `startup::backend_choice_from_env` makes, which defaults to `Sqlite`),
+    /// `startup::backend_choice_from_env` reads from `SCP_RELAY_STORAGE_BACKEND`),
     /// which would break the all-in-memory contract documented on
     /// `run_full_node_ephemeral` and re-persist blobs to disk. If someone swaps
     /// `ephemeral_blob_backend()` to any non-in-memory backend, this fails.
@@ -1425,6 +1534,109 @@ mod tests {
         );
     }
 
+    /// Two or three run-mode selections fail closed instead of one silently
+    /// winning, and the error names each selector: `--ephemeral` beside
+    /// `--self-host`, the `SCP_NODE_SELF_HOST` fallback, or `--relay-only` is
+    /// refused, as is `--relay-only` beside self-host and all three together
+    /// (SHB-001, the exactly-one-run-mode acceptance criterion).
+    #[test]
+    fn two_run_modes_are_refused() {
+        for (args, env_self_host, named) in [
+            (
+                &["--self-host", "--ephemeral"][..],
+                false,
+                &["--self-host", "--ephemeral"][..],
+            ),
+            (
+                &["--ephemeral"][..],
+                true,
+                &["SCP_NODE_SELF_HOST", "--ephemeral"][..],
+            ),
+            (
+                &["--relay-only", "--ephemeral"][..],
+                false,
+                &["--relay-only", "--ephemeral"][..],
+            ),
+            (
+                &["--relay-only", "--self-host"][..],
+                false,
+                &["--relay-only", "--self-host"][..],
+            ),
+            (
+                &["--relay-only"][..],
+                true,
+                &["--relay-only", "SCP_NODE_SELF_HOST"][..],
+            ),
+            (
+                &["--relay-only", "--self-host", "--ephemeral"][..],
+                false,
+                &["--relay-only", "--self-host", "--ephemeral"][..],
+            ),
+        ] {
+            let mut full = vec!["scp-node"];
+            full.extend_from_slice(args);
+            let cfg = parse_cli_from(&argv(&full), env_self_host, None, None);
+            let error = conflicting_modes(&cfg);
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|e| named.iter().all(|n| e.contains(n))),
+                "{args:?} (env {env_self_host}) must be refused naming each of {named:?}: {error:?}"
+            );
+        }
+    }
+
+    /// Zero or one run-mode selection passes.
+    #[test]
+    fn one_run_mode_is_accepted() {
+        for (args, env_self_host) in [
+            (&[][..], false),
+            (&["--ephemeral"][..], false),
+            (&["--relay-only"][..], false),
+            (&["--self-host"][..], false),
+            (&[][..], true),
+            (&["--self-host"][..], true),
+        ] {
+            let mut full = vec!["scp-node"];
+            full.extend_from_slice(args);
+            let cfg = parse_cli_from(&argv(&full), env_self_host, None, None);
+            assert_eq!(
+                conflicting_modes(&cfg),
+                None,
+                "{args:?} (env {env_self_host})"
+            );
+        }
+    }
+
+    /// `--ephemeral` is refused, alone or beside `--health`, exactly when the
+    /// build does not compile it; every other mode passes in either build.
+    #[test]
+    fn ephemeral_is_refused_only_where_it_is_not_compiled() {
+        for args in [&["--ephemeral"][..], &["--ephemeral", "--health"][..]] {
+            let mut full = vec!["scp-node"];
+            full.extend_from_slice(args);
+            let cfg = parse_cli_from(&argv(&full), false, None, None);
+            assert_eq!(
+                unavailable_mode(&cfg, false),
+                Some(EPHEMERAL_UNAVAILABLE),
+                "{args:?}"
+            );
+            assert_eq!(unavailable_mode(&cfg, true), None, "{args:?}");
+        }
+        for args in [
+            &[][..],
+            &["--health"][..],
+            &["--relay-only"][..],
+            &["--self-host"][..],
+        ] {
+            let mut full = vec!["scp-node"];
+            full.extend_from_slice(args);
+            let cfg = parse_cli_from(&argv(&full), false, None, None);
+            assert_eq!(unavailable_mode(&cfg, false), None, "{args:?}");
+            assert_eq!(unavailable_mode(&cfg, true), None, "{args:?}");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Self-host disclosure banner content (`self_host_banner`)
     //
@@ -1494,34 +1706,37 @@ mod tests {
         );
     }
 
-    /// With DHT publishing OFF (`SCP_NODE_DHT_MODE=memory`), the banner must NOT
+    /// With DHT publishing OFF (`SCP_NODE_DHT_MODE=disabled`), the banner must NOT
     /// claim the host's IP is published — it must instead state the node is
     /// reachable but not DHT-discoverable. This is the banner half of the M2
-    /// correction: `memory` (no publish) is a valid self-host mode that opens the
-    /// port without disclosing the address to the DHT.
+    /// correction: `disabled` (no publish) is a valid self-host mode that opens the
+    /// port without disclosing the address to the DHT. ADR-062, capability
+    /// injection, moved the former `memory` value behind the `testing` feature, so
+    /// `disabled` is the no-publish value a shipped binary accepts here.
     #[test]
-    fn self_host_banner_memory_mode_states_no_publish() {
+    fn self_host_banner_no_publish_mode_states_no_publish() {
         let port = 8443u16;
-        let memory = self_host_banner(port, false, false);
+        let no_publish = self_host_banner(port, false, false);
 
         // The port is still opened, so the public-internet exposure stands.
         assert!(
-            memory.contains("PUBLIC INTERNET"),
-            "memory-mode banner must still disclose public-internet port exposure"
+            no_publish.contains("PUBLIC INTERNET"),
+            "no-publish banner must still disclose public-internet port exposure"
         );
         // But the IP<->identity DHT publication line must be GONE.
         assert!(
-            !memory.contains("PUBLIC IP will be published"),
-            "memory-mode banner must NOT claim the public IP is published to the DHT"
+            !no_publish.contains("PUBLIC IP will be published"),
+            "no-publish banner must NOT claim the public IP is published to the DHT"
         );
         assert!(
-            !memory.contains("IP<->identity disclosure"),
-            "memory-mode banner must NOT claim an IP<->identity disclosure"
+            !no_publish.contains("IP<->identity disclosure"),
+            "no-publish banner must NOT claim an IP<->identity disclosure"
         );
         // And it must state the no-publish / not-discoverable posture.
         assert!(
-            memory.contains("DHT publishing is OFF") && memory.contains("NOT DHT-discoverable"),
-            "memory-mode banner must state the address is not published and not DHT-discoverable"
+            no_publish.contains("DHT publishing is OFF")
+                && no_publish.contains("NOT DHT-discoverable"),
+            "no-publish banner must state the address is not published and not DHT-discoverable"
         );
     }
 }

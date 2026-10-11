@@ -98,11 +98,11 @@ style:
 # Lint
 ./gradlew detekt
 
-# Build
-./gradlew build
+# Build (`build` runs the tests, so it takes the same opt-in as `test`)
+./gradlew build -Pscp.uniffi.cargoFeatures=testing
 
-# Test
-./gradlew test
+# Test (the tests load a cdylib built with the `testing` feature)
+./gradlew test -Pscp.uniffi.cargoFeatures=testing
 
 # Publish to Maven Local
 ./gradlew publishToMavenLocal

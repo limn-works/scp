@@ -73,9 +73,10 @@ pub enum TlsError {
 /// TLS configuration. Both fields are PEM strings.
 ///
 /// The private key PEM is wrapped in [`Zeroizing`] so that the backing
-/// allocation is zeroed on drop, preventing key material from lingering
-/// in freed memory (defense-in-depth against core dumps, swap recovery,
-/// and cold-boot attacks). See issue #82.
+/// allocation is zeroed on drop, whichever global allocator links. While the
+/// value is live its bytes can still reach a core dump, swap, or a
+/// hibernation image; security model spec §9.15 (freed heap memory) lists
+/// those limits.
 #[derive(Clone)]
 pub struct CertificateData {
     /// PEM-encoded certificate chain (leaf + intermediates).

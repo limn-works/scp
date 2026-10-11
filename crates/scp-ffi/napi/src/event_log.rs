@@ -165,7 +165,8 @@ pub(crate) async fn event_log_query_on(
             );
             #[allow(clippy::cast_precision_loss)]
             events.push(NapiEvent {
-                event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type),
+                event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type)
+                    .to_owned(),
                 actor_did: entry.actor_did.0.clone(),
                 timestamp: entry.timestamp as f64,
                 payload_json: payload_value.to_string(),
@@ -501,18 +502,7 @@ pub(crate) fn event_log_checkpoint_on(
                     &signer,
                 )
                 .await
-                .map_err(|e| match &e {
-                    scp_event_log::EventLogError::Custody(failure) => {
-                        ScpNapiError::custody_failure(
-                            format!("checkpoint generation failed: {e}"),
-                            failure,
-                        )
-                    }
-                    _ => ScpNapiError::Context {
-                        message: format!("checkpoint generation failed: {e}"),
-                        code: codes::CTX_2023.to_owned(),
-                    },
-                })
+                .map_err(|e| ScpNapiError::checkpoint_error(&e))
             })
         })
         .map_err(napi::Error::from)?;
@@ -568,18 +558,7 @@ pub(crate) fn event_log_checkpoint_by_did_on(
                     &signer,
                 )
                 .await
-                .map_err(|e| match &e {
-                    scp_event_log::EventLogError::Custody(failure) => {
-                        ScpNapiError::custody_failure(
-                            format!("checkpoint generation failed: {e}"),
-                            failure,
-                        )
-                    }
-                    _ => ScpNapiError::Context {
-                        message: format!("checkpoint generation failed: {e}"),
-                        code: codes::CTX_2023.to_owned(),
-                    },
-                })
+                .map_err(|e| ScpNapiError::checkpoint_error(&e))
             })
         })
         .map_err(napi::Error::from)?;

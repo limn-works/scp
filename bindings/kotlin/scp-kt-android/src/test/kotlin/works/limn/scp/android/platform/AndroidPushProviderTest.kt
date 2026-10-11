@@ -2,10 +2,16 @@
  * Unit tests for [AndroidPushProvider].
  *
  * Tests cover the [AndroidPushProvider.handleNotification] logic — payload
- * validation, wake signal generation, and error code correctness. The
- * [AndroidPushProvider.register] method requires a live Firebase instance and
- * is tested via integration tests (instrumented tests on a real or emulated
- * Android device).
+ * validation, wake signal generation, and error code correctness. No test
+ * covers [AndroidPushProvider.register]: the method calls
+ * `FirebaseMessaging.getInstance()` itself, and the class takes no
+ * `FirebaseMessaging` to inject. ADR-027 criterion 13 requires FCM tests on
+ * Firebase Test Lab or against a mock `FirebaseMessaging` injected through
+ * dependency injection, and the module has neither. Story SCP-112 stays in
+ * progress while any acceptance criterion its description in
+ * `.docs/prds/main.json` records as unmet stands. That description records all
+ * five as unmet; the two this file bears on are "FCM token registration and
+ * refresh handled" and "Integration tests verify push delivery flow".
  *
  * See ADR-027 (Android Platform Adapter) and §10.7 (push payload opacity).
  */
@@ -165,15 +171,18 @@ class AndroidPushProviderTest {
     }
 
     // -----------------------------------------------------------------------
-    // Payload with extra fields — still valid per FCM data message format
+    // Payload with extra fields — the accept path §16.12.5 permits
     // -----------------------------------------------------------------------
 
     @Test
-    fun `payload with scp field and extra fields still returns Pull`() {
-        // FCM data messages may contain additional fields from the relay.
-        // As long as "scp" == "1", the handler accepts it. The opacity
-        // requirement (§10.7) is enforced at the relay side — the client
-        // validates only the wake signal field.
+    fun `handleNotification returns Pull for a payload with extra fields`() {
+        // handleNotification checks only the "scp" field, so a payload with
+        // other fields returns Pull. §10.7 requires a push payload to carry a
+        // wake signal and nothing else; §10.7.1 step 5 puts that on the sender
+        // (the relay sends exactly { "scp": 1 }), and FCM has carried every
+        // field before the handler sees it. §16.12.5 push_conformance lets an
+        // adapter accept such a payload with a byte-identical WakeSignal or
+        // reject it. This test pins the accept path this adapter takes.
         val payload = mapOf("scp" to "1", "extra" to "ignored")
         val signal = provider.handleNotification(payload)
         assertEquals(WakeSignal.PULL, signal)

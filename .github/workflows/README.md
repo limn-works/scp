@@ -14,7 +14,7 @@ runbook otherwise cannot tell that its triggers never fire.
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| [`ci.yml`](ci.yml) | Pushes to `main`, PRs to `main`, merge-queue entries | Lint, build, and test the Rust workspace. Its `ci` job aggregates every other job in the file, and the Default ruleset requires that one status check |
+| [`ci.yml`](ci.yml) | Pushes to `main`, PRs to `main`, merge-queue entries | Lint, build, and test the Rust workspace. Its `ci` job aggregates every other job in the file, and the Default ruleset requires that one status check. Job `changes` publishes one output per lane and a `code` output that is false on a pull request changing only prose (`.docs/**`, `.claude/**`, a root-level `*.md`, `docs/guides/**/*.md`), so the jobs that output guards skip on such a pull request. The CI-gate self-test runs in two jobs: ci-workflow-selftest-docs runs the checks that read prose (`--group docs`) on every pull request, and ci-workflow-selftest runs the rest (`--group rest`) under `code` |
 | [`docs.yml`](docs.yml) | Release tags (`scp-core@*`), pushes to `main`, PRs to `main`, merge-queue entries. Its `changes` job then skips every doc job unless the diff touches `crates/`, `bindings/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml` or `.cargo/` | Generate and publish SDK API reference docs |
 | [`codeql.yml`](codeql.yml) | Pushes to `main`, PRs to `main`, Sundays at 00:00 UTC | CodeQL analysis of the JavaScript/TypeScript, Python and Rust sources |
 | [`build-matrix.yml`](build-matrix.yml) | Release tags (`scp-*@*`), called by `release.yml` | Build platform-specific release artifacts for all SDKs |
@@ -66,7 +66,7 @@ The `docs-swift` artifact name is the same regardless of which workflow produces
 
 ### Runner pinning
 
-The `swift-xcframework` job and (formerly) the `swift-docs` job are pinned to `macos-26`. This is required because `Package.swift` declares `swift-tools-version: 6.2`, which needs Swift 6.2. The `macos-latest` runner (macOS 15) only ships Swift 6.1.
+The `swift-xcframework` job and (formerly) the `swift-docs` job are pinned to `macos-26`, because `Package.swift` declares `swift-tools-version: 6.2`, which needs Swift 6.2 or later, and the macOS 26 image ships it. A pin keeps the job on such an image whatever `macos-latest` later points to.
 
 ### Publishing
 
@@ -115,13 +115,15 @@ The `build-matrix.yml` workflow builds release artifacts for all SDK targets:
 | Job | What it builds | Platforms |
 |-----|---------------|-----------|
 | `rust` | `libscp_core`, `libscp_ffi` | Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64) |
-| `python-wheels` | maturin-built wheels | Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64) |
+| `python-wheels` | maturin-built wheels, one per CPython minor 3.10-3.13 | Linux manylinux_2_28 (x86_64, aarch64), macOS universal2 (one wheel for x86_64 and aarch64), Windows (x86_64) |
 | `python-sdist` | Source distribution | Platform-independent |
 | `typescript-napi` | napi-rs native addon | Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64) |
 | `swift-xcframework` | XCFramework + DocC docs | macOS universal2, iOS arm64, iOS Simulator |
 | `kotlin-aar` | AAR with bundled `.so` | Android (arm64, armv7, x86_64, x86) |
 | `cbindgen` | C ABI shared library | Linux, macOS, Windows (same as Rust) |
 | `aggregate` | Combined release bundle | All of the above |
+
+On a pull request that changes Rust or `bindings/python/`, `ci.yml` job `python-wheel-build` builds a debug wheel for CPython 3.10 and 3.12 on Linux x86_64 from the same `[tool.maturin]` table, installs it, imports every `scp_sdk` module, and fails when the extension links libcrypto or libssl dynamically.
 
 ## Release Pipeline
 

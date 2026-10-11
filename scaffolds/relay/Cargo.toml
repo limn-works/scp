@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+scp-alloc = { path = "../../crates/scp-alloc" }
 scp-node = { path = "../../crates/scp-node" }
 scp-transport = { path = "../../crates/scp-transport", features = ["sqlite-blob"] }
 scp-core = { path = "../../crates/scp-core" }

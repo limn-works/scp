@@ -10,7 +10,6 @@ body:
       description: Which PRD does this story belong to?
       options:
         - agent-binding
-        - bridge-cooperative
         - capability-registry
         - content-access
         - governance-gaps

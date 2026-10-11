@@ -239,9 +239,12 @@ def filtered_tools(
     for tool_name, schema in TOOL_SCHEMAS.items():
         required_cap = TOOL_CAPABILITIES.get(tool_name)
         # For tools that need a context, check capability if context_id is provided.
-        if required_cap is not None and context_id is not None:
-            if not agent_has_capability(state, context_id, required_cap):
-                continue
+        if (
+            required_cap is not None
+            and context_id is not None
+            and not agent_has_capability(state, context_id, required_cap)
+        ):
+            continue
         tools.append(schema)
     return tools
 

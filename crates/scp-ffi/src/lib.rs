@@ -64,13 +64,16 @@ compile_error!(
 pub mod context;
 pub mod economy;
 
+// Links the one `#[global_allocator]`, which wipes every heap block before
+// freeing it (09-security-model.md §9.15, freed heap memory).
+use scp_alloc as _;
+
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use pyo3::prelude::*;
 
 pub mod bridge_adapters;
-pub mod bridge_connector;
 pub mod custody;
 pub mod discovery;
 pub mod error;
@@ -80,6 +83,7 @@ pub mod mcp;
 pub mod media;
 pub mod outlet_stream;
 pub mod outlets;
+pub mod p256_host;
 pub mod provenance;
 pub mod runtime;
 pub mod scp;
@@ -263,10 +267,10 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     provenance::register_provenance(m)?;
     mcp::register_mcp(m)?;
     trust::register_trust(m)?;
-    bridge_connector::register_bridge_connector(m)?;
     sync::register_sync(m)?;
     scpid::register_scpid(m)?;
     media::register_media(m)?;
+    p256_host::register_p256_host(m)?;
 
     // Server startup (relay + application node) — feature-gated.
     #[cfg(feature = "server")]

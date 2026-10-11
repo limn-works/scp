@@ -1,0 +1,19 @@
+[package]
+name = "scp-alloc"
+version = "0.1.0-beta.2"
+description = "Wiping global allocator for SCP (Shared Context Protocol) binaries and cdylibs"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["protocol", "allocator", "zeroize", "security"]
+categories = ["memory-management", "cryptography"]
+
+# No dependencies: this crate holds the process's `#[global_allocator]`, so
+# anything it depended on would run inside every allocation of every shipped
+# artifact.
+[dependencies]
+
+[lints]
+workspace = true

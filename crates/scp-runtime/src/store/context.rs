@@ -15,7 +15,6 @@
 
 use hex;
 use scp_platform::traits::Storage;
-use zeroize::Zeroize;
 
 use scp_did::DID;
 
@@ -407,15 +406,8 @@ impl<S: Storage> ProtocolRepository<S> {
         snapshot: &crate::context::state::ContextSnapshot,
     ) -> Result<(), StoreError> {
         let key = full_snapshot_key(context_id)?;
-        let mut bytes = Self::serialize(snapshot)?;
-        let result = self
-            .storage
-            .store(&key, &bytes)
-            .await
-            .map_err(StoreError::Storage);
-        // Defense-in-depth: clear serialized data from memory.
-        bytes.zeroize();
-        result
+        // The snapshot carries `mls_crypto_state` and the access-key store.
+        self.store_value_zeroize(&key, snapshot).await
     }
 
     /// Loads a full context snapshot from persistence.
@@ -588,7 +580,7 @@ impl<S: Storage> ProtocolRepository<S> {
     ) -> Result<(), StoreError> {
         let storage_key = sender_key_key(context_id, did)?;
         // Sender keys are cryptographic material — zeroize after storage.
-        self.store_value_zeroize(&storage_key, &key.to_vec()).await
+        self.store_value_zeroize(&storage_key, key).await
     }
 
     /// Loads a sender key for a DID within a context.
@@ -1324,7 +1316,7 @@ mod tests {
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
-            mls_crypto_state: Vec::new(),
+            mls_crypto_state: crate::context::state::MlsCryptoState::default(),
             migration_state: None,
             access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
             consequence_rules: Vec::new(),

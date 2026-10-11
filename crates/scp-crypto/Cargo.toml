@@ -19,18 +19,14 @@ testing = []
 [dependencies]
 ed25519-dalek = { workspace = true }
 # Pseudonym derivation (§9.10.4.A): HKDF-SHA-256 pseudonym secret + HMAC-SHA-256
-# per-context keypair derivation. All pure RustCrypto primitives already in the
-# wasm tree, so `scp-crypto` stays wasm-safe with the derivation moved here.
-#
-# scp-crypto pins the RustCrypto hmac 0.13 / sha2 0.11 line instead of the
-# workspace's hmac 0.12 / sha2 0.10, because only the newer line wipes the keyed
-# HMAC and hash state (`zeroize` features). HKDF is hand-written on Hmac<Sha256>
-# (src/kdf.rs) so the PRK and every T(i) block sit in Zeroizing buffers; the
-# hkdf crate leaves them unwiped. Wiping is best effort: compiler-made copies in
-# registers or spilled stack slots are out of reach. No type from these crates
-# crosses scp-crypto's API.
-hmac = { version = "0.13", features = ["zeroize"] }
-sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
+# per-context seed, and the §9.10.4 seed-to-scalar HKDF-Expand. Pure RustCrypto
+# crates already in the wasm tree, so `scp-crypto` stays wasm-safe. These are the
+# workspace's one hash-crate generation; their HMAC and HKDF state is not wiped,
+# so wiping secret intermediates is best effort: scp-crypto wipes the buffers it
+# owns (`Zeroizing`), not the crates' internal state or compiler-made copies.
+hkdf = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 zeroize = { workspace = true }
 # P-256 primitives (§9.5, §9.10.4): signing, strict/lenient verification, ECDH,
 # SEC1 point validation, and the FIPS 186-5 A.2.1 seed-to-scalar step.
@@ -44,8 +40,6 @@ thiserror = { workspace = true }
 getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
-# RFC 5869 A.1-A.3 equivalence test for the hand-written HKDF (src/kdf.rs).
-hkdf = "0.13"
 rand = { workspace = true }
 hex = { workspace = true }
 proptest = "1"

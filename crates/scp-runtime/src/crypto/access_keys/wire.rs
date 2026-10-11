@@ -694,7 +694,7 @@ mod tests {
     /// A response whose `enc` is a valid P-256 point, so `open` reaches
     /// both custody calls. The sealed key is never opened by these tests.
     fn response_with_valid_enc() -> AccessKeyResponse {
-        let secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         AccessKeyResponse {
             context_id: "ctx-1".to_owned(),
             member_did: "did:dht:alice".to_owned(),
@@ -926,7 +926,7 @@ mod tests {
     #[test]
     fn hpke_seal_open_roundtrip() {
         // Generate a simulated wrapping keypair (software-held).
-        let wrapping_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let wrapping_secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         let wrapping_public = wrapping_secret.public_key();
 
         let access_key = generate_access_key("ctx-1", "did:dht:alice");
@@ -961,7 +961,7 @@ mod tests {
 
     #[test]
     fn hpke_seal_produces_ciphertext_plus_tag() {
-        let wrapping_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let wrapping_secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         let wrapping_public = wrapping_secret.public_key();
         let info = build_hpke_info("ctx-1", "did:dht:alice", 0);
         let aad = build_hpke_aad("ctx-1", "did:dht:alice", 0);
@@ -979,7 +979,7 @@ mod tests {
         // Sealing the same key under different info strings (different context)
         // must not cross-open: a ciphertext sealed with info_a fails to open
         // with info_b.
-        let wrapping_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let wrapping_secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         let wrapping_public = wrapping_secret.public_key();
         let info_a = build_hpke_info("ctx-a", "did:dht:alice", 0);
         let aad_a = build_hpke_aad("ctx-a", "did:dht:alice", 0);
@@ -1171,7 +1171,9 @@ mod tests {
 
     /// The JSON encoding of an `AccessKeyRequest`, captured before the wrapping
     /// key moved from `Vec<u8>` to a validating point type. The type change
-    /// must not change a byte on the wire.
+    /// must not change a byte on the wire. The point bytes were re-captured
+    /// when the test point fixture moved to `SeedLabel::TestVectorKey`; every
+    /// other byte is the original capture.
     #[test]
     fn access_key_request_json_encoding_is_unchanged() {
         let request = AccessKeyRequest {
@@ -1188,7 +1190,7 @@ mod tests {
         assert_eq!(serde_json::to_vec(&decoded).expect("re-encode"), encoded);
     }
 
-    const GOLDEN_ACCESS_KEY_REQUEST_JSON_HEX: &str = "7b227265717565737465725f646964223a226469643a6468743a626f62222c22636f6e746578745f6964223a226374782d676f6c64656e222c227772617070696e675f7075626b6579223a5b342c36392c37362c37302c3231372c3233392c31392c3134352c3135352c3234322c3136312c3232312c3232342c32302c3135332c3133372c34372c39302c38312c3138392c35362c3230362c36362c3138382c34332c35332c31342c35322c3136342c39352c3131372c37302c3233312c35382c33372c32372c3134332c352c33342c3134362c3136372c34372c3231362c3132332c36352c3136312c35392c34382c3232392c332c38342c3134382c3231332c3138362c3137382c37362c3233362c3230382c37302c3232362c38332c3132312c3133362c3131372c36325d2c226e6f6e6365223a5b31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31375d2c2274696d657374616d70223a313730303030303030302c227369676e6174757265223a5b33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33345d7d";
+    const GOLDEN_ACCESS_KEY_REQUEST_JSON_HEX: &str = "7b227265717565737465725f646964223a226469643a6468743a626f62222c22636f6e746578745f6964223a226374782d676f6c64656e222c227772617070696e675f7075626b6579223a5b342c3135352c36332c3233352c3135382c3134332c3235322c3136312c3231342c31332c3130382c39362c3134342c39332c39362c31332c38302c35312c36342c3135362c38372c3231302c3137342c3134312c3235312c34302c3134362c3234372c32362c3234312c3130392c382c3132312c3137332c3134302c36322c3233342c3233302c342c382c3131332c3232362c3139302c3230332c3137342c33322c3132332c3137362c38312c3131352c33302c3132332c3233382c3230302c3137352c3233352c3135342c38362c33322c3135362c35332c33342c392c3139302c34345d2c226e6f6e6365223a5b31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31375d2c2274696d657374616d70223a313730303030303030302c227369676e6174757265223a5b33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33342c33345d7d";
 
     /// §9.5: a wire key that is not a 65-byte uncompressed P-256 point fails
     /// at decode, in the request's `wrapping_pubkey` and the response's
@@ -1340,7 +1342,7 @@ mod tests {
 
         // 2. Generate a DHKEM(P-256) wrapping keypair for the requester
         //    (software-held so the test can run the software `hpke::open` path).
-        let wrapping_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let wrapping_secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         let wrapping_public = wrapping_secret.public_key();
 
         let timestamp = 1_700_000_000_u64;
@@ -1431,7 +1433,7 @@ mod tests {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
 
-        let wrapping_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let wrapping_secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         let wrapping_public = wrapping_secret.public_key();
 
         let timestamp = 1_700_000_000_u64;

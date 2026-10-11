@@ -273,7 +273,7 @@ fn query_manager_entries(
         );
         let payload = json_to_py_dict(py, &payload_json)?;
         py_events.push(PyEvent {
-            event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type),
+            event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type).to_owned(),
             actor_did: entry.actor_did.0.clone(),
             timestamp,
             payload,
@@ -406,7 +406,7 @@ fn query_storage_fallback(
         {
             // Apply additional filters.
             if let Some(ref et) = query_filter.event_type
-                && format!("{:?}", event.event_type) != *et
+                && scp_ffi_common::event_log::event_type_label(&event.event_type) != et.as_str()
             {
                 continue;
             }
@@ -442,7 +442,8 @@ fn query_storage_fallback(
 
             #[allow(clippy::cast_precision_loss)]
             py_events.push(PyEvent {
-                event_type: format!("{:?}", event.event_type),
+                event_type: scp_ffi_common::event_log::event_type_label(&event.event_type)
+                    .to_owned(),
                 actor_did: event.actor_did.0.clone(),
                 timestamp: event.timestamp as f64,
                 payload,
@@ -753,13 +754,7 @@ fn event_log_checkpoint_impl(
                 .await
             });
 
-            result.map_err(|e| match &e {
-                scp_event_log::EventLogError::Custody(failure) => ScpPyError::custody_failure(
-                    format!("checkpoint generation failed: {e}"),
-                    failure,
-                ),
-                _ => ScpPyError::context(format!("checkpoint generation failed: {e}")),
-            })
+            result.map_err(|e| ScpPyError::checkpoint_error(&e))
         })
     })?;
 

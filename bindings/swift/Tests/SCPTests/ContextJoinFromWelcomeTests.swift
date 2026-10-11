@@ -52,9 +52,10 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
     }
 
     /// Legible params for a `SingleAdmin` context. The invite gate enforces only
-    /// `governance:propose` (routed through the actor governance gate); the
-    /// ceiling below simply keeps the default SingleAdmin capability set, so
-    /// `inviteMember` seals unilaterally.
+    /// `governance:propose` (routed through the actor governance gate). The
+    /// SingleAdmin creator holds every capability in the declared ceiling, so
+    /// the ceiling below declares `governance:propose` and `inviteMember`
+    /// seals unilaterally.
     private func makeInviteParams() -> ContextParams {
         ContextParams(
             mode: .encrypted,

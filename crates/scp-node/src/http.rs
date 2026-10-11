@@ -224,21 +224,6 @@ pub struct NodeState {
     /// the critical section is a single `Option` copy with no `.await`.
     pub(crate) default_site_routing_id: std::sync::RwLock<Option<[u8; 32]>>,
 
-    /// Shared state for bridge shadow operations.
-    ///
-    /// Holds per-context shadow registries and sender key stores for the
-    /// bridge shadow creation endpoint (`POST /v1/scp/bridge/shadow`).
-    /// See SCP-BCH-002.
-    pub(crate) bridge_state: Arc<crate::bridge_handlers::BridgeState>,
-
-    /// Production bridge lookup for bridge auth middleware (spec section 12.10.2).
-    ///
-    /// When `Some`, the bridge router is wrapped with [`bridge_auth_middleware`](crate::bridge_auth::bridge_auth_middleware)
-    /// and [`webhook_auth_middleware`](crate::bridge_auth::webhook_auth_middleware) using this lookup. When `None` (e.g., in
-    /// tests or when bridges are not configured), the bridge router is mounted
-    /// without authentication.
-    pub(crate) bridge_lookup: Option<Arc<dyn crate::bridge_auth::BridgeLookup>>,
-
     /// Shared PUBLISH rate limiter from the relay server.
     ///
     /// Cloned from the WebSocket relay so the QUIC listener enforces the same
@@ -278,7 +263,7 @@ pub struct NodeState {
 
     /// Whether the relay-side QUIC listener actually bound and started.
     ///
-    /// Set to `true` by [`ApplicationNode::serve`] only after
+    /// Set to `true` by [`ApplicationNode::bind`] only after
     /// [`spawn_quic_listener`] reports a successful UDP bind, and stays `false`
     /// if the bind fails (port held, permission denied) or no
     /// [`quic_server_config`](Self::quic_server_config) is present. This is the
@@ -582,17 +567,6 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         crate::projection::broadcast_projection_router(Arc::clone(&self.state))
     }
 
-    /// Returns an axum [`Router`] serving bridge endpoints.
-    ///
-    /// Includes `POST /v1/scp/bridge/shadow` for shadow identity creation.
-    /// Requires bridge authentication middleware to be applied by the caller.
-    ///
-    /// See SCP-BCH-002 and spec section 12.10.
-    #[must_use = "returns the bridge router, which must be mounted into an axum application"]
-    pub fn bridge_router(&self) -> Router {
-        crate::bridge_handlers::bridge_router(Arc::clone(&self.state.bridge_state))
-    }
-
     /// Returns the dev API router if the dev API is enabled.
     ///
     /// Returns `Some(Router)` when `NodeConfig::local_api` was set (i.e., a
@@ -681,10 +655,9 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     /// [`PublicSurface::Full`](crate::PublicSurface::Full) is identical to
     /// [`serve`](Self::serve). [`PublicSurface::SelfHost`](crate::PublicSurface::SelfHost)
     /// exposes ONLY the read-only website projection surface on the public
-    /// bind — the relay upgrade (`/scp/v1`) and bridge routes
-    /// (`/v1/scp/bridge/*`) are not mounted, so anonymous internet clients
-    /// cannot reach the node's loopback relay or bridge through the public
-    /// listener (§10.12.8).
+    /// bind — the relay upgrade (`/scp/v1`) is not mounted, so anonymous
+    /// internet clients cannot reach the node's loopback relay or bridge
+    /// through the public listener (§10.12.8).
     ///
     /// TLS termination, the dev API listener, and the HTTP/3 listener behave
     /// exactly as in [`serve`](Self::serve); the only difference is which SCP
@@ -700,26 +673,164 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         surface: crate::PublicSurface,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<(), NodeError> {
+        self.bind()
+            .await?
+            .serve_with_surface(app_router, surface, shutdown)
+            .await
+    }
+
+    /// Binds the node's public listeners and returns the bound node, without
+    /// serving yet.
+    ///
+    /// Binds the public TCP listener on `NodeConfig::http_bind_addr` and, with
+    /// the `quic` feature and a provisioned TLS certificate, the relay QUIC
+    /// listener on the same port over UDP (spec §10.14.3 item 1). The returned
+    /// [`BoundApplicationNode`] reports the addresses the operating system
+    /// assigned, so a caller that requests port 0 learns the real port without
+    /// binding it a second time. [`serve`](Self::serve) is `bind` followed by
+    /// [`BoundApplicationNode::serve`].
+    ///
+    /// ## Port 0
+    ///
+    /// When `http_bind_addr` requests port 0 and the QUIC listener cannot bind
+    /// UDP on the TCP port the OS assigned (another socket holds that UDP
+    /// port), `bind` releases the TCP port and draws a fresh one, a bounded
+    /// number of times, so both transports share one port. A fixed port is
+    /// never re-drawn: if its UDP bind fails, the node serves WebSocket only,
+    /// `.well-known/scp` does not advertise `"quic"`, and
+    /// [`BoundApplicationNode::quic_addr`] returns `None` (spec §10.14.3: QUIC
+    /// is RECOMMENDED, WebSocket is the mandatory baseline).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Serve`] if the public TCP listener cannot bind or
+    /// its bound address cannot be read.
+    pub async fn bind(self) -> Result<BoundApplicationNode<S>, NodeError> {
+        let (listener, http_addr, quic_addr) = bind_public_listeners(&self.state).await?;
+        let unserved = CancelOnDrop(Some(self.state.shutdown_token.clone()));
+        Ok(BoundApplicationNode {
+            node: self,
+            listener,
+            http_addr,
+            quic_addr,
+            unserved,
+        })
+    }
+}
+
+/// An [`ApplicationNode`] whose public listeners are bound but not yet served.
+///
+/// Returned by [`ApplicationNode::bind`]. It reports the bound TCP address and
+/// the bound QUIC address, then serves on the listeners it already holds, so
+/// no window exists between learning the port and binding it.
+///
+/// Dropping it without serving cancels the node's shutdown token, which stops
+/// the QUIC listener that [`ApplicationNode::bind`] started.
+pub struct BoundApplicationNode<S: Storage> {
+    node: ApplicationNode<S>,
+    listener: tokio::net::TcpListener,
+    http_addr: SocketAddr,
+    quic_addr: Option<SocketAddr>,
+    unserved: CancelOnDrop,
+}
+
+/// Cancels a token when dropped, unless disarmed first.
+struct CancelOnDrop(Option<CancellationToken>);
+
+impl CancelOnDrop {
+    /// Disarms the guard so dropping it cancels nothing.
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(token) = self.0.take() {
+            token.cancel();
+        }
+    }
+}
+
+impl<S: Storage + Send + Sync + 'static> BoundApplicationNode<S> {
+    /// The address the public TCP listener (HTTPS/WSS, or plain HTTP/WS in
+    /// no-domain mode) is bound to.
+    #[must_use]
+    pub const fn http_addr(&self) -> SocketAddr {
+        self.http_addr
+    }
+
+    /// The address the relay QUIC listener is bound to, or `None` when the node
+    /// runs no QUIC listener: the build lacks the `quic` feature, the node has
+    /// no TLS certificate (no-domain mode), or the UDP bind failed.
+    #[must_use]
+    pub const fn quic_addr(&self) -> Option<SocketAddr> {
+        self.quic_addr
+    }
+
+    /// Serves on the bound listeners until `shutdown` resolves.
+    ///
+    /// Behaves exactly as [`ApplicationNode::serve`] after its bind step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Serve`] if the dev API cannot bind or either server
+    /// encounters a fatal I/O error.
+    pub async fn serve(
+        self,
+        app_router: Router,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), NodeError> {
+        self.serve_with_surface(app_router, crate::PublicSurface::Full, shutdown)
+            .await
+    }
+
+    /// Serves the requested [`PublicSurface`](crate::PublicSurface) on the
+    /// bound listeners until `shutdown` resolves.
+    ///
+    /// Behaves exactly as [`ApplicationNode::serve_with_surface`] after its
+    /// bind step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Serve`] if the dev API cannot bind or either server
+    /// encounters a fatal I/O error.
+    pub async fn serve_with_surface(
+        self,
+        app_router: Router,
+        surface: crate::PublicSurface,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), NodeError> {
+        let Self {
+            node,
+            listener,
+            http_addr: local_addr,
+            quic_addr: _,
+            unserved,
+        } = self;
+        // From here the serve path owns shutdown and cancels the token itself.
+        unserved.disarm();
+
         spawn_projection_rate_limit_cleanup(
-            self.state.projection_rate_limiter.clone(),
-            self.state.shutdown_token.clone(),
+            node.state.projection_rate_limiter.clone(),
+            node.state.shutdown_token.clone(),
         );
 
         // Build the merged router for the requested public surface.
-        let merged = self.build_scp_router_with_surface(app_router, surface);
+        let merged = node.build_scp_router_with_surface(app_router, surface);
 
-        let dev_router = self
+        let dev_router = node
             .state
             .dev_token
             .clone()
-            .map(|t| crate::dev_api::dev_router(Arc::clone(&self.state), t));
-        let dev_bind_addr = self.state.dev_bind_addr;
-        let tls_config = self.state.tls_config.clone();
+            .map(|t| crate::dev_api::dev_router(Arc::clone(&node.state), t));
+        let dev_bind_addr = node.state.dev_bind_addr;
+        let tls_config = node.state.tls_config.clone();
         #[cfg(feature = "http3")]
-        let http3_config = self.http3_config;
+        let http3_config = node.http3_config;
 
-        let relay = self.relay;
-        let state = self.state;
+        let relay = node.relay;
+        let state = node.state;
 
         let dev_api_handle = spawn_dev_api(dev_router, dev_bind_addr, state.shutdown_token.clone());
 
@@ -729,30 +840,6 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
             spawn_http3_listener(http3_config, &state);
         }
 
-        let listener = tokio::net::TcpListener::bind(state.http_bind_addr)
-            .await
-            .map_err(|e| NodeError::Serve(e.to_string()))?;
-        let local_addr = listener
-            .local_addr()
-            .map_err(|e| NodeError::Serve(e.to_string()))?;
-
-        // Start the relay-side QUIC listener on the SAME port as the WebSocket
-        // TCP listener, but UDP (spec §10.14.3 item 1). We start it after the
-        // TCP bind so that, when `http_bind_addr` requests an OS-assigned port
-        // (port 0), QUIC binds the *actual* bound port rather than a second,
-        // unrelated OS-assigned port. Shares subscription + blob state with the
-        // WebSocket relay (spec §10.14.3 item 2). No-op without the `quic`
-        // feature or in no-domain mode (no TLS certificate).
-        #[cfg(feature = "quic")]
-        {
-            // The bind is synchronous (it completes before `start()` returns),
-            // so the flag is settled before the server future below is awaited
-            // and before the first `.well-known/scp` request can be served.
-            let started = spawn_quic_listener(&state, local_addr.port());
-            state
-                .quic_listening
-                .store(started, std::sync::atomic::Ordering::Release);
-        }
         let shutdown_token = state.shutdown_token.clone();
         let token = shutdown_token.clone();
         tokio::spawn(async move {
@@ -812,46 +899,88 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     }
 }
 
+/// How many OS-assigned ports [`ApplicationNode::bind`] draws, at most, when
+/// the QUIC listener cannot bind UDP on the TCP port the OS assigned.
+///
+/// A draw fails only when another socket already holds the UDP port that
+/// carries the same number as a free TCP port, so exhausting eight draws points
+/// at something other than chance.
+#[cfg(feature = "quic")]
+const PORT_ZERO_PAIR_ATTEMPTS: u32 = 8;
+
+/// Binds the public TCP listener and, when configured, the QUIC listener on
+/// the same port. Returns the TCP listener, its bound address, and the QUIC
+/// listener's bound address (`None` when no QUIC listener runs).
+///
+/// Sets `NodeState::quic_listening` so `.well-known/scp` advertises `"quic"`
+/// only while the QUIC listener runs (spec §10.14.3 item 3).
+async fn bind_public_listeners(
+    state: &Arc<NodeState>,
+) -> Result<(tokio::net::TcpListener, SocketAddr, Option<SocketAddr>), NodeError> {
+    let requested = state.http_bind_addr;
+    #[cfg(feature = "quic")]
+    {
+        let mut draws: u32 = 1;
+        loop {
+            let (listener, local_addr) = bind_public_tcp(requested).await?;
+            // The QUIC listener binds after the TCP listener so that, when
+            // `http_bind_addr` requests port 0, QUIC binds the port the OS
+            // assigned to TCP rather than a second, unrelated port. It shares
+            // subscription and blob state with the WebSocket relay (spec
+            // §10.14.3 item 2).
+            let quic_addr = match spawn_quic_listener(state, local_addr.port()) {
+                Ok(quic_addr) => quic_addr,
+                Err(e) if requested.port() == 0 && draws < PORT_ZERO_PAIR_ATTEMPTS => {
+                    tracing::debug!(
+                        port = local_addr.port(), draws, error = %e,
+                        "UDP port taken for the OS-assigned TCP port; drawing a fresh port"
+                    );
+                    draws += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "failed to start relay QUIC listener — serving WebSocket only"
+                    );
+                    None
+                }
+            };
+            // The QUIC bind is synchronous, so the flag is settled before any
+            // `.well-known/scp` request can be served.
+            state
+                .quic_listening
+                .store(quic_addr.is_some(), std::sync::atomic::Ordering::Release);
+            return Ok((listener, local_addr, quic_addr));
+        }
+    }
+    #[cfg(not(feature = "quic"))]
+    {
+        let (listener, local_addr) = bind_public_tcp(requested).await?;
+        Ok((listener, local_addr, None))
+    }
+}
+
+/// Binds the public TCP listener on `requested` and reads its bound address.
+async fn bind_public_tcp(
+    requested: SocketAddr,
+) -> Result<(tokio::net::TcpListener, SocketAddr), NodeError> {
+    let listener = tokio::net::TcpListener::bind(requested)
+        .await
+        .map_err(|e| {
+            NodeError::Serve(format!(
+                "failed to bind public listener on {requested}: {e}"
+            ))
+        })?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| NodeError::Serve(format!("failed to read public listener address: {e}")))?;
+    Ok((listener, local_addr))
+}
+
 // ---------------------------------------------------------------------------
 // Dev API spawning (extracted for clippy::too_many_lines)
 // ---------------------------------------------------------------------------
-
-/// Builds the bridge and webhook routers with appropriate auth middleware.
-///
-/// JWT-authenticated bridge routes use `bridge_auth_middleware_dyn` (Bearer
-/// token). The webhook route uses `webhook_auth_middleware_dyn`
-/// (`X-SCP-Signature` header). When no `BridgeLookup` is configured (dev
-/// mode), both are mounted without authentication.
-///
-/// See spec section 12.10.2.
-pub(crate) fn build_bridge_routers(
-    bridge_state: &Arc<crate::bridge_handlers::BridgeState>,
-    bridge_lookup: Option<&Arc<dyn crate::bridge_auth::BridgeLookup>>,
-) -> (Router, Router) {
-    let bridge = {
-        let base = crate::bridge_handlers::bridge_router(Arc::clone(bridge_state));
-        if let Some(lookup) = bridge_lookup {
-            base.layer(axum::middleware::from_fn_with_state(
-                Arc::clone(lookup),
-                crate::bridge_auth::bridge_auth_middleware_dyn,
-            ))
-        } else {
-            base
-        }
-    };
-    let bridge_webhook = {
-        let base = crate::bridge_handlers::bridge_webhook_router(Arc::clone(bridge_state));
-        if let Some(lookup) = bridge_lookup {
-            base.layer(axum::middleware::from_fn_with_state(
-                Arc::clone(lookup),
-                crate::bridge_auth::webhook_auth_middleware_dyn,
-            ))
-        } else {
-            base
-        }
-    };
-    (bridge, bridge_webhook)
-}
 
 /// Builds the merged axum router for `serve()`, combining SCP protocol
 /// routes (well-known, relay, projection, ACME challenges) with the
@@ -870,16 +999,12 @@ pub(crate) fn build_merged_router(
     well_known: Router,
     relay_rt: Router,
     projection: Router,
-    bridge: Router,
-    bridge_webhook: Router,
     state: &Arc<NodeState>,
 ) -> Router {
     let merged = app_router
         .merge(well_known)
         .merge(relay_rt)
-        .merge(projection)
-        .merge(bridge)
-        .merge(bridge_webhook);
+        .merge(projection);
 
     finalize_router(merged, state)
 }
@@ -890,15 +1015,14 @@ pub(crate) fn build_merged_router(
 /// `.well-known/scp`, the broadcast projection endpoints (`/scp/broadcast/*`,
 /// including `/feed`, `/messages`, and `/site/*`), any configured ACME
 /// challenge routes, and the virtual-host fallback. It deliberately does NOT
-/// merge the relay upgrade router (`/scp/v1`) nor the bridge routers
-/// (`/v1/scp/bridge/*`).
+/// merge the relay upgrade router (`/scp/v1`).
 ///
 /// This is the security seam for §10.12.8: in self-host mode the node's own
 /// loopback relay is reached in-process over `127.0.0.1` (the relay's listener
 /// stays loopback), so the relay upgrade/bridge must never be exposed on the
-/// public bind. An external client hitting `/scp/v1` or `/v1/scp/bridge/*` on
-/// the self-host public listener therefore falls through to the virtual-host
-/// fallback and receives 404 (no registered hostname matches those paths),
+/// public bind. An external client hitting `/scp/v1` on the self-host public
+/// listener therefore falls through to the virtual-host fallback and receives
+/// 404 (no registered hostname matches that path),
 /// while the website projection routes serve normally.
 ///
 /// **Caller note:** whatever `app_router` is passed IS exposed on the public
@@ -1208,8 +1332,6 @@ mod tests {
             acme_challenges: None,
             hostname_index: RwLock::new(HashMap::new()),
             default_site_routing_id: std::sync::RwLock::new(None),
-            bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
-            bridge_lookup: None,
             #[cfg(feature = "quic")]
             publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(100),
             #[cfg(feature = "quic")]
@@ -1407,8 +1529,6 @@ mod vhost_tests {
             acme_challenges: None,
             hostname_index: RwLock::new(hostname_index),
             default_site_routing_id: std::sync::RwLock::new(None),
-            bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
-            bridge_lookup: None,
             #[cfg(feature = "quic")]
             publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(100),
             #[cfg(feature = "quic")]
@@ -1803,19 +1923,24 @@ fn spawn_http3_listener(http3_config: scp_transport::http3::Http3Config, state: 
 /// a QUIC subscriber receives blobs published over WebSocket and vice-versa
 /// (spec §10.14.3 item 2).
 ///
-/// Returns `true` if the listener was started, `false` otherwise (no config, or
-/// bind failure — in which case the node degrades to WebSocket-only).
+/// Returns `Ok(Some(addr))` with the listener's bound address once it starts,
+/// `Ok(None)` when the node has no QUIC server config (no TLS certificate), and
+/// the bind error otherwise; the caller decides whether to draw another port or
+/// serve WebSocket only.
 ///
 /// The listener's lifecycle is tied to `state.shutdown_token`: a small task
 /// awaits cancellation and then signals the QUIC listener to stop, so
 /// [`ApplicationNode::shutdown`] (and `serve()`'s graceful shutdown) stop both
 /// transports together.
 #[cfg(feature = "quic")]
-fn spawn_quic_listener(state: &Arc<NodeState>, tcp_port: u16) -> bool {
+fn spawn_quic_listener(
+    state: &Arc<NodeState>,
+    tcp_port: u16,
+) -> Result<Option<SocketAddr>, scp_transport::quic::listener::QuicListenerError> {
     use scp_transport::quic::listener::{QuicListener, QuicListenerConfig};
 
     let Some(server_config) = state.quic_server_config.clone() else {
-        return false;
+        return Ok(None);
     };
 
     // Bind UDP on the same interface and port as the public WebSocket/TLS
@@ -1852,21 +1977,14 @@ fn spawn_quic_listener(state: &Arc<NodeState>, tcp_port: u16) -> bool {
         state.did_slot_registry.clone(),
     );
 
-    match listener.start(server_config) {
-        Ok((quic_handle, local_addr)) => {
-            tracing::info!(addr = %local_addr, "relay QUIC listener started");
-            // Bridge the node's cancellation token to the QUIC shutdown handle so
-            // graceful shutdown stops both transports.
-            let shutdown_token = state.shutdown_token.clone();
-            tokio::spawn(async move {
-                shutdown_token.cancelled().await;
-                quic_handle.shutdown();
-            });
-            true
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "failed to start relay QUIC listener — serving WebSocket only");
-            false
-        }
-    }
+    let (quic_handle, local_addr) = listener.start(server_config)?;
+    tracing::info!(addr = %local_addr, "relay QUIC listener started");
+    // Bridge the node's cancellation token to the QUIC shutdown handle so
+    // graceful shutdown stops both transports.
+    let shutdown_token = state.shutdown_token.clone();
+    tokio::spawn(async move {
+        shutdown_token.cancelled().await;
+        quic_handle.shutdown();
+    });
+    Ok(Some(local_addr))
 }

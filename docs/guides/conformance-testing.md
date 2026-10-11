@@ -174,7 +174,7 @@ The `scp_testing::conformance::blob_store::test_helpers` module provides:
 crates/scp-testing/src/blob_store_tests.rs                -- InMemoryBlobStorage
 crates/scp-transport/tests/sqlite_blob_conformance.rs      -- SqliteBlobStore
 crates/scp-transport/tests/redb_blob_conformance.rs        -- RedbBlobStore
-crates/scp-transport/tests/local_cache_conformance.rs      -- LocalCacheBlobStore
+crates/scp-transport/tests/local_cache_conformance.rs      -- LocalBlobCache
 crates/scp-transport/tests/combined_conformance.rs         -- combined storage + blob store
 ```
 
@@ -304,7 +304,7 @@ mod tests {
 | # | Test | Contract verified |
 |---|------|-------------------|
 | 1 | `register_returns_token` | `register()` returns a non-empty `PushToken` |
-| 2 | `handle_notification_produces_event` | `handle_notification(payload)` returns a non-empty `WakeSignal` |
+| 2 | `handle_notification_returns_fixed_wake` | `handle_notification(payload)` accepts at least one permitted wake payload and returns a non-empty `WakeSignal` for it, and returns a byte-identical `WakeSignal` for every other payload it accepts among the fixed set the check sends (other permitted payloads, those with trailing whitespace, and payloads carrying a context ID or sender) |
 
 ---
 

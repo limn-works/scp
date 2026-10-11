@@ -1,0 +1,20 @@
+[package]
+name = "scp-sqlite-pools"
+version = "0.1.0-beta.2"
+description = "Opens SQLCipher connections for SCP (Shared Context Protocol) with SQLite's lookaside pool and page-cache bulk block off"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["protocol", "sqlite", "sqlcipher", "security"]
+categories = ["database", "cryptography"]
+
+[dependencies]
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

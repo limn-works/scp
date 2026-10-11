@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use scp_crypto::p256::{
-    P256Error, P256PublicKey, P256SigningKey, der_to_raw, ecdh_p256, verify_prehash_lenient,
+    P256Error, P256PublicKey, P256SecretKey, der_to_raw, ecdh_p256, verify_prehash_lenient,
     verify_prehash_strict,
 };
 use serde_json::Value;
@@ -87,7 +87,7 @@ fn ecdh_secp256r1_ecpoint() {
             "valid" | "acceptable" => {
                 let peer = parsed.unwrap_or_else(|e| panic!("tcId {id}: {e}"));
                 let key =
-                    P256SigningKey::from_scalar_bytes(&scalar32(&hexf(&t["private"]))).unwrap();
+                    P256SecretKey::from_scalar_bytes(&scalar32(&hexf(&t["private"]))).unwrap();
                 assert_eq!(
                     ecdh_p256(&key, &peer).to_vec(),
                     hexf(&t["shared"]),

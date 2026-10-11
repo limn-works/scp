@@ -135,27 +135,6 @@ export { evaluateTrust } from "./trust";
 export type { McpClient, McpServer, NativeMcpClientHandle, NativeMcpServerHandle } from "./mcp";
 
 // ---------------------------------------------------------------------------
-// Bridge Connector — types + bridge-provenance trust tier
-// ---------------------------------------------------------------------------
-//
-// Stateful entry points (`bridgeCreateShadow`, credentials) live on SCP.
-// `evaluateTrust` (exported here as `bridgeEvaluateTrust` to disambiguate
-// from the four-layer `evaluateTrust` in `./trust`, mirroring the Python
-// SDK's `bridge_evaluate_trust` re-export name) is the pure bridge-provenance
-// trust-tier classifier (spec §12).
-
-export type {
-  BridgeCredential,
-  BridgeMode,
-  BridgeRegistration,
-  BridgeTrustLevel,
-  BridgeTrustOptions,
-  ShadowIdentity,
-  ShadowStatus,
-} from "./bridge";
-export { bridgeRegister, evaluateTrust as bridgeEvaluateTrust } from "./bridge";
-
-// ---------------------------------------------------------------------------
 // Discovery — types + pure helpers (entry points for stateful ops moved to SCP)
 // ---------------------------------------------------------------------------
 
@@ -234,15 +213,20 @@ export { Node, Relay } from "./server";
 
 export type {
   ContextReconnectResult,
+  CustodyKeyRole,
+  CustodyKeyType,
   CustodyPublicKey,
   KeyCustodyProvider,
   KeyPackageReservation,
-  PseudonymResult,
   ReconnectReport,
   ScpOptions,
   StorageConfig,
 } from "./scp";
-export { SCP } from "./scp";
+export {
+  p256PseudonymPoint,
+  p256SoftwarePseudonymPoint,
+  SCP,
+} from "./scp";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -271,6 +255,7 @@ export {
   StreamGap,
   TransportError,
   UcanPermissionError,
+  UnknownGovernanceOutcomeError,
   ValidationError,
 } from "./errors";
 
@@ -286,6 +271,7 @@ export type {
   AttestorInfo,
   BatchPublishResult,
   BroadcastAdmissionPolicy,
+  BuiltInRole,
   CachedAttestation,
   CachedAttestationDuration,
   CachedAttestationEnvelope,
@@ -300,6 +286,7 @@ export type {
   Checkpoint,
   ContextParams,
   CrossContextInvocationResult,
+  CustomRole,
   DIDDocument,
   Event,
   EventClaim,
@@ -322,8 +309,10 @@ export type {
   ParticipationProfile,
   ParticipationThreshold,
   Proof,
+  ProposalStatus,
   Provenance,
   PublishResult,
+  RejectionReason,
   RequireParticipation,
   ResolutionLayer,
   ResolutionPath,
@@ -342,9 +331,18 @@ export type {
 
 export {
   allValid,
+  BUILT_IN_ROLES,
   Capabilities,
+  checkProposalResponse,
+  GOVERNANCE_ACTION_RESULTS,
+  governanceActionResultFromBridge,
+  memberRoleFromBridge,
   outletCall,
   outletQuery,
+  PROPOSAL_STATUSES,
+  proposalStatusFromBridge,
+  REJECTION_REASONS,
+  rejectionReasonFromBridge,
   validateAdmission,
   validateBroadcastKeyHex,
   validateSiteConfig,

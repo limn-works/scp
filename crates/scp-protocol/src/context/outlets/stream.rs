@@ -1125,16 +1125,26 @@ pub fn compute_chunk_interior_hash(left_hash: &[u8; 32], right_hash: &[u8; 32]) 
 /// Propagates the first JCS canonicalization error encountered while
 /// hashing leaves.
 pub fn compute_chunk_manifest_root(chunks: &[OutletStreamChunk]) -> Result<[u8; 32], String> {
-    if chunks.is_empty() {
-        return Ok([0u8; 32]);
-    }
-
     // Layer 0: leaf hashes.
-    let mut current: Vec<[u8; 32]> = chunks
+    let leaves: Vec<[u8; 32]> = chunks
         .iter()
         .map(compute_chunk_leaf_hash)
         .collect::<Result<Vec<_>, String>>()?;
+    Ok(fold_chunk_leaf_hashes(leaves))
+}
 
+/// Folds an ordered list of chunk leaf hashes into the RFC 6962 §2.1
+/// manifest root, level by level, as step 2 and step 3 of
+/// [`compute_chunk_manifest_root`] describe. An empty list yields the
+/// all-zero sentinel `[0u8; 32]`, and a single leaf hash is returned as the
+/// root.
+///
+/// [`compute_chunk_manifest_root`] hashes each chunk and calls this fold.
+/// The frontier property test calls it directly over every prefix of one
+/// precomputed leaf list, so the test hashes each chunk once per case
+/// instead of once per prefix.
+fn fold_chunk_leaf_hashes(leaves: Vec<[u8; 32]>) -> [u8; 32] {
+    let mut current = leaves;
     while current.len() > 1 {
         let mut next: Vec<[u8; 32]> = Vec::with_capacity(current.len().div_ceil(2));
         // `as_chunks::<2>` splits the level into fixed-size pairs plus the
@@ -1155,9 +1165,9 @@ pub fn compute_chunk_manifest_root(chunks: &[OutletStreamChunk]) -> Result<[u8; 
         current = next;
     }
 
-    // current.len() == 1 by the loop invariant + the early return on
-    // empty input; index 0 is safe.
-    Ok(current[0])
+    // The loop leaves exactly one hash for a non-empty input and leaves an
+    // empty input untouched, which maps to the all-zero sentinel.
+    current.first().copied().unwrap_or([0u8; 32])
 }
 
 // ---------------------------------------------------------------------------
@@ -3024,8 +3034,11 @@ mod tests {
     }
 
     proptest::proptest! {
-        // Deterministic: proptest uses a fixed default RNG seed unless the
-        // PROPTEST_SEED env var overrides it, so CI runs are reproducible.
+        // proptest 1.10.0 seeds this test's RNG from the operating system on
+        // every run, because its default `Config::rng_seed` is
+        // `RngSeed::Random`. Setting `PROPTEST_RNG_SEED=<u64>` fixes the seed.
+        // A failing run saves its input under `proptest-regressions/`, and
+        // later runs replay that input first.
 
         /// For random chunk sequences (length 0..=257, mixed @types, mixed
         /// sequence numbers) and a random cancel-ack ceiling, the frontier's
@@ -3060,11 +3073,17 @@ mod tests {
 
             // The running root must also match the oracle at EVERY prefix,
             // not just at the end — the pump reads the root at close but the
-            // frontier must be correct incrementally.
+            // frontier must be correct incrementally. The prefix oracle folds
+            // a prefix of leaf hashes computed once per case. The full-length
+            // assertion above still checks `compute_chunk_manifest_root` itself.
+            let leaves: Vec<[u8; 32]> = chunks
+                .iter()
+                .map(|c| compute_chunk_leaf_hash(c).unwrap())
+                .collect();
             let mut f = MerkleFrontier::with_ceiling(ceiling);
             for (i, c) in chunks.iter().enumerate() {
                 f.push(c).unwrap();
-                let prefix_oracle = compute_chunk_manifest_root(&chunks[..=i]).unwrap();
+                let prefix_oracle = fold_chunk_leaf_hashes(leaves[..=i].to_vec());
                 proptest::prop_assert_eq!(
                     f.root(),
                     prefix_oracle,
@@ -3258,6 +3277,40 @@ mod tests {
                 indep_mth(&odd),
                 "{n}-leaf root diverged from independent MTH"
             );
+        }
+    }
+
+    /// Golden manifest roots for a 3-leaf manifest and a 257-leaf manifest.
+    /// The 3-leaf tree promotes its third leaf hash past one odd level. The
+    /// 257-leaf tree is one leaf past 256, so its levels hold 257, 129, 65,
+    /// 33, 17, 9, 5, 3, 2 and 1 hashes, and the 257th leaf hash is promoted
+    /// unchanged through the eight odd levels. The hex digests were computed
+    /// with the level-by-level pair-and-promote loop that
+    /// `compute_chunk_manifest_root` held when this test was added. The
+    /// hardcoded bytes depend on neither `indep_mth` nor `MerkleFrontier`, so
+    /// a change to the library's level fold turns this test red even when
+    /// the frontier and the fold change together.
+    #[test]
+    fn manifest_root_kat_pins_odd_and_past_power_of_two_counts() {
+        for (n, golden) in [
+            (
+                3u64,
+                "5538d6a9bdb72a2418aa6af8277e1a284860280f69497d0311b1227204864608",
+            ),
+            (
+                257u64,
+                "e99783f40a56b15ead7e36c799ed5273ef5340c87e81d38319d1ee69e81f8fd3",
+            ),
+        ] {
+            let chunks: Vec<OutletStreamChunk> =
+                (0..n).map(|i| chunk_of_kind(i, (i % 4) as u8)).collect();
+            let root = compute_chunk_manifest_root(&chunks).unwrap();
+            assert_eq!(
+                root,
+                indep_mth(&chunks),
+                "{n}-leaf root diverged from independent MTH"
+            );
+            assert_eq!(hex::encode(root), golden, "{n}-leaf root golden KAT drift");
         }
     }
 }

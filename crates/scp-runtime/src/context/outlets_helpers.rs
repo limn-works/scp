@@ -1181,7 +1181,7 @@ pub async fn reserve_outlet_economy(
 /// - An escrow-overflow / insufficient-funds [`ContextError`] — reusing the
 ///   [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection)
 ///   `EscrowOverflow` / `InsufficientFunds` variants routed through
-///   [`OpenStreamRejection::to_invocation_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_invocation_error)
+///   [`OpenStreamRejection::to_open_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_open_error)
 ///   — `cost × count` overflowed, or the effective remaining budget is below
 ///   the reservation.
 /// - [`ContextError::PersistenceFailed`] — the fail-closed escrow-debit persist
@@ -1277,7 +1277,7 @@ pub async fn reserve_outlet_stream_economy(
                 .rollback(invoker_did, velocity_token);
             gov.hard_rate_limit_mut().refund(invoker_did);
             return Err(invocation_error_to_context(
-                OpenStreamRejection::EscrowOverflow.to_invocation_error(),
+                OpenStreamRejection::EscrowOverflow.to_open_error(),
             ));
         };
 
@@ -1309,7 +1309,7 @@ pub async fn reserve_outlet_stream_economy(
                             .velocity_tracker
                             .rollback(invoker_did, velocity_token);
                         return Err(invocation_error_to_context(
-                            OpenStreamRejection::InsufficientFunds.to_invocation_error(),
+                            OpenStreamRejection::InsufficientFunds.to_open_error(),
                         ));
                     }
                     if state
@@ -1327,7 +1327,7 @@ pub async fn reserve_outlet_stream_economy(
                             .velocity_tracker
                             .rollback(invoker_did, velocity_token);
                         return Err(invocation_error_to_context(
-                            OpenStreamRejection::InsufficientFunds.to_invocation_error(),
+                            OpenStreamRejection::InsufficientFunds.to_open_error(),
                         ));
                     }
                     // `value` = the reserved hold returned to the caller;
@@ -1466,7 +1466,7 @@ pub async fn reserve_stream_grant_escrow(
     // overflow rejects without consulting or debiting the budget.
     let Some(reserved) = cost_per_chunk.checked_mul(u64::from(grant)) else {
         return Err(invocation_error_to_context(
-            OpenStreamRejection::EscrowOverflow.to_invocation_error(),
+            OpenStreamRejection::EscrowOverflow.to_open_error(),
         ));
     };
 
@@ -1488,7 +1488,7 @@ pub async fn reserve_stream_grant_escrow(
             if reserved.value() > remaining.value() {
                 // Insufficient funds: reject BEFORE the debit / record bump.
                 return Err(invocation_error_to_context(
-                    OpenStreamRejection::InsufficientFunds.to_invocation_error(),
+                    OpenStreamRejection::InsufficientFunds.to_open_error(),
                 ));
             }
             if state
@@ -1501,7 +1501,7 @@ pub async fn reserve_stream_grant_escrow(
                 // local comparison). The serial actor makes this unreachable,
                 // but fail closed.
                 return Err(invocation_error_to_context(
-                    OpenStreamRejection::InsufficientFunds.to_invocation_error(),
+                    OpenStreamRejection::InsufficientFunds.to_open_error(),
                 ));
             }
             // Bump the durable crash-recovery record so reconcile refunds
@@ -2963,12 +2963,16 @@ fn check_invocation_error_to_context(
 /// The per-variant `(class, code, slug, detail, retry)` mapping is
 /// single-sourced on [`InvocationError::to_surface`] — never re-derived in the
 /// bridges.
-// Ownership-consuming conversion (a `From`-like seam): every caller hands over
-// an owned `InvocationError` it no longer needs. `to_surface` borrows, so the
-// value is dropped at the end — the by-value signature is the natural shape.
-#[allow(clippy::needless_pass_by_value)]
-fn invocation_error_to_context(err: InvocationError) -> ContextError {
-    ContextError::Outlet(Box::new(err.to_surface()))
+fn invocation_error_to_context(
+    err: impl Into<crate::context::outlets::invoke::OutletOpenError>,
+) -> ContextError {
+    use crate::context::outlets::invoke::OutletOpenError;
+    match err.into() {
+        OutletOpenError::SupervisorShutDown { message } => {
+            ContextError::SupervisorShutDown(message)
+        }
+        OutletOpenError::Invocation(other) => ContextError::Outlet(Box::new(other.to_surface())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2978,7 +2982,9 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
 /// Reverse-maps the streaming reserve's [`ContextError`] into the open-time
 /// [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection)
 /// taxonomy for the [`Supervisor::open_outlet_stream`](crate::context::supervisor::supervisor::Supervisor::open_outlet_stream)
-/// orchestrator.
+/// orchestrator. A [`ContextError::SupervisorShutDown`] maps to
+/// [`OutletStreamOpenError::SupervisorShutDown`](crate::context::outlets::invoke::OutletStreamOpenError::SupervisorShutDown)
+/// instead.
 ///
 /// # Mapping direction (documented per the chunk-3 plan §3a note)
 ///
@@ -2986,7 +2992,7 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
 /// per-context actor and can only reply with a `Send` [`ContextError`] across
 /// the mailbox, so it encodes its two economic open-time rejections through the
 /// LOSSLESS forward direction —
-/// [`OpenStreamRejection::to_invocation_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_invocation_error)
+/// [`OpenStreamRejection::to_open_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_open_error)
 /// → [`invocation_error_to_context`] — which embeds the §5.4.4 slug verbatim in
 /// the resulting `PermissionDenied` message. This function is the REVERSE map,
 /// applied supervisor-side once the reservation error crosses back over the
@@ -3006,11 +3012,12 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
 #[allow(clippy::match_same_arms)]
 pub fn reserve_error_to_open_rejection(
     err: &ContextError,
-) -> crate::context::outlets::dispatch::OpenStreamRejection {
+) -> crate::context::outlets::invoke::OutletStreamOpenError {
     use crate::context::outlets::dispatch::OpenStreamRejection;
+    use crate::context::outlets::invoke::OutletStreamOpenError;
     use scp_protocol::context::outlets::error_codes;
 
-    match err {
+    let rejection = match err {
         ContextError::RateLimited { .. } => OpenStreamRejection::AdmissionRateLimited {
             slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
         },
@@ -3062,12 +3069,20 @@ pub fn reserve_error_to_open_rejection(
                 slug: error_codes::SLUG_AUTHORIZATION_DENIED.to_owned(),
             }
         }
+        // Shutdown has begun (ADR-049 Decision 16, item 2): the open takes the
+        // Supervisor's shutdown refusal, never the retryable transport slug below.
+        ContextError::SupervisorShutDown(message) => {
+            return OutletStreamOpenError::SupervisorShutDown {
+                message: message.clone(),
+            };
+        }
         // A persist failure / mailbox fault / any other reserve error is GENUINELY
         // transient — keep it on the retryable transport-fault path.
         _ => OpenStreamRejection::AdmissionRateLimited {
             slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
         },
-    }
+    };
+    OutletStreamOpenError::Rejected(rejection)
 }
 
 /// The pair returned by [`build_stream_post_input_hook`]: the synchronous
@@ -3457,6 +3472,7 @@ mod tests {
                 Some(clock),
                 mls_storage,
             );
+            crate::context::supervisor::supervisor::leak_for_test(&supervisor);
             supervisor
                 .build_actor_deps(&DID(ADMIN.to_owned()))
                 .await
@@ -3658,12 +3674,35 @@ mod tests {
             }
         }
 
+        /// A shutdown refusal crosses the seam as `SupervisorShutDown` with its
+        /// detail intact; `ContextNotActive` stays a typed outlet error.
+        #[test]
+        fn invocation_error_to_context_keeps_supervisor_shut_down() {
+            match super::super::invocation_error_to_context(
+                crate::context::outlets::invoke::OutletOpenError::SupervisorShutDown {
+                    message: "open refused".into(),
+                },
+            ) {
+                ContextError::SupervisorShutDown(m) => assert_eq!(m, "open refused"),
+                other => panic!("expected ContextError::SupervisorShutDown, got {other:?}"),
+            }
+            let not_active =
+                super::super::invocation_error_to_context(InvocationError::ContextNotActive {
+                    current_state: "Closing".into(),
+                });
+            assert!(
+                matches!(not_active, ContextError::Outlet(_)),
+                "got {not_active:?}"
+            );
+        }
+
         /// SCP-OUT-031 PR-2a — direct coverage of the supervisor-side
         /// `reserve_error_to_open_rejection` reverse-map arms (previously only
         /// exercised indirectly through Display-string assertions).
         #[test]
         fn reserve_error_reverse_map_arms() {
             use crate::context::outlets::dispatch::OpenStreamRejection;
+            use crate::context::outlets::invoke::OutletStreamOpenError;
             use scp_protocol::context::outlets::error_codes;
             use scp_protocol::context::outlets::errors::OutletErrorSurface;
 
@@ -3676,7 +3715,10 @@ mod tests {
                 )),
             ));
             assert!(
-                matches!(escrow, OpenStreamRejection::EscrowOverflow),
+                matches!(
+                    escrow,
+                    OutletStreamOpenError::Rejected(OpenStreamRejection::EscrowOverflow)
+                ),
                 "{escrow:?}"
             );
 
@@ -3687,7 +3729,10 @@ mod tests {
                 )),
             ));
             assert!(
-                matches!(funds, OpenStreamRejection::InsufficientFunds),
+                matches!(
+                    funds,
+                    OutletStreamOpenError::Rejected(OpenStreamRejection::InsufficientFunds)
+                ),
                 "{funds:?}"
             );
 
@@ -3698,7 +3743,9 @@ mod tests {
                 },
             );
             match not_active {
-                OpenStreamRejection::ContextNotActive { current_state } => {
+                OutletStreamOpenError::Rejected(OpenStreamRejection::ContextNotActive {
+                    current_state,
+                }) => {
                     assert!(
                         current_state.contains("Closing"),
                         "reverse-map recovers the typed lifecycle state: {current_state}"
@@ -3714,7 +3761,12 @@ mod tests {
                 retry_after_ms: None,
             });
             assert!(
-                matches!(rl, OpenStreamRejection::AdmissionRateLimited { .. }),
+                matches!(
+                    rl,
+                    OutletStreamOpenError::Rejected(
+                        OpenStreamRejection::AdmissionRateLimited { .. }
+                    )
+                ),
                 "{rl:?}"
             );
 
@@ -3723,8 +3775,26 @@ mod tests {
                 &ContextError::PersistenceFailed("disk".to_owned()),
             );
             assert!(
-                matches!(other, OpenStreamRejection::AdmissionRateLimited { .. }),
+                matches!(
+                    other,
+                    OutletStreamOpenError::Rejected(
+                        OpenStreamRejection::AdmissionRateLimited { .. }
+                    )
+                ),
                 "{other:?}"
+            );
+
+            // A shutdown refusal keeps the Supervisor's shutdown arm and its
+            // message, not the retryable transport slug.
+            let shut = super::super::reserve_error_to_open_rejection(
+                &ContextError::SupervisorShutDown("reserve refused".to_owned()),
+            );
+            assert!(
+                matches!(
+                    &shut,
+                    OutletStreamOpenError::SupervisorShutDown { message } if message == "reserve refused"
+                ),
+                "{shut:?}"
             );
         }
 
@@ -4038,6 +4108,7 @@ mod tests {
                 Some(clock),
                 mls_storage,
             );
+            crate::context::supervisor::supervisor::leak_for_test(&supervisor);
             supervisor
                 .build_actor_deps(&DID(INVOKER.to_owned()))
                 .await
@@ -4534,6 +4605,7 @@ mod tests {
                 Some(clock),
                 mls_storage,
             );
+            crate::context::supervisor::supervisor::leak_for_test(&supervisor);
             supervisor
                 .build_actor_deps(&DID(INVOKER.to_owned()))
                 .await
@@ -4969,6 +5041,7 @@ mod tests {
                 Some(clock),
                 mls_storage,
             );
+            crate::context::supervisor::supervisor::leak_for_test(&supervisor);
             supervisor
                 .build_actor_deps(&invoker())
                 .await
@@ -5746,7 +5819,11 @@ mod tests {
                 "the reserve emits the canonical 6089 membership marker: {msg}"
             );
 
-            let rejection = super::super::reserve_error_to_open_rejection(&err);
+            let crate::context::outlets::invoke::OutletStreamOpenError::Rejected(rejection) =
+                super::super::reserve_error_to_open_rejection(&err)
+            else {
+                panic!("a membership denial is an open rejection, not a shutdown refusal");
+            };
             assert_ne!(
                 rejection.error_code(),
                 error_codes::CODE_TRANSPORT_FAULT,

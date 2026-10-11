@@ -79,8 +79,8 @@ async fn failing_tls_falls_through_to_nat() {
     // flat-config representation of an arbitrary `Arc<dyn TlsProvider>` that the
     // closed named `TlsMode` variants do not cover), and `NatSlot::Custom`
     // injects a `FailingNatStrategy`. With both the TLS and NAT paths failing,
-    // the build must error. Domain is a publishing reach → `DhtMode::Production`
-    // (M2).
+    // the build must error. The config opts into `DhtMode::Production` (M2
+    // accepts `Disabled` for every `Reach`, `Domain` included).
     let result = Node::start_for_testing(NodeConfig {
         dht: DhtMode::Production,
         tls: TlsMode::Custom(Arc::new(helpers::FailingTlsProvider)),
@@ -124,7 +124,8 @@ async fn failing_nat_strategy() {
     let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let did_method = Arc::new(helpers::make_test_dht(&custody));
 
-    // NatTraversal is a publishing reach → DhtMode::Production (M2). The
+    // The config opts into DhtMode::Production (M2 accepts Disabled for every
+    // Reach, NatTraversal included). The
     // `FailingNatStrategy` makes NAT tier selection fail, so the build must err.
     let result = Node::start_for_testing(NodeConfig {
         dht: DhtMode::Production,

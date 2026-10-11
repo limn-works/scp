@@ -21,6 +21,7 @@ import type {
   ChallengeResponse,
   EventLogEntry,
 } from "../src/types";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Guard: skip if native addon unavailable
@@ -32,8 +33,7 @@ let skipReason = "";
 try {
   scp = new SCP({ storage: { type: "in_memory" } });
 } catch (e: unknown) {
-  const msg = e instanceof Error ? e.message : String(e);
-  skipReason = `Native NAPI bridge not available: ${msg}`;
+  skipReason = skipReasonIfAddonAbsent(e);
 }
 
 /** A genesis `MemberJoined` event for the aggregated subject. */

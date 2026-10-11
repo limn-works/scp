@@ -599,8 +599,8 @@ public actor Context {
     /// - Throws: ``ScpError/Context(msg:code:)`` if the bridge close
     ///   operation fails.
     public func close() async throws {
-        guard state == .active else {
-            // Closing an already-closed context is idempotent — no error.
+        guard !didClose else {
+            // This actor already closed or left the context — no error.
             return
         }
         try await scp.contextClose(handle: handle, identity: identity)

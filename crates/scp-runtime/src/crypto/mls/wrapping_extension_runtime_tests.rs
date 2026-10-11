@@ -38,7 +38,7 @@ fn generate_wrapping_keypair_produces_valid_keypair() {
     assert_ne!(sec1, sec2, "wrapping secret keys must be distinct");
 
     // Verify the public key is derived from the secret key.
-    let derived_pub = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&sec1)
+    let derived_pub = scp_crypto::p256::P256SecretKey::from_scalar_bytes(&sec1)
         .unwrap()
         .public_key()
         .to_uncompressed();
@@ -208,7 +208,7 @@ fn sender_keys_wrapping_stable_001() {
     let (pub_key, sec_key) = generate_wrapping_keypair();
 
     // 1. Wrapping keypair is valid (public derives from secret).
-    let derived_pub = scp_crypto::p256::P256SigningKey::from_scalar_bytes(&sec_key)
+    let derived_pub = scp_crypto::p256::P256SecretKey::from_scalar_bytes(&sec_key)
         .unwrap()
         .public_key()
         .to_uncompressed();

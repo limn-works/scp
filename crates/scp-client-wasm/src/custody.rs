@@ -63,13 +63,15 @@ mod wasm_impl {
         /// signature bytes. The private key never leaves JS/WebCrypto.
         ///
         /// For a `"p256"` key, `data` is the 32-byte digest and the result is
-        /// either the 64-byte raw `r ‖ s` or DER. No Rust caller exists yet:
-        /// whoever wires one MUST route it through
-        /// `scp_ffi_common::callback_custody::sign` (with
-        /// `callback_custody::generate_keypair` for key creation), which
-        /// converts DER, normalises to low-`s`, verifies strictly and rejects
-        /// every malformed return; calling this binding directly skips all of
-        /// that.
+        /// either the 64-byte raw `r ‖ s` or DER. No Rust caller exists yet,
+        /// and this seam's shape is not the native host contract:
+        /// [`JsKeyCustody::get_public_key`] returns bare bytes with no type or
+        /// role, and [`JsKeyCustody::generate_keypair`] takes no role. A
+        /// result from this binding is unchecked: nothing converts DER,
+        /// normalises to low-`s`, verifies the signature or rejects a
+        /// malformed return. The slice that wires a caller changes this seam
+        /// to the native contract and routes every call through the shared
+        /// `scp_ffi_common::callback_custody` flows, which make those checks.
         ///
         /// `data` is passed **by value** (an owned `Vec<u8>`), so wasm-bindgen
         /// marshals it as a JS-owned `Uint8Array` copy detached from wasm linear
@@ -117,9 +119,10 @@ mod wasm_impl {
         /// Performs DH agreement against `peer_public`, returning the 32-byte
         /// shared secret: X25519 for an `"x25519"` key (32-byte peer), P-256
         /// ECDH for an `"hpke-p256"` key (65-byte uncompressed SEC1 peer). No
-        /// Rust caller exists yet: whoever wires one MUST route it through
-        /// `scp_ffi_common::callback_custody::dh_agree`, which validates the
-        /// peer point and the 32-byte result.
+        /// Rust caller exists yet, and nothing here validates the peer point
+        /// or the 32-byte result; the wiring described at
+        /// [`JsKeyCustody::sign`] routes it through
+        /// `scp_ffi_common::callback_custody::dh_agree`, which does.
         ///
         /// `peer_public` is passed **by value** (an owned `Vec<u8>`) for the same
         /// owned-copy-detached-from-wasm-memory reason as [`JsKeyCustody::sign`] —

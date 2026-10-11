@@ -2,11 +2,13 @@ import Foundation
 
 // MARK: - McpToolDefinition
 
-/// An MCP tool definition as reported by an external MCP server.
+/// An MCP tool definition as reported by an MCP server.
 ///
 /// Represents a tool available through the Model Context Protocol. When
 /// consumed via SCP, tool results are wrapped with provenance metadata
-/// recording the external source, invoking agent, and context.
+/// recording the tool name as `mcp:{tool_name}`, the invoking agent, the
+/// context, and the time. The provenance does not name the MCP server the
+/// tool came from.
 ///
 /// See ADR-015 in `.docs/adrs/phase-3.md`.
 public nonisolated struct McpToolDefinition: Sendable {
@@ -29,10 +31,13 @@ public nonisolated struct McpToolDefinition: Sendable {
 
 // MARK: - McpToolResult
 
-/// The result of invoking an external MCP tool, wrapped with SCP provenance.
+/// The result of invoking an MCP tool, wrapped with SCP provenance.
 ///
-/// Maintains the protocol's provenance-everywhere principle: even tool calls
-/// to external (non-SCP) MCP servers carry verifiable origin metadata.
+/// Follows the protocol's provenance-everywhere principle: a tool call to
+/// any MCP server, an SCP SSE server or another, carries origin metadata that
+/// the client records locally and does not sign. That metadata names the tool
+/// but not the server, so two servers exposing the same tool name produce the
+/// same `source`.
 ///
 /// See ADR-015 in `.docs/adrs/phase-3.md`.
 public nonisolated struct McpToolResult: Sendable {
@@ -74,10 +79,10 @@ public nonisolated struct McpToolResult: Sendable {
 
 // MARK: - McpClientConfig
 
-/// Configuration for connecting to an external MCP server.
+/// Configuration for connecting to an MCP server.
 ///
-/// Specifies how to connect to an external (non-SCP) MCP server. Tool results
-/// from external servers are wrapped with SCP provenance metadata.
+/// Specifies how to connect to an MCP server, an SCP SSE server or
+/// another. Tool results are wrapped with SCP provenance metadata.
 public nonisolated enum McpClientConfig: Sendable {
     /// Connect via stdio: spawn a subprocess and communicate over stdin/stdout.
     ///
@@ -88,17 +93,22 @@ public nonisolated enum McpClientConfig: Sendable {
 
     /// Connect via SSE: HTTP client with Server-Sent Events.
     ///
-    /// - Parameter url: The URL of the SSE endpoint.
-    case sse(url: String)
+    /// - Parameters:
+    ///   - url: The URL of the SSE endpoint.
+    ///   - authToken: The bearer token sent in an `Authorization` header on
+    ///     every request, or `nil` for a server that runs no bearer check. An
+    ///     SCP SSE server always runs one (ADR-015). The transport has no
+    ///     TLS, so a token is sent only to a loopback host.
+    case sse(url: String, authToken: String?)
 }
 
 // MARK: - McpClient
 
-/// An MCP client for consuming external tools with SCP provenance.
+/// An MCP client that calls an MCP server's tools and records SCP provenance.
 ///
-/// Connects to an external MCP server (non-SCP) via an ``SCP`` instance
-/// and wraps tool results with SCP provenance metadata. This maintains
-/// SCP's provenance-everywhere principle even for external tool calls.
+/// Connects to an MCP server, an SCP SSE server or another, via an
+/// ``SCP`` instance and wraps tool results with SCP provenance metadata. This
+/// maintains SCP's provenance-everywhere principle for every tool call.
 ///
 /// ## Usage
 ///
@@ -138,7 +148,7 @@ public actor McpClient {
 
     // MARK: - Factory
 
-    /// Connects to an external MCP server and completes the MCP handshake.
+    /// Connects to an MCP server, an SCP SSE server or another, and completes the MCP handshake.
     ///
     /// - Parameters:
     ///   - scp: The owning ``SCP`` instance whose MCP client registry
@@ -155,15 +165,15 @@ public actor McpClient {
         case let .stdio(command, args):
             let handle = try await scp.mcpClientConnectStdio(command: [command] + args)
             return McpClient(scp: scp, handle: handle)
-        case let .sse(url):
-            let handle = try await scp.mcpClientConnectSse(url: url)
+        case let .sse(url, authToken):
+            let handle = try await scp.mcpClientConnectSse(url: url, authToken: authToken)
             return McpClient(scp: scp, handle: handle)
         }
     }
 
     // MARK: - Tool Listing
 
-    /// Lists available tools from the external MCP server.
+    /// Lists available tools from the connected MCP server.
     ///
     /// Sends a `tools/list` JSON-RPC request and returns the tool definitions.
     ///
@@ -183,14 +193,14 @@ public actor McpClient {
 
     // MARK: - Tool Invocation
 
-    /// Invokes an external tool and wraps the result with SCP provenance.
+    /// Invokes a tool on the connected MCP server and wraps the result with SCP provenance.
     ///
-    /// Sends a `tools/call` JSON-RPC request to the external MCP server, then
-    /// wraps the result with provenance metadata recording the external tool
+    /// Sends a `tools/call` JSON-RPC request to the connected MCP server, then
+    /// wraps the result with provenance metadata recording the tool
     /// source, the invoking agent's DID, the SCP context, and the timestamp.
     ///
     /// - Parameters:
-    ///   - tool: The name of the external tool to invoke.
+    ///   - tool: The name of the tool to invoke.
     ///   - input: The tool's input as serialized JSON data.
     ///   - contextId: The SCP context ID for provenance tracking.
     ///   - invokerDid: The DID of the agent invoking the tool.

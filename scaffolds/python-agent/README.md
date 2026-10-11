@@ -5,6 +5,7 @@ Minimal Python agent using the SCP SDK. Creates a DID identity, opens an encrypt
 ## Prerequisites
 
 - Python 3.12+
+- For the source install: a Rust toolchain, a C compiler, and, on Linux and Windows, a full perl (plus make on Linux) for the OpenSSL the build compiles; `bindings/python/README.md` §Requirements has the details
 - SCP Python SDK (`pip install scp-python`, or install from source: `pip install -e ../../bindings/python`)
 
 ## Build and Run

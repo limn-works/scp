@@ -6,8 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use scp_platform::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
 
 /// [`InMemoryKeyCustody`] that counts [`KeyCustody::dh_agree`] calls and
@@ -65,7 +64,7 @@ impl KeyCustody for DhCountingCustody {
         &self,
         key: &KeyHandle,
         context_id: &[u8],
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         self.inner.derive_pseudonym(key, context_id).await
     }
 
@@ -74,7 +73,7 @@ impl KeyCustody for DhCountingCustody {
         key: &KeyHandle,
         context_id: &[u8],
         pseudonym_epoch: u64,
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         self.inner
             .derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
             .await

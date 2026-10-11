@@ -38,8 +38,6 @@ const PYO3_OUTLETS: &str = include_str!("../../../../crates/scp-ffi/src/outlets.
 const PYO3_UCAN: &str = include_str!("../../../../crates/scp-ffi/src/ucan.rs");
 const PYO3_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/src/event_log.rs");
 const PYO3_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/src/transport.rs");
-const PYO3_BRIDGE_CONNECTOR: &str =
-    include_str!("../../../../crates/scp-ffi/src/bridge_connector.rs");
 const PYO3_SYNC: &str = include_str!("../../../../crates/scp-ffi/src/sync.rs");
 const PYO3_PROVENANCE: &str = include_str!("../../../../crates/scp-ffi/src/provenance.rs");
 const PYO3_DISCOVERY: &str = include_str!("../../../../crates/scp-ffi/src/discovery.rs");
@@ -63,6 +61,9 @@ const PYO3_SERVER: &str = include_str!("../../../../crates/scp-ffi/src/server.rs
 // single-shot outlet ops in `outlets.rs`. Embedded so the streaming
 // canonicals resolve in the forward coverage tests.
 const PYO3_OUTLET_STREAM: &str = include_str!("../../../../crates/scp-ffi/src/outlet_stream.rs");
+// P-256 custody-host helpers (§9.10.4, §9.5): module-level free functions each
+// bridge exports from its own `p256_host.rs`.
+const PYO3_P256_HOST: &str = include_str!("../../../../crates/scp-ffi/src/p256_host.rs");
 
 // UniFFI bridge spans three files: the central `bridge.rs` (most ops),
 // `server.rs` (site-projection methods on the `Server` type), and `scp.rs`
@@ -80,6 +81,7 @@ const UNIFFI_SCP: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/scp
 // streaming canonicals resolve in the forward coverage tests.
 const UNIFFI_OUTLET_STREAM: &str =
     include_str!("../../../../crates/scp-ffi/uniffi/src/outlet_stream.rs");
+const UNIFFI_P256_HOST: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/p256_host.rs");
 
 // NAPI bridge sources
 const NAPI_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/napi/src/identity.rs");
@@ -88,8 +90,6 @@ const NAPI_OUTLETS: &str = include_str!("../../../../crates/scp-ffi/napi/src/out
 const NAPI_UCAN: &str = include_str!("../../../../crates/scp-ffi/napi/src/ucan.rs");
 const NAPI_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/napi/src/event_log.rs");
 const NAPI_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/napi/src/transport.rs");
-const NAPI_BRIDGE_CONNECTOR: &str =
-    include_str!("../../../../crates/scp-ffi/napi/src/bridge_connector.rs");
 const NAPI_SYNC: &str = include_str!("../../../../crates/scp-ffi/napi/src/sync.rs");
 const NAPI_PROVENANCE: &str = include_str!("../../../../crates/scp-ffi/napi/src/provenance.rs");
 const NAPI_DISCOVERY: &str = include_str!("../../../../crates/scp-ffi/napi/src/discovery.rs");
@@ -104,6 +104,7 @@ const NAPI_SCP: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp.rs"
 // NAPI server module hosts `enable_site_projection` / `disable_site_projection`
 // methods on the `Server` type — added in Batch 2 (#1543).
 const NAPI_SERVER: &str = include_str!("../../../../crates/scp-ffi/napi/src/server.rs");
+const NAPI_P256_HOST: &str = include_str!("../../../../crates/scp-ffi/napi/src/p256_host.rs");
 
 // ---------------------------------------------------------------------------
 // Shared alias table — compiled in at build time from scripts/bridge-aliases.json
@@ -655,6 +656,7 @@ fn uniffi_has_operation(canonical: &str) -> bool {
             || source_has_fn(UNIFFI_SERVER, name)
             || source_has_fn(UNIFFI_SCP, name)
             || source_has_fn(UNIFFI_OUTLET_STREAM, name)
+            || source_has_fn(UNIFFI_P256_HOST, name)
     })
 }
 
@@ -676,7 +678,6 @@ fn pyo3_sources() -> Vec<&'static str> {
         PYO3_UCAN,
         PYO3_EVENT_LOG,
         PYO3_TRANSPORT,
-        PYO3_BRIDGE_CONNECTOR,
         PYO3_SYNC,
         PYO3_PROVENANCE,
         PYO3_DISCOVERY,
@@ -688,6 +689,7 @@ fn pyo3_sources() -> Vec<&'static str> {
         PYO3_SCPID,
         PYO3_SERVER,
         PYO3_OUTLET_STREAM,
+        PYO3_P256_HOST,
     ]
 }
 
@@ -699,7 +701,6 @@ fn napi_sources() -> Vec<&'static str> {
         NAPI_UCAN,
         NAPI_EVENT_LOG,
         NAPI_TRANSPORT,
-        NAPI_BRIDGE_CONNECTOR,
         NAPI_SYNC,
         NAPI_PROVENANCE,
         NAPI_DISCOVERY,
@@ -709,6 +710,7 @@ fn napi_sources() -> Vec<&'static str> {
         NAPI_MEDIA,
         NAPI_SCP,
         NAPI_SERVER,
+        NAPI_P256_HOST,
     ]
 }
 
@@ -1431,7 +1433,27 @@ fn discovery_and_provenance_coverage() {
 // native bridge (PyO3 / UniFFI / NAPI) and removing the pass-1 bridge-alias
 // exemptions. Pure coverage expansion, not a swap for the removed
 // `economy_adjust_relay_price`.
-const MIN_PARITY_OPERATIONS: usize = 109;
+//
+// Subsequently RAISED 109 -> 112 by the three P-256 custody-host helpers
+// (`p256_pseudonym_scalar` / `p256_public_key` / `p256_sign_prehash_rfc6979`,
+// §9.10.4 and §9.5): one implementation in `scp_ffi_common::p256_host`, first
+// exported by UniFFI alone and now by PyO3 and NAPI too, so their
+// `ffi-export-allowlist.json` bridge-specific entries are gone. Pure coverage
+// expansion, not a swap for the removed `economy_adjust_relay_price`.
+//
+// Subsequently RAISED 112 -> 114 by the two pseudonym point helpers
+// (`p256_pseudonym_point` / `p256_software_pseudonym_point`, §9.10.4.A): a
+// keystore host and a software host each get the pseudonym point without any
+// scalar reaching them, exported by all three native bridges. Pure coverage
+// expansion, not a swap for the removed `economy_adjust_relay_price`.
+//
+// Subsequently LOWERED 114 -> 111, with human approval, by removing the three
+// scalar and sign helpers (`p256_pseudonym_scalar` / `p256_public_key` /
+// `p256_sign_prehash_rfc6979`) from every bridge and SDK: under SCP-307 and
+// §9.10.4.A a pseudonym is a point with no private key that any party holds
+// or signs with, so no host may receive a pseudonym scalar. The two point
+// helpers above replace them, and nothing is added in their place.
+const MIN_PARITY_OPERATIONS: usize = 111;
 
 // ---------------------------------------------------------------------------
 // Ratchet meta-tests — detect weakening of enforcement
@@ -1583,10 +1605,11 @@ fn every_alias_resolves_to_a_real_fn_or_exemption() {
                     || source_has_fn(UNIFFI_SERVER, name)
                     || source_has_fn(UNIFFI_SCP, name)
                     || source_has_fn(UNIFFI_OUTLET_STREAM, name)
+                    || source_has_fn(UNIFFI_P256_HOST, name)
             });
             if !any_resolves {
                 phantom.push(format!(
-                    "uniffi:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/uniffi/src/{{bridge,server,scp,outlet_stream}}.rs",
+                    "uniffi:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/uniffi/src/{{bridge,server,scp,outlet_stream,p256_host}}.rs",
                     op.canonical, op.uniffi
                 ));
             }
@@ -3370,7 +3393,7 @@ fn ffi_export_allowlist_reasons_are_justified() {
             //
             // The earlier gate ran this only when `cites_matrix` was true, so an
             // entry that justified itself via a real ADR/§/SCP (the alternative
-            // path) while naming a cross-bridge matrix op — e.g. "Per ADR-023 the
+            // path) while naming a cross-bridge matrix op — e.g. "Per ADR-015 the
             // create operation is implemented only on PyO3 here" — skipped the
             // contradiction check entirely and buried a 4-SDK op as one-bridge.
             // "Is this entry justified at all" (cites matrix OR real ADR/§/SCP,
@@ -3437,4 +3460,326 @@ fn ffi_export_allowlist_reasons_are_justified() {
         offenders.len(),
         offenders.join("\n  ")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Shared wire names for governance outcomes
+// ---------------------------------------------------------------------------
+
+/// Every native bridge names a governance outcome through
+/// `scp_ffi_common::governance_result`: `governance_execute` through
+/// `governance_action_result_name` and `governance_propose` through
+/// `governance_propose_response`. A bridge that builds its own string can
+/// send a Rust `Debug` dump, which no SDK enum parses.
+#[test]
+fn every_bridge_names_governance_outcomes_through_the_shared_functions() {
+    for (bridge, src) in [
+        ("pyo3", PYO3_CONTEXT),
+        ("napi", NAPI_CONTEXT),
+        ("uniffi", UNIFFI_BRIDGE),
+    ] {
+        for call in [
+            "scp_ffi_common::governance_result::governance_action_result_name(",
+            "scp_ffi_common::governance_result::governance_propose_response(",
+        ] {
+            assert!(
+                src.contains(call),
+                "{bridge} bridge must call {call}...) to name a governance outcome"
+            );
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// Shared wire names: no bridge hands an SDK a `Debug` rendering
+// ---------------------------------------------------------------------------
+
+/// Identifiers and `Debug` format literals that one bridge function's body
+/// holds, including inside macro token streams such as `json!` and `format!`.
+#[derive(Default)]
+struct WireBodyScan {
+    idents: BTreeSet<String>,
+    debug_literals: Vec<String>,
+}
+
+impl WireBodyScan {
+    fn walk_tokens(&mut self, tokens: proc_macro2::TokenStream) {
+        for tree in tokens {
+            match tree {
+                proc_macro2::TokenTree::Group(group) => self.walk_tokens(group.stream()),
+                proc_macro2::TokenTree::Ident(ident) => {
+                    self.idents.insert(ident.to_string());
+                }
+                proc_macro2::TokenTree::Literal(literal) => {
+                    let text = literal.to_string();
+                    if text.contains(":?}") || text.contains(":#?}") {
+                        self.debug_literals.push(text);
+                    }
+                }
+                proc_macro2::TokenTree::Punct(_) => {}
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for WireBodyScan {
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        self.idents.insert(ident.to_string());
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.walk_tokens(mac.tokens.clone());
+        syn::visit::visit_macro(self, mac);
+    }
+}
+
+/// Collects a [`WireBodyScan`] for every non-test function named `name`.
+struct WireFnFinder<'n> {
+    name: &'n str,
+    scans: Vec<WireBodyScan>,
+}
+
+impl WireFnFinder<'_> {
+    fn scan_fn(&mut self, attrs: &[syn::Attribute], ident: &syn::Ident, block: &syn::Block) {
+        if ident == self.name && !attrs_contain_cfg_test(attrs) {
+            let mut scan = WireBodyScan::default();
+            scan.visit_block(block);
+            self.scans.push(scan);
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for WireFnFinder<'_> {
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        self.scan_fn(&node.attrs, &node.sig.ident, &node.block);
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        self.scan_fn(&node.attrs, &node.sig.ident, &node.block);
+    }
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if !attrs_contain_cfg_test(&node.attrs) {
+            syn::visit::visit_item_mod(self, node);
+        }
+    }
+}
+
+/// One bridge function that hands an SDK a wire string: bridge, source,
+/// function name, and the shared name functions its body must call.
+type WireSite = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+);
+
+const OUTCOME: &str = "governance_action_result_name";
+const PROPOSE: &str = "governance_propose_response";
+const STATUS: &str = "proposal_status_response";
+const CHECKPOINT: &str = "checkpoint_cosignature_response";
+const EVENT: &str = "context_event_wire_string";
+const MESSAGE_TYPE: &str = "message_type_name";
+const SOURCE_TYPE: &str = "source_type_name";
+const MEMORY_SCOPE: &str = "memory_scope_name";
+const EVENT_TYPE: &str = "event_type_label";
+const ADMISSION: &str = "broadcast_admission_name";
+const ROLE: &str = "role_name";
+const WIRE_SITES: &[WireSite] = &[
+    ("pyo3", PYO3_CONTEXT, "broadcast_admission", &[ADMISSION]),
+    ("pyo3", PYO3_CONTEXT, "context_member_role", &[ROLE]),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_broadcast_admission_on",
+        &[ADMISSION],
+    ),
+    ("napi", NAPI_CONTEXT, "context_member_role_on", &[ROLE]),
+    ("uniffi", UNIFFI_BRIDGE, "broadcast_admission", &[ADMISSION]),
+    ("uniffi", UNIFFI_BRIDGE, "context_member_role", &[ROLE]),
+    ("pyo3", PYO3_CONTEXT, "governance_execute", &[OUTCOME]),
+    ("pyo3", PYO3_CONTEXT, "governance_propose", &[PROPOSE]),
+    ("pyo3", PYO3_CONTEXT, "governance_approve", &[STATUS]),
+    ("pyo3", PYO3_CONTEXT, "governance_reject", &[STATUS]),
+    ("pyo3", PYO3_CONTEXT, "governance_withdraw", &[STATUS]),
+    (
+        "pyo3",
+        PYO3_CONTEXT,
+        "add_checkpoint_cosignature",
+        &[CHECKPOINT],
+    ),
+    ("pyo3", PYO3_CONTEXT, "convert_context_event", &[EVENT]),
+    ("pyo3", PYO3_CONTEXT, "context_drain_events", &[EVENT]),
+    (
+        "pyo3",
+        PYO3_MEDIA,
+        "py_media_send_signaling",
+        &[MESSAGE_TYPE],
+    ),
+    (
+        "pyo3",
+        PYO3_PROVENANCE,
+        "provenance_to_dict",
+        &[SOURCE_TYPE, MEMORY_SCOPE],
+    ),
+    (
+        "pyo3",
+        PYO3_EVENT_LOG,
+        "query_manager_entries",
+        &[EVENT_TYPE],
+    ),
+    (
+        "pyo3",
+        PYO3_EVENT_LOG,
+        "query_storage_fallback",
+        &[EVENT_TYPE],
+    ),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_execute_governance_action_on",
+        &[OUTCOME],
+    ),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_governance_propose_on",
+        &[PROPOSE],
+    ),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_governance_approve_on",
+        &[STATUS],
+    ),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_governance_reject_on",
+        &[STATUS],
+    ),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_governance_withdraw_on",
+        &[STATUS],
+    ),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_add_checkpoint_cosignature_on",
+        &[CHECKPOINT],
+    ),
+    ("napi", NAPI_CONTEXT, "context_drain_events_on", &[EVENT]),
+    (
+        "napi",
+        NAPI_MEDIA,
+        "media_send_signaling_on",
+        &[MESSAGE_TYPE],
+    ),
+    (
+        "napi",
+        NAPI_PROVENANCE,
+        "provenance_attach_on",
+        &[SOURCE_TYPE, MEMORY_SCOPE],
+    ),
+    ("napi", NAPI_EVENT_LOG, "event_log_query_on", &[EVENT_TYPE]),
+    ("uniffi", UNIFFI_BRIDGE, "governance_execute", &[OUTCOME]),
+    ("uniffi", UNIFFI_BRIDGE, "governance_propose", &[PROPOSE]),
+    ("uniffi", UNIFFI_BRIDGE, "governance_approve", &[STATUS]),
+    ("uniffi", UNIFFI_BRIDGE, "governance_reject", &[STATUS]),
+    ("uniffi", UNIFFI_BRIDGE, "governance_withdraw", &[STATUS]),
+    (
+        "uniffi",
+        UNIFFI_BRIDGE,
+        "add_checkpoint_cosignature",
+        &[CHECKPOINT],
+    ),
+    ("uniffi", UNIFFI_BRIDGE, "context_drain_events", &[EVENT]),
+    (
+        "uniffi",
+        UNIFFI_BRIDGE,
+        "media_send_signaling",
+        &[MESSAGE_TYPE],
+    ),
+    (
+        "uniffi",
+        UNIFFI_BRIDGE,
+        "provenance_attach",
+        &[SOURCE_TYPE, MEMORY_SCOPE],
+    ),
+    ("uniffi", UNIFFI_BRIDGE, "event_log_query", &[EVENT_TYPE]),
+];
+
+/// Every bridge function that hands an SDK a governance outcome, proposal
+/// status, checkpoint attestation status, signaling message type, provenance
+/// source type or memory scope, event-log `event_type`, drained context
+/// event, broadcast admission, or member role builds that string through `scp_ffi_common`'s exhaustive name
+/// function and holds no `Debug` format literal (`{x:?}`).
+///
+/// A `Debug` rendering is a Rust implementation detail: a payload-carrying
+/// variant dumps its fields (`Rejected { reason: AdminRejected }`), and any
+/// derive or field change alters what an SDK receives. For a fieldless enum,
+/// `Debug` happens to equal the shared name, so only this structural check
+/// fails when a site reverts to `format!("{x:?}")`.
+#[test]
+fn no_bridge_hands_an_sdk_a_debug_rendering() {
+    let offenders = wire_site_offenders(WIRE_SITES);
+    assert!(
+        offenders.is_empty(),
+        "{} bridge site(s) can hand an SDK a Debug rendering:\n  {}",
+        offenders.len(),
+        offenders.join("\n  ")
+    );
+}
+
+/// The scan flags a site that formats with `{x:?}` and skips its shared name
+/// function, and passes the same site once it calls that function.
+#[test]
+fn wire_site_scan_rejects_a_debug_rendering() {
+    // `concat!` keeps the Debug literal out of one string clippy would read
+    // as a format string.
+    let reverted = concat!(
+        "fn broadcast_admission(a: Admission) -> String { format!(\"{a",
+        ":?}\") }"
+    );
+    let offenders = wire_site_offenders(&[("t", reverted, "broadcast_admission", &[ADMISSION])]);
+    assert_eq!(offenders.len(), 2, "got {offenders:?}");
+
+    let named = "fn broadcast_admission(a: Admission) -> String { \
+                 broadcast_admission_name(a).to_owned() }";
+    let offenders = wire_site_offenders(&[("t", named, "broadcast_admission", &[ADMISSION])]);
+    assert!(offenders.is_empty(), "got {offenders:?}");
+}
+
+fn wire_site_offenders(sites: &[WireSite]) -> Vec<String> {
+    let mut offenders = Vec::new();
+    for &(bridge, src, name, required) in sites {
+        let file =
+            syn::parse_file(src).unwrap_or_else(|e| panic!("{bridge} source failed to parse: {e}"));
+        let mut finder = WireFnFinder {
+            name,
+            scans: Vec::new(),
+        };
+        finder.visit_file(&file);
+        if finder.scans.is_empty() {
+            offenders.push(format!("{bridge}::{name} not found outside test code"));
+        }
+        for scan in &finder.scans {
+            for call in required {
+                if !scan.idents.contains(*call) {
+                    offenders.push(format!(
+                        "{bridge}::{name} must build its wire string through \
+                         scp_ffi_common's {call}"
+                    ));
+                }
+            }
+            if !scan.debug_literals.is_empty() {
+                offenders.push(format!(
+                    "{bridge}::{name} holds Debug format literal(s) {:?}",
+                    scan.debug_literals
+                ));
+            }
+        }
+    }
+    offenders
 }

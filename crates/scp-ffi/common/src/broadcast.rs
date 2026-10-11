@@ -24,7 +24,7 @@
 //!
 //! Requires the `resolvers` feature (scp-core).
 
-use scp_core::context::broadcast::{KeyRequestDecision, SealedBroadcastKey};
+use scp_core::context::broadcast::{BroadcastAdmission, KeyRequestDecision, SealedBroadcastKey};
 use scp_core::crypto::sender_keys::broadcast::open_broadcast_key;
 use scp_protocol::crypto::hpke::p256::P256Point;
 
@@ -213,6 +213,21 @@ pub fn open_sealed_broadcast_key(
     Ok(key.as_bytes().to_vec())
 }
 
+/// Returns a caller-facing wire name for a broadcast context's admission
+/// policy: `"Open"` or `"Gated"`.
+///
+/// Every bridge's `broadcast_admission` returns this name. Each arm names its
+/// variant with no wildcard, so a new `BroadcastAdmission` variant stops this
+/// crate from compiling until someone names it, and a payload added to a
+/// variant cannot leak into a caller's string through `Debug`.
+#[must_use]
+pub const fn broadcast_admission_name(admission: BroadcastAdmission) -> &'static str {
+    match admission {
+        BroadcastAdmission::Open => "Open",
+        BroadcastAdmission::Gated => "Gated",
+    }
+}
+
 /// Copies the caller's wrapping scalar into a [`Zeroizing`](zeroize::Zeroizing) array, so the one
 /// copy this module makes is wiped when it drops.
 fn wrapping_secret_array(
@@ -232,6 +247,12 @@ fn wrapping_secret_array(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broadcast_admission_names_are_pinned() {
+        assert_eq!(broadcast_admission_name(BroadcastAdmission::Open), "Open");
+        assert_eq!(broadcast_admission_name(BroadcastAdmission::Gated), "Gated");
+    }
     use scp_core::crypto::sender_keys::broadcast::{
         generate_broadcast_key, seal_broadcast_key_to_subscriber,
     };

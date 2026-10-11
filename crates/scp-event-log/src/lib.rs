@@ -550,7 +550,8 @@ pub enum EventLogError {
     AbsenceProofForPresentEvent,
 
     /// The key custody call that signs a checkpoint failed. The bridges report
-    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` otherwise.
+    /// the code `scp_ffi_common::error_codes::custody_failure_code` assigns to the
+    /// failure's kind.
     #[error(transparent)]
     Custody(#[from] scp_crypto::CustodyFailure),
 

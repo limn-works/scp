@@ -1771,7 +1771,7 @@ mod tests {
     #[test]
     fn broadcast_key_hpke_distribution_roundtrip() {
         let key = generate_broadcast_key("did:dht:author");
-        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let subscriber_secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         let subscriber_pub = subscriber_secret.public_key();
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
@@ -1801,7 +1801,7 @@ mod tests {
     #[test]
     fn broadcast_key_hpke_rejects_wrong_context() {
         let key = generate_broadcast_key("did:dht:author");
-        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let subscriber_secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         let subscriber_pub = subscriber_secret.public_key();
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
@@ -1849,7 +1849,7 @@ mod tests {
         // Flipping a single ciphertext bit must make the AEAD open fail.
 
         let key = generate_broadcast_key("did:dht:author");
-        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let subscriber_secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         let subscriber_pub = subscriber_secret.public_key();
 
         let (mut ct, enc) = seal_broadcast_key_to_subscriber(
@@ -1880,7 +1880,7 @@ mod tests {
         // shared secret, so the AEAD open must fail.
 
         let key = generate_broadcast_key("did:dht:author");
-        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let subscriber_secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         let subscriber_pub = subscriber_secret.public_key();
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
@@ -1915,9 +1915,9 @@ mod tests {
 
         let key = generate_broadcast_key("did:dht:author");
 
-        let recipient_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let recipient_secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         let recipient_pub = recipient_secret.public_key();
-        let intruder_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let intruder_secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
             key.key(),
@@ -1955,7 +1955,7 @@ mod tests {
             build_hpke_info as build_sender_key_hpke_info,
         };
 
-        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let subscriber_secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         let subscriber_pub = subscriber_secret.public_key();
 
         let payload = [0x42u8; 32];
@@ -2028,7 +2028,7 @@ mod tests {
         // opening at epoch N+1 (same context/author/keys) must fail the AEAD.
 
         let key = generate_broadcast_key("did:dht:author");
-        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let subscriber_secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         let subscriber_pub = subscriber_secret.public_key();
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
@@ -2058,7 +2058,7 @@ mod tests {
         // and opening as another (same context/epoch/keys) must fail the AEAD.
 
         let key = generate_broadcast_key("did:dht:author");
-        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
+        let subscriber_secret = scp_crypto::p256::P256SecretKey::random(&mut OsRng);
         let subscriber_pub = subscriber_secret.public_key();
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(

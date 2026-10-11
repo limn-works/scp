@@ -241,9 +241,14 @@ async fn live_poll_next_drains_to_terminal() {
     // open-time UCAN signature check resolves the issuer key.
     seed_owner_document_into_resolver(&creator_identity, &resolver_dht).await;
 
-    // Context owned by the creator; ceiling admits the Action outlet stem.
+    // Context owned by the creator; ceiling admits the Action outlet stem and
+    // the registration the creator performs below. `outlet_register_on` reads
+    // the ceiling off the supervisor actor, so a capability this list omits is
+    // one the registration no longer has; the bridge-local role-state copy it
+    // used to read carried `default_ceiling()` and admitted the call whatever
+    // this list said.
     let params = serde_json::json!({
-        "ceiling": ["outlet:call:*", "messages:read", "messages:write", "governance:propose"],
+        "ceiling": ["outlet:register", "outlet:call:*", "messages:read", "messages:write", "governance:propose"],
         "governance": "single_admin",
         "memoryScope": "ephemeral",
     })
@@ -378,6 +383,44 @@ async fn live_poll_next_drains_to_terminal() {
     assert!(
         format!("{after}").contains("no active outlet stream"),
         "post-terminal poll is a not-found error: {after}"
+    );
+
+    // Once bridge shutdown has begun, the open call site refuses to register a
+    // stream the still-live Supervisor opened: the caller receives
+    // `SCP-CTX-2139` and the registry holds no entry for it. The late open
+    // carries a token of its own, because the nonce check refuses a second use
+    // of the first open's token before the open reaches registration.
+    let late_ucan = crate::ucan::ucan_mint_on(
+        &bi,
+        &handle,
+        invoker.clone(),
+        vec!["outlet_call:*".to_owned()],
+        None,
+    )
+    .await
+    .expect("ucan_mint should succeed");
+    bi.core.stop_borrowers();
+    let late = outlet_stream_open_on(
+        &bi,
+        &handle,
+        outlet_id.clone(),
+        r#"{"a":"1","b":"2"}"#.to_owned(),
+        invoker.clone(),
+        late_ucan.encoded().clone(),
+        None,
+        None,
+        None,
+        Some(1),
+    )
+    .await
+    .expect_err("an open after bridge shutdown began must be refused");
+    assert!(
+        format!("{late}").contains(codes::CTX_2139),
+        "a late open is refused with SCP-CTX-2139: {late}"
+    );
+    assert!(
+        bi.outlet_stream_registry.is_empty(),
+        "a refused late open leaves no registry entry"
     );
 }
 
@@ -885,8 +928,11 @@ mod streaming_vectors_live {
 
         seed_owner_document_into_resolver(&creator_identity, &resolver_dht).await;
 
+        // The ceiling admits the registration the creator performs below.
+        // `outlet_register_on` reads it off the supervisor actor, so a
+        // capability this list omits is one the registration no longer has.
         let params = serde_json::json!({
-            "ceiling": ["outlet:call:*", "messages:read", "messages:write", "governance:propose"],
+            "ceiling": ["outlet:register", "outlet:call:*", "messages:read", "messages:write", "governance:propose"],
             "governance": "single_admin",
             "memoryScope": "ephemeral",
         })
@@ -1346,15 +1392,15 @@ mod xctx_streaming_saga_tests {
             .expect("context_create should succeed")
     }
 
-    /// Drives `context_id` to a real non-active (`Closed`) lifecycle state through
-    /// the REAL supervisor close path — the exact `LifecycleCommand::CloseContext`
-    /// dispatch the bridge's close uses — so a subsequent
-    /// `supervisor.read_context_state(context_id)` returns a non-`Active` state.
-    /// That authoritative state (NOT the bridge-cached handle state) is what the
-    /// streaming-saga open's active-state guard now reads. `initiator_did` must be
-    /// the creator of a context created with a `ContextClose`-bearing ceiling (see
-    /// `create_closeable_saga_context`).
-    async fn drive_context_closed(
+    /// Drives `context_id` to the `Closing` lifecycle state through the
+    /// supervisor's `LifecycleCommand::CloseContext` dispatch, the command the
+    /// bridge's close sends, and asserts that
+    /// `supervisor.read_context_state(context_id)` then returns
+    /// `Some(ContextState::Closing)`: the actor stays resident, so the gate under
+    /// test answers from a real non-`Active` state rather than from an absent
+    /// actor. `initiator_did` must be the creator of a context created with a
+    /// `ContextClose`-bearing ceiling (see `create_closeable_saga_context`).
+    async fn drive_context_closing(
         bi: &std::sync::Arc<NapiBridgeInstance>,
         context_id: &str,
         initiator_did: &str,
@@ -1380,6 +1426,28 @@ mod xctx_streaming_saga_tests {
         rx.await
             .expect("close reply channel should not drop")
             .expect("close should succeed");
+        assert_eq!(
+            supervisor.read_context_state(context_id).await,
+            Some(scp_core::context::ContextState::Closing),
+            "the close dispatch must leave a resident actor in Closing"
+        );
+    }
+
+    /// Asserts `msg` is the withheld refusal: the shared withheld text, and
+    /// neither the lifecycle state nor the context id.
+    fn assert_withheld(msg: &str, context_id: &str) {
+        assert!(
+            msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "expected the withheld refusal, got: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("closing"),
+            "the refusal must not name the lifecycle state: {msg}"
+        );
+        assert!(
+            !msg.contains(context_id),
+            "the refusal must not name the context id: {msg}"
+        );
     }
 
     /// (LIFECYCLE) A money-moving streaming-saga OPEN against a NON-active source
@@ -1388,11 +1456,11 @@ mod xctx_streaming_saga_tests {
     /// guard — BEFORE any input validation, UCAN check, or saga drive, so no saga
     /// is started and no receiver is handed out.
     ///
-    /// The context is driven to a REAL `Closed` state through the actual
-    /// supervisor close path; the guard reads the AUTHORITATIVE actor state via
-    /// `read_context_state` (NOT the lagging FFI `NapiContextHandle::state()`
-    /// cache), so this genuinely exercises the authoritative read that closes the
-    /// Closing-cache money gap.
+    /// The context is driven to `Closing` through the supervisor close path
+    /// ([`drive_context_closing`] asserts the state). The guard reads the actor
+    /// state through `active_role_state_before_authz`, not the
+    /// `NapiContextHandle::state()` cache, which still reads `Active`, and
+    /// reports the withheld refusal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xctx_streaming_saga_open_rejects_non_active_context() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -1407,23 +1475,11 @@ mod xctx_streaming_saga_tests {
             scp_ffi_common::outlet_id::generate_outlet_id("xctx_streaming_non_active_probe");
 
         // --- source (caller) context non-active → OUTLET_6010 ---------------
-        // Drive the CALLER context to a REAL Closed state through the supervisor;
-        // the authoritative guard must reject it.
+        // Drive the CALLER context to Closing through the supervisor; the guard
+        // must reject it.
         let handle_a = create_closeable_saga_context(&bi, &owner_identity).await;
         let handle_b = create_closeable_saga_context(&bi, &owner_identity).await;
-        drive_context_closed(&bi, &handle_a.context_id(), &hosted_caller).await;
-
-        // Precondition: the authoritative supervisor state is non-active. This is
-        // what the guard reads — proving the test drives a REAL Closing/Closed
-        // context, not the FFI cache.
-        assert_ne!(
-            crate::runtime::supervisor(&bi)
-                .expect("supervisor")
-                .read_context_state(&handle_a.context_id())
-                .await,
-            Some(scp_core::context::ContextState::Active),
-            "the caller context must be authoritatively non-active before the open"
-        );
+        drive_context_closing(&bi, &handle_a.context_id(), &hosted_caller).await;
 
         let err = Box::pin(outlet_streaming_saga_open_on(
             &bi,
@@ -1448,6 +1504,7 @@ mod xctx_streaming_saga_tests {
             msg.contains(codes::OUTLET_6010),
             "expected caller-axis SCP-OUTLET-6010, got: {msg}"
         );
+        assert_withheld(&msg, &handle_a.context_id());
         assert!(
             bi.outlet_streaming_saga_registry.is_empty(),
             "a rejected non-active open must NOT start a saga / hand out a receiver"
@@ -1458,7 +1515,7 @@ mod xctx_streaming_saga_tests {
         // only the target axis is non-active.
         let handle_c = create_closeable_saga_context(&bi, &owner_identity).await;
         let handle_d = create_closeable_saga_context(&bi, &owner_identity).await;
-        drive_context_closed(&bi, &handle_d.context_id(), &hosted_caller).await;
+        drive_context_closing(&bi, &handle_d.context_id(), &hosted_caller).await;
 
         let err = Box::pin(outlet_streaming_saga_open_on(
             &bi,
@@ -1483,9 +1540,289 @@ mod xctx_streaming_saga_tests {
             msg.contains(codes::OUTLET_6011),
             "expected target-axis SCP-OUTLET-6011, got: {msg}"
         );
+        assert_withheld(&msg, &handle_d.context_id());
         assert!(
             bi.outlet_streaming_saga_registry.is_empty(),
             "a rejected non-active open must NOT start a saga / hand out a receiver"
         );
+    }
+
+    /// A streaming-saga open authorizes against the target's supervisor ceiling
+    /// and creator, and resolves both signing keys from the creators the
+    /// supervisor holds.
+    ///
+    /// Both handles name `crate::runtime::KEYLESS_HANDLE_CREATOR`. No
+    /// supervisor saga interface exists, so the open fails after both reads.
+    /// An open that took either creator from a handle fails to resolve that
+    /// creator's identity, and the refusal names it.
+    #[cfg(feature = "outlet-capability-test-grant")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_saga_open_reads_the_supervisor_not_the_bridge_copy() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let resolver_dht = install_seedable_resolver(&bi);
+        let owner_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let owner = owner_identity.inner.did.clone();
+        seed_owner_document_into_resolver(&owner_identity, &resolver_dht).await;
+        let source = create_closeable_saga_context(&bi, &owner_identity).await;
+        let target = create_closeable_saga_context(&bi, &owner_identity).await;
+        let outlet_id = crate::outlets::outlet_register_on(
+            &bi,
+            &target,
+            crate::outlets::NapiOutletDefinition {
+                name: "xctx_streaming_live_state_probe".to_owned(),
+                description: "streaming-saga live-state probe".to_owned(),
+                kind: crate::outlets::NapiOutletKind::Action,
+                input_schema_json:
+                    r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}}"#
+                        .to_owned(),
+                output_schema_json: r#"{"type":"object"}"#.to_owned(),
+                test_vectors_json: None,
+                implementation_hash: None,
+                operator_did: owner.clone(),
+                cost: None,
+            },
+        )
+        .await
+        .expect("outlet_register should succeed");
+        let invoker = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (invoker) should succeed")
+            .inner
+            .did
+            .clone();
+        crate::runtime::supervisor(&bi)
+            .expect("supervisor must be initialized")
+            .test_insert_member(
+                &source.context_id(),
+                scp_did::DID(invoker.clone()),
+                "member",
+            )
+            .await
+            .expect("test_insert_member seeds the invoker in the caller context");
+        let token = crate::ucan::ucan_mint_on(
+            &bi,
+            &target,
+            invoker.clone(),
+            vec!["outlet_call:*".to_owned()],
+            None,
+        )
+        .await
+        .expect("ucan_mint should succeed")
+        .encoded();
+
+        crate::runtime::ensure_registered(&bi, &source)
+            .expect("registering the caller context's bridge state must succeed");
+        let narrowed = crate::runtime::KEYLESS_HANDLE_CREATOR;
+        let source = NapiContextHandle::test_active_on(&bi, source.context_id(), narrowed.into());
+        let target = NapiContextHandle::test_active_on(&bi, target.context_id(), narrowed.into());
+
+        let err = Box::pin(outlet_streaming_saga_open_on(
+            &bi,
+            &source,
+            &target,
+            invoker,
+            outlet_id,
+            r#"{"a":"x","b":"y"}"#.to_owned(),
+            "0123456789abcdef0123456789abcdef".to_owned(),
+            now_ms(),
+            1,
+            token,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect_err("no saga interface connects the two contexts");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("has no established interface") && !msg.contains(narrowed),
+            "the open must authorize and sign from the supervisor's state, got: {msg}"
+        );
+    }
+
+    /// Recovery resolves the target's signing key from the creator the
+    /// supervisor holds.
+    ///
+    /// In the first context the supervisor names the hosted invoker, so the
+    /// key resolves and the recovery driver refuses a saga the supervisor does
+    /// not hold. In the second the supervisor names a creator no identity
+    /// carries, so the key resolution refuses and names that creator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_saga_recover_signs_as_the_supervisor_creator() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let invoker = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (invoker)")
+            .inner
+            .did
+            .clone();
+
+        let hosted = format!("napi-recover-hosted-creator-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(&bi, &hosted, &invoker)
+            .await
+            .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &hosted);
+        scp.insert_test_streaming_saga_entry("saga-napi-recover-hosted", &hosted, &invoker);
+        let err = outlet_streaming_saga_recover_truncated_close_on(
+            &bi,
+            "saga-napi-recover-hosted",
+            &invoker,
+        )
+        .await
+        .expect_err("no supervisor saga exists to recover");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("truncated-close recovery") && !msg.contains(codes::IDENT_1001),
+            "the key must resolve and the recovery driver refuse, got: {msg}"
+        );
+
+        let keyless_creator = "did:dht:z6MkNapiRecoverKeylessCreator";
+        let keyless = format!("napi-recover-keyless-creator-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(&bi, &keyless, keyless_creator)
+            .await
+            .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &keyless);
+        scp.insert_test_streaming_saga_entry("saga-napi-recover-keyless", &keyless, &invoker);
+        let err = outlet_streaming_saga_recover_truncated_close_on(
+            &bi,
+            "saga-napi-recover-keyless",
+            &invoker,
+        )
+        .await
+        .expect_err("the supervisor's creator holds no key on this bridge");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::IDENT_1001) && msg.contains(keyless_creator),
+            "the key resolution must refuse the supervisor's keyless creator, got: {msg}"
+        );
+    }
+}
+
+/// A stream or streaming saga the bridge refuses to register once bridge
+/// shutdown has begun had already started, so it reaches the caller as the
+/// Context class with `SCP-CTX-2139` (and, for a saga, its id), never with
+/// `SCP-CTX-2138`, the code of the Supervisor's own stream refusal, which
+/// comes before anything started and is also the Context class.
+#[test]
+fn late_shutdown_refusals_differ_from_supervisor_refusal_code() {
+    let ScpNapiError::Context { code, .. } = late_registration_err(
+        scp_ffi_common::bridge_instance::late_registration_refusal(None),
+    ) else {
+        panic!("a late stream refusal must be the Context class");
+    };
+    assert_eq!(code, codes::CTX_2139);
+    let ScpNapiError::Context { code, .. } = open_rejection_to_err(
+        &scp_core::context::outlets::invoke::OutletStreamOpenError::SupervisorShutDown {
+            message: "open outlet stream refused".to_owned(),
+        },
+    ) else {
+        panic!("the Supervisor's own stream refusal must be the Context class");
+    };
+    assert_eq!(code, codes::CTX_2138);
+    assert!(
+        matches!(
+            open_rejection_to_err(
+                &scp_core::context::outlets::invoke::OutletStreamOpenError::Rejected(
+                    scp_core::context::outlets::OpenStreamRejection::ContextNotActive {
+                        current_state: "Closing".to_owned(),
+                    },
+                ),
+            ),
+            ScpNapiError::Outlet { .. }
+        ),
+        "an open rejection keeps the Outlet class"
+    );
+
+    assert!(
+        matches!(
+            crate::outlets::map_saga_error(
+                scp_core::context::supervisor::SagaError::SupervisorShutDown {
+                    message: "start cross-context streaming saga".to_owned(),
+                }
+            ),
+            ScpNapiError::SagaAborted { .. }
+        ),
+        "the Supervisor's own streaming-saga refusal keeps the SagaAborted class"
+    );
+}
+
+/// A started streaming saga registers while the bridge runs, and once
+/// `stop_borrowers` has run the registration is refused with the Context
+/// class, `SCP-CTX-2139` and the saga id, and leaves no registry entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_saga_registration_refused_after_shutdown_began() {
+    let scp = crate::scp::Scp::new_in_memory_for_test();
+    let bi = std::sync::Arc::clone(&scp.inner);
+    let entry = |id: &str| {
+        let (_tx, rx) = mpsc::channel(1);
+        StreamingSagaEntry {
+            receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+            saga_id: scp_core::context::supervisor::SagaId(id.to_owned()),
+            target_context_id: "target-ctx-late".to_owned(),
+            invoker_did: "did:scp:test-invoker".to_owned(),
+            request_id: [0u8; 16],
+        }
+    };
+
+    let registered = register_streaming_saga(&bi, entry("saga-before-1"))
+        .expect("a saga started before shutdown registers");
+    assert_eq!(registered, "saga-before-1");
+    assert!(
+        bi.outlet_streaming_saga_registry
+            .contains_key("saga-before-1")
+    );
+
+    bi.core.stop_borrowers();
+    let Err(ScpNapiError::Context { message, code }) =
+        register_streaming_saga(&bi, entry("saga-late-1"))
+    else {
+        panic!("a late streaming-saga registration must be refused with the Context class");
+    };
+    assert_eq!(code, codes::CTX_2139);
+    assert!(
+        message.contains("saga-late-1"),
+        "the error names the started saga: {message}"
+    );
+    assert!(
+        !bi.outlet_streaming_saga_registry
+            .contains_key("saga-late-1"),
+        "a refused registration leaves no entry"
+    );
+}
+
+/// A stream signer for an identity whose `#active` key custody no longer holds
+/// fails with key-not-found `SCP-CRYPTO-4006`, the code every other custody
+/// operation reports, never the context code of the verifying-key check.
+#[cfg(feature = "testing")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_signer_under_a_destroyed_custody_key_is_crypto_4006() {
+    use scp_platform::KeyCustody as _;
+    let scp = crate::scp::Scp::new_in_memory_for_test();
+    let bi = std::sync::Arc::clone(&scp.inner);
+    let identity = scp
+        .identity_create("in_memory".to_owned(), None)
+        .await
+        .expect("identity_create should succeed");
+    let did = identity.inner.did.clone();
+    let (custody, active) = crate::runtime::with_identity(&bi, &did, |entry| {
+        Ok((entry.custody.clone(), entry.identity.active_signing_key))
+    })
+    .expect("registered identity");
+    custody
+        .destroy_key(&active)
+        .await
+        .expect("destroy_key should succeed");
+    match resolve_stream_signer(&bi, &did).await {
+        Err(ScpNapiError::Crypto { code, .. }) => assert_eq!(code, codes::CRYPTO_4006),
+        Err(other) => panic!("expected Crypto CRYPTO_4006, got {other:?}"),
+        Ok(_) => panic!("a destroyed #active key must not resolve a stream signer"),
     }
 }

@@ -15,8 +15,15 @@
 //
 // ## Storage Backend
 //
-// Uses the system `sqlite3` C library (available on all Apple platforms) with
-// SQLCipher pragmas for encryption. The database is stored in Application
+// The `sqlite3_` symbols this file calls through `import SQLite3` must resolve
+// to the SQLCipher copy that `ScpFFI.xcframework` bundles, which receives the
+// encryption key through `PRAGMA key`. `open(at:encryptionKey:cipherVersion:)` asks the
+// connection for `PRAGMA cipher_version` right after `PRAGMA key`, before any
+// statement that can write a page, and throws when the answer is empty, so a
+// process whose symbols resolved to Apple's system SQLite, which ignores
+// `PRAGMA key` and would write every value in the clear, opens no storage and
+// writes no page to the database file.
+// The database is stored in Application
 // Support at `dev.limn.scp/scp.db`. The schema matches the Rust core's
 // `SqliteStorage`:
 //
@@ -168,9 +175,22 @@
         ///     file. On iOS this method sets file protection on that path before
         ///     it opens the connection.
         ///   - encryptionKey: 32 bytes SQLCipher takes through `PRAGMA key`.
+        ///   - cipherVersion: Reads the SQLCipher version from the connection
+        ///     right after `PRAGMA key` and before the other pragmas, and throws
+        ///     when the connection is not SQLCipher. `PRAGMA journal_mode = WAL`
+        ///     writes page 1 of a new database, and plain SQLite writes that page
+        ///     in the clear, so a check that ran after it would leave a plaintext
+        ///     header at `fileURL` that SQLCipher then refuses to open under the
+        ///     key. Every production caller takes the default,
+        ///     ``sqlCipherVersion(db:)``; a test passes a probe that answers the
+        ///     way plain SQLite does, to prove this method runs the check.
         /// - Throws: ``StorageError/databaseError(_:)`` if the database cannot
-        ///   be opened or configured.
-        static func open(at fileURL: URL, encryptionKey: Data) throws -> AppleStorage {
+        ///   be opened or configured, or if `cipherVersion` throws.
+        static func open(
+            at fileURL: URL,
+            encryptionKey: Data,
+            cipherVersion: (OpaquePointer) throws -> String = AppleStorage.sqlCipherVersion(db:)
+        ) throws -> AppleStorage {
             #if os(iOS)
                 // Set file protection before opening the database.
                 // NSFileProtectionCompleteUntilFirstUserAuthentication allows background
@@ -202,25 +222,40 @@
                 throw StorageError.databaseError("Failed to open database: \(msg)")
             }
 
-            // Apply SQLCipher encryption key (spec §17.5).
+            // SQLCipher encryption key and settings (spec §17.5). `PRAGMA key`
+            // runs before any other statement, as ADR-025 requires, and writes
+            // no page.
             let hexKey = encryptionKey.hexEncodedString
+            let keyPragma = "PRAGMA key = \"x'\(hexKey)'\";"
             let pragmas = """
-            PRAGMA key = "x'\(hexKey)'";
             PRAGMA cipher_page_size = 4096;
             PRAGMA kdf_iter = 256000;
             PRAGMA cipher_hmac_algorithm = HMAC_SHA512;
             PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;
             PRAGMA journal_mode = WAL;
             """
-            try execSQL(db: db, sql: pragmas)
+            // No `AppleStorage` owns `db` until the return below, so its
+            // `deinit` cannot close the connection: every statement that can
+            // throw between `sqlite3_open` and that return sits inside this
+            // `do`, whose `catch` closes it.
+            do {
+                try execSQL(db: db, sql: keyPragma)
+                // Before `PRAGMA journal_mode = WAL`, so a connection that is
+                // not SQLCipher writes no page to `fileURL`.
+                _ = try cipherVersion(db)
+                try execSQL(db: db, sql: pragmas)
 
-            // Create the KV table.
-            try execSQL(db: db, sql: """
-            CREATE TABLE IF NOT EXISTS kv (
-                key TEXT PRIMARY KEY,
-                value BLOB NOT NULL
-            ) WITHOUT ROWID;
-            """)
+                // Create the KV table.
+                try execSQL(db: db, sql: """
+                CREATE TABLE IF NOT EXISTS kv (
+                    key TEXT PRIMARY KEY,
+                    value BLOB NOT NULL
+                ) WITHOUT ROWID;
+                """)
+            } catch {
+                sqlite3_close_v2(db)
+                throw error
+            }
 
             return AppleStorage(db: db, encryptionKey: encryptionKey)
         }
@@ -500,13 +535,7 @@
                 try Self.bindText(prefix, to: stmt, at: 1)
             }
 
-            var keys: [String] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                if let cStr = sqlite3_column_text(stmt, 0) {
-                    keys.append(String(cString: cStr))
-                }
-            }
-            return keys
+            return try Self.readKeys(from: stmt)
         }
 
         /// Delete all keys whose prefix matches `prefix`.
@@ -578,6 +607,44 @@
             String(cString: sqlite3_errmsg(db))
         }
 
+        /// Read `PRAGMA cipher_version` on `db` and return the SQLCipher
+        /// version it reports.
+        ///
+        /// Plain SQLite ignores an unknown pragma without an error, so a
+        /// process whose `sqlite3_` symbols resolved to the system library
+        /// accepts `PRAGMA key` and then writes every value in the clear.
+        /// SQLCipher answers `PRAGMA cipher_version` with one row, and plain
+        /// SQLite answers it with no row, so `open(at:encryptionKey:cipherVersion:)` calls
+        /// this method through its default `cipherVersion` argument and fails
+        /// closed on that answer.
+        ///
+        /// - Throws: `StorageError.databaseError` when the statement cannot be
+        ///   prepared or stepped, and when ``requireSQLCipherVersion(_:)``
+        ///   rejects the rows it returned.
+        static func sqlCipherVersion(db: OpaquePointer) throws -> String { // swiftlint:disable:this identifier_name
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, "PRAGMA cipher_version;", -1, &stmt, nil) == SQLITE_OK else {
+                throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
+            }
+            return try requireSQLCipherVersion(readTextColumn(from: stmt, naming: "cipher_version"))
+        }
+
+        /// Return the one non-empty version `PRAGMA cipher_version` answered.
+        ///
+        /// - Throws: `StorageError.databaseError` when `rows` is not exactly
+        ///   one non-empty string, which means SQLCipher is not the SQLite
+        ///   library this process linked, so no value would be encrypted.
+        static func requireSQLCipherVersion(_ rows: [String]) throws -> String {
+            guard rows.count == 1, let version = rows.first, !version.isEmpty else {
+                throw StorageError.databaseError(
+                    "PRAGMA cipher_version returned \(rows.count) rows and no SQLCipher version, "
+                        + "so this process linked a SQLite library that does not encrypt"
+                )
+            }
+            return version
+        }
+
         /// Execute a batch SQL statement (no results expected).
         private static func execSQL(db: OpaquePointer, sql: String) throws { // swiftlint:disable:this identifier_name
             var errMsg: UnsafeMutablePointer<CChar>?
@@ -627,7 +694,7 @@
         }
     }
 
-    // MARK: - Length conversion
+    // MARK: - Length conversion and key scanning
 
     extension AppleStorage {
         /// Convert a bound value's byte count into the `Int32` length SQLite's
@@ -651,6 +718,83 @@
                 )
             }
             return byteCount
+        }
+
+        /// Step `statement`, a scan whose first column holds a `kv` key, to
+        /// completion and return every key it read.
+        ///
+        /// `listKeys` reads its rows through this method. The `kv` table's
+        /// primary key holds no `NULL`, and §17.3 of the persistence-and-storage
+        /// spec states that keys are UTF-8 strings, so a `NULL` column or bytes
+        /// that decode as no UTF-8 string name a key this storage never wrote.
+        /// Throwing reports that, where skipping the row or substituting U+FFFD
+        /// would return a list naming no row.
+        ///
+        /// - Parameter statement: A statement `sqlite3_prepare_v2` produced,
+        ///   with every parameter bound, whose first column holds a key.
+        /// - Throws: `StorageError.databaseError` for every case
+        ///   ``readTextColumn(from:naming:)`` throws for.
+        static func readKeys(from statement: OpaquePointer?) throws -> [String] {
+            try readTextColumn(from: statement, naming: "key")
+        }
+
+        /// Step `statement` to completion and return the text of its first
+        /// column for every row, throwing unless SQLite reports `SQLITE_DONE`.
+        ///
+        /// `sqlite3_step` answers `SQLITE_BUSY`, `SQLITE_IOERR`, `SQLITE_CORRUPT`,
+        /// or another error code when it cannot produce the next row. A loop
+        /// that stops on any answer other than `SQLITE_ROW` and returns what it
+        /// collected would report a partial list as a complete one, so this
+        /// method reads the answer that ended the loop. `sqlite3_column_text`
+        /// answers `NULL` for a `NULL` column and when it runs out of memory,
+        /// and neither caller's column holds a `NULL`, so this method throws for
+        /// that answer too rather than skipping a row.
+        ///
+        /// `String(cString:)` stops at the first zero byte, which would return
+        /// `a` for a stored key `a\u{0}b` and would return one string for two
+        /// keys that differ only after that byte. `sqlite3_column_bytes`
+        /// reports how many bytes SQLite holds for this column, and SQLite's
+        /// documentation requires the call order below: read the column
+        /// through `sqlite3_column_text` first, then ask for its byte count.
+        ///
+        /// - Parameters:
+        ///   - statement: A statement `sqlite3_prepare_v2` produced, with every
+        ///     parameter bound.
+        ///   - column: What the first column holds, which every thrown message
+        ///     names: `key` for ``readKeys(from:)``, `cipher_version` for
+        ///     ``sqlCipherVersion(db:)``.
+        /// - Throws: `StorageError.databaseError` when `statement` is `nil`,
+        ///   when a step ends with anything other than `SQLITE_ROW` or
+        ///   `SQLITE_DONE`, when a row's first column reads `NULL`, and when a
+        ///   column's bytes decode as no UTF-8 string.
+        static func readTextColumn(from statement: OpaquePointer?, naming column: String) throws -> [String] {
+            guard let statement else {
+                throw StorageError.databaseError("the \(column) scan received no prepared statement")
+            }
+            var texts: [String] = []
+            var result = sqlite3_step(statement)
+            while result == SQLITE_ROW {
+                guard let text = sqlite3_column_text(statement, 0) else {
+                    throw StorageError.databaseError(
+                        "a \(column) row read NULL: \(errorMessage(for: statement))"
+                    )
+                }
+                let byteCount = Int(sqlite3_column_bytes(statement, 0))
+                let bytes = Data(UnsafeBufferPointer(start: text, count: byteCount))
+                guard let decoded = String(bytes: bytes, encoding: .utf8) else {
+                    throw StorageError.databaseError(
+                        "a \(column) value of \(byteCount) bytes decodes as no UTF-8 string"
+                    )
+                }
+                texts.append(decoded)
+                result = sqlite3_step(statement)
+            }
+            guard result == SQLITE_DONE else {
+                throw StorageError.databaseError(
+                    "the \(column) scan ended with: \(errorMessage(for: statement))"
+                )
+            }
+            return texts
         }
     }
 

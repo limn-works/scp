@@ -12,7 +12,7 @@ python3.12 scripts/gen-test-vectors-p256.py
 
 The script uses nothing outside the Python standard library, and it self-gates before it prints a byte: it checks itself against `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, and the Vector 35 `DataProvenance` hash, which the Rust KAT that §25.8 names computes independently through `rmp_serde`, and it computes every public key twice by two scalar multiplications sharing no arithmetic, and a third time through the `cryptography` package where that package imports. A mismatch raises before anything prints.
 
-**Identifier strings in the fixtures.** Where a signed or hashed structure takes a fixture party's identifier as UTF-8 bytes, the vectors print it in the `scp:` text form that Vector 57 of §25.29 pins: `"scp:"` followed by the lowercase, unpadded RFC 4648 base32 of the 32-byte identifier, 56 characters in all, so each such field carries the length prefix `BE32(56)` or the MessagePack header `0xd9 0x38`. Each fixture party's 32-byte identifier is `SHA-256("SCP test vector identifier <role>")` over the ASCII label, with one role per party, following the precedent of §25.9. The 24 roles, each `<role>` exactly as the label spells it, are `a`, `agent`, `alice`, `announcing member`, `app`, `b`, `bob`, `carol`, `claimant`, `dave`, `event-log actor`, `hpke member`, `hpke sender`, `issuer`, `leaf attester`, `m`, `new member`, `other member`, `proposer`, `pseudonymized member`, `sender`, `subject`, `sync member`, `voter`. A fixture identifier is bound to no key: the vectors that carry one pin a preimage, not a binding between an identifier and the key that signs it. The rule covers the fixture parties only: Vector 52's signed export preimage carries the literal snapshot string `"creator_did":"<scp-identifier:creator>"`, which is not an identifier in the `scp:` form, and Vectors 41 through 57 are unchanged by it.
+**Identifier strings in the fixtures.** Where a signed or hashed structure takes a fixture party's identifier as UTF-8 bytes, the vectors print it in the `scp:` text form that Vector 57 of §25.29 pins: `"scp:"` followed by the lowercase, unpadded RFC 4648 base32 of the 32-byte identifier, 56 characters in all, so each such field carries the length prefix `BE32(56)` or the MessagePack header `0xd9 0x38`. Each fixture party's 32-byte identifier is `SHA-256("SCP test vector identifier <role>")` over the ASCII label, with one role per party, following the precedent of §25.9. The 23 roles, each `<role>` exactly as the label spells it, are `a`, `agent`, `alice`, `announcing member`, `app`, `b`, `bob`, `carol`, `dave`, `event-log actor`, `hpke member`, `hpke sender`, `issuer`, `leaf attester`, `m`, `new member`, `other member`, `proposer`, `pseudonymized member`, `sender`, `subject`, `sync member`, `voter`. A fixture identifier is bound to no key: the vectors that carry one pin a preimage, not a binding between an identifier and the key that signs it. The rule covers the fixture parties only: Vector 52's signed export preimage carries the literal snapshot string `"creator_did":"<scp-identifier:creator>"`, which is not an identifier in the `scp:` form, and Vectors 41 through 57 are unchanged by it.
 
 **What a signature covers.** Every SCP signature here is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 reaches it. The vectors run RFC 6979 with `h1` set to that same digest, because §9.5 fixes RFC 6979 with SHA-256 for a software signer and states no value for `h1` under a prehashed digest. An implementation that hashes the digest a second time reproduces none of the signature bytes below.
 
@@ -207,7 +207,7 @@ Verification vector:
   verdict:    accept
 ```
 
-## 25.5 Vote Signing Vectors (§6.4 [no such section])
+## 25.5 Vote Signing Vectors (§9.5.2)
 
 Domain: `"SCP-VOTE-V1:"`
 
@@ -623,39 +623,7 @@ Fingerprint:
 
 An implementation that concatenates the caller's own block first computes two different values for one honest pair and raises §9.11's maximum-severity MITM alert against an honest counterparty.
 
-## 25.10 Claim Validation Vectors (§12.3)
-
-Domain: `"SCP-CLAIM-V1:"`
-
-### Vector 22: Shadow Claim Hash
-
-```
-Input:
-  shadow_id:    "shadow-alice-x-12345"
-  claimant_did: "scp:nof3f4ikizgjnnxysigd42wgfx4srjkvbirtaicvnw7qfulrpmeq"
-                (the fixture identifier claimant, §25.1)
-  context_id:   "bridge-test-context"
-  timestamp:    1700000000
-
-Canonical hash input:
-  "SCP-CLAIM-V1:"                              (13 bytes)
-  || BE32(20) || "shadow-alice-x-12345"         (4 + 20 = 24 bytes)
-  || BE32(56) || claimant_did                  (4 + 56 = 60 bytes)
-  || BE32(19) || "bridge-test-context"          (4 + 19 = 23 bytes)
-  || BE64(1700000000)                           (8 bytes)
-
-Total: 13 + 24 + 60 + 23 + 8 = 128 bytes
-
-Preimage (hex, 128 bytes):
-  5343502d434c41494d2d56313a00000014736861646f772d616c6963652d782d3132333435000000387363703a6e6f66336634696b697a676a6e6e7879736967643432776766783473726a6b7662697274616963766e77377166756c72706d6571000000136272696467652d746573742d636f6e74657874000000006553f100
-
-Expected SHA-256:
-  0x08d9bd5de3ff51a2ff7d8c750ec2361c70b4f0106cd7c98f5d331abbf0f67fcd
-```
-
-The domain separator is 13 ASCII bytes. Before 2026-09-10 this vector stated a 14-byte separator and a total one byte longer than its fields, so an implementer following §25.17 step 3 would have read a correct encoding as wrong. The claim hash is new here: §25.17 step 4 tells an implementer to compare each canonical byte sequence's SHA-256 against an expected hash, and this vector carried none.
-
-## 25.11 Proposal ID Vectors (§6.4 [no such section])
+## 25.11 Proposal ID Vectors (§9.5.2)
 
 Domain: `"SCP-PROPOSAL-V1:"`
 
@@ -937,7 +905,7 @@ Independent implementations SHOULD run the generator, compare its output against
 
 ## 25.19 Per-Context Pseudonym Derivation Vectors (§9.10.4, §9.10.4.A, §9.10.4.1)
 
-These vectors pin the **software-custody** per-context pseudonym keypair derivation. Software custody is cross-platform deterministic: every SDK (Rust, Swift, Kotlin, TypeScript, Python) MUST reproduce the exact public-key bytes below for the same identity seed, `context_id`, and epoch. Under the §9.10.4.A native interim, native software custody reproduces them when the 32-byte `identity_scalar` below is held as the identity's Ed25519 seed; the Rust, Swift and Kotlin KATs install it that way in the custody under test, and the TypeScript and Python KATs pass it to the bridge's `testing` hook, which runs the production derivation and returns the v1 routing id. **Hardware custody** (Secure Enclave, Android Keystore TEE, HSM) is device-local by design — the `pseudonym_secret` is a device-local secret generated inside the hardware boundary, so hardware pseudonyms are NOT expected to match these values and are NOT cross-device deterministic (§9.10.4.A).
+These vectors pin the **software-custody** per-context pseudonym derivation. Software custody is cross-platform deterministic: every SDK (Rust, Swift, Kotlin, TypeScript, Python) MUST reproduce the exact public-key bytes below for the same identity seed, `context_id`, and epoch. Under the §9.10.4.A native interim, native software custody reproduces them when the 32-byte `identity_scalar` below is held as the identity's Ed25519 seed; the Rust, Swift and Kotlin KATs install it that way in the custody under test. The TypeScript and Python KATs pass it to the software-host export `p256_software_pseudonym_point`, which runs the production derivation and returns the point. The v1 routing id that each bridge's callback adapter computes from the Vector 30 point is asserted per bridge: for PyO3 and UniFFI by a Rust test, and for napi, whose Rust unit tests cannot host a JavaScript callback, by a TypeScript test that runs through the addon (the tests are named below). **Hardware custody** (Secure Enclave, Android Keystore TEE, HSM) is device-local by design — the `pseudonym_secret` is a device-local secret generated inside the hardware boundary, so hardware pseudonyms are NOT expected to match these values and are NOT cross-device deterministic (§9.10.4.A).
 
 Derivation recipe (all implementations agree):
 
@@ -961,7 +929,7 @@ context_seed_v2 = HMAC-SHA256(pseudonym_secret, context_id || BE64(epoch) || "sc
 # seed-to-scalar (FIPS 186-5 A.2.1, extra random bits — §9.10.4):
 scalar_input = HKDF-Expand-SHA256(context_seed, "SCP-PSEUDONYM-P256-V1", 48)
 d            = (int(scalar_input) mod (n - 1)) + 1
-pseudonym_public_key = P256_keypair_from_scalar(d).public_key   (33-byte compressed)
+pseudonym_public_key = d·G   (33-byte compressed; d is discarded)
 
 # routing id (every routing field carries this, never the point):
 pseudonym_routing_id = SHA-256("scp-pseudonym-routing-v1:" || pseudonym_public_key)
@@ -1037,7 +1005,7 @@ Expected v2 pseudonym_routing_id (epoch = 1):
   0x3c0ac4dec86c0dafe38195a7b66cdfec6b0ae0d44834c6e8b6b6129e097b5e27
 ```
 
-`spec_25_19_vectors_30_31` in `crates/scp-crypto/src/pseudonym.rs` (the wasm-safe home of the derivation, ADR-057 Option A) and `pseudonym_derivation_matches_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs` assert every value above, routing ids included, on native and on `wasm32`. `scripts/gen-test-vectors-p256.py` emits them.
+`spec_25_19_vectors_30_31` in `crates/scp-crypto/src/pseudonym.rs` (the wasm-safe home of the derivation, ADR-057 Option A) and `pseudonym_derivation_matches_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs` assert every value above, routing ids included, on native and on `wasm32`. `scripts/gen-test-vectors-p256.py` emits them. `test_software_pseudonym_point_reproduces_spec_25_19` in `bindings/python/tests/test_p256_host_helpers.py` and the matching test in `bindings/typescript/tests/p256-host-helpers.test.ts` assert the four points through the bridge exports. The Vector 30 v1 routing id is asserted through each bridge's callback adapter: for PyO3 by `callback_pseudonym_routing_id_is_spec_25_19_vector_30` in `crates/scp-ffi/src/custody.rs`, for UniFFI by `callback_pseudonym_routing_id_is_spec_25_19_vector_30` in `crates/scp-ffi/uniffi/src/bridge.rs`, and for napi by the test "the host receives the caller's context and epoch unchanged and the bridge returns the §25.19 Vector 30 routing ids" in `bindings/typescript/tests/custody-bridge-checks.test.ts`, which drives the addon's `TestingCallbackCustody`.
 
 ### Vector 36: `PseudonymAnnouncement` wire format + classifier decisions (§9.10.4)
 

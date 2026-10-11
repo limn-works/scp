@@ -47,6 +47,7 @@ wires an in-memory MLS storage backend and no-op persistence:
 use std::sync::Arc;
 use scp_runtime::context::test_supervisor;
 use scp_runtime::crypto::mls::provider::NodeMlsFactory;
+use scp_protocol::context::roles::Capability;
 use scp_protocol::context::{ContextParams, ContextState};
 
 // `test_supervisor` returns an `Arc<Supervisor>` with the given providers and
@@ -64,11 +65,18 @@ let supervisor = test_supervisor(
     my_key_resolver,
 );
 
-// Create a context. Returns a `ContextHandle` in `Active` state.
+// Create a context. Returns a `ContextHandle` in `Active` state. A create
+// must declare a non-empty ceiling; an empty one fails with
+// `ContextCreationError::StateTransition(
+//     ContextError::CeilingRequired(CeilingDeclaration::Empty))`.
+let params = ContextParams {
+    ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
+    ..ContextParams::default()     // encrypted mode, default TTL
+};
 let handle = supervisor
     .create_context(
         "my-context-1".into(),
-        ContextParams::default(),      // encrypted mode, default TTL
+        params,
         "did:dht:z6Mk...creator".into(),
         None,                          // local pseudonym (§9.10.4)
     )

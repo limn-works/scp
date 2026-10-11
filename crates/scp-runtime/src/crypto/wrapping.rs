@@ -7,7 +7,7 @@
 //! the public point once, so a stored public key can never disagree with the
 //! stored scalar.
 
-use scp_crypto::p256::{P256Error, P256SigningKey};
+use scp_crypto::p256::{P256Error, P256SecretKey};
 use zeroize::Zeroizing;
 
 /// A DHKEM(P-256) wrapping keypair: a scalar in `[1, n − 1]` and the
@@ -39,7 +39,7 @@ impl WrappingKeyPair {
     /// [`P256Error::InvalidScalar`] if the scalar is zero or at least the
     /// group order `n`.
     pub fn from_secret(secret: Zeroizing<[u8; 32]>) -> Result<Self, P256Error> {
-        let public = P256SigningKey::from_scalar_bytes(&secret)?
+        let public = P256SecretKey::from_scalar_bytes(&secret)?
             .public_key()
             .to_uncompressed();
         Ok(Self { secret, public })

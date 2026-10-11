@@ -472,12 +472,7 @@ impl GovernanceEngine for MajorityVoteEngine {
         context: &GovernanceContext,
         _signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), GovernanceError> {
-        // Any eligible voter can propose in majority model.
-        if !self.eligible_voter_dids.contains(proposer) {
-            return Err(GovernanceError::NotEligible(format!(
-                "{proposer} is not an eligible voter"
-            )));
-        }
+        self.check_proposer(proposer)?;
 
         // RFC 8785 JCS canonical serialization for cross-implementation
         // deterministic proposal ID computation (§9.5.2). JCS (not
@@ -520,6 +515,17 @@ impl GovernanceEngine for MajorityVoteEngine {
         self.proposals.insert(proposal_id, proposal.clone());
 
         Ok((proposal, events))
+    }
+
+    fn check_proposer(&self, proposer: &DID) -> Result<(), GovernanceError> {
+        // Any eligible voter can propose in majority model.
+        if self.eligible_voter_dids.contains(proposer) {
+            Ok(())
+        } else {
+            Err(GovernanceError::NotEligible(format!(
+                "{proposer} is not an eligible voter"
+            )))
+        }
     }
 
     fn approve(

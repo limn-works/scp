@@ -1,29 +1,51 @@
-// AndroidStorageTest.kt — Unit tests for AndroidStorage (SCP-113)
+// AndroidStorageTest.kt — StorageProvider contract tests against InMemoryStorageProvider,
+// and tests of AndroidStorage's constants and signatures (SCP-113)
 //
 // IMPORTANT: These are IN-MEMORY-ONLY tests. All StorageProvider contract tests run
 // against InMemoryStorageProvider, NOT the real AndroidStorage implementation. The
 // following production behaviors are NOT exercised by these tests:
-//   - Android Keystore TEE key derivation (Bug #2: setRandomizedEncryptionRequired)
-//   - SQLCipher SQL LIKE escaping with % and _ wildcards (Bug #4)
-//   - Non-atomic deletePrefix under concurrent access (Bug #5)
-//   - Passphrase ByteArray zeroing after database open (Bug #3)
+//   - Android Keystore key derivation with setRandomizedEncryptionRequired(false), which
+//     the caller-supplied fixed GCM IV needs
+//   - SQL LIKE escaping of % and _ wildcards on real SQLCipher
+//   - Transactional deletePrefix (DELETE plus changes() in one transaction) on real
+//     SQLCipher under concurrent access
+//   - Zeroing of the passphrase ByteArray in the finally block after database open
 //
-// Instrumented tests on real devices are required to verify the full SQLCipher +
-// Android Keystore path. See ADR-027 for the testing strategy.
+// Only an instrumented test can run the SQLCipher and Android Keystore path.
+// ADR-027 (the Android platform adapter) acceptance criterion 13 requires
+// `storage_conformance!()` against AndroidStorage and a SQLCipher test that opens
+// the raw database file and confirms it is unreadable without the
+// Keystore-derived key. Criterion 13 separately requires hardware tests to run on
+// an API 33+ physical device or an API 33 emulator with Play Store; it names no
+// device for the SQLCipher test. No such test exists.
 //
 // Test strategies:
 //
-// 1. **Contract tests**: Verify the StorageProvider interface contract using an
-//    InMemoryStorageProvider that mirrors the production AndroidStorage semantics
-//    (INSERT OR REPLACE, lexicographic ordering, prefix matching). These tests
-//    validate that any conforming StorageProvider implementation behaves correctly.
+// 1. **Contract tests**: Check the StorageProvider interface contract against
+//    InMemoryStorageProvider. The double shares INSERT OR REPLACE with AndroidStorage,
+//    but its prefix matching and ordering differ from AndroidStorage's:
+//    - AndroidStorage matches a prefix with SQL `LIKE`, which SQLite matches without
+//      regard to ASCII letter case (no `PRAGMA case_sensitive_like` is set), so
+//      listKeys("ctx.a") also returns "ctx.Abc" and deletePrefix("ctx.a") also deletes
+//      it. The double's `startsWith` is case-sensitive, as are the Rust SqliteStorage
+//      and AppleStorage byte-range scans.
+//    - AndroidStorage orders keys by SQLite's BINARY collation over UTF-8 bytes; the
+//      double's TreeMap orders by UTF-16 code units. The two disagree when one key holds
+//      a character in U+E000..U+FFFF and another a supplementary-plane character.
+//    These tests run no other StorageProvider implementation, so they show nothing
+//    about AndroidStorage.
 //
-// 2. **AndroidStorage verification tests**: Verify that AndroidStorage uses the
-//    correct Keystore alias, error codes, and constant values. These verify the
-//    production class structure without requiring Android runtime dependencies.
+// 2. **AndroidStorage constant and signature tests**: Assert the values of
+//    AndroidStorage's constants (Keystore alias, database and column names, error
+//    codes), that AndroidStorage implements StorageProvider, and the signatures of
+//    its constructor and getOrCreateStorageKey. No test in this file calls AndroidStorage code, so
+//    none shows that AndroidStorage passes its alias to Keystore or throws the right
+//    error code.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
-// SCP-113 (Android Storage trait with TEE-backed SQLCipher).
+// SCP-113 (Android Storage trait with TEE-backed SQLCipher; the adapter derives the SQLCipher
+// passphrase from a Keystore-held AES-256 key and does not check that Keystore put the AES key
+// in the TEE).
 
 package works.limn.scp.android.platform
 
@@ -42,15 +64,17 @@ import kotlin.reflect.KFunction1
 /**
  * In-memory implementation of [StorageProvider] for contract testing.
  *
- * Mirrors the SQLCipher-backed production semantics: INSERT OR REPLACE on store,
- * lexicographic ordering on listKeys, prefix-based matching, and cursor-style
- * retrieval. This implementation validates the StorageProvider contract without
- * requiring Android runtime dependencies.
+ * Shares INSERT OR REPLACE on store with AndroidStorage. Its prefix matching is
+ * case-sensitive `startsWith`, while AndroidStorage's SQL `LIKE` ignores ASCII letter
+ * case, and its ordering is by UTF-16 code units, while AndroidStorage's is by UTF-8
+ * bytes; the file header states both differences. This implementation checks the
+ * StorageProvider contract without Android runtime dependencies.
  */
 class InMemoryStorageProvider : StorageProvider {
 
-    // TreeMap provides natural lexicographic ordering, matching SQLCipher's
-    // ORDER BY key ASC behavior. TreeMap is not thread-safe, and the
+    // TreeMap orders keys by UTF-16 code units. SQLCipher's ORDER BY key ASC orders
+    // by UTF-8 bytes, which differs only for keys holding characters in U+E000..U+FFFF
+    // and supplementary-plane characters. TreeMap is not thread-safe, and the
     // StorageProvider contract requires concurrent callers not to interfere
     // (conformance case 12, concurrent_access), so every operation holds [lock].
     private val lock = Any()
@@ -444,20 +468,23 @@ class AndroidStorageTest {
     }
 
     // -------------------------------------------------------------------
-    // TEE key derivation verification (constants and structure)
+    // AndroidStorage structure and error-code constant values. No test here runs
+    // Keystore key derivation or any AndroidStorage code that throws these codes,
+    // so none shows which code a failing AndroidStorage call throws; see the file
+    // header.
     // -------------------------------------------------------------------
 
     @Nested
-    inner class TeeKeyDerivation {
+    inner class AndroidStorageStructure {
 
         @Test
         fun `AndroidStorage class exists and implements StorageProvider`() {
-            // Verify at the type level that AndroidStorage implements the trait
+            // Verify at the type level that AndroidStorage implements the Kotlin interface
             assertTrue(StorageProvider::class.java.isAssignableFrom(AndroidStorage::class.java))
         }
 
         @Test
-        fun `getOrCreateStorageKey is accessible for integration testing`() {
+        fun `getOrCreateStorageKey takes no argument and returns ByteArray`() {
             // Verify the method exists on the production class with the signature
             // `AndroidStorage.() -> ByteArray` (calling it throws without Android
             // Keystore). The method is `internal`, so the Kotlin compiler mangles its
@@ -481,7 +508,7 @@ class AndroidStorageTest {
         }
 
         @Test
-        fun `ScpException for key derivation failure carries correct error code`() {
+        fun `ScpException the test builds with ERROR_KEY_DERIVATION_FAILED carries SCP-STORAGE-8003`() {
             val exception = ScpException(
                 "Failed to derive storage encryption key: test",
                 AndroidStorage.ERROR_KEY_DERIVATION_FAILED
@@ -491,7 +518,7 @@ class AndroidStorageTest {
         }
 
         @Test
-        fun `ScpException for storage operation failure carries correct error code`() {
+        fun `ScpException the test builds with ERROR_STORAGE_OPERATION_FAILED carries SCP-STORAGE-8002`() {
             val exception = ScpException(
                 "Storage set operation failed",
                 AndroidStorage.ERROR_STORAGE_OPERATION_FAILED
@@ -537,7 +564,7 @@ class AndroidStorageTest {
 
         @Test
         fun `store value of exactly 32 bytes round-trips`() {
-            // 32 bytes is the SQLCipher passphrase length — ensure no special handling
+            // InMemoryStorageProvider stores a 32-byte value like a value of any other length.
             val key = "exact32"
             val value = ByteArray(32) { it.toByte() }
             storage.set(key, value)
@@ -545,8 +572,8 @@ class AndroidStorageTest {
         }
 
         @Test
-        fun `concurrent stores to different keys do not interfere`() {
-            // Sequential simulation of concurrent access pattern
+        fun `sequential stores to 100 distinct keys each read back their own value`() {
+            // One thread stores the 100 keys in turn, so this test runs no concurrent access.
             val keys = (1..100).map { "concurrent.$it" }
             keys.forEach { storage.set(it, it.toByteArray()) }
             keys.forEach { key ->

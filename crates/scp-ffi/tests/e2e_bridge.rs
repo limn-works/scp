@@ -2,8 +2,8 @@
 //!
 //! These tests exercise the public API surface of `scp-ffi` from an
 //! integration test crate. They cover: identity registry, context
-//! lifecycle, outlets, UCAN, event log, discovery, provenance, bridge
-//! trust, sync, and trust engine.
+//! lifecycle, outlets, UCAN, event log, discovery, provenance, sync, and
+//! trust engine.
 //!
 //! For `ContextManager` methods that require complex types (`join_context`,
 //! `leave_context`), membership is set up via the manager's internal
@@ -151,7 +151,13 @@ fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
     let ctx_id = context_id.clone();
 
     rt.block_on(async move {
-        let params = scp_core::context::ContextParams::default();
+        let params = scp_core::context::ContextParams {
+            ceiling: scp_core::context::roles::default_ceiling()
+                .iter()
+                .cloned()
+                .collect(),
+            ..scp_core::context::ContextParams::default()
+        };
         supervisor
             .create_context(ctx_id.clone(), params, creator.clone(), None)
             .await
@@ -251,8 +257,18 @@ fn context_create_registers_in_runtime() {
     let did = create_test_identity(&bi);
     let ctx_id = create_test_context(&bi, &did);
 
-    let creator = runtime::with_context(&bi, &ctx_id, |rt| Ok(rt.creator_did.clone())).unwrap();
+    let supervisor = runtime::supervisor(&bi).unwrap().clone();
+    let read_ctx = ctx_id.clone();
+    let creator = test_runtime()
+        .block_on(async move { supervisor.get_role_state_checked(&read_ctx).await })
+        .unwrap()
+        .expect("the supervisor holds role state for the created context")
+        .creator_did;
     assert_eq!(creator, did);
+    assert!(
+        runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_ok(),
+        "register_context must leave FFI bridge state for the context"
+    );
 }
 
 #[test]
@@ -288,6 +304,89 @@ fn context_member_role_creator_is_admin() {
         role_str.to_lowercase().contains("admin"),
         "Creator role should contain 'admin', got: {role_str}"
     );
+}
+
+/// Builds a `PyScp` whose owner identity a single-admin governance engine can
+/// resolve, plus a context whose ceiling lets that owner propose a
+/// `SuspendCapability`.
+///
+/// `identity_create` publishes an owner's DID document into this instance's
+/// resolver, which single-admin vote verification reads to resolve a
+/// proposer's public key. It precedes `init_context_manager_for_test`,
+/// because a supervisor snapshots its resolver when it is built.
+fn single_admin_owner_and_context(
+    py: Python<'_>,
+) -> (_scp_core::scp::PyScp, String, PyContextHandle) {
+    setup();
+    let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+    let owner = scp
+        .identity_create(py, "in_memory", None)
+        .unwrap()
+        .into_pyobject(py)
+        .unwrap()
+        .getattr("did")
+        .unwrap()
+        .extract::<String>()
+        .unwrap();
+    runtime::init_context_manager_for_test(scp.bridge_instance());
+    let params = PyDict::new(py);
+    let ceiling = PyList::new(
+        py,
+        [
+            "governance:propose",
+            "member:ban",
+            "messages:read",
+            "messages:write",
+        ],
+    )
+    .unwrap();
+    params.set_item("ceiling", ceiling).unwrap();
+    let handle = scp.context_create(&owner, &params.as_borrowed()).unwrap();
+    (scp, owner, handle)
+}
+
+/// A `single_admin` context auto-approves and auto-executes a proposal, so
+/// `governance_propose`'s `execution_result` field names which action ran.
+/// `SuspendCapability` yields `GovernanceActionResult::MemberSuspended`, whose
+/// `SuspendMemberResult` payload made `format!("{r:?}")` send
+/// `MemberSuspended(SuspendMemberResult { .. })`; `execution_result` must
+/// equal `governance_action_result_name`'s bare name.
+#[test]
+fn governance_propose_execution_result_is_a_wire_name() {
+    Python::with_gil(|py| {
+        let (scp, owner, handle) = single_admin_owner_and_context(py);
+        let action_json = serde_json::json!({
+            "SuspendCapability": { "did": owner, "capabilities": ["MessagesWrite"] }
+        })
+        .to_string();
+        let response = scp
+            .governance_propose(&handle, &owner, &action_json)
+            .expect("SuspendCapability must auto-execute under single_admin");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response).expect("governance_propose must return JSON");
+        assert_eq!(
+            parsed["status"].as_str(),
+            Some("Approved"),
+            "got {response}"
+        );
+        assert_eq!(
+            parsed["execution_result"].as_str(),
+            Some("MemberSuspended"),
+            "execution_result must be a bare outcome name; got {response}"
+        );
+    });
+}
+
+/// `context_member_role` returns `RoleAssignment.role_name`, which every
+/// SDK's `MemberRole` parser reads. A `Debug` dump of `RoleAssignment` also
+/// contains "admin", so only equality proves a bare name crossed.
+#[test]
+fn context_member_role_bridge_returns_role_name() {
+    Python::with_gil(|py| {
+        let (scp, owner, handle) = single_admin_owner_and_context(py);
+        let role = scp.context_member_role(&handle, &owner).unwrap();
+        assert_eq!(role.as_deref(), Some("admin"));
+    });
 }
 
 #[test]
@@ -1046,117 +1145,6 @@ fn provenance_attach_rejects_invalid_memory_scope() {
 }
 
 // ============================================================================
-// Bridge trust evaluation
-// ============================================================================
-
-#[test]
-fn bridge_evaluate_trust_native_native() {
-    setup();
-    assert_eq!(
-        _scp_core::bridge_connector::py_bridge_evaluate_trust(false, true, "shadow").unwrap(),
-        3
-    );
-}
-
-#[test]
-fn bridge_evaluate_trust_native_bridged() {
-    setup();
-    assert_eq!(
-        _scp_core::bridge_connector::py_bridge_evaluate_trust(false, false, "shadow").unwrap(),
-        2
-    );
-}
-
-#[test]
-fn bridge_evaluate_trust_shadow_bridged() {
-    setup();
-    assert_eq!(
-        _scp_core::bridge_connector::py_bridge_evaluate_trust(true, false, "shadow").unwrap(),
-        0
-    );
-}
-
-#[test]
-fn bridge_evaluate_trust_claimed_bridged() {
-    setup();
-    assert_eq!(
-        _scp_core::bridge_connector::py_bridge_evaluate_trust(true, false, "claimed").unwrap(),
-        1
-    );
-}
-
-#[test]
-fn bridge_register_succeeds_with_separate_governance_did() {
-    // py_bridge_register now takes a separate governance_did parameter,
-    // so providing distinct operator and governance DIDs should succeed.
-    setup();
-    Python::with_gil(|py| {
-        let r = _scp_core::bridge_connector::py_bridge_register(
-            py,
-            "ctx-br",
-            "did:key:op",
-            "did:key:gov",
-            "discord",
-            "relay",
-            None,
-            None,
-            10_000,
-            "",
-            "",
-            "",
-        );
-        assert!(
-            r.is_ok(),
-            "Registration with distinct governance DID should succeed"
-        );
-    });
-}
-
-#[test]
-fn bridge_register_rejects_self_approval() {
-    // approve_registration rejects self-approval. This test verifies that
-    // constraint is enforced when governance_did == operator_did.
-    setup();
-    Python::with_gil(|py| {
-        let r = _scp_core::bridge_connector::py_bridge_register(
-            py,
-            "ctx-br-self",
-            "did:key:op",
-            "did:key:op",
-            "discord",
-            "relay",
-            None,
-            None,
-            10_000,
-            "",
-            "",
-            "",
-        );
-        assert!(r.is_err(), "Self-approval should be rejected");
-    });
-}
-
-#[test]
-fn bridge_create_shadow_returns_dict() {
-    setup();
-    Python::with_gil(|py| {
-        let r = _scp_core::scp::PyScp::new_in_memory_for_test()
-            .bridge_create_shadow(py, "bridge-d", "@user#1234", "relay", "ctx-sh")
-            .unwrap();
-        let d = r.bind(py);
-        let sid: String = d.get_item("shadow_id").unwrap().unwrap().extract().unwrap();
-        assert!(!sid.is_empty());
-        let h: String = d
-            .get_item("platform_handle")
-            .unwrap()
-            .unwrap()
-            .extract()
-            .unwrap();
-        assert_eq!(h, "@user#1234");
-    });
-}
-
-// ============================================================================
 // Sync classification
 // ============================================================================
 
@@ -1310,13 +1298,6 @@ fn cross_domain_identity_context_outlet_eventlog_provenance() {
         let did_a = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did_a);
 
-        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
-            rt.ceiling_strings.insert("outlet_call:*".to_owned());
-            rt.ceiling_strings.insert("messages:write".to_owned());
-            Ok(())
-        })
-        .unwrap();
-
         // Register an outlet using the helper.
         let reg = build_outlet_reg(py, "cross_domain_outlet", &did_a);
         let outlet_id = scp.outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
@@ -1425,36 +1406,11 @@ fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context
     let ctx_id = context_id.to_owned();
 
     rt.block_on(async move {
-        let params = scp_core::context::ContextParams::default();
-        supervisor
-            .create_context(ctx_id.clone(), params, creator.clone(), None)
-            .await
-            .unwrap();
-        supervisor.register_local_did(creator).await.unwrap();
-    });
-}
-
-/// Creates a registered context whose CREATOR holds the `ContextClose`
-/// capability (the ceiling is seeded with `context:close`), so the creator can
-/// later drive it `Closed` through the REAL supervisor close path. The default
-/// `create_test_context_with_id` uses an EMPTY ceiling, under which even the
-/// creator lacks `context:close` — hence this close-capable variant. Returns the
-/// generated 64-hex context id.
-fn create_closeable_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
-    use scp_core::context::roles::Capability;
-
-    setup();
-    let context_id = random_64hex_context_id();
-    runtime::register_context(bi, &context_id, creator_did, &[]).unwrap();
-
-    let rt = test_runtime();
-    let supervisor = runtime::supervisor(bi).unwrap().clone();
-    let creator = scp_did::DID(creator_did.to_owned());
-    let ctx_id = context_id.clone();
-
-    rt.block_on(async move {
         let params = scp_core::context::ContextParams {
-            ceiling: vec![Capability::ContextClose],
+            ceiling: scp_core::context::roles::default_ceiling()
+                .iter()
+                .cloned()
+                .collect(),
             ..scp_core::context::ContextParams::default()
         };
         supervisor
@@ -1463,18 +1419,32 @@ fn create_closeable_test_context(bi: &PyBridgeInstance, creator_did: &str) -> St
             .unwrap();
         supervisor.register_local_did(creator).await.unwrap();
     });
+}
+
+/// Creates a registered context under a fresh 64-hex id whose CREATOR holds the
+/// `ContextClose` capability, so the creator can later drive it out of `Active`
+/// (into `Closing`) through the REAL supervisor close path. Returns the
+/// generated id.
+///
+/// `default_ceiling()` carries `context:close`, and
+/// [`create_test_context_with_id`] seeds the supervisor with that ceiling, so
+/// this helper is that call under a generated id.
+fn create_closeable_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
+    let context_id = random_64hex_context_id();
+    create_test_context_with_id(bi, creator_did, &context_id);
     context_id
 }
 
-/// Drives a registered context to a NON-active (`Closed`) lifecycle state through
-/// the REAL supervisor close path — the exact `LifecycleCommand::CloseContext`
-/// dispatch the bridge's `context_close` uses. The per-context actor stays alive
-/// reporting `Closed` (close is non-terminal for the actor; ADR-049 §10), so a
-/// subsequent `supervisor.read_context_state(context_id)` returns
-/// `Some(Closed)` — exactly what the streaming-saga open's active-state guard
-/// reads. `initiator_did` must be the creator of a context created with a
-/// `ContextClose`-bearing ceiling (see `create_closeable_test_context`).
-fn drive_context_closed(bi: &PyBridgeInstance, context_id: &str, initiator_did: &str) {
+/// Drives a registered context to a NON-active (`Closing`) lifecycle state
+/// through the REAL supervisor close path — the exact
+/// `LifecycleCommand::CloseContext` dispatch the bridge's `context_close` uses.
+/// `ttl::close_context` moves the context from `Active` to `Closing`, and the
+/// per-context actor stays alive reporting `Closing` (close is non-terminal for
+/// the actor; ADR-049 §10), so a subsequent
+/// `supervisor.read_context_state(context_id)` returns `Some(Closing)`. `initiator_did`
+/// must be the creator of a context created with a `ContextClose`-bearing
+/// ceiling (see `create_closeable_test_context`).
+fn drive_context_closing(bi: &PyBridgeInstance, context_id: &str, initiator_did: &str) {
     use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
 
     let rt = test_runtime();
@@ -2118,13 +2088,6 @@ fn xctx_streaming_saga_recover_hosted_non_invoker_rejected() {
 /// (caller axis) / `SCP-OUTLET-6011` (target axis) — parity with the NAPI and
 /// `UniFFI` streaming-open guards — BEFORE the caller-principal binding, the UCAN
 /// check, or the saga drive, so NO saga is started and NO receiver is handed out.
-///
-/// The guard is LOAD-BEARING: the runtime streaming reserve path
-/// (`reserve_outlet_stream_economy`) debits escrow with no context-active gate,
-/// so this bridge check is the sole barrier. `PyO3` is string-keyed (no handle),
-/// so the state is read authoritatively from the supervisor actor via
-/// `read_context_state`; the context is driven to `Closed` through the REAL
-/// supervisor close path.
 #[test]
 fn xctx_streaming_saga_open_rejects_non_active_context() {
     Python::with_gil(|py| {
@@ -2141,7 +2104,7 @@ fn xctx_streaming_saga_open_rejects_non_active_context() {
         let caller_ctx = create_closeable_test_context(bi, &owner);
         let target_ctx = create_closeable_test_context(bi, &owner);
         let outlet_id = register_saga_outlet(py, &scp, &target_ctx, &owner);
-        drive_context_closed(bi, &caller_ctx, &owner);
+        drive_context_closing(bi, &caller_ctx, &owner);
 
         let err = scp
             .outlet_streaming_saga_open(
@@ -2180,7 +2143,7 @@ fn xctx_streaming_saga_open_rejects_non_active_context() {
         let caller_ctx2 = create_closeable_test_context(bi, &owner);
         let target_ctx2 = create_closeable_test_context(bi, &owner);
         let outlet_id2 = register_saga_outlet(py, &scp, &target_ctx2, &owner);
-        drive_context_closed(bi, &target_ctx2, &owner);
+        drive_context_closing(bi, &target_ctx2, &owner);
 
         let err = scp
             .outlet_streaming_saga_open(
@@ -2850,6 +2813,13 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
         // created on a different runtime is unreachable → transport.rate-limited).
         let ctx = {
             let params = PyDict::new(py);
+            // Every capability in `default_ceiling()`, so the fixture's mint, delegation and
+            // outlet calls all sit inside the ceiling.
+            let ceiling: Vec<String> = scp_core::context::roles::default_ceiling()
+                .iter()
+                .map(|cap| cap.name().into_owned())
+                .collect();
+            params.set_item("ceiling", ceiling).unwrap();
             let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
             handle_context_id(py, &handle)
         };
@@ -3028,6 +2998,13 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
         runtime::init_context_manager_for_test(bi);
         let ctx = {
             let params = PyDict::new(py);
+            // Every capability in `default_ceiling()`, so the fixture's mint, delegation and
+            // outlet calls all sit inside the ceiling.
+            let ceiling: Vec<String> = scp_core::context::roles::default_ceiling()
+                .iter()
+                .map(|cap| cap.name().into_owned())
+                .collect();
+            params.set_item("ceiling", ceiling).unwrap();
             let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
             handle_context_id(py, &handle)
         };
@@ -3254,5 +3231,945 @@ fn outlet_stream_pure_wrappers_roundtrip() {
             .unwrap(),
             "chunk signed by a different key must NOT verify"
         );
+    });
+}
+
+/// `ucan_validate`, `ucan_evaluate`, and `ucan_delegate` compare a token's
+/// grants against the ceiling the SUPERVISOR holds for the context named in the
+/// call.
+///
+/// One creator owns two contexts: `wide` holds `messages:write` and `narrow`
+/// omits it. A `messages:write` token minted in `wide` passes each call there
+/// and fails the ceiling check in `narrow`. An edit that hands the core
+/// `default_ceiling()`, an empty ceiling, or the other context's ceiling passes
+/// one of the two halves and fails the other.
+#[cfg(feature = "testing")]
+#[test]
+fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() {
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let owner = published_identity_did(py, &scp);
+        let holder = published_identity_did(py, &scp);
+        let delegatee = published_identity_did(py, &scp);
+        let bi = scp.bridge_instance();
+        runtime::init_context_manager_for_test(bi);
+
+        let wide = random_context_id();
+        let narrow = random_context_id();
+        let rt = test_runtime();
+        let supervisor = runtime::supervisor(bi).unwrap().clone();
+        for (ctx, ceiling) in [
+            (&wide, &["messages:read", "messages:write"][..]),
+            (&narrow, &["messages:read"][..]),
+        ] {
+            runtime::register_context(bi, ctx, &owner, &[]).unwrap();
+            let params = scp_core::context::ContextParams {
+                ceiling: ceiling
+                    .iter()
+                    .map(|c| scp_core::context::roles::Capability::new(c).unwrap())
+                    .collect(),
+                ..scp_core::context::ContextParams::default()
+            };
+            let (sup, id, creator) = (supervisor.clone(), ctx.clone(), scp_did::DID(owner.clone()));
+            rt.block_on(async move { sup.create_context(id, params, creator, None).await })
+                .unwrap();
+        }
+        let creator = scp_did::DID(owner);
+        let sup = supervisor;
+        rt.block_on(async move { sup.register_local_did(creator).await })
+            .unwrap();
+
+        let token = scp
+            .ucan_mint(&wide, &holder, vec!["messages:write".to_owned()], None)
+            .expect("a mint inside the wide ceiling must succeed")
+            .encoded;
+
+        // Evaluate and validate take a full capability URI. The token's grant is
+        // scoped to the wide context, and every call names that grant, so the
+        // narrow context refuses at its ceiling rather than at a scope mismatch.
+        let cap = format!("scp:ctx:{wide}/messages:write");
+
+        let in_wide = scp
+            .ucan_evaluate(&wide, &token, Some(cap.as_str()), &holder, None)
+            .unwrap();
+        let in_narrow = scp
+            .ucan_evaluate(&narrow, &token, Some(cap.as_str()), &holder, None)
+            .unwrap();
+        assert!(
+            in_wide.within_ceiling,
+            "evaluate must pass the wide ceiling"
+        );
+        assert!(
+            !in_narrow.within_ceiling,
+            "evaluate must report the narrow supervisor ceiling"
+        );
+
+        scp.ucan_delegate(&wide, &holder, &delegatee, &token, vec![cap.clone()])
+            .expect("a delegation inside the wide ceiling must succeed");
+        let delegate_err = scp
+            .ucan_delegate(&narrow, &holder, &delegatee, &token, vec![cap.clone()])
+            .expect_err("the narrow supervisor ceiling must refuse the delegation")
+            .to_string()
+            .to_lowercase();
+        assert!(
+            delegate_err.contains("ceiling"),
+            "the delegation refusal must be the ceiling check: {delegate_err}"
+        );
+
+        let validate_err = scp
+            .ucan_validate(&narrow, &token, &cap, &holder, None)
+            .expect_err("the narrow supervisor ceiling must refuse the validation")
+            .to_string()
+            .to_lowercase();
+        assert!(
+            validate_err.contains("ceiling"),
+            "the validation refusal must be the ceiling check: {validate_err}"
+        );
+        scp.ucan_validate(&wide, &token, &cap, &holder, None)
+            .expect("a validation inside the wide ceiling must succeed");
+    });
+}
+
+/// `ucan_validate` and `ucan_evaluate` anchor a token's root issuer on the
+/// context creator the SUPERVISOR holds.
+///
+/// In `anchored` the supervisor names `owner`, the token's issuer; in `crossed`
+/// the supervisor names `other`. The token passes the root-issuer check in `anchored` and fails it in
+/// `crossed`.
+#[cfg(feature = "testing")]
+#[test]
+fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator() {
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let owner = published_identity_did(py, &scp);
+        let other = published_identity_did(py, &scp);
+        let holder = published_identity_did(py, &scp);
+        let bi = scp.bridge_instance();
+        runtime::init_context_manager_for_test(bi);
+
+        let anchored = random_context_id();
+        let crossed = random_context_id();
+        let rt = test_runtime();
+        let supervisor = runtime::supervisor(bi).unwrap().clone();
+        for (ctx, register_arg, supervisor_creator) in
+            [(&anchored, &other, &owner), (&crossed, &owner, &other)]
+        {
+            runtime::register_context(bi, ctx, register_arg, &[]).unwrap();
+            let params = scp_core::context::ContextParams {
+                ceiling: ["messages:read", "messages:write"]
+                    .iter()
+                    .map(|c| scp_core::context::roles::Capability::new(c).unwrap())
+                    .collect(),
+                ..scp_core::context::ContextParams::default()
+            };
+            let (sup, id, creator) = (
+                supervisor.clone(),
+                ctx.clone(),
+                scp_did::DID(supervisor_creator.clone()),
+            );
+            rt.block_on(async move { sup.create_context(id, params, creator, None).await })
+                .unwrap();
+        }
+        let creator = scp_did::DID(owner.clone());
+        let sup = supervisor;
+        rt.block_on(async move { sup.register_local_did(creator).await })
+            .unwrap();
+
+        // The mint issues as the supervisor's creator of `anchored`: `owner`.
+        let token = scp
+            .ucan_mint(&anchored, &holder, vec!["messages:write".to_owned()], None)
+            .expect("a mint by the supervisor's creator must succeed")
+            .encoded;
+        let cap = format!("scp:ctx:{anchored}/messages:write");
+
+        let in_anchored = scp
+            .ucan_evaluate(&anchored, &token, Some(cap.as_str()), &holder, None)
+            .unwrap();
+        let in_crossed = scp
+            .ucan_evaluate(&crossed, &token, Some(cap.as_str()), &holder, None)
+            .unwrap();
+        assert!(
+            in_anchored.signatures_valid,
+            "evaluate must accept the root issuer the supervisor names as creator"
+        );
+        assert!(
+            !in_crossed.signatures_valid,
+            "evaluate must refuse a root issuer the supervisor does not name as creator"
+        );
+
+        let crossed_err = scp
+            .ucan_validate(&crossed, &token, &cap, &holder, None)
+            .expect_err(
+                "validate must refuse a root issuer the supervisor does not name as creator",
+            )
+            .to_string();
+        assert!(
+            crossed_err.contains(&format!("invalid issuer: expected {other}, got {owner}")),
+            "the validation refusal must be the root-issuer check: {crossed_err}"
+        );
+        scp.ucan_validate(&anchored, &token, &cap, &holder, None)
+            .expect("the root issuer the supervisor names as creator must validate");
+    });
+}
+
+/// Re-signs `encoded` as `signer` with its `nb` replaced by `nb` and a fresh
+/// nonce, so a test can present a root token whose signed §7.3.8 caveats the
+/// bridge mint does not originate.
+#[cfg(feature = "testing")]
+fn resign_with_nb(
+    bi: &PyBridgeInstance,
+    signer: &str,
+    encoded: &str,
+    nb: scp_core::trust::caveats::InvocationCaveats,
+) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use scp_platform::traits::KeyCustody as _;
+
+    let mut token = scp_core::crypto::ucan::validate::parse_ucan(encoded).unwrap();
+    token.payload.nb = Some(nb);
+    token.payload.nnc = scp_core::crypto::ucan::nonce::generate_nonce(&scp_clock::SystemClock);
+    let header_b64 = encoded.split('.').next().unwrap();
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&token.payload).unwrap());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let (custody, key) = runtime::with_identity(bi, signer, |entry| {
+        Ok((
+            Arc::clone(&entry.custody),
+            entry.identity.active_signing_key,
+        ))
+    })
+    .unwrap();
+    let sig = test_runtime()
+        .block_on(custody.sign(&key, signing_input.as_bytes()))
+        .unwrap();
+    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.as_bytes()))
+}
+
+/// A context whose ceiling holds `outlet_call:*` and `messages:write`, plus a
+/// root `outlet_call:*` token minted to `holder` and its capability string.
+#[cfg(feature = "testing")]
+struct NbFixture {
+    scp: _scp_core::scp::PyScp,
+    creator: String,
+    holder: String,
+    ctx: String,
+    root: String,
+    cap: String,
+}
+
+#[cfg(feature = "testing")]
+fn nb_fixture(py: Python<'_>) -> NbFixture {
+    setup();
+    let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+    let creator = published_identity_did(py, &scp);
+    let holder = published_identity_did(py, &scp);
+    runtime::init_context_manager_for_test(scp.bridge_instance());
+    let ctx = {
+        let params = PyDict::new(py);
+        let ceiling: Vec<String> = scp_core::context::roles::default_ceiling()
+            .iter()
+            .map(|cap| cap.name().into_owned())
+            .collect();
+        params.set_item("ceiling", ceiling).unwrap();
+        let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
+        handle_context_id(py, &handle)
+    };
+    let root = scp
+        .ucan_mint(&ctx, &holder, vec!["outlet_call:*".to_owned()], None)
+        .unwrap();
+    let cap = root.capabilities[0].clone();
+    NbFixture {
+        scp,
+        creator,
+        holder,
+        ctx,
+        root: root.encoded,
+        cap,
+    }
+}
+
+#[cfg(feature = "testing")]
+fn valid_until(offset: i64) -> scp_core::trust::caveats::InvocationCaveats {
+    let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+    scp_core::trust::caveats::InvocationCaveats {
+        valid_until: Some(now.saturating_add_signed(offset)),
+        ..scp_core::trust::caveats::InvocationCaveats::empty()
+    }
+}
+
+/// §7.3.8 Step 11b: `ucan_validate` and `ucan_evaluate` refuse a root
+/// `outlet_call:*` token whose signed `nb.valid_until` has passed although its
+/// `exp` has not.
+#[cfg(feature = "testing")]
+#[test]
+fn ucan_validate_refuses_a_root_outlet_token_past_its_nb_time_box() {
+    Python::with_gil(|py| {
+        let f = nb_fixture(py);
+        let lapsed = resign_with_nb(
+            f.scp.bridge_instance(),
+            &f.creator,
+            &f.root,
+            valid_until(-60),
+        );
+        let evaluation = f
+            .scp
+            .ucan_evaluate(&f.ctx, &lapsed, Some(f.cap.as_str()), &f.holder, None)
+            .unwrap();
+        assert!(
+            evaluation.signatures_valid && !evaluation.time_bounds_valid,
+            "evaluate must report only the time-box failure"
+        );
+        let err = f
+            .scp
+            .ucan_validate(&f.ctx, &lapsed, &f.cap, &f.holder, None)
+            .expect_err("a root outlet token past nb.valid_until must not validate")
+            .to_string();
+        assert!(
+            err.contains("caveat time-box violation: valid_until"),
+            "the refusal must be the Step 11b time-box: {err}"
+        );
+    });
+}
+
+/// §7.3.8 Step 7b: a delegated outlet token whose `nb` carries the
+/// materialized `origin_kind` and an unexpired `valid_until` validates.
+#[cfg(feature = "testing")]
+#[test]
+fn ucan_validate_admits_a_delegated_outlet_token_inside_its_time_box() {
+    Python::with_gil(|py| {
+        let f = nb_fixture(py);
+        let delegatee = published_identity_did(py, &f.scp);
+        let live = resign_with_nb(
+            f.scp.bridge_instance(),
+            &f.creator,
+            &f.root,
+            valid_until(1800),
+        );
+        let child = f
+            .scp
+            .ucan_delegate(&f.ctx, &f.holder, &delegatee, &live, vec![f.cap.clone()])
+            .unwrap()
+            .encoded;
+        let evaluation = f
+            .scp
+            .ucan_evaluate(
+                &f.ctx,
+                &child,
+                Some(f.cap.as_str()),
+                &delegatee,
+                Some(vec![live.clone()]),
+            )
+            .unwrap();
+        assert!(
+            evaluation.signatures_valid && evaluation.time_bounds_valid,
+            "evaluate must admit the delegated outlet token"
+        );
+        f.scp
+            .ucan_validate(&f.ctx, &child, &f.cap, &delegatee, Some(vec![live]))
+            .expect("a delegated outlet token inside its time-box must validate");
+    });
+}
+
+/// A `messages:write` token carries no `nb`, so the caveat steps leave it
+/// unaffected.
+#[cfg(feature = "testing")]
+#[test]
+fn ucan_validate_leaves_a_non_outlet_token_unaffected() {
+    Python::with_gil(|py| {
+        let f = nb_fixture(py);
+        let plain = f
+            .scp
+            .ucan_mint(&f.ctx, &f.holder, vec!["messages:write".to_owned()], None)
+            .unwrap();
+        f.scp
+            .ucan_validate(
+                &f.ctx,
+                &plain.encoded,
+                &plain.capabilities[0],
+                &f.holder,
+                None,
+            )
+            .expect("a messages:write token must validate");
+    });
+}
+
+/// `ucan_mint` enforces the ceiling the SUPERVISOR holds.
+///
+/// The fixture hands `register_context` a WIDE ceiling carrying `outlet:call:*`
+/// and creates the supervisor context with a NARROW one that omits it, then
+/// mints `outlet_call:*`. The supervisor's ceiling forbids that capability, so
+/// the mint must refuse.
+#[cfg(feature = "testing")]
+#[test]
+fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let owner = published_identity_did(py, &scp);
+        let audience = published_identity_did(py, &scp);
+        let bi = scp.bridge_instance();
+        runtime::init_context_manager_for_test(bi);
+
+        let ctx_id = random_context_id();
+        let wide = vec![
+            "outlet:call:*".to_owned(),
+            "messages:read".to_owned(),
+            "messages:write".to_owned(),
+        ];
+        runtime::register_context(bi, &ctx_id, &owner, &wide).unwrap();
+
+        let rt = test_runtime();
+        let supervisor = runtime::supervisor(bi).unwrap().clone();
+        let creator = scp_did::DID(owner);
+        let narrow_ctx = ctx_id.clone();
+        rt.block_on(async move {
+            let params = scp_core::context::ContextParams {
+                ceiling: vec![
+                    scp_core::context::roles::Capability::new("messages:read").unwrap(),
+                    scp_core::context::roles::Capability::new("messages:write").unwrap(),
+                ],
+                ..scp_core::context::ContextParams::default()
+            };
+            supervisor
+                .create_context(narrow_ctx, params, creator.clone(), None)
+                .await
+                .unwrap();
+            supervisor.register_local_did(creator).await.unwrap();
+        });
+
+        let err = scp
+            .ucan_mint(&ctx_id, &audience, vec!["outlet_call:*".to_owned()], None)
+            .expect_err("the supervisor ceiling omits outlet_call, so the mint must refuse");
+        let message = err.to_string().to_lowercase();
+        assert!(
+            message.contains("ceiling"),
+            "the refusal must be the ceiling check: {message}"
+        );
+
+        // The capability the supervisor's ceiling holds still mints, so the
+        // refusal above is the ceiling check and not a broken fixture.
+        scp.ucan_mint(&ctx_id, &audience, vec!["messages:read".to_owned()], None)
+            .expect("a mint inside the supervisor's ceiling must succeed");
+    });
+}
+
+/// The UNARY cross-context saga refuses a non-active caller context and a
+/// non-active target context, read from each context's supervisor actor
+/// through the outlet lifecycle gate.
+///
+/// Removing either check makes the call fall
+/// through to a `SagaAborted` from the saga drive instead, failing the code
+/// assertions below.
+#[test]
+fn xctx_unary_saga_rejects_non_active_context() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let bi = scp.bridge_instance();
+
+        let owner = create_test_identity(bi);
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+
+        // --- source (caller) context non-active → OUTLET_6010 ---------------
+        let caller_ctx = create_closeable_test_context(bi, &owner);
+        let target_ctx = create_closeable_test_context(bi, &owner);
+        let outlet_id = register_saga_outlet(py, &scp, &target_ctx, &owner);
+        drive_context_closing(bi, &caller_ctx, &owner);
+
+        let err = scp
+            .outlet_invoke_cross_context_saga(
+                &caller_ctx,
+                &target_ctx,
+                &owner,
+                &outlet_id,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                1_700_000_000_000,
+                1,
+                None,
+            )
+            .expect_err("a non-active caller context must be rejected before the saga runs");
+        assert!(
+            err.is_instance_of::<_scp_core::error::ContextError>(py),
+            "expected ContextError, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-OUTLET-6010"),
+            "expected caller-axis SCP-OUTLET-6010, got: {msg}"
+        );
+
+        // --- caller active, target non-active → OUTLET_6011 -----------------
+        let caller_ctx2 = create_closeable_test_context(bi, &owner);
+        let target_ctx2 = create_closeable_test_context(bi, &owner);
+        let outlet_id2 = register_saga_outlet(py, &scp, &target_ctx2, &owner);
+        drive_context_closing(bi, &target_ctx2, &owner);
+
+        let err = scp
+            .outlet_invoke_cross_context_saga(
+                &caller_ctx2,
+                &target_ctx2,
+                &owner,
+                &outlet_id2,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                1_700_000_000_000,
+                1,
+                None,
+            )
+            .expect_err("a non-active target context must be rejected before the saga runs");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-OUTLET-6011"),
+            "expected target-axis SCP-OUTLET-6011, got: {msg}"
+        );
+    });
+}
+
+/// Builds a context whose ceiling admits outlet registration and outlet calls,
+/// registers one outlet in it, seeds `invoker` in the SUPERVISOR only, and
+/// mints an `outlet_call:*` UCAN for that invoker. When `grant_outlet_call` is
+/// true the invoker is a `member` the supervisor also grants `outlet_call:*`;
+/// when it is false the invoker is an `observer`, which holds no invocation
+/// capability, so a capability gate that reads the supervisor must refuse the
+/// invoker even though the UCAN is valid.
+#[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+fn supervisor_only_member_context(
+    py: Python<'_>,
+    scp: &_scp_core::scp::PyScp,
+    owner: &str,
+    invoker: &str,
+    grant_outlet_call: bool,
+) -> (String, String, String) {
+    let params = PyDict::new(py);
+    let ceiling = PyList::new(
+        py,
+        [
+            "outlet:register",
+            "outlet:call:*",
+            "messages:read",
+            "messages:write",
+        ],
+    )
+    .unwrap();
+    params.set_item("ceiling", ceiling).unwrap();
+    let handle = scp.context_create(owner, &params.as_borrowed()).unwrap();
+    let ctx_id = handle_context_id(py, &handle);
+
+    let reg = build_outlet_reg(py, "supervisor_member_outlet", owner);
+    let outlet_id = scp.outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
+
+    let rt = test_runtime();
+    let supervisor = runtime::supervisor(scp.bridge_instance()).unwrap().clone();
+    // The built-in `member` role carries `OutletCallAll`, and `observer`
+    // carries `MessagesRead` only, so a withheld grant seeds an observer.
+    let role = if grant_outlet_call {
+        "member"
+    } else {
+        "observer"
+    };
+    rt.block_on(supervisor.test_insert_member(&ctx_id, scp_did::DID(invoker.to_owned()), role))
+        .expect("seed the invoker in the supervisor only");
+    if grant_outlet_call {
+        rt.block_on(supervisor.test_grant_member_capability(
+            &ctx_id,
+            scp_did::DID(invoker.to_owned()),
+            "outlet_call:*",
+        ))
+        .expect("grant OutletCallAll in the supervisor only");
+    }
+
+    let ucan = scp
+        .ucan_mint(&ctx_id, invoker, vec!["outlet_call:*".to_owned()], None)
+        .expect("mint the invocation UCAN")
+        .encoded;
+
+    (ctx_id, outlet_id, ucan)
+}
+
+/// `outlet_session_invoke` admits an invoker whose capability exists ONLY in the
+/// supervisor's role state, so the session capability gate reads the supervisor.
+#[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+#[test]
+fn session_invoke_admits_a_supervisor_only_capability_holder() {
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        // Published BEFORE the supervisor is built, so the supervisor snapshots
+        // the document-backed resolver the UCAN signature check needs.
+        let owner = published_identity_did(py, &scp);
+        let invoker = published_identity_did(py, &scp);
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let (ctx_id, outlet_id, ucan) =
+            supervisor_only_member_context(py, &scp, &owner, &invoker, true);
+
+        let session_id = scp
+            .outlet_session_create(&ctx_id, &outlet_id, &ctx_id, None)
+            .expect("session creation");
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+        scp.outlet_session_invoke(
+            py,
+            &ctx_id,
+            &session_id,
+            &input.as_borrowed(),
+            &invoker,
+            &ucan,
+            None,
+        )
+        .expect("the supervisor grants the capability, so the session invocation proceeds");
+    });
+}
+
+/// `outlet_session_invoke` refuses a member the supervisor never granted an
+/// invocation capability, although the invoker's UCAN is valid.
+#[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+#[test]
+fn session_invoke_refuses_a_member_the_supervisor_did_not_grant() {
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let owner = published_identity_did(py, &scp);
+        let invoker = published_identity_did(py, &scp);
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let (ctx_id, outlet_id, ucan) =
+            supervisor_only_member_context(py, &scp, &owner, &invoker, false);
+
+        let session_id = scp
+            .outlet_session_create(&ctx_id, &outlet_id, &ctx_id, None)
+            .expect("session creation");
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+        let err = scp
+            .outlet_session_invoke(
+                py,
+                &ctx_id,
+                &session_id,
+                &input.as_borrowed(),
+                &invoker,
+                &ucan,
+                None,
+            )
+            .expect_err("the supervisor grants no invocation capability, so the gate refuses");
+        assert!(
+            err.to_string()
+                .contains("does not have invocation capability"),
+            "the refusal must come from the capability gate: {err}"
+        );
+    });
+}
+
+/// The cross-context source-capability gate refuses an invoker the source
+/// context's supervisor never granted an invocation capability, although the
+/// target context grants it and the UCAN is valid.
+///
+/// The companion to `cross_context_invoke_admits_a_supervisor_only_capability_holder`:
+/// this test goes red when the source gate stops refusing.
+#[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+#[test]
+fn cross_context_invoke_refuses_a_source_member_the_supervisor_did_not_grant() {
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let owner = published_identity_did(py, &scp);
+        let invoker = published_identity_did(py, &scp);
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let (source_ctx, _source_outlet, _source_ucan) =
+            supervisor_only_member_context(py, &scp, &owner, &invoker, false);
+        let (target_ctx, target_outlet, target_ucan) =
+            supervisor_only_member_context(py, &scp, &owner, &invoker, true);
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+        let err = scp
+            .outlet_invoke_cross_context(
+                py,
+                &source_ctx,
+                &target_ctx,
+                &target_outlet,
+                &input.as_borrowed(),
+                &invoker,
+                &target_ucan,
+                1,
+                None,
+            )
+            .expect_err(
+                "the source supervisor grants no invocation capability, so the gate refuses",
+            );
+        assert!(
+            err.to_string()
+                .contains("does not have invocation capability"),
+            "the refusal must come from the source capability gate: {err}"
+        );
+    });
+}
+
+/// The cross-context source-capability gate admits an invoker whose capability
+/// exists ONLY in the source context's supervisor role state.
+///
+/// Past the gate the call checks chain
+/// depth, validates the input against the target outlet's schema, and answers in
+/// echo mode because the fixture registers no handler. The test asserts that
+/// echo-mode output, so a refusal at the gate or at any earlier check turns it red.
+#[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+#[test]
+fn cross_context_invoke_admits_a_supervisor_only_capability_holder() {
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        // Published BEFORE the supervisor is built, so the supervisor snapshots
+        // the document-backed resolver the UCAN signature check needs.
+        let owner = published_identity_did(py, &scp);
+        let invoker = published_identity_did(py, &scp);
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let (source_ctx, _source_outlet, _source_ucan) =
+            supervisor_only_member_context(py, &scp, &owner, &invoker, true);
+        let (target_ctx, target_outlet, target_ucan) =
+            supervisor_only_member_context(py, &scp, &owner, &invoker, true);
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+        let result = scp.outlet_invoke_cross_context(
+            py,
+            &source_ctx,
+            &target_ctx,
+            &target_outlet,
+            &input.as_borrowed(),
+            &invoker,
+            &target_ucan,
+            1,
+            None,
+        );
+        let output = result.expect(
+            "the source context's supervisor grants the capability, so the cross-context invocation proceeds",
+        );
+        let output = output.bind(py);
+        let field = |key: &str| -> String {
+            output
+                .get_item(key)
+                .expect("echo-mode output carries the requested key")
+                .extract()
+                .expect("echo-mode output values are strings")
+        };
+        assert_eq!(field("status"), "validated");
+        assert_eq!(field("source_context"), source_ctx);
+        assert_eq!(field("target_context"), target_ctx);
+        assert_eq!(field("outlet"), target_outlet);
+    });
+}
+
+/// The outlet UCAN validation compares the token's grants against the ceiling
+/// in the role state the lifecycle gate read from the supervisor.
+///
+/// The fixture creates the supervisor context with a ceiling that carries
+/// `outlet:call:*`. The supervisor seeds a `member` holding `outlet_call:*`,
+/// the creator mints that member an `outlet_call:*` token, and the member
+/// invokes a session with it.
+#[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+#[test]
+fn session_invoke_validates_the_ucan_against_the_supervisor_ceiling() {
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        // Published BEFORE the supervisor is built, so the supervisor snapshots
+        // the document-backed resolver the UCAN signature check needs.
+        let owner = published_identity_did(py, &scp);
+        let invoker = published_identity_did(py, &scp);
+        let bi = scp.bridge_instance();
+        runtime::init_context_manager_for_test(bi);
+
+        let ctx_id = random_context_id();
+        runtime::register_context(bi, &ctx_id, &owner, &["messages:read".to_owned()]).unwrap();
+        let rt = test_runtime();
+        let supervisor = runtime::supervisor(bi).unwrap().clone();
+        let creator = scp_did::DID(owner.clone());
+        let supervisor_ctx = ctx_id.clone();
+        let seeding_supervisor = supervisor.clone();
+        rt.block_on(async move {
+            let params = scp_core::context::ContextParams {
+                ceiling: ["outlet:register", "outlet:call:*", "messages:read"]
+                    .iter()
+                    .map(|c| scp_core::context::roles::Capability::new(c).unwrap())
+                    .collect(),
+                ..scp_core::context::ContextParams::default()
+            };
+            supervisor
+                .create_context(supervisor_ctx, params, creator.clone(), None)
+                .await
+                .unwrap();
+            supervisor.register_local_did(creator).await.unwrap();
+        });
+        rt.block_on(seeding_supervisor.test_insert_member(
+            &ctx_id,
+            scp_did::DID(invoker.clone()),
+            "member",
+        ))
+        .expect("seed the invoker in the supervisor");
+        rt.block_on(seeding_supervisor.test_grant_member_capability(
+            &ctx_id,
+            scp_did::DID(invoker.clone()),
+            "outlet_call:*",
+        ))
+        .expect("grant OutletCallAll in the supervisor");
+
+        let reg = build_outlet_reg(py, "supervisor_ceiling_outlet", &owner);
+        let outlet_id = scp.outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
+        let ucan = scp
+            .ucan_mint(&ctx_id, &invoker, vec!["outlet_call:*".to_owned()], None)
+            .expect("the supervisor ceiling carries outlet_call, so the mint succeeds")
+            .encoded;
+        let session_id = scp
+            .outlet_session_create(&ctx_id, &outlet_id, &ctx_id, None)
+            .expect("session creation");
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+        scp.outlet_session_invoke(
+            py,
+            &ctx_id,
+            &session_id,
+            &input.as_borrowed(),
+            &invoker,
+            &ucan,
+            None,
+        )
+        .expect("the supervisor ceiling carries outlet_call, so the UCAN validates");
+    });
+}
+
+/// The outlet UCAN validation anchors the delegation chain on the creator the
+/// SUPERVISOR holds.
+///
+/// The fixture mints the invocation UCAN as `owner`, the supervisor's creator,
+/// and this test requires the token to validate.
+#[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+#[test]
+fn session_invoke_anchors_the_ucan_on_the_supervisor_creator() {
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let owner = published_identity_did(py, &scp);
+        let invoker = published_identity_did(py, &scp);
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let (ctx_id, outlet_id, ucan) =
+            supervisor_only_member_context(py, &scp, &owner, &invoker, true);
+
+        let session_id = scp
+            .outlet_session_create(&ctx_id, &outlet_id, &ctx_id, None)
+            .expect("session creation");
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+        scp.outlet_session_invoke(
+            py,
+            &ctx_id,
+            &session_id,
+            &input.as_borrowed(),
+            &invoker,
+            &ucan,
+            None,
+        )
+        .expect("the token's issuer is the supervisor's creator, so the UCAN validates");
+    });
+}
+
+/// The unary cross-context saga signs with the keys of the creators the
+/// SUPERVISOR holds for the caller and target contexts.
+///
+/// This test requires the saga to reach `Committed`.
+#[test]
+fn xctx_saga_signs_as_the_supervisor_creators() {
+    Python::with_gil(|py| {
+        let (scp, ctx_a, ctx_b, owner, outlet_id) = establish_xctx_saga_commit_preconditions(py);
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+        // Prepare-B enforces a five-minute skew tolerance, so the timestamp is now.
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        let result = scp
+            .outlet_invoke_cross_context_saga(
+                &ctx_a,
+                &ctx_b,
+                &owner,
+                &outlet_id,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                now_ms,
+                1,
+                None,
+            )
+            .expect("both signers are the supervisor's creator, so the saga commits");
+        assert!(
+            result.receipt.is_some(),
+            "a committed saga carries a receipt"
+        );
+    });
+}
+
+/// The cross-context streaming saga open signs with the keys of the creators
+/// the SUPERVISOR holds for the caller and target contexts.
+///
+/// This test requires the open to return a saga id.
+#[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+#[test]
+fn xctx_streaming_saga_open_signs_as_the_supervisor_creators() {
+    Python::with_gil(|py| {
+        let (scp, ctx_a, ctx_b, invoker, outlet_id, ucan, release_tx) =
+            establish_xctx_streaming_saga_preconditions(py);
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        let saga_id = scp
+            .outlet_streaming_saga_open(
+                &ctx_a,
+                &ctx_b,
+                &invoker,
+                &outlet_id,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                now_ms,
+                1,
+                &ucan,
+                None,
+                None,
+                None,
+                Some(1),
+            )
+            .expect("both signers are the supervisor's creator, so the open succeeds");
+        assert!(
+            !saga_id.is_empty(),
+            "an opened streaming saga carries an id"
+        );
+        release_tx
+            .send(())
+            .expect("release the blocked target handler");
     });
 }

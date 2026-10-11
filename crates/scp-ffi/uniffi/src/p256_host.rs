@@ -1,107 +1,65 @@
-//! P-256 primitives the Swift and Kotlin custody adapters call so that no host
-//! re-implements the §9.10.4 scalar reduction or the §9.5 nonce.
+//! P-256 pseudonym point helpers the Swift and Kotlin custody adapters call
+//! so that no host re-implements the §9.10.4 derivation (§9.10.4.A).
 //!
-//! A host pseudonym key is a 32-byte P-256 scalar the host stores in its own
-//! custody. The host computes the §9.10.4 `context_seed` (HMAC-SHA-256 under
-//! its `pseudonym_secret`, which on hardware custody never leaves the secure
-//! boundary, §9.10.4.A), then:
+//! Each export wraps the function of the same name in
+//! `scp_ffi_common::p256_host`, which the `PyO3` and napi-rs exports wrap too,
+//! and returns the 33-byte compressed point: no scalar reaches the host.
 //!
-//! 1. [`p256_seed_to_scalar`] maps the seed to the scalar (FIPS 186-5 A.2.1,
-//!    constant-time `crypto-bigint` reduction in `scp-crypto`);
-//! 2. [`p256_public_key`] gives the 33-byte compressed point it returns from
-//!    `derive_pseudonym` and `get_public_key`;
-//! 3. [`p256_sign_prehash_rfc6979`] signs a 32-byte digest with RFC 6979
-//!    deterministic nonces and returns the low-`s` `r || s` (§9.5), which the
-//!    bridge then verifies strictly.
-//!
-//! The scalar crosses the FFI boundary because the host is its custodian.
-//! Wiping is best-effort: the Rust side wipes the seed and scalar `Vec`s it is
-//! handed and its own copies (`Zeroizing`), but uniffi's lift and
-//! `rustbuffer_free` do not wipe the transfer buffers that carry the seed and
-//! the scalar across the boundary, in either direction, and the returned
-//! scalar `Vec` is freed by uniffi unwiped. The host wipes its own arrays.
+//! Wiping is best-effort: the Rust side wipes the seed and `ikm` `Vec`s it is
+//! handed (`Zeroizing`), but uniffi's lift and `rustbuffer_free` do not wipe
+//! the transfer buffer that carries them across the boundary. The host wipes
+//! its own arrays.
 
-use scp_crypto::p256::{P256SigningKey, seed_to_scalar, sign_prehash_rfc6979};
-use scp_ffi_common::error_codes as codes;
+use scp_ffi_common::p256_host::{self as shared, P256HostError};
 use zeroize::Zeroizing;
 
 use crate::bridge::ScpError;
 
-fn exact_32(what: &str, bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>, ScpError> {
-    let array: [u8; 32] = bytes.try_into().map_err(|_| ScpError::Validation {
-        msg: format!("{what} must be 32 bytes, got {}", bytes.len()),
-        code: codes::VALID_7005.to_owned(),
-    })?;
-    Ok(Zeroizing::new(array))
+fn scp_error(e: P256HostError) -> ScpError {
+    let code = e.code().to_owned();
+    match e {
+        P256HostError::Validation(msg) => ScpError::Validation { msg, code },
+    }
 }
 
-fn signing_key(scalar: &[u8]) -> Result<P256SigningKey, ScpError> {
-    let scalar = exact_32("P-256 scalar", scalar)?;
-    P256SigningKey::from_scalar_bytes(&scalar).map_err(|e| ScpError::Crypto {
-        msg: format!("invalid P-256 scalar: {e}"),
-        code: codes::CRYPTO_4001.to_owned(),
-    })
-}
-
-/// Maps a 32-byte seed to a P-256 private scalar in `[1, n − 1]` under `label`.
+/// The compressed pseudonym point of a §9.10.4 `context_seed`.
 ///
-/// FIPS 186-5 A.2.1, §9.10.4: `HKDF-Expand(seed, label, 48) mod (n − 1) + 1`.
-/// Returns the 32-byte big-endian scalar. For a pseudonym the label is
-/// `"SCP-PSEUDONYM-P256-V1"` and the seed the §9.10.4 `context_seed`.
+/// The 33-byte SEC1 point of a 32-byte `context_seed` (v1 or v2), for a
+/// host that computes the seed inside its keystore. No scalar reaches the
+/// host.
 ///
 /// # Errors
 ///
-/// `SCP-VALID-7005` when `seed` is not 32 bytes; `SCP-CRYPTO-4001` if the
-/// reduction fails (unreachable for a 32-byte seed).
+/// `SCP-VALID-7005` when `context_seed` is not 32 bytes.
 #[uniffi::export]
-pub fn p256_seed_to_scalar(label: Vec<u8>, seed: Vec<u8>) -> Result<Vec<u8>, ScpError> {
-    let seed = Zeroizing::new(seed);
-    let seed = exact_32("seed", &seed)?;
-    let scalar = seed_to_scalar(&label, &seed).map_err(|e| ScpError::Crypto {
-        msg: format!("seed_to_scalar failed: {e}"),
-        code: codes::CRYPTO_4001.to_owned(),
-    })?;
-    let key = P256SigningKey::from_nonzero_scalar(scalar);
-    Ok(key.to_scalar_bytes().to_vec())
+pub fn p256_pseudonym_point(context_seed: Vec<u8>) -> Result<Vec<u8>, ScpError> {
+    let context_seed = Zeroizing::new(context_seed);
+    Ok(shared::p256_pseudonym_point(&context_seed)
+        .map_err(scp_error)?
+        .to_vec())
 }
 
-/// The 33-byte SEC1 compressed public key `d·G` of a 32-byte scalar.
+/// The compressed pseudonym point a software custody derives (§9.10.4.A).
+///
+/// From the 32-byte identity key material `ikm`: the v1 point for
+/// `context_id` when `epoch` is `None`, the v2 point at `epoch` otherwise. No
+/// scalar reaches the host.
 ///
 /// # Errors
 ///
-/// `SCP-VALID-7005` when `scalar` is not 32 bytes; `SCP-CRYPTO-4001` when it
-/// is zero or not below `n`.
+/// `SCP-VALID-7005` when `ikm` is not 32 bytes.
 #[uniffi::export]
-pub fn p256_public_key(scalar: Vec<u8>) -> Result<Vec<u8>, ScpError> {
-    let scalar = Zeroizing::new(scalar);
-    Ok(signing_key(&scalar)?.public_key().to_compressed().to_vec())
-}
-
-/// Signs a 32-byte digest with the scalar: RFC 6979 deterministic nonce
-/// (`h1 = digest`), low-`s` normalized, returned as the 64-byte `r || s`
-/// (§9.5).
-///
-/// # Errors
-///
-/// `SCP-VALID-7005` when `scalar` or `digest` is not 32 bytes;
-/// `SCP-CRYPTO-4001` when the scalar is out of range or signing fails.
-#[uniffi::export]
-pub fn p256_sign_prehash_rfc6979(scalar: Vec<u8>, digest: Vec<u8>) -> Result<Vec<u8>, ScpError> {
-    let scalar = Zeroizing::new(scalar);
-    let key = signing_key(&scalar)?;
-    let digest: [u8; 32] = digest
-        .as_slice()
-        .try_into()
-        .map_err(|_| ScpError::Validation {
-            msg: format!("digest must be 32 bytes, got {}", digest.len()),
-            code: codes::VALID_7005.to_owned(),
-        })?;
-    sign_prehash_rfc6979(&key, &digest)
-        .map(|sig| sig.to_vec())
-        .map_err(|e| ScpError::Crypto {
-            msg: format!("P-256 signing failed: {e}"),
-            code: codes::CRYPTO_4001.to_owned(),
-        })
+pub fn p256_software_pseudonym_point(
+    ikm: Vec<u8>,
+    context_id: Vec<u8>,
+    epoch: Option<u64>,
+) -> Result<Vec<u8>, ScpError> {
+    let ikm = Zeroizing::new(ikm);
+    Ok(
+        shared::p256_software_pseudonym_point(&ikm, &context_id, epoch)
+            .map_err(scp_error)?
+            .to_vec(),
+    )
 }
 
 #[cfg(test)]
@@ -113,68 +71,50 @@ mod tests {
         hex::decode(s).unwrap()
     }
 
-    /// P-256 group order `n` (SEC 2 / FIPS 186-5).
-    const N: &str = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551";
-
-    /// Big-endian `a + b mod 2^256`.
-    fn add_be(a: &[u8], b: &[u8]) -> Vec<u8> {
-        let mut out = vec![0u8; 32];
-        let mut carry = 0u16;
-        for i in (0..32).rev() {
-            let sum = u16::from(a[i]) + u16::from(b[i]) + carry;
-            out[i] = u8::try_from(sum & 0xff).unwrap();
-            carry = sum >> 8;
+    /// §25.19 Vectors 30 and 31 through the exports: each `identity_scalar`
+    /// (the software `ikm`) over "context-alpha" gives the spec's v1 point,
+    /// and at epoch 1 its v2 point; each `context_seed_v1` gives the v1
+    /// point.
+    #[test]
+    fn point_exports_reproduce_spec_25_19_vectors_30_and_31() {
+        for (ikm, seed_v1, v1, v2) in [
+            (
+                "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
+                "47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b",
+                "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
+                "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479",
+            ),
+            (
+                "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
+                "5157d14a2362044199ba88d66d6a52a4bfbe0598ebe921c5fb9c362d3bebaedd",
+                "0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d",
+                "037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3",
+            ),
+        ] {
+            let ctx = b"context-alpha".to_vec();
+            let point = p256_software_pseudonym_point(h(ikm), ctx.clone(), None).unwrap();
+            assert_eq!(hex::encode(point), v1);
+            let point = p256_software_pseudonym_point(h(ikm), ctx, Some(1)).unwrap();
+            assert_eq!(hex::encode(point), v2);
+            assert_eq!(hex::encode(p256_pseudonym_point(h(seed_v1)).unwrap()), v1);
         }
-        out
     }
 
-    /// RFC 6979 A.2.5 (P-256, SHA-256, message "sample"): the export uses the
-    /// RFC's deterministic nonce (its `r` reproduces), returns the low-`s`
-    /// form of the RFC's high `s` (the two sum to `n`), and signs the same
-    /// digest to the same bytes every time.
+    /// A wrong-length seed or `ikm` is `ScpError::Validation` carrying
+    /// `SCP-VALID-7005`.
     #[test]
-    fn sign_export_reproduces_rfc6979_a25_low_s() {
-        let x = h("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
-        let digest = {
-            use sha2::Digest;
-            sha2::Sha256::digest(b"sample").to_vec()
-        };
-        let sig = p256_sign_prehash_rfc6979(x.clone(), digest.clone()).expect("sign");
-        assert_eq!(
-            hex::encode(&sig[..32]),
-            "efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716"
+    fn point_exports_report_a_wrong_length_input_as_valid_7005() {
+        use scp_ffi_common::error_codes as codes;
+        let err = p256_pseudonym_point(vec![0; 31]).expect_err("31-byte seed");
+        assert!(
+            matches!(&err, ScpError::Validation { code, .. } if code == codes::VALID_7005),
+            "{err:?}"
         );
-        let rfc_s = h("f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8");
-        assert_eq!(hex::encode(add_be(&sig[32..], &rfc_s)), N);
-        let point =
-            scp_crypto::p256::P256PublicKey::from_sec1(&p256_public_key(x.clone()).unwrap())
-                .unwrap();
-        let digest32: [u8; 32] = digest.as_slice().try_into().unwrap();
-        scp_crypto::p256::verify_prehash_strict(&point, &digest32, &sig).expect("strict, low-s");
-        assert_eq!(p256_sign_prehash_rfc6979(x, digest).expect("sign"), sig);
-    }
-
-    /// §25.19 Vector 30: the spec's `context_seed_v1` maps through the
-    /// exported reduction to the spec's v1 point.
-    #[test]
-    fn seed_export_reproduces_vector_30_v1_point() {
-        let seed = h("47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b");
-        let scalar = p256_seed_to_scalar(b"SCP-PSEUDONYM-P256-V1".to_vec(), seed).expect("scalar");
-        assert_eq!(
-            hex::encode(p256_public_key(scalar).expect("point")),
-            "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72"
+        let err = p256_software_pseudonym_point(vec![0; 33], b"ctx".to_vec(), None)
+            .expect_err("33-byte ikm");
+        assert!(
+            matches!(&err, ScpError::Validation { code, .. } if code == codes::VALID_7005),
+            "{err:?}"
         );
-    }
-
-    #[test]
-    fn exports_reject_malformed_input() {
-        let err = p256_seed_to_scalar(b"L".to_vec(), vec![0; 31]).expect_err("31-byte seed");
-        assert!(matches!(err, ScpError::Validation { .. }), "{err:?}");
-        let err = p256_public_key(vec![0; 32]).expect_err("zero scalar");
-        assert!(matches!(err, ScpError::Crypto { .. }), "{err:?}");
-        let err = p256_public_key(vec![0xff; 32]).expect_err("scalar ≥ n");
-        assert!(matches!(err, ScpError::Crypto { .. }), "{err:?}");
-        let err = p256_sign_prehash_rfc6979(vec![1; 32], vec![0; 12]).expect_err("12-byte digest");
-        assert!(matches!(err, ScpError::Validation { .. }), "{err:?}");
     }
 }

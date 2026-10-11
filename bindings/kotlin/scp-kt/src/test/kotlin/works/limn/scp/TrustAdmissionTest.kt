@@ -9,7 +9,7 @@
 // TypeScript SDK `trust.test.ts` and Swift SDK `TrustAdmissionTests.swift`
 // encoder tests 1:1. Pure serialization logic — no native library required.
 // The real call-through against the Rust deserializers lives in
-// TrustAdmissionFfiTest.kt (which skips when the native lib is absent).
+// TrustAdmissionFfiTest.kt (which fails when the native lib is absent or does not load).
 
 package works.limn.scp
 

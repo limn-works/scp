@@ -206,6 +206,11 @@ pub struct ScpDnsProvider {
     base_domain: String,
     /// DNS API base URL (default: `https://dns.ctx.network`).
     api_url: String,
+    /// Per-request timeout and inter-attempt delay for registration.
+    /// [`ScpDnsProvider::new`] sets [`DNS_API_TIMEOUT`] and [`RETRY_DELAY`];
+    /// only the `#[cfg(test)]` `with_registration_timing` changes them.
+    request_timeout: Duration,
+    retry_delay: Duration,
     /// The assigned domain after successful registration. Cached for
     /// subsequent calls to `provision()` (avoids redundant API calls).
     assigned_domain: RwLock<Option<String>>,
@@ -238,6 +243,8 @@ impl ScpDnsProvider {
             port,
             base_domain: DEFAULT_BASE_DOMAIN.to_owned(),
             api_url: DEFAULT_DNS_API_URL.to_owned(),
+            request_timeout: DNS_API_TIMEOUT,
+            retry_delay: RETRY_DELAY,
             assigned_domain: RwLock::new(None),
             cached_cert: RwLock::new(None),
         }
@@ -254,6 +261,20 @@ impl ScpDnsProvider {
     #[must_use]
     pub fn with_api_url(mut self, url: &str) -> Self {
         url.clone_into(&mut self.api_url);
+        self
+    }
+
+    /// Replace the production request timeout and retry delay so tests can
+    /// drive the timeout and retry paths in milliseconds. Test builds only.
+    #[cfg(test)]
+    #[must_use]
+    const fn with_registration_timing(
+        mut self,
+        request_timeout: Duration,
+        retry_delay: Duration,
+    ) -> Self {
+        self.request_timeout = request_timeout;
+        self.retry_delay = retry_delay;
         self
     }
 
@@ -291,7 +312,7 @@ impl ScpDnsProvider {
         let register_url = format!("{}/register", self.api_url);
 
         let client = reqwest::Client::builder()
-            .timeout(DNS_API_TIMEOUT)
+            .timeout(self.request_timeout)
             .build()
             .map_err(|e| TlsError::Acme(format!("failed to build HTTP client: {e}")))?;
 
@@ -311,7 +332,7 @@ impl ScpDnsProvider {
                     max = MAX_REGISTRATION_RETRIES,
                     "retrying DNS API registration"
                 );
-                tokio::time::sleep(RETRY_DELAY).await;
+                tokio::time::sleep(self.retry_delay).await;
             }
 
             let result = client.post(&register_url).json(&request_body).send().await;
@@ -560,15 +581,41 @@ mod tests {
         );
     }
 
+    /// Registration timing for tests: a short per-request timeout and retry
+    /// delay so the failure paths run in milliseconds instead of the
+    /// production 3 x 30 s timeouts plus 2 x 2 s delays.
+    const TEST_REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
+    const TEST_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+    /// Returns a loopback API URL whose server closes every connection on
+    /// accept without answering, so each request fails at once instead of
+    /// waiting out the request timeout the way a non-routable address does.
+    /// The listener runs on the calling test's runtime and holds the port
+    /// until that runtime shuts down, so no other test's listener can take
+    /// the port while the test runs.
+    async fn closing_api_url() -> String {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        format!("http://{addr}")
+    }
+
     #[tokio::test]
-    async fn provision_falls_back_to_self_signed_when_api_unreachable() {
-        // Use a non-routable API URL that will fail immediately.
+    async fn provision_falls_back_to_self_signed_when_api_closes_connections() {
+        let api_url = closing_api_url().await;
         let provider = ScpDnsProvider::new(
             "did:dht:test-fallback",
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             8443,
         )
-        .with_api_url("http://192.0.2.1:1"); // TEST-NET-1, non-routable
+        .with_api_url(&api_url)
+        .with_registration_timing(TEST_REQUEST_TIMEOUT, TEST_RETRY_DELAY);
 
         // provision_with_fallback() should succeed via self-signed fallback.
         let cert = provider.provision_with_fallback().await.unwrap();
@@ -584,10 +631,12 @@ mod tests {
 
     #[tokio::test]
     async fn cached_cert_is_returned_on_second_call() {
-        // Use a non-routable API so we get self-signed, then verify cache.
+        // Use a closing API so we get self-signed, then verify cache.
+        let api_url = closing_api_url().await;
         let provider =
             ScpDnsProvider::new("did:dht:test-cache", IpAddr::V4(Ipv4Addr::LOCALHOST), 8443)
-                .with_api_url("http://192.0.2.1:1");
+                .with_api_url(&api_url)
+                .with_registration_timing(TEST_REQUEST_TIMEOUT, TEST_RETRY_DELAY);
 
         let cert1 = provider.provision_with_fallback().await.unwrap();
         let cert2 = provider.provision_with_fallback().await.unwrap();
@@ -597,6 +646,90 @@ mod tests {
             cert1.certificate_chain_pem, cert2.certificate_chain_pem,
             "second call should return cached certificate"
         );
+    }
+
+    /// A DNS API that accepts the connection and never answers trips the
+    /// per-request timeout on every attempt, and registration fails after
+    /// [`MAX_REGISTRATION_RETRIES`] attempts. The test runs on the real clock:
+    /// a closed or reset connection fails at once, so an elapsed time of at
+    /// least every timeout plus every delay, with every connection still held
+    /// open by the server, shows each attempt ended by timing out.
+    #[tokio::test]
+    async fn register_times_out_each_attempt_when_api_hangs() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept every connection and hold it open without writing a byte:
+        // each stream waits in the channel buffer until `held` drops, since
+        // closing a stream would end the request before the timeout.
+        let (hold_tx, mut held) = tokio::sync::mpsc::unbounded_channel();
+        let acceptor = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                hold_tx.send(stream).unwrap();
+            }
+        });
+
+        let provider = ScpDnsProvider::new(
+            "did:dht:test-timeout",
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            8443,
+        )
+        .with_api_url(&format!("http://{addr}"))
+        .with_registration_timing(TEST_REQUEST_TIMEOUT, TEST_RETRY_DELAY);
+
+        let started = std::time::Instant::now();
+        let err = provider.register().await.unwrap_err();
+        let elapsed = started.elapsed();
+        acceptor.abort();
+
+        let TlsError::Acme(message) = err else {
+            panic!("expected TlsError::Acme, got {err:?}");
+        };
+        assert!(
+            message.contains(&format!("after {MAX_REGISTRATION_RETRIES} attempts")),
+            "registration should exhaust every attempt, got: {message}"
+        );
+        let minimum = TEST_REQUEST_TIMEOUT * MAX_REGISTRATION_RETRIES
+            + TEST_RETRY_DELAY * (MAX_REGISTRATION_RETRIES - 1);
+        assert!(
+            elapsed >= minimum,
+            "each attempt should wait out the request timeout: elapsed {elapsed:?}, expected at least {minimum:?}"
+        );
+        // Production timing takes 3 x 30 s plus 2 x 2 s, and the production
+        // retry delay alone adds 4 s, so this ceiling fails the test if
+        // register() ignores either configured value.
+        let ceiling = Duration::from_secs(3);
+        assert!(
+            elapsed < ceiling,
+            "register() should use the configured timing: elapsed {elapsed:?}, expected under {ceiling:?}"
+        );
+        let mut accepted = 0_u32;
+        while held.try_recv().is_ok() {
+            accepted += 1;
+        }
+        assert_eq!(
+            accepted, MAX_REGISTRATION_RETRIES,
+            "every attempt should reach the hanging server"
+        );
+        assert!(
+            provider.cached_cert.read().await.is_none(),
+            "a failed registration must not cache a certificate"
+        );
+        assert!(
+            provider.assigned_domain().await.is_none(),
+            "a failed registration must not assign a domain"
+        );
+    }
+
+    /// The production constructor carries the production timing; the
+    /// test-only override is the sole way to change it.
+    #[test]
+    fn new_uses_production_registration_timing() {
+        let provider = ScpDnsProvider::new("did:dht:abc123", IpAddr::V4(Ipv4Addr::LOCALHOST), 8443);
+        assert_eq!(provider.request_timeout, DNS_API_TIMEOUT);
+        assert_eq!(provider.retry_delay, RETRY_DELAY);
     }
 
     #[test]

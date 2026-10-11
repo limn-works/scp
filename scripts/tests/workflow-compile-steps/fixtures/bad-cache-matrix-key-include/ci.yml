@@ -1,0 +1,17 @@
+name: Bad
+on: push
+jobs:
+  optional:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        group: [transport, node-relay]
+        include:
+          - os: ubuntu-latest
+            group: extra
+    steps:
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: optional-${{ matrix.group }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}

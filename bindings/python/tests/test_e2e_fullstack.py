@@ -8,7 +8,8 @@ Prerequisites:
 - The PyO3 bridge must be compiled with `testing` feature.
   Run: `maturin develop --release --features testing`
 
-If the native extension is not available, all tests are skipped gracefully.
+If the native extension is not installed, all tests are skipped. An installed
+extension that fails to load or lacks the fullstack methods fails collection.
 
 Run:
     PYTHONPATH=bindings/python python3.12 -m pytest bindings/python/tests/test_e2e_fullstack.py -v
@@ -20,6 +21,8 @@ import json
 
 import pytest
 
+from tests.conftest import skip_reason_if_extension_absent
+
 # ---------------------------------------------------------------------------
 # Skip entire module if the native extension or fullstack functions are
 # not available.
@@ -27,23 +30,25 @@ import pytest
 
 try:
     from scp_sdk import _scp_core
+    from scp_sdk._extension import EXTENSION_LOAD_FAILED_CODE
+    from scp_sdk.errors import ScpError
 
     # The fullstack operations were migrated from flat ``py_fullstack_*``
     # module functions to ``SCP`` methods (Phase 4 PR 4 sub-slice E, #1549)
     # and are feature-gated behind ``testing``. Probe a
     # throwaway ``_scp_core.SCP`` instance for the migrated method rather than
-    # the module — the free functions no longer exist.
+    # the module — the free functions no longer exist. An installed extension
+    # without the method is a wrong build, not an absent one, so it fails
+    # collection instead of skipping the module.
     _probe = _scp_core.SCP({"type": "in_memory"})
     if not hasattr(_probe, "fullstack_create_node"):
-        pytest.skip(
-            "fullstack methods not available — rebuild with testing feature",
-            allow_module_level=True,
+        raise ScpError(
+            "_scp_core is installed without the testing-gated fullstack methods — "
+            "rebuild with `maturin develop --release --features testing`",
+            code=EXTENSION_LOAD_FAILED_CODE,
         )
-except (ImportError, AttributeError):
-    pytest.skip(
-        "Native _scp_core extension not available — run maturin develop first",
-        allow_module_level=True,
-    )
+except Exception as _exc:
+    pytest.skip(skip_reason_if_extension_absent(_exc), allow_module_level=True)
 
 from scp_sdk import SCP
 

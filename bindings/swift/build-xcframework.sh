@@ -13,6 +13,12 @@
 #   ./build-xcframework.sh            # Full build (iOS + macOS)
 #   ./build-xcframework.sh --dev      # macOS-only build (fast local testing)
 #   ./build-xcframework.sh --clean    # Remove artifacts and rebuild
+#   ./build-xcframework.sh --dev --profile ci-bridge
+#                                     # Build under the named cargo profile
+#                                     # (default: release). The CI producer job
+#                                     # `xcframework` passes `ci-bridge`, the
+#                                     # test-bridge profile the root Cargo.toml
+#                                     # defines; every other caller keeps release.
 #
 # Prerequisites:
 #   - Rust toolchain with Apple targets (auto-installed if missing)
@@ -56,22 +62,43 @@ UNIFFI_OUT_DIR="$BUILD_DIR/uniffi-out"
 # ---------------------------------------------------------------------------
 
 DEV_MODE=false
+CARGO_PROFILE=release
+USAGE="Usage: $0 [--dev] [--clean] [--profile <cargo-profile>]"
 
-for arg in "$@"; do
-    case "$arg" in
+while [ "$#" -gt 0 ]; do
+    case "$1" in
         --dev)
             DEV_MODE=true
             ;;
         --clean)
             # --clean is handled implicitly (we always clean before building)
             ;;
+        --profile)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                echo "--profile needs a cargo profile name" >&2
+                echo "$USAGE" >&2
+                exit 1
+            fi
+            CARGO_PROFILE="$2"
+            shift
+            ;;
         *)
-            echo "Unknown flag: $arg" >&2
-            echo "Usage: $0 [--dev] [--clean]" >&2
+            echo "Unknown flag: $1" >&2
+            echo "$USAGE" >&2
             exit 1
             ;;
     esac
+    shift
 done
+
+# The directory cargo writes a profile's output into: the profile's own name,
+# except `dev` and `test`, which write `debug`, and `bench`, which writes
+# `release` (Cargo reference, Profiles).
+case "$CARGO_PROFILE" in
+    dev|test) PROFILE_DIR=debug ;;
+    bench) PROFILE_DIR=release ;;
+    *) PROFILE_DIR="$CARGO_PROFILE" ;;
+esac
 
 # Set targets based on mode
 if [ "$DEV_MODE" = true ]; then
@@ -111,7 +138,7 @@ die() {
 # Clean previous artifacts (idempotent rebuild)
 # ---------------------------------------------------------------------------
 
-log "Build mode: $log_mode"
+log "Build mode: $log_mode, cargo profile: $CARGO_PROFILE"
 log "Cleaning previous build artifacts"
 rm -rf "$XCFRAMEWORK_OUTPUT"
 rm -rf "$BUILD_DIR"
@@ -152,12 +179,12 @@ done
 log "Building host dylib for uniffi-bindgen (aarch64-apple-darwin)"
 # shellcheck disable=SC2086
 cargo build \
-    --release \
+    --profile "$CARGO_PROFILE" \
     --target "$TARGET_MACOS_ARM" \
     --manifest-path "$FFI_CRATE_DIR/Cargo.toml" \
     $EXTRA_FEATURES
 
-HOST_DYLIB="$TARGET_DIR/$TARGET_MACOS_ARM/release/libscp_ffi_uniffi.dylib"
+HOST_DYLIB="$TARGET_DIR/$TARGET_MACOS_ARM/$PROFILE_DIR/libscp_ffi_uniffi.dylib"
 if [ ! -f "$HOST_DYLIB" ]; then
     die "Host dylib not found at $HOST_DYLIB"
 fi
@@ -173,8 +200,8 @@ log "Generating Swift bindings and C header via uniffi-bindgen"
 #
 # Cargo keys its artifact directory on the profile and on whether the command passes
 # `--target`, and it shares nothing across two directories. Step 1 compiles this crate
-# and its ~650 dependencies under the release profile into
-# `target/aarch64-apple-darwin/release`. A `cargo run` that passes neither flag compiles
+# and its ~650 dependencies under `$CARGO_PROFILE` into
+# `target/aarch64-apple-darwin/$PROFILE_DIR`. A `cargo run` that passes neither flag compiles
 # the same crate graph a second time, under the dev profile, into `target/debug`.
 # Measured on CI run 34724307976: step 1 took 13m45s and this command took a further
 # 6m02s, of which the bindgen binary itself is a few seconds of the total.
@@ -187,7 +214,7 @@ log "Generating Swift bindings and C header via uniffi-bindgen"
 # where `"${empty[@]}"` under `set -u` aborts the script.
 BINDGEN_PROFILE_FLAGS=""
 if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
-    BINDGEN_PROFILE_FLAGS="--release --target $TARGET_MACOS_ARM"
+    BINDGEN_PROFILE_FLAGS="--profile $CARGO_PROFILE --target $TARGET_MACOS_ARM"
 fi
 
 # shellcheck disable=SC2086
@@ -255,7 +282,7 @@ for target in "${ALL_TARGETS[@]}"; do
     log "  Building for $target"
     # shellcheck disable=SC2086
     cargo build \
-        --release \
+        --profile "$CARGO_PROFILE" \
         --target "$target" \
         --manifest-path "$FFI_CRATE_DIR/Cargo.toml" \
         $EXTRA_FEATURES
@@ -266,7 +293,7 @@ done
 # ---------------------------------------------------------------------------
 
 for target in "${ALL_TARGETS[@]}"; do
-    lib_path="$TARGET_DIR/$target/release/$FFI_LIB_NAME"
+    lib_path="$TARGET_DIR/$target/$PROFILE_DIR/$FFI_LIB_NAME"
     if [ ! -f "$lib_path" ]; then
         die "Static library not found at $lib_path"
     fi
@@ -280,7 +307,7 @@ if [ "$DEV_MODE" = true ]; then
     # Dev mode: single-slice XCFramework with just macOS arm64
     log "Creating dev XCFramework (macOS arm64 only)"
     xcodebuild -create-xcframework \
-        -library "$TARGET_DIR/$TARGET_MACOS_ARM/release/$FFI_LIB_NAME" \
+        -library "$TARGET_DIR/$TARGET_MACOS_ARM/$PROFILE_DIR/$FFI_LIB_NAME" \
         -headers "$HEADER_DIR" \
         -output "$XCFRAMEWORK_OUTPUT"
 else
@@ -290,16 +317,16 @@ else
     SIM_FAT_LIB="$BUILD_DIR/libscp_ffi_uniffi_sim.a"
     log "Creating iOS simulator fat library (arm64 + x86_64)"
     lipo -create \
-        "$TARGET_DIR/$TARGET_IOS_SIM_ARM/release/$FFI_LIB_NAME" \
-        "$TARGET_DIR/$TARGET_IOS_SIM_X86/release/$FFI_LIB_NAME" \
+        "$TARGET_DIR/$TARGET_IOS_SIM_ARM/$PROFILE_DIR/$FFI_LIB_NAME" \
+        "$TARGET_DIR/$TARGET_IOS_SIM_X86/$PROFILE_DIR/$FFI_LIB_NAME" \
         -output "$SIM_FAT_LIB"
 
     # macOS fat library (arm64 + x86_64)
     MACOS_FAT_LIB="$BUILD_DIR/libscp_ffi_uniffi_macos.a"
     log "Creating macOS fat library (arm64 + x86_64)"
     lipo -create \
-        "$TARGET_DIR/$TARGET_MACOS_ARM/release/$FFI_LIB_NAME" \
-        "$TARGET_DIR/$TARGET_MACOS_X86/release/$FFI_LIB_NAME" \
+        "$TARGET_DIR/$TARGET_MACOS_ARM/$PROFILE_DIR/$FFI_LIB_NAME" \
+        "$TARGET_DIR/$TARGET_MACOS_X86/$PROFILE_DIR/$FFI_LIB_NAME" \
         -output "$MACOS_FAT_LIB"
 
     # Three-slice XCFramework:
@@ -308,7 +335,7 @@ else
     #   3. macOS            — fat (aarch64-apple-darwin + x86_64-apple-darwin)
     log "Creating ScpFFI.xcframework (3 slices)"
     xcodebuild -create-xcframework \
-        -library "$TARGET_DIR/$TARGET_IOS/release/$FFI_LIB_NAME" \
+        -library "$TARGET_DIR/$TARGET_IOS/$PROFILE_DIR/$FFI_LIB_NAME" \
         -headers "$HEADER_DIR" \
         -library "$SIM_FAT_LIB" \
         -headers "$HEADER_DIR" \

@@ -25,7 +25,7 @@
 use sha2::{Digest, Sha256};
 
 use scp_crypto::p256::{
-    P256Error, P256PublicKey, P256SigningKey, sign_prehash_rfc6979, verify_prehash_strict,
+    P256Error, P256PublicKey, P256SecretKey, SeedLabel, sign_prehash_rfc6979, verify_prehash_strict,
 };
 use scp_did::{DID, SigningKeyId};
 use scp_protocol::context::governance::{GovernanceAction, compute_proposal_id};
@@ -80,7 +80,6 @@ const ID_NEW_MEMBER: &str = "scp:ykcz3x3dycntc6lkxzbe3nixvd7w5c37riaowlh26lczdnc
 const ID_HPKE_SENDER: &str = "scp:jx35aojrkpxu2pjy7k6v6blpsotz5iakm7yui2t3rc6lmthfcbpa";
 const ID_ISSUER: &str = "scp:mhe6nmpij74wrgb46ngrakeetnlycmnfmcgppkfqqufyl7kkl3ia";
 const ID_SUBJECT: &str = "scp:ktarg6aqtsju6mh2ws3hk7t5kmsvmckq7d5eqwsmaw5di3e3p4ta";
-const ID_CLAIMANT: &str = "scp:nof3f4ikizgjnnxysigd42wgfx4srjkvbirtaicvnw7qfulrpmeq";
 const ID_LEAF_ATTESTER: &str = "scp:gomjxlxjt4kesb5fghb6tpykrvhsxdduwwlo3uwgmvh2jhoqvjyq";
 
 /// The P-256 group order `n`.
@@ -109,8 +108,8 @@ fn fixture_identifier_bytes(role: &str) -> [u8; 32] {
     sha256(format!("SCP test vector identifier {role}").as_bytes())
 }
 
-fn reference_key() -> P256SigningKey {
-    P256SigningKey::from_seed(TEST_VECTOR_KEY_LABEL, &unhex32(REFERENCE_KEYS[0].0)).unwrap()
+fn reference_key() -> P256SecretKey {
+    P256SecretKey::from_seed(SeedLabel::TestVectorKey, &unhex32(REFERENCE_KEYS[0].0))
 }
 
 /// Asserts that the spec's printed preimage is `expected_len` bytes and hashes
@@ -186,8 +185,9 @@ fn assert_reference_signature(label: &str, digest: &[u8; 32], expected_hex: &str
 
 #[test]
 fn vector_0_reference_keys_derive_from_seeds() {
+    assert_eq!(SeedLabel::TestVectorKey.as_bytes(), TEST_VECTOR_KEY_LABEL);
     for (seed, scalar, compressed, uncompressed) in REFERENCE_KEYS {
-        let key = P256SigningKey::from_seed(TEST_VECTOR_KEY_LABEL, &unhex32(seed)).unwrap();
+        let key = P256SecretKey::from_seed(SeedLabel::TestVectorKey, &unhex32(seed));
         assert_eq!(
             hex::encode(*key.to_scalar_bytes()),
             scalar,
@@ -597,8 +597,7 @@ fn continuity_preimage(
 #[test]
 fn vectors_20_38_key_continuity_fingerprint() {
     let key = |seed: u8| {
-        P256SigningKey::from_seed(TEST_VECTOR_KEY_LABEL, &[seed; 32])
-            .unwrap()
+        P256SecretKey::from_seed(SeedLabel::TestVectorKey, &[seed; 32])
             .public_key()
             .to_compressed()
     };
@@ -626,38 +625,6 @@ fn vectors_20_38_key_continuity_fingerprint() {
     assert_eq!(
         hex::encode(sha256(&reversed)),
         "c6cdaa8eeb6d04798e308ee0f7c1ecdc29874f8f4411c7c9df921539ad975466"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// §25.10 Claim Validation Vectors
-// ---------------------------------------------------------------------------
-
-/// Vector 22 over the spec's field set with the canonical-encoding
-/// primitives. Production `compute_claim_canonical_hash` hashes a different
-/// field set, and the platform-bridge cut removes the claim path and this
-/// vector together, so no production builder computes this preimage.
-#[test]
-fn vector_22_shadow_claim_hash() {
-    let bytes = canonical_hash_bytes(
-        b"SCP-CLAIM-V1:",
-        &[
-            CanonicalField::VarBytes(b"shadow-alice-x-12345"),
-            CanonicalField::VarBytes(ID_CLAIMANT.as_bytes()),
-            CanonicalField::VarBytes(b"bridge-test-context"),
-            CanonicalField::U64(1_700_000_000),
-        ],
-    )
-    .unwrap();
-    // 13 (domain) + (4+20) + (4+56) + (4+19) + 8 = 128
-    assert_eq!(
-        hex::encode(&bytes),
-        "5343502d434c41494d2d56313a00000014736861646f772d616c6963652d782d3132333435000000387363703a6e6f66336634696b697a676a6e6e7879736967643432776766783473726a6b7662697274616963766e77377166756c72706d6571000000136272696467652d746573742d636f6e74657874000000006553f100"
-    );
-    assert_eq!(bytes.len(), 128);
-    assert_eq!(
-        hex::encode(sha256(&bytes)),
-        "08d9bd5de3ff51a2ff7d8c750ec2361c70b4f0106cd7c98f5d331abbf0f67fcd"
     );
 }
 
@@ -902,8 +869,7 @@ fn trust_attestation_verify_round_trip_rule_b_ed25519() {
 #[test]
 fn vector37_keypackage_attestation() {
     let derived = |seed: u8| {
-        P256SigningKey::from_seed(TEST_VECTOR_KEY_LABEL, &[seed; 32])
-            .unwrap()
+        P256SecretKey::from_seed(SeedLabel::TestVectorKey, &[seed; 32])
             .public_key()
             .to_uncompressed()
     };
@@ -981,7 +947,6 @@ fn domain_separators_are_all_unique() {
         "SCP-VOTE-V1:",
         "SCP-RESET-REQUEST-V1:",
         "SCP-KEY-CONTINUITY-V1:",
-        "SCP-CLAIM-V1:",
         "SCP-PROPOSAL-V1:",
         "SCP-ATTESTATION-V1:",
         "SCP-PSEUDONYM-V1:",
@@ -1023,7 +988,6 @@ fn domain_separators_are_all_unique() {
         "scp-private-state-v1",
         "scp-private-state-salt-v1",
         "scp-media-key-v1",
-        "scp-bridge-credential-v1",
         "scp-pseudonym-secret-v1",
         "scp-participation-statement-v1",
         "scp-context-export-integrity-v1",

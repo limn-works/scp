@@ -110,6 +110,18 @@ SDK_EXTENSIONS: dict[str, str] = {
 # Do NOT "simplify" by deleting these entries: removing one re-opens a
 # fail-closed gap for that op.
 ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
+    # P-256 pseudonym point helpers are module-level free functions named
+    # without a domain prefix in every SDK.
+    ("Crypto", "p256_pseudonym_point"): {
+        "python": ["p256_pseudonym_point"],
+        "typescript": ["p256PseudonymPoint"],
+        "swift": ["p256PseudonymPoint"],
+    },
+    ("Crypto", "p256_software_pseudonym_point"): {
+        "python": ["p256_software_pseudonym_point"],
+        "typescript": ["p256SoftwarePseudonymPoint"],
+        "swift": ["p256SoftwarePseudonymPoint"],
+    },
     # Identity attestations carry the "Link" infix across all SDKs.
     ("Identity", "create_attestation"): {
         "python": ["create_identity_link_attestation"],
@@ -935,14 +947,6 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["resume"],
         "swift": ["resume"],
     },
-    # Bridge -- Python uses bare 'register' and 'evaluate_trust'.
-    # TypeScript's bridgeRegister is matched by the domain_camel auto-candidate.
-    ("Bridge", "register"): {
-        "python": ["register"],
-    },
-    ("Bridge", "evaluate_trust"): {
-        "python": ["evaluate_trust"],
-    },
     # Server -- Kotlin uses domain-prefixed bare names (e.g. relayStartInMemory);
     # Python uses domain-prefixed snake_case (relay_start_in_memory);
     # TypeScript uses domain-prefixed camelCase (relayStartInMemory).
@@ -1077,18 +1081,6 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "typescript": ["instanceId"],
         "swift": ["instanceId"],
         "kotlin": ["instanceId"],
-    },
-    # Bridge credential storage backend is bridge-INTERNAL: the durable
-    # `FfiCredentialStore` is selected from the SAME storage config the SDK
-    # already chooses (ADR-062 §Decision 5, SCP-CAPINJECT-009). There is no
-    # dedicated SDK wrapper method — selecting storage (SCP / withStorage /
-    # withSqlite) selects the durable credential backend by construction, so the
-    # matrix cell aliases to the existing storage-selection symbols.
-    ("Bridge", "credential_backend_durable"): {
-        "python": ["SCP"],
-        "typescript": ["SCP"],
-        "swift": ["withStorage", "SCP"],
-        "kotlin": ["withStorage", "withSqlite", "SCP"],
     },
     ("Lifecycle", "scp_with_storage_in_memory"): {
         "python": ["SCP"],

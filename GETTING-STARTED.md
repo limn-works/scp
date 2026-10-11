@@ -5,7 +5,7 @@
 Install these manually before running setup:
 
 - [Homebrew](https://brew.sh)
-- [mise](https://mise.jdx.dev): `brew install mise`
+- [mise](https://mise.jdx.dev) 2026.9.15 or newer: `brew install mise`. `.mise.toml` sets `min_version = "2026.9.15"`, so an older mise exits with an error in this repository, and `./scripts/setup-toolchain.sh` stops before `mise install`; run `brew upgrade mise` to move an older install past the floor.
 - Xcode Command Line Tools: `xcode-select --install`
 
 ## Setup
@@ -28,7 +28,7 @@ Add this to `~/.zshenv` for persistence.
 
 ## Toolchain
 
-rustup manages Rust, and mise manages every other tool (see `.mise.toml`):
+rustup manages Rust, and mise manages the other tools in the table below (see `.mise.toml`). Building the Python binding with `maturin develop` also needs a C compiler and, on Linux and Windows, a full perl (plus make on Linux) for the OpenSSL the build compiles; neither manager installs those (see `bindings/python/README.md` §Requirements).
 
 | Tool | Version | Manager |
 |------|---------|---------|

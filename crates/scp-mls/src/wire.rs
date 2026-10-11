@@ -1,13 +1,13 @@
 //! The one place SCP decodes MLS wire objects that arrive from a peer.
 //!
-//! `tls_codec` 0.4 (its `mls` feature) `debug_assert!`s that a variable-length
-//! vector header's length-of-length is at most 4 bytes before it returns
-//! `InvalidVectorLength` for exactly that input. The header byte comes from the
-//! peer, so in a build with debug assertions on, a hostile `KeyPackage`, Welcome
-//! or commit would panic the decoder where a release build rejects it. Each
-//! parser here runs the decoder under `catch_unwind` and returns
-//! [`MlsError::DeserializationFailed`] either way, so every build profile, in
-//! every workspace that builds this crate, rejects the bytes with a typed error.
+//! `tls_codec` 0.4 (its `mls` feature) `debug_assert!`ed that a variable-length
+//! vector header's length-of-length is at most 4 bytes, so in a build with
+//! debug assertions on a hostile `KeyPackage`, Welcome or commit panicked the
+//! decoder. `tls_codec` 0.5.0 returns `InvalidVectorLength` for that header in
+//! every profile. Each parser here still runs the decoder under `catch_unwind`
+//! and returns [`MlsError::DeserializationFailed`] for a decode error or a
+//! panic, so a decoder assertion on peer bytes in any later version is a typed
+//! error in every build profile, in every workspace that builds this crate.
 //!
 //! On wasm32 (`panic = "abort"`) nothing is caught; the browser SDK ships a
 //! release build, where the assertion is compiled out.
@@ -66,14 +66,12 @@ pub fn parse_welcome(bytes: &[u8]) -> Result<Welcome, MlsError> {
     parse("Welcome", bytes)
 }
 
-// Every test here drives tls_codec's debug assertion, so they need it on.
-#[cfg(all(test, debug_assertions))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     /// A variable-length header byte whose top two bits are `0b11`: a
     /// length-of-length of 8 bytes, above the 4 the `mls` feature allows.
-    /// `tls_codec` `debug_assert!`s on it before returning an error.
     const HOSTILE_LEN: u8 = 0xC0;
 
     /// Pads a hostile prefix so the decoder has bytes to read past the header.
@@ -113,27 +111,31 @@ mod tests {
         ));
     }
 
-    /// Decodes `bytes` as `T` without `catch_unwind` and reports whether the
-    /// decoder panicked.
-    fn raw_decode_panics<T: Deserialize>(bytes: &[u8]) -> bool {
-        catch_unwind(|| {
-            let mut reader = bytes;
-            let _ = T::tls_deserialize(&mut reader);
-        })
-        .is_err()
+    /// Whether decoding `bytes` as `T` without `catch_unwind` fails at the
+    /// length header, with `InvalidVectorLength`.
+    fn raw_decode_hits_length_header<T: Deserialize>(bytes: &[u8]) -> bool {
+        let mut reader = bytes;
+        matches!(
+            T::tls_deserialize(&mut reader),
+            Err(tls_codec::Error::InvalidVectorLength)
+        )
     }
 
-    /// Each row of the test above reaches `tls_codec`'s assertion: decoding it
-    /// as the same type without `catch_unwind` panics. Without this control
-    /// the test above could pass on bytes the decoder rejects before the
-    /// header.
+    /// Each row of the test above reaches the decoder's length-header check:
+    /// decoding it as the same type without `catch_unwind` fails with
+    /// `InvalidVectorLength`. Without this control the test above could pass
+    /// on bytes the decoder rejects before the header.
     #[test]
-    fn hostile_length_header_reaches_the_decoder_assertion() {
-        assert!(raw_decode_panics::<KeyPackageIn>(&hostile(&[0, 1, 0, 2])));
-        assert!(raw_decode_panics::<MlsMessageIn>(&hostile(&[
+    fn hostile_length_header_reaches_the_decoder_length_check() {
+        assert!(raw_decode_hits_length_header::<KeyPackageIn>(&hostile(&[
+            0, 1, 0, 2
+        ])));
+        assert!(raw_decode_hits_length_header::<MlsMessageIn>(&hostile(&[
             0, 1, 0, 3, 0, 2
         ])));
-        assert!(raw_decode_panics::<MlsMessageIn>(&hostile(&[0, 1, 0, 1])));
-        assert!(raw_decode_panics::<Welcome>(&hostile(&[0, 2])));
+        assert!(raw_decode_hits_length_header::<MlsMessageIn>(&hostile(&[
+            0, 1, 0, 1
+        ])));
+        assert!(raw_decode_hits_length_header::<Welcome>(&hostile(&[0, 2])));
     }
 }

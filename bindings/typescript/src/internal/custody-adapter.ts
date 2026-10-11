@@ -3,20 +3,22 @@
 // it to the bridge; the bridge-check tests drive the same record through the
 // napi `TestingCallbackCustody` hook.
 
-import type { CustodyPublicKey, KeyCustodyProvider, PseudonymResult } from "../scp";
+import type { CustodyKeyRole, CustodyKeyType, CustodyPublicKey, KeyCustodyProvider } from "../scp";
 
 /** The shape napi-rs marshals for a `CustodyPublicKey`: bytes as a number array. */
 export interface NativeCustodyPublicKey {
-  keyType: string;
+  keyType: CustodyKeyType;
   publicKey: number[];
-  role: string;
+  role: CustodyKeyRole;
 }
 
-/** The shape napi-rs marshals for a {@link PseudonymResult}: bytes as a number array. */
-export interface NativePseudonymResult {
-  publicKey: number[];
-  keyId: string;
-}
+const KEY_TYPES: readonly unknown[] = [
+  "ed25519",
+  "x25519",
+  "p256",
+  "hpke-p256",
+] satisfies CustodyKeyType[];
+const KEY_ROLES: readonly unknown[] = ["identity", "operational"] satisfies CustodyKeyRole[];
 
 /**
  * The one outcome shape every custody callback hands the bridge. A host
@@ -121,28 +123,38 @@ function asPublicKey(method: string): (raw: unknown) => NativeCustodyPublicKey {
     if (
       typeof raw !== "object" ||
       result === null ||
-      typeof result.keyType !== "string" ||
+      !KEY_TYPES.includes(result.keyType) ||
       !(result.publicKey instanceof Uint8Array) ||
-      typeof result.role !== "string"
+      !KEY_ROLES.includes(result.role)
     ) {
-      throw wrongType(method, "a { keyType: string, publicKey: Uint8Array, role: string } result");
+      throw wrongType(
+        method,
+        "a { keyType: CustodyKeyType, publicKey: Uint8Array, role: CustodyKeyRole } result",
+      );
     }
-    return { keyType: result.keyType, publicKey: Array.from(result.publicKey), role: result.role };
+    return {
+      keyType: result.keyType as CustodyKeyType,
+      publicKey: Array.from(result.publicKey),
+      role: result.role as CustodyKeyRole,
+    };
   };
 }
 
-function asPseudonym(method: string): (raw: unknown) => NativePseudonymResult {
+/**
+ * `asBytes` for key material (`dhAgree`, `exportSigningKeyBytes`). napi-rs
+ * reads a Rust `Vec<u8>` only from a JS `Array<number>`, so the adapter must
+ * hand the bridge a copy of the host's secret. napi-rs copies that array into
+ * Rust synchronously, as soon as the callback returns; the microtask below
+ * then zero-fills the adapter's copy, so no second copy of the secret stays
+ * on the JS heap. The host's own `Uint8Array` belongs to the host and is left
+ * untouched.
+ */
+function asSecretBytes(method: string): (raw: unknown) => number[] {
+  const convert = asBytes(method);
   return (raw) => {
-    const result = raw as Partial<PseudonymResult> | null;
-    if (
-      typeof raw !== "object" ||
-      result === null ||
-      !(result.publicKey instanceof Uint8Array) ||
-      typeof result.keyId !== "string"
-    ) {
-      throw wrongType(method, "a { publicKey: Uint8Array, keyId: string } result");
-    }
-    return { publicKey: Array.from(result.publicKey), keyId: result.keyId };
+    const copy = convert(raw);
+    queueMicrotask(() => copy.fill(0));
+    return copy;
   };
 }
 
@@ -165,7 +177,10 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
   // `deriveRotatablePseudonym`) accept
   // one array and destructure it.
   return {
-    generateKeypair: ([keyType, role]: [string, string]): NativeHostResult<string> =>
+    generateKeypair: ([keyType, role]: [
+      CustodyKeyType,
+      CustodyKeyRole,
+    ]): NativeHostResult<string> =>
       hostCall(
         "generateKeypair",
         () => provider.generateKeypair(keyType, role),
@@ -187,16 +202,14 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
       hostCall(
         "dhAgree",
         () => provider.dhAgree(keyId, Uint8Array.from(peerPublic)),
-        asBytes("dhAgree"),
+        asSecretBytes("dhAgree"),
       ),
-    derivePseudonym: ([keyId, contextId]: [
-      string,
-      number[],
-    ]): NativeHostResult<NativePseudonymResult> =>
+    derivePseudonym: ([keyId, contextId]: [string, number[]]): NativeHostResult<number[]> =>
       hostCall(
         "derivePseudonym",
         () => provider.derivePseudonym(keyId, Uint8Array.from(contextId)),
-        asPseudonym("derivePseudonym"),
+        // The bridge checks the bytes are a compressed P-256 point.
+        asBytes("derivePseudonym"),
       ),
     // The Rust `(String, Vec<u8>, u64)` tuple likewise arrives as a single
     // `[keyId, contextId, epoch]` array; the `u64` epoch crosses as a JS
@@ -205,11 +218,11 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
       string,
       number[],
       bigint,
-    ]): NativeHostResult<NativePseudonymResult> =>
+    ]): NativeHostResult<number[]> =>
       hostCall(
         "deriveRotatablePseudonym",
         () => provider.deriveRotatablePseudonym(keyId, Uint8Array.from(contextId), epoch),
-        asPseudonym("deriveRotatablePseudonym"),
+        asBytes("deriveRotatablePseudonym"),
       ),
     // A sign-only / hardware / secure-enclave custody throws here to signal it
     // cannot export raw private-key bytes (ADR-006). The failure reaches Rust
@@ -222,7 +235,7 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
       hostCall(
         "exportSigningKeyBytes",
         () => provider.exportSigningKeyBytes(keyId),
-        asBytes("exportSigningKeyBytes"),
+        asSecretBytes("exportSigningKeyBytes"),
       ),
     custodyType: (keyId: string): NativeHostResult<string> =>
       hostCall("custodyType", () => provider.custodyType(keyId), asString("custodyType")),

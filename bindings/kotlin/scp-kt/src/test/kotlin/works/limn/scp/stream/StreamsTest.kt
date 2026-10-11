@@ -3,7 +3,12 @@
 
 package works.limn.scp.stream
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.take
@@ -21,6 +26,9 @@ import org.junit.jupiter.api.Test
 import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.CancellationHandle
 import works.limn.scp.bridge.MessageCallback
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.logging.Level
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -277,6 +285,219 @@ class StreamsTest {
             }
 
         @Test
+        fun `stopAll releases every subscription after one unsubscribe throws`() =
+            runTest {
+                val eventFailure = IllegalStateException("event subscription 420 already torn down")
+                val messageFailure = IllegalStateException("message subscription 421 already torn down")
+                stubBindings.contextSubscribeEventsResult = 420L
+                factory.contextEvents(42L)
+                stubBindings.contextSubscribeEventsResult = 430L
+                factory.contextEvents(43L)
+                stubBindings.contextSubscribeResult = 421L
+                factory.incomingMessages(42L)
+                stubBindings.contextSubscribeResult = 431L
+                factory.incomingMessages(43L)
+                stubBindings.onUnsubscribeEvents = { if (it == 420L) throw eventFailure }
+                stubBindings.onUnsubscribeMessages = { if (it == 421L) throw messageFailure }
+
+                val records = captureLogs(HotStreamFactory::class.java.name) { factory.stopAll() }
+
+                assertEquals(listOf(430L), stubBindings.releasedEventHandles)
+                assertEquals(listOf(431L), stubBindings.releasedMessageHandles)
+                // Messages, not identities: coroutine stack-trace recovery may copy an exception
+                // as it crosses a withContext boundary.
+                assertEquals(
+                    setOf(eventFailure.message, messageFailure.message),
+                    records.map { it.thrown?.message }.toSet(),
+                )
+                assertEquals(2, records.size)
+                assertTrue(records.all { it.level == Level.WARNING })
+
+                // stopAll released every registry entry, the failed ones included, so a second
+                // call finds nothing to release and nothing to log.
+                stubBindings.onUnsubscribeEvents = null
+                stubBindings.onUnsubscribeMessages = null
+                val retryRecords = captureLogs(HotStreamFactory::class.java.name) { factory.stopAll() }
+
+                assertEquals(listOf(430L), stubBindings.releasedEventHandles)
+                assertEquals(listOf(431L), stubBindings.releasedMessageHandles)
+                assertTrue(retryRecords.isEmpty())
+            }
+
+        @Test
+        fun `a single stop whose unsubscribe throws logs it and releases its registry entry`() =
+            runTest {
+                val events = factory.contextEvents(42L)
+                val messages = factory.incomingMessages(42L)
+                stubBindings.onUnsubscribeEvents = { throw IllegalStateException("event unsubscribe failed") }
+                stubBindings.onUnsubscribeMessages = { throw IllegalStateException("message unsubscribe failed") }
+
+                // Neither stop throws: sdk-common §Cleanup error handling logs a cleanup failure.
+                val records =
+                    captureLogs(HotStreamFactory::class.java.name) {
+                        factory.stopContextEvents(42L)
+                        factory.stopMessageStream(42L)
+                    }
+
+                assertEquals(
+                    listOf("event unsubscribe failed", "message unsubscribe failed"),
+                    records.map { it.thrown?.message },
+                )
+                assertTrue(records.all { it.level == Level.WARNING })
+                assertTrue(records[0].message.startsWith("HotStreamFactory.stopContextEvents: "))
+                assertTrue(records[1].message.startsWith("HotStreamFactory.stopMessageStream: "))
+
+                // The entries are gone, so asking again opens a new subscription.
+                stubBindings.onUnsubscribeEvents = null
+                stubBindings.onUnsubscribeMessages = null
+                assertTrue(events !== factory.contextEvents(42L))
+                assertTrue(messages !== factory.incomingMessages(42L))
+                assertEquals(2, stubBindings.eventSubscribeCount)
+                assertEquals(2, stubBindings.messageSubscribeCount)
+
+                // A stop whose unsubscribe succeeds logs nothing.
+                val cleanRecords =
+                    captureLogs(HotStreamFactory::class.java.name) {
+                        factory.stopContextEvents(42L)
+                        factory.stopMessageStream(42L)
+                    }
+                assertTrue(cleanRecords.isEmpty())
+                assertEquals(1, stubBindings.eventUnsubscribeCount)
+                assertEquals(1, stubBindings.messageUnsubscribeCount)
+            }
+
+        @Test
+        fun `stopAll from a cancelled caller releases every subscription and logs no failure`() =
+            runTest {
+                // A dispatcher distinct from runTest's makes each removal's withContext resume
+                // its caller by dispatch, which is where a cancelled caller throws.
+                val factory = HotStreamFactory(stubBindings, StandardTestDispatcher(testScheduler))
+                factory.contextEvents(42L)
+                factory.contextEvents(43L)
+                factory.incomingMessages(42L)
+
+                val records =
+                    captureLogs(HotStreamFactory::class.java.name) {
+                        val stopping =
+                            launch {
+                                cancel()
+                                factory.stopAll()
+                            }
+                        advanceUntilIdle()
+                        stopping.join()
+                    }
+
+                assertEquals(2, stubBindings.eventUnsubscribeCount)
+                assertEquals(1, stubBindings.messageUnsubscribeCount)
+                // Every release succeeded. Without stopAll's NonCancellable wrapper each removal's
+                // withContext throws CancellationException on resuming this cancelled caller,
+                // and releaseLogged logs that throw as a failed release.
+                assertTrue(records.isEmpty(), "stopAll logged a successful release as failed: $records")
+            }
+
+        @Test
+        fun `a caller cancelled before contextEvents or incomingMessages opens no subscription`() =
+            runTest {
+                // The mutex is uncontended, so withLock never suspends and never checks
+                // cancellation; only the check before the NonCancellable block can stop the call.
+                val subscribing =
+                    launch {
+                        cancel()
+                        runCatching { factory.contextEvents(CONTEXT_HANDLE) }
+                        runCatching { factory.incomingMessages(CONTEXT_HANDLE) }
+                    }
+                advanceUntilIdle()
+                subscribing.join()
+
+                assertEquals(0, stubBindings.eventSubscribeCount)
+                assertEquals(0, stubBindings.messageSubscribeCount)
+
+                // Nothing was registered, so a live caller subscribes afresh.
+                factory.contextEvents(CONTEXT_HANDLE)
+                factory.incomingMessages(CONTEXT_HANDLE)
+                assertEquals(1, stubBindings.eventSubscribeCount)
+                assertEquals(1, stubBindings.messageSubscribeCount)
+            }
+
+        @Test
+        fun `a stopContextEvents cancelled while waiting for the mutex still releases`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, Dispatchers.IO)
+                val subscribeEntered = CountDownLatch(1)
+                val releaseSubscribe = CountDownLatch(1)
+                stubBindings.onSubscribeEvents = {
+                    subscribeEntered.countDown()
+                    releaseSubscribe.await()
+                }
+
+                val subscribing = launch(Dispatchers.Default) { factory.contextEvents(CONTEXT_HANDLE) }
+                try {
+                    assertTrue(
+                        subscribeEntered.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                        "contextEvents did not reach its subscribe call",
+                    )
+                    // UNDISPATCHED runs the stop on this thread up to its first suspension,
+                    // which is the held mutex inside withContext(NonCancellable), before launch
+                    // returns. The cancel below therefore lands on a stop that is already
+                    // waiting for the mutex, however slowly the runner schedules threads.
+                    val stopping =
+                        launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+                            factory.stopContextEvents(CONTEXT_HANDLE)
+                        }
+                    assertTrue(stopping.isActive, "stopContextEvents returned while the subscribe held its mutex")
+                    stopping.cancel()
+
+                    releaseSubscribe.countDown()
+                    subscribing.join()
+                    stopping.join()
+
+                    assertEquals(1, stubBindings.eventSubscribeCount)
+                    assertEquals(1, stubBindings.eventUnsubscribeCount)
+                } finally {
+                    releaseSubscribe.countDown()
+                    subscribing.join()
+                }
+            }
+
+        @Test
+        fun `a stopMessageStream cancelled while waiting for the mutex still releases`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, Dispatchers.IO)
+                val subscribeEntered = CountDownLatch(1)
+                val releaseSubscribe = CountDownLatch(1)
+                stubBindings.onSubscribe = {
+                    subscribeEntered.countDown()
+                    releaseSubscribe.await()
+                }
+
+                val subscribing = launch(Dispatchers.Default) { factory.incomingMessages(CONTEXT_HANDLE) }
+                try {
+                    assertTrue(
+                        subscribeEntered.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                        "incomingMessages did not reach its subscribe call",
+                    )
+                    // UNDISPATCHED parks the stop on the held mutex before launch returns, for
+                    // the reason the event-side test above states.
+                    val stopping =
+                        launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+                            factory.stopMessageStream(CONTEXT_HANDLE)
+                        }
+                    assertTrue(stopping.isActive, "stopMessageStream returned while the subscribe held its mutex")
+                    stopping.cancel()
+
+                    releaseSubscribe.countDown()
+                    subscribing.join()
+                    stopping.join()
+
+                    assertEquals(1, stubBindings.messageSubscribeCount)
+                    assertEquals(1, stubBindings.messageUnsubscribeCount)
+                } finally {
+                    releaseSubscribe.countDown()
+                    subscribing.join()
+                }
+            }
+
+        @Test
         fun `hot stream error callback emits error event`() =
             runTest {
                 val flow = factory.contextEvents(42L)
@@ -323,9 +544,216 @@ class StreamsTest {
     }
 
     @Nested
+    inner class SubscriptionOwnershipTests {
+        @BeforeEach
+        fun setUpHandles() {
+            stubBindings.contextSubscribeEventsResult = 200L
+            stubBindings.contextSubscribeResult = 300L
+        }
+
+        @Test
+        fun `a cancelled contextEvents still records its subscription for stopAll`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, StandardTestDispatcher(testScheduler))
+                lateinit var subscribing: Job
+                // A Rust engine returns a subscription handle, and this stub cancels
+                // whichever coroutine asked for it while that call is on a stack, placing a
+                // cancellation exactly where a registry write follows a subscribe call.
+                stubBindings.onSubscribeEvents = { subscribing.cancel() }
+
+                subscribing = launch { factory.contextEvents(CONTEXT_HANDLE) }
+                advanceUntilIdle()
+
+                assertEquals(1, stubBindings.eventSubscribeCount)
+
+                factory.stopAll()
+
+                assertEquals(1, stubBindings.eventUnsubscribeCount)
+                assertEquals(200L, stubBindings.lastEventUnsubscribeHandle)
+            }
+
+        @Test
+        fun `a cancelled incomingMessages still records its subscription for stopAll`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, StandardTestDispatcher(testScheduler))
+                lateinit var subscribing: Job
+                stubBindings.onSubscribe = { subscribing.cancel() }
+
+                subscribing = launch { factory.incomingMessages(CONTEXT_HANDLE) }
+                advanceUntilIdle()
+
+                assertEquals(1, stubBindings.messageSubscribeCount)
+
+                factory.stopAll()
+
+                assertEquals(1, stubBindings.messageUnsubscribeCount)
+                assertEquals(300L, stubBindings.lastUnsubscribeHandle)
+            }
+
+        @Test
+        fun `stopContextEvents waits for an in-flight contextEvents`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, Dispatchers.Unconfined)
+                val subscribeEntered = CountDownLatch(1)
+                val releaseSubscribe = CountDownLatch(1)
+                stubBindings.onSubscribeEvents = {
+                    subscribeEntered.countDown()
+                    releaseSubscribe.await()
+                }
+
+                val subscribing = launch(Dispatchers.Default) { factory.contextEvents(CONTEXT_HANDLE) }
+                // A failing assertion below leaves `subscribing` parked on releaseSubscribe,
+                // which a Rust callback thread cannot interrupt, so this latch opens in a
+                // finally block: a test that fails an assertion reports that failure instead
+                // of hanging a runner.
+                try {
+                    assertTrue(
+                        subscribeEntered.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                        "contextEvents did not reach its subscribe call",
+                    )
+
+                    // UNDISPATCHED runs the stop on this thread up to its first suspension
+                    // before launch returns, and the Unconfined ioDispatcher lets its
+                    // withContext run inline instead of suspending. So the stop's only possible
+                    // suspension is the mutex the gated subscribe holds: a stop that ignored that
+                    // mutex would finish inside launch, however slowly the runner schedules
+                    // threads.
+                    val stopping =
+                        launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+                            factory.stopContextEvents(CONTEXT_HANDLE)
+                        }
+                    assertTrue(
+                        stopping.isActive,
+                        "stopContextEvents returned while contextEvents held its mutex, so it " +
+                            "read a registry that had no entry yet",
+                    )
+
+                    releaseSubscribe.countDown()
+                    subscribing.join()
+                    stopping.join()
+
+                    assertEquals(1, stubBindings.eventSubscribeCount)
+                    assertEquals(1, stubBindings.eventUnsubscribeCount)
+                } finally {
+                    releaseSubscribe.countDown()
+                    subscribing.join()
+                }
+            }
+
+        @Test
+        fun `stopMessageStream waits for an in-flight incomingMessages`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, Dispatchers.Unconfined)
+                val subscribeEntered = CountDownLatch(1)
+                val releaseSubscribe = CountDownLatch(1)
+                stubBindings.onSubscribe = {
+                    subscribeEntered.countDown()
+                    releaseSubscribe.await()
+                }
+
+                val subscribing = launch(Dispatchers.Default) { factory.incomingMessages(CONTEXT_HANDLE) }
+                // This finally block opens releaseSubscribe for a reason an event-side test
+                // above states.
+                try {
+                    assertTrue(
+                        subscribeEntered.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                        "incomingMessages did not reach its subscribe call",
+                    )
+
+                    // UNDISPATCHED and the Unconfined ioDispatcher leave the held mutex as the
+                    // stop's only possible suspension, for the reason the event-side test above
+                    // states.
+                    val stopping =
+                        launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+                            factory.stopMessageStream(CONTEXT_HANDLE)
+                        }
+                    assertTrue(
+                        stopping.isActive,
+                        "stopMessageStream returned while incomingMessages held its mutex, so " +
+                            "it read a registry that had no entry yet",
+                    )
+
+                    releaseSubscribe.countDown()
+                    subscribing.join()
+                    stopping.join()
+
+                    assertEquals(1, stubBindings.messageSubscribeCount)
+                    assertEquals(1, stubBindings.messageUnsubscribeCount)
+                } finally {
+                    releaseSubscribe.countDown()
+                    subscribing.join()
+                }
+            }
+
+        @Test
+        fun `a completion callback removes only its own subscription`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, StandardTestDispatcher(testScheduler))
+                factory.contextEvents(CONTEXT_HANDLE)
+                val staleCallback = assertNotNull(stubBindings.lastEventCallback)
+
+                factory.stopContextEvents(CONTEXT_HANDLE)
+                factory.contextEvents(CONTEXT_HANDLE)
+                staleCallback.onComplete()
+
+                factory.stopAll()
+
+                assertEquals(2, stubBindings.eventUnsubscribeCount)
+            }
+
+        @Test
+        fun `a message completion callback removes only its own subscription`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, StandardTestDispatcher(testScheduler))
+                factory.incomingMessages(CONTEXT_HANDLE)
+                val staleCallback = assertNotNull(stubBindings.lastMessageCallback)
+
+                factory.stopMessageStream(CONTEXT_HANDLE)
+                factory.incomingMessages(CONTEXT_HANDLE)
+                staleCallback.onComplete()
+
+                factory.stopAll()
+
+                assertEquals(2, stubBindings.messageUnsubscribeCount)
+            }
+
+        @Test
+        fun `an event completion arriving during subscribe leaves no registry entry`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, StandardTestDispatcher(testScheduler))
+                // A Rust engine ends this subscription before contextSubscribeEvents returns,
+                // so its completion reaches the slot before the slot's registry write.
+                stubBindings.onSubscribeEvents = { assertNotNull(stubBindings.lastEventCallback).onComplete() }
+                factory.contextEvents(CONTEXT_HANDLE)
+                stubBindings.onSubscribeEvents = null
+
+                // A registry that still named the ended subscription would hand it back here.
+                factory.contextEvents(CONTEXT_HANDLE)
+
+                assertEquals(2, stubBindings.eventSubscribeCount)
+            }
+
+        @Test
+        fun `a message completion arriving during subscribe leaves no registry entry`() =
+            runTest {
+                val factory = HotStreamFactory(stubBindings, StandardTestDispatcher(testScheduler))
+                // A Rust engine ends this subscription before contextSubscribe returns, so its
+                // completion reaches the slot before the slot's registry write.
+                stubBindings.onSubscribe = { assertNotNull(stubBindings.lastMessageCallback).onComplete() }
+                factory.incomingMessages(CONTEXT_HANDLE)
+                stubBindings.onSubscribe = null
+
+                // A registry that still named the ended subscription would hand it back here.
+                factory.incomingMessages(CONTEXT_HANDLE)
+
+                assertEquals(2, stubBindings.messageSubscribeCount)
+            }
+    }
+
+    @Nested
     inner class ColdMessageFlowTests {
         @Test
-        fun `ColdMessageFlow emits messages from callback`() =
+        fun `ColdMessageFlow emits messages and releases its subscription when take ends collection`() =
             runTest(testDispatcher) {
                 stubBindings.contextSubscribeResult = 100L
 
@@ -348,10 +776,12 @@ class StreamsTest {
                 assertEquals(2, messages.size)
                 assertEquals("""{"seq":1}""", messages[0])
                 assertEquals("""{"seq":2}""", messages[1])
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
             }
 
         @Test
-        fun `ColdMessageFlow completes on onComplete callback`() =
+        fun `ColdMessageFlow completes on onComplete callback and releases its subscription`() =
             runTest(testDispatcher) {
                 stubBindings.contextSubscribeResult = 100L
 
@@ -372,10 +802,12 @@ class StreamsTest {
                 job.join()
 
                 assertEquals(1, messages.size)
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
             }
 
         @Test
-        fun `ColdMessageFlow closes with BridgeException on error`() =
+        fun `ColdMessageFlow closes with BridgeException on error and releases its subscription`() =
             runTest(testDispatcher) {
                 stubBindings.contextSubscribeResult = 100L
 
@@ -402,6 +834,8 @@ class StreamsTest {
 
                 assertTrue(caughtException is BridgeException)
                 assertEquals("SCP-CTX-2001", (caughtException as BridgeException).code)
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
             }
 
         @Test
@@ -422,6 +856,72 @@ class StreamsTest {
                 assertTrue(stubBindings.contextUnsubscribeCalled)
                 assertEquals(100L, stubBindings.lastUnsubscribeHandle)
             }
+
+        @Test
+        fun `ColdMessageFlow releases a subscription whose collector was cancelled during subscribe`() =
+            runTest {
+                stubBindings.contextSubscribeResult = 100L
+                // A dispatcher other than the collector's, so withContext hands contextSubscribe's
+                // result back through a dispatch, where a cancelled caller would drop it.
+                val flow = ColdMessageFlow(stubBindings, 42L, StandardTestDispatcher(testScheduler))
+                lateinit var collecting: Job
+                // This stub cancels the collector while contextSubscribe is on a stack, after
+                // a Rust engine would have opened the subscription.
+                stubBindings.onSubscribe = { collecting.cancel() }
+
+                collecting = launch { flow.collect {} }
+                advanceUntilIdle()
+
+                assertEquals(1, stubBindings.messageSubscribeCount)
+                assertEquals(1, stubBindings.messageUnsubscribeCount)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
+            }
+
+        @Test
+        fun `ColdMessageFlow logs a release that throws and its collector ends cancelled`() =
+            runTest(testDispatcher) {
+                stubBindings.contextSubscribeResult = 100L
+                val failure = IllegalStateException("subscription 100 already torn down")
+                stubBindings.onUnsubscribe = { throw failure }
+                val flow = ColdMessageFlow(stubBindings, 42L, testDispatcher)
+
+                // A release that rethrew would fail this job with the stub's exception instead
+                // of cancelling it. The completion cause recorded below tells the two apart:
+                // a failed job completes with the stub's exception, a cancelled one with a
+                // CancellationException. runTest's scope would also fail on that exception.
+                lateinit var collecting: Job
+                var completionCause: Throwable? = null
+                val records =
+                    captureLogs(COLD_MESSAGE_FLOW_LOGGER) {
+                        collecting = launch { flow.collect {} }
+                        collecting.invokeOnCompletion { completionCause = it }
+                        advanceUntilIdle()
+                        collecting.cancelAndJoin()
+                    }
+
+                val cause = completionCause
+                assertTrue(cause is CancellationException, "collector completed with $cause")
+                assertFalse(generateSequence<Throwable>(cause) { it.cause }.any { it === failure })
+                assertEquals(1, records.size)
+                assertEquals(Level.WARNING, records[0].level)
+                assertEquals(failure.message, records[0].thrown?.message)
+                assertTrue(records[0].message.startsWith("ColdMessageFlow: releasing subscription 100 "))
+            }
+
+        @Test
+        fun `ColdMessageFlow releases its subscription without parking the collector thread`() {
+            stubBindings.contextSubscribeResult = 100L
+
+            assertReleaseLeavesCollectorFree(
+                openFlow = { ffiDispatcher -> ColdMessageFlow(stubBindings, 42L, ffiDispatcher) },
+                installHooks = { onSubscribe, onUnsubscribe ->
+                    stubBindings.onSubscribe = onSubscribe
+                    stubBindings.onUnsubscribe = onUnsubscribe
+                },
+            )
+
+            assertEquals(100L, stubBindings.lastUnsubscribeHandle)
+        }
 
         @Test
         fun `ColdMessageFlow has no double buffering`() =
@@ -494,6 +994,30 @@ class StubEventContextBindings : EventContextBindings {
     var eventUnsubscribeCount = 0
     var messageUnsubscribeCount = 0
 
+    /** Runs inside [contextSubscribeEvents], where a Rust engine would be opening a stream. */
+    var onSubscribeEvents: (() -> Unit)? = null
+
+    /** Runs inside [contextSubscribe], where a Rust engine would be opening a stream. */
+    var onSubscribe: (() -> Unit)? = null
+
+    /** Runs inside [contextUnsubscribe], where a Rust engine would be closing a stream. */
+    var onUnsubscribe: (() -> Unit)? = null
+
+    /**
+     * Runs first inside [contextUnsubscribeEvents] with its subscription handle; a throw from it
+     * stands for an engine that refused the release, so nothing is recorded as released.
+     */
+    var onUnsubscribeEvents: ((Long) -> Unit)? = null
+
+    /** Runs first inside [contextUnsubscribe], as [onUnsubscribeEvents] does for events. */
+    var onUnsubscribeMessages: ((Long) -> Unit)? = null
+
+    /** Subscription handles whose [contextUnsubscribeEvents] call returned, in call order. */
+    val releasedEventHandles = mutableListOf<Long>()
+
+    /** Subscription handles whose [contextUnsubscribe] call returned, in call order. */
+    val releasedMessageHandles = mutableListOf<Long>()
+
     override fun contextCreate(
         identityHandle: Long,
         paramsJson: String,
@@ -538,13 +1062,17 @@ class StubEventContextBindings : EventContextBindings {
     ): Long {
         lastMessageCallback = callback
         messageSubscribeCount++
+        onSubscribe?.invoke()
         return contextSubscribeResult
     }
 
     override fun contextUnsubscribe(subscriptionHandle: Long) {
+        onUnsubscribeMessages?.invoke(subscriptionHandle)
+        onUnsubscribe?.invoke()
         contextUnsubscribeCalled = true
         lastUnsubscribeHandle = subscriptionHandle
         messageUnsubscribeCount++
+        releasedMessageHandles += subscriptionHandle
     }
 
     override fun contextSetEconomicPolicy(
@@ -560,13 +1088,16 @@ class StubEventContextBindings : EventContextBindings {
     ): Long {
         lastEventCallback = callback
         eventSubscribeCount++
+        onSubscribeEvents?.invoke()
         return contextSubscribeEventsResult
     }
 
     override fun contextUnsubscribeEvents(subscriptionHandle: Long) {
+        onUnsubscribeEvents?.invoke(subscriptionHandle)
         eventUnsubscribeCalled = true
         lastEventUnsubscribeHandle = subscriptionHandle
         eventUnsubscribeCount++
+        releasedEventHandles += subscriptionHandle
     }
 }
 
@@ -610,3 +1141,12 @@ class StubInfraBindings : works.limn.scp.bridge.InfraBindings {
 
     override fun transportDisconnect(transportHandle: Long) { /* no-op */ }
 }
+
+/**
+ * Context handle that HotStreamFactoryTests and SubscriptionOwnershipTests subscribe
+ * their event and message streams against.
+ */
+private const val CONTEXT_HANDLE = 42L
+
+/** Upper bound on how long a test waits for a latch that a stub's own thread opens. */
+private const val LATCH_TIMEOUT_SECONDS = 10L

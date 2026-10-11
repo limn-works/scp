@@ -15,9 +15,9 @@
 //!
 //! See §3.10.10, §9.5, §7.4.1, §22.3.1, §22.4, §22.8 in `.docs/specs/`.
 
-pub mod bridge_state;
 pub mod error_codes;
 pub mod outlet_id;
+pub mod p256_host;
 pub mod ucan_errors;
 pub mod validate;
 
@@ -52,9 +52,6 @@ pub const fn context_state_str(state: &scp_protocol::context::ContextState) -> &
         S::Poisoned => "poisoned",
     }
 }
-
-mod bridge_id;
-pub use bridge_id::generate_bridge_id;
 
 // Canonical §18.4.1 context-ID generator — shared across all FFI
 // bridges so `Scp::context_create` cannot regress to non-hex shapes
@@ -120,6 +117,12 @@ pub mod custody_parse;
 #[cfg(feature = "custody")]
 pub mod callback_custody;
 
+// Resolves `$HOME/.scp/keys.bin` and `SCP_KEY_PASSPHRASE` for `"file"`
+// custody, rejecting an unset, empty or relative HOME and an empty passphrase,
+// then opens the key file. See ADR-006 and spec §17.8.
+#[cfg(feature = "custody")]
+pub mod custody_file;
+
 // Shared attestation construction pipeline for all FFI bridges.
 // Requires scp-core + scp-identity (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
@@ -143,13 +146,6 @@ pub use bridge_instance::{
 // Requires scp-core + scp-platform (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
 pub mod bridge_runtime;
-
-// Bridge credential-store selection seam shared by all three FFI bridges
-// (ADR-062 §Decision 5, SCP-CAPINJECT-009). The `FfiCredentialStore` enum
-// dispatches between the real durable backend and a testing-only in-memory
-// double. Requires scp-core (behind `resolvers` feature).
-#[cfg(feature = "resolvers")]
-pub mod credentials;
 
 // Crash-safe per-stream `monotonic_seq` grant counter (SCP-OUT-034 AC31) shared
 // by all three bridges. Persists the cursor to durable `Storage` so an SDK
@@ -198,6 +194,21 @@ pub mod saga_errors;
 // echo cannot drift. Requires scp-core (behind `resolvers`).
 #[cfg(feature = "resolvers")]
 pub mod broadcast;
+
+// Wire names for protocol enums that bridges hand an SDK (signaling message
+// type, provenance source type, memory scope), so no bridge sends a Rust
+// `Debug` rendering across its FFI boundary.
+pub mod wire_name;
+
+// One string rendering per `ContextEvent`, shared by every bridge's event
+// drain and PyO3's receive pipeline in place of `Debug` dumps.
+pub mod context_event;
+
+// Wire names for governance outcomes, shared by PyO3, napi-rs, and UniFFI so
+// no bridge sends a Rust `Debug` dump across its FFI boundary. Requires
+// scp-core (behind `resolvers`).
+#[cfg(feature = "resolvers")]
+pub mod governance_result;
 
 // Shared signed-context-export verifying-key resolver (§23.16.8, ADR-050).
 // Local-custody-first then DID-resolver (#active/#agent) fallback. Closure-based

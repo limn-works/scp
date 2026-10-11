@@ -816,7 +816,7 @@ public protocol IdentityProtocol: AnyObject, Sendable {
     /**
      * Returns the custody method string for this identity.
      *
-     * One of: `"in_memory"`, `"platform"`, `"software"`, `"external"`.
+     * One of: `"in_memory"`, `"callback"`, `"external"`.
      */
     func custodyType()  -> String
     
@@ -1043,7 +1043,7 @@ open func addAgentKey()async throws  -> Identity  {
     /**
      * Returns the custody method string for this identity.
      *
-     * One of: `"in_memory"`, `"platform"`, `"software"`, `"external"`.
+     * One of: `"in_memory"`, `"callback"`, `"external"`.
      */
 open func custodyType() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -2003,57 +2003,6 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func applyPendingCeilingModification(handle: ContextHandle, currentTimestamp: UInt64) async throws  -> Bool
     
     /**
-     * Per-instance equivalent of the free-function `bridge_create_shadow`.
-     *
-     * Mutates this instance's per-context bridge state. Rejects any
-     * cross-instance caller (the method takes `&self` — the `bi` threaded
-     * into `bridge_create_shadow_on` is always this instance's).
-     */
-    func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMode: String, contextId: String) throws  -> ShadowIdentityResult
-    
-    /**
-     * Deletes and zeroizes a bridge credential key (spec §12.11).
-     */
-    func bridgeCredentialDeleteKey(bridgeId: String) throws 
-    
-    /**
-     * Retrieves a bridge credential key from the custody boundary (spec §12.11).
-     */
-    func bridgeCredentialGetKey(bridgeId: String) throws  -> Data
-    
-    /**
-     * Lists all credential types stored for a bridge instance (spec §12.11).
-     */
-    func bridgeCredentialList(bridgeId: String) throws  -> [String]
-    
-    /**
-     * Provisions (stores) an encrypted credential for a bridge instance
-     * (spec §12.11). Routes through `&self.inner` — credentials live in
-     * THIS instance's credential store (ADR-048 §1).
-     */
-    func bridgeCredentialProvision(bridgeId: String, credentialType: String, plaintext: Data, bridgeCredentialKey: Data) throws  -> BridgeCredentialResult
-    
-    /**
-     * Retrieves and decrypts a credential for a bridge instance (spec §12.11).
-     */
-    func bridgeCredentialRetrieve(bridgeId: String, credentialType: String, bridgeCredentialKey: Data) throws  -> Data
-    
-    /**
-     * Revokes all credentials for a bridge instance (spec §12.11).
-     */
-    func bridgeCredentialRevoke(bridgeId: String) throws 
-    
-    /**
-     * Rotates (replaces) a credential for a bridge instance (spec §12.11).
-     */
-    func bridgeCredentialRotate(bridgeId: String, credentialType: String, newPlaintext: Data, bridgeCredentialKey: Data) throws  -> BridgeCredentialResult
-    
-    /**
-     * Stores a bridge credential key in the custody boundary (spec §12.11).
-     */
-    func bridgeCredentialStoreKey(bridgeId: String, key: Data) throws 
-    
-    /**
      * Per-instance equivalent of the free-function `broadcast_admission`.
      *
      * Routes through `&*self.inner`. Returns `None` when the handle's
@@ -2184,9 +2133,22 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
      * `Identity` whose `instance_id` does not match this `SCP`'s.
      *
-     * Authorization is enforced by the `ContextManager` (which delegates
-     * to `ttl::close_context` checking the `ContextClose` capability) —
-     * no bridge-layer auth check.
+     * Reads the context's lifecycle state from its supervisor actor, not
+     * from the handle's cached state. On `Active` it dispatches
+     * `CloseContext`, whose `ttl::close_context` checks the `ContextClose`
+     * capability; this function runs no capability check of its own. When
+     * no actor serves the context, or the actor reports `Closed`, `Expired`,
+     * or `Tombstoned`, it skips the dispatch and only releases this bridge's
+     * per-context state. It refuses `Poisoned` with `SCP-CTX-2134` and every
+     * other state with `SCP-CTX-2017`, keeps that state, and propagates a
+     * failed state read.
+     *
+     * The release marks the id. When a re-read after the mark reports
+     * `Active`, or a readmit clears the mark before the release removes the
+     * state, this function removes nothing, leaves the handle's cached state
+     * unchanged, and refuses with `SCP-CTX-2017`. When that re-read fails,
+     * it removes nothing, leaves the handle's cached state unchanged, and
+     * returns the read's error.
      */
     func contextClose(handle: ContextHandle, identity: Identity) async throws 
     
@@ -2622,7 +2584,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * calls produce byte-identical Ed25519 keys across bridges — the
      * basis of the cross-bridge parity test (ADR-046). `testing_seed`
      * is only valid for `"in_memory"` custody; other custody types
-     * reject it with `SCP-VALID-7009`.
+     * reject it with `SCP-VALID-7009` before the custody string is read.
      */
     func identityCreate(custody: String, testingSeed: Data?) async throws  -> Identity
     
@@ -2866,37 +2828,57 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func isLocalDid(did: String) async  -> Bool
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_connect_sse`.
+     * Connects to the MCP SSE server at `url`.
      *
-     * Routes through the module-level MCP client registry.
+     * Registers the client in this instance's MCP client registry; the
+     * returned handle works only on this instance. `auth_token` is
+     * sent as `Authorization: Bearer <token>` on the `GET` and on every POST,
+     * or `None` for a server that runs no bearer check; an SCP SSE server
+     * always runs one (ADR-015). The transport has no TLS, so a token is
+     * sent only to a loopback host.
      */
-    func mcpClientConnectSse(url: String) async throws  -> String
+    func mcpClientConnectSse(url: String, authToken: String?) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
+     * Starts `command` as an MCP server subprocess and connects to it over
+     * stdio.
      *
-     * Routes through the module-level MCP client registry.
+     * Registers the client in this instance's MCP client registry; the
+     * returned handle works only on this instance.
      */
     func mcpClientConnectStdio(command: [String]) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_disconnect`.
+     * Disconnects the MCP client registered under `handle`.
      *
-     * Routes through the module-level MCP client registry.
+     * Removes the entry from this instance's MCP client registry; a handle
+     * another instance returned is not found. Dropping the
+     * entry closes the client's transport, even while a call on the handle
+     * is in flight. A stdio client's server process group, which holds the
+     * processes the server started, is dead when this returns. An SSE
+     * client's POST and `GET`
+     * sockets are shut down, and the call fails as closed. A call queued
+     * behind the in-flight one, on a stdio or an SSE client, fails as
+     * disconnected once it takes the client's lock and sends nothing. A
+     * connect still waiting for its server to answer `initialize` (stdio or
+     * SSE) has no handle yet, so no disconnect, and no instance shutdown,
+     * ends it.
      */
     func mcpClientDisconnect(handle: String) async throws 
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_invoke`.
+     * Invokes a tool on the MCP server behind `handle`.
      *
-     * Routes through the module-level MCP client registry.
+     * Looks the handle up in this instance's MCP client registry; a handle
+     * another instance returned is not found.
      */
     func mcpClientInvoke(handle: String, outletName: String, inputJson: String, contextId: String, invokerDid: String) async throws  -> McpInvokeResult
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_list_tools`.
+     * Lists the tools the MCP server behind `handle` exposes.
      *
-     * Routes through the module-level MCP client registry.
+     * Looks the handle up in this instance's MCP client registry; a handle
+     * another instance returned is not found.
      */
     func mcpClientListTools(handle: String) async throws  -> [McpOutletInfo]
     
@@ -2935,19 +2917,46 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func mcpResetStdioAllowlist() throws 
     
     /**
-     * Per-instance equivalent of the free-function `mcp_server_create`.
+     * Starts an MCP server over this instance's contexts on the `stdio` or
+     * `sse` transport.
      *
-     * Routes through `&*self.inner`. The MCP server registry is
-     * module-level (not per-instance) so the returned opaque handle
-     * string is globally unique; this method preserves that behaviour.
+     * Registers the server in this instance's MCP server registry under a
+     * random opaque handle; only this instance's `mcp_server_stop` finds it.
+     *
+     * A server created while the instance has no supervisor serves no
+     * resource subscriptions for its whole life: it advertises
+     * `resources.subscribe: false` and rejects `resources/subscribe`, and
+     * attaching a supervisor does not change that. Create the server again
+     * once the instance has a supervisor and is not suspended to get
+     * subscriptions.
+     *
+     * A `stdio` server writes to this process's stdout, and its event pump
+     * writes there after the reading client may have exited. Before serving,
+     * this call makes such a write fail with `EPIPE` instead of raising
+     * SIGPIPE, whose default action terminates the host: on Apple targets it
+     * sets `F_SETNOSIGPIPE` on stdout alone; on other Unix targets, where a
+     * pipe has no such switch, it sets SIGPIPE to ignored when SIGPIPE still
+     * has its default action, for the whole process.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` with `SCP-TRANS-5050` when a `stdio`
+     * server's stdout cannot be made to fail without SIGPIPE, for example
+     * because stdout is closed.
+     *
+     * With a supervisor attached, returns `ScpError::Context` with
+     * `SCP-CTX-2000` when the instance is suspended, and `ScpError::Transport`
+     * with `SCP-TRANS-5001` when the supervisor does not report a served
+     * context `Active` (the refusal withholds the state) or does not count
+     * `identity_did` among that context's members.
      */
     func mcpServerCreate(config: McpServerConfig) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function `mcp_server_stop`.
+     * Stops the MCP server registered under `handle`.
      *
-     * Routes through the module-level MCP server registry (the registry
-     * is not per-instance; the opaque handle string is globally unique).
+     * Looks the handle up in this instance's MCP server registry; a handle
+     * another instance returned is not found.
      */
     func mcpServerStop(handle: String) async throws 
     
@@ -3018,6 +3027,12 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Carries no lifecycle gate. It reads no context state and grants
+     * nothing: it builds an `InterfaceRevoked` event from the interface id,
+     * the handle's context id and the clock and hands it back for the caller to distribute, so a gate
+     * would deny a member the record of a revocation without withholding any
+     * capability.
      */
     func outletInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String) async throws  -> String
     
@@ -3109,17 +3124,17 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * # Errors
      *
-     * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
-     * Prepare-phase abort that may be a permanent rejection — authorization,
-     * freshness, rate limit, or co-residency — OR a retryable transient: a rate
-     * limit, or a participant actor unavailable to complete the Prepare
-     * exchange; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+     * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (its causes told
+     * apart by its code; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
      * (Commit-retry exhausted — carries the durable `saga_id` operator-repair
      * handle), or [`ScpError::SagaBusy`] (the participant context set
      * overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
      * if an id/DID/outlet-id is malformed or `asserted_nonce_hex` does not
      * decode to 16 bytes, and [`ScpError::Outlet`] if `input_json` is not valid
-     * JSON.
+     * JSON. Returns [`ScpError::Outlet`] with `SCP-OUTLET-6010` (caller
+     * context) or `SCP-OUTLET-6011` (target context) and the text "context is
+     * not active" when that context's supervisor actor does not report
+     * `Active`, when no actor serves it, or when either read fails.
      *
      * See spec §6.2.4 and ADR-049 §3a.
      */
@@ -3138,6 +3153,11 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Carries no lifecycle gate. It releases one session entry the handle
+     * itself owns and decides no authorization question, and refusing that
+     * release in a `Closing` or `Expired` context would strand the entry until
+     * the handle drops.
      */
     func outletSessionClose(handle: ContextHandle, sessionId: String) async throws 
     
@@ -3540,15 +3560,17 @@ public protocol ScpProtocol: AnyObject, Sendable {
     /**
      * Shuts down this bridge instance with a graceful deadline.
      *
-     * Awaits in-flight tasks up to `timeout_millis` **milliseconds**,
-     * aborts any remaining tasks, then clears registries and runs
-     * shutdown hooks. Permanent — a shut-down instance cannot be
-     * reused. A second call is a no-op from the caller's perspective
-     * (the underlying `ShutdownError::AlreadyShutDown` is swallowed).
+     * Awaits in-flight tasks up to `timeout_millis` **milliseconds**.
+     * Permanent — a shut-down instance cannot be reused.
      *
      * The unit is **milliseconds** — unified across all Rust bridges
      * so the Swift and Kotlin SDKs can share a single conversion
      * surface.
+     *
+     * # Errors
+     *
+     * Returns [`ScpError::Validation`] with `SCP-STORAGE-8005` when the
+     * durable store still holds its advisory lock after the call.
      */
     func shutdown(timeoutMillis: UInt64) async throws 
     
@@ -3808,8 +3830,10 @@ open class Scp: ScpProtocol, @unchecked Sendable {
      *
      * FAIL CLOSED (spec §17.6): if a durable (`Sqlite`) backend cannot be
      * opened — bad key/passphrase, permission denied, corrupt file, or a
-     * salt-sidecar fail-closed condition — this returns `ScpError::Context`
-     * rather than silently degrading to in-memory storage. Surfaces to Swift
+     * salt-sidecar fail-closed condition — this returns
+     * `ScpError::Validation` with `SCP-STORAGE-8004`, or with
+     * `SCP-STORAGE-8005` when another store holds the directory's advisory
+     * lock, rather than silently degrading to in-memory storage. Surfaces to Swift
      * as `throws` and Kotlin as a thrown exception.
      */
 public static func withStorage(config: StorageConfig)throws  -> Scp  {
@@ -3976,120 +4000,6 @@ open func applyPendingCeilingModification(handle: ContextHandle, currentTimestam
             liftFunc: FfiConverterBool.lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
-}
-    
-    /**
-     * Per-instance equivalent of the free-function `bridge_create_shadow`.
-     *
-     * Mutates this instance's per-context bridge state. Rejects any
-     * cross-instance caller (the method takes `&self` — the `bi` threaded
-     * into `bridge_create_shadow_on` is always this instance's).
-     */
-open func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMode: String, contextId: String)throws  -> ShadowIdentityResult  {
-    return try  FfiConverterTypeShadowIdentityResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_create_shadow(self.uniffiClonePointer(),
-        FfiConverterString.lower(bridgeId),
-        FfiConverterString.lower(platformHandle),
-        FfiConverterString.lower(bridgeMode),
-        FfiConverterString.lower(contextId),$0
-    )
-})
-}
-    
-    /**
-     * Deletes and zeroizes a bridge credential key (spec §12.11).
-     */
-open func bridgeCredentialDeleteKey(bridgeId: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_delete_key(self.uniffiClonePointer(),
-        FfiConverterString.lower(bridgeId),$0
-    )
-}
-}
-    
-    /**
-     * Retrieves a bridge credential key from the custody boundary (spec §12.11).
-     */
-open func bridgeCredentialGetKey(bridgeId: String)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_get_key(self.uniffiClonePointer(),
-        FfiConverterString.lower(bridgeId),$0
-    )
-})
-}
-    
-    /**
-     * Lists all credential types stored for a bridge instance (spec §12.11).
-     */
-open func bridgeCredentialList(bridgeId: String)throws  -> [String]  {
-    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_list(self.uniffiClonePointer(),
-        FfiConverterString.lower(bridgeId),$0
-    )
-})
-}
-    
-    /**
-     * Provisions (stores) an encrypted credential for a bridge instance
-     * (spec §12.11). Routes through `&self.inner` — credentials live in
-     * THIS instance's credential store (ADR-048 §1).
-     */
-open func bridgeCredentialProvision(bridgeId: String, credentialType: String, plaintext: Data, bridgeCredentialKey: Data)throws  -> BridgeCredentialResult  {
-    return try  FfiConverterTypeBridgeCredentialResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_provision(self.uniffiClonePointer(),
-        FfiConverterString.lower(bridgeId),
-        FfiConverterString.lower(credentialType),
-        FfiConverterData.lower(plaintext),
-        FfiConverterData.lower(bridgeCredentialKey),$0
-    )
-})
-}
-    
-    /**
-     * Retrieves and decrypts a credential for a bridge instance (spec §12.11).
-     */
-open func bridgeCredentialRetrieve(bridgeId: String, credentialType: String, bridgeCredentialKey: Data)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_retrieve(self.uniffiClonePointer(),
-        FfiConverterString.lower(bridgeId),
-        FfiConverterString.lower(credentialType),
-        FfiConverterData.lower(bridgeCredentialKey),$0
-    )
-})
-}
-    
-    /**
-     * Revokes all credentials for a bridge instance (spec §12.11).
-     */
-open func bridgeCredentialRevoke(bridgeId: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_revoke(self.uniffiClonePointer(),
-        FfiConverterString.lower(bridgeId),$0
-    )
-}
-}
-    
-    /**
-     * Rotates (replaces) a credential for a bridge instance (spec §12.11).
-     */
-open func bridgeCredentialRotate(bridgeId: String, credentialType: String, newPlaintext: Data, bridgeCredentialKey: Data)throws  -> BridgeCredentialResult  {
-    return try  FfiConverterTypeBridgeCredentialResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_rotate(self.uniffiClonePointer(),
-        FfiConverterString.lower(bridgeId),
-        FfiConverterString.lower(credentialType),
-        FfiConverterData.lower(newPlaintext),
-        FfiConverterData.lower(bridgeCredentialKey),$0
-    )
-})
-}
-    
-    /**
-     * Stores a bridge credential key in the custody boundary (spec §12.11).
-     */
-open func bridgeCredentialStoreKey(bridgeId: String, key: Data)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_credential_store_key(self.uniffiClonePointer(),
-        FfiConverterString.lower(bridgeId),
-        FfiConverterData.lower(key),$0
-    )
-}
 }
     
     /**
@@ -4411,9 +4321,22 @@ open func configureRelayTransport(relayUrl: String, localDid: String)async throw
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
      * `Identity` whose `instance_id` does not match this `SCP`'s.
      *
-     * Authorization is enforced by the `ContextManager` (which delegates
-     * to `ttl::close_context` checking the `ContextClose` capability) —
-     * no bridge-layer auth check.
+     * Reads the context's lifecycle state from its supervisor actor, not
+     * from the handle's cached state. On `Active` it dispatches
+     * `CloseContext`, whose `ttl::close_context` checks the `ContextClose`
+     * capability; this function runs no capability check of its own. When
+     * no actor serves the context, or the actor reports `Closed`, `Expired`,
+     * or `Tombstoned`, it skips the dispatch and only releases this bridge's
+     * per-context state. It refuses `Poisoned` with `SCP-CTX-2134` and every
+     * other state with `SCP-CTX-2017`, keeps that state, and propagates a
+     * failed state read.
+     *
+     * The release marks the id. When a re-read after the mark reports
+     * `Active`, or a readmit clears the mark before the release removes the
+     * state, this function removes nothing, leaves the handle's cached state
+     * unchanged, and refuses with `SCP-CTX-2017`. When that re-read fails,
+     * it removes nothing, leaves the handle's cached state unchanged, and
+     * returns the read's error.
      */
 open func contextClose(handle: ContextHandle, identity: Identity)async throws   {
     return
@@ -5441,7 +5364,7 @@ open func identityAttestDevice(identity: Identity)async throws  -> String  {
      * calls produce byte-identical Ed25519 keys across bridges — the
      * basis of the cross-bridge parity test (ADR-046). `testing_seed`
      * is only valid for `"in_memory"` custody; other custody types
-     * reject it with `SCP-VALID-7009`.
+     * reject it with `SCP-VALID-7009` before the custody string is read.
      */
 open func identityCreate(custody: String, testingSeed: Data?)async throws  -> Identity  {
     return
@@ -5866,17 +5789,22 @@ open func isLocalDid(did: String)async  -> Bool  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_connect_sse`.
+     * Connects to the MCP SSE server at `url`.
      *
-     * Routes through the module-level MCP client registry.
+     * Registers the client in this instance's MCP client registry; the
+     * returned handle works only on this instance. `auth_token` is
+     * sent as `Authorization: Bearer <token>` on the `GET` and on every POST,
+     * or `None` for a server that runs no bearer check; an SCP SSE server
+     * always runs one (ADR-015). The transport has no TLS, so a token is
+     * sent only to a loopback host.
      */
-open func mcpClientConnectSse(url: String)async throws  -> String  {
+open func mcpClientConnectSse(url: String, authToken: String?)async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_mcp_client_connect_sse(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(url)
+                    FfiConverterString.lower(url),FfiConverterOptionString.lower(authToken)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -5888,9 +5816,11 @@ open func mcpClientConnectSse(url: String)async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
+     * Starts `command` as an MCP server subprocess and connects to it over
+     * stdio.
      *
-     * Routes through the module-level MCP client registry.
+     * Registers the client in this instance's MCP client registry; the
+     * returned handle works only on this instance.
      */
 open func mcpClientConnectStdio(command: [String])async throws  -> String  {
     return
@@ -5910,9 +5840,20 @@ open func mcpClientConnectStdio(command: [String])async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_disconnect`.
+     * Disconnects the MCP client registered under `handle`.
      *
-     * Routes through the module-level MCP client registry.
+     * Removes the entry from this instance's MCP client registry; a handle
+     * another instance returned is not found. Dropping the
+     * entry closes the client's transport, even while a call on the handle
+     * is in flight. A stdio client's server process group, which holds the
+     * processes the server started, is dead when this returns. An SSE
+     * client's POST and `GET`
+     * sockets are shut down, and the call fails as closed. A call queued
+     * behind the in-flight one, on a stdio or an SSE client, fails as
+     * disconnected once it takes the client's lock and sends nothing. A
+     * connect still waiting for its server to answer `initialize` (stdio or
+     * SSE) has no handle yet, so no disconnect, and no instance shutdown,
+     * ends it.
      */
 open func mcpClientDisconnect(handle: String)async throws   {
     return
@@ -5932,9 +5873,10 @@ open func mcpClientDisconnect(handle: String)async throws   {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_invoke`.
+     * Invokes a tool on the MCP server behind `handle`.
      *
-     * Routes through the module-level MCP client registry.
+     * Looks the handle up in this instance's MCP client registry; a handle
+     * another instance returned is not found.
      */
 open func mcpClientInvoke(handle: String, outletName: String, inputJson: String, contextId: String, invokerDid: String)async throws  -> McpInvokeResult  {
     return
@@ -5954,9 +5896,10 @@ open func mcpClientInvoke(handle: String, outletName: String, inputJson: String,
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_list_tools`.
+     * Lists the tools the MCP server behind `handle` exposes.
      *
-     * Routes through the module-level MCP client registry.
+     * Looks the handle up in this instance's MCP client registry; a handle
+     * another instance returned is not found.
      */
 open func mcpClientListTools(handle: String)async throws  -> [McpOutletInfo]  {
     return
@@ -6028,11 +5971,38 @@ open func mcpResetStdioAllowlist()throws   {try rustCallWithError(FfiConverterTy
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_server_create`.
+     * Starts an MCP server over this instance's contexts on the `stdio` or
+     * `sse` transport.
      *
-     * Routes through `&*self.inner`. The MCP server registry is
-     * module-level (not per-instance) so the returned opaque handle
-     * string is globally unique; this method preserves that behaviour.
+     * Registers the server in this instance's MCP server registry under a
+     * random opaque handle; only this instance's `mcp_server_stop` finds it.
+     *
+     * A server created while the instance has no supervisor serves no
+     * resource subscriptions for its whole life: it advertises
+     * `resources.subscribe: false` and rejects `resources/subscribe`, and
+     * attaching a supervisor does not change that. Create the server again
+     * once the instance has a supervisor and is not suspended to get
+     * subscriptions.
+     *
+     * A `stdio` server writes to this process's stdout, and its event pump
+     * writes there after the reading client may have exited. Before serving,
+     * this call makes such a write fail with `EPIPE` instead of raising
+     * SIGPIPE, whose default action terminates the host: on Apple targets it
+     * sets `F_SETNOSIGPIPE` on stdout alone; on other Unix targets, where a
+     * pipe has no such switch, it sets SIGPIPE to ignored when SIGPIPE still
+     * has its default action, for the whole process.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` with `SCP-TRANS-5050` when a `stdio`
+     * server's stdout cannot be made to fail without SIGPIPE, for example
+     * because stdout is closed.
+     *
+     * With a supervisor attached, returns `ScpError::Context` with
+     * `SCP-CTX-2000` when the instance is suspended, and `ScpError::Transport`
+     * with `SCP-TRANS-5001` when the supervisor does not report a served
+     * context `Active` (the refusal withholds the state) or does not count
+     * `identity_did` among that context's members.
      */
 open func mcpServerCreate(config: McpServerConfig)async throws  -> String  {
     return
@@ -6052,10 +6022,10 @@ open func mcpServerCreate(config: McpServerConfig)async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_server_stop`.
+     * Stops the MCP server registered under `handle`.
      *
-     * Routes through the module-level MCP server registry (the registry
-     * is not per-instance; the opaque handle string is globally unique).
+     * Looks the handle up in this instance's MCP server registry; a handle
+     * another instance returned is not found.
      */
 open func mcpServerStop(handle: String)async throws   {
     return
@@ -6229,6 +6199,12 @@ open func outletInterfaceExpose(handle: ContextHandle, outletId: String, targetC
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Carries no lifecycle gate. It reads no context state and grants
+     * nothing: it builds an `InterfaceRevoked` event from the interface id,
+     * the handle's context id and the clock and hands it back for the caller to distribute, so a gate
+     * would deny a member the record of a revocation without withholding any
+     * capability.
      */
 open func outletInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String)async throws  -> String  {
     return
@@ -6365,17 +6341,17 @@ open func outletInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: Co
      *
      * # Errors
      *
-     * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
-     * Prepare-phase abort that may be a permanent rejection — authorization,
-     * freshness, rate limit, or co-residency — OR a retryable transient: a rate
-     * limit, or a participant actor unavailable to complete the Prepare
-     * exchange; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+     * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (its causes told
+     * apart by its code; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
      * (Commit-retry exhausted — carries the durable `saga_id` operator-repair
      * handle), or [`ScpError::SagaBusy`] (the participant context set
      * overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
      * if an id/DID/outlet-id is malformed or `asserted_nonce_hex` does not
      * decode to 16 bytes, and [`ScpError::Outlet`] if `input_json` is not valid
-     * JSON.
+     * JSON. Returns [`ScpError::Outlet`] with `SCP-OUTLET-6010` (caller
+     * context) or `SCP-OUTLET-6011` (target context) and the text "context is
+     * not active" when that context's supervisor actor does not report
+     * `Active`, when no actor serves it, or when either read fails.
      *
      * See spec §6.2.4 and ADR-049 §3a.
      */
@@ -6424,6 +6400,11 @@ open func outletRegister(handle: ContextHandle, definition: OutletDefinition)asy
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Carries no lifecycle gate. It releases one session entry the handle
+     * itself owns and decides no authorization question, and refusing that
+     * release in a `Closing` or `Expired` context would strand the entry until
+     * the handle drops.
      */
 open func outletSessionClose(handle: ContextHandle, sessionId: String)async throws   {
     return
@@ -7282,15 +7263,17 @@ open func setEconomicPolicy(handle: ContextHandle, policyJson: String)throws   {
     /**
      * Shuts down this bridge instance with a graceful deadline.
      *
-     * Awaits in-flight tasks up to `timeout_millis` **milliseconds**,
-     * aborts any remaining tasks, then clears registries and runs
-     * shutdown hooks. Permanent — a shut-down instance cannot be
-     * reused. A second call is a no-op from the caller's perspective
-     * (the underlying `ShutdownError::AlreadyShutDown` is swallowed).
+     * Awaits in-flight tasks up to `timeout_millis` **milliseconds**.
+     * Permanent — a shut-down instance cannot be reused.
      *
      * The unit is **milliseconds** — unified across all Rust bridges
      * so the Swift and Kotlin SDKs can share a single conversion
      * surface.
+     *
+     * # Errors
+     *
+     * Returns [`ScpError::Validation`] with `SCP-STORAGE-8005` when the
+     * durable store still holds its advisory lock after the call.
      */
 open func shutdown(timeoutMillis: UInt64)async throws   {
     return
@@ -8530,260 +8513,6 @@ public func FfiConverterTypeBatchPublishResult_lower(_ value: BatchPublishResult
 
 
 /**
- * Bridge credential metadata result.
- *
- * Returned by `bridge_credential_provision` and `bridge_credential_rotate`.
- * Mirrors the `PyO3` dict (`bridge_id`, `credential_type`, `created_at`).
- * The encrypted credential bytes never cross the FFI boundary — only
- * non-secret metadata.
- *
- * See spec section 12.11 (Credential Lifecycle) and ADR-023.
- */
-public struct BridgeCredentialResult {
-    /**
-     * The bridge instance this credential belongs to.
-     */
-    public var bridgeId: String
-    /**
-     * The credential type string (e.g. `"ApiKey"`, `"OAuthAccessToken"`,
-     * `"Custom:<name>"`).
-     */
-    public var credentialType: String
-    /**
-     * Unix timestamp (seconds) when the credential was created.
-     */
-    public var createdAt: UInt64
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * The bridge instance this credential belongs to.
-         */bridgeId: String, 
-        /**
-         * The credential type string (e.g. `"ApiKey"`, `"OAuthAccessToken"`,
-         * `"Custom:<name>"`).
-         */credentialType: String, 
-        /**
-         * Unix timestamp (seconds) when the credential was created.
-         */createdAt: UInt64) {
-        self.bridgeId = bridgeId
-        self.credentialType = credentialType
-        self.createdAt = createdAt
-    }
-}
-
-#if compiler(>=6)
-extension BridgeCredentialResult: Sendable {}
-#endif
-
-
-extension BridgeCredentialResult: Equatable, Hashable {
-    public static func ==(lhs: BridgeCredentialResult, rhs: BridgeCredentialResult) -> Bool {
-        if lhs.bridgeId != rhs.bridgeId {
-            return false
-        }
-        if lhs.credentialType != rhs.credentialType {
-            return false
-        }
-        if lhs.createdAt != rhs.createdAt {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(bridgeId)
-        hasher.combine(credentialType)
-        hasher.combine(createdAt)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeBridgeCredentialResult: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BridgeCredentialResult {
-        return
-            try BridgeCredentialResult(
-                bridgeId: FfiConverterString.read(from: &buf), 
-                credentialType: FfiConverterString.read(from: &buf), 
-                createdAt: FfiConverterUInt64.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: BridgeCredentialResult, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.bridgeId, into: &buf)
-        FfiConverterString.write(value.credentialType, into: &buf)
-        FfiConverterUInt64.write(value.createdAt, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeBridgeCredentialResult_lift(_ buf: RustBuffer) throws -> BridgeCredentialResult {
-    return try FfiConverterTypeBridgeCredentialResult.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeBridgeCredentialResult_lower(_ value: BridgeCredentialResult) -> RustBuffer {
-    return FfiConverterTypeBridgeCredentialResult.lower(value)
-}
-
-
-/**
- * Bridge registration result record.
- *
- * Returned by `bridge_register`. Contains the details of a successfully
- * registered bridge connector.
- *
- * See spec section 12 (Bridge System) and ADR-023.
- */
-public struct BridgeRegistrationResult {
-    /**
-     * Unique identifier for the registered bridge.
-     */
-    public var bridgeId: String
-    /**
-     * DID of the bridge operator.
-     */
-    public var operatorDid: String
-    /**
-     * External platform name (e.g., `"discord"`, `"slack"`).
-     */
-    public var platform: String
-    /**
-     * Bridge operating mode (`"relay"`, `"puppet"`, `"api"`, `"cooperative"`).
-     */
-    public var mode: String
-    /**
-     * Bridge status after registration (e.g., `"active"`).
-     */
-    public var status: String
-    /**
-     * Context the bridge is registered in.
-     */
-    public var contextId: String
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * Unique identifier for the registered bridge.
-         */bridgeId: String, 
-        /**
-         * DID of the bridge operator.
-         */operatorDid: String, 
-        /**
-         * External platform name (e.g., `"discord"`, `"slack"`).
-         */platform: String, 
-        /**
-         * Bridge operating mode (`"relay"`, `"puppet"`, `"api"`, `"cooperative"`).
-         */mode: String, 
-        /**
-         * Bridge status after registration (e.g., `"active"`).
-         */status: String, 
-        /**
-         * Context the bridge is registered in.
-         */contextId: String) {
-        self.bridgeId = bridgeId
-        self.operatorDid = operatorDid
-        self.platform = platform
-        self.mode = mode
-        self.status = status
-        self.contextId = contextId
-    }
-}
-
-#if compiler(>=6)
-extension BridgeRegistrationResult: Sendable {}
-#endif
-
-
-extension BridgeRegistrationResult: Equatable, Hashable {
-    public static func ==(lhs: BridgeRegistrationResult, rhs: BridgeRegistrationResult) -> Bool {
-        if lhs.bridgeId != rhs.bridgeId {
-            return false
-        }
-        if lhs.operatorDid != rhs.operatorDid {
-            return false
-        }
-        if lhs.platform != rhs.platform {
-            return false
-        }
-        if lhs.mode != rhs.mode {
-            return false
-        }
-        if lhs.status != rhs.status {
-            return false
-        }
-        if lhs.contextId != rhs.contextId {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(bridgeId)
-        hasher.combine(operatorDid)
-        hasher.combine(platform)
-        hasher.combine(mode)
-        hasher.combine(status)
-        hasher.combine(contextId)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeBridgeRegistrationResult: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BridgeRegistrationResult {
-        return
-            try BridgeRegistrationResult(
-                bridgeId: FfiConverterString.read(from: &buf), 
-                operatorDid: FfiConverterString.read(from: &buf), 
-                platform: FfiConverterString.read(from: &buf), 
-                mode: FfiConverterString.read(from: &buf), 
-                status: FfiConverterString.read(from: &buf), 
-                contextId: FfiConverterString.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: BridgeRegistrationResult, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.bridgeId, into: &buf)
-        FfiConverterString.write(value.operatorDid, into: &buf)
-        FfiConverterString.write(value.platform, into: &buf)
-        FfiConverterString.write(value.mode, into: &buf)
-        FfiConverterString.write(value.status, into: &buf)
-        FfiConverterString.write(value.contextId, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeBridgeRegistrationResult_lift(_ buf: RustBuffer) throws -> BridgeRegistrationResult {
-    return try FfiConverterTypeBridgeRegistrationResult.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeBridgeRegistrationResult_lower(_ value: BridgeRegistrationResult) -> RustBuffer {
-    return FfiConverterTypeBridgeRegistrationResult.lower(value)
-}
-
-
-/**
  * Structured, side-effect-free result of evaluating a UCAN token.
  *
  * Mirrors scp-core's `CapabilityValidation` — the diagnostic counterpart to
@@ -9188,8 +8917,6 @@ public func FfiConverterTypeCheckpoint_lower(_ value: Checkpoint) -> RustBuffer 
 /**
  * Context creation parameters.
  *
- * All fields are optional and fall back to protocol defaults when omitted.
- *
  * See ADR-008 (Context Lifecycle) and spec §5 (Contexts).
  */
 public struct ContextParams {
@@ -9200,7 +8927,8 @@ public struct ContextParams {
     public var mode: ContextMode
     /**
      * Capability ceiling — maximum capabilities any participant can hold.
-     * Empty list means no ceiling restriction.
+     * Required and non-empty (construction.md M2): an empty list fails the
+     * create with `SCP-VALID-7005`.
      */
     public var ceiling: [String]
     /**
@@ -9277,7 +9005,8 @@ public struct ContextParams {
          */mode: ContextMode, 
         /**
          * Capability ceiling — maximum capabilities any participant can hold.
-         * Empty list means no ceiling restriction.
+         * Required and non-empty (construction.md M2): an empty list fails the
+         * create with `SCP-VALID-7005`.
          */ceiling: [String], 
         /**
          * Ceiling mutability policy — `Immutable` (default) or `Governed`.
@@ -9650,43 +9379,39 @@ public func FfiConverterTypeContextReconnectResult_lower(_ value: ContextReconne
 
 
 /**
- * A host key's stated type and public key, returned by
+ * A host key's type, public key and role, returned by
  * [`KeyCustodyProvider::get_public_key`].
  */
 public struct CustodyPublicKey {
     /**
-     * `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`.
+     * The key's type.
      */
-    public var keyType: String
+    public var keyType: CustodyKeyType
     /**
      * The public key in that type's one encoding: 32 bytes (Ed25519,
-     * X25519), the 33-byte compressed SEC1 point (`"p256"`), or the 65-byte
-     * uncompressed SEC1 point (`"hpke-p256"`).
+     * X25519), the 33-byte compressed SEC1 point (P-256 signing), or the
+     * 65-byte uncompressed SEC1 point (HPKE P-256).
      */
     public var publicKey: Data
     /**
-     * `"identity"` or `"operational"`: the role
-     * [`KeyCustodyProvider::generate_keypair`] minted the key in. A pseudonym
-     * key is `"operational"`.
+     * The role [`KeyCustodyProvider::generate_keypair`] minted the key in.
      */
-    public var role: String
+    public var role: CustodyKeyRole
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
-         * `"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`.
-         */keyType: String, 
+         * The key's type.
+         */keyType: CustodyKeyType, 
         /**
          * The public key in that type's one encoding: 32 bytes (Ed25519,
-         * X25519), the 33-byte compressed SEC1 point (`"p256"`), or the 65-byte
-         * uncompressed SEC1 point (`"hpke-p256"`).
+         * X25519), the 33-byte compressed SEC1 point (P-256 signing), or the
+         * 65-byte uncompressed SEC1 point (HPKE P-256).
          */publicKey: Data, 
         /**
-         * `"identity"` or `"operational"`: the role
-         * [`KeyCustodyProvider::generate_keypair`] minted the key in. A pseudonym
-         * key is `"operational"`.
-         */role: String) {
+         * The role [`KeyCustodyProvider::generate_keypair`] minted the key in.
+         */role: CustodyKeyRole) {
         self.keyType = keyType
         self.publicKey = publicKey
         self.role = role
@@ -9728,16 +9453,16 @@ public struct FfiConverterTypeCustodyPublicKey: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CustodyPublicKey {
         return
             try CustodyPublicKey(
-                keyType: FfiConverterString.read(from: &buf), 
+                keyType: FfiConverterTypeCustodyKeyType.read(from: &buf), 
                 publicKey: FfiConverterData.read(from: &buf), 
-                role: FfiConverterString.read(from: &buf)
+                role: FfiConverterTypeCustodyKeyRole.read(from: &buf)
         )
     }
 
     public static func write(_ value: CustodyPublicKey, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.keyType, into: &buf)
+        FfiConverterTypeCustodyKeyType.write(value.keyType, into: &buf)
         FfiConverterData.write(value.publicKey, into: &buf)
-        FfiConverterString.write(value.role, into: &buf)
+        FfiConverterTypeCustodyKeyRole.write(value.role, into: &buf)
     }
 }
 
@@ -11597,93 +11322,6 @@ public func FfiConverterTypeProof_lower(_ value: Proof) -> RustBuffer {
 
 
 /**
- * A host-derived §9.10.4 pseudonym, returned by
- * [`KeyCustodyProvider::derive_pseudonym`] and
- * [`KeyCustodyProvider::derive_rotatable_pseudonym`].
- */
-public struct PseudonymResult {
-    /**
-     * The 33-byte SEC1 compressed P-256 pseudonym public key.
-     */
-    public var publicKey: Data
-    /**
-     * The key id of the pseudonym's signing key in the host's custody.
-     */
-    public var keyId: String
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * The 33-byte SEC1 compressed P-256 pseudonym public key.
-         */publicKey: Data, 
-        /**
-         * The key id of the pseudonym's signing key in the host's custody.
-         */keyId: String) {
-        self.publicKey = publicKey
-        self.keyId = keyId
-    }
-}
-
-#if compiler(>=6)
-extension PseudonymResult: Sendable {}
-#endif
-
-
-extension PseudonymResult: Equatable, Hashable {
-    public static func ==(lhs: PseudonymResult, rhs: PseudonymResult) -> Bool {
-        if lhs.publicKey != rhs.publicKey {
-            return false
-        }
-        if lhs.keyId != rhs.keyId {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(publicKey)
-        hasher.combine(keyId)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypePseudonymResult: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PseudonymResult {
-        return
-            try PseudonymResult(
-                publicKey: FfiConverterData.read(from: &buf), 
-                keyId: FfiConverterString.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: PseudonymResult, into buf: inout [UInt8]) {
-        FfiConverterData.write(value.publicKey, into: &buf)
-        FfiConverterString.write(value.keyId, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypePseudonymResult_lift(_ buf: RustBuffer) throws -> PseudonymResult {
-    return try FfiConverterTypePseudonymResult.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypePseudonymResult_lower(_ value: PseudonymResult) -> RustBuffer {
-    return FfiConverterTypePseudonymResult.lower(value)
-}
-
-
-/**
  * Result of publishing an asset to a broadcast context (SCP-290, SCP-292).
  */
 public struct PublishResult {
@@ -12405,138 +12043,6 @@ public func FfiConverterTypeSealedInvitation_lift(_ buf: RustBuffer) throws -> S
 #endif
 public func FfiConverterTypeSealedInvitation_lower(_ value: SealedInvitation) -> RustBuffer {
     return FfiConverterTypeSealedInvitation.lower(value)
-}
-
-
-/**
- * Shadow identity result record.
- *
- * Returned by `bridge_create_shadow`. Contains the details of a shadow
- * identity representing an external platform participant.
- *
- * See spec section 12 (Bridge System) and ADR-023.
- */
-public struct ShadowIdentityResult {
-    /**
-     * Unique identifier for this shadow identity.
-     */
-    public var shadowId: String
-    /**
-     * External platform handle (e.g., `"@user#1234"`).
-     */
-    public var platformHandle: String
-    /**
-     * Bridge connector that created this shadow.
-     */
-    public var bridgeId: String
-    /**
-     * Role attributed to this shadow.
-     */
-    public var attributedRole: String
-    /**
-     * Provenance status: `"Shadow"` or `"Claimed"`.
-     */
-    public var provenanceStatus: String
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * Unique identifier for this shadow identity.
-         */shadowId: String, 
-        /**
-         * External platform handle (e.g., `"@user#1234"`).
-         */platformHandle: String, 
-        /**
-         * Bridge connector that created this shadow.
-         */bridgeId: String, 
-        /**
-         * Role attributed to this shadow.
-         */attributedRole: String, 
-        /**
-         * Provenance status: `"Shadow"` or `"Claimed"`.
-         */provenanceStatus: String) {
-        self.shadowId = shadowId
-        self.platformHandle = platformHandle
-        self.bridgeId = bridgeId
-        self.attributedRole = attributedRole
-        self.provenanceStatus = provenanceStatus
-    }
-}
-
-#if compiler(>=6)
-extension ShadowIdentityResult: Sendable {}
-#endif
-
-
-extension ShadowIdentityResult: Equatable, Hashable {
-    public static func ==(lhs: ShadowIdentityResult, rhs: ShadowIdentityResult) -> Bool {
-        if lhs.shadowId != rhs.shadowId {
-            return false
-        }
-        if lhs.platformHandle != rhs.platformHandle {
-            return false
-        }
-        if lhs.bridgeId != rhs.bridgeId {
-            return false
-        }
-        if lhs.attributedRole != rhs.attributedRole {
-            return false
-        }
-        if lhs.provenanceStatus != rhs.provenanceStatus {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(shadowId)
-        hasher.combine(platformHandle)
-        hasher.combine(bridgeId)
-        hasher.combine(attributedRole)
-        hasher.combine(provenanceStatus)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeShadowIdentityResult: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShadowIdentityResult {
-        return
-            try ShadowIdentityResult(
-                shadowId: FfiConverterString.read(from: &buf), 
-                platformHandle: FfiConverterString.read(from: &buf), 
-                bridgeId: FfiConverterString.read(from: &buf), 
-                attributedRole: FfiConverterString.read(from: &buf), 
-                provenanceStatus: FfiConverterString.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: ShadowIdentityResult, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.shadowId, into: &buf)
-        FfiConverterString.write(value.platformHandle, into: &buf)
-        FfiConverterString.write(value.bridgeId, into: &buf)
-        FfiConverterString.write(value.attributedRole, into: &buf)
-        FfiConverterString.write(value.provenanceStatus, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeShadowIdentityResult_lift(_ buf: RustBuffer) throws -> ShadowIdentityResult {
-    return try FfiConverterTypeShadowIdentityResult.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeShadowIdentityResult_lower(_ value: ShadowIdentityResult) -> RustBuffer {
-    return FfiConverterTypeShadowIdentityResult.lower(value)
 }
 
 
@@ -13499,6 +13005,184 @@ extension ContextState: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * The role a host custody key was minted in.
+ */
+
+public enum CustodyKeyRole {
+    
+    /**
+     * The participant's identity key, the only pseudonym-derivation source.
+     */
+    case identity
+    /**
+     * Any other key.
+     */
+    case operational
+}
+
+
+#if compiler(>=6)
+extension CustodyKeyRole: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCustodyKeyRole: FfiConverterRustBuffer {
+    typealias SwiftType = CustodyKeyRole
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CustodyKeyRole {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .identity
+        
+        case 2: return .operational
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CustodyKeyRole, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .identity:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .operational:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCustodyKeyRole_lift(_ buf: RustBuffer) throws -> CustodyKeyRole {
+    return try FfiConverterTypeCustodyKeyRole.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCustodyKeyRole_lower(_ value: CustodyKeyRole) -> RustBuffer {
+    return FfiConverterTypeCustodyKeyRole.lower(value)
+}
+
+
+extension CustodyKeyRole: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The type of a host custody key.
+ */
+
+public enum CustodyKeyType {
+    
+    /**
+     * An Ed25519 signing key.
+     */
+    case ed25519
+    /**
+     * An X25519 key-agreement key.
+     */
+    case x25519
+    /**
+     * A P-256 (ECDSA) signing key.
+     */
+    case p256
+    /**
+     * A P-256 ECDH key for HPKE.
+     */
+    case hpkeP256
+}
+
+
+#if compiler(>=6)
+extension CustodyKeyType: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCustodyKeyType: FfiConverterRustBuffer {
+    typealias SwiftType = CustodyKeyType
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CustodyKeyType {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .ed25519
+        
+        case 2: return .x25519
+        
+        case 3: return .p256
+        
+        case 4: return .hpkeP256
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CustodyKeyType, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .ed25519:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .x25519:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .p256:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .hpkeP256:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCustodyKeyType_lift(_ buf: RustBuffer) throws -> CustodyKeyType {
+    return try FfiConverterTypeCustodyKeyType.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCustodyKeyType_lower(_ value: CustodyKeyType) -> RustBuffer {
+    return FfiConverterTypeCustodyKeyType.lower(value)
+}
+
+
+extension CustodyKeyType: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * The custody method used to protect an identity's private key.
  *
  * See ADR-006 (Platform Abstraction) and `scp_platform::CustodyType`.
@@ -13511,14 +13195,13 @@ public enum CustodyMethod {
      */
     case inMemory
     /**
-     * Key material protected by hardware security module
-     * (Secure Enclave on iOS, Android Keystore on Android).
+     * Key material held by a host `KeyCustodyProvider` (Secure Enclave,
+     * Android Keystore, or any other host key store) injected through
+     * `identity_create_with_custody`. No custody string selects it:
+     * `identity_create` answers `"callback"`, `"platform"`, and
+     * `"software"` with `SCP-IDENT-1003` (SCP-294).
      */
-    case platform
-    /**
-     * Key material in software-managed encrypted storage (not HSM-backed).
-     */
-    case software
+    case callback
     /**
      * Identity loaded by DID string without local key material.
      *
@@ -13545,11 +13228,9 @@ public struct FfiConverterTypeCustodyMethod: FfiConverterRustBuffer {
         
         case 1: return .inMemory
         
-        case 2: return .platform
+        case 2: return .callback
         
-        case 3: return .software
-        
-        case 4: return .external
+        case 3: return .external
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -13563,16 +13244,12 @@ public struct FfiConverterTypeCustodyMethod: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
         
         
-        case .platform:
+        case .callback:
             writeInt(&buf, Int32(2))
         
         
-        case .software:
-            writeInt(&buf, Int32(3))
-        
-        
         case .external:
-            writeInt(&buf, Int32(4))
+            writeInt(&buf, Int32(3))
         
         }
     }
@@ -14113,32 +13790,23 @@ public enum ScpError: Swift.Error {
     case Validation(msg: String, code: String
     )
     /**
-     * A §6.2.4 cross-context outlet-invocation saga aborted at a Prepare phase.
+     * A §6.2.4 cross-context outlet-invocation saga aborted.
      *
-     * Surfaces the `Aborted` terminal of
-     * `Supervisor::start_cross_context_outlet_invocation_saga`. This terminal may
-     * be a PERMANENT rejection (authorization / freshness / rate-limit /
-     * co-residency policy denial, or the §6.2.4 *Caller authentication*
-     * mismatch this bridge enforces before the saga runs) OR a RETRYABLE
-     * transient (a rate-limit back-off, or a participant actor unavailable to
-     * complete the Prepare exchange) — distinguished by the `SCP-SAGA-*` code.
+     * The code tells its causes apart.
      * Carries the rate-limit back-off hint STRUCTURALLY
      * (`retry_after_ms`): `Some(ms)` is the limiter's computed cooldown;
-     * `None` (NEVER `0`) means no precise back-off instant exists (a
-     * token-bucket hard limit, an unavailable participant actor, or a permanent
-     * rejection) — `0` would read as "retry immediately" and re-trip the same
-     * hard limit. `code` is the
-     * canonical `SCP-SAGA-13xxx` string. Maps to Swift `ScpError.SagaAborted`
-     * / Kotlin `ScpException.SagaAborted` (the `msg` field surfaces as the
-     * Swift `msg:` label — the `UniFFI` field-name convention every variant
-     * here follows).
+     * `None` (NEVER `0`) means no precise back-off instant exists — `0` would
+     * read as "retry immediately" and re-trip the same hard limit. Maps to
+     * Swift `ScpError.SagaAborted` / Kotlin `ScpException.SagaAborted` (the
+     * `msg` field surfaces as the Swift `msg:` label — the `UniFFI`
+     * field-name convention every variant here follows).
      */
     case SagaAborted(
         /**
-         * Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+         * Human-readable detail.
          */msg: String, 
         /**
-         * The canonical `SCP-SAGA-13xxx` code.
+         * Stable error code.
          */code: String, 
         /**
          * Rate-limit back-off hint in milliseconds, or `None` (never `0`).
@@ -14673,7 +14341,9 @@ extension StorageConfig: Equatable, Hashable {}
  * Swift SDK: `DCAppAttestService` (App Attest on iOS 14+ / macOS 11+).
  * Kotlin SDK: Play Integrity API on Android.
  *
- * Implemented by Swift/Kotlin code and injected into the Rust engine.
+ * The Swift SDK's `AppleDeviceAttestation` conforms to this callback
+ * interface. No Rust code holds or calls it yet, so nothing injects an
+ * implementation into the Rust engine.
  *
  * # SAFETY: Thread execution context
  *
@@ -14690,12 +14360,20 @@ public protocol DeviceAttestationProvider: AnyObject, Sendable {
     /**
      * Generate a cryptographic attestation for this device.
      *
-     * `challenge` — server-provided challenge bytes (SHA-256 digested with
-     * `device_id` before submission to the platform attestation service).
-     * `device_id` — stable identifier for this device instance.
+     * `challenge` — Apple: the 32-byte binding digest `D` of
+     * `09-security-model.md` §9.3.1, which the Swift adapter hands App
+     * Attest as `clientDataHash` unchanged. When App Attest is supported,
+     * the adapter rejects a `challenge` that is not 32 bytes with
+     * `SCP-ATTEST-9026` (ADR-025 acceptance criterion 3); when it is not
+     * supported, the adapter throws `SCP-ATTEST-9019` before it reads the
+     * length. Android: ADR-027, the Android platform adapter, states
+     * what it binds.
+     * `device_id` — stable identifier for this device instance. The Swift
+     * adapter does not read it.
      *
-     * Returns the platform attestation object bytes (Apple: CBOR-encoded
-     * attestation; Android: Play Integrity token bytes).
+     * Returns the platform attestation bytes. Apple: the raw CBOR attestation
+     * object Apple signed (ADR-025 acceptance criterion 3). Android: the Play
+     * Integrity token bytes.
      */
     func attest(challenge: Data, deviceId: Data) async throws  -> Data
     
@@ -14706,7 +14384,12 @@ public protocol DeviceAttestationProvider: AnyObject, Sendable {
      * `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` of
      * `09-security-model.md` §9.3.1 over the caller's request bytes `m`,
      * never `SHA-256(m)` and never `m` itself. The domain separator keeps
-     * every `A` distinct from every attestation binding digest `D`.
+     * every `A` distinct from every attestation binding digest `D`. The
+     * Swift adapter hands `A` to App Attest as `clientDataHash` unchanged.
+     * When App Attest is supported, the adapter rejects an `A` that is not
+     * 32 bytes with `SCP-ATTEST-9026` (ADR-025 acceptance criterion 3);
+     * when it is not supported, the adapter throws `SCP-ATTEST-9019`
+     * before it reads the length.
      *
      * Returns the platform assertion object bytes (Apple: CBOR assertion;
      * Android: integrity verdict).
@@ -14894,8 +14577,7 @@ public func FfiConverterCallbackInterfaceDeviceAttestationProvider_lower(_ v: De
  *
  * Implemented by host code and injected into the Rust engine. No in-tree
  * Swift or Kotlin host implements this protocol yet: `AppleKeyCustody` and
- * `AndroidKeyCustody` implement their SDKs' own custody interfaces (UUID or
- * hex key ids, no [`PseudonymResult`]), and S0 PR8 conforms them to it.
+ * `AndroidKeyCustody` implement their SDKs' own custody interfaces.
  *
  * A method reports failure by returning an [`ScpError`]. Return one whose
  * code is `SCP-CRYPTO-4006` (key not found) for a key id that was destroyed or
@@ -14905,10 +14587,21 @@ public func FfiConverterCallbackInterfaceDeviceAttestationProvider_lower(_ v: De
  * reports these two codes, including the pseudonym derivation inside
  * `context_create` and the identity key reads and signatures of identity
  * operations. There are two exceptions: `SCP-IDENT-1055`, reported when the
- * bridge rejects the pseudonym a `derive_pseudonym` call returned, and
- * `SCP-IDENT-1037`, which `scpid_sign` reports for any custody failure (spec
- * §3.11.4). Throw only
+ * bytes a `derive_pseudonym` or `derive_rotatable_pseudonym` call returned
+ * are not a compressed P-256 point, and `SCP-IDENT-1037`, which `scpid_sign`
+ * reports for any custody failure (spec §3.11.4). Throw only
  * [`ScpError`]: `UniFFI` 0.29 panics on any other error a callback throws.
+ *
+ * Every key id the host returns is the canonical decimal form of a `u64`, as
+ * `String(n)` (Swift, `UInt64`) or `n.toString()` (Kotlin, `ULong`) writes it:
+ * ASCII digits only, with no sign, no leading zero (`"0"` itself is allowed)
+ * and no whitespace. The bridge rejects any other id (`"007"`, `"+7"`,
+ * `" 7"`, a UUID) from `generate_keypair` with the custody error
+ * `SCP-CRYPTO-4060`.
+ *
+ * A pseudonym has no private key (`09-security-model.md` §9.10.4): a host
+ * stores no pseudonym key and signs with none, so `sign`, `get_public_key`
+ * and `destroy_key` never receive a pseudonym.
  *
  * # SAFETY: Thread execution context
  *
@@ -14927,10 +14620,9 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     /**
      * Sign `message` bytes with the key identified by `key_id`.
      *
-     * For an Ed25519 key, returns the raw 64-byte signature. For a `"p256"`
-     * key or a pseudonym key id from `derive_pseudonym`, `message` is a
-     * 32-byte prehash (§9.5.1, no second hash) and the result is raw
-     * `r || s` (64 bytes) or DER (`SecKeyCreateSignature` /
+     * For an Ed25519 key, returns the raw 64-byte signature. For a P-256 signing
+     * key, `message` is a 32-byte prehash (§9.5.1, no second hash) and the
+     * result is raw `r || s` (64 bytes) or DER (`SecKeyCreateSignature` /
      * `java.security.Signature` output); the bridge normalises it to low-s
      * and verifies it strictly against the key's registered public key, and
      * any mismatch is an error. A software host MUST derive the ECDSA nonce
@@ -14944,54 +14636,49 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      *
      * The bridge types the key by `key_type` alone and requires exactly that
      * type's length: 32 bytes (`"ed25519"`, `"x25519"`), the 33-byte
-     * compressed SEC1 point (`"p256"`, and a pseudonym key id, whose point is
-     * byte-identical to the one `derive_pseudonym` returned), or the 65-byte
-     * uncompressed SEC1 point (`"hpke-p256"`). An unknown type, a length that
-     * does not match the stated type, or an invalid point is an error, and
-     * the bridge binds nothing. The bridge asks this for every key id it has
-     * not yet registered, whichever operation names it first.
+     * compressed SEC1 point (P-256 signing), or the 65-byte uncompressed
+     * SEC1 point (HPKE P-256). A length that does not match the stated type,
+     * or an invalid point, is an error, and the bridge binds nothing. The bridge asks this for every key id it has not yet
+     * registered, whichever operation names it first.
      *
      * `role` is the role `generate_keypair` minted the key in, recorded by
-     * the host for the key's lifetime and reported across sessions; a
-     * pseudonym key is `"operational"`. A key id the bridge has not seen
-     * binds as an identity only when `role` is `"identity"`, so an identity
-     * from an earlier session can still derive pseudonyms. Any other role
-     * string is an error. The bridge cannot check the host's word: a host
-     * that reports `"identity"` for a key it minted as `"operational"` lets
-     * that key derive pseudonyms, which is outside Rust's control.
+     * the host for the key's lifetime and reported across sessions. A key id
+     * the bridge has not seen binds as an identity only when `role` is
+     * [`CustodyKeyRole::Identity`], so an identity from an earlier session
+     * can still derive pseudonyms. The bridge cannot check the host's word:
+     * a host that reports an identity for a key it minted as operational
+     * lets that key derive pseudonyms, which is outside Rust's control.
      */
     func getPublicKey(keyId: String) async throws  -> CustodyPublicKey
     
     /**
-     * Destroy key material for `key_id`. Subsequent operations must fail.
-     *
-     * Destroying an identity key also destroys its `pseudonym_secret` and
-     * every v1 and v2 pseudonym key derived from it, so each such pseudonym
-     * key id then fails too (`09-security-model.md` §9.10.4.A).
+     * Destroy key material for `key_id`. Subsequent operations must fail,
+     * including pseudonym derivation under a destroyed identity key, which
+     * returns `SCP-CRYPTO-4006` (`09-security-model.md` §9.10.4.A).
      */
     func destroyKey(keyId: String) async throws 
     
     /**
-     * Generate a new keypair. `key_type` is `"ed25519"`, `"x25519"`,
-     * `"p256"` (ECDSA P-256 signing) or `"hpke-p256"` (P-256 ECDH for HPKE).
-     * `role` is `"identity"` (an identity key, the only pseudonym-derivation
-     * source) or `"operational"`. The host records `role` and reports it
-     * from [`Self::get_public_key`] for the key's lifetime; the bridge
-     * refuses and destroys a key whose reported role differs.
+     * Generate a new keypair of `key_type` in `role`
+     * ([`CustodyKeyRole::Identity`] is the only pseudonym-derivation
+     * source). The host records `role` and reports it from
+     * [`Self::get_public_key`] for the key's lifetime; the bridge refuses
+     * and destroys a key whose reported type or role differs.
      *
-     * Returns an opaque key identifier string. A host never reuses a key
-     * id: the id returned here, or by a pseudonym derivation, names no other
-     * key on the host for the host's lifetime, even after that key is
-     * destroyed.
+     * Returns the new key's id, a canonical decimal `u64` string (see
+     * [`KeyCustodyProvider`]); the bridge rejects any other id with
+     * `SCP-CRYPTO-4060`. A host never reuses a key id: the id returned here
+     * names no other key on the host for the host's lifetime, even after
+     * that key is destroyed.
      */
-    func generateKeypair(keyType: String, role: String) async throws  -> String
+    func generateKeypair(keyType: CustodyKeyType, role: CustodyKeyRole) async throws  -> String
     
     /**
      * Perform Diffie-Hellman key agreement.
      *
-     * `key_id` — the X25519 or `"hpke-p256"` key handle.
+     * `key_id` — the X25519 or HPKE P-256 key handle.
      * `peer_public` — the 32-byte peer X25519 public key, or for
-     * `"hpke-p256"` the 65-byte uncompressed SEC1 peer point (validated
+     * HPKE P-256 the 65-byte uncompressed SEC1 peer point (validated
      * on-curve by the bridge before this call).
      *
      * Returns the 32-byte shared secret. The private key never leaves the
@@ -15000,55 +14687,39 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     func dhAgree(keyId: String, peerPublic: Data) async throws  -> Data
     
     /**
-     * Derive a deterministic, context-scoped P-256 pseudonym keypair (§9.10.4).
+     * Derive the deterministic, context-scoped P-256 pseudonym point (§9.10.4).
      *
-     * The derivation runs inside the host's custody. Algorithm:
+     * The derivation runs inside the host's custody. Canonical recipe
+     * (§9.10.4, §9.10.4.A; every software host MUST produce identical bytes;
+     * `ikm` is the identity private key material, the 32-byte Ed25519 seed
+     * until the identity key moves to P-256 (SCP-315)):
      * 1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
      * 2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
-     * 3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; the public key
-     * is the 33-byte SEC1 compressed point `d·G`.
+     * 3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; return the
+     * 33-byte SEC1 compressed point `d·G`. `d` is discarded, never stored.
      *
      * The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key —
-     * public key bytes would be a membership-enumeration oracle (§9.10.4).
+     * public key bytes would be a membership-enumeration oracle (§9.10.4.A).
      * Routing fields carry `SHA-256("scp-pseudonym-routing-v1:" || point)`,
      * which the Rust side computes from the returned point.
      *
-     * Returns the pseudonym's 33-byte compressed point and the key id of its
-     * signing key as a [`PseudonymResult`]. The bridge rejects (fail closed,
-     * `SCP-IDENT-1055`) a point that is not a valid compressed P-256 point, a
-     * non-numeric key id, and a key id whose `get_public_key` does not return
-     * the same 33 bytes. `sign` on that key id receives a 32-byte digest and
-     * must return a 64-byte low-`s` `r || s` that verifies under the point.
-     * A host maps the seed with [`crate::p256_host::p256_seed_to_scalar`]
-     * rather than reducing it itself.
-     *
-     * The pseudonym dies with its identity (`09-security-model.md`
-     * §9.10.4.A): `destroy_key` on `key_id` destroys it, and a derivation
-     * still in flight when `key_id` is destroyed fails with key-not-found
-     * (`SCP-CRYPTO-4006`) and stores nothing.
-     *
-     * The same (`key_id`, `context_id`) MUST return the same pseudonym key id
-     * on every call, so re-deriving names one key rather than minting another;
-     * the bridge's per-key-id point bindings grow with the distinct ids a
-     * host returns.
+     * Returns the 33-byte compressed point and nothing else. The bridge
+     * fails the derivation with `SCP-IDENT-1055` when the bytes are not a
+     * valid compressed P-256 point. A host returns `SCP-CRYPTO-4006` when
+     * `key_id` was destroyed or never existed, and the caller receives
+     * key-not-found.
      */
-    func derivePseudonym(keyId: String, contextId: Data) async throws  -> PseudonymResult
+    func derivePseudonym(keyId: String, contextId: Data) async throws  -> Data
     
     /**
-     * Derive a rotatable (epoch-versioned) per-context pseudonym keypair.
+     * Derive a rotatable (epoch-versioned) per-context pseudonym point.
      *
-     * Canonical recipe (spec §9.10.4.A / §9.10.4.1): the HMAC key is the
-     * private-derived `pseudonym_secret` (HKDF over the identity private seed),
-     * NEVER the public key.
-     * `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`;
-     * `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`. Returns a
-     * [`PseudonymResult`], checked exactly as for `derive_pseudonym`.
-     *
-     * The same (`key_id`, `context_id`, `pseudonym_epoch`) MUST return the
-     * same pseudonym key id on every call, as for `derive_pseudonym`.
-     * Destroying `key_id` destroys this pseudonym, and an in-flight
-     * derivation fails and stores nothing, as for `derive_pseudonym`
-     * (`09-security-model.md` §9.10.4.A).
+     * Canonical recipe (§9.10.4.1): steps 1 and 3 of `derive_pseudonym`, with
+     * step 2 replaced by
+     * `seed = HMAC-SHA256(pseudonym_secret, context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2")`
+     * where `BE64` is the 8-byte big-endian epoch. The HMAC key is the
+     * `pseudonym_secret`, NEVER the public key. Returns the 33-byte
+     * compressed point, checked exactly as for `derive_pseudonym`.
      *
      * The `pseudonym_epoch` is passed through to the provider so it performs
      * the canonical v2 derivation itself. Bridges MUST NOT synthesize a
@@ -15060,8 +14731,7 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      *
      * Rust-side providers that do not rotate return `ScpError::Context`
      * (SCP-CTX-2050) indicating the method is not implemented. A host that
-     * rotates overrides it; no in-tree Swift or Kotlin host implements this
-     * protocol yet (S0 PR8).
+     * rotates overrides it.
      *
      * **Note:** `UniFFI` callback interfaces require foreign implementations to
      * define all methods. The generated Swift protocol / Kotlin interface will
@@ -15069,23 +14739,32 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      *
      * # Errors
      *
-     * Returns `ScpError` if the key is not found, is not an Ed25519 key, or the
-     * provider does not support rotatable pseudonyms.
+     * The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
+     * destroyed or never existed, and the caller receives key-not-found
+     * (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
+     * `SCP-CTX-2050`, reaches the caller as the custody error `SCP-CRYPTO-4060`
+     * carrying the host's code and message. A returned result the bridge
+     * rejects is `SCP-IDENT-1055`, as for `derive_pseudonym`.
      */
-    func deriveRotatablePseudonym(keyId: String, contextId: Data, pseudonymEpoch: UInt64) async throws  -> PseudonymResult
+    func deriveRotatablePseudonym(keyId: String, contextId: Data, pseudonymEpoch: UInt64) async throws  -> Data
     
     /**
      * Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
      *
-     * Required for governance vote signing, which uses `ed25519_dalek::SigningKey`
-     * directly. Platform implementations using software-backed Ed25519 storage
-     * (e.g., Keychain, Android Keystore with `PURPOSE_SIGN`) MUST support this.
+     * The bridge's signing paths that sign with an `ed25519_dalek::SigningKey`,
+     * governance vote signing among them, build that key from the returned
+     * bytes. A key held in hardware or in Android Keystore does not export its
+     * bytes, and ADR-063 requires every key-export accessor, this callback
+     * included, to leave the custody adapters and all three bridges, because
+     * hardware custody on the governance path is impossible until then.
      *
      * # Default
      *
      * Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-     * implemented. A host that needs it overrides it (no in-tree Swift or
-     * Kotlin host implements this protocol yet, S0 PR8). Third-party
+     * implemented. A host that needs it overrides it. No Kotlin class
+     * implements this callback: the Kotlin `AndroidKeyCustody` implements the
+     * Kotlin SDK's own `KeyCustodyProvider` interface, and no code passes it
+     * to the Rust engine. Third-party
      * `KeyCustodyProvider` implementations that do not need governance vote
      * signing may rely on the default until they add support.
      *
@@ -15095,8 +14774,12 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      *
      * # Errors
      *
-     * Returns `ScpError` if the key is not found, not exportable, or not
-     * an Ed25519 key.
+     * The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
+     * destroyed or never existed, and the caller receives key-not-found
+     * (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
+     * `SCP-CTX-2050` and a key that is not exportable or not Ed25519, reaches
+     * the caller as the custody error `SCP-CRYPTO-4060` carrying the host's
+     * code and message.
      */
     func exportSigningKeyBytes(keyId: String) async throws  -> Data
     
@@ -15261,8 +14944,8 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
                 return try await uniffiObj.generateKeypair(
-                     keyType: try FfiConverterString.lift(keyType),
-                     role: try FfiConverterString.lift(role)
+                     keyType: try FfiConverterTypeCustodyKeyType_lift(keyType),
+                     role: try FfiConverterTypeCustodyKeyRole_lift(role)
                 )
             }
 
@@ -15346,7 +15029,7 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
             uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
         ) in
             let makeCall = {
-                () async throws -> PseudonymResult in
+                () async throws -> Data in
                 guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
@@ -15356,11 +15039,11 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                 )
             }
 
-            let uniffiHandleSuccess = { (returnValue: PseudonymResult) in
+            let uniffiHandleSuccess = { (returnValue: Data) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
                     UniffiForeignFutureStructRustBuffer(
-                        returnValue: FfiConverterTypePseudonymResult_lower(returnValue),
+                        returnValue: FfiConverterData.lower(returnValue),
                         callStatus: RustCallStatus()
                     )
                 )
@@ -15392,7 +15075,7 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
             uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
         ) in
             let makeCall = {
-                () async throws -> PseudonymResult in
+                () async throws -> Data in
                 guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
@@ -15403,11 +15086,11 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                 )
             }
 
-            let uniffiHandleSuccess = { (returnValue: PseudonymResult) in
+            let uniffiHandleSuccess = { (returnValue: Data) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
                     UniffiForeignFutureStructRustBuffer(
-                        returnValue: FfiConverterTypePseudonymResult_lower(returnValue),
+                        returnValue: FfiConverterData.lower(returnValue),
                         callStatus: RustCallStatus()
                     )
                 )
@@ -15803,7 +15486,12 @@ public protocol PushProvider: AnyObject, Sendable {
     /**
      * Handle an incoming push notification `payload`.
      *
-     * Returns wake signal bytes indicating which context has new messages.
+     * An implementation returns fixed wake signal bytes that do not depend on
+     * `payload` and copy no byte of it. §10.7 of the infrastructure spec
+     * states: "Push payloads MUST contain a wake signal and nothing else. No
+     * context ID, no sender identifier, no message preview, no metadata of any
+     * kind." A wake signal built from the received bytes would hand the caller
+     * whatever a relay put in them. No Rust code calls this method yet.
      */
     func handleNotification(payload: Data) async throws  -> Data
     
@@ -16989,74 +16677,6 @@ public func uniffiForeignFutureHandleCountScp() -> Int {
     UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.count
 }
 /**
- * Evaluates the trust level for an action based on bridge provenance.
- *
- * Returns an integer (0-3) representing the trust tier.
- */
-public func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadowStatus: String)throws  -> UInt8  {
-    return try  FfiConverterUInt8.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_bridge_evaluate_trust(
-        FfiConverterBool.lower(isBridged),
-        FfiConverterBool.lower(isNativeTransport),
-        FfiConverterString.lower(shadowStatus),$0
-    )
-})
-}
-/**
- * Registers a new bridge connector with a context.
- *
- * Creates a bridge registration, submits a registration request, and
- * immediately approves it using the provided governance DID.
- *
- * # Arguments
- *
- * * `context_id` — Context to register the bridge in.
- * * `operator_did` — DID of the human operator accountable for the bridge.
- * * `governance_did` — DID of the governance authority approving the
- * registration.  Must differ from `operator_did` (self-approval is
- * forbidden per ADR-023).
- * * `platform` — External platform name (e.g., `"discord"`, `"slack"`).
- * * `mode` — Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
- * * `webhook_url` — For cooperative mode: the platform's webhook receiver URL.
- * * `platform_key` — For cooperative mode: the platform's Ed25519 public key (32 bytes).
- * * `max_shadows` — Governance-configured shadow limit (default 10,000).
- * * `metadata_display_name` — Human-readable display name for the bridge.
- * * `metadata_description` — Free-text description of the bridge.
- * * `metadata_operator_contact` — Contact information for the bridge operator.
- *
- * # Returns
- *
- * A `BridgeRegistrationResult` with the registration details.
- *
- * # Errors
- *
- * Returns `ScpError::Validation` if `operator_did` or `governance_did`
- * is not a valid DID string (empty, exceeds 512 bytes, missing
- * `did:{method}:{id}` structure, method not lowercase alphanumeric, or
- * contains control characters), or if `mode` is not recognized. Returns
- * `ScpError::Context` if registration or approval fails (including
- * self-approval).
- *
- * See spec section 12 (Bridge System) and ADR-023.
- */
-public func bridgeRegister(contextId: String, operatorDid: String, governanceDid: String, platform: String, mode: String, webhookUrl: String?, platformKey: Data?, maxShadows: UInt32?, metadataDisplayName: String?, metadataDescription: String?, metadataOperatorContact: String?)throws  -> BridgeRegistrationResult  {
-    return try  FfiConverterTypeBridgeRegistrationResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_bridge_register(
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(operatorDid),
-        FfiConverterString.lower(governanceDid),
-        FfiConverterString.lower(platform),
-        FfiConverterString.lower(mode),
-        FfiConverterOptionString.lower(webhookUrl),
-        FfiConverterOptionData.lower(platformKey),
-        FfiConverterOptionUInt32.lower(maxShadows),
-        FfiConverterOptionString.lower(metadataDisplayName),
-        FfiConverterOptionString.lower(metadataDescription),
-        FfiConverterOptionString.lower(metadataOperatorContact),$0
-    )
-})
-}
-/**
  * Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held 32-byte
  * DHKEM(P-256) wrapping scalar, returning the raw 32-byte AES-256 broadcast key.
  *
@@ -17543,55 +17163,40 @@ public func metadataRecordToJson(contextId: String, sequence: UInt64, signerDid:
 })
 }
 /**
- * The 33-byte SEC1 compressed public key `d·G` of a 32-byte scalar.
+ * The compressed pseudonym point of a §9.10.4 `context_seed`.
+ *
+ * The 33-byte SEC1 point of a 32-byte `context_seed` (v1 or v2), for a
+ * host that computes the seed inside its keystore. No scalar reaches the
+ * host.
  *
  * # Errors
  *
- * `SCP-VALID-7005` when `scalar` is not 32 bytes; `SCP-CRYPTO-4001` when it
- * is zero or not below `n`.
+ * `SCP-VALID-7005` when `context_seed` is not 32 bytes.
  */
-public func p256PublicKey(scalar: Data)throws  -> Data  {
+public func p256PseudonymPoint(contextSeed: Data)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_p256_public_key(
-        FfiConverterData.lower(scalar),$0
+    uniffi_scp_ffi_uniffi_fn_func_p256_pseudonym_point(
+        FfiConverterData.lower(contextSeed),$0
     )
 })
 }
 /**
- * Maps a 32-byte seed to a P-256 private scalar in `[1, n − 1]` under `label`.
+ * The compressed pseudonym point a software custody derives (§9.10.4.A).
  *
- * FIPS 186-5 A.2.1, §9.10.4: `HKDF-Expand(seed, label, 48) mod (n − 1) + 1`.
- * Returns the 32-byte big-endian scalar. For a pseudonym the label is
- * `"SCP-PSEUDONYM-P256-V1"` and the seed the §9.10.4 `context_seed`.
- *
- * # Errors
- *
- * `SCP-VALID-7005` when `seed` is not 32 bytes; `SCP-CRYPTO-4001` if the
- * reduction fails (unreachable for a 32-byte seed).
- */
-public func p256SeedToScalar(label: Data, seed: Data)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_p256_seed_to_scalar(
-        FfiConverterData.lower(label),
-        FfiConverterData.lower(seed),$0
-    )
-})
-}
-/**
- * Signs a 32-byte digest with the scalar: RFC 6979 deterministic nonce
- * (`h1 = digest`), low-`s` normalized, returned as the 64-byte `r || s`
- * (§9.5).
+ * From the 32-byte identity key material `ikm`: the v1 point for
+ * `context_id` when `epoch` is `None`, the v2 point at `epoch` otherwise. No
+ * scalar reaches the host.
  *
  * # Errors
  *
- * `SCP-VALID-7005` when `scalar` or `digest` is not 32 bytes;
- * `SCP-CRYPTO-4001` when the scalar is out of range or signing fails.
+ * `SCP-VALID-7005` when `ikm` is not 32 bytes.
  */
-public func p256SignPrehashRfc6979(scalar: Data, digest: Data)throws  -> Data  {
+public func p256SoftwarePseudonymPoint(ikm: Data, contextId: Data, epoch: UInt64?)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_p256_sign_prehash_rfc6979(
-        FfiConverterData.lower(scalar),
-        FfiConverterData.lower(digest),$0
+    uniffi_scp_ffi_uniffi_fn_func_p256_software_pseudonym_point(
+        FfiConverterData.lower(ikm),
+        FfiConverterData.lower(contextId),
+        FfiConverterOptionUInt64.lower(epoch),$0
     )
 })
 }
@@ -17891,12 +17496,6 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_bridge_evaluate_trust() != 16710) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_bridge_register() != 24353) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_open_key() != 2915) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -17984,13 +17583,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_metadata_record_to_json() != 58960) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_p256_public_key() != 39495) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_pseudonym_point() != 15648) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_p256_seed_to_scalar() != 31098) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_p256_sign_prehash_rfc6979() != 49215) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_software_pseudonym_point() != 30231) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_provenance_check_chain_depth() != 15774) {
@@ -18059,7 +17655,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_add_agent_key() != 23309) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_identity_custody_type() != 7777) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_custody_type() != 16200) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_did() != 6016) {
@@ -18152,33 +17748,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_apply_pending_ceiling_modification() != 41792) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_create_shadow() != 8590) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_delete_key() != 40862) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_get_key() != 4810) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_list() != 16239) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_provision() != 36927) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_retrieve() != 15897) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_revoke() != 22652) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_rotate() != 19177) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_credential_store_key() != 48091) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_admission() != 47745) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -18218,7 +17787,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_relay_transport() != 46916) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_close() != 41503) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_close() != 6358) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_create() != 337) {
@@ -18350,7 +17919,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_attest_device() != 36607) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 25630) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 30085) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_link_attestation() != 29874) {
@@ -18398,19 +17967,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_is_local_did() != 10856) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_sse() != 44028) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_sse() != 35239) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_stdio() != 2953) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_stdio() != 55993) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 63976) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 3151) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_invoke() != 16053) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_invoke() != 47603) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_list_tools() != 20301) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_list_tools() != 56929) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_configure_stdio_allowlist() != 7937) {
@@ -18425,10 +17994,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_reset_stdio_allowlist() != 39655) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_create() != 11371) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_create() != 21168) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_stop() != 46867) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_stop() != 10523) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_media_activate_session() != 3062) {
@@ -18452,7 +18021,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_interface_expose() != 3812) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_interface_revoke() != 20193) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_interface_revoke() != 18966) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_invoke() != 47804) {
@@ -18461,13 +18030,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_invoke_cross_context() != 45495) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_invoke_cross_context_saga() != 11316) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_invoke_cross_context_saga() != 6751) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_register() != 48642) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_session_close() != 2713) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_session_close() != 40222) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_session_create() != 284) {
@@ -18587,7 +18156,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_set_economic_policy() != 12223) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_shutdown() != 65387) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_shutdown() != 20138) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_suspend() != 57088) {
@@ -18668,37 +18237,37 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_token_id() != 51675) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 20129) {
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 22077) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 4506) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 18976) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 3156) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 50940) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 31392) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 25409) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 42836) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 8353) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_destroy_key() != 41195) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_destroy_key() != 48628) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 61586) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 28522) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 46704) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 1106) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 36664) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 1572) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 41285) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 54334) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 44263) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 56607) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 30807) {
@@ -18716,7 +18285,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_register_push() != 31432) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_handle_notification() != 49354) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_handle_notification() != 50826) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_storageprovider_get() != 34518) {

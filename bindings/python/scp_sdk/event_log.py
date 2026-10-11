@@ -29,40 +29,6 @@ logger = logging.getLogger("scp_sdk")
 logger.addHandler(logging.NullHandler())
 
 
-def _init_pyo3_log_bridge() -> None:
-    """Forward Rust ``tracing`` output to Python logging via pyo3 log bridge.
-
-    Attempts to import ``_scp_core`` and call its log bridge
-    initializer.  If the extension is not installed or does not expose
-    a log bridge function, this is a silent no-op.
-
-    The bridge maps Rust ``tracing`` levels to Python logging levels:
-
-    - ``TRACE``/``DEBUG`` -> ``logging.DEBUG``
-    - ``INFO``  -> ``logging.INFO``
-    - ``WARN``  -> ``logging.WARNING``
-    - ``ERROR`` -> ``logging.ERROR``
-
-    Users control the verbosity via the standard Python API::
-
-        logging.getLogger("scp_sdk").setLevel(logging.DEBUG)
-    """
-    try:
-        import _scp_core  # type: ignore[import-not-found]
-
-        if hasattr(_scp_core, "init_pyo3_log"):
-            _scp_core.init_pyo3_log()
-    except (ImportError, Exception):
-        # Extension not installed or log bridge not available -- this
-        # is expected during development or testing without the Rust
-        # extension compiled.
-        pass
-
-
-# Eagerly attempt to initialize the pyo3 log bridge on first import.
-_init_pyo3_log_bridge()
-
-
 # ---------------------------------------------------------------------------
 # Internal helpers for bridge payload extraction
 # ---------------------------------------------------------------------------

@@ -33,7 +33,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypedDict
 
-from scp_sdk.errors import ContextError, ScpError, _coded_bridge_error
+from scp_sdk._extension import native_module
+from scp_sdk.errors import ContextError, _coded_bridge_error
 
 if TYPE_CHECKING:
     from scp_sdk.scp import SCP
@@ -55,16 +56,7 @@ NO_PARTICIPATION_FACTS_CODE = "SCP-CTX-2076"
 
 def _bridge() -> Any:
     """Return the ``_scp_core`` extension module, imported lazily."""
-    try:
-        import _scp_core  # type: ignore[import-not-found]
-
-        return _scp_core
-    except ImportError as exc:
-        raise ScpError(
-            "The _scp_core extension module is not installed. "
-            "Install scp-python with: pip install scp-python",
-            code="SCP-UNKNOWN-0001",
-        ) from exc
+    return native_module()
 
 
 # ---------------------------------------------------------------------------
@@ -885,9 +877,12 @@ async def evaluate_trust(
 
     Layer 1 consumes the structured bridge result directly (ADR-059): it
     does not reverse-engineer *which* check failed by parsing error prose.
-    The diagnostic is non-throwing for capability outcomes; it raises only
+    The diagnostic is non-throwing for capability outcomes; it raises
     for malformed FFI inputs (e.g. a ``context_id`` with control
     characters), which propagate to the caller.
+
+    Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+    the context is not active.
 
     This module-level function consumes the :class:`SCP` instance to
     dispatch the ``ucan_evaluate`` (Layer 1) and ``participation_record``
@@ -939,7 +934,9 @@ async def evaluate_trust(
         for token in capability_tokens:
             # The structured diagnostic reads bools; it does NOT throw on
             # capability outcomes. Malformed FFI input (bad context_id /
-            # token) still raises and propagates.
+            # token) and a context the supervisor does not report ``Active``
+            # (``ContextError``, ``SCP-CTX-2023``) raise, re-raised as coded SDK
+            # exceptions as ``_participation_record_from`` does.
             #
             # No challenge capability is supplied: trust evaluation assesses
             # each token's GENERAL (intrinsic) validity — signatures, ceiling,
@@ -961,9 +958,12 @@ async def evaluate_trust(
             # inflation) — so the bridge refuses to assume it. The TS canonical
             # API passes the subject the same way; this keeps an identical shape
             # across bindings (Agent-first API design tenet).
-            result = await asyncio.to_thread(
-                instance.ucan_evaluate, context_id, token, None, subject_did
-            )
+            try:
+                result = await asyncio.to_thread(
+                    instance.ucan_evaluate, context_id, token, None, subject_did
+                )
+            except Exception as exc:  # PyO3 raises native Scp*Error
+                raise _coded_bridge_error(exc) from exc
             per_token = structured_to_capability_validation(result)
             cap_validation.tokens_valid &= per_token.tokens_valid
             cap_validation.signatures_valid &= per_token.signatures_valid

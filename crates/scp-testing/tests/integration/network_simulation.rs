@@ -183,7 +183,13 @@ async fn end_to_end_network_demo() {
         .unwrap();
     let kp_in = scp_core::crypto::mls::wire::parse_key_package_in(kp_bytes.as_slice()).unwrap();
     let add_result = add_member(&mut alice_group, kp_in, &scp_clock::SystemClock).unwrap();
-    let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+    let bob_group = join_group(
+        &add_result.welcome,
+        bob_provider,
+        bob_signer,
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
     assert_eq!(bob_group.epoch().unwrap(), alice_group.epoch().unwrap());
     assert_eq!(bob_group.members().unwrap().len(), 2);
 

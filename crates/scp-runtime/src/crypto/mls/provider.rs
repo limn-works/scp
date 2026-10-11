@@ -40,13 +40,13 @@ use openmls_traits::OpenMlsProvider;
 use scp_clock::Clock;
 use scp_did::SigningKeyId;
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use super::backend::MlsBackend;
 use super::production_backend::ProductionMlsBackend;
 use scp_mls::credential::ScpCredential;
 use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
-use scp_mls::validate_key_package_lifetime;
+use scp_mls::validate_key_package_lifetime_for_add;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::builder::ReceiveFloor;
@@ -93,10 +93,15 @@ use scp_protocol::crypto::sender_keys::{
 /// satisfy this. In-memory storage used in tests is acceptable because no
 /// persistence occurs.
 ///
-/// **Defense in depth:** `export_crypto_state` and `restore_crypto_state`
-/// zeroize the intermediate `MlsCryptoSnapshot` struct after
-/// serialization/extraction to minimize the window where private keys
-/// exist as a structured, easily-extractable object in memory.
+/// **Defense in depth:** every field that holds private key material has a
+/// type that wipes on drop (`Zeroizing`, or `SenderKey`'s `ZeroizeOnDrop`), so
+/// the intermediate `MlsCryptoSnapshot` wipes those fields when it drops on an
+/// export or restore path, early returns included. Buffers that serde
+/// allocates and frees while decoding the blob are wiped as they are freed by
+/// the wiping global allocator every shipped artifact installs (security model
+/// spec §9.15, freed heap memory). `Zeroizing`'s
+/// serde impls delegate to the inner value, so the encoding is that of the
+/// plain fields.
 // ADR-049 PR-7 (crypto-state move, prep A): visibility elevated from private to
 // `pub(crate)` (fields included) so the additive
 // [`crate::context::actor::PerContextState::export_crypto_state`] inherent method
@@ -110,11 +115,13 @@ use scp_protocol::crypto::sender_keys::{
 pub(crate) struct MlsCryptoSnapshot {
     /// The raw key-value pairs from the `OpenMLS` `MemoryStorage`.
     /// Each pair is `(key_bytes, value_bytes)`.
-    pub(crate) mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) mls_storage_entries: scp_mls::snapshot::ProviderStorageEntries,
     /// The local member's AES-256 sender key (32 bytes).
     pub(crate) local_sender_key: SenderKey,
-    /// All sender keys for this context: `(sender_did, key)` pairs.
-    pub(crate) sender_key_entries: Vec<(String, SenderKey)>,
+    /// All sender keys for this context: `(sender_did, key)` pairs. The
+    /// `Zeroizing` vector wipes its whole buffer on drop, including the slots
+    /// restore drains keys out of.
+    pub(crate) sender_key_entries: Zeroizing<Vec<(String, SenderKey)>>,
     /// Per-sender epoch high-water marks for this context:
     /// `(sender_did, epoch)` pairs.
     ///
@@ -153,7 +160,7 @@ pub(crate) struct MlsCryptoSnapshot {
     /// The MLS signer (`SignatureKeyPair`) serialized via serde to bytes.
     /// `SignatureKeyPair` does not derive `Clone` without the `clonable`
     /// feature, so we serialize it separately and store the blob here.
-    pub(crate) signer_bytes: Vec<u8>,
+    pub(crate) signer_bytes: Zeroizing<Vec<u8>>,
     /// The MLS group ID bytes. Required to call `MlsGroup::load` on restore.
     pub(crate) group_id: Vec<u8>,
     /// Receive-side sequence tracking: `(sender_did, last_epoch, last_sequence)`.
@@ -164,6 +171,20 @@ pub(crate) struct MlsCryptoSnapshot {
     #[serde(default)]
     pub(crate) recv_sequence_tracker: Vec<(String, u64, u64)>,
 }
+
+impl Drop for MlsCryptoSnapshot {
+    fn drop(&mut self) {
+        // Exists only as a move guard: `local_sender_key` is inline, so restore must
+        // `mem::replace` it, which zeroes its slot, and a partial move out is a
+        // compile error (E0509). Every field wipes itself through its type.
+    }
+}
+
+#[expect(drop_bounds, reason = "asserts the E0509 move guard")]
+const _: fn() = || {
+    const fn guard<T: Drop>() {}
+    guard::<MlsCryptoSnapshot>();
+};
 
 // SECURITY: Manual Debug impl redacts all sensitive key material.
 // Clone is intentionally NOT derived — snapshots contain raw private keys
@@ -199,47 +220,6 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
             .field("signer_bytes", &"[REDACTED]")
             .field("group_id", &format_args!("[{} bytes]", self.group_id.len()))
             .finish()
-    }
-}
-
-impl MlsCryptoSnapshot {
-    /// Zeroizes every field that holds private key material.
-    ///
-    /// [`export_crypto_state`](crate::context::actor::state::PerContextState::export_crypto_state) calls this once at its
-    /// end (belt-and-suspenders) after serializing the snapshot.
-    /// [`build_restored_owned`](crate::crypto::mls::provider::NodeMlsFactory::build_restored_owned) does NOT call it:
-    /// restore consumes each secret field incrementally as it moves the material
-    /// into the live crypto state (`drain`/`mem::replace`/per-field `zeroize` at
-    /// the point of use), so there is no single end-of-function sweep to make. On
-    /// both paths the [`Drop`] impl below is the backstop that also fires on an
-    /// early `?` return, so raw signer / sender-key / wrapping-secret / MLS-secret
-    /// bytes never linger un-zeroized in freed memory on ANY path (matches the
-    /// parity guarantee the `scp-mls` and `scp-client` snapshots make via their
-    /// own `Drop`s).
-    ///
-    /// ADR-049 PR-7 (prep A): `pub(crate)` so the additive
-    /// [`crate::context::actor::PerContextState::export_crypto_state`] verbatim
-    /// move can perform the identical end-of-function secret sweep.
-    pub(crate) fn zeroize_secrets(&mut self) {
-        self.signer_bytes.zeroize();
-        self.local_sender_key.zeroize();
-        for (_, value) in &mut self.mls_storage_entries {
-            value.zeroize();
-        }
-        for (_, key) in &mut self.sender_key_entries {
-            key.zeroize();
-        }
-    }
-}
-
-// SECURITY: zeroize key material on every drop path — including an early `?`
-// return between deserialization and the explicit trailing `zeroize` calls — so
-// private material never lingers in freed memory. No field is ever moved out of a
-// `MlsCryptoSnapshot` (the export/restore paths drain/replace/borrow in place), so
-// this `Drop` does not conflict with a partial move.
-impl Drop for MlsCryptoSnapshot {
-    fn drop(&mut self) {
-        self.zeroize_secrets();
     }
 }
 
@@ -363,14 +343,15 @@ impl OwnedMlsCryptoState {
         }
     }
 
-    /// Best-effort teardown of a born-but-never-seeded payload's secrets on a
-    /// creation-rollback path (#2148 F6). A bare drop FREES the group's
-    /// in-memory `OpenMLS` storage but does NOT zeroize its epoch-secret bytes or
-    /// the Ed25519 signer (`OpenMLS` `SignatureKeyPair` implements no `Zeroize` —
-    /// `scp-mls` `EagerDropSigner` / issue #82); [`scp_mls::group::destroy_group`]
-    /// eagerly FREES the signer's `Vec<u8>` via `EagerDropSigner::take` (freed,
-    /// not overwritten — signer zeroization stays open upstream, #82). The
+    /// Teardown of a born-but-never-seeded payload's secrets on a
+    /// creation-rollback path. A bare drop zeroizes every value in
+    /// the group's in-memory `OpenMLS` provider storage (`scp_mls::InMemoryMlsProvider`
+    /// wipes on drop); the Ed25519 signer zeroizes on drop (`OpenMLS` `SignatureKeyPair` holds its
+    /// private key in `SecretVLBytes`), and [`scp_mls::group::destroy_group`]
+    /// drops both. The
     /// [`SenderKey`] zeroizes on its own `ZeroizeOnDrop` when the payload drops.
+    /// Every caller drops the payload right after this call, so the call is
+    /// equivalent to that drop.
     pub(crate) fn dispose_secrets(&mut self) {
         let _ = scp_mls::group::destroy_group(&mut self.mls_group);
     }
@@ -469,7 +450,9 @@ impl NodeMlsFactory {
     /// * `local_did` - The local member's DID (must be a valid `did:dht:z...`).
     /// * `clock` - The injected hardened [`Clock`] (ADR-057 §Prereq-1). Shared
     ///   with the constructed [`ProductionMlsBackend`] so a node has exactly one
-    ///   hardened clock governing every `KeyPackage` / group-leaf `Lifetime`.
+    ///   hardened clock governing every `KeyPackage` / group-leaf `Lifetime`
+    ///   check SCP runs against a clock; another member's Welcome tree leaf is
+    ///   checked for range only and reads no clock.
     #[must_use]
     pub fn new(local_did: String, clock: Arc<dyn Clock>) -> Self {
         Self::with_backends(
@@ -659,10 +642,10 @@ impl NodeMlsFactory {
     /// `pending_distributions`, and `member_wrapping_keys` start empty — the same
     /// initial shape a fresh join produces. `member_wrapping_keys` STAYS empty
     /// for a joiner: it caches other members' STABLE wrapping keys, used ONLY by
-    /// the proactive/offline PUSH path and populated on the incumbent/adder side;
-    /// openmls 0.8.1 exposes no way to read a remote member's `scp_wrapping_key`
-    /// `LeafNode` extension from a joined group (ADR-057), and a joiner does not
-    /// need them — it reaches every incumbent through the pull protocol and
+    /// the proactive/offline PUSH path and populated on the incumbent/adder side.
+    /// [`scp_mls::extract_member_wrapping_key`] returns only the local member's
+    /// key; its rustdoc says why. A joiner
+    /// does not need the cache — it reaches every incumbent through the pull protocol and
     /// answers incumbents' pulls via the ephemeral key in their requests.
     pub fn install_joined_group(&self, group: ScpMlsGroup) -> OwnedMlsCryptoState {
         // Direct assembly — the joined group moves in verbatim; `fresh_birth`
@@ -750,15 +733,15 @@ impl NodeMlsFactory {
             .map_err(|e| ContextError::InvalidKeyPackage(format!("validation failed: {e}")))?;
 
         // SECURITY (ADR-057 §Prereq-1): openmls's `validate` above runs its own
-        // internal `Lifetime::is_valid` against openmls's (wasm: unhardened)
+        // internal `Lifetime::validate` against openmls's (wasm: unhardened)
         // clock. This eager join gate is the accept-family sibling of
         // `ProductionMlsBackend::validate_key_package` — re-validate the accepted
         // `Lifetime` against the injected hardened clock and enforce the RFC 9420
         // max-range bound openmls's `validate` never applies. Additive hardening;
         // never replaces openmls.
-        validate_key_package_lifetime(verified.life_time(), self.clock.as_ref()).map_err(|e| {
-            ContextError::InvalidKeyPackage(format!("key package lifetime invalid: {e}"))
-        })?;
+        validate_key_package_lifetime_for_add(verified.life_time(), self.clock.as_ref()).map_err(
+            |e| ContextError::InvalidKeyPackage(format!("key package lifetime invalid: {e}")),
+        )?;
 
         if verified.ciphersuite() != SCP_CIPHERSUITE {
             return Err(ContextError::InvalidKeyPackage(format!(
@@ -893,7 +876,8 @@ impl NodeMlsFactory {
     /// Returns [`ContextError::CryptoFailed`] if `data` is empty (the owned path
     /// must always yield material — unlike the legacy no-op-on-empty
     /// `restore_crypto_state`), if deserialization
-    /// fails, or if the data is corrupt.
+    /// fails, if the data is corrupt, or if a provider storage entry carries
+    /// openmls's signature-key-pair label (persistence spec §17.9.1).
     pub(crate) fn build_restored_owned(
         context_id: &[u8; 32],
         data: &[u8],
@@ -907,28 +891,20 @@ impl NodeMlsFactory {
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(data)
             .map_err(|e| ContextError::CryptoFailed(format!("snapshot deserialization: {e}")))?;
 
-        // Reconstruct the InMemoryMlsProvider with the persisted storage entries.
-        let provider = scp_mls::InMemoryMlsProvider::default();
-        {
-            let mut values =
-                provider.storage().values.write().map_err(|e| {
-                    ContextError::CryptoFailed(format!("storage lock poisoned: {e}"))
-                })?;
-            // Drain entries so the snapshot no longer holds MLS storage data
-            // (which contains epoch secrets and HPKE private keys).
-            for (k, v) in snapshot.mls_storage_entries.drain(..) {
-                values.insert(k, v);
-            }
-        }
+        // Reconstruct the InMemoryMlsProvider with the persisted storage
+        // entries. It drains them, so the snapshot no longer holds MLS storage
+        // data (epoch secrets and HPKE private keys), and it refuses a
+        // signer-labelled entry before draining any (persistence spec
+        // §17.9.1); the `Zeroizing` vector wipes whatever it still holds when
+        // it drops.
+        let provider =
+            scp_mls::InMemoryMlsProvider::from_storage_entries(&mut snapshot.mls_storage_entries)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-        // Deserialize the signer from the snapshot's raw bytes.
+        // Deserialize the signer from the snapshot's raw bytes, which their
+        // `Zeroizing` type wipes when the snapshot drops.
         let signer: SignatureKeyPair = rmp_serde::from_slice(&snapshot.signer_bytes)
             .map_err(|e| ContextError::CryptoFailed(format!("signer deserialization: {e}")))?;
-
-        // SECURITY: Zeroize the raw signer bytes now that they've been
-        // deserialized — the P-256 private scalar should not linger in this
-        // intermediate buffer.
-        snapshot.signer_bytes.zeroize();
 
         // Reconstruct the MLS group from persisted storage via MlsGroup::load.
         let group_id = GroupId::from_slice(&snapshot.group_id);
@@ -945,7 +921,8 @@ impl NodeMlsFactory {
         // loaded group runs `SCP_CIPHERSUITE`, the signer is a P-256 pair whose
         // public key is scalar·G, and that key is the own leaf's signature key.
         // SCP migrates no state from another suite, so any failure fails the
-        // restore closed. It then stores the signer so OpenMLS can find it.
+        // restore closed. The signer stays beside the group, never in the
+        // provider's key store.
         let scp_group = ScpMlsGroup::from_parts(mls_group, provider, signer)
             .map_err(|e| ContextError::CryptoFailed(format!("restored group: {e}")))?;
 
@@ -1020,7 +997,9 @@ impl NodeMlsFactory {
 
         // Take the local_sender_key and leave a zeroed placeholder. SenderKey
         // implements ZeroizeOnDrop, so the placeholder is cleaned when snapshot
-        // drops, and the original is moved into crypto_state.
+        // drops, and the original is moved into crypto_state. Stack copies the
+        // move makes are not wiped; security model spec §9.15 (freed heap
+        // memory) lists stack copies as a limit.
         let local_sender_key = std::mem::replace(
             &mut snapshot.local_sender_key,
             SenderKey::from_bytes([0u8; 32]),
@@ -1104,7 +1083,7 @@ impl NodeMlsFactory {
 mod tests {
     use super::*;
     use crate::crypto::wrapping::WrappingKeyPair;
-    use scp_clock::SystemClock;
+    use scp_clock::{SystemClock, TestClock};
     use scp_mls::group::generate_key_package;
     use tls_codec::Serialize as TlsSerializeTrait;
 
@@ -1182,7 +1161,7 @@ mod tests {
         ctx: &[u8; 32],
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, ReceiveFloor)>,
-    ) -> Result<Vec<u8>, ContextError> {
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, ContextError> {
         let state = take_into_actor(provider, ctx);
         state.export_crypto_state(sender_key_epochs, recv_sequence_floors)
     }
@@ -1199,7 +1178,7 @@ mod tests {
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, ReceiveFloor)>,
         mutate: impl FnOnce(&mut crate::context::actor::ContextCryptoState),
-    ) -> Vec<u8> {
+    ) -> zeroize::Zeroizing<Vec<u8>> {
         let mut state = take_into_actor(provider, ctx);
         mutate(actor_crypto_mut(&mut state));
         state
@@ -1333,7 +1312,7 @@ mod tests {
         // `Lifetime` against the provider's injected hardened clock — mirroring
         // its accept-family sibling `ProductionMlsBackend::validate_key_package`
         // — so a KeyPackage that is temporally invalid under the SCP clock is
-        // rejected even though openmls's own internal `is_valid` (against the
+        // rejected even though openmls's own internal `validate` (against the
         // real system clock) accepts it.
 
         // Bob's KeyPackage is minted at the REAL present via `SystemClock`, so
@@ -1384,6 +1363,56 @@ mod tests {
                 .validate_key_package(&bob_cred.did, Some(&kp_bytes))
                 .is_ok(),
             "a freshly-minted KeyPackage must pass under a real-present clock"
+        );
+    }
+
+    /// Security-model spec §9.7.1, the adder: the joiner-`KeyPackage` gate
+    /// accepts exactly the minimum remaining lifetime under the provider's
+    /// clock and refuses one a second short of it.
+    #[test]
+    fn validate_key_package_enforces_min_remaining_lifetime_boundary() {
+        use scp_mls::{KEY_PACKAGE_LIFETIME_SECS, KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS};
+        let minted_at = SystemClock.now_secs();
+        let bob_cred = ScpCredential::new(
+            "did:dht:z6MkBobBoundary".to_string(),
+            None,
+            SigningKeyId::Active,
+        )
+        .unwrap();
+        let (bundle, _signer, _provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &TestClock::new(minted_at),
+        )
+        .unwrap();
+        let kp_bytes = bundle.key_package().tls_serialize_detached().unwrap();
+        let not_after = minted_at + KEY_PACKAGE_LIFETIME_SECS;
+
+        let at_min = NodeMlsFactory::new(
+            TEST_DID.to_string(),
+            Arc::new(TestClock::new(
+                not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS,
+            )),
+        );
+        assert!(
+            at_min
+                .validate_key_package(&bob_cred.did, Some(&kp_bytes))
+                .is_ok(),
+            "exactly the minimum remaining must pass the gate"
+        );
+
+        let past_min = NodeMlsFactory::new(
+            TEST_DID.to_string(),
+            Arc::new(TestClock::new(
+                not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 1,
+            )),
+        );
+        let err = past_min
+            .validate_key_package(&bob_cred.did, Some(&kp_bytes))
+            .expect_err("one second short of the minimum must be refused");
+        assert!(
+            matches!(err, ContextError::InvalidKeyPackage(ref m) if m.contains("lifetime")),
+            "rejection must be at the lifetime gate, got: {err:?}"
         );
     }
 
@@ -1961,6 +1990,39 @@ mod tests {
         );
     }
 
+    /// A snapshot whose provider storage entries include one under openmls's
+    /// signature-key-pair label fails the owned restore with `CryptoFailed`
+    /// carrying the signer refusal (persistence spec §17.9.1); the same
+    /// snapshot without that entry restores.
+    #[test]
+    fn build_restored_owned_refuses_signer_entry() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        let actor = take_into_actor(&provider, &ctx_id);
+        let exported = actor.export_crypto_state(vec![], vec![]).unwrap();
+
+        // Control: the unmodified snapshot restores.
+        let _restored = NodeMlsFactory::build_restored_owned(&ctx_id, &exported).unwrap();
+
+        let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
+        let mut signer_key = b"SignatureKeyPair".to_vec();
+        signer_key.extend_from_slice(b"[1,2,3]");
+        snapshot
+            .mls_storage_entries
+            .push((signer_key, b"signer private key".to_vec()));
+        let crafted = rmp_serde::to_vec_named(&snapshot).unwrap();
+
+        let err = NodeMlsFactory::build_restored_owned(&ctx_id, &crafted)
+            .expect_err("a signer entry must be refused on restore");
+        let ContextError::CryptoFailed(message) = err else {
+            panic!("expected CryptoFailed, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            scp_mls::error::MlsError::SignerStorageForbidden.to_string()
+        );
+    }
+
     /// Prep-D pass-through pin (ADR-049 PR-6): the floors that
     /// `export_crypto_state` now takes as parameters must land in the exported
     /// snapshot exactly as the provider's own `export_sender_key_epochs` /
@@ -2402,14 +2464,20 @@ mod tests {
         let provider = make_provider();
         let ctx_id = make_context_id();
         let mut snapshot = exported_snapshot(&provider, &ctx_id);
-        let key = scp_crypto::p256::P256SigningKey::from_seed(b"provider-t7", &[3; 32]).unwrap();
-        let other = scp_crypto::p256::P256SigningKey::from_seed(b"provider-t7", &[4; 32]).unwrap();
+        let key = scp_crypto::p256::P256SecretKey::from_seed(
+            scp_crypto::p256::SeedLabel::TestVectorKey,
+            &[3; 32],
+        );
+        let other = scp_crypto::p256::P256SecretKey::from_seed(
+            scp_crypto::p256::SeedLabel::TestVectorKey,
+            &[4; 32],
+        );
         let tampered = SignatureKeyPair::from_raw(
             SCP_CIPHERSUITE.signature_algorithm(),
             key.to_scalar_bytes().to_vec(),
             other.public_key().to_uncompressed().to_vec(),
         );
-        snapshot.signer_bytes = rmp_serde::to_vec(&tampered).unwrap();
+        snapshot.signer_bytes = Zeroizing::new(rmp_serde::to_vec(&tampered).unwrap());
         let err = restore_error(&snapshot);
         assert!(err.contains("restored group: invalid MLS signer"), "{err}");
     }
@@ -2423,7 +2491,7 @@ mod tests {
         let ctx_id = make_context_id();
         let mut snapshot = exported_snapshot(&provider, &ctx_id);
         let foreign = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
-        snapshot.signer_bytes = rmp_serde::to_vec(&foreign).unwrap();
+        snapshot.signer_bytes = Zeroizing::new(rmp_serde::to_vec(&foreign).unwrap());
         let err = restore_error(&snapshot);
         assert!(
             err.contains("signer public key is not the own leaf's signature key"),
@@ -2449,7 +2517,6 @@ mod tests {
         let cs1 = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
         let cs1_provider = scp_mls::InMemoryMlsProvider::default();
         let signer = SignatureKeyPair::new(cs1.signature_algorithm()).unwrap();
-        signer.store(cs1_provider.storage()).unwrap();
         let credential =
             scp_mls::ScpCredential::new(TEST_DID.to_owned(), None, scp_did::SigningKeyId::Active)
                 .unwrap();
@@ -2463,16 +2530,18 @@ mod tests {
             .build();
         let group = MlsGroup::new(&cs1_provider, &signer, &config, credential_with_key).unwrap();
 
-        snapshot.mls_storage_entries = cs1_provider
-            .storage()
-            .values
-            .read()
-            .unwrap()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        snapshot.mls_storage_entries = Zeroizing::new(
+            cs1_provider
+                .storage()
+                .values()
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        );
         snapshot.group_id = group.group_id().as_slice().to_vec();
-        snapshot.signer_bytes = rmp_serde::to_vec(&signer).unwrap();
+        snapshot.signer_bytes = Zeroizing::new(rmp_serde::to_vec(&signer).unwrap());
 
         let err = restore_error(&snapshot);
         assert!(
@@ -2596,17 +2665,15 @@ mod tests {
         // dedicated guard-rejection path is covered by
         // `open_rejects_context_id_str_that_does_not_resolve_to_context_id`.
         let hex_ctx = hex::encode(ctx_id);
-        bob_actor
-            .open(&SystemClock, &hex_ctx, &sealed_neg)
-            .expect_err(
-                "opening with hex(ctx_id) as the AAD source must fail — the message was sealed \
+        bob_actor.open(&hex_ctx, &sealed_neg).expect_err(
+            "opening with hex(ctx_id) as the AAD source must fail — the message was sealed \
              under the RAW context_id string, so the rebuilt AAD does not authenticate",
-            );
+        );
 
         // Positive: opening the second blob with the RAW context_id string
         // (the spec value) succeeds, proving the AAD binds the raw string.
         let opened = bob_actor
-            .open(&SystemClock, TEST_CTX_STR, &sealed_pos)
+            .open(TEST_CTX_STR, &sealed_pos)
             .expect("opening with the raw context_id string (spec AAD) must succeed");
         match opened {
             scp_protocol::context::builder::OpenResult::Application(env) => {
@@ -2645,7 +2712,7 @@ mod tests {
         // by its absence that the fail-fast assert ran ahead of the AEAD layer.
         let bogus_outer = [0xABu8; 64];
         let err = bob_actor
-            .open(&SystemClock, mismatched_ctx_str, &bogus_outer)
+            .open(mismatched_ctx_str, &bogus_outer)
             .expect_err("open must reject a context_id_str that does not resolve to context_id");
 
         match err {
@@ -2853,7 +2920,7 @@ mod tests {
 
         // Bob opens the same blob and recovers the application plaintext,
         // proving the zeroed routing_id does not break delivery.
-        let opened = bob_actor.open(&SystemClock, ctx_str, &wire).unwrap();
+        let opened = bob_actor.open(ctx_str, &wire).unwrap();
         match opened {
             scp_protocol::context::builder::OpenResult::Application(env) => {
                 assert_eq!(

@@ -9,22 +9,22 @@
 //!
 //! See spec section 17.6 (`SQLite` storage) and ADR-006 (platform adapters).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use scp_crypto::p256::P256SigningKey;
+use scp_crypto::p256::P256SecretKey;
 use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use super::SqliteStorage;
 use crate::error::PlatformError;
-use crate::pseudonym_keys::PseudonymKeys;
 use crate::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
+    CustodyType, KeyCustody, KeyHandle, KeyRole, KeyType, Pseudonym, PublicKey, SharedSecret,
     Signature, Storage,
 };
+use scp_crypto::pseudonym::{PseudonymVersion, derive_pseudonym};
 
 /// Storage key prefix for persisted key material.
 const KEY_PREFIX: &str = "custody/keys/";
@@ -44,13 +44,6 @@ const KEY_TYPE_P256_SIGNING: u8 = 2;
 /// Key type discriminant for P-256 HPKE keys ([`KeyType::HpkeP256`]).
 const KEY_TYPE_P256_HPKE: u8 = 3;
 
-/// Role byte for an operational key ([`KeyCustody::generate_keypair`]).
-const ROLE_OPERATIONAL: u8 = 0;
-
-/// Role byte for an identity key ([`KeyCustody::generate_identity_keypair`],
-/// [`KeyCustody::import_ed25519_signing_key`]), the only derivation source.
-const ROLE_IDENTITY: u8 = 1;
-
 /// Length of a persisted key row: `[key_type, role, private_key(32)]`.
 const ROW_LEN: usize = 34;
 
@@ -68,38 +61,39 @@ const fn wrong_type(actual: KeyType, expected: KeyType) -> PlatformError {
     PlatformError::WrongKeyType { expected, actual }
 }
 
+/// A handle's key type, which says which operations it permits, and its role.
+#[derive(Debug, Clone, Copy)]
+struct KeyRecord {
+    key_type: KeyType,
+    role: KeyRole,
+}
+
 /// Consolidated in-memory key store protected by a single mutex.
 ///
 /// Eliminates TOCTOU gaps and lock-ordering deadlock risks that arise from
-/// three independent mutexes (`key_types`, `ed25519_keys`, `x25519_keys`).
+/// three independent mutexes (`records`, `ed25519_keys`, `x25519_keys`).
 struct SqliteKeyStore {
-    /// Key type lookup, indexed by handle ID.
-    key_types: HashMap<u64, KeyType>,
+    /// Key type and role, indexed by handle ID.
+    records: HashMap<u64, KeyRecord>,
     /// In-memory cache of Ed25519 signing keys, indexed by handle ID.
     ed25519_keys: HashMap<u64, SigningKey>,
     /// In-memory cache of X25519 static secrets, indexed by handle ID.
     x25519_keys: HashMap<u64, StaticSecret>,
-    /// P-256 signing and HPKE keys, indexed by handle ID; `key_types` says
+    /// P-256 signing and HPKE keys, indexed by handle ID; `records` says
     /// which.
-    p256_keys: HashMap<u64, P256SigningKey>,
-    /// Derived P-256 pseudonym keys, each owned by its identity (§9.10.4,
-    /// §9.15), typed [`KeyType::P256Signing`] in `key_types`. Never
-    /// persisted, because they re-derive from the identity key.
-    pseudonyms: PseudonymKeys,
-    /// Handles in the identity role, the only pseudonym-derivation sources.
-    identity_ids: HashSet<u64>,
+    p256_keys: HashMap<u64, P256SecretKey>,
 }
 
 impl SqliteKeyStore {
     /// The Ed25519 seed of a pseudonym-derivation source, after the role and
-    /// (until S12) curve check.
+    /// (until SCP-315) curve check.
     fn derive_source(&self, key_id: u64) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-        let key_type = self
-            .key_types
+        let KeyRecord { key_type, role } = self
+            .records
             .get(&key_id)
             .copied()
             .ok_or(PlatformError::KeyNotFound)?;
-        crate::traits::require_derive_source(self.identity_ids.contains(&key_id), key_type)?;
+        crate::traits::require_derive_source(role, key_type)?;
         let signing_key = self
             .ed25519_keys
             .get(&key_id)
@@ -107,11 +101,10 @@ impl SqliteKeyStore {
         Ok(Zeroizing::new(signing_key.to_bytes()))
     }
 
-    /// The P-256 key behind `key_id`: a stored key or a derived pseudonym.
-    fn p256_key(&self, key_id: u64) -> Result<&P256SigningKey, PlatformError> {
+    /// The stored P-256 key behind `key_id`.
+    fn p256_key(&self, key_id: u64) -> Result<&P256SecretKey, PlatformError> {
         self.p256_keys
             .get(&key_id)
-            .or_else(|| self.pseudonyms.get(key_id))
             .ok_or(PlatformError::KeyNotFound)
     }
 }
@@ -133,10 +126,6 @@ impl SqliteKeyStore {
 /// `n`, and any other length, type or role, fails the load. The handle counter is persisted
 /// at `custody/next_id` as an 8-byte little-endian u64 to ensure handle
 /// uniqueness across restarts.
-///
-/// Pseudonym-derived keys are NOT persisted — they are deterministically
-/// re-derivable from the identity key and are only held in the in-memory cache
-/// for the lifetime of the process.
 pub struct SqliteKeyCustody {
     /// The underlying encrypted `SQLite` storage.
     storage: SqliteStorage,
@@ -164,12 +153,14 @@ impl SqliteKeyCustody {
         let mut ed25519_keys = HashMap::new();
         let mut x25519_keys = HashMap::new();
         let mut p256_keys = HashMap::new();
-        let mut key_types = HashMap::new();
-        let mut identity_ids = HashSet::new();
+        let mut records = HashMap::new();
         let mut max_id: u64 = 0;
 
-        // Load the persisted handle counter. An absent counter is a fresh
-        // store; a counter of any other length is corruption, never zero.
+        // Load the persisted handle counter. An absent counter means no key was
+        // ever allocated. A counter of any length but 8 is corruption: reading
+        // it as 0 would let the counter fall back to the highest surviving ID,
+        // reissuing the handle of a key destroyed after it, so it fails closed
+        // like every other corrupt record below.
         let persisted_next_id = match storage.retrieve(COUNTER_KEY).await? {
             None => 0,
             Some(data) => {
@@ -212,17 +203,9 @@ impl SqliteKeyCustody {
             }
 
             let key_type_byte = data[0];
-            match data[1] {
-                ROLE_OPERATIONAL => {}
-                ROLE_IDENTITY => {
-                    identity_ids.insert(id);
-                }
-                other => {
-                    return Err(PlatformError::StorageError(format!(
-                        "key {id} has unknown role {other}"
-                    )));
-                }
-            }
+            let role = KeyRole::from_byte(data[1]).ok_or_else(|| {
+                PlatformError::StorageError(format!("key {id} has unknown role {}", data[1]))
+            })?;
             let mut key_bytes = Zeroizing::new([0u8; 32]);
             key_bytes.copy_from_slice(&data[2..ROW_LEN]);
 
@@ -230,12 +213,24 @@ impl SqliteKeyCustody {
                 KEY_TYPE_ED25519 => {
                     let signing_key = SigningKey::from_bytes(&key_bytes);
                     ed25519_keys.insert(id, signing_key);
-                    key_types.insert(id, KeyType::Ed25519);
+                    records.insert(
+                        id,
+                        KeyRecord {
+                            key_type: KeyType::Ed25519,
+                            role,
+                        },
+                    );
                 }
                 KEY_TYPE_X25519 => {
                     let secret = StaticSecret::from(*key_bytes);
                     x25519_keys.insert(id, secret);
-                    key_types.insert(id, KeyType::X25519);
+                    records.insert(
+                        id,
+                        KeyRecord {
+                            key_type: KeyType::X25519,
+                            role,
+                        },
+                    );
                 }
                 KEY_TYPE_P256_SIGNING | KEY_TYPE_P256_HPKE => {
                     let key = crate::traits::p256_key_from_stored(&key_bytes)
@@ -246,7 +241,7 @@ impl SqliteKeyCustody {
                     } else {
                         KeyType::HpkeP256
                     };
-                    key_types.insert(id, key_type);
+                    records.insert(id, KeyRecord { key_type, role });
                 }
                 other => {
                     // key_bytes is Zeroizing — automatically zeroed on drop
@@ -264,12 +259,10 @@ impl SqliteKeyCustody {
         Ok(Self {
             storage,
             store: Mutex::new(SqliteKeyStore {
-                key_types,
+                records,
                 ed25519_keys,
                 x25519_keys,
                 p256_keys,
-                pseudonyms: PseudonymKeys::default(),
-                identity_ids,
             }),
             next_id: AtomicU64::new(next_id),
         })
@@ -290,15 +283,11 @@ impl SqliteKeyCustody {
         id: u64,
         private_key: &[u8; 32],
         key_type: u8,
-        identity: bool,
+        role: KeyRole,
     ) -> Result<(), PlatformError> {
         let mut blob = Zeroizing::new([0u8; ROW_LEN]);
         blob[0] = key_type;
-        blob[1] = if identity {
-            ROLE_IDENTITY
-        } else {
-            ROLE_OPERATIONAL
-        };
+        blob[1] = role.to_byte();
         blob[2..ROW_LEN].copy_from_slice(private_key);
         let key_path = format!("{KEY_PREFIX}{id}");
         self.storage.store(&key_path, blob.as_ref()).await
@@ -311,13 +300,8 @@ impl SqliteKeyCustody {
         self.storage.delete(&key_path).await
     }
 
-    /// Mints and persists a key of `key_type`, in the identity role when
-    /// `identity`.
-    async fn generate(
-        &self,
-        key_type: KeyType,
-        identity: bool,
-    ) -> Result<KeyHandle, PlatformError> {
+    /// Mints and persists a key of `key_type` in `role`.
+    async fn generate(&self, key_type: KeyType, role: KeyRole) -> Result<KeyHandle, PlatformError> {
         let p256_key = match key_type {
             KeyType::P256Signing | KeyType::HpkeP256 => {
                 Some(crate::traits::generate_p256_os_rng()?)
@@ -330,12 +314,12 @@ impl SqliteKeyCustody {
                 rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, key_bytes.as_mut());
                 key_bytes
             },
-            P256SigningKey::to_scalar_bytes,
+            P256SecretKey::to_scalar_bytes,
         );
         let handle = self.next_handle().await?;
 
         // Persist to storage before adding to cache.
-        self.persist_key(handle.id(), &key_bytes, type_byte(key_type), identity)
+        self.persist_key(handle.id(), &key_bytes, type_byte(key_type), role)
             .await?;
 
         let mut store = self.store.lock().await;
@@ -357,10 +341,9 @@ impl SqliteKeyCustody {
                 ));
             }
         }
-        store.key_types.insert(handle.id(), key_type);
-        if identity {
-            store.identity_ids.insert(handle.id());
-        }
+        store
+            .records
+            .insert(handle.id(), KeyRecord { key_type, role });
         drop(store);
 
         Ok(handle)
@@ -369,50 +352,30 @@ impl SqliteKeyCustody {
     /// Returns the stored key type for a handle, or an error if not found.
     fn lookup_type(store: &SqliteKeyStore, handle: KeyHandle) -> Result<KeyType, PlatformError> {
         store
-            .key_types
+            .records
             .get(&handle.id())
-            .copied()
+            .map(|record| record.key_type)
             .ok_or(PlatformError::KeyNotFound)
     }
 
-    /// The §9.10.4 P-256 pseudonym of identity `key_id` in `context_id` at
-    /// `epoch` (`None` for v1). A re-derive returns the handle already in the
-    /// slot; the store lock is held throughout, so a concurrent destroy of the
-    /// identity lands wholly before or after. Pseudonyms are cached only,
-    /// never persisted: they re-derive from the identity key.
+    /// The §9.10.4 P-256 pseudonym of identity `key_id` in `context_id` under
+    /// `version`. A pseudonym has no private key, so this reads the identity
+    /// seed under the store lock, derives the point, and stores nothing; a
+    /// destroyed identity fails with `KeyNotFound` (§9.10.4.A).
     async fn derive_p256_pseudonym(
         &self,
         key_id: u64,
         context_id: &[u8],
-        epoch: Option<u64>,
-    ) -> Result<PseudonymKeypair, PlatformError> {
-        let mut store = self.store.lock().await;
+        version: PseudonymVersion,
+    ) -> Result<Pseudonym, PlatformError> {
+        let store = self.store.lock().await;
         // Software custody (§9.10.4.A): the ikm is the identity private
         // seed, never the public key. Only an identity key derives, and
-        // until S12 (§9.10.4.A native interim) it is Ed25519, so its
-        // 32-byte seed is the ikm.
+        // until the identity key moves to P-256 (SCP-315) it is Ed25519, so
+        // its 32-byte seed is the ikm.
         let ikm = store.derive_source(key_id)?;
-        if let Some((handle, public_key)) = store.pseudonyms.existing(key_id, context_id, epoch) {
-            drop(store);
-            return PseudonymKeypair::new(&public_key, KeyHandle::new(handle));
-        }
-        let pseudonym_key =
-            scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, epoch)
-                .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
-        let public_key = pseudonym_key.public_key().to_compressed();
-
-        let handle = KeyHandle::new(self.next_id.fetch_add(1, Ordering::Relaxed));
-        store.pseudonyms.insert(
-            key_id,
-            context_id,
-            epoch,
-            handle.id(),
-            Box::new(pseudonym_key),
-        );
-        store.key_types.insert(handle.id(), KeyType::P256Signing);
         drop(store);
-
-        PseudonymKeypair::new(&public_key, handle)
+        Ok(Pseudonym::new(derive_pseudonym(&ikm, context_id, version)))
     }
 }
 
@@ -424,13 +387,13 @@ impl KeyCustody for SqliteKeyCustody {
         &self,
         key_type: KeyType,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
-        self.generate(key_type, false)
+        self.generate(key_type, KeyRole::Operational)
     }
 
     fn generate_identity_keypair(
         &self,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
-        self.generate(KeyType::Ed25519, true)
+        self.generate(KeyType::Ed25519, KeyRole::Identity)
     }
 
     fn sign(
@@ -514,12 +477,6 @@ impl KeyCustody for SqliteKeyCustody {
         async move {
             let mut store = self.store.lock().await;
             let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
-            // Every pseudonym derived from this key goes with it (§9.10.4.A),
-            // whatever the key's type, under the same lock a derive holds.
-            for pseudonym in store.pseudonyms.remove_identity(key_id) {
-                store.key_types.remove(&pseudonym);
-            }
-
             match kt {
                 KeyType::Ed25519 => {
                     store.ed25519_keys.remove(&key_id);
@@ -528,16 +485,10 @@ impl KeyCustody for SqliteKeyCustody {
                     store.x25519_keys.remove(&key_id);
                 }
                 KeyType::P256Signing | KeyType::HpkeP256 => {
-                    if store.pseudonyms.remove(key_id) {
-                        // Never persisted, so there is no stored row to remove.
-                        store.key_types.remove(&key_id);
-                        return Ok(());
-                    }
                     store.p256_keys.remove(&key_id);
                 }
             }
-            store.key_types.remove(&key_id);
-            store.identity_ids.remove(&key_id);
+            store.records.remove(&key_id);
             drop(store);
 
             // Remove from persistent storage.
@@ -584,10 +535,13 @@ impl KeyCustody for SqliteKeyCustody {
         &self,
         key: &KeyHandle,
         context_id: &[u8],
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         let key_id = key.id();
         let context_id = context_id.to_vec();
-        async move { self.derive_p256_pseudonym(key_id, &context_id, None).await }
+        async move {
+            self.derive_p256_pseudonym(key_id, &context_id, PseudonymVersion::Static)
+                .await
+        }
     }
 
     fn derive_rotatable_pseudonym(
@@ -595,12 +549,18 @@ impl KeyCustody for SqliteKeyCustody {
         key: &KeyHandle,
         context_id: &[u8],
         pseudonym_epoch: u64,
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         let key_id = key.id();
         let context_id = context_id.to_vec();
         async move {
-            self.derive_p256_pseudonym(key_id, &context_id, Some(pseudonym_epoch))
-                .await
+            self.derive_p256_pseudonym(
+                key_id,
+                &context_id,
+                PseudonymVersion::Rotatable {
+                    epoch: pseudonym_epoch,
+                },
+            )
+            .await
         }
     }
 
@@ -655,14 +615,19 @@ impl KeyCustody for SqliteKeyCustody {
             let handle = self.next_handle().await?;
             let key_bytes = Zeroizing::new(**seed);
             // The imported key is the migrated identity's new `#0`.
-            self.persist_key(handle.id(), &key_bytes, KEY_TYPE_ED25519, true)
+            self.persist_key(handle.id(), &key_bytes, KEY_TYPE_ED25519, KeyRole::Identity)
                 .await?;
 
             let mut store = self.store.lock().await;
             let signing_key = SigningKey::from_bytes(&key_bytes);
             store.ed25519_keys.insert(handle.id(), signing_key);
-            store.key_types.insert(handle.id(), KeyType::Ed25519);
-            store.identity_ids.insert(handle.id());
+            store.records.insert(
+                handle.id(),
+                KeyRecord {
+                    key_type: KeyType::Ed25519,
+                    role: KeyRole::Identity,
+                },
+            );
 
             Ok(handle)
         }
@@ -680,53 +645,6 @@ mod tests {
         let key = [0x42u8; 32];
         let storage = SqliteStorage::new(dir, &key).unwrap();
         SqliteKeyCustody::new(storage).await.unwrap()
-    }
-
-    /// A destroy removes the pseudonyms seeded under the destroyed key's id
-    /// for every key type, not only Ed25519, so a non-Ed25519 identity
-    /// cannot leave a live pseudonym behind (§9.10.4.A).
-    #[tokio::test]
-    async fn destroy_clears_seeded_pseudonyms_for_every_key_type() {
-        let dir = tempfile::tempdir().unwrap();
-        let custody = temp_custody(dir.path()).await;
-        let pseudonym_key =
-            scp_crypto::p256::P256SigningKey::from_scalar_bytes(&[5u8; 32]).unwrap();
-        for (i, key_type) in [
-            KeyType::Ed25519,
-            KeyType::X25519,
-            KeyType::P256Signing,
-            KeyType::HpkeP256,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let key = custody.generate_keypair(key_type).await.unwrap();
-            let pseudonym = u64::MAX - i as u64;
-            {
-                let mut store = custody.store.lock().await;
-                store.pseudonyms.insert(
-                    key.id(),
-                    b"ctx",
-                    None,
-                    pseudonym,
-                    Box::new(pseudonym_key.clone()),
-                );
-                store.key_types.insert(pseudonym, KeyType::P256Signing);
-            }
-            custody.destroy_key(&key).await.unwrap();
-            let store = custody.store.lock().await;
-            let pseudonym_kept = store.pseudonyms.get(pseudonym).is_some();
-            let type_kept = store.key_types.contains_key(&pseudonym);
-            drop(store);
-            assert!(
-                !pseudonym_kept,
-                "{key_type:?}: the destroyed key's pseudonym must be removed"
-            );
-            assert!(
-                !type_kept,
-                "{key_type:?}: the destroyed key's pseudonym must lose its type entry"
-            );
-        }
     }
 
     #[tokio::test]
@@ -798,7 +716,7 @@ mod tests {
         assert!(verifying_key.verify(data, &signature).is_ok());
     }
 
-    /// C1/C2: the role is persisted. After a reopen the identity key and the
+    /// The role is persisted. After a reopen the identity key and the
     /// imported key derive, and the operational Ed25519 key is refused by its
     /// role (it still signs). A row with an unknown role, or of the old
     /// 33-byte shape, and a handle counter of the wrong length fail the load.
@@ -822,16 +740,16 @@ mod tests {
             .unwrap();
         assert!(matches!(
             custody.derive_pseudonym(&operational, b"ctx").await,
-            Err(PlatformError::WrongKeyType {
-                expected: KeyType::Ed25519,
-                actual: KeyType::Ed25519
-            })
+            Err(PlatformError::NotIdentityKey)
         ));
         custody.sign(&operational, b"data").await.unwrap();
 
         let row = format!("{KEY_PREFIX}{}", operational.id());
         let mut blob = custody.storage.retrieve(&row).await.unwrap().unwrap();
-        assert_eq!((blob.len(), blob[1]), (ROW_LEN, ROLE_OPERATIONAL));
+        assert_eq!(
+            (blob.len(), blob[1]),
+            (ROW_LEN, KeyRole::Operational.to_byte())
+        );
         drop(custody);
         let open = || SqliteStorage::new(dir.path(), &[0x42u8; 32]).unwrap();
         blob[1] = 7;
@@ -858,52 +776,31 @@ mod tests {
     /// `scp_crypto` recipe over the identity seed, a handle that signs only a
     /// 32-byte digest, and misuse that fails closed. Never persisted.
     #[tokio::test]
-    async fn derive_pseudonym_is_p256_and_fails_closed() {
-        use scp_crypto::p256::{P256PublicKey, verify_prehash_strict};
-
+    async fn derive_pseudonym_is_the_shared_recipe_over_the_identity_seed() {
         let dir = tempfile::tempdir().unwrap();
         let custody = temp_custody(dir.path()).await;
         let seed = Zeroizing::new([0x24u8; 32]);
         let identity = custody.import_ed25519_signing_key(&seed).await.unwrap();
 
-        for epoch in [None, Some(3)] {
-            let pseudo = match epoch {
-                None => custody.derive_pseudonym(&identity, b"ctx").await.unwrap(),
-                Some(e) => custody
-                    .derive_rotatable_pseudonym(&identity, b"ctx", e)
-                    .await
-                    .unwrap(),
-            };
-            let expected = scp_crypto::pseudonym::derive_pseudonym_keypair(&seed, b"ctx", epoch)
-                .unwrap()
-                .public_key()
-                .to_compressed();
-            assert_eq!(pseudo.public_key().as_bytes(), expected.as_slice());
+        for version in [
+            PseudonymVersion::Static,
+            PseudonymVersion::Rotatable { epoch: 3 },
+        ] {
+            let pseudo = match version {
+                PseudonymVersion::Static => custody.derive_pseudonym(&identity, b"ctx").await,
+                PseudonymVersion::Rotatable { epoch } => {
+                    custody
+                        .derive_rotatable_pseudonym(&identity, b"ctx", epoch)
+                        .await
+                }
+            }
+            .unwrap();
+            let point = derive_pseudonym(&seed, b"ctx", version);
+            assert_eq!(pseudo.public_key(), &point);
             assert_eq!(
                 pseudo.routing_id(),
-                &scp_crypto::pseudonym::pseudonym_routing_id(&expected)
+                &scp_crypto::pseudonym::pseudonym_routing_id(&point)
             );
-
-            let digest = [0x77u8; 32];
-            let sig = custody.sign(pseudo.key_handle(), &digest).await.unwrap();
-            let pk = P256PublicKey::from_sec1(&expected).unwrap();
-            verify_prehash_strict(&pk, &digest, sig.as_bytes()).unwrap();
-            assert!(matches!(
-                custody.sign(pseudo.key_handle(), &[0u8; 31]).await,
-                Err(PlatformError::CustodyError(_))
-            ));
-            assert!(matches!(
-                custody.dh_agree(pseudo.key_handle(), &[1u8; 32]).await,
-                Err(PlatformError::WrongKeyType {
-                    expected: KeyType::HpkeP256,
-                    actual: KeyType::P256Signing
-                })
-            ));
-            custody.destroy_key(pseudo.key_handle()).await.unwrap();
-            assert!(matches!(
-                custody.public_key(pseudo.key_handle()).await,
-                Err(PlatformError::KeyNotFound)
-            ));
         }
     }
 
@@ -928,7 +825,7 @@ mod tests {
         }
     }
 
-    /// A11: destroying a P-256 key (either type) deletes its row, so it is
+    /// Destroying a P-256 key (either type) deletes its row, so it is
     /// gone after a reload while a sibling key survives.
     #[tokio::test]
     async fn destroyed_p256_keys_are_gone_after_reload() {
@@ -1020,6 +917,72 @@ mod tests {
         }
     }
 
+    // Construction fails closed on a corrupt persisted record (§17.17.1
+    // SCP-CAPSEL-8001 of `.docs/specs/17-persistence-and-storage.md`):
+    // `SqliteKeyCustody::new` returns `PlatformError::StorageError` and no
+    // custody object.
+
+    /// Opens storage in `dir`, writes `value` at `key`, and returns what
+    /// `SqliteKeyCustody::new` makes of the store afterwards.
+    async fn open_after_writing(
+        dir: &Path,
+        key: &str,
+        value: &[u8],
+    ) -> Result<SqliteKeyCustody, PlatformError> {
+        let db_key = [0x42u8; 32];
+        {
+            let storage = SqliteStorage::new(dir, &db_key).unwrap();
+            storage.store(key, value).await.unwrap();
+        }
+        let storage = SqliteStorage::new(dir, &db_key).unwrap();
+        SqliteKeyCustody::new(storage).await
+    }
+
+    fn expect_storage_error(result: Result<SqliteKeyCustody, PlatformError>, needle: &str) {
+        match result {
+            Err(PlatformError::StorageError(msg)) => assert!(
+                msg.contains(needle),
+                "the error must contain {needle:?}: {msg}"
+            ),
+            Err(other) => panic!("expected PlatformError::StorageError, got {other:?}"),
+            Ok(_) => panic!(
+                "SqliteKeyCustody::new must fail closed on a corrupt record \
+                 (spec §17.17.1 SCP-CAPSEL-8001)"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_on_a_key_record_of_wrong_length_fails_closed_with_storage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = format!("{KEY_PREFIX}1");
+        let result = open_after_writing(dir.path(), &record, &[KEY_TYPE_ED25519; 12]).await;
+        expect_storage_error(result, "invalid length");
+    }
+
+    #[tokio::test]
+    async fn new_on_a_key_record_of_unknown_type_fails_closed_with_storage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = format!("{KEY_PREFIX}1");
+        // A full-length row with a valid role byte, so the type byte is what
+        // the load refuses.
+        let mut value = vec![0xEEu8, KeyRole::Operational.to_byte()];
+        value.extend_from_slice(&[0x07u8; 32]);
+        assert_eq!(value.len(), ROW_LEN);
+        let result = open_after_writing(dir.path(), &record, &value).await;
+        expect_storage_error(result, "unknown type");
+    }
+
+    /// A handle counter of the wrong length is refused rather than read as 0.
+    /// Read as 0, the counter would restart above the highest surviving key
+    /// and reissue the handle of any key destroyed after it.
+    #[tokio::test]
+    async fn new_on_a_handle_counter_of_wrong_length_fails_closed_with_storage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = open_after_writing(dir.path(), COUNTER_KEY, &[0x05u8; 3]).await;
+        expect_storage_error(result, "handle counter has invalid length 3");
+    }
+
     #[tokio::test]
     async fn custody_type_returns_software() {
         let dir = tempfile::tempdir().unwrap();
@@ -1081,7 +1044,7 @@ mod tests {
                 scp_crypto::p256::verify_prehash_strict(&pk, &digest, sig.as_bytes()).unwrap();
             }
 
-            let peer = P256SigningKey::from_scalar_bytes(&[5u8; 32]).unwrap();
+            let peer = P256SecretKey::from_scalar_bytes(&[5u8; 32]).unwrap();
             let own = scp_crypto::p256::P256PublicKey::from_sec1(hpke_pub.as_bytes()).unwrap();
             let shared = custody
                 .dh_agree(&hpke_handle, &peer.public_key().to_uncompressed())
@@ -1113,15 +1076,5 @@ mod tests {
                 ));
             }
         }
-    }
-
-    #[tokio::test]
-    async fn identity_destroy_removes_its_pseudonyms() {
-        let dir = tempfile::tempdir().unwrap();
-        crate::pseudonym_keys::tests::check_identity_owns_pseudonyms(
-            &temp_custody(dir.path()).await,
-        )
-        .await
-        .unwrap();
     }
 }

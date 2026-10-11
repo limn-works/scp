@@ -20,7 +20,9 @@ use std::time::Duration;
 use napi::Env;
 use napi::Error as NapiError;
 use napi_derive::napi;
-use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
+use scp_ffi_common::bridge_instance::{
+    BridgeInstanceCore as _, ShutdownError, ShutdownOutcome, sdk_shutdown_result,
+};
 use scp_ffi_common::error_codes as codes;
 use scp_identity::DidMethod as _;
 
@@ -36,7 +38,7 @@ use crate::context::{
     NapiInviteMemberOutcome, NapiKeyPackageReservation, NapiMessage, NapiPublishResult,
     NapiSealedInvitation,
 };
-use crate::error::{ScpNapiError, validate_custody_type};
+use crate::error::{ScpNapiError, custody_without_backend, validate_custody_type};
 use crate::event_log::{NapiCheckpoint, NapiEvent, NapiProof};
 use crate::identity::NapiIdentity;
 use crate::mcp::{
@@ -276,7 +278,7 @@ impl Scp {
         let bi = NapiBridgeInstance::with_storage_napi(storage).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: e.to_string(),
-                code: codes::STORAGE_8004.to_owned(),
+                code: e.code().to_owned(),
             })
         })?;
         Ok(Self {
@@ -316,9 +318,8 @@ impl Scp {
 
     /// Shuts down this bridge instance with a graceful deadline.
     ///
-    /// Awaits in-flight tasks up to `timeout_millis` **milliseconds**,
-    /// aborts any remaining tasks, then clears registries and runs
-    /// shutdown hooks. Permanent — a shut-down instance cannot be reused.
+    /// Awaits in-flight tasks up to `timeout_millis` **milliseconds**.
+    /// Permanent — a shut-down instance cannot be reused.
     ///
     /// The unit is **milliseconds** — unified across all Rust bridges.
     /// The width is `u64` so the NAPI / `UniFFI` / `PyO3` bridges share
@@ -329,6 +330,11 @@ impl Scp {
     /// semantics (last tuple element flags lossless conversion, which
     /// we intentionally ignore — any bigint beyond `u64::MAX` is
     /// clamped to "effectively unbounded").
+    ///
+    /// # Errors
+    ///
+    /// Throws a validation error with `SCP-STORAGE-8005` when the durable
+    /// store still holds its advisory lock after the call.
     #[napi]
     pub async fn shutdown(
         &self,
@@ -336,13 +342,7 @@ impl Scp {
     ) -> napi::Result<()> {
         let (_sign, value, _lossless) = timeout_millis.get_u64();
         let timeout = Duration::from_millis(value);
-        match self.inner.shutdown(timeout).await {
-            Ok(_) => Ok(()),
-            // `AlreadyShutDown` is treated as a harmless lifecycle
-            // observation — double-shutdown is idempotent at the SDK
-            // surface.
-            Err(_already) => Ok(()),
-        }
+        sdk_shutdown(self.inner.shutdown(timeout).await).map_err(Into::into)
     }
 
     /// Returns the instance id as a base-10 string.
@@ -392,14 +392,13 @@ impl Scp {
         use crate::identity::NapiIdentityInner;
         use crate::identity::ensure_did_resolver_initialized_on;
 
-        validate_custody_type(&custody).map_err(NapiError::from)?;
-
         // Validate the optional 32-byte `testing_seed` at the FFI boundary
         // so we fail early rather than panicking in
         // `InMemoryKeyCustody::from_seed_bytes`. A length mismatch is
-        // `SCP-VALID-7007`; a seed paired with a non-InMemory custody
-        // surfaces later as `SCP-VALID-7009`. The seed bytes feed
-        // `Ed25519 SigningKey::from_bytes` inside the custody's RNG, so
+        // `SCP-VALID-7007`; a seed the custody cannot honor is rejected
+        // next by `check_testing_seed`, before the custody string is read.
+        // The seed bytes feed `Ed25519 SigningKey::from_bytes` inside the
+        // custody's RNG, so
         // we wrap the narrowed `[u8; 32]` in `Zeroizing` immediately to
         // wipe them when dropped rather than leaving them on the stack.
         //
@@ -428,6 +427,18 @@ impl Scp {
                 Some(zeroize::Zeroizing::new(narrowed))
             }
         };
+        scp_ffi_common::validate::check_testing_seed(
+            &custody,
+            testing_seed_bytes.is_some(),
+            cfg!(feature = "testing"),
+        )
+        .map_err(|(code, message)| {
+            NapiError::from(ScpNapiError::Validation {
+                message: message.to_owned(),
+                code: code.to_owned(),
+            })
+        })?;
+        validate_custody_type(&custody).map_err(NapiError::from)?;
 
         let bi = &*self.inner;
         ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
@@ -497,46 +508,15 @@ impl Scp {
                 Ok(handle)
             }
             #[cfg(not(feature = "testing"))]
-            "in_memory" => {
-                // Mirrors PyO3 `parse_custody_with_seed`
-                // (cfg(not(testing))): a `testing_seed` is
-                // a parity-harness affordance gated on the
-                // `testing` feature, so surface it as
-                // SCP-VALID-7008 ("testing-only feature requires feature
-                // flag") ahead of the generic custody-unavailable error.
-                if testing_seed_bytes.is_some() {
-                    return Err(NapiError::from(ScpNapiError::Validation {
-                        message: "`testing_seed` parameter requires the testing feature".to_owned(),
-                        code: codes::VALID_7008.to_owned(),
-                    }));
-                }
-                Err(ScpNapiError::Identity {
-                    message: "in_memory custody is not available in this build -- use \
-                              \"software\" or \"platform\" custody for production key storage"
-                        .to_owned(),
-                    code: codes::IDENT_1008.to_owned(),
-                }
-                .into())
+            "in_memory" => Err(ScpNapiError::Identity {
+                message: format!(
+                    "in_memory custody is not available in this build — {}",
+                    crate::error::ACCEPTED_CUSTODY
+                ),
+                code: codes::IDENT_1008.to_owned(),
             }
-            "platform" | "software" => {
-                if testing_seed_bytes.is_some() {
-                    return Err(NapiError::from(ScpNapiError::Validation {
-                        message: "`testing_seed` parameter is only valid for custody=\"in_memory\""
-                            .to_owned(),
-                        code: codes::VALID_7009.to_owned(),
-                    }));
-                }
-                Err(ScpNapiError::Identity {
-                    message: format!(
-                        "custody type {custody:?} requires a wired platform \
-                         KeyCustodyProvider — use the KeyCustodyProvider callback \
-                         interface to inject Secure Enclave (iOS) or Android \
-                         Keystore (Android) backed custody"
-                    ),
-                    code: codes::IDENT_1003.to_owned(),
-                }
-                .into())
-            }
+            .into()),
+            "platform" | "software" => Err(custody_without_backend(&custody).into()),
             _ => Err(ScpNapiError::Identity {
                 code: codes::IDENT_1005.to_owned(),
                 message: format!(
@@ -626,22 +606,14 @@ impl Scp {
             }
             #[cfg(not(feature = "testing"))]
             "in_memory" => Err(ScpNapiError::Identity {
-                message: "in_memory custody is not available in this build -- use \
-                          \"software\" or \"platform\" custody for production key storage"
-                    .to_owned(),
+                message: format!(
+                    "in_memory custody is not available in this build — {}",
+                    crate::error::ACCEPTED_CUSTODY
+                ),
                 code: codes::IDENT_1008.to_owned(),
             }
             .into()),
-            "platform" | "software" => Err(ScpNapiError::Identity {
-                message: format!(
-                    "custody type {custody:?} requires a wired platform \
-                     KeyCustodyProvider — use the KeyCustodyProvider callback \
-                     interface to inject Secure Enclave (iOS) or Android \
-                     Keystore (Android) backed custody"
-                ),
-                code: codes::IDENT_1003.to_owned(),
-            }
-            .into()),
+            "platform" | "software" => Err(custody_without_backend(&custody).into()),
             _ => Err(ScpNapiError::Identity {
                 code: codes::IDENT_1005.to_owned(),
                 message: format!(
@@ -732,7 +704,7 @@ impl Scp {
             // FAIL CLOSED on a shipped (no-`testing`) build (ADR-062 §Decision
             // 6, IDENT_1059). This callback-custody path funnels through the
             // same mandatory pre-rotation commitment as every other create path
-            // (spec §9.7.4.1 §3); the only `PreRotationCustody` backend is the
+            // (spec §9.7.4.1 item 5(a)); the only `PreRotationCustody` backend is the
             // severed in-memory nullifier, so production returns a typed error
             // rather than minting it. Mirrors the `PyO3` reference bridge.
             #[cfg(not(feature = "testing"))]
@@ -991,9 +963,9 @@ impl Scp {
             rt.block_on(custody.sign(&key_handle, &built.canonical_bytes))
         })
         .map_err(|e| {
-            NapiError::from(ScpNapiError::custody(
+            NapiError::from(ScpNapiError::custody_failure(
                 format!("link attestation signing failed: {e}"),
-                &e,
+                &scp_crypto::CustodyFailure::from(&e),
             ))
         })?;
         attestation.signature = sig.as_bytes().to_vec();
@@ -3338,11 +3310,8 @@ impl Scp {
     ///
     /// # Errors
     ///
-    /// Rejects with a typed saga error — `SagaAborted` (a Prepare-phase abort
-    /// that may be a permanent rejection — authorization, freshness, rate limit,
-    /// or co-residency — OR a retryable transient: a rate limit, or a
-    /// participant actor unavailable to complete the Prepare exchange; carries
-    /// `retry_after_ms`), `SagaNeedsRepair` (Commit-retry exhausted —
+    /// Rejects with a typed saga error — `SagaAborted` (its causes told
+    /// apart by its code; carries `retry_after_ms`), `SagaNeedsRepair` (Commit-retry exhausted —
     /// carries the durable `saga_id`), or `SagaBusy` (the participant context
     /// set overlapped an in-flight saga — §5.15.4). Rejects with a validation
     /// error if an id/DID/outlet-id is malformed or `asserted_nonce_hex` does not
@@ -4047,7 +4016,22 @@ impl Scp {
     // MCP
     // -------------------------------------------------------------------
 
-    /// Per-instance equivalent of the free-function `mcp_server_create`.
+    /// Starts an MCP server over this instance's contexts on the `stdio` or
+    /// `sse` transport.
+    ///
+    /// A server started while no supervisor is attached, or while the instance
+    /// is suspended, has no resource subscriptions for its whole life: it
+    /// advertises `resources.subscribe`, `resources.listChanged` and
+    /// `tools.listChanged` as false, rejects `resources/subscribe`, and sends
+    /// no `list_changed` notification. With or without a supervisor, this
+    /// server lists no tools and refuses every `tools/call`. Attaching a
+    /// supervisor or calling `resume()` later does not add subscriptions or
+    /// `list_changed` notifications to a running server; stop it and serve
+    /// again to get them. Authorization and `resources/list|read` read role
+    /// state on every request, from the bridge's copy while no supervisor is
+    /// attached and from the actor once one is, so attaching a supervisor
+    /// changes which contexts a running server serves from the next request
+    /// on.
     #[napi(js_name = "mcpServerCreate")]
     pub async fn mcp_server_create(
         &self,
@@ -4073,12 +4057,27 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `mcp_client_connect_sse`.
+    /// `auth_token` is sent as `Authorization: Bearer <token>` on the `GET`
+    /// and on every POST, or `None` for a server that runs no bearer check; an
+    /// SCP SSE server always runs one (ADR-015). The transport has no TLS, so a
+    /// token is sent only to a loopback host.
     #[napi(js_name = "mcpClientConnectSse")]
-    pub async fn mcp_client_connect_sse(&self, url: String) -> napi::Result<NapiMcpClientHandle> {
-        crate::mcp::mcp_client_connect_sse_on(&self.inner, url).await
+    pub async fn mcp_client_connect_sse(
+        &self,
+        url: String,
+        auth_token: Option<String>,
+    ) -> napi::Result<NapiMcpClientHandle> {
+        crate::mcp::mcp_client_connect_sse_on(&self.inner, url, auth_token).await
     }
 
     /// Per-instance equivalent of the free-function `mcp_client_disconnect`.
+    ///
+    /// A stdio client's server process group is killed, or an SSE client's
+    /// sockets are shut down, before this returns. A call still waiting
+    /// behind an in-flight call on the handle fails once it reaches the
+    /// client, on either transport, and sends no request. A connect still
+    /// waiting for its server to answer `initialize` (stdio or SSE) has no
+    /// handle yet, so no disconnect, and no instance shutdown, ends it.
     #[napi(js_name = "mcpClientDisconnect")]
     pub async fn mcp_client_disconnect(&self, handle: &NapiMcpClientHandle) -> napi::Result<()> {
         crate::napi_check_handle!(&self.inner.core, handle);
@@ -4408,120 +4407,6 @@ impl Scp {
             tier_1_threshold_secs,
             tier_2_threshold_secs,
         )
-    }
-
-    /// Per-instance equivalent of the free-function `bridge_create_shadow`.
-    ///
-    /// Routes through `&*self.inner` — the shadow identity state is stored
-    /// in this instance's per-context `BridgeContextState`. Free function
-    /// deleted in Phase 4 PR 4 demolition Phase A gap-fill.
-    #[napi(js_name = "bridgeCreateShadow")]
-    pub fn bridge_create_shadow(
-        &self,
-        bridge_id: String,
-        platform_handle: String,
-        bridge_mode: String,
-        context_id: Option<String>,
-    ) -> napi::Result<crate::bridge_connector::NapiShadowIdentity> {
-        crate::bridge_connector::bridge_create_shadow_on(
-            &self.inner,
-            bridge_id,
-            platform_handle,
-            bridge_mode,
-            context_id,
-        )
-    }
-
-    // -------------------------------------------------------------------
-    // Bridge credential store (§12.11)
-    //
-    // Per-instance equivalents of the PyO3 `bridge_credential_*` methods.
-    // Each routes through `&*self.inner` — credentials live in THIS
-    // instance's durable `FfiCredentialStore`, selected from its chosen
-    // storage backend and isolated from every other `Scp` in the process
-    // (ADR-048 §1; ADR-062 §Decision 5, SCP-CAPINJECT-009).
-    // -------------------------------------------------------------------
-
-    /// Provisions (stores) an encrypted credential for a bridge instance.
-    #[napi(js_name = "bridgeCredentialProvision")]
-    pub fn bridge_credential_provision(
-        &self,
-        bridge_id: String,
-        credential_type: String,
-        plaintext: Vec<u8>,
-        bridge_credential_key: Vec<u8>,
-    ) -> napi::Result<crate::bridge_connector::NapiBridgeCredential> {
-        crate::bridge_connector::bridge_credential_provision_on(
-            &self.inner,
-            bridge_id,
-            credential_type,
-            plaintext,
-            bridge_credential_key,
-        )
-    }
-
-    /// Retrieves and decrypts a credential for a bridge instance.
-    #[napi(js_name = "bridgeCredentialRetrieve")]
-    pub fn bridge_credential_retrieve(
-        &self,
-        bridge_id: String,
-        credential_type: String,
-        bridge_credential_key: Vec<u8>,
-    ) -> napi::Result<Vec<u8>> {
-        crate::bridge_connector::bridge_credential_retrieve_on(
-            &self.inner,
-            bridge_id,
-            credential_type,
-            bridge_credential_key,
-        )
-    }
-
-    /// Rotates (replaces) a credential for a bridge instance.
-    #[napi(js_name = "bridgeCredentialRotate")]
-    pub fn bridge_credential_rotate(
-        &self,
-        bridge_id: String,
-        credential_type: String,
-        new_plaintext: Vec<u8>,
-        bridge_credential_key: Vec<u8>,
-    ) -> napi::Result<crate::bridge_connector::NapiBridgeCredential> {
-        crate::bridge_connector::bridge_credential_rotate_on(
-            &self.inner,
-            bridge_id,
-            credential_type,
-            new_plaintext,
-            bridge_credential_key,
-        )
-    }
-
-    /// Revokes all credentials for a bridge instance.
-    #[napi(js_name = "bridgeCredentialRevoke")]
-    pub fn bridge_credential_revoke(&self, bridge_id: String) -> napi::Result<()> {
-        crate::bridge_connector::bridge_credential_revoke_on(&self.inner, bridge_id)
-    }
-
-    /// Lists all credential types stored for a bridge instance.
-    #[napi(js_name = "bridgeCredentialList")]
-    pub fn bridge_credential_list(&self, bridge_id: String) -> napi::Result<Vec<String>> {
-        crate::bridge_connector::bridge_credential_list_on(&self.inner, bridge_id)
-    }
-
-    /// Stores a bridge credential key in the custody boundary.
-    #[napi(js_name = "bridgeCredentialStoreKey")]
-    pub fn bridge_credential_store_key(&self, bridge_id: String, key: Vec<u8>) -> napi::Result<()> {
-        crate::bridge_connector::bridge_credential_store_key_on(&self.inner, bridge_id, key)
-    }
-
-    /// Retrieves a bridge credential key from the custody boundary.
-    #[napi(js_name = "bridgeCredentialGetKey")]
-    pub fn bridge_credential_get_key(&self, bridge_id: String) -> napi::Result<Vec<u8>> {
-        crate::bridge_connector::bridge_credential_get_key_on(&self.inner, bridge_id)
-    }
-
-    /// Deletes and zeroizes a bridge credential key.
-    #[napi(js_name = "bridgeCredentialDeleteKey")]
-    pub fn bridge_credential_delete_key(&self, bridge_id: String) -> napi::Result<()> {
-        crate::bridge_connector::bridge_credential_delete_key_on(&self.inner, bridge_id)
     }
 
     // -------------------------------------------------------------------
@@ -5312,6 +5197,67 @@ mod concurrency_cap_tests {
     }
 }
 
+/// Maps a bridge shutdown result to the SDK result (spec §17.6 "One Opener
+/// per Durable Directory"): a durable store the shutdown left holding its
+/// advisory lock raises `SCP-STORAGE-8005`.
+fn sdk_shutdown(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), ScpNapiError> {
+    sdk_shutdown_result(result).map_err(|message| ScpNapiError::Validation {
+        message,
+        code: codes::STORAGE_8005.to_owned(),
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod sdk_shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn store_left_locked_raises_storage_8005() {
+        let err = sdk_shutdown(Ok(ShutdownOutcome::TimedOut {
+            aborted_tasks: 0,
+            panicked_tasks: 0,
+            drain: scp_ffi_common::bridge_instance::DrainState::Panicked,
+            durable_store_open: true,
+        }))
+        .err()
+        .map(NapiError::from)
+        .expect("a store left holding its lock must not report success");
+        assert!(err.reason.contains(codes::STORAGE_8005), "{}", err.reason);
+        let err = sdk_shutdown(Err(ShutdownError::DurableStoreClose(
+            scp_platform::PlatformError::StorageError("close refused".to_owned()),
+        )))
+        .err()
+        .map(NapiError::from)
+        .expect("a store that refused to close must not report success");
+        assert!(err.reason.contains(codes::STORAGE_8005), "{}", err.reason);
+        let err = sdk_shutdown(Err(ShutdownError::AlreadyShutDown {
+            durable_store_open: true,
+        }))
+        .err()
+        .map(NapiError::from)
+        .expect("a repeat shutdown that finds the store still locked must not report success");
+        assert!(err.reason.contains(codes::STORAGE_8005), "{}", err.reason);
+    }
+
+    #[test]
+    fn released_store_reports_success() {
+        assert!(
+            sdk_shutdown(Ok(ShutdownOutcome::GracefulWithin {
+                elapsed: Duration::ZERO,
+                panicked_tasks: 0,
+            }))
+            .is_ok()
+        );
+        assert!(
+            sdk_shutdown(Err(ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            }))
+            .is_ok()
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod petname_validation_tests {
@@ -5475,5 +5421,107 @@ mod identity_remove_validation_tests {
                 .expect("valid DID must not be rejected by identity_remove_if_present"),
             "removing an unregistered DID must report false"
         );
+    }
+}
+
+/// Every custody-string rejection on this bridge names the strings it accepts,
+/// and none of them sends the caller to `"platform"` or `"software"` (SCP-294).
+#[cfg(test)]
+mod custody_string_message_tests {
+    use super::*;
+    use crate::error::ACCEPTED_CUSTODY;
+
+    fn create_error(custody: &str) -> String {
+        let scp = Scp::new_in_memory_for_test();
+        crate::runtime()
+            .block_on(scp.identity_create(custody.to_owned(), None))
+            .err()
+            .map_or_else(
+                || format!("{custody:?} created an identity"),
+                |e| e.to_string(),
+            )
+    }
+
+    fn create_with_agent_key_error(custody: &str) -> String {
+        let scp = Scp::new_in_memory_for_test();
+        crate::runtime()
+            .block_on(scp.identity_create_with_agent_key(custody.to_owned()))
+            .err()
+            .map_or_else(
+                || format!("{custody:?} created an identity"),
+                |e| e.to_string(),
+            )
+    }
+
+    /// A seed paired with `"platform"`, `"software"`, or an unknown string
+    /// reports the seed misuse (`SCP-VALID-7009`) before the custody string
+    /// is read, as the `PyO3` and `UniFFI` bridges do; without a seed the
+    /// same strings keep their custody codes.
+    #[test]
+    fn seed_misuse_is_reported_before_the_custody_string() {
+        for (custody, unseeded) in [
+            ("platform", codes::IDENT_1003),
+            ("software", codes::IDENT_1003),
+            ("keychain", codes::VALID_7005),
+        ] {
+            let scp = Scp::new_in_memory_for_test();
+            let seeded = crate::runtime()
+                .block_on(scp.identity_create(
+                    custody.to_owned(),
+                    Some(napi::bindgen_prelude::Buffer::from(vec![7u8; 32])),
+                ))
+                .err()
+                .map_or_else(|| "created an identity".to_owned(), |e| e.to_string());
+            assert!(seeded.contains(codes::VALID_7009), "{custody}: {seeded}");
+            let plain = create_error(custody);
+            assert!(plain.contains(unseeded), "{custody}: {plain}");
+        }
+    }
+
+    /// `"platform"` and `"software"` return `SCP-IDENT-1003` on both string
+    /// create paths, with a message naming the accepted set.
+    #[test]
+    fn platform_and_software_reject_with_ident_1003_naming_the_accepted_set() {
+        for custody in ["platform", "software"] {
+            for msg in [create_error(custody), create_with_agent_key_error(custody)] {
+                assert!(msg.contains(codes::IDENT_1003), "{custody}: {msg}");
+                assert!(msg.contains(ACCEPTED_CUSTODY), "{custody}: {msg}");
+            }
+        }
+    }
+
+    /// An unknown string returns `SCP-VALID-7005` naming the accepted set,
+    /// which lists neither rejected string as expected.
+    #[test]
+    fn unknown_custody_rejects_with_valid_7005_naming_the_accepted_set() {
+        for msg in [
+            create_error("keychain"),
+            create_with_agent_key_error("keychain"),
+        ] {
+            assert!(msg.contains(codes::VALID_7005), "{msg}");
+            assert!(msg.contains(ACCEPTED_CUSTODY), "{msg}");
+            assert!(
+                !msg.contains("\"platform\"") && !msg.contains("\"software\""),
+                "{msg}"
+            );
+        }
+    }
+
+    /// A shipped build refuses `"in_memory"` with `SCP-IDENT-1008` and names
+    /// the accepted set instead of `"software"` or `"platform"`.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn in_memory_on_a_shipped_build_names_the_accepted_set() {
+        for msg in [
+            create_error("in_memory"),
+            create_with_agent_key_error("in_memory"),
+        ] {
+            assert!(msg.contains(codes::IDENT_1008), "{msg}");
+            assert!(msg.contains(ACCEPTED_CUSTODY), "{msg}");
+            assert!(
+                !msg.contains("\"platform\"") && !msg.contains("\"software\""),
+                "{msg}"
+            );
+        }
     }
 }

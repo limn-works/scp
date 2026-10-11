@@ -82,7 +82,11 @@ async fn handle_standing_context_count(
     let count_fut = async { crate::context::standing_helpers::standing_context_count(deps) };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, count_fut).await {
-        Ok(count) => (Outcome::ok(()), Ok(count)),
+        Ok(Ok(count)) => (Outcome::ok(()), Ok(count)),
+        Ok(Err(err)) => {
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "standing_context_count exceeded {HANDLER_TIMEOUT:?} budget"
@@ -105,7 +109,11 @@ async fn handle_has_standing_context(
     let has_fut = async { crate::context::standing_helpers::has_standing_context(deps, &peer_did) };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, has_fut).await {
-        Ok(has) => (Outcome::ok(()), Ok(has)),
+        Ok(Ok(has)) => (Outcome::ok(()), Ok(has)),
+        Ok(Err(err)) => {
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "has_standing_context exceeded {HANDLER_TIMEOUT:?} budget"
@@ -194,6 +202,64 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::GovernanceFailed(msg) => ContextError::GovernanceFailed(msg.clone()),
         ContextError::InvalidState(msg) => ContextError::InvalidState(msg.clone()),
         ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
+        ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use scp_did::DID;
+
+    use crate::context::messaging_helpers::dropped_supervisor_tests::{Fixture, assert_shut_down};
+
+    #[tokio::test]
+    async fn standing_queries_answer_with_live_supervisor() {
+        let f = Fixture::new().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let out = super::handle_standing_context_count(&f.deps, tx).await;
+        assert!(out.result.is_ok(), "count: {:?}", out.result);
+        assert_eq!(rx.await.unwrap().unwrap(), 0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let peer = DID("did:example:standing-peer".to_owned());
+        let out = super::handle_has_standing_context(&f.deps, peer, tx).await;
+        assert!(out.result.is_ok(), "has: {:?}", out.result);
+        assert!(!rx.await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn standing_queries_fail_closed_after_supervisor_drops() {
+        let f = Fixture::new().await.drop_supervisor();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let out = super::handle_standing_context_count(&f.deps, tx).await;
+        assert!(
+            out.result.is_err(),
+            "the Outcome must record the failed count"
+        );
+        assert_shut_down(&rx.await.unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let peer = DID("did:example:standing-peer".to_owned());
+        let out = super::handle_has_standing_context(&f.deps, peer, tx).await;
+        assert!(
+            out.result.is_err(),
+            "the Outcome must record the failed query"
+        );
+        assert_shut_down(&rx.await.unwrap());
+    }
+
+    /// The Outcome sketch keeps a Supervisor shutdown typed rather than
+    /// recording it as a crypto failure.
+    mod outcome_sketch_tests {
+        use super::super::{ContextError, outcome_error_sketch};
+
+        #[test]
+        fn sketch_keeps_supervisor_shut_down_typed() {
+            let sketch = outcome_error_sketch(&ContextError::SupervisorShutDown("gone".to_owned()));
+            assert!(
+                matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
+                "got {sketch:?}"
+            );
+        }
     }
 }

@@ -5,7 +5,10 @@
 //! SCP adds the rules openmls cannot know:
 //!
 //! - **Added leaf** ([`admit_added_leaf`]), in order:
-//!   1. the `KeyPackage` `Lifetime` holds against the injected hardened clock;
+//!   1. the `KeyPackage` `Lifetime` passes the check for the caller's role
+//!      ([`LifetimeCheck`]): the adder reads its injected clock, and a
+//!      receiver checks the range alone and reads no clock (security-model
+//!      spec §9.7.1);
 //!   2. the leaf credential parses to an SCP DID;
 //!   3. the leaf carries a valid `0xFF01` wrapping key;
 //!   4. on the tree **after** the Commit ([`admit_staged_commit`]), every leaf
@@ -33,7 +36,9 @@ use scp_clock::Clock;
 
 use crate::credential::ScpCredential;
 use crate::error::MlsError;
-use crate::lifetime::validate_key_package_lifetime;
+use crate::lifetime::{
+    validate_key_package_lifetime_for_add, validate_received_key_package_lifetime_range,
+};
 use crate::wrapping_extension::extract_wrapping_key;
 use scp_protocol::crypto::hpke::p256::P256Point;
 
@@ -77,6 +82,18 @@ impl std::fmt::Display for LeafAdmissionRejection {
             Self::IdentityChanged => "the replacing leaf names a different DID",
         })
     }
+}
+
+/// Which `KeyPackage` `Lifetime` check admission runs (security-model spec
+/// §9.7.1).
+#[derive(Clone, Copy)]
+pub(crate) enum LifetimeCheck<'a> {
+    /// The adder: the `Lifetime` holds under the injected clock, with the
+    /// add-side minimum remaining lifetime and minimum `not_before` age.
+    Adder(&'a dyn Clock),
+    /// A receiver of a Commit: the range alone, reading no clock, so every
+    /// honest receiver reaches the same verdict.
+    Receiver,
 }
 
 /// One occupied leaf of the current tree.
@@ -263,20 +280,29 @@ pub(crate) fn tree_leaves(group: &MlsGroup) -> Result<Vec<TreeLeaf>, MlsError> {
 }
 
 /// The checks an added leaf passes on its own, before the Commit-wide rules:
-/// the `KeyPackage` `Lifetime` against the hardened clock, an SCP credential,
+/// the `KeyPackage` `Lifetime` check for the caller's role ([`LifetimeCheck`]),
+/// an SCP credential,
 /// and a present, valid `0xFF01`.
 ///
 /// # Errors
 ///
-/// In check order: [`MlsError::KeyPackageLifetimeInvalid`],
+/// In check order: [`MlsError::KeyPackageLifetimeInvalid`] (adder) or
+/// [`MlsError::ReceivedKeyPackageLifetimeRangeInvalid`] (receiver),
 /// [`MlsError::InvalidCredential`], [`MlsError::ExtensionError`] (a
 /// malformed `0xFF01`), then [`MlsError::LeafAdmissionRejected`] with
 /// [`LeafAdmissionRejection::MissingWrappingKey`].
 pub(crate) fn admit_added_leaf(
     key_package: &KeyPackage,
-    clock: &dyn Clock,
+    lifetime: LifetimeCheck<'_>,
 ) -> Result<AdmittedLeaf, MlsError> {
-    validate_key_package_lifetime(key_package.life_time(), clock)?;
+    match lifetime {
+        LifetimeCheck::Adder(clock) => {
+            validate_key_package_lifetime_for_add(key_package.life_time(), clock)?;
+        }
+        LifetimeCheck::Receiver => {
+            validate_received_key_package_lifetime_range(key_package.life_time())?;
+        }
+    }
     let leaf = key_package.leaf_node();
     let did = leaf_did(leaf)?;
     let wrapping_key = required_wrapping_key(leaf, &did)?;
@@ -336,7 +362,10 @@ fn replace_leaf(
 /// travels with.
 ///
 /// `committer` is the Commit sender's leaf, which the `UpdatePath` leaf (when
-/// present) replaces.
+/// present) replaces. `lifetime` selects each added leaf's `Lifetime` check:
+/// [`LifetimeCheck::Adder`] when the local member committed (it is then the
+/// adder of every Add, including one openmls folded in from an earlier
+/// proposal), and [`LifetimeCheck::Receiver`] for a received Commit.
 ///
 /// # Errors
 ///
@@ -350,7 +379,7 @@ pub(crate) fn admit_staged_commit(
     group: &MlsGroup,
     staged_commit: &StagedCommit,
     committer: LeafNodeIndex,
-    clock: &dyn Clock,
+    lifetime: LifetimeCheck<'_>,
 ) -> Result<CommitAdmission, MlsError> {
     let tree = tree_leaves(group)?;
     let mut after = tree.clone();
@@ -377,9 +406,10 @@ pub(crate) fn admit_staged_commit(
         admission.wrapping_key_updates.extend(change);
     }
     for add in staged_commit.add_proposals() {
-        admission
-            .added
-            .push(admit_added_leaf(add.add_proposal().key_package(), clock)?);
+        admission.added.push(admit_added_leaf(
+            add.add_proposal().key_package(),
+            lifetime,
+        )?);
     }
 
     let post_commit: Vec<(&str, Option<P256Point>)> = after
@@ -497,14 +527,14 @@ mod tests {
             )
             .unwrap();
             let add = add_member(alice, bundle.key_package().clone().into(), &SystemClock).unwrap();
-            let joined = join_group(&add.welcome, provider, signer).unwrap();
+            let joined = join_group(&add.welcome, provider, signer, &SystemClock).unwrap();
             (add.commit, joined)
         };
         let (_, bob) = join(&mut alice, "bob");
         let (add_dave, dave) = join(&mut alice, "dave");
         let mut f = Fixture { alice, bob, dave };
         let bytes = add_dave.tls_serialize_detached().unwrap();
-        decrypt_with_sender_did(&mut f.bob, &bytes, &SystemClock).unwrap();
+        decrypt_with_sender_did(&mut f.bob, &bytes).unwrap();
         assert_eq!(f.bob.epoch().unwrap(), 2);
         f
     }
@@ -566,13 +596,13 @@ mod tests {
         assert_eq!(f.alice.epoch().unwrap(), 2);
 
         let commit = hostile_add(&mut f.alice, &[keyless_kp("carol")]);
-        let err = decrypt_with_sender_did(&mut f.bob, &commit, &SystemClock).unwrap_err();
+        let err = decrypt_with_sender_did(&mut f.bob, &commit).unwrap_err();
         assert_eq!(
             rejection(&err),
             Some(LeafAdmissionRejection::MissingWrappingKey)
         );
         assert_eq!(f.bob.epoch().unwrap(), 2);
-        let err = decrypt_with_membership_changes(&mut f.dave, &commit, &SystemClock).unwrap_err();
+        let err = decrypt_with_membership_changes(&mut f.dave, &commit).unwrap_err();
         assert_eq!(
             rejection(&err),
             Some(LeafAdmissionRejection::MissingWrappingKey)
@@ -598,7 +628,7 @@ mod tests {
         assert_eq!(f.alice.epoch().unwrap(), 2);
 
         let commit = hostile_add(&mut f.alice, &[kp("bob", &other)]);
-        let err = decrypt_with_membership_changes(&mut f.dave, &commit, &SystemClock).unwrap_err();
+        let err = decrypt_with_membership_changes(&mut f.dave, &commit).unwrap_err();
         assert_eq!(
             rejection(&err),
             Some(LeafAdmissionRejection::WrappingKeyMismatch)
@@ -617,7 +647,7 @@ mod tests {
                 kp("erin", &valid_uncompressed_point(0x22)),
             ],
         );
-        let err = decrypt_with_sender_did(&mut f.dave, &commit, &SystemClock).unwrap_err();
+        let err = decrypt_with_sender_did(&mut f.dave, &commit).unwrap_err();
         assert_eq!(
             rejection(&err),
             Some(LeafAdmissionRejection::WrappingKeyMismatch)
@@ -645,7 +675,7 @@ mod tests {
         );
 
         let bytes = add.commit.tls_serialize_detached().unwrap();
-        match decrypt_with_membership_changes(&mut f.dave, &bytes, &SystemClock).unwrap() {
+        match decrypt_with_membership_changes(&mut f.dave, &bytes).unwrap() {
             InboundChange::Commit {
                 added_dids,
                 added_wrapping_keys,
@@ -671,7 +701,7 @@ mod tests {
         let key = uncompressed_point_for(&did("frank"));
         let ten: Vec<_> = (0..MAX_LEAVES_PER_DID).map(|_| kp("frank", &key)).collect();
         let commit = hostile_add(&mut f.alice, &ten);
-        decrypt_with_sender_did(&mut f.dave, &commit, &SystemClock).unwrap();
+        decrypt_with_sender_did(&mut f.dave, &commit).unwrap();
         assert_eq!(f.dave.epoch().unwrap(), 3);
 
         let err = add_member(&mut f.alice, kp("frank", &key).into(), &SystemClock)
@@ -680,7 +710,7 @@ mod tests {
         assert_eq!(rejection(&err), Some(LeafAdmissionRejection::TooManyLeaves));
 
         let commit = hostile_add(&mut f.alice, &[kp("frank", &key)]);
-        let err = decrypt_with_sender_did(&mut f.dave, &commit, &SystemClock).unwrap_err();
+        let err = decrypt_with_sender_did(&mut f.dave, &commit).unwrap_err();
         assert_eq!(rejection(&err), Some(LeafAdmissionRejection::TooManyLeaves));
         assert_eq!(f.dave.epoch().unwrap(), 3);
     }
@@ -695,13 +725,13 @@ mod tests {
                 .with_extensions(Extensions::empty())
                 .build(),
         );
-        let err = decrypt_with_sender_did(&mut f.dave, &commit, &SystemClock).unwrap_err();
+        let err = decrypt_with_sender_did(&mut f.dave, &commit).unwrap_err();
         assert_eq!(
             rejection(&err),
             Some(LeafAdmissionRejection::MissingWrappingKey)
         );
         assert_eq!(f.dave.epoch().unwrap(), 2);
-        let err = decrypt_with_membership_changes(&mut f.alice, &commit, &SystemClock).unwrap_err();
+        let err = decrypt_with_membership_changes(&mut f.alice, &commit).unwrap_err();
         assert_eq!(
             rejection(&err),
             Some(LeafAdmissionRejection::MissingWrappingKey)
@@ -722,7 +752,7 @@ mod tests {
         )];
         let commit = self_update(&mut f.bob, with_wrapping_key(&new_key));
 
-        match decrypt_with_sender_did(&mut f.dave, &commit, &SystemClock).unwrap() {
+        match decrypt_with_sender_did(&mut f.dave, &commit).unwrap() {
             DecryptedContent::Commit {
                 sender_did,
                 members,
@@ -738,7 +768,7 @@ mod tests {
             }
             other => panic!("expected a Commit, got {other:?}"),
         }
-        match decrypt_with_membership_changes(&mut f.alice, &commit, &SystemClock).unwrap() {
+        match decrypt_with_membership_changes(&mut f.alice, &commit).unwrap() {
             InboundChange::Commit { members, .. } => {
                 assert_eq!(members.rotated(), rotated.as_slice());
             }
@@ -748,7 +778,7 @@ mod tests {
 
         // Dave's own update keeping his key changes nothing recorded.
         let commit = self_update(&mut f.dave, LeafNodeParameters::builder().build());
-        match decrypt_with_sender_did(&mut f.alice, &commit, &SystemClock).unwrap() {
+        match decrypt_with_sender_did(&mut f.alice, &commit).unwrap() {
             DecryptedContent::Commit { members, .. } => assert!(members.rotated().is_empty()),
             other => panic!("expected a Commit, got {other:?}"),
         }
@@ -775,7 +805,7 @@ mod tests {
                 )
                 .build(),
         );
-        let err = decrypt_with_sender_did(&mut f.dave, &commit, &SystemClock).unwrap_err();
+        let err = decrypt_with_sender_did(&mut f.dave, &commit).unwrap_err();
         assert_eq!(
             rejection(&err),
             Some(LeafAdmissionRejection::IdentityChanged)
@@ -787,10 +817,9 @@ mod tests {
     /// client that accepts proposals by reference does. SCP's own receive path
     /// does not store proposals, so these tests store them directly.
     fn cache_proposal(group: &mut ScpMlsGroup, out: &MlsMessageOut) {
-        use openmls::prelude::tls_codec::Deserialize as _;
-        use openmls::prelude::{MlsMessageIn, OpenMlsProvider as _, ProcessedMessageContent};
+        use openmls::prelude::{OpenMlsProvider as _, ProcessedMessageContent};
         let bytes = out.tls_serialize_detached().unwrap();
-        let message = MlsMessageIn::tls_deserialize_exact(bytes.as_slice()).unwrap();
+        let message = crate::wire::parse_mls_message_in(&bytes).unwrap();
         let g = group.group.as_mut().unwrap();
         let processed = g
             .process_message(
@@ -851,7 +880,7 @@ mod tests {
         assert_eq!(f.alice.epoch().unwrap(), 3);
 
         let bytes = add.commit.tls_serialize_detached().unwrap();
-        match decrypt_with_sender_did(&mut f.dave, &bytes, &SystemClock).unwrap() {
+        match decrypt_with_sender_did(&mut f.dave, &bytes).unwrap() {
             DecryptedContent::Commit { members, .. } => {
                 let directory = members.wrapping_key_directory(&empty);
                 assert_eq!(directory.get(&did("bob")), Some(&new_key));
@@ -871,7 +900,7 @@ mod tests {
         let key = uncompressed_point_for(&did("frank"));
         let ten: Vec<_> = (0..MAX_LEAVES_PER_DID).map(|_| kp("frank", &key)).collect();
         let commit = hostile_add(&mut f.alice, &ten);
-        decrypt_with_sender_did(&mut f.dave, &commit, &SystemClock).unwrap();
+        decrypt_with_sender_did(&mut f.dave, &commit).unwrap();
         assert_eq!(f.dave.epoch().unwrap(), 3);
 
         let frank = leaf_of(&f.alice, "frank");
@@ -879,7 +908,7 @@ mod tests {
         let add = add_member(&mut f.alice, kp("frank", &key).into(), &SystemClock)
             .expect("ten leaves after the commit");
         let bytes = add.commit.tls_serialize_detached().unwrap();
-        decrypt_with_sender_did(&mut f.dave, &bytes, &SystemClock)
+        decrypt_with_sender_did(&mut f.dave, &bytes)
             .expect("the bystander counts the post-commit tree");
         assert_eq!(f.dave.epoch().unwrap(), 4);
         assert_eq!(f.dave.members().unwrap().len(), 3 + MAX_LEAVES_PER_DID);
@@ -918,7 +947,7 @@ mod tests {
 
         // A committer skipping admission sends it anyway; the bystander refuses.
         let commit = self_update(&mut f.bob, with_wrapping_key(&new_key));
-        let err = decrypt_with_sender_did(&mut f.dave, &commit, &SystemClock).unwrap_err();
+        let err = decrypt_with_sender_did(&mut f.dave, &commit).unwrap_err();
         assert_eq!(
             rejection(&err),
             Some(LeafAdmissionRejection::WrappingKeyMismatch)

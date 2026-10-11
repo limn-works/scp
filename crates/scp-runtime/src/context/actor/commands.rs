@@ -1097,10 +1097,11 @@ pub enum LifecycleCommand {
     /// Mirrors the per-context body of the legacy
     /// `shutdown_all_contexts_legacy`. Destroys per-context sender keys,
     /// MLS groups, and event logs in that order (release secrets before
-    /// tearing down structure; `SenderKey`s zeroize, the MLS group/signer is
-    /// freed — not zeroized, #82). Does NOT send leave messages or notify
-    /// remote peers — used by `scp_ffi_common::BridgeInstance::shutdown`
-    /// for process exit / test teardown.
+    /// tearing down structure; `SenderKey`s and the MLS Ed25519 signer
+    /// zeroize on drop, and the MLS provider-storage values zeroize on
+    /// drop). Does NOT send leave messages or notify remote peers — used
+    /// by `scp_ffi_common::BridgeInstance::shutdown` for process exit /
+    /// test teardown.
     ///
     /// The handler operates on the actor's owned `&mut state` so the
     /// secrets are zeroed in place. Supervisor-level state (standing
@@ -3821,8 +3822,10 @@ pub enum LifecycleControlCommand {
     /// variant is dispatched before any timer or persistence arm fires
     /// on the same poll.
     Shutdown {
-        /// Oneshot reply channel. The actor sends `Ok(())` after its
-        /// final persist completes.
+        /// Oneshot reply channel. The handler sends `Ok(())` during
+        /// dispatch, before the run loop's post-loop drain persists dirty
+        /// state, so the ack does not mean the final write landed; a caller
+        /// that needs that order uses `ContextActorHandle::shutdown_and_await_exit`.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
     /// Test-only fault-injection seam (ADR-049 §10 watchdog tests). The
@@ -3854,7 +3857,7 @@ pub enum LifecycleControlCommand {
     PrepareForReplace {
         /// The incoming export's MLS crypto bytes (empty = no incoming
         /// crypto state) — the only handler-side payload import needs.
-        mls_state: Vec<u8>,
+        mls_state: zeroize::Zeroizing<Vec<u8>>,
         /// `Ok(())` iff the context was replaceable AND crypto teardown +
         /// epoch-floor validate/merge succeeded. On failure the actor stays
         /// live (no terminal claim) and surfaces the reason: `MembershipFailed`

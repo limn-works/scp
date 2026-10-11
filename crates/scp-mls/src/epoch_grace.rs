@@ -75,8 +75,7 @@ use serde::{Deserialize, Serialize};
 /// additional cleanup. The callback must not panic.
 ///
 /// This is a type alias for a boxed closure to keep the grace store decoupled
-/// from `OpenMLS` types. The caller (e.g., `process_commit` in `ratchet.rs`)
-/// is responsible for translating epoch numbers into any provider-specific
+/// from `OpenMLS` types. The caller is responsible for translating epoch numbers into any provider-specific
 /// key deletion operations if needed.
 pub type OnEpochExpired = Box<dyn FnMut(&[u64]) + Send>;
 

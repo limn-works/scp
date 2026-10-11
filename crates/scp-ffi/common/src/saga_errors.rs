@@ -14,7 +14,7 @@
 //!
 //! This module exposes one function — [`decompose_saga_error`] — that every
 //! bridge routes through. It returns a neutral [`SagaErrorParts`] carrying the
-//! already-formatted `SCP-SAGA-…` code, the message, and a [`SagaErrorKind`]
+//! already-formatted code, the message, and a [`SagaErrorKind`]
 //! holding only the per-terminal structured payload. Each bridge's
 //! `map_saga_error` becomes a thin 3-arm match from [`SagaErrorParts`] onto
 //! its own enum, carrying only the per-bridge field-label difference
@@ -45,7 +45,7 @@ use scp_core::context::supervisor::{SagaAbortReason, SagaError};
 /// own error enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SagaErrorKind {
-    /// A Prepare-phase abort (spec §6.2.4) — neither side committed.
+    /// Neither side committed.
     ///
     /// `retry_after_ms` is read off the back-off-carrying
     /// `SagaAbortReason::RateLimited` (an `Option<u64>`); the unit
@@ -73,9 +73,9 @@ pub enum SagaErrorKind {
 
 /// The neutral, bridge-agnostic decomposition of a [`SagaError`] terminal.
 ///
-/// Carries the canonical `SCP-SAGA-…` `code` (already formatted — for
-/// `Aborted` it is `SCP-SAGA-{numeric}`, for `NeedsRepair`/`Busy` it is the
-/// fixed terminal code), the human-readable `message`, and the per-terminal
+/// Carries the `code` (already formatted — for `Aborted` it is
+/// `SCP-SAGA-{numeric}`, for `NeedsRepair`/`Busy` it is the fixed terminal
+/// code, for `SupervisorShutDown` it is `SCP-CTX-2138`), the human-readable `message`, and the per-terminal
 /// structured payload in `kind`. Each bridge's thin `map_saga_error` maps this
 /// onto its own typed error enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +83,7 @@ pub struct SagaErrorParts {
     /// The per-terminal structured payload (`retry_after_ms` / `saga_id` /
     /// `contended_context`).
     pub kind: SagaErrorKind,
-    /// The canonical `SCP-SAGA-…` code string (already formatted).
+    /// The code string (already formatted).
     pub code: String,
     /// Human-readable detail (the underlying terminal's message).
     pub message: String,
@@ -105,6 +105,8 @@ pub struct SagaErrorParts {
 ///   `code = SCP-SAGA-13065` (the durable operator-repair terminal).
 /// - `Busy { contended_context, message }` → `kind = Busy { contended_context }`,
 ///   `code = SCP-SAGA-13066`.
+/// - `SupervisorShutDown { message }` → `kind = Aborted { retry_after_ms: None }`,
+///   `code = SCP-CTX-2138`.
 #[must_use]
 pub fn decompose_saga_error(err: SagaError) -> SagaErrorParts {
     match err {
@@ -136,6 +138,15 @@ pub fn decompose_saga_error(err: SagaError) -> SagaErrorParts {
         } => SagaErrorParts {
             kind: SagaErrorKind::Busy { contended_context },
             code: codes::SAGA_13066.to_owned(),
+            message,
+        },
+        // Nothing was staged, so the saga aborted with no back-off hint; the
+        // code tells a shutdown refusal apart from a policy reject.
+        SagaError::SupervisorShutDown { message } => SagaErrorParts {
+            kind: SagaErrorKind::Aborted {
+                retry_after_ms: None,
+            },
+            code: codes::CTX_2138.to_owned(),
             message,
         },
     }
@@ -221,6 +232,23 @@ mod tests {
             message: "caller not a member".to_owned(),
         });
         assert_eq!(parts.code, "SCP-SAGA-13050");
+        assert_eq!(
+            parts.kind,
+            SagaErrorKind::Aborted {
+                retry_after_ms: None,
+            }
+        );
+    }
+
+    /// A saga refused by Supervisor shutdown keeps `SCP-CTX-2138`, not a
+    /// saga-abort code, and carries no back-off hint.
+    #[test]
+    fn supervisor_shut_down_keeps_ctx_2138() {
+        let parts = decompose_saga_error(SagaError::SupervisorShutDown {
+            message: "start cross-context streaming saga refused".to_owned(),
+        });
+        assert_eq!(parts.code, codes::CTX_2138);
+        assert_ne!(parts.code, "SCP-SAGA-13067");
         assert_eq!(
             parts.kind,
             SagaErrorKind::Aborted {

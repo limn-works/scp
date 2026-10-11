@@ -37,10 +37,9 @@ pub mod crypto {
             InMemoryMlsProvider, credential, encrypt, epoch_grace, error, group, key_package,
             ratchet, wire, wrapping_extension,
         };
-        // Node-only async durable-storage bridge from scp-runtime.
+        // Node-only async MLS backend and provider from scp-runtime.
         pub use scp_runtime::crypto::mls::{
-            MlsStorageBridge, MlsStorageBridgeError, NodeMlsFactory, ScpMlsProvider, backend,
-            production_backend, provider, storage, storage_adapter,
+            NodeMlsFactory, backend, production_backend, provider, storage_adapter,
         };
     }
     pub mod sender_keys {
@@ -169,11 +168,15 @@ pub mod trust {
     };
     pub use scp_protocol::trust::attestation::{
         Attestation, AttestationEvidence, AttestationRevocationChecker, AttestorInfo,
-        DidPublicKeyResolver, FreshnessStatus, IdentityDidPublicKeyResolver, NoOpRevocationChecker,
-        RevocationStatus, ThresholdCheckInput, ThresholdRequirement, ThresholdResult,
-        canonical_attestation_bytes, check_attestation_freshness, check_threshold_attestation,
-        verify_attestation, verify_attestation_with_revocation,
+        DidPublicKeyResolver, FreshnessStatus, IdentityDidPublicKeyResolver, RevocationStatus,
+        ThresholdCheckInput, ThresholdRequirement, ThresholdResult, canonical_attestation_bytes,
+        check_attestation_freshness, check_threshold_attestation, verify_attestation,
+        verify_attestation_with_revocation,
     };
+    // `NoOpRevocationChecker` reports every attestation as not revoked, so its
+    // re-export carries the same `testing` gate as its definition.
+    #[cfg(feature = "testing")]
+    pub use scp_protocol::trust::attestation::NoOpRevocationChecker;
     pub use scp_protocol::trust::challenge::{
         ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
         VerificationMethod, canonical_challenge_verification_bytes, issue_challenge,
@@ -263,12 +266,6 @@ pub mod sync {
     pub use scp_runtime::sync::days_offline;
     pub use scp_runtime::sync::hours_offline;
     pub use scp_runtime::sync::weeks_offline;
-}
-
-pub mod bridge {
-    pub use scp_protocol::bridge::*;
-    pub use scp_runtime::bridge::credentials;
-    pub use scp_runtime::bridge::oauth;
 }
 
 pub mod provenance {

@@ -24,12 +24,12 @@ package works.limn.scp.bridge
 
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -41,14 +41,13 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import works.limn.scp.AssetEntry
 import works.limn.scp.BatchPublishResult
-import works.limn.scp.BridgeConnectorBindings
-import works.limn.scp.BridgeConnectorBridge
 import works.limn.scp.ConsequenceConfig
 import works.limn.scp.ConsequenceRule
 import works.limn.scp.DiscoveryBindings
 import works.limn.scp.DiscoveryBridge
 import works.limn.scp.EconomyBindings
 import works.limn.scp.EconomyBridge
+import works.limn.scp.GovernanceActionResult
 import works.limn.scp.IdentityAdvancedBindings
 import works.limn.scp.IdentityAdvancedBridge
 import works.limn.scp.MetadataBindings
@@ -62,12 +61,15 @@ import works.limn.scp.SyncBindings
 import works.limn.scp.SyncBridge
 import works.limn.scp.auth.ScpIdBindings
 import works.limn.scp.auth.ScpIdBridge
+import works.limn.scp.checkProposalResponse
 import works.limn.scp.encodeConsequenceConfigJson
 import works.limn.scp.encodeConsequenceRulesJson
 import works.limn.scp.validateContentPath
 import works.limn.scp.validateDeployId
 import works.limn.scp.validateMimeType
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.logging.Level
+import java.util.logging.Logger
 import kotlin.coroutines.cancellation.CancellationException
 
 /**
@@ -923,7 +925,7 @@ interface OutletBindings {
      *
      * Blocks until the saga reaches a terminal state. On commit returns the
      * JSON-encoded saga result; otherwise throws a [BridgeException] carrying
-     * the typed `SCP-SAGA-13xxx` terminal code (aborted/needs-repair/busy) or
+     * the typed terminal code (aborted/needs-repair/busy) or
      * a bridge-surfaced validation/permission code.
      *
      * @param sourceContextHandle Opaque handle for the calling (source) context.
@@ -937,8 +939,8 @@ interface OutletBindings {
      *   range 0-255 (ADR-043, spec §24.4).
      * @param ucanProofId Optional UCAN proof id for delegation-chain traversal.
      * @return JSON-encoded saga result.
-     * @throws BridgeException with a `SCP-SAGA-13xxx` code on a non-committed
-     *   terminal, or a bridge validation/permission code.
+     * @throws BridgeException on a non-committed terminal, or with a bridge
+     *   validation/permission code.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
     fun outletInvokeCrossContextSaga(
@@ -1276,7 +1278,6 @@ interface NativeBindings :
  * @property provenance Provenance evaluation, attachment, and chain depth bindings.
  * @property sync Sync/offline classification bindings.
  * @property discovery Address parsing, query creation, and normalization bindings.
- * @property bridgeConnector Bridge connector trust, registration, and shadow bindings.
  * @property identityAdvanced Agent key, migration, and device attestation bindings.
  * @property identityAttestation Identity link attestation CRUD bindings (§3.5).
  * @property scpId SCPID DID authentication bindings (spec section 3.11).
@@ -1288,7 +1289,6 @@ data class ExtendedBindings(
     val provenance: ProvenanceBindings? = null,
     val sync: SyncBindings? = null,
     val discovery: DiscoveryBindings? = null,
-    val bridgeConnector: BridgeConnectorBindings? = null,
     val identityAdvanced: IdentityAdvancedBindings? = null,
     val scpId: ScpIdBindings? = null,
     val metadata: MetadataBindings? = null,
@@ -1374,12 +1374,6 @@ class CoroutineBridge(
     /** Discovery operations — FFI on IO. Null if bindings not provided. */
     val discovery: DiscoveryBridge? =
         extendedBindings?.discovery?.let { DiscoveryBridge(it, this) }
-
-    /** Bridge connector operations — FFI on IO. Null if bindings not provided. */
-    val bridgeConnector: BridgeConnectorBridge? =
-        extendedBindings?.bridgeConnector?.let {
-            BridgeConnectorBridge(it, this)
-        }
 
     /** Advanced identity operations — FFI on IO. Null if bindings not provided. */
     val identityAdvanced: IdentityAdvancedBridge? =
@@ -1688,13 +1682,18 @@ class ContextBridge internal constructor(
     /**
      * Subscribe to incoming messages on a context as a cold [Flow].
      *
-     * Collection begins the UniFFI subscription; cancellation ends it.
-     * Uses [callbackFlow] with [Channel.BUFFERED] capacity (64 items) to
-     * absorb burst delivery from the Rust engine without dropping messages.
+     * Collection begins the UniFFI subscription; closing the flow calls the unsubscribe
+     * function on the bridge's IO dispatcher. An unsubscribe that throws is logged at
+     * WARNING and not rethrown, and the Rust subscription may then stay live.
+     * Uses [callbackFlow] with [Channel.BUFFERED] capacity (64 items) to absorb burst
+     * delivery from the Rust engine; a message that does not fit closes the flow with
+     * [BridgeException] code `SCP-CTX-2001` rather than being dropped silently.
      *
      * Per ADR-028: `callbackFlow` is the streaming primitive for message
      * reception. Cold stream semantics: the subscription starts when the
-     * flow is collected and stops when the collector cancels.
+     * flow is collected and is released when the flow closes, whether the
+     * collector cancels, the collector stops early (for example through
+     * `take`), or the engine calls `onComplete` or `onError`.
      *
      * @param contextHandle Handle from context create or join.
      * @return Cold [Flow] of JSON-encoded messages.
@@ -1722,24 +1721,65 @@ class ContextBridge internal constructor(
                     }
                 }
 
-            // Subscribe on IO dispatcher since it crosses the FFI boundary.
-            val subscriptionHandle =
-                withContext(bridge.ioDispatcher) {
-                    bindings.contextSubscribe(contextHandle, callback)
-                }
+            // Subscribe on IO dispatcher since it crosses the FFI boundary. The handle is
+            // recorded inside the NonCancellable block, never taken from withContext's return
+            // value: when bridge.ioDispatcher differs from the collector's dispatcher, so that
+            // withContext resumes the collector by dispatch, a collector cancelled while
+            // contextSubscribe runs makes withContext throw on that resumption and drop
+            // whatever the block returned, which would leave a live Rust subscription that
+            // nothing releases.
+            var subscriptionHandle: Long? = null
 
-            awaitClose {
-                // Use Dispatchers.IO directly — NOT bridge.ioDispatcher — because
-                // awaitClose is a non-suspend lambda that blocks its thread via
-                // runBlocking. If bridge.ioDispatcher is a single-threaded test
-                // dispatcher, runBlocking would deadlock (blocking the only thread
-                // that the dispatcher can schedule work on). Dispatchers.IO is an
-                // unbounded thread pool that always has capacity.
-                runBlocking(kotlinx.coroutines.Dispatchers.IO) {
-                    bindings.contextUnsubscribe(subscriptionHandle)
+            // Release the subscription by suspending on bridge.ioDispatcher, never by
+            // blocking: the finally below runs on the collector's thread, which is an Android
+            // main thread under collectAsState, so a runBlocking here would park that
+            // thread until the FFI call returns (ADR-028's AutoCloseable amendment).
+            // NonCancellable lets the release run although the collector was cancelled. A
+            // release that throws is logged, never rethrown (sdk-common.md §Cleanup error
+            // handling): rethrown from the finally, it would replace the collector's
+            // cancellation as the failure and propagate to the collector's parent scope.
+            try {
+                withContext(NonCancellable + bridge.ioDispatcher) {
+                    subscriptionHandle = bindings.contextSubscribe(contextHandle, callback)
+                }
+                awaitClose()
+            } finally {
+                val opened = subscriptionHandle
+                if (opened != null) {
+                    withContext(NonCancellable + bridge.ioDispatcher) {
+                        releaseSubscriptionLogged(opened, contextHandle)
+                    }
                 }
             }
         }
+
+    /**
+     * Unsubscribe [subscriptionHandle] and log its failure instead of throwing it.
+     *
+     * Catches [Exception], not [Throwable], so an [Error] such as an out-of-memory condition
+     * still propagates. The caller runs this under [NonCancellable], so no cancellation of the
+     * collector reaches this catch.
+     */
+    @Suppress("TooGenericExceptionCaught")
+    private fun releaseSubscriptionLogged(
+        subscriptionHandle: Long,
+        contextHandle: Long,
+    ) {
+        try {
+            bindings.contextUnsubscribe(subscriptionHandle)
+        } catch (e: Exception) {
+            logger.log(
+                Level.WARNING,
+                "ContextBridge.subscribe: releasing subscription $subscriptionHandle for context " +
+                    "handle $contextHandle failed; the Rust subscription may stay live",
+                e,
+            )
+        }
+    }
+
+    private companion object {
+        val logger: Logger = Logger.getLogger(ContextBridge::class.java.name)
+    }
 }
 
 /**
@@ -1908,7 +1948,7 @@ class OutletBridge internal constructor(
      *
      * Blocks until the saga reaches a terminal state. On commit returns the
      * JSON-encoded saga result; a non-committed terminal throws a
-     * [BridgeException] carrying the typed `SCP-SAGA-13xxx` code.
+     * [BridgeException] carrying its typed code.
      *
      * @param sourceContextHandle Handle for the calling (source) context.
      * @param targetContextHandle Handle for the context holding the outlet.
@@ -2174,12 +2214,17 @@ class GovernanceBridgeOps internal constructor(
      *
      * @param contextHandle Handle from context create.
      * @param proposalIdHex Hex-encoded id of the approved, tracked proposal.
-     * @return A string describing the governance action result.
+     * @return The outcome naming which action ran.
+     * @throws uniffi.scp.ScpException.Context with code `SCP-GOV-11040` when the
+     *   bridge reports an outcome this SDK version does not name.
      */
     suspend fun execute(
         contextHandle: Long,
         proposalIdHex: String,
-    ): String = bridge.ffiCall { bindings.governanceExecute(contextHandle, proposalIdHex) }
+    ): GovernanceActionResult =
+        GovernanceActionResult.fromBridge(
+            bridge.ffiCall { bindings.governanceExecute(contextHandle, proposalIdHex) },
+        )
 
     /**
      * Propose a governance action for voting (#621).
@@ -2190,16 +2235,22 @@ class GovernanceBridgeOps internal constructor(
      * @param contextHandle Handle from context create.
      * @param proposerDid DID of the proposer.
      * @param actionJson JSON-serialized governance action.
-     * @return JSON string with `proposal_id`, `status`, and `execution_result`.
+     * @return JSON string with `proposal_id`, `status`, and `execution_result`,
+     *   after [checkProposalResponse] checks every name in it.
+     * @throws uniffi.scp.ScpException.Context with code `SCP-GOV-11040` when the
+     *   response names a status, reason, or outcome this SDK version does not
+     *   name.
      */
     suspend fun propose(
         contextHandle: Long,
         proposerDid: String,
         actionJson: String,
     ): String =
-        bridge.ffiCall {
-            bindings.governancePropose(contextHandle, proposerDid, actionJson)
-        }
+        checkProposalResponse(
+            bridge.ffiCall {
+                bindings.governancePropose(contextHandle, proposerDid, actionJson)
+            },
+        )
 
     /**
      * Cast an approval vote on a pending governance proposal (#621).
@@ -2207,16 +2258,21 @@ class GovernanceBridgeOps internal constructor(
      * @param contextHandle Handle from context create.
      * @param voterDid DID of the voter.
      * @param proposalIdHex Hex-encoded 32-byte proposal ID.
-     * @return JSON string with `status`.
+     * @return JSON string with `status`, after [checkProposalResponse] checks
+     *   every name in it.
+     * @throws uniffi.scp.ScpException.Context with code `SCP-GOV-11040` when the
+     *   response names a status or reason this SDK version does not name.
      */
     suspend fun approve(
         contextHandle: Long,
         voterDid: String,
         proposalIdHex: String,
     ): String =
-        bridge.ffiCall {
-            bindings.governanceApprove(contextHandle, voterDid, proposalIdHex)
-        }
+        checkProposalResponse(
+            bridge.ffiCall {
+                bindings.governanceApprove(contextHandle, voterDid, proposalIdHex)
+            },
+        )
 
     /**
      * Cast a rejection vote on a pending governance proposal (#621).
@@ -2224,16 +2280,21 @@ class GovernanceBridgeOps internal constructor(
      * @param contextHandle Handle from context create.
      * @param voterDid DID of the voter.
      * @param proposalIdHex Hex-encoded 32-byte proposal ID.
-     * @return JSON string with `status`.
+     * @return JSON string with `status`, after [checkProposalResponse] checks
+     *   every name in it.
+     * @throws uniffi.scp.ScpException.Context with code `SCP-GOV-11040` when the
+     *   response names a status or reason this SDK version does not name.
      */
     suspend fun reject(
         contextHandle: Long,
         voterDid: String,
         proposalIdHex: String,
     ): String =
-        bridge.ffiCall {
-            bindings.governanceReject(contextHandle, voterDid, proposalIdHex)
-        }
+        checkProposalResponse(
+            bridge.ffiCall {
+                bindings.governanceReject(contextHandle, voterDid, proposalIdHex)
+            },
+        )
 
     /**
      * Withdraw a previously cast vote on a pending governance proposal (#621).
@@ -2241,16 +2302,21 @@ class GovernanceBridgeOps internal constructor(
      * @param contextHandle Handle from context create.
      * @param voterDid DID of the voter.
      * @param proposalIdHex Hex-encoded 32-byte proposal ID.
-     * @return JSON string with `status`.
+     * @return JSON string with `status`, after [checkProposalResponse] checks
+     *   every name in it.
+     * @throws uniffi.scp.ScpException.Context with code `SCP-GOV-11040` when the
+     *   response names a status or reason this SDK version does not name.
      */
     suspend fun withdraw(
         contextHandle: Long,
         voterDid: String,
         proposalIdHex: String,
     ): String =
-        bridge.ffiCall {
-            bindings.governanceWithdraw(contextHandle, voterDid, proposalIdHex)
-        }
+        checkProposalResponse(
+            bridge.ffiCall {
+                bindings.governanceWithdraw(contextHandle, voterDid, proposalIdHex)
+            },
+        )
 
     /**
      * Retrieve a single governance proposal by hex-encoded ID (#621).

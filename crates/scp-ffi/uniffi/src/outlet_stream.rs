@@ -66,21 +66,21 @@
 
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use ed25519_dalek::VerifyingKey;
 use scp_platform::KeyHandle;
 use scp_platform::error::PlatformError;
 use scp_platform::traits::KeyCustody;
 use tokio::sync::mpsc;
 
+use scp_core::context::outlets::invoke::OutletStreamOpenError;
 use scp_core::context::outlets::stream::{
     MlsEpoch, OutletStreamChunk, OutletStreamCredit, TerminateReason, compute_caveats_binding,
     compute_credit_sig_preimage, verify_chunk_signature,
 };
 use scp_core::context::outlets::{
-    AdmissionCaps, CancelIdentity, OpenStreamParams, OpenStreamRejection, OutletExecutor,
-    OutletExecutorError, StreamIdentity, StreamSessionHandle, StreamSigner,
-    StreamSignerCustodyCategory, StreamSignerError, cancel_error_to_code, grant_error_to_code,
+    AdmissionCaps, CancelIdentity, OpenStreamParams, OutletExecutor, OutletExecutorError,
+    StreamIdentity, StreamSessionHandle, StreamSigner, StreamSignerCustodyCategory,
+    StreamSignerError, cancel_error_to_code, grant_error_to_code,
 };
 
 use scp_ffi_common::error_codes as codes;
@@ -239,9 +239,9 @@ async fn resolve_stream_signer(
         (Arc::clone(custody), *key_handle)
     };
     let public_key = custody.public_key(&handle).await.map_err(|e| {
-        ScpError::custody(
+        ScpError::custody_failure(
             format!("failed to resolve stream signing key for '{identity_did}': {e}"),
-            &e,
+            &scp_crypto::CustodyFailure::from(&e),
         )
     })?;
     let verifying_key = scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
@@ -256,33 +256,6 @@ async fn resolve_stream_signer(
         handle,
         verifying_key,
     })
-}
-
-// ---------------------------------------------------------------------------
-// UniffiStreamRevocationChecker — LIVE per-context revocation view
-// ---------------------------------------------------------------------------
-
-/// [`RevocationChecker`](scp_core::crypto::ucan::validate::RevocationChecker)
-/// giving the runtime pump a LIVE view of this instance's per-context revocation
-/// list, so the §5.4.5 authoritative UCAN-revocation re-check timer
-/// (`stream_ucan_recheck_secs`) observes revocations that land AFTER the stream
-/// opened — not a stale open-time snapshot.
-///
-/// Holds an `Arc` clone of the per-instance UCAN-state registry and the hosting
-/// context id; `is_revoked` does a brief (sync, no-`await`) `DashMap` lookup per
-/// tick. A vanished context returns `false` — the separate
-/// context-closed-mid-stream termination path handles substrate loss.
-struct UniffiStreamRevocationChecker {
-    states: Arc<DashMap<String, crate::runtime::UcanContextState>>,
-    context_id: String,
-}
-
-impl scp_core::crypto::ucan::validate::RevocationChecker for UniffiStreamRevocationChecker {
-    fn is_revoked(&self, token_cid: &str) -> bool {
-        self.states
-            .get(&self.context_id)
-            .is_some_and(|state| state.revocation_list.is_revoked(token_cid))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -341,19 +314,40 @@ impl OutletExecutor for UniffiStreamExecutor {
 }
 
 // ---------------------------------------------------------------------------
-// Error mapping — every code is a canonical SCP-OUTLET-/SCP-PERM- literal
+// Error mapping
 // ---------------------------------------------------------------------------
 
-/// Maps an [`OpenStreamRejection`] onto the bridge error surface, carrying the
-/// rejection's own §5.4.4 `SCP-OUTLET-NNNN` code verbatim.
-fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpError {
-    ScpError::Outlet {
-        msg: format!(
-            "outlet stream open rejected ({}): {}",
-            rejection.error_code(),
-            rejection.slug()
+/// Maps an [`OutletStreamOpenError`] onto the bridge error surface. A
+/// Supervisor shutdown refusal takes the conversion of
+/// `ContextError::SupervisorShutDown`; a rejection carries its own code
+/// verbatim.
+fn open_rejection_to_err(err: &OutletStreamOpenError) -> ScpError {
+    match err {
+        OutletStreamOpenError::SupervisorShutDown { message } => ScpError::from(
+            scp_core::context::ContextError::SupervisorShutDown(message.clone()),
         ),
-        code: rejection.error_code().to_owned(),
+        OutletStreamOpenError::Rejected(rejection) => ScpError::Outlet {
+            msg: format!(
+                "outlet stream open rejected ({}): {}",
+                rejection.error_code(),
+                rejection.slug()
+            ),
+            code: rejection.error_code().to_owned(),
+        },
+    }
+}
+
+/// The error for a stream or streaming saga the Supervisor started but the
+/// bridge refused to register because bridge shutdown had begun, built from
+/// the refusal
+/// [`CoreFields::register_or_refuse`](scp_ffi_common::bridge_instance::CoreFields::register_or_refuse)
+/// returns. The stream had already reserved escrow and started its pump, and
+/// the saga had already staged its Prepare phase, so this is the Context class
+/// with `SCP-CTX-2139`.
+fn late_registration_err((code, message): (&'static str, String)) -> ScpError {
+    ScpError::Context {
+        msg: message,
+        code: code.to_owned(),
     }
 }
 
@@ -457,10 +451,27 @@ pub(crate) async fn outlet_stream_open_impl(
             code: codes::OUTLET_6002.to_owned(),
         })?;
 
+    // The lifecycle gate asks the supervisor actor, never the handle's cached
+    // state, and returns the role state the UCAN check below reads.
+    let gated =
+        crate::bridge::GatedHandle::gate(bi, handle, "open outlet stream in context", |msg| {
+            ScpError::Outlet {
+                msg,
+                code: codes::OUTLET_6005.to_owned(),
+            }
+        })
+        .await?;
+
     // Snapshot the bridge-owned per-handle outlet registry once (cheap Vec of
     // registrations); every subsequent outlet field is read off this clone, so
     // the handle's `outlet_registry` mutex is released before the runtime call.
-    let registry = { handle.outlet_registry.lock().await.clone() };
+    let registry = {
+        handle
+            .outlet_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    };
     let registration = registry.get(&outlet_id).ok_or_else(|| ScpError::Outlet {
         msg: format!("outlet '{outlet_id}' not registered in context '{context_id}'"),
         code: codes::OUTLET_6002.to_owned(),
@@ -479,13 +490,12 @@ pub(crate) async fn outlet_stream_open_impl(
     // The OPERATOR signs every chunk that crosses the outer wire.
     let operator_did = registration.operator_did.0.clone();
 
-    // Primary authorization: the full 11-step ADR-016 UCAN pipeline over the
-    // bridge-owned per-context UCAN state — IDENTICAL to `outlet_invoke`. The
+    // Primary authorization: the full 11-step ADR-016 UCAN pipeline. The
     // stream is validated ONCE at open (§5.4.5 "UCAN check locus"); chunks do not
     // re-present.
     crate::bridge::validate_outlet_ucan_uniffi(
         bi,
-        handle,
+        &gated,
         &outlet_id,
         outlet_kind,
         &ucan_token,
@@ -541,7 +551,14 @@ pub(crate) async fn outlet_stream_open_impl(
 
     // Snapshot the registered handler (an `Arc<dyn Fn>` — cloning is a refcount
     // bump) off the owned handle.
-    let handler = { handle.outlet_handlers.lock().await.get(&outlet_id).cloned() };
+    let handler = {
+        handle
+            .outlet_handlers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&outlet_id)
+            .cloned()
+    };
 
     // Clone the supervisor `Arc` out of the borrow so it outlives the later
     // `bi`-borrowing calls and the `'static` executor.
@@ -556,12 +573,7 @@ pub(crate) async fn outlet_stream_open_impl(
     });
 
     // LIVE revocation view for the runtime's authoritative re-check timer.
-    let revocation_checker: Arc<
-        dyn scp_core::crypto::ucan::validate::RevocationChecker + Send + Sync,
-    > = Arc::new(UniffiStreamRevocationChecker {
-        states: Arc::clone(bi.ucan_registry()),
-        context_id: context_id.clone(),
-    });
+    let revocation_checker = bi.live_revocation_checker(context_id.clone());
 
     let identity = StreamIdentity {
         context_id: context_id.clone(),
@@ -653,20 +665,24 @@ pub(crate) async fn outlet_stream_open_impl(
     };
 
     let handle_id = hex::encode(request_id);
-    bi.outlet_stream_registry.insert(
-        handle_id.clone(),
-        StreamEntry {
-            handle: Arc::new(tokio::sync::Mutex::new(stream_handle)),
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-            invoker_did: caller_did,
-            context_id,
-            outlet_id,
-            caveats_binding,
-            request_id,
-            stream_epoch,
-            cost_per_chunk,
-        },
-    );
+    bi.core
+        .register_or_refuse(
+            &bi.outlet_stream_registry,
+            handle_id.clone(),
+            StreamEntry {
+                handle: Arc::new(tokio::sync::Mutex::new(stream_handle)),
+                receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+                invoker_did: caller_did,
+                context_id,
+                outlet_id,
+                caveats_binding,
+                request_id,
+                stream_epoch,
+                cost_per_chunk,
+            },
+            None,
+        )
+        .map_err(late_registration_err)?;
     Ok(handle_id)
 }
 
@@ -738,8 +754,8 @@ pub(crate) async fn outlet_stream_poll_next_impl(
 // ---------------------------------------------------------------------------
 
 /// Maps a credit-grant signing failure to the caller's error. A custody
-/// failure carries `SCP-CRYPTO-4006` (key not found) or `SCP-CRYPTO-4060`; a
-/// canonicalization failure carries `SCP-CTX-2001`.
+/// failure carries the code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+/// assigns; a canonicalization failure carries `SCP-CTX-2001`.
 fn credit_sign_error(e: &StreamSignerError) -> ScpError {
     e.custody_failure().map_or_else(
         || ScpError::Context {
@@ -751,8 +767,9 @@ fn credit_sign_error(e: &StreamSignerError) -> ScpError {
 }
 
 /// Maps a rejected stream cancel to the caller's error. A custody failure
-/// while signing the cancel carries `SCP-CRYPTO-4006` (key not found) or
-/// `SCP-CRYPTO-4060`; every other rejection carries its §5.4.4 code.
+/// while signing the cancel carries the code
+/// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code) assigns; every
+/// other rejection carries its §5.4.4 code.
 fn cancel_rejected_error(e: &scp_core::context::outlets::CancelError) -> ScpError {
     e.custody_failure().map_or_else(
         || ScpError::Outlet {
@@ -1090,9 +1107,7 @@ pub(crate) fn outlet_stream_compute_caveats_binding_impl(
 // `bridge.rs`, sharing its `enforce_caller_principal_binding`,
 // `resolve_uniffi_signing_key`, `validate_outlet_ucan_uniffi`, `map_saga_error`,
 // and `decode_asserted_nonce` verbatim, and the SAME `UniffiStreamExecutor` /
-// `resolve_stream_signer` / `UniffiStreamRevocationChecker` this module already
-// defines. Mirrors the CANONICAL `PyO3` reference bridge's cross-context
-// section.
+// `resolve_stream_signer` this module already defines.
 //
 // Like the `UniFFI` unary cross-context saga (and the 037 same-context open)
 // this is HANDLE-based: the caller/target contexts cross the FFI boundary as
@@ -1117,27 +1132,28 @@ fn no_active_saga_err(saga_id: &str) -> ScpError {
 /// Resolves the TARGET context's raw Ed25519 Active Signing Key from a
 /// context-id STRING (the streaming-saga RECOVER path has no `ContextHandle`,
 /// only the `target_context_id` pinned in the registry entry). Reads the
-/// context creator DID off the per-context UCAN state, then exports that
-/// identity's Active Signing Key from this instance's identity custody registry
+/// context creator DID off the supervisor actor, then exports that identity's
+/// Active Signing Key from this instance's identity custody registry
 /// (co-resident single-tenant). The key never enters the runtime autonomously
 /// (ADR-006) — it is resolved per-call here and passed to the seal.
+///
+/// The creator DID comes from the actor rather than from the handle's
+/// `creator_did`, because this call chooses the authority a streaming saga
+/// signs as: a context no actor serves refuses to sign rather than signing
+/// as the creator the handle recorded. A failed read reports its own error
+/// and is not withheld.
+///
+/// # Errors
+///
+/// Returns the error
+/// [`UniffiBridgeInstance::live_role_state`](crate::runtime::UniffiBridgeInstance::live_role_state)
+/// returns, `SCP-CTX-2001` when this bridge instance hosts no custody for the
+/// creator, and `SCP-CTX-2040` when the custody export fails.
 async fn resolve_context_active_signing_key_by_id(
     bi: &Arc<UniffiBridgeInstance>,
     context_id: &str,
 ) -> Result<ed25519_dalek::SigningKey, ScpError> {
-    let creator_did = bi
-        .with_ucan_state(context_id, |state| state.creator_did.clone())
-        .ok_or_else(|| ScpError::Context {
-            msg: format!(
-                "context '{context_id}' not found in the UCAN registry — cannot resolve its \
-                 Active Signing Key for streaming-saga reconnect recovery"
-            ),
-            // Same "not hosted by this bridge instance" (channel-auth /
-            // co-resident single-tenant) class as the identity-custody miss
-            // below — a context whose per-context UCAN state is absent here is
-            // not hosted here. Aligned to CTX_2001 for cross-bridge consistency.
-            code: codes::CTX_2001.to_owned(),
-        })?;
+    let creator_did = bi.live_role_state(context_id).await?.creator_did;
     let (custody, key_handle) = {
         let registry = identity_custody_registry(bi);
         let entry = registry.get(&creator_did).ok_or_else(|| ScpError::Context {
@@ -1158,7 +1174,7 @@ async fn resolve_context_active_signing_key_by_id(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("failed to export Active Signing Key for context '{context_id}': {e}"),
-            // INTENTIONALLY DISTINCT from the CTX_2001 "not hosted here" siblings
+            // INTENTIONALLY DISTINCT from the CTX_2001 "not hosted here" error
             // above: the identity IS hosted, but the custody export operation
             // itself failed (a crypto/custody operational fault, not a hosting /
             // channel-auth class) — kept as CTX_2040.
@@ -1211,13 +1227,12 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
 
     // Both contexts MUST be Active before this money-moving open touches any
     // state. Read the AUTHORITATIVE lifecycle state from the per-context
-    // supervisor actor (`read_context_state`) — NOT the bridge-cached
+    // supervisor actor — NOT the bridge-cached
     // `ContextHandle::state`, which LAGS: on close the core handle flips to
     // `Closing` immediately, but the FFI cache stays `Active` until the async
     // finalize completes. A stale-cache read would let a `Closing` context (actor
-    // alive, members intact) pass this gate and DEBIT ESCROW. Mirrors the PyO3
-    // reference's authoritative `read_context_state`. A missing actor (`None`) is
-    // treated as non-active (fail-closed). Codes match NAPI/PyO3: OUTLET_6010
+    // alive, members intact) pass this gate and DEBIT ESCROW. A missing actor is
+    // treated as non-active (fail-closed). OUTLET_6010
     // (caller axis) / OUTLET_6011 (target axis). Checked BEFORE input validation,
     // the caller-principal binding, and the saga drive, so a non-active context is
     // rejected before any receiver is ever handed out (§5.3 lifecycle / §6.2.4).
@@ -1232,26 +1247,30 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
     // bridge's target-axis check (OUTLET_6011) is demoted to defense-in-depth.
     // The reserve does NOT run on the CALLER/source context, so this bridge's
     // caller-axis check (OUTLET_6010) remains the authoritative gate stopping a
-    // non-active source from initiating the saga.
-    let supervisor = Arc::clone(bi.context_manager_or_error()?);
-    let source_state = supervisor.read_context_state(&caller_context_id).await;
-    if !matches!(source_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpError::Outlet {
-            msg: format!(
-                "cannot start cross-context streaming saga: caller context in {source_state:?} state"
-            ),
+    // non-active source from initiating the saga. Both gates run before the
+    // caller-principal binding, so both withhold the lifecycle state. The
+    // caller side reads no role state, so its gate's role state goes unused;
+    // the target side's role state feeds the UCAN check in (c).
+    bi.require_active_context_before_authz(
+        &caller_context_id,
+        "start cross-context streaming saga from caller context",
+        |msg| ScpError::Outlet {
+            msg,
             code: codes::OUTLET_6010.to_owned(),
-        });
-    }
-    let target_state = supervisor.read_context_state(&target_context_id).await;
-    if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpError::Outlet {
-            msg: format!(
-                "cannot start cross-context streaming saga: target context in {target_state:?} state"
-            ),
+        },
+    )
+    .await?;
+    let target_gated = crate::bridge::GatedHandle::gate(
+        bi,
+        target_handle,
+        "start cross-context streaming saga into target context",
+        |msg| ScpError::Outlet {
+            msg,
             code: codes::OUTLET_6011.to_owned(),
-        });
-    }
+        },
+    )
+    .await?;
+    let supervisor = Arc::clone(bi.context_manager_or_error()?);
 
     // ----- (a) validate inputs ------------------------------------------------
     validate_context_id(&caller_context_id)?;
@@ -1278,22 +1297,26 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
     // ----- (b) caller-principal binding (CALLER axis) — BEFORE anything else --
     //
     // Runs before ANY outlet read or state mutation, so an unauthenticated caller
-    // is rejected before it can touch B's state (identical to the `PyO3`
-    // reference's ordering). `supervisor` was resolved above for the authoritative
-    // lifecycle gate; reuse it.
+    // is rejected before it can touch B's state. The binding reuses the
+    // `supervisor` resolved above.
     enforce_caller_principal_binding(bi, &supervisor, &caller_context_id, &caller_did).await?;
 
     // ----- (c) validate the invocation UCAN against the TARGET context --------
     //
-    // The outlet lives in the operating context B, so its registered kind +
-    // per-context UCAN state are B's — IDENTICAL to `outlet_stream_open_impl`,
-    // just rebased onto the TARGET handle. Validated ONCE at open (§5.4.5 "UCAN
-    // check locus").
+    // The outlet lives in the operating context B, so its registered kind, its
+    // role state and its per-context UCAN state are B's. Validated ONCE at open
+    // (§5.4.5 "UCAN check locus").
     //
     // Snapshot the TARGET handle's per-context outlet registry once (cheap Vec of
     // registrations); every subsequent outlet field is read off this clone, so
     // the handle's `outlet_registry` mutex is released before the runtime call.
-    let registry = { target_handle.outlet_registry.lock().await.clone() };
+    let registry = {
+        target_handle
+            .outlet_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    };
     let registration = registry
         .get(&outlet_registration_id)
         .ok_or_else(|| ScpError::Outlet {
@@ -1310,7 +1333,7 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
     let operator_did = registration.operator_did.0.clone();
     validate_outlet_ucan_uniffi(
         bi,
-        target_handle,
+        &target_gated,
         &outlet_registration_id,
         outlet_kind,
         &ucan_token,
@@ -1368,7 +1391,7 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
         target_handle
             .outlet_handlers
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&outlet_registration_id)
             .cloned()
     };
@@ -1386,12 +1409,7 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
 
     // LIVE revocation view (B's per-context list) for the runtime pump's
     // authoritative re-check timer.
-    let revocation_checker: Arc<
-        dyn scp_core::crypto::ucan::validate::RevocationChecker + Send + Sync,
-    > = Arc::new(UniffiStreamRevocationChecker {
-        states: Arc::clone(bi.ucan_registry()),
-        context_id: target_context_id.clone(),
-    });
+    let revocation_checker = bi.live_revocation_checker(target_context_id.clone());
 
     let identity = StreamIdentity {
         context_id: target_context_id.clone(),
@@ -1485,19 +1503,34 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
     .map_err(map_saga_error)?;
 
     // ----- (g) register the promptly-returned receiver ------------------------
-    let saga_id = handle.saga_id;
-    let receiver = handle.receiver;
-    let handle_id = saga_id.0.clone();
-    bi.outlet_streaming_saga_registry.insert(
-        handle_id.clone(),
+    register_streaming_saga(
+        bi,
         StreamingSagaEntry {
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-            saga_id,
+            receiver: Arc::new(tokio::sync::Mutex::new(handle.receiver)),
+            saga_id: handle.saga_id,
             target_context_id,
             invoker_did: caller_did,
             request_id,
         },
-    );
+    )
+}
+
+/// Registers a started streaming saga's entry under its saga id and returns
+/// the id. Returns [`late_registration_err`], with the entry dropped, when
+/// bridge shutdown began before the insert.
+fn register_streaming_saga(
+    bi: &UniffiBridgeInstance,
+    entry: StreamingSagaEntry,
+) -> Result<String, ScpError> {
+    let handle_id = entry.saga_id.0.clone();
+    bi.core
+        .register_or_refuse(
+            &bi.outlet_streaming_saga_registry,
+            handle_id.clone(),
+            entry,
+            Some(&handle_id),
+        )
+        .map_err(late_registration_err)?;
     Ok(handle_id)
 }
 
@@ -1982,6 +2015,11 @@ impl Scp {
     /// budget injection has no bridge-public wiring — same rationale as the
     /// unary-saga bridge tests). The receiver's sender is dropped immediately
     /// (recover never polls it).
+    ///
+    /// # Panics
+    ///
+    /// Panics when bridge shutdown has begun, because the registry then refuses
+    /// the entry and the test would run against an empty registry.
     pub fn insert_test_streaming_saga_entry(
         &self,
         saga_id: &str,
@@ -1989,7 +2027,7 @@ impl Scp {
         invoker_did: &str,
     ) {
         let (_tx, rx) = mpsc::channel(1);
-        self.inner.outlet_streaming_saga_registry.insert(
+        let registered = self.inner.outlet_streaming_saga_registry.insert(
             saga_id.to_owned(),
             StreamingSagaEntry {
                 receiver: Arc::new(tokio::sync::Mutex::new(rx)),
@@ -1998,6 +2036,10 @@ impl Scp {
                 invoker_did: invoker_did.to_owned(),
                 request_id: [0u8; 16],
             },
+        );
+        assert!(
+            registered,
+            "bridge shutdown began before the test entry for {saga_id} was registered"
         );
     }
 
@@ -2021,10 +2063,10 @@ mod custody_error_tests {
         e.code().to_owned()
     }
 
-    /// A key-not-found custody failure while signing a credit grant or a
-    /// cancel reaches the caller as `SCP-CRYPTO-4006`, any other custody
-    /// failure as `SCP-CRYPTO-4060`, and a non-custody failure keeps its
-    /// own code.
+    /// A custody failure while signing a credit grant or a cancel reaches the
+    /// caller with the code `custody_failure_code` assigns (checked here for
+    /// key-not-found and a generic custody failure), and a non-custody failure
+    /// keeps its own code.
     #[test]
     fn outlet_signing_custody_failures_carry_the_custody_codes() {
         let not_found = StreamSignerError::Custody {

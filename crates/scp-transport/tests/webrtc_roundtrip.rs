@@ -1,6 +1,6 @@
 //! Roundtrip integration test for the WebRTC transport adapter.
 //!
-//! Tests the full cycle: construct adapter with mock DataChannelProvider,
+//! Tests one full cycle: construct adapter with mock `DataChannelProvider`,
 //! send envelope, subscribe, verify envelope received through the provider.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -100,6 +100,7 @@ impl DataChannelProvider for MockDataChannelProvider {
                 buffer: std::collections::VecDeque::new(),
                 open: true,
             });
+            drop(channels);
             Ok(())
         })
     }
@@ -119,6 +120,7 @@ impl DataChannelProvider for MockDataChannelProvider {
                 return Err(TransportError::NotConnected);
             }
             ch.buffer.push_back(data);
+            drop(channels);
             Ok(())
         })
     }
@@ -135,10 +137,13 @@ impl DataChannelProvider for MockDataChannelProvider {
             let ch = channels
                 .get_mut(&label)
                 .ok_or(TransportError::NotConnected)?;
-            if !ch.open && ch.buffer.is_empty() {
-                return Ok(None);
-            }
-            Ok(ch.buffer.pop_front())
+            let item = if ch.open || !ch.buffer.is_empty() {
+                ch.buffer.pop_front()
+            } else {
+                None
+            };
+            drop(channels);
+            Ok(item)
         })
     }
 
@@ -152,6 +157,7 @@ impl DataChannelProvider for MockDataChannelProvider {
             if let Some(ch) = channels.get_mut(&label) {
                 ch.open = false;
             }
+            drop(channels);
             Ok(())
         })
     }
@@ -207,6 +213,7 @@ async fn webrtc_send_and_receive_roundtrip() {
 
     // Deserialize and verify the envelope matches.
     let received: OuterEnvelope = rmp_serde::from_slice(&ch.buffer[0]).unwrap();
+    drop(channels);
     assert_eq!(received.routing_id, envelope.routing_id);
     assert_eq!(received.blob_ttl, envelope.blob_ttl);
     assert_eq!(received.encrypted_blob, envelope.encrypted_blob);

@@ -7,7 +7,7 @@ This section defines the conformance test suite for independent SCP implementati
 Conformance is split into two tiers:
 
 - **SCP Core Conformance** — identity, contexts, messaging, and sync. The minimum bar for interoperability.
-- **SCP Full Conformance** — all protocol layers including trust, discovery, economy, and bridges.
+- **SCP Full Conformance** — all protocol layers including trust, discovery, and economy.
 
 All tests target SCP protocol version 1.
 
@@ -18,7 +18,7 @@ Each test specifies:
 | Field | Description |
 |-------|-------------|
 | **ID** | `CONF-NNN` — unique, stable identifier. |
-| **Layer** | Protocol layer (Identity, Context, Messaging, Sync, Trust, Transport, Discovery, Economy, Bridge). |
+| **Layer** | Protocol layer (Identity, Context, Messaging, Sync, Trust, Transport, Discovery, Economy). |
 | **Tier** | Core or Full. |
 | **Spec Sections** | Which spec sections the test covers. |
 | **Preconditions** | Required state before the test begins. |
@@ -123,7 +123,7 @@ Each test specifies:
 |-------|-------|
 | **Layer** | Context |
 | **Tier** | Core |
-| **Spec Sections** | §6.4 [no such section] |
+| **Spec Sections** | §5.9, §9.5.2 |
 | **Preconditions** | Context with 3 members. Governance model: majority vote. |
 | **Steps** | 1. Member A proposes role change for Member C. 2. Proposal ID is computed per §9.5.2 (domain: `"SCP-PROPOSAL-V1:"`). 3. Member A votes approve (signed per `"SCP-VOTE-V1:"`). 4. Member B votes approve. 5. Quorum reached (2/3). 6. Role change is applied. |
 | **Expected Outcome** | Proposal passes with 2/3 votes. Member C's role is updated. Governance event recorded in event log. All vote signatures are verifiable. |
@@ -134,7 +134,7 @@ Each test specifies:
 |-------|-------|
 | **Layer** | Context |
 | **Tier** | Core |
-| **Spec Sections** | §6.4 [no such section] |
+| **Spec Sections** | §5.9 |
 | **Preconditions** | Context with 5 members. Governance model: 3-of-5 threshold. |
 | **Steps** | 1. Propose parameter change. 2. Two members vote approve (below threshold). 3. Third member votes approve (meets threshold). 4. Verify proposal passes. 5. Verify a fourth vote does not double-apply. |
 | **Expected Outcome** | Proposal passes exactly when the 3rd approval is received. Parameter change is applied once. |
@@ -145,7 +145,7 @@ Each test specifies:
 |-------|-------|
 | **Layer** | Context |
 | **Tier** | Core |
-| **Spec Sections** | §5.6, §6.4 [no such section] |
+| **Spec Sections** | §5.6, §5.9 |
 | **Preconditions** | Context with mutable parameters. |
 | **Steps** | 1. Propose changing a context parameter (e.g., name). 2. Vote and pass the proposal. 3. Verify context metadata reflects the change. 4. Verify the change is recorded in the event log. |
 | **Expected Outcome** | Context metadata is updated. Event log contains the parameter change event. All members see the updated metadata. |
@@ -426,41 +426,6 @@ Each test specifies:
 | **Steps** | 1. Set metrics: `MemberCount = 50`, `ContextMessageRate = 10`. 2. Evaluate `PricingFormula` with `Linear` variable. 3. Verify: `cost = base_cost + (coefficient * metric / 1,000,000)`. 4. Verify cap and floor constraints. |
 | **Expected Outcome** | Formula evaluation is deterministic. Two implementations produce identical costs for identical inputs. |
 
-## 26.11 Bridge Tests (§12)
-
-### CONF-036: Bridge Registration and Approval
-
-| Field | Value |
-|-------|-------|
-| **Layer** | Bridge |
-| **Tier** | Full |
-| **Spec Sections** | §12.2.1, §12.12 |
-| **Preconditions** | Context with governance that can approve bridges. |
-| **Steps** | 1. Submit `BridgeRegistrationRequest`. 2. Governance votes to approve. 3. Bridge status changes to `Active`. 4. Bridge appears in context metadata `bridges` field (§5.7). |
-| **Expected Outcome** | Registration event in event log. Bridge visible in metadata. Status is `Active`. |
-
-### CONF-037: Shadow Identity Creation and Claiming
-
-| Field | Value |
-|-------|-------|
-| **Layer** | Bridge |
-| **Tier** | Full |
-| **Spec Sections** | §12.3, §12.12.3, §12.12.4 |
-| **Preconditions** | Active bridge in context. |
-| **Steps** | 1. Bridge creates shadow identity for platform user. 2. Shadow has `provenance_status: Shadow`. 3. Platform user creates SCP identity and attestation. 4. User submits `ClaimRequest` with attestation proof. 5. Claim validation hash computed (domain: `"SCP-CLAIM-V1:"`). 6. Shadow status changes to `Claimed`. |
-| **Expected Outcome** | Shadow created. Claim succeeds. Provenance status updated. Event log records both events. |
-
-### CONF-038: Bridged Message Provenance Marking
-
-| Field | Value |
-|-------|-------|
-| **Layer** | Bridge |
-| **Tier** | Full |
-| **Spec Sections** | §12.5, §12.12.5 |
-| **Preconditions** | Active bridge with shadow identity. |
-| **Steps** | 1. Bridge relays message from platform user. 2. Message includes `BridgeProvenance` with platform, bridge ID, mode, shadow status. 3. Recipients verify provenance. 4. `BridgeTrustLevel` is `ShadowBridged` (lowest). |
-| **Expected Outcome** | Message carries correct provenance. Trust level is distinguishable from native messages. |
-
 ## 26.12 Interop Scenarios (Cross-Cutting)
 
 ### CONF-039: Two Implementations Exchange Messages
@@ -491,7 +456,7 @@ Each test specifies:
 |-------|-------|
 | **Layer** | Interop |
 | **Tier** | Full |
-| **Spec Sections** | §6.4 [no such section] |
+| **Spec Sections** | §5.9, §9.5.2 |
 | **Preconditions** | Context with member A (Implementation 1) and member B (Implementation 2). |
 | **Steps** | 1. A proposes governance action. 2. B votes approve (signed per `"SCP-VOTE-V1:"`). 3. A verifies B's vote signature. 4. Proposal passes. |
 | **Expected Outcome** | Vote signature produced by Implementation 2 is verifiable by Implementation 1. Canonical hash construction is interoperable. |
@@ -523,13 +488,12 @@ An implementation that passes all Core tests can:
 
 ### SCP Full Conformance
 
-Tests: All CONF-001 through CONF-042.
+Tests: CONF-001 through CONF-035 and CONF-039 through CONF-042.
 
 An implementation that passes all Full tests additionally supports:
 - UCAN delegation chains and revocation
 - Discovery protocol (handles, agent search, push notifications)
 - Economic governance (cost schedules, payments, dynamic pricing)
-- Bridge protocol (registration, shadows, claiming, provenance)
 - Multi-relay operation
 - Cross-implementation sync and governance
 

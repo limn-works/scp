@@ -59,7 +59,7 @@ Existing platform identities (Google, Apple, social accounts) can be linked to a
 
 ## 3.5 Identity Attestations
 
-A user can publish cryptographic attestations binding their external platform identities to their identifier. These attestations are the mechanism that makes bridging trustworthy and social graph import possible.
+A user can publish cryptographic attestations binding their external platform identities to their identifier. These attestations are the mechanism that makes social graph import possible.
 
 An attestation says: "The human behind the identity `<scp-identifier:alice>` is the same human behind `@alice` on X." The attestation is verifiable — the user proves ownership of the external identity (e.g., by signing a challenge, posting a proof, or using OAuth) and the result is a signed statement linking the two.
 
@@ -71,11 +71,10 @@ Properties of identity attestations:
 - **Revocable.** Users can revoke attestations at any time, severing the link.
 - **Discoverable.** Other SCP participants can look up whether a given external identity maps to a known identifier. Attestations are discoverable through contexts with discovery outlets (§6.2.2B [no such section]) and service-record entries (§3.5.3). Reverse-lookup, from an external handle to an identifier, is provided by the `attestation_lookup` outlet in contexts with discovery outlets (§22.5).
 
-Identity attestations enable three critical flows:
+Identity attestations enable two critical flows:
 
 1. **Social graph import.** A user exports their follower list from X. Their local agent resolves each handle against known attestations. Contacts who have also joined SCP are automatically discoverable.
-2. **Shadow identity claiming.** When a bridge connector creates a shadow identity for an external participant (see §12), a user can claim it by presenting a matching attestation. The shadow identity merges with that user's own identifier (see §3.5.5 for the claiming protocol).
-3. **Cross-platform reputation continuity.** Trust judgments about a person can follow them across platforms — not because platforms share data, but because the human has cryptographically proven they're the same person.
+2. **Cross-platform reputation continuity.** Trust judgments about a person can follow them across platforms — not because platforms share data, but because the human has cryptographically proven they're the same person.
 
 ### 3.5.0 Attestation Classes
 
@@ -86,7 +85,7 @@ Identity link attestations are sub-classified into two classes based on when and
 - The SDK performs the verification flow (OAuth code exchange, challenge-response round trip) locally at creation time.
 - On success, the SDK extracts the minimal identifying claim (`provider`, `subject_id`, `verified_at`) and signs it with the identity's `#active` key. This SDK-signed proof replaces the raw provider token — no JWT, no OIDC ID token, no PII is stored.
 - The attestation proof is: `{ "provider": "<platform>", "subject_id": "<platform_user_id>", "verified_at": <unix_s> }` signed by the issuer's `#active` key. The signature is the one on the `IdentityLinkAttestation` envelope itself — the proof field carries the claim content, the envelope signature covers it.
-- Self-attestation model: issuer == subject. The identity's controller asserts "I verified this at creation time." Consumers trust the assertion because: (a) the `#active` key signed it, (b) the claim is minimal (no forgery incentive beyond the link itself), and (c) falsifying the link provides no benefit — shadow claiming (§3.5.5) and social graph import (§3.6) only work if the external account is genuinely controlled.
+- Self-attestation model: issuer == subject. The identity's controller asserts "I verified this at creation time." Consumers trust the assertion because: (a) the `#active` key signed it, (b) the claim is minimal (no forgery incentive beyond the link itself), and (c) falsifying the link provides no benefit — social graph import (§3.6) only works if the external account is genuinely controlled.
 - **No raw token storage.** The SDK MUST discard the OAuth access token, refresh token, and ID token after extracting the `subject_id`. Only the minimal signed claim persists. This eliminates PII leakage — Google OIDC tokens always include `email`, Apple tokens include `email` when requested. None of that data enters the attestation.
 
 **Class 2: Reference.** The proof is a live external resource that consumers must verify themselves. Verification methods: `SignedPost`, `DnsRecord`.
@@ -130,7 +129,7 @@ The following 16 platforms are supported for identity link attestations. New pro
 - `.well-known` uses the bare string `well-known`. The `platform_handle` field contains the domain name. The proof is an HTTP GET to `https://<domain>/.well-known/scp`, which must return the identifier.
 - DNS uses the bare string `dns`. The `platform_handle` field contains the domain name.
 
-**`ChallengeResponse` verification method:** the registry above names two platforms that use it, Telegram and Steam, and the mechanism is platform-agnostic beyond them. Any verifier — a context governance engine, a bridge connector, or another participant — challenges an agent to prove a capability or an identity claim over a cryptographic round trip. The verifier chooses the `platform` value, such as the context id or its own domain, and `evidence.verifier_did` names the verifier that issued the challenge.
+**`ChallengeResponse` verification method:** the registry above names two platforms that use it, Telegram and Steam, and the mechanism is platform-agnostic beyond them. Any verifier — a context governance engine or another participant — challenges an agent to prove a capability or an identity claim over a cryptographic round trip. The verifier chooses the `platform` value, such as the context id or its own domain, and `evidence.verifier_did` names the verifier that issued the challenge.
 
 **`ChallengeResponse` creation flow:**
 1. A verifier sends a random 32-byte challenge to the subject.
@@ -247,7 +246,7 @@ Verification procedure depends on the attestation class (§3.5.0).
 3. Check `revocation_status` is `Active`. If `Revoked`, reject.
 4. Check `expires_at` (if present). If expired, reject.
 5. Check freshness: if `evidence.verified_at` is older than the renewal interval for the verification method (§3.5.1), the attestation is stale. Stale attestations are degraded (reduced trust weight), not rejected outright.
-6. **Trust the self-attestation.** Because issuer == subject, the `#active` signature is sufficient. The attestation asserts "I performed OAuth verification at `verified_at` and the OIDC `sub` was `subject_id`." There is no cryptographic proof that the OAuth flow actually occurred — this is a self-attestation. It is acceptable for identity links because: (a) the claim is minimal, (b) the only use case is linking identities the user actually controls, (c) falsifying a link provides no protocol benefit (shadow claiming verifies independently, social graph import only surfaces genuine contacts).
+6. **Trust the self-attestation.** Because issuer == subject, the `#active` signature is sufficient. The attestation asserts "I performed OAuth verification at `verified_at` and the OIDC `sub` was `subject_id`." There is no cryptographic proof that the OAuth flow actually occurred — this is a self-attestation. It is acceptable for identity links because: (a) the claim is minimal, (b) the only use case is linking identities the user actually controls, (c) falsifying a link provides no protocol benefit (social graph import only surfaces genuine contacts).
 
 **Class 2 (Reference) verification:**
 
@@ -267,44 +266,6 @@ Verification procedure depends on the attestation class (§3.5.0).
 - Class 1 attestations do not require caching, because signature verification is deterministic and fast.
 
 **Renewal intervals.** The provider registry of §3.5.1 carries the interval for every platform. A consumer SHOULD re-verify at that interval, and an attestation that is stale but not expired is degraded rather than rejected. The intervals track how fast each proof decays: an OIDC token expires and its account may be revoked, a profile bio is edited and its account suspended, a `ChallengeResponse` leaves no persistent proof at all, and a DNS record or a `.well-known` endpoint changes hands only with its domain. A `ChallengeResponse` attestation that names no platform in that registry renews at 60 days.
-
-### 3.5.5 Shadow Identity Claiming Protocol
-
-When a bridge connector creates a shadow identity for an external platform participant (§12.3), the following protocol governs claiming:
-
-**Claiming sequence:**
-
-1. **Eligibility check.** The claimant presents an `IdentityLinkAttestation` (§3.5.2) for the same platform and handle as the shadow identity. The bridge verifies:
-   a. The attestation is valid (signature verifies, not expired, not revoked).
-   b. The `platform` and `platform_handle` (or `platform_id` if available) match the shadow identity's external identity.
-   c. The attestation's `evidence` has been verified within the last renewal interval (§3.5.4).
-
-2. **Claim request.** The claimant sends a `ShadowClaimRequest` to the bridge context:
-   ```
-   ShadowClaimRequest {
-     claimant_did:      Identifier,
-     shadow_did:        Identifier,     // the shadow identity's identifier
-     attestation_id:    String,         // ID of the IdentityLinkAttestation
-     attestation:       IdentityLinkAttestation, // Full attestation for verification
-     timestamp:         u64,
-     signature:         P256Signature,    // Signs claimant_did || shadow_did || attestation_id || timestamp
-   }
-   ```
-
-3. **Bridge verification.** The bridge operator verifies:
-   a. The attestation links the claimant's identifier to the shadow identity's external identity.
-   b. No other identifier has already claimed this shadow identity.
-   c. The claimant's identifier is not on any block list relevant to the context.
-
-4. **Merge execution.** On successful verification:
-   a. The shadow identity's membership records in all bridge contexts are updated to reference the claimant's identifier.
-   b. Historical messages from the shadow identity are re-attributed to the claimant's identifier in the context event log via a `ShadowClaimed { shadow_did, claimant_did, attestation_id, timestamp }` event.
-   c. The shadow identity is deactivated — it cannot send new messages or be claimed by another party.
-   d. The claimant inherits the shadow identity's role in the context (typically `member`; never higher than the context's default role for new members unless governance explicitly grants an upgrade).
-
-5. **Conflict resolution.** If two claimants present valid attestations for the same shadow identity simultaneously, the first `ShadowClaimRequest` processed by the bridge wins. The second claimant receives a `SHADOW_ALREADY_CLAIMED` error (code 4040). The losing claimant MAY dispute via the bridge context's governance mechanism.
-
-**Participation record handling.** The shadow identity's participation history (message counts, duration, event log entries) is NOT merged into the claimant's participation profile. Shadow participation is recorded under the shadow identity's own identifier: the `ShadowClaimed` event establishes the link for auditing, and participation records stay separate so that no party inflates participation by creating shadow identities.
 
 ### 3.5.6 Security Considerations
 

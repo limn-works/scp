@@ -8,22 +8,25 @@
 
 package works.limn.scp.android
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import works.limn.scp.bridge.CoroutineBridge
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
  * Resource handle for an active SCP context tracked by [ScpViewModel].
  *
- * Encapsulates the opaque context handle returned by [CoroutineBridge.ContextBridge.create]
- * or [CoroutineBridge.ContextBridge.join], the identity handle of the member, and the bridge
- * needed to call [leave] on cleanup.
+ * Encapsulates the opaque context handle returned by
+ * [works.limn.scp.bridge.ContextBridge.create] or [works.limn.scp.bridge.ContextBridge.join],
+ * the identity handle of the member, and the bridge
+ * needed to call [works.limn.scp.bridge.ContextBridge.leave] on cleanup.
  *
  * @property handle Opaque context handle from the FFI layer.
  * @property identityHandle Opaque identity handle for the member in this context.
@@ -36,17 +39,22 @@ data class TrackedContext(
 )
 
 /**
- * Base [ViewModel] that manages SCP resource lifecycle.
+ * Base [ViewModel] that leaves every tracked SCP context when the ViewModel is cleared.
  *
- * Extend this class in your app's ViewModels to get automatic cleanup of SCP connections,
- * streams, and subscriptions when the ViewModel is cleared (i.e., when the associated
- * Activity or Fragment is destroyed and not recreating due to configuration change).
+ * Extend this class in your app's ViewModels so that clearing the ViewModel (when the
+ * associated Activity or Fragment is destroyed and not recreated for a configuration change)
+ * leaves every context tracked through [trackContext]: [onCleared] launches
+ * [works.limn.scp.bridge.ContextBridge.leave] for each one, passes each `leave` failure to
+ * [onCleanupFailure], and returns without waiting on a `leave` that suspends into its bridge's
+ * dispatcher. It closes no connection and releases no stream or subscription; an app that holds
+ * an `ScpHotStreams` calls `ScpHotStreams.close()` itself, from a coroutine the app owns.
  *
  * Per ADR-028, the recommended pattern is:
  * 1. Create [CoroutineBridge] and context handles in the ViewModel
  * 2. Track contexts via [trackContext]
  * 3. Expose message flows via `stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())`
- * 4. Override [onCleared] calls [leave] on all tracked contexts automatically
+ * 4. Let [onCleared], which this class already overrides, call
+ *    [works.limn.scp.bridge.ContextBridge.leave] on every tracked context
  *
  * Usage:
  * ```kotlin
@@ -66,18 +74,32 @@ data class TrackedContext(
  * ```
  *
  * Thread safety: [trackContext] and [untrackContext] are safe to call from any coroutine
- * or thread. The internal context list is protected by a [Mutex].
+ * or thread. A monitor lock guards the internal context list. Neither method suspends and
+ * neither blocks on coroutine machinery, so a caller running on a single-threaded
+ * dispatcher cannot deadlock on them.
+ *
+ * A Java subclass calls `super()`, so this class must keep a zero-argument JVM constructor.
+ * `ScpViewModelTest.ScpViewModel exposes a zero-argument constructor to Java callers` asserts
+ * that constructor by reflection.
  */
 abstract class ScpViewModel : ViewModel() {
 
-    private val mutex = Mutex()
+    private val contextsLock = Any()
     private val activeContexts = mutableListOf<TrackedContext>()
-    private val cleanupJob = SupervisorJob()
 
-    // `Dispatchers.Unconfined` starts the cleanup coroutine on the thread that calls
-    // [onCleared] and keeps it there only until the first `leave` suspends into the
-    // bridge's I/O dispatcher, so [onCleared] returns without waiting on an FFI call.
-    private val cleanupScope = CoroutineScope(cleanupJob + Dispatchers.Unconfined)
+    // Written and read only under [contextsLock]; true once [onCleared] has run.
+    private var cleared = false
+
+    // [launchLeave] starts each cleanup coroutine undispatched on the thread that calls
+    // [onCleared] or [trackContext].
+    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+
+    // Serializes [onCleanupFailure] across every cleanup coroutine: [onCleared] launches one
+    // and each post-clear [trackContext] launches another, and with a dispatching bridge
+    // their `leave` calls fail on different threads at once. A [Mutex] suspends a waiting
+    // coroutine instead of blocking its thread, which may be an Android main thread. Under
+    // `Dispatchers.Unconfined` a waiting coroutine resumes on the thread that unlocks it.
+    private val cleanupFailureLock = Mutex()
 
     /**
      * Register a context for automatic cleanup on ViewModel clear.
@@ -86,11 +108,28 @@ abstract class ScpViewModel : ViewModel() {
      * when the ViewModel is destroyed. Returns the same [TrackedContext] for
      * chaining convenience.
      *
+     * A context registered after [onCleared] has run is left at once, the way
+     * `ViewModel.addCloseable` closes a resource added after clear: Android never calls
+     * [onCleared] a second time, so tracking it would drop its `leave` silently. That
+     * `leave` runs on the same cleanup coroutine path, and a failure reaches
+     * [onCleanupFailure]. With a bridge whose I/O dispatcher runs inline, the `leave` runs on
+     * the calling thread before this method returns, even when the caller is itself a
+     * coroutine on `Dispatchers.Unconfined`, such as an [onCleanupFailure] override that
+     * retries. So does its [onCleanupFailure] call, unless an [onCleanupFailure] call is
+     * running at that moment, the retrying override's own included. In that case this method
+     * returns first, and the call waits for the running one and then runs on the thread that
+     * ran it.
+     *
      * @param context The [TrackedContext] wrapping the context handle and bridge.
      * @return The same [context] passed in, for chaining.
      */
     fun trackContext(context: TrackedContext): TrackedContext {
-        runBlocking { mutex.withLock { activeContexts.add(context) } }
+        val alreadyCleared =
+            synchronized(contextsLock) {
+                if (!cleared) activeContexts.add(context)
+                cleared
+            }
+        if (alreadyCleared) launchLeave(listOf(context))
         return context
     }
 
@@ -103,35 +142,148 @@ abstract class ScpViewModel : ViewModel() {
      * @param context The [TrackedContext] to stop tracking.
      */
     fun untrackContext(context: TrackedContext) {
-        runBlocking { mutex.withLock { activeContexts.remove(context) } }
+        synchronized(contextsLock) { activeContexts.remove(context) }
     }
 
     /**
      * Called when the ViewModel is cleared (Activity/Fragment destroyed permanently).
      *
-     * Android calls this method on the main thread after it has cancelled [viewModelScope],
-     * so a coroutine launched into [viewModelScope] here would never run. The method
-     * launches the cleanup into a dedicated [cleanupScope] instead and returns without
-     * waiting for it: each `leave` is a blocking FFI call that the bridge runs on its I/O
-     * dispatcher, and `.docs/standards/kotlin.md` keeps callers off the main thread.
-     * The cleanup coroutine leaves every tracked context, catching each error so that one
-     * failed `leave` does not stop the others.
+     * What this method guarantees when it returns:
+     * - [activeContexts] is empty, and a snapshot taken under [contextsLock] holds every
+     *   context that [trackContext] registered and [untrackContext] did not remove. The same
+     *   lock marks this view model cleared, so every later [trackContext] leaves its context
+     *   at once instead of tracking it.
+     * - A coroutine is submitted to [cleanupScope]. That coroutine calls
+     *   [works.limn.scp.bridge.ContextBridge.leave] exactly once per snapshotted context,
+     *   in snapshot order.
+     * - A `leave` call that throws, whatever it throws, does not stop remaining `leave`
+     *   calls. Its throwable goes to [onCleanupFailure]. That includes a
+     *   [CancellationException]: nothing cancels [cleanupScope], so a cancellation that
+     *   `leave` throws never reports that this cleanup coroutine was cancelled. It comes from
+     *   inside `leave`, for example from an injected I/O dispatcher that rejected the task.
+     * - An [onCleanupFailure] override that throws does not stop remaining `leave` calls
+     *   either. Its throwable is logged at warning level and the loop continues.
+     * - Snapshot order binds this coroutine only. A context [trackContext] registers after
+     *   this call is left on a coroutine of its own, whose `leave` can run at the same time
+     *   as this one's on another thread. [onCleanupFailure] calls never overlap.
      *
-     * The method completes [cleanupJob] after launching, so the scope finishes once the
-     * cleanup coroutine returns and a second call starts no second cleanup.
+     * What this method does not guarantee: that `leave` calls have finished. The cleanup
+     * coroutine starts on the calling thread. Cleanup is best-effort — those calls run to
+     * completion only if a process outlives them. Blocking until they finish is not an option:
+     * [onCleared] runs on an Android main thread, and blocking that thread on FFI calls both
+     * risks an ANR and deadlocks whenever an injected dispatcher schedules its work onto a
+     * blocked thread.
+     *
+     * Uses a dedicated [cleanupScope] because `viewModelScope` is already cancelled before
+     * [onCleared] is called, so a coroutine launched there would be dropped without running.
+     * [onCleared] does not cancel [cleanupScope] afterwards. A [SupervisorJob] whose children
+     * have all completed holds no thread, no handle, and no memory a cancellation would
+     * release, and [Dispatchers.Unconfined] owns no thread, so cancelling that job frees
+     * nothing. Cancelling it would instead start every later [cleanupScope] launch already
+     * cancelled. [launchLeave] starts undispatched, so that coroutine still runs, but each
+     * `leave` then throws [CancellationException] from the bridge's `withContext` before its
+     * FFI call. That exception reaches [onCleanupFailure] only when [cleanupFailureLock] is
+     * free: a cancelled coroutine that finds the lock held gets a [CancellationException] from
+     * `Mutex.lock` instead of waiting, and its loop ends with no [onCleanupFailure] call and
+     * no `leave` for its remaining contexts. A context that [trackContext] registers after
+     * [onCleared] would then never be left.
      */
     override fun onCleared() {
         super.onCleared()
-        cleanupScope.launch {
-            val contexts = mutex.withLock {
+        val contexts =
+            synchronized(contextsLock) {
+                cleared = true
                 val snapshot = activeContexts.toList()
                 activeContexts.clear()
                 snapshot
             }
+        launchLeave(contexts)
+    }
+
+    /**
+     * Calls `leave` on each of [contexts] in order, on a coroutine [cleanupScope] owns.
+     *
+     * [CoroutineStart.UNDISPATCHED] runs the coroutine on the calling thread up to its first
+     * suspension. A default start would, when the caller runs inside the thread's active
+     * unconfined event loop, queue it on that loop until the caller's coroutine suspends, and the
+     * inline-bridge guarantee in the KDoc of [trackContext] would not hold. A
+     * retry from [onCleanupFailure] runs inside that loop whenever the failed `leave` resumed its
+     * cleanup coroutine from a dispatching bridge, such as the default `Dispatchers.IO` one.
+     */
+    private fun launchLeave(contexts: List<TrackedContext>) {
+        cleanupScope.launch(start = CoroutineStart.UNDISPATCHED) {
             for (ctx in contexts) {
-                runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
+                val failure =
+                    runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
+                        .exceptionOrNull() ?: continue
+                cleanupFailureLock.withLock { runCatching { onCleanupFailure(ctx, failure) } }
+                    .onFailure { overrideFailure ->
+                        Log.w(
+                            TAG,
+                            "onCleanupFailure threw; remaining contexts are still left " +
+                                "(contextHandle=${ctx.handle})",
+                            overrideFailure,
+                        )
+                    }
             }
         }
-        cleanupJob.complete()
+    }
+
+    /**
+     * Called once per context whose `leave` threw, with whatever `leave` threw.
+     *
+     * What reaches this point is whatever the tracked context's `leave` throws:
+     * [works.limn.scp.bridge.ContextBridge.leave] runs `contextLeave` on the
+     * [works.limn.scp.bridge.NativeBindings] its [CoroutineBridge] was constructed with and
+     * passes on what that call throws. No production class in this SDK implements
+     * `NativeBindings` today, so those failures come from an app's own implementation or a
+     * test stub, never from the Rust engine. A [kotlinx.coroutines.CancellationException]
+     * raised inside `leave`, such as one from a bridge I/O dispatcher that rejects the task,
+     * reaches this point too.
+     * Override to record the failure, to retry, or to tell a user that a departure did not
+     * land.
+     *
+     * A default body logs at warning level, which is what `.docs/standards/sdk-common.md`
+     * §Cleanup error handling requires: "Errors during cleanup are logged but never
+     * propagated as exceptions — callers must not be penalized for disposing resources."
+     * That standard is why this method returns [Unit] rather than rethrowing, and why a
+     * cleanup coroutine keeps calling `leave` on its remaining contexts after one fails.
+     *
+     * Runs inside a cleanup coroutine that [onCleared] or a [trackContext] call after clear
+     * launches. When the bridge's I/O dispatcher dispatches (the default `Dispatchers.IO`
+     * does), that is on whichever thread is running that coroutine when it reaches this call,
+     * and the call that launched it can return before this call runs. It must not block its
+     * thread, for a reason `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` states.
+     *
+     * Calls never overlap, so an override may update unsynchronized state, although
+     * successive calls can run on different threads. [onCleared]'s coroutine and each
+     * coroutine that [trackContext] launches after clear can see `leave` fail at the same
+     * time; a [Mutex] makes each wait, suspended rather than blocking its thread, until the
+     * running call returns. Calls from one coroutine keep its order; calls from different
+     * coroutines have no defined order.
+     *
+     * A throw from an override does not propagate: the cleanup coroutine that called it,
+     * whether [onCleared] or a [trackContext] after clear launched it, catches it, logs it at
+     * warning level, and still calls `leave` on every remaining context, so throwing here
+     * fails nothing closed. The coroutine catches it because an uncaught throw from it would
+     * reach the thread's uncaught-exception handler, which on Android kills the process
+     * after the screen that owned this ViewModel is gone.
+     *
+     * @param context Tracked context whose `leave` failed.
+     * @param cause Throwable that `leave` threw. A [CancellationException] here was raised
+     *   inside `leave`; it never means the cleanup coroutine was cancelled, because nothing
+     *   cancels that coroutine.
+     */
+    protected open fun onCleanupFailure(context: TrackedContext, cause: Throwable) {
+        Log.w(
+            TAG,
+            "SCP context leave failed during ViewModel cleanup " +
+                "(contextHandle=${context.handle}, identityHandle=${context.identityHandle})",
+            cause,
+        )
+    }
+
+    private companion object {
+        private const val TAG = "ScpViewModel"
     }
 }

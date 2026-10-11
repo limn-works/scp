@@ -1,6 +1,6 @@
 //! In-memory key-custody conformance tests.
 //!
-//! Expands `key_custody_conformance!()` — 10 tests for
+//! Expands `key_custody_conformance!()` — 13 tests for
 //! `scp_platform::KeyCustody` — against `InMemoryKeyCustody`, which ADR-006
 //! (`.docs/adrs/phase-1.md`, platform abstraction) names as its reference
 //! implementation. `FileKeyCustody` and `SqliteKeyCustody` carry their own

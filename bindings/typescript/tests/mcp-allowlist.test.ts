@@ -94,3 +94,16 @@ describe("SCP allowlist plumbing", () => {
     expect(state.unrestricted).toBe(false);
   });
 });
+
+describe("SCP MCP client plumbing", () => {
+  test("mcpClientConnectSse forwards the URL and the bearer token to the native handle", async () => {
+    const native = createMockNativeScp({ strict: false });
+    native.__stub("mcpClientConnectSse", async () => "mcp-client-1");
+    const { scp } = mountMockScp(native);
+
+    await scp.mcpClientConnectSse("http://127.0.0.1:9/sse", "tok-1");
+
+    const call = native.__lastCall("mcpClientConnectSse");
+    expect(call?.args).toEqual(["http://127.0.0.1:9/sse", "tok-1"]);
+  });
+});

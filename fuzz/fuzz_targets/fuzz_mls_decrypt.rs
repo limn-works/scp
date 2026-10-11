@@ -1,21 +1,20 @@
 #![no_main]
 #![allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 
-//! MLS decrypt-path panic-safety fuzz target (Tier 4 — ADR-057 §Prereq-4, #1444).
+//! MLS decrypt-path panic-safety fuzz target (Tier 4 — ADR-057 §Prereq-4).
 //!
 //! # What this proves
 //!
 //! The in-browser SCP client (ADR-057) decrypts ciphertext delivered by an
 //! **untrusted relay**. The untrusted-relay guarantee is that a tampered or
 //! malformed ciphertext must surface a **typed** `MlsError::DecryptionFailed`
-//! (→ browser `[SCP-CRYPTO-4010]`), never abort the tab.
+//! (→ browser `[SCP-CRYPTO-4041]`), never abort the tab.
 //!
-//! No release-mode panic has been *found* on the openmls 0.8.1 decrypt path
-//! (this target is that standing evidence, pinned to openmls 0.8.1; a version
-//! bump could introduce one, caught by the nightly fuzz job). The one known
-//! debug-build panic is an openmls `debug_assert!` (`"Ciphertext decryption
-//! failed"`, `openmls-0.8.1/src/framing/private_message_in.rs`), **compiled out
-//! of `--release` builds**. This target drives arbitrary and tampered-AEAD
+//! No panic has been *found* on the openmls 0.9.0 decrypt path (this target is
+//! that standing evidence; a version bump could introduce one, caught by the
+//! nightly fuzz job). openmls 0.9.0 returns a typed error for a failed
+//! content-AEAD open in every build profile. This target drives arbitrary and
+//! tampered-AEAD
 //! ciphertext through the browser/relay-reachable `scp-mls` decrypt entry points
 //! and asserts they never panic. libFuzzer treats any panic/abort as a crash,
 //! so "no panic" is the invariant (I1) — returning `Ok` or `Err` are both
@@ -27,16 +26,15 @@
 //! malicious authenticated **member** (insider) — is a distinct threat model,
 //! out of scope here.
 //!
-//! # CRITICAL: run with `-O` (debug-assertions OFF)
+//! # Build profiles
 //!
-//! This target validates the SHIPPED RELEASE path. It MUST be built with
-//! debug-assertions OFF, i.e. `cd fuzz && cargo fuzz run fuzz_mls_decrypt -O …`.
-//! Without `-O`, cargo-fuzz injects `-Cdebug-assertions`, openmls's
-//! `debug_assert!` fires on every tampered input, and the target reports a
-//! false crash on the very first tampered ciphertext. `[profile.release]
-//! debug-assertions = false` in `fuzz/Cargo.toml` keeps the profile consistent;
-//! `-O` is the operative switch. See `.github/workflows/fuzz.yml`
-//! (`fuzz-mls-decrypt` job).
+//! The shipped browser wasm is a `--release` build with debug-assertions off.
+//! CI runs this target like every other, without `-O`, so cargo-fuzz injects
+//! `-Cdebug-assertions` and `-Coverflow-checks` and the fuzzed build also
+//! exercises openmls's and SCP's debug-only checks, a superset of the panic
+//! sites the shipped build carries. openmls 0.9.0 returns a typed error for a
+//! tampered ciphertext in both configurations. See the `fuzz_mls_decrypt` leg of
+//! `fuzz-nightly` in `.github/workflows/fuzz.yml`.
 //!
 //! # Strategy — a FRESH generation-0 receiver per decrypt call
 //!
@@ -47,13 +45,13 @@
 //! (`ScpMlsGroup::serialize_state`); every decrypt call restores a FRESH gen-0
 //! receiver from that snapshot (`ScpMlsGroup::deserialize_state`) before running.
 //!
-//! Fresh-receiver-per-call is load-bearing, not incidental. openmls 0.8.1 advances
+//! Fresh-receiver-per-call is load-bearing, not incidental. openmls 0.9.0 advances
 //! Bob's secret-tree receive ratchet (consuming generation 0) DURING
 //! `process_message`, BEFORE the content-AEAD open, on `&mut self` state, and does
-//! NOT roll it back on AEAD failure (openmls 0.8.1 `group/mls_group/processing.rs`,
+//! NOT roll it back on AEAD failure (openmls 0.9.0 `group/mls_group/processing.rs`,
 //! `framing/validation.rs`, `framing/private_message_in.rs`,
 //! `tree/sender_ratchet.rs`). So a *shared* receiver would reach the content-AEAD
-//! path (the openmls `debug_assert!` this target stresses) at most ONCE per
+//! open this target stresses at most ONCE per
 //! process: after the first genuinely-tampered ciphertext consumes gen-0, every
 //! later one is rejected at `secret_for_decryption` with a secret-reuse error
 //! BEFORE content-AEAD. Restoring a fresh gen-0 receiver per call makes the
@@ -69,9 +67,9 @@
 //!      PRISTINE valid ciphertext that decrypts `Ok`; the guard flips the last byte
 //!      when the XOR was a no-op). A **small-to-medium** tail tamper leaves the
 //!      frame header — and thus sender-data, which samples only the first 32 bytes
-//!      (`openmls-0.8.1/src/schedule/mod.rs`) — intact, so openmls passes
-//!      sender-data and reaches the content-AEAD open, the path that trips the
-//!      debug-only `debug_assert!`. libFuzzer favors short inputs, so the
+//!      (`openmls-0.9.0/src/schedule/mod.rs`) — intact, so openmls passes
+//!      sender-data and reaches the content-AEAD open. libFuzzer favors short
+//!      inputs, so the
 //!      content-AEAD path is reached on a **large fraction** of the campaign; a
 //!      **large** `data` (tail region `len − n` sliding into the first 32 bytes or
 //!      the frame header) instead fails at sender-data-AEAD / framing *before*
@@ -99,7 +97,7 @@ struct FuzzState {
     /// Serialized pristine generation-0 state of Bob's group. Restored into a
     /// FRESH receiver before every decrypt call (openmls advances the receive
     /// ratchet before content-AEAD and does not roll back — see module docs).
-    receiver_snapshot: Vec<u8>,
+    receiver_snapshot: zeroize::Zeroizing<Vec<u8>>,
     /// A genuinely valid application ciphertext from Alice, decryptable by a fresh
     /// gen-0 receiver (the base for the guaranteed-tamper Path-2 mutation).
     valid_ciphertext: Vec<u8>,
@@ -131,7 +129,7 @@ fn build_state() -> Option<FuzzState> {
         &SystemClock,
     )
     .ok()?;
-    let bob = join_group(&add.welcome, bob_provider, bob_signer).ok()?;
+    let bob = join_group(&add.welcome, bob_provider, bob_signer, &scp_clock::SystemClock).ok()?;
 
     // Snapshot Bob BEFORE he decrypts anything — this is the pristine generation-0
     // state restored fresh before every decrypt call.
@@ -199,10 +197,10 @@ fuzz_target!(|data: &[u8]| {
             let _ = decrypt(&mut g, data);
         }
         if let Some(mut g) = fresh_receiver(snap) {
-            let _ = decrypt_with_sender_did(&mut g, data, &SystemClock);
+            let _ = decrypt_with_sender_did(&mut g, data);
         }
         if let Some(mut g) = fresh_receiver(snap) {
-            let _ = decrypt_with_membership_changes(&mut g, data, &SystemClock);
+            let _ = decrypt_with_membership_changes(&mut g, data);
         }
 
         // --- Path 2: tamper the TAIL of a valid ciphertext ---
@@ -245,7 +243,6 @@ fuzz_target!(|data: &[u8]| {
             decrypt_with_sender_did(
                 &mut fresh_receiver(snap).expect(expect_msg),
                 &tampered,
-                &SystemClock
             )
             .is_err(),
             "tampered ciphertext decrypted Ok via decrypt_with_sender_did (AEAD forgery?)"
@@ -254,7 +251,6 @@ fuzz_target!(|data: &[u8]| {
             decrypt_with_membership_changes(
                 &mut fresh_receiver(snap).expect(expect_msg),
                 &tampered,
-                &SystemClock
             )
             .is_err(),
             "tampered ciphertext decrypted Ok via decrypt_with_membership_changes (AEAD forgery?)"

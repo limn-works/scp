@@ -43,6 +43,7 @@ import { ContextError, IdentityError } from "../src/errors";
 import { SCP } from "../src/scp";
 import type { SealedInvitation } from "../src/types";
 import { mountMockScp } from "./mock-bridge";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Layer 1 — delegation / marshaling via the mock native handle
@@ -257,7 +258,7 @@ try {
   scpAvailable = true;
   probe.shutdown(1).catch(() => {});
 } catch (e: unknown) {
-  skipReason = `NAPI SCP class not available: ${e instanceof Error ? e.message : String(e)}`;
+  skipReason = skipReasonIfAddonAbsent(e);
 }
 
 if (!scpAvailable) {
@@ -323,9 +324,10 @@ if (!scpAvailable) {
         // Encrypted SingleAdmin context: the creator can invite unilaterally.
         // The invite is routed through the actor's governance gate, which checks
         // the proposer's `governance:propose` capability before auto-executing —
-        // that is the ONLY capability enforced for the invite (a normally-created
-        // SingleAdmin context grants it at genesis); the ceiling below keeps the
-        // default SingleAdmin capability set. Mirrors the PyO3 reference
+        // that is the ONLY capability enforced for the invite. The SingleAdmin
+        // creator holds every capability in the declared ceiling, so the ceiling
+        // below declares `governance:propose`; a ceiling without it cannot
+        // invite. Mirrors the PyO3 reference
         // `test_invite_member_seals_for_single_admin_context`.
         const ctx = await scp.contextCreate(
           creator,

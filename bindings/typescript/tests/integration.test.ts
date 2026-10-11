@@ -37,7 +37,7 @@
  * See ADR-022 in `.docs/adrs/phase-4.md` and ADR-048.
  */
 
-import { afterEach, beforeEach, describe, expect, it, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,6 +55,7 @@ import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 import type { ConsequenceRule as ConsequenceRuleTypeAlias, OutletDefinition } from "../src/types";
 import { createMockNativeScp, mountMockScp } from "./mock-bridge";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 /**
  * Generates a DHKEM(P-256) wrapping keypair (32-byte secret scalar + 65-byte
@@ -694,16 +695,15 @@ try {
   // those changes would miss the surface. Check before claiming the
   // bridge is usable.
   if (typeof (probe as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
-    napiSkipReason = "SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
-  } else {
-    napiAvailable = true;
+    throw new Error("SCP missing relayStartInMemory — rebuild with the Phase 4 changes");
   }
+  napiAvailable = true;
   // Always shut the probe down — it is disposable and never used by tests.
   // Fresh `new SCP({ storage: { type: "in_memory" } })` instances are minted per-test in the `beforeEach`
   // below, so there is no shared NAPI state between tests.
   probe.shutdown(1).catch(() => {});
 } catch (e: unknown) {
-  napiSkipReason = e instanceof Error ? e.message : String(e);
+  napiSkipReason = skipReasonIfAddonAbsent(e);
 }
 
 // Only stateful contexts — everything stateless (mock/harness) is unaffected.
@@ -1138,13 +1138,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         identity,
         JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
       );
-      // The raw NAPI handle returns the lowercase role string (the
-      // `Bridge` wrapper in `internal/native.ts` is what case-normalizes
-      // to "Admin" — see #1236). At the SCP class surface we get the
-      // Rust-native serde form.
       const role = await scp.contextMemberRole(ctx._rawHandle, identity.did);
-      expect(role).not.toBeNull();
-      expect(String(role).toLowerCase()).toBe("admin");
+      expect(role).toBe("Admin");
     });
 
     it("scp.contextCreate rejects an unknown governance model (SCP-GOV error)", async () => {
@@ -1696,8 +1691,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       };
       expect(typeof proposeJson.proposal_id).toBe("string");
       const newRole = await scp.contextMemberRole(ctx._rawHandle, member.did);
-      expect(newRole !== null).toBe(true);
-      expect(String(newRole).toLowerCase()).toContain("moderator");
+      expect(newRole).toBe("Moderator");
     });
 
     it("scp.contextExecuteGovernanceAction removes a member", async () => {
@@ -1797,10 +1791,10 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
       // ADR-011 amendment (phase-2.md:907-934): MessageSent is per-author,
       // non-convergent application activity surfaced only as a local
-      // `ContextEvent::MessageSent` on the in-process buffer (drained here as a
-      // Debug-formatted string) — never a durable Merkle leaf.
+      // `ContextEvent::MessageSent` on the in-process buffer — never a durable
+      // Merkle leaf.
       const drained = await scp.contextDrainEvents(ctx._rawHandle);
-      expect(drained.some((e) => e.includes("MessageSent"))).toBe(true);
+      expect(drained.some((e) => e.startsWith("message_sent:"))).toBe(true);
 
       // The durable event log (read by eventLogQuery) deliberately excludes
       // MessageSent so two honest members derive the same merkle_root (§9.9.3).
@@ -2177,7 +2171,8 @@ function napiIsUsable(): boolean {
     const probe = new SCP({ storage: { type: "in_memory" } });
     probe.shutdown(1).catch(() => {});
     return true;
-  } catch {
+  } catch (e: unknown) {
+    skipReasonIfAddonAbsent(e);
     return false;
   }
 }
@@ -2453,11 +2448,4 @@ describe("Error hierarchy (SDK-level)", () => {
     // construction. We assert the semantic contract the SDK relies on.
     expect(err.code).toBe("SCP-GEN-0000");
   });
-});
-
-// Consume import-only symbols so the lint/ci layer does not flag
-// unused imports. `test` is referenced here so future contributors
-// know the block has seen a skip-safe check.
-test.skipIf(true)("unused-import hold-down", () => {
-  // intentionally empty
 });

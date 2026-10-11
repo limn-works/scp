@@ -1,0 +1,376 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+//! Structural check that named test doubles compile only in test builds.
+//!
+//! Root `AGENTS.md` ("No dev/test-only stand-ins in production") forbids an
+//! in-memory store or an always-succeeds verifier on a shipped path, and §17.17
+//! of `.docs/specs/17-persistence-and-storage.md` gives the mechanism: the
+//! stand-in compiles only under a `testing` feature, and
+//! `scripts/check-shipped-feature-graph.sh` proves that no shipped artifact
+//! resolves a `testing` feature. That gate reads feature graphs, so it cannot
+//! see a stand-in whose `#[cfg]` someone deleted. This test closes that hole for
+//! the types in [`GATED_DOUBLES`]: it parses every Rust source file under
+//! `crates/` with `syn` and fails when an item that declares, implements, or
+//! re-exports one of them carries no cfg predicate that implies
+//! `test || feature = "testing"`. A `use` item in a file under a crate's own
+//! `tests/` directory is exempt; a declaration or impl there is not.
+
+use std::path::{Path, PathBuf};
+
+/// Test doubles that must compile only under `test` or `feature = "testing"`.
+///
+/// `InMemoryFfiTrustStore` forgets every entry when dropped, so trust
+/// aggregation through it reads an empty store. `InMemoryViolationStore`
+/// forgets every custody violation, which ADR-039 requires to be durable.
+/// `NoOpRevocationChecker` reports every attestation as not revoked without
+/// consulting a revocation list. `InMemoryPersistence` forgets every context
+/// snapshot when dropped, so a restart restores nothing.
+/// `InMemoryRevocationChecker` starts empty and so reports every UCAN as not
+/// revoked. `InMemoryCaveatResolver` attaches caveats that no token signature
+/// covers. `NoOpContextPersistence` reports every context snapshot as stored
+/// and stores nothing, so a restart restores no context. `NoOpSagaJournal`
+/// journals no saga, so crash recovery replays nothing.
+const GATED_DOUBLES: &[&str] = &[
+    "InMemoryFfiTrustStore",
+    "InMemoryViolationStore",
+    "NoOpRevocationChecker",
+    "InMemoryPersistence",
+    "InMemoryRevocationChecker",
+    "InMemoryCaveatResolver",
+    "NoOpContextPersistence",
+    "NoOpSagaJournal",
+];
+
+/// True when a cfg predicate holds only if `test` or `feature = "testing"` holds.
+///
+/// `all(..)` implies the gate when any child does; `any(..)` only when every
+/// child does, because a non-test child reaches a shipped build; `not(..)`
+/// never does, which errs toward reporting an item as ungated.
+fn implies_harness(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(p) => p.is_ident("test"),
+        syn::Meta::NameValue(nv) => {
+            nv.path.is_ident("feature")
+                && matches!(
+                    &nv.value,
+                    syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) if s.value() == "testing"
+                )
+        }
+        syn::Meta::List(list) => {
+            let Ok(nested) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                nested.iter().any(implies_harness)
+            } else if list.path.is_ident("any") {
+                !nested.is_empty() && nested.iter().all(implies_harness)
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// True when any `#[cfg(..)]` among `attrs` implies the harness gate.
+fn attrs_gated(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("cfg")
+            && attr
+                .parse_args::<syn::Meta>()
+                .is_ok_and(|meta| implies_harness(&meta))
+    })
+}
+
+fn type_names_double(ty: &syn::Type) -> Option<&'static str> {
+    let syn::Type::Path(tp) = ty else {
+        return None;
+    };
+    let last = tp.path.segments.last()?;
+    GATED_DOUBLES
+        .iter()
+        .copied()
+        .find(|name| last.ident == name)
+}
+
+fn use_tree_doubles(tree: &syn::UseTree, out: &mut Vec<&'static str>) {
+    match tree {
+        syn::UseTree::Path(p) => use_tree_doubles(&p.tree, out),
+        syn::UseTree::Name(n) => {
+            out.extend(GATED_DOUBLES.iter().copied().filter(|name| n.ident == name));
+        }
+        syn::UseTree::Rename(r) => {
+            out.extend(GATED_DOUBLES.iter().copied().filter(|name| r.ident == name));
+        }
+        syn::UseTree::Group(g) => {
+            for t in &g.items {
+                use_tree_doubles(t, out);
+            }
+        }
+        syn::UseTree::Glob(_) => {}
+    }
+}
+
+/// One item that declares, implements, or re-exports a gated double.
+#[derive(Debug)]
+struct Mention {
+    name: &'static str,
+    kind: &'static str,
+    gated: bool,
+}
+
+fn collect(items: &[syn::Item], inherited: bool, out: &mut Vec<Mention>) {
+    for item in items {
+        let (attrs, names, kind): (&[syn::Attribute], Vec<&'static str>, &'static str) = match item
+        {
+            syn::Item::Struct(s) => (
+                &s.attrs,
+                GATED_DOUBLES
+                    .iter()
+                    .copied()
+                    .filter(|n| s.ident == n)
+                    .collect(),
+                "struct",
+            ),
+            syn::Item::Enum(e) => (
+                &e.attrs,
+                GATED_DOUBLES
+                    .iter()
+                    .copied()
+                    .filter(|n| e.ident == n)
+                    .collect(),
+                "enum",
+            ),
+            syn::Item::Impl(i) => (
+                &i.attrs,
+                type_names_double(&i.self_ty).into_iter().collect(),
+                "impl",
+            ),
+            syn::Item::Use(u) => {
+                let mut names = Vec::new();
+                use_tree_doubles(&u.tree, &mut names);
+                (&u.attrs, names, "use")
+            }
+            syn::Item::Mod(m) => {
+                if let Some((_, inner)) = &m.content {
+                    collect(inner, inherited || attrs_gated(&m.attrs), out);
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        let gated = inherited || attrs_gated(attrs);
+        out.extend(names.into_iter().map(|name| Mention { name, kind, gated }));
+    }
+}
+
+fn mentions_in_source(src: &str) -> Vec<Mention> {
+    let file = syn::parse_file(src).expect("fixture or workspace source parses");
+    let mut out = Vec::new();
+    collect(&file.items, attrs_gated(&file.attrs), &mut out);
+    out
+}
+
+/// Mentions in the file at `path` that the cfg check accepts or rejects.
+///
+/// A `use` item in a file under a crate's `tests/` directory counts as gated:
+/// it names a declaration that this check holds to the cfg gate, so a shipped
+/// build that reached the file through `#[path]`, `include!`, or a manifest
+/// target path would fail to resolve the name. A struct, enum, or impl there
+/// gets no exemption, because no cfg on it means the shipped build compiles it.
+fn checked_mentions(path: &Path, src: &str) -> Vec<Mention> {
+    let in_tests = in_integration_test_target(path);
+    let Ok(file) = syn::parse_file(src) else {
+        panic!("{} does not parse", path.display());
+    };
+    let mut found = Vec::new();
+    collect(&file.items, attrs_gated(&file.attrs), &mut found);
+    for m in &mut found {
+        m.gated |= in_tests && m.kind == "use";
+    }
+    found
+}
+
+/// True when `path` sits under the `tests/` directory of the crate that owns
+/// it, the nearest ancestor directory holding a `Cargo.toml`.
+fn in_integration_test_target(path: &Path) -> bool {
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if d.join("Cargo.toml").is_file() {
+            return path.strip_prefix(d).is_ok_and(|rel| {
+                rel.components().next() == Some(std::path::Component::Normal("tests".as_ref()))
+            });
+        }
+        dir = d.parent();
+    }
+    false
+}
+
+fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if path.is_dir() {
+            // Build output and vendored trees hold no workspace source.
+            if name != "target" && name != "node_modules" {
+                rust_files(&path, out);
+            }
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn named_test_doubles_compile_only_under_test_or_testing() {
+    let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("scp-testing sits under crates/")
+        .to_path_buf();
+    let mut files = Vec::new();
+    rust_files(&crates_dir, &mut files);
+
+    let mut ungated = Vec::new();
+    let mut declarations: Vec<&'static str> = Vec::new();
+    for path in &files {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if !GATED_DOUBLES.iter().any(|n| src.contains(n)) {
+            continue;
+        }
+        for m in checked_mentions(path, &src) {
+            if m.kind == "struct" || m.kind == "enum" {
+                declarations.push(m.name);
+            }
+            if !m.gated {
+                let shown = path.strip_prefix(&crates_dir).unwrap_or(path);
+                ungated.push(format!("crates/{}: {} {}", shown.display(), m.kind, m.name));
+            }
+        }
+    }
+
+    // Each double is declared exactly once; a rename or a move out of `crates/`
+    // would otherwise leave this test checking nothing.
+    for name in GATED_DOUBLES {
+        let count = declarations.iter().filter(|d| *d == name).count();
+        assert_eq!(
+            count, 1,
+            "expected one declaration of `{name}` under crates/, found {count}"
+        );
+    }
+    assert!(
+        ungated.is_empty(),
+        "these items declare, implement, or re-export a test double without a \
+         cfg that implies `test` or `feature = \"testing\"`, so a shipped build \
+         compiles them:\n{}",
+        ungated.join("\n")
+    );
+}
+
+/// The checker reports the gated fixture as gated and every weakened copy as
+/// ungated, so a pass above means the cfg is present, not that the checker is
+/// blind.
+#[test]
+fn checker_rejects_each_weakened_gate() {
+    let gated = r#"
+        #[cfg(any(test, feature = "testing"))]
+        pub struct NoOpRevocationChecker;
+        #[cfg(any(test, feature = "testing"))]
+        impl Checker for NoOpRevocationChecker {}
+        #[cfg(feature = "testing")]
+        pub use a::b::NoOpRevocationChecker;
+        #[cfg(test)]
+        mod tests {
+            impl Default for NoOpRevocationChecker { fn default() -> Self { Self } }
+        }
+        #[cfg(all(unix, feature = "testing"))]
+        impl Other for NoOpRevocationChecker {}
+    "#;
+    let found = mentions_in_source(gated);
+    assert_eq!(found.len(), 5, "{found:?}");
+    assert!(found.iter().all(|m| m.gated), "{found:?}");
+
+    let weakened = [
+        // The gate deleted.
+        "pub struct NoOpRevocationChecker;",
+        // A non-test arm of `any` reaches a shipped build.
+        r#"#[cfg(any(test, feature = "other"))] pub struct NoOpRevocationChecker;"#,
+        // A negated gate is the shipped build.
+        r#"#[cfg(not(feature = "testing"))] pub struct NoOpRevocationChecker;"#,
+        // A gate on a sibling item does not cover the impl.
+        "impl Checker for NoOpRevocationChecker {}",
+        // An ungated re-export, in a group, under a rename.
+        "pub use a::{b::NoOpRevocationChecker as Checker};",
+        // An ungated enclosing module gates nothing.
+        "pub mod m { pub struct InMemoryViolationStore; }",
+    ];
+    for src in weakened {
+        let found = mentions_in_source(src);
+        assert_eq!(found.len(), 1, "{src}: {found:?}");
+        assert!(!found[0].gated, "checker accepted an ungated item: {src}");
+    }
+}
+
+/// The integration-test exemption accepts only a `use` item, and only in a
+/// file under a crate's own `tests/` directory: an ungated declaration or impl
+/// there is rejected, and an ungated `use` in `src/` is rejected.
+#[test]
+fn integration_test_exemption_accepts_only_use_items() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let in_tests = crate_dir.join("tests/integration/fixture.rs");
+    let in_src = crate_dir.join("src/fixture.rs");
+
+    let import = "use scp_core::crypto::ucan::validate::InMemoryCaveatResolver;";
+    let found = checked_mentions(&in_tests, import);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].gated, "{found:?}");
+    let found = checked_mentions(&in_src, import);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(!found[0].gated, "{found:?}");
+
+    for src in [
+        "pub struct InMemoryPersistence;",
+        "pub enum InMemoryPersistence {}",
+        "impl RevocationChecker for InMemoryRevocationChecker {}",
+        "impl InMemoryCaveatResolver { fn new() -> Self { todo!() } }",
+    ] {
+        let found = checked_mentions(&in_tests, src);
+        assert_eq!(found.len(), 1, "{src}: {found:?}");
+        assert!(!found[0].gated, "exemption accepted a declaration: {src}");
+    }
+}
+
+/// `in_integration_test_target` holds for files under a crate's own `tests/`
+/// directory and nothing else: a `tests` directory inside `src/`, or a
+/// `tests.rs` module file, does not count.
+#[test]
+fn integration_test_exemption_covers_only_the_crate_tests_dir() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(in_integration_test_target(
+        &crate_dir.join("tests/integration/attacks.rs")
+    ));
+    assert!(in_integration_test_target(
+        &crate_dir.join("tests/integration/test_double_gating.rs")
+    ));
+    let runtime_dir = crate_dir.parent().unwrap().join("scp-runtime");
+    assert!(in_integration_test_target(
+        &runtime_dir.join("tests/ucan_validate_integration.rs")
+    ));
+    assert!(!in_integration_test_target(
+        &runtime_dir.join("src/context/providers/persistence.rs")
+    ));
+    assert!(!in_integration_test_target(
+        &runtime_dir.join("src/tests/fixture.rs")
+    ));
+    assert!(!in_integration_test_target(
+        &runtime_dir.join("src/tests.rs")
+    ));
+    let protocol_dir = crate_dir.parent().unwrap().join("scp-protocol");
+    assert!(!in_integration_test_target(
+        &protocol_dir.join("src/crypto/ucan/validate.rs")
+    ));
+}

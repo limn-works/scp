@@ -6,10 +6,9 @@
 //!
 //! `OpenMLS`'s `StorageProvider` is a **sync** trait — the upstream contract
 //! returns `Result<..., Self::Error>` from every method and does not support
-//! async. The existing sync-to-async bridge in [`super::storage`] satisfies
-//! that contract by running `block_in_place(|| handle.block_on(...))` around
-//! each call, which pins the tokio worker thread and makes `current_thread`
-//! runtimes panic.
+//! async. A sync-to-async bridge that satisfies that contract by running
+//! `block_in_place(|| handle.block_on(...))` around each call pins the tokio
+//! worker thread and makes `current_thread` runtimes panic.
 //!
 //! Commit 4 introduces [`OpenMlsStorageAdapter`] as an **async** KV surface
 //! that underlies the sync `OpenMLS` bridge. The adapter is dyn-compatible
@@ -23,8 +22,8 @@
 //!
 //! The minimum surface `OpenMLS` needs is a keyed blob store: `store`,
 //! `retrieve`, `delete`. Higher-level shapes (lists, composite keys,
-//! namespacing) live in the `OpenMLS` bridge on top, exactly where they live
-//! today in [`super::storage::MlsStorageBridge`].
+//! namespacing) belong to the caller on top. Today the one caller is the
+//! durable consumed-init-key set that `join_from_welcome` checks.
 //!
 //! # Production impl
 //!

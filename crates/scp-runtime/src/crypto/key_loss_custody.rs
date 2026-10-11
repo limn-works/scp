@@ -2,17 +2,17 @@
 //! sender-key and access-key wire protocols can be driven to key-not-found.
 //!
 //! A destroyed signing key or wrapping key reaches a `sign` or `dh_agree` call
-//! through plain [`InMemoryKeyCustody`]. Three calls cannot be reached that
+//! through plain [`InMemoryKeyCustody`]. Four calls cannot be reached that
 //! way, because the protocol obtains or uses the key inside one function:
 //! `generate_keypair` itself, `public_key` on the key `generate_keypair` just
-//! returned, and `public_key` on the wrapping key after `dh_agree` used it.
-//! [`KeyLoss`] names each of those steps.
+//! returned, `public_key` on the wrapping key after `dh_agree` used it, and
+//! `public_key` on the joiner's `#active` key after `ed25519_to_x25519_agree`
+//! used it to open an invitation. [`KeyLoss`] names each of those steps.
 
 use scp_platform::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
 
 /// The step at which [`KeyLossCustody`] loses a key.
@@ -26,6 +26,9 @@ pub enum KeyLoss {
     /// `dh_agree` destroys its key after agreeing, so the next `public_key`
     /// on that handle is key-not-found.
     AfterDhAgree,
+    /// `ed25519_to_x25519_agree` destroys its key after agreeing, so the next
+    /// `public_key` on that handle is key-not-found.
+    AfterEd25519Agree,
 }
 
 /// [`InMemoryKeyCustody`] that loses a key at the step [`KeyLoss`] names and
@@ -53,7 +56,9 @@ impl KeyCustody for KeyLossCustody {
                 self.inner.destroy_key(&handle).await?;
                 Ok(handle)
             }
-            KeyLoss::AfterDhAgree => self.inner.generate_keypair(key_type).await,
+            KeyLoss::AfterDhAgree | KeyLoss::AfterEd25519Agree => {
+                self.inner.generate_keypair(key_type).await
+            }
         }
     }
 
@@ -89,7 +94,7 @@ impl KeyCustody for KeyLossCustody {
         &self,
         key: &KeyHandle,
         context_id: &[u8],
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         self.inner.derive_pseudonym(key, context_id).await
     }
 
@@ -98,7 +103,7 @@ impl KeyCustody for KeyLossCustody {
         key: &KeyHandle,
         context_id: &[u8],
         pseudonym_epoch: u64,
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         self.inner
             .derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
             .await
@@ -109,9 +114,14 @@ impl KeyCustody for KeyLossCustody {
         ed25519_handle: &KeyHandle,
         peer_x25519_public: &[u8; 32],
     ) -> Result<SharedSecret, PlatformError> {
-        self.inner
+        let shared = self
+            .inner
             .ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
-            .await
+            .await?;
+        if matches!(self.loss, KeyLoss::AfterEd25519Agree) {
+            self.inner.destroy_key(ed25519_handle).await?;
+        }
+        Ok(shared)
     }
 
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {

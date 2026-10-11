@@ -651,8 +651,6 @@ mod tests {
             acme_challenges: None,
             hostname_index: RwLock::new(HashMap::new()),
             default_site_routing_id: std::sync::RwLock::new(None),
-            bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
-            bridge_lookup: None,
             #[cfg(feature = "quic")]
             publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(100),
             #[cfg(feature = "quic")]

@@ -96,7 +96,8 @@ pub enum ServerError {
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
 
-    /// No passphrase was provided when one is required for persistent node identity.
+    /// No passphrase, or an empty one, was provided when one is required for
+    /// persistent node identity.
     #[error("passphrase required for persistent node identity")]
     MissingPassphrase,
 
@@ -391,9 +392,11 @@ pub async fn start_node_in_memory(
         Some(id) => {
             // Migrated to the ADR-052 flat-config front door (Phase B-P2).
             // The dropped explicit `SelfSignedTlsProvider::new("localhost")` is
-            // reproduced by the default `TlsMode::SelfSigned`. `Domain` is a
-            // publishing reach, so M2 requires `DhtMode::Production` (advisory
-            // in P1 — the in-memory DHT client publishes nothing).
+            // reproduced by the default `TlsMode::SelfSigned`. This node opts
+            // into `DhtMode::Production` (M2 accepts `Disabled` for every
+            // `Reach`, `Domain` included), which makes `Node::start` publish
+            // through the caller's `did_method` and fail the start if that
+            // publish fails.
             //
             // Constructed via a PRODUCTION `Node::start` (spec §17.5: FFI
             // bridges must not rely on an `allow_unencrypted_storage` escape
@@ -574,7 +577,9 @@ const fn warn_on_permissive_data_dir(_data_dir: &Path) {}
 /// - A data directory cannot be created ([`ServerError::Io`])
 /// - A redb blob database cannot be opened ([`ServerError::Storage`])
 /// - A key custody file cannot be opened ([`ServerError::Platform`])
-/// - No passphrase arrived when `identity` is `None` ([`ServerError::MissingPassphrase`])
+/// - No passphrase, or an empty one, arrived when `identity` is `None`
+///   ([`ServerError::MissingPassphrase`]); this check runs before the data
+///   directory or any file in it is created
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
 pub async fn start_node_local<S>(
     data_dir: &Path,
@@ -586,6 +591,19 @@ where
     S: EncryptedStorage + 'static,
 {
     use scp_identity::DidCache;
+
+    // A persisted identity needs a passphrase, and an empty one counts as
+    // absent: Argon2id over "" seals the key file under a key anyone who reads
+    // the salt can derive (spec §17.8). Checked before the data directory or
+    // the blob database is created, so a refused call leaves nothing on disk.
+    let passphrase = match identity {
+        Some(_) => None,
+        None => Some(
+            passphrase
+                .filter(|passphrase| !passphrase.is_empty())
+                .ok_or(ServerError::MissingPassphrase)?,
+        ),
+    };
 
     // Validate and ensure data directory exists.
     validate_data_dir(data_dir)?;
@@ -611,10 +629,11 @@ where
     // Build the node via the ADR-052 flat-config front door (Phase B-P2). The
     // two identity arms differ only in their `IdentitySource`; the dropped
     // explicit `SelfSignedTlsProvider::new("localhost")` is reproduced by the
-    // default `TlsMode::SelfSigned`. `Domain` is a publishing reach, so M2
-    // requires `DhtMode::Production` (advisory in P1 — the in-memory DHT client
-    // publishes nothing). Each arm moves `storage` into its own config, so both
-    // arms build a config separately.
+    // default `TlsMode::SelfSigned`. This node opts into `DhtMode::Production`
+    // (M2 accepts `Disabled` for every `Reach`, `Domain` included), which makes
+    // `Node::start` publish through `did_method` and fail the start if that
+    // publish fails. Each arm moves
+    // `storage` into its own config, so both arms build a config separately.
     let node = if let Some(id) = identity {
         Node::start(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
@@ -642,22 +661,32 @@ where
         })
         .await?
     } else {
-        // Persistent key custody — keys survive process restarts.
+        // Persistent key custody — keys survive process restarts. The
+        // passphrase was validated at entry, before any file was created.
         let passphrase = passphrase.ok_or(ServerError::MissingPassphrase)?;
         let key_path = data_dir.join("identity.key");
-        let key_custody = Arc::new(scp_platform::file::FileKeyCustody::new(
-            &key_path,
-            &passphrase,
-        )?);
+        // `FileKeyCustody::new` runs an Argon2id derivation (64 MiB, three
+        // passes) and can wait up to 10 s on a file another process is
+        // creating (spec §17.8), so it runs on the blocking pool rather than
+        // on this future's worker thread. A panicked or cancelled task
+        // surfaces as `ServerError::Io`.
+        let key_custody = Arc::new(
+            tokio::task::spawn_blocking(move || {
+                scp_platform::file::FileKeyCustody::new(&key_path, &passphrase)
+            })
+            .await
+            .map_err(std::io::Error::from)??,
+        );
 
         // Build the node's DHT client for its DID method. A shipped build uses
         // the real Mainline Pkarr client, fail-closed (never an in-memory
         // substitution; ADR-062 §Decision 1) — the node's dht gateways would
         // thread in here; the local path uses direct Mainline DHT (no gateways).
         // A test-harness build (`testing`) uses the in-memory §17.17.3 double so
-        // `Node::start`'s mandatory startup publish (a full relay node always
-        // publishes; see `scp_node`) stays offline instead of timing out
-        // against live Mainline. The client backs both this node's DID
+        // the startup publish stays offline instead of timing out against live
+        // Mainline. `Node::start` publishes, and fails on a failed publish,
+        // because this call selects `DhtMode::Production` below; it skips the
+        // publish under `DhtMode::Disabled`. The client backs both this node's DID
         // publication and its `did:dht` resolution.
         #[cfg(not(any(test, feature = "testing")))]
         let dht_client = Arc::new(ClientDhtConfig::default().into_client()?);
@@ -757,9 +786,8 @@ const fn assert_running_node_backends_are_encrypted(node: &RunningNode) {
 /// evaluates `$body` against it.
 ///
 /// Every [`RunningNode`] method dispatches over both variants. Written out per
-/// method, each body appears twice, and one copy can drift from its sibling —
-/// drift of exactly that kind left only a `PyO3` bridge wired for webhook
-/// events. One body per method removes that risk.
+/// method, each body appears twice, and one copy can drift from its sibling.
+/// One body per method removes that risk.
 macro_rules! dispatch_running_node {
     ($self:expr, |$n:ident| $body:expr) => {
         match $self {
@@ -825,68 +853,6 @@ impl RunningNode {
     /// Signals the node to stop (relay + background tasks).
     pub fn shutdown(&self) {
         dispatch_running_node!(self, |n| n.shutdown());
-    }
-
-    /// Spawns a background task forwarding local `Supervisor` events to this
-    /// node's outbound webhook dispatcher (§12.10.5).
-    ///
-    /// The `events` receiver is obtained from
-    /// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events).
-    /// The returned [`JoinHandle`](tokio::task::JoinHandle) owns the consumer
-    /// task and MUST be retained by a lifecycle owner (e.g. the bridge instance
-    /// `JoinSet`) so it is aborted on shutdown rather than leaked.
-    ///
-    /// See [`ApplicationNode::wire_context_events`](scp_node::ApplicationNode::wire_context_events).
-    #[must_use]
-    pub fn wire_context_events(
-        &self,
-        events: tokio::sync::broadcast::Receiver<(
-            String,
-            scp_core::context::membership::ContextEvent,
-        )>,
-    ) -> tokio::task::JoinHandle<()> {
-        dispatch_running_node!(self, |n| n.wire_context_events(events))
-    }
-
-    /// Subscribes to the supervisor's event channel, wires the consumer into
-    /// this node's webhook dispatcher, and supervises the consumer under the
-    /// bridge instance's lifecycle (spec §12.10.5).
-    ///
-    /// This is the shared seam for all three FFI bridges (`PyO3`, `NAPI`,
-    /// `UniFFI`). Each bridge's node-startup path calls it once, after the
-    /// `Supervisor` is attached, passing the instance's `JoinSet` guard and
-    /// cancellation token. Consolidating the subscribe → wire → supervise block
-    /// here prevents per-bridge drift (the regression that reopened the webhook
-    /// wiring, where only `PyO3` was wired).
-    ///
-    /// Behavior:
-    /// - If the supervisor has no event channel (`subscribe_events()` returns
-    ///   `None`), wiring is skipped with a warning rather than panicking.
-    ///   Production supervisors always enable the channel (see each bridge's
-    ///   `build_supervisor`), so this is purely defensive against a supervisor
-    ///   initialized by some other path.
-    /// - The consumer task runs until the broadcast channel closes (supervisor
-    ///   dropped) OR the bridge instance's cancellation token fires, at which
-    ///   point the consumer is aborted. This makes the consumer deterministically
-    ///   bound to the instance lifecycle rather than leaked as a detached task.
-    pub fn wire_and_supervise_context_events(
-        &self,
-        supervisor: &Arc<Supervisor>,
-        tasks: &mut tokio::task::JoinSet<()>,
-        cancel: tokio_util::sync::CancellationToken,
-    ) {
-        let Some(events) = supervisor.subscribe_events() else {
-            // Defensive: production supervisors always have the channel, but a
-            // Supervisor initialized by another path without it would return
-            // None. Skip wiring rather than panic.
-            tracing::warn!(
-                "wire_and_supervise_context_events: Supervisor has no event \
-                 channel — local context events will not reach the webhook dispatcher"
-            );
-            return;
-        };
-        let consumer = self.wire_context_events(events);
-        spawn_supervised_event_consumer(consumer, tasks, cancel);
     }
 
     /// Activates HTTP broadcast projection with optional site configuration.
@@ -989,7 +955,7 @@ impl InstanceBorrower for RunningNode {
 /// forget while still obtaining an `Arc<RunningNode>` for its handle type.
 ///
 /// Registration is what makes `SCP.shutdown()` stop a node before
-/// `bridge_specific_shutdown` closes this instance's `SQLCipher` handle and
+/// the durable store closer closes this instance's `SQLCipher` handle and
 /// drops an advisory `flock(2)` on `{dir}/scp.db.lock`. See
 /// [`InstanceBorrower`] for what that release corrupts when a node outlives
 /// it, and [`CoreFields::register_borrower`] for how a registration races a
@@ -999,39 +965,6 @@ pub fn register_node(core: &CoreFields, node: RunningNode) -> Arc<RunningNode> {
     let node = Arc::new(node);
     core.register_borrower(&node);
     node
-}
-
-/// Spawns a webhook-event `consumer` (from `ApplicationNode::wire_context_events`
-/// or [`RunningNode::wire_context_events`]) under the bridge instance's
-/// `JoinSet`, bound to its cancellation token.
-///
-/// This is the single shared supervision wire for all three FFI bridges
-/// (`PyO3` reference, `NAPI`, `UniFFI`). Each bridge subscribes to its
-/// `Supervisor` event channel and wires the consumer via its node, then hands
-/// the resulting `JoinHandle` here so the supervision policy lives in one place
-/// and cannot drift per-bridge (the failure mode that reopened the webhook
-/// wiring, where only `PyO3` was wired).
-///
-/// Lifecycle: the spawned guard task runs until either the consumer completes
-/// (the broadcast channel closed because the `Supervisor` was dropped) or
-/// `cancel` fires on bridge shutdown, at which point the consumer is aborted so
-/// it never outlives the instance as a detached task.
-pub fn spawn_supervised_event_consumer(
-    mut consumer: tokio::task::JoinHandle<()>,
-    tasks: &mut tokio::task::JoinSet<()>,
-    cancel: tokio_util::sync::CancellationToken,
-) {
-    tasks.spawn(async move {
-        tokio::select! {
-            // The consumer task runs until the broadcast channel closes.
-            _ = &mut consumer => {}
-            // On bridge shutdown, abort the consumer so it does not
-            // outlive the instance as a detached task.
-            () = cancel.cancelled() => {
-                consumer.abort();
-            }
-        }
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1404,7 +1337,7 @@ mod tests {
             drop(node);
             // Release an advisory lock on `<db_dir>/scp.db.lock` before a
             // second open, which `SqliteStorage::new` takes non-blockingly.
-            storage.close();
+            storage.close().expect("close releases the lock");
             drop(storage);
             // Yield to let the tokio runtime drain cancelled relay tasks.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1423,7 +1356,7 @@ mod tests {
             );
             node.shutdown();
             drop(node);
-            storage.close();
+            storage.close().expect("close releases the lock");
         }
 
         // Cleanup
@@ -1438,16 +1371,16 @@ mod tests {
     /// `Arc<SqliteStorage>` exactly as `PyBridgeInstance`,
     /// `NapiBridgeInstance`, and `UniffiBridgeInstance` hold theirs.
     ///
-    /// Its `bridge_specific_shutdown` reproduces what all three shipped
-    /// bridges do there: it calls [`SqliteStorage::close`], which drops an
-    /// advisory `flock(2)` on `{dir}/scp.db.lock`. Before that call it records
-    /// whether its registered node had already stopped, which is what makes
-    /// ordering — not merely eventual shutdown — observable to a test.
+    /// Its `durable_store_closer` reproduces what all three shipped bridges
+    /// return: a closer that calls [`SqliteStorage::close`], which drops an
+    /// advisory `flock(2)` on `{dir}/scp.db.lock`. Before that call the closer
+    /// records whether the registered node had already stopped, which is what
+    /// makes ordering — not merely eventual shutdown — observable to a test.
     struct StorageOwningInstance {
         core: CoreFields,
         storage: Arc<SqliteStorage>,
-        node: std::sync::Mutex<Option<std::sync::Weak<RunningNode>>>,
-        node_stopped_before_close: std::sync::atomic::AtomicBool,
+        node: Arc<std::sync::Mutex<Option<std::sync::Weak<RunningNode>>>>,
+        node_stopped_before_close: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl StorageOwningInstance {
@@ -1455,8 +1388,8 @@ mod tests {
             Self {
                 core: CoreFields::new(),
                 storage,
-                node: std::sync::Mutex::new(None),
-                node_stopped_before_close: std::sync::atomic::AtomicBool::new(false),
+                node: Arc::new(std::sync::Mutex::new(None)),
+                node_stopped_before_close: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
 
@@ -1467,7 +1400,7 @@ mod tests {
             *self.node.lock().expect("observation mutex") = Some(Arc::downgrade(node));
         }
 
-        /// Reports what `bridge_specific_shutdown` saw when it ran.
+        /// Reports what the store closer saw when it ran.
         fn node_stopped_before_close(&self) -> bool {
             self.node_stopped_before_close
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -1480,20 +1413,23 @@ mod tests {
             &self.core
         }
 
-        fn bridge_specific_shutdown(&self) {
-            let stopped = self
-                .node
-                .lock()
-                .expect("observation mutex")
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-                .is_some_and(|node| InstanceBorrower::stopped(&*node));
-            self.node_stopped_before_close
-                .store(stopped, std::sync::atomic::Ordering::SeqCst);
-            // What every shipped bridge does here, and what makes ordering
-            // load-bearing: releasing an advisory lock that guards one writer
-            // per directory.
-            self.storage.close();
+        fn durable_store_closer(&self) -> Option<crate::bridge_instance::DurableStoreCloser> {
+            let node = Arc::clone(&self.node);
+            let observed = Arc::clone(&self.node_stopped_before_close);
+            let storage = Arc::clone(&self.storage);
+            Some(Box::new(move || {
+                let stopped = node
+                    .lock()
+                    .expect("observation mutex")
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                    .is_some_and(|node| InstanceBorrower::stopped(&*node));
+                observed.store(stopped, std::sync::atomic::Ordering::SeqCst);
+                // What every shipped bridge does here, and what makes
+                // ordering load-bearing: releasing an advisory lock that
+                // guards one writer per directory.
+                storage.close()
+            }))
         }
     }
 
@@ -1537,7 +1473,7 @@ mod tests {
         );
         assert!(
             instance.node_stopped_before_close(),
-            "a node must already be stopped when bridge_specific_shutdown releases \
+            "a node must already be stopped when the durable store closer releases \
              an advisory SQLCipher lock, otherwise a live writer outlives that lock"
         );
 
@@ -1579,7 +1515,7 @@ mod tests {
         // exists so a reopen succeeds while a caller still holds its handle.
         let reopened = SqliteStorage::new(&db_dir, &[0x11u8; 32])
             .expect("a second SQLCipher open must succeed after an instance shutdown");
-        reopened.close();
+        reopened.close().expect("close releases the lock");
 
         drop(instance);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1720,7 +1656,7 @@ mod tests {
         running.shutdown();
         assert!(running.is_shutdown());
         drop(running);
-        storage.close();
+        storage.close().expect("close releases the lock");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1947,5 +1883,90 @@ mod tests {
 
         // Cleanup (data_dir may not have been fully created).
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An empty passphrase is refused with `MissingPassphrase` before the data
+    /// directory exists, so no `identity.key` sealed under "" and no blob
+    /// database is left behind.
+    #[tokio::test]
+    async fn node_local_rejects_an_empty_passphrase_before_touching_disk() {
+        let tmp = temp_dir_for("node-empty-pass");
+        let result = start_node_local(
+            &tmp,
+            instance_in_memory_storage(),
+            None,
+            Some(zeroize::Zeroizing::new(String::new())),
+        )
+        .await;
+        let created = tmp.exists();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let err = result.err().expect("an empty passphrase must be refused");
+        assert!(
+            matches!(err, ServerError::MissingPassphrase),
+            "expected ServerError::MissingPassphrase, got: {err:?}"
+        );
+        assert!(
+            !created,
+            "a refused start must not create the data directory {}",
+            tmp.display()
+        );
+    }
+
+    /// `FileKeyCustody::new` runs its Argon2id derivation on the blocking
+    /// pool. With one worker thread, a derivation run inline would stall a
+    /// sibling task for the whole derivation; the sibling's longest stall must
+    /// stay under half of one derivation measured on this machine and build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn node_local_opens_key_custody_on_the_blocking_pool() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let probe = temp_dir_for("custody-cost");
+        std::fs::create_dir_all(&probe).expect("probe dir");
+        let started = Instant::now();
+        let probe_custody = FileKeyCustody::new(&probe.join("identity.key"), "probe-passphrase");
+        let derivation = started.elapsed();
+        drop(probe_custody.expect("probe custody opens"));
+        let _ = std::fs::remove_dir_all(&probe);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker_stop = Arc::clone(&stop);
+        let ticker = tokio::spawn(async move {
+            let mut last = Instant::now();
+            let mut longest = Duration::ZERO;
+            while !ticker_stop.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                let now = Instant::now();
+                longest = longest.max(now - last);
+                last = now;
+            }
+            longest
+        });
+
+        let tmp = temp_dir_for("node-blocking-pool");
+        let data_dir = tmp.clone();
+        let started = tokio::spawn(async move {
+            start_node_local(
+                &data_dir,
+                instance_in_memory_storage(),
+                None,
+                Some(zeroize::Zeroizing::new("blocking-pool-pass".to_owned())),
+            )
+            .await
+        })
+        .await
+        .expect("start task joins");
+        stop.store(true, Ordering::Release);
+        let longest = ticker.await.expect("ticker joins");
+        let node = started.expect("node starts");
+        node.shutdown();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            longest < derivation / 2,
+            "a sibling task stalled {longest:?}, against {derivation:?} for one derivation; \
+             FileKeyCustody::new ran on the worker thread"
+        );
     }
 }

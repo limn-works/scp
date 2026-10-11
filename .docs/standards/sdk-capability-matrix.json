@@ -1818,6 +1818,28 @@
             "kotlin": "internal sender-key delivery loop, not a standalone SDK operation",
             "swift": "internal sender-key delivery loop, not a standalone SDK operation"
           }
+        },
+        {
+          "name": "p256_pseudonym_point",
+          "python": true,
+          "typescript": true,
+          "kotlin": false,
+          "swift": true,
+          "notes": "Custody-host helper (§9.10.4, FIPS 186-5 A.2.1): the 33-byte compressed P-256 pseudonym point of a 32-byte context_seed the host computed itself (inside a keystore, say). No scalar reaches the host. One implementation in scp_ffi_common::p256_host, exported by PyO3, napi-rs and UniFFI.",
+          "exemptions": {
+            "kotlin": "Kotlin hosts call the UniFFI-generated uniffi.scp.p256PseudonymPoint directly (scp-kt-android's P256Pseudonym wraps it); the generated Kotlin is built, not committed, so the scanned scp-kt sources hold no symbol for it."
+          }
+        },
+        {
+          "name": "p256_software_pseudonym_point",
+          "python": true,
+          "typescript": true,
+          "kotlin": false,
+          "swift": true,
+          "notes": "Custody-host helper (§9.10.4.A): the 33-byte compressed P-256 pseudonym point a software custody derives from its 32-byte identity key material, v1 or v2 at an epoch. No scalar reaches the host. One implementation in scp_ffi_common::p256_host, exported by PyO3, napi-rs and UniFFI.",
+          "exemptions": {
+            "kotlin": "Kotlin hosts call the UniFFI-generated uniffi.scp.p256SoftwarePseudonymPoint directly (scp-kt-android's P256Pseudonym wraps it); the generated Kotlin is built, not committed, so the scanned scp-kt sources hold no symbol for it."
+          }
         }
       ]
     },
@@ -1855,98 +1877,6 @@
             "kotlin": "MCP module not implemented in Kotlin SDK",
             "swift": "register_outlet_handler not exposed in Swift SDK"
           }
-        }
-      ]
-    },
-    {
-      "domain": "Bridge",
-      "operations": [
-        {
-          "name": "register",
-          "python": true,
-          "typescript": false,
-          "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "bridge_register is an internal Bridge interface method (bridgeRegister on the internal Bridge interface in bindings/typescript/src/internal/bridge.ts); it is not exposed as a named public SDK function — registration is handled at the FFI layer directly via the NAPI addon"
-          }
-        },
-        {
-          "name": "evaluate_trust",
-          "python": true,
-          "typescript": true,
-          "kotlin": true,
-          "swift": true
-        },
-        {
-          "name": "create_shadow",
-          "python": true,
-          "typescript": true,
-          "kotlin": true,
-          "swift": true
-        },
-        {
-          "name": "credential_provision",
-          "python": true,
-          "typescript": true,
-          "kotlin": true,
-          "swift": true
-        },
-        {
-          "name": "credential_retrieve",
-          "python": true,
-          "typescript": true,
-          "kotlin": true,
-          "swift": true
-        },
-        {
-          "name": "credential_rotate",
-          "python": true,
-          "typescript": true,
-          "kotlin": true,
-          "swift": true
-        },
-        {
-          "name": "credential_revoke",
-          "python": true,
-          "typescript": true,
-          "kotlin": true,
-          "swift": true
-        },
-        {
-          "name": "credential_list",
-          "python": true,
-          "typescript": true,
-          "kotlin": true,
-          "swift": true
-        },
-        {
-          "name": "credential_store_key",
-          "python": true,
-          "typescript": true,
-          "kotlin": true,
-          "swift": true
-        },
-        {
-          "name": "credential_get_key",
-          "python": true,
-          "typescript": true,
-          "kotlin": true,
-          "swift": true
-        },
-        {
-          "name": "credential_delete_key",
-          "python": true,
-          "typescript": true,
-          "kotlin": true,
-          "swift": true
-        },
-        {
-          "name": "credential_backend_durable",
-          "python": true,
-          "typescript": true,
-          "kotlin": true,
-          "swift": true
         }
       ]
     },
@@ -2116,7 +2046,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "SCP.shutdown(timeout) — bounded graceful shutdown replacing the Phase 4 PR 1 terminal infallible shutdown. Propagates a tokio_util::sync::CancellationToken into every long-running task, waits on a JoinSet up to the timeout, and forcibly cancels anything still running at the deadline. Async across all bridges: PyO3 returns a coroutine, NAPI returns Promise<void>, UniFFI generates Kotlin suspend fun / Swift async throws. Timeout is carried as u64 milliseconds across all three bridges (NAPI was widened from u32 in #1692). Each SDK wrapper clamps to its bridge's maximum at the boundary. See ADR-048 §Decision 5 and §Notes/Shutdown-timeout integer width across FFI bridges."
+          "notes": "SCP.shutdown(timeout) — bounded graceful shutdown replacing the Phase 4 PR 1 terminal infallible shutdown. Propagates a tokio_util::sync::CancellationToken into every long-running task, waits on the bridge's own JoinSet up to the timeout and aborts the JoinSet tasks still running at the deadline, then drains the Supervisor within the remaining budget before the store closes; a drain still running at the deadline is never aborted. An SDK shutdown raises SCP-STORAGE-8005 when the instance's own store keeps its advisory lock. Async across all bridges: PyO3 returns a coroutine, NAPI returns Promise<void>, UniFFI generates Kotlin suspend fun / Swift async throws. Timeout is carried as u64 milliseconds across all three bridges (NAPI was widened from u32 in #1692). Each SDK wrapper clamps to its bridge's maximum at the boundary. See ADR-048 §Decision 5 and §Notes/Shutdown-timeout integer width across FFI bridges."
         },
         {
           "name": "suspend",

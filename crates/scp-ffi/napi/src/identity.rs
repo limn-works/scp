@@ -105,7 +105,7 @@ pub(crate) fn build_ffi_dht_client() -> Result<FfiDhtClient, ScpNapiError> {
 /// custody backend is available (ADR-062 §Decision 6).
 ///
 /// Every identity commits a pre-rotation commitment at creation (spec §9.7.4.1
-/// §3 — mandatory), which requires a `PreRotationCustody` backend. The only
+/// item 5(a) — mandatory), which requires a `PreRotationCustody` backend. The only
 /// implementation is the test-harness `InMemoryPreRotationCustody` nullifier,
 /// severed from every production dependency line, so a shipped (no-`testing`)
 /// build returns this typed [`codes::IDENT_1059`] error rather than silently

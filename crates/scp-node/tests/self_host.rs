@@ -176,9 +176,9 @@ async fn build_self_host_node() -> BuiltNode {
     let blob_storage_handle = blob_storage.clone();
 
     // `Node::start` requires `S: EncryptedStorage`, satisfied by `SqliteStorage`.
-    // `NatTraversal` (no_domain) is a publishing reach → `DhtMode::Production`
-    // (M2; advisory in P1). The `FixedTierNatStrategy` is supplied via
-    // `NatSlot::Custom`.
+    // `NatTraversal` (no_domain) is a publishing reach: `DhtMode::Production`
+    // makes the start publish and fail if that publish fails. The
+    // `FixedTierNatStrategy` is supplied via `NatSlot::Custom`.
     let node = Node::start(NodeConfig {
         nat: NatSlot::Custom(Arc::new(FixedTierNatStrategy)),
         dht: DhtMode::Production,
@@ -222,6 +222,19 @@ async fn build_self_host_node() -> BuiltNode {
     }
 }
 
+/// The loopback supervisor's context persistence over `mls_inner`, the SAME
+/// encrypted `SQLite` handle that backs its `DurableProviders`, mirroring the
+/// production `build_host_site_deployer`.
+fn persistence_over(
+    mls_inner: &Arc<SqliteStorage>,
+) -> Box<dyn scp_core::context::persistence::ContextPersistence> {
+    Box::new(
+        scp_core::store::context::ProtocolRepositoryContextBridge::new(Arc::new(
+            scp_core::store::ProtocolRepository::new(Arc::clone(mls_inner)),
+        )),
+    )
+}
+
 /// Full in-process self-host deploy + HTTP serve, end to end.
 ///
 /// Mirrors the production `--self-host` path: build a no-domain node on real
@@ -256,7 +269,8 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
     );
     // Durable saga journal + `mls_storage` view bound into one `DurableProviders`
     // over the SAME `Arc<SqliteStorage>`, exactly as the production binary does.
-    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
+    let durable =
+        scp_core::context::supervisor::DurableProviders::from_handle(Arc::clone(&mls_inner));
 
     // -- Embedded default site (index.html + style.css + app.js), with the node
     //    DID injected into the index <head>, just like production.
@@ -285,6 +299,7 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
         key_resolver,
         custody: custody.as_ref(),
         durable,
+        persistence: persistence_over(&mls_inner),
         assets: &assets,
     };
 
@@ -295,6 +310,18 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
         committed, expected_count,
         "commit_deploy must report exactly the number of published assets"
     );
+
+    // -- `deploy_site` drained its Supervisor before returning (ADR-049
+    //    Decision 16): no tracked task still holds the MLS store, so the store
+    //    closes and its directory reopens on the first attempt (spec §17.6).
+    assert_eq!(
+        Arc::strong_count(&mls_inner),
+        1,
+        "deploy_site must leave no task holding the MLS store"
+    );
+    mls_inner.close().expect("the drained MLS store must close");
+    SqliteStorage::new(&storage_dir.join("mls"), storage_key.as_ref())
+        .expect("the MLS directory must reopen on the first attempt after deploy_site");
 
     // -- Fetch /index.html back over HTTP from the node's real projection router.
     let routing_hex = scp_node::routing_id_hex(&context_id);
@@ -360,7 +387,8 @@ async fn build_deployer(built: &BuiltNode, context_id: &str) -> scp_node::SelfHo
         SqliteStorage::new(&built.storage_dir.join("mls"), built.storage_key.as_ref())
             .expect("MLS SQLite should open"),
     );
-    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
+    let durable =
+        scp_core::context::supervisor::DurableProviders::from_handle(Arc::clone(&mls_inner));
     let signing_key_handle = built.node.identity().identity().active_signing_key;
     scp_node::SelfHostDeployer::start(
         &built.node,
@@ -370,6 +398,7 @@ async fn build_deployer(built: &BuiltNode, context_id: &str) -> scp_node::SelfHo
         signing_key_handle,
         built.key_resolver(),
         durable,
+        persistence_over(&mls_inner),
     )
     .await
     .expect("deployer setup should succeed")
@@ -414,15 +443,14 @@ async fn projection_status(node: &scp_node::ApplicationNode<SqliteStorage>, path
 }
 
 /// FIX 1 (security): the self-host PUBLIC surface must expose ONLY the
-/// read-only website projection — never the relay upgrade (`/scp/v1`) nor the
-/// bridge routes (`/v1/scp/bridge/*`).
+/// read-only website projection — never the relay upgrade (`/scp/v1`).
 ///
 /// Builds the restricted self-host router via `serve_background_with_surface`
 /// against a real bound listener, then asserts over the wire that the site
-/// route serves while `/scp/v1` and `/v1/scp/bridge/shadow` are NOT routed
-/// (they fall through to the virtual-host fallback -> 404).
+/// route serves while `/scp/v1` is NOT routed (it falls through to the
+/// virtual-host fallback -> 404).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn self_host_public_surface_excludes_relay_and_bridge() {
+async fn self_host_public_surface_excludes_relay() {
     let built = build_self_host_node().await;
     let node_did = built.node.identity().did().to_owned();
     let context_id = self_host_context_id(&node_did);
@@ -474,22 +502,6 @@ async fn self_host_public_surface_excludes_relay_and_bridge() {
         "relay upgrade `/scp/v1` must NOT be reachable on the self-host public surface, \
          got {}",
         relay.status()
-    );
-
-    // -- The bridge routes `/v1/scp/bridge/*` are NOT routed publicly. --
-    let bridge = client
-        .post(format!("{base}/v1/scp/bridge/shadow"))
-        .header("content-type", "application/json")
-        .body("{}")
-        .send()
-        .await
-        .expect("bridge probe should complete");
-    assert_eq!(
-        bridge.status().as_u16(),
-        404,
-        "bridge route `/v1/scp/bridge/shadow` must NOT be reachable on the self-host \
-         public surface, got {}",
-        bridge.status()
     );
 
     built.node.shutdown();
@@ -858,14 +870,19 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
     //    the SAME root directory MUST be rejected by the advisory lock. This is
     //    precisely what the binary used to do at its second `open_sqlite_or_exit`
     //    call, and is the bug this fix removes. --
-    let second_open = SqliteStorage::new(&storage_dir, storage_key.as_ref());
+    let second_open = scp_node::self_host::open_sqlite(&storage_dir, &storage_key);
     let err = second_open
         .err()
         .expect("opening the root DB twice (while the first handle lives) must fail");
-    let err_str = err.to_string();
     assert!(
-        err_str.contains("already open by another SCP instance"),
-        "the second root open must be rejected by the advisory lock, got: {err_str}"
+        matches!(
+            &err,
+            scp_node::self_host::HostSiteError::StorageOpen {
+                error: scp_platform::PlatformError::StorageLockHeld { .. },
+                ..
+            }
+        ),
+        "the second root open must be rejected by the advisory lock, typed, got: {err}"
     );
 
     // -- A second, live owner of the SAME handle, standing in for the binary's
@@ -921,7 +938,7 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
     .await
     .expect(
         "the node must build over the SHARED root storage handle without a \
-         lock conflict (os error 35)",
+         lock conflict",
     );
 
     // -- The REAL document-derived governance resolver over the node's shared
@@ -977,7 +994,9 @@ async fn deploy_embedded_and_assert_serves<S>(
         SqliteStorage::new(&storage_dir.join("mls"), storage_key.as_ref())
             .expect("MLS SQLite should open (distinct subdirectory)"),
     );
-    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
+    let durable =
+        scp_core::context::supervisor::DurableProviders::from_handle(Arc::clone(&mls_inner));
+    let persistence = persistence_over(&mls_inner);
 
     let assets = scp_node::embedded_assets(Some(&node_did));
     let expected_count = assets.len();
@@ -993,6 +1012,7 @@ async fn deploy_embedded_and_assert_serves<S>(
             key_resolver,
             custody,
             durable,
+            persistence,
             assets: &assets,
         },
     )
@@ -1065,7 +1085,8 @@ async fn build_self_host_node_over_dir(dir: &std::path::Path) -> ApplicationNode
 
     // The production `--self-host` identity wiring: `IdentitySource::Persisted`
     // load-or-creates from the root storage so the DID is stable across
-    // restarts. `NatTraversal` (publishing) → `DhtMode::Production` (M2).
+    // restarts. The node opts into `DhtMode::Production` (M2 accepts
+    // `Disabled` for every `Reach`, `NatTraversal` included).
     Node::start(NodeConfig {
         nat: NatSlot::Custom(Arc::new(FixedTierNatStrategy)),
         dht: DhtMode::Production,
@@ -1243,10 +1264,10 @@ async fn skip_nat_probe_uses_loopback_relay_url_without_probing() {
     let http_port = 28444u16;
 
     // `Reach::Local` skips the NAT probe (the flat-config equivalent of
-    // `no_domain().skip_nat_probe()`). Local is non-publishing → `DhtMode::Memory`
-    // (the default). The `PanicOnProbeNatStrategy` is still supplied via
-    // `NatSlot::Custom`: a clean build proves `Local` short-circuited the probe
-    // before `select_tier` was ever called.
+    // `no_domain().skip_nat_probe()`). Local is non-publishing → `DhtMode::Disabled`,
+    // the value `NodeConfig::defaults` sets. The `PanicOnProbeNatStrategy` is still
+    // supplied via `NatSlot::Custom`: a clean build proves `Local` short-circuited
+    // the probe before `select_tier` was ever called.
     let node = Node::start(NodeConfig {
         nat: NatSlot::Custom(Arc::new(PanicOnProbeNatStrategy)),
         bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
@@ -1288,8 +1309,8 @@ async fn skip_nat_probe_uses_loopback_relay_url_without_probing() {
 /// absent) while the site projection serves — and the SAME GET on the `Full`
 /// surface IS routed (non-404, the WebSocket extractor rejecting a plain GET),
 /// proving the self-host 404 is genuine route absence, not a generic rejection.
-/// (The companion `self_host_public_surface_excludes_relay_and_bridge` covers
-/// the bridge routes and the full surface/site detail; this test deliberately
+/// (The companion `self_host_public_surface_excludes_relay` covers
+/// the full surface/site detail; this test deliberately
 /// keeps the surface half tight and adds the relay-loopback binding the other
 /// test lacks.)
 ///
@@ -1569,4 +1590,62 @@ async fn external_participant_access_is_cryptographic() {
     assert_relay_view_is_ciphertext(&built, &routing_id, "external-participant").await;
 
     built.node.shutdown();
+}
+
+/// ADR-049 Decision 16 for a long-lived deployer: `shutdown` drains the
+/// Supervisor so no tracked task outlives it, every later deploy fails, and
+/// once the deployer drops the MLS store has no other holder, so it closes and
+/// its directory reopens on the first attempt (spec §17.6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_host_deployer_shutdown_drains_before_store_close() {
+    let built = build_self_host_node().await;
+    let node_did = built.node.identity().did().to_owned();
+    let context_id = self_host_context_id(&node_did);
+    let mls_dir = built.storage_dir.join("mls");
+    let mls_inner = Arc::new(
+        SqliteStorage::new(&mls_dir, built.storage_key.as_ref()).expect("MLS SQLite should open"),
+    );
+    let durable =
+        scp_core::context::supervisor::DurableProviders::from_handle(Arc::clone(&mls_inner));
+    let deployer = scp_node::SelfHostDeployer::start(
+        &built.node,
+        node_did.clone(),
+        context_id,
+        "selfhost.scp.local".to_owned(),
+        built.node.identity().identity().active_signing_key,
+        built.key_resolver(),
+        durable,
+        persistence_over(&mls_inner),
+    )
+    .await
+    .expect("deployer setup should succeed");
+    deploy_through(&deployer, &built, "selfhost-drain-run-1").await;
+
+    deployer
+        .shutdown()
+        .await
+        .expect("an idle Supervisor drains within the deadline");
+    let assets = scp_node::embedded_assets(Some(&node_did));
+    assert!(
+        deployer
+            .deploy(
+                &built.node,
+                "selfhost-drain-run-2",
+                built.custody.as_ref(),
+                &assets
+            )
+            .await
+            .is_err(),
+        "a deploy after shutdown must fail"
+    );
+
+    drop(deployer);
+    assert_eq!(
+        Arc::strong_count(&mls_inner),
+        1,
+        "no tracked task may hold the MLS store after the drain"
+    );
+    mls_inner.close().expect("the drained MLS store must close");
+    SqliteStorage::new(&mls_dir, built.storage_key.as_ref())
+        .expect("the MLS directory must reopen on the first attempt");
 }

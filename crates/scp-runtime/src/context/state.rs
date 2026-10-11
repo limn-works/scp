@@ -844,8 +844,12 @@ pub struct ContextSnapshot {
     ///
     /// Empty if no crypto state was exported (e.g., broadcast-only contexts
     /// or mock providers). See issue #645.
-    #[serde(default, with = "serde_bytes")]
-    pub mls_crypto_state: Vec<u8>,
+    ///
+    /// An [`MlsCryptoState`], because the blob carries the MLS signer and the
+    /// group's HPKE and epoch secrets: it is wiped when the snapshot drops
+    /// (security model spec §9.15 step 2) and `Debug` prints its length only.
+    #[serde(default)]
+    pub mls_crypto_state: MlsCryptoState,
     /// Active migration state (§5.11A). `Some` when the context is in
     /// `MigratingOut` state, `None` otherwise. Persisted so migration
     /// can survive process restarts during the grace period.
@@ -1238,6 +1242,42 @@ pub struct ContextSnapshot {
     /// non-broadcast snapshots deserialize cleanly.
     #[serde(default)]
     pub broadcast: Option<BroadcastContextSnapshot>,
+}
+
+/// The MLS crypto state blob a [`ContextSnapshot`] carries: the MLS signer and
+/// the provider's HPKE and epoch secrets.
+///
+/// The bytes sit in [`zeroize::Zeroizing`], so they are wiped on drop
+/// (security model spec §9.15 step 2). `Debug` prints the length only, like
+/// [`scp_protocol::context::membership::RedactedBytes`]. Serde encodes the bytes
+/// as `MessagePack` bin, the form `serde_bytes` gives a `Vec<u8>`.
+#[derive(Clone, Default)]
+pub struct MlsCryptoState(pub zeroize::Zeroizing<Vec<u8>>);
+
+impl std::fmt::Debug for MlsCryptoState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{} bytes, REDACTED]", self.0.len())
+    }
+}
+
+impl std::ops::Deref for MlsCryptoState {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Serialize for MlsCryptoState {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        serde_bytes::serialize(self.0.as_slice(), s)
+    }
+}
+
+impl<'de> Deserialize<'de> for MlsCryptoState {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        serde_bytes::deserialize::<Vec<u8>, D>(d).map(|bytes| Self(zeroize::Zeroizing::new(bytes)))
+    }
 }
 
 /// Default routing variant for degraded / pre-routing-field snapshots.

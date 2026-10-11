@@ -1,0 +1,13 @@
+# A bindgen `cargo run` under the built-in `test` profile writes target/debug, not a
+# directory named after the profile, so a `--library` under target/test reads a
+# directory no cargo command writes.
+name: Bad
+on: push
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cargo run --profile test -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
+            --library target/test/libscp_ffi_uniffi.so \
+            --language kotlin
