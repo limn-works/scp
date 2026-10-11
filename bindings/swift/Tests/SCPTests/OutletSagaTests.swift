@@ -163,7 +163,7 @@ final class OutletSagaTests: XCTestCase {
     /// A non-active source context is rejected before any bridge call with
     /// `ScpError.Context` `SCP-CTX-2001`.
     func testSagaRejectsInactiveSourceContext() async throws {
-        let identity = try await scp.identityCreate(custody: "in_memory")
+        let identity = try await scp.identityCreate(custody: .inMemory)
         let source = try await makeContext(identity: identity)
         let target = try await makeContext(identity: identity)
 
@@ -190,7 +190,7 @@ final class OutletSagaTests: XCTestCase {
     /// Non-UTF-8 input is rejected at the wrapper boundary with
     /// `ScpError.Outlet` `SCP-OUTLET-6001` (mirrors the sibling's UTF-8 guard).
     func testSagaRejectsNonUtf8Input() async throws {
-        let identity = try await scp.identityCreate(custody: "in_memory")
+        let identity = try await scp.identityCreate(custody: .inMemory)
         let source = try await makeContext(identity: identity)
         let target = try await makeContext(identity: identity)
 
@@ -231,7 +231,7 @@ final class OutletSagaTests: XCTestCase {
     /// layer would require committed-saga bidirectional-consent setup).
     func testSagaForwardsArgumentsToBridge() async throws {
         try scp.configureLocalTransport(localDid: "did:key:z6MkSwiftSagaForwardTest")
-        let identity = try await scp.identityCreate(custody: "in_memory")
+        let identity = try await scp.identityCreate(custody: .inMemory)
         let source = try await makeContext(identity: identity)
         let target = try await makeContext(identity: identity)
         let outletId = try await target.registerOutlet(weatherOutlet(operatorDid: identity.did()))
