@@ -456,6 +456,12 @@ impl ContextActorHandle {
         }
     }
 
+    /// Whether the actor's inbox receiver has dropped, which happens when its
+    /// `run()` returns or its task unwinds from a panic.
+    pub(in crate::context) fn is_closed(&self) -> bool {
+        self.inbox.is_closed()
+    }
+
     /// [`Self::shutdown_and_await_exit`] with no time bound, for a caller that
     /// must not proceed until the actor has exited however long it takes.
     ///
