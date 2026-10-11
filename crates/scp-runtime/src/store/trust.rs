@@ -207,7 +207,7 @@ impl<S: Storage> ProtocolRepository<S> {
     ///
     /// Returns [`TrustError::StoreError`] if key sanitization, serialization,
     /// or storage fails.
-    pub async fn add_trust_revocations(
+    async fn add_trust_revocations(
         &self,
         context_id: &str,
         entries: &[RevocationEntry],
