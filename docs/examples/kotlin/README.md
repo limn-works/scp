@@ -43,11 +43,14 @@ here. Implement `uniffi.scp.KeyCustodyProvider` over your own key store:
 ```kotlin
 identityExample(myProvider, File(filesDir, "scp-identity"), passphrase)
 contextExample(aliceProvider, bobProvider, filesDir, passphrase)
+messagingExample(aliceProvider, bobProvider, "wss://relay.example.com", filesDir, passphrase)
 toolsExample(myProvider, File(filesDir, "scp-tools"), passphrase)
 ```
 
-`messagingExample` takes two nodes, two identities and two context handles that
-the invite-and-join handshake in `contextExample` produces, plus a relay URL.
+`messagingExample` needs a relay both nodes reach. Each node attaches the relay
+with `configureRelayTransport` before it creates or joins a context; the first
+context binds the transport the node has then, and a later call attaches
+nothing.
 
 No example calls `SCP.shutdown`. It takes a `CoroutineBridge`, and the SDK ships
 no `NativeBindings` implementation to build one with.

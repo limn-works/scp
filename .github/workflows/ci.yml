@@ -748,8 +748,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # The version the python-test job pins.
-      - run: pip install mypy==1.20.2
+      # mypy at the version the python-test job pins, and the cryptography
+      # package templates/broadcast-feed/subscriber.py imports, so mypy
+      # resolves its types.
+      - run: pip install mypy==1.20.2 cryptography==50.0.0
       - uses: oven-sh/setup-bun@v2
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
@@ -1121,8 +1123,9 @@ jobs:
       - run: pip install 'tree-sitter-rust>=0.21,<0.25' tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift ruff==0.15.4 'pyyaml>=6,<7'
       # check-examples-typecheck.sh runs mypy, at the pin the python-test and
       # examples-typecheck jobs carry, and the TypeScript compiler that
-      # `bun install` puts under bindings/typescript/node_modules.
-      - run: pip install mypy==1.20.2
+      # `bun install` puts under bindings/typescript/node_modules, plus the
+      # cryptography package templates/broadcast-feed/subscriber.py imports.
+      - run: pip install mypy==1.20.2 cryptography==50.0.0
       - uses: oven-sh/setup-bun@v2
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript

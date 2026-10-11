@@ -36,11 +36,16 @@ let passphrase = "..."  // from the user or your app's keychain item
 try await IdentityExample.run(provider: myProvider, storagePassphrase: passphrase)
 try await ContextExample.run(
     aliceProvider: aliceProvider, bobProvider: bobProvider, storagePassphrase: passphrase)
+try await MessagingExample.run(
+    aliceProvider: aliceProvider, bobProvider: bobProvider,
+    relayURL: "wss://relay.example.com", storagePassphrase: passphrase)
 try await ToolsExample.run(provider: myProvider, storagePassphrase: passphrase)
 ```
 
-`MessagingExample.run` takes two nodes, two identities and two context handles
-that the invite-and-join handshake in `ContextExample` produces, plus a relay URL.
+`MessagingExample.run` needs a relay both nodes reach. Each node attaches the
+relay with `configureRelayTransport` before it creates or joins a context; the
+first context binds the transport the node has then, and a later call attaches
+nothing.
 
 ## Examples
 

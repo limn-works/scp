@@ -83,8 +83,11 @@ scaffolds/                       Clonable barebones project setups
 └── relay/                       Minimal relay with scp-node, TLS, monitoring
 
 templates/                       Clonable working applications for common use cases
+├── chat/                        Two-party encrypted chat (Python CLI)
 ├── agent-tool-provider/         Agent exposing outlets via SCP context + MCP
+├── collaborative-workspace/     Multi-party context with roles and outlets
 ├── personal-relay/              Self-hosted relay with auto-TLS
+├── broadcast-feed/              Broadcast context with subscriber management
 └── cross-context-bridge/        Outlet interface bridging two contexts
 
 bindings/python/README.md      ✓ Python SDK: install, quickstart, platform notes
@@ -458,8 +461,11 @@ Each template is a complete, running application that demonstrates a real use ca
 
 | Template | Language(s) | What it is |
 |---|---|---|
+| `templates/chat/` | Python | Two-party encrypted chat (Python CLI) |
 | `templates/agent-tool-provider/` | Python | Agent exposing outlets via SCP context with MCP bridge |
+| `templates/collaborative-workspace/` | TypeScript | Multi-party context with roles, outlets, and governance |
 | `templates/personal-relay/` | Rust | Self-hosted relay with automatic TLS and key-event-record publishing |
+| `templates/broadcast-feed/` | Python | Broadcast context (§5.14) with subscriber management |
 | `templates/cross-context-bridge/` | Rust | Outlet interface bridging two contexts (§6.2) |
 
 > A functional two-party **browser** chat template (`templates/chat/typescript/`) is
@@ -467,12 +473,6 @@ Each template is a complete, running application that demonstrates a real use ca
 > wasm tier (`09-security-model.md` §9.7.1). Until then, `scaffolds/typescript-web/`
 > demonstrates the single-tab in-browser client (ADR-057). No TypeScript chat template
 > exists yet — the row is intentionally absent rather than phantom.
->
-> A Python two-party chat template, a Python broadcast-feed template (§5.14), and a
-> TypeScript collaborative-workspace template return once the Python and TypeScript
-> SDKs take the returned `Context` as the argument of their send, receive, broadcast
-> and governance methods (**#2840**). Those methods take a bridge handle that only a
-> private attribute exposes today, so each row is absent rather than phantom.
 
 Templates are **functional** — they solve a real problem out of the box. An agent studying a template understands not just how SCP works mechanically but how it's used to build real things.
 

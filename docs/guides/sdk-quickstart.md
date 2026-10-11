@@ -299,7 +299,46 @@ println("Context ID: ${handle.contextId()}")
 
 Messages are MLS-encrypted, signed with the sender's identity, and tagged with provenance metadata. The SDK handles encryption, signing, and envelope construction transparently.
 
-The Python and TypeScript SDKs have no public send or receive call yet. Their `context_send` and `contextSend` methods take a bridge handle that the returned `Context` exposes only through a private attribute, so this guide shows messaging in Swift and Kotlin only.
+A message reaches another member's node over a relay. Each node attaches the relay with `configure_relay_transport` (`configureRelayTransport` in the other SDKs) before it creates or joins its first context: that context starts the node's context supervisor, which binds the transport the node has then, and a later call attaches nothing. A send to a member whose routing announcement has not yet arrived fails with `SCP-CTX-2095` and is rolled back, so it is safe to retry. The `messaging` example for each SDK runs the full flow on two nodes: relay, create, invite, join, send, receive.
+
+The Python SDK does not yet subscribe a context to the relay, so a Python node receives nothing its peer sends, and its sends to a remote member keep failing with `SCP-CTX-2095` (#2856).
+
+### Python
+
+```python
+# Before the first context_create or context_join_from_welcome on this node:
+await scp.configure_relay_transport("wss://relay.example.com", identity.did)
+await scp.transport_connect("wss://relay.example.com")
+
+# Send
+await scp.context_send(ctx, identity.did, "Hello from SCP")
+
+# Receive
+receiver = await scp.context_receive(ctx)
+async for msg in receiver:
+    print(msg.sender_did, msg.payload.decode())
+
+await scp.context_leave(ctx, identity.did)
+```
+
+### TypeScript
+
+```typescript
+// Before the first contextCreate or contextJoinFromWelcome on this node:
+await scp.configureRelayTransport("wss://relay.example.com", identity.did);
+await scp.transportConnect("wss://relay.example.com");
+
+// Receive: the callback runs once per delivered message.
+await scp.contextSubscribe(ctx, identity.did, (message) => {
+  console.log(message);
+});
+
+// Send
+await scp.contextSend(ctx, identity.did, new TextEncoder().encode("Hello from SCP"));
+
+scp.contextCancelSubscription(ctx);
+await scp.contextLeave(ctx, identity.did);
+```
 
 ### Swift
 
@@ -417,8 +456,8 @@ Runnable examples for each SDK sit in `docs/examples/`:
 |---------|--------|-----------|-------|--------|
 | Identity | `identity.py` | `identity.ts` | `Identity.swift` | `Identity.kt` |
 | Context and invite-and-join | `context.py` | `context.ts` | `Context.swift` | `Context.kt` |
-| Messaging | -- | -- | `Messaging.swift` | `Messaging.kt` |
-| Outlets and UCAN | `tools.py` | -- | `Tools.swift` | `Tools.kt` |
+| Messaging | `messaging.py` | `messaging.ts` | `Messaging.swift` | `Messaging.kt` |
+| Outlets and UCAN | `tools.py` | `tools.ts` | `Tools.swift` | `Tools.kt` |
 
 ### Type stubs and IDE support
 

@@ -1,7 +1,7 @@
 # SCP Python SDK Examples
 
-Demonstrates identity creation, the context invite-and-join handshake, and
-outlet registration in the SCP Python SDK.
+Demonstrates identity creation, the context invite-and-join handshake,
+messaging over a relay, and outlet registration in the SCP Python SDK.
 
 ## Prerequisites
 
@@ -47,6 +47,9 @@ python context.py
 
 # Outlet registration, verification, and UCAN minting
 python tools.py
+
+# Two-node messaging over a relay
+SCP_RELAY_URL=wss://relay.example.com python messaging.py
 ```
 
 ## Examples
@@ -55,12 +58,14 @@ python tools.py
 |------|-------------|
 | `identity.py` | Create identity, resolve DID, inspect document, agent key management |
 | `context.py` | Create a context, reserve a KeyPackage, invite a member, join from the sealed invitation |
+| `messaging.py` | Two nodes on one relay: invite, join, send a message, receive it, leave |
 | `tools.py` | Define an outlet with JSON schemas and test vectors, register it, verify it, mint a UCAN |
 
-No example sends or receives messages. Every `SCP` method that does, such as
-`context_send` and `context_receive`, takes the context's bridge handle, and the
-`Context` object `context_create` returns exposes that handle only through a
-private attribute.
+`messaging.py` needs a relay both nodes reach, named in `SCP_RELAY_URL`. The
+Python SDK does not yet subscribe a context to the relay, so the receiving node
+never gets the routing announcement the send waits for, and the send keeps
+failing with `SCP-CTX-2095` (#2856). The example is written against the calls
+that fix makes work.
 
 ## Key Patterns
 

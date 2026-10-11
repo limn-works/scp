@@ -1,7 +1,7 @@
 # SCP TypeScript SDK Examples
 
-Demonstrates identity creation and the context invite-and-join handshake in the
-SCP TypeScript SDK.
+Demonstrates identity creation, the context invite-and-join handshake,
+messaging over a relay, and outlet registration in the SCP TypeScript SDK.
 
 ## Prerequisites
 
@@ -34,13 +34,20 @@ system's keychain:
 ```ts
 import { identityExample } from "./identity";
 import { contextExample } from "./context";
+import { messagingExample } from "./messaging";
+import { toolsExample } from "./tools";
 
 const passphrase = process.env.SCP_STORAGE_PASSPHRASE;
 if (!passphrase) throw new Error("set SCP_STORAGE_PASSPHRASE");
 
 await identityExample(myProvider, passphrase);
 await contextExample(aliceProvider, bobProvider, passphrase);
+await messagingExample(aliceProvider, bobProvider, "wss://relay.example.com", passphrase);
+await toolsExample(operatorProvider, passphrase);
 ```
+
+`messagingExample` runs two `SCP` instances that must both reach the relay at
+the URL it is given.
 
 ## Examples
 
@@ -48,11 +55,9 @@ await contextExample(aliceProvider, bobProvider, passphrase);
 |------|-------------|
 | `identity.ts` | Create identity, resolve DID, inspect document, agent key management |
 | `context.ts` | Create a context, reserve a KeyPackage, invite a member, join from the sealed invitation |
+| `messaging.ts` | Two nodes on one relay: invite, join, subscribe, send a message, receive it, leave |
+| `tools.ts` | Define a query outlet, register and verify it, mint a scoped UCAN, invoke the outlet |
 
-No example sends messages, registers outlets, or mints UCAN tokens. Every `SCP`
-method that does, such as `contextSend`, `outletRegister` and `ucanMint`, takes
-the context's bridge handle, and the `Context` object `contextCreate` returns
-exposes that handle only through the internal `_rawHandle` field.
 
 ## Key Patterns
 
