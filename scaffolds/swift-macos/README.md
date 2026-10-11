@@ -26,9 +26,11 @@ swift run
 
 `makeKeyCustodyProvider()` in `Sources/main.swift` throws
 `ScaffoldError.keyCustodyProviderMissing` until you implement it over your app's
-key store. The SDK ships no `KeyCustodyProvider` implementation, and its one
-`CustodyType`, `.inMemory`, works only in a build compiled with the `testing`
-feature; a shipped build rejects it with `SCP-IDENT-1008`.
+key store. The SDK ships no `KeyCustodyProvider` implementation. A build
+without the bridge's `testing` feature has no pre-rotation custody backend and
+throws `SCP-IDENT-1059` for `CustodyType.encryptedFile`, and
+`CustodyType.osKeystore` needs the provider that
+`identityCreateWithCustody(provider:)` takes (`SCP-IDENT-1003`).
 
 ## Next Steps
 

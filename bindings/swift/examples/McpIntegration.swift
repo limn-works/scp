@@ -13,7 +13,7 @@ struct McpIntegration {
         let scp = try SCP(storage: .inMemory)
         defer { Task { try? await scp.shutdown(timeout: 5) } }
 
-        let identity = try await scp.identityCreate(custody: .inMemory)
+        let identity = try await scp.identityCreate(custody: .encryptedFile)
 
         let params = ContextParams(
             mode: .encrypted,

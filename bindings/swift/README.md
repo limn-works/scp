@@ -16,7 +16,7 @@ dependencies: [
 
 ## Quick Start
 
-This quick start runs only against an XCFramework built with the `testing` feature (`./build-xcframework.sh --dev`), because a release build rejects `CustodyType.inMemory`.
+This quick start runs only against an XCFramework built with the `testing` feature (`./build-xcframework.sh --dev`). A release build has no pre-rotation custody backend, so it throws `SCP-IDENT-1059` for `CustodyType.encryptedFile`. Set `SCP_KEY_PASSPHRASE` before you run it: the identity's keys go to `$HOME/.scp/keys.bin`, sealed under that passphrase.
 
 ```swift
 import Foundation
@@ -26,8 +26,8 @@ func runQuickStart() async throws {
     // Every call goes through an SCP instance, which takes a required storage backend.
     let scp = try SCP(storage: .inMemory)
 
-    // Create a cryptographic identity (DID) whose keys live in process memory.
-    let identity = try await scp.identityCreate(custody: .inMemory)
+    // Create a cryptographic identity (DID) whose keys live in the encrypted key file.
+    let identity = try await scp.identityCreate(custody: .encryptedFile)
     print("DID: \(identity.did())")
 
     // Create an encrypted context that this identity administers.

@@ -6,8 +6,8 @@
 ///
 /// The creator and the joiner each run their own `SCP` instance with its own
 /// database, as two devices would, and each passes its own
-/// ``KeyCustodyProvider``. ``CustodyType/inMemory`` works only in a build
-/// compiled with the `testing` feature.
+/// ``KeyCustodyProvider``, the `os_keystore` custody request of spec section
+/// 3.2.2.
 ///
 /// Prerequisites:
 ///   - Add the SCP Swift package to your project

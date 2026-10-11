@@ -67,8 +67,8 @@ final class BroadcastKeyRequestTests: XCTestCase {
     /// valid point, the positive control, is granted the sealed key.
     func testWrappingKeyThatIsNotAP256PointIsAValidationErrorWithValid7007() async throws {
         XCTAssertEqual(Self.p256G.count, 65)
-        let author = try await scp.identityCreate(custody: .inMemory)
-        let subscriber = try await scp.identityCreate(custody: .inMemory)
+        let author = try await createInMemoryIdentity(scp)
+        let subscriber = try await createInMemoryIdentity(scp)
         let ctx = try await Context.create(scp: scp, identity: author, params: makeBroadcastParams())
         try await ctx.broadcastSubscribe(subscriberDid: subscriber.did())
 

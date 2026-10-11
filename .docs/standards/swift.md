@@ -117,7 +117,11 @@ import Testing
 
 @Test
 func createIdentityReturnsA32ByteIdentifier() async throws {
-    let identity = try await Identity.create(custody: "in_memory")
+    // CustodyType has no in-memory case (spec 03 section 3.2.2); the
+    // test-only helper in Tests/SCPTests/TestHarnessCustody.swift sends the
+    // raw string to a `testing` XCFramework.
+    let scp = try SCP(storage: .inMemory)
+    let identity = try await createInMemoryIdentity(scp)
     // 09-security-model.md §9.7.4.2 R13
     #expect(identity.identifier.count == 32)
 }
