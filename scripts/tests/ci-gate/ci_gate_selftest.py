@@ -8366,8 +8366,8 @@ def run_filter_source(inputs: Inputs) -> None:
 # CRITERION: each job here lints and tests EVERY target of each package paired
 # with it in a build that leaves that package's `testing` feature off: one
 # `cargo clippy` over `--all-targets` that denies warnings, and one `cargo
-# test`/`cargo nextest run` carrying no name filter. Every other clippy and
-# test lane enables `testing`, and the filtered commands
+# test`/`cargo nextest run` carrying no target or test selector. Every other
+# clippy and test lane enables `testing`, and the filtered commands
 # check_shipped_build_assertions_run reads select a handful of tests by name,
 # so a test helper only `testing`-gated tests construct (dead code in this
 # configuration, which `-D warnings` rejects) and a test needing `testing`
@@ -8375,6 +8375,64 @@ def run_filter_source(inputs: Inputs) -> None:
 SHIPPED_CONFIG_FULL_RUN_LANES = {
     "rust-build-uniffi-production": {"scp-ffi-uniffi"},
 }
+
+# Flags a full-run command may carry: none selects a target or a test. A full
+# run is a command made only of these, so any selector (`--lib`, `--test X`,
+# `--doc`, `-E`, a name, `-- --skip X`) fails it without being listed.
+FULL_RUN_VALUE_FLAGS = {
+    "-p",
+    "--package",
+    "--features",
+    "-F",
+    "--profile",
+    "--no-tests",
+    "-j",
+    "--jobs",
+    "--target-dir",
+}
+FULL_RUN_SWITCHES = {
+    "--all-targets",
+    "--locked",
+    "--frozen",
+    "--offline",
+    "--no-fail-fast",
+    "-q",
+    "--quiet",
+    "-v",
+    "--verbose",
+}
+HARNESS_FULL_RUN_VALUE_FLAGS = {"--test-threads"}
+HARNESS_FULL_RUN_SWITCHES = {"--nocapture", "--show-output"}
+
+
+def selects_every_target(tokens: list[str], lint: bool = False) -> bool:
+    """Whether a `cargo clippy`/`cargo test`/`cargo nextest run` token list
+    carries only FULL_RUN flags, so it selects no target and no test subset.
+    A lint command's tokens after `--` are lint levels and are not read.
+    """
+    cargo_side = tokens[: tokens.index("--")] if "--" in tokens else tokens
+    harness_side = tokens[len(cargo_side) + 1 :]
+    if lint:
+        harness_side = []
+    rest = list(cargo_side)
+    for word in ("cargo", "clippy", "test", "nextest", "run"):
+        if rest and rest[0] == word:
+            rest.pop(0)
+
+    def only(side: list[str], value_flags: set, switches: set) -> bool:
+        take_next = False
+        for token in side:
+            if take_next:
+                take_next = False
+            elif token in value_flags:
+                take_next = True
+            elif token.split("=", 1)[0] not in value_flags | switches:
+                return False
+        return not take_next
+
+    return only(rest, FULL_RUN_VALUE_FLAGS, FULL_RUN_SWITCHES) and only(
+        harness_side, HARNESS_FULL_RUN_VALUE_FLAGS, HARNESS_FULL_RUN_SWITCHES
+    )
 
 
 def shipped_config_full_run_gaps(job: dict, package: str) -> list[str]:
@@ -8400,12 +8458,13 @@ def shipped_config_full_run_gaps(job: dict, package: str) -> list[str]:
                 denies = any(
                     after[i : i + 2] == ["-D", "warnings"] for i in range(len(after))
                 )
-                lints = lints or ("--all-targets" in tokens and denies)
+                lints = lints or (
+                    "--all-targets" in tokens
+                    and selects_every_target(tokens, lint=True)
+                    and denies
+                )
     for tokens in cargo_test_commands(job):
-        unfiltered = not ({"-E", "--filter-expr"} & set(tokens)) and not (
-            positional_filters(" ".join(tokens))
-        )
-        tests = tests or (unfiltered and testing_off(tokens))
+        tests = tests or (selects_every_target(tokens) and testing_off(tokens))
     gaps = []
     if not lints:
         gaps.append(
@@ -8441,6 +8500,48 @@ def check_shipped_config_full_runs(jobs: dict) -> None:
         "a lane with only a filtered test run and a `testing` clippy has two gaps",
         len(shipped_config_full_run_gaps(filtered_only, "scp-ffi-uniffi")) == 2,
         f"returned {shipped_config_full_run_gaps(filtered_only, 'scp-ffi-uniffi')}",
+    )
+    full = "cargo test -p scp-ffi-uniffi --features server"
+    for command in (
+        full,
+        "cargo nextest run --no-tests=fail -p scp-ffi-uniffi --features server",
+        f"{full} -- --test-threads 1",
+    ):
+        check(
+            f"`{command}` counts as a full run",
+            selects_every_target(split_command(command)),
+            "rejected",
+        )
+    for suffix in (
+        "--lib",
+        "--test e2e_bridge",
+        "--test=e2e_bridge",
+        "--bins",
+        "--doc",
+        "--examples",
+        "lifecycle",
+        "-- conformance",
+        "-- --skip e2e",
+        "-- --ignored",
+    ):
+        command = f"{full} {suffix}"
+        check(
+            f"`{command}` does not count as a full run",
+            not selects_every_target(split_command(command)),
+            "accepted",
+        )
+    clippy = "cargo clippy -p scp-ffi-uniffi --all-targets --features server"
+    check(
+        "a full clippy over --all-targets counts as linting every target",
+        selects_every_target(split_command(f"{clippy} -- -D warnings"), lint=True),
+        "rejected",
+    )
+    check(
+        "a clippy carrying a target selector does not count",
+        not selects_every_target(
+            split_command(f"{clippy} --lib -- -D warnings"), lint=True
+        ),
+        "accepted",
     )
     for job_id, packages in sorted(SHIPPED_CONFIG_FULL_RUN_LANES.items()):
         for package in sorted(packages):
