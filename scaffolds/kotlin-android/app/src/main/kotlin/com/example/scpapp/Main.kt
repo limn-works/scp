@@ -5,9 +5,10 @@
  * opens an encrypted context.
  *
  * The Kotlin SDK ships no key store that `identityCreate(custody)` reaches in
- * a shipped build: its one `CustodyType`, `IN_MEMORY`, works only in a build
- * compiled with the `testing` feature, and a shipped build rejects it with
- * `SCP-IDENT-1008`. Implement [makeKeyCustodyProvider] over your app's key
+ * a shipped build: such a build has no pre-rotation custody backend and
+ * raises `SCP-IDENT-1059` for `CustodyType.ENCRYPTED_FILE`, and
+ * `identityCreate` answers `CustodyType.OS_KEYSTORE` with `SCP-IDENT-1003`,
+ * because only a [KeyCustodyProvider] reaches the host key store. Implement [makeKeyCustodyProvider] over your app's key
  * store before running.
  */
 package com.example.scpapp

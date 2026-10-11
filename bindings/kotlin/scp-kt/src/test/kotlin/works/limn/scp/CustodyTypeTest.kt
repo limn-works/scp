@@ -12,8 +12,6 @@
 
 package works.limn.scp
 
-import com.sun.jna.Library
-import com.sun.jna.Native
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
@@ -46,24 +44,6 @@ internal fun acceptedCustodyStrings(rejection: String): List<String>? {
     val quoted = Regex("\"([^\"]*)\"").findAll(clause).map { it.groupValues[1] }.toList()
     return quoted.ifEmpty { null }
 }
-
-/**
- * The libc environment calls. The bridge reads `HOME` and `SCP_KEY_PASSPHRASE`
- * from the process environment, which `System.getenv` only reads.
- */
-private interface CLibrary : Library {
-    fun setenv(
-        name: String,
-        value: String,
-        overwrite: Int,
-    ): Int
-
-    fun unsetenv(name: String): Int
-
-    fun getenv(name: String): String?
-}
-
-private val libc: CLibrary = Native.load("c", CLibrary::class.java)
 
 /** The error code a bridge call threw, or a description of what it did instead. */
 private suspend fun errorCode(body: suspend () -> Identity): String =
@@ -101,8 +81,9 @@ class CustodyTypeTest {
 
     /**
      * Reads the accepted set from the bridge's own `SCP-VALID-7005` rejection of
-     * "platform". The two request entries must be exactly that set; IN_MEMORY is
-     * the testing affordance on top of it.
+     * "platform". The entries must be exactly that set, so the type carries no
+     * third entry such as the test-harness `in_memory` string (spec section
+     * 3.2.2).
      */
     @Test
     fun `request entries are exactly the custody strings the bridge accepts`() {
@@ -113,10 +94,7 @@ class CustodyTypeTest {
         assertEquals("SCP-VALID-7005", rejection.code)
         val accepted = assertNotNull(acceptedCustodyStrings(rejection.msg), rejection.msg)
         assertEquals(listOf(CustodyType.ENCRYPTED_FILE, CustodyType.OS_KEYSTORE).map { it.rawValue }, accepted)
-        assertEquals(
-            listOf(CustodyType.ENCRYPTED_FILE, CustodyType.OS_KEYSTORE, CustodyType.IN_MEMORY),
-            CustodyType.entries,
-        )
+        assertEquals(accepted, CustodyType.entries.map { it.rawValue })
     }
 
     @Test
@@ -138,7 +116,7 @@ class CustodyTypeTest {
         for (entry in CustodyType.entries) {
             assertEquals(entry, CustodyType.fromRawValue(entry.rawValue))
         }
-        for (refused in listOf("platform", "software", "callback", "file", "ENCRYPTED_FILE")) {
+        for (refused in listOf("in_memory", "platform", "software", "callback", "file", "ENCRYPTED_FILE")) {
             assertNull(CustodyType.fromRawValue(refused), "fromRawValue parsed \"$refused\"")
         }
     }
@@ -178,26 +156,50 @@ class CustodyTypeTest {
         }
     }
 
-    /** A testing seed with any entry other than IN_MEMORY is `SCP-VALID-7009`. */
+    /**
+     * A testing seed with any custody value other than `in_memory` is
+     * `SCP-VALID-7009`. [SCP.identityCreate] sends no seed, so the test reaches
+     * the bridge through [SCP.inner].
+     */
     @Test
-    fun `a seed without IN_MEMORY is VALID-7009`() {
+    fun `a seed with an entry is VALID-7009`() {
         runBlocking {
-            for (custody in listOf(CustodyType.ENCRYPTED_FILE, CustodyType.OS_KEYSTORE)) {
-                val code = errorCode { scp.identityCreate(custody = custody, testingSeed = ByteArray(32) { 7 }) }
+            for (custody in CustodyType.entries) {
+                val seed = ByteArray(32) { 7 }
+                val code = errorCode { scp.inner.identityCreate(custody = custody.rawValue, testingSeed = seed) }
                 assertEquals("SCP-VALID-7009", code, "$custody")
             }
         }
     }
 
-    /** IN_MEMORY creates an identity through both methods on the testing build. */
+    /**
+     * The test-harness helpers reach the in-memory key store with the raw
+     * `in_memory` string through both identity-create methods on the testing
+     * build, and the handle reports that string.
+     */
     @Test
-    fun `IN_MEMORY creates an identity through both methods`() {
+    fun `the harness reaches in_memory through both methods`() {
         runBlocking {
-            val identity = scp.identityCreate(custody = CustodyType.IN_MEMORY)
-            assertEquals("in_memory", identity.custodyType())
+            val identity = scp.identityCreateInMemory()
+            assertEquals(IN_MEMORY_CUSTODY, identity.custodyType())
             assertFalse(identity.verifyingKey().isNullOrEmpty(), "in_memory holds no key")
-            val agent = scp.identityCreateWithAgentKey(custody = CustodyType.IN_MEMORY)
-            assertEquals("in_memory", agent.custodyType())
+            val agent = scp.identityCreateWithAgentKeyInMemory()
+            assertEquals(IN_MEMORY_CUSTODY, agent.custodyType())
+        }
+    }
+
+    /**
+     * The harness passes the ADR-046 seed to the bridge: a 32-byte seed creates
+     * an identity, and a 31-byte seed is a validation error that only the
+     * bridge's seed check raises.
+     */
+    @Test
+    fun `the harness passes the testing seed to the bridge`() {
+        runBlocking {
+            val seeded = scp.identityCreateInMemory(testingSeed = ByteArray(32) { 7 })
+            assertEquals(IN_MEMORY_CUSTODY, seeded.custodyType())
+            val short = errorCode { scp.identityCreateInMemory(testingSeed = ByteArray(31) { 7 }) }
+            assertTrue(short.startsWith("SCP-VALID-"), short)
         }
     }
 
@@ -214,12 +216,8 @@ class CustodyTypeTest {
     ) {
         val createHome = File(base, "create")
         val agentHome = File(base, "agent")
-        val savedHome = libc.getenv("HOME")
-        val savedPassphrase = libc.getenv("SCP_KEY_PASSPHRASE")
-        try {
+        withKeyFileEnvironment(createHome, "kotlin-encrypted-file-passphrase") {
             runBlocking {
-                libc.setenv("SCP_KEY_PASSPHRASE", "kotlin-encrypted-file-passphrase", 1)
-                libc.setenv("HOME", createHome.absolutePath, 1)
                 val identity = scp.identityCreate(custody = CustodyType.ENCRYPTED_FILE)
                 assertEquals("encrypted_file", identity.custodyType())
                 assertTrue(identity.did().startsWith("did:dht:"), identity.did())
@@ -239,13 +237,6 @@ class CustodyTypeTest {
                 val noPassphrase =
                     errorCode { scp.identityCreateWithAgentKey(custody = CustodyType.ENCRYPTED_FILE) }
                 assertEquals("SCP-VALID-7001", noPassphrase)
-            }
-        } finally {
-            if (savedHome != null) libc.setenv("HOME", savedHome, 1) else libc.unsetenv("HOME")
-            if (savedPassphrase != null) {
-                libc.setenv("SCP_KEY_PASSPHRASE", savedPassphrase, 1)
-            } else {
-                libc.unsetenv("SCP_KEY_PASSPHRASE")
             }
         }
     }

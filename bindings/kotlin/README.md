@@ -15,7 +15,7 @@ dependencies {
 
 ## Quick Start
 
-This quick start runs only with a native library built with the `testing` feature (`./gradlew :scp-kt:test -Pscp.uniffi.cargoFeatures=testing` builds one), because a release build rejects `CustodyType.IN_MEMORY`.
+This quick start runs only with a native library built with the `testing` feature (`./gradlew :scp-kt:test -Pscp.uniffi.cargoFeatures=testing` builds one). A release build has no pre-rotation custody backend, so it raises `SCP-IDENT-1059` for `CustodyType.ENCRYPTED_FILE`. Set `SCP_KEY_PASSPHRASE` before you run it: the identity's keys go to `$HOME/.scp/keys.bin`, sealed under that passphrase.
 
 ```kotlin
 import uniffi.scp.CeilingPolicy
@@ -31,8 +31,9 @@ suspend fun main() {
     // Every call goes through an SCP instance, which takes a required storage backend.
     val scp = SCP(StorageConfig.InMemory)
 
-    // Create a cryptographic identity (DID) whose keys live in process memory.
-    val identity = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+    // Create a cryptographic identity (DID) whose keys live in $HOME/.scp/keys.bin,
+    // sealed under the SCP_KEY_PASSPHRASE environment variable.
+    val identity = scp.identityCreate(custody = CustodyType.ENCRYPTED_FILE)
     println("DID: ${identity.did()}")
 
     // Create an encrypted context that this identity administers.

@@ -18,8 +18,9 @@ suspend fun main() {
     // Every call goes through an SCP instance, which takes a required storage backend.
     val scp = SCP(StorageConfig.InMemory)
 
-    // Create a cryptographic identity (DID) whose keys live in process memory.
-    val identity = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+    // Create a cryptographic identity (DID) whose keys live in $HOME/.scp/keys.bin,
+    // sealed under the SCP_KEY_PASSPHRASE environment variable.
+    val identity = scp.identityCreate(custody = CustodyType.ENCRYPTED_FILE)
     println("DID: ${identity.did()}")
 
     // Create an encrypted context that this identity administers.
