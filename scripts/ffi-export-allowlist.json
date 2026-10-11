@@ -794,12 +794,6 @@
       "reason": "Getter for governance config on a metadata result type."
     },
     {
-      "name": "member_count",
-      "path": "crates/scp-ffi/napi/src/context.rs",
-      "kind": "getter",
-      "reason": "Getter for member count on a context-info result type (the parity op is context_member_count)."
-    },
-    {
       "name": "mode",
       "path": "crates/scp-ffi/napi/src/context.rs",
       "kind": "getter",

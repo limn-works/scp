@@ -6721,6 +6721,72 @@ async fn resolve_identity_signing_key(
     }
 }
 
+/// Builds the `#active` [`CommandSigner`](scp_core::context::actor::CommandSigner)
+/// over an `Identity`'s retained custody (ADR-049 Decision 7a). The private
+/// key stays in custody.
+///
+/// # Errors
+///
+/// - `SCP-IDENT-1054` when the identity has no retained key material or no
+///   custody.
+/// - The custody's own code through `ScpError::from(PlatformError)` when the
+///   signer cannot be built; a destroyed key is `SCP-CRYPTO-4006`.
+async fn resolve_identity_signer(
+    identity: &Identity,
+) -> Result<scp_core::context::actor::CommandSigner, ScpError> {
+    let core_id = identity
+        .core_id
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            msg: "identity has no retained key material — signing requires a custodied \
+              identity"
+                .to_owned(),
+            code: codes::IDENT_1054.to_owned(),
+        })?;
+    let custody = identity
+        .custody
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            msg: "identity has no usable custody backend for signing".to_owned(),
+            code: codes::IDENT_1054.to_owned(),
+        })?;
+    scp_ffi_common::signer::identity_command_signer(Arc::clone(custody), core_id.active_signing_key)
+        .await
+        .map_err(ScpError::from)
+}
+
+/// Builds the `#active` [`CommandSigner`](scp_core::context::actor::CommandSigner)
+/// over a `ContextHandle`'s retained custody (ADR-049 Decision 7a), for the
+/// governance lifecycle. The private key stays in custody.
+///
+/// # Errors
+///
+/// - `SCP-CTX-2040` when the handle holds no custody or no key handle.
+/// - The custody's own code through `ScpError::from(PlatformError)` when the
+///   signer cannot be built; a destroyed key is `SCP-CRYPTO-4006`.
+async fn resolve_uniffi_signer(
+    handle: &ContextHandle,
+) -> Result<scp_core::context::actor::CommandSigner, ScpError> {
+    let key_handle = handle.signing_key.ok_or_else(|| ScpError::Context {
+        msg: "no signing key on context handle — governance lifecycle \
+                  requires an identity with an active signing key"
+            .to_owned(),
+        code: codes::CTX_2040.to_owned(),
+    })?;
+    let custody = handle.custody.as_ref().ok_or_else(|| ScpError::Context {
+        msg: "no custody provider on context handle — governance lifecycle \
+              requires an identity created with custody"
+            .to_owned(),
+        code: codes::CTX_2040.to_owned(),
+    })?;
+    scp_ffi_common::signer::identity_command_signer(Arc::clone(custody), key_handle)
+        .await
+        .map_err(ScpError::from)
+}
+
+/// Resolves the raw Ed25519 signing key from a `UniFFI` `ContextHandle`, for
+/// the runtime paths that still take `&SigningKey`. Governance signs through
+/// [`resolve_uniffi_signer`].
 pub(crate) async fn resolve_uniffi_signing_key(
     handle: &ContextHandle,
 ) -> Result<ed25519_dalek::SigningKey, ScpError> {
@@ -10802,12 +10868,10 @@ impl Scp {
                 bi.init_context_manager_with_did(&creator_did);
                 let sup = bi.context_manager_or_error()?;
 
-                // Resolve the inviter's raw Ed25519 signing key from retained
-                // custody. A non-custodied (DID-only) inviter fails HERE with
-                // SCP-IDENT-1054, before any context lookup. This `.await` completes
-                // before the invite `.await` below, so the two are sequential (not
-                // nested).
-                let signing_key = resolve_identity_signing_key(&identity).await?;
+                // Build the inviter's custody signer (ADR-049 Decision 7a). A
+                // non-custodied (DID-only) inviter fails HERE with SCP-IDENT-1054,
+                // before any context lookup.
+                let signer = resolve_identity_signer(&identity).await?;
                 let outcome = sup
                     .invite_member(
                         context_id,
@@ -10815,15 +10879,9 @@ impl Scp {
                         scp_did::DID(invitee_did),
                         invitee_key_package,
                         relay_urls,
-                        &signing_key,
+                        &signer,
                     )
                     .await;
-                // Defense-in-depth: wipe the raw signing key the moment the invite
-                // is produced. `ed25519_dalek::SigningKey` is `ZeroizeOnDrop` (the
-                // `zeroize` feature) but does NOT implement bare `Zeroize`, so the
-                // explicit early `drop` — not a `.zeroize()` call — triggers the
-                // wipe here rather than at end-of-scope.
-                drop(signing_key);
 
                 let outcome = outcome.map_err(ScpError::from)?;
                 Ok(InviteMemberOutcome::from_core(outcome))
@@ -11542,7 +11600,7 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
-        let signing_key = resolve_uniffi_signing_key(&handle).await?;
+        let signer = resolve_uniffi_signer(&handle).await?;
         let bi = Arc::clone(&self.inner);
         let context_id = handle.context_id.clone();
 
@@ -11561,7 +11619,7 @@ impl Scp {
                 let did = scp_did::DID(proposer_did);
                 let manager = bi.context_manager_or_error()?;
                 let outcome = manager
-                    .propose_governance_action_checked(&context_id, &did, action, &signing_key)
+                    .propose_governance_action_checked(&context_id, &did, action, &signer)
                     .await
                     .map_err(ScpError::from)?;
 
@@ -11596,7 +11654,7 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
-        let signing_key = resolve_uniffi_signing_key(&handle).await?;
+        let signer = resolve_uniffi_signer(&handle).await?;
         let bi = Arc::clone(&self.inner);
         let context_id = handle.context_id.clone();
         let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
@@ -11607,7 +11665,7 @@ impl Scp {
                 let sup = bi.context_manager_or_error()?;
                 let status = {
                     use scp_core::context::actor::commands::{
-                        GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
+                        GovernanceCommand, VoteOnProposalPayload,
                     };
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let cmd = GovernanceCommand::ApproveGovernanceProposal {
@@ -11615,7 +11673,7 @@ impl Scp {
                             context_id: context_id.clone(),
                             proposal_id,
                             voter_did: did,
-                            signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+                            signer,
                         }),
                         reply: tx,
                     };
@@ -11655,7 +11713,7 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
-        let signing_key = resolve_uniffi_signing_key(&handle).await?;
+        let signer = resolve_uniffi_signer(&handle).await?;
         let bi = Arc::clone(&self.inner);
         let context_id = handle.context_id.clone();
         let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
@@ -11666,7 +11724,7 @@ impl Scp {
                 let sup = bi.context_manager_or_error()?;
                 let status = {
                     use scp_core::context::actor::commands::{
-                        GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
+                        GovernanceCommand, VoteOnProposalPayload,
                     };
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let cmd = GovernanceCommand::RejectGovernanceProposal {
@@ -11674,7 +11732,7 @@ impl Scp {
                             context_id: context_id.clone(),
                             proposal_id,
                             voter_did: did,
-                            signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+                            signer,
                         }),
                         reply: tx,
                     };
@@ -32737,6 +32795,76 @@ mod tests {
                     );
                 }
                 other => panic!("expected SagaAborted (axis a), got {other:?}"),
+            }
+        }
+
+        /// ADR-049 Decision 7a: governance signs through custody, so a host
+        /// custody whose raw key cannot be exported (`ProdLikeCustody` keeps
+        /// the trait's `export_signing_key_bytes` refusal) still proposes, and
+        /// the single-admin proposal auto-executes after the engine verifies
+        /// the custody's signature.
+        #[tokio::test]
+        async fn governance_propose_signs_through_sign_only_custody() {
+            let scp = scp_test();
+            let bi = Arc::clone(&scp.inner);
+            install_seedable_resolver(&bi);
+            let owner_identity = scp
+                .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
+                .await
+                .expect("identity_create_with_custody");
+            let owner = owner_identity.did.clone();
+            let handle = scp
+                .context_create(
+                    Arc::clone(&owner_identity),
+                    saga_context_params(&["governance:propose", "outlet:register"]),
+                )
+                .await
+                .expect("context_create");
+            let register_json =
+                saga_register_outlet_action_json("outlet-sign_only", "sign_only", &owner);
+            let result = scp
+                .governance_propose(handle, owner, register_json)
+                .await
+                .expect("a sign-only custody proposes through CommandSigner");
+            assert_governance_executed(&result, "RegisterOutlet");
+        }
+
+        /// A proposer whose `#active` key custody no longer holds fails
+        /// `governance_propose` with `SCP-CRYPTO-4006` when the signer is
+        /// built, before any proposal is recorded.
+        #[tokio::test]
+        async fn governance_propose_with_a_destroyed_signing_key_is_crypto_4006() {
+            use scp_platform::traits::KeyCustody as _;
+            let scp = scp_test();
+            let identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create");
+            let owner = identity.did.clone();
+            let handle = scp
+                .context_create(
+                    Arc::clone(&identity),
+                    saga_context_params(&["governance:propose", "outlet:register"]),
+                )
+                .await
+                .expect("context_create");
+            let Some(UniffiKeyCustody::InMemory(custody)) = handle.custody.as_deref() else {
+                panic!("an in-memory identity retains its custody on the handle");
+            };
+            let key = handle
+                .signing_key
+                .expect("the handle retains the signing key");
+            custody.0.destroy_key(&key).await.expect("destroy_key");
+
+            let register_json =
+                saga_register_outlet_action_json("outlet-destroyed", "destroyed", &owner);
+            let err = scp
+                .governance_propose(handle, owner, register_json)
+                .await
+                .expect_err("a destroyed signing key cannot propose");
+            match err {
+                ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4006),
+                other => panic!("expected Crypto CRYPTO_4006, got: {other:?}"),
             }
         }
     }

@@ -2615,7 +2615,7 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
             bob.clone(),
             kp_public_bytes,
             vec![],
-            &alice_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await
         .expect("alice seals an invitation for bob");
@@ -2792,7 +2792,7 @@ async fn invite_member_broadcasts_the_add_commit_to_existing_members() {
             bob.clone(),
             kp_public_bytes,
             vec![],
-            &alice_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await
         .expect("alice invites bob");
@@ -2855,7 +2855,7 @@ async fn invite_member_into_voting_context_is_rejected() {
             bob.clone(),
             kp_public_bytes,
             vec![],
-            &alice_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await
         .expect_err("a voting context refuses a unilateral invite with an error");
@@ -2924,7 +2924,7 @@ async fn invite_member_by_non_admin_is_rejected() {
             bob.clone(),
             kp_public_bytes,
             vec![],
-            &bob_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(bob_signing_key().clone()),
         )
         .await;
 
@@ -3030,7 +3030,7 @@ async fn invite_member_rolls_back_the_add_on_delivery_failure() {
             bob.clone(),
             kp_public_bytes,
             vec![],
-            &alice_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await;
 

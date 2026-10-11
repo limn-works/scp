@@ -379,6 +379,203 @@ fn governance_propose_execution_result_is_a_wire_name() {
     });
 }
 
+/// Python source for a sign-only custody provider. `sign` and `get_public_key`
+/// call the Rust functions it is constructed with, and
+/// `export_signing_key_bytes` raises, as a keychain or HSM custody that never
+/// releases its private key would.
+const SIGN_ONLY_GOVERNANCE_PROVIDER_PY: &std::ffi::CStr = c"
+import types
+
+class SignOnlyCustody:
+    def __init__(self, key_id, sign_fn, public_key):
+        self._key_id = str(key_id)
+        self._sign_fn = sign_fn
+        self._public_key = bytes(public_key)
+        self.export_calls = 0
+        self.sign_calls = 0
+
+    def generate_keypair(self, key_type, role):
+        return self._key_id
+
+    def sign(self, key_id, message):
+        self.sign_calls += 1
+        return self._sign_fn(bytes(message))
+
+    def get_public_key(self, key_id):
+        return types.SimpleNamespace(
+            key_type='ed25519', public_key=self._public_key, role='identity')
+
+    def destroy_key(self, key_id):
+        return None
+
+    def dh_agree(self, key_id, peer_public):
+        raise RuntimeError('sign-only custody: dh_agree unsupported')
+
+    def derive_pseudonym(self, key_id, context_id):
+        raise RuntimeError('sign-only custody: derive_pseudonym unsupported')
+
+    def derive_rotatable_pseudonym(self, key_id, context_id, pseudonym_epoch):
+        raise RuntimeError('sign-only custody: derive_rotatable_pseudonym unsupported')
+
+    def export_signing_key_bytes(self, key_id):
+        self.export_calls += 1
+        raise RuntimeError('sign-only custody refuses raw key export')
+
+    def custody_type(self, key_id):
+        return 'hardware'
+";
+
+/// Replaces `did`'s custody with a sign-only Python provider that signs
+/// through the identity's original custody, so its signatures verify under
+/// the DID's published key while its raw key can never be exported. Returns
+/// the provider object, whose `export_calls` and `sign_calls` the caller reads.
+fn install_sign_only_governance_custody(
+    py: Python<'_>,
+    bi: &PyBridgeInstance,
+    did: &str,
+) -> Py<PyAny> {
+    use scp_platform::KeyCustody as _;
+
+    let (original, key) = runtime::with_identity(bi, did, |entry: &IdentityEntry| {
+        Ok((
+            Arc::clone(&entry.custody),
+            entry.identity.active_signing_key,
+        ))
+    })
+    .unwrap();
+    let public_key = {
+        let original = Arc::clone(&original);
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime")
+                .block_on(original.public_key(&key))
+        })
+        .join()
+        .expect("public key thread")
+        .expect("the original custody holds the #active key")
+        .into_bytes()
+    };
+    // The provider's `sign` runs under the GIL on whatever thread drives
+    // custody; the original in-memory custody signs on a separate thread with
+    // its own runtime so no runtime is entered twice.
+    let sign_fn = pyo3::types::PyCFunction::new_closure(py, None, None, move |args, _kwargs| {
+        let message: Vec<u8> = args.get_item(0)?.extract()?;
+        let original = Arc::clone(&original);
+        let signature = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("signing runtime")
+                .block_on(original.sign(&key, &message))
+        })
+        .join()
+        .expect("signing thread")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok::<Vec<u8>, PyErr>(signature.into_bytes())
+    })
+    .unwrap();
+    let module = PyModule::from_code(
+        py,
+        SIGN_ONLY_GOVERNANCE_PROVIDER_PY,
+        c"sign_only_governance_custody.py",
+        c"sign_only_governance_custody",
+    )
+    .unwrap();
+    let obj = module
+        .getattr("SignOnlyCustody")
+        .unwrap()
+        .call1((key.id(), sign_fn, public_key))
+        .unwrap();
+    let host = obj.clone().unbind();
+    let provider = _scp_core::custody::PyKeyCustodyProvider::new(py, obj.unbind()).unwrap();
+    let custody = Arc::new(FfiKeyCustody::Callback(
+        _scp_core::custody::PyCallbackKeyCustody::new(provider),
+    ));
+    runtime::with_identity_mut(bi, did, |entry: &mut IdentityEntry| {
+        entry.custody = custody;
+        Ok(())
+    })
+    .unwrap();
+    host
+}
+
+/// ADR-049 Decision 7a: governance signs through custody, so a custody that
+/// refuses raw key export still proposes. The single-admin proposal
+/// auto-executes after the engine verifies the custody's signature, and the
+/// host is never asked for its key.
+#[test]
+fn governance_propose_signs_through_sign_only_custody() {
+    Python::with_gil(|py| {
+        let (scp, owner, handle) = single_admin_owner_and_context(py);
+        let host = install_sign_only_governance_custody(py, scp.bridge_instance(), &owner);
+        let action_json = serde_json::json!({
+            "SuspendCapability": { "did": owner, "capabilities": ["MessagesWrite"] }
+        })
+        .to_string();
+        let response = scp
+            .governance_propose(py, &handle, &owner, &action_json)
+            .expect("a sign-only custody proposes through CommandSigner");
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed["status"].as_str(),
+            Some("Approved"),
+            "got {response}"
+        );
+        let calls = |name: &str| {
+            host.bind(py)
+                .getattr(name)
+                .and_then(|n| n.extract::<usize>())
+                .unwrap()
+        };
+        assert_eq!(calls("export_calls"), 0, "the raw key is never requested");
+        assert!(
+            calls("sign_calls") >= 1,
+            "the proposal signed through the host"
+        );
+    });
+}
+
+/// A proposer whose `#active` key custody no longer holds fails
+/// `governance_propose` with `SCP-CRYPTO-4006` when the signer is built.
+#[test]
+fn governance_propose_with_a_destroyed_signing_key_is_crypto_4006() {
+    use scp_platform::KeyCustody as _;
+    Python::with_gil(|py| {
+        let (scp, owner, handle) = single_admin_owner_and_context(py);
+        let (custody, key) =
+            runtime::with_identity(scp.bridge_instance(), &owner, |entry: &IdentityEntry| {
+                Ok((
+                    Arc::clone(&entry.custody),
+                    entry.identity.active_signing_key,
+                ))
+            })
+            .unwrap();
+        py.allow_threads(|| {
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("runtime")
+                    .block_on(custody.destroy_key(&key))
+            })
+            .join()
+            .expect("destroy thread")
+        })
+        .expect("destroy_key");
+        let action_json = serde_json::json!({
+            "SuspendCapability": { "did": owner, "capabilities": ["MessagesWrite"] }
+        })
+        .to_string();
+        let err = scp
+            .governance_propose(py, &handle, &owner, &action_json)
+            .expect_err("a destroyed signing key cannot propose")
+            .to_string();
+        assert!(
+            err.contains("SCP-CRYPTO-4006"),
+            "expected key-not-found SCP-CRYPTO-4006, got: {err}"
+        );
+    });
+}
+
 /// `context_member_role` returns `RoleAssignment.role_name`, which every
 /// SDK's `MemberRole` parser reads. A `Debug` dump of `RoleAssignment` also
 /// contains "admin", so only equality proves a bare name crossed.

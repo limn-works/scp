@@ -26,8 +26,8 @@ use std::collections::{HashMap, HashSet};
 use super::{
     CheckpointAttestationStatus, CosignedCheckpoint, GovernanceAction, GovernanceContext,
     GovernanceEngine, GovernanceError, GovernanceEvent, GovernanceModelConfig, GovernanceProposal,
-    KeyResolver, ProposalId, ProposalStatus, RejectionReason, VoteType, compute_proposal_id,
-    sign_vote, verify_vote,
+    KeyResolver, ProposalId, ProposalStatus, ProposeIntent, RejectionReason, SignedVote,
+    VoteIntent, VoteType,
 };
 use scp_did::{DID, SigningKeyId};
 
@@ -216,27 +216,23 @@ impl ThresholdEngine {
         Ok((new_status, events))
     }
 
-    /// Run the pre-vote guard checks.
-    ///
-    /// This is the portion that MUST run **before** any signing or signature
-    /// verification, so that a double vote is caught as
-    /// `AlreadyVoted` regardless of which key signed the second attempt, and an
-    /// ineligible voter is rejected as `NotEligible` rather than
-    /// `InvalidSignature`. The checks and their error variants match the
-    /// original pre-refactor `approve`/`reject` exactly: eligibility
+    /// Run the pre-vote guard checks, in this order: eligibility
     /// (`NotEligible`), proposal existence (`ProposalNotFound`), pending state
     /// (`ProposalNotPending`), deadline (`VotingWindowExpired`), single-vote
     /// dedup (`AlreadyVoted`).
     ///
-    /// Threshold treats a past-deadline vote as `VotingWindowExpired` (no
-    /// auto-resolve), so this only ever returns
-    /// [`PrecheckOutcome::Proceed`](super::PrecheckOutcome::Proceed) on success.
-    fn precheck_vote(
+    /// [`GovernanceEngine::precheck_vote`] runs them before the voter's key
+    /// resolves and before anyone signs, so a double vote is `AlreadyVoted`
+    /// whichever key signed it and an ineligible voter is `NotEligible`, never
+    /// `InvalidSignature`. The `*_signed` methods run them again before the
+    /// vote counts. A past-deadline vote is `VotingWindowExpired`; this engine
+    /// never auto-resolves here.
+    fn guard_vote(
         &self,
         proposal_id: &ProposalId,
         voter: &DID,
         context: &GovernanceContext,
-    ) -> Result<super::PrecheckOutcome, GovernanceError> {
+    ) -> Result<(), GovernanceError> {
         // Voter must be a signer.
         if !self.is_signer(voter) {
             return Err(GovernanceError::NotEligible(
@@ -270,12 +266,12 @@ impl ThresholdEngine {
             return Err(GovernanceError::AlreadyVoted);
         }
 
-        Ok(super::PrecheckOutcome::Proceed)
+        Ok(())
     }
 
     /// Record an already-checked, already-verified vote and run the tally.
     ///
-    /// Runs **after** `precheck_vote` (and after signature verification):
+    /// Runs **after** `guard_vote` and signature verification:
     /// pushes the vote into `approvals`/`rejections`, emits the
     /// `VoteCast` event, and resolves. No unverified vote ever reaches this
     /// point.
@@ -287,7 +283,7 @@ impl ThresholdEngine {
         vote: VoteType,
         context: &GovernanceContext,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        // `precheck_vote` already validated the proposal exists, is pending, and
+        // `guard_vote` already validated the proposal exists, is pending, and
         // within the deadline. We re-acquire it via `get_mut` here; in the
         // single-threaded `&mut self` flow it cannot have been removed in
         // between, so the absence is impossible. We nonetheless fail loud with
@@ -315,6 +311,30 @@ impl ThresholdEngine {
 
         Ok((status, events))
     }
+
+    /// Re-run the guards, check `vote` is `voter`'s `expected` vote at
+    /// `context.now` with a verifying signature, then record it.
+    fn cast_signed(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+        vote: SignedVote,
+        expected: VoteType,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        self.guard_vote(proposal_id, voter, context)?;
+        // Verify strictly before push_and_resolve: a vote counts only after
+        // its signature verifies.
+        super::check_signed_vote(
+            &self.key_resolver,
+            proposal_id,
+            voter,
+            &expected,
+            context,
+            &vote,
+        )?;
+        self.push_and_resolve(proposal_id, voter, vote, expected, context)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -322,56 +342,57 @@ impl ThresholdEngine {
 // ---------------------------------------------------------------------------
 
 impl GovernanceEngine for ThresholdEngine {
-    fn propose(
+    fn precheck_propose(
+        &self,
+        proposer: &DID,
+        action: &GovernanceAction,
+        context: &GovernanceContext,
+    ) -> Result<ProposeIntent, GovernanceError> {
+        self.check_proposer(proposer)?;
+        let proposal_id = super::proposal_id_for(proposer, action, context)?;
+        if self.proposals.contains_key(&proposal_id) {
+            return Err(GovernanceError::DuplicateProposal(hex::encode(proposal_id)));
+        }
+        // The proposer's vote counts as the first approval.
+        let digest = super::vote_sign_digest(
+            &self.key_resolver,
+            &proposal_id,
+            proposer,
+            &VoteType::Approve,
+            context,
+        )?;
+        Ok(ProposeIntent::SignApproval {
+            proposal_id,
+            timestamp: context.now,
+            digest,
+        })
+    }
+
+    fn propose_signed(
         &mut self,
         proposer: &DID,
         action: GovernanceAction,
         context: &GovernanceContext,
-        signing_key: &ed25519_dalek::SigningKey,
+        proposer_vote: Option<SignedVote>,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), GovernanceError> {
-        self.check_proposer(proposer)?;
-
-        // RFC 8785 JCS canonical serialization for cross-implementation
-        // deterministic proposal ID computation (§9.5.2). JCS (not
-        // MessagePack) because GovernanceAction is a complex enum that must
-        // hash identically across all SDK languages. See
-        // compute_proposal_id() doc comment.
-        let action_bytes =
-            crate::jcs::to_vec(&action).map_err(GovernanceError::SerializationFailed)?;
-
-        let proposal_id =
-            compute_proposal_id(&context.context_id, proposer, &action_bytes, context.now);
-
-        // Reject duplicate proposals.
-        if self.proposals.contains_key(&proposal_id) {
-            return Err(GovernanceError::DuplicateProposal(hex::encode(proposal_id)));
-        }
-
-        let voting_deadline = context.now + self.voting_window_secs;
-
-        // The proposer's vote counts as the first approval.
-        let proposer_vote = sign_vote(
+        let intent = self.precheck_propose(proposer, &action, context)?;
+        let proposal_id = intent.proposal_id();
+        let proposer_vote = super::proposer_vote_for(&intent, proposer_vote)?.ok_or(
+            GovernanceError::ProposerVoteMismatch {
+                expected_signed: true,
+            },
+        )?;
+        // Verify before inserting, so a bad signature leaves no proposal.
+        super::check_signed_vote(
+            &self.key_resolver,
             &proposal_id,
+            proposer,
             &VoteType::Approve,
-            proposer.as_ref(),
-            context.now,
-            signing_key,
+            context,
+            &proposer_vote,
         )?;
 
-        // Verify the proposer's vote signature against their DID-resolved key.
-        let resolved_key =
-            (self.key_resolver)(proposer, SigningKeyId::Active).ok_or_else(|| {
-                GovernanceError::UnknownVoter {
-                    did: proposer.to_string(),
-                }
-            })?;
-        verify_vote(&proposal_id, &proposer_vote, &resolved_key).map_err(|_| {
-            GovernanceError::InvalidSignature {
-                voter_did: proposer.to_string(),
-                proposal_id: hex::encode(proposal_id),
-            }
-        })?;
-
+        let voting_deadline = context.now + self.voting_window_secs;
         let proposal = GovernanceProposal {
             proposal_id,
             context_id: context.context_id.clone(),
@@ -433,93 +454,40 @@ impl GovernanceEngine for ThresholdEngine {
         }
     }
 
-    fn approve(
+    fn precheck_vote(
         &mut self,
         proposal_id: &ProposalId,
         voter: &DID,
+        vote: &VoteType,
         context: &GovernanceContext,
-        signing_key: &ed25519_dalek::SigningKey,
-    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        // Guards run BEFORE sign/verify: a double vote must be caught as
-        // AlreadyVoted (and an ineligible voter as NotEligible) regardless of
-        // which key signed the attempt. Threshold never early-resolves in
-        // precheck, so Proceed is the only success outcome.
-        match self.precheck_vote(proposal_id, voter, context)? {
-            super::PrecheckOutcome::Proceed => {}
-            // Unreachable for this engine: `precheck_vote` returns `VotingWindowExpired`
-            // past-deadline rather than auto-resolving. This arm exists only for
-            // call-site uniformity with the majority engine.
-            super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
-        }
-
-        // Build and sign the vote.
-        let vote = sign_vote(
-            proposal_id,
-            &VoteType::Approve,
-            voter.as_ref(),
-            context.now,
-            signing_key,
-        )?;
-
-        // Verify the vote signature against the voter's DID-resolved key.
-        // This MUST stay strictly before push_and_resolve: the signed path
-        // counts a vote only after its signature is verified.
-        let resolved_key = (self.key_resolver)(voter, SigningKeyId::Active).ok_or_else(|| {
-            GovernanceError::UnknownVoter {
-                did: voter.to_string(),
-            }
-        })?;
-        verify_vote(proposal_id, &vote, &resolved_key).map_err(|_| {
-            GovernanceError::InvalidSignature {
-                voter_did: voter.to_string(),
-                proposal_id: hex::encode(proposal_id),
-            }
-        })?;
-
-        self.push_and_resolve(proposal_id, voter, vote, VoteType::Approve, context)
+    ) -> Result<VoteIntent, GovernanceError> {
+        self.guard_vote(proposal_id, voter, context)?;
+        let digest =
+            super::vote_sign_digest(&self.key_resolver, proposal_id, voter, vote, context)?;
+        Ok(VoteIntent::Sign {
+            timestamp: context.now,
+            digest,
+        })
     }
 
-    fn reject(
+    fn approve_signed(
         &mut self,
         proposal_id: &ProposalId,
         voter: &DID,
         context: &GovernanceContext,
-        signing_key: &ed25519_dalek::SigningKey,
+        vote: SignedVote,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        // Guards run BEFORE sign/verify (see `approve`).
-        match self.precheck_vote(proposal_id, voter, context)? {
-            super::PrecheckOutcome::Proceed => {}
-            // Unreachable for this engine: `precheck_vote` returns `VotingWindowExpired`
-            // past-deadline rather than auto-resolving. This arm exists only for
-            // call-site uniformity with the majority engine.
-            super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
-        }
+        self.cast_signed(proposal_id, voter, context, vote, VoteType::Approve)
+    }
 
-        // Build and sign the rejection vote.
-        let vote = sign_vote(
-            proposal_id,
-            &VoteType::Reject,
-            voter.as_ref(),
-            context.now,
-            signing_key,
-        )?;
-
-        // Verify the vote signature against the voter's DID-resolved key.
-        // This MUST stay strictly before push_and_resolve: the signed path
-        // counts a vote only after its signature is verified.
-        let resolved_key = (self.key_resolver)(voter, SigningKeyId::Active).ok_or_else(|| {
-            GovernanceError::UnknownVoter {
-                did: voter.to_string(),
-            }
-        })?;
-        verify_vote(proposal_id, &vote, &resolved_key).map_err(|_| {
-            GovernanceError::InvalidSignature {
-                voter_did: voter.to_string(),
-                proposal_id: hex::encode(proposal_id),
-            }
-        })?;
-
-        self.push_and_resolve(proposal_id, voter, vote, VoteType::Reject, context)
+    fn reject_signed(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+        vote: SignedVote,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        self.cast_signed(proposal_id, voter, context, vote, VoteType::Reject)
     }
 
     fn withdraw_vote(
@@ -730,6 +698,7 @@ impl GovernanceEngine for ThresholdEngine {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::context::governance::GovernanceEngineRawKey as _;
 
     fn alice() -> DID {
         DID::from("did:dht:z6MkAlice")

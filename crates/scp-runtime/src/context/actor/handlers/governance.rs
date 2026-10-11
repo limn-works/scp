@@ -401,7 +401,7 @@ async fn handle_propose_governance_action_actor(
     _checked: bool,
 ) -> Outcome<()> {
     let context_id = p.context_id.clone();
-    let signing_key = p.signing_key.to_signing_key();
+    let signer = p.signer;
     let proposer_did = p.proposer_did.clone();
     let action = p.action;
     let key_package = p.key_package;
@@ -422,7 +422,7 @@ async fn handle_propose_governance_action_actor(
                 &p.context_id,
                 &proposer_did,
                 action,
-                &signing_key,
+                &signer,
                 false,
                 key_package.as_deref(),
             ),
@@ -459,7 +459,7 @@ async fn handle_propose_governance_action_checked_actor(
     reply: ProposeGovernanceActionCheckedReply,
 ) -> Outcome<()> {
     let context_id = p.context_id.clone();
-    let signing_key = p.signing_key.to_signing_key();
+    let signer = p.signer;
     let proposer_did = p.proposer_did.clone();
     let action = p.action;
     let key_package = p.key_package;
@@ -472,7 +472,7 @@ async fn handle_propose_governance_action_checked_actor(
                 &p.context_id,
                 &proposer_did,
                 action,
-                &signing_key,
+                &signer,
                 key_package.as_deref(),
             ),
         )
@@ -518,7 +518,7 @@ async fn handle_vote_on_proposal_actor(
     reply: VoteOnProposalReply,
 ) -> Outcome<()> {
     let context_id = p.context_id.clone();
-    let signing_key = p.signing_key.to_signing_key();
+    let signer = p.signer;
     let voter_did = p.voter_did.clone();
     let proposal_id = p.proposal_id;
 
@@ -530,7 +530,7 @@ async fn handle_vote_on_proposal_actor(
             &proposal_id,
             &voter_did,
             approve,
-            &signing_key,
+            &signer,
             false,
         ))
         .await
@@ -564,7 +564,7 @@ async fn handle_approve_governance_proposal_actor(
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
 ) -> Outcome<()> {
     let context_id = p.context_id.clone();
-    let signing_key = p.signing_key.to_signing_key();
+    let signer = p.signer;
     let voter_did = p.voter_did.clone();
     let proposal_id = p.proposal_id;
 
@@ -576,7 +576,7 @@ async fn handle_approve_governance_proposal_actor(
                 &p.context_id,
                 &proposal_id,
                 &voter_did,
-                &signing_key,
+                &signer,
             ),
         )
         .await
@@ -611,7 +611,7 @@ async fn handle_reject_governance_proposal_actor(
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
 ) -> Outcome<()> {
     let context_id = p.context_id.clone();
-    let signing_key = p.signing_key.to_signing_key();
+    let signer = p.signer;
     let voter_did = p.voter_did.clone();
     let proposal_id = p.proposal_id;
 
@@ -623,7 +623,7 @@ async fn handle_reject_governance_proposal_actor(
                 &p.context_id,
                 &proposal_id,
                 &voter_did,
-                &signing_key,
+                &signer,
             ),
         )
         .await

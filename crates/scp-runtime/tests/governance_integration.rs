@@ -38,6 +38,7 @@ use ed25519_dalek::Signer;
 
 use scp_did::DID;
 use scp_protocol::context::builder::ContextCreationError;
+use scp_protocol::context::governance::GovernanceEngineRawKey as _;
 use scp_protocol::context::governance::majority::MajorityVoteEngine;
 use scp_protocol::context::governance::multisig::ThresholdEngine;
 use scp_protocol::context::governance::unanimity::UnanimityEngine;
@@ -296,7 +297,12 @@ async fn ac2_single_admin_auto_approve_and_execute() {
     };
 
     let (proposal, events, _) = manager
-        .propose_governance_action(ctx_id, &alice(), action, &sk)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk.clone()),
+        )
         .await
         .unwrap();
 
@@ -343,7 +349,12 @@ async fn ac2_single_admin_checked_returns_execution_result() {
     };
 
     let outcome: ProposalOutcome = manager
-        .propose_governance_action_checked(ctx_id, &alice(), action, &sk)
+        .propose_governance_action_checked(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk.clone()),
+        )
         .await
         .unwrap();
 
@@ -387,7 +398,12 @@ async fn ac3_threshold_propose_approve_execute() {
 
     // Alice proposes (auto-approves as first signer = 1/2 threshold).
     let (proposal, events, _) = manager
-        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(proposal.status, ProposalStatus::Pending);
@@ -401,7 +417,13 @@ async fn ac3_threshold_propose_approve_execute() {
     // Bob approves -> threshold met (2/2), auto-executes.
     let sk_bob = signing_key_for_did(&bob());
     let (status, vote_events) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);
@@ -451,14 +473,25 @@ async fn ac4_majority_propose_approve_execute() {
 
     // Alice proposes. In Majority model, proposing does NOT auto-approve.
     let (proposal, _events, _) = manager
-        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(proposal.status, ProposalStatus::Pending);
 
     // Alice explicitly approves.
     let (status_after_alice, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &alice(), true, &sk_alice)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &alice(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status_after_alice, ProposalStatus::Pending);
@@ -466,7 +499,13 @@ async fn ac4_majority_propose_approve_execute() {
     // Bob approves -> 2/3 majority, should auto-execute.
     let sk_bob = signing_key_for_did(&bob());
     let (status, _events) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);
@@ -528,14 +567,25 @@ async fn governance_action_executed_leaf_stamps_executor_not_proposer() {
     let sk_alice = signing_key_for_did(&alice());
 
     let (proposal, _events, _) = manager
-        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(proposal.status, ProposalStatus::Pending);
 
     // Alice's own approval is #1 of quorum 2 — still Pending.
     let (status_after_alice, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &alice(), true, &sk_alice)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &alice(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status_after_alice, ProposalStatus::Pending);
@@ -544,7 +594,13 @@ async fn governance_action_executed_leaf_stamps_executor_not_proposer() {
     // Bob is therefore the executor (committing member), not alice.
     let sk_bob = signing_key_for_did(&bob());
     let (status, _events) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);
@@ -615,14 +671,25 @@ async fn governance_quorum_voter_without_action_capability_mints_one_leaf() {
     let sk_alice = signing_key_for_did(&alice());
 
     let (proposal, _events, _) = manager
-        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(proposal.status, ProposalStatus::Pending);
 
     // Alice's approval is #1 of quorum 2 — still Pending.
     let (status_after_alice, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &alice(), true, &sk_alice)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &alice(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status_after_alice, ProposalStatus::Pending);
@@ -630,7 +697,13 @@ async fn governance_quorum_voter_without_action_capability_mints_one_leaf() {
     // Bob's approval is #2 — crosses majority quorum and COMMITS the action.
     let sk_bob = signing_key_for_did(&bob());
     let (status, _events) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);
@@ -689,7 +762,12 @@ async fn governance_out_of_ceiling_action_rejected_native() {
     };
     let sk_alice = signing_key_for_did(&alice());
     let result = manager
-        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await;
     assert!(
         result.is_err(),
@@ -756,7 +834,12 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
 
     let sk_alice = signing_key_for_did(&alice());
     let result = manager
-        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await;
     assert!(
         result.is_err(),
@@ -822,7 +905,12 @@ async fn governance_out_of_ceiling_establish_outlet_interface_rejected_native() 
 
     let sk_alice = signing_key_for_did(&alice());
     let result = manager
-        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await;
     assert!(
         result.is_err(),
@@ -873,7 +961,12 @@ async fn ac5_unanimity_all_approve_execute() {
 
     // Alice proposes (counts as one approval).
     let (proposal, _events, _) = manager
-        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(proposal.status, ProposalStatus::Pending);
@@ -881,7 +974,13 @@ async fn ac5_unanimity_all_approve_execute() {
     // Bob approves -> 2/3.
     let sk_bob = signing_key_for_did(&bob());
     let (status, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status, ProposalStatus::Pending);
@@ -889,7 +988,13 @@ async fn ac5_unanimity_all_approve_execute() {
     // Carol approves -> 3/3, unanimity reached.
     let sk_carol = signing_key_for_did(&carol());
     let (status, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &carol(), true, &sk_carol)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &carol(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_carol.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);
@@ -922,14 +1027,25 @@ async fn ac6_rejected_proposal_not_executed_unanimity() {
     let sk_alice = signing_key_for_did(&alice());
 
     let (proposal, _, _) = manager
-        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
 
     // Bob rejects — unanimity broken, proposal rejected immediately.
     let sk_bob = signing_key_for_did(&bob());
     let (status, events) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), false, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            false,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
 
@@ -978,20 +1094,37 @@ async fn ac6_rejected_threshold_proposal() {
     let sk_alice = signing_key_for_did(&alice());
 
     let (proposal, _, _) = manager
-        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
 
     // Bob and Carol reject -> 2 rejections, only 3 signers, threshold 2 impossible.
     let sk_bob = signing_key_for_did(&bob());
     let (status_bob, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), false, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            false,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
 
     let sk_carol = signing_key_for_did(&carol());
     let (status_carol, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &carol(), false, &sk_carol)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &carol(),
+            false,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_carol.clone()),
+        )
         .await
         .unwrap();
 
@@ -1165,7 +1298,7 @@ async fn ac8_vote_withdrawn_event_via_manager() {
                 did: alice(),
                 new_role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1204,7 +1337,7 @@ async fn ac9_non_admin_cannot_propose_in_single_admin() {
             ctx_id,
             &bob(),
             GovernanceAction::CloseContext { reason: None },
-            &sk_bob,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await;
     assert!(result.is_err());
@@ -1238,7 +1371,7 @@ async fn ac9_checked_propose_requires_capability() {
             ctx_id,
             &alice(),
             GovernanceAction::CloseContext { reason: None },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await;
     assert!(result.is_err());
@@ -1278,7 +1411,7 @@ async fn ac10_remove_member_action() {
                 did: bob(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1293,7 +1426,7 @@ async fn ac10_remove_member_action() {
                 did: bob(),
                 reason: Some("test removal".into()),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1329,7 +1462,7 @@ async fn ctx_with_alice_admin_bob_member(ctx_id: &str) -> std::sync::Arc<Supervi
                 did: bob(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1352,7 +1485,7 @@ async fn execute_remove_member_clears_suspension() {
                 did: bob(),
                 capabilities: vec![Capability::new("messages:write").expect("known capability")],
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1374,7 +1507,7 @@ async fn execute_remove_member_clears_suspension() {
                 did: bob(),
                 reason: Some("test".into()),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1406,7 +1539,7 @@ async fn execute_remove_member_clears_read_exclusion() {
                 did: bob(),
                 access: AccessScope::Read,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1434,7 +1567,7 @@ async fn execute_remove_member_clears_read_exclusion() {
                 did: bob(),
                 reason: Some("test".into()),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1471,7 +1604,7 @@ async fn execute_remove_then_readmit_regression() {
                 did: bob(),
                 capabilities: vec![Capability::new("messages:write").expect("known capability")],
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1492,7 +1625,7 @@ async fn execute_remove_then_readmit_regression() {
                 did: bob(),
                 reason: Some("test".into()),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1511,7 +1644,7 @@ async fn execute_remove_then_readmit_regression() {
                 did: bob(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1552,7 +1685,7 @@ async fn leave_context_clears_suspension() {
                 did: bob(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1567,7 +1700,7 @@ async fn leave_context_clears_suspension() {
                 did: bob(),
                 capabilities: vec![Capability::new("messages:write").expect("known capability")],
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1615,7 +1748,7 @@ async fn ac10_change_role_action() {
                 did: alice(),
                 new_role: "admin".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1644,7 +1777,7 @@ async fn ac10_close_context_action() {
             GovernanceAction::CloseContext {
                 reason: Some("done".into()),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1679,7 +1812,7 @@ async fn ac10_add_signer_action() {
                 did: dave(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1691,7 +1824,7 @@ async fn ac10_add_signer_action() {
             &add_member_proposal.proposal_id,
             &bob(),
             true,
-            &sk_bob,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .unwrap();
@@ -1703,7 +1836,7 @@ async fn ac10_add_signer_action() {
             ctx_id,
             &alice(),
             GovernanceAction::AddSigner { did: dave() },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1711,7 +1844,13 @@ async fn ac10_add_signer_action() {
     assert_eq!(proposal.status, ProposalStatus::Pending);
 
     let (status, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);
@@ -1739,7 +1878,7 @@ async fn ac10_extend_ttl_action() {
             GovernanceAction::ExtendTtl {
                 additional_secs: 3600,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1771,7 +1910,7 @@ async fn ac10_revoke_write_access_action() {
                 did: bob(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1785,7 +1924,7 @@ async fn ac10_revoke_write_access_action() {
                 did: bob(),
                 access: AccessScope::Write,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1816,7 +1955,7 @@ async fn ac10_restore_write_access_action() {
                 did: bob(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1829,7 +1968,7 @@ async fn ac10_restore_write_access_action() {
                 did: bob(),
                 access: AccessScope::Write,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1842,7 +1981,7 @@ async fn ac10_restore_write_access_action() {
                 did: bob(),
                 capabilities: vec![Capability::MessagesWrite],
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1880,7 +2019,7 @@ async fn ac11_extend_ttl_requires_unanimity_in_threshold() {
             GovernanceAction::ExtendTtl {
                 additional_secs: 7200,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1890,7 +2029,13 @@ async fn ac11_extend_ttl_requires_unanimity_in_threshold() {
     // Bob approves (2/3).
     let sk_bob = signing_key_for_did(&bob());
     let (status, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     // With unanimity override, 2/3 is not enough.
@@ -1903,7 +2048,13 @@ async fn ac11_extend_ttl_requires_unanimity_in_threshold() {
         // Unanimity override enforced: need Carol too.
         let sk_carol = signing_key_for_did(&carol());
         let (final_status, _) = manager
-            .vote_on_proposal(ctx_id, &proposal.proposal_id, &carol(), true, &sk_carol)
+            .vote_on_proposal(
+                ctx_id,
+                &proposal.proposal_id,
+                &carol(),
+                true,
+                &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_carol.clone()),
+            )
             .await
             .unwrap();
         assert_eq!(final_status, ProposalStatus::Approved);
@@ -1951,19 +2102,31 @@ async fn ac12_promote_context_requires_unanimity_in_majority() {
                 did: bob(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
     // Majority of 3 voters: Alice must explicitly approve.
     let (_, _) = manager
-        .vote_on_proposal(ctx_id, &add_bob.proposal_id, &alice(), true, &sk_alice)
+        .vote_on_proposal(
+            ctx_id,
+            &add_bob.proposal_id,
+            &alice(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     // Bob approves -> 2/3 majority.
     let sk_bob = signing_key_for_did(&bob());
     let (add_bob_status, _) = manager
-        .vote_on_proposal(ctx_id, &add_bob.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &add_bob.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(add_bob_status, ProposalStatus::Approved);
@@ -1977,16 +2140,28 @@ async fn ac12_promote_context_requires_unanimity_in_majority() {
                 did: carol(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
     let (_, _) = manager
-        .vote_on_proposal(ctx_id, &add_carol.proposal_id, &alice(), true, &sk_alice)
+        .vote_on_proposal(
+            ctx_id,
+            &add_carol.proposal_id,
+            &alice(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     let (add_carol_status, _) = manager
-        .vote_on_proposal(ctx_id, &add_carol.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &add_carol.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(add_carol_status, ProposalStatus::Approved);
@@ -1997,7 +2172,7 @@ async fn ac12_promote_context_requires_unanimity_in_majority() {
             ctx_id,
             &alice(),
             GovernanceAction::PromoteContext,
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -2006,7 +2181,13 @@ async fn ac12_promote_context_requires_unanimity_in_majority() {
 
     // Alice explicitly approves.
     let (_, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &alice(), true, &sk_alice)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &alice(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
 
@@ -2015,7 +2196,13 @@ async fn ac12_promote_context_requires_unanimity_in_majority() {
     // but the unanimity override at execution should cause an error because
     // Carol hasn't approved yet.
     let vote_result = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await;
 
     // The unanimity override enforced at execution level means the promotion
@@ -2449,7 +2636,7 @@ async fn list_proposals_returns_all_proposals() {
                 did: alice(),
                 new_role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -2458,7 +2645,7 @@ async fn list_proposals_returns_all_proposals() {
             ctx_id,
             &alice(),
             GovernanceAction::CloseContext { reason: None },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -2506,7 +2693,7 @@ async fn full_threshold_lifecycle_add_signer_then_change_role() {
                 did: dave(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -2517,7 +2704,7 @@ async fn full_threshold_lifecycle_add_signer_then_change_role() {
             &add_member_proposal.proposal_id,
             &bob(),
             true,
-            &sk_bob,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .unwrap();
@@ -2529,7 +2716,7 @@ async fn full_threshold_lifecycle_add_signer_then_change_role() {
             ctx_id,
             &alice(),
             GovernanceAction::AddSigner { did: dave() },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -2546,7 +2733,7 @@ async fn full_threshold_lifecycle_add_signer_then_change_role() {
             &add_signer_proposal.proposal_id,
             &bob(),
             true,
-            &sk_bob,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
         )
         .await
         .unwrap();
@@ -2566,14 +2753,20 @@ async fn full_threshold_lifecycle_add_signer_then_change_role() {
                 did: alice(),
                 new_role: "observer".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
     assert_eq!(role_proposal.status, ProposalStatus::Pending);
 
     let (final_status, _) = manager
-        .vote_on_proposal(ctx_id, &role_proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &role_proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(final_status, ProposalStatus::Approved);
@@ -2718,7 +2911,7 @@ async fn multi_party_threshold_propose_approve_verify() {
                 did: dave(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -2732,7 +2925,13 @@ async fn multi_party_threshold_propose_approve_verify() {
 
     // Step 2: Bob approves → 2/2 threshold met, auto-executes.
     let (final_status, vote_events) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(final_status, ProposalStatus::Approved);
@@ -2908,15 +3107,32 @@ async fn direct_execute_of_genuine_proposal_runs_once_then_replay_rejected() {
         new_role: "observer".into(),
     };
     let (proposal, _, _) = manager
-        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &alice(), true, &sk_alice)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &alice(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     let (status, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -2990,7 +3206,12 @@ async fn governance_deadlock_recovery_appends_both_event_leaves() {
 
     // Proposal auto-executes (threshold=1, alice auto-votes).
     let (proposal, _events, _) = manager
-        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -3115,7 +3336,12 @@ async fn reconfigure_governance_bumps_checkpoint_counter_by_exactly_two() {
 
     // Proposal auto-executes (threshold=1, alice auto-votes).
     let (proposal, _events, _) = manager
-        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -3204,7 +3430,7 @@ async fn rotate_content_keys_broadcast_kea_governance_integration() {
             ctx_id,
             &alice(),
             GovernanceAction::RotateContentKeys { reason: None },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -3290,7 +3516,7 @@ async fn rotate_content_keys_counter_multi_author() {
             ctx_id,
             &alice(),
             GovernanceAction::RotateContentKeys { reason: None },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -3421,7 +3647,7 @@ async fn governance_ban_subscriber_bumps_counter_per_kea() {
                 did: carol(),
                 access: AccessScope::Both,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -3866,7 +4092,7 @@ async fn revoke_kea_append_failure_after_durable_ban_does_not_fail_the_proposal(
                 did: carol(),
                 access: AccessScope::Both,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .expect(
@@ -3926,7 +4152,7 @@ async fn rotate_content_keys_kea_append_failure_after_durable_advance_does_not_f
             ctx_id,
             &alice(),
             GovernanceAction::RotateContentKeys { reason: None },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .expect(
@@ -4010,7 +4236,7 @@ async fn assert_dropped_kea_leaf_is_never_reappended(
             GovernanceAction::RotateContentKeys {
                 reason: Some("follow-up rotation after a dropped KeyEpochAdvance leaf".to_string()),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .expect("the follow-up rotation runs against a healthy event log");
@@ -4093,7 +4319,7 @@ async fn revoke_dropped_kea_leaf_is_never_reappended_by_a_later_rotation() {
                 did: carol(),
                 access: AccessScope::Both,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .expect(
@@ -4115,7 +4341,7 @@ async fn rotate_content_keys_dropped_kea_leaf_is_never_reappended_by_a_later_rot
             ctx_id,
             &alice(),
             GovernanceAction::RotateContentKeys { reason: None },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .expect(

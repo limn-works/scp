@@ -211,14 +211,20 @@ async fn setup_threshold_context_with_dave(ctx_id: &str) -> std::sync::Arc<Super
                 did: dave(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
     assert_eq!(proposal.status, ProposalStatus::Pending);
 
     let (status, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);
@@ -262,7 +268,12 @@ fn propose_and_approve_threshold<'a>(
         let sk_alice = signing_key_for_did(&alice());
 
         let outcome = manager
-            .propose_governance_action_checked(ctx_id, &alice(), action, &sk_alice)
+            .propose_governance_action_checked(
+                ctx_id,
+                &alice(),
+                action,
+                &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            )
             .await
             .unwrap();
 
@@ -271,7 +282,13 @@ fn propose_and_approve_threshold<'a>(
         if outcome.status == ProposalStatus::Pending {
             let sk_bob = signing_key_for_did(&bob());
             let (status, _events) = manager
-                .vote_on_proposal(ctx_id, &outcome.proposal.proposal_id, &bob(), true, &sk_bob)
+                .vote_on_proposal(
+                    ctx_id,
+                    &outcome.proposal.proposal_id,
+                    &bob(),
+                    true,
+                    &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -674,12 +691,18 @@ async fn revoked_member_can_still_participate_in_governance() {
                 did: dave(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
     let (status, _) = manager
-        .vote_on_proposal(ctx_id, &add_dave.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &add_dave.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);
@@ -695,12 +718,18 @@ async fn revoked_member_can_still_participate_in_governance() {
                 did: dave(),
                 access: AccessScope::Write,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
     let (status, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);
@@ -720,7 +749,7 @@ async fn revoked_member_can_still_participate_in_governance() {
                 did: alice(),
                 new_role: "admin".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -730,7 +759,13 @@ async fn revoked_member_can_still_participate_in_governance() {
     // read-only members retain governance capabilities (§5.9).
     let sk_dave = signing_key_for_did(&dave());
     let (status, events) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &dave(), true, &sk_dave)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &dave(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_dave.clone()),
+        )
         .await
         .unwrap();
 
@@ -758,12 +793,18 @@ async fn revoked_member_can_still_participate_in_governance() {
                 did: dave(),
                 access: AccessScope::Read,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
     let (status, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);
@@ -783,7 +824,7 @@ async fn revoked_member_can_still_participate_in_governance() {
                 did: bob(),
                 new_role: "admin".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -791,7 +832,13 @@ async fn revoked_member_can_still_participate_in_governance() {
 
     // Dave's vote should be rejected — presence-only members cannot vote.
     let vote_result = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &dave(), true, &sk_dave)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &dave(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_dave.clone()),
+        )
         .await;
     assert!(
         vote_result.is_err(),
@@ -836,7 +883,7 @@ async fn single_admin_auto_executes_revoke_read_access() {
                 did: dave(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -851,7 +898,7 @@ async fn single_admin_auto_executes_revoke_read_access() {
                 did: dave(),
                 access: AccessScope::Read,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -905,7 +952,7 @@ async fn single_admin_auto_executes_revoke_write_access() {
                 did: dave(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -919,7 +966,7 @@ async fn single_admin_auto_executes_revoke_write_access() {
                 did: dave(),
                 access: AccessScope::Write,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -963,7 +1010,7 @@ async fn single_admin_auto_executes_restore_read_access() {
                 did: dave(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -976,7 +1023,7 @@ async fn single_admin_auto_executes_restore_read_access() {
                 did: dave(),
                 access: AccessScope::Read,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -990,7 +1037,7 @@ async fn single_admin_auto_executes_restore_read_access() {
                 did: dave(),
                 capabilities: vec![Capability::MessagesRead],
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1031,7 +1078,7 @@ async fn single_admin_auto_executes_rotate_content_keys() {
             GovernanceAction::RotateContentKeys {
                 reason: Some("compromise detected".into()),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1074,7 +1121,7 @@ async fn unanimity_rotate_content_keys_requires_all_votes() {
             GovernanceAction::RotateContentKeys {
                 reason: Some("unanimity test".into()),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1084,7 +1131,13 @@ async fn unanimity_rotate_content_keys_requires_all_votes() {
     // Bob approves (2/3) — still pending.
     let sk_bob = signing_key_for_did(&bob());
     let (status, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1096,7 +1149,13 @@ async fn unanimity_rotate_content_keys_requires_all_votes() {
     // Carol approves (3/3) — unanimity reached, should auto-execute.
     let sk_carol = signing_key_for_did(&carol());
     let (status, events) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &carol(), true, &sk_carol)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &carol(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_carol.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1144,7 +1203,7 @@ async fn unanimity_rotate_content_keys_rejected_by_single_vote() {
             GovernanceAction::RotateContentKeys {
                 reason: Some("should be rejected".into()),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1152,7 +1211,13 @@ async fn unanimity_rotate_content_keys_rejected_by_single_vote() {
     // Bob rejects — unanimity broken, proposal rejected immediately.
     let sk_bob = signing_key_for_did(&bob());
     let (status, events) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), false, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &bob(),
+            false,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
 
@@ -1308,20 +1373,32 @@ async fn majority_revoke_write_access() {
                 did: dave(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
     // Majority: proposing does NOT auto-approve; Alice must vote explicitly.
     let (status, _) = manager
-        .vote_on_proposal(ctx_id, &add_proposal.proposal_id, &alice(), true, &sk_alice)
+        .vote_on_proposal(
+            ctx_id,
+            &add_proposal.proposal_id,
+            &alice(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     // 1/3 — still pending.
     if status == ProposalStatus::Pending {
         let sk_bob = signing_key_for_did(&bob());
         let (status, _) = manager
-            .vote_on_proposal(ctx_id, &add_proposal.proposal_id, &bob(), true, &sk_bob)
+            .vote_on_proposal(
+                ctx_id,
+                &add_proposal.proposal_id,
+                &bob(),
+                true,
+                &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+            )
             .await
             .unwrap();
         assert_eq!(status, ProposalStatus::Approved);
@@ -1336,7 +1413,7 @@ async fn majority_revoke_write_access() {
                 did: dave(),
                 access: AccessScope::Both,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
@@ -1344,7 +1421,13 @@ async fn majority_revoke_write_access() {
 
     // Alice votes (1/3 — not majority yet).
     let (status, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &alice(), true, &sk_alice)
+        .vote_on_proposal(
+            ctx_id,
+            &proposal.proposal_id,
+            &alice(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
 
@@ -1352,7 +1435,13 @@ async fn majority_revoke_write_access() {
         // Bob approves (2/3 — majority).
         let sk_bob = signing_key_for_did(&bob());
         let (status, _) = manager
-            .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+            .vote_on_proposal(
+                ctx_id,
+                &proposal.proposal_id,
+                &bob(),
+                true,
+                &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+            )
             .await
             .unwrap();
         assert_eq!(

@@ -210,11 +210,18 @@ fn shutdown_runtime(py: Python<'_>, _timeout_millis: u64) {
     // runtime is a no-op, so this does not go through `block_on_released`,
     // which fails on an absent runtime.
     if let Some(rt) = RUNTIME.get() {
-        py.allow_threads(|| {
-            // ci-allow: bridge-block-on: the atexit drain sleeps with the GIL released and waits on no context actor
-            rt.block_on(tokio::time::sleep(SHUTDOWN_DRAIN));
-        });
+        py.allow_threads(|| drain_runtime(rt));
     }
+}
+
+/// Sleeps [`SHUTDOWN_DRAIN`] on `rt` from a thread outside any runtime.
+///
+/// The sleep is built inside the `async` block, on the runtime: a
+/// `tokio::time::sleep` built on the calling thread needs a current runtime
+/// and panics on the atexit thread, which has none.
+fn drain_runtime(rt: &tokio::runtime::Runtime) {
+    // ci-allow: bridge-block-on: the atexit drain sleeps with the GIL released and waits on no context actor
+    rt.block_on(async { tokio::time::sleep(SHUTDOWN_DRAIN).await });
 }
 
 /// The `_scp_core` Python extension module.
@@ -310,6 +317,15 @@ pub use _scp_core::__pyo3_init;
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The atexit drain runs on a thread with no current runtime.
+    #[test]
+    fn drain_runtime_runs_off_a_runtime_thread() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        std::thread::spawn(move || drain_runtime(&rt))
+            .join()
+            .expect("the drain must not panic off a runtime thread");
+    }
 
     #[test]
     fn init_runtime_creates_runtime() {

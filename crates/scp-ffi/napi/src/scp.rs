@@ -684,15 +684,13 @@ impl Scp {
         // raw seed into Rust (held in `Zeroizing`, wiped on drop), a surface
         // tracked for migration to `KeyCustody::sign`.
 
-        // `NapiIdentityInner` is only named in the `testing`-gated success arm
-        // below; the shipped build fails closed before minting a handle
-        // (ADR-062 §Decision 6).
+        // Both names are used only in the `testing`-gated success arm below;
+        // the shipped build fails closed before minting a handle (ADR-062
+        // §Decision 6).
         #[cfg(feature = "testing")]
-        use crate::identity::NapiIdentityInner;
-        use crate::identity::ensure_did_resolver_initialized_on;
+        use crate::identity::{NapiIdentityInner, ensure_did_resolver_initialized_on};
 
         let bi_arc = Arc::clone(&self.inner);
-        ensure_did_resolver_initialized_on(&bi_arc).map_err(NapiError::from)?;
 
         // Promote the JS callbacks to threadsafe functions on the JS
         // thread (consuming the non-Send `Function`s). A malformed
@@ -717,6 +715,9 @@ impl Scp {
             #[cfg(feature = "testing")]
             {
                 let bi = &*bi_arc;
+                // On the tokio runtime, unlike this function's JS-thread body,
+                // so the resolver the identity publishes into exists.
+                ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                 let dht = crate::identity::shared_did_method()?;

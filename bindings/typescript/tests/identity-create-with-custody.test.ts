@@ -320,5 +320,33 @@ if (!scpAvailable) {
         await scp.shutdown(1000).catch(() => {});
       }
     });
+
+    // ADR-049 Decision 7a: governance signs through `KeyCustody::sign`, so a
+    // custody that refuses raw key export still proposes, and the single-admin
+    // proposal auto-executes after the engine verifies the custody signature.
+    test("sign-only (no raw-key-export) custody can still propose governance", async () => {
+      const scp = new SCP({ storage: { type: "in_memory" } });
+      try {
+        const identity = await scp.identityCreateWithCustody(new SignOnlyKeychain());
+        const ctx = await scp.contextCreate(
+          identity,
+          JSON.stringify({
+            ceiling: ["messages:read", "messages:write", "governance:propose", "member:ban"],
+            memoryScope: "ephemeral",
+            governance: "single_admin",
+          }),
+        );
+        const response = await scp.contextGovernancePropose(
+          ctx,
+          JSON.stringify({
+            SuspendCapability: { did: identity.did, capabilities: ["MessagesWrite"] },
+          }),
+          identity.did,
+        );
+        expect(JSON.parse(response).status).toBe("Approved");
+      } finally {
+        await scp.shutdown(1000).catch(() => {});
+      }
+    });
   });
 }

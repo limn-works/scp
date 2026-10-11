@@ -1267,7 +1267,7 @@ pub fn check_threshold_attestation(input: &ThresholdCheckInput<'_>) -> Threshold
 ///   implementations. This matches how the same §9.5.2 "compact JSON" phrase
 ///   is implemented for `GovernanceProposal` `action_bytes`
 ///   (`compute_proposal_id`) and `SignedVote` `vote_type`
-///   (`compute_vote_hash`).
+///   (`vote_signing_digest`).
 /// - `evidence` and `revocation_status` — `rmp_serde::to_vec_named`
 ///   (`MessagePack`, named keys), as the §9.5.2 note explicitly sanctions for
 ///   these two fields.
@@ -1324,7 +1324,7 @@ pub fn canonical_attestation_bytes(attestation: &Attestation) -> Result<Vec<u8>,
     // `json.dumps(separators=(',', ':'))`). RFC 8785 JCS produces exactly
     // that compact form with deterministic (sorted) key ordering — the same
     // implementation of the same spec phrase as `compute_proposal_id`
-    // (`action_bytes`) and `compute_vote_hash` (`vote_type`).
+    // (`action_bytes`) and `vote_signing_digest` (`vote_type`).
     let claim_bytes = crate::jcs::to_vec(&attestation.claim).map_err(|err| {
         TrustError::CanonicalizationFailed {
             reason: format!("claim serialization failed: {err}"),

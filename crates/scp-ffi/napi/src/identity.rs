@@ -165,9 +165,14 @@ pub(crate) fn ensure_did_resolver_initialized_on(
         return Ok(());
     }
 
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return Ok(()); // No runtime available; skip initialization.
-    };
+    // Fails closed off a runtime: skipping here left the instance with no
+    // resolver, so the supervisor later snapshotted the not-configured key
+    // resolver and every governance vote by this instance's identities failed
+    // as an unknown voter, far from the cause.
+    let handle = tokio::runtime::Handle::try_current().map_err(|e| ScpNapiError::Identity {
+        message: format!("DID resolver initialization requires a tokio runtime: {e}"),
+        code: codes::IDENT_1058.to_owned(),
+    })?;
 
     // Reuse the process-wide `SHARED_DHT_CLIENT` when already set so Alice
     // (on `SCP` A) publishes to the same DHT Bob (on `SCP` B) reads from.
@@ -2256,6 +2261,25 @@ mod tests {
                 "an attestation whose handle changed after signing must not verify"
             );
         });
+    }
+
+    /// Off a tokio runtime the resolver cannot be built, and initialization
+    /// fails with `SCP-IDENT-1058` instead of returning `Ok` with no resolver
+    /// attached, which left the supervisor's governance key resolver
+    /// unconfigured.
+    #[test]
+    fn did_resolver_initialization_off_a_runtime_is_ident_1058() {
+        let bi = crate::runtime::NapiBridgeInstance::new_napi();
+        let err = ensure_did_resolver_initialized_on(&bi)
+            .expect_err("no runtime is current on this thread");
+        assert!(
+            format!("{err}").contains(codes::IDENT_1058),
+            "expected SCP-IDENT-1058, got: {err}"
+        );
+        assert!(
+            crate::runtime::did_resolver(&bi).is_none(),
+            "a failed initialization attaches no resolver"
+        );
     }
 }
 

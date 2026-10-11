@@ -31,8 +31,8 @@ use std::collections::{HashMap, HashSet};
 use super::{
     CheckpointAttestationStatus, CosignedCheckpoint, GovernanceAction, GovernanceContext,
     GovernanceEngine, GovernanceError, GovernanceEvent, GovernanceModelConfig, GovernanceProposal,
-    KeyResolver, ProposalId, ProposalStatus, RejectionReason, VoteType, compute_proposal_id,
-    sign_vote, verify_vote,
+    KeyResolver, ProposalId, ProposalStatus, ProposeIntent, RejectionReason, SignedVote,
+    VoteIntent, VoteType,
 };
 use scp_did::{DID, SigningKeyId};
 
@@ -320,26 +320,22 @@ impl MajorityVoteEngine {
             || proposal.rejections.iter().any(|v| v.voter_did == *voter)
     }
 
-    /// Run the pre-vote guard checks.
-    ///
-    /// This is the portion that MUST run **before** any signing or signature
-    /// verification, so that a double vote is caught as
-    /// `AlreadyVoted` regardless of which key signed the second attempt, and an
-    /// ineligible voter is rejected as `NotEligible` rather than
-    /// `InvalidSignature`. The checks and their error variants match the
-    /// original pre-refactor `approve`/`reject` exactly: eligibility
+    /// Run the pre-vote guard checks, in this order: eligibility
     /// (`NotEligible`), proposal existence (`ProposalNotFound`), pending state
     /// (`ProposalNotPending`), then the deadline branch.
     ///
-    /// Majority-specific subtlety: a past-deadline vote does **not** error.
-    /// Exactly as the original control flow, it auto-resolves the proposal via
-    /// `resolve()` **without recording a vote and without signing**, returning
-    /// the resolution as [`PrecheckOutcome::Resolved`](super::PrecheckOutcome::Resolved)
-    /// so the caller short-circuits. The single-vote dedup (`AlreadyVoted`) is
-    /// only evaluated when the deadline has **not** passed — matching the
-    /// original `!expired && Self::has_voted(..)` guard. Takes `&mut self`
-    /// because the early-resolve transitions proposal state.
-    fn precheck_vote(
+    /// [`GovernanceEngine::precheck_vote`] runs them before the voter's key
+    /// resolves and before anyone signs, so a double vote is `AlreadyVoted`
+    /// whichever key signed it and an ineligible voter is `NotEligible`, never
+    /// `InvalidSignature`. The `*_signed` methods run them again before the
+    /// vote counts.
+    ///
+    /// A past-deadline vote does **not** error: it resolves the proposal via
+    /// `resolve()` without recording a vote, returning the resolution as
+    /// [`PrecheckOutcome::Resolved`](super::PrecheckOutcome::Resolved). The
+    /// single-vote dedup (`AlreadyVoted`) runs only before the deadline. Takes
+    /// `&mut self` because the resolution transitions proposal state.
+    fn guard_vote(
         &mut self,
         proposal_id: &ProposalId,
         voter: &DID,
@@ -376,7 +372,7 @@ impl MajorityVoteEngine {
         };
 
         // Handle deadline expiry (self.resolve needs &mut self). Auto-resolve
-        // WITHOUT recording a vote or signing — the caller returns this result.
+        // WITHOUT recording a vote; the caller applies this result.
         if past_deadline {
             return Ok(super::PrecheckOutcome::Resolved(
                 self.resolve(proposal_id, context)?,
@@ -389,13 +385,13 @@ impl MajorityVoteEngine {
     /// Record an already-checked, already-verified vote and run the inline
     /// early-resolution.
     ///
-    /// Runs **after** `precheck_vote` (and after signature verification):
+    /// Runs **after** `guard_vote` and signature verification:
     /// pushes the vote into `approvals`/`rejections`, emits the
     /// `VoteCast` event, and applies the inline early-resolution
     /// (`approvals * 2 > eligible` for an approval, `rejections >=
     /// eligible.div_ceil(2)` for a rejection). No unverified vote ever reaches
     /// this point. The deadline has already been handled
-    /// by `precheck_vote`, so the proposal here is guaranteed not past-deadline.
+    /// by `guard_vote`, so the proposal here is guaranteed not past-deadline.
     fn push_and_resolve(
         &mut self,
         proposal_id: &ProposalId,
@@ -458,6 +454,34 @@ impl MajorityVoteEngine {
 
         Ok((proposal.status.clone(), events))
     }
+
+    /// Re-run the guards, check `vote` is `voter`'s `expected` vote at
+    /// `context.now` with a verifying signature, then record it. Past the
+    /// deadline the guards resolve the proposal and the vote is not recorded.
+    fn cast_signed(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+        vote: SignedVote,
+        expected: VoteType,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        match self.guard_vote(proposal_id, voter, context)? {
+            super::PrecheckOutcome::Proceed => {}
+            super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
+        }
+        // Verify strictly before push_and_resolve: a vote counts only after
+        // its signature verifies.
+        super::check_signed_vote(
+            &self.key_resolver,
+            proposal_id,
+            voter,
+            &expected,
+            context,
+            &vote,
+        )?;
+        self.push_and_resolve(proposal_id, voter, vote, expected, context)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -465,29 +489,34 @@ impl MajorityVoteEngine {
 // ---------------------------------------------------------------------------
 
 impl GovernanceEngine for MajorityVoteEngine {
-    fn propose(
+    fn precheck_propose(
+        &self,
+        proposer: &DID,
+        action: &GovernanceAction,
+        context: &GovernanceContext,
+    ) -> Result<ProposeIntent, GovernanceError> {
+        self.check_proposer(proposer)?;
+        let proposal_id = super::proposal_id_for(proposer, action, context)?;
+        if self.proposals.contains_key(&proposal_id) {
+            return Err(GovernanceError::DuplicateProposal(hex::encode(proposal_id)));
+        }
+        // The proposer casts no implicit vote in the majority model.
+        Ok(ProposeIntent::NoSignature { proposal_id })
+    }
+
+    fn propose_signed(
         &mut self,
         proposer: &DID,
         action: GovernanceAction,
         context: &GovernanceContext,
-        _signing_key: &ed25519_dalek::SigningKey,
+        proposer_vote: Option<SignedVote>,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), GovernanceError> {
-        self.check_proposer(proposer)?;
-
-        // RFC 8785 JCS canonical serialization for cross-implementation
-        // deterministic proposal ID computation (§9.5.2). JCS (not
-        // MessagePack) because GovernanceAction is a complex enum that must
-        // hash identically across all SDK languages. See
-        // compute_proposal_id() doc comment.
-        let action_bytes =
-            crate::jcs::to_vec(&action).map_err(GovernanceError::SerializationFailed)?;
-
-        let proposal_id =
-            compute_proposal_id(&context.context_id, proposer, &action_bytes, context.now);
-
-        // Reject duplicate proposals.
-        if self.proposals.contains_key(&proposal_id) {
-            return Err(GovernanceError::DuplicateProposal(hex::encode(proposal_id)));
+        let intent = self.precheck_propose(proposer, &action, context)?;
+        let proposal_id = intent.proposal_id();
+        if super::proposer_vote_for(&intent, proposer_vote)?.is_some() {
+            return Err(GovernanceError::ProposerVoteMismatch {
+                expected_signed: false,
+            });
         }
 
         let voting_deadline = context.now + self.voting_window_secs;
@@ -528,88 +557,47 @@ impl GovernanceEngine for MajorityVoteEngine {
         }
     }
 
-    fn approve(
+    fn precheck_vote(
         &mut self,
         proposal_id: &ProposalId,
         voter: &DID,
+        vote: &VoteType,
         context: &GovernanceContext,
-        signing_key: &ed25519_dalek::SigningKey,
-    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        // Guards run BEFORE sign/verify: a double vote must be caught as
-        // AlreadyVoted (and an ineligible voter as NotEligible) regardless of
-        // which key signed the attempt. Majority additionally short-circuits a
-        // past-deadline vote by auto-resolving WITHOUT recording a vote or
-        // signing — exactly as the original control flow did.
-        match self.precheck_vote(proposal_id, voter, context)? {
+    ) -> Result<VoteIntent, GovernanceError> {
+        match self.guard_vote(proposal_id, voter, context)? {
             super::PrecheckOutcome::Proceed => {}
-            super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
+            // Past the deadline: the proposal resolved, no vote is recorded
+            // and nothing is signed.
+            super::PrecheckOutcome::Resolved((status, events)) => {
+                return Ok(VoteIntent::Resolved(status, events));
+            }
         }
-
-        // Build and sign the vote.
-        let signed_vote = sign_vote(
-            proposal_id,
-            &VoteType::Approve,
-            voter.as_ref(),
-            context.now,
-            signing_key,
-        )?;
-
-        // Verify the vote signature against the voter's DID-resolved key.
-        // This MUST stay strictly before push_and_resolve: the signed path
-        // counts a vote only after its signature is verified.
-        let resolved_key = (self.key_resolver)(voter, SigningKeyId::Active).ok_or_else(|| {
-            GovernanceError::UnknownVoter {
-                did: voter.to_string(),
-            }
-        })?;
-        verify_vote(proposal_id, &signed_vote, &resolved_key).map_err(|_| {
-            GovernanceError::InvalidSignature {
-                voter_did: voter.to_string(),
-                proposal_id: hex::encode(proposal_id),
-            }
-        })?;
-
-        self.push_and_resolve(proposal_id, voter, signed_vote, VoteType::Approve, context)
+        let digest =
+            super::vote_sign_digest(&self.key_resolver, proposal_id, voter, vote, context)?;
+        Ok(VoteIntent::Sign {
+            timestamp: context.now,
+            digest,
+        })
     }
 
-    fn reject(
+    fn approve_signed(
         &mut self,
         proposal_id: &ProposalId,
         voter: &DID,
         context: &GovernanceContext,
-        signing_key: &ed25519_dalek::SigningKey,
+        vote: SignedVote,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        // Guards run BEFORE sign/verify (see `approve`).
-        match self.precheck_vote(proposal_id, voter, context)? {
-            super::PrecheckOutcome::Proceed => {}
-            super::PrecheckOutcome::Resolved(resolution) => return Ok(resolution),
-        }
+        self.cast_signed(proposal_id, voter, context, vote, VoteType::Approve)
+    }
 
-        // Build and sign the rejection vote.
-        let signed_vote = sign_vote(
-            proposal_id,
-            &VoteType::Reject,
-            voter.as_ref(),
-            context.now,
-            signing_key,
-        )?;
-
-        // Verify the vote signature against the voter's DID-resolved key.
-        // This MUST stay strictly before push_and_resolve: the signed path
-        // counts a vote only after its signature is verified.
-        let resolved_key = (self.key_resolver)(voter, SigningKeyId::Active).ok_or_else(|| {
-            GovernanceError::UnknownVoter {
-                did: voter.to_string(),
-            }
-        })?;
-        verify_vote(proposal_id, &signed_vote, &resolved_key).map_err(|_| {
-            GovernanceError::InvalidSignature {
-                voter_did: voter.to_string(),
-                proposal_id: hex::encode(proposal_id),
-            }
-        })?;
-
-        self.push_and_resolve(proposal_id, voter, signed_vote, VoteType::Reject, context)
+    fn reject_signed(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+        vote: SignedVote,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        self.cast_signed(proposal_id, voter, context, vote, VoteType::Reject)
     }
 
     fn resolve(
@@ -768,6 +756,7 @@ impl GovernanceEngine for MajorityVoteEngine {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::context::governance::GovernanceEngineRawKey as _;
 
     // -----------------------------------------------------------------------
     // Test helpers

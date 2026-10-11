@@ -14745,7 +14745,7 @@ impl Supervisor {
         invitee_did: DID,
         invitee_key_package: Vec<u8>,
         relay_urls: Vec<String>,
-        proposer_signing_key: &ed25519_dalek::SigningKey,
+        proposer_signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<InviteMemberOutcome, ContextError> {
         use rand::RngCore as _;
         use scp_protocol::context::governance::GovernanceAction;
@@ -14835,7 +14835,7 @@ impl Supervisor {
                     did: invitee_did.clone(),
                     role: "member".to_owned(),
                 },
-                proposer_signing_key,
+                proposer_signer,
                 Some(invitee_key_package),
             )
             .await?;
@@ -14900,9 +14900,9 @@ impl Supervisor {
                 sender_key_seed: None,
             };
 
-            // 5. Build + sign the bundle with the creator's #active key. The SAME
-            //    key just authorized (and signed) the governance `AddMember`
-            //    proposal, so signing the bundle here with it makes it
+            // 5. Build + sign the bundle through the creator's signer (ADR-049
+            //    Decision 7a). The SAME signer just authorized (and signed) the
+            //    governance `AddMember` proposal, so signing the bundle with it makes it
             //    STRUCTURALLY impossible for the authenticated `creator_did` on
             //    the bundle to diverge from the DID the governance gate authorized
             //    (a two-signing-input design could sign the proposal under admin A
@@ -14919,9 +14919,13 @@ impl Supervisor {
                 metadata_snapshot,
                 signature: Vec::new(),
             };
-            bundle.sign(proposer_signing_key).map_err(|e| {
-                ContextError::CryptoFailed(format!("invite_member: bundle sign failed: {e}"))
+            let bundle_hash = bundle.invitation_bundle_signing_hash().map_err(|e| {
+                ContextError::CryptoFailed(format!("invite_member: bundle hash failed: {e}"))
             })?;
+            // A custody refusal or timeout keeps its typed custody error.
+            bundle.set_signature(
+                crate::context::actor::signer::sign_bounded(proposer_signer, &bundle_hash).await?,
+            );
 
             // 6. HPKE-seal the serialized bundle to the invitee. `wire` carries
             //    the plaintext `context_metadata_key` (§9.10.4.B) — hold it in
@@ -15013,7 +15017,7 @@ impl Supervisor {
                                 "invitation could not be sealed/delivered after the add".to_owned(),
                             ),
                         },
-                        proposer_signing_key,
+                        proposer_signer,
                         None,
                     )
                     .await;
@@ -16659,7 +16663,7 @@ impl Supervisor {
         context_id: &str,
         proposer_did: &DID,
         action: scp_protocol::context::governance::GovernanceAction,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<
         (
             scp_protocol::context::governance::GovernanceProposal,
@@ -16674,9 +16678,7 @@ impl Supervisor {
                 context_id: context_id.to_owned(),
                 proposer_did: proposer_did.clone(),
                 action,
-                signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                    signing_key,
-                ),
+                signer: signer.clone(),
                 // The unchecked propose path never carries an invitee KeyPackage
                 // (the invitation path uses the checked variant).
                 key_package: None,
@@ -16703,13 +16705,13 @@ impl Supervisor {
         context_id: &str,
         proposer_did: &DID,
         action: scp_protocol::context::governance::GovernanceAction,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<crate::context::state::ProposalOutcome, ContextError> {
         self.propose_governance_action_checked_carrying_key_package(
             context_id,
             proposer_did,
             action,
-            signing_key,
+            signer,
             None,
         )
         .await
@@ -16734,7 +16736,7 @@ impl Supervisor {
         context_id: &str,
         proposer_did: &DID,
         action: scp_protocol::context::governance::GovernanceAction,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
         key_package: Option<Vec<u8>>,
     ) -> Result<crate::context::state::ProposalOutcome, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -16743,9 +16745,7 @@ impl Supervisor {
                 context_id: context_id.to_owned(),
                 proposer_did: proposer_did.clone(),
                 action,
-                signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                    signing_key,
-                ),
+                signer: signer.clone(),
                 key_package,
             },
         );
@@ -16776,7 +16776,7 @@ impl Supervisor {
         proposal_id: &scp_protocol::context::governance::ProposalId,
         voter_did: &DID,
         approve: bool,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<
         (
             scp_protocol::context::governance::ProposalStatus,
@@ -16789,9 +16789,7 @@ impl Supervisor {
             context_id: context_id.to_owned(),
             proposal_id: *proposal_id,
             voter_did: voter_did.clone(),
-            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                signing_key,
-            ),
+            signer: signer.clone(),
         });
         let cmd = GovernanceCommand::VoteOnProposal {
             payload,

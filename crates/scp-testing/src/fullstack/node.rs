@@ -398,7 +398,7 @@ impl FullStackNode {
                 DID::from(member_did),
                 kp_bytes,
                 vec![],
-                &self.signing_key,
+                &scp_core::context::actor::CommandSigner::local_ed25519(self.signing_key.clone()),
             )
             .await?;
         let InviteMemberOutcome::Sealed { bundle, .. } = outcome;
@@ -923,7 +923,12 @@ impl FullStackNode {
     ) -> Result<scp_core::context::governance::GovernanceProposal, ContextError> {
         let (proposal, _events, _execution) = self
             .manager
-            .propose_governance_action(context_id, &self.did, action, &self.signing_key)
+            .propose_governance_action(
+                context_id,
+                &self.did,
+                action,
+                &scp_core::context::actor::CommandSigner::local_ed25519(self.signing_key.clone()),
+            )
             .await?;
         Ok(proposal)
     }
@@ -942,7 +947,13 @@ impl FullStackNode {
     ) -> Result<scp_core::context::governance::ProposalStatus, ContextError> {
         let (status, _events) = self
             .manager
-            .vote_on_proposal(context_id, proposal_id, &self.did, true, &self.signing_key)
+            .vote_on_proposal(
+                context_id,
+                proposal_id,
+                &self.did,
+                true,
+                &scp_core::context::actor::CommandSigner::local_ed25519(self.signing_key.clone()),
+            )
             .await?;
         Ok(status)
     }

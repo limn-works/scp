@@ -429,7 +429,7 @@ async fn governance_ban_emits_key_epoch_advance_per_author() {
                 did: bob(),
                 access: AccessScope::Both,
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .expect("propose RevokeAccess");
@@ -529,7 +529,7 @@ async fn rotate_content_keys_broadcast_emits_key_epoch_advance_per_author() {
             ctx_id,
             &alice(),
             GovernanceAction::RotateContentKeys { reason: None },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .expect("propose RotateContentKeys");

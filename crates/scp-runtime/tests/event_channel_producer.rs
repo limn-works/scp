@@ -211,12 +211,18 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
                 did: bob(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .expect("proposing AddMember should succeed");
     supervisor
-        .vote_on_proposal(ctx_id, &prop.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &prop.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .expect("Bob voting to approve his own add should succeed");
     supervisor

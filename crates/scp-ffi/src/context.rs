@@ -1740,8 +1740,8 @@ pub(crate) fn default_ceiling_strings() -> Vec<String> {
 ///
 /// Looks up the identity in the global registry, retrieves the custody
 /// provider and active signing key handle, and exports the raw
-/// `ed25519_dalek::SigningKey`. Required because the core governance
-/// lifecycle functions take `&SigningKey` directly.
+/// `ed25519_dalek::SigningKey`, for the runtime paths that still take
+/// `&SigningKey`. Governance and invite sign through [`resolve_signer`].
 ///
 /// `pub(crate)` so the cross-context saga export in `outlets.rs` can resolve
 /// each co-resident participant context's Active Signing Key (via that
@@ -1771,6 +1771,34 @@ pub(crate) fn resolve_signing_key(
     .map_err(|e| {
         PyRuntimeError::new_err(format!("failed to export signing key for governance: {e}"))
     })
+}
+
+/// Builds the identity's `#active` [`CommandSigner`] (ADR-049 Decision 7a).
+///
+/// The private key stays in custody: the signer signs each digest through it.
+/// The custody `Arc` and key handle are cloned out of the `with_identity`
+/// closure before the await, so no `DashMap` shard guard is held across it.
+///
+/// # Errors
+///
+/// - The registry's typed identity error when `identity_did` is not
+///   registered.
+/// - The custody's error through [`ScpPyError::from`](crate::error::ScpPyError)
+///   when the signer cannot be built; a destroyed key is `SCP-CRYPTO-4006`.
+pub(crate) fn resolve_signer(
+    py: Python<'_>,
+    bi: &crate::runtime::PyBridgeInstance,
+    identity_did: &str,
+) -> PyResult<scp_core::context::actor::CommandSigner> {
+    let (custody, handle) = crate::runtime::with_identity(bi, identity_did, |entry| {
+        Ok((entry.custody.clone(), entry.identity.active_signing_key))
+    })?;
+    let signer = crate::actor_wait::block_on_released(
+        py,
+        scp_ffi_common::signer::identity_command_signer(custody, handle),
+    )?
+    .map_err(crate::error::ScpPyError::from)?;
+    Ok(signer)
 }
 
 /// Resolves the [`ResolvedMessageSigner`](scp_ffi_common::persona::ResolvedMessageSigner)
@@ -3270,11 +3298,10 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
 
-        // Resolve the inviter's Ed25519 signing key. `resolve_signing_key` runs
-        // its own `block_on` and returns BEFORE the invite `block_on` below, so
-        // the two calls are sequential (not nested — nesting would deadlock the
-        // multi-threaded runtime).
-        let signing_key = resolve_signing_key(py, bi, &creator_did)?;
+        // Build the inviter's custody signer. `resolve_signer` runs its own
+        // wait and returns BEFORE the invite wait below, so the two calls are
+        // sequential, never nested.
+        let signer = resolve_signer(py, bi, &creator_did)?;
         let outcome = crate::actor_wait::block_on_released(
             py,
             sup.invite_member(
@@ -3283,15 +3310,9 @@ impl crate::scp::PyScp {
                 scp_did::DID(invitee_did),
                 invitee_key_package,
                 relay_urls,
-                &signing_key,
+                &signer,
             ),
         )?;
-        // Defense-in-depth: wipe the raw signing key the moment the invite is
-        // produced, rather than letting it linger to end-of-scope. `SigningKey`
-        // is `ZeroizeOnDrop` (ed25519-dalek `zeroize` feature) but does NOT
-        // implement bare `Zeroize`, so the explicit early `drop` — not a
-        // `.zeroize()` call — is what triggers the wipe here.
-        drop(signing_key);
 
         let outcome = outcome.map_err(|e| typed_supervisor_failure("invite_member", &e))?;
         Ok(PyInviteMemberOutcome::from_outcome(outcome))
@@ -4160,7 +4181,7 @@ impl crate::scp::PyScp {
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
         let action_json_owned = action_json.to_owned();
-        let signing_key = resolve_signing_key(py, bi, identity_did)?;
+        let signer = resolve_signer(py, bi, identity_did)?;
         let proposer_did = scp_did::DID(identity_did.to_owned());
 
         crate::actor_wait::block_on_released(py, async move {
@@ -4175,7 +4196,7 @@ impl crate::scp::PyScp {
                 .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2040: {}", e.message)))?;
 
             let outcome = sup
-                .propose_governance_action_checked(&context_id, &proposer_did, action, &signing_key)
+                .propose_governance_action_checked(&context_id, &proposer_did, action, &signer)
                 .await
                 .map_err(|e| typed_supervisor_failure("SCP-CTX-2041: governance proposal", &e))?;
 
@@ -4224,14 +4245,12 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
-        let signing_key = resolve_signing_key(py, bi, identity_did)?;
+        let signer = resolve_signer(py, bi, identity_did)?;
         let voter_did = scp_did::DID(identity_did.to_owned());
         let proposal_id = parse_proposal_id(proposal_id_hex)?;
 
         crate::actor_wait::block_on_released(py, async move {
-            use scp_core::context::actor::commands::{
-                GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
-            };
+            use scp_core::context::actor::commands::{GovernanceCommand, VoteOnProposalPayload};
 
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = GovernanceCommand::ApproveGovernanceProposal {
@@ -4239,7 +4258,7 @@ impl crate::scp::PyScp {
                     context_id: context_id.clone(),
                     proposal_id,
                     voter_did,
-                    signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+                    signer,
                 }),
                 reply: tx,
             };
@@ -4294,14 +4313,12 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
-        let signing_key = resolve_signing_key(py, bi, identity_did)?;
+        let signer = resolve_signer(py, bi, identity_did)?;
         let voter_did = scp_did::DID(identity_did.to_owned());
         let proposal_id = parse_proposal_id(proposal_id_hex)?;
 
         crate::actor_wait::block_on_released(py, async move {
-            use scp_core::context::actor::commands::{
-                GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
-            };
+            use scp_core::context::actor::commands::{GovernanceCommand, VoteOnProposalPayload};
 
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = GovernanceCommand::RejectGovernanceProposal {
@@ -4309,7 +4326,7 @@ impl crate::scp::PyScp {
                     context_id: context_id.clone(),
                     proposal_id,
                     voter_did,
-                    signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+                    signer,
                 }),
                 reply: tx,
             };

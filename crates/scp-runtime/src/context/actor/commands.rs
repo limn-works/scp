@@ -1221,10 +1221,10 @@ pub struct ProposeGovernanceActionPayload {
     pub proposer_did: scp_did::DID,
     /// Typed governance action — one of the 28 variants from ADR-031.
     pub action: scp_protocol::context::governance::GovernanceAction,
-    /// Proposer's Ed25519 signing key. Wrapped in [`SigningKeyBytes`]
-    /// so the private key zeroes on drop (mirrors the messaging path's
-    /// command-level zeroize contract).
-    pub signing_key: SigningKeyBytes,
+    /// The proposer's signer (ADR-049 Decision 7a). The handler signs the
+    /// proposer's approval digest through it once the prechecks pass; the
+    /// command carries no key material.
+    pub signer: crate::context::actor::signer::CommandSigner,
     /// The invitee's TLS-serialized MLS `KeyPackage` for an `AddMember`
     /// auto-execute. Carried here — on the in-process actor command envelope,
     /// NOT on the signed/logged
@@ -1240,10 +1240,9 @@ pub struct ProposeGovernanceActionPayload {
 /// Payload for [`GovernanceCommand::VoteOnProposal`],
 /// [`GovernanceCommand::ApproveGovernanceProposal`], and
 /// [`GovernanceCommand::RejectGovernanceProposal`]. Boxed so the outer
-/// enum's variant sizes stay uniform — the signing key embeds a
-/// [`Zeroizing<[u8; 32]>`](zeroize::Zeroizing) and the proposal-ID +
-/// DID + context-id fields combine to ~150 bytes; boxing keeps the
-/// variant payload size constant.
+/// enum's variant sizes stay uniform — the proposal-ID, DID, context-id and
+/// signer fields combine to ~150 bytes; boxing keeps the variant payload size
+/// constant.
 pub struct VoteOnProposalPayload {
     /// Context identifier string.
     pub context_id: String,
@@ -1251,9 +1250,9 @@ pub struct VoteOnProposalPayload {
     pub proposal_id: scp_protocol::context::governance::ProposalId,
     /// Voter DID.
     pub voter_did: scp_did::DID,
-    /// Voter's Ed25519 signing key (zeroized on drop via
-    /// [`SigningKeyBytes`]).
-    pub signing_key: SigningKeyBytes,
+    /// The voter's signer (ADR-049 Decision 7a). The handler signs the vote
+    /// digest through it only when the precheck asks for a signature.
+    pub signer: crate::context::actor::signer::CommandSigner,
 }
 
 /// Payload for [`GovernanceCommand::ExecuteGovernanceAction`].

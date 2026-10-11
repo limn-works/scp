@@ -8,7 +8,7 @@
 //! production result, which proves the production preimage is byte-identical
 //! to the printed one.
 //!
-//! Vectors asserted elsewhere: V7 (`compute_vote_hash`) and V27
+//! Vectors asserted elsewhere: V7 (`vote_signing_digest`, also here) and V27
 //! (`pseudonymize_did`) in-module in `scp-protocol`, V25 (access-key
 //! `build_hpke_info`) in-module in `scp-runtime`, V32 and V33 in
 //! `scp-event-log/tests/test_vectors.rs`, V35 in `scp-protocol`'s
@@ -28,7 +28,9 @@ use scp_crypto::p256::{
     P256Error, P256PublicKey, P256SecretKey, SeedLabel, sign_prehash_rfc6979, verify_prehash_strict,
 };
 use scp_did::{DID, SigningKeyId};
-use scp_protocol::context::governance::{GovernanceAction, compute_proposal_id};
+use scp_protocol::context::governance::{
+    GovernanceAction, VoteType, compute_proposal_id, vote_signing_digest,
+};
 use scp_protocol::context::outlets::interface::InterfaceOffer;
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 use scp_protocol::crypto::sender_keys::key_protocol_verify::build_hpke_info;
@@ -325,13 +327,24 @@ fn vector_6_inner_envelope_with_provenance() {
 // §25.5 Vote signing
 // ---------------------------------------------------------------------------
 
-/// The production `compute_vote_hash` is private; the in-module test
-/// `spec_25_vector_7_vote_canonical_hash` in `scp-protocol` asserts the
-/// canonical hash through it. This test asserts the printed preimage and the
-/// signature over that hash.
+/// Asserts the printed preimage, that the production `vote_signing_digest`
+/// (the digest a voter's signer signs) equals its hash, and the signature over
+/// that hash.
 #[test]
 fn vector_7_vote_signature() {
     let hash = unhex32("3a0c35742f6ddd8c3a935f924ede5ca85ad905c1312ca99e18eb618223769c67");
+    let proposal_id = unhex32("0102030405060708091011121314151617181920212223242526272829303132");
+    assert_eq!(
+        vote_signing_digest(
+            &proposal_id,
+            "scp:bbxkpyevxkco6odwvddqgluf3ug2a3qj3lacn4olgxtpshuk4a6a",
+            &VoteType::Approve,
+            1_700_000_000,
+        )
+        .expect("vote digest"),
+        hash,
+        "vector 7: production vote digest drift"
+    );
     assert_spec_preimage(
         "vector 7",
         "5343502d564f54452d56313a0102030405060708091011121314151617181920212223242526272829303132000000387363703a6262786b70796576786b636f366f647776646471676c7566337567326133716a336c61636e346f6c677874707368756b346136610000000922417070726f766522000000006553f100",

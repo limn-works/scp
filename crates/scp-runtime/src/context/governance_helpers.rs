@@ -29,7 +29,7 @@ use scp_protocol::context::governance::mls_integration::{
 };
 use scp_protocol::context::governance::{
     AccessScope, GovernanceAction, GovernanceContext, GovernanceEvent, GovernanceProposal,
-    ProposalId, ProposalStatus, PruningPolicy,
+    ProposalId, ProposalStatus, ProposeIntent, PruningPolicy, VoteIntent, VoteType, signed_vote,
 };
 use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::outlets::interface::OutletInterface;
@@ -40,6 +40,7 @@ use scp_protocol::economy::types::EconomicPolicy;
 use tracing::instrument;
 
 use crate::context::actor::deps::ActorDeps;
+use crate::context::actor::signer::{CommandSigner, sign_bounded};
 use crate::context::actor::state::PerContextState;
 use crate::context::governance_logic::ConsequenceStateSplit;
 use crate::context::governance_logic::{
@@ -4112,7 +4113,7 @@ pub async fn propose_governance_action_inner(
     context_id: &str,
     proposer_did: &DID,
     action: GovernanceAction,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &CommandSigner,
     check_propose_capability: bool,
     // The invitee's MLS `KeyPackage` for an `AddMember` auto-execute, carried on
     // the actor command envelope by `Supervisor::invite_member` and threaded to
@@ -4231,17 +4232,37 @@ pub async fn propose_governance_action_inner(
         ));
     }
 
+    // ADR-049 Decision 7a: precheck, sign once, apply, all on this one
+    // `gov_ctx`. The engines require the signed vote's timestamp to equal
+    // `gov_ctx.now`, and the single-admin proposal id hashes it, so the
+    // context is never rebuilt after the sign await.
     let gov_ctx = build_governance_context(&*cell, &*deps.clock);
-    let (proposal, events) = {
-        let mut view = cell.class_c_view();
-        view.governance_class_c_mut().engine_mut().propose(
-            proposer_did,
-            action,
-            &gov_ctx,
-            signing_key,
-        )
-    }
-    .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+    let intent = cell
+        .governance
+        .engine
+        .precheck_propose(proposer_did, &action, &gov_ctx)
+        .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+    let proposer_vote = match intent {
+        ProposeIntent::SignApproval {
+            timestamp, digest, ..
+        } => {
+            debug_assert_eq!(timestamp, gov_ctx.now);
+            let signature = sign_bounded(signer, &digest).await?;
+            Some(signed_vote(
+                &VoteType::Approve,
+                proposer_did,
+                timestamp,
+                signature,
+            ))
+        }
+        ProposeIntent::NoSignature { .. } => None,
+    };
+    let (proposal, events) = cell
+        .class_c_view()
+        .governance_class_c_mut()
+        .engine_mut()
+        .propose_signed(proposer_did, action, &gov_ctx, proposer_vote)
+        .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
 
     cell.class_c_view()
         .governance_class_c_mut()
@@ -4492,7 +4513,7 @@ pub async fn propose_governance_action_checked(
     context_id: &str,
     proposer_did: &DID,
     action: GovernanceAction,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &CommandSigner,
     // The invitee's MLS `KeyPackage` for an `AddMember` auto-execute, carried on
     // the actor command envelope by `Supervisor::invite_member`. `None` for the
     // generic FFI governance path (which never invites a member here).
@@ -4504,7 +4525,7 @@ pub async fn propose_governance_action_checked(
         context_id,
         proposer_did,
         action,
-        signing_key,
+        signer,
         true,
         key_package,
     )
@@ -4534,7 +4555,7 @@ pub async fn vote_on_proposal_inner(
     proposal_id: &ProposalId,
     voter_did: &DID,
     approve: bool,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &CommandSigner,
     check_vote_capability: bool,
 ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
     // ADR-049 §9 Class-S cell seam: the pre-execute body reads through the
@@ -4568,17 +4589,39 @@ pub async fn vote_on_proposal_inner(
         )));
     }
 
+    // ADR-049 Decision 7a: precheck, sign once, apply, all on this one
+    // `gov_ctx` (the engines require `vote.timestamp == gov_ctx.now`). A
+    // precheck that resolves the proposal or needs no vote signs nothing and
+    // takes the same tail as a recorded vote.
     let gov_ctx = build_governance_context(&*cell, &*deps.clock);
-    let (status, events) = {
-        let mut view = cell.class_c_view();
-        let engine = view.governance_class_c_mut().engine_mut();
-        if approve {
-            engine.approve(proposal_id, voter_did, &gov_ctx, signing_key)
-        } else {
-            engine.reject(proposal_id, voter_did, &gov_ctx, signing_key)
+    let vote_type = if approve {
+        VoteType::Approve
+    } else {
+        VoteType::Reject
+    };
+    let intent = cell
+        .class_c_view()
+        .governance_class_c_mut()
+        .engine_mut()
+        .precheck_vote(proposal_id, voter_did, &vote_type, &gov_ctx)
+        .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+    let (status, events) = match intent {
+        VoteIntent::Sign { timestamp, digest } => {
+            debug_assert_eq!(timestamp, gov_ctx.now);
+            let signature = sign_bounded(signer, &digest).await?;
+            let vote = signed_vote(&vote_type, voter_did, timestamp, signature);
+            let mut view = cell.class_c_view();
+            let engine = view.governance_class_c_mut().engine_mut();
+            if approve {
+                engine.approve_signed(proposal_id, voter_did, &gov_ctx, vote)
+            } else {
+                engine.reject_signed(proposal_id, voter_did, &gov_ctx, vote)
+            }
+            .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
         }
-    }
-    .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+        VoteIntent::Resolved(status, events) => (status, events),
+        VoteIntent::NoOp(status) => (status, Vec::new()),
+    };
 
     let proposal_for_execution = if status == ProposalStatus::Approved {
         cell.governance.engine.get_proposal(proposal_id).cloned()
@@ -4689,7 +4732,7 @@ pub async fn approve_governance_proposal(
     context_id: &str,
     proposal_id: &ProposalId,
     voter_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &CommandSigner,
 ) -> Result<ProposalStatus, ContextError> {
     let (status, _events) = vote_on_proposal_inner(
         cell,
@@ -4698,7 +4741,7 @@ pub async fn approve_governance_proposal(
         proposal_id,
         voter_did,
         true,
-        signing_key,
+        signer,
         true,
     )
     .await?;
@@ -4719,7 +4762,7 @@ pub async fn reject_governance_proposal(
     context_id: &str,
     proposal_id: &ProposalId,
     voter_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &CommandSigner,
 ) -> Result<ProposalStatus, ContextError> {
     let (status, _events) = vote_on_proposal_inner(
         cell,
@@ -4728,7 +4771,7 @@ pub async fn reject_governance_proposal(
         proposal_id,
         voter_did,
         false,
-        signing_key,
+        signer,
         true,
     )
     .await?;
@@ -6729,6 +6772,23 @@ mod commit_broadcast_retry_tests {
         transport: Box<dyn ContextTransportProvider>,
         persistence: Box<dyn ContextPersistence>,
     ) -> ActorDeps {
+        build_deps_with(
+            transport,
+            persistence,
+            Arc::new(scp_clock::TestClock::new(1_700_000_000)),
+            Arc::new(|_, _| None),
+        )
+        .await
+    }
+
+    /// [`build_deps`] with a caller-held `TestClock` (so a test can advance
+    /// the clock `deps.clock` reads) and a caller-supplied key resolver.
+    async fn build_deps_with(
+        transport: Box<dyn ContextTransportProvider>,
+        persistence: Box<dyn ContextPersistence>,
+        clock: Arc<scp_clock::TestClock>,
+        key_resolver: scp_protocol::context::governance::KeyResolver,
+    ) -> ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
         use scp_platform::in_memory::InMemoryStorage;
 
@@ -6737,14 +6797,13 @@ mod commit_broadcast_retry_tests {
             Arc::new(scp_clock::SystemClock),
         ));
         let event_log: Box<dyn ContextEventLogProvider> = Box::new(TestEventLog);
-        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
                     InMemoryStorage::new(),
                 )),
             );
-        let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
+        let clock: Arc<dyn scp_clock::Clock> = clock;
         let supervisor = Supervisor::with_providers(
             crypto,
             transport,
@@ -7349,5 +7408,383 @@ mod commit_broadcast_retry_tests {
             cell.ttl.timer.deadline_unix_secs, None,
             "promotion kept: the armed absolute deadline is disarmed in memory"
         );
+    }
+
+    /// ADR-049 Decision 7a, governance handler sequence: the precheck runs
+    /// before any signature, the sign is awaited once, and the signed vote is
+    /// applied on the `gov_ctx` built before the sign.
+    mod signer_turn {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use scp_crypto::{ScpSigner, SigAlg, SignError};
+        use scp_did::DID;
+        use scp_protocol::context::governance::majority::MajorityVoteEngine;
+        use scp_protocol::context::governance::multisig::ThresholdEngine;
+        use scp_protocol::context::governance::{
+            GovernanceAction, GovernanceEngine, GovernanceEvent, KeyResolver, ProposalId,
+            ProposalStatus,
+        };
+        use scp_protocol::context::params::GovernanceModel;
+        use scp_protocol::context::roles::{CapabilityCeiling, ContextRoleState};
+        use scp_protocol::context::{Capability, ContextParams, ContextState};
+
+        use super::{
+            CountingOkPersistence, RecordingTransport, build_deps_with, ctx_hex, fresh_state,
+        };
+        use crate::context::ContextHandle;
+        use crate::context::actor::class_s::ClassSCell;
+        use crate::context::actor::deps::ActorDeps;
+        use crate::context::actor::signer::CommandSigner;
+
+        const A: &str = "did:dht:z6MkSignerTurnA";
+        const B: &str = "did:dht:z6MkSignerTurnB";
+        const C: &str = "did:dht:z6MkSignerTurnC";
+        const D: &str = "did:dht:z6MkSignerTurnD";
+        const OUTSIDER: &str = "did:dht:z6MkSignerTurnOutsider";
+        const WINDOW: u64 = 3_600;
+
+        fn did(s: &str) -> DID {
+            DID(s.to_owned())
+        }
+
+        fn key_for(voter: &str) -> ed25519_dalek::SigningKey {
+            let seed = match voter {
+                A => 0x11,
+                B => 0x12,
+                C => 0x13,
+                D => 0x14,
+                _ => 0x15,
+            };
+            ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+        }
+
+        fn resolver() -> KeyResolver {
+            Arc::new(|d: &DID, _| {
+                [A, B, C, D]
+                    .into_iter()
+                    .find(|v| *v == d.as_ref())
+                    .map(|v| key_for(v).verifying_key())
+            })
+        }
+
+        /// Signs with the voter's key, counts every sign, and advances the
+        /// clock by `advance` seconds inside the sign.
+        struct ProbeSigner {
+            key: ed25519_dalek::SigningKey,
+            signs: Arc<AtomicUsize>,
+            clock: Arc<scp_clock::TestClock>,
+            advance: u64,
+        }
+
+        impl ScpSigner for ProbeSigner {
+            fn algorithm(&self) -> SigAlg {
+                SigAlg::Ed25519
+            }
+
+            fn public_key(&self) -> Vec<u8> {
+                self.key.verifying_key().to_bytes().to_vec()
+            }
+
+            async fn sign(&self, digest: &[u8; 32]) -> Result<[u8; 64], SignError> {
+                use ed25519_dalek::Signer as _;
+                self.signs.fetch_add(1, Ordering::SeqCst);
+                if self.advance > 0 {
+                    self.clock.advance(self.advance);
+                }
+                Ok(self.key.sign(digest).to_bytes())
+            }
+        }
+
+        fn probe(
+            voter: &str,
+            clock: &Arc<scp_clock::TestClock>,
+            advance: u64,
+        ) -> (CommandSigner, Arc<AtomicUsize>) {
+            let signs = Arc::new(AtomicUsize::new(0));
+            let signer = CommandSigner::new(Arc::new(ProbeSigner {
+                key: key_for(voter),
+                signs: Arc::clone(&signs),
+                clock: Arc::clone(clock),
+                advance,
+            }));
+            (signer, signs)
+        }
+
+        fn local(voter: &str) -> CommandSigner {
+            CommandSigner::local_ed25519(key_for(voter))
+        }
+
+        fn ceiling() -> Vec<Capability> {
+            [
+                "messages:read",
+                "messages:write",
+                "role:assign",
+                "governance:propose",
+                "governance:vote",
+            ]
+            .into_iter()
+            .map(|c| Capability::new(c).expect("known capability"))
+            .collect()
+        }
+
+        /// An active context whose four members A-D are governed by `engine`,
+        /// with A the creator (the only role-state member, as `admin`).
+        fn cell_with(
+            governance: GovernanceModel,
+            engine: Box<dyn GovernanceEngine>,
+            clock: &scp_clock::TestClock,
+        ) -> ClassSCell {
+            let mut state = fresh_state();
+            state.handle = ContextHandle::new(
+                ctx_hex(),
+                ContextParams {
+                    ceiling: ceiling(),
+                    governance,
+                    ..ContextParams::default()
+                },
+            );
+            state
+                .handle
+                .transition_to(&ContextState::Active)
+                .expect("activate");
+            state.role_state = ContextRoleState::new(
+                ctx_hex(),
+                A,
+                CapabilityCeiling::new(ceiling()),
+                Vec::new(),
+                clock,
+            )
+            .expect("role state");
+            state
+                .membership
+                .add_member(did(A), "admin".to_owned(), vec![]);
+            for member in [B, C, D] {
+                state
+                    .membership
+                    .add_member(did(member), "member".to_owned(), vec![]);
+            }
+            state.governance.engine = engine;
+            ClassSCell::new(state)
+        }
+
+        fn change_role() -> GovernanceAction {
+            GovernanceAction::ChangeRole {
+                did: did(A),
+                new_role: "observer".to_owned(),
+            }
+        }
+
+        async fn deps_and_clock() -> (ActorDeps, Arc<scp_clock::TestClock>, Arc<AtomicUsize>) {
+            let clock = Arc::new(scp_clock::TestClock::new(1_700_000_000));
+            let persists = Arc::new(AtomicUsize::new(0));
+            let deps = build_deps_with(
+                Box::new(RecordingTransport {
+                    sends: Arc::new(AtomicUsize::new(0)),
+                    fail: false,
+                }),
+                Box::new(CountingOkPersistence {
+                    persists: Arc::clone(&persists),
+                    last_snapshot: Arc::new(std::sync::Mutex::new(None)),
+                }),
+                Arc::clone(&clock),
+                resolver(),
+            )
+            .await;
+            (deps, clock, persists)
+        }
+
+        fn majority_cell(clock: &scp_clock::TestClock) -> ClassSCell {
+            let voters = vec![did(A), did(B), did(C), did(D)];
+            let engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 2_500, resolver())
+                .expect("majority engine");
+            cell_with(
+                GovernanceModel::Majority {
+                    eligible_voters: voters,
+                },
+                Box::new(engine),
+                clock,
+            )
+        }
+
+        async fn propose(
+            cell: &mut ClassSCell,
+            deps: &ActorDeps,
+            proposer: &str,
+            signer: &CommandSigner,
+        ) -> ProposalId {
+            let (proposal, _, _) =
+                crate::context::governance_helpers::propose_governance_action_inner(
+                    cell,
+                    deps,
+                    &ctx_hex(),
+                    &did(proposer),
+                    change_role(),
+                    signer,
+                    false,
+                    None,
+                )
+                .await
+                .expect("propose");
+            proposal.proposal_id
+        }
+
+        async fn vote(
+            cell: &mut ClassSCell,
+            deps: &ActorDeps,
+            proposal_id: &ProposalId,
+            voter: &str,
+            signer: &CommandSigner,
+        ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), scp_protocol::context::ContextError>
+        {
+            crate::context::governance_helpers::vote_on_proposal_inner(
+                cell,
+                deps,
+                &ctx_hex(),
+                proposal_id,
+                &did(voter),
+                true,
+                signer,
+                false,
+            )
+            .await
+        }
+
+        /// A vote the engine precheck refuses never reaches the signer: an
+        /// ineligible voter and a duplicate vote each fail with the signer's
+        /// count at zero.
+        #[tokio::test]
+        async fn failed_governance_precheck_never_signs() {
+            let (deps, clock, _) = deps_and_clock().await;
+            let mut cell = majority_cell(&clock);
+            let pid = propose(&mut cell, &deps, A, &local(A)).await;
+            vote(&mut cell, &deps, &pid, B, &local(B))
+                .await
+                .expect("B's first vote");
+
+            let (outsider, outsider_signs) = probe(OUTSIDER, &clock, 0);
+            let err = vote(&mut cell, &deps, &pid, OUTSIDER, &outsider)
+                .await
+                .expect_err("an ineligible voter is refused");
+            assert!(
+                matches!(
+                    err,
+                    scp_protocol::context::ContextError::GovernanceFailed(_)
+                ),
+                "ineligible voter: {err:?}"
+            );
+            assert_eq!(outsider_signs.load(Ordering::SeqCst), 0);
+
+            let (again, again_signs) = probe(B, &clock, 0);
+            let err = vote(&mut cell, &deps, &pid, B, &again)
+                .await
+                .expect_err("a duplicate vote is refused");
+            assert!(
+                matches!(
+                    err,
+                    scp_protocol::context::ContextError::GovernanceFailed(_)
+                ),
+                "duplicate vote: {err:?}"
+            );
+            assert_eq!(again_signs.load(Ordering::SeqCst), 0);
+        }
+
+        /// A Majority vote cast after the voting deadline resolves the
+        /// proposal without a signature, and the approved action executes
+        /// through `vote_on_proposal_inner`'s tail.
+        #[tokio::test]
+        async fn majority_vote_past_deadline_executes_through_vote_on_proposal_inner() {
+            let (deps, clock, persists) = deps_and_clock().await;
+            let mut cell = majority_cell(&clock);
+            let pid = propose(&mut cell, &deps, A, &local(A)).await;
+            let (status, _) = vote(&mut cell, &deps, &pid, B, &local(B))
+                .await
+                .expect("B approves");
+            assert_eq!(
+                status,
+                ProposalStatus::Pending,
+                "one approval of four voters is not an absolute majority"
+            );
+
+            clock.advance(WINDOW + 1);
+            let persists_before = persists.load(Ordering::SeqCst);
+            let (c_signer, c_signs) = probe(C, &clock, 0);
+            let (status, events) = vote(&mut cell, &deps, &pid, C, &c_signer)
+                .await
+                .expect("C's vote past the deadline resolves the proposal");
+
+            assert_eq!(status, ProposalStatus::Approved);
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    GovernanceEvent::ProposalResolved {
+                        status: ProposalStatus::Approved,
+                        ..
+                    }
+                )),
+                "expected ProposalResolved(Approved): {events:?}"
+            );
+            assert_eq!(c_signs.load(Ordering::SeqCst), 0, "nothing is signed");
+            assert_eq!(
+                cell.membership.get(&did(A)).map(|m| m.role_name.as_str()),
+                Some("observer"),
+                "the role change is applied"
+            );
+            let executed = cell.class_c_view().receive_buffer_mut().drain();
+            assert!(
+                executed.iter().any(|e| matches!(
+                    e,
+                    scp_protocol::context::membership::ContextEvent::GovernanceActionExecuted {
+                        proposal_id,
+                        ..
+                    } if *proposal_id == pid
+                )),
+                "expected GovernanceActionExecuted for the proposal: {executed:?}"
+            );
+            assert!(
+                persists.load(Ordering::SeqCst) > persists_before,
+                "the vote path persists"
+            );
+        }
+
+        /// The signed vote carries the `gov_ctx.now` read before the sign. A
+        /// clock that advances during the sign does not move it, so the
+        /// engine's `vote.timestamp == gov_ctx.now` check passes.
+        #[tokio::test]
+        async fn vote_applies_when_clock_advances_during_sign() {
+            let (deps, clock, _) = deps_and_clock().await;
+            let signers = vec![did(A), did(B), did(C), did(D)];
+            let engine = ThresholdEngine::new(signers.clone(), 3, WINDOW, resolver())
+                .expect("threshold engine");
+            let mut cell = cell_with(
+                GovernanceModel::Threshold {
+                    signers,
+                    threshold: 3,
+                },
+                Box::new(engine),
+                &clock,
+            );
+            let pid = propose(&mut cell, &deps, A, &local(A)).await;
+
+            let pre_sign_now = scp_clock::Clock::now_secs(&*clock);
+            let (b_signer, b_signs) = probe(B, &clock, 5);
+            let (status, _) = vote(&mut cell, &deps, &pid, B, &b_signer)
+                .await
+                .expect("B's vote applies although the clock moved during the sign");
+            assert_eq!(status, ProposalStatus::Pending);
+            assert_eq!(b_signs.load(Ordering::SeqCst), 1);
+            let proposal = cell.governance.engine.get_proposal(&pid).expect("proposal");
+            let b_vote = proposal
+                .approvals
+                .iter()
+                .find(|v| v.voter_did == did(B))
+                .expect("B's vote is recorded");
+            assert_eq!(b_vote.timestamp, pre_sign_now);
+            assert_eq!(
+                scp_clock::Clock::now_secs(&*clock),
+                pre_sign_now + 5,
+                "the clock did advance inside the sign"
+            );
+        }
     }
 }

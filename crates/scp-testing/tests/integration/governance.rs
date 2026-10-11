@@ -16,9 +16,9 @@ use scp_core::context::governance::timeout::{
 use scp_core::context::governance::unanimity::UnanimityEngine;
 use scp_core::context::governance::{
     AccessScope, ConflictResolution, DeadlockJustification, GovernanceAction, GovernanceContext,
-    GovernanceEngine, GovernanceError, GovernanceEvent, GovernanceReconfigAction, KeyResolver,
-    ProposalStatus, PruningPolicy, SingleAdminEngine, VoteType, actions_conflict, sign_vote,
-    verify_vote,
+    GovernanceEngineRawKey as _, GovernanceError, GovernanceEvent, GovernanceReconfigAction,
+    KeyResolver, ProposalStatus, PruningPolicy, SingleAdminEngine, VoteType, actions_conflict,
+    sign_vote, verify_vote,
 };
 use scp_core::context::outlets::OutletSchema;
 use scp_core::context::outlets::interface::OutletInterface;

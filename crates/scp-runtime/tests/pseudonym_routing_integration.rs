@@ -222,12 +222,18 @@ async fn encrypted_send_fans_out_to_peer_registry_not_shared_rid() {
                 did: bob(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
     manager
-        .vote_on_proposal(ctx_id, &prop.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &prop.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
 
@@ -294,12 +300,18 @@ async fn multi_member_empty_registry_send_errors_and_rolls_back() {
                 did: bob(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
     manager
-        .vote_on_proposal(ctx_id, &prop.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &prop.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
 
@@ -417,12 +429,18 @@ async fn lone_member_encrypted_send_is_noop_no_charge_no_event() {
                 did: bob(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
     manager
-        .vote_on_proposal(ctx_id, &prop.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &prop.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     manager

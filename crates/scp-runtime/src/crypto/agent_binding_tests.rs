@@ -14,6 +14,7 @@
     clippy::type_complexity
 )]
 mod tests {
+    use scp_protocol::context::governance::GovernanceEngineRawKey as _;
     use std::collections::HashSet;
 
     use scp_did::{DidDocument, VerificationMethod};
@@ -325,7 +326,7 @@ mod tests {
         use scp_did::DID;
         use scp_protocol::context::governance::majority::MajorityVoteEngine;
         use scp_protocol::context::governance::{
-            GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError,
+            GovernanceAction, GovernanceContext, GovernanceError,
         };
 
         let admin_did = DID::from("did:dht:z6MkAdmin");

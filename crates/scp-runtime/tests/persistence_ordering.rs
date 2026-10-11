@@ -322,7 +322,12 @@ async fn suspend_bob_governance_vote(
         capabilities: vec![Capability::GovernanceVote],
     };
     supervisor
-        .propose_governance_action(ctx_id, &alice(), action, &sk)
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            action,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk.clone()),
+        )
         .await
         .map(|_| ())
 }

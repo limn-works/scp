@@ -680,6 +680,7 @@ fn handle_seed_broadcast_author(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use scp_protocol::context::governance::GovernanceEngineRawKey as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1856,7 +1857,7 @@ mod tests {
         action: scp_protocol::context::governance::GovernanceAction,
     ) -> scp_protocol::context::governance::ProposalId {
         use scp_protocol::context::governance::{
-            GovernanceContext, GovernanceEngine, KeyResolver, SingleAdminEngine,
+            GovernanceContext, KeyResolver, SingleAdminEngine,
         };
         let creator_vk = creator_key().verifying_key();
         let resolver: KeyResolver = Arc::new(move |did: &DID, kid: SigningKeyId| {
@@ -2107,8 +2108,7 @@ mod tests {
     #[tokio::test]
     async fn key_epoch_advance_failure_keeps_executed_proposal_marker() {
         use scp_protocol::context::governance::{
-            AccessScope, GovernanceAction, GovernanceContext, GovernanceEngine, KeyResolver,
-            SingleAdminEngine,
+            AccessScope, GovernanceAction, GovernanceContext, KeyResolver, SingleAdminEngine,
         };
 
         let (mut deps, _appends) = build_deps().await;
@@ -2552,7 +2552,7 @@ mod tests {
             &ctx_hex,
             &DID(LURKER_DID.to_owned()),
             migrate(Vec::new()),
-            &creator_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
             true,
             None,
         )
@@ -2569,7 +2569,7 @@ mod tests {
             &ctx_hex,
             &proposer,
             migrate(Vec::new()),
-            &creator_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
             false,
             None,
         )
@@ -2594,7 +2594,7 @@ mod tests {
             &ctx_hex,
             &proposer,
             migrate(vec![Capability::MessagesRead]),
-            &creator_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
             false,
             None,
         )
@@ -2660,7 +2660,7 @@ mod tests {
                 grace_period_secs: 60,
                 auto_invite: false,
             },
-            &creator_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
             false,
             None,
         )
@@ -2710,7 +2710,7 @@ mod tests {
             &ctx_hex,
             &DID(LURKER_DID.to_owned()),
             empty_migration(),
-            &creator_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
             false,
             None,
         )
@@ -2729,7 +2729,7 @@ mod tests {
             &ctx_hex,
             &DID(CREATOR_DID.to_owned()),
             empty_migration(),
-            &creator_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(creator_key().clone()),
             false,
             None,
         )

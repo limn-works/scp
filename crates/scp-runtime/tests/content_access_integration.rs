@@ -223,14 +223,25 @@ fn propose_and_approve_threshold<'a>(
         let sk_alice = signing_key_for_did(&alice());
 
         let outcome = manager
-            .propose_governance_action_checked(ctx_id, &alice(), action, &sk_alice)
+            .propose_governance_action_checked(
+                ctx_id,
+                &alice(),
+                action,
+                &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+            )
             .await
             .unwrap();
 
         if outcome.status == ProposalStatus::Pending {
             let sk_bob = signing_key_for_did(&bob());
             let (status, _events) = manager
-                .vote_on_proposal(ctx_id, &outcome.proposal.proposal_id, &bob(), true, &sk_bob)
+                .vote_on_proposal(
+                    ctx_id,
+                    &outcome.proposal.proposal_id,
+                    &bob(),
+                    true,
+                    &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -758,12 +769,18 @@ async fn tier3_governance_revoke_write_access_broadcast() {
                 did: author_did(),
                 role: "author".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
     let (status, _) = manager
-        .vote_on_proposal(ctx_id, &add_author.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &add_author.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);
@@ -1474,12 +1491,18 @@ async fn governance_tier_stacking_via_context_manager() {
                 did: dave(),
                 role: "member".into(),
             },
-            &sk_alice,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
         )
         .await
         .unwrap();
     let (status, _) = manager
-        .vote_on_proposal(ctx_id, &add_dave.proposal_id, &bob(), true, &sk_bob)
+        .vote_on_proposal(
+            ctx_id,
+            &add_dave.proposal_id,
+            &bob(),
+            true,
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_bob.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);

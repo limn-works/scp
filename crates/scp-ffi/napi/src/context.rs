@@ -1594,22 +1594,16 @@ pub(crate) async fn invite_member_on(
 
     // Resolve the inviter's retained custody + `#active` KeyHandle from the
     // identity registry (a non-custodied inviter hard-fails here with
-    // SCP-IDENT-1001, before any context lookup), then export the raw Ed25519
-    // signing key for the single runtime driver call. Private key material never
-    // lingers past the invite (ADR-006).
+    // SCP-IDENT-1001, before any context lookup), then build the custody signer
+    // the invite signs through (ADR-049 Decision 7a). The private key stays in
+    // custody.
     let (custody, active_handle) = crate::runtime::with_identity(bi, &creator_did, |entry| {
         Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })
     .map_err(NapiError::from)?;
-    let signing_key = custody
-        .export_ed25519_signing_key(&active_handle)
+    let signer = scp_ffi_common::signer::identity_command_signer(custody, active_handle)
         .await
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!("failed to export signing key for invite: {e}"),
-                code: codes::CTX_2040.to_owned(),
-            })
-        })?;
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
     let outcome = sup
         .invite_member(
@@ -1618,15 +1612,9 @@ pub(crate) async fn invite_member_on(
             DID(invitee_did),
             invitee_key_package,
             relay_urls,
-            &signing_key,
+            &signer,
         )
         .await;
-    // Defense-in-depth: wipe the raw signing key the moment the invite is
-    // produced, rather than letting it linger to end-of-scope. `SigningKey` is
-    // `ZeroizeOnDrop` (ed25519-dalek `zeroize` feature) but does NOT implement
-    // bare `Zeroize`, so the explicit early `drop` — not a `.zeroize()` call —
-    // is what triggers the wipe here (matching the PyO3 reference bridge).
-    drop(signing_key);
 
     let outcome = outcome.map_err(|e| {
         NapiError::from(typed_supervisor_failure(
@@ -3720,7 +3708,44 @@ pub(crate) async fn context_reconnect_on(
 // Bridge functions — governance proposal lifecycle (#621)
 // ---------------------------------------------------------------------------
 
-/// Resolves the raw Ed25519 signing key from the context handle's custody.
+/// Builds the `#active` [`CommandSigner`](scp_core::context::actor::CommandSigner)
+/// over the context handle's retained custody (ADR-049 Decision 7a).
+///
+/// The NAPI handle retains `in_memory_custody` and `signing_key` (`KeyHandle`)
+/// from the creating identity. The private key stays in custody.
+///
+/// # Errors
+///
+/// - `SCP-CTX-2040` when the handle carries no custody or no signing key.
+/// - The custody's own code through `ScpNapiError::from(PlatformError)` when
+///   the signer cannot be built; a destroyed key is `SCP-CRYPTO-4006`.
+async fn resolve_napi_signer(
+    handle: &NapiContextHandle,
+) -> napi::Result<scp_core::context::actor::CommandSigner> {
+    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+        NapiError::from(ScpNapiError::Context {
+            message: "no custody provider on context handle — governance lifecycle \
+                      requires an identity created with custody"
+                .to_owned(),
+            code: codes::CTX_2040.to_owned(),
+        })
+    })?;
+    let key_handle = handle.signing_key.ok_or_else(|| {
+        NapiError::from(ScpNapiError::Context {
+            message: "no signing key on context handle — governance lifecycle \
+                      requires an identity with an active signing key"
+                .to_owned(),
+            code: codes::CTX_2040.to_owned(),
+        })
+    })?;
+    scp_ffi_common::signer::identity_command_signer(Arc::clone(custody), key_handle)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))
+}
+
+/// Resolves the raw Ed25519 signing key from the context handle's custody,
+/// for the runtime paths that still take `&SigningKey`. Governance signs
+/// through [`resolve_napi_signer`].
 ///
 /// The NAPI handle retains `in_memory_custody` and `signing_key` (`KeyHandle`)
 /// from the creating identity. This function exports the raw key bytes.
@@ -4005,11 +4030,9 @@ pub(crate) async fn context_governance_propose_on(
         })
     })?;
 
-    use scp_core::context::actor::commands::{
-        GovernanceCommand, ProposeGovernanceActionPayload, SigningKeyBytes,
-    };
+    use scp_core::context::actor::commands::{GovernanceCommand, ProposeGovernanceActionPayload};
 
-    let signing_key = resolve_napi_signing_key(handle).await?;
+    let signer = resolve_napi_signer(handle).await?;
 
     let did = DID(proposer_did);
     let context_id = handle.context_id.clone();
@@ -4025,7 +4048,7 @@ pub(crate) async fn context_governance_propose_on(
             context_id: context_id.clone(),
             proposer_did: did,
             action,
-            signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+            signer,
             // The generic FFI governance path never carries an invitee
             // KeyPackage (that rides only Supervisor::invite_member).
             key_package: None,
@@ -4047,10 +4070,12 @@ pub(crate) async fn context_governance_propose_on(
             })
         })?
         .map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!("governance proposal failed: {e}"),
-                code: codes::CTX_2041.to_owned(),
-            })
+            // A custody refusal or sign timeout keeps its custody code.
+            NapiError::from(typed_supervisor_failure(
+                "governance proposal",
+                codes::CTX_2041,
+                &e,
+            ))
         })?;
 
     Ok(
@@ -4072,11 +4097,9 @@ pub(crate) async fn context_governance_approve_on(
     crate::napi_check_handle!(&bi.core, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
 
-    use scp_core::context::actor::commands::{
-        GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
-    };
+    use scp_core::context::actor::commands::{GovernanceCommand, VoteOnProposalPayload};
 
-    let signing_key = resolve_napi_signing_key(handle).await?;
+    let signer = resolve_napi_signer(handle).await?;
 
     let did = DID(voter_did);
     let context_id = handle.context_id.clone();
@@ -4089,7 +4112,7 @@ pub(crate) async fn context_governance_approve_on(
             context_id: context_id.clone(),
             proposal_id,
             voter_did: did,
-            signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+            signer,
         }),
         reply: tx,
     };
@@ -4108,10 +4131,12 @@ pub(crate) async fn context_governance_approve_on(
             })
         })?
         .map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!("governance approval failed: {e}"),
-                code: codes::CTX_2042.to_owned(),
-            })
+            // A custody refusal or sign timeout keeps its custody code.
+            NapiError::from(typed_supervisor_failure(
+                "governance approval",
+                codes::CTX_2042,
+                &e,
+            ))
         })?;
 
     Ok(scp_ffi_common::governance_result::proposal_status_response(
@@ -4129,10 +4154,8 @@ pub(crate) async fn context_governance_reject_on(
     crate::napi_check_handle!(&bi.core, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
 
-    use scp_core::context::actor::commands::{
-        GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
-    };
-    let signing_key = resolve_napi_signing_key(handle).await?;
+    use scp_core::context::actor::commands::{GovernanceCommand, VoteOnProposalPayload};
+    let signer = resolve_napi_signer(handle).await?;
 
     let did = DID(voter_did);
     let sup = crate::runtime::supervisor(bi)?;
@@ -4145,7 +4168,7 @@ pub(crate) async fn context_governance_reject_on(
             context_id: context_id.clone(),
             proposal_id,
             voter_did: did,
-            signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+            signer,
         }),
         reply: tx,
     };
@@ -4164,10 +4187,12 @@ pub(crate) async fn context_governance_reject_on(
             })
         })?
         .map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!("governance rejection failed: {e}"),
-                code: codes::CTX_2043.to_owned(),
-            })
+            // A custody refusal or sign timeout keeps its custody code.
+            NapiError::from(typed_supervisor_failure(
+                "governance rejection",
+                codes::CTX_2043,
+                &e,
+            ))
         })?;
 
     Ok(scp_ffi_common::governance_result::proposal_status_response(
@@ -9223,6 +9248,53 @@ mod tests {
         assert!(
             msg.contains(codes::CRYPTO_4006),
             "expected CRYPTO_4006 for a destroyed export key, got: {msg}"
+        );
+    }
+
+    /// A proposer whose `#active` key custody no longer holds fails
+    /// `context_governance_propose` with `SCP-CRYPTO-4006` when the signer is
+    /// built (ADR-049 Decision 7a), before any proposal is recorded.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn governance_propose_with_a_destroyed_signing_key_is_crypto_4006() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read", "messages:write", "governance:propose", "member:ban"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &identity, params_json)
+            .await
+            .expect("context_create should succeed");
+        let custody = handle
+            .in_memory_custody
+            .as_ref()
+            .expect("an in-memory identity retains its custody on the handle");
+        let key = handle
+            .signing_key
+            .expect("the handle retains the signing key");
+        scp_platform::traits::KeyCustody::destroy_key(custody.as_ref(), &key)
+            .await
+            .expect("destroy_key should succeed");
+
+        let owner = identity.inner.did.clone();
+        let action_json = serde_json::json!({
+            "SuspendCapability": { "did": owner, "capabilities": ["MessagesWrite"] }
+        })
+        .to_string();
+        let err = super::context_governance_propose_on(&bi, &handle, action_json, owner)
+            .await
+            .expect_err("a destroyed signing key cannot propose");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::CRYPTO_4006),
+            "expected CRYPTO_4006 for a destroyed proposer key, got: {msg}"
         );
     }
 
