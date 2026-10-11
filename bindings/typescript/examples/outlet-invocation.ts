@@ -11,7 +11,7 @@
  * `Relay.startInMemory()` factory were removed — use
  * `scp.relayStartInMemory()` and `scp.ucanMint(...)`.
  *
- * Run: bun run examples/outlet-invocation.ts
+ * Run it as the "Running the examples" section of ../README.md describes.
  */
 
 import { SCP, type OutletDefinition, type UcanToken, defineOutletDefinition } from "../src/index";

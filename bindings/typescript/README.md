@@ -76,7 +76,9 @@ See [`examples/`](./examples/) for runnable scripts:
 | `multi-agent.ts` | Coordinate multiple agents in a shared context |
 | `node-demo.ts` | End-to-end NAPI demo: identity, context, messaging, membership |
 
-### Quick Start (Node.js/Bun)
+### Running the examples
+
+Each example creates `"encrypted_file"` identities, so it needs `SCP_KEY_PASSPHRASE` set and writes their keys to `$HOME/.scp/keys.bin`. The commands below point `HOME` at a scratch directory so the run leaves no key file in your home directory.
 
 ```bash
 # Build the native addon
@@ -88,8 +90,8 @@ mkdir -p "$PKG_DIR"
 cp ../../target/release/libscp_ffi_napi.dylib "$PKG_DIR/index.node"
 echo '{"name":"@limn-works/scp-ts-napi-darwin-arm64","version":"0.1.0","main":"index.node"}' > "$PKG_DIR/package.json"
 
-# Run the demo
-bun run examples/node-demo.ts
+# Run an example (replace node-demo.ts with any file in examples/)
+HOME=$(mktemp -d) SCP_KEY_PASSPHRASE=example-passphrase bun run examples/node-demo.ts
 ```
 
 ## Error Handling

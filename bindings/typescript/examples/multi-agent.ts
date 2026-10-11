@@ -6,7 +6,7 @@
  * explicit `SCP` instance. The free-function `mintUcan` was removed —
  * use `scp.ucanMint(...)`.
  *
- * Run: bun run examples/multi-agent.ts
+ * Run it as the "Running the examples" section of ../README.md describes.
  */
 
 import { SCP, type Context, type Identity } from "../src/index";

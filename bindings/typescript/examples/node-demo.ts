@@ -10,18 +10,7 @@
  * `Context.create`) were removed — use `scp.identityCreate`,
  * `scp.contextCreate`, and the other `scp.*` methods directly.
  *
- * Prerequisites:
- *   1. Build the native addon:
- *      cargo build -p scp-ffi-napi --release --features testing
- *
- *   2. Wire it into node_modules (macOS arm64 — adjust for your platform):
- *      PKG_DIR="node_modules/@limn-works/scp-ts-napi-darwin-arm64"
- *      mkdir -p "$PKG_DIR"
- *      cp ../../target/release/libscp_ffi_napi.dylib "$PKG_DIR/index.node"
- *      echo '{"name":"@limn-works/scp-ts-napi-darwin-arm64","version":"0.1.0","main":"index.node"}' > "$PKG_DIR/package.json"
- *
- *   3. Run:
- *      bun run examples/node-demo.ts
+ * Run it as the "Running the examples" section of ../README.md describes.
  */
 
 import { SCP } from "../src/index";
@@ -45,7 +34,7 @@ async function main(): Promise<void> {
   const scp = new SCP({ storage: { type: "in_memory" } });
   try {
     // ---- Step 1: Create identities ----
-    step(1, "Create identities (in-memory custody)");
+    step(1, "Create identities (encrypted-file custody)");
 
     const alice = await scp.identityCreate("encrypted_file");
     console.log(`Alice DID: ${alice.did}`);

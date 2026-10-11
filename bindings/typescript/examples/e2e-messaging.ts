@@ -10,7 +10,7 @@
  * `SCP` instance. The static `Relay.startInMemory()` factory was
  * removed — construct via `scp.relayStartInMemory()`.
  *
- * Run: bun run examples/e2e-messaging.ts
+ * Run it as the "Running the examples" section of ../README.md describes.
  */
 
 import { SCP } from "../src/index";

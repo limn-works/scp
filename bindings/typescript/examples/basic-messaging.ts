@@ -6,6 +6,8 @@
  * instance. Construct one at process start, invoke bridge operations as
  * `scp.<method>(...)`, and call `scp.shutdown(...)` to drain in-flight
  * work on exit.
+ *
+ * Run it as the "Running the examples" section of ../README.md describes.
  */
 
 import { SCP } from "../src/index";

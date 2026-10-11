@@ -10,7 +10,7 @@
  * static factories were removed — construct a relay via
  * `scp.relayStartInMemory()`.
  *
- * Run: bun run examples/broadcast.ts
+ * Run it as the "Running the examples" section of ../README.md describes.
  */
 
 import { SCP } from "../src/index";
