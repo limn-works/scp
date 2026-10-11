@@ -181,6 +181,22 @@ All remaining provider traits (`ContextTransportProvider`, `ContextPersistence`,
 
 This enables `current_thread` tokio runtimes (test default, FFI embedders), which the prior discipline-enforced `multi_thread` requirement broke.
 
+### 7a. Signing goes through an erased signer carried in commands (ADR-063, the curve slice's build constraint)
+
+The actor holds no key material. A command that needs a signature carries a `CommandSigner`, an `Arc<dyn scp_crypto::DynScpSigner>`. Production signers are `scp_platform::CustodySigner<C>`, which owns `Arc<C: KeyCustody>` and a `KeyHandle` and caches the public key at construction. `DynScpSigner` is the object-safe twin of `ScpSigner`, an erased async provider in the same sense as the `#[async_trait]` traits above; construction.md's "never `dyn`" rule governs config-object providers and does not apply. scp-crypto stays a wasm-safe leaf, so `DynScpSigner` returns a hand-written `Pin<Box<dyn Future + Send>>`.
+
+**One signing pattern.** Every runtime command that signs, broadcast publish included, follows this pattern. There is no reserve, sign-outside-the-actor, apply path. A handler awaits custody only through `sign_bounded`, which wraps `tokio::time::timeout(30 s, …)`. The handler runs every sync precheck first, signs only when they pass, and applies the signed result in the same actor turn, so a failed precheck never prompts custody and no other command interleaves between precheck and apply. Any context value the precheck stamps into the signed bytes (the governance `now`) is computed once and reused by the apply. A handler that reserves a sequence before it signs (broadcast publish) rolls the reservation back inside the same turn when the sign fails, so a failed sign never burns a sequence.
+
+**Custody errors.** A sign that exceeds the budget is `ContextError::Custody` with kind `TimedOut` (SCP-CRYPTO-4061), not a transport timeout: an unanswered biometric prompt is not a retryable network fault. A custody refusal keeps its `CustodyFailure` kind and code: SCP-CRYPTO-4006 (key not found), SCP-IDENT-1055 (pseudonym rejected), SCP-STORAGE-8005 (directory lock held), SCP-STORAGE-8006 (store closed), or SCP-CRYPTO-4060 (any other custody failure).
+
+**Stall cost, accepted.** While custody waits (a biometric prompt, a Keychain unlock, a host callback), the signing context's mailbox stalls: its inbound processing, its TTL timers and every other caller of that context wait. The stall is bounded by the custody budget, since at 30 s the sign fails with 4061 and the turn ends. It is limited to the signer's own instance: the one context actor whose turn is signing. Other contexts' actors, and other bridge instances, keep running. `MAX_CONSECUTIVE_INBOX` does not shorten it, because the stall is inside one turn. This cost is accepted in exchange for the one-turn guarantee and a single signing pattern.
+
+**Host threads.** A bridge never blocks a host-runtime thread on a context actor reply while holding that runtime's lock, because the actor may be waiting on that host for a custody callback. PyO3 waits only through `block_on_released`, which releases the GIL. napi exposes every production actor wait as `async`, because a `ThreadsafeFunction` callback runs on the JS thread. UniFFI callbacks run on the calling tokio thread, so UniFFI holds no host lock. `scripts/check-bridge-block-on.py` enforces this. The helper's use of `block_in_place` on a multi-thread ambient runtime stays under the bridges' existing exemption from Decision 7's removal of `block_in_place`; actor-scope code remains under `scripts/check-block-in-place.py`.
+
+scp-protocol stays sync and signs nothing on a production path. It exposes preimage and digest functions and sync constructors that take a `[u8; 64]`. Its raw-key `sign*` helpers compile only under `cfg(any(test, feature = "testing"))`. An engine that accepts a caller-signed vote checks the vote's voter, vote type and timestamp against the call, and that a signature is present exactly when the engine asked for one, before it verifies the signature.
+
+Bridges build the signer from the identity's custody handle. No bridge, custody adapter or host SDK exports private key bytes.
+
 ### 8. `SequenceReservation` RAII
 
 Sequence numbers are reserved by a `SequenceReservation` guard. Rollback fires on `Drop` unless `commit()` is called. Combined with actor-owned state (respawn loads a snapshot that predates any in-flight reservation), sequence monotonicity holds across panics, cancellations, and early `?` returns.

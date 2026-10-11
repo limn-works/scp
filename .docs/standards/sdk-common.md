@@ -76,7 +76,7 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | Code | Layer | Condition |
 |------|-------|-----------|
 | `SCP-SAGA-13000` | protocol | Canonical preimage construction exceeded the length-prefix ceiling |
-| `SCP-SAGA-13001` | protocol | P-256 saga signature failed verification |
+| `SCP-SAGA-13001` | protocol | Saga signature failed verification |
 | `SCP-SAGA-13002` | protocol | Malformed P-256 verifying key |
 | `SCP-SAGA-13010` | handler | Caller lacks `outlet:interface` capability (outbound) |
 | `SCP-SAGA-13011` | handler | Caller not in outbound `allowed_callers` |
