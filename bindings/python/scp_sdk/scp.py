@@ -41,22 +41,26 @@ Example usage::
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import math
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from types import TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
     Literal,
+    ParamSpec,
     Protocol,
     TypeAlias,
     TypedDict,
+    TypeVar,
     runtime_checkable,
 )
 
 from scp_sdk._extension import EXTENSION_LOAD_FAILED_CODE, native_module
-from scp_sdk.errors import ScpError, ValidationError, _coded_bridge_error
+from scp_sdk.errors import IdentityError, ScpError, ValidationError, _coded_bridge_error
 from scp_sdk.governance import GovernanceActionResult, check_proposal_response
 from scp_sdk.types import CustodyType, CustomRole, MemberRole
 
@@ -481,6 +485,68 @@ def _to_invite_outcome(raw: Any) -> InviteMemberOutcome:
     )
 
 
+#: The custody argument an identity-creating method takes: a
+#: :class:`~scp_sdk.types.CustodyType` member or the string it carries, which
+#: are exactly the custody strings the PyO3 bridge builds a key store from.
+CustodyArg: TypeAlias = "CustodyType | Literal['file', 'in_memory']"
+
+#: Code raised when an identity-creating method receives no custody argument.
+CUSTODY_REQUIRED_CODE = "SCP-IDENT-1116"
+
+
+def _custody_required_error(method: str) -> IdentityError:
+    return IdentityError(
+        f"{method}() requires a custody argument and this SDK names no default key "
+        "store: pass CustodyType.FILE (an encrypted key file) or CustodyType.IN_MEMORY "
+        "(a build carrying the bridge's testing feature only), or call "
+        "identity_create_with_custody() with a KeyCustodyProvider for any other key store",
+        CUSTODY_REQUIRED_CODE,
+    )
+
+
+def _custody_string(method: str, custody: object) -> str:
+    """Return the custody string the bridge receives for ``custody``.
+
+    Raises:
+        ValidationError: ``SCP-VALID-7005`` when ``custody`` is neither a
+            :class:`CustodyType` nor a string.
+    """
+    if isinstance(custody, CustodyType):
+        return custody.value
+    if isinstance(custody, str):
+        return custody
+    raise ValidationError(
+        f"{method}() custody must be a CustodyType or one of 'file', 'in_memory'; "
+        f"got {type(custody).__name__}",
+        "SCP-VALID-7005",
+    )
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _requires_custody(fn: Callable[_P, Awaitable[_R]]) -> Callable[_P, Awaitable[_R]]:
+    """Raise ``SCP-IDENT-1116`` when the caller passes no custody, before ``fn`` runs.
+
+    ``fn`` is a method whose second parameter names the custody. The wrapper
+    keeps ``fn``'s signature for a type checker, which rejects the omission;
+    an untyped caller that omits the custody or passes ``None`` reaches the
+    wrapper and gets ``SCP-IDENT-1116`` instead of Python's ``TypeError``,
+    before any bridge call (SCP-294).
+    """
+    custody_param = fn.__code__.co_varnames[1]
+
+    @functools.wraps(fn)
+    async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        custody = args[1] if len(args) > 1 else kwargs.get(custody_param)
+        if custody is None:
+            raise _custody_required_error(fn.__name__)
+        return await fn(*args, **kwargs)
+
+    return wrapper
+
+
 class SCP:
     """Caller-owned SCP instance — the sole public SDK entry point.
 
@@ -828,27 +894,46 @@ class SCP:
             )
         return await asyncio.to_thread(self._native.identity_attest_device, identity_did)
 
-    async def identity_create(self, custody: CustodyType | str = CustodyType.FILE) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_create`` (returns :class:`Identity`)."""
-        from scp_sdk.identity import Identity
+    @_requires_custody
+    async def identity_create(self, custody: CustodyArg) -> Any:
+        """Create a DID whose keys live in the key store ``custody`` names.
 
-        custody_str = custody.value if isinstance(custody, CustodyType) else custody
-        raw = await asyncio.to_thread(self._native.identity_create, custody_str)
-        return Identity(raw)
+        Delegate to ``_scp_core.SCP.identity_create`` and return an
+        :class:`Identity`. ``custody`` is required and carries no default:
+        which key store holds a private key decides who can reach that key,
+        so this SDK picks none for the caller. Read
+        :class:`~scp_sdk.types.CustodyType` for what each value reaches.
 
-    async def identity_create_with_agent_key(
-        self, custody: CustodyType | str = CustodyType.FILE
-    ) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_create_with_agent_key``.
-
-        Returns an :class:`Identity` wrapper.
+        :raises IdentityError: ``SCP-IDENT-1116`` when ``custody`` is absent
+            or ``None``, before any bridge call.
+        :raises ValidationError: ``SCP-VALID-7005`` when ``custody`` is not a
+            :class:`~scp_sdk.types.CustodyType` or string.
         """
         from scp_sdk.identity import Identity
 
-        custody_str = custody.value if isinstance(custody, CustodyType) else custody
+        custody_str = _custody_string("identity_create", custody)
+        raw = await asyncio.to_thread(self._native.identity_create, custody_str)
+        return Identity(raw)
+
+    @_requires_custody
+    async def identity_create_with_agent_key(self, custody: CustodyArg) -> Any:
+        """Delegate to ``_scp_core.SCP.identity_create_with_agent_key``.
+
+        Returns an :class:`Identity` wrapper. ``custody`` is required and
+        carries no default, as for :meth:`identity_create`.
+
+        :raises IdentityError: ``SCP-IDENT-1116`` when ``custody`` is absent
+            or ``None``, before any bridge call.
+        :raises ValidationError: ``SCP-VALID-7005`` when ``custody`` is not a
+            :class:`~scp_sdk.types.CustodyType` or string.
+        """
+        from scp_sdk.identity import Identity
+
+        custody_str = _custody_string("identity_create_with_agent_key", custody)
         raw = await asyncio.to_thread(self._native.identity_create_with_agent_key, custody_str)
         return Identity(raw)
 
+    @_requires_custody
     async def identity_create_with_custody(self, provider: KeyCustodyProvider) -> Any:
         """Create a DID whose key material lives in a caller-provided custody.
 
@@ -864,9 +949,10 @@ class SCP:
 
         :param provider: A :class:`KeyCustodyProvider` implementation.
         :returns: An :class:`Identity` wrapper.
-        :raises ScpError: if the provider is missing required methods
-            (``ValidationError``) or key/DID creation fails inside the
-            provider (``IdentityError``).
+        :raises ScpError: ``IdentityError`` carrying ``SCP-IDENT-1116`` when
+            ``provider`` is absent or ``None``, before any bridge call;
+            ``ValidationError`` if the provider is missing required methods;
+            ``IdentityError`` if key/DID creation fails inside the provider.
         """
         from scp_sdk.identity import Identity
 

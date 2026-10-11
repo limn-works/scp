@@ -3305,7 +3305,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install pytest pytest-asyncio
+          pip install pytest pytest-asyncio mypy==1.20.2
       # THE DEFECT THIS CLOSES: every real-FFI test module under bindings/python/tests
       # skips itself when the extension is absent, and so does the `scp` fixture in
       # bindings/python/tests/conftest.py, which skips a test only when `SCP(...)`

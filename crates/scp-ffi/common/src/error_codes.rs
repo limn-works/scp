@@ -372,6 +372,21 @@ pub const IDENT_1061: &str = "SCP-IDENT-1061";
 /// unchecked is an external resource rather than an issuer's document.
 pub const IDENT_1062: &str = "SCP-IDENT-1062";
 
+/// An identity-creating SDK entry received no custody argument (FAIL CLOSED).
+///
+/// Raised by the Python and TypeScript SDK wrappers, never by a bridge, before
+/// any bridge call: `identity_create` / `identityCreate`,
+/// `identity_create_with_agent_key` / `identityCreateWithAgentKey`, and
+/// `identity_create_with_custody` / `identityCreateWithCustody` raise it when an
+/// untyped caller passes nothing, `None`, `null`, or `undefined` where the
+/// custody belongs. Which key store holds an identity's private key decides who
+/// can reach that key, so no SDK picks one for the caller (SCP-294). Typed
+/// callers meet the omission as a type-checker error instead.
+///
+/// Sits in the `SCP-IDENT-1100`..`1199` sub-block (`sdk-common.md` §Error code
+/// format), at the number the key-event-log workstream allocated for it.
+pub const IDENT_1116: &str = "SCP-IDENT-1116";
+
 // -------------------------------------------------------------------------
 // Context (SCP-CTX- 2000--2999)
 // -------------------------------------------------------------------------

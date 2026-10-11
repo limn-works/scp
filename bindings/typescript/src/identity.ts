@@ -66,8 +66,22 @@ export interface IdentityLinkAttestation {
 // CustodyType
 // ---------------------------------------------------------------------------
 
-/** Supported custody methods for identity key management. */
-export type CustodyType = "platform" | "in_memory" | "software";
+/**
+ * The custody string an identity-creating {@link SCP} method sends to the
+ * NAPI bridge (spec §3.2, key custody).
+ *
+ * The union is exactly the custody strings the NAPI bridge builds a key store
+ * from: `"in_memory"`, which an addon built with the bridge's `testing`
+ * feature builds and a shipped addon answers with `SCP-IDENT-1008`. No custody
+ * string reaches Apple Keychain or Android Keystore; pass a
+ * `KeyCustodyProvider` to {@link SCP.identityCreateWithCustody} for any other
+ * key store.
+ *
+ * No SDK method defaults custody: the caller names the key store, and a call
+ * that passes none rejects with an `IdentityError` carrying `SCP-IDENT-1116`
+ * before any bridge call (SCP-294).
+ */
+export type CustodyType = "in_memory";
 
 // ---------------------------------------------------------------------------
 // Identity

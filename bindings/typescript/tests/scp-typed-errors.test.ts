@@ -133,20 +133,24 @@ describe("SCP typed-error mapping", () => {
     expect((thrown as OutletError).code).toBe("SCP-OUTLET-6002");
   });
 
-  it("maps a sync identity error from a sync method (identityRemove)", () => {
+  it("maps a sync identity error from a sync method (identityRemoveLinkAttestation)", () => {
+    // `SCP-IDENT-1001` is the registry miss the NAPI bridge's
+    // `with_identity_mut` raises for a DID this instance never created.
     const { scp, native } = mountMockScp();
-    native.__stub("identityRemove", () => {
-      throw rawBridgeError("[SCP-IDENT-1003] identity error: unknown DID");
+    native.__stub("identityRemoveLinkAttestation", () => {
+      throw rawBridgeError(
+        "[SCP-IDENT-1001] identity error: identity 'did:dht:z6MkUnknown' is not registered on this bridge instance",
+      );
     });
 
     let thrown: unknown;
     try {
-      scp.identityRemove("did:dht:z6MkUnknown");
+      scp.identityRemoveLinkAttestation("did:dht:z6MkUnknown", "att-1");
     } catch (err) {
       thrown = err;
     }
     expect(thrown).toBeInstanceOf(IdentityError);
-    expect((thrown as IdentityError).code).toBe("SCP-IDENT-1003");
+    expect((thrown as IdentityError).code).toBe("SCP-IDENT-1001");
   });
 
   it("maps a sync permission error from a sync method (identityExecuteRecovery)", () => {

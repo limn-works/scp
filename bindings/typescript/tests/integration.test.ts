@@ -357,17 +357,6 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
     expect(call?.args).toEqual(["in_memory"]);
   });
 
-  it("identityCreate defaults custody to 'in_memory' when omitted", async () => {
-    const { scp, native } = mountMockScp();
-    native.__stub("identityCreate", () =>
-      Promise.resolve({ did: "did:dht:z6MkDefault", custodyType: "in_memory" }),
-    );
-
-    await scp.identityCreate();
-
-    expect(native.__lastCall("identityCreate")?.args).toEqual(["in_memory"]);
-  });
-
   it("contextSend forwards handle, did, payload array, and null spending ucan by default", async () => {
     const { scp, native } = mountMockScp();
     native.__stub("contextSend", () => Promise.resolve(undefined));
