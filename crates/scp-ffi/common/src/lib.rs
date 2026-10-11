@@ -117,6 +117,12 @@ pub mod custody_parse;
 #[cfg(feature = "custody")]
 pub mod callback_custody;
 
+// Resolves `$HOME/.scp/keys.bin` and `SCP_KEY_PASSPHRASE` for `"file"`
+// custody, rejecting an unset, empty or relative HOME and an empty passphrase,
+// then opens the key file. See ADR-006 and spec §17.8.
+#[cfg(feature = "custody")]
+pub mod custody_file;
+
 // Shared attestation construction pipeline for all FFI bridges.
 // Requires scp-core + scp-identity (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
@@ -188,6 +194,21 @@ pub mod saga_errors;
 // echo cannot drift. Requires scp-core (behind `resolvers`).
 #[cfg(feature = "resolvers")]
 pub mod broadcast;
+
+// Wire names for protocol enums that bridges hand an SDK (signaling message
+// type, provenance source type, memory scope), so no bridge sends a Rust
+// `Debug` rendering across its FFI boundary.
+pub mod wire_name;
+
+// One string rendering per `ContextEvent`, shared by every bridge's event
+// drain and PyO3's receive pipeline in place of `Debug` dumps.
+pub mod context_event;
+
+// Wire names for governance outcomes, shared by PyO3, napi-rs, and UniFFI so
+// no bridge sends a Rust `Debug` dump across its FFI boundary. Requires
+// scp-core (behind `resolvers`).
+#[cfg(feature = "resolvers")]
+pub mod governance_result;
 
 // Shared signed-context-export verifying-key resolver (§23.16.8, ADR-050).
 // Local-custody-first then DID-resolver (#active/#agent) fallback. Closure-based

@@ -1295,6 +1295,23 @@ jobs:
       - name: Real check
         run: bash scripts/check-no-panic-abort.sh
 
+  noop-spelling:
+    needs: check-draft
+    if: github.event_name != 'push'
+    name: Hygiene / canonical NoOp identifier prefix
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      # Self-test MUST run first: it proves the detector flags the planted
+      # non-canonical spellings and passes the benign controls listed in the
+      # script header, before the real check runs on the tree. This gate is naming hygiene so
+      # name-based searches stay honest; it is NOT the nullifier check.
+      - name: Self-test gate
+        run: bash scripts/check-noop-spelling.sh --self-test
+      - name: Real check
+        run: bash scripts/check-noop-spelling.sh
+
   saga-gating-granularity:
     needs: check-draft
     if: github.event_name != 'push'
@@ -4327,10 +4344,13 @@ jobs:
       # This step names no channel. Run from `fuzz/`, `cargo check` resolves the nightly
       # `fuzz/rust-toolchain.toml` names, which the toolchain step above installed — the
       # same invocation `fuzz/README.md` documents. That file records why the channel is
-      # a dated nightly.
+      # a dated nightly. `--locked` fails the step when `fuzz/Cargo.lock` no longer
+      # matches what cargo resolves, as it does after a workspace crate gains a
+      # dependency and the change updates only the root `Cargo.lock`; without it, cargo
+      # rewrites the lockfile in the runner and passes.
       - name: Check fuzz crate compiles
         working-directory: fuzz
-        run: cargo check
+        run: cargo check --locked
       # `cargo check` never compiles `#[cfg(test)]`, so the fuzz crate's one
       # library test — which asserts that Arbitrary MessageType discriminants
       # still match a production enum — ran in no job. This step selects that
@@ -4827,6 +4847,7 @@ jobs:
       - block-in-place
       - no-panic-abort
       - handler-no-panic
+      - noop-spelling
       - saga-gating-granularity
       - doc-citations
       - doc-includes

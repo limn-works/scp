@@ -4,7 +4,13 @@
 //! These tests exercise the binary's `SCP_RELAY_STORAGE_BACKEND` env-var
 //! driven backend selection, verifying that:
 //!
-//! - `SQLite` is the default and persists across restarts (AC 1, 2, 3, 8)
+//! - an unset or empty `SCP_RELAY_STORAGE_BACKEND` produces a non-zero exit
+//!   naming that variable and SCP-CAPSEL-8000, because persistence spec §17.7
+//!   and §17.17.1 forbid a default backend
+//! - `sqlite` with an unset, empty, or relative `SCP_RELAY_STORAGE_PATH`
+//!   produces a non-zero exit naming that variable and opens no store
+//! - an operator who names `sqlite` with an absolute path gets `SQLite`, and
+//!   stored blobs survive a reopen (AC 1, 3, 8)
 //! - Invalid backend names produce a non-zero exit and descriptive error (AC 9)
 //! - `postgres` without `SCP_RELAY_DATABASE_URL` produces a non-zero exit (AC 10)
 //! - `s3` without `SCP_RELAY_S3_BUCKET` produces a non-zero exit (AC 6)
@@ -97,6 +103,89 @@ fn assert_cloud_backend_fails_closed(backend: &str, required_var: &str) {
 /// does not re-export `CARGO_BIN_EXE_*` into the test's runtime environment.
 fn relay_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_scp-relay"))
+}
+
+/// An unset `SCP_RELAY_STORAGE_BACKEND`, and an empty or whitespace one, each
+/// make the relay exit 1 with an error naming the variable, SCP-CAPSEL-8000
+/// (persistence spec §17.17.1, selection is mandatory), and the valid values,
+/// and the relay opens no store.
+///
+/// Restoring the `sqlite` default for an unset variable makes the relay open
+/// `SCP_RELAY_STORAGE_PATH` and serve, so the deadline or the exit assertion
+/// fails.
+#[test]
+fn unset_or_empty_backend_exits_with_capsel_8000() {
+    for value in [None, Some(""), Some("  ")] {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tmp.path().join("must-not-exist.db");
+        let mut command = Command::new(relay_bin());
+        command
+            .current_dir(tmp.path())
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env_remove("RUST_LOG");
+        match value {
+            Some(v) => command.env("SCP_RELAY_STORAGE_BACKEND", v),
+            None => command.env_remove("SCP_RELAY_STORAGE_BACKEND"),
+        };
+        let output = output_within_deadline(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{value:?}: {stderr}");
+        assert!(
+            stderr.contains("SCP_RELAY_STORAGE_BACKEND is unset or empty"),
+            "{value:?}: {stderr}"
+        );
+        assert!(stderr.contains("SCP-CAPSEL-8000"), "{value:?}: {stderr}");
+        assert!(
+            stderr.contains(&scp_transport::startup::valid_backends()),
+            "{value:?}: {stderr}"
+        );
+        assert!(!db_path.exists(), "{value:?} opened {}", db_path.display());
+    }
+}
+
+/// `sqlite` with `SCP_RELAY_STORAGE_PATH` unset, empty, or relative makes the
+/// relay exit 1 with an error naming that variable, and the relay creates no
+/// database in its working directory.
+///
+/// Restoring the `./scp-relay.db` default makes the unset case open that file
+/// in the working directory and serve, so the deadline or the exit assertion
+/// fails.
+#[test]
+fn sqlite_without_an_absolute_path_exits_with_error() {
+    for (path, expected) in [
+        (None, "requires SCP_RELAY_STORAGE_PATH"),
+        (Some(""), "requires SCP_RELAY_STORAGE_PATH"),
+        (Some("./scp-relay.db"), "is a relative path"),
+        (Some("scp-relay.db"), "is a relative path"),
+    ] {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let mut command = Command::new(relay_bin());
+        command
+            .current_dir(tmp.path())
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env_remove("RUST_LOG");
+        match path {
+            Some(p) => command.env("SCP_RELAY_STORAGE_PATH", p),
+            None => command.env_remove("SCP_RELAY_STORAGE_PATH"),
+        };
+        let output = output_within_deadline(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{path:?}: {stderr}");
+        assert!(
+            stderr.contains("SCP_RELAY_STORAGE_PATH"),
+            "{path:?}: {stderr}"
+        );
+        assert!(stderr.contains(expected), "{path:?}: {stderr}");
+        let created: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read tempdir")
+            .collect();
+        assert!(
+            created.is_empty(),
+            "{path:?} created {created:?} in the working directory"
+        );
+    }
 }
 
 /// AC 9: An invalid backend value causes a non-zero exit with an error
@@ -216,19 +305,20 @@ fn sqlite_blob_persistence_across_reopens() {
     }
 }
 
-/// AC 2 (default): When `SCP_RELAY_STORAGE_BACKEND` is not set, the relay
-/// defaults to sqlite. Verify by starting the relay with a temp storage
-/// path and confirming the sqlite DB file is created.
+/// AC 2 (explicit selection): `SCP_RELAY_STORAGE_BACKEND=sqlite` with an
+/// absolute `SCP_RELAY_STORAGE_PATH` starts a relay on `SQLite`. Verify by
+/// starting the relay with a temp storage path and confirming the sqlite DB
+/// file is created. The backend has no default, so this test names it.
 #[test]
-fn default_backend_is_sqlite() {
+fn explicit_sqlite_backend_starts() {
     use std::io::Read;
     use std::time::Duration;
 
     let tmp = tempfile::tempdir().expect("failed to create tempdir");
-    let db_path = tmp.path().join("default-backend.db");
+    let db_path = tmp.path().join("explicit-backend.db");
 
     let mut child = Command::new(relay_bin())
-        .env_remove("SCP_RELAY_STORAGE_BACKEND") // not set = default
+        .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
         .env("SCP_RELAY_STORAGE_PATH", db_path.to_str().unwrap())
         .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
         .env("SCP_RELAY_LOG_FORMAT", "json")
@@ -279,7 +369,7 @@ fn default_backend_is_sqlite() {
 
     assert!(
         db_created,
-        "sqlite database file should be created when using default backend; output: {output}"
+        "sqlite database file should be created when the operator names sqlite; output: {output}"
     );
 
     // Verify the relay used sqlite (logged "using sqlite blob storage").

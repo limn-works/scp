@@ -41,9 +41,9 @@ use scp_runtime::context::supervisor::{
     ProtocolRepositorySagaJournal, SagaInput, SagaJournal, Supervisor, SupervisorConfig,
 };
 
-struct NoopPersistence;
+struct NoOpPersistence;
 #[async_trait::async_trait]
-impl scp_runtime::context::persistence::ContextPersistence for NoopPersistence {
+impl scp_runtime::context::persistence::ContextPersistence for NoOpPersistence {
     async fn persist_context(
         &self,
         _: &str,
@@ -75,7 +75,7 @@ impl scp_runtime::context::persistence::ContextPersistence for NoopPersistence {
 
 fn test_supervisor() -> Arc<Supervisor> {
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(NoopPersistence);
+        Arc::new(NoOpPersistence);
     let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
         InMemoryStorage::new(),
     )));

@@ -537,8 +537,10 @@ impl ContextActor {
                 }
             }
         }
-        // Final drain: write any pending state before the actor exits
-        // so callers observing the shutdown ack can rely on durability.
+        // Final drain: write any pending state before the actor exits. It runs
+        // after the `Shutdown` ack and after every sender dropped, so a caller
+        // that must order work after this write waits for the inbox receiver
+        // to drop (`ContextActorHandle::shutdown_and_await_exit`).
         if self.dirty {
             self.persist_snapshot().await;
         }

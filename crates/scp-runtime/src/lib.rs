@@ -31,7 +31,6 @@ compile_error!(
      `--features scp-runtime/testing` explicitly)."
 );
 
-pub mod bridge;
 pub mod context;
 pub mod crypto;
 pub mod discovery;

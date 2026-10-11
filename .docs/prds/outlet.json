@@ -408,7 +408,7 @@
     },
     {
       "id": "SCP-OUT-005",
-      "title": "Rename tool \u2192 outlet across all four FFI bridges (PyO3, UniFFI, NAPI, WASM)",
+      "title": "Rename tool \u2192 outlet across the three FFI bridges (PyO3, UniFFI, NAPI)",
       "gate": "gate-rename",
       "priority": "P0",
       "severity": "major",
@@ -424,13 +424,9 @@
         "crates/scp-ffi/uniffi/src/scp.udl",
         "crates/scp-ffi/napi/src/tools.rs",
         "crates/scp-ffi/napi/src/lib.rs",
-        "crates/scp-ffi/napi/src/context.rs",
-        "crates/scp-ffi/wasm/src/tools.rs",
-        "crates/scp-ffi/wasm/src/lib.rs",
-        "crates/scp-ffi/wasm/src/context.rs",
-        "crates/scp-ffi/wasm/src/manager.rs"
+        "crates/scp-ffi/napi/src/context.rs"
       ],
-      "description": "Rename every tool-era identifier to outlet vocabulary across all four FFI bridges in a single coordinated pass. Per-bridge action items below are parallel (one agent per bridge is fine, but the landing is atomic because every bridge must export the same operation set per the FFI conformance matrix). PyO3 is the reference bridge; it is always renamed first within this story, and every exported symbol in PyO3 must have a matching export in each of UniFFI, NAPI, and WASM before the story is done. UCAN stem behavior is the temporary `outlet_invoke:*` from SCP-OUT-002 (split into `outlet_query:*` / `outlet_call:*` is SCP-OUT-014 in gate-classification). No stubs; no tool-era symbols remain after this story. SCP-OUTLET-REGISTRATION-V2 domain separator propagates through every bridge's signing helpers.",
+      "description": "Rename every tool-era identifier to outlet vocabulary across the three FFI bridges in a single coordinated pass. Per-bridge action items below are parallel (one agent per bridge is fine, but the landing is atomic because every bridge must export the same operation set per the FFI conformance matrix). PyO3 is the reference bridge; it is always renamed first within this story, and every exported symbol in PyO3 must have a matching export in each of UniFFI and NAPI before the story is done. UCAN stem behavior is the temporary `outlet_invoke:*` from SCP-OUT-002 (split into `outlet_query:*` / `outlet_call:*` is SCP-OUT-014 in gate-classification). No stubs; no tool-era symbols remain after this story. SCP-OUTLET-REGISTRATION-V2 domain separator propagates through every bridge's signing helpers.",
       "acceptanceCriteria": [
         "PyO3: file crates/scp-ffi/src/outlets.rs exists; src/tools.rs does not",
         "PyO3: grep -rn 'PyTool\\|context_tool_' crates/scp-ffi/src/ returns 0",
@@ -444,21 +440,16 @@
         "NAPI: grep -rn 'contextTool\\|ContextTool' crates/scp-ffi/napi/src/ returns 0",
         "NAPI: exported functions include contextOutletRegister, contextOutletInvoke, contextOutletUpdate, contextOutletDeregister, contextOutletVerify, contextOutletList, contextOutletGet, contextOutletSessionOpen, contextOutletSessionInvoke, contextOutletSessionClose",
         "NAPI: cargo build -p scp-ffi-napi --release succeeds; bun build in bindings/typescript produces an index.d.ts that shows outlet-prefixed NAPI exports and no tool-prefixed ones",
-        "WASM: file crates/scp-ffi/wasm/src/outlets.rs exists; tools.rs does not",
-        "WASM: grep -rn '#\\[wasm_bindgen(js_name = tool' crates/scp-ffi/wasm/src/ returns 0",
-        "WASM: grep -rn 'js_name = outlet' crates/scp-ffi/wasm/src/outlets.rs returns >= 10 matches (register/invoke/update/deregister/verify/list/get/interface-offer/interface-accept/interface-revoke)",
-        "WASM: wasm-pack build crates/scp-ffi/wasm --target bundler succeeds; cargo clippy -p scp-ffi-wasm --target wasm32-unknown-unknown passes",
-        "Every public operation exported by the PyO3 bridge (excluding PyO3-only helpers) has a matching export in each of UniFFI, NAPI, and WASM (subject to WASM constraint set per ADR-034); the FFI conformance matrix is regenerated and shows no gaps for the outlet surface",
+        "Every public operation exported by the PyO3 bridge (excluding PyO3-only helpers) has a matching export in each of UniFFI and NAPI; the FFI conformance matrix is regenerated and shows no gaps for the outlet surface",
         "Bridge-level error slugs referencing tool are replaced with outlet slugs (e.g., outlet-not-found); code prefix stays SCP-OUTLET- per SCP-OUT-008",
-        "Running all four bridge CIs (cargo build, bun build, maturin develop, wasm-pack build) green"
+        "Running all three bridge CIs (cargo build, bun build, maturin develop) green"
       ],
       "actionItems": [
         "PyO3: git mv crates/scp-ffi/src/tools.rs crates/scp-ffi/src/outlets.rs; rename every identifier; update lib.rs and context.rs; regenerate .pyi",
         "UniFFI: edit scp.udl, scp.rs, bridge.rs; rename namespace, types, functions; run scripts/generate-uniffi-kotlin.sh and inspect output",
         "NAPI: git mv napi/src/tools.rs napi/src/outlets.rs; rename all identifiers (camelCase JS-facing); rebuild .node; validate generated index.d.ts",
-        "WASM: git mv wasm/src/tools.rs wasm/src/outlets.rs; rename identifiers and js_name attributes; wasm-pack build and validate generated .d.ts",
         "Update crates/scp-testing/tests/ffi_conformance.rs to reference the new export names across every bridge (additive \u2014 do not weaken existing assertions per the enforcement-file rule)",
-        "Run the full FFI conformance suite and confirm green across all four bridges"
+        "Run the full FFI conformance suite and confirm green across all three bridges"
       ],
       "blockedBy": [
         "SCP-OUT-004"
@@ -471,10 +462,6 @@
         {
           "file": ".docs/standards/sdk-capability-matrix.json",
           "section": ""
-        },
-        {
-          "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-034: WASM Bridge Re-Implementation Strategy"
         }
       ],
       "details": {}
@@ -499,7 +486,6 @@
         "bindings/typescript/src/types.ts",
         "bindings/typescript/src/errors.ts",
         "bindings/typescript/src/internal/napi.ts",
-        "bindings/typescript/src/internal/wasm.ts",
         "bindings/typescript/tests/tools.test.ts",
         "bindings/swift/Sources/SCP/Tools.swift",
         "bindings/swift/Sources/SCP/Context.swift",
@@ -654,6 +640,7 @@
         "scripts/check-cross-layer.sh",
         "scripts/check-protocol-deps.sh",
         "scripts/check-protocol-sync.py",
+        "scripts/bridge-aliases.json",
         "fuzz/dicts/ucan_jwt.dict",
         "fuzz/dicts/msgpack_client_message.dict"
       ],
@@ -678,7 +665,7 @@
         "scripts/check-no-fallback-registry.sh continues to exit 0 after the rename (no fallback registry introduced for outlet lookups)",
         "scripts/check-no-default-in-tests.sh continues to exit 0 after the rename",
         "ratchet/once-lock-count.json is verified unchanged (rename adds no new globals; if the rename legitimately removes one, the count is decreased accordingly \u2014 never increased)",
-        "bridge_ratchet_baseline.json is regenerated to reflect the rename of existing exports (identifier-only change; no new exports added here \u2014 new exports land in the streaming gate)",
+        "scripts/bridge-aliases.json renames each existing tool_* canonical operation and its PyO3, UniFFI, and NAPI aliases to the outlet_* spelling (identifier-only change; no new canonical operations added here \u2014 new exports land in the streaming gate); MIN_PARITY_OPERATIONS in crates/scp-testing/tests/integration/ffi_conformance.rs is unchanged; the tests parity_operation_count_never_decreases, aliases_json_is_in_sync_with_parity_operations, and every_exported_ffi_fn_is_registered_or_allowlisted in crates/scp-testing/tests/integration/ffi_conformance.rs pass, and bash scripts/check-bridge-symmetry.sh exits 0",
         "Capability matrix .docs/standards/sdk-capability-matrix.json lists outlets namespace verbs uniformly across all four SDKs",
         "pipeline_wiring.rs asserts register_outlet / invoke_outlet / deregister_outlet / verify_outlet / update_outlet reach the runtime pipeline; no tool_* symbols remain in the assertion table (additive: new outlet_* assertions added alongside retained assertions for identity/messaging/economy)"
       ],
@@ -691,7 +678,7 @@
         "Add outlet_* entries to fuzz dicts",
         "Run the full CI command and confirm zero warnings",
         "Run scripts/check-handle-affinity.sh, check-no-bridge-globals.sh, check-no-fallback-registry.sh, check-no-default-in-tests.sh and confirm all exit 0 after the rename",
-        "Regenerate bridge_ratchet_baseline.json (identifier-only rename; no added exports)",
+        "Rename the tool_* canonical operations and aliases in scripts/bridge-aliases.json to outlet_* (identifier-only rename; no added exports; MIN_PARITY_OPERATIONS unchanged)",
         "Confirm ratchet/once-lock-count.json remains unchanged (or decreased)",
         "Confirm pipeline_wiring.rs outlet_* assertions are additive alongside pre-existing non-outlet assertions (never weakened)"
       ],
@@ -726,7 +713,7 @@
         ".docs/specs/25-test-vectors.md",
         "tests/conformance/vectors/outlet_registration_v2.json"
       ],
-      "description": "Regenerate the canonical outlet-registration test vectors under the new V2 domain separator (\u00a75.4.1). The V1 vectors are deleted \u2014 they are no longer valid, and keeping them risks tools accidentally validating against the wrong separator. The new vector file documents 12 test cases: minimal Query, minimal Action, Query with cost=None, Query with cost=0, Action with cost>0, registration with aggregate_schema, registration with max-size schema (64 KiB), registration with 100 test vectors, registration with LLM-backed impl hash, registration with remote-service impl hash, multi-caveat UCAN invocation, and a cross-context invocation. Each vector's signature is computed against the V2 preimage and stored alongside the input. The conformance test harness loads these vectors and validates them against every bridge (PyO3, UniFFI-Swift, UniFFI-Kotlin, NAPI, WASM).",
+      "description": "Regenerate the canonical outlet-registration test vectors under the new V2 domain separator (\u00a75.4.1). The V1 vectors are deleted \u2014 they are no longer valid, and keeping them risks tools accidentally validating against the wrong separator. The new vector file documents 12 test cases: minimal Query, minimal Action, Query with cost=None, Query with cost=0, Action with cost>0, registration with aggregate_schema, registration with max-size schema (64 KiB), registration with 100 test vectors, registration with LLM-backed impl hash, registration with remote-service impl hash, multi-caveat UCAN invocation, and a cross-context invocation. Each vector's signature is computed against the V2 preimage and stored alongside the input. The conformance test harness loads these vectors and validates them against every bridge (PyO3, UniFFI-Swift, UniFFI-Kotlin, NAPI).",
       "acceptanceCriteria": [
         "File tests/conformance/vectors/outlet_registration_v2.json contains 12 test-vector entries",
         "Each entry has fields: name, input (registration fields), expected_preimage (hex-encoded), expected_signature (hex-encoded), operator_did, operator_public_key (hex)",
@@ -979,7 +966,7 @@
         "Capability::new('outlet_query:') (empty suffix) returns None",
         "Capability::new('outlet_query:FOO') returns None (case-sensitive regex: lowercase only)",
         "Capability::new('outlet_query:a' \u00d7 129 chars) returns None (length bound)",
-        "Bridge/SDK parser conformance: a JSON fixture file tests/conformance/vectors/outlet_capability_parse.json lists positive and negative parse cases; every bridge (PyO3, UniFFI, NAPI, WASM) accepts/rejects each fixture identically",
+        "Bridge/SDK parser conformance: a JSON fixture file tests/conformance/vectors/outlet_capability_parse.json lists positive and negative parse cases; every bridge (PyO3, UniFFI, NAPI) accepts/rejects each fixture identically",
         "Fuzz target ucan_capability_parse_ffi in fuzz/ is added (or extended) to cover 'outlet_query:' and 'outlet_call:' prefix variants; 1M iterations produce no parser-differential"
       ],
       "actionItems": [
@@ -1124,7 +1111,6 @@
         "crates/scp-ffi/src/outlets.rs",
         "crates/scp-ffi/napi/src/outlets.rs",
         "crates/scp-ffi/uniffi/src/scp.udl",
-        "crates/scp-ffi/wasm/src/outlets.rs",
         "bindings/python/scp_sdk/outlets.py",
         "bindings/typescript/src/outlets.ts",
         "bindings/swift/Sources/SCP/Outlets.swift",
@@ -1450,7 +1436,7 @@
     },
     {
       "id": "SCP-OUT-023",
-      "title": "Pass-through InvocationCaveats on UCAN `nb` field across all 4 FFI bridges + 4 SDKs",
+      "title": "Pass-through InvocationCaveats on UCAN `nb` field across all 3 FFI bridges + 4 SDKs",
       "gate": "gate-caveats",
       "priority": "P0",
       "severity": "major",
@@ -1459,13 +1445,12 @@
         "crates/scp-ffi/src/ucan.rs",
         "crates/scp-ffi/napi/src/ucan.rs",
         "crates/scp-ffi/uniffi/src/scp.udl",
-        "crates/scp-ffi/wasm/src/ucan.rs",
         "bindings/python/scp_sdk/ucan.py",
         "bindings/typescript/src/ucan.ts",
         "bindings/swift/Sources/SCP/Ucan.swift",
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Ucan.kt"
       ],
-      "description": "Expose InvocationCaveats through all 4 FFI bridges and 4 SDKs so apps can mint and delegate caveated tokens. Each SDK gets idiomatic constructors: Python InvocationCaveats(amount_max_per_call=100, ...); TypeScript const c: InvocationCaveats = { amountMaxPerCall: 100, ... }; Swift InvocationCaveats(amountMaxPerCall: 100, ...); Kotlin InvocationCaveats(amountMaxPerCall = 100, ...). Each SDK exposes `ucan.mint(caveats: InvocationCaveats, ...)` and `ucan.narrow(parent_token, child_caveats) -> child_token`. Mint-limit errors surface as SCP-OUTLET-6114. Round-trip fidelity enforced via conformance test (SDK-created caveat survives marshal-unmarshal through FFI and back).",
+      "description": "Expose InvocationCaveats through all 3 FFI bridges (PyO3, UniFFI, NAPI) and 4 SDKs so apps can mint and delegate caveated tokens. Each SDK gets idiomatic constructors: Python InvocationCaveats(amount_max_per_call=100, ...); TypeScript const c: InvocationCaveats = { amountMaxPerCall: 100, ... }; Swift InvocationCaveats(amountMaxPerCall: 100, ...); Kotlin InvocationCaveats(amountMaxPerCall = 100, ...). Each SDK exposes `ucan.mint(caveats: InvocationCaveats, ...)` and `ucan.narrow(parent_token, child_caveats) -> child_token`. Mint-limit errors surface as SCP-OUTLET-6114. Round-trip fidelity enforced via conformance test (SDK-created caveat survives marshal-unmarshal through FFI and back).",
       "acceptanceCriteria": [
         "Every FFI bridge has an InvocationCaveats marshalling shim that round-trips all 12 fields",
         "Python: InvocationCaveats dataclass with optional fields; ucan.mint accepts caveats param; ucan.narrow(parent, child_caveats) returns a new token",
@@ -1845,7 +1830,7 @@
         "crates/scp-testing/tests/integration/outlet_error_conformance.rs",
         "tests/conformance/vectors/outlet_error_fixtures.json"
       ],
-      "description": "Each SDK renders OutletErrorClass as a sealed type idiomatic to the language, and every concrete code surfaces as a distinct error class that extends or belongs to the appropriate class. Python: subclass tree (OutletError \u2192 OutletProtocolError \u2192 QueryViolationError etc.); TypeScript: discriminated union / tagged classes (OutletError abstract with class tag); Swift: enum OutletError with associated values per variant; Kotlin: sealed class OutletError with data classes per variant. The eight concrete outlet subclasses ALL carry a uniform `Outlet` prefix: OutletProtocolError, OutletAuthorizationError, OutletInputError, OutletExecutionError, OutletOutputError, OutletEconomicError, OutletTransportError, OutletGovernanceError. The uniform prefix (not just on the three that collide with top-level MLS/transport/governance classes) is deliberate: it gives one canonical naming pattern across all 8 and eliminates the silent wrong-catch hazard where an un-prefixed `except ProtocolError` / `catch (TransportError)` would bind the unrelated top-level class. A shared JSON fixture set (outlet_error_fixtures.json) containing >= 35 fixtures (one per code) is round-tripped: each fixture is deserialized through all 4 bridges, converted to the SDK type, serialized back, and asserted byte-equal. This ensures all 4 SDKs agree on the wire contract. The IkmCommitment struct encapsulation (a from-scratch scp-runtime crypto feature, formerly an acceptance criterion of this story) is owned by SCP-OUT-042b, whose title and ACs already cover derive_accept_time + sign + verify + the canonical-pair swap-regression test; it was removed here to keep that crypto single-sourced (this story consumes the resulting type, it does not define it).",
+      "description": "Each SDK renders OutletErrorClass as a sealed type idiomatic to the language, and every concrete code surfaces as a distinct error class that extends or belongs to the appropriate class. Python: subclass tree (OutletError \u2192 OutletProtocolError \u2192 QueryViolationError etc.); TypeScript: discriminated union / tagged classes (OutletError abstract with class tag); Swift: enum OutletError with associated values per variant; Kotlin: sealed class OutletError with data classes per variant. The eight concrete outlet subclasses ALL carry a uniform `Outlet` prefix: OutletProtocolError, OutletAuthorizationError, OutletInputError, OutletExecutionError, OutletOutputError, OutletEconomicError, OutletTransportError, OutletGovernanceError. The uniform prefix (not just on the three that collide with top-level MLS/transport/governance classes) is deliberate: it gives one canonical naming pattern across all 8 and eliminates the silent wrong-catch hazard where an un-prefixed `except ProtocolError` / `catch (TransportError)` would bind the unrelated top-level class. A shared JSON fixture set (outlet_error_fixtures.json) containing >= 35 fixtures (one per code) is round-tripped: each fixture is deserialized through all 3 bridges (PyO3, UniFFI, NAPI), converted to the SDK type, serialized back, and asserted byte-equal. This ensures all 4 SDKs agree on the wire contract. The IkmCommitment struct encapsulation (a from-scratch scp-runtime crypto feature, formerly an acceptance criterion of this story) is owned by SCP-OUT-042b, whose title and ACs already cover derive_accept_time + sign + verify + the canonical-pair swap-regression test; it was removed here to keep that crypto single-sourced (this story consumes the resulting type, it does not define it).",
       "acceptanceCriteria": [
         "TypeScript: abstract class OutletError { class, code, slug, ... }; discriminated subclasses with static `code` + runtime type guard",
         "Swift: enum OutletError: Error with associated types per concrete variant",
@@ -1928,7 +1913,7 @@
         "Conformance test: '@type' ordering vs body keys spanning a-z \u2014 a synthetic ChunkPayload with body key 'aggregate' and another with 'zeta_field' both canonicalize with '@type' FIRST and the body key SECOND; without the leading '@' (e.g., if a draft used 'type'), 'aggregate' would sort before 'type' \u2014 regression test asserts the bug is absent (test is named chunk_payload_type_first_with_body_keys_across_alphabet)",
         "ChunkPayload variant collision guard: two distinct variants canonical-hash to different values even when their non-type fields overlap (test constructs Data{value: ''} and Progress{pct: 0, note: None} and asserts hash inequality after JCS encoding)",
         "Domain separators SCP-OUTLET-CHUNK-V1:, SCP-OUTLET-CHUNK-SIG-V1:, SCP-OUTLET-CAVEAT-BIND-V1:, SCP-OUTLET-CREDIT-V1:, SCP-OUTLET-OFFER-ID-V1: are registered in .docs/specs/09-security-model.md \u00a79.18.2 Domain Separators table (grep -c '\"SCP-OUTLET-CHUNK-SIG-V1:\"' .docs/specs/09-security-model.md returns >= 1 for each)",
-        "Conformance test: full V2-shape OutletStreamOpen (fully populated \u2014 session_id: Some('sess-abc'), estimated_chunk_count: 42, every other field at realistic value) round-trips through each FFI bridge (PyO3, NAPI, UniFFI, WASM) without dropping session_id or estimated_chunk_count; round-trip assertion is byte-equal after serde_json_canonicalizer re-canonicalization",
+        "Conformance test: full V2-shape OutletStreamOpen (fully populated \u2014 session_id: Some('sess-abc'), estimated_chunk_count: 42, every other field at realistic value) round-trips through each FFI bridge (PyO3, NAPI, UniFFI) without dropping session_id or estimated_chunk_count; round-trip assertion is byte-equal after serde_json_canonicalizer re-canonicalization",
         "Session\u00d7stream invariants (\u00a76.2.1.1) \u2014 session_id carried on open: when OutletStreamOpen.session_id is Some, the runtime validates that the named session exists, is not expired, and whose recorded origin_kind is compatible with the outlet's kind. Mismatch \u2192 OutletErrorClass::Protocol::UnknownSession (slug 'protocol.unknown-session') or OutletErrorClass::Authorization::AmplificationViolation (per \u00a76.2.0.3). Unit test: OutletStreamOpen with session_id pointing to an expired session fails with UnknownSession.",
         "Session\u00d7stream invariants (\u00a76.2.1.1) \u2014 one concurrent stream per session: a second OutletStreamOpen referencing a session_id that already has a live stream is rejected with OutletErrorClass::Protocol::StreamAlreadyOpen (slug 'protocol.stream-already-open'). Unit test: two concurrent opens against the same session_id \u2014 first succeeds, second fails with StreamAlreadyOpen.",
         "Session\u00d7stream invariants (\u00a76.2.1.1) \u2014 session owns origin_kind: the stream's effective_caveats.origin_kind MUST equal the session's recorded origin_kind. Mismatch fails at open with AttenuationViolation. Unit test: session opened as Query; subsequent stream declares Action in caveats \u2192 AttenuationViolation.",
@@ -2266,7 +2251,7 @@
     },
     {
       "id": "SCP-OUT-037",
-      "title": "Stream APIs across all 4 FFI bridges (PyO3, UniFFI, NAPI, WASM)",
+      "title": "Stream APIs across the 3 FFI bridges (PyO3, UniFFI, NAPI) and the browser client\u2019s invoker predicates",
       "gate": "gate-streaming",
       "priority": "P1",
       "severity": "major",
@@ -2284,7 +2269,7 @@
         "scripts/bridge-aliases.json",
         "ratchet/once-lock-count.json"
       ],
-      "description": "Plumb streaming through all 4 FFI bridges. PyO3: `outlet_stream_open` returns an async iterator wrapping Python asyncio queue; chunks flow through via a background task. UniFFI: `outlet_stream_open` returns an `OutletStreamHandle` with `next() -> Option<OutletStreamChunk>` (polling) AND a callback interface (push). NAPI: `outletStreamOpen` returns an object with AsyncIterator protocol. WASM: `outletStreamOpen` returns an object with `{ next() -> Promise<Option<Chunk>> }`. Each bridge also exposes `outlet_stream_grant_credit(request_id, grant)` and `outlet_stream_cancel(request_id)`.",
+      "description": "Plumb streaming through the three FFI bridges. PyO3: `outlet_stream_open` returns an async iterator wrapping Python asyncio queue; chunks flow through via a background task. UniFFI: `outlet_stream_open` returns an `OutletStreamHandle` with `next() -> Option<OutletStreamChunk>` (polling) AND a callback interface (push). NAPI: `outletStreamOpen` returns an object with AsyncIterator protocol. The ADR-057 browser client (crates/scp-client-wasm) exposes no open or poll; its streaming surface is the two invoker-side predicates the acceptance criteria name. Each bridge also exposes `outlet_stream_grant_credit(request_id, grant)` and `outlet_stream_cancel(request_id)`.",
       "acceptanceCriteria": [
         "PyO3 exposes outlet_stream_open(...caller_did...) -> str returning a StreamHandleId, plus outlet_stream_poll_next(handle_id) -> Optional[bytes] returning the JSON-serialized OutletStreamChunk or None at terminal. The Python SDK's InvocationHandle builds the async iterator (__aiter__/__anext__) over poll_next (SCP-OUT-006 single-verb; \u00a75.4.5).",
         "UniFFI exposes async outlet_stream_open -> String + outlet_stream_poll_next on Scp; the Swift/Kotlin SDK builds the AsyncSequence/Flow. No separate OutletStreamHandle or callback interface at the bridge (SCP-OUT-006).",
@@ -2298,13 +2283,13 @@
         "Integration tests per bridge green",
         "Each bridge exposes a chunk-signature verification surface: `verify_chunk_signature(chunk_bytes, operator_pk, context_id, outlet_id, caveats_binding) -> bool` which verifies the \u00a75.4.5 SCP-OUTLET-CHUNK-SIG-V1 preimage (binds context_id, outlet_id, request_id, sequence, caveats_binding, and SHA-256(canonical_jcs(payload)) \u2014 byte-for-byte matching \u00a75.4.5 per-chunk operator signature block)",
         "Each bridge exposes a caveats-binding recomputation helper matching \u00a75.4.5 caveats_binding preimage block byte-for-byte: `compute_caveats_binding(ucan_cid, request_id, invoker_did, estimated_chunk_count, effective_caveats) -> [u8; 32]` (the helper takes each preimage input as a typed parameter; internally it runs SHA-256 over 'SCP-OUTLET-CAVEAT-BIND-V1:' || len_be32(ucan_cid) || ucan_cid || request_id || len_be32(invoker_did) || invoker_did || estimated_chunk_count_be || len_be32(canonical_jcs(effective_caveats)) || canonical_jcs(effective_caveats))",
-        "The native-bridge streaming exports are covered by the alias-driven parity ratchet (scripts/bridge-aliases.json, additive); no separate bridge_ratchet_baseline.json exists. CI check-bridge-symmetry + ffi_conformance pass.",
+        "The native-bridge streaming exports are covered by the alias-driven parity ratchet: scripts/bridge-aliases.json gains their canonical entries additively, and the MIN_PARITY_OPERATIONS floor in crates/scp-testing/tests/integration/ffi_conformance.rs never decreases. CI check-bridge-symmetry + ffi_conformance pass.",
         "The 7 streaming canonicals (outlet_stream_open, outlet_stream_poll_next, outlet_stream_grant_credit, outlet_stream_cancel, outlet_stream_terminate, verify_chunk_signature, compute_caveats_binding) are present in scripts/bridge-aliases.json for all 3 native bridges; NAPI #[napi] exports resolve in crates/scp-ffi/napi/src/scp.rs; WASM's 2 pure ops are conformance-tested in scp-client-wasm's own vectors (crates/scp-client-wasm/src/lib.rs).",
         "CRITICAL #1 \u2014 every control-plane FFI function (`outlet_stream_grant_credit`, `outlet_stream_cancel`, `outlet_stream_terminate`) takes a `caller_did: &str` parameter and rejects the call with `authorization.denied` (`SCP-PERM-3001`) when `caller_did` does not match the `invoker_did` pinned in the bridge's stream registry at open. Mirrors the runtime's signature-verification gate at the bridge layer.",
         "N/A for WASM per ADR-057 scope fence (no cancel/session in the browser); the native bridges' cancel builds+signs the OutletStreamCancel via custody and self-consistency is enforced at the runtime layer (CRITICAL#2 applies to the node-side signing path).",
         "CRITICAL #3 \u2014 `outlet_stream_cancel` no longer accepts a caller-supplied `next_seq`. The runtime publishes the live next-to-emit cursor on `SharedSessionState::next_emission_seq` (read via `StreamSessionHandle::current_next_emission_seq`); the bridge derives `next_seq` from that read and binds it into the SCP-OUTLET-CANCEL-V1 preimage. N/A for WASM (no session/cancel per ADR-057). Spec \u00a75.4.5 cancel-signature block updated to require runtime-derived `next_seq`.",
         "CRITICAL#4: the StreamAdmissionTracker is parked in the runtime supervisor, keyed by context_id (the outlet_stream_admission map, lazily created per context via outlet_stream_admission_for), with the per-origin-invoker ceiling in a separate operator-scoped OriginAdmissionTracker; caps trip across successive opens within a context (persistent-per-context, not vacuous per-call). Tested in crates/scp-protocol/src/context/outlets/stream.rs.",
-        "CRITICAL#5: the streaming operations are registered in the FFI conformance enforcement (crates/scp-testing/tests/integration/ffi_conformance.rs via the alias table + MIN_PARITY_OPERATIONS floor = 106); check-sdk-coverage and ffi_conformance pass."
+        "CRITICAL#5: the streaming operations are registered in the FFI conformance enforcement: each has a canonical entry in scripts/bridge-aliases.json, so the parity-operation count in crates/scp-testing/tests/integration/ffi_conformance.rs includes them; the MIN_PARITY_OPERATIONS floor in that file never decreases (test parity_operation_count_never_decreases); check-sdk-coverage and ffi_conformance pass."
       ],
       "actionItems": [
         "Add stream APIs to each bridge",
@@ -2313,7 +2298,7 @@
         "Add the conformance test",
         "Document semantics on each bridge",
         "Expose verify_chunk_signature and compute_caveats_binding on every bridge",
-        "Regenerate bridge_ratchet_baseline.json (additive \u2014 new exports only; must not reduce any existing ratchet count)",
+        "Add the streaming canonical operations to scripts/bridge-aliases.json and raise MIN_PARITY_OPERATIONS in crates/scp-testing/tests/integration/ffi_conformance.rs (additive \u2014 new exports only; must not reduce any existing ratchet count)",
         "Extend the FFI conformance matrix with the five streaming operations"
       ],
       "blockedBy": [
@@ -2498,7 +2483,7 @@
         "Unit test: changing a single catalog entry's template by one byte produces a different catalog_hash AND therefore a different V2 preimage AND therefore a different signature over the registration \u2014 no silent catalog edit is possible without invalidating the signature",
         "Unit test: changing a single byte of description produces a different description_hash AND therefore a different V2 preimage \u2014 no silent description edit without invalidating the signature",
         "Unit test: the catalog is NOT covered by schema_hash \u2014 serializing a registration with schema fixed and catalog varied produces the same schema_hash but different catalog_hash (regression test: asserts the round-4 'covered via schema_hash' claim was false)",
-        "Canonical MessagePack of Vec<MessageTemplate>: the serialization uses msgpack-rpc canonical encoding (entries in insertion order; keys within each MessageTemplate ordered alphabetically). Cross-SDK conformance fixture round-trips a canonical message_catalog through all four bridges (PyO3, NAPI, UniFFI, WASM) and asserts byte-for-byte catalog_hash equality",
+        "Canonical MessagePack of Vec<MessageTemplate>: the serialization uses msgpack-rpc canonical encoding (entries in insertion order; keys within each MessageTemplate ordered alphabetically). Cross-SDK conformance fixture round-trips a canonical message_catalog through all three bridges (PyO3, NAPI, UniFFI) and asserts byte-for-byte catalog_hash equality",
         "Round-trip MessagePack test on OutletRegistration with a non-empty message_catalog (10 entries) + description field \u2014 round-trip preserves catalog ordering, template bytes, and description",
         "Empty catalog case: a registration with message_catalog = Vec::new() produces catalog_hash = SHA-256(MessagePack([])) = SHA-256(0x90) (the MessagePack 0-length array byte); unit test asserts the empty-catalog hash is well-defined and deterministic",
         "Round-trip test: full V2 OutletRegistration (with catalog, description, schema, all other fields) round-trips through canonical JCS serialization preserving every field and producing a stable hash_preimage",
@@ -2509,7 +2494,7 @@
         "Add message_catalog field to OutletRegistration struct in registration.rs; extend OutletRegistration::try_new with the catalog bounds check",
         "Rewrite OutletRegistration::hash_preimage() to include description_hash and catalog_hash terms in the order specified by \u00a75.4.1",
         "Add unit tests: empty catalog, 256-entry catalog, duplicate-key rejection, single-byte change detection (catalog AND description), regression test asserting schema_hash does NOT cover the catalog",
-        "Add cross-SDK conformance fixture that round-trips canonical MessagePack through all four bridges with byte-equal catalog_hash",
+        "Add cross-SDK conformance fixture that round-trips canonical MessagePack through all three bridges with byte-equal catalog_hash",
         "Document the canonical MessagePack encoding rule in rustdoc"
       ],
       "blockedBy": [
@@ -2655,7 +2640,7 @@
     },
     {
       "id": "SCP-OUT-041d",
-      "title": "FFI surfaces + SDK wrappers (4\u00d74) + conformance fixture + ratchet bump for OutletError::new + LRU + CatalogRotationTooFrequent",
+      "title": "FFI surfaces + SDK wrappers (3\u00d74) + conformance fixture + ratchet bump for OutletError::new + LRU + CatalogRotationTooFrequent",
       "gate": "gate-round5-fixes",
       "priority": "P0",
       "severity": "critical",
@@ -2665,7 +2650,6 @@
         "crates/scp-ffi/napi/src/outlets.rs",
         "crates/scp-ffi/uniffi/src/scp.udl",
         "crates/scp-ffi/uniffi/src/scp.rs",
-        "crates/scp-ffi/wasm/src/outlets.rs",
         "bindings/python/scp_sdk/outlets.py",
         "bindings/python/scp_sdk/errors.py",
         "bindings/typescript/src/outlets.ts",
@@ -2675,28 +2659,29 @@
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Outlets.kt",
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Errors.kt",
         "tests/conformance/vectors/outlet_message_hmac_fixtures.json",
-        "crates/scp-ffi/bridge_ratchet_baseline.json"
+        "scripts/bridge-aliases.json",
+        "crates/scp-testing/tests/integration/ffi_conformance.rs"
       ],
-      "description": "Surface the OUT-041a/b/c runtime functionality through all four FFI bridges (PyO3, NAPI, UniFFI, WASM) and all four language SDKs (Python, TypeScript, Swift, Kotlin). Each bridge exposes outlet_error_new with the options-object signature; each SDK exposes OutletError.new with language-idiomatic options; each SDK integrates the CatalogRotationTooFrequent rejection path. Add a shared conformance fixture (outlet_message_hmac_fixtures.json) that round-trips (outlet_id, catalog_key) pairs across all four bridges producing byte-identical wire_message output. Regenerate bridge_ratchet_baseline.json additively.",
+      "description": "Surface the OUT-041a/b/c runtime functionality through all three FFI bridges (PyO3, NAPI, UniFFI) and all four language SDKs (Python, TypeScript, Swift, Kotlin). Each bridge exposes outlet_error_new with the options-object signature; each SDK exposes OutletError.new with language-idiomatic options; each SDK integrates the CatalogRotationTooFrequent rejection path. Add a shared conformance fixture (outlet_message_hmac_fixtures.json) that round-trips (outlet_id, catalog_key) pairs across all three bridges producing byte-identical wire_message output. Register the new bridge exports additively in the FFI parity ratchet: scripts/bridge-aliases.json and the MIN_PARITY_OPERATIONS floor in crates/scp-testing/tests/integration/ffi_conformance.rs.",
       "acceptanceCriteria": [
         "SDK surface: Python OutletError.new(*, outlet_id=..., catalog_key=..., class_=..., ...) calls FFI outlet_error_new (PyO3) which HMACs at the bridge boundary; the SDK never receives the raw outlet_message_key. grep -c 'outlet_error_new' bindings/python/scp_sdk/ returns >= 1",
         "SDK surface: TypeScript OutletError.new({ outletId, catalogKey, class, ... }) calls outletErrorNew NAPI export; bun test asserts wire_message is a 32-byte opaque value, not the catalog_key string",
         "SDK surface: Swift OutletError.new(outletId:catalogKey:class:...) calls the UniFFI binding; swift test asserts construction; Swift retains labeled-argument form per API MAJOR 22",
         "SDK surface: Kotlin OutletError.new(opts: OutletErrorNewOptions) where OutletErrorNewOptions is a builder carrying outletId/catalogKey/class; gradle test -Pscp.uniffi.cargoFeatures=testing asserts construction",
-        "FFI bridges: PyO3 outlet_error_new, NAPI outletErrorNew, UniFFI outlet_error_new (UDL), WASM outletErrorNew \u2014 all four bridges expose the catalog_key -> wire_message HMAC at the FFI boundary with the options-object signature",
-        "FFI bridges: all four bridges expose outlet_catalog_rotation_validator (check-only path) that returns CatalogRotationTooFrequent typed error when the dwell-time rule (OUT-041c) fails; SDK wrappers surface this as a typed OutletProtocolError subclass",
+        "FFI bridges: PyO3 outlet_error_new, NAPI outletErrorNew, UniFFI outlet_error_new (UDL) \u2014 all three bridges expose the catalog_key -> wire_message HMAC at the FFI boundary with the options-object signature",
+        "FFI bridges: all three bridges expose outlet_catalog_rotation_validator (check-only path) that returns CatalogRotationTooFrequent typed error when the dwell-time rule (OUT-041c) fails; SDK wrappers surface this as a typed OutletProtocolError subclass",
         "Per-SDK test: Python/TypeScript/Swift/Kotlin each verify that registering an outlet with catalog C0 at T0, then updating to catalog C1 at T0 + 23.99h (simulated via the test event log) produces CatalogRotationTooFrequent; T0 + 24.01h succeeds",
         "Conformance fixture: tests/conformance/vectors/outlet_message_hmac_fixtures.json \u2014 one fixture per (outlet_id, catalog_key) pair (minimum 10 fixtures covering varied outlet_ids and catalog sizes); every bridge produces byte-identical wire_message for the same (outlet_message_key, catalog_key) input",
-        "bridge_ratchet_baseline.json is regenerated additively (new exports only \u2014 outlet_error_new, outlet_catalog_rotation_validator); CI ratchet passes",
+        "scripts/bridge-aliases.json gains canonical entries outlet_error_new and outlet_catalog_rotation_validator with PyO3, UniFFI, and NAPI aliases (additive \u2014 new exports only); MIN_PARITY_OPERATIONS in crates/scp-testing/tests/integration/ffi_conformance.rs rises by 2; the tests parity_operation_count_never_decreases, aliases_json_is_in_sync_with_parity_operations, and every_exported_ffi_fn_is_registered_or_allowlisted in crates/scp-testing/tests/integration/ffi_conformance.rs pass, and bash scripts/check-bridge-symmetry.sh exits 0",
         "cargo test --workspace --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing succeeds",
         "python3.12 -m pytest bindings/python/tests/test_outlet_error_new.py succeeds; bun test bindings/typescript/tests/outlet-error-new.test.ts succeeds; swift test bindings/swift/Tests/SCPTests/OutletErrorTests.swift succeeds; ./gradlew test -Pscp.uniffi.cargoFeatures=testing for OutletErrorTests passes"
       ],
       "actionItems": [
-        "Add all four bridge exports (PyO3, NAPI, UniFFI, WASM) for outlet_error_new and outlet_catalog_rotation_validator",
+        "Add all three bridge exports (PyO3, NAPI, UniFFI) for outlet_error_new and outlet_catalog_rotation_validator",
         "Add SDK wrappers in all four language SDKs",
         "Add per-SDK unit tests for OutletError.new options-object form and CatalogRotationTooFrequent rejection",
         "Create tests/conformance/vectors/outlet_message_hmac_fixtures.json with \u2265 10 cross-bridge fixtures",
-        "Regenerate bridge_ratchet_baseline.json (additive only \u2014 new exports)"
+        "Add outlet_error_new and outlet_catalog_rotation_validator to scripts/bridge-aliases.json and raise MIN_PARITY_OPERATIONS in crates/scp-testing/tests/integration/ffi_conformance.rs by 2 (additive only \u2014 new exports)"
       ],
       "blockedBy": [
         "SCP-OUT-041a",
@@ -2772,7 +2757,7 @@
         "Method: IkmCommitment::sign(&self, custody: &impl KeyCustody, key: &KeyHandle) -> P256Signature computes SHA-256('SCP-OUTLET-IKM-COMMITMENT-V1:' || len_be32(context_a_id) || context_a_id || len_be32(context_b_id) || context_b_id || epoch_be || ikm) and signs it under the admin's #active key, returning the 64-byte raw r || s value \u00a79.5 fixes",
         "Method: IkmCommitment::verify(&self, verifying_key: &P256VerifyingKey, sig: &P256Signature) -> Result<(), IkmSignatureError>, which rejects a high-s signature (\u00a79.5)",
         "Function derive_hop_salt_from_committed_ikms(ikm_a: &[u8; 32], ikm_b: &[u8; 32], context_a_id: &ContextId, context_b_id: &ContextId) -> [u8; 32] implements \u00a76.2.0.1 Step 2 \u2014 canonical ordering + HKDF-SHA-256 with info = 'SCP-CONTEXT-HOP-SALT-V1:' || canonical_context_pair",
-        "Cross-SDK byte-equality conformance test: derive_hop_salt_from_committed_ikms produces identical output across all four bridges for identical inputs",
+        "Cross-SDK byte-equality conformance test: derive_hop_salt_from_committed_ikms produces identical output across all three bridges (PyO3, UniFFI, NAPI) for identical inputs",
         "AcceptOutletInterface handler: uses IkmCommitment::derive_accept_time + sign to produce ikm_local + ikm_local_sig; assembles InterfaceEstablished with (epoch_a, epoch_b, ikm_a, ikm_a_sig, ikm_b, ikm_b_sig). Both sides' signatures are verified via IkmCommitment::verify BEFORE the event is appended \u2014 a failed verification rejects the establishment entirely with OutletErrorClass::Authorization slug authorization.ikm-signature-invalid (SCP-OUTLET-6110) and the event does NOT land in either event log",
         "Unit test: a tampered ikm_a_sig (last byte flipped) rejects at event-log append time with authorization.ikm-signature-invalid",
         "Unit test: an ikm_a value from interface A\u2194B with A's signature does NOT verify when replayed as the ikm in an A\u2194C InterfaceEstablished event \u2014 the context-id pair is in the preimage, so a signature for A\u2194B cannot be reused for A\u2194C",

@@ -108,10 +108,11 @@ from scp_sdk.errors import (
     StreamGap,
     TransportError,
     UcanPermissionError,
+    UnknownGovernanceOutcomeError,
     ValidationError,
 )
 from scp_sdk.event_log import Checkpoint, Event, Proof, SignedCheckpoint
-from scp_sdk.governance import GovernanceActionResult
+from scp_sdk.governance import GovernanceActionResult, ProposalStatus, RejectionReason
 from scp_sdk.identity import DIDDocument, Identity, IdentityAttestation, RevocationStatus
 from scp_sdk.mcp import (
     McpClient,
@@ -222,6 +223,7 @@ from scp_sdk.types import (
     CeilingPolicy,
     ContextMode,
     CustodyType,
+    CustomRole,
     DiscoveryMethod,
     MemberRole,
     MemoryScope,
@@ -268,6 +270,7 @@ __all__ = [
     "CustodyKeyType",
     "CustodyPublicKey",
     "CustodyType",
+    "CustomRole",
     "DIDDocument",
     "DiscoveryMethod",
     "EconomyError",
@@ -310,10 +313,12 @@ __all__ = [
     "PaymentReceiptVerificationResult",
     "PromotionPolicy",
     "Proof",
+    "ProposalStatus",
     "ProtocolError",
     "Provenance",
     "ProvenanceQuality",
     "PublishResult",
+    "RejectionReason",
     "Relay",
     "RequireParticipation",
     "RevocationStatus",
@@ -345,6 +350,7 @@ __all__ = [
     "TrustEvaluation",
     "UcanPermissionError",
     "UcanToken",
+    "UnknownGovernanceOutcomeError",
     "ValidationError",
     "VerificationLevel",
     "__version__",

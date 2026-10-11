@@ -278,7 +278,6 @@ impl scp_core::crypto::ucan::validate::RevocationChecker for UniffiStreamRevocat
 /// during PR 1 — they move onto this struct in PR 2.
 ///
 /// Constructed via [`UniffiBridgeInstance::new_uniffi`] /
-/// [`UniffiBridgeInstance::with_persistence_uniffi`] /
 /// [`UniffiBridgeInstance::with_storage_uniffi`]. Every caller-owned
 /// `#[derive(uniffi::Object)] Scp` constructs its own instance —
 /// Phase D (#1695, ADR-048) deleted the process-wide
@@ -455,7 +454,8 @@ impl UniffiBridgeInstance {
     /// Constructs a new `UniffiBridgeInstance` with default in-memory state.
     ///
     /// Allocates a fresh `CoreFields` (new `instance_id`, new
-    /// `CancellationToken`, empty `JoinSet`) and populates the protocol
+    /// `CancellationToken`, empty `JoinSet`) carrying a context persistence
+    /// over the in-memory protocol repository, and populates the protocol
     /// repository + typed registries. No `ContextManager` is attached —
     /// callers attach one later via `CoreFields::set_context_manager`.
     #[must_use]
@@ -469,43 +469,17 @@ impl UniffiBridgeInstance {
         // `DurableProviders` derived from the SAME `Arc`, so they cannot diverge
         // by construction (§17.6 / §17.16).
         let durable_providers = durable_providers_from_handle(storage_handle);
-        let core = CoreFields::new();
-        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
-        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
-        Self {
-            core,
-            ucan_registry: Arc::new(DashMap::new()),
-            released_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
-            next_release_generation: std::sync::atomic::AtomicU64::new(0),
-            identity_custody_registry: Arc::new(DashMap::new()),
-            protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
-            identity_link_attestation_registry: Arc::new(DashMap::new()),
-            context_handle_registry: Arc::new(DashMap::new()),
-            mcp_server_registry: Arc::new(DashMap::new()),
-            mcp_client_registry: Arc::new(DashMap::new()),
-            durable_providers: Some(durable_providers),
-            outlet_stream_registry,
-            outlet_streaming_saga_registry,
-        }
-    }
-
-    /// Constructs a new `UniffiBridgeInstance` with an explicit
-    /// [`scp_core::context::persistence::ContextPersistence`] provider.
-    ///
-    /// Used by callers that already have a persistence strategy (typically
-    /// unit tests; production persistence is wired through PR 3's
-    /// [`StorageConfig::InMemory`] path on
-    /// [`UniffiBridgeInstance::with_storage_uniffi`]).
-    #[must_use]
-    pub fn with_persistence_uniffi(
-        persistence: Box<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
-    ) -> Self {
-        let (_event_log, protocol_repository, storage_handle) =
-            scp_ffi_common::bridge_runtime::build_event_log_provider();
-        // Saga journal + `mls_storage` bound into one `DurableProviders` derived
-        // from one handle (§17.6 / §17.16).
-        let durable_providers = durable_providers_from_handle(storage_handle);
-        let core = CoreFields::with_persistence(persistence);
+        // The context persistence bridges over the SAME repository (spec
+        // §17.6), so the supervisor receives a real persistence that stores
+        // every snapshot in the chosen backend — never a no-op (§17.17
+        // `SCP-CAPSEL-8000`).
+        let persistence: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync> =
+            Arc::new(
+                scp_core::store::context::ProtocolRepositoryContextBridge::new(Arc::clone(
+                    &protocol_repository,
+                )),
+            );
+        let core = CoreFields::with_persistence_arc(persistence);
         let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
         let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
@@ -910,7 +884,14 @@ impl UniffiBridgeInstance {
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let event_log = self.protocol_repository.event_log_provider();
-        let persistence = self.core.persistence_arc_clone();
+        let Some(persistence) = self.core.persistence_arc_clone() else {
+            tracing::error!(
+                "storage-before-supervisor precondition failed — no context persistence \
+                 on the bridge instance; refusing to attach a supervisor (fail closed, \
+                 spec §17.17 SCP-CAPSEL-8000)"
+            );
+            return;
+        };
         // Storage-before-supervisor precondition (spec §17.6): the chosen
         // storage must already be erased into the `mls_storage` view. The
         // runtime never defaults storage, so a missing backend fails closed —
@@ -963,7 +944,14 @@ impl UniffiBridgeInstance {
         ));
         let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
         let event_log = self.protocol_repository.event_log_provider();
-        let persistence = self.core.persistence_arc_clone();
+        let Some(persistence) = self.core.persistence_arc_clone() else {
+            tracing::error!(
+                "storage-before-supervisor precondition failed — no context persistence \
+                 on the bridge instance; refusing to attach a supervisor (fail closed, \
+                 spec §17.17 SCP-CAPSEL-8000)"
+            );
+            return;
+        };
         let Some(durable) = self.durable_providers_ref().cloned() else {
             tracing::error!(
                 "init_context_manager_with_relay_transport: storage-before-supervisor \
@@ -1010,7 +998,14 @@ impl UniffiBridgeInstance {
         ));
         let transport = Box::new(scp_core::context::LocalTransportProvider);
         let event_log = self.protocol_repository.event_log_provider();
-        let persistence = self.core.persistence_arc_clone();
+        let Some(persistence) = self.core.persistence_arc_clone() else {
+            tracing::error!(
+                "storage-before-supervisor precondition failed — no context persistence \
+                 on the bridge instance; refusing to attach a supervisor (fail closed, \
+                 spec §17.17 SCP-CAPSEL-8000)"
+            );
+            return;
+        };
         let Some(durable) = self.durable_providers_ref().cloned() else {
             tracing::error!(
                 "init_context_manager_with_local_transport: storage-before-supervisor \
@@ -1912,12 +1907,13 @@ pub(crate) struct ReleaseTicket {
 ///
 /// ADR-049 commit 12c.9g.3.6 — the FFI bridge no longer touches
 /// the deleted `ContextManager` at all.
-/// [`scp_core::context::supervisor::Supervisor::with_providers`] is
-/// the single entry point that constructs the supervisor + populates
+/// [`scp_core::context::supervisor::Supervisor::with_providers_and_journal`]
+/// is the single entry point that constructs the supervisor + populates
 /// the lifted-provider slots. The supervisor is the only handle
 /// returned to the bridge layer.
 ///
-/// When `persistence` is `Some`, the shared `Arc` is wrapped in
+/// `persistence` is required (spec §17.17 `SCP-CAPSEL-8000`). The shared
+/// `Arc` is wrapped in
 /// [`ArcContextPersistence`] so the manager's internal `Arc` and the
 /// `CoreFields::persistence` mirror end up pointing at the same
 /// provider — a single `SQLite` connection, not two. Callers pull
@@ -1935,15 +1931,12 @@ fn build_supervisor(
     crypto: Arc<NodeMlsFactory>,
     transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
-    persistence: Option<Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>>,
+    persistence: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
     durable: scp_core::context::supervisor::DurableProviders,
     key_resolver: scp_core::context::governance::KeyResolver,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
-    let persistence_box: Option<Box<dyn scp_core::context::persistence::ContextPersistence>> =
-        persistence.map(|shared| {
-            Box::new(ArcContextPersistence::new(shared))
-                as Box<dyn scp_core::context::persistence::ContextPersistence>
-        });
+    let persistence_box: Box<dyn scp_core::context::persistence::ContextPersistence> =
+        Box::new(ArcContextPersistence::new(persistence));
     // Enable the event broadcast channel so `subscribe_events()` yields a
     // receiver for the MCP server's resource notifications. The unused receiver
     // is dropped immediately; the retained sender keeps the channel open.

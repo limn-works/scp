@@ -66,8 +66,8 @@
 // `clippy.toml` bans `std::sync::Mutex` on runtime paths. This module runs
 // OFF the actor mailbox (the pump runs supervisor-side), so it legitimately
 // owns its own shared per-stream state — but it uses `std::sync::RwLock`
-// (NOT banned; the sanctioned off-mailbox pattern also used by
-// `bridge::credentials`), always acquired via `.write()` for exclusive
+// (NOT banned; the sanctioned off-mailbox pattern), always acquired via
+// `.write()` for exclusive
 // access (semantically identical to a `Mutex`). The guard is NEVER held
 // across an `.await`, so `await_holding_lock` does not fire — the signer
 // call in `apply_outlet_cancel_signed` runs entirely off-lock.
@@ -541,10 +541,8 @@ pub struct OpenStreamParams {
     /// every [`Self::stream_ucan_recheck_secs`]. The runtime-side
     /// recheck is the authoritative termination locus per §5.4.5;
     /// SDK-side recheck loops remain in place as defense-in-depth.
-    /// Implementations include
-    /// [`scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker`]
-    /// for unit tests and per-context revocation-list adapters in the
-    /// FFI bridges. The bound is `Send + Sync` because the checker
+    /// Implementations include the per-context revocation-list adapters
+    /// in the FFI bridges and, in test builds, `InMemoryRevocationChecker`. The bound is `Send + Sync` because the checker
     /// is shared across the open path and the spawned pump task.
     pub revocation_checker: Arc<dyn RevocationChecker + Send + Sync>,
     /// §5.4.5 MED-HIGH — the economic policy snapshotted at acceptance so

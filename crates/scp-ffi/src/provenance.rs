@@ -393,7 +393,10 @@ fn parse_memory_scope(s: &str) -> PyResult<MemoryScope> {
 fn provenance_to_dict<'py>(py: Python<'py>, prov: &DataProvenance) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("source_context", &prov.source_context)?;
-    dict.set_item("source_type", format!("{:?}", prov.source_type))?;
+    dict.set_item(
+        "source_type",
+        scp_ffi_common::wire_name::source_type_name(prov.source_type),
+    )?;
     dict.set_item("chain_depth", prov.chain_depth)?;
     dict.set_item(
         "counterparties",
@@ -403,7 +406,10 @@ fn provenance_to_dict<'py>(py: Python<'py>, prov: &DataProvenance) -> PyResult<B
             .collect::<Vec<_>>(),
     )?;
     dict.set_item("age_secs", prov.age.as_secs())?;
-    dict.set_item("memory_scope", format!("{:?}", prov.memory_scope))?;
+    dict.set_item(
+        "memory_scope",
+        scp_ffi_common::wire_name::memory_scope_name(prov.memory_scope),
+    )?;
     dict.set_item("chain_path", prov.chain_path.clone())?;
     dict.set_item("purpose", prov.purpose.as_deref())?;
 

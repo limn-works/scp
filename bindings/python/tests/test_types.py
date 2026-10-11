@@ -12,6 +12,8 @@ See ``.docs/standards/python.md`` for test naming conventions.
 
 from __future__ import annotations
 
+import pytest
+
 import scp_sdk
 from scp_sdk.errors import (
     BRIDGE_ERROR_MAP,
@@ -976,3 +978,290 @@ class TestBroadcastKeyHexValidation:
 
         with pytest.raises(ValueError, match="broadcast_key_hex must be exactly 64 hex characters"):
             validate_broadcast_key_hex("")
+
+
+# Names every bridge emits, copied from the name functions in
+# crates/scp-ffi/common/src/governance_result.rs. Listed here as literals so a
+# test reads each name a bridge sends, not the enum under test.
+_RUST_ACTION_RESULT_NAMES = (
+    "MemberAdded",
+    "MemberRemoved",
+    "RoleChanged",
+    "OutletRegistered",
+    "OutletRemoved",
+    "CeilingModified",
+    "ContextClosed",
+    "TtlExtended",
+    "PruningPolicyModified",
+    "AdminTransferred",
+    "SignerAdded",
+    "SignerRemoved",
+    "ThresholdModified",
+    "ChildContextCreated",
+    "OutletInterfaceEstablished",
+    "MemberReset",
+    "ConflictResolved",
+    "ContextPromoted",
+    "MemberSuspended",
+    "AccessRevoked",
+    "AccessRestored",
+    "ContentKeysRotated",
+    "GovernanceReconfigured",
+    "SubscriberBanned",
+    "SubscriberUnbanned",
+    "Executed",
+    "MigrationProposed",
+    "MigrationCancelled",
+    "ContextTombstoned",
+)
+_RUST_PROPOSAL_STATUS_NAMES = (
+    "Pending",
+    "Approved",
+    "Rejected",
+    "Expired",
+    "Cancelled",
+    "Invalidated",
+)
+_RUST_REJECTION_REASON_NAMES = (
+    "AdminRejected",
+    "MajorityRejected",
+    "UnanimityBroken",
+    "ApprovalImpossible",
+    "InsufficientParticipation",
+)
+
+
+class TestGovernanceNamesFromBridge:
+    """Each governance enum parses every name a bridge emits and raises
+    ``SCP-GOV-11040`` for any other name, never substituting a known member."""
+
+    def test_every_action_result_name_parses(self) -> None:
+        from scp_sdk.governance import GovernanceActionResult
+
+        for name in _RUST_ACTION_RESULT_NAMES:
+            assert GovernanceActionResult.from_bridge(name).value == name
+
+    def test_every_proposal_status_name_parses(self) -> None:
+        from scp_sdk.governance import ProposalStatus
+
+        for name in _RUST_PROPOSAL_STATUS_NAMES:
+            assert ProposalStatus.from_bridge(name).value == name
+
+    def test_every_rejection_reason_name_parses(self) -> None:
+        from scp_sdk.governance import RejectionReason
+
+        for name in _RUST_REJECTION_REASON_NAMES:
+            assert RejectionReason.from_bridge(name).value == name
+
+    def test_unknown_name_raises_gov_11040(self) -> None:
+        import pytest
+
+        from scp_sdk.errors import GovernanceError, UnknownGovernanceOutcomeError
+        from scp_sdk.governance import (
+            GovernanceActionResult,
+            ProposalStatus,
+            RejectionReason,
+        )
+
+        for parse in (
+            GovernanceActionResult.from_bridge,
+            ProposalStatus.from_bridge,
+            RejectionReason.from_bridge,
+        ):
+            for raw in ("SomethingThisSdkDoesNotKnow", "", " Executed", "executed"):
+                with pytest.raises(UnknownGovernanceOutcomeError) as excinfo:
+                    parse(raw)
+                assert excinfo.value.code == "SCP-GOV-11040"
+                assert excinfo.value.raw_outcome == raw
+                assert isinstance(excinfo.value, GovernanceError)
+
+
+class TestCheckProposalResponse:
+    """``check_proposal_response`` parses every name in a proposal response."""
+
+    def test_known_names_return_the_response(self) -> None:
+        import json
+
+        from scp_sdk.governance import check_proposal_response
+
+        for body in (
+            {"proposal_id": "ab", "status": "Approved", "execution_result": "RoleChanged"},
+            {"proposal_id": "ab", "status": "Pending", "execution_result": None},
+            {"status": "Rejected", "reason": "UnanimityBroken", "rejector": "did:dht:zA"},
+            {"status": "Invalidated", "reason": "proposer removed"},
+            {"status": "Cancelled"},
+        ):
+            raw = json.dumps(body)
+            assert check_proposal_response(raw) == raw
+
+    def test_unreadable_names_raise_gov_11040(self) -> None:
+        import json
+
+        import pytest
+
+        from scp_sdk.errors import UnknownGovernanceOutcomeError
+        from scp_sdk.governance import check_proposal_response
+
+        for raw in (
+            json.dumps({"status": "Approved", "execution_result": "SomethingNew"}),
+            json.dumps({"status": "SomethingNew"}),
+            json.dumps({"status": "Rejected", "reason": "SomethingNew"}),
+            json.dumps({"status": "Rejected"}),
+            json.dumps({"status": "Invalidated"}),
+            json.dumps({"execution_result": "Executed"}),
+            json.dumps({"status": "Approved", "execution_result": 7}),
+            "not json",
+            "[]",
+        ):
+            with pytest.raises(UnknownGovernanceOutcomeError) as excinfo:
+                check_proposal_response(raw)
+            assert excinfo.value.code == "SCP-GOV-11040", raw
+
+
+class TestScpGovernanceWrappers:
+    """``SCP`` governance methods return typed outcomes and check responses."""
+
+    @staticmethod
+    def _scp(method: str, raw: object) -> object:
+        from unittest.mock import MagicMock
+
+        scp = MagicMock()
+        setattr(scp._native, method, MagicMock(return_value=raw))
+        return scp
+
+    async def test_execute_returns_a_typed_outcome(self) -> None:
+        from scp_sdk.governance import GovernanceActionResult
+        from scp_sdk.scp import SCP
+
+        got = await SCP.governance_execute(
+            self._scp("governance_execute", "MemberSuspended"), "ctx", "ab"
+        )
+        assert got is GovernanceActionResult.MEMBER_SUSPENDED
+
+    async def test_execute_raises_on_an_unknown_outcome(self) -> None:
+        import pytest
+
+        from scp_sdk.errors import UnknownGovernanceOutcomeError
+        from scp_sdk.scp import SCP
+
+        with pytest.raises(UnknownGovernanceOutcomeError) as excinfo:
+            await SCP.governance_execute(
+                self._scp("governance_execute", "SomethingNew"), "ctx", "ab"
+            )
+        assert excinfo.value.code == "SCP-GOV-11040"
+
+    async def test_propose_and_votes_raise_on_an_unknown_name(self) -> None:
+        import json
+
+        import pytest
+
+        from scp_sdk.errors import UnknownGovernanceOutcomeError
+        from scp_sdk.scp import SCP
+
+        cases = (
+            (
+                "governance_propose",
+                SCP.governance_propose,
+                json.dumps({"status": "Approved", "execution_result": "SomethingNew"}),
+            ),
+            ("governance_approve", SCP.governance_approve, json.dumps({"status": "SomethingNew"})),
+            ("governance_reject", SCP.governance_reject, json.dumps({"status": "SomethingNew"})),
+            (
+                "governance_withdraw",
+                SCP.governance_withdraw,
+                json.dumps({"status": "SomethingNew"}),
+            ),
+        )
+        ok = json.dumps({"status": "Pending"})
+        for method, call, raw in cases:
+            with pytest.raises(UnknownGovernanceOutcomeError) as excinfo:
+                await call(self._scp(method, raw), "ctx", "did:dht:zA", "ab")
+            assert excinfo.value.code == "SCP-GOV-11040", method
+            assert await call(self._scp(method, ok), "ctx", "did:dht:zA", "ab") == ok
+
+
+# The six names ``RESERVED_ROLE_NAMES`` in
+# ``crates/scp-protocol/src/context/roles.rs`` reserves, as bridges report them.
+RUST_RESERVED_ROLE_NAMES = ("admin", "moderator", "member", "observer", "author", "subscriber")
+
+
+class TestMemberRoleFromBridge:
+    """``MemberRole.from_bridge`` reads ``RoleAssignment.role_name``.
+
+    The imports sit inside each test so that a source without the parsed types
+    fails these tests alone.
+    """
+
+    def test_author_and_subscriber_are_built_in_roles(self) -> None:
+        from scp_sdk.types import MemberRole
+
+        assert MemberRole.from_bridge("author") is MemberRole.AUTHOR
+        assert MemberRole.from_bridge("subscriber") is MemberRole.SUBSCRIBER
+
+    def test_every_reserved_name_parses_to_its_built_in_role(self) -> None:
+        from scp_sdk.types import MemberRole
+
+        parsed = [MemberRole.from_bridge(name) for name in RUST_RESERVED_ROLE_NAMES]
+        assert parsed == list(MemberRole)
+
+    def test_governance_defined_role_carries_its_name(self) -> None:
+        from scp_sdk.types import CustomRole, MemberRole
+
+        assert MemberRole.from_bridge("night-shift-reviewer") == CustomRole(
+            name="night-shift-reviewer"
+        )
+
+    @pytest.mark.parametrize("raw", ["Author", "My-role", "", "-lead", "a b", "x" * 65])
+    def test_malformed_name_raises_gov_11040(self, raw: str) -> None:
+        from scp_sdk.errors import UnknownGovernanceOutcomeError
+        from scp_sdk.types import MemberRole
+
+        with pytest.raises(UnknownGovernanceOutcomeError) as excinfo:
+            MemberRole.from_bridge(raw)
+        assert excinfo.value.code == "SCP-GOV-11040"
+        assert excinfo.value.raw_outcome == raw
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("author", "AUTHOR"),
+            ("subscriber", "SUBSCRIBER"),
+            ("night-shift-reviewer", None),
+        ],
+    )
+    async def test_scp_context_member_role_returns_the_parsed_role(
+        self, raw: str, expected: str | None
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from scp_sdk.scp import SCP
+        from scp_sdk.types import CustomRole, MemberRole
+
+        scp = MagicMock()
+        scp._native.context_member_role = MagicMock(return_value=raw)
+        got = await SCP.context_member_role(scp, "ctx", "did:dht:zA")
+        if expected is None:
+            assert got == CustomRole(name=raw)
+        else:
+            assert got is MemberRole[expected]
+
+    async def test_scp_context_member_role_returns_none_for_a_non_member(self) -> None:
+        from unittest.mock import MagicMock
+
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        scp._native.context_member_role = MagicMock(return_value=None)
+        assert await SCP.context_member_role(scp, "ctx", "did:dht:zA") is None
+
+    async def test_scp_context_member_role_raises_gov_11040_for_a_malformed_name(self) -> None:
+        from unittest.mock import MagicMock
+
+        from scp_sdk.errors import UnknownGovernanceOutcomeError
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        scp._native.context_member_role = MagicMock(return_value="Admin")
+        with pytest.raises(UnknownGovernanceOutcomeError) as excinfo:
+            await SCP.context_member_role(scp, "ctx", "did:dht:zA")
+        assert excinfo.value.code == "SCP-GOV-11040"

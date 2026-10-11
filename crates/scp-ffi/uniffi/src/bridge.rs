@@ -303,14 +303,19 @@ fn no_pre_rotation_backend() -> ScpError {
 }
 
 /// Tears down a committed Welcome join, re-marks the id released, and returns
-/// the join's `CTX_2040` error.
+/// the join's `CTX_2040` error, or the teardown's own error when the discard
+/// fails (when the actor did not exit in time, the Supervisor deletes the
+/// snapshot once it has).
 async fn tear_down_vanished_join(
     bi: &crate::runtime::UniffiBridgeInstance,
-    sup: &scp_core::context::supervisor::Supervisor,
+    sup: &Arc<scp_core::context::supervisor::Supervisor>,
     context_id: &str,
 ) -> ScpError {
-    sup.discard_joined_context(context_id).await;
+    let discarded = sup.discard_joined_context(context_id).await;
     bi.release_ucan_state(context_id);
+    if let Err(e) = discarded {
+        return ScpError::from(e);
+    }
     ScpError::Context {
         msg: format!(
             "UCAN state for context '{context_id}' vanished after the join committed; the \
@@ -4669,8 +4674,7 @@ pub(crate) fn validate_outlet_ucan_uniffi(
             // §5.4.5 HIGH-3 — outlet-invocation site resolves effective caveats
             // from each token's `nb` field so §7.3.8 Step 7b (per-edge narrow)
             // and Step 11b (time-box) run over the proof chain's VALIDATED-
-            // NARROWED caveat set. Generic validate/evaluate sites stay on
-            // `NoCaveatResolver`.
+            // NARROWED caveat set.
             caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
         };
 
@@ -5603,8 +5607,7 @@ impl McpUniFfiBridgeProvider {
                 // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
                 // caveats from each token's `nb` field so §7.3.8 Step 7b
                 // (per-edge narrow) and Step 11b (time-box) run over the
-                // proof chain's VALIDATED-NARROWED caveat set. Generic
-                // validate/evaluate sites stay on `NoCaveatResolver`.
+                // proof chain's VALIDATED-NARROWED caveat set.
                 caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
             };
 
@@ -7296,55 +7299,6 @@ pub struct BatchPublishResult {
 // Free functions — events (#387)
 // ---------------------------------------------------------------------------
 
-/// Formats a [`ContextEvent`](scp_core::context::membership::ContextEvent) as a human-readable string.
-///
-/// Consequence events (`ConsequenceTriggered`, `ConsequenceEnforced`) are
-/// formatted with structured key=value pairs for observability. All other
-/// events use their `Debug` representation.
-fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> String {
-    use scp_core::context::membership::ContextEvent::{ConsequenceEnforced, ConsequenceTriggered};
-    match event {
-        ConsequenceTriggered {
-            context_id,
-            member_did,
-            rule_index,
-            trigger_type,
-            action_type,
-        } => format!(
-            "consequence_triggered:member={member_did},\
-             rule={rule_index},trigger={trigger_type},\
-             action={action_type},context={context_id}"
-        ),
-        ConsequenceEnforced {
-            context_id,
-            member_did,
-            action_type,
-            success,
-        } => format!(
-            "consequence_enforced:member={member_did},\
-             action={action_type},success={success},\
-             context={context_id}"
-        ),
-        // Relay equivocation detected (§9.9.3, §23.7). Security event — MUST NOT
-        // be silently discarded (§9.9.4); surface as a structured, non-lossy,
-        // HTML-escaped record rather than a Debug blob.
-        scp_core::context::membership::ContextEvent::EquivocationDetected {
-            context_id,
-            remote_sender_did,
-            event_count,
-            local_merkle_root,
-            remote_merkle_root,
-        } => scp_ffi_common::html_escape_event_string(&format!(
-            "equivocation_detected:context={context_id},\
-             remote_sender={remote_sender_did},event_count={event_count},\
-             local_merkle_root={},remote_merkle_root={}",
-            hex::encode(local_merkle_root),
-            hex::encode(remote_merkle_root),
-        )),
-        other => scp_ffi_common::html_escape_event_string(&format!("{other:?}")),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Free functions — access key lifecycle (#1529)
 // ---------------------------------------------------------------------------
@@ -8470,7 +8424,7 @@ pub fn media_send_signaling(signaling_json: String) -> Result<String, ScpError> 
     use base64::Engine;
     serde_json::to_string(&serde_json::json!({
         "payload": base64::engine::general_purpose::STANDARD.encode(&payload),
-        "message_type": format!("{message_type:?}"),
+        "message_type": scp_ffi_common::wire_name::message_type_name(message_type),
     }))
     .map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize result: {e}"),
@@ -11641,40 +11595,8 @@ impl Scp {
                         .map_err(ScpError::from)?
                 };
                 // Serialize the result variant name for the caller.
-                use scp_core::context::state::GovernanceActionResult;
-                let result_str = match result {
-                    GovernanceActionResult::MemberAdded { .. } => "MemberAdded",
-                    GovernanceActionResult::MemberRemoved => "MemberRemoved",
-                    GovernanceActionResult::RoleChanged => "RoleChanged",
-                    GovernanceActionResult::OutletRegistered => "OutletRegistered",
-                    GovernanceActionResult::OutletRemoved => "OutletRemoved",
-                    GovernanceActionResult::CeilingModified => "CeilingModified",
-                    GovernanceActionResult::ContextClosed => "ContextClosed",
-                    GovernanceActionResult::TtlExtended => "TtlExtended",
-                    GovernanceActionResult::PruningPolicyModified => "PruningPolicyModified",
-                    GovernanceActionResult::AdminTransferred => "AdminTransferred",
-                    GovernanceActionResult::SignerAdded => "SignerAdded",
-                    GovernanceActionResult::SignerRemoved => "SignerRemoved",
-                    GovernanceActionResult::ThresholdModified => "ThresholdModified",
-                    GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
-                    GovernanceActionResult::OutletInterfaceEstablished => {
-                        "OutletInterfaceEstablished"
-                    }
-                    GovernanceActionResult::MemberReset => "MemberReset",
-                    GovernanceActionResult::ConflictResolved => "ConflictResolved",
-                    GovernanceActionResult::ContextPromoted => "ContextPromoted",
-                    GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
-                    GovernanceActionResult::AccessRevoked(_) => "AccessRevoked",
-                    GovernanceActionResult::AccessRestored(_) => "AccessRestored",
-                    GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
-                    GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
-                    GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
-                    GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
-                    GovernanceActionResult::Executed => "Executed",
-                    GovernanceActionResult::MigrationProposed(_) => "MigrationProposed",
-                    GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
-                    GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
-                };
+                let result_str =
+                    scp_ffi_common::governance_result::governance_action_result_name(&result);
                 Ok::<_, ScpError>(result_str.to_owned())
             })
             .await
@@ -11737,14 +11659,13 @@ impl Scp {
                     .await
                     .map_err(ScpError::from)?;
 
-                let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
-
-                let response = serde_json::json!({
-                    "proposal_id": hex::encode(outcome.proposal.proposal_id),
-                    "status": format!("{:?}", outcome.status),
-                    "execution_result": result_str,
-                });
-                Ok::<_, ScpError>(response.to_string())
+                Ok::<_, ScpError>(
+                    scp_ffi_common::governance_result::governance_propose_response(
+                        &outcome.proposal.proposal_id,
+                        &outcome.status,
+                        outcome.execution_result.as_ref(),
+                    ),
+                )
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -11803,7 +11724,9 @@ impl Scp {
                         .map_err(ScpError::from)?
                 };
 
-                Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+                Ok(scp_ffi_common::governance_result::proposal_status_response(
+                    &status,
+                ))
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -11860,7 +11783,9 @@ impl Scp {
                         .map_err(ScpError::from)?
                 };
 
-                Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+                Ok(scp_ffi_common::governance_result::proposal_status_response(
+                    &status,
+                ))
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -11896,7 +11821,9 @@ impl Scp {
                     .await
                     .map_err(ScpError::from)?;
 
-                Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+                Ok(scp_ffi_common::governance_result::proposal_status_response(
+                    &status,
+                ))
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -12224,11 +12151,14 @@ impl Scp {
                         .map_err(ScpError::from)?
                 };
 
-                let response = serde_json::json!({
-                    "attestation_status": format!("{status:?}"),
-                    "checkpoint": serde_json::to_value(&updated_checkpoint).unwrap_or_default(),
-                });
-                Ok(response.to_string())
+                scp_ffi_common::governance_result::checkpoint_cosignature_response(
+                    &updated_checkpoint,
+                    &status,
+                )
+                .map_err(|e| ScpError::Context {
+                    msg: format!("add_checkpoint_cosignature failed to encode checkpoint: {e}"),
+                    code: codes::CTX_2063.to_owned(),
+                })
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -13314,7 +13244,9 @@ impl Scp {
             return None;
         }
         match rx.await {
-            Ok(Ok(admission)) => admission.map(|a| format!("{a:?}")),
+            Ok(Ok(admission)) => {
+                admission.map(|a| scp_ffi_common::broadcast::broadcast_admission_name(a).to_owned())
+            }
             _ => None,
         }
     }
@@ -13446,7 +13378,7 @@ impl Scp {
         manager
             .member_role(&handle.context_id, &did)
             .await
-            .map(|r| format!("{r:?}"))
+            .map(|r| r.role_name)
     }
 
     /// Per-instance equivalent of the free-function `context_drain_events`.
@@ -13464,7 +13396,7 @@ impl Scp {
             .drain_events(&handle.context_id)
             .await
             .iter()
-            .map(format_context_event)
+            .map(scp_ffi_common::context_event::context_event_wire_string)
             .collect()
     }
 
@@ -15231,7 +15163,8 @@ impl Scp {
                             manager_events.push(Event {
                                 event_type: scp_ffi_common::event_log::event_type_label(
                                     &entry.event_type,
-                                ),
+                                )
+                                .to_owned(),
                                 actor_did: entry.actor_did.0.clone(),
                                 timestamp: entry.timestamp,
                                 payload_json: payload_value.to_string(),
@@ -15280,7 +15213,8 @@ impl Scp {
                                 }
                                 // Apply event type filter.
                                 if let Some(ref et) = filter_event_type
-                                    && format!("{:?}", evt.event_type) != *et
+                                    && scp_ffi_common::event_log::event_type_label(&evt.event_type)
+                                        != et.as_str()
                                 {
                                     continue;
                                 }
@@ -15318,7 +15252,10 @@ impl Scp {
                                 let payload_json = payload_value.to_string();
 
                                 results.push(Event {
-                                    event_type: format!("{:?}", evt.event_type),
+                                    event_type: scp_ffi_common::event_log::event_type_label(
+                                        &evt.event_type,
+                                    )
+                                    .to_owned(),
                                     actor_did: evt.actor_did.0.clone(),
                                     timestamp: evt.timestamp,
                                     payload_json,
@@ -15737,11 +15674,13 @@ impl Scp {
                             presenting_agent_did: agent_did,
                             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                             clock: &scp_clock::SystemClock,
-                            // Generic validate site: not an outlet-invocation
-                            // path, so caveat resolution is a constant `None`
-                            // (`NoCaveatResolver`). Only outlet-invocation sites
-                            // use `TokenNbCaveatResolver`.
-                            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
+                            // §7.3.8: resolve caveats from the token's own
+                            // signed `nb`, so Step 7b narrows every outlet edge
+                            // and Step 11b enforces the presenting token's
+                            // time-box. A non-outlet token carries `nb = None`,
+                            // so both caveat steps are no-ops for it.
+                            caveat_resolver:
+                                &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
                         };
 
                         validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(|e| {
@@ -15912,11 +15851,13 @@ impl Scp {
                             presenting_agent_did: agent_did,
                             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                             clock: &scp_clock::SystemClock,
-                            // Generic evaluate site: not an outlet-invocation
-                            // path, so caveat resolution is a constant `None`
-                            // (`NoCaveatResolver`). Only outlet-invocation sites
-                            // use `TokenNbCaveatResolver`.
-                            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
+                            // §7.3.8: resolve caveats from the token's own
+                            // signed `nb`, so Step 7b narrows every outlet edge
+                            // and Step 11b enforces the presenting token's
+                            // time-box. A non-outlet token carries `nb = None`,
+                            // so both caveat steps are no-ops for it.
+                            caveat_resolver:
+                                &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
                         };
 
                         evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx)
@@ -18034,11 +17975,11 @@ impl Scp {
 
         let result = serde_json::json!({
             "source_context": prov.source_context,
-            "source_type": format!("{:?}", prov.source_type),
+            "source_type": scp_ffi_common::wire_name::source_type_name(prov.source_type),
             "chain_depth": prov.chain_depth,
             "counterparties": prov.counterparties.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "age_secs": prov.age.as_secs(),
-            "memory_scope": format!("{:?}", prov.memory_scope),
+            "memory_scope": scp_ffi_common::wire_name::memory_scope_name(prov.memory_scope),
             "chain_path": prov.chain_path,
             "purpose": prov.purpose,
         });
@@ -21400,6 +21341,197 @@ mod tests {
         );
     }
 
+    /// Re-signs `encoded` as `signer` with its `nb` replaced by `nb` and a
+    /// fresh nonce, so a test can present a root token whose signed §7.3.8
+    /// caveats the bridge mint does not originate.
+    #[cfg(feature = "testing")]
+    fn resign_with_nb(
+        scp: &crate::scp::Scp,
+        signer: &str,
+        encoded: &str,
+        nb: scp_core::trust::caveats::InvocationCaveats,
+    ) -> String {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use scp_platform::traits::KeyCustody as _;
+
+        let mut token = scp_core::crypto::ucan::validate::parse_ucan(encoded).unwrap();
+        token.payload.nb = Some(nb);
+        token.payload.nnc = scp_core::crypto::ucan::nonce::generate_nonce(&scp_clock::SystemClock);
+        let header_b64 = encoded.split('.').next().unwrap();
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&token.payload).unwrap());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let (custody, key) = {
+            let entry = identity_custody_registry(&scp.inner).get(signer).unwrap();
+            let (custody, key) = entry.value();
+            (Arc::clone(custody), *key)
+        };
+        let sig = runtime()
+            .block_on(custody.sign(&key, signing_input.as_bytes()))
+            .unwrap();
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.as_bytes()))
+    }
+
+    /// A context whose ceiling holds `outlet_call:*` and `messages:write`, plus
+    /// a root `outlet_call:*` token minted to `holder` and its capability.
+    #[cfg(feature = "testing")]
+    struct NbFixture {
+        scp: Arc<crate::scp::Scp>,
+        creator: String,
+        holder: String,
+        handle: Arc<ContextHandle>,
+        root: String,
+        cap: String,
+    }
+
+    #[cfg(feature = "testing")]
+    fn nb_fixture() -> NbFixture {
+        let rt = runtime();
+        let scp = scp_test();
+        let creator = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let holder = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed")
+            .did();
+        let mut params = closable_test_params();
+        params.ceiling.push("outlet_call:*".to_owned());
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&creator), params))
+            .expect("context_create should succeed");
+        let root = rt
+            .block_on(scp.ucan_mint(
+                Arc::clone(&handle),
+                holder.clone(),
+                vec!["outlet_call:*".to_owned()],
+                None,
+            ))
+            .expect("outlet mint");
+        NbFixture {
+            creator: creator.did(),
+            holder,
+            handle,
+            root: root.encoded.clone(),
+            cap: root.data.capabilities[0].clone(),
+            scp,
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    fn valid_until(offset: i64) -> scp_core::trust::caveats::InvocationCaveats {
+        let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+        scp_core::trust::caveats::InvocationCaveats {
+            valid_until: Some(now.saturating_add_signed(offset)),
+            ..scp_core::trust::caveats::InvocationCaveats::empty()
+        }
+    }
+
+    /// §7.3.8 Step 11b: `ucan_validate` and `ucan_evaluate` refuse a root
+    /// `outlet_call:*` token whose signed `nb.valid_until` has passed although
+    /// its `exp` has not.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_validate_refuses_a_root_outlet_token_past_its_nb_time_box() {
+        let rt = runtime();
+        let f = nb_fixture();
+        let lapsed = resign_with_nb(&f.scp, &f.creator, &f.root, valid_until(-60));
+        let evaluation = rt
+            .block_on(f.scp.ucan_evaluate(
+                Arc::clone(&f.handle),
+                lapsed.clone(),
+                Some(f.cap.clone()),
+                f.holder.clone(),
+                None,
+            ))
+            .expect("evaluate");
+        assert!(
+            evaluation.signatures_valid && !evaluation.time_bounds_valid,
+            "evaluate must report only the time-box failure"
+        );
+        let err = rt
+            .block_on(
+                f.scp
+                    .ucan_validate(Arc::clone(&f.handle), lapsed, f.cap, f.holder, None),
+            )
+            .expect_err("a root outlet token past nb.valid_until must not validate");
+        assert!(
+            matches!(&err, ScpError::Permission { code, msg }
+                if code == codes::PERM_3002
+                    && msg.contains("caveat time-box violation: valid_until")),
+            "the refusal must be the Step 11b time-box: {err:?}"
+        );
+    }
+
+    /// §7.3.8 Step 7b: a delegated outlet token whose `nb` carries the
+    /// materialized `origin_kind` and an unexpired `valid_until` validates.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_validate_admits_a_delegated_outlet_token_inside_its_time_box() {
+        let rt = runtime();
+        let f = nb_fixture();
+        let delegatee = "did:dht:z6MkUniffiNbTimeBoxDelegatee".to_owned();
+        let live = resign_with_nb(&f.scp, &f.creator, &f.root, valid_until(1800));
+        let child = rt
+            .block_on(f.scp.ucan_delegate(
+                Arc::clone(&f.handle),
+                f.holder.clone(),
+                delegatee.clone(),
+                live.clone(),
+                vec![f.cap.clone()],
+            ))
+            .expect("delegate")
+            .encoded
+            .clone();
+        let evaluation = rt
+            .block_on(f.scp.ucan_evaluate(
+                Arc::clone(&f.handle),
+                child.clone(),
+                Some(f.cap.clone()),
+                delegatee.clone(),
+                Some(vec![live.clone()]),
+            ))
+            .expect("evaluate");
+        assert!(
+            evaluation.signatures_valid && evaluation.time_bounds_valid,
+            "evaluate must admit the delegated outlet token"
+        );
+        rt.block_on(f.scp.ucan_validate(
+            Arc::clone(&f.handle),
+            child,
+            f.cap,
+            delegatee,
+            Some(vec![live]),
+        ))
+        .expect("a delegated outlet token inside its time-box must validate");
+    }
+
+    /// A `messages:write` token carries no `nb`, so the caveat steps leave it
+    /// unaffected.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_validate_leaves_a_non_outlet_token_unaffected() {
+        let rt = runtime();
+        let f = nb_fixture();
+        let plain = rt
+            .block_on(f.scp.ucan_mint(
+                Arc::clone(&f.handle),
+                f.holder.clone(),
+                vec!["messages:write".to_owned()],
+                None,
+            ))
+            .expect("messages mint");
+        let plain_cap = plain.data.capabilities[0].clone();
+        rt.block_on(f.scp.ucan_validate(
+            f.handle,
+            plain.encoded.clone(),
+            plain_cap,
+            f.holder,
+            None,
+        ))
+        .expect("a messages:write token must validate");
+    }
+
     /// A token revoked before a close stays refused after the close released
     /// the context's revocation list, and `ensure_ucan_registered` builds no
     /// state for the released id until `readmit_context` clears the mark.
@@ -21546,8 +21678,6 @@ mod tests {
     fn restore_readmits_the_ids_it_restores() {
         use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
         let rt = runtime();
-        // `restore_context` reads the snapshot the persistence provider holds;
-        // only the Sqlite backend attaches one.
         let tmp = tempfile::tempdir().expect("tempdir");
         let scp = crate::scp::Scp::with_storage(crate::StorageConfig::Sqlite {
             path: tmp.path().to_string_lossy().into_owned(),
@@ -21998,7 +22128,8 @@ mod tests {
                 .context_manager_or_error()
                 .expect("test supervisor must be attached"),
         );
-        rt.block_on(sup.discard_joined_context(&context_id));
+        rt.block_on(sup.discard_joined_context(&context_id))
+            .expect("the discard stops the creator's actor and deletes its snapshot");
         deregister_context_handle(&scp.inner, &context_id);
         scp.inner.release_ucan_state(&context_id);
 
@@ -27010,74 +27141,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Consequence event format tests (#1531, #1593, #1594)
+    // Consequence rule parameter tests
     // -------------------------------------------------------------------
-
-    #[test]
-    fn format_consequence_triggered_event() {
-        use scp_core::context::membership::ContextEvent;
-
-        let event = ContextEvent::ConsequenceTriggered {
-            context_id: "ctx-uniffi-123".to_owned(),
-            member_did: scp_did::DID("did:dht:z6MkBob".to_owned()),
-            rule_index: 3,
-            trigger_type: "outlet_rate".to_owned(),
-            action_type: "capability_suspension".to_owned(),
-        };
-
-        let formatted = super::format_context_event(&event);
-        assert!(
-            formatted.contains("consequence_triggered:"),
-            "must contain consequence_triggered prefix"
-        );
-        assert!(
-            formatted.contains("member=did:dht:z6MkBob"),
-            "must contain member DID"
-        );
-        assert!(formatted.contains("rule=3"), "must contain rule index");
-        assert!(
-            formatted.contains("trigger=outlet_rate"),
-            "must contain trigger type"
-        );
-        assert!(
-            formatted.contains("action=capability_suspension"),
-            "must contain action type"
-        );
-        assert!(
-            formatted.contains("context=ctx-uniffi-123"),
-            "must contain context ID"
-        );
-    }
-
-    #[test]
-    fn format_consequence_enforced_event() {
-        use scp_core::context::membership::ContextEvent;
-
-        let event = ContextEvent::ConsequenceEnforced {
-            context_id: "ctx-uniffi-456".to_owned(),
-            member_did: scp_did::DID("did:dht:z6MkAlice".to_owned()),
-            action_type: "access_revocation".to_owned(),
-            success: true,
-        };
-
-        let formatted = super::format_context_event(&event);
-        assert!(
-            formatted.contains("consequence_enforced:"),
-            "must contain consequence_enforced prefix"
-        );
-        assert!(
-            formatted.contains("member=did:dht:z6MkAlice"),
-            "must contain member DID"
-        );
-        assert!(
-            formatted.contains("action=access_revocation"),
-            "must contain action type"
-        );
-        assert!(
-            formatted.contains("success=true"),
-            "must contain success=true"
-        );
-    }
 
     /// Verifies that `ContextParams` correctly accepts `consequence_rules`
     /// when parsed from JSON (mirrors the `UniFFI` bridge param flow).

@@ -278,10 +278,6 @@ name = "heartbeat_suppression"
 path = "tests/integration/heartbeat_suppression.rs"
 
 [[test]]
-name = "bridge_cooperative"
-path = "tests/integration/bridge_cooperative.rs"
-
-[[test]]
 name = "compromise_recovery"
 path = "tests/integration/compromise_recovery.rs"
 
@@ -300,6 +296,10 @@ path = "tests/integration/conformance.rs"
 [[test]]
 name = "ffi_conformance"
 path = "tests/integration/ffi_conformance.rs"
+
+[[test]]
+name = "test_double_gating"
+path = "tests/integration/test_double_gating.rs"
 
 [[test]]
 name = "sdk_wrapper"

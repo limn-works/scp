@@ -47,6 +47,7 @@ import works.limn.scp.DiscoveryBindings
 import works.limn.scp.DiscoveryBridge
 import works.limn.scp.EconomyBindings
 import works.limn.scp.EconomyBridge
+import works.limn.scp.GovernanceActionResult
 import works.limn.scp.IdentityAdvancedBindings
 import works.limn.scp.IdentityAdvancedBridge
 import works.limn.scp.MetadataBindings
@@ -60,6 +61,7 @@ import works.limn.scp.SyncBindings
 import works.limn.scp.SyncBridge
 import works.limn.scp.auth.ScpIdBindings
 import works.limn.scp.auth.ScpIdBridge
+import works.limn.scp.checkProposalResponse
 import works.limn.scp.encodeConsequenceConfigJson
 import works.limn.scp.encodeConsequenceRulesJson
 import works.limn.scp.validateContentPath
@@ -2210,12 +2212,17 @@ class GovernanceBridgeOps internal constructor(
      *
      * @param contextHandle Handle from context create.
      * @param proposalIdHex Hex-encoded id of the approved, tracked proposal.
-     * @return A string describing the governance action result.
+     * @return The outcome naming which action ran.
+     * @throws uniffi.scp.ScpException.Context with code `SCP-GOV-11040` when the
+     *   bridge reports an outcome this SDK version does not name.
      */
     suspend fun execute(
         contextHandle: Long,
         proposalIdHex: String,
-    ): String = bridge.ffiCall { bindings.governanceExecute(contextHandle, proposalIdHex) }
+    ): GovernanceActionResult =
+        GovernanceActionResult.fromBridge(
+            bridge.ffiCall { bindings.governanceExecute(contextHandle, proposalIdHex) },
+        )
 
     /**
      * Propose a governance action for voting (#621).
@@ -2226,16 +2233,22 @@ class GovernanceBridgeOps internal constructor(
      * @param contextHandle Handle from context create.
      * @param proposerDid DID of the proposer.
      * @param actionJson JSON-serialized governance action.
-     * @return JSON string with `proposal_id`, `status`, and `execution_result`.
+     * @return JSON string with `proposal_id`, `status`, and `execution_result`,
+     *   after [checkProposalResponse] checks every name in it.
+     * @throws uniffi.scp.ScpException.Context with code `SCP-GOV-11040` when the
+     *   response names a status, reason, or outcome this SDK version does not
+     *   name.
      */
     suspend fun propose(
         contextHandle: Long,
         proposerDid: String,
         actionJson: String,
     ): String =
-        bridge.ffiCall {
-            bindings.governancePropose(contextHandle, proposerDid, actionJson)
-        }
+        checkProposalResponse(
+            bridge.ffiCall {
+                bindings.governancePropose(contextHandle, proposerDid, actionJson)
+            },
+        )
 
     /**
      * Cast an approval vote on a pending governance proposal (#621).
@@ -2243,16 +2256,21 @@ class GovernanceBridgeOps internal constructor(
      * @param contextHandle Handle from context create.
      * @param voterDid DID of the voter.
      * @param proposalIdHex Hex-encoded 32-byte proposal ID.
-     * @return JSON string with `status`.
+     * @return JSON string with `status`, after [checkProposalResponse] checks
+     *   every name in it.
+     * @throws uniffi.scp.ScpException.Context with code `SCP-GOV-11040` when the
+     *   response names a status or reason this SDK version does not name.
      */
     suspend fun approve(
         contextHandle: Long,
         voterDid: String,
         proposalIdHex: String,
     ): String =
-        bridge.ffiCall {
-            bindings.governanceApprove(contextHandle, voterDid, proposalIdHex)
-        }
+        checkProposalResponse(
+            bridge.ffiCall {
+                bindings.governanceApprove(contextHandle, voterDid, proposalIdHex)
+            },
+        )
 
     /**
      * Cast a rejection vote on a pending governance proposal (#621).
@@ -2260,16 +2278,21 @@ class GovernanceBridgeOps internal constructor(
      * @param contextHandle Handle from context create.
      * @param voterDid DID of the voter.
      * @param proposalIdHex Hex-encoded 32-byte proposal ID.
-     * @return JSON string with `status`.
+     * @return JSON string with `status`, after [checkProposalResponse] checks
+     *   every name in it.
+     * @throws uniffi.scp.ScpException.Context with code `SCP-GOV-11040` when the
+     *   response names a status or reason this SDK version does not name.
      */
     suspend fun reject(
         contextHandle: Long,
         voterDid: String,
         proposalIdHex: String,
     ): String =
-        bridge.ffiCall {
-            bindings.governanceReject(contextHandle, voterDid, proposalIdHex)
-        }
+        checkProposalResponse(
+            bridge.ffiCall {
+                bindings.governanceReject(contextHandle, voterDid, proposalIdHex)
+            },
+        )
 
     /**
      * Withdraw a previously cast vote on a pending governance proposal (#621).
@@ -2277,16 +2300,21 @@ class GovernanceBridgeOps internal constructor(
      * @param contextHandle Handle from context create.
      * @param voterDid DID of the voter.
      * @param proposalIdHex Hex-encoded 32-byte proposal ID.
-     * @return JSON string with `status`.
+     * @return JSON string with `status`, after [checkProposalResponse] checks
+     *   every name in it.
+     * @throws uniffi.scp.ScpException.Context with code `SCP-GOV-11040` when the
+     *   response names a status or reason this SDK version does not name.
      */
     suspend fun withdraw(
         contextHandle: Long,
         voterDid: String,
         proposalIdHex: String,
     ): String =
-        bridge.ffiCall {
-            bindings.governanceWithdraw(contextHandle, voterDid, proposalIdHex)
-        }
+        checkProposalResponse(
+            bridge.ffiCall {
+                bindings.governanceWithdraw(contextHandle, voterDid, proposalIdHex)
+            },
+        )
 
     /**
      * Retrieve a single governance proposal by hex-encoded ID (#621).

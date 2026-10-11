@@ -83,8 +83,7 @@ pub(crate) fn validate_ucan_for_outlet(
             // §5.4.5 HIGH-3 — outlet-invocation site resolves effective caveats
             // from each token's `nb` field so §7.3.8 Step 7b (per-edge narrow)
             // and Step 11b (time-box) run over the proof chain's VALIDATED-
-            // NARROWED caveat set. Generic validate/evaluate sites (ucan.rs)
-            // stay on `NoCaveatResolver`.
+            // NARROWED caveat set.
             caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
         };
 

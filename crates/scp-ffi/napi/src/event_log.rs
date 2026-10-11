@@ -165,7 +165,8 @@ pub(crate) async fn event_log_query_on(
             );
             #[allow(clippy::cast_precision_loss)]
             events.push(NapiEvent {
-                event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type),
+                event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type)
+                    .to_owned(),
                 actor_did: entry.actor_did.0.clone(),
                 timestamp: entry.timestamp as f64,
                 payload_json: payload_value.to_string(),

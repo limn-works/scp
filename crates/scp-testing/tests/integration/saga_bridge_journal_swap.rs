@@ -1,7 +1,7 @@
 //! Behavioral proof for the production saga-journal swap (§17.16 / ADR-049).
 //!
 //! PR-7 / Phase 2D swaps every production `Supervisor` construction seam from
-//! `NoopSagaJournal` to `ProtocolRepositorySagaJournal` over the single chosen
+//! `NoOpSagaJournal` to `ProtocolRepositorySagaJournal` over the single chosen
 //! `Storage` backend. The structural wiring is pinned by
 //! `prod_supervisor_construction_wires_durable_saga_journal` in
 //! `pipeline_wiring.rs`; THIS file is the BEHAVIORAL proof that, with the durable
@@ -172,7 +172,7 @@ fn journal_supervisor(
         Box::new(LocalTransportProvider) as Box<dyn ContextTransportProvider>,
         Box::new(NoOpEventLog) as Box<dyn ContextEventLogProvider>,
         key_resolver,
-        Some(Box::new(SharedPersistenceArc(persistence))),
+        Box::new(SharedPersistenceArc(persistence)),
         None,
         None,
         None,

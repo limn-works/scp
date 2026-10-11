@@ -32,7 +32,7 @@ use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
 use scp_protocol::crypto::ucan::validate::{
     DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
-    InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver, ValidationContext,
+    InMemoryProofResolver, InMemoryRevocationChecker, TokenNbCaveatResolver, ValidationContext,
     validate_ucan,
 };
 use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
@@ -206,7 +206,7 @@ fuzz_target!(|input: FuzzValidationInput| {
         presenting_agent_did: FUZZ_AUDIENCE_DID,
         clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         clock: &clock,
-        caveat_resolver: &NoCaveatResolver,
+        caveat_resolver: &TokenNbCaveatResolver,
     };
 
     // I1: must not panic on any input.

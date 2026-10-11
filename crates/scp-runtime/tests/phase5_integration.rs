@@ -8,10 +8,9 @@
 )]
 //! Phase 5 end-to-end integration test.
 //!
-//! Exercises all four Phase 5 ADRs together with the Phase 1-4 foundation:
+//! Exercises the Phase 5 media and platform ADRs together with the Phase 1-4
+//! foundation:
 //!
-//! - **ADR-023**: Bridge connector registration, shadow identity creation,
-//!   provenance marking, and shadow claiming via identity attestation.
 //! - **ADR-024**: Media session lifecycle with ceiling checks, MLS-derived
 //!   DTLS-SRTP key export, WebRTC signaling, and session metadata capture.
 //! - **ADR-025**: Platform adapter traits (key custody, device attestation,
@@ -19,10 +18,8 @@
 //! - **ADR-026**: Swift SDK wrappers [OUT OF SCOPE -- requires `XCFramework`
 //!   build (SCP-103)].
 //!
-//! The test verifies that bridge, media, platform, and cross-ADR integration
+//! The test verifies that media, platform, and cross-ADR integration
 //! all function correctly as a cohesive whole.
-
-use std::time::Duration;
 
 use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
@@ -30,20 +27,6 @@ use sha2::{Digest, Sha256};
 use scp_did::DID;
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
-use scp_protocol::bridge::claiming::{ClaimRequest, claim_shadow};
-use scp_protocol::bridge::provenance::{
-    BridgeTrustLevel, evaluate_bridge_trust_level, mark_bridge_provenance,
-};
-use scp_protocol::bridge::registration::{
-    BridgeRegistrationRequest, BridgeRegistry, approve_registration, register_bridge,
-};
-use scp_protocol::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow};
-use scp_protocol::bridge::{BridgeMode, BridgeStatus, ShadowProvenanceStatus};
-use scp_protocol::context::MemoryScope;
-use scp_protocol::crypto::sender_keys::SenderKeyStore;
-use scp_protocol::provenance::{DataProvenance, DiscoveryMethod, SourceType};
-use scp_protocol::trust::attestation::{AttestationEvidence, RevocationStatus};
-use scp_protocol::trust::{Attestation, AttestationType};
 
 use scp_media::keys::export_media_keys;
 use scp_media::session::{
@@ -121,298 +104,6 @@ fn append_and_hash(log: &mut EventLog, event: &Event) -> [u8; 32] {
     hasher.update([0x00]);
     hasher.update(&serialized);
     hasher.finalize().into()
-}
-
-/// Computes the canonical SHA-256 hash of a claim request's content
-/// (matching the internal `compute_claim_canonical_hash` in claiming.rs).
-fn compute_claim_hash(request: &ClaimRequest) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"SCP-CLAIM-V1:");
-    #[allow(clippy::cast_possible_truncation)]
-    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
-        hasher.update((bytes.len() as u32).to_be_bytes());
-        hasher.update(bytes);
-    };
-    length_prefix(&mut hasher, request.shadow_id.as_bytes());
-    length_prefix(&mut hasher, request.claimant_did.as_bytes());
-    length_prefix(&mut hasher, request.platform_handle.as_bytes());
-    length_prefix(&mut hasher, request.identity_attestation.id.as_bytes());
-    hasher.update(request.timestamp.to_be_bytes());
-    hasher.finalize().to_vec()
-}
-
-/// Computes the canonical attestation bytes for signing (matches the
-/// `pub(crate) canonical_attestation_bytes` in `trust/attestation.rs`).
-fn compute_attestation_canonical_bytes(attestation: &Attestation) -> Vec<u8> {
-    use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
-
-    let evidence_bytes = attestation.evidence.as_ref().map(|e| {
-        rmp_serde::to_vec_named(e).expect("AttestationEvidence serialization is infallible")
-    });
-    // Claim is compact JSON (RFC 8785 JCS) per §9.5.2 Attestation row 5;
-    // evidence/revocation_status stay MessagePack per the §9.5.2 note.
-    let claim_bytes =
-        scp_protocol::jcs::to_vec(&attestation.claim).expect("claim serialization is infallible");
-    let revocation_bytes = rmp_serde::to_vec_named(&attestation.revocation_status)
-        .expect("RevocationStatus serialization is infallible");
-
-    canonical_hash(
-        "SCP-ATTESTATION-V1:",
-        &[
-            CanonicalField::VarBytes(attestation.id.as_bytes()),
-            CanonicalField::U16(scp_protocol::trust::attestation_type_tag(
-                &attestation.attestation_type,
-            )),
-            CanonicalField::VarBytes(attestation.issuer.as_bytes()),
-            CanonicalField::VarBytes(attestation.subject.as_bytes()),
-            CanonicalField::VarBytes(&claim_bytes),
-            evidence_bytes
-                .as_deref()
-                .map_or(CanonicalField::Absent, CanonicalField::VarBytes),
-            CanonicalField::U64(attestation.issued_at),
-            attestation
-                .expires_at
-                .map_or(CanonicalField::Absent, CanonicalField::U64),
-            CanonicalField::VarBytes(&revocation_bytes),
-        ],
-    )
-    .unwrap()
-    .to_vec()
-}
-
-/// Constructs a signed identity attestation.
-fn make_identity_attestation(
-    subject_did: &str,
-    platform_handle: &str,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> Attestation {
-    let mut attestation = Attestation {
-        id: "attest-phase5-001".to_owned(),
-        attestation_type: AttestationType::IdentityLink,
-        issuer: subject_did.into(),
-        subject: subject_did.into(),
-        claim: serde_json::json!({
-            "platform_handle": platform_handle,
-            "platform": "discord"
-        }),
-        evidence: Some(AttestationEvidence {
-            evidence_type: "signed-challenge".to_owned(),
-            data: serde_json::json!({"challenge": "phase5-test"}),
-        }),
-        issued_at: 1_700_000_200,
-        expires_at: Some(1_700_100_000),
-        renewal_interval: Some(Duration::from_hours(24)),
-        renewed_at: None,
-        revocation_status: RevocationStatus::Active,
-        signature: Vec::new(),
-    };
-
-    // Sign the attestation using canonical bytes.
-    let canonical_bytes = compute_attestation_canonical_bytes(&attestation);
-    let sig = signing_key.sign(&canonical_bytes);
-    attestation.signature = sig.to_bytes().to_vec();
-
-    attestation
-}
-
-/// Constructs a signed claim request.
-fn make_claim_request(
-    shadow_id: &str,
-    claimant_did: &str,
-    platform_handle: &str,
-    attestation: Attestation,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> ClaimRequest {
-    let mut request = ClaimRequest {
-        shadow_id: shadow_id.to_owned(),
-        claimant_did: claimant_did.into(),
-        platform_handle: platform_handle.to_owned(),
-        identity_attestation: attestation,
-        timestamp: 1_700_000_300,
-        signature: Vec::new(),
-    };
-
-    let canonical_hash = compute_claim_hash(&request);
-    let sig = signing_key.sign(&canonical_hash);
-    request.signature = sig.to_bytes().to_vec();
-
-    request
-}
-
-// ===========================================================================
-// Section 1: Bridge lifecycle (ADR-023)
-// ===========================================================================
-
-#[test]
-fn bridge_registration_shadow_creation_provenance_and_claiming() {
-    let context_id = "ctx-phase5-bridge";
-
-    // -- Identity setup --
-    let (operator_vk, _operator_sk) = test_keypair();
-    let operator_did = did_from_pubkey(&operator_vk);
-
-    let (governance_vk, _governance_sk) = test_keypair();
-    let governance_did = did_from_pubkey(&governance_vk);
-
-    // -- Step 1: Create a BridgeRegistry for the test context --
-    let mut bridge_registry = BridgeRegistry::new(context_id.to_owned());
-    assert_eq!(bridge_registry.context_id(), context_id);
-    assert!(bridge_registry.bridges().is_empty());
-
-    // -- Step 2: Register a bridge connector (operator DID, "discord", Relay mode) --
-    let registration_request = BridgeRegistrationRequest {
-        bridge_id: "bridge-phase5-001".to_owned(),
-        operator_did: operator_did.clone(),
-        platform: "discord".to_owned(),
-        mode: BridgeMode::Relay,
-        context_id: context_id.to_owned(),
-        requested_at: 1_700_000_000,
-        self_hosted: false,
-        webhook_url: None,
-        platform_key: None,
-        max_shadows: 10_000,
-        metadata: scp_protocol::bridge::registration::BridgeRegistrationMetadata::default(),
-    };
-
-    let reg_event = register_bridge(&mut bridge_registry, registration_request)
-        .expect("bridge registration should succeed");
-    assert_eq!(reg_event.bridge_id, "bridge-phase5-001");
-    assert_eq!(bridge_registry.pending_requests().len(), 1);
-
-    // -- Step 3: Governance approves the registration --
-    let (connector, approval_event) = approve_registration(
-        &mut bridge_registry,
-        "bridge-phase5-001",
-        &governance_did,
-        1_700_000_001,
-    )
-    .expect("bridge approval should succeed");
-
-    assert_eq!(connector.bridge_id, "bridge-phase5-001");
-    assert_eq!(connector.platform, "discord");
-    assert_eq!(connector.mode, BridgeMode::Relay);
-    assert_eq!(connector.status, BridgeStatus::Active);
-    assert_eq!(connector.operator_did, operator_did);
-    assert_eq!(approval_event.bridge_id, "bridge-phase5-001");
-    assert_eq!(bridge_registry.bridges().len(), 1);
-    assert!(bridge_registry.pending_requests().is_empty());
-
-    // -- Step 4: Create a shadow identity for an external participant --
-    let mut shadow_registry = ShadowRegistry::new(context_id.to_owned());
-    let platform_handle = "@alice#1234";
-    let shadow_id = "shadow-phase5-001";
-
-    let mut sender_key_store = SenderKeyStore::new();
-    let shadow_params = CreateShadowParams {
-        shadow_id,
-        bridge_id: "bridge-phase5-001",
-        bridge_mode: BridgeMode::Relay,
-        platform_handle,
-        context_member_dids: &[],
-        timestamp: 1_700_000_100,
-    };
-    let (shadow, creation_event) =
-        create_shadow(&mut shadow_registry, &mut sender_key_store, &shadow_params)
-            .expect("shadow creation should succeed");
-
-    assert_eq!(shadow.shadow_id, shadow_id);
-    assert_eq!(shadow.platform_handle, platform_handle);
-    assert_eq!(shadow.bridge_id, "bridge-phase5-001");
-    assert_eq!(shadow.attributed_role, "observer");
-    assert_eq!(shadow.provenance_status, ShadowProvenanceStatus::Shadow);
-    assert_eq!(creation_event.shadow_id, shadow_id);
-    assert_eq!(creation_event.bridge_mode, BridgeMode::Relay);
-
-    // -- Step 5: Mark content with BridgeProvenance and verify trust level --
-    let base_provenance = DataProvenance {
-        source_context: context_id.to_string(),
-        source_type: SourceType::Persistent,
-        counterparties: vec![operator_did.clone()],
-        purpose: Some("bridged message from Discord".to_string()),
-        discovery_method: DiscoveryMethod::SharedContext(context_id.to_string()),
-        age: Duration::from_secs(30),
-        memory_scope: MemoryScope::Full,
-        chain_depth: 0,
-        chain_path: None,
-        payment_amount: None,
-        payment_adapter: None,
-        payment_receipt_id: None,
-    };
-
-    let bridge_provenance = mark_bridge_provenance(base_provenance, &connector, &shadow);
-
-    // Before claiming: trust level should be ShadowBridged (weakest).
-    assert_eq!(
-        bridge_provenance.shadow_status,
-        ShadowProvenanceStatus::Shadow
-    );
-    assert_eq!(bridge_provenance.originating_platform, "discord");
-    assert_eq!(bridge_provenance.bridge_connector_id, "bridge-phase5-001");
-    assert_eq!(bridge_provenance.operator_did, operator_did);
-    assert_eq!(bridge_provenance.bridge_mode, BridgeMode::Relay);
-
-    let trust_level = evaluate_bridge_trust_level(&bridge_provenance);
-    assert_eq!(trust_level, BridgeTrustLevel::ShadowBridged);
-
-    // -- Step 6: Claim the shadow via identity attestation --
-    let (claimant_vk, claimant_sk) = test_keypair();
-    let claimant_did = did_from_pubkey(&claimant_vk);
-
-    let attestation = make_identity_attestation(&claimant_did, platform_handle, &claimant_sk);
-    let claim_request = make_claim_request(
-        shadow_id,
-        &claimant_did,
-        platform_handle,
-        attestation,
-        &claimant_sk,
-    );
-
-    let claim_event =
-        claim_shadow(&mut shadow_registry, &claim_request).expect("claim should succeed");
-
-    // Verify claim event fields.
-    assert_eq!(claim_event.shadow_id, shadow_id);
-    assert_eq!(claim_event.claimant_did, claimant_did);
-    assert_eq!(claim_event.platform_handle, platform_handle);
-    assert_eq!(claim_event.context_id, context_id);
-
-    // -- Step 7: Verify provenance status transitions to Claimed --
-    let claimed_shadow = &shadow_registry.shadows()[0];
-    assert_eq!(
-        claimed_shadow.provenance_status,
-        ShadowProvenanceStatus::Claimed
-    );
-
-    // -- Step 8: Verify trust level upgrades to ClaimedBridged after claiming --
-    let post_claim_provenance = mark_bridge_provenance(
-        DataProvenance {
-            source_context: context_id.to_string(),
-            source_type: SourceType::Persistent,
-            counterparties: vec![claimant_did],
-            purpose: Some("post-claim message".to_string()),
-            discovery_method: DiscoveryMethod::SharedContext(context_id.to_string()),
-            age: Duration::from_secs(5),
-            memory_scope: MemoryScope::Full,
-            chain_depth: 0,
-            chain_path: None,
-            payment_amount: None,
-            payment_adapter: None,
-            payment_receipt_id: None,
-        },
-        &connector,
-        claimed_shadow,
-    );
-
-    assert_eq!(
-        post_claim_provenance.shadow_status,
-        ShadowProvenanceStatus::Claimed
-    );
-    let post_claim_trust = evaluate_bridge_trust_level(&post_claim_provenance);
-    assert_eq!(post_claim_trust, BridgeTrustLevel::ClaimedBridged);
-    assert!(
-        post_claim_trust > trust_level,
-        "ClaimedBridged > ShadowBridged"
-    );
 }
 
 // ===========================================================================
@@ -742,127 +433,9 @@ async fn platform_storage_operations() {
 // ===========================================================================
 
 #[test]
-fn cross_adr_bridge_provenance_carries_correct_metadata() {
-    // Bridge + Provenance: bridged message carries BridgeProvenance with correct
-    // operator DID, platform, and mode.
-    let (operator_vk, _operator_sk) = test_keypair();
-    let operator_did = did_from_pubkey(&operator_vk);
-
-    let connector = scp_protocol::bridge::BridgeConnector {
-        bridge_id: "bridge-cross-001".to_owned(),
-        operator_did: operator_did.clone(),
-        platform: "slack".to_owned(),
-        mode: BridgeMode::Api,
-        status: BridgeStatus::Active,
-        registration_context: "ctx-cross-test".to_owned(),
-        registered_at: 1_700_000_000,
-    };
-
-    let shadow = scp_protocol::bridge::ShadowIdentity {
-        shadow_id: "shadow-cross-001".to_owned(),
-        platform_handle: "@bob".to_owned(),
-        bridge_id: "bridge-cross-001".to_owned(),
-        attributed_role: "observer".to_owned(),
-        provenance_status: ShadowProvenanceStatus::Shadow,
-        created_at: 1_700_000_100,
-    };
-
-    let base = DataProvenance {
-        source_context: "ctx-cross-test".to_string(),
-        source_type: SourceType::Persistent,
-        counterparties: vec![operator_did.clone()],
-        purpose: Some("cross-adr test message".to_string()),
-        discovery_method: DiscoveryMethod::SharedContext("ctx-cross-test".to_string()),
-        age: Duration::from_secs(10),
-        memory_scope: MemoryScope::Full,
-        chain_depth: 0,
-        chain_path: None,
-        payment_amount: None,
-        payment_adapter: None,
-        payment_receipt_id: None,
-    };
-
-    let bp = mark_bridge_provenance(base, &connector, &shadow);
-
-    // Verify all fields are correctly populated.
-    assert_eq!(bp.originating_platform, "slack");
-    assert_eq!(bp.bridge_connector_id, "bridge-cross-001");
-    assert_eq!(bp.operator_did, operator_did);
-    assert_eq!(bp.bridge_mode, BridgeMode::Api);
-    assert_eq!(bp.shadow_status, ShadowProvenanceStatus::Shadow);
-    assert_eq!(bp.base.source_context, "ctx-cross-test");
-}
-
-#[tokio::test]
-async fn cross_adr_platform_key_custody_signs_claim_request() {
-    // Platform + Bridge: use platform key custody to sign the claim request
-    // for shadow claiming.
-    let custody = InMemoryKeyCustody::new();
-
-    // Generate a signing key through the platform custody trait.
-    let key_handle = custody
-        .generate_keypair(KeyType::Ed25519)
-        .await
-        .expect("generate key");
-    let pubkey = custody
-        .public_key(&key_handle)
-        .await
-        .expect("get public key");
-    let pubkey_bytes: [u8; 32] = pubkey.as_bytes().try_into().expect("32 byte pubkey");
-
-    // Construct DID from the public key.
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey_bytes).expect("valid key");
-    let _claimant_did = did_from_pubkey(&verifying_key);
-
-    // For signing we need the ed25519_dalek signing key, which the InMemory
-    // adapter wraps. We can verify the signature using the platform trait's
-    // sign method. The claim_shadow function requires raw Ed25519 signatures,
-    // so we use the custody trait to sign and then embed the result.
-    let platform_handle = "@platformuser#5678";
-    let shadow_id = "shadow-platform-001";
-
-    // Create a shadow registry and shadow.
-    let mut shadow_registry = ShadowRegistry::new("ctx-platform-claim".to_owned());
-    let shadow_params = CreateShadowParams {
-        shadow_id,
-        bridge_id: "bridge-platform-001",
-        bridge_mode: BridgeMode::Relay,
-        platform_handle,
-        context_member_dids: &[],
-        timestamp: 1_700_000_100,
-    };
-    create_shadow(
-        &mut shadow_registry,
-        &mut SenderKeyStore::new(),
-        &shadow_params,
-    )
-    .expect("shadow creation");
-
-    // Build an identity attestation. Since we need to use ed25519_dalek's
-    // Signer trait for the canonical bytes, and the InMemoryKeyCustody wraps
-    // the actual signing key, we sign using the custody.sign method and
-    // verify it matches what we expect.
-
-    // First, sign test data through the platform trait.
-    let test_data = b"platform custody verification";
-    let sig = custody.sign(&key_handle, test_data).await.expect("sign");
-
-    // Verify the signature using ed25519-dalek directly.
-    let ed_sig = ed25519_dalek::Signature::from_bytes(sig.as_bytes().try_into().expect("64 bytes"));
-    use ed25519_dalek::Verifier;
-    assert!(verifying_key.verify(test_data, &ed_sig).is_ok());
-
-    // This demonstrates that platform key custody can produce signatures
-    // compatible with the Ed25519 verification used in claim_shadow.
-    // A full end-to-end claim through the platform trait would require
-    // access to the canonical hash functions, which we've already tested
-    // in the bridge lifecycle test above.
-}
-
-#[test]
-fn cross_adr_event_log_records_bridge_and_media_events() {
-    // Event log integration: verify that bridge registration, shadow creation,
-    // and media session events can all be recorded in a single context event log.
+fn cross_adr_event_log_records_media_events() {
+    // Event log integration: verify that context creation and media session
+    // events can all be recorded in a single context event log.
     let context_id = "ctx-phase5-eventlog";
 
     let (alice_vk, alice_sk) = test_keypair();
@@ -885,49 +458,7 @@ fn cross_adr_event_log_records_bridge_and_media_events() {
     prev_hash = append_and_hash(&mut event_log, &ctx_created);
     seq += 1;
 
-    // Event 2: Bridge registration (GovernanceAction event type).
-    let bridge_reg_payload = serde_json::to_vec(&serde_json::json!({
-        "action": "bridge_registered",
-        "bridge_id": "bridge-eventlog-001",
-        "platform": "discord",
-        "mode": "Relay"
-    }))
-    .expect("serialize bridge reg payload");
-
-    let bridge_reg_event = sign_event(
-        EventType::GovernanceAction,
-        &alice_did,
-        1_700_000_001,
-        seq,
-        bridge_reg_payload,
-        prev_hash,
-        &alice_sk,
-    );
-    prev_hash = append_and_hash(&mut event_log, &bridge_reg_event);
-    seq += 1;
-
-    // Event 3: Shadow identity created (member joined as shadow).
-    let shadow_payload = serde_json::to_vec(&serde_json::json!({
-        "action": "shadow_created",
-        "shadow_id": "shadow-eventlog-001",
-        "platform_handle": "@user#9999",
-        "bridge_id": "bridge-eventlog-001"
-    }))
-    .expect("serialize shadow payload");
-
-    let shadow_event = sign_event(
-        EventType::MemberJoined,
-        &alice_did,
-        1_700_000_002,
-        seq,
-        shadow_payload,
-        prev_hash,
-        &alice_sk,
-    );
-    prev_hash = append_and_hash(&mut event_log, &shadow_event);
-    seq += 1;
-
-    // Event 4: Media session started.
+    // Event 2: Media session started.
     let media_start_payload = serde_json::to_vec(&serde_json::json!({
         "session_id": "ms-eventlog-001",
         "capabilities": ["Voice"],
@@ -947,7 +478,7 @@ fn cross_adr_event_log_records_bridge_and_media_events() {
     prev_hash = append_and_hash(&mut event_log, &media_start_event);
     seq += 1;
 
-    // Event 5: Media session ended.
+    // Event 3: Media session ended.
     let media_end_payload = serde_json::to_vec(&serde_json::json!({
         "session_id": "ms-eventlog-001",
         "ended_at": 1_700_003_600
@@ -965,15 +496,15 @@ fn cross_adr_event_log_records_bridge_and_media_events() {
     );
     let _prev_hash_final = append_and_hash(&mut event_log, &media_end_event);
 
-    // Verify the event log contains all 5 events.
-    assert_eq!(tree::event_count(&event_log), 5);
+    // Verify the event log contains all 3 events.
+    assert_eq!(tree::event_count(&event_log), 3);
 
     // Verify the Merkle root is non-zero and consistent.
     let root = tree::root(&event_log);
     assert_ne!(root, [0u8; 32], "Merkle root must not be zero");
 
     // Verify all leaf hashes are preserved and non-zero.
-    assert_eq!(event_log.leaves().len(), 5);
+    assert_eq!(event_log.leaves().len(), 3);
     for (i, leaf) in event_log.leaves().iter().enumerate() {
         assert_ne!(*leaf, [0u8; 32], "leaf {i} must not be zero");
     }

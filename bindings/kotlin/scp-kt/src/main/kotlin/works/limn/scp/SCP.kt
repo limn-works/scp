@@ -1043,16 +1043,26 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.getEconomicPolicy] on [inner]. */
     fun getEconomicPolicy(handle: ContextHandle): String? = inner.getEconomicPolicy(handle = handle)
 
-    /** Forwards to [NativeScp.governanceApprove] on [inner]. */
+    /**
+     * Forwards to [NativeScp.governanceApprove] on [inner].
+     *
+     * Returns the bridge's JSON after [checkProposalResponse] checks every
+     * name in it.
+     *
+     * @throws ScpException.Context with code `SCP-GOV-11040` when the response
+     *   names a status, reason, or outcome this SDK version does not name.
+     */
     suspend fun governanceApprove(
         handle: ContextHandle,
         voterDid: String,
         proposalIdHex: String,
     ): String =
-        inner.governanceApprove(
-            handle = handle,
-            voterDid = voterDid,
-            proposalIdHex = proposalIdHex,
+        checkProposalResponse(
+            inner.governanceApprove(
+                handle = handle,
+                voterDid = voterDid,
+                proposalIdHex = proposalIdHex,
+            ),
         )
 
     /**
@@ -1063,14 +1073,20 @@ class SCP internal constructor(
      * quorum-validated governance engine; the caller supplies no proposal,
      * action, status, or identity. The executor and consequence subject are
      * resolved from the tracked proposal's proposer.
+     *
+     * @return The outcome naming which action ran.
+     * @throws ScpException.Context with code `SCP-GOV-11040` when the bridge
+     *   reports an outcome this SDK version does not name.
      */
     suspend fun governanceExecute(
         handle: ContextHandle,
         proposalIdHex: String,
-    ): String =
-        inner.governanceExecute(
-            handle = handle,
-            proposalIdHex = proposalIdHex,
+    ): GovernanceActionResult =
+        GovernanceActionResult.fromBridge(
+            inner.governanceExecute(
+                handle = handle,
+                proposalIdHex = proposalIdHex,
+            ),
         )
 
     /** Forwards to [NativeScp.governanceGetProposal] on [inner]. */
@@ -1086,40 +1102,70 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.governanceListProposals] on [inner]. */
     suspend fun governanceListProposals(handle: ContextHandle): String = inner.governanceListProposals(handle = handle)
 
-    /** Forwards to [NativeScp.governancePropose] on [inner]. */
+    /**
+     * Forwards to [NativeScp.governancePropose] on [inner].
+     *
+     * Returns the bridge's JSON after [checkProposalResponse] checks every
+     * name in it.
+     *
+     * @throws ScpException.Context with code `SCP-GOV-11040` when the response
+     *   names a status, reason, or outcome this SDK version does not name.
+     */
     suspend fun governancePropose(
         handle: ContextHandle,
         proposerDid: String,
         actionJson: String,
     ): String =
-        inner.governancePropose(
-            handle = handle,
-            proposerDid = proposerDid,
-            actionJson = actionJson,
+        checkProposalResponse(
+            inner.governancePropose(
+                handle = handle,
+                proposerDid = proposerDid,
+                actionJson = actionJson,
+            ),
         )
 
-    /** Forwards to [NativeScp.governanceReject] on [inner]. */
+    /**
+     * Forwards to [NativeScp.governanceReject] on [inner].
+     *
+     * Returns the bridge's JSON after [checkProposalResponse] checks every
+     * name in it.
+     *
+     * @throws ScpException.Context with code `SCP-GOV-11040` when the response
+     *   names a status, reason, or outcome this SDK version does not name.
+     */
     suspend fun governanceReject(
         handle: ContextHandle,
         voterDid: String,
         proposalIdHex: String,
     ): String =
-        inner.governanceReject(
-            handle = handle,
-            voterDid = voterDid,
-            proposalIdHex = proposalIdHex,
+        checkProposalResponse(
+            inner.governanceReject(
+                handle = handle,
+                voterDid = voterDid,
+                proposalIdHex = proposalIdHex,
+            ),
         )
 
-    /** Forwards to [NativeScp.governanceWithdraw] on [inner]. */
+    /**
+     * Forwards to [NativeScp.governanceWithdraw] on [inner].
+     *
+     * Returns the bridge's JSON after [checkProposalResponse] checks every
+     * name in it.
+     *
+     * @throws ScpException.Context with code `SCP-GOV-11040` when the response
+     *   names a status, reason, or outcome this SDK version does not name.
+     */
     suspend fun governanceWithdraw(
         handle: ContextHandle,
         voterDid: String,
         proposalIdHex: String,
     ): String =
-        inner.governanceWithdraw(
-            handle = handle,
-            voterDid = voterDid,
-            proposalIdHex = proposalIdHex,
+        checkProposalResponse(
+            inner.governanceWithdraw(
+                handle = handle,
+                voterDid = voterDid,
+                proposalIdHex = proposalIdHex,
+            ),
         )
 
     /** Forwards to [NativeScp.handleDeregister] on [inner]. */

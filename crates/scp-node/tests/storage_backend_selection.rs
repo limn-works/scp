@@ -2,7 +2,9 @@
 //! that it cannot serve (a build without `cloud-blobs`, or a missing URL or
 //! bucket) instead of opening another blob store. `--self-host`, which opens
 //! only `SQLite`, and `--ephemeral`, which keeps blobs in memory, reject both in
-//! every build that has the mode.
+//! every build that has the mode. A persistent full node and a `--relay-only`
+//! node also reject an unset or empty backend, which has no default, and a
+//! `sqlite` backend whose path is unset or relative.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -151,6 +153,100 @@ fn a_fixed_store_mode_rejects_a_cloud_backend() {
                 )),
                 "{flag} {backend}: {stderr}"
             );
+        }
+    }
+}
+
+/// A persistent full node and a `--relay-only` node each exit 1 when
+/// `SCP_RELAY_STORAGE_BACKEND` is unset, empty, or whitespace, with an error
+/// naming the variable and SCP-CAPSEL-8000 (persistence spec §17.17.1: the
+/// backend selection has no default), and the full node exits before it
+/// creates its storage directory.
+#[test]
+fn an_unset_or_empty_backend_fails_closed() {
+    for mode in [&[][..], &["--relay-only"][..]] {
+        for value in [None, Some(""), Some(" ")] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let blob_db = tmp.path().join("blobs.db");
+            let node_storage = tmp.path().join("node-storage");
+            let mut command = Command::new(node_bin());
+            command
+                .args(mode)
+                .current_dir(tmp.path())
+                .env("SCP_NODE_DOMAIN", "example.com")
+                .env("SCP_NODE_BIND_ADDR", "127.0.0.1:0")
+                .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+                .env("SCP_STORAGE_PATH", &node_storage)
+                .env("SCP_RELAY_STORAGE_PATH", &blob_db)
+                .env_remove("SCP_NODE_DHT_MODE")
+                .env_remove("SCP_STORAGE_KEY")
+                .env_remove("RUST_LOG");
+            match value {
+                Some(v) => command.env("SCP_RELAY_STORAGE_BACKEND", v),
+                None => command.env_remove("SCP_RELAY_STORAGE_BACKEND"),
+            };
+            let output = output_within_deadline(&mut command);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let case = format!("{value:?} {mode:?}");
+            assert_eq!(output.status.code(), Some(1), "{case}: {stderr}");
+            assert!(
+                stderr.contains("SCP_RELAY_STORAGE_BACKEND is unset or empty"),
+                "{case}: {stderr}"
+            );
+            assert!(stderr.contains("SCP-CAPSEL-8000"), "{case}: {stderr}");
+            assert!(
+                !node_storage.exists(),
+                "{case} created {}",
+                node_storage.display()
+            );
+            assert!(!blob_db.exists(), "{case} opened {}", blob_db.display());
+        }
+    }
+}
+
+/// A persistent full node and a `--relay-only` node each exit 1 on
+/// `SCP_RELAY_STORAGE_BACKEND=sqlite` with `SCP_RELAY_STORAGE_PATH` unset or
+/// relative, naming the variable, and create nothing in the working directory;
+/// the full node exits before it creates its storage directory.
+#[test]
+fn a_sqlite_backend_without_an_absolute_path_fails_closed() {
+    for mode in [&[][..], &["--relay-only"][..]] {
+        for (path, expected) in [
+            (None, "requires SCP_RELAY_STORAGE_PATH"),
+            (Some("scp-relay.db"), "is a relative path"),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let work = tmp.path().join("work");
+            std::fs::create_dir(&work).expect("create work dir");
+            let node_storage = tmp.path().join("node-storage");
+            let mut command = Command::new(node_bin());
+            command
+                .args(mode)
+                .current_dir(&work)
+                .env("SCP_NODE_DOMAIN", "example.com")
+                .env("SCP_NODE_BIND_ADDR", "127.0.0.1:0")
+                .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+                .env("SCP_STORAGE_PATH", &node_storage)
+                .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+                .env_remove("SCP_NODE_DHT_MODE")
+                .env_remove("SCP_STORAGE_KEY")
+                .env_remove("RUST_LOG");
+            match path {
+                Some(p) => command.env("SCP_RELAY_STORAGE_PATH", p),
+                None => command.env_remove("SCP_RELAY_STORAGE_PATH"),
+            };
+            let output = output_within_deadline(&mut command);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let case = format!("{path:?} {mode:?}");
+            assert_eq!(output.status.code(), Some(1), "{case}: {stderr}");
+            assert!(stderr.contains(expected), "{case}: {stderr}");
+            assert!(
+                !node_storage.exists(),
+                "{case} created {}",
+                node_storage.display()
+            );
+            let created: Vec<_> = std::fs::read_dir(&work).expect("read work dir").collect();
+            assert!(created.is_empty(), "{case} created {created:?}");
         }
     }
 }

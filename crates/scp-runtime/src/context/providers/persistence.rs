@@ -6,22 +6,28 @@
 //! [`ContextPersistence`] trait by `.await`-ing the async `ProtocolRepository`
 //! methods directly (ADR-049 Decision 7).
 //!
-//! This module re-exports the canonical implementation for convenience and
-//! provides an additional in-memory implementation suitable for integration
-//! tests that need persistence semantics without a storage backend.
+//! This module re-exports the canonical implementation for convenience. Under
+//! `test` or the `testing` feature it also provides `InMemoryPersistence`,
+//! which keeps snapshots only in memory and so compiles into no shipped build
+//! (root `AGENTS.md`, "No dev/test-only stand-ins in production").
 //!
 //! [`ContextPersistence`]: crate::context::persistence::ContextPersistence
 
+#[cfg(any(test, feature = "testing"))]
 use std::collections::HashMap;
+#[cfg(any(test, feature = "testing"))]
 #[allow(
     clippy::disallowed_types,
     reason = "`ContextPersistence` is async (ADR-049 Decision 7), but this in-memory map's critical section is a synchronous lock→mutate→drop with NO await held across the guard, so `std::sync::Mutex` is correct — a `tokio::sync::Mutex` would add a needless async lock where none is required."
 )]
 use std::sync::Mutex;
 
+#[cfg(any(test, feature = "testing"))]
 use async_trait::async_trait;
 
+#[cfg(any(test, feature = "testing"))]
 use crate::context::persistence::ContextPersistence;
+#[cfg(any(test, feature = "testing"))]
 use crate::context::state::ContextSnapshot;
 
 // Re-export the canonical implementation.
@@ -50,6 +56,7 @@ pub use crate::store::context::ProtocolRepositoryContextBridge;
 ///     key_resolver,
 /// );
 /// ```
+#[cfg(any(test, feature = "testing"))]
 pub struct InMemoryPersistence {
     #[allow(
         clippy::disallowed_types,
@@ -62,6 +69,7 @@ pub struct InMemoryPersistence {
     clippy::disallowed_types,
     reason = "`ContextPersistence` is async (ADR-049 Decision 7), but this map's critical section is a synchronous lock→mutate→drop with NO await held across the guard, so `std::sync::Mutex` is correct — a `tokio::sync::Mutex` would add a needless async lock where none is required."
 )]
+#[cfg(any(test, feature = "testing"))]
 impl InMemoryPersistence {
     /// Creates a new empty in-memory persistence provider.
     #[must_use]
@@ -72,12 +80,14 @@ impl InMemoryPersistence {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl Default for InMemoryPersistence {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 #[async_trait]
 impl ContextPersistence for InMemoryPersistence {
     async fn persist_context(

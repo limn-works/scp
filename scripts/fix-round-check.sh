@@ -932,6 +932,7 @@ GATES=(
     scripts/check-no-panic-abort.sh
     scripts/check-no-shim-reexports.sh
     scripts/check-no-ts-mutable-globals.sh
+    scripts/check-noop-spelling.sh
     scripts/check-protocol-deps.sh
     scripts/check-protocol-sync.py
     scripts/check-pyi-generated.sh

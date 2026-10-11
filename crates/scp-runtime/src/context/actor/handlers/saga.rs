@@ -163,10 +163,10 @@ fn hex_context_id(id: &[u8; 32]) -> String {
 /// methods return `Ok(())` unconditionally — `validate_ucan` consults the
 /// tracker exactly once (Step 9, single token nonce; the delegation-chain walk
 /// never touches it), so this provides identical (zero) intra-call dedup to a
-/// fresh per-call tracker. Mirrors the accepted production `NoopNonceTracker`
+/// fresh per-call tracker. Mirrors the accepted production `NoOpNonceTracker`
 /// pattern in `broadcast.rs`.
-struct NoopNonceTracker;
-impl scp_protocol::crypto::ucan::validate::NonceTracker for NoopNonceTracker {
+struct NoOpNonceTracker;
+impl scp_protocol::crypto::ucan::validate::NonceTracker for NoOpNonceTracker {
     fn check_replay(
         &self,
         _nonce: &str,
@@ -1374,8 +1374,8 @@ fn validate_ucan_rebind(
     // UCAN-nonce replay, and a long-lived proof's nonce timestamp is
     // legitimately stale (well outside the §9.14 freshness window), so a
     // format/freshness-checking tracker would wrongly reject it. This mirrors
-    // the accepted production `NoopNonceTracker` pattern in `broadcast.rs`.
-    let mut nonce_tracker = NoopNonceTracker;
+    // the accepted production `NoOpNonceTracker` pattern in `broadcast.rs`.
+    let mut nonce_tracker = NoOpNonceTracker;
 
     let mut ctx = ValidationContext {
         did_resolver: &did_resolver,

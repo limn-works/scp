@@ -666,8 +666,15 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/governanceApprove`` on ``inner``.
+    ///
+    /// Returns the bridge's JSON after ``checkProposalResponse(_:)`` checks
+    /// every name in it, and throws ``ScpError/Context(msg:code:)`` with code
+    /// `SCP-GOV-11040` for a status, reason, or outcome this SDK version does
+    /// not name.
     func governanceApprove(handle: ContextHandle, voterDid: String, proposalIdHex: String) async throws -> String {
-        try await inner.governanceApprove(handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex)
+        try checkProposalResponse(
+            await inner.governanceApprove(handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex)
+        )
     }
 
     /// Forwards to ``Scp/governanceExecute`` on ``inner``.
@@ -677,8 +684,14 @@ public extension SCP {
     /// quorum-validated governance engine; the caller supplies no proposal,
     /// action, status, or identity. The executor and consequence subject are
     /// resolved from the tracked proposal's proposer.
-    func governanceExecute(handle: ContextHandle, proposalIdHex: String) async throws -> String {
-        try await inner.governanceExecute(handle: handle, proposalIdHex: proposalIdHex)
+    ///
+    /// Returns the outcome naming which action ran, and throws
+    /// ``ScpError/Context(msg:code:)`` with code `SCP-GOV-11040` for an outcome
+    /// this SDK version does not name.
+    func governanceExecute(handle: ContextHandle, proposalIdHex: String) async throws -> GovernanceActionResult {
+        try GovernanceActionResult.fromBridge(
+            await inner.governanceExecute(handle: handle, proposalIdHex: proposalIdHex)
+        )
     }
 
     /// Forwards to ``Scp/governanceGetProposal`` on ``inner``.
@@ -692,18 +705,39 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/governancePropose`` on ``inner``.
+    ///
+    /// Returns the bridge's JSON after ``checkProposalResponse(_:)`` checks
+    /// every name in it, and throws ``ScpError/Context(msg:code:)`` with code
+    /// `SCP-GOV-11040` for a status, reason, or outcome this SDK version does
+    /// not name.
     func governancePropose(handle: ContextHandle, proposerDid: String, actionJson: String) async throws -> String {
-        try await inner.governancePropose(handle: handle, proposerDid: proposerDid, actionJson: actionJson)
+        try checkProposalResponse(
+            await inner.governancePropose(handle: handle, proposerDid: proposerDid, actionJson: actionJson)
+        )
     }
 
     /// Forwards to ``Scp/governanceReject`` on ``inner``.
+    ///
+    /// Returns the bridge's JSON after ``checkProposalResponse(_:)`` checks
+    /// every name in it, and throws ``ScpError/Context(msg:code:)`` with code
+    /// `SCP-GOV-11040` for a status, reason, or outcome this SDK version does
+    /// not name.
     func governanceReject(handle: ContextHandle, voterDid: String, proposalIdHex: String) async throws -> String {
-        try await inner.governanceReject(handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex)
+        try checkProposalResponse(
+            await inner.governanceReject(handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex)
+        )
     }
 
     /// Forwards to ``Scp/governanceWithdraw`` on ``inner``.
+    ///
+    /// Returns the bridge's JSON after ``checkProposalResponse(_:)`` checks
+    /// every name in it, and throws ``ScpError/Context(msg:code:)`` with code
+    /// `SCP-GOV-11040` for a status, reason, or outcome this SDK version does
+    /// not name.
     func governanceWithdraw(handle: ContextHandle, voterDid: String, proposalIdHex: String) async throws -> String {
-        try await inner.governanceWithdraw(handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex)
+        try checkProposalResponse(
+            await inner.governanceWithdraw(handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex)
+        )
     }
 
     /// Forwards to ``Scp/handleDeregister`` on ``inner``.

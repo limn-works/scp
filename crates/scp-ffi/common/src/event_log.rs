@@ -30,15 +30,99 @@
 
 use scp_event_log::Event;
 
-/// Renders an event type as its canonical label string (the `Debug` form,
-/// e.g. `"MessageSent"`).
+/// Returns an event type's canonical wire label, such as `"MessageSent"`.
 ///
 /// This is the single source of truth for the `event_type` string surfaced
 /// across all FFI bridges and matched by the `event_type` filter clause, so
-/// the filter and the surfaced value stay in lock-step by construction.
+/// the filter and the surfaced value stay in lock-step by construction. SDKs
+/// read the label as a Rust `EventType` variant name (Python's
+/// `EventLogEntry.event_type`, Kotlin's `TrustAggregate` inputs).
+///
+/// The match names every variant with no wildcard arm, so an `EventType`
+/// added in `scp-event-log` stops this crate from compiling until someone
+/// labels it, and no label depends on `Debug` output.
 #[must_use]
-pub fn event_type_label(event_type: &scp_event_log::EventType) -> String {
-    format!("{event_type:?}")
+pub const fn event_type_label(event_type: &scp_event_log::EventType) -> &'static str {
+    use scp_event_log::EventType;
+    match event_type {
+        EventType::ContextCreated => "ContextCreated",
+        EventType::ContextClosing => "ContextClosing",
+        EventType::ContextClosed => "ContextClosed",
+        EventType::ContextExpired => "ContextExpired",
+        EventType::MemberJoined => "MemberJoined",
+        EventType::MemberLeft => "MemberLeft",
+        EventType::RoleAssigned => "RoleAssigned",
+        EventType::TokenRevoked => "TokenRevoked",
+        EventType::MessageSent => "MessageSent",
+        EventType::OutletRegistered => "OutletRegistered",
+        EventType::OutletUpdated => "OutletUpdated",
+        EventType::OutletInvoked => "OutletInvoked",
+        EventType::OutletVerified => "OutletVerified",
+        EventType::OutletInterfaceEstablished => "OutletInterfaceEstablished",
+        EventType::GovernanceAction => "GovernanceAction",
+        EventType::ConsistencyCheckpoint => "ConsistencyCheckpoint",
+        EventType::AbsenceProofRequested => "AbsenceProofRequested",
+        EventType::MemberBlocked => "MemberBlocked",
+        EventType::KeyEpochAdvance => "KeyEpochAdvance",
+        EventType::MediaSessionStarted => "MediaSessionStarted",
+        EventType::MediaSessionEnded => "MediaSessionEnded",
+        EventType::PaymentReceived => "PaymentReceived",
+        EventType::EconomicPolicyChanged => "EconomicPolicyChanged",
+        EventType::EconomicPolicyApplied => "EconomicPolicyApplied",
+        EventType::SpendingUcanGranted => "SpendingUcanGranted",
+        EventType::SpendingUcanRevoked => "SpendingUcanRevoked",
+        EventType::GovernanceProposalCreated => "GovernanceProposalCreated",
+        EventType::GovernanceVoteCast => "GovernanceVoteCast",
+        EventType::GovernanceVoteWithdrawn => "GovernanceVoteWithdrawn",
+        EventType::GovernanceProposalResolved => "GovernanceProposalResolved",
+        EventType::GovernanceConflictDetected => "GovernanceConflictDetected",
+        EventType::GovernanceConflictResolved => "GovernanceConflictResolved",
+        EventType::GovernanceDeadlockRecovery => "GovernanceDeadlockRecovery",
+        EventType::GovernanceActionExecuted => "GovernanceActionExecuted",
+        EventType::ProvenanceAttached => "ProvenanceAttached",
+        EventType::ProvenanceReceived => "ProvenanceReceived",
+        EventType::AdminTransferred => "AdminTransferred",
+        EventType::CeilingModified => "CeilingModified",
+        EventType::CeilingModificationPending => "CeilingModificationPending",
+        EventType::ThresholdModified => "ThresholdModified",
+        EventType::SignerAdded => "SignerAdded",
+        EventType::SignerRemoved => "SignerRemoved",
+        EventType::ChildContextCreated => "ChildContextCreated",
+        EventType::ContextPromoted => "ContextPromoted",
+        EventType::ContentKeysRotated => "ContentKeysRotated",
+        EventType::MemberReset => "MemberReset",
+        EventType::MemberSuspended => "MemberSuspended",
+        EventType::MemberSuspendedAll => "MemberSuspendedAll",
+        EventType::MemberUnblocked => "MemberUnblocked",
+        EventType::AccessRestored => "AccessRestored",
+        EventType::GovernanceReconfigured => "GovernanceReconfigured",
+        EventType::GovernanceFreezeExpired => "GovernanceFreezeExpired",
+        EventType::HardRateLimitModified => "HardRateLimitModified",
+        EventType::EconomicPolicyLocked => "EconomicPolicyLocked",
+        EventType::ContextMigrationStarted => "ContextMigrationStarted",
+        EventType::OutletRemoved => "OutletRemoved",
+        EventType::PruningPolicyModified => "PruningPolicyModified",
+        EventType::CommitBroadcasted => "CommitBroadcasted",
+        EventType::CommitBroadcastPending => "CommitBroadcastPending",
+        EventType::ContextTombstoned => "ContextTombstoned",
+        EventType::ContextMigrationCancelled => "ContextMigrationCancelled",
+        EventType::TtlExtended => "TtlExtended",
+        EventType::TtlExtensionRejected => "TtlExtensionRejected",
+        EventType::AccessRevoked => "AccessRevoked",
+        EventType::SpendApproved => "SpendApproved",
+        EventType::PaymentCaptureFailed => "PaymentCaptureFailed",
+        EventType::ConsequenceTriggered => "ConsequenceTriggered",
+        EventType::ConsequenceEnforced => "ConsequenceEnforced",
+        EventType::ConsequenceEnforcementFailed => "ConsequenceEnforcementFailed",
+        EventType::ConsequenceEscalatedToSuspendAll => "ConsequenceEscalatedToSuspendAll",
+        EventType::CommitBroadcastSucceeded => "CommitBroadcastSucceeded",
+        EventType::CommitBroadcastFailed => "CommitBroadcastFailed",
+        EventType::RecoveryEpochAdvanced => "RecoveryEpochAdvanced",
+        EventType::AppBound => "AppBound",
+        EventType::AppUnbound => "AppUnbound",
+        EventType::CrossContextOutletInvoked => "CrossContextOutletInvoked",
+        EventType::CrossContextDivergenceMarker => "CrossContextDivergenceMarker",
+    }
 }
 
 /// Injects a typed event payload's bridge-facing projection fields into a JSON object.
@@ -170,6 +254,152 @@ mod tests {
             entry(EventType::MessageSent, "did:example:bob"),
             entry(EventType::MemberLeft, "did:example:alice"),
         ]
+    }
+
+    /// Every `EventType` with the label bridges surface as `event_type` and
+    /// SDKs compare against variant names.
+    const EVENT_TYPE_LABELS: [(scp_event_log::EventType, &str); 77] = {
+        use scp_event_log::EventType;
+        [
+            (EventType::ContextCreated, "ContextCreated"),
+            (EventType::ContextClosing, "ContextClosing"),
+            (EventType::ContextClosed, "ContextClosed"),
+            (EventType::ContextExpired, "ContextExpired"),
+            (EventType::MemberJoined, "MemberJoined"),
+            (EventType::MemberLeft, "MemberLeft"),
+            (EventType::RoleAssigned, "RoleAssigned"),
+            (EventType::TokenRevoked, "TokenRevoked"),
+            (EventType::MessageSent, "MessageSent"),
+            (EventType::OutletRegistered, "OutletRegistered"),
+            (EventType::OutletUpdated, "OutletUpdated"),
+            (EventType::OutletInvoked, "OutletInvoked"),
+            (EventType::OutletVerified, "OutletVerified"),
+            (
+                EventType::OutletInterfaceEstablished,
+                "OutletInterfaceEstablished",
+            ),
+            (EventType::GovernanceAction, "GovernanceAction"),
+            (EventType::ConsistencyCheckpoint, "ConsistencyCheckpoint"),
+            (EventType::AbsenceProofRequested, "AbsenceProofRequested"),
+            (EventType::MemberBlocked, "MemberBlocked"),
+            (EventType::KeyEpochAdvance, "KeyEpochAdvance"),
+            (EventType::MediaSessionStarted, "MediaSessionStarted"),
+            (EventType::MediaSessionEnded, "MediaSessionEnded"),
+            (EventType::PaymentReceived, "PaymentReceived"),
+            (EventType::EconomicPolicyChanged, "EconomicPolicyChanged"),
+            (EventType::EconomicPolicyApplied, "EconomicPolicyApplied"),
+            (EventType::SpendingUcanGranted, "SpendingUcanGranted"),
+            (EventType::SpendingUcanRevoked, "SpendingUcanRevoked"),
+            (
+                EventType::GovernanceProposalCreated,
+                "GovernanceProposalCreated",
+            ),
+            (EventType::GovernanceVoteCast, "GovernanceVoteCast"),
+            (
+                EventType::GovernanceVoteWithdrawn,
+                "GovernanceVoteWithdrawn",
+            ),
+            (
+                EventType::GovernanceProposalResolved,
+                "GovernanceProposalResolved",
+            ),
+            (
+                EventType::GovernanceConflictDetected,
+                "GovernanceConflictDetected",
+            ),
+            (
+                EventType::GovernanceConflictResolved,
+                "GovernanceConflictResolved",
+            ),
+            (
+                EventType::GovernanceDeadlockRecovery,
+                "GovernanceDeadlockRecovery",
+            ),
+            (
+                EventType::GovernanceActionExecuted,
+                "GovernanceActionExecuted",
+            ),
+            (EventType::ProvenanceAttached, "ProvenanceAttached"),
+            (EventType::ProvenanceReceived, "ProvenanceReceived"),
+            (EventType::AdminTransferred, "AdminTransferred"),
+            (EventType::CeilingModified, "CeilingModified"),
+            (
+                EventType::CeilingModificationPending,
+                "CeilingModificationPending",
+            ),
+            (EventType::ThresholdModified, "ThresholdModified"),
+            (EventType::SignerAdded, "SignerAdded"),
+            (EventType::SignerRemoved, "SignerRemoved"),
+            (EventType::ChildContextCreated, "ChildContextCreated"),
+            (EventType::ContextPromoted, "ContextPromoted"),
+            (EventType::ContentKeysRotated, "ContentKeysRotated"),
+            (EventType::MemberReset, "MemberReset"),
+            (EventType::MemberSuspended, "MemberSuspended"),
+            (EventType::MemberSuspendedAll, "MemberSuspendedAll"),
+            (EventType::MemberUnblocked, "MemberUnblocked"),
+            (EventType::AccessRestored, "AccessRestored"),
+            (EventType::GovernanceReconfigured, "GovernanceReconfigured"),
+            (
+                EventType::GovernanceFreezeExpired,
+                "GovernanceFreezeExpired",
+            ),
+            (EventType::HardRateLimitModified, "HardRateLimitModified"),
+            (EventType::EconomicPolicyLocked, "EconomicPolicyLocked"),
+            (
+                EventType::ContextMigrationStarted,
+                "ContextMigrationStarted",
+            ),
+            (EventType::OutletRemoved, "OutletRemoved"),
+            (EventType::PruningPolicyModified, "PruningPolicyModified"),
+            (EventType::CommitBroadcasted, "CommitBroadcasted"),
+            (EventType::CommitBroadcastPending, "CommitBroadcastPending"),
+            (EventType::ContextTombstoned, "ContextTombstoned"),
+            (
+                EventType::ContextMigrationCancelled,
+                "ContextMigrationCancelled",
+            ),
+            (EventType::TtlExtended, "TtlExtended"),
+            (EventType::TtlExtensionRejected, "TtlExtensionRejected"),
+            (EventType::AccessRevoked, "AccessRevoked"),
+            (EventType::SpendApproved, "SpendApproved"),
+            (EventType::PaymentCaptureFailed, "PaymentCaptureFailed"),
+            (EventType::ConsequenceTriggered, "ConsequenceTriggered"),
+            (EventType::ConsequenceEnforced, "ConsequenceEnforced"),
+            (
+                EventType::ConsequenceEnforcementFailed,
+                "ConsequenceEnforcementFailed",
+            ),
+            (
+                EventType::ConsequenceEscalatedToSuspendAll,
+                "ConsequenceEscalatedToSuspendAll",
+            ),
+            (
+                EventType::CommitBroadcastSucceeded,
+                "CommitBroadcastSucceeded",
+            ),
+            (EventType::CommitBroadcastFailed, "CommitBroadcastFailed"),
+            (EventType::RecoveryEpochAdvanced, "RecoveryEpochAdvanced"),
+            (EventType::AppBound, "AppBound"),
+            (EventType::AppUnbound, "AppUnbound"),
+            (
+                EventType::CrossContextOutletInvoked,
+                "CrossContextOutletInvoked",
+            ),
+            (
+                EventType::CrossContextDivergenceMarker,
+                "CrossContextDivergenceMarker",
+            ),
+        ]
+    };
+
+    /// Pins all 77 labels and checks that no two event types share one.
+    #[test]
+    fn every_event_type_has_its_pinned_label() {
+        let mut seen = std::collections::HashSet::new();
+        for (event_type, label) in EVENT_TYPE_LABELS {
+            assert_eq!(event_type_label(&event_type), label);
+            assert!(seen.insert(label), "duplicate label {label}");
+        }
     }
 
     #[test]

@@ -3461,3 +3461,325 @@ fn ffi_export_allowlist_reasons_are_justified() {
         offenders.join("\n  ")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Shared wire names for governance outcomes
+// ---------------------------------------------------------------------------
+
+/// Every native bridge names a governance outcome through
+/// `scp_ffi_common::governance_result`: `governance_execute` through
+/// `governance_action_result_name` and `governance_propose` through
+/// `governance_propose_response`. A bridge that builds its own string can
+/// send a Rust `Debug` dump, which no SDK enum parses.
+#[test]
+fn every_bridge_names_governance_outcomes_through_the_shared_functions() {
+    for (bridge, src) in [
+        ("pyo3", PYO3_CONTEXT),
+        ("napi", NAPI_CONTEXT),
+        ("uniffi", UNIFFI_BRIDGE),
+    ] {
+        for call in [
+            "scp_ffi_common::governance_result::governance_action_result_name(",
+            "scp_ffi_common::governance_result::governance_propose_response(",
+        ] {
+            assert!(
+                src.contains(call),
+                "{bridge} bridge must call {call}...) to name a governance outcome"
+            );
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// Shared wire names: no bridge hands an SDK a `Debug` rendering
+// ---------------------------------------------------------------------------
+
+/// Identifiers and `Debug` format literals that one bridge function's body
+/// holds, including inside macro token streams such as `json!` and `format!`.
+#[derive(Default)]
+struct WireBodyScan {
+    idents: BTreeSet<String>,
+    debug_literals: Vec<String>,
+}
+
+impl WireBodyScan {
+    fn walk_tokens(&mut self, tokens: proc_macro2::TokenStream) {
+        for tree in tokens {
+            match tree {
+                proc_macro2::TokenTree::Group(group) => self.walk_tokens(group.stream()),
+                proc_macro2::TokenTree::Ident(ident) => {
+                    self.idents.insert(ident.to_string());
+                }
+                proc_macro2::TokenTree::Literal(literal) => {
+                    let text = literal.to_string();
+                    if text.contains(":?}") || text.contains(":#?}") {
+                        self.debug_literals.push(text);
+                    }
+                }
+                proc_macro2::TokenTree::Punct(_) => {}
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for WireBodyScan {
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        self.idents.insert(ident.to_string());
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.walk_tokens(mac.tokens.clone());
+        syn::visit::visit_macro(self, mac);
+    }
+}
+
+/// Collects a [`WireBodyScan`] for every non-test function named `name`.
+struct WireFnFinder<'n> {
+    name: &'n str,
+    scans: Vec<WireBodyScan>,
+}
+
+impl WireFnFinder<'_> {
+    fn scan_fn(&mut self, attrs: &[syn::Attribute], ident: &syn::Ident, block: &syn::Block) {
+        if ident == self.name && !attrs_contain_cfg_test(attrs) {
+            let mut scan = WireBodyScan::default();
+            scan.visit_block(block);
+            self.scans.push(scan);
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for WireFnFinder<'_> {
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        self.scan_fn(&node.attrs, &node.sig.ident, &node.block);
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        self.scan_fn(&node.attrs, &node.sig.ident, &node.block);
+    }
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if !attrs_contain_cfg_test(&node.attrs) {
+            syn::visit::visit_item_mod(self, node);
+        }
+    }
+}
+
+/// One bridge function that hands an SDK a wire string: bridge, source,
+/// function name, and the shared name functions its body must call.
+type WireSite = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+);
+
+const OUTCOME: &str = "governance_action_result_name";
+const PROPOSE: &str = "governance_propose_response";
+const STATUS: &str = "proposal_status_response";
+const CHECKPOINT: &str = "checkpoint_cosignature_response";
+const EVENT: &str = "context_event_wire_string";
+const MESSAGE_TYPE: &str = "message_type_name";
+const SOURCE_TYPE: &str = "source_type_name";
+const MEMORY_SCOPE: &str = "memory_scope_name";
+const EVENT_TYPE: &str = "event_type_label";
+const ADMISSION: &str = "broadcast_admission_name";
+const ROLE: &str = "role_name";
+const WIRE_SITES: &[WireSite] = &[
+    ("pyo3", PYO3_CONTEXT, "broadcast_admission", &[ADMISSION]),
+    ("pyo3", PYO3_CONTEXT, "context_member_role", &[ROLE]),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_broadcast_admission_on",
+        &[ADMISSION],
+    ),
+    ("napi", NAPI_CONTEXT, "context_member_role_on", &[ROLE]),
+    ("uniffi", UNIFFI_BRIDGE, "broadcast_admission", &[ADMISSION]),
+    ("uniffi", UNIFFI_BRIDGE, "context_member_role", &[ROLE]),
+    ("pyo3", PYO3_CONTEXT, "governance_execute", &[OUTCOME]),
+    ("pyo3", PYO3_CONTEXT, "governance_propose", &[PROPOSE]),
+    ("pyo3", PYO3_CONTEXT, "governance_approve", &[STATUS]),
+    ("pyo3", PYO3_CONTEXT, "governance_reject", &[STATUS]),
+    ("pyo3", PYO3_CONTEXT, "governance_withdraw", &[STATUS]),
+    (
+        "pyo3",
+        PYO3_CONTEXT,
+        "add_checkpoint_cosignature",
+        &[CHECKPOINT],
+    ),
+    ("pyo3", PYO3_CONTEXT, "convert_context_event", &[EVENT]),
+    ("pyo3", PYO3_CONTEXT, "context_drain_events", &[EVENT]),
+    (
+        "pyo3",
+        PYO3_MEDIA,
+        "py_media_send_signaling",
+        &[MESSAGE_TYPE],
+    ),
+    (
+        "pyo3",
+        PYO3_PROVENANCE,
+        "provenance_to_dict",
+        &[SOURCE_TYPE, MEMORY_SCOPE],
+    ),
+    (
+        "pyo3",
+        PYO3_EVENT_LOG,
+        "query_manager_entries",
+        &[EVENT_TYPE],
+    ),
+    (
+        "pyo3",
+        PYO3_EVENT_LOG,
+        "query_storage_fallback",
+        &[EVENT_TYPE],
+    ),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_execute_governance_action_on",
+        &[OUTCOME],
+    ),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_governance_propose_on",
+        &[PROPOSE],
+    ),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_governance_approve_on",
+        &[STATUS],
+    ),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_governance_reject_on",
+        &[STATUS],
+    ),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_governance_withdraw_on",
+        &[STATUS],
+    ),
+    (
+        "napi",
+        NAPI_CONTEXT,
+        "context_add_checkpoint_cosignature_on",
+        &[CHECKPOINT],
+    ),
+    ("napi", NAPI_CONTEXT, "context_drain_events_on", &[EVENT]),
+    (
+        "napi",
+        NAPI_MEDIA,
+        "media_send_signaling_on",
+        &[MESSAGE_TYPE],
+    ),
+    (
+        "napi",
+        NAPI_PROVENANCE,
+        "provenance_attach_on",
+        &[SOURCE_TYPE, MEMORY_SCOPE],
+    ),
+    ("napi", NAPI_EVENT_LOG, "event_log_query_on", &[EVENT_TYPE]),
+    ("uniffi", UNIFFI_BRIDGE, "governance_execute", &[OUTCOME]),
+    ("uniffi", UNIFFI_BRIDGE, "governance_propose", &[PROPOSE]),
+    ("uniffi", UNIFFI_BRIDGE, "governance_approve", &[STATUS]),
+    ("uniffi", UNIFFI_BRIDGE, "governance_reject", &[STATUS]),
+    ("uniffi", UNIFFI_BRIDGE, "governance_withdraw", &[STATUS]),
+    (
+        "uniffi",
+        UNIFFI_BRIDGE,
+        "add_checkpoint_cosignature",
+        &[CHECKPOINT],
+    ),
+    ("uniffi", UNIFFI_BRIDGE, "context_drain_events", &[EVENT]),
+    (
+        "uniffi",
+        UNIFFI_BRIDGE,
+        "media_send_signaling",
+        &[MESSAGE_TYPE],
+    ),
+    (
+        "uniffi",
+        UNIFFI_BRIDGE,
+        "provenance_attach",
+        &[SOURCE_TYPE, MEMORY_SCOPE],
+    ),
+    ("uniffi", UNIFFI_BRIDGE, "event_log_query", &[EVENT_TYPE]),
+];
+
+/// Every bridge function that hands an SDK a governance outcome, proposal
+/// status, checkpoint attestation status, signaling message type, provenance
+/// source type or memory scope, event-log `event_type`, drained context
+/// event, broadcast admission, or member role builds that string through `scp_ffi_common`'s exhaustive name
+/// function and holds no `Debug` format literal (`{x:?}`).
+///
+/// A `Debug` rendering is a Rust implementation detail: a payload-carrying
+/// variant dumps its fields (`Rejected { reason: AdminRejected }`), and any
+/// derive or field change alters what an SDK receives. For a fieldless enum,
+/// `Debug` happens to equal the shared name, so only this structural check
+/// fails when a site reverts to `format!("{x:?}")`.
+#[test]
+fn no_bridge_hands_an_sdk_a_debug_rendering() {
+    let offenders = wire_site_offenders(WIRE_SITES);
+    assert!(
+        offenders.is_empty(),
+        "{} bridge site(s) can hand an SDK a Debug rendering:\n  {}",
+        offenders.len(),
+        offenders.join("\n  ")
+    );
+}
+
+/// The scan flags a site that formats with `{x:?}` and skips its shared name
+/// function, and passes the same site once it calls that function.
+#[test]
+fn wire_site_scan_rejects_a_debug_rendering() {
+    // `concat!` keeps the Debug literal out of one string clippy would read
+    // as a format string.
+    let reverted = concat!(
+        "fn broadcast_admission(a: Admission) -> String { format!(\"{a",
+        ":?}\") }"
+    );
+    let offenders = wire_site_offenders(&[("t", reverted, "broadcast_admission", &[ADMISSION])]);
+    assert_eq!(offenders.len(), 2, "got {offenders:?}");
+
+    let named = "fn broadcast_admission(a: Admission) -> String { \
+                 broadcast_admission_name(a).to_owned() }";
+    let offenders = wire_site_offenders(&[("t", named, "broadcast_admission", &[ADMISSION])]);
+    assert!(offenders.is_empty(), "got {offenders:?}");
+}
+
+fn wire_site_offenders(sites: &[WireSite]) -> Vec<String> {
+    let mut offenders = Vec::new();
+    for &(bridge, src, name, required) in sites {
+        let file =
+            syn::parse_file(src).unwrap_or_else(|e| panic!("{bridge} source failed to parse: {e}"));
+        let mut finder = WireFnFinder {
+            name,
+            scans: Vec::new(),
+        };
+        finder.visit_file(&file);
+        if finder.scans.is_empty() {
+            offenders.push(format!("{bridge}::{name} not found outside test code"));
+        }
+        for scan in &finder.scans {
+            for call in required {
+                if !scan.idents.contains(*call) {
+                    offenders.push(format!(
+                        "{bridge}::{name} must build its wire string through \
+                         scp_ffi_common's {call}"
+                    ));
+                }
+            }
+            if !scan.debug_literals.is_empty() {
+                offenders.push(format!(
+                    "{bridge}::{name} holds Debug format literal(s) {:?}",
+                    scan.debug_literals
+                ));
+            }
+        }
+    }
+    offenders
+}

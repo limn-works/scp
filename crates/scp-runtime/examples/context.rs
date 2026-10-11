@@ -24,16 +24,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    In production, these would be real MLS crypto, relay transport,
     //    and Merkle event log implementations.
     let key_resolver: KeyResolver = Arc::new(|_did: &DID, _kid: scp_did::SigningKeyId| None);
-    let manager = Supervisor::with_providers(
+    let (durable, persistence) = support::example_storage_providers();
+    let manager = Supervisor::with_providers_and_journal(
         support::example_crypto("did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"),
         Box::new(support::MockTransport),
         Box::new(support::MockEventLog),
         key_resolver,
+        persistence,
         None,
         None,
         None,
-        None,
-        support::example_mls_storage(),
+        durable,
     );
 
     // 2. Register our DID so the manager recognizes us as a local participant.

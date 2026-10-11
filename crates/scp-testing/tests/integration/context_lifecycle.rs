@@ -353,7 +353,6 @@ async fn all_capability_variants() {
         (Capability::ContextClose, "context:close"),
         (Capability::ChildContextCreate, "context:child:create"),
         (Capability::OutletInterface, "outlet:interface"),
-        (Capability::Bridging, "bridging"),
         (Capability::MediaVoice, "media:voice"),
         (Capability::MediaVideo, "media:video"),
         (Capability::MediaScreenShare, "media:screen_share"),

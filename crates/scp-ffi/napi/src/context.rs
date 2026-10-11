@@ -1338,14 +1338,19 @@ pub(crate) async fn reserve_key_package_on(
 }
 
 /// Tears down a committed Welcome join whose bridge state a concurrent close
-/// removed, and returns the join's `CTX_2040` error.
+/// removed, and returns the join's `CTX_2040` error, or the teardown's own
+/// error when the discard fails (when the actor did not exit in time, the
+/// Supervisor deletes the snapshot once it has).
 async fn tear_down_vanished_join(
     bi: &crate::runtime::NapiBridgeInstance,
-    sup: &scp_core::context::supervisor::Supervisor,
+    sup: &Arc<scp_core::context::supervisor::Supervisor>,
     context_id: &str,
 ) -> ScpNapiError {
-    sup.discard_joined_context(context_id).await;
+    let discarded = sup.discard_joined_context(context_id).await;
     crate::runtime::release_context(bi, context_id);
+    if let Err(e) = discarded {
+        return ScpNapiError::from(e);
+    }
     ScpNapiError::Context {
         message: format!(
             "bridge state for context '{context_id}' vanished between the reversible \
@@ -2692,55 +2697,6 @@ pub(crate) async fn context_member_role_on(
 // Bridge functions — events (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 
-/// Formats a [`ContextEvent`](scp_core::context::membership::ContextEvent) as a human-readable string.
-///
-/// Consequence events (`ConsequenceTriggered`, `ConsequenceEnforced`) are
-/// formatted with structured key=value pairs for observability. All other
-/// events use their `Debug` representation.
-fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> String {
-    use scp_core::context::membership::ContextEvent::{ConsequenceEnforced, ConsequenceTriggered};
-    match event {
-        ConsequenceTriggered {
-            context_id,
-            member_did,
-            rule_index,
-            trigger_type,
-            action_type,
-        } => format!(
-            "consequence_triggered:member={member_did},\
-             rule={rule_index},trigger={trigger_type},\
-             action={action_type},context={context_id}"
-        ),
-        ConsequenceEnforced {
-            context_id,
-            member_did,
-            action_type,
-            success,
-        } => format!(
-            "consequence_enforced:member={member_did},\
-             action={action_type},success={success},\
-             context={context_id}"
-        ),
-        // Relay equivocation detected (§9.9.3, §23.7). Security event — MUST NOT
-        // be silently discarded (§9.9.4); surface as a structured, non-lossy,
-        // HTML-escaped record rather than a Debug blob.
-        scp_core::context::membership::ContextEvent::EquivocationDetected {
-            context_id,
-            remote_sender_did,
-            event_count,
-            local_merkle_root,
-            remote_merkle_root,
-        } => scp_ffi_common::html_escape_event_string(&format!(
-            "equivocation_detected:context={context_id},\
-             remote_sender={remote_sender_did},event_count={event_count},\
-             local_merkle_root={},remote_merkle_root={}",
-            hex::encode(local_merkle_root),
-            hex::encode(remote_merkle_root),
-        )),
-        other => scp_ffi_common::html_escape_event_string(&format!("{other:?}")),
-    }
-}
-
 /// Per-bridge-instance implementation of [`Scp::context_drain_events`](crate::scp::Scp::context_drain_events).
 ///
 /// Routed through the ADR-049 messaging dispatch surface
@@ -2768,7 +2724,10 @@ pub(crate) async fn context_drain_events_on(
         .await
         .map_err(|e| napi::Error::from_reason(format!("drain_events shim reply dropped: {e}")))?
         .map_err(|e| napi::Error::from_reason(format!("drain_events failed: {e}")))?;
-    Ok(events.iter().map(format_context_event).collect())
+    Ok(events
+        .iter()
+        .map(scp_ffi_common::context_event::context_event_wire_string)
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -2944,7 +2903,9 @@ pub(crate) async fn context_broadcast_admission_on(
         .await
         .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-    Ok(admission.map(|a| format!("{a:?}")))
+    Ok(admission
+        .map(scp_ffi_common::broadcast::broadcast_admission_name)
+        .map(str::to_owned))
 }
 
 // ---------------------------------------------------------------------------
@@ -3642,7 +3603,7 @@ pub(crate) async fn context_execute_governance_action_on(
         _ => {}
     }
 
-    Ok(format!("{result:?}"))
+    Ok(scp_ffi_common::governance_result::governance_action_result_name(&result).to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -4125,14 +4086,13 @@ pub(crate) async fn context_governance_propose_on(
             })
         })?;
 
-    let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
-
-    let response = serde_json::json!({
-        "proposal_id": hex::encode(outcome.proposal.proposal_id),
-        "status": format!("{:?}", outcome.status),
-        "execution_result": result_str,
-    });
-    Ok(response.to_string())
+    Ok(
+        scp_ffi_common::governance_result::governance_propose_response(
+            &outcome.proposal.proposal_id,
+            &outcome.status,
+            outcome.execution_result.as_ref(),
+        ),
+    )
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_governance_approve`](crate::scp::Scp::context_governance_approve).
@@ -4187,7 +4147,9 @@ pub(crate) async fn context_governance_approve_on(
             })
         })?;
 
-    Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+    Ok(scp_ffi_common::governance_result::proposal_status_response(
+        &status,
+    ))
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_governance_reject`](crate::scp::Scp::context_governance_reject).
@@ -4241,7 +4203,9 @@ pub(crate) async fn context_governance_reject_on(
             })
         })?;
 
-    Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+    Ok(scp_ffi_common::governance_result::proposal_status_response(
+        &status,
+    ))
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_governance_withdraw`](crate::scp::Scp::context_governance_withdraw).
@@ -4290,7 +4254,9 @@ pub(crate) async fn context_governance_withdraw_on(
             })
         })?;
 
-    Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+    Ok(scp_ffi_common::governance_result::proposal_status_response(
+        &status,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -4647,11 +4613,13 @@ pub(crate) async fn context_add_checkpoint_cosignature_on(
             })
         })?;
 
-    let response = serde_json::json!({
-        "attestation_status": format!("{status:?}"),
-        "checkpoint": serde_json::to_value(&updated_checkpoint).unwrap_or_default(),
-    });
-    Ok(response.to_string())
+    scp_ffi_common::governance_result::checkpoint_cosignature_response(&updated_checkpoint, &status)
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("add_checkpoint_cosignature failed to encode checkpoint: {e}"),
+                code: codes::CTX_2063.to_owned(),
+            })
+        })
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_restore`](crate::scp::Scp::context_restore).
@@ -7511,6 +7479,173 @@ mod tests {
         }
     }
 
+    /// Re-signs `encoded` as `signer` with its `nb` replaced by `nb` and a
+    /// fresh nonce, so a test can present a root token whose signed §7.3.8
+    /// caveats the bridge mint does not originate.
+    #[cfg(feature = "testing")]
+    async fn resign_with_nb(
+        bi: &crate::runtime::NapiBridgeInstance,
+        signer: &str,
+        encoded: &str,
+        nb: scp_core::trust::caveats::InvocationCaveats,
+    ) -> String {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use scp_platform::traits::KeyCustody as _;
+
+        let mut token = scp_core::crypto::ucan::validate::parse_ucan(encoded).unwrap();
+        token.payload.nb = Some(nb);
+        token.payload.nnc = scp_core::crypto::ucan::nonce::generate_nonce(&scp_clock::SystemClock);
+        let header_b64 = encoded.split('.').next().unwrap();
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&token.payload).unwrap());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let (custody, key) = crate::runtime::with_identity(bi, signer, |entry| {
+            Ok((
+                Arc::clone(&entry.custody),
+                entry.identity.active_signing_key,
+            ))
+        })
+        .unwrap();
+        let sig = custody.sign(&key, signing_input.as_bytes()).await.unwrap();
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.as_bytes()))
+    }
+
+    /// A context whose ceiling holds `outlet_call:*` and `messages:write`, a
+    /// `messages:write` token and its capability, and a root `outlet_call:*`
+    /// token minted to the holder with its capability.
+    #[cfg(feature = "testing")]
+    struct NbFixture {
+        bi: Arc<crate::runtime::NapiBridgeInstance>,
+        handle: super::NapiContextHandle,
+        plain: String,
+        plain_cap: String,
+        owner_did: String,
+        holder_did: String,
+        root: String,
+        cap: String,
+    }
+
+    #[cfg(feature = "testing")]
+    async fn nb_fixture(scp: &crate::scp::Scp) -> NbFixture {
+        let (bi, handle, plain, plain_cap, owner_did, holder_did) =
+            active_context_with_token(scp, &["messages:read", "messages:write", "outlet_call:*"])
+                .await;
+        let root = crate::ucan::ucan_mint_on(
+            &bi,
+            &handle,
+            holder_did.clone(),
+            vec!["outlet_call:*".to_owned()],
+            None,
+        )
+        .await
+        .expect("outlet mint");
+        let cap = root.capabilities()[0].clone();
+        NbFixture {
+            bi,
+            handle,
+            plain,
+            plain_cap,
+            owner_did,
+            holder_did,
+            root: root.encoded(),
+            cap,
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    fn valid_until(offset: i64) -> scp_core::trust::caveats::InvocationCaveats {
+        let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+        scp_core::trust::caveats::InvocationCaveats {
+            valid_until: Some(now.saturating_add_signed(offset)),
+            ..scp_core::trust::caveats::InvocationCaveats::empty()
+        }
+    }
+
+    /// §7.3.8 Step 11b: `ucan_validate_on` and `ucan_evaluate_on` refuse a
+    /// root `outlet_call:*` token whose signed `nb.valid_until` has passed
+    /// although its `exp` has not.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_validate_refuses_a_root_outlet_token_past_its_nb_time_box() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let f = nb_fixture(&scp).await;
+        let lapsed = resign_with_nb(&f.bi, &f.owner_did, &f.root, valid_until(-60)).await;
+        let evaluation = crate::ucan::ucan_evaluate_on(
+            &f.bi,
+            &f.handle,
+            lapsed.clone(),
+            Some(f.cap.clone()),
+            f.holder_did.clone(),
+            None,
+        )
+        .await
+        .expect("evaluate");
+        assert!(
+            evaluation.signatures_valid && !evaluation.time_bounds_valid,
+            "evaluate must report only the time-box failure"
+        );
+        let err =
+            crate::ucan::ucan_validate_on(&f.bi, &f.handle, lapsed, f.cap, f.holder_did, None)
+                .await
+                .expect_err("a root outlet token past nb.valid_until must not validate")
+                .to_string();
+        assert!(
+            err.contains("caveat time-box violation: valid_until"),
+            "the refusal must be the Step 11b time-box: {err}"
+        );
+    }
+
+    /// §7.3.8 Step 7b: a delegated outlet token whose `nb` carries the
+    /// materialized `origin_kind` and an unexpired `valid_until` validates.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_validate_admits_a_delegated_outlet_token_inside_its_time_box() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let f = nb_fixture(&scp).await;
+        let delegatee = "did:dht:z6MkNapiNbTimeBoxDelegatee".to_owned();
+        let live = resign_with_nb(&f.bi, &f.owner_did, &f.root, valid_until(1800)).await;
+        let child = crate::ucan::ucan_delegate_on(
+            &f.bi,
+            &f.handle,
+            f.holder_did.clone(),
+            delegatee.clone(),
+            live.clone(),
+            vec![f.cap.clone()],
+        )
+        .await
+        .expect("delegate")
+        .encoded();
+        let evaluation = crate::ucan::ucan_evaluate_on(
+            &f.bi,
+            &f.handle,
+            child.clone(),
+            Some(f.cap.clone()),
+            delegatee.clone(),
+            Some(vec![live.clone()]),
+        )
+        .await
+        .expect("evaluate");
+        assert!(
+            evaluation.signatures_valid && evaluation.time_bounds_valid,
+            "evaluate must admit the delegated outlet token"
+        );
+        crate::ucan::ucan_validate_on(&f.bi, &f.handle, child, f.cap, delegatee, Some(vec![live]))
+            .await
+            .expect("a delegated outlet token inside its time-box must validate");
+    }
+
+    /// A `messages:write` token carries no `nb`, so the caveat steps leave it
+    /// unaffected.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_validate_leaves_a_non_outlet_token_unaffected() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let f = nb_fixture(&scp).await;
+        crate::ucan::ucan_validate_on(&f.bi, &f.handle, f.plain, f.plain_cap, f.holder_did, None)
+            .await
+            .expect("a messages:write token must validate");
+    }
+
     /// `ucan_mint_on` signs with the custody this bridge holds for the
     /// supervisor's creator, not with the custody the handle carries.
     ///
@@ -8450,74 +8585,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Consequence event format tests (#1531, #1593, #1594)
+    // Consequence rule parameter tests
     // -------------------------------------------------------------------
-
-    #[test]
-    fn format_consequence_triggered_event() {
-        use scp_core::context::membership::ContextEvent;
-
-        let event = ContextEvent::ConsequenceTriggered {
-            context_id: "ctx-napi-123".to_owned(),
-            member_did: scp_did::DID("did:dht:z6MkBob".to_owned()),
-            rule_index: 1,
-            trigger_type: "velocity".to_owned(),
-            action_type: "mute".to_owned(),
-        };
-
-        let formatted = super::format_context_event(&event);
-        assert!(
-            formatted.contains("consequence_triggered:"),
-            "must contain consequence_triggered prefix"
-        );
-        assert!(
-            formatted.contains("member=did:dht:z6MkBob"),
-            "must contain member DID"
-        );
-        assert!(formatted.contains("rule=1"), "must contain rule index");
-        assert!(
-            formatted.contains("trigger=velocity"),
-            "must contain trigger type"
-        );
-        assert!(
-            formatted.contains("action=mute"),
-            "must contain action type"
-        );
-        assert!(
-            formatted.contains("context=ctx-napi-123"),
-            "must contain context ID"
-        );
-    }
-
-    #[test]
-    fn format_consequence_enforced_event() {
-        use scp_core::context::membership::ContextEvent;
-
-        let event = ContextEvent::ConsequenceEnforced {
-            context_id: "ctx-napi-456".to_owned(),
-            member_did: scp_did::DID("did:dht:z6MkAlice".to_owned()),
-            action_type: "restrict_write".to_owned(),
-            success: false,
-        };
-
-        let formatted = super::format_context_event(&event);
-        assert!(
-            formatted.contains("consequence_enforced:"),
-            "must contain consequence_enforced prefix"
-        );
-        assert!(
-            formatted.contains("member=did:dht:z6MkAlice"),
-            "must contain member DID"
-        );
-        assert!(
-            formatted.contains("action=restrict_write"),
-            "must contain action type"
-        );
-        assert!(
-            formatted.contains("success=false"),
-            "must contain success=false"
-        );
-    }
 
     /// Verifies that `ContextParams` accepts `consequence_rules` and they
     /// serialize/deserialize correctly for FFI bridge consumption.
@@ -10268,6 +10337,66 @@ mod tests {
         assert!(
             !crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
             "session close must not build bridge state"
+        );
+    }
+
+    /// A context created on a SQLCipher-backed instance survives a reopen of
+    /// the store: its snapshot lands in the caller's chosen backend (spec
+    /// §17.6, one chosen backend with derived consumers), so a fresh instance
+    /// over the same directory restores it. A process-local snapshot store
+    /// would lose the snapshot with the first instance and restore nothing.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sqlite_instance_restores_its_context_after_reopen() {
+        use crate::runtime::{NapiBridgeInstance, SqliteKeyMaterial, StorageConfig};
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let open = || {
+            NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+                path: tmp.path().to_path_buf(),
+                key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x5Au8; 32])),
+            })
+            .expect("SQLCipher open must succeed")
+        };
+
+        let scp = crate::scp::Scp {
+            inner: Arc::new(open()),
+        };
+        let bi = Arc::clone(&scp.inner);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let did = identity.inner.did.clone();
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read", "messages:write"],
+            "memoryScope": "full",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &identity, params_json)
+            .await
+            .expect("context_create should succeed");
+        let ctx_id = handle.context_id.clone();
+        drop(handle);
+        drop(identity);
+        bi.shutdown(std::time::Duration::from_secs(10))
+            .await
+            .expect("shutdown must release the store");
+        drop(bi);
+        drop(scp);
+
+        let reopened = open();
+        crate::runtime::init_supervisor(&reopened, &did);
+        let restored_json = super::context_restore_all_on(&reopened)
+            .await
+            .expect("restore_all must succeed on the reopened store");
+        let restored: Vec<String> =
+            serde_json::from_str(&restored_json).expect("restore_all returns a JSON array");
+        assert_eq!(
+            restored,
+            vec![ctx_id],
+            "the reopened SQLCipher instance must restore the context the first instance created"
         );
     }
 }

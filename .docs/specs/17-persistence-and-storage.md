@@ -729,7 +729,7 @@ Key custody is the `KeyCustody` trait ADR-006 defines, named here for completene
 
 ### FileKeyCustody Argon2id Parameters
 
-`FileKeyCustody`, the software-key backend behind the headless row above, derives from a passphrase, with Argon2id, the root key from which HKDF derives the subkeys below. **A single Argon2id parameterization is REQUIRED across the codebase**, and an implementation MUST NOT define a second, divergent parameter set: two parameterizations derive two keys from one passphrase, so one of them cannot decrypt what the other wrote. The SQLCipher passphrase key-derivation mode of §17.6 draws from the same parameter source.
+`FileKeyCustody`, the software-key backend behind the headless row above, derives an AES-256 wrapping key from a passphrase with Argon2id. **A single Argon2id parameterization is REQUIRED across the codebase**, and an implementation MUST NOT define a second, divergent parameter set: two parameterizations derive two keys from one passphrase, so one of them cannot decrypt what the other wrote. The SQLCipher passphrase key-derivation mode of §17.6 draws from the same parameter source.
 
 ```
 algorithm  = Argon2id
@@ -741,38 +741,44 @@ output_len = 32                      // 32-byte derived key
 salt       = per-file 16-byte salt   // generated once, persisted with the custody file
 ```
 
-The Argon2id output is not used as a key itself. HKDF-SHA256 over it, with no salt, derives two 32-byte subkeys (L = 32) under distinct info labels: `scp/file-key-custody/v1/entry-aead` is the AES-256-GCM key for each entry, and `scp/file-key-custody/v1/file-mac` is an HMAC-SHA256 key. The file ends with an HMAC-SHA256 tag over every byte before it. An implementation MUST refuse a file whose length is not exactly the header, plus `entry_count` entries, plus the 32-byte tag, and MUST refuse a file whose tag does not verify, on open and on every later read. The tag stops an entry from being removed, appended or replayed, and stops the entry count from being changed. It does not stop the whole file being rolled back to an earlier copy of itself.
+### FileKeyCustody Key-File Format
 
-**The key file is a header, `entry_count` entries, and a tag, at these fixed widths.** The format version is `0x01`; an implementation MUST refuse a file with any other version byte. Integers are unsigned.
+A `FileKeyCustody` file holds a header followed by zero or more fixed-width encrypted entries. Version `0x02` is current:
 
-| Field | Offset | Width (bytes) | Encoding |
-|-------|--------|---------------|----------|
-| `version` | 0 | 1 | `0x01` |
-| `argon2id_salt` | 1 | 16 | the per-file salt above |
-| `entry_count` | 17 | 4 | little-endian |
-| entries | 21 | `entry_count` × 62 | the entry layout below, in index order from 0 |
-| `file_tag` | 21 + 62 × `entry_count` | 32 | HMAC-SHA256 under the `v1/file-mac` subkey over every byte before it |
+```
+version:      u8         (1 byte, 0x02)
+argon2id_salt:[u8; 16]   (16 bytes, generated once at creation)
+commitment:   [u8; 32]   (32 bytes, HMAC-SHA-256)
+file_hmac:    [u8; 32]   (32 bytes, HMAC-SHA-256)
+entry_count:  u32 LE     (4 bytes)
+entry[i]:     key_type u8 | role u8 | entry_id [u8; 16] | nonce [u8; 12] | ciphertext+tag [u8; 48]
 
-Each entry is 62 bytes:
+key_type:     0x01 = Ed25519, 0x02 = X25519, 0x03 = P-256 signing, 0x04 = P-256 HPKE
+role:         0x00 = operational, 0x01 = identity
+```
 
-| Field | Offset in entry | Width (bytes) | Encoding |
-|-------|-----------------|---------------|----------|
-| `key_type` | 0 | 1 | `0x01` Ed25519, `0x02` X25519, `0x03` P-256 signing, `0x04` P-256 HPKE |
-| `role` | 1 | 1 | `0x00` operational, `0x01` identity |
-| `nonce` | 2 | 12 | AES-256-GCM nonce, unique per entry write |
-| `ciphertext` | 14 | 32 | the 32-byte private key under the `v1/entry-aead` subkey; a P-256 key is its big-endian scalar |
-| `aead_tag` | 46 | 16 | the AES-256-GCM tag |
+Each entry is 78 bytes. `ciphertext` is the 32-byte private key wrapped under AES-256-GCM; a P-256 key (`0x03` or `0x04`) is stored as its big-endian scalar, and an implementation MUST refuse a decrypted P-256 scalar that is zero or not below the group order `n`. Only an entry whose role byte is `0x01` may be a pseudonym-derivation source (`09-security-model.md` §9.10.4.A).
 
-Each entry's AES-256-GCM associated data is 7 bytes:
+**Key separation.** One Argon2id derivation, with the parameters the previous subsection fixes, over a caller's passphrase and `argon2id_salt` produces a 32-byte root secret. Three HMAC-SHA-256 invocations keyed by that root secret expand it under three labels: `scp-file-key-custody/v2/wrap` yields the AES-256-GCM key that wraps each stored private key, `scp-file-key-custody/v2/mac` yields the file HMAC key, and `scp-file-key-custody/v2/commit` yields the stored `commitment`. The three labels MUST differ. Each output is a pseudorandom function of that root secret and its own label, so storing `commitment` in cleartext reveals nothing about either key. Construction MUST reject an empty passphrase before it creates or reads a file, because Argon2id over an empty passphrase yields a key that anyone who reads the salt can derive.
 
-| Field | Offset | Width (bytes) | Encoding |
-|-------|--------|---------------|----------|
-| `version` | 0 | 1 | `0x01` |
-| `key_type` | 1 | 1 | the entry's `key_type` byte |
-| `role` | 2 | 1 | the entry's `role` byte |
-| `entry_index` | 3 | 4 | the entry's zero-based position, big-endian |
+**SCP-CAPSEL-8001 at construction.** Opening an existing file MUST check both header values before returning a custody object, and MUST report them as two distinct conditions:
 
-Because the associated data binds the type, the role and the position, an implementation that flips an entry's type or role byte, or moves an entry to another index, fails decryption instead of reinterpreting the key. Only an entry whose role byte is `0x01` may be a pseudonym-derivation source (`09-security-model.md` §9.10.4.A). An implementation MUST refuse a decrypted P-256 scalar that is zero or not below the group order `n`. Removing an entry re-encrypts every entry whose index shifts.
+1. A stored `commitment` that differs from the one a caller's passphrase produces means those two passphrases differ. Construction MUST return an error naming a wrong passphrase. This check answers for a file holding zero entries, where no stored key exists to test a passphrase against.
+2. A `file_hmac` that does not match, computed over every byte of that file except `file_hmac` itself (version, salt, commitment, entry count, and every entry in order), means that file changed after custody wrote it. Construction MUST return an error naming an integrity failure, because an operator answers it by restoring a backup rather than by retyping a passphrase.
+
+A file whose length differs from `85 + 78 × entry_count` bytes (the 85-byte header plus one 78-byte entry per counted entry) fails as an integrity failure too. Authenticating `entry_count` and every entry makes two attacks detectable: splicing one file's header onto another file's entries, and rewriting `entry_count` to zero to hide stored keys. Every write path (creation, append, and the rewrite that key destruction performs) MUST recompute `file_hmac` before it writes.
+
+**Every read, not construction alone.** An implementation MUST verify `file_hmac` on every read of that file, not once at construction. Verifying once leaves two conditions undetected in a process that already holds an open custody object. A writer who removes an entry, truncates the file, or rewrites `entry_count` changes which keys that file holds, and a read that checks nothing reports whatever survived that write as custody's whole contents. A later append or key destruction then reads bytes it never authenticated and recomputes `file_hmac` over them, which hands a modified file a valid tag under the victim's own MAC key.
+
+**Per-entry binding.** Every entry carries a 16-byte `entry_id` that an implementation draws from a cryptographic random source when it appends that entry, whose first eight bytes differ from those of every `entry_id` the file already holds, and that no later write changes. An implementation MUST derive the handle it returns to a caller from that `entry_id`, so that one entry carries one handle in every custody object over the file and after every reopen; `FileKeyCustody` uses the first eight bytes of `entry_id`, read little-endian, as the handle's `u64`, and construction MUST return an error when two entries derive one handle. An implementation MUST locate an entry by comparing `entry_id` rather than by indexing on a position, and MUST pass `key_type ‖ role ‖ entry_id` (18 bytes) as AES-256-GCM associated data when it encrypts that entry, where `key_type` and `role` are that entry's stored bytes. A read path MUST read the stored `key_type` byte and compare it against the key type a caller's handle names before it decrypts anything, and MUST return an error naming both types when the two differ. A read path MUST likewise compare the stored `role` byte against the role a caller's handle names, and MUST return an error naming both roles when the two differ. An implementation MUST return an error when no entry in the file carries the `entry_id` a caller's handle names, because that key left custody. A rewrite that moves an entry to another position MUST copy that entry verbatim, because the associated data covers no position.
+
+Binding a handle to a position instead hands a caller another caller's key. Two custody objects can sit over one file: two processes can open one path, and an SDK that constructs one custody object per identity over one key file puts two objects in one process. Removing an entry moves every entry after it down one position, so a handle that the second custody object minted before the removal names the entry that slid into its recorded position. The stored `key_type` byte equals what that handle expects whenever both entries hold the same key type, and re-encrypting a moved entry under its new position makes positional associated data match as well, so AES-256-GCM accepts a key its caller never designated and signing returns a signature under it. A destruction followed by an append reuses a position the same way, and so does a restore of an older copy of the file followed by an append. A constructor that numbers handles by position when it opens the file does the same to every handle a caller persisted across a restart.
+
+**One writer at a time.** An implementation MUST hold an exclusive advisory lock, which excludes other processes as well as other objects inside one process, from the read that starts a read-modify-write of a key file through the write that ends that sequence. Append, key destruction, and key import (whose duplicate scan reads the file before it decides to append) are each one such sequence. The lock lives on a sibling file, the key file's path with `.lock` appended, because every write replaces the key file by rename and a lock on the replaced inode would stop excluding a writer that opened the path after the rename. An in-process mutex does not satisfy this requirement: two custody objects that both start a read-modify-write read one entry count, each append an entry at that count, and the later write replaces the earlier one, so one generated private key never reaches disk while both callers read success. An implementation MUST bound its wait for that lock and MUST return an error naming lock contention when the wait expires, because a holder in a stopped process keeps the lock indefinitely; `FileKeyCustody` waits 10 seconds and then writes nothing.
+
+**Creation and versions.** Creating a file MUST use an exclusive create (`O_EXCL` or a platform equivalent), so two processes creating one path never both succeed and one never overwrites another's keys. A constructor that loses that race opens the existing file; when that file is still zero-length because the winner is deriving its key, `FileKeyCustody` waits up to 10 seconds for the header and then returns an error. An implementation reading a version other than `0x02` MUST reject that file by version rather than open it.
+
+**What a passphrase commitment and a file HMAC do not catch.** Both values live inside the file they authenticate, so both roll back with it. An attacker who copies a key file, waits for an operator to destroy a compromised key, and restores that copy presents a file whose commitment matches the operator's passphrase and whose HMAC matches its own bytes; construction accepts it and a destroyed key is back in service. Detecting a rollback needs monotonic state outside that file, which this format does not carry, so an operator who destroys a key MUST treat a restorable copy of a key file as live key material.
 
 ## 17.9 OpenMLS StorageProvider Bridge
 
