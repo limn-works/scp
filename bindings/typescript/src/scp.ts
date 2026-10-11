@@ -39,8 +39,15 @@
 // methods via dynamic `import()` calls.
 import type { Context } from "./context";
 import type { PaymentReceiptVerificationResult } from "./economy";
-import { ContextError, mapBridgeError, mapSagaError, ScpError, ValidationError } from "./errors";
-import type { Identity } from "./identity";
+import {
+  ContextError,
+  IdentityError,
+  mapBridgeError,
+  mapSagaError,
+  ScpError,
+  ValidationError,
+} from "./errors";
+import type { CustodyType, Identity } from "./identity";
 import { type BridgeContextHandle, getBridge, toCapabilityValidation } from "./internal/bridge";
 import { toNativeCustodyProvider } from "./internal/custody-adapter";
 import {
@@ -106,6 +113,47 @@ import {
  * across all bridges.
  */
 const NO_PARTICIPATION_FACTS_CODE = "SCP-CTX-2076";
+
+/**
+ * Code an identity-creating method raises, before any bridge call, when an
+ * untyped caller passes no custody (`IDENT_1116` in
+ * `crates/scp-ffi/common/src/error_codes.rs`; SCP-294).
+ */
+export const CUSTODY_REQUIRED_CODE = "SCP-IDENT-1116";
+
+/** Remedy for a method whose custody argument is a {@link CustodyType}. */
+const CUSTODY_VALUE_REMEDY =
+  'pass "in_memory" (an addon built with the bridge\'s testing feature only), or call ' +
+  "identityCreateWithCustody() with a KeyCustodyProvider for any other key store";
+
+/** Remedy for a method whose custody argument is a {@link KeyCustodyProvider}. */
+const CUSTODY_PROVIDER_REMEDY =
+  "pass a KeyCustodyProvider, or call identityCreate() with a CustodyType " +
+  "to use a key store this SDK builds";
+
+function custodyRequiredError(method: string, remedy: string): IdentityError {
+  return new IdentityError(
+    `${method}() requires a custody argument and this SDK names no default key store: ${remedy}`,
+    CUSTODY_REQUIRED_CODE,
+  );
+}
+
+/**
+ * Rejects a custody argument the type checker would have rejected: absent,
+ * `null`, or not a string. A string goes on to the bridge, which answers a
+ * string it builds no key store from with its own typed error.
+ */
+function requireCustody(method: string, custody: unknown): void {
+  if (custody === undefined || custody === null) {
+    throw custodyRequiredError(method, CUSTODY_VALUE_REMEDY);
+  }
+  if (typeof custody !== "string") {
+    throw new ValidationError(
+      `${method}() custody must be a string naming a key store; got ${typeof custody}`,
+      "SCP-VALID-7005",
+    );
+  }
+}
 
 /**
  * Refined view of the native addon used by this module. The shared
@@ -940,7 +988,19 @@ export class SCP {
   // Domain: Identity
   // ───────────────────────────────────────────────────────────────────────
 
-  async identityCreate(custody: string = "in_memory"): Promise<Identity> {
+  /**
+   * Create an identity whose keys live in the key store `custody` names.
+   *
+   * `custody` is required and carries no default: which key store holds a
+   * private key decides who can reach that key, so this SDK picks none for the
+   * caller. Read {@link CustodyType} for what each value reaches.
+   *
+   * @throws IdentityError `SCP-IDENT-1116` when `custody` is `undefined` or
+   *   `null`, before any bridge call.
+   * @throws ValidationError `SCP-VALID-7005` when `custody` is not a string.
+   */
+  async identityCreate(custody: CustodyType): Promise<Identity> {
+    requireCustody("identityCreate", custody);
     try {
       const raw = await (this.#native.identityCreate as (c: string) => Promise<unknown>)(custody);
       const { Identity: IdentityCls } = await import("./identity");
@@ -950,7 +1010,15 @@ export class SCP {
     }
   }
 
-  async identityCreateWithAgentKey(custody: string = "in_memory"): Promise<Identity> {
+  /**
+   * Same as {@link SCP.identityCreate}, and the identity also carries an agent key.
+   *
+   * @throws IdentityError `SCP-IDENT-1116` when `custody` is `undefined` or
+   *   `null`, before any bridge call.
+   * @throws ValidationError `SCP-VALID-7005` when `custody` is not a string.
+   */
+  async identityCreateWithAgentKey(custody: CustodyType): Promise<Identity> {
+    requireCustody("identityCreateWithAgentKey", custody);
     try {
       const raw = await (
         this.#native.identityCreateWithAgentKey as (c: string) => Promise<unknown>
@@ -973,10 +1041,15 @@ export class SCP {
    * `new SCP(...)` outside a Node.js/Bun runtime already throws before this
    * method is reachable. Browser callers use `@limn-works/scp-ts-wasm` (ADR-057).
    *
+   * @throws IdentityError `SCP-IDENT-1116` when `provider` is `undefined` or
+   *   `null`, before any bridge call.
    * @throws ValidationError if the provider is missing required methods, or
    *   IdentityError if key/DID creation fails inside the provider.
    */
   async identityCreateWithCustody(provider: KeyCustodyProvider): Promise<Identity> {
+    if (provider === undefined || provider === null) {
+      throw custodyRequiredError("identityCreateWithCustody", CUSTODY_PROVIDER_REMEDY);
+    }
     // Validate provider completeness up front. The byte-converting adapter
     // below always supplies all nine closures, so a provider missing a method
     // would otherwise surface only later as a cryptic native "oneshot canceled"

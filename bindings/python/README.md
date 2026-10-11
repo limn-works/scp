@@ -14,12 +14,15 @@ pip install scp-python
 
 ```python
 import asyncio
-from scp_sdk import Identity, Context
+from scp_sdk import SCP, Context, CustodyType
 
 
 async def main():
     # Create a cryptographic identity (DID)
-    identity = await Identity.create(custody="platform")
+    scp = SCP({"type": "sqlite", "path": "./scp-data", "passphrase": "change me"})
+    # CustodyType.FILE keeps the keys in $HOME/.scp/keys.bin, encrypted under
+    # the SCP_KEY_PASSPHRASE environment variable.
+    identity = await scp.identity_create(CustodyType.FILE)
     print(f"DID: {identity.did}")
 
     # Create an encrypted context

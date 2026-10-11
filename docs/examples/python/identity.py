@@ -18,7 +18,6 @@ from scp_sdk import Identity, CustodyType
 
 async def main() -> None:
     # 1. Create a new identity with in-memory key custody.
-    #    In production, use CustodyType.PLATFORM for secure key storage.
     identity = await Identity.create(custody=CustodyType.IN_MEMORY)
 
     print(f"DID: {identity.did}")
