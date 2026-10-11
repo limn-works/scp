@@ -25,9 +25,9 @@ import { runAgent } from "./src/index";
 await runAgent(myProvider, process.env.SCP_STORAGE_PASSPHRASE ?? "");
 ```
 
-The SDK ships no production key store. Its one custody string, `"in_memory"`,
-works only with an addon built with the `testing` feature; a shipped addon
-rejects it with `SCP-IDENT-1008`.
+`myProvider` is a `KeyCustodyProvider` over your own key store: the
+`"os_keystore"` custody request of spec `03-identity.md` §3.2.2 reaches a host
+key store only through such a provider.
 
 ## What This Does
 

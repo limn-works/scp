@@ -14,7 +14,7 @@ bun add @limn-works/scp-ts
 
 ## Quick Start
 
-This quick start runs only with a native addon built with the `testing` feature (`cargo build -p scp-ffi-napi --features testing`), because a published addon rejects `"in_memory"` custody.
+The identity below asks for `"encrypted_file"` custody (spec `03-identity.md` §3.2.2): its keys live in the encrypted key file `$HOME/.scp/keys.bin`, sealed under the passphrase in the `SCP_KEY_PASSPHRASE` environment variable, so set that variable before you run it. The quick start runs only with a native addon built with the `testing` feature (`cargo build -p scp-ffi-napi --features testing`), because a published addon has no pre-rotation custody backend and answers `"encrypted_file"`, and a `KeyCustodyProvider`, with `SCP-IDENT-1059`. For a key store you own, pass a `KeyCustodyProvider` to `identityCreateWithCustody`, which creates an `"os_keystore"` identity.
 
 ```typescript
 import { SCP } from "@limn-works/scp-ts";
@@ -22,8 +22,8 @@ import { SCP } from "@limn-works/scp-ts";
 // Every call goes through an SCP instance, which takes a required storage backend.
 const scp = new SCP({ storage: { type: "in_memory" } });
 
-// Create a cryptographic identity (DID) whose keys live in process memory.
-const identity = await scp.identityCreate("in_memory");
+// Create a cryptographic identity (DID) whose keys live in the encrypted key file.
+const identity = await scp.identityCreate("encrypted_file");
 console.log(`DID: ${identity.did}`);
 
 // Create an encrypted context that this identity administers.
@@ -76,7 +76,9 @@ See [`examples/`](./examples/) for runnable scripts:
 | `multi-agent.ts` | Coordinate multiple agents in a shared context |
 | `node-demo.ts` | End-to-end NAPI demo: identity, context, messaging, membership |
 
-### Quick Start (Node.js/Bun)
+### Running the examples
+
+Each example creates `"encrypted_file"` identities, so it needs `SCP_KEY_PASSPHRASE` set and writes their keys to `$HOME/.scp/keys.bin`. The commands below point `HOME` at a scratch directory so the run leaves no key file in your home directory.
 
 ```bash
 # Build the native addon
@@ -88,19 +90,19 @@ mkdir -p "$PKG_DIR"
 cp ../../target/release/libscp_ffi_napi.dylib "$PKG_DIR/index.node"
 echo '{"name":"@limn-works/scp-ts-napi-darwin-arm64","version":"0.1.0","main":"index.node"}' > "$PKG_DIR/package.json"
 
-# Run the demo
-bun run examples/node-demo.ts
+# Run an example (replace node-demo.ts with any file in examples/)
+HOME=$(mktemp -d) SCP_KEY_PASSPHRASE=example-passphrase bun run examples/node-demo.ts
 ```
 
 ## Error Handling
 
-`SCP` methods throw subclasses of `ScpError`, each with a machine-readable `code`. Here `contextCreate` rejects an unknown governance model with `ValidationError` code `SCP-VALID-7000`. Like the quick start, this example needs a native addon built with the `testing` feature.
+`SCP` methods throw subclasses of `ScpError`, each with a machine-readable `code`. Here `contextCreate` rejects an unknown governance model with `ValidationError` code `SCP-VALID-7000`. Like the quick start, this example needs `SCP_KEY_PASSPHRASE` set and a native addon built with the `testing` feature.
 
 ```typescript
 import { SCP, ValidationError } from "@limn-works/scp-ts";
 
 const scp = new SCP({ storage: { type: "in_memory" } });
-const identity = await scp.identityCreate("in_memory");
+const identity = await scp.identityCreate("encrypted_file");
 try {
   await scp.contextCreate(
     identity,

@@ -85,9 +85,12 @@ export interface IdentityLinkAttestation {
  *   reach, so it answers `"os_keystore"` with an `IdentityError` carrying
  *   `SCP-IDENT-1003`. The value promises that every use of a key goes through
  *   the provider; it promises no hardware backing.
- * - `"in_memory"` keeps plaintext keys in process memory. Only an addon built
- *   with the bridge's `testing` feature accepts it; a shipped addon answers it
- *   with an `IdentityError` carrying `SCP-IDENT-1008`.
+ *
+ * The union carries these two values and no other (§3.2.2). An addon built
+ * with the bridge's `testing` feature also accepts the string `"in_memory"`,
+ * which reaches a plaintext in-memory key store; that string is a test-harness
+ * affordance, not a value of this type, and a shipped addon answers it with an
+ * `IdentityError` carrying `SCP-IDENT-1008`.
  *
  * The bridge answers any other string, `"platform"`, `"software"`, `"file"`
  * and `"callback"` included, with a `ValidationError` carrying
@@ -99,7 +102,7 @@ export interface IdentityLinkAttestation {
  * that passes none rejects with an `IdentityError` carrying `SCP-IDENT-1116`
  * before any bridge call (SCP-294).
  */
-export type CustodyType = "encrypted_file" | "os_keystore" | "in_memory";
+export type CustodyType = "encrypted_file" | "os_keystore";
 
 // ---------------------------------------------------------------------------
 // Identity
@@ -116,7 +119,7 @@ export type CustodyType = "encrypted_file" | "os_keystore" | "in_memory";
  * wherever the underlying bridge call needs access to key material.
  *
  * ```typescript
- * const identity = await scp.identityCreate("in_memory");
+ * const identity = await scp.identityCreate("encrypted_file");
  * console.log(identity.did); // "did:dht:z6Mk..."
  * await scp.identityRotateKey(identity);
  * ```
@@ -126,10 +129,10 @@ export class Identity {
   readonly did: string;
 
   /**
-   * The custody request the identity was created with (`"encrypted_file"`,
-   * `"os_keystore"`, or `"in_memory"` on a testing addon; see
-   * {@link CustodyType}), or `"external"` for an identity loaded with no
-   * retained key material.
+   * The custody request the identity was created with (`"encrypted_file"` or
+   * `"os_keystore"`; see {@link CustodyType}), or `"external"` for an identity
+   * loaded with no retained key material. A test harness on a `testing` addon
+   * also sees `"in_memory"`.
    */
   readonly custodyType: string;
 

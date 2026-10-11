@@ -8,9 +8,10 @@
  * `scp.mcpServerCreate`, `scp.mcpClientConnectSse`, and the other
  * `scp.mcp*` methods directly.
  *
- * Run: bun run examples/mcp-integration.ts, with a separate SCP SSE server
- * listening on localhost:8080 and SCP_MCP_SSE_TOKEN and
- * SCP_MCP_SSE_CONTEXT_ID set as the client section below describes.
+ * Run it as the "Running the examples" section of ../README.md describes,
+ * with a separate SCP SSE server listening on localhost:8080 and
+ * SCP_MCP_SSE_TOKEN and SCP_MCP_SSE_CONTEXT_ID set as the client section
+ * below describes.
  */
 
 import { SCP, defineOutletDefinition } from "../src/index";
@@ -18,7 +19,7 @@ import { SCP, defineOutletDefinition } from "../src/index";
 async function main(): Promise<void> {
   const scp = new SCP({ storage: { type: "in_memory" } });
   try {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await scp.identityCreate("encrypted_file");
 
     // Create a context with outlet capabilities.
     const ctx = await scp.contextCreate(

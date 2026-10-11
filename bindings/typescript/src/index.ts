@@ -14,7 +14,7 @@
  * // Storage selection is required — there is no default (spec §17.6).
  * const scp = new SCP({ storage: { type: "in_memory" } });
  * try {
- *   const identity = await scp.identityCreate("in_memory");
+ *   const identity = await scp.identityCreate("encrypted_file");
  *
  *   const ctx = await scp.contextCreate(identity, JSON.stringify({
  *     ceiling: ["messages:read", "messages:write"],

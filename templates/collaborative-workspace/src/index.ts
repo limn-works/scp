@@ -12,10 +12,9 @@
  * - Event log auditing with Merkle proofs
  *
  * One SCP instance hosts every participant, as a team server hosting its
- * members' agents would. The TypeScript SDK ships no production key store,
- * so the caller passes the `KeyCustodyProvider` that holds every
- * participant's keys; the SDK's one `CustodyType`, `"in_memory"`, works only
- * with an addon built with the `testing` feature.
+ * members' agents would. The caller passes the `KeyCustodyProvider` that
+ * holds every participant's keys, which is how the `"os_keystore"` custody
+ * request of spec `03-identity.md` §3.2.2 reaches a host key store.
  *
  * Usage:
  *   import { runWorkspace } from "./src/index";

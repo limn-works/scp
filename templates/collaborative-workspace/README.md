@@ -77,10 +77,9 @@ for one-to-many publishing instead of encrypted group messaging.
 
 ## Running
 
-The TypeScript SDK ships no production key store. Its one custody string,
-`"in_memory"`, works only with an addon built with the `testing` feature; a
-shipped addon rejects it with `SCP-IDENT-1008`. `src/index.ts` therefore
-exports `runWorkspace(custody, relayUrl, storagePassphrase)`, which takes a
+The `"os_keystore"` custody request of spec `03-identity.md` §3.2.2 reaches a
+host key store only through a provider, so `src/index.ts` exports
+`runWorkspace(custody, relayUrl, storagePassphrase)`, which takes a
 `KeyCustodyProvider` that your application implements over its own key store.
 One SCP instance hosts every participant, so that provider holds every
 participant's keys.

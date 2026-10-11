@@ -5,9 +5,8 @@
  * registering it in a context, verifying it against its vectors, and
  * invoking it under a UCAN that grants the call.
  *
- * The TypeScript SDK ships no production key store, so the caller passes a
- * `KeyCustodyProvider`; its one `CustodyType`, `"in_memory"`, works only
- * with an addon built with the `testing` feature.
+ * The caller passes a `KeyCustodyProvider`, which is how the `"os_keystore"`
+ * custody request of spec `03-identity.md` §3.2.2 reaches a host key store.
  *
  * Prerequisites:
  *   bun add @limn-works/scp-ts

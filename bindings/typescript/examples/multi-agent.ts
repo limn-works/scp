@@ -6,7 +6,7 @@
  * explicit `SCP` instance. The free-function `mintUcan` was removed —
  * use `scp.ucanMint(...)`.
  *
- * Run: bun run examples/multi-agent.ts
+ * Run it as the "Running the examples" section of ../README.md describes.
  */
 
 import { SCP, type Context, type Identity } from "../src/index";
@@ -66,9 +66,9 @@ async function main(): Promise<void> {
   const scp = new SCP({ storage: { type: "in_memory" } });
   try {
     // Create identities for coordinator and two agents.
-    const coordinator = await scp.identityCreate("in_memory");
-    const agentA = await scp.identityCreate("in_memory");
-    const agentB = await scp.identityCreate("in_memory");
+    const coordinator = await scp.identityCreate("encrypted_file");
+    const agentA = await scp.identityCreate("encrypted_file");
+    const agentB = await scp.identityCreate("encrypted_file");
 
     // Coordinator creates the context with agent capabilities.
     const ctx = await scp.contextCreate(

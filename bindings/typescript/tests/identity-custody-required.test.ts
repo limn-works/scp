@@ -6,18 +6,34 @@
  *
  * The custody strings are the request vocabulary of spec `03-identity.md`
  * §3.2.2: the SDK forwards each accepted value unchanged, and the real addon
- * answers each rejected one with the code §3.2.2's table gives.
+ * answers each rejected one with the code §3.2.2's table gives. `CustodyType`
+ * carries the two request values and no other member; a test reaches the
+ * testing addon's in-memory key store only through `./harness-custody`.
  */
 
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { IdentityError, ValidationError } from "../src/errors";
 import type { CustodyType } from "../src/identity";
+import * as sdk from "../src/index";
 import { CUSTODY_REQUIRED_CODE, type KeyCustodyProvider, SCP } from "../src/scp";
+import {
+  createInMemoryIdentity,
+  createInMemoryIdentityWithAgentKey,
+  HARNESS_IN_MEMORY_CUSTODY,
+} from "./harness-custody";
 import { mountMockScp } from "./mock-bridge";
 import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 /** Every custody request value the union carries (spec §3.2.2). */
-const CUSTODY_VALUES: readonly CustodyType[] = ["encrypted_file", "os_keystore", "in_memory"];
+const CUSTODY_VALUES: readonly CustodyType[] = ["encrypted_file", "os_keystore"];
+
+/** Each `CustodyType` member, listed once; `tsc` fails if the union gains or loses one. */
+const CUSTODY_MEMBERS = {
+  encrypted_file: true,
+  os_keystore: true,
+} as const satisfies Record<CustodyType, true>;
 
 const METHODS = [
   "identityCreate",
@@ -127,10 +143,73 @@ describe("identity-creating methods require custody", () => {
       void scp.identityCreate("platform");
       // @ts-expect-error the custody union carries only the §3.2.2 request values
       void scp.identityCreateWithAgentKey("callback");
+      // @ts-expect-error in_memory is a testing-addon affordance, not a CustodyType member
+      void scp.identityCreate("in_memory");
+      // @ts-expect-error in_memory is a testing-addon affordance, not a CustodyType member
+      void scp.identityCreateWithAgentKey("in_memory");
       void scp.identityCreateWithCustody(provider);
     };
     expect(typeof typeOnly).toBe("function");
   });
+
+  it("CustodyType carries encrypted_file and os_keystore and no other member", () => {
+    expect(Object.keys(CUSTODY_MEMBERS).sort()).toEqual([...CUSTODY_VALUES].sort());
+  });
+});
+
+describe("harness custody stays out of the package", () => {
+  it("the package entry exports no harness helper", () => {
+    const exported = Object.keys(sdk);
+    for (const name of [
+      "createInMemoryIdentity",
+      "createInMemoryIdentityWithAgentKey",
+      "HARNESS_IN_MEMORY_CUSTODY",
+    ]) {
+      expect(exported).not.toContain(name);
+    }
+  });
+
+  it("the published files list ships no test file", () => {
+    const manifest = JSON.parse(
+      readFileSync(join(import.meta.dir, "..", "package.json"), "utf8"),
+    ) as { files: string[] };
+    expect(manifest.files.length).toBeGreaterThan(0);
+    expect(manifest.files.some((f) => f.startsWith("tests"))).toBe(false);
+  });
+
+  for (const [label, create, method] of [
+    ["createInMemoryIdentity", createInMemoryIdentity, "identityCreate"],
+    [
+      "createInMemoryIdentityWithAgentKey",
+      createInMemoryIdentityWithAgentKey,
+      "identityCreateWithAgentKey",
+    ],
+  ] as const) {
+    it(`${label} sends the raw in_memory string to the bridge's ${method}`, async () => {
+      const { scp, native } = mountMockScp();
+      native.__stub(method, () =>
+        Promise.resolve({ did: "did:dht:z6MkHarness", custodyType: "in_memory" }),
+      );
+
+      const identity = await create(scp);
+
+      expect(identity.did).toBe("did:dht:z6MkHarness");
+      expect(HARNESS_IN_MEMORY_CUSTODY).toBe("in_memory");
+      expect(native.__lastCall(method)?.args).toEqual(["in_memory"]);
+    });
+
+    it(`${label} maps a bridge rejection to the typed SDK error`, async () => {
+      const { scp, native } = mountMockScp();
+      native.__stub(method, () =>
+        Promise.reject(new Error("[SCP-IDENT-1008] in_memory custody needs a testing build")),
+      );
+
+      const err = await rejection(create(scp));
+
+      expect(err).toBeInstanceOf(IdentityError);
+      expect((err as IdentityError).code).toBe("SCP-IDENT-1008");
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -157,7 +236,8 @@ if (addonReason !== "") {
   });
 } else {
   // Like `real-napi.test.ts`, this suite runs against an addon built with the
-  // bridge's `testing` feature, the only build that accepts `in_memory`.
+  // bridge's `testing` feature, the only build that accepts the harness's raw
+  // `in_memory` string.
   describe("custody request codes (real NAPI)", () => {
     async function withScp<T>(body: (scp: SCP) => Promise<T>): Promise<T> {
       const scp = new SCP({ storage: { type: "in_memory" } });
@@ -189,9 +269,14 @@ if (addonReason !== "") {
         expect((err as { code: string }).code).toBe("SCP-VALID-7001");
         expect((err as Error).message).toContain("SCP_KEY_PASSPHRASE");
       });
+    }
 
-      it(`${method}("in_memory") creates an identity on a testing addon`, async () => {
-        const identity = await withScp((scp) => scp[method]("in_memory"));
+    for (const [label, create] of [
+      ["createInMemoryIdentity", createInMemoryIdentity],
+      ["createInMemoryIdentityWithAgentKey", createInMemoryIdentityWithAgentKey],
+    ] as const) {
+      it(`${label} creates an in_memory identity on a testing addon`, async () => {
+        const identity = await withScp((scp) => create(scp));
         expect(identity.did).toMatch(/^did:dht:/);
         expect(identity.custodyType).toBe("in_memory");
       });

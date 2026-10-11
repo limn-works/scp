@@ -4,11 +4,10 @@
  * Creates a DID identity and opens an encrypted context, through the NAPI
  * native addon.
  *
- * The TypeScript SDK ships no production key store: its one custody string,
- * `"in_memory"`, works only with an addon built with the `testing` feature,
- * and a shipped addon rejects it with `SCP-IDENT-1008`. `runAgent` therefore
- * takes a `KeyCustodyProvider` that your application implements over its own
- * key store.
+ * `runAgent` takes a `KeyCustodyProvider` that your application implements
+ * over its own key store: the `"os_keystore"` custody request of spec
+ * `03-identity.md` §3.2.2 reaches a host key store only through such a
+ * provider.
  *
  * Usage:
  *   import { runAgent } from "./index";

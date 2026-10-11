@@ -4,11 +4,11 @@
  * Demonstrates creating a new SCP identity using did:dht,
  * inspecting the resulting DID document, and resolving it.
  *
- * The TypeScript SDK ships no production key store: its one `CustodyType`,
- * `"in_memory"`, works only with an addon built with the `testing` feature,
- * and a shipped addon rejects it with SCP-IDENT-1008. A production caller
- * passes its own `KeyCustodyProvider`, such as one backed by an HSM or the
- * operating system's key store, to `identityCreateWithCustody`.
+ * The TypeScript SDK's `CustodyType` carries the two custody requests of spec
+ * `03-identity.md` §3.2.2, `"encrypted_file"` and `"os_keystore"`. For
+ * `"os_keystore"` a caller passes its own `KeyCustodyProvider`, such as one
+ * backed by an HSM or the operating system's key store, to
+ * `identityCreateWithCustody`.
  *
  * Prerequisites:
  *   bun add @limn-works/scp-ts

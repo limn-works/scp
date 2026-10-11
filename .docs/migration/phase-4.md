@@ -69,8 +69,8 @@ const ctx = await Context.create(identity, { ceiling, memoryScope });
 import { SCP } from "@limn-works/scp-ts";
 const scp = new SCP({ storage: { type: "in_memory" } });
 try {
-  const identity = await scp.identityCreate("in_memory");
-  const ctx = await scp.contextCreate(identity.did, {...});
+  const identity = await scp.identityCreate("encrypted_file");
+  const ctx = await scp.contextCreate(identity, paramsJson);
 } finally {
   await scp.shutdown(5);
 }
@@ -305,8 +305,8 @@ async def test_context_create(scp: scp_sdk.SCP) -> None:
 
 ```ts
 // tests/lifecycle.test.ts
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { SCP, Identity, Context } from "@limn-works/scp-ts";
+import { afterEach, beforeEach, describe } from "bun:test";
+import { SCP } from "@limn-works/scp-ts";
 
 describe("lifecycle", () => {
   let scp: SCP;
@@ -317,16 +317,6 @@ describe("lifecycle", () => {
 
   afterEach(async () => {
     await scp.shutdown(5);
-  });
-
-  test("context_create", async () => {
-    const identity = await Identity.create(scp, { custody: "in_memory" });
-    const ctx = await Context.create(identity, params);
-    // Handles expose no instanceId getter (ADR-048); affinity is observed
-    // via misuse — a handle from one SCP is rejected by another.
-    const other = new SCP();
-    await expect(other.contextSend(ctx, payload)).rejects.toThrow(/SCP-PERM-3030/);
-    await other.shutdown(5);
   });
 });
 ```

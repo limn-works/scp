@@ -12,7 +12,7 @@
  *
  * // Storage selection is required — there is no default (spec §17.6).
  * const scp = new SCP({ storage: { type: "in_memory" } }); // dev/test storage
- * const identity = await scp.identityCreate("in_memory");
+ * const identity = await scp.identityCreate("encrypted_file");
  * await scp.resume();                    // async — reconnects transport
  * await scp.shutdown(5);                 // graceful shutdown
  * ```
@@ -21,7 +21,7 @@
  * bridge operation has a corresponding instance method on `SCP`. The
  * process-wide default-instance façade and free-function shorthands were
  * deleted — callers construct an explicit `new SCP()` and invoke methods
- * directly (e.g. `scp.identityCreate("in_memory")`).
+ * directly (e.g. `scp.identityCreate("encrypted_file")`).
  *
  * NOTE: `SCP` requires a Node.js or Bun runtime with the native addon.
  * Browser clients run the full protocol in-tab (keys on-device) via the
@@ -1074,7 +1074,7 @@ export class SCP {
    * @throws ValidationError `SCP-VALID-7001` for `"encrypted_file"` when `HOME`
    *   or `SCP_KEY_PASSPHRASE` is unset, empty, or (for `HOME`) relative.
    * @throws IdentityError `SCP-IDENT-1008` for `"encrypted_file"` when the key
-   *   file does not open, and for `"in_memory"` on a shipped addon.
+   *   file does not open.
    * @throws IdentityError `SCP-IDENT-1059` on a shipped addon, which has no
    *   pre-rotation custody backend.
    */
