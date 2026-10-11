@@ -147,7 +147,7 @@ dependencies {
 
 Every SCP participant starts by creating a cryptographic identity -- a DID (Decentralized Identifier) backed by Ed25519 keys. The identity is the root of trust for all protocol operations.
 
-Every SDK takes the custody choice as a required argument, from the custody request vocabulary of `03-identity.md` §3.2.2. Python's `CustodyType` carries `ENCRYPTED_FILE` and `OS_KEYSTORE`, and TypeScript's carries `"encrypted_file"` and `"os_keystore"`, and no other value. Swift's `CustodyType` carries `.encryptedFile`, `.osKeystore` and `.inMemory`, and Kotlin's carries `ENCRYPTED_FILE`, `OS_KEYSTORE` and `IN_MEMORY`. `encrypted_file` keeps the keys in `$HOME/.scp/keys.bin`, sealed under the `SCP_KEY_PASSPHRASE` environment variable; a build without the bridge's `testing` feature has no pre-rotation custody backend and raises `SCP-IDENT-1059` for it, in every SDK. `identityCreate` answers `os_keystore` with `SCP-IDENT-1003`, because only a `KeyCustodyProvider` reaches the host key store. In TypeScript a production caller implements `KeyCustodyProvider` over its own key store and passes it to `identityCreateWithCustody`. Swift ships that provider over the Keychain as `AppleKeyCustody`, and Android ships it over Android Keystore as `UniffiKeyCustody(AndroidKeyCustody(context))` in `scp-kt-android`. Swift's and Kotlin's `in_memory` works only in a build compiled with the `testing` feature, and a shipped build rejects it with `SCP-IDENT-1008`.
+Every SDK takes the custody choice as a required argument, from the custody request vocabulary of `03-identity.md` §3.2.2. Python's `CustodyType` carries `ENCRYPTED_FILE` and `OS_KEYSTORE`, TypeScript's carries `"encrypted_file"` and `"os_keystore"`, and Kotlin's carries `ENCRYPTED_FILE` and `OS_KEYSTORE`, and no other value. Swift's `CustodyType` carries `.encryptedFile` and `.osKeystore`, and no other value. `encrypted_file` keeps the keys in `$HOME/.scp/keys.bin`, sealed under the `SCP_KEY_PASSPHRASE` environment variable; a build without the bridge's `testing` feature has no pre-rotation custody backend and refuses every identity creation, `identityCreateWithCustody` included, with `SCP-IDENT-1059`, in every SDK (ADR-062 §Decision 6). `identityCreate` answers `os_keystore` with `SCP-IDENT-1003`, because only a `KeyCustodyProvider` reaches the host key store. In TypeScript a production caller implements `KeyCustodyProvider` over its own key store and passes it to `identityCreateWithCustody`. Swift ships that provider over the Keychain as `AppleKeyCustody`, and Android ships it over Android Keystore as `UniffiKeyCustody(AndroidKeyCustody(context))` in `scp-kt-android`; both reach `identityCreateWithCustody`, so a shipped build refuses them with `SCP-IDENT-1059` as well.
 
 ### Python
 
@@ -186,7 +186,7 @@ import SCP
 
 let provider: KeyCustodyProvider = AppleKeyCustody()  // the Keychain
 let scp = try SCP.withStorage(sqliteDir: storageDir, passphrase: "change me")
-let identity = try await scp.identityCreateWithCustody(provider: provider)
+let identity = try await scp.identityCreateWithCustody(provider: provider)  // SCP-IDENT-1059 in a shipped build
 print("DID: \(identity.did())")
 ```
 
@@ -200,6 +200,7 @@ import works.limn.scp.android.platform.UniffiKeyCustody
 
 suspend fun createIdentity(context: Context, storageDir: java.io.File) {
     val scp = SCP.withSqlite(storageDir, "change me")
+    // A shipped build throws SCP-IDENT-1059 here.
     val identity = scp.identityCreateWithCustody(UniffiKeyCustody(AndroidKeyCustody(context)))
     println("DID: ${identity.did()}")
 }

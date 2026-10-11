@@ -773,7 +773,7 @@ class SCP internal constructor(
      * ```kotlin
      * // Step 1 (joiner): reserve a single-use KeyPackage under the joiner's
      * // own locally-custodied identity.
-     * val joiner = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+     * val joiner = scp.identityCreate(custody = CustodyType.ENCRYPTED_FILE)
      * val reservation = scp.reserveKeyPackage(joiner)
      *
      * // Hand reservation.keyPackagePublic to the creator out of band. The
@@ -1255,14 +1255,13 @@ class SCP internal constructor(
      * because only a `KeyCustodyProvider` reaches the host key store; pass one
      * to [identityCreateWithCustody].
      *
-     * [testingSeed] is a testing-only parameter for the ADR-046
-     * cross-bridge parity harness; pass `null` from production callers
-     * (in-memory custody uses OS RNG when [testingSeed] is `null`).
+     * The method sends no ADR-046 testing seed: spec section 3.2.2 answers a
+     * seed with `SCP-VALID-7009` for every [CustodyType] entry, because only the
+     * test-harness `in_memory` string, which this type does not carry, takes one.
      */
-    suspend fun identityCreate(
-        custody: CustodyType,
-        testingSeed: ByteArray? = null,
-    ): Identity = inner.identityCreate(custody = custody.rawValue, testingSeed = testingSeed)
+    suspend fun identityCreate(custody: CustodyType): Identity {
+        return inner.identityCreate(custody = custody.rawValue, testingSeed = null)
+    }
 
     /** Forwards to [NativeScp.identityCreateLinkAttestation] on [inner]. */
     @Suppress("LongParameterList")

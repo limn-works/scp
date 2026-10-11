@@ -1018,23 +1018,25 @@ public extension AppleKeyCustody {
 
     // MARK: custodyType
 
-    /// Returns the custody type for any key handle managed by this instance.
+    /// Returns the custody type of the key `keyHandle` names.
     ///
-    /// Returns `"software"` when no biometric policy is active, or
-    /// `"software_biometric"` when biometric gating is enabled. Both are
-    /// Keychain-backed (software) -- the Secure Enclave is NOT used for
-    /// Ed25519/X25519 SCP keys (hardware supports P-256 only).
+    /// For a key the Keychain holds, returns `"software"` when no biometric
+    /// policy is active, or `"software_biometric"` when biometric gating is
+    /// enabled. Both are Keychain-backed (software) -- the Secure Enclave is
+    /// NOT used for Ed25519/X25519 SCP keys (hardware supports P-256 only).
+    /// For an id whose metadata the Keychain does not return, returns
+    /// `"unknown"`, as `UniffiKeyCustody` does on Android; the bridge reads it
+    /// as its weakest custody. The lookup reads attributes only and never
+    /// prompts.
     ///
     /// See ADR-025 Rationale, Biometric gating, and 17.8 of the SCP
     /// specification.
     ///
-    /// - Parameter keyHandle: The key id (not inspected; the custody type
-    ///   is determined by the instance's ``biometricPolicy``).
-    /// - Returns: `"software"` or `"software_biometric"` -- mirroring
-    ///   `CustodyType::Software` in `scp-platform/src/traits.rs` with an
-    ///   additional biometric qualifier when applicable.
-    nonisolated func custodyType(_: String) -> String {
-        switch biometricPolicy {
+    /// - Parameter keyHandle: The key id.
+    /// - Returns: `"software"`, `"software_biometric"` or `"unknown"`.
+    nonisolated func custodyType(_ keyHandle: String) -> String {
+        guard (try? fetchKeyType(for: keyHandle)) != nil else { return "unknown" }
+        return switch biometricPolicy {
         case .none: "software"
         case .required: "software_biometric"
         }

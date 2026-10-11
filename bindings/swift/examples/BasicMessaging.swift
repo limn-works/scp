@@ -10,13 +10,14 @@ import SCP
 struct BasicMessaging {
     // swiftlint:disable:next function_body_length
     static func main() async throws {
-        // Instantiate SCP (in_memory custody for examples).
+        // Instantiate SCP over in-memory storage.
         let scp = try SCP(storage: .inMemory)
         defer { Task { try? await scp.shutdown(timeout: 5) } }
 
-        // Create two identities via the SDK wrapper function.
-        let alice = try await scp.identityCreate(custody: .inMemory)
-        let bob = try await scp.identityCreate(custody: .inMemory)
+        // Create two identities whose keys live in $HOME/.scp/keys.bin, sealed
+        // under SCP_KEY_PASSPHRASE.
+        let alice = try await scp.identityCreate(custody: .encryptedFile)
+        let bob = try await scp.identityCreate(custody: .encryptedFile)
         print("Alice DID: \(alice.did())")
         print("Bob DID: \(bob.did())")
 

@@ -27,9 +27,10 @@ For a full iOS app, open in Xcode and add to an iOS project target.
 
 `Sources/main.swift` passes `AppleKeyCustody()`, the SDK's `KeyCustodyProvider`
 over the Keychain, to `identityCreateWithCustody(provider:)`: the `os_keystore`
-custody request of spec 03 §3.2.2. The SDK's `CustodyType` case `.inMemory`
-works only in a build compiled with the `testing` feature; a shipped build
-rejects it with `SCP-IDENT-1008`.
+custody request of spec 03 §3.2.2. A build without the bridge's `testing`
+feature has no pre-rotation custody backend and throws `SCP-IDENT-1059` from
+that call; the custody paragraph of `docs/guides/sdk-quickstart.md` states which
+identity creations a shipped build refuses.
 
 ## Next Steps
 

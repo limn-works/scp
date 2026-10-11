@@ -7,7 +7,7 @@ import Foundation
 // MARK: - CustodyType
 
 /// The custody choice a caller passes to
-/// ``SCP/identityCreate(custody:testingSeed:)`` and
+/// ``SCP/identityCreate(custody:)`` and
 /// ``SCP/identityCreateWithAgentKey(custody:)``: the custody request
 /// vocabulary of spec section 3.2.2.
 ///
@@ -22,15 +22,17 @@ import Foundation
 ///   reaches, so both methods answer it with `SCP-IDENT-1003`. Pass the
 ///   provider to ``SCP/identityCreateWithCustody(provider:)``; the identity it
 ///   returns reports `"os_keystore"` from `custodyType()`.
-/// - ``inMemory`` is a test affordance that a shipped build answers with
-///   `SCP-IDENT-1008`.
+///
+/// The type has no other case. Spec section 3.2.2 makes `in_memory` a
+/// testing-build affordance and never a peer of the two request values, so a
+/// test reaches the in-memory key store outside this type; a bridge built
+/// without the `testing` feature answers the raw string with `SCP-IDENT-1008`.
 ///
 /// A shipped build also refuses every identity creation with `SCP-IDENT-1059`
 /// until a production pre-rotation custody backend exists (ADR-062
 /// §Decision 6).
 ///
-/// The Kotlin SDK's `works.limn.scp.CustodyType` carries the same cases. This
-/// type is a pure Swift type and conflicts with no UniFFI-generated type.
+/// This type is a pure Swift type and conflicts with no UniFFI-generated type.
 ///
 /// ## Provenance
 ///
@@ -53,7 +55,7 @@ public nonisolated enum CustodyType: String, Sendable, CaseIterable {
     /// The host operating system's key store, reached only through a
     /// `KeyCustodyProvider`.
     ///
-    /// ``SCP/identityCreate(custody:testingSeed:)`` and
+    /// ``SCP/identityCreate(custody:)`` and
     /// ``SCP/identityCreateWithAgentKey(custody:)`` take no provider, so they
     /// answer this case with `SCP-IDENT-1003`; pass the provider to
     /// ``SCP/identityCreateWithCustody(provider:)``. The value promises that
@@ -61,12 +63,6 @@ public nonisolated enum CustodyType: String, Sendable, CaseIterable {
     /// through the provider. It promises no hardware backing: the Secure
     /// Enclave performs P-256 operations and no others (ADR-025).
     case osKeystore = "os_keystore"
-
-    /// An in-memory key store that loses every key when the process exits.
-    ///
-    /// The UniFFI bridge builds it only under its `testing` feature; a shipped
-    /// build answers it with `SCP-IDENT-1008`.
-    case inMemory = "in_memory"
 }
 
 // MARK: - Capability

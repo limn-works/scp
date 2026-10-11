@@ -11,8 +11,12 @@ import XCTest
 /// README block red: the edit either diverges from the copy or, applied to both,
 /// stops compiling or misbehaves.
 ///
-/// Both examples use `CustodyType.inMemory`, which only an XCFramework built with
-/// the `testing` feature accepts (`build-xcframework.sh --dev`, which CI uses).
+/// The quick start uses `CustodyType.encryptedFile`, which only an XCFramework
+/// built with the `testing` feature serves (`build-xcframework.sh --dev`, which
+/// CI uses; a release build throws `SCP-IDENT-1059`). Its run test points `HOME`
+/// at a scratch directory, sets `SCP_KEY_PASSPHRASE`, and checks that the key
+/// file lands there. The error-handling test creates its identity through
+/// `TestHarnessCustody.swift`.
 final class ReadmeQuickStartTests: XCTestCase {
     private static let testsDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 
@@ -72,8 +76,34 @@ final class ReadmeQuickStartTests: XCTestCase {
         try assertCopyMatchesReadme(copyFile: "ReadmeErrorHandling.swift", heading: "Error Handling")
     }
 
+    /// XCTest runs these methods serially, and the variables are restored
+    /// before the method returns.
     func testReadmeQuickStartRuns() async throws {
+        let fileManager = FileManager.default
+        let home = fileManager.temporaryDirectory
+            .appendingPathComponent("scp-readme-\(UUID().uuidString)")
+        let savedHome = getenv("HOME").map { String(cString: $0) }
+        let savedPassphrase = getenv("SCP_KEY_PASSPHRASE").map { String(cString: $0) }
+        defer {
+            if let savedHome {
+                setenv("HOME", savedHome, 1)
+            } else {
+                unsetenv("HOME")
+            }
+            if let savedPassphrase {
+                setenv("SCP_KEY_PASSPHRASE", savedPassphrase, 1)
+            } else {
+                unsetenv("SCP_KEY_PASSPHRASE")
+            }
+            try? fileManager.removeItem(at: home)
+        }
+        setenv("HOME", home.path, 1)
+        setenv("SCP_KEY_PASSPHRASE", "readme-quickstart-test-passphrase", 1)
+
         try await runQuickStart()
+
+        let keyFile = home.appendingPathComponent(".scp/keys.bin")
+        XCTAssertTrue(fileManager.fileExists(atPath: keyFile.path), keyFile.path)
     }
 
     /// The README function returns a code only from its `catch ScpError.Context`
@@ -81,7 +111,7 @@ final class ReadmeQuickStartTests: XCTestCase {
     /// clause caught the send to a closed context.
     func testReadmeErrorHandlingCatchesTheContextError() async throws {
         let scp = try SCP(storage: .inMemory)
-        let identity = try await scp.identityCreate(custody: .inMemory)
+        let identity = try await createInMemoryIdentity(scp)
         let ctx = try await scp.contextCreate(
             identity: identity,
             params: ContextParams(

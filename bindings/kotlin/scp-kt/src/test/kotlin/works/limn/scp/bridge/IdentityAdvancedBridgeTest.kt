@@ -203,9 +203,9 @@ class IdentityAdvancedBridgeTest {
         @Test
         fun `createWithAgentKey sends the custody choice's raw value to bindings`() =
             runTest(testDispatcher) {
-                val result = advancedBridge.createWithAgentKey(CustodyType.IN_MEMORY)
+                val result = advancedBridge.createWithAgentKey(CustodyType.ENCRYPTED_FILE)
                 assertTrue(stubAdvanced.createWithAgentKeyCalled)
-                assertEquals("in_memory", stubAdvanced.lastCustody)
+                assertEquals("encrypted_file", stubAdvanced.lastCustody)
                 assertEquals(100L, result)
             }
 
@@ -214,7 +214,7 @@ class IdentityAdvancedBridgeTest {
             runTest(testDispatcher) {
                 stubAdvanced.createWithAgentKeyError = BridgeException("custody not available", "SCP-IDENT-1020")
                 assertFailsWith<BridgeException> {
-                    advancedBridge.createWithAgentKey(CustodyType.IN_MEMORY)
+                    advancedBridge.createWithAgentKey(CustodyType.ENCRYPTED_FILE)
                 }
             }
     }

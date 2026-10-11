@@ -30,9 +30,11 @@ For a full Android app, import into Android Studio and add the SCP SDK as a depe
 `makeKeyCustodyProvider()` in `Main.kt` returns the
 `uniffi.scp.KeyCustodyProvider` that `identityCreateWithCustody` takes. In an
 Android app, return `UniffiKeyCustody(AndroidKeyCustody(applicationContext))`
-from `works.limn:scp-kt-android`, which holds the identity in Android Keystore.
-This scaffold runs on the JVM with no Android `Context`, so the function throws
-until you implement it over your key store.
+from `works.limn:scp-kt-android`, the provider over Android Keystore. This
+scaffold runs on the JVM with no Android `Context`, so the function throws
+until you implement it over your key store. The KDoc of
+`works.limn.scp.CustodyType` states which identity creations a build without
+the `testing` feature refuses; `identityCreateWithCustody` is one of them.
 
 The scaffold does not call `SCP.shutdown`: it takes a `CoroutineBridge`, and the
 SDK ships no `NativeBindings` implementation to build one with.

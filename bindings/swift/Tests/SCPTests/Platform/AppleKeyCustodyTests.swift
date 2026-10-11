@@ -617,11 +617,11 @@
             try await custodyNone.destroyKey(handle)
         }
 
-        @Test("custodyType returns 'software_biometric' for BiometricPolicy.required")
-        func custodyTypeRequired() {
-            let custodyBio = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
-            // custodyType does not access the Keychain -- it reflects the policy.
-            #expect(custodyBio.custodyType("any-handle") == "software_biometric")
+        @Test("custodyType returns 'unknown' for an id the Keychain does not hold, under either policy")
+        func custodyTypeUnknownId() {
+            let unknown = String(UInt64.random(in: .min ... .max))
+            #expect(AppleKeyCustody(accessGroup: nil, biometricPolicy: .none).custodyType(unknown) == "unknown")
+            #expect(AppleKeyCustody(accessGroup: nil, biometricPolicy: .required).custodyType(unknown) == "unknown")
         }
 
         // MARK: - BiometricPolicy.required creates biometric-gated keys
@@ -690,6 +690,8 @@
                     "biometric key must have kSecAttrAccessControl set"
                 )
             }
+
+            #expect(custodyBio.custodyType(handle) == "software_biometric")
 
             // Cleanup
             try await custodyBio.destroyKey(handle)
@@ -857,6 +859,7 @@
                 _ = try await provider.deriveRotatablePseudonym(keyId: unknown, contextId: context, pseudonymEpoch: 1)
             } == notFound)
             #expect(await cryptoCode { _ = try await provider.exportSigningKeyBytes(keyId: unknown) } == notFound)
+            #expect(provider.custodyType(keyId: unknown) == "unknown")
         }
 
         @Test("a destroyed key is not found afterwards")
@@ -867,6 +870,7 @@
                 _ = try await provider.derivePseudonym(keyId: keyId, contextId: Data("ctx".utf8))
             }
             #expect(code == "SCP-CRYPTO-4006")
+            #expect(provider.custodyType(keyId: keyId) == "unknown")
         }
 
         @Test("a wrong-type operation is the custody error SCP-CRYPTO-4060")
@@ -929,10 +933,10 @@
             try await scp.shutdown(timeoutMillis: 1000)
         }
 
-        @Test("custodyType reports software_biometric under a biometric policy")
-        func biometricCustodyType() {
+        @Test("custodyType reports unknown for an id the Keychain does not hold under a biometric policy")
+        func biometricCustodyTypeUnknownId() {
             let gated: any KeyCustodyProvider = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
-            #expect(gated.custodyType(keyId: "1") == "software_biometric")
+            #expect(gated.custodyType(keyId: String(UInt64.random(in: .min ... .max))) == "unknown")
         }
     }
 

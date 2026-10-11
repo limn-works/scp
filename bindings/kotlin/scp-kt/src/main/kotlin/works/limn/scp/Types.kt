@@ -92,8 +92,12 @@ object Capability {
  *   reaches, so those methods answer it with `SCP-IDENT-1003`. Pass the
  *   provider to [SCP.identityCreateWithCustody]; the identity it returns
  *   reports `"os_keystore"` from `custodyType()`.
- * - [IN_MEMORY] is a test affordance that a shipped build answers with
- *   `SCP-IDENT-1008`.
+ *
+ * The type has no third entry. Spec section 3.2.2 makes `in_memory` a
+ * testing-build affordance and never a peer of these two values: a bridge
+ * built with the `testing` feature accepts the raw string, a bridge built
+ * without it answers `SCP-IDENT-1008`, and a test harness reaches it outside
+ * this type. [fromRawValue] therefore returns null for `"in_memory"`.
  *
  * A shipped build also refuses every identity creation with `SCP-IDENT-1059`
  * until a production pre-rotation custody backend exists (ADR-062
@@ -134,14 +138,6 @@ enum class CustodyType(val rawValue: String) {
      * provider. It promises no hardware backing.
      */
     OS_KEYSTORE("os_keystore"),
-
-    /**
-     * An in-memory key store that loses every key when the process exits.
-     *
-     * The UniFFI bridge builds it only under its `testing` feature; a shipped
-     * build answers it with `SCP-IDENT-1008`.
-     */
-    IN_MEMORY("in_memory"),
     ;
 
     companion object {

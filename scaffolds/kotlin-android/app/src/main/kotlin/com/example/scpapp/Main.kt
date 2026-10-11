@@ -4,11 +4,9 @@
  * Creates a DID identity through a caller-supplied key custody provider and
  * opens an encrypted context.
  *
- * The Kotlin SDK ships no key store that `identityCreate(custody)` reaches in
- * a shipped build: its one `CustodyType`, `IN_MEMORY`, works only in a build
- * compiled with the `testing` feature, and a shipped build rejects it with
- * `SCP-IDENT-1008`. Implement [makeKeyCustodyProvider] over your app's key
- * store before running.
+ * Implement [makeKeyCustodyProvider] over your app's key store before
+ * running. [works.limn.scp.CustodyType] states which identity creations a
+ * build without the `testing` feature refuses.
  */
 package com.example.scpapp
 
