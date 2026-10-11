@@ -94,15 +94,30 @@ See [`examples/`](./examples/) for runnable code:
 
 ## Error Handling
 
-All errors are cases of the `ScpError` enum with associated `message` and `code` values:
+SCP calls throw cases of the `ScpError` enum, such as `ScpError.Context(msg:code:)`, whose `code` is machine-readable. Here `contextSend` to a context that has already been closed throws `ScpError.Context`, and the function returns its code.
 
 ```swift
-do {
-    try await ctx.send(Data("data".utf8))
-} catch ScpError.context(let message, let code) {
-    print("[\(code)] \(message)")
+import Foundation
+import SCP
+
+/// Sends `payload` to `ctx`; returns the error code when the context rejects the send.
+func sendReportingRejection(
+    scp: SCP,
+    ctx: ContextHandle,
+    identity: Identity,
+    payload: Data
+) async throws -> String? {
+    do {
+        try await scp.contextSend(handle: ctx, identity: identity, payload: payload, spendingUcanJwt: nil)
+        return nil
+    } catch let ScpError.Context(msg, code) {
+        print("[\(code)] \(msg)")
+        return code
+    }
 }
 ```
+
+`Tests/SCPTests/ReadmeErrorHandling.swift` holds a compiled copy of this block, and `ReadmeQuickStartTests` checks it against this file and calls it on a closed context.
 
 ## Source
 

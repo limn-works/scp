@@ -1,16 +1,17 @@
 /**
- * Runs the quick start in `bindings/typescript/README.md`.
+ * Runs the code examples in `bindings/typescript/README.md`.
  *
- * `quickStartScript` reads the first `typescript` code block under the README's
- * `## Quick Start` heading, replaces its one package specifier
- * `"@limn-works/scp-ts"` with the absolute path of `src/index.ts`, and writes
- * the result to a scratch file. The test runs that file in a child `bun`
- * process, so an edit that leaves the README block unable to run fails here.
- * The specifier swap is needed because this package has no `node_modules`
- * entry for itself and no built `dist/` during `bun test`.
+ * `extractBlock` reads the first `typescript` code block under a README
+ * heading. Each test replaces that block's one package specifier
+ * `"@limn-works/scp-ts"` with the absolute path of `src/index.ts`, writes the
+ * result to a scratch file, and runs it in a child `bun` process, so an edit
+ * that leaves a README block unable to run fails here. The specifier swap is
+ * needed because this package has no `node_modules` entry for itself and no
+ * built `dist/` during `bun test`.
  *
- * The block uses `"in_memory"` custody, which only a `testing` addon accepts;
- * every SDK test run builds the addon with that feature.
+ * Both blocks use in-memory storage and `"in_memory"` custody, which only a
+ * `testing` addon accepts; every SDK test run builds the addon with that
+ * feature.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -23,32 +24,58 @@ import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 const PACKAGE_ROOT = join(import.meta.dir, "..");
 const README = join(PACKAGE_ROOT, "README.md");
-const HEADING = "\n## Quick Start\n";
+const QUICK_START = "Quick Start";
+const ERROR_HANDLING = "Error Handling";
 const FENCE_OPEN = "```typescript\n";
 const FENCE_CLOSE = "\n```\n";
 const SPECIFIER = '"@limn-works/scp-ts"';
 
 /**
- * Returns the first `typescript` block after the Quick Start heading, and
+ * Returns the first `typescript` block after the `## {heading}` line, and
  * throws when the README has no such heading or block, so a README that drops
- * the quick start fails the test instead of running nothing.
+ * the example fails the test instead of running nothing.
  */
-function extractQuickStart(readmeText: string): string {
-  const [, afterHeading] = readmeText.split(HEADING, 2);
-  if (afterHeading === undefined) throw new Error("the README has no '## Quick Start' heading");
+function extractBlock(readmeText: string, heading: string): string {
+  const [, afterHeading] = readmeText.split(`\n## ${heading}\n`, 2);
+  if (afterHeading === undefined) throw new Error(`the README has no '## ${heading}' heading`);
   const [, body] = afterHeading.split(FENCE_OPEN, 2);
-  if (body === undefined) throw new Error("the Quick Start section has no typescript block");
+  if (body === undefined) throw new Error(`the ${heading} section has no typescript block`);
   const end = body.indexOf(FENCE_CLOSE);
-  if (end < 0) throw new Error("the Quick Start typescript block has no closing fence");
+  if (end < 0) throw new Error(`the ${heading} typescript block has no closing fence`);
   return `${body.slice(0, end)}\n`;
 }
 
 /** Returns the block with its package specifier pointed at this package's source. */
 function pointAtSource(block: string): string {
   if (!block.includes(SPECIFIER)) {
-    throw new Error(`the Quick Start block does not import ${SPECIFIER}`);
+    throw new Error(`the README block does not import ${SPECIFIER}`);
   }
   return block.replaceAll(SPECIFIER, JSON.stringify(join(PACKAGE_ROOT, "src", "index.ts")));
+}
+
+/** Runs the README block under `heading` in a child `bun` process. */
+async function runReadmeBlock(
+  heading: string,
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const dir = await mkdtemp(join(tmpdir(), "scp-ts-readme-"));
+  try {
+    const script = join(dir, "readme-block.ts");
+    await writeFile(script, pointAtSource(extractBlock(await readFile(README, "utf8"), heading)));
+    const child = Bun.spawn([process.execPath, "run", script], {
+      cwd: dir,
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    return { stdout, stderr, exitCode };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 function addonInstalled(): boolean {
@@ -61,13 +88,14 @@ function addonInstalled(): boolean {
   }
 }
 
-describe("README quick start extraction", () => {
+describe("README block extraction", () => {
   it("reads the typescript block under the heading, not an earlier one", () => {
     const text =
       "# T\n\n```typescript\nbefore();\n```\n\n" +
+      "### Quick Start\n\n```typescript\nh3();\n```\n\n" +
       "## Quick Start\n\nProse.\n\n```typescript\nquick();\n```\n\n" +
       "```typescript\nafter();\n```\n";
-    expect(extractQuickStart(text)).toBe("quick();\n");
+    expect(extractBlock(text, QUICK_START)).toBe("quick();\n");
   });
 
   it("throws when the block imports no package specifier", () => {
@@ -77,28 +105,19 @@ describe("README quick start extraction", () => {
 
 const describeNapi = addonInstalled() ? describe : describe.skip;
 
-describeNapi("README quick start", () => {
-  it("runs and prints the DID and context it created", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "scp-ts-readme-quickstart-"));
-    try {
-      const script = join(dir, "readme-quickstart.ts");
-      await writeFile(script, pointAtSource(extractQuickStart(await readFile(README, "utf8"))));
-      const child = Bun.spawn([process.execPath, "run", script], {
-        cwd: dir,
-        env: process.env,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
-        child.exited,
-      ]);
-      expect(exitCode, `the README quick start failed:\n${stderr}`).toBe(0);
-      expect(stdout).toMatch(/^DID: did:/m);
-      expect(stdout).toMatch(/^Context: \S+/m);
-    } finally {
-      await rm(dir, { recursive: true, force: true });
-    }
+describeNapi("README examples", () => {
+  it("the quick start runs and prints the DID and context it created", async () => {
+    const { stdout, stderr, exitCode } = await runReadmeBlock(QUICK_START);
+    expect(exitCode, `the README quick start failed:\n${stderr}`).toBe(0);
+    expect(stdout).toMatch(/^DID: did:/m);
+    expect(stdout).toMatch(/^Context: \S+/m);
+  }, 60_000);
+
+  // The block rethrows anything that is not a ValidationError, so exit 0 plus
+  // the printed code proves its catch clause handled the typed error.
+  it("the error handling block catches the typed ValidationError", async () => {
+    const { stderr, exitCode } = await runReadmeBlock(ERROR_HANDLING);
+    expect(exitCode, `the README error example failed:\n${stderr}`).toBe(0);
+    expect(stderr).toMatch(/^contextCreate rejected the params: SCP-VALID-7000$/m);
   }, 60_000);
 });

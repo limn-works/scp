@@ -85,16 +85,29 @@ See [`examples/`](./examples/) for runnable scripts:
 
 ## Error Handling
 
-All errors inherit from `ScpError` with a machine-readable `code` field:
+When an `SCP` method rejects its arguments before calling the native module, it raises a subclass of `scp_sdk.ScpError` that carries a machine-readable `code`. Here `identity_create` rejects a missing custody choice with `IdentityError` code `SCP-IDENT-1116`. Like the quick start, this example needs a build with the `testing` feature.
 
 ```python
-from scp_sdk import ScpError, ContextError
+import asyncio
 
-try:
-    await ctx.send(b"data")
-except ContextError as e:
-    print(f"[{e.code}] {e}")
+from scp_sdk import SCP, IdentityError
+
+
+async def main():
+    scp = SCP({"type": "in_memory"})
+    custody = None  # for example, a setting nobody filled in
+    try:
+        await scp.identity_create(custody)
+    except IdentityError as e:
+        print(f"[{e.code}] {e.message}")
+    finally:
+        await scp.shutdown(5.0)
+
+
+asyncio.run(main())
 ```
+
+`tests/test_readme_quickstart.py` runs this block too.
 
 ## Source
 

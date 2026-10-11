@@ -94,19 +94,31 @@ bun run examples/node-demo.ts
 
 ## Error Handling
 
-All errors extend `ScpError` with a machine-readable `code` field:
+`SCP` methods throw subclasses of `ScpError`, each with a machine-readable `code`. Here `contextCreate` rejects an unknown governance model with `ValidationError` code `SCP-VALID-7000`. Like the quick start, this example needs a native addon built with the `testing` feature.
 
 ```typescript
-import { ScpError, ContextError } from "@limn-works/scp-ts";
+import { SCP, ValidationError } from "@limn-works/scp-ts";
 
+const scp = new SCP({ storage: { type: "in_memory" } });
+const identity = await scp.identityCreate("in_memory");
 try {
-  await ctx.send(payload);
+  await scp.contextCreate(
+    identity,
+    JSON.stringify({
+      ceiling: ["messages:read"],
+      memoryScope: "ephemeral",
+      governance: "dictator",
+    }),
+  );
 } catch (e) {
-  if (e instanceof ContextError) {
-    console.error(`[${e.code}] ${e.message}`);
-  }
+  if (!(e instanceof ValidationError)) throw e;
+  console.error(`contextCreate rejected the params: ${e.code}`);
+} finally {
+  await scp.shutdown(5);
 }
 ```
+
+`tests/readme-quickstart.test.ts` runs this block too.
 
 ## Source
 

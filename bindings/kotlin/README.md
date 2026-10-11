@@ -101,15 +101,31 @@ See [`examples/`](./examples/) for runnable code:
 
 ## Error Handling
 
-All exceptions extend `ScpException` with a machine-readable `code` field:
+SCP calls throw subclasses of `uniffi.scp.ScpException`, such as `ScpException.Context`, each with `msg` and a machine-readable `code`. Here `contextSend` to a context that has already been closed throws `ScpException.Context`, and the function returns its code.
 
 ```kotlin
-try {
-    ctx.send(payload)
-} catch (e: ContextException) {
-    println("[${e.code}] ${e.message}")
-}
+import uniffi.scp.ContextHandle
+import uniffi.scp.Identity
+import uniffi.scp.ScpException
+import works.limn.scp.SCP
+
+/** Sends [payload] to [ctx]; returns the error code when the context rejects the send. */
+suspend fun sendReportingRejection(
+    scp: SCP,
+    ctx: ContextHandle,
+    identity: Identity,
+    payload: ByteArray,
+): String? =
+    try {
+        scp.contextSend(handle = ctx, identity = identity, payload = payload, spendingUcanJwt = null)
+        null
+    } catch (e: ScpException.Context) {
+        println("[${e.code}] ${e.msg}")
+        e.code
+    }
 ```
+
+`scp-kt/src/test/kotlin/works/limn/scp/quickstart/ReadmeErrorHandling.kt` holds a compiled copy of this block, and `ReadmeQuickStartTest` checks it against this file and calls it on a closed context.
 
 ## Publishing
 
