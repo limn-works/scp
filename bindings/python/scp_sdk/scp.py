@@ -60,8 +60,13 @@ from typing import (
 )
 
 from scp_sdk._extension import EXTENSION_LOAD_FAILED_CODE, native_module
+from scp_sdk.context import Context
 from scp_sdk.errors import IdentityError, ScpError, ValidationError, _coded_bridge_error
+from scp_sdk.fullstack import FullStackNode
 from scp_sdk.governance import GovernanceActionResult, check_proposal_response
+from scp_sdk.identity import Identity
+from scp_sdk.mcp import McpClient, McpServer
+from scp_sdk.server import Node, Relay
 from scp_sdk.types import CustodyType, CustomRole, MemberRole
 
 if TYPE_CHECKING:
@@ -515,6 +520,30 @@ def _native_cls() -> Any:
     return cls
 
 
+def _unwrap_handle(
+    value: object,
+    expected: type[Context | Identity | McpClient | McpServer | FullStackNode],
+    method: str,
+    param: str,
+) -> Any:
+    """Return the native handle inside an SDK handle object.
+
+    Every public :class:`SCP` method that operates on a context, identity,
+    MCP client or server, or full-stack node takes the object the SDK
+    returned for it, the same shape the Swift and Kotlin SDKs take. A raw
+    native handle, a string, or any other type raises
+    :class:`~scp_sdk.errors.ValidationError` with ``SCP-VALID-7005``, so a
+    caller never meets an ``AttributeError`` or a bridge ``TypeError``.
+    """
+    if isinstance(value, expected):
+        return value._raw_handle
+    raise ValidationError(
+        f"SCP.{method}(): {param} must be a scp_sdk.{expected.__name__} returned "
+        f"by the SDK, got {type(value).__module__}.{type(value).__qualname__}",
+        "SCP-VALID-7005",
+    )
+
+
 def _to_native_sealed(sealed: SealedInvitation) -> Any:
     """Project an SDK :class:`SealedInvitation` into the native pyclass.
 
@@ -945,12 +974,12 @@ class SCP:
         data = json.loads(result_json) if isinstance(result_json, str) else result_json
         return IdentityAttestation._from_dict(data)
 
-    async def identity_add_agent_key(self, identity: Any) -> Any:
+    async def identity_add_agent_key(self, identity: Identity) -> Identity:
         """Delegate to ``_scp_core.SCP.identity_add_agent_key`` (returns :class:`Identity`)."""
-        from scp_sdk.identity import Identity
+        native_handle = _unwrap_handle(identity, Identity, "identity_add_agent_key", "identity")
 
         try:
-            raw = await asyncio.to_thread(self._native.identity_add_agent_key, identity)
+            raw = await asyncio.to_thread(self._native.identity_add_agent_key, native_handle)
         except Exception as exc:
             raise _coded_bridge_error(exc) from exc
         return Identity(raw)
@@ -979,7 +1008,7 @@ class SCP:
         return await asyncio.to_thread(self._native.identity_attest_device, identity_did)
 
     @_requires_custody(_CUSTODY_VALUE_REMEDY)
-    async def identity_create(self, custody: CustodyArg) -> Any:
+    async def identity_create(self, custody: CustodyArg) -> Identity:
         """Create an identity whose keys live in the key store ``custody`` names.
 
         Delegate to ``_scp_core.SCP.identity_create`` and return an
@@ -993,14 +1022,13 @@ class SCP:
         :raises ValidationError: ``SCP-VALID-7005`` when ``custody`` is not a
             :class:`~scp_sdk.types.CustodyType` or string.
         """
-        from scp_sdk.identity import Identity
 
         custody_str = _custody_string("identity_create", custody)
         raw = await asyncio.to_thread(self._native.identity_create, custody_str)
         return Identity(raw)
 
     @_requires_custody(_CUSTODY_VALUE_REMEDY)
-    async def identity_create_with_agent_key(self, custody: CustodyArg) -> Any:
+    async def identity_create_with_agent_key(self, custody: CustodyArg) -> Identity:
         """Delegate to ``_scp_core.SCP.identity_create_with_agent_key``.
 
         Returns an :class:`Identity` wrapper. ``custody`` is required and
@@ -1011,14 +1039,13 @@ class SCP:
         :raises ValidationError: ``SCP-VALID-7005`` when ``custody`` is not a
             :class:`~scp_sdk.types.CustodyType` or string.
         """
-        from scp_sdk.identity import Identity
 
         custody_str = _custody_string("identity_create_with_agent_key", custody)
         raw = await asyncio.to_thread(self._native.identity_create_with_agent_key, custody_str)
         return Identity(raw)
 
     @_requires_custody(_CUSTODY_PROVIDER_REMEDY)
-    async def identity_create_with_custody(self, provider: KeyCustodyProvider) -> Any:
+    async def identity_create_with_custody(self, provider: KeyCustodyProvider) -> Identity:
         """Create a DID whose key material lives in a caller-provided custody.
 
         Delegate to ``_scp_core.SCP.identity_create_with_custody``. The
@@ -1038,7 +1065,6 @@ class SCP:
             ``ValidationError`` if the provider is missing required methods;
             ``IdentityError`` if key/DID creation fails inside the provider.
         """
-        from scp_sdk.identity import Identity
 
         raw = await asyncio.to_thread(self._native.identity_create_with_custody, provider)
         return Identity(raw)
@@ -1137,14 +1163,13 @@ class SCP:
         items = json.loads(result_json) if isinstance(result_json, str) else result_json
         return [IdentityAttestation._from_dict(item) for item in items]
 
-    async def identity_load(self, did: str) -> Any:
+    async def identity_load(self, did: str) -> Identity:
         """Delegate to ``_scp_core.SCP.identity_load`` (returns :class:`Identity`)."""
-        from scp_sdk.identity import Identity
 
         raw = await asyncio.to_thread(self._native.identity_load, did)
         return Identity(raw)
 
-    async def identity_migrate(self, identity: Any) -> Any:
+    async def identity_migrate(self, identity: Identity) -> Identity:
         """Delegate to ``_scp_core.SCP.identity_migrate``.
 
         The bridge returns a tuple ``(PyIdentity, rotation_event_json)``
@@ -1154,22 +1179,22 @@ class SCP:
         distribute the event to active context members (spec §9.12,
         ADR-003 §4b).
         """
-        from scp_sdk.identity import Identity
+        native_handle = _unwrap_handle(identity, Identity, "identity_migrate", "identity")
 
         try:
             raw_handle, rotation_event_json = await asyncio.to_thread(
-                self._native.identity_migrate, identity
+                self._native.identity_migrate, native_handle
             )
         except Exception as exc:
             raise _coded_bridge_error(exc) from exc
         return Identity(raw_handle, rotation_event_json=rotation_event_json)
 
-    async def identity_remove_agent_key(self, identity: Any) -> Any:
+    async def identity_remove_agent_key(self, identity: Identity) -> Identity:
         """Delegate to ``_scp_core.SCP.identity_remove_agent_key`` (returns :class:`Identity`)."""
-        from scp_sdk.identity import Identity
+        native_handle = _unwrap_handle(identity, Identity, "identity_remove_agent_key", "identity")
 
         try:
-            raw = await asyncio.to_thread(self._native.identity_remove_agent_key, identity)
+            raw = await asyncio.to_thread(self._native.identity_remove_agent_key, native_handle)
         except Exception as exc:
             raise _coded_bridge_error(exc) from exc
         return Identity(raw)
@@ -1231,22 +1256,22 @@ class SCP:
         raw = await asyncio.to_thread(self._native.identity_resolve, did)
         return _bridge_doc_to_dataclass(raw)
 
-    async def identity_rotate_agent_key(self, identity: Any) -> Any:
+    async def identity_rotate_agent_key(self, identity: Identity) -> Identity:
         """Delegate to ``_scp_core.SCP.identity_rotate_agent_key`` (returns :class:`Identity`)."""
-        from scp_sdk.identity import Identity
+        native_handle = _unwrap_handle(identity, Identity, "identity_rotate_agent_key", "identity")
 
         try:
-            raw = await asyncio.to_thread(self._native.identity_rotate_agent_key, identity)
+            raw = await asyncio.to_thread(self._native.identity_rotate_agent_key, native_handle)
         except Exception as exc:
             raise _coded_bridge_error(exc) from exc
         return Identity(raw)
 
-    async def identity_rotate_key(self, identity: Any) -> Any:
+    async def identity_rotate_key(self, identity: Identity) -> Identity:
         """Delegate to ``_scp_core.SCP.identity_rotate_key`` (returns :class:`Identity`)."""
-        from scp_sdk.identity import Identity
+        native_handle = _unwrap_handle(identity, Identity, "identity_rotate_key", "identity")
 
         try:
-            raw = await asyncio.to_thread(self._native.identity_rotate_key, identity)
+            raw = await asyncio.to_thread(self._native.identity_rotate_key, native_handle)
         except Exception as exc:
             raise _coded_bridge_error(exc) from exc
         return Identity(raw)
@@ -1371,30 +1396,32 @@ class SCP:
             self._native.access_key_revoke, context_id, member_did, caller_did
         )
 
-    async def context_close(self, handle: Any, identity_did: str) -> Any:
+    async def context_close(self, handle: Context, identity_did: str) -> Any:
         """Delegate to ``_scp_core.SCP.context_close``."""
-        return await asyncio.to_thread(self._native.context_close, handle, identity_did)
+        native_handle = _unwrap_handle(handle, Context, "context_close", "handle")
+        return await asyncio.to_thread(self._native.context_close, native_handle, identity_did)
 
-    async def context_create(self, identity_did: str, params: dict[str, Any]) -> Any:
+    async def context_create(self, identity_did: str, params: dict[str, Any]) -> Context:
         """Delegate to ``_scp_core.SCP.context_create`` (returns :class:`Context`)."""
-        from scp_sdk.context import Context
 
         raw = await asyncio.to_thread(self._native.context_create, identity_did, params)
         return Context(raw, identity_did=identity_did, scp=self)
 
-    async def context_drain_events(self, handle: Any) -> Any:
+    async def context_drain_events(self, handle: Context) -> Any:
         """Delegate to ``_scp_core.SCP.context_drain_events``."""
-        return await asyncio.to_thread(self._native.context_drain_events, handle)
+        native_handle = _unwrap_handle(handle, Context, "context_drain_events", "handle")
+        return await asyncio.to_thread(self._native.context_drain_events, native_handle)
 
     async def context_export(self, context_id: str) -> Any:
         """Delegate to ``_scp_core.SCP.context_export``."""
         return await asyncio.to_thread(self._native.context_export, context_id)
 
-    async def context_handle_ttl_expiry(self, handle: Any) -> Any:
+    async def context_handle_ttl_expiry(self, handle: Context) -> Any:
         """Delegate to ``_scp_core.SCP.context_handle_ttl_expiry``."""
-        return await asyncio.to_thread(self._native.context_handle_ttl_expiry, handle)
+        native_handle = _unwrap_handle(handle, Context, "context_handle_ttl_expiry", "handle")
+        return await asyncio.to_thread(self._native.context_handle_ttl_expiry, native_handle)
 
-    async def context_import(self, data: Any, importer_did: str) -> Any:
+    async def context_import(self, data: Any, importer_did: str) -> Context | None:
         """Delegate to ``_scp_core.SCP.context_import`` (returns :class:`Context`).
 
         ``importer_did`` is the DID of the identity importing the context; the
@@ -1402,23 +1429,24 @@ class SCP:
         (§9.10.4) so the importer fans out under its own routing ID rather than
         inheriting the exporter's local-instance pseudonym.
         """
-        from scp_sdk.context import Context
 
         raw = await asyncio.to_thread(self._native.context_import, data, importer_did)
         if raw is None:
             return None
         return Context(raw, identity_did=importer_did, scp=self)
 
-    async def context_is_member(self, handle: Any, did: str) -> Any:
+    async def context_is_member(self, handle: Context, did: str) -> Any:
         """Delegate to ``_scp_core.SCP.context_is_member``."""
-        return await asyncio.to_thread(self._native.context_is_member, handle, did)
+        native_handle = _unwrap_handle(handle, Context, "context_is_member", "handle")
+        return await asyncio.to_thread(self._native.context_is_member, native_handle, did)
 
     async def context_join(
-        self, handle: Any, identity_did: str, spending_ucan_jwt: str | None = None
+        self, handle: Context, identity_did: str, spending_ucan_jwt: str | None = None
     ) -> Any:
         """Delegate to ``_scp_core.SCP.context_join``."""
+        native_handle = _unwrap_handle(handle, Context, "context_join", "handle")
         return await asyncio.to_thread(
-            self._native.context_join, handle, identity_did, spending_ucan_jwt
+            self._native.context_join, native_handle, identity_did, spending_ucan_jwt
         )
 
     async def reserve_key_package(self, owning_did: str) -> tuple[str, bytes]:
@@ -1469,7 +1497,7 @@ class SCP:
         owning_did: str,
         sealed: SealedInvitation,
         reservation_id: str,
-    ) -> Any:
+    ) -> Context:
         """Join a context from a sealed invitation bundle (returns :class:`Context`).
 
         Completes the reserve -> invite -> join handshake begun by
@@ -1529,7 +1557,6 @@ class SCP:
 
         Delegates to ``_scp_core.SCP.context_join_from_welcome``.
         """
-        from scp_sdk.context import Context
 
         native_sealed = _to_native_sealed(sealed)
         raw = await asyncio.to_thread(
@@ -1614,49 +1641,60 @@ class SCP:
         )
         return _to_invite_outcome(raw)
 
-    async def context_leave(self, handle: Any, identity_did: str) -> Any:
+    async def context_leave(self, handle: Context, identity_did: str) -> Any:
         """Delegate to ``_scp_core.SCP.context_leave``."""
-        return await asyncio.to_thread(self._native.context_leave, handle, identity_did)
+        native_handle = _unwrap_handle(handle, Context, "context_leave", "handle")
+        return await asyncio.to_thread(self._native.context_leave, native_handle, identity_did)
 
-    async def context_member_count(self, handle: Any) -> Any:
+    async def context_member_count(self, handle: Context) -> Any:
         """Delegate to ``_scp_core.SCP.context_member_count``."""
+        native_handle = _unwrap_handle(handle, Context, "context_member_count", "handle")
 
         try:
-            return await asyncio.to_thread(self._native.context_member_count, handle)
+            return await asyncio.to_thread(self._native.context_member_count, native_handle)
         except Exception as exc:
             raise _coded_bridge_error(exc) from exc
 
-    async def context_member_dids(self, handle: Any) -> Any:
+    async def context_member_dids(self, handle: Context) -> Any:
         """Delegate to ``_scp_core.SCP.context_member_dids``."""
-        return await asyncio.to_thread(self._native.context_member_dids, handle)
+        native_handle = _unwrap_handle(handle, Context, "context_member_dids", "handle")
+        return await asyncio.to_thread(self._native.context_member_dids, native_handle)
 
-    async def context_member_role(self, handle: Any, did: str) -> MemberRole | CustomRole | None:
+    async def context_member_role(
+        self, handle: Context, did: str
+    ) -> MemberRole | CustomRole | None:
         """Return the role ``did`` holds in the context, or ``None`` for a non-member.
 
         Raises:
             UnknownGovernanceOutcomeError: the bridge reported a role name
                 :meth:`MemberRole.from_bridge` cannot parse (code ``SCP-GOV-11040``).
         """
-        raw = await asyncio.to_thread(self._native.context_member_role, handle, did)
+        native_handle = _unwrap_handle(handle, Context, "context_member_role", "handle")
+        raw = await asyncio.to_thread(self._native.context_member_role, native_handle, did)
         if raw is None:
             return None
         return MemberRole.from_bridge(raw)
 
     async def context_propose_ttl_extension(
-        self, handle: Any, member_did: str, proposed_seconds: int
+        self, handle: Context, member_did: str, proposed_seconds: int
     ) -> Any:
         """Delegate to ``_scp_core.SCP.context_propose_ttl_extension``."""
+        native_handle = _unwrap_handle(handle, Context, "context_propose_ttl_extension", "handle")
         return await asyncio.to_thread(
-            self._native.context_propose_ttl_extension, handle, member_did, proposed_seconds
+            self._native.context_propose_ttl_extension, native_handle, member_did, proposed_seconds
         )
 
-    async def context_receive(self, handle: Any) -> Any:
+    async def context_receive(self, handle: Context) -> Any:
         """Delegate to ``_scp_core.SCP.context_receive``."""
-        return await asyncio.to_thread(self._native.context_receive, handle)
+        native_handle = _unwrap_handle(handle, Context, "context_receive", "handle")
+        return await asyncio.to_thread(self._native.context_receive, native_handle)
 
-    async def context_reset_ttl_timer(self, handle: Any, new_seconds: int) -> Any:
+    async def context_reset_ttl_timer(self, handle: Context, new_seconds: int) -> Any:
         """Delegate to ``_scp_core.SCP.context_reset_ttl_timer``."""
-        return await asyncio.to_thread(self._native.context_reset_ttl_timer, handle, new_seconds)
+        native_handle = _unwrap_handle(handle, Context, "context_reset_ttl_timer", "handle")
+        return await asyncio.to_thread(
+            self._native.context_reset_ttl_timer, native_handle, new_seconds
+        )
 
     async def reconnect(
         self,
@@ -1706,7 +1744,7 @@ class SCP:
 
     async def context_send(
         self,
-        handle: Any,
+        handle: Context,
         identity_did: str,
         payload: bytes | str,
         spending_ucan_jwt: str | None = None,
@@ -1719,17 +1757,19 @@ class SCP:
         event); retry once peers' pseudonym-announcement messages have arrived.
         A lone-member send is a no-op; broadcast contexts are unaffected.
         """
+        native_handle = _unwrap_handle(handle, Context, "context_send", "handle")
 
         try:
             return await asyncio.to_thread(
-                self._native.context_send, handle, identity_did, payload, spending_ucan_jwt
+                self._native.context_send, native_handle, identity_did, payload, spending_ucan_jwt
             )
         except Exception as exc:
             raise _coded_bridge_error(exc) from exc
 
-    async def get_economic_policy(self, handle: Any) -> Any:
+    async def get_economic_policy(self, handle: Context) -> Any:
         """Delegate to ``_scp_core.SCP.get_economic_policy``."""
-        return await asyncio.to_thread(self._native.get_economic_policy, handle)
+        native_handle = _unwrap_handle(handle, Context, "get_economic_policy", "handle")
+        return await asyncio.to_thread(self._native.get_economic_policy, native_handle)
 
     async def restore_all_contexts(self) -> Any:
         """Delegate to ``_scp_core.SCP.restore_all_contexts``."""
@@ -1739,9 +1779,10 @@ class SCP:
         """Delegate to ``_scp_core.SCP.restore_context``."""
         return await asyncio.to_thread(self._native.restore_context, context_id)
 
-    async def set_economic_policy(self, handle: Any, policy_json: str) -> Any:
+    async def set_economic_policy(self, handle: Context, policy_json: str) -> Any:
         """Delegate to ``_scp_core.SCP.set_economic_policy``."""
-        return await asyncio.to_thread(self._native.set_economic_policy, handle, policy_json)
+        native_handle = _unwrap_handle(handle, Context, "set_economic_policy", "handle")
+        return await asyncio.to_thread(self._native.set_economic_policy, native_handle, policy_json)
 
     # endregion Context
 
@@ -1910,20 +1951,22 @@ class SCP:
 
     # region Broadcast
 
-    async def broadcast_admission(self, handle: Any) -> Any:
+    async def broadcast_admission(self, handle: Context) -> Any:
         """Delegate to ``_scp_core.SCP.broadcast_admission``."""
-        return await asyncio.to_thread(self._native.broadcast_admission, handle)
+        native_handle = _unwrap_handle(handle, Context, "broadcast_admission", "handle")
+        return await asyncio.to_thread(self._native.broadcast_admission, native_handle)
 
     async def broadcast_block_subscriber(
-        self, handle: Any, subscriber_did: str, blocker_did: str
+        self, handle: Context, subscriber_did: str, blocker_did: str
     ) -> Any:
         """Delegate to ``_scp_core.SCP.broadcast_block_subscriber``."""
+        native_handle = _unwrap_handle(handle, Context, "broadcast_block_subscriber", "handle")
         return await asyncio.to_thread(
-            self._native.broadcast_block_subscriber, handle, subscriber_did, blocker_did
+            self._native.broadcast_block_subscriber, native_handle, subscriber_did, blocker_did
         )
 
     async def broadcast_handle_key_request(
-        self, handle: Any, author_did: str, requester_did: str, wrapping_pubkey: bytes
+        self, handle: Context, author_did: str, requester_did: str, wrapping_pubkey: bytes
     ) -> str | None:
         """Delegate to ``_scp_core.SCP.broadcast_handle_key_request``.
 
@@ -1935,9 +1978,10 @@ class SCP:
         requester receives no key material). The subscriber opens the returned
         JSON with :meth:`broadcast_open_key`.
         """
+        native_handle = _unwrap_handle(handle, Context, "broadcast_handle_key_request", "handle")
         return await asyncio.to_thread(
             self._native.broadcast_handle_key_request,
-            handle,
+            native_handle,
             author_did,
             requester_did,
             wrapping_pubkey,
@@ -1959,17 +2003,21 @@ class SCP:
             self._native.broadcast_open_key, sealed_json, wrapping_secret
         )
 
-    async def broadcast_is_subscriber(self, handle: Any, did: str) -> Any:
+    async def broadcast_is_subscriber(self, handle: Context, did: str) -> Any:
         """Delegate to ``_scp_core.SCP.broadcast_is_subscriber``."""
-        return await asyncio.to_thread(self._native.broadcast_is_subscriber, handle, did)
+        native_handle = _unwrap_handle(handle, Context, "broadcast_is_subscriber", "handle")
+        return await asyncio.to_thread(self._native.broadcast_is_subscriber, native_handle, did)
 
-    async def broadcast_publish(self, handle: Any, author_did: str, payload: bytes) -> Any:
+    async def broadcast_publish(self, handle: Context, author_did: str, payload: bytes) -> Any:
         """Delegate to ``_scp_core.SCP.broadcast_publish``."""
-        return await asyncio.to_thread(self._native.broadcast_publish, handle, author_did, payload)
+        native_handle = _unwrap_handle(handle, Context, "broadcast_publish", "handle")
+        return await asyncio.to_thread(
+            self._native.broadcast_publish, native_handle, author_did, payload
+        )
 
     async def broadcast_publish_asset(
         self,
-        handle: Any,
+        handle: Context,
         author_did: str,
         path: str,
         content_type: str,
@@ -1977,9 +2025,10 @@ class SCP:
         deploy_id: str | None = None,
     ) -> Any:
         """Delegate to ``_scp_core.SCP.broadcast_publish_asset``."""
+        native_handle = _unwrap_handle(handle, Context, "broadcast_publish_asset", "handle")
         return await asyncio.to_thread(
             self._native.broadcast_publish_asset,
-            handle,
+            native_handle,
             author_did,
             path,
             content_type,
@@ -1989,18 +2038,19 @@ class SCP:
 
     async def broadcast_publish_assets(
         self,
-        handle: Any,
+        handle: Context,
         author_did: str,
         assets: list[tuple[str, str, bytes]],
         deploy_id: str | None = None,
     ) -> Any:
         """Delegate to ``_scp_core.SCP.broadcast_publish_assets``."""
+        native_handle = _unwrap_handle(handle, Context, "broadcast_publish_assets", "handle")
         return await asyncio.to_thread(
-            self._native.broadcast_publish_assets, handle, author_did, assets, deploy_id
+            self._native.broadcast_publish_assets, native_handle, author_did, assets, deploy_id
         )
 
     async def broadcast_subscribe(
-        self, handle: Any, subscriber_did: str, messages_read_ucan_jwt: str | None = None
+        self, handle: Context, subscriber_did: str, messages_read_ucan_jwt: str | None = None
     ) -> Any:
         """Delegate to ``_scp_core.SCP.broadcast_subscribe``.
 
@@ -2008,28 +2058,32 @@ class SCP:
         ``messages:read`` UCAN JWT issued to ``subscriber_did`` by the context
         admin/creator (spec §5.14.4). It is unused for an OPEN context.
         """
+        native_handle = _unwrap_handle(handle, Context, "broadcast_subscribe", "handle")
         return await asyncio.to_thread(
-            self._native.broadcast_subscribe, handle, subscriber_did, messages_read_ucan_jwt
+            self._native.broadcast_subscribe, native_handle, subscriber_did, messages_read_ucan_jwt
         )
 
-    async def broadcast_subscriber_count(self, handle: Any) -> Any:
+    async def broadcast_subscriber_count(self, handle: Context) -> Any:
         """Delegate to ``_scp_core.SCP.broadcast_subscriber_count``."""
-        return await asyncio.to_thread(self._native.broadcast_subscriber_count, handle)
+        native_handle = _unwrap_handle(handle, Context, "broadcast_subscriber_count", "handle")
+        return await asyncio.to_thread(self._native.broadcast_subscriber_count, native_handle)
 
     async def broadcast_unblock_subscriber(
-        self, handle: Any, subscriber_did: str, unblocker_did: str
+        self, handle: Context, subscriber_did: str, unblocker_did: str
     ) -> Any:
         """Delegate to ``_scp_core.SCP.broadcast_unblock_subscriber``."""
+        native_handle = _unwrap_handle(handle, Context, "broadcast_unblock_subscriber", "handle")
         return await asyncio.to_thread(
-            self._native.broadcast_unblock_subscriber, handle, subscriber_did, unblocker_did
+            self._native.broadcast_unblock_subscriber, native_handle, subscriber_did, unblocker_did
         )
 
     async def broadcast_unsubscribe(
-        self, handle: Any, subscriber_did: str, rotate_keys: bool = False
+        self, handle: Context, subscriber_did: str, rotate_keys: bool = False
     ) -> Any:
         """Delegate to ``_scp_core.SCP.broadcast_unsubscribe``."""
+        native_handle = _unwrap_handle(handle, Context, "broadcast_unsubscribe", "handle")
         return await asyncio.to_thread(
-            self._native.broadcast_unsubscribe, handle, subscriber_did, rotate_keys
+            self._native.broadcast_unsubscribe, native_handle, subscriber_did, rotate_keys
         )
 
     # endregion Broadcast
@@ -2037,26 +2091,32 @@ class SCP:
     # region Governance
 
     async def add_checkpoint_cosignature(
-        self, handle: Any, checkpoint_json: str, signer_did: str, signature_hex: str
+        self, handle: Context, checkpoint_json: str, signer_did: str, signature_hex: str
     ) -> Any:
         """Delegate to ``_scp_core.SCP.add_checkpoint_cosignature``."""
+        native_handle = _unwrap_handle(handle, Context, "add_checkpoint_cosignature", "handle")
         return await asyncio.to_thread(
             self._native.add_checkpoint_cosignature,
-            handle,
+            native_handle,
             checkpoint_json,
             signer_did,
             signature_hex,
         )
 
-    async def apply_pending_ceiling_modification(self, handle: Any, current_timestamp: int) -> Any:
+    async def apply_pending_ceiling_modification(
+        self, handle: Context, current_timestamp: int
+    ) -> Any:
         """Delegate to ``_scp_core.SCP.apply_pending_ceiling_modification``."""
+        native_handle = _unwrap_handle(
+            handle, Context, "apply_pending_ceiling_modification", "handle"
+        )
         return await asyncio.to_thread(
-            self._native.apply_pending_ceiling_modification, handle, current_timestamp
+            self._native.apply_pending_ceiling_modification, native_handle, current_timestamp
         )
 
     async def create_governance_checkpoint(
         self,
-        handle: Any,
+        handle: Context,
         checkpoint_seq: int,
         merkle_root_hex: str,
         event_count: int,
@@ -2066,9 +2126,10 @@ class SCP:
         creator_signature_hex: str,
     ) -> Any:
         """Delegate to ``_scp_core.SCP.create_governance_checkpoint``."""
+        native_handle = _unwrap_handle(handle, Context, "create_governance_checkpoint", "handle")
         return await asyncio.to_thread(
             self._native.create_governance_checkpoint,
-            handle,
+            native_handle,
             checkpoint_seq,
             merkle_root_hex,
             event_count,
@@ -2101,11 +2162,14 @@ class SCP:
             spending_json,
         )
 
-    async def finalize_close(self, handle: Any) -> Any:
+    async def finalize_close(self, handle: Context) -> Any:
         """Delegate to ``_scp_core.SCP.finalize_close``."""
-        return await asyncio.to_thread(self._native.finalize_close, handle)
+        native_handle = _unwrap_handle(handle, Context, "finalize_close", "handle")
+        return await asyncio.to_thread(self._native.finalize_close, native_handle)
 
-    async def governance_approve(self, handle: Any, identity_did: str, proposal_id_hex: str) -> Any:
+    async def governance_approve(
+        self, handle: Context, identity_did: str, proposal_id_hex: str
+    ) -> Any:
         """Delegate to ``_scp_core.SCP.governance_approve``.
 
         Returns the bridge's JSON ``{status, reason?, rejector?}`` after
@@ -2116,12 +2180,15 @@ class SCP:
             UnknownGovernanceOutcomeError: The response names a status or
                 reason this SDK version does not carry (``SCP-GOV-11040``).
         """
+        native_handle = _unwrap_handle(handle, Context, "governance_approve", "handle")
         raw = await asyncio.to_thread(
-            self._native.governance_approve, handle, identity_did, proposal_id_hex
+            self._native.governance_approve, native_handle, identity_did, proposal_id_hex
         )
         return check_proposal_response(raw)
 
-    async def governance_execute(self, handle: Any, proposal_id_hex: str) -> GovernanceActionResult:
+    async def governance_execute(
+        self, handle: Context, proposal_id_hex: str
+    ) -> GovernanceActionResult:
         """Delegate to ``_scp_core.SCP.governance_execute``.
 
         Executes a previously-approved governance proposal *by id*. The runtime
@@ -2137,20 +2204,25 @@ class SCP:
             UnknownGovernanceOutcomeError: The bridge reported an outcome this
                 SDK version does not carry (``SCP-GOV-11040``).
         """
-        raw = await asyncio.to_thread(self._native.governance_execute, handle, proposal_id_hex)
+        native_handle = _unwrap_handle(handle, Context, "governance_execute", "handle")
+        raw = await asyncio.to_thread(
+            self._native.governance_execute, native_handle, proposal_id_hex
+        )
         return GovernanceActionResult.from_bridge(raw)
 
-    async def governance_get_proposal(self, handle: Any, proposal_id_hex: str) -> Any:
+    async def governance_get_proposal(self, handle: Context, proposal_id_hex: str) -> Any:
         """Delegate to ``_scp_core.SCP.governance_get_proposal``."""
+        native_handle = _unwrap_handle(handle, Context, "governance_get_proposal", "handle")
         return await asyncio.to_thread(
-            self._native.governance_get_proposal, handle, proposal_id_hex
+            self._native.governance_get_proposal, native_handle, proposal_id_hex
         )
 
-    async def governance_list_proposals(self, handle: Any) -> Any:
+    async def governance_list_proposals(self, handle: Context) -> Any:
         """Delegate to ``_scp_core.SCP.governance_list_proposals``."""
-        return await asyncio.to_thread(self._native.governance_list_proposals, handle)
+        native_handle = _unwrap_handle(handle, Context, "governance_list_proposals", "handle")
+        return await asyncio.to_thread(self._native.governance_list_proposals, native_handle)
 
-    async def governance_propose(self, handle: Any, identity_did: str, action_json: str) -> Any:
+    async def governance_propose(self, handle: Context, identity_did: str, action_json: str) -> Any:
         """Delegate to ``_scp_core.SCP.governance_propose``.
 
         Returns the bridge's JSON ``{proposal_id, status, reason?, rejector?,
@@ -2164,10 +2236,11 @@ class SCP:
                 reason, or outcome this SDK version does not carry
                 (``SCP-GOV-11040``).
         """
+        native_handle = _unwrap_handle(handle, Context, "governance_propose", "handle")
 
         try:
             raw = await asyncio.to_thread(
-                self._native.governance_propose, handle, identity_did, action_json
+                self._native.governance_propose, native_handle, identity_did, action_json
             )
         except Exception as exc:
             raise _coded_bridge_error(exc) from exc
@@ -2175,7 +2248,9 @@ class SCP:
         # as a bridge error.
         return check_proposal_response(raw)
 
-    async def governance_reject(self, handle: Any, identity_did: str, proposal_id_hex: str) -> Any:
+    async def governance_reject(
+        self, handle: Context, identity_did: str, proposal_id_hex: str
+    ) -> Any:
         """Delegate to ``_scp_core.SCP.governance_reject``.
 
         Returns the bridge's JSON ``{status, reason?, rejector?}`` after
@@ -2186,13 +2261,14 @@ class SCP:
             UnknownGovernanceOutcomeError: The response names a status or
                 reason this SDK version does not carry (``SCP-GOV-11040``).
         """
+        native_handle = _unwrap_handle(handle, Context, "governance_reject", "handle")
         raw = await asyncio.to_thread(
-            self._native.governance_reject, handle, identity_did, proposal_id_hex
+            self._native.governance_reject, native_handle, identity_did, proposal_id_hex
         )
         return check_proposal_response(raw)
 
     async def governance_withdraw(
-        self, handle: Any, identity_did: str, proposal_id_hex: str
+        self, handle: Context, identity_did: str, proposal_id_hex: str
     ) -> Any:
         """Delegate to ``_scp_core.SCP.governance_withdraw``.
 
@@ -2204,24 +2280,27 @@ class SCP:
             UnknownGovernanceOutcomeError: The response names a status or
                 reason this SDK version does not carry (``SCP-GOV-11040``).
         """
+        native_handle = _unwrap_handle(handle, Context, "governance_withdraw", "handle")
         raw = await asyncio.to_thread(
-            self._native.governance_withdraw, handle, identity_did, proposal_id_hex
+            self._native.governance_withdraw, native_handle, identity_did, proposal_id_hex
         )
         return check_proposal_response(raw)
 
-    async def migration_state(self, handle: Any) -> Any:
+    async def migration_state(self, handle: Context) -> Any:
         """Delegate to ``_scp_core.SCP.migration_state``."""
-        return await asyncio.to_thread(self._native.migration_state, handle)
+        native_handle = _unwrap_handle(handle, Context, "migration_state", "handle")
+        return await asyncio.to_thread(self._native.migration_state, native_handle)
 
-    async def tombstone_migrated_context(self, handle: Any) -> Any:
+    async def tombstone_migrated_context(self, handle: Context) -> Any:
         """Delegate to ``_scp_core.SCP.tombstone_migrated_context``."""
-        return await asyncio.to_thread(self._native.tombstone_migrated_context, handle)
+        native_handle = _unwrap_handle(handle, Context, "tombstone_migrated_context", "handle")
+        return await asyncio.to_thread(self._native.tombstone_migrated_context, native_handle)
 
     # endregion Governance
 
     # region MCP
 
-    async def mcp_client_connect_sse(self, url: str, auth_token: str | None) -> Any:
+    async def mcp_client_connect_sse(self, url: str, auth_token: str | None) -> McpClient:
         """Connect an MCP client via SSE transport (returns :class:`McpClient`).
 
         *auth_token* is the bearer token sent in an ``Authorization`` header
@@ -2229,13 +2308,13 @@ class SCP:
         An SCP SSE server always runs one (ADR-015). The transport has no
         TLS, so a token is sent only to a loopback host.
         """
-        from scp_sdk.mcp import McpClient, validate_client_connect
+        from scp_sdk.mcp import validate_client_connect
 
         validate_client_connect("sse", url=url)
         raw = await asyncio.to_thread(self._native.py_mcp_client_connect_sse, url, auth_token)
         return McpClient(raw)
 
-    async def mcp_client_connect_stdio(self, command: list[str]) -> Any:
+    async def mcp_client_connect_stdio(self, command: list[str]) -> McpClient:
         """Connect an MCP client via stdio transport (returns :class:`McpClient`).
 
         Pre-flight allowlist check uses THIS instance's allowlist
@@ -2244,7 +2323,7 @@ class SCP:
         :meth:`mcp_configure_stdio_allowlist` first; to inspect the
         current per-instance state, use :meth:`mcp_get_stdio_allowlist`.
         """
-        from scp_sdk.mcp import McpClient, validate_client_connect
+        from scp_sdk.mcp import validate_client_connect
 
         # Snapshot this instance's per-instance allowlist for defense-in-depth
         # validation before round-tripping into the FFI bridge.
@@ -2330,31 +2409,27 @@ class SCP:
         """
         return self._native.mcp_get_stdio_allowlist()
 
-    async def mcp_client_disconnect(self, handle: Any) -> Any:
+    async def mcp_client_disconnect(self, handle: McpClient) -> Any:
         """Delegate to ``_scp_core.SCP.py_mcp_client_disconnect``.
 
-        Accepts an :class:`McpClient` instance (extracting the raw
-        bridge handle via ``_raw_handle``) or a raw handle directly.
+        Takes the :class:`McpClient` the connect call returned.
         """
-        from scp_sdk.mcp import McpClient
 
-        raw = handle._raw_handle if isinstance(handle, McpClient) else handle
+        raw = _unwrap_handle(handle, McpClient, "mcp_client_disconnect", "handle")
         return await asyncio.to_thread(self._native.py_mcp_client_disconnect, raw)
 
-    async def mcp_client_info(self, handle: Any) -> Any:
+    async def mcp_client_info(self, handle: McpClient) -> Any:
         """Delegate to ``_scp_core.SCP.py_mcp_client_info``.
 
-        Accepts an :class:`McpClient` instance (extracting the raw
-        bridge handle via ``_raw_handle``) or a raw handle directly.
+        Takes the :class:`McpClient` the connect call returned.
         """
-        from scp_sdk.mcp import McpClient
 
-        raw = handle._raw_handle if isinstance(handle, McpClient) else handle
+        raw = _unwrap_handle(handle, McpClient, "mcp_client_info", "handle")
         return await asyncio.to_thread(self._native.py_mcp_client_info, raw)
 
     async def mcp_client_invoke(
         self,
-        handle: Any,
+        handle: McpClient,
         outlet_name: str,
         input: dict[str, Any],
         context_id: str,
@@ -2365,9 +2440,9 @@ class SCP:
         Returns an :class:`~scp_sdk.mcp.McpToolResult` wrapping the raw
         bridge result with SCP provenance metadata.
         """
-        from scp_sdk.mcp import McpClient, McpProvenance, McpToolResult
+        from scp_sdk.mcp import McpProvenance, McpToolResult
 
-        raw_handle = handle._raw_handle if isinstance(handle, McpClient) else handle
+        raw_handle = _unwrap_handle(handle, McpClient, "mcp_client_invoke", "handle")
         raw = await asyncio.to_thread(
             self._native.py_mcp_client_invoke,
             raw_handle,
@@ -2388,14 +2463,14 @@ class SCP:
             provenance=provenance,
         )
 
-    async def mcp_client_list_tools(self, handle: Any) -> list[Any]:
+    async def mcp_client_list_tools(self, handle: McpClient) -> list[Any]:
         """Delegate to ``_scp_core.SCP.py_mcp_client_list_tools``.
 
         Returns a list of :class:`~scp_sdk.mcp.McpToolDefinition`.
         """
-        from scp_sdk.mcp import McpClient, McpToolDefinition
+        from scp_sdk.mcp import McpToolDefinition
 
-        raw_handle = handle._raw_handle if isinstance(handle, McpClient) else handle
+        raw_handle = _unwrap_handle(handle, McpClient, "mcp_client_list_tools", "handle")
         raw_tools = await asyncio.to_thread(self._native.py_mcp_client_list_tools, raw_handle)
         return [
             McpToolDefinition(
@@ -2424,43 +2499,39 @@ class SCP:
         context_ids: list[str],
         transport: str,
         ucan_token: str | None = None,
-    ) -> Any:
+    ) -> McpServer:
         """Delegate to ``_scp_core.SCP.py_mcp_serve`` (returns :class:`McpServer`)."""
-        from scp_sdk.mcp import McpServer
 
         raw = await asyncio.to_thread(
             self._native.py_mcp_serve, identity_did, context_ids, transport, ucan_token
         )
         return McpServer(raw)
 
-    async def mcp_server_info(self, handle: Any) -> Any:
+    async def mcp_server_info(self, handle: McpServer) -> Any:
         """Delegate to ``_scp_core.SCP.py_mcp_server_info``.
 
-        Accepts an :class:`McpServer` instance or a raw bridge handle.
+        Takes the :class:`McpServer` that :meth:`mcp_serve` returned.
         """
-        from scp_sdk.mcp import McpServer
 
-        raw = handle._raw_handle if isinstance(handle, McpServer) else handle
+        raw = _unwrap_handle(handle, McpServer, "mcp_server_info", "handle")
         return await asyncio.to_thread(self._native.py_mcp_server_info, raw)
 
-    async def mcp_server_stop(self, handle: Any) -> Any:
+    async def mcp_server_stop(self, handle: McpServer) -> Any:
         """Delegate to ``_scp_core.SCP.py_mcp_server_stop``.
 
-        Accepts an :class:`McpServer` instance or a raw bridge handle.
+        Takes the :class:`McpServer` that :meth:`mcp_serve` returned.
         """
-        from scp_sdk.mcp import McpServer
 
-        raw = handle._raw_handle if isinstance(handle, McpServer) else handle
+        raw = _unwrap_handle(handle, McpServer, "mcp_server_stop", "handle")
         return await asyncio.to_thread(self._native.py_mcp_server_stop, raw)
 
-    async def mcp_server_wait(self, handle: Any) -> Any:
+    async def mcp_server_wait(self, handle: McpServer) -> Any:
         """Delegate to ``_scp_core.SCP.py_mcp_server_wait``.
 
-        Accepts an :class:`McpServer` instance or a raw bridge handle.
+        Takes the :class:`McpServer` that :meth:`mcp_serve` returned.
         """
-        from scp_sdk.mcp import McpServer
 
-        raw = handle._raw_handle if isinstance(handle, McpServer) else handle
+        raw = _unwrap_handle(handle, McpServer, "mcp_server_wait", "handle")
         return await asyncio.to_thread(self._native.py_mcp_server_wait, raw)
 
     async def registry_cleanup(self) -> Any:
@@ -3338,54 +3409,83 @@ class SCP:
 
     # region Fullstack
 
-    async def fullstack_add_member(self, node: Any, context_id: str, member_did: str) -> Any:
+    async def fullstack_add_member(
+        self, node: FullStackNode, context_id: str, member_did: str
+    ) -> Any:
         """Delegate to ``_scp_core.SCP.fullstack_add_member``."""
+        native_handle = _unwrap_handle(node, FullStackNode, "fullstack_add_member", "node")
         return await asyncio.to_thread(
-            self._native.fullstack_add_member, node, context_id, member_did
+            self._native.fullstack_add_member, native_handle, context_id, member_did
         )
 
-    async def fullstack_create_context(self, node: Any, context_id: str, ceiling_json: str) -> Any:
+    async def fullstack_create_context(
+        self, node: FullStackNode, context_id: str, ceiling_json: str
+    ) -> Any:
         """Delegate to ``_scp_core.SCP.fullstack_create_context``."""
+        native_handle = _unwrap_handle(node, FullStackNode, "fullstack_create_context", "node")
         return await asyncio.to_thread(
-            self._native.fullstack_create_context, node, context_id, ceiling_json
+            self._native.fullstack_create_context, native_handle, context_id, ceiling_json
         )
 
-    async def fullstack_create_node(self, did: str) -> Any:
-        """Delegate to ``_scp_core.SCP.fullstack_create_node``."""
-        return await asyncio.to_thread(self._native.fullstack_create_node, did)
+    async def fullstack_create_node(self, did: str) -> FullStackNode:
+        """Delegate to ``_scp_core.SCP.fullstack_create_node`` (returns :class:`FullStackNode`)."""
+        raw = await asyncio.to_thread(self._native.fullstack_create_node, did)
+        return FullStackNode(raw)
 
     async def fullstack_decrypt_message(
-        self, node: Any, context_id: str, ciphertext: Any, sender_did: str
+        self, node: FullStackNode, context_id: str, ciphertext: Any, sender_did: str
     ) -> Any:
         """Delegate to ``_scp_core.SCP.fullstack_decrypt_message``."""
+        native_handle = _unwrap_handle(node, FullStackNode, "fullstack_decrypt_message", "node")
         return await asyncio.to_thread(
-            self._native.fullstack_decrypt_message, node, context_id, ciphertext, sender_did
+            self._native.fullstack_decrypt_message,
+            native_handle,
+            context_id,
+            ciphertext,
+            sender_did,
         )
 
-    async def fullstack_join_from_welcome(self, node: Any, context_id: str) -> Any:
+    async def fullstack_join_from_welcome(self, node: FullStackNode, context_id: str) -> Any:
         """Delegate to ``_scp_core.SCP.fullstack_join_from_welcome``."""
-        return await asyncio.to_thread(self._native.fullstack_join_from_welcome, node, context_id)
-
-    async def fullstack_remove_member(self, node: Any, context_id: str, member_did: str) -> Any:
-        """Delegate to ``_scp_core.SCP.fullstack_remove_member``."""
+        native_handle = _unwrap_handle(node, FullStackNode, "fullstack_join_from_welcome", "node")
         return await asyncio.to_thread(
-            self._native.fullstack_remove_member, node, context_id, member_did
+            self._native.fullstack_join_from_welcome, native_handle, context_id
+        )
+
+    async def fullstack_remove_member(
+        self, node: FullStackNode, context_id: str, member_did: str
+    ) -> Any:
+        """Delegate to ``_scp_core.SCP.fullstack_remove_member``."""
+        native_handle = _unwrap_handle(node, FullStackNode, "fullstack_remove_member", "node")
+        return await asyncio.to_thread(
+            self._native.fullstack_remove_member, native_handle, context_id, member_did
         )
 
     async def fullstack_reset_network(self) -> Any:
         """Delegate to ``_scp_core.SCP.fullstack_reset_network``."""
         return await asyncio.to_thread(self._native.fullstack_reset_network)
 
-    async def fullstack_send_message(self, node: Any, context_id: str, payload: Any) -> Any:
+    async def fullstack_send_message(
+        self, node: FullStackNode, context_id: str, payload: Any
+    ) -> Any:
         """Delegate to ``_scp_core.SCP.fullstack_send_message``."""
+        native_handle = _unwrap_handle(node, FullStackNode, "fullstack_send_message", "node")
         return await asyncio.to_thread(
-            self._native.fullstack_send_message, node, context_id, payload
+            self._native.fullstack_send_message, native_handle, context_id, payload
         )
 
-    async def fullstack_sync_sender_keys(self, node_a: Any, node_b: Any, context_id: str) -> Any:
+    async def fullstack_sync_sender_keys(
+        self, node_a: FullStackNode, node_b: FullStackNode, context_id: str
+    ) -> Any:
         """Delegate to ``_scp_core.SCP.fullstack_sync_sender_keys``."""
+        native_node_a = _unwrap_handle(
+            node_a, FullStackNode, "fullstack_sync_sender_keys", "node_a"
+        )
+        native_node_b = _unwrap_handle(
+            node_b, FullStackNode, "fullstack_sync_sender_keys", "node_b"
+        )
         return await asyncio.to_thread(
-            self._native.fullstack_sync_sender_keys, node_a, node_b, context_id
+            self._native.fullstack_sync_sender_keys, native_node_a, native_node_b, context_id
         )
 
     # endregion Fullstack
@@ -3527,34 +3627,30 @@ class SCP:
 
     # region Server
 
-    async def node_start_in_memory(self, identity_did: str | None = None) -> Any:
+    async def node_start_in_memory(self, identity_did: str | None = None) -> Node:
         """Delegate to ``_scp_core.SCP.node_start_in_memory`` (returns :class:`Node`)."""
-        from scp_sdk.server import Node
 
         raw = await asyncio.to_thread(self._native.node_start_in_memory, identity_did)
         return Node(raw)
 
     async def node_start_local(
         self, data_dir: str, identity_did: str | None = None, passphrase: str | None = None
-    ) -> Any:
+    ) -> Node:
         """Delegate to ``_scp_core.SCP.node_start_local`` (returns :class:`Node`)."""
-        from scp_sdk.server import Node
 
         raw = await asyncio.to_thread(
             self._native.node_start_local, data_dir, identity_did, passphrase
         )
         return Node(raw)
 
-    async def relay_start_in_memory(self) -> Any:
+    async def relay_start_in_memory(self) -> Relay:
         """Delegate to ``_scp_core.SCP.relay_start_in_memory`` (returns :class:`Relay`)."""
-        from scp_sdk.server import Relay
 
         raw = await asyncio.to_thread(self._native.relay_start_in_memory)
         return Relay(raw)
 
-    async def relay_start_local(self, data_dir: str) -> Any:
+    async def relay_start_local(self, data_dir: str) -> Relay:
         """Delegate to ``_scp_core.SCP.relay_start_local`` (returns :class:`Relay`)."""
-        from scp_sdk.server import Relay
 
         raw = await asyncio.to_thread(self._native.relay_start_local, data_dir)
         return Relay(raw)

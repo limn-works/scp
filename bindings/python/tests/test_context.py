@@ -366,7 +366,7 @@ class TestScpContextJoinLeaveClose:
         scp = _make_scp(native)
         ctx = _make_context()
 
-        await SCP.context_join(scp, ctx._raw_handle, "did:dht:z6MkBob", "spending-jwt")
+        await SCP.context_join(scp, ctx, "did:dht:z6MkBob", "spending-jwt")
 
         native.context_join.assert_called_once_with(
             ctx._raw_handle, "did:dht:z6MkBob", "spending-jwt"
@@ -379,7 +379,7 @@ class TestScpContextJoinLeaveClose:
         scp = _make_scp(native)
         ctx = _make_context()
 
-        await SCP.context_join(scp, ctx._raw_handle, "did:dht:z6MkBob")
+        await SCP.context_join(scp, ctx, "did:dht:z6MkBob")
 
         native.context_join.assert_called_once_with(ctx._raw_handle, "did:dht:z6MkBob", None)
 
@@ -390,7 +390,7 @@ class TestScpContextJoinLeaveClose:
         scp = _make_scp(native)
         ctx = _make_context()
 
-        await SCP.context_leave(scp, ctx._raw_handle, "did:dht:z6MkBob")
+        await SCP.context_leave(scp, ctx, "did:dht:z6MkBob")
 
         native.context_leave.assert_called_once_with(ctx._raw_handle, "did:dht:z6MkBob")
 
@@ -401,7 +401,7 @@ class TestScpContextJoinLeaveClose:
         scp = _make_scp(native)
         ctx = _make_context()
 
-        await SCP.context_close(scp, ctx._raw_handle, "did:dht:z6MkAlice")
+        await SCP.context_close(scp, ctx, "did:dht:z6MkAlice")
 
         native.context_close.assert_called_once_with(ctx._raw_handle, "did:dht:z6MkAlice")
 
@@ -421,7 +421,7 @@ class TestScpContextSend:
         scp = _make_scp(native)
         ctx = _make_context()
 
-        await SCP.context_send(scp, ctx._raw_handle, "did:dht:z6MkBob", "hello world")
+        await SCP.context_send(scp, ctx, "did:dht:z6MkBob", "hello world")
 
         native.context_send.assert_called_once_with(
             ctx._raw_handle, "did:dht:z6MkBob", "hello world", None
@@ -434,7 +434,7 @@ class TestScpContextSend:
         scp = _make_scp(native)
         ctx = _make_context()
 
-        await SCP.context_send(scp, ctx._raw_handle, "did:dht:z6MkAlice", b"\x00\x01\x02")
+        await SCP.context_send(scp, ctx, "did:dht:z6MkAlice", b"\x00\x01\x02")
 
         native.context_send.assert_called_once_with(
             ctx._raw_handle, "did:dht:z6MkAlice", b"\x00\x01\x02", None
@@ -447,7 +447,7 @@ class TestScpContextSend:
         scp = _make_scp(native)
         ctx = _make_context()
 
-        await SCP.context_send(scp, ctx._raw_handle, "did:dht:z6MkAlice", "msg", "spending.jwt")
+        await SCP.context_send(scp, ctx, "did:dht:z6MkAlice", "msg", "spending.jwt")
 
         native.context_send.assert_called_once_with(
             ctx._raw_handle, "did:dht:z6MkAlice", "msg", "spending.jwt"
@@ -597,7 +597,7 @@ class TestScpContextReceive:
         scp = _make_scp(native)
         ctx = _make_context()
 
-        receiver = await SCP.context_receive(scp, ctx._raw_handle)
+        receiver = await SCP.context_receive(scp, ctx)
         assert receiver is fake_receiver
 
 
@@ -632,8 +632,8 @@ class TestEconomicPolicyRoundtrip:
             '"payment_adapters":[],"pricing_formula":null,'
             '"payee":"did:dht:z6MkPayee"}'
         )
-        await SCP.set_economic_policy(scp, ctx._raw_handle, ep_json)
-        result = await SCP.get_economic_policy(scp, ctx._raw_handle)
+        await SCP.set_economic_policy(scp, ctx, ep_json)
+        result = await SCP.get_economic_policy(scp, ctx)
 
         assert result == ep_json
 
@@ -646,7 +646,7 @@ class TestEconomicPolicyRoundtrip:
         scp = _make_scp(native)
         ctx = _make_context()
 
-        result = await SCP.get_economic_policy(scp, ctx._raw_handle)
+        result = await SCP.get_economic_policy(scp, ctx)
         assert result is None
 
 

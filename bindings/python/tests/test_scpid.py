@@ -195,7 +195,7 @@ class TestScpIdVerify:
         _run(scp.scpid_verify(response.to_json(), challenge.to_json()))
 
         # Rotate the active signing key (DID string is unchanged).
-        rotated = _run(scp.identity_rotate_key(identity._raw_handle))
+        rotated = _run(scp.identity_rotate_key(identity))
         assert rotated.did == identity.did
 
         # A fresh challenge signed with the NEW active key must verify, which

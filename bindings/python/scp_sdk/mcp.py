@@ -134,8 +134,8 @@ class McpServer:
     """Opaque handle to a running MCP server.
 
     Construct via :meth:`scp_sdk.SCP.mcp_serve`. All lifecycle operations
-    (``stop``, ``wait``, ``info``) live on :class:`scp_sdk.SCP` — pass
-    ``server._raw_handle`` to invoke them.
+    (``stop``, ``wait``, ``info``) live on :class:`scp_sdk.SCP` and take
+    the ``McpServer`` object itself.
     """
 
     __slots__ = ("_raw_handle",)
@@ -150,7 +150,7 @@ class McpClient:
     Construct via :meth:`scp_sdk.SCP.mcp_client_connect_stdio` or
     :meth:`scp_sdk.SCP.mcp_client_connect_sse`. All operations
     (``list_tools``, ``invoke``, ``disconnect``, ``info``) live on
-    :class:`scp_sdk.SCP` — pass ``client._raw_handle`` to invoke them.
+    :class:`scp_sdk.SCP` and take the ``McpClient`` object itself.
     """
 
     __slots__ = ("_raw_handle",)

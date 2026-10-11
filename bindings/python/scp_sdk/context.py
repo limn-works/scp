@@ -11,7 +11,7 @@ Typical call-sites shape::
     with SCP(storage={"type": "in_memory"}) as scp:
         identity = await scp.identity_create("in_memory")
         ctx = await scp.context_create(identity.did, {"ceiling": ["core:send_message"]})
-        await scp.context_send(ctx._raw_handle, identity.did, b"hello")
+        await scp.context_send(ctx, identity.did, b"hello")
 
 Data classes (:class:`AssetEntry`, :class:`BatchPublishResult`,
 :class:`Membership`, :class:`PublishResult`, :class:`SiteConfig`) and
@@ -510,8 +510,7 @@ class Context:
     Pure handle wrapper. The underlying ``PyContextHandle`` is produced by
     :meth:`scp_sdk.SCP.context_create` (and related factory methods). All
     lifecycle, messaging, outlet, broadcast, and governance operations now
-    live on :class:`scp_sdk.SCP` — pass ``ctx._raw_handle`` into the
-    per-op methods.
+    live on :class:`scp_sdk.SCP` and take the ``Context`` object itself.
 
     Attributes:
         context_id: Unique identifier for this context.

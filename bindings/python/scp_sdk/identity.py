@@ -14,7 +14,7 @@ Call sites shape::
     with SCP(storage={"type": "in_memory"}) as scp:
         identity = await scp.identity_create(CustodyType.IN_MEMORY)
         # identity is an Identity wrapper — use identity.did / identity.custody_type
-        rotated = await scp.identity_rotate_key(identity._raw_handle)
+        rotated = await scp.identity_rotate_key(identity)
 
 :class:`DIDDocument`, :class:`IdentityAttestation`, and
 :class:`RevocationStatus` are pure data classes; they hold no SCP
@@ -103,8 +103,8 @@ class Identity:
 
     All mutating/effectful operations (``rotate_key``, ``add_agent_key``,
     ``attest_device``, ``execute_recovery``, attestation lifecycle, etc.)
-    live as methods on :class:`scp_sdk.SCP`. Pass ``identity._raw_handle``
-    when the SCP-level method needs the opaque bridge handle.
+    live as methods on :class:`scp_sdk.SCP`, which take the ``Identity``
+    object itself.
 
     The ``rotation_event_json`` attribute is populated only on handles
     produced by :meth:`scp_sdk.SCP.identity_migrate` (spec §9.12,

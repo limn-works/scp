@@ -1134,7 +1134,7 @@ class TestScpGovernanceWrappers:
         from scp_sdk.scp import SCP
 
         got = await SCP.governance_execute(
-            self._scp("governance_execute", "MemberSuspended"), "ctx", "ab"
+            self._scp("governance_execute", "MemberSuspended"), scp_sdk.Context(object()), "ab"
         )
         assert got is GovernanceActionResult.MEMBER_SUSPENDED
 
@@ -1146,7 +1146,7 @@ class TestScpGovernanceWrappers:
 
         with pytest.raises(UnknownGovernanceOutcomeError) as excinfo:
             await SCP.governance_execute(
-                self._scp("governance_execute", "SomethingNew"), "ctx", "ab"
+                self._scp("governance_execute", "SomethingNew"), scp_sdk.Context(object()), "ab"
             )
         assert excinfo.value.code == "SCP-GOV-11040"
 
@@ -1175,9 +1175,12 @@ class TestScpGovernanceWrappers:
         ok = json.dumps({"status": "Pending"})
         for method, call, raw in cases:
             with pytest.raises(UnknownGovernanceOutcomeError) as excinfo:
-                await call(self._scp(method, raw), "ctx", "did:dht:zA", "ab")
+                await call(self._scp(method, raw), scp_sdk.Context(object()), "did:dht:zA", "ab")
             assert excinfo.value.code == "SCP-GOV-11040", method
-            assert await call(self._scp(method, ok), "ctx", "did:dht:zA", "ab") == ok
+            assert (
+                await call(self._scp(method, ok), scp_sdk.Context(object()), "did:dht:zA", "ab")
+                == ok
+            )
 
 
 # The six names ``RESERVED_ROLE_NAMES`` in
@@ -1239,7 +1242,7 @@ class TestMemberRoleFromBridge:
 
         scp = MagicMock()
         scp._native.context_member_role = MagicMock(return_value=raw)
-        got = await SCP.context_member_role(scp, "ctx", "did:dht:zA")
+        got = await SCP.context_member_role(scp, scp_sdk.Context(object()), "did:dht:zA")
         if expected is None:
             assert got == CustomRole(name=raw)
         else:
@@ -1252,7 +1255,7 @@ class TestMemberRoleFromBridge:
 
         scp = MagicMock()
         scp._native.context_member_role = MagicMock(return_value=None)
-        assert await SCP.context_member_role(scp, "ctx", "did:dht:zA") is None
+        assert await SCP.context_member_role(scp, scp_sdk.Context(object()), "did:dht:zA") is None
 
     async def test_scp_context_member_role_raises_gov_11040_for_a_malformed_name(self) -> None:
         from unittest.mock import MagicMock
@@ -1263,5 +1266,5 @@ class TestMemberRoleFromBridge:
         scp = MagicMock()
         scp._native.context_member_role = MagicMock(return_value="Admin")
         with pytest.raises(UnknownGovernanceOutcomeError) as excinfo:
-            await SCP.context_member_role(scp, "ctx", "did:dht:zA")
+            await SCP.context_member_role(scp, scp_sdk.Context(object()), "did:dht:zA")
         assert excinfo.value.code == "SCP-GOV-11040"

@@ -33,7 +33,7 @@ try:
 except Exception as _exc:
     pytest.skip(skip_reason_if_extension_absent(_exc), allow_module_level=True)
 
-from scp_sdk import SCP
+from scp_sdk import SCP, Context
 from scp_sdk.errors import ValidationError
 from scp_sdk.types import CustodyType
 
@@ -186,17 +186,17 @@ class TestIdentity:
         identity = await scp.identity_create(CustodyType.IN_MEMORY)
         assert not identity._raw_handle.has_agent_key
 
-        with_agent = await scp.identity_add_agent_key(identity._raw_handle)
+        with_agent = await scp.identity_add_agent_key(identity)
         assert with_agent._raw_handle.has_agent_key
         pk1 = with_agent._raw_handle.get_agent_public_key()
         assert pk1 is not None
 
-        rotated = await scp.identity_rotate_agent_key(with_agent._raw_handle)
+        rotated = await scp.identity_rotate_agent_key(with_agent)
         assert rotated._raw_handle.has_agent_key
         pk2 = rotated._raw_handle.get_agent_public_key()
         assert pk2 != pk1
 
-        removed = await scp.identity_remove_agent_key(rotated._raw_handle)
+        removed = await scp.identity_remove_agent_key(rotated)
         assert not removed._raw_handle.has_agent_key
 
     async def test_remove_existing_identity(self, scp: SCP):
@@ -309,7 +309,7 @@ class TestIdentity:
 
         identity = await scp.identity_create(CustodyType.IN_MEMORY)
         try:
-            new_identity = await scp.identity_migrate(identity._raw_handle)
+            new_identity = await scp.identity_migrate(identity)
             # Migration succeeded — new identity should have a different DID
             assert new_identity.did != identity.did
             assert new_identity.did.startswith("did:dht:")
@@ -1253,9 +1253,9 @@ class TestBroadcastKeyDistribution:
     P256_G_SECRET = (1).to_bytes(32, "big")
 
     @staticmethod
-    def _broadcast_handle(scp: SCP, author_did: str):
+    def _broadcast_handle(scp: SCP, author_did: str) -> Context:
         """Create an active broadcast context whose creator is the sole author."""
-        return scp._native.context_create(
+        raw = scp._native.context_create(
             author_did,
             {
                 "ceiling": ["messages:read"],
@@ -1263,6 +1263,8 @@ class TestBroadcastKeyDistribution:
                 "mode": "broadcast",
             },
         )
+        assert raw.mode == "broadcast"
+        return Context(raw, identity_did=author_did, scp=scp)
 
     async def test_key_request_denies_unregistered_requester(self, scp: SCP):
         """§5.14.8: an author returns no key material to a requester that never
@@ -1272,7 +1274,6 @@ class TestBroadcastKeyDistribution:
         author = await scp.identity_create(CustodyType.IN_MEMORY)
         stranger = await scp.identity_create(CustodyType.IN_MEMORY)
         handle = self._broadcast_handle(scp, author.did)
-        assert handle.mode == "broadcast"
 
         decision = await scp.broadcast_handle_key_request(
             handle,

@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from scp_sdk import SCP, discovery
+from scp_sdk import SCP, Identity, discovery
 from scp_sdk.errors import ScpError
 
 
@@ -81,7 +81,7 @@ async def test_identity_migrate_propagates_scperror() -> None:
     )
 
     with pytest.raises(ScpError, match="custody migration failed"):
-        await scp.identity_migrate(MagicMock())
+        await scp.identity_migrate(Identity(MagicMock()))
 
 
 @pytest.mark.asyncio
