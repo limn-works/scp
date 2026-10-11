@@ -1,6 +1,6 @@
 # SCP Chat Template
 
-Two-party encrypted chat over the Shared Context Protocol. Provides a Python CLI client that uses real SCP SDK APIs: DID identity creation, encrypted context creation, the invite-and-join handshake, and async message send/receive over a relay.
+Two-party encrypted chat over the Shared Context Protocol. Provides a Python CLI client that uses real SCP SDK APIs: DID identity creation, encrypted context creation, the invite-and-join handshake, and async message send/receive over a relay. The message exchange does not complete yet; see [What runs today](#what-runs-today).
 
 A browser chat client is not included yet. In-browser SCP is a real in-tab participant — the full MLS protocol runs in the tab with keys on-device (ADR-057, which amends ADR-055's earlier remote-thin-client model), not a remote thin client to a server-side `scp-node`. A functional two-party browser chat template (`templates/chat/typescript/`) is forthcoming under #2187, once relay-mediated invitation-join is available in the wasm tier. In the meantime, `scaffolds/typescript-web/` demonstrates the single-tab in-browser client over `@limn-works/scp-ts-wasm` today.
 
@@ -19,7 +19,7 @@ Messages are end-to-end encrypted via MLS. The relay is an untrusted transport p
 
 ## What runs today
 
-The Python SDK does not yet subscribe a context to the relay, so a Python node never receives what its peer sends, including the routing announcement a send waits for (#2856). Until that lands, sends keep failing with `SCP-CTX-2095` and the receive stream stays empty. The template is written against the calls that fix will make work.
+The Python SDK does not yet subscribe a context to the relay, so a Python node never receives what its peer sends, including the routing announcement a send waits for (#2856). Until that lands, sends keep failing with `SCP-CTX-2095` and the receive stream stays empty.
 
 ## Python CLI
 

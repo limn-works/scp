@@ -62,6 +62,21 @@ if ! command -v bun >/dev/null 2>&1; then
 fi
 [[ $fail -eq 0 ]] || exit 1
 
+# An outlet capability names its stem in a hand-written string only by mistake: a
+# Query outlet takes `outlet:query:` and an Action outlet `outlet:call:` (spec 05
+# §5.4.2), and the SDK helpers (`Capability.outlet_query` / `outletQuery` and the
+# `*_ALL` constants) name the stem for the caller. No code site under these
+# directories, in any SDK language, spells either stem as a literal.
+literal_stems="$(git grep -nE "[\"'\`]outlet:(call|query):" -- 'docs/examples/*.py' \
+    'docs/examples/*.ts' 'docs/examples/*.swift' 'docs/examples/*.kt' 'scaffolds/*.py' \
+    'scaffolds/*.ts' 'scaffolds/*.swift' 'scaffolds/*.kt' 'templates/*.py' 'templates/*.ts' \
+    'templates/*.swift' 'templates/*.kt' || true)"
+if [[ -n $literal_stems ]]; then
+    printf '%s\n' "$literal_stems" >&2
+    echo "check-examples-typecheck: FAIL: the site(s) above spell an outlet capability stem by hand; call the SDK helper for the outlet's kind" >&2
+    exit 1
+fi
+
 echo "check-examples-typecheck: mypy over ${#py_files[@]} Python site(s)"
 if ! MYPYPATH="$ROOT/bindings/python" "$PY" -m mypy --config-file "$CONF_DIR/mypy.ini" \
     --no-incremental "${py_files[@]}"; then

@@ -27,6 +27,7 @@ import uniffi.scp.KeyCustodyProvider
 import uniffi.scp.MemoryScope
 import uniffi.scp.OutletDefinition
 import uniffi.scp.OutletKind
+import works.limn.scp.Capability
 import works.limn.scp.SCP
 import java.io.File
 
@@ -41,11 +42,11 @@ fun toolsExample(
     val operator = scp.identityCreateWithCustody(provider)
     println("Operator DID: ${operator.did()}")
 
-    // 2. Create a context whose ceiling allows registering and calling outlets.
+    // 2. Create a context whose ceiling allows registering and invoking Query outlets.
     val params =
         ContextParams(
             mode = ContextMode.ENCRYPTED,
-            ceiling = listOf("messages:read", "outlet:register", "outlet:call:*"),
+            ceiling = listOf(Capability.MESSAGES_READ, Capability.OUTLET_REGISTER, Capability.OUTLET_QUERY_ALL),
             ceilingPolicy = CeilingPolicy.IMMUTABLE,
             governance = GovernanceModel.SINGLE_ADMIN,
             memoryScope = MemoryScope.EPHEMERAL,
@@ -109,12 +110,12 @@ fun toolsExample(
     println("  Verification passed: ${verification.passed}")
     verification.failures.forEach { println("    - $it") }
 
-    // 6. Mint a UCAN token that authorizes calling this one outlet.
+    // 6. Mint a UCAN token that authorizes invoking this one Query outlet.
     val token =
         scp.ucanMint(
             handle = handle,
             memberDid = operator.did(),
-            capabilities = listOf("outlet:call:$outletId"),
+            capabilities = listOf(Capability.outletQuery(outletId)),
             proofs = null,
         )
     println("\nUCAN minted: ${token.tokenId()}")

@@ -3,6 +3,10 @@
 One side creates an encrypted context and invites the other; both then
 exchange messages via stdin/stdout over a shared relay.
 
+The exchange does not complete yet: the Python SDK does not subscribe a
+context to the relay, so every send fails with SCP-CTX-2095 and no message
+arrives.
+
 The invitation crosses between the two terminals by copy and paste: the
 joiner prints its DID and a single-use KeyPackage, the creator pastes that
 line and prints a sealed invitation, and the joiner pastes the invitation.

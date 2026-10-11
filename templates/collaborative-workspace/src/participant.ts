@@ -6,6 +6,7 @@
  */
 
 import {
+  Capabilities,
   type BuiltInRole,
   type Context,
   type Identity,
@@ -50,26 +51,26 @@ export type WorkspaceRole = Extract<BuiltInRole, "Admin" | "Moderator" | "Member
  */
 const ROLE_CAPABILITIES: Readonly<Record<WorkspaceRole, readonly string[]>> = {
   Admin: [
-    "messages:read",
-    "messages:write",
-    "role:assign",
-    "member:invite",
-    "member:remove",
-    "outlet:register",
-    "outlet:query:*",
-    "governance:propose",
-    "governance:vote",
+    Capabilities.MESSAGES_READ,
+    Capabilities.MESSAGES_WRITE,
+    Capabilities.ROLE_ASSIGN,
+    Capabilities.MEMBER_INVITE,
+    Capabilities.MEMBER_REMOVE,
+    Capabilities.OUTLET_REGISTER,
+    Capabilities.OUTLET_QUERY_ALL,
+    Capabilities.GOVERNANCE_PROPOSE,
+    Capabilities.GOVERNANCE_VOTE,
   ],
   Moderator: [
-    "messages:read",
-    "messages:write",
-    "member:invite",
-    "outlet:query:*",
-    "governance:propose",
-    "governance:vote",
+    Capabilities.MESSAGES_READ,
+    Capabilities.MESSAGES_WRITE,
+    Capabilities.MEMBER_INVITE,
+    Capabilities.OUTLET_QUERY_ALL,
+    Capabilities.GOVERNANCE_PROPOSE,
+    Capabilities.GOVERNANCE_VOTE,
   ],
-  Member: ["messages:read", "messages:write", "outlet:query:*"],
-  Observer: ["messages:read"],
+  Member: [Capabilities.MESSAGES_READ, Capabilities.MESSAGES_WRITE, Capabilities.OUTLET_QUERY_ALL],
+  Observer: [Capabilities.MESSAGES_READ],
 };
 
 /** Returns the token capability set for a workspace role. */

@@ -51,14 +51,14 @@ async def main() -> None:
         operator = await scp.identity_create(CustodyType.FILE)
         print(f"Operator DID: {operator.did}")
 
-        # 2. Create a context whose ceiling allows registering and calling outlets.
+        # 2. Create a context whose ceiling allows registering and invoking Query outlets.
         ctx = await scp.context_create(
             operator.did,
             {
                 "ceiling": [
                     Capability.MESSAGES_READ.value,
                     Capability.OUTLET_REGISTER.value,
-                    Capability.OUTLET_CALL_ALL.value,
+                    Capability.OUTLET_QUERY_ALL.value,
                 ],
                 "memory_scope": MemoryScope.EPHEMERAL.value,
                 "governance": "single_admin",
@@ -108,11 +108,11 @@ async def main() -> None:
         verification = await scp.outlet_verify(ctx.context_id, outlet_id)
         print(f"  Verification passed: {verification.passed}")
 
-        # 6. Mint a UCAN token that authorizes calling this one outlet.
+        # 6. Mint a UCAN token that authorizes invoking this one Query outlet.
         token = await scp.ucan_mint(
             ctx.context_id,
             operator.did,
-            [f"outlet:call:{outlet_id}"],
+            [Capability.outlet_query(outlet_id)],
         )
         print(f"\nUCAN minted: {token.token_id}")
         print(f"  Capabilities: {token.capabilities}")

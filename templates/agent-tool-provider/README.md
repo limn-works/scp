@@ -26,10 +26,10 @@ python agent.py --mcp                 # also start an MCP server (stdio)
 Every call is a method on one `SCP` instance, which the `async with` block shuts down on exit.
 
 1. **Identity creation** -- `identity_create(CustodyType.FILE)` creates a `did:dht` identity whose keys live in `$HOME/.scp/keys.bin`, sealed under `SCP_KEY_PASSPHRASE`. `CustodyType.IN_MEMORY` works only in a build compiled with the `testing` feature; a shipped build rejects it with `SCP-IDENT-1008`.
-2. **Context creation** -- `context_create` opens an encrypted context with `outlet:register` and `outlet:call:*` in the ceiling.
+2. **Context creation** -- `context_create` opens an encrypted context with `outlet:register` and `outlet:query:*` in the ceiling.
 3. **Outlet registration** -- `outlet_register` registers two outlets (`calculator`, `search`) with JSON Schema input and output definitions and test vectors, and returns each outlet's id.
 4. **Handler attachment** -- `mcp_register_outlet_handler(context_id, outlet_id, handler)` attaches a Python callable to each outlet. When the outlet is invoked, the handler receives the validated JSON input as a dict and returns a dict.
-5. **UCAN minting** -- `ucan_mint` mints a UCAN token carrying `outlet:call:<outlet id>` for both outlets. Every outlet invocation requires a valid UCAN.
+5. **UCAN minting** -- `ucan_mint` mints a UCAN token carrying `outlet:query:<outlet id>` for both outlets, which are Query outlets. Every outlet invocation requires a valid UCAN.
 6. **Invocation** -- `outlet_invoke(context_id, outlet_id, input, identity_did, ucan_token)` validates the UCAN, checks the input against the outlet's JSON Schema, runs the handler, and returns the result.
 7. **MCP serving** (optional) -- `mcp_serve(identity_did, [context_id], "stdio", ucan_token)` exposes the context's outlets to an MCP client over stdin and stdout, and `mcp_server_wait` returns when the client closes stdin.
 
@@ -98,7 +98,7 @@ The handler receives the validated input dict and must return a dict matching th
 Outlets are invoked through the instance with UCAN authorization:
 
 ```python
-token = await scp.ucan_mint(ctx.context_id, identity.did, [f"outlet:call:{outlet_id}"])
+token = await scp.ucan_mint(ctx.context_id, identity.did, [Capability.outlet_query(outlet_id)])
 
 result = await scp.outlet_invoke(
     ctx.context_id, outlet_id, {"param": "hello"}, identity.did, token.encoded
@@ -143,7 +143,7 @@ The stdio transport reads line-delimited JSON on stdin and writes it on stdout, 
 
 ### Capability Filtering
 
-The MCP server only exposes outlets that the agent's role permits. If the agent lacks `outlet:call:*`, only outlets matching specific `outlet:call:<outlet id>` capabilities are listed.
+The MCP server only exposes outlets that the agent's role permits.
 
 ### Provenance
 
@@ -172,7 +172,7 @@ A command outside the instance's stdio allowlist is rejected; `mcp_configure_std
 1. Define an `OutletDefinition` with JSON Schema for input and output.
 2. Register it with `outlet_register` and keep the returned outlet id.
 3. Write a handler function `(dict) -> dict` and attach it with `mcp_register_outlet_handler(context_id, outlet_id, handler)`.
-4. Mint a UCAN token with the `outlet:call:<outlet id>` capability.
+4. Mint a UCAN token with `Capability.outlet_query(outlet_id)` for a Query outlet, or `Capability.outlet_call(outlet_id)` for an Action outlet.
 5. Invoke it with `outlet_invoke` or expose it via MCP with `mcp_serve`.
 
 Test vectors are optional but recommended -- they document expected behavior, and `outlet_verify` checks the outlet against them.

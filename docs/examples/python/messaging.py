@@ -4,6 +4,10 @@ Demonstrates two nodes that each attach a relay transport, a context
 that Alice creates and Bob joins, a message that Alice sends, and the
 receive iterator on Bob's side.
 
+The exchange does not complete yet: the Python SDK does not subscribe a
+context to the relay, so Alice's send fails with SCP-CTX-2095 and Bob's
+receive iterator yields nothing.
+
 The creator and the joiner each run their own ``SCP`` instance with its
 own database, as two devices would. Both instances read the same key file,
 because this script runs both in one process.

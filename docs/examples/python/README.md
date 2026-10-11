@@ -58,14 +58,13 @@ SCP_RELAY_URL=wss://relay.example.com python messaging.py
 |------|-------------|
 | `identity.py` | Create identity, resolve DID, inspect document, agent key management |
 | `context.py` | Create a context, reserve a KeyPackage, invite a member, join from the sealed invitation |
-| `messaging.py` | Two nodes on one relay: invite, join, send a message, receive it, leave |
+| `messaging.py` | Two nodes on one relay: invite, join, send, receive, leave. The send does not complete yet; see below |
 | `tools.py` | Define an outlet with JSON schemas and test vectors, register it, verify it, mint a UCAN |
 
 `messaging.py` needs a relay both nodes reach, named in `SCP_RELAY_URL`. The
 Python SDK does not yet subscribe a context to the relay, so the receiving node
 never gets the routing announcement the send waits for, and the send keeps
-failing with `SCP-CTX-2095` (#2856). The example is written against the calls
-that fix makes work.
+failing with `SCP-CTX-2095` (#2856).
 
 ## Key Patterns
 
@@ -78,8 +77,9 @@ that fix makes work.
   your own store, pass a `KeyCustodyProvider` to `identity_create_with_custody`.
 - **Enum types**: use `CustodyType`, `Capability`, `MemoryScope` and `OutletKind`
   in place of raw strings.
-- **UCAN authorization**: calling an outlet requires a UCAN token that grants
-  `outlet:call:<outlet id>`.
+- **UCAN authorization**: invoking a Query outlet requires a UCAN token that
+  grants `outlet:query:<outlet id>` (`Capability.outlet_query`); an Action
+  outlet requires `outlet:call:<outlet id>` (`Capability.outlet_call`).
 
 ## SDK Reference
 

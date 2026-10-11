@@ -29,13 +29,13 @@ enum ToolsExample {
         let operatorIdentity = try await scp.identityCreateWithCustody(provider: provider)
         print("Operator DID: \(operatorIdentity.did())")
 
-        // 2. Create a context whose ceiling allows registering and calling outlets.
+        // 2. Create a context whose ceiling allows registering and invoking Query outlets.
         let params = ContextParams(
             mode: .encrypted,
             ceiling: [
-                "messages:read",
-                "outlet:register",
-                "outlet:call:*",
+                Capability.Name.messagesRead,
+                Capability.Name.outletRegister,
+                Capability.Name.outletQueryAll,
             ],
             ceilingPolicy: .immutable,
             governance: .singleAdmin,
@@ -98,11 +98,11 @@ enum ToolsExample {
             print("    - \(failure)")
         }
 
-        // 6. Mint a UCAN token that authorizes calling this one outlet.
+        // 6. Mint a UCAN token that authorizes invoking this one Query outlet.
         let token = try await scp.ucanMint(
             handle: handle,
             memberDid: operatorIdentity.did(),
-            capabilities: ["outlet:call:\(outletId)"],
+            capabilities: [Capability.outletQuery(outletId)],
             proofs: nil
         )
         print("\nUCAN minted: \(token.tokenId())")

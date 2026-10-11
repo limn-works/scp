@@ -4,7 +4,7 @@ Demonstrates the outlet lifecycle:
   1. Create an identity and a context with outlet capabilities.
   2. Register outlet definitions (calculator, search) with JSON schemas.
   3. Attach Python handler functions to the registered outlets.
-  4. Mint a UCAN token that authorizes calling both outlets.
+  4. Mint a UCAN token that authorizes invoking both Query outlets.
   5. Invoke the outlets programmatically within the context.
   6. Optionally serve the context's outlets to an MCP client over stdio.
 
@@ -283,7 +283,7 @@ async def run_agent(*, enable_mcp: bool = False) -> None:
             {
                 "ceiling": [
                     Capability.OUTLET_REGISTER.value,
-                    Capability.OUTLET_CALL_ALL.value,
+                    Capability.OUTLET_QUERY_ALL.value,
                     Capability.MESSAGES_READ.value,
                     Capability.MESSAGES_WRITE.value,
                 ],
@@ -312,11 +312,14 @@ async def run_agent(*, enable_mcp: bool = False) -> None:
         await scp.mcp_register_outlet_handler(ctx.context_id, search_id, handle_search)
         logger.info("Outlet handlers attached")
 
-        # 5. Mint a UCAN token that authorizes calling these two outlets.
+        # 5. Mint a UCAN token that authorizes invoking these two Query outlets.
         token = await scp.ucan_mint(
             ctx.context_id,
             identity.did,
-            [f"outlet:call:{calculator_id}", f"outlet:call:{search_id}"],
+            [
+                Capability.outlet_query(calculator_id),
+                Capability.outlet_query(search_id),
+            ],
         )
         logger.info("Minted UCAN token: %s", token.token_id)
 
