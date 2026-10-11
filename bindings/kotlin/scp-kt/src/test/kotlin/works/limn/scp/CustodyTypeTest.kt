@@ -16,20 +16,29 @@ import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import uniffi.scp.ScpException
 import uniffi.scp.StorageConfig
 import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.conformance.ConformanceStubBindings
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
-import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
 
 /**
- * The custody strings `parse_custody_method` in
- * `crates/scp-ffi/uniffi/src/bridge.rs` builds a key store for. Listed as
- * literals so the test reads the bridge's accepted set, not the enum under test.
+ * The quoted custody strings a bridge custody rejection names after
+ * "this bridge accepts " and before the next ";" (`ACCEPTED_CUSTODY` in
+ * `crates/scp-ffi/uniffi/src/bridge.rs`), or null when the message carries no
+ * such clause.
  */
-private val BRIDGE_ACCEPTED_CUSTODY_STRINGS = listOf("in_memory")
+internal fun acceptedCustodyStrings(rejection: String): List<String>? {
+    if (!rejection.contains("this bridge accepts ")) return null
+    val clause = rejection.substringAfter("this bridge accepts ").substringBefore(";")
+    val quoted = Regex("\"([^\"]*)\"").findAll(clause).map { it.groupValues[1] }.toList()
+    return quoted.ifEmpty { null }
+}
 
 class CustodyTypeTest {
     private lateinit var scp: SCP
@@ -54,9 +63,30 @@ class CustodyTypeTest {
         runBlocking { scp.shutdown(bridge, 5.seconds) }
     }
 
+    /** Reads the accepted set from the bridge's own `SCP-IDENT-1003` rejection of "platform". */
     @Test
     fun `entries are exactly the custody strings the bridge accepts`() {
-        assertEquals(BRIDGE_ACCEPTED_CUSTODY_STRINGS, CustodyType.entries.map { it.rawValue })
+        val rejection =
+            assertFailsWith<ScpException.Identity> {
+                runBlocking { scp.inner.identityCreate(custody = "platform", testingSeed = null) }
+            }
+        assertEquals("SCP-IDENT-1003", rejection.code)
+        val accepted = assertNotNull(acceptedCustodyStrings(rejection.msg), rejection.msg)
+        assertEquals(accepted, CustodyType.entries.map { it.rawValue })
+    }
+
+    @Test
+    fun `acceptedCustodyStrings parses every quoted string in the clause`() {
+        val message =
+            "custody type \"x\" names no key store — this bridge accepts " +
+                "\"in_memory\" or \"file\" only here; inject \"callback\""
+        assertEquals(listOf("in_memory", "file"), acceptedCustodyStrings(message))
+    }
+
+    @Test
+    fun `acceptedCustodyStrings is null without the clause`() {
+        assertNull(acceptedCustodyStrings("custody type \"platform\" is refused"))
+        assertNull(acceptedCustodyStrings("this bridge accepts nothing; done"))
     }
 
     @Test
@@ -72,7 +102,7 @@ class CustodyTypeTest {
         runBlocking {
             for (custody in CustodyType.entries) {
                 val identity = scp.identityCreate(custody = custody)
-                assertTrue(identity.did().startsWith("did:"), "$custody created no DID")
+                assertFalse(identity.verifyingKey().isNullOrEmpty(), "$custody holds no key")
             }
         }
     }
@@ -82,7 +112,7 @@ class CustodyTypeTest {
         runBlocking {
             for (custody in CustodyType.entries) {
                 val identity = scp.identityCreateWithAgentKey(custody = custody)
-                assertTrue(identity.did().startsWith("did:"), "$custody created no DID")
+                assertFalse(identity.verifyingKey().isNullOrEmpty(), "$custody holds no key")
             }
         }
     }
