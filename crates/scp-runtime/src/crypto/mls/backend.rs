@@ -11,7 +11,8 @@
 //! The split strictly preserves RFC 9420 conformance: every method maps to a
 //! single `OpenMLS` primitive with no SCP orchestration in between. The SCP
 //! ciphersuite is fixed to
-//! [`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`](scp_mls::group::SCP_CIPHERSUITE).
+//! [`MLS_128_DHKEMP256_AES128GCM_SHA256_P256`](scp_mls::group::SCP_CIPHERSUITE)
+//! (ciphersuite 2, §9.5).
 //!
 //! # Method contracts
 //!
@@ -186,7 +187,8 @@ impl std::fmt::Debug for SignerState {
 pub trait MlsBackend: Send + Sync {
     /// Creates a new MLS group with the caller as the sole member.
     ///
-    /// Wraps [`scp_mls::group::create_group_with_wrapping_key`] exactly.
+    /// Wraps [`scp_mls::group::create_group`] exactly: the creator's leaf
+    /// publishes `wrapping_pubkey` as its `0xFF01` (spec 09 §9.16.1).
     ///
     /// # Errors
     ///
@@ -195,7 +197,7 @@ pub trait MlsBackend: Send + Sync {
     async fn create_group(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: &[u8; 65],
     ) -> Result<ScpMlsGroup, MlsError>;
 
     /// Adds a member to `group` by their TLS-serialized `KeyPackage` bytes
@@ -255,8 +257,9 @@ pub trait MlsBackend: Send + Sync {
     ) -> Result<DecryptedContent, MlsError>;
 
     /// Advances the group epoch via a self-update Commit that republishes
-    /// the caller's `LeafNode` with `wrapping_pubkey` (§9.16.1). Returns the
-    /// TLS-serialized Commit bytes.
+    /// the caller's `LeafNode` with `wrapping_pubkey` (§9.16.1), the 65-byte
+    /// DHKEM(P-256) point the extension carries. Returns the TLS-serialized
+    /// Commit bytes.
     ///
     /// # Errors
     ///
@@ -265,7 +268,7 @@ pub trait MlsBackend: Send + Sync {
     async fn advance_epoch(
         &self,
         group: &mut ScpMlsGroup,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: &[u8; 65],
     ) -> Result<Vec<u8>, MlsError>;
 
     /// Validates a TLS-serialized `KeyPackage` for joinability. Does not
@@ -294,8 +297,8 @@ pub trait MlsBackend: Send + Sync {
         clock: &dyn Clock,
     ) -> Result<ValidatedKeyPackage, MlsError>;
 
-    /// Generates a fresh `KeyPackage` for `credential`, optionally with an
-    /// `scp_wrapping_key` `LeafNode` extension. Returns the TLS-serialized KP
+    /// Generates a fresh `KeyPackage` for `credential` whose leaf carries
+    /// `wrapping_pubkey` as its `scp_wrapping_key` extension. Returns the TLS-serialized KP
     /// bytes plus an opaque signer-state handle the caller retains to later
     /// join a group from a Welcome addressed to this KP.
     ///
@@ -305,7 +308,7 @@ pub trait MlsBackend: Send + Sync {
     async fn generate_key_package(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: &[u8; 65],
     ) -> Result<GeneratedKeyPackage, MlsError>;
 
     /// Joins a group from a TLS-serialized MLS Welcome message using the

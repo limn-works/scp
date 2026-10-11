@@ -373,6 +373,28 @@ and are documented with their own features.
 
 **Cross-bridge note.** PyO3 surfaces the analogous failure as `SCP-IDENT-1001` (registry-based key resolution per ADR-048 §7 — a registered identity always retains custody, so the "registered-but-no-custody" condition cannot arise); NAPI's and UniFFI's UCAN **delegate** paths are registry-based for that same structural reason and surface `SCP-IDENT-1001` as well (see that table above). On all three bridges (PyO3, NAPI, and UniFFI → Swift / Kotlin / TS-via-NAPI), consumers that catch the `IdentityError` category are safe for the missing-custody condition; only code that switches on the exact code string must account for the per-bridge code splits described above.
 
+### Custody request
+
+`03-identity.md` §3.2.2 defines the custody request vocabulary: the two values, `encrypted_file` and `os_keystore`, that a caller passes to create an identity on the PyO3, napi-rs and UniFFI bridges. Each SDK's custody type carries those two members and no other, and an identity handle's custody accessor returns the value the identity was created with.
+
+**`encrypted_file` inputs.** The key file is `$HOME/.scp/keys.bin`, and the passphrase is the value of the environment variable `SCP_KEY_PASSPHRASE`. Every bridge resolves both through `scp_ffi_common::custody_file`, which reads the environment and touches no file, so the bridges read one path and return one code for each bad input. Every bridge returns these codes:
+
+| Condition | Code |
+|---|---|
+| `$HOME` is unset, empty, or a relative path | `SCP-VALID-7001` |
+| `SCP_KEY_PASSPHRASE` is unset, empty, or not valid UTF-8 | `SCP-VALID-7001` |
+| The bridge cannot create `$HOME/.scp`, or `FileKeyCustody` rejects the key file for a wrong passphrase, a version the build rejects, a failed integrity check or an I/O error | `SCP-IDENT-1008` |
+
+**Requests outside the vocabulary.** Every bridge checks `testing_seed` before it reads the request value, and returns these codes, which §3.2.2 states:
+
+| Request | Code |
+|---|---|
+| A `testing_seed` with any value other than `in_memory` | `SCP-VALID-7009` |
+| `os_keystore` with no `KeyCustodyProvider` | `SCP-IDENT-1003` |
+| A `KeyCustodyProvider` with any value other than `os_keystore` | `SCP-IDENT-1005` |
+| `in_memory` on a bridge built without the `testing` feature | `SCP-IDENT-1008` |
+| Any other string, including `platform`, `software`, `file` and `callback` | `SCP-VALID-7005` |
+
 ## Stub and Placeholder Policy
 
 Code that does not fully implement its documented contract (acceptance criterion, ADR spec, or trait method) is a **stub**. Stubs are tolerated during phased implementation but must be traceable to the planning system.

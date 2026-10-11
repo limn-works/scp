@@ -123,6 +123,33 @@ BAN_ENTRIES=(
     # prepare_key_package_for_join has zero live definitions in any form.
     "fn prepare_key_package_for_join|crates/scp-runtime|*.rs|ADR-049 2F-residual deleted the legacy prepare_key_package_for_join provider method; joiners reserve KeyPackages via the KeyPackageStoreActor reserve/confirm protocol"
     "pub fn join_from_welcome\\(|crates/scp-runtime|*.rs|ADR-049 2F-residual deleted the legacy synchronous NodeMlsFactory::join_from_welcome provider method; every join flows through the async MlsBackend::join_from_welcome fused-confirm primitive"
+    # A peer's MLS bytes are decoded only through `crates/scp-mls/src/wire.rs`,
+    # which runs tls_codec under `catch_unwind` because tls_codec
+    # `debug_assert!`s on a peer-controlled length header. wire.rs decodes
+    # through one generic `T::tls_deserialize`, so these type-named tokens
+    # match every other call site. The profile override that once hid the
+    # assertion covered only the root workspace; it must not return.
+    "MlsMessageIn::tls_deserialize|crates|*.rs|Decode peer MLS messages with scp_mls::wire::parse_mls_message_in (catch_unwind over tls_codec's debug assertion)"
+    "KeyPackageIn::tls_deserialize|crates|*.rs|Decode peer KeyPackages with scp_mls::wire::parse_key_package_in (catch_unwind over tls_codec's debug assertion)"
+    "Welcome::tls_deserialize|crates|*.rs|Decode Welcome bodies with scp_mls::wire::parse_welcome (catch_unwind over tls_codec's debug assertion)"
+    "profile\\.dev\\.package\\.tls_codec|.|Cargo.toml|The tls_codec debug-assertions override covered one workspace root only; scp_mls::wire handles the assertion in every build"
+    # Envelopes are sealed and opened only in the context actor
+    # (ContextCryptoState::seal / ContextCryptoState::open, then
+    # messaging_helpers::verify_and_unwrap, which binds the inner sender to the
+    # MLS sender before resolving a key). A free-standing seal or open function
+    # with a caller-supplied sender-layer AAD bypassed that binding.
+    "fn seal_envelope|crates|*.rs|Seal through the context actor (ContextCryptoState::seal); no free-standing envelope seal exists"
+    "fn open_envelope|crates|*.rs|Open through the context actor (ContextCryptoState::open + verify_and_unwrap); no free-standing envelope open exists"
+    "SenderLayerAad|crates|*.rs|The sender-layer AAD is built inside ContextCryptoState from the MLS-authenticated sender, never from caller input"
+    # HPKE is a direct call to scp_protocol::crypto::hpke::p256. The runtime's
+    # HpkeBackend trait had one implementation and no method callers.
+    "HpkeBackend|crates|*.rs|Call scp_protocol::crypto::hpke::p256 directly; the HPKE backend trait is deleted"
+    # A peer P-256 key on the wire is a P256Point, validated when it is
+    # decoded; byte-array serde helpers and a second point parser would let
+    # an unvalidated key reach a hash, a seal or a key agreement.
+    "serde_pubkey_65|crates|*.rs|Type the field as scp_protocol::crypto::hpke::p256::P256Point, which validates at decode"
+    "serde_wrapping_key_list_65|crates|*.rs|Type the list as Vec<(String, P256Point)>, which validates each key at decode"
+    "validate_uncompressed_point|crates|*.rs|Parse a wire point with P256Point::try_from (or validate_enc for an HPKE enc), the one P-256 wire-point parser"
     # #2148 (birth-into-actor): the six provider-dissolution symbols
     # (take_crypto_state / with_context / create_group_into_slot method defs, and
     # the contexts / taken_context_ids / broadcast_keys fields) are NOT banned
@@ -182,6 +209,7 @@ for entry in "${BAN_ENTRIES[@]}"; do
             --exclude-dir=target \
             --exclude-dir=.git \
             --exclude-dir=node_modules \
+            --exclude-dir=.claude \
             -- \
             "$token" \
             "$scope" 2>/dev/null || true

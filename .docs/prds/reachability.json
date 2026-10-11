@@ -686,7 +686,7 @@
         "phase": 3,
         "crate": "scp-core"
       },
-      "result": "DualLayerHealingPublisher trait + DualLayerResolver integration. When seq numbers diverge between relay and DHT, fresher document is asynchronously republished to stale layer via tokio::spawn. HealingPublisher trait enables mock injection. NoOpHealer for tests. Tests: seq_divergence_triggers_healing, healing_failure_logged_not_propagated."
+      "result": "DualLayerHealingPublisher trait + DualLayerResolver integration. When seq numbers diverge between relay and DHT, fresher document is asynchronously republished to stale layer via tokio::spawn. HealingPublisher trait enables mock injection. An uninhabited NoHealing is the default type parameter for a resolver without healing. Tests: seq_divergence_triggers_healing, healing_failure_logged_not_propagated."
     },
     {
       "id": "SCP-246",

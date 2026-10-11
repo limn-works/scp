@@ -87,7 +87,13 @@ impl PerContextState {
         // The creator is the sole initial member; record it in the wrapping-key
         // directory (the authoritative member set) with its own wrapping key.
         let creator_wrapping_key = state.crypto.wrapping_public;
-        state.add_member_record(creator_did, creator_wrapping_key);
+        state
+            .crypto
+            .member_wrapping_keys
+            .insert(creator_did.to_owned(), creator_wrapping_key);
+        state
+            .member_sequence_numbers
+            .insert(creator_did.to_owned(), 0);
         state
     }
 
@@ -133,17 +139,42 @@ impl PerContextState {
         self.local_pseudonym
     }
 
-    /// Records a member in the context's wrapping-key directory (the
+    /// Points the wrapping-key directory at the tree after a merged Commit
+    /// ([`scp_mls::MemberLeaves::wrapping_key_directory`]): every DID with a
+    /// leaf, at the key the tree publishes for it. Seeds the
+    /// outgoing-sequence counter of each DID in `added`.
+    pub fn follow_tree(&mut self, members: &scp_mls::MemberLeaves, added: &[&str]) {
+        self.crypto.member_wrapping_keys =
+            members.wrapping_key_directory(&self.crypto.member_wrapping_keys);
+        for did in added {
+            self.member_sequence_numbers
+                .entry((*did).to_owned())
+                .or_insert(0);
+        }
+    }
+
+    /// Admits a member into the context's wrapping-key directory (the
     /// authoritative member set — ADR-057 sender-key distribution INVARIANT 1)
     /// with the wrapping key a peer needs to HPKE-seal a sender key to it, and
-    /// seeds their outgoing-sequence counter. Re-recording updates the wrapping
-    /// key (e.g. a rotation) and leaves the sequence counter intact.
-    pub fn add_member_record(&mut self, member_did: &str, wrapping_key: [u8; 32]) {
+    /// seeds their outgoing-sequence counter. Re-admitting a member with its
+    /// recorded key (a second device) changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a key that differs from the member's recorded key and leaves
+    /// the recorded entry in place; see
+    /// [`ContextCryptoState::admit_member_wrapping_key`].
+    pub fn admit_member_record(
+        &mut self,
+        member_did: &str,
+        wrapping_key: scp_protocol::crypto::hpke::p256::P256Point,
+    ) -> Result<(), ClientError> {
         self.crypto
-            .record_member_wrapping_key(member_did, wrapping_key);
+            .admit_member_wrapping_key(member_did, wrapping_key)?;
         self.member_sequence_numbers
             .entry(member_did.to_owned())
             .or_insert(0);
+        Ok(())
     }
 
     /// Returns the member DIDs of this context, sorted (the wrapping-key directory

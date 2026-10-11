@@ -889,6 +889,28 @@ async fn full_stack_relay_encrypted_roundtrip() {
         received_outer.encrypted_blob.len()
     );
 
+    // 7b. The relay sees only the routing id, TTL and opaque blob: no DID, no
+    //     context id, no plaintext, and no decodable inner envelope.
+    let relayed_bytes = received_outer.to_bytes().unwrap();
+    for (needle, label) in [
+        (ALICE_DID.as_bytes(), "Alice's DID"),
+        (BOB_DID.as_bytes(), "Bob's DID"),
+        (ctx_id.as_bytes(), "the context id"),
+        (plaintext.as_slice(), "the plaintext"),
+    ] {
+        assert!(
+            !relayed_bytes.windows(needle.len()).any(|w| w == needle),
+            "the relayed envelope must not carry {label}"
+        );
+    }
+    assert!(
+        rmp_serde::from_slice::<scp_core::envelope::inner::InnerEnvelope>(
+            &received_outer.encrypted_blob
+        )
+        .is_err(),
+        "the relayed blob must not decode as an inner envelope"
+    );
+
     // 8. Bob decrypts using the original captured envelope (which is the
     //    full serialized OuterEnvelope from the send pipeline).
     //    The relay roundtrip above verified the encrypted_blob survived intact.

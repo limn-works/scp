@@ -1,16 +1,16 @@
 //! Lifecycle handlers — see
-//! [`LifecycleCommand`](crate::context::actor::commands::LifecycleCommand)
+//! [`LifecycleCommand`]
 //! and ADR-049 Phase 2A.9 (`lifecycle` domain migration).
 //!
 //! # Single dispatch entry point
 //!
-//! - [`dispatch`] — actor-shape entry point. Takes `(&mut state,
+//! - `dispatch` — actor-shape entry point. Takes `(&mut state,
 //!   &deps, cmd)` and routes to actor-shape helpers in
-//!   [`crate::context::lifecycle_helpers`] for per-context variants
+//!   `crate::context::lifecycle_helpers` for per-context variants
 //!   (Join / Leave / Close / Export), and to actor-shape helpers in
-//!   [`crate::context::queries_helpers`] for access-key variants
+//!   `crate::context::queries_helpers` for access-key variants
 //!   (Generate / Revoke / Restore). Used from the actor's
-//!   [`dispatch_state`](crate::context::actor::ContextActor::dispatch_state)
+//!   `dispatch_state`
 //!   loop.
 //!
 //! Bootstrap variants (`CreateContext`, `ImportContext`, `RestoreContext`)
@@ -18,7 +18,7 @@
 //! per-context actor that does not yet exist. They are handled by
 //! [`Supervisor::dispatch_lifecycle_direct`](crate::context::supervisor::supervisor::Supervisor)
 //! which delegates to the actor-shape bootstrap helpers in
-//! [`crate::context::lifecycle_helpers`]. If a bootstrap variant
+//! `crate::context::lifecycle_helpers`. If a bootstrap variant
 //! reaches this actor-shape dispatch (because an actor is already
 //! registered for the target context_id — a re-create attempt), the
 //! handler surfaces `ContextError::InvalidState` on the reply oneshot.
@@ -535,9 +535,9 @@ fn handle_flush_snapshot_actor<'d>(
     // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
     // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
     // durable-blob params. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the export now runs
-    // on the actor's `state` (was the provider); the X25519 wrapping keypair enters
-    // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
-    // sequence is read from `state.send_tracker` inside the twin.
+    // on the actor's `state` (was the provider), and the send sequence is read
+    // from `state.send_tracker` inside the twin. The blob carries no wrapping
+    // key: the identity's pair persists on its own (spec 09 §9.16.1).
     //
     // The floors come from the Supervisor. When it has dropped (ADR-049
     // Decision 16), no floor export exists, and persisting a snapshot with
@@ -566,13 +566,7 @@ fn handle_flush_snapshot_actor<'d>(
             return futures::future::Either::Left(std::future::ready(Outcome::ok(())));
         }
     };
-    let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
-    match state.export_crypto_state(
-        sender_epochs,
-        recv_floors,
-        wrapping_public_key,
-        &*wrapping_secret_key,
-    ) {
+    match state.export_crypto_state(sender_epochs, recv_floors) {
         Ok(crypto_state) => {
             snapshot.mls_crypto_state = crate::context::state::MlsCryptoState(crypto_state);
         }
@@ -775,13 +769,20 @@ async fn handle_issue_mls_update_actor(
     // provider-authoritative arch, where the provider ratcheted and the actor only
     // shadowed) is subsumed here: the actor `advance_epoch` ratchets the group but
     // does not itself bump the `mls_epoch` scalar, so the single authoritative bump
-    // now lives in the Class-S closure. `wrapping_public_key` comes from the
-    // retained `deps.crypto.wrapping_keypair()`.
-    let wrapping_public_key = deps.crypto.wrapping_keypair().0;
+    // now lives in the Class-S closure. The Update keeps publishing the
+    // identity's wrapping key (spec 09 §9.16.1); with none loaded it fails
+    // closed before anything ratchets.
+    let wrapping_public_key = match deps.supervisor.my_wrapping_keypair(&deps.owned_identity) {
+        Ok(pair) => *pair.public(),
+        Err(e) => {
+            let _ = reply.send(Err(e));
+            return Outcome::ok(());
+        }
+    };
     let result = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
             let s = v.rest_mut();
-            let out = s.advance_epoch(wrapping_public_key)?;
+            let out = s.advance_epoch(wrapping_public_key, deps.clock.as_ref())?;
             s.epoch.mls_epoch = s.epoch.mls_epoch.saturating_add(1);
             Ok(out.commit_bytes)
         })

@@ -80,7 +80,9 @@
 //!      pristine-replay `Ok`.
 
 use libfuzzer_sys::fuzz_target;
+use rand::rngs::OsRng;
 use scp_clock::SystemClock;
+use scp_crypto::p256::P256SecretKey;
 use scp_did::SigningKeyId;
 use scp_mls::ScpMlsGroup;
 use scp_mls::credential::ScpCredential;
@@ -114,12 +116,16 @@ fn build_state() -> Option<FuzzState> {
         SigningKeyId::Active,
     )
     .ok()?;
-    let mut alice = create_group(&alice_cred, &SystemClock).ok()?;
+    // Each member's leaf carries a fresh, valid P-256 wrapping public key, so
+    // the leaf-extension validation on the add and join path runs as shipped.
+    let alice_wrapping = P256SecretKey::random(&mut OsRng).public_key().to_uncompressed();
+    let mut alice = create_group(&alice_cred, &alice_wrapping, &SystemClock).ok()?;
 
     let bob_cred =
         ScpCredential::new("did:dht:z6MkfuzzBob".to_owned(), None, SigningKeyId::Active).ok()?;
+    let bob_wrapping = P256SecretKey::random(&mut OsRng).public_key().to_uncompressed();
     let (bob_bundle, bob_signer, bob_provider) =
-        generate_key_package(&bob_cred, &SystemClock).ok()?;
+        generate_key_package(&bob_cred, &bob_wrapping, &SystemClock).ok()?;
 
     // `.into()` infers `KeyPackageIn` from `add_member`'s signature — no direct
     // openmls dependency needed in the fuzz crate.

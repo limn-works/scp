@@ -4,8 +4,8 @@
 //! # Purpose
 //!
 //! This module hosts lifecycle-domain helpers that operate on actor-owned
-//! [`PerContextState`](crate::context::state::PerContextState) and
-//! capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
+//! [`PerContextState`] and
+//! capability-reduced [`ActorDeps`].
 //! Phase 2A finalization deleted the legacy `&Supervisor` lock-and-call
 //! bodies (and the shim fallback); every lifecycle command now runs
 //! through these actor-shape helpers.
@@ -280,7 +280,8 @@ pub async fn leave_context(
                 // twins. `local_did` is node-resident identity (retained on the
                 // provider); the actor `remove_member` skips a self-leave.
                 let local_did = deps.crypto.local_did();
-                let remove_output = state.remove_member(local_did, member_did.as_ref())?;
+                let remove_output =
+                    state.remove_member(local_did, member_did.as_ref(), deps.clock.as_ref())?;
                 if let Err(e) = state.remove_member_sender_key(member_did.as_ref()) {
                     tracing::warn!(
                         context_id = %context_id,
@@ -1077,7 +1078,7 @@ pub async fn join_context(
         let _ = cell
             .commit_class_s_keep(deps, &context_id, |mut v| {
                 let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did);
+                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
                 s.remove_member_sender_key(&member_did)
             })
             .await;
@@ -1119,7 +1120,7 @@ pub async fn join_context(
         let _ = cell
             .commit_class_s_keep(deps, &context_id, |mut v| {
                 let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did);
+                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
                 s.remove_member_sender_key(&member_did)
             })
             .await;
@@ -1158,7 +1159,7 @@ pub async fn join_context(
         let _ = cell
             .commit_class_s_keep(deps, &context_id, |mut v| {
                 let s = v.rest_mut();
-                let _ = s.remove_member(&local_did, &member_did);
+                let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
                 s.remove_member_sender_key(&member_did)
             })
             .await;
@@ -1574,11 +1575,11 @@ fn rollback_join_economy_ticket(
 /// # Errors
 ///
 /// - [`ContextCreationError::StateTransition`] wrapping
-///   [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)
+///   [`ContextError::CeilingRequired`]
 ///   with [`CeilingDeclaration::Empty`](scp_protocol::context::CeilingDeclaration::Empty)
 ///   when `params.ceiling` is empty, before any context state exists.
 /// - [`ContextCreationError::StateTransition`] wrapping
-///   [`ContextError::VersionIncompatible`](scp_protocol::context::ContextError::VersionIncompatible)
+///   [`ContextError::VersionIncompatible`]
 ///   when the running SDK does not satisfy `params.min_protocol_version`.
 /// - [`ContextCreationError::InvalidCeilingCategory`] when a ceiling entry
 ///   breaks the ceiling-entry grammar (spec §5.3.1.1).
@@ -1645,13 +1646,22 @@ pub async fn create_context(
     // every member as the base for the TTL expiry deadline
     // (= creation + params.ttl), which IS computed identically on each member.
     let creation_timestamp_secs = deps.clock.now_secs();
+    // The creator's leaf publishes the owning identity's wrapping key (spec 09
+    // §9.16.1); with none loaded the creation fails closed before any group exists.
+    let wrapping_public_key = *deps
+        .supervisor
+        .my_wrapping_keypair(&deps.owned_identity)?
+        .public();
     let (handle, created_owned_crypto) = crate::context::builder::create_context(
         context_id.clone(),
         params.clone(),
         deps.crypto.as_ref(),
         deps.transport.as_ref(),
         deps.event_log.as_ref(),
-        creator_did.as_ref(),
+        crate::context::builder::ContextCreator {
+            did: creator_did.as_ref(),
+            wrapping_public_key: &wrapping_public_key,
+        },
         creation_timestamp_secs,
     )
     .await?;
@@ -2019,12 +2029,13 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
             crate::crypto::mls::provider::RestoredFloors::default(),
         )
     } else {
-        let (owned, floors) = deps
-            .crypto
-            .build_restored_owned(ctx_id_bytes, mls_state)
-            .map_err(|e| {
-                ContextError::PersistenceFailed(format!("import: crypto state restore failed: {e}"))
-            })?;
+        let (owned, floors) = crate::crypto::mls::provider::NodeMlsFactory::build_restored_owned(
+            ctx_id_bytes,
+            mls_state,
+        )
+        .map_err(|e| {
+            ContextError::PersistenceFailed(format!("import: crypto state restore failed: {e}"))
+        })?;
         (Some(owned), floors)
     };
 
@@ -3083,9 +3094,9 @@ pub async fn restore_context(
     // floors → `seed_encrypted_crypto_from_owned`). This is the RESPAWN
     // (`Supervisor::respawn_from_snapshot`) AND COLD-RESTART
     // (`restore_all_contexts`) path — both reach here through `restore_context`.
-    // `build_restored_owned` restores the node-level wrapping keypair as a `&self`
-    // side effect (OBS-2 — NOT side-effect-free) but touches NO provider
-    // per-context state (the provider holds none — its `contexts` map is DELETED).
+    // `build_restored_owned` is a pure function of the snapshot: it touches no
+    // provider state and no wrapping key (a snapshot carries none; the keypair is
+    // one per identity, owned by the supervisor, spec 09 §9.16.1).
     // The actor is the SOLE crypto authority by construction; there is no
     // provider-resident second home to tear down first.
     let mut restored_owned: Option<crate::crypto::mls::provider::OwnedMlsCryptoState> = None;
@@ -3098,9 +3109,11 @@ pub async fn restore_context(
         // rehydrates from the last COALESCED snapshot, which may lag the live
         // per-sender epoch floors by up to one coalesce interval (ADR-049 §9); the
         // max-merge below tolerates that lag.
-        let (owned, restored_floors) = deps
-            .crypto
-            .build_restored_owned(&ctx_id_bytes, &ctx_snapshot.mls_crypto_state)
+        let (owned, restored_floors) =
+            crate::crypto::mls::provider::NodeMlsFactory::build_restored_owned(
+                &ctx_id_bytes,
+                &ctx_snapshot.mls_crypto_state,
+            )
             .map_err(|e| {
                 ContextError::PersistenceFailed(format!(
                     "restore: crypto state restore failed: {e}"
@@ -3831,18 +3844,19 @@ async fn shutdown_sweep(supervisor: &crate::context::supervisor::Supervisor) -> 
     // Supervisor-level state clear. Acquired under the write_lock once
     // for the standing_contexts + local_dids stores so a concurrent
     // reader observes a coherent shutdown rather than a partially-
-    // cleared registry.
+    // cleared registry. The wrapping keys clear under the same guard: a
+    // wrapping-key load in flight inserts only under it, after re-checking
+    // the gate closed above, so none re-inserts a secret after this clear.
     {
-        let _guard = supervisor.write_lock.lock().await;
+        let guard = supervisor.write_lock.lock().await;
         supervisor
             .standing_contexts_ref()
             .store(std::sync::Arc::new(HashMap::new()));
         supervisor
             .local_dids_ref()
             .store(std::sync::Arc::new(HashSet::new()));
+        supervisor.clear_wrapping_keys(&guard);
     }
-
-    supervisor.clear_wrapping_keys();
 
     // TTL / governance timers are ACTOR-OWNED arms (ADR-049 finding A3) and
     // end with their actor's task. Every other supervisor-held task (actor
@@ -3880,7 +3894,7 @@ const SYNC_SHUTDOWN_DRAIN_BOUND: std::time::Duration = std::time::Duration::from
 ///
 /// # Errors
 ///
-/// [`ContextError::InvalidState`](scp_protocol::context::ContextError::InvalidState)
+/// [`ContextError::InvalidState`]
 /// when called outside a tokio runtime: nothing was shut down and nothing was
 /// drained, so the caller must not close the storage backend. The same error
 /// when the tracker drain has not finished within
@@ -5034,9 +5048,12 @@ mod restore_reconcile_tests {
             scp_did::SigningKeyId::Active,
         )
         .expect("joiner credential");
-        let (kp_bundle, _signer, _provider) =
-            scp_mls::group::generate_key_package(&joiner_cred, &scp_clock::SystemClock)
-                .expect("generate joiner key package");
+        let (kp_bundle, _signer, _provider) = scp_mls::group::generate_key_package(
+            &joiner_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&joiner_cred.did),
+            &scp_clock::SystemClock,
+        )
+        .expect("generate joiner key package");
         let kp_bytes =
             openmls::prelude::tls_codec::Serialize::tls_serialize_detached(kp_bundle.key_package())
                 .expect("serialize key package");

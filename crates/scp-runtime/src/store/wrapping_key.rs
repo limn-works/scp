@@ -1,62 +1,49 @@
-//! Wrapping key storage operations for `ProtocolRepository`.
+//! Durable storage of an identity's DHKEM(P-256) wrapping keypair.
 //!
-//! Persists X25519 wrapping keypairs per context per DID, following the key
-//! convention from spec section 17.3:
+//! One keypair per identity (spec 09 §9.16.1), stored under the key from
+//! spec 17 §17.3:
 //!
 //! ```text
-//! wrapping_key/{context_id}/{did}/public
-//! wrapping_key/{context_id}/{did}/secret
+//! wrapping_key/{did}
 //! ```
 //!
-//! The wrapping keypair is stable across MLS epoch advances and rotates only
-//! on identity key rotation (§9.12) or suspected compromise. See §9.16.1.
+//! The supervisor is the only reader and writer: it loads the pair when an
+//! identity's first actor is built and, when none is stored, generates one and
+//! stores it once. The functions take the supervisor's storage view
+//! ([`OpenMlsStorageAdapter`]), which is the same `Storage` handle the rest of
+//! the node persists through, and encode the value with the shared
+//! [`scp_platform::store_value`] envelope, so the bytes match what
+//! `ProtocolRepository` writes for any other key.
+//!
+//! Only the 32-byte scalar is stored, in one write; the public point is
+//! derived on load by [`WrappingKeyPair::from_secret`]. A store therefore
+//! cannot be torn between two halves, and a loaded pair cannot disagree with
+//! itself. A stored value that is not a scalar in `[1, n − 1]` fails the load
+//! with [`ContextError::CryptoFailed`]; nothing is regenerated over it.
 
-use scp_platform::traits::Storage;
+use scp_did::DID;
+use scp_protocol::context::ContextError;
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
-use super::{ProtocolRepository, StoreError};
+use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
+use crate::crypto::wrapping::WrappingKeyPair;
 
-// ---------------------------------------------------------------------------
-// Key helpers
-// ---------------------------------------------------------------------------
-
-/// Builds the storage key for a wrapping public key.
+/// Builds the storage key for an identity's wrapping scalar.
 ///
-/// Format: `wrapping_key/{context_id}/{did}/public`
-fn wrapping_public_key_path(context_id: &str, did: &str) -> Result<String, StoreError> {
-    let ctx = super::sanitize_key_component(context_id)?;
-    let d = super::sanitize_key_component(did)?;
-    Ok(format!("wrapping_key/{ctx}/{d}/public"))
+/// Format: `wrapping_key/{did}`
+fn wrapping_key_path(did: &DID) -> Result<String, ContextError> {
+    let d = scp_platform::store_value::sanitize_key_component(&did.0)
+        .map_err(|e| ContextError::PersistenceFailed(format!("wrapping key path: {e}")))?;
+    Ok(format!("wrapping_key/{d}"))
 }
 
-/// Builds the storage key for a wrapping secret key.
-///
-/// Format: `wrapping_key/{context_id}/{did}/secret`
-fn wrapping_secret_key_path(context_id: &str, did: &str) -> Result<String, StoreError> {
-    let ctx = super::sanitize_key_component(context_id)?;
-    let d = super::sanitize_key_component(did)?;
-    Ok(format!("wrapping_key/{ctx}/{d}/secret"))
-}
-
-// ---------------------------------------------------------------------------
-// Stored types
-// ---------------------------------------------------------------------------
-
-/// Stored wrapping public key (32 bytes X25519).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredWrappingPublicKey {
-    /// Raw 32-byte X25519 public key.
-    #[serde(with = "serde_bytes")]
-    pub key: Vec<u8>,
-}
-
-/// Stored wrapping secret key (32 bytes X25519).
+/// Stored wrapping secret key (32-byte P-256 scalar).
 ///
 /// Implements `Zeroize` and `Drop` for defense-in-depth key material cleanup.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
 pub struct StoredWrappingSecretKey {
-    /// Raw 32-byte X25519 secret key.
+    /// Raw 32-byte P-256 scalar.
     #[serde(with = "serde_bytes")]
     pub key: Vec<u8>,
 }
@@ -75,226 +62,193 @@ impl std::fmt::Debug for StoredWrappingSecretKey {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ProtocolRepository methods
-// ---------------------------------------------------------------------------
+/// Stores `pair`'s scalar as the wrapping key of `did`, replacing any stored
+/// one. The serialized buffer is zeroized after the write.
+///
+/// # Errors
+///
+/// [`ContextError::PersistenceFailed`] if `did` is not a valid key component,
+/// or if serialization or the storage write fails.
+pub(crate) async fn store_wrapping_key(
+    storage: &dyn OpenMlsStorageAdapter,
+    did: &DID,
+    pair: &WrappingKeyPair,
+) -> Result<(), ContextError> {
+    let path = wrapping_key_path(did)?;
+    let value = StoredWrappingSecretKey {
+        key: pair.secret().to_vec(),
+    };
+    let mut bytes = scp_platform::store_value::to_stored_value_bytes(&value)
+        .map_err(|e| ContextError::PersistenceFailed(format!("wrapping key encode: {e}")))?;
+    let result = storage
+        .store(&path, &bytes)
+        .await
+        .map_err(|e| ContextError::PersistenceFailed(format!("wrapping key write: {e}")));
+    bytes.zeroize();
+    result
+}
 
-impl<S: Storage> ProtocolRepository<S> {
-    /// Stores a wrapping keypair for a member in a context.
-    ///
-    /// Both the public and secret key are stored under separate keys.
-    /// The secret key buffer is zeroized after writing for defense-in-depth.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError`] if serialization or storage fails.
-    pub async fn store_wrapping_keypair(
-        &self,
-        context_id: &str,
-        did: &str,
-        public_key: &[u8; 32],
-        secret_key: &[u8; 32],
-    ) -> Result<(), StoreError> {
-        let pub_path = wrapping_public_key_path(context_id, did)?;
-        let sec_path = wrapping_secret_key_path(context_id, did)?;
-
-        let pub_value = StoredWrappingPublicKey {
-            key: public_key.to_vec(),
-        };
-        let sec_value = StoredWrappingSecretKey {
-            key: secret_key.to_vec(),
-        };
-
-        self.store_value(&pub_path, &pub_value).await?;
-        self.store_value_zeroize(&sec_path, &sec_value).await?;
-
-        Ok(())
-    }
-
-    /// Loads the wrapping public key for a member in a context.
-    ///
-    /// Returns `None` if no wrapping key is stored.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError`] if deserialization fails.
-    pub async fn load_wrapping_public_key(
-        &self,
-        context_id: &str,
-        did: &str,
-    ) -> Result<Option<[u8; 32]>, StoreError> {
-        let path = wrapping_public_key_path(context_id, did)?;
-        let stored: Option<StoredWrappingPublicKey> = self.load_value(&path).await?;
-        match stored {
-            None => Ok(None),
-            Some(v) => {
-                let arr: [u8; 32] = v.key.as_slice().try_into().map_err(|_| {
-                    StoreError::DeserializationFailed(format!(
-                        "wrapping public key must be 32 bytes, got {}",
-                        v.key.len()
-                    ))
-                })?;
-                Ok(Some(arr))
-            }
-        }
-    }
-
-    /// Loads the wrapping secret key for a member in a context.
-    ///
-    /// Returns `None` if no wrapping key is stored.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError`] if deserialization fails.
-    pub async fn load_wrapping_secret_key(
-        &self,
-        context_id: &str,
-        did: &str,
-    ) -> Result<Option<[u8; 32]>, StoreError> {
-        let path = wrapping_secret_key_path(context_id, did)?;
-        let stored: Option<StoredWrappingSecretKey> = self.load_value(&path).await?;
-        match stored {
-            None => Ok(None),
-            Some(v) => {
-                let arr: [u8; 32] = v.key.as_slice().try_into().map_err(|_| {
-                    StoreError::DeserializationFailed(format!(
-                        "wrapping secret key must be 32 bytes, got {}",
-                        v.key.len()
-                    ))
-                })?;
-                Ok(Some(arr))
-            }
-        }
-    }
-
-    /// Deletes the wrapping keypair for a member in a context.
-    ///
-    /// Used during identity key rotation (§9.12) to remove the old keypair
-    /// before storing the new one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError`] if the delete operation fails.
-    pub async fn delete_wrapping_keypair(
-        &self,
-        context_id: &str,
-        did: &str,
-    ) -> Result<(), StoreError> {
-        let pub_path = wrapping_public_key_path(context_id, did)?;
-        let sec_path = wrapping_secret_key_path(context_id, did)?;
-
-        self.storage.delete(&pub_path).await?;
-        self.storage.delete(&sec_path).await?;
-
-        Ok(())
-    }
+/// Loads the wrapping keypair of `did`, deriving its public point from the
+/// stored scalar. Returns `None` if none is stored.
+///
+/// # Errors
+///
+/// - [`ContextError::PersistenceFailed`] if the storage read fails or the
+///   stored bytes are not a well-formed envelope.
+/// - [`ContextError::CryptoFailed`] if the stored value is not a 32-byte
+///   P-256 scalar in `[1, n − 1]`.
+pub(crate) async fn load_wrapping_key(
+    storage: &dyn OpenMlsStorageAdapter,
+    did: &DID,
+) -> Result<Option<WrappingKeyPair>, ContextError> {
+    let path = wrapping_key_path(did)?;
+    let Some(mut bytes) = storage
+        .retrieve(&path)
+        .await
+        .map_err(|e| ContextError::PersistenceFailed(format!("wrapping key read: {e}")))?
+    else {
+        return Ok(None);
+    };
+    let decoded: Result<StoredWrappingSecretKey, _> =
+        scp_platform::store_value::from_stored_value_bytes(&bytes);
+    bytes.zeroize();
+    let stored = decoded
+        .map_err(|e| ContextError::PersistenceFailed(format!("wrapping key decode: {e}")))?;
+    let secret: Zeroizing<[u8; 32]> =
+        Zeroizing::new(stored.key.as_slice().try_into().map_err(|_| {
+            ContextError::CryptoFailed(format!(
+                "stored wrapping secret key must be 32 bytes, got {}",
+                stored.key.len()
+            ))
+        })?);
+    WrappingKeyPair::from_secret(secret)
+        .map(Some)
+        .map_err(|e| ContextError::CryptoFailed(format!("stored wrapping secret key: {e}")))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::sync::Arc;
+
     use scp_platform::in_memory::InMemoryStorage;
 
     use super::*;
+    use crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter;
 
-    fn test_store() -> ProtocolRepository<InMemoryStorage> {
-        ProtocolRepository::new_for_testing(InMemoryStorage::new())
+    fn adapter() -> SpawnBlockingStorageAdapter<InMemoryStorage> {
+        SpawnBlockingStorageAdapter::new(Arc::new(InMemoryStorage::new()))
     }
 
+    fn did(s: &str) -> DID {
+        DID(s.to_owned())
+    }
+
+    async fn write_raw(storage: &dyn OpenMlsStorageAdapter, d: &DID, key: Vec<u8>) {
+        let bytes =
+            scp_platform::store_value::to_stored_value_bytes(&StoredWrappingSecretKey { key })
+                .unwrap();
+        storage
+            .store(&wrapping_key_path(d).unwrap(), &bytes)
+            .await
+            .unwrap();
+    }
+
+    /// A stored pair loads back with the same scalar and the same point, and
+    /// the store wrote exactly one entry: the scalar under `wrapping_key/{did}`,
+    /// in the shared `StoredValue` envelope.
     #[tokio::test]
-    async fn store_and_load_wrapping_keypair() {
-        let store = test_store();
-        let pubkey = [42u8; 32];
-        let secret = [99u8; 32];
+    async fn store_and_load_round_trips_through_one_scalar_entry() {
+        let storage = adapter();
+        let alice = did("did:dht:alice");
+        let pair = WrappingKeyPair::generate();
 
-        store
-            .store_wrapping_keypair("ctx-1", "did:dht:alice", &pubkey, &secret)
+        store_wrapping_key(&storage, &alice, &pair).await.unwrap();
+
+        let loaded = load_wrapping_key(&storage, &alice).await.unwrap().unwrap();
+        assert_eq!(loaded.public(), pair.public());
+        assert_eq!(**loaded.secret(), **pair.secret());
+
+        let path = wrapping_key_path(&alice).unwrap();
+        assert_eq!(path, "wrapping_key/did:dht:alice");
+        let raw = storage.retrieve(&path).await.unwrap().unwrap();
+        let stored: StoredWrappingSecretKey =
+            scp_platform::store_value::from_stored_value_bytes(&raw).unwrap();
+        assert_eq!(stored.key.as_slice(), pair.secret().as_slice());
+    }
+
+    /// A stored value that is not a valid P-256 scalar (wrong length, zero,
+    /// or at least the group order) fails to load with `CryptoFailed`, and
+    /// bytes that are not an envelope fail with `PersistenceFailed`.
+    #[tokio::test]
+    async fn load_rejects_invalid_stored_secret_key() {
+        let storage = adapter();
+        let alice = did("did:dht:alice");
+        for (case, key) in [
+            ("16 bytes", vec![1u8; 16]),
+            ("zero scalar", vec![0u8; 32]),
+            ("all-ones scalar", vec![0xFFu8; 32]),
+        ] {
+            write_raw(&storage, &alice, key).await;
+            let err = load_wrapping_key(&storage, &alice).await.unwrap_err();
+            assert!(
+                matches!(err, ContextError::CryptoFailed(_)),
+                "{case}: {err:?}"
+            );
+        }
+        storage
+            .store(&wrapping_key_path(&alice).unwrap(), b"not msgpack")
             .await
             .unwrap();
-
-        let loaded_pub = store
-            .load_wrapping_public_key("ctx-1", "did:dht:alice")
-            .await
-            .unwrap();
-        assert_eq!(loaded_pub, Some(pubkey));
-
-        let loaded_sec = store
-            .load_wrapping_secret_key("ctx-1", "did:dht:alice")
-            .await
-            .unwrap();
-        assert_eq!(loaded_sec, Some(secret));
+        let err = load_wrapping_key(&storage, &alice).await.unwrap_err();
+        assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
     }
 
     #[tokio::test]
     async fn load_returns_none_when_not_stored() {
-        let store = test_store();
-
-        let loaded = store
-            .load_wrapping_public_key("ctx-1", "did:dht:nobody")
-            .await
-            .unwrap();
-        assert_eq!(loaded, None);
-    }
-
-    #[tokio::test]
-    async fn delete_wrapping_keypair_removes_both_keys() {
-        let store = test_store();
-        let pubkey = [1u8; 32];
-        let secret = [2u8; 32];
-
-        store
-            .store_wrapping_keypair("ctx-1", "did:dht:alice", &pubkey, &secret)
-            .await
-            .unwrap();
-
-        store
-            .delete_wrapping_keypair("ctx-1", "did:dht:alice")
-            .await
-            .unwrap();
-
-        assert_eq!(
-            store
-                .load_wrapping_public_key("ctx-1", "did:dht:alice")
+        let storage = adapter();
+        assert!(
+            load_wrapping_key(&storage, &did("did:dht:nobody"))
                 .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            store
-                .load_wrapping_secret_key("ctx-1", "did:dht:alice")
-                .await
-                .unwrap(),
-            None
+                .unwrap()
+                .is_none()
         );
     }
 
+    /// A DID that is not a valid key component is refused before any I/O.
     #[tokio::test]
-    async fn different_contexts_are_isolated() {
-        let store = test_store();
-        let key1 = [10u8; 32];
-        let key2 = [20u8; 32];
-        let sec1 = [11u8; 32];
-        let sec2 = [21u8; 32];
+    async fn path_traversal_did_is_refused() {
+        let storage = adapter();
+        let evil = did("../identity/victim");
+        let err = load_wrapping_key(&storage, &evil).await.unwrap_err();
+        assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
+        let err = store_wrapping_key(&storage, &evil, &WrappingKeyPair::generate())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
+    }
 
-        store
-            .store_wrapping_keypair("ctx-1", "did:dht:alice", &key1, &sec1)
+    #[tokio::test]
+    async fn different_identities_are_isolated() {
+        let storage = adapter();
+        let alice = WrappingKeyPair::generate();
+        let bob = WrappingKeyPair::generate();
+        store_wrapping_key(&storage, &did("did:dht:alice"), &alice)
             .await
             .unwrap();
-        store
-            .store_wrapping_keypair("ctx-2", "did:dht:alice", &key2, &sec2)
+        store_wrapping_key(&storage, &did("did:dht:bob"), &bob)
             .await
             .unwrap();
-
-        let loaded1 = store
-            .load_wrapping_public_key("ctx-1", "did:dht:alice")
+        let got_alice = load_wrapping_key(&storage, &did("did:dht:alice"))
             .await
+            .unwrap()
             .unwrap();
-        let loaded2 = store
-            .load_wrapping_public_key("ctx-2", "did:dht:alice")
+        let got_bob = load_wrapping_key(&storage, &did("did:dht:bob"))
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(loaded1, Some(key1));
-        assert_eq!(loaded2, Some(key2));
+        assert_eq!(got_alice.public(), alice.public());
+        assert_eq!(got_bob.public(), bob.public());
     }
 
     #[test]

@@ -218,7 +218,7 @@ pub enum MessagingCommand {
     /// management message.
     ///
     /// Mirrors the legacy
-    /// [`messaging_helpers::deliver_incoming`](crate::context::messaging_helpers::deliver_incoming)
+    /// `messaging_helpers::deliver_incoming`
     /// signature. Used by the relay subscription loop; the return type
     /// matches the bridge's per-event dispatch pattern.
     ///
@@ -299,7 +299,7 @@ pub enum MessagingCommand {
     /// other members of a context.
     ///
     /// Mirrors the legacy
-    /// [`messaging_helpers::send_pseudonym_announcement`](crate::context::messaging_helpers::send_pseudonym_announcement)
+    /// `messaging_helpers::send_pseudonym_announcement`
     /// signature exactly: the handler delegates to that method which
     /// in turn wraps the announcement payload and routes it through
     /// `send_message`. Best-effort — the legacy method returns no
@@ -454,7 +454,7 @@ pub enum MessagingCommand {
     /// Answer a §9.16.2 sender-key PULL request on the actor's OWNED crypto
     /// state (ADR-049 PR-7 / SCP-CRYPTOMOVE-001). The steady-state ANSWER half
     /// moved off the provider onto
-    /// [`ContextCryptoState::handle_sender_key_request`](crate::context::actor::state::ContextCryptoState::handle_sender_key_request);
+    /// `ContextCryptoState::handle_sender_key_request`;
     /// a taken (actor-owned) context can no longer answer through the emptied
     /// provider, so this mailbox entry lets the full-stack harness reach the
     /// actor answer by `context_id` (the requester side is driven externally with
@@ -523,12 +523,12 @@ pub enum MessagingCommand {
     /// # Non-mutating receive-state invariant (§9)
     ///
     /// The handler drives ONLY
-    /// [`ContextCryptoState::open`](crate::context::actor::state::ContextCryptoState::open),
+    /// `ContextCryptoState::open`,
     /// which performs a PURE decrypt + surfaces `env.receive_floor` — it does
     /// NOT run the authoritative anti-replay gate
     /// (`check_and_advance_recv_sequence`), touch the Class-M floor registry,
     /// mutate `nonce_dedup`, or change the epoch. Those live at the messaging
-    /// seam ([`decrypt_and_dispatch`](crate::context::messaging_helpers::decrypt_and_dispatch)),
+    /// seam (`messaging_helpers::deliver_incoming`),
     /// which this inspection deliberately skips. The sole state change is the
     /// unavoidable MLS decryption-ratchet advance inherent to any decrypt (the
     /// deleted provider inspection twin was likewise non-mutating in exactly this
@@ -588,7 +588,7 @@ pub enum MessagingCommand {
     /// retained checkpoint ring.
     ///
     /// Delegates to
-    /// [`force_create_checkpoint_fields`](crate::context::queries_helpers::force_create_checkpoint_fields).
+    /// `force_create_checkpoint_fields`.
     /// Used by the reconnection driver's Phase 3 (`event_log_sync`) at the
     /// FFI/SDK layer: the driver builds its local checkpoint, sends it to
     /// peers via the send path, and compares peer checkpoints against local
@@ -620,7 +620,7 @@ pub enum MessagingCommand {
     /// records (deduped per distinct divergent checkpoint per sender).
     ///
     /// Delegates to
-    /// [`compare_remote_checkpoint`](crate::context::queries_helpers::compare_remote_checkpoint).
+    /// `compare_remote_checkpoint`.
     /// The reply carries the typed
     /// [`CheckpointComparison`](scp_event_log::checkpoint::CheckpointComparison)
     /// (`Consistent` / `Behind` / `Ahead` / `Divergent`). The `Behind`
@@ -640,7 +640,7 @@ pub enum MessagingCommand {
     /// Send a suppression-detection heartbeat (§9.9.2) to context peers.
     ///
     /// Delegates to
-    /// [`send_heartbeat`](crate::context::messaging_helpers::send_heartbeat),
+    /// `send_heartbeat`,
     /// which routes an EMPTY-payload [`MessageType::Heartbeat`](scp_protocol::envelope::inner::MessageType::Heartbeat)
     /// envelope through the regular encrypt-and-send path. Driven by the
     /// bridge/SDK subscribe-path scheduler (the §9.9.2 "the SDK sends
@@ -764,7 +764,7 @@ pub type CloseContextReply =
 /// event-log data. The actor holds no custody/signing key, so the snapshot
 /// signature is applied by the dispatcher
 /// ([`Supervisor::export_context`](crate::context::supervisor::Supervisor::export_context))
-/// via [`create_export`](crate::context::export_import::create_export) once
+/// via `create_export` once
 /// these blocks are returned — keeping the signature over the exact canonical
 /// bytes a verifier recomputes (§23.16.8, ADR-050).
 pub type ExportContextReply =
@@ -919,7 +919,7 @@ pub enum LifecycleCommand {
     },
 
     /// Initiates cooperative context closure. Mirrors
-    /// [`lifecycle_helpers::close_context`](crate::context::lifecycle_helpers::close_context)
+    /// `lifecycle_helpers::close_context`
     /// (not `close_context_with_key` — the latter is an internal
     /// optimization for checkpoint generation; commit 9 exposes the
     /// public surface through the command enum).
@@ -1004,7 +1004,7 @@ pub enum LifecycleCommand {
 
     /// Generate and store a per-member access key for explicit
     /// lifecycle management (§9.17.2 step 1). Mirrors
-    /// [`queries_helpers::generate_context_access_key`](crate::context::queries_helpers::generate_context_access_key).
+    /// `queries_helpers::generate_context_access_key`.
     ///
     /// Requires `ContextClose` capability on the caller. Overwrites any
     /// existing key for the same `(context_id, member_did)` pair.
@@ -1021,7 +1021,7 @@ pub enum LifecycleCommand {
 
     /// Revoke (remove) a member's access key from the context's
     /// access key store (§9.17.2 step 3, ADR-038). Mirrors
-    /// [`queries_helpers::revoke_context_access_key`](crate::context::queries_helpers::revoke_context_access_key).
+    /// `queries_helpers::revoke_context_access_key`.
     ///
     /// Requires `ContextClose` capability on the caller.
     RevokeContextAccessKey {
@@ -1038,7 +1038,7 @@ pub enum LifecycleCommand {
     /// Restore a member's access key by generating a fresh key at
     /// epoch 0 (§9.17.2 step 5, ADR-038 forward-only restoration).
     /// Mirrors
-    /// [`restore_context_access_key`](crate::context::queries_helpers::restore_context_access_key).
+    /// `restore_context_access_key`.
     ///
     /// Requires `ContextClose` capability on the caller. Historical
     /// content from the revocation period remains permanently
@@ -1060,7 +1060,7 @@ pub enum LifecycleCommand {
     ///
     /// Dispatched per-actor by the supervisor's iterating sweep entry
     /// point
-    /// [`lifecycle_helpers::flush_all_contexts`](crate::context::lifecycle_helpers::flush_all_contexts)
+    /// `lifecycle_helpers::flush_all_contexts`
     /// (and its sync wrapper). The supervisor iterates
     /// `supervisor.actors` and sends one of these commands per actor;
     /// each actor flushes its own state with no cross-actor lock.
@@ -1090,7 +1090,7 @@ pub enum LifecycleCommand {
     ///
     /// Dispatched per-actor by the supervisor's iterating sweep entry
     /// points
-    /// [`lifecycle_helpers::shutdown_all_contexts`](crate::context::lifecycle_helpers::shutdown_all_contexts)
+    /// `lifecycle_helpers::shutdown_all_contexts`
     /// (and its sync wrapper). The supervisor iterates
     /// `supervisor.actors` and sends one of these commands per actor.
     ///
@@ -1122,8 +1122,8 @@ pub enum LifecycleCommand {
     /// Sweep: report THIS actor's receive-buffer occupancy.
     ///
     /// Dispatched per-actor by the supervisor's gauge sweep
-    /// [`update_context_gauges`](crate::context::manager_methods::update_context_gauges).
-    /// The supervisor iterates [`actor_ids`](crate::context::supervisor::Supervisor::actor_ids)
+    /// `update_context_gauges`.
+    /// The supervisor iterates `actor_ids`
     /// and sends one of these commands per actor, summing the replies to
     /// produce the `buffer_occupancy` gauge.
     ///
@@ -1157,7 +1157,7 @@ pub enum LifecycleCommand {
     /// Issue an MLS Update proposal + self-Commit for post-compromise
     /// security (§9.12 step 2). Mutating — ratchets the group to a new
     /// epoch with fresh key material via
-    /// [`PerContextState::advance_epoch`](crate::context::actor::state::PerContextState::advance_epoch)
+    /// `PerContextState::advance_epoch`
     /// (which calls `ratchet::propose_update_with_wrapping_key`,
     /// preserving the `scp_wrapping_key` leaf extension per §9.16.1).
     ///
@@ -1281,7 +1281,7 @@ pub struct ExecuteGovernanceActionPayload {
 /// See [`ContextCommand::Governance`]. Real variants land in a later slice of
 /// the ADR-049 actor migration (ADR-049 §15; see `handlers/governance.rs`).
 /// Variants mirror the public surface of
-/// [`crate::context::governance_helpers`] one-to-one: propose, vote,
+/// `crate::context::governance_helpers` one-to-one: propose, vote,
 /// approve/reject/withdraw, execute, read proposals, apply pending
 /// ceiling / economic-policy changes, tombstone migrations, acknowledge
 /// commit faults. ADR-031 defines 28 governance actions; those are the
@@ -1334,7 +1334,7 @@ pub enum GovernanceCommand {
     },
 
     /// Casts an approval vote with explicit capability pre-check.
-    /// Mirrors [`governance_helpers::approve_governance_proposal`](crate::context::governance_helpers::approve_governance_proposal).
+    /// Mirrors `governance_helpers::approve_governance_proposal`.
     /// The reply carries only the resulting status (the legacy method
     /// discards the event list by convention — see its implementation).
     ApproveGovernanceProposal {
@@ -1347,7 +1347,7 @@ pub enum GovernanceCommand {
     },
 
     /// Casts a rejection vote with explicit capability pre-check.
-    /// Mirrors [`governance_helpers::reject_governance_proposal`](crate::context::governance_helpers::reject_governance_proposal).
+    /// Mirrors `governance_helpers::reject_governance_proposal`.
     RejectGovernanceProposal {
         /// Boxed owned payload.
         payload: Box<VoteOnProposalPayload>,
@@ -1375,7 +1375,7 @@ pub enum GovernanceCommand {
     },
 
     /// Executes an already-approved governance proposal. Mirrors
-    /// [`governance_helpers::execute_governance_action`](crate::context::governance_helpers::execute_governance_action).
+    /// `governance_helpers::execute_governance_action`.
     /// Caller MUST pass a proposal whose status is
     /// [`ProposalStatus::Approved`](scp_protocol::context::governance::ProposalStatus);
     /// the legacy method enforces the gate.
@@ -1413,7 +1413,7 @@ pub enum GovernanceCommand {
 
     /// Applies a pending ceiling modification whose notification period
     /// has expired. Mirrors
-    /// [`governance_helpers::apply_pending_ceiling_modification`](crate::context::governance_helpers::apply_pending_ceiling_modification).
+    /// `governance_helpers::apply_pending_ceiling_modification`.
     /// Returns `true` iff a pending modification was applied.
     ApplyPendingCeilingModification {
         /// Context identifier string.
@@ -1427,7 +1427,7 @@ pub enum GovernanceCommand {
 
     /// Applies a pending economic-policy change whose notification
     /// period has expired. Mirrors
-    /// [`governance_helpers::apply_pending_economic_policy_change`](crate::context::governance_helpers::apply_pending_economic_policy_change).
+    /// `governance_helpers::apply_pending_economic_policy_change`.
     /// Returns `true` iff a pending change was applied.
     ApplyPendingEconomicPolicyChange {
         /// Context identifier string.
@@ -1440,7 +1440,7 @@ pub enum GovernanceCommand {
 
     /// Tombstones a migrated context after the grace period expires.
     /// Mirrors
-    /// [`governance_helpers::tombstone_migrated_context`](crate::context::governance_helpers::tombstone_migrated_context).
+    /// `governance_helpers::tombstone_migrated_context`.
     TombstoneMigratedContext {
         /// Context identifier string.
         context_id: String,
@@ -1449,7 +1449,7 @@ pub enum GovernanceCommand {
     },
 
     /// Returns the migration state for a context if one exists. Mirrors
-    /// [`governance_helpers::migration_state`](crate::context::governance_helpers::migration_state).
+    /// `governance_helpers::migration_state`.
     ///
     /// This is read-only; the handler returns
     /// [`Outcome::ok`](crate::context::actor::Outcome::ok) and reports
@@ -1464,7 +1464,7 @@ pub enum GovernanceCommand {
 
     /// Acknowledges and clears a commit-fault marker for a context
     /// (PR #1606 C6). Mirrors
-    /// [`governance_helpers::acknowledge_commit_fault`](crate::context::governance_helpers::acknowledge_commit_fault).
+    /// `governance_helpers::acknowledge_commit_fault`.
     AcknowledgeCommitFault {
         /// Context identifier string.
         context_id: String,
@@ -1477,7 +1477,7 @@ pub enum GovernanceCommand {
     ///
     /// Dispatched per-actor by the supervisor's iterating sweep entry
     /// point
-    /// [`governance_helpers::evaluate_periodic_consequences`](crate::context::governance_helpers::evaluate_periodic_consequences).
+    /// `governance_helpers::evaluate_periodic_consequences`.
     /// The supervisor iterates `supervisor.actors` and sends one of these
     /// commands per actor; aggregate completion is implicit (the
     /// iterator waits for each reply in turn).
@@ -1503,7 +1503,7 @@ pub enum GovernanceCommand {
     ///
     /// Dispatched per-actor by the supervisor's iterating sweep entry
     /// point
-    /// [`governance_helpers::process_pending_commits`](crate::context::governance_helpers::process_pending_commits).
+    /// `governance_helpers::process_pending_commits`.
     /// The supervisor iterates `supervisor.actors` and sends one of
     /// these commands per actor.
     ///
@@ -1625,10 +1625,10 @@ pub struct UnsubscribeBroadcastPayload {
 ///   [`Supervisor::dispatch_broadcast_command_with_custody`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command_with_custody)
 ///   drives the two-phase publish path: the actor reserves the
 ///   sequence via
-///   [`broadcast_helpers::reserve_broadcast_publish`](crate::context::broadcast_helpers::reserve_broadcast_publish)
+///   `broadcast_helpers::reserve_broadcast_publish`
 ///   and returns the signing-payload digest, the supervisor signs with
 ///   the caller's custody OUTSIDE the actor, then the actor seals via
-///   [`broadcast_helpers::apply_broadcast_publish`](crate::context::broadcast_helpers::apply_broadcast_publish).
+///   `broadcast_helpers::apply_broadcast_publish`.
 /// - Dispatching this variant directly on the actor mailbox is
 ///   rejected with a typed error pointing at the custody-generic
 ///   entry point (see `handlers/broadcast.rs`).
@@ -1711,7 +1711,7 @@ pub struct BroadcastBlockPayload {
 }
 
 /// See [`ContextCommand::Broadcast`]. Real variants cover every public
-/// method on [`crate::context::broadcast_helpers`].
+/// method on `crate::context::broadcast_helpers`.
 ///
 /// # Key-custody handoff
 ///
@@ -1728,7 +1728,7 @@ pub struct BroadcastBlockPayload {
 /// the actor.
 pub enum BroadcastCommand {
     /// Subscribe a DID to a broadcast context. Mirrors
-    /// [`broadcast_helpers::subscribe_broadcast`](crate::context::broadcast_helpers::subscribe_broadcast).
+    /// `broadcast_helpers::subscribe_broadcast`.
     ///
     /// The validation-context-generic form of that helper carries a
     /// `ValidationContext<'_, D, N, R, P, S>` parameter. The
@@ -1748,7 +1748,7 @@ pub enum BroadcastCommand {
     },
 
     /// Unsubscribe a DID from a broadcast context. Mirrors
-    /// [`broadcast_helpers::unsubscribe_broadcast`](crate::context::broadcast_helpers::unsubscribe_broadcast).
+    /// `broadcast_helpers::unsubscribe_broadcast`.
     UnsubscribeBroadcast {
         /// Boxed owned payload.
         payload: Box<UnsubscribeBroadcastPayload>,
@@ -1758,8 +1758,8 @@ pub enum BroadcastCommand {
 
     /// Publish raw bytes to a broadcast context. Dispatched via the
     /// custody-generic supervisor path, which drives the two-phase
-    /// [`broadcast_helpers::reserve_broadcast_publish`](crate::context::broadcast_helpers::reserve_broadcast_publish)
-    /// / [`broadcast_helpers::apply_broadcast_publish`](crate::context::broadcast_helpers::apply_broadcast_publish)
+    /// `broadcast_helpers::reserve_broadcast_publish`
+    /// / `broadcast_helpers::apply_broadcast_publish`
     /// pair — see the enum-level key-custody handoff docs.
     PublishBroadcast {
         /// Boxed owned payload.
@@ -1771,8 +1771,8 @@ pub enum BroadcastCommand {
     /// Publish structured [`BroadcastContent`](scp_protocol::context::broadcast_content::BroadcastContent)
     /// to a broadcast context. Serializes the content, then follows the
     /// same custody-generic two-phase
-    /// [`broadcast_helpers::reserve_broadcast_publish`](crate::context::broadcast_helpers::reserve_broadcast_publish)
-    /// / [`broadcast_helpers::apply_broadcast_publish`](crate::context::broadcast_helpers::apply_broadcast_publish)
+    /// `broadcast_helpers::reserve_broadcast_publish`
+    /// / `broadcast_helpers::apply_broadcast_publish`
     /// path as [`Self::PublishBroadcast`].
     PublishBroadcastContent {
         /// Boxed owned payload.
@@ -1816,7 +1816,7 @@ pub enum BroadcastCommand {
 
     /// Block a subscriber from receiving future broadcasts from a
     /// specific author. Mirrors
-    /// [`broadcast_helpers::block_broadcast_subscriber`](crate::context::broadcast_helpers::block_broadcast_subscriber).
+    /// `broadcast_helpers::block_broadcast_subscriber`.
     BlockBroadcastSubscriber {
         /// Boxed owned payload.
         payload: Box<BroadcastBlockPayload>,
@@ -1825,7 +1825,7 @@ pub enum BroadcastCommand {
     },
 
     /// Unblock a previously blocked subscriber. Mirrors
-    /// [`broadcast_helpers::unblock_broadcast_subscriber`](crate::context::broadcast_helpers::unblock_broadcast_subscriber).
+    /// `broadcast_helpers::unblock_broadcast_subscriber`.
     UnblockBroadcastSubscriber {
         /// Boxed owned payload.
         payload: Box<BroadcastBlockPayload>,
@@ -1834,7 +1834,7 @@ pub enum BroadcastCommand {
     },
 
     /// Evaluate a subscriber's broadcast-key request. Mirrors
-    /// [`broadcast_helpers::handle_broadcast_key_request`](crate::context::broadcast_helpers::handle_broadcast_key_request).
+    /// `broadcast_helpers::handle_broadcast_key_request`.
     ///
     /// Read-mostly (no per-context mutation) — handler reports
     /// `mutated: false`.
@@ -1845,17 +1845,18 @@ pub enum BroadcastCommand {
         author_did: scp_did::DID,
         /// Requester DID.
         requester_did: scp_did::DID,
-        /// Requester's X25519 wrapping public key. The broadcast key is
-        /// HPKE-sealed to this key inside the protocol handler (§5.14.2) — the
-        /// raw key never leaves the protocol layer.
-        wrapping_pubkey: [u8; 32],
+        /// Requester's DHKEM(P-256) wrapping public key, a validated
+        /// uncompressed point (§9.5). The broadcast key is HPKE-sealed to this
+        /// key inside the protocol handler (§5.14.2); the raw key never leaves
+        /// the protocol layer.
+        wrapping_pubkey: scp_protocol::crypto::hpke::p256::P256Point,
         /// Oneshot reply channel. See
         /// [`HandleBroadcastKeyRequestReply`].
         reply: HandleBroadcastKeyRequestReply,
     },
 
     /// Return the subscriber count for a broadcast context. Mirrors
-    /// [`broadcast_helpers::broadcast_subscriber_count`](crate::context::broadcast_helpers::broadcast_subscriber_count).
+    /// `broadcast_helpers::broadcast_subscriber_count`.
     /// Read-only. `Ok(None)` iff the context is unknown or not broadcast.
     BroadcastSubscriberCount {
         /// Context identifier string.
@@ -1865,7 +1866,7 @@ pub enum BroadcastCommand {
     },
 
     /// Membership predicate — `true` iff `did` is a subscriber. Mirrors
-    /// [`broadcast_helpers::is_broadcast_subscriber`](crate::context::broadcast_helpers::is_broadcast_subscriber).
+    /// `broadcast_helpers::is_broadcast_subscriber`.
     /// Read-only.
     IsBroadcastSubscriber {
         /// Context identifier string.
@@ -1877,7 +1878,7 @@ pub enum BroadcastCommand {
     },
 
     /// Return the broadcast context's admission policy. Mirrors
-    /// [`broadcast_helpers::broadcast_admission`](crate::context::broadcast_helpers::broadcast_admission).
+    /// `broadcast_helpers::broadcast_admission`.
     /// Read-only. `Ok(None)` iff the context is unknown or not broadcast.
     BroadcastAdmission {
         /// Context identifier string.
@@ -1925,8 +1926,8 @@ pub type VerifyPaymentReceiptsReply = oneshot::Sender<
 
 /// See [`ContextCommand::Economy`]. Real variants land in a later slice of
 /// the ADR-049 actor migration (ADR-049 §15; see `handlers/economy.rs`). The public
-/// surface of [`crate::context::economy_helpers`] currently consists
-/// of a single method, [`verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts);
+/// surface of `crate::context::economy_helpers` currently consists
+/// of a single method, `verify_payment_receipts`;
 /// all other economy methods (`authorize_paid_action`,
 /// `complete_paid_action`, `void_paid_action`,
 /// `rollback_economy_ticket_inline_view`)
@@ -1937,7 +1938,7 @@ pub type VerifyPaymentReceiptsReply = oneshot::Sender<
 pub enum EconomyCommand {
     /// Verifies a batch of payment receipts against the configured
     /// payment adapter. Mirrors
-    /// [`economy_helpers::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts).
+    /// `economy_helpers::verify_payment_receipts`.
     ///
     /// Read-only — the handler returns
     /// [`Outcome::ok`](crate::context::actor::Outcome::ok) and reports
@@ -2015,13 +2016,13 @@ pub struct RecoveryNotifyContactPayload {
 /// See [`ContextCommand::TrustRecovery`]. Real variants land in commit
 /// 10 of the ADR-049 commit ladder (see `handlers/trust_recovery.rs`).
 /// Variants mirror the public surface of
-/// [`crate::context::trust_recovery_helpers`] one-to-one: attestation
+/// `crate::context::trust_recovery_helpers` one-to-one: attestation
 /// verification, challenge issuance + verification, governance
 /// checkpoints + cosignatures, compromise-recovery epoch advance, and
 /// recovery notifications (spec §9.12).
 pub enum TrustRecoveryCommand {
     /// Creates a governance-aware checkpoint for a context. Mirrors
-    /// [`trust_recovery_helpers::create_governance_checkpoint`](crate::context::trust_recovery_helpers::create_governance_checkpoint).
+    /// `trust_recovery_helpers::create_governance_checkpoint`.
     CreateGovernanceCheckpoint {
         /// Boxed owned payload.
         payload: Box<CreateGovernanceCheckpointPayload>,
@@ -2033,7 +2034,7 @@ pub enum TrustRecoveryCommand {
 
     /// Adds a cosignature to an existing checkpoint and re-evaluates
     /// attestation status. Mirrors
-    /// [`trust_recovery_helpers::add_checkpoint_cosignature`](crate::context::trust_recovery_helpers::add_checkpoint_cosignature).
+    /// `trust_recovery_helpers::add_checkpoint_cosignature`.
     ///
     /// The caller supplies a mutable checkpoint (by owned value) and
     /// the cosignature; the handler applies the cosignature on success
@@ -2063,7 +2064,7 @@ pub enum TrustRecoveryCommand {
 
     /// Advances the MLS epoch for a context as part of compromise
     /// recovery (spec §9.12 step 2). Mirrors
-    /// [`trust_recovery_helpers::recovery_advance_epoch`](crate::context::trust_recovery_helpers::recovery_advance_epoch).
+    /// `trust_recovery_helpers::recovery_advance_epoch`.
     RecoveryAdvanceEpoch {
         /// Context identifier string.
         context_id: String,
@@ -2073,7 +2074,7 @@ pub enum TrustRecoveryCommand {
 
     /// Sends a recovery notification directly through a named context
     /// (spec §9.12 step 5 — context already known). Mirrors
-    /// [`trust_recovery_helpers::recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification).
+    /// `trust_recovery_helpers::recovery_send_notification`.
     RecoverySendNotification {
         /// Boxed owned payload (carries the signing key bytes).
         payload: Box<RecoverySendNotificationPayload>,
@@ -2083,7 +2084,7 @@ pub enum TrustRecoveryCommand {
 
     /// Sends a recovery notification to a contact DID by finding a
     /// shared context. Mirrors
-    /// [`trust_recovery_helpers::recovery_notify_contact`](crate::context::trust_recovery_helpers::recovery_notify_contact).
+    /// `trust_recovery_helpers::recovery_notify_contact`.
     RecoveryNotifyContact {
         /// Boxed owned payload (carries the signing key bytes).
         payload: Box<RecoveryNotifyContactPayload>,
@@ -2093,7 +2094,7 @@ pub enum TrustRecoveryCommand {
 }
 
 /// See [`ContextCommand::Standing`]. Real variants cover the public
-/// methods on [`crate::context::standing_helpers`].
+/// methods on `crate::context::standing_helpers`.
 pub enum StandingCommand {
     /// Get-or-create a standing bilateral context between two identities
     /// (spec §5.12.6 — contact graph). Mirrors the supervisor's
@@ -2123,7 +2124,7 @@ pub enum StandingCommand {
     },
 
     /// Returns the number of tracked standing contexts. Mirrors
-    /// [`standing_helpers::standing_context_count`](crate::context::standing_helpers::standing_context_count).
+    /// `standing_helpers::standing_context_count`.
     /// Read-only.
     StandingContextCount {
         /// Oneshot reply channel.
@@ -2132,7 +2133,7 @@ pub enum StandingCommand {
 
     /// Returns `true` iff a standing context exists for the given peer.
     /// Mirrors
-    /// [`standing_helpers::has_standing_context`](crate::context::standing_helpers::has_standing_context).
+    /// `standing_helpers::has_standing_context`.
     /// Read-only.
     HasStandingContext {
         /// Candidate peer DID.
@@ -2142,7 +2143,7 @@ pub enum StandingCommand {
     },
 
     /// Registers an existing context as a standing context. Mirrors
-    /// [`standing_helpers::register_standing_context`](crate::context::standing_helpers::register_standing_context).
+    /// `standing_helpers::register_standing_context`.
     /// Called during SDK init to restore the contact-graph index from a
     /// persisted snapshot.
     RegisterStandingContext {
@@ -2153,7 +2154,7 @@ pub enum StandingCommand {
     },
 
     /// Reconnects transport for every standing context. Mirrors
-    /// [`standing_helpers::reconnect_all_standing`](crate::context::standing_helpers::reconnect_all_standing).
+    /// `standing_helpers::reconnect_all_standing`.
     /// Returns the number of contexts that were successfully
     /// reconnected.
     ReconnectAllStanding {
@@ -2195,7 +2196,7 @@ pub struct TtlTimerPayload {
     /// `StartTtlTimer`, which records an absolute `deadline_override` instead.
     pub duration: std::time::Duration,
     /// Absolute convergent expiry deadline to record for `StartTtlTimer`, as a
-    /// [`ConvergentDeadline`](crate::context::ttl_close_helpers::ConvergentDeadline)
+    /// `ConvergentDeadline`
     /// — the transient arming-seam newtype, carried in-process across this
     /// (never-serialized) mailbox command, NEVER persisted (B2). `Some(d)`
     /// installs `d` verbatim — the restore/import paths pass the deadline derived
@@ -2246,7 +2247,7 @@ pub enum TtlCloseCommand {
     },
 
     /// Proposes a TTL extension on behalf of a specific member. Mirrors
-    /// [`propose_ttl_extension`](crate::context::ttl_close_helpers::propose_ttl_extension).
+    /// `propose_ttl_extension`.
     ///
     /// Reply is `Ok(true)` iff the extension reaches unanimous consent
     /// on this call; the caller then invokes
@@ -2269,7 +2270,7 @@ pub enum TtlCloseCommand {
 
     /// Resets the TTL timer to a new duration after a successful
     /// unanimous extension. Mirrors
-    /// [`reset_ttl_timer`](crate::context::ttl_close_helpers::reset_ttl_timer).
+    /// `reset_ttl_timer`.
     ResetTtlTimer {
         /// Boxed owned payload — see [`TtlTimerPayload`].
         payload: Box<TtlTimerPayload>,
@@ -2278,7 +2279,7 @@ pub enum TtlCloseCommand {
     },
 
     /// Executes a caller-initiated TTL expiry. Mirrors
-    /// [`handle_ttl_expiry`](crate::context::ttl_close_helpers::handle_ttl_expiry).
+    /// `handle_ttl_expiry`.
     ///
     /// This is the EXPLICIT-expiry entry point (an FFI
     /// `context_handle_ttl_expiry` request); the AUTOMATIC path is driven
@@ -2296,7 +2297,7 @@ pub enum TtlCloseCommand {
 
     /// Completes context closure after all members have processed the
     /// `ContextClosing` notification. Mirrors
-    /// [`finalize_close`](crate::context::ttl_close_helpers::finalize_close).
+    /// `finalize_close`.
     FinalizeClose {
         /// Boxed owned payload — see [`TtlContextPayload`].
         payload: Box<TtlContextPayload>,
@@ -2306,7 +2307,7 @@ pub enum TtlCloseCommand {
 }
 
 /// See [`ContextCommand::Outlets`]. Real variants cover every public
-/// method on [`crate::context::outlets_helpers`] EXCEPT
+/// method on `crate::context::outlets_helpers` EXCEPT
 /// [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
 /// — that method is the cross-context outlet-invocation entry and carries
 /// a generic executor closure `F: FnOnce(Value) -> Fut` which cannot
@@ -2321,12 +2322,12 @@ pub enum TtlCloseCommand {
 /// The migrated variants are the hard-rate-limit consume / refund
 /// helpers (async + sync + runtime-agnostic) that FFI bridges call from
 /// their own outlet-dispatch paths. All 6 methods on
-/// [`crate::context::outlets_helpers`] migrate here because they are the
+/// `crate::context::outlets_helpers` migrate here because they are the
 /// supervisor-observable outlet surface.
 pub enum OutletsCommand {
     /// Try to consume one hard-rate-limit token for the given
     /// `(context_id, did)` pair (async variant). Mirrors
-    /// [`outlets_helpers::try_consume_hard_rate_limit`](crate::context::outlets_helpers::try_consume_hard_rate_limit).
+    /// `outlets_helpers::try_consume_hard_rate_limit`.
     ///
     /// Reply carries `Ok(true)` iff a token was consumed or the context
     /// is unknown (pass-through contract on unknown contexts — matches
@@ -2344,7 +2345,7 @@ pub enum OutletsCommand {
     },
 
     /// Refund one hard-rate-limit token (async variant). Mirrors
-    /// [`outlets_helpers::refund_hard_rate_limit`](crate::context::outlets_helpers::refund_hard_rate_limit).
+    /// `outlets_helpers::refund_hard_rate_limit`.
     /// No-op on unknown context.
     RefundHardRateLimit {
         /// Context identifier string.
@@ -2360,10 +2361,10 @@ pub enum OutletsCommand {
     /// `invoke_outlet_with_economy`: consume the hard rate limit, record
     /// the velocity entry, run the economy pre-check, deduct budget,
     /// authorize the payment escrow. Replies with a `Send`
-    /// [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation)
+    /// `OutletEconomyReservation`
     /// that the supervisor carries across the non-`Send` executor.
     ///
-    /// See [`crate::context::outlets_helpers::reserve_outlet_economy`].
+    /// See `crate::context::outlets_helpers::reserve_outlet_economy`.
     ReserveOutletEconomy {
         /// Context identifier string.
         context_id: String,
@@ -2410,8 +2411,8 @@ pub enum OutletsCommand {
     /// consequence enforcement + payment capture; on executor failure
     /// voids the escrow and reverses budget / velocity / rate-limit.
     ///
-    /// See [`crate::context::outlets_helpers::settle_outlet_economy_capture`]
-    /// and [`crate::context::outlets_helpers::rollback_outlet_economy`].
+    /// See `crate::context::outlets_helpers::settle_outlet_economy_capture`
+    /// and `crate::context::outlets_helpers::rollback_outlet_economy`.
     SettleOutletEconomy {
         /// Context identifier string.
         context_id: String,
@@ -2436,10 +2437,10 @@ pub enum OutletsCommand {
     /// draws A's own persistent per-sender counter at the §9.16/§5.15.7 encrypt
     /// seam (SCP-OUT-047) — no bridge-local counter is minted.
     /// Replies with a `Send`
-    /// [`StreamEconomyReservation`](crate::context::outlets_helpers::StreamEconomyReservation)
+    /// `StreamEconomyReservation`
     /// the supervisor carries across the off-mailbox stream pump.
     ///
-    /// See [`crate::context::outlets_helpers::reserve_outlet_stream_economy`].
+    /// See `crate::context::outlets_helpers::reserve_outlet_stream_economy`.
     ReserveOutletStreamEconomy {
         /// Context identifier string.
         context_id: String,
@@ -2479,7 +2480,7 @@ pub enum OutletsCommand {
     /// as `reserved_top_up`, and reverses via [`Self::ReverseStreamGrantEscrow`]
     /// if the grant apply then rejects (signature / replay / stream-closed).
     ///
-    /// See [`crate::context::outlets_helpers::reserve_stream_grant_escrow`].
+    /// See `crate::context::outlets_helpers::reserve_stream_grant_escrow`.
     ReserveStreamGrantEscrow {
         /// Context identifier string.
         context_id: String,
@@ -2504,11 +2505,11 @@ pub enum OutletsCommand {
     /// Reverse of [`Self::ReserveStreamGrantEscrow`] — CREDIT the grant hold back
     /// AND un-bump the durable crash-recovery record, atomically, when a grant
     /// apply is rejected after the reserve debited. Both legs move together so a
-    /// crash between them cannot make [`crate::context::outlets_helpers::reconcile_stream_reservations`]
+    /// crash between them cannot make `crate::context::outlets_helpers::reconcile_stream_reservations`
     /// double-refund the reversed hold. Both operations are saturating, so a
     /// double-reverse is a safe no-op.
     ///
-    /// See [`crate::context::outlets_helpers::reverse_stream_grant_escrow`].
+    /// See `crate::context::outlets_helpers::reverse_stream_grant_escrow`.
     ReverseStreamGrantEscrow {
         /// Context identifier string.
         context_id: String,
@@ -2528,7 +2529,7 @@ pub enum OutletsCommand {
     /// unary `consume_caveat_counters` gate. The stream pump runs
     /// supervisor-side (it holds no `&mut` to actor-owned state) and routes
     /// its open-time per-kind `check_and_increment` back through this command
-    /// via [`crate::context::outlets::stream_counter_adapter::ActorClassSCaveatCounterAdapter`].
+    /// via `crate::context::outlets::stream_counter_adapter::ActorClassSCaveatCounterAdapter`.
     ///
     /// The handler runs [`crate::trust::CaveatCounters::try_consume`] against
     /// the owned `ClassSState.caveat_counters` record keyed by `ucan_cid`. An
@@ -2585,7 +2586,7 @@ pub enum OutletsCommand {
     /// Off-mailbox streaming §5.4.5 open-time escrow REVERSAL on actor-owned
     /// state — the actor-mailbox port of the reference
     /// `ContextManager::outlet_stream_reverse_spend`. Fired by
-    /// [`crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink`]
+    /// `crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink`
     /// from the [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)
     /// Drop-guard when an open-time escrow HOLD was debited against the
     /// invoker's `MemberBudgetTracker` but the pump never spawned (an
@@ -2612,7 +2613,7 @@ pub enum OutletsCommand {
     /// Off-mailbox streaming §5.4.5 close-time economic SETTLEMENT on
     /// actor-owned state — the actor-mailbox port of the reference
     /// `ContextManager::outlet_stream_settle`. Fired by
-    /// [`crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink`]
+    /// `crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink`
     /// at stream close (terminal chunk delivered).
     ///
     /// The handler is generation-guarded (confused-deputy protection): if the
@@ -2626,7 +2627,7 @@ pub enum OutletsCommand {
     /// fail-closed `commit_class_s_keep`, then (3) captures the §19.15.5
     /// `PaymentReceipt` for the exact billed amount off-persist. The no-actor
     /// fallback (context torn down mid-stream) is handled supervisor-side in
-    /// [`Supervisor::settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor)
+    /// `Supervisor::settle_outlet_stream_via_actor`
     /// BEFORE this command is dispatched.
     SettleOutletStream {
         /// The close-time settlement inputs (boxed — the largest
@@ -2660,7 +2661,7 @@ pub enum OutletsCommand {
     /// on actor-owned Class-S state at pump open, AFTER both open-time
     /// reservations (the §5.4.5 escrow hold + the §7.3.8 cumulative counter
     /// reserve) are durable. Fired by
-    /// [`ActorStreamSettlementSink::persist_reservation`](crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink)
+    /// `ActorStreamSettlementSink::persist_reservation`
     /// from the off-mailbox open path.
     ///
     /// The handler inserts the record (keyed by the hex `request_id`) into
@@ -2682,7 +2683,7 @@ pub enum OutletsCommand {
     /// Fix-D — restore-time crash-recovery sweep: reconcile every unresolved
     /// streaming reservation recovery record on actor-owned Class-S state. Fired
     /// once per context from the restore path
-    /// ([`restore_context`](crate::context::lifecycle_helpers)) after the actor
+    /// (`restore_context`) after the actor
     /// is respawned, mirroring the §6.2.4 saga-recovery reconciliation but
     /// scoped to the SAME restored context (streaming has no cross-context saga
     /// journal — the reservation is this context's own owned state).
@@ -2770,7 +2771,7 @@ pub enum QueriesCommand {
         /// Author DID to look up.
         author_did: String,
         /// Oneshot reply channel — `Zeroizing<[u8; 32]>` key + epoch.
-        /// See [`BroadcastKeyReply`] for the typed alias.
+        /// See `BroadcastKeyReply` for the typed alias.
         reply: BroadcastKeyReply,
     },
     /// Current member count for the context.
@@ -3008,9 +3009,9 @@ pub enum QueriesCommand {
 ///
 /// Carries the `Send` reservation handles the caller-context actor staged but
 /// did NOT apply: the escrow + outbound rate-limit reservation rolled into the
-/// existing [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation).
+/// existing `OutletEconomyReservation`.
 /// The supervisor FSM (slice 5) holds this across the saga; the
-/// [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation)'s
+/// `OutletEconomyReservation`'s
 /// `#[must_use]` drop guard releases the held escrow/rate-limit on every
 /// terminal non-commit path (abort, timeout, panic — spec §6.2.4 "Reservation
 /// release on every terminal path"). On Commit-A the FSM settles it.
@@ -3021,7 +3022,7 @@ pub enum QueriesCommand {
 pub struct PreparedAFields {
     /// The staged escrow + outbound rate-limit reservation (RAII release on
     /// not-commit). Produced via the existing
-    /// [`reserve_outlet_economy`](crate::context::outlets_helpers::reserve_outlet_economy)
+    /// `reserve_outlet_economy`
     /// mechanism so Prepare-A reuses the single-context reserve/settle split.
     pub reservation: crate::context::outlets_helpers::OutletEconomyReservation,
 }
@@ -3071,7 +3072,7 @@ pub struct PreparedBFields {
 /// / Class-S-persist failures (a dropped receiver, a Prepare timeout, a journal
 /// I/O fault). Those lift to the generic saga-abort code `13067`. Construct a
 /// `SagaReject` via the
-/// [`saga_reject!`](crate::context::actor::commands::saga_reject) macro so the
+/// `saga_reject!` macro so the
 /// structural `code` and the `SCP-SAGA-{code}:` message prefix derive from ONE
 /// code literal and cannot diverge.
 #[derive(Debug)]
@@ -3092,7 +3093,7 @@ pub struct SagaReject {
 /// failure, not a §6.2.4 policy reject. It lifts to the generic saga-abort code
 /// `13067`. ONLY the `?`-propagated infrastructure paths route through this
 /// conversion; every Prepare-axis POLICY reject is built via the
-/// [`saga_reject!`](crate::context::actor::commands::saga_reject) macro with an
+/// `saga_reject!` macro with an
 /// explicit `code`, so a real discriminant is never silently dropped to `None`.
 impl From<ContextError> for SagaReject {
     fn from(error: ContextError) -> Self {
@@ -3286,7 +3287,7 @@ pub struct CommitBStreamSettleOutcome {
     /// built by the handler from the DURABLE ledger (SCP-OUT-046): the escrow
     /// refund + billed capture + §7.3.8 cumulative-counter release. `Some` on the
     /// FIRST seal — the off-mailbox seal task applies it via
-    /// [`Supervisor::settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor)
+    /// `Supervisor::settle_outlet_stream_via_actor`
     /// (the actor handler CANNOT dispatch to its own mailbox — re-entrant
     /// deadlock — so the money movement runs off-mailbox). `None` on a REPLAY
     /// (the money already moved on the first settle; the seal task must NOT
@@ -3435,7 +3436,7 @@ pub enum SagaPhaseMessage {
     /// stages (not applies) the outbound rate-limit decrement + escrow
     /// reservation of the outlet's REGISTERED per-invocation cost (resolved from
     /// the caller's economy policy / outlet registry by
-    /// [`reserve_outlet_economy`](crate::context::outlets_helpers::reserve_outlet_economy),
+    /// `reserve_outlet_economy`,
     /// NOT any caller-asserted value), persists Class-S fail-closed, and replies
     /// the `Send` reservation handles.
     PrepareA {

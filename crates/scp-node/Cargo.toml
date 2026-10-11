@@ -120,7 +120,8 @@ tempfile = "3"
 # feature nor `testing`, and `scripts/check-shipped-feature-graph.sh` rejects a
 # resolved set that names either.
 allow_unencrypted_storage = ["scp-core/allow_unencrypted_storage"]
-# Test-harness-only. Carries `scp-dht/testing` so `ApplicationNode::dev`,
+# Test-harness-only. Carries `scp-identity/testing` so the `--ephemeral` path
+# can build `InMemorySequenceStore`, and `scp-dht/testing` so `ApplicationNode::dev`,
 # `DhtMode::Memory`, and `build_memory_did_method` (all in-memory-DHT test
 # doubles) compile. It implies `allow_unencrypted_storage` for this crate's
 # integration-test crates — `tests/integration.rs`, `tests/quic_listener.rs`, and
@@ -131,7 +132,12 @@ allow_unencrypted_storage = ["scp-core/allow_unencrypted_storage"]
 # MUST NOT appear in any default/non-testing feature list (ADR-062 §Decision 1);
 # a shipped node build never enables it, so an in-memory DHT nullifier is absent
 # from shipped artifacts.
-testing = ["scp-dht/testing", "scp-platform/testing", "allow_unencrypted_storage"]
+testing = [
+    "scp-dht/testing",
+    "scp-identity/testing",
+    "scp-platform/testing",
+    "allow_unencrypted_storage",
+]
 # The PostgreSQL and S3 blob backends, off by default so a default build links
 # neither the `sqlx` PostgreSQL client nor the AWS S3 client. In `--relay-only`
 # and persistent full-node mode, a build that did not compile the selected

@@ -25,14 +25,13 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use openmls::prelude::*;
-use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
+use tls_codec::Serialize as TlsSerializeTrait;
 
 use crate::convergent_timestamp::decode_convergent_timestamp_aad;
 use crate::error::MlsError;
 use crate::group::ScpMlsGroup;
 
 use crate::lifetime::validate_received_key_package_lifetime_range;
-use crate::wrapping_extension::extract_wrapping_key;
 
 /// Runs `MlsGroup::process_message` on an inbound protocol message and rejects
 /// a self-authored echo.
@@ -117,6 +116,7 @@ fn process_inbound(
         _ => Ok(processed),
     }
 }
+use crate::admission::admit_staged_commit;
 
 /// The result of decrypting an MLS protocol message.
 ///
@@ -146,6 +146,14 @@ pub enum DecryptedContent {
     Commit {
         /// The sender's DID string extracted from the MLS credential.
         sender_did: String,
+        /// The tree's leaves after this Commit, computed before the merge.
+        /// A holder of a wrapping-key directory replaces it with
+        /// [`MemberLeaves::wrapping_key_directory`](crate::admission::MemberLeaves::wrapping_key_directory),
+        /// so the directory follows every Add, Remove and Update this Commit
+        /// carried. [`MemberLeaves::rotated`](crate::admission::MemberLeaves::rotated)
+        /// lists each leaf this Commit replaced (an Update proposal or the
+        /// committer's `UpdatePath`) whose `0xFF01` changed.
+        members: crate::admission::MemberLeaves,
     },
     /// A Proposal message. openmls does not store it: a received proposal is
     /// stored only through `store_pending_proposal`, which SCP does not call.
@@ -215,7 +223,7 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
     }
 
     // Deserialize the ciphertext bytes into an MlsMessageIn.
-    let message_in = MlsMessageIn::tls_deserialize(&mut &*ciphertext)
+    let message_in = crate::wire::parse_mls_message_in(ciphertext)
         .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?;
 
     // Convert to a ProtocolMessage for processing.
@@ -235,84 +243,29 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
     }
 }
 
-/// Decrypts an MLS `PrivateMessage` and returns both the plaintext bytes and
-/// the sender's Ed25519 signature key (as extracted from the MLS group state).
-///
-/// This function performs the same decryption as [`decrypt`] but additionally
-/// resolves the sender's identity from the MLS group tree. The sender's
-/// `signature_key` from their leaf node is returned alongside the plaintext,
-/// enabling the caller to verify inner envelope signatures without requiring
-/// the sender's public key as an external parameter.
-///
-/// # Arguments
-///
-/// * `group` - The MLS group to decrypt within. Must be active.
-/// * `ciphertext` - The serialized MLS ciphertext bytes.
-///
-/// # Returns
-///
-/// A tuple of `(plaintext, sender_signature_key)` where `sender_signature_key`
-/// is the Ed25519 public key bytes from the sender's MLS leaf node.
+/// The leaf index of the member that sent a processed message, and the DID in
+/// that leaf's credential.
 ///
 /// # Errors
 ///
-/// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
-/// Returns [`MlsError::DecryptionFailed`] if decryption or sender resolution
-/// fails.
-/// Returns [`MlsError::NotApplicationMessage`] if the decrypted message is
-/// not an application message.
-///
-/// See SCP-177: resolve sender key internally in `open_envelope`.
-pub fn decrypt_with_sender_key(
-    group: &mut ScpMlsGroup,
-    ciphertext: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), MlsError> {
-    if group.group.is_none() {
-        return Err(MlsError::GroupDestroyed);
-    }
-
-    // Deserialize the ciphertext bytes into an MlsMessageIn.
-    let message_in = MlsMessageIn::tls_deserialize(&mut &*ciphertext)
-        .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?;
-
-    // Convert to a ProtocolMessage for processing.
-    let protocol_message = message_in
-        .try_into_protocol_message()
-        .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
-
-    // Process the message — this verifies membership tag and generation number,
-    // and rejects a self-authored echo before the sender lookup below.
-    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-    let processed = process_inbound(g, &group.provider, protocol_message)?;
-
-    // Extract the sender's leaf index from the ProcessedMessage before
-    // consuming it with into_content().
-    let sender = processed.sender().clone();
+/// [`MlsError::DecryptionFailed`] when the sender is not a member or its leaf
+/// is absent from the tree, and the credential errors of [`credential_to_did`].
+fn sender_member(group: &MlsGroup, sender: &Sender) -> Result<(LeafNodeIndex, String), MlsError> {
     let Sender::Member(sender_leaf_index) = sender else {
         return Err(MlsError::DecryptionFailed(
             "sender is not a group member".to_string(),
         ));
     };
-
-    // Look up the sender's signature key from the group member list.
-    let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
-    let sender_signature_key = g
+    let sender_credential = group
         .members()
-        .find(|m| m.index == sender_leaf_index)
-        .map(|m| m.signature_key)
+        .find(|m| m.index == *sender_leaf_index)
+        .map(|m| m.credential)
         .ok_or_else(|| {
             MlsError::DecryptionFailed(format!(
                 "sender leaf index {sender_leaf_index:?} not found in group members"
             ))
         })?;
-
-    // Extract the application message content.
-    match processed.into_content() {
-        ProcessedMessageContent::ApplicationMessage(app_msg) => {
-            Ok((app_msg.into_bytes(), sender_signature_key))
-        }
-        _ => Err(MlsError::NotApplicationMessage),
-    }
+    Ok((*sender_leaf_index, credential_to_did(&sender_credential)?))
 }
 
 /// Decrypts an MLS `PrivateMessage` and returns a [`DecryptedContent`] enum
@@ -391,7 +344,7 @@ fn parse_protocol_message(
     if group.group.is_none() {
         return Err(MlsError::GroupDestroyed);
     }
-    MlsMessageIn::tls_deserialize(&mut &*ciphertext)
+    crate::wire::parse_mls_message_in(ciphertext)
         .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?
         .try_into_protocol_message()
         .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))
@@ -407,27 +360,10 @@ fn decrypt_protocol_message_with_sender_did(
     // Rejects a self-authored echo before the sender lookup below.
     let processed = process_inbound(g, &group.provider, protocol_message)?;
 
-    // Extract the sender's leaf index before consuming the ProcessedMessage.
-    let sender = processed.sender().clone();
-    let Sender::Member(sender_leaf_index) = sender else {
-        return Err(MlsError::DecryptionFailed(
-            "sender is not a group member".to_string(),
-        ));
-    };
-
-    // Look up the sender's credential from the group member list and parse
-    // the SCP credential to extract the DID.
+    // Resolve the sender DID from their leaf credential before consuming the
+    // ProcessedMessage.
     let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
-    let sender_credential = g
-        .members()
-        .find(|m| m.index == sender_leaf_index)
-        .map(|m| m.credential)
-        .ok_or_else(|| {
-            MlsError::DecryptionFailed(format!(
-                "sender leaf index {sender_leaf_index:?} not found in group members"
-            ))
-        })?;
-    let sender_did = credential_to_did(&sender_credential)?;
+    let (sender_leaf_index, sender_did) = sender_member(g, processed.sender())?;
 
     // Dispatch based on the processed message content type.
     match processed.into_content() {
@@ -436,18 +372,23 @@ fn decrypt_protocol_message_with_sender_did(
             sender_did,
         }),
         ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-            // Security-model spec §9.7.1, the receiver: bound each Add
-            // proposal's KeyPackage `Lifetime` to the RFC 9420 maximum range
-            // BEFORE merging, reading no clock, so every honest receiver
-            // reaches the same verdict. On failure we return WITHOUT merging,
-            // so the group stays on its current epoch (fail-closed, not
-            // half-applied), the same shape as the Remove-refusal in
-            // `decrypt_with_membership_changes`.
-            for add in staged_commit.add_proposals() {
-                validate_received_key_package_lifetime_range(
-                    add.add_proposal().key_package().life_time(),
-                )?;
-            }
+            // SCP admission BEFORE merging (spec 09 §9.16.1, security-model
+            // spec §9.7.1): every added leaf passes the receiver's range-only
+            // `Lifetime` check (no clock, so every honest receiver reaches the
+            // same verdict), the SCP credential, a present and valid 0xFF01, and the
+            // per-DID key-equality and leaf-count rules; every replaced leaf
+            // keeps its DID and carries a valid 0xFF01. On failure we return
+            // WITHOUT merging, so the group stays on its current epoch
+            // (fail-closed, not half-applied).
+            let admission = {
+                let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+                admit_staged_commit(
+                    g,
+                    &staged_commit,
+                    sender_leaf_index,
+                    crate::admission::LifetimeCheck::Receiver,
+                )?
+            };
 
             // Merge the staged commit to advance the group epoch. Without
             // this call, process_message has consumed the message but the
@@ -457,7 +398,10 @@ fn decrypt_protocol_message_with_sender_did(
                 .map_err(|e| {
                     MlsError::CommitProcessingFailed(format!("merging staged commit: {e}"))
                 })?;
-            Ok(DecryptedContent::Commit { sender_did })
+            Ok(DecryptedContent::Commit {
+                sender_did,
+                members: admission.members,
+            })
         }
         ProcessedMessageContent::ProposalMessage(proposal)
         | ProcessedMessageContent::ExternalJoinProposalMessage(proposal) => {
@@ -517,7 +461,7 @@ pub enum InboundChange {
         /// DIDs added by this Commit's Add proposals, in proposal order. Empty
         /// for a no-add Commit (e.g. a self-update).
         added_dids: Vec<String>,
-        /// The `scp_wrapping_key` X25519 public keys of the members this Commit's
+        /// The `scp_wrapping_key` P-256 public keys of the members this Commit's
         /// Add proposals add, in the SAME proposal order as `added_dids` (so
         /// `added_wrapping_keys[i]` is the wrapping key published by the member
         /// named in `added_dids[i]`). Recovered from each Add proposal's
@@ -530,7 +474,9 @@ pub enum InboundChange {
         /// HPKE-seal a sender key to would silently break §9.16 distribution. This
         /// vector is therefore always exactly as long as `added_dids`; it is empty
         /// only for a no-add Commit.
-        added_wrapping_keys: Vec<[u8; 32]>,
+        added_wrapping_keys: Vec<scp_protocol::crypto::hpke::p256::P256Point>,
+        /// The tree's leaves after this Commit; see [`DecryptedContent::Commit`].
+        members: crate::admission::MemberLeaves,
         /// The authenticated convergent committer timestamp (Unix seconds),
         /// recovered from the Commit's verified MLS AAD *before* the merge and
         /// adopted **verbatim** (ADR-057). The receiver stamps this exact value
@@ -591,6 +537,7 @@ impl std::fmt::Debug for InboundChange {
                 sender_did,
                 added_dids,
                 added_wrapping_keys,
+                members,
                 committer_timestamp_secs,
             } => f
                 .debug_struct("Commit")
@@ -602,6 +549,15 @@ impl std::fmt::Debug for InboundChange {
                     "added_wrapping_keys",
                     &format_args!("[{} keys]", added_wrapping_keys.len()),
                 )
+                .field(
+                    "rotated",
+                    &members
+                        .rotated()
+                        .iter()
+                        .map(|(did, _)| did.as_str())
+                        .collect::<Vec<_>>(),
+                )
+                .field("leaves", &format_args!("[{} leaves]", members.leaves().len()))
                 .field("committer_timestamp_secs", committer_timestamp_secs)
                 .finish(),
             Self::UnsupportedMembershipChange {
@@ -632,48 +588,6 @@ fn credential_to_did(credential: &Credential) -> Result<String, MlsError> {
     let scp_cred = crate::credential::ScpCredential::from_bytes(basic.identity())
         .map_err(|e| MlsError::DecryptionFailed(format!("parsing ScpCredential: {e}")))?;
     Ok(scp_cred.did)
-}
-
-/// Recovers, pre-merge, the DID and published `scp_wrapping_key` of every member
-/// a staged Commit's Add proposals add, in proposal order (so the two returned
-/// vectors are index-aligned and equal-length).
-///
-/// Each Add proposal's `KeyPackage` was already validated by `process_message`,
-/// so its DID is cryptographically authenticated. This pass additionally
-/// bounds the `KeyPackage` `Lifetime` to the maximum range, reading no clock
-/// (security-model spec §9.7.1, the receiver), and enforces the sender-key-distribution fail-closed
-/// requirement (INVARIANT 3): a leaf carrying no `scp_wrapping_key` extension is
-/// rejected via `?`, so the caller drops the staged commit unmerged and the group
-/// stays on its current epoch. A member no peer can HPKE-seal a sender key to must
-/// never be admitted.
-///
-/// # Errors
-///
-/// Returns [`MlsError::ReceivedKeyPackageLifetimeRangeInvalid`] if an Add
-/// proposal's `Lifetime` range is empty, inverted, or over the maximum, [`MlsError::ExtensionError`] if a
-/// leaf carries no `scp_wrapping_key` extension, or a credential-parse error.
-fn recover_added_members_pre_merge(
-    staged_commit: &StagedCommit,
-) -> Result<(Vec<String>, Vec<[u8; 32]>), MlsError> {
-    let mut added_dids = Vec::new();
-    let mut added_wrapping_keys = Vec::new();
-    for add in staged_commit.add_proposals() {
-        let key_package = add.add_proposal().key_package();
-        validate_received_key_package_lifetime_range(key_package.life_time())?;
-        added_dids.push(credential_to_did(key_package.leaf_node().credential())?);
-        let wrapping_key =
-            extract_wrapping_key(key_package.leaf_node().extensions())?.ok_or_else(|| {
-                MlsError::ExtensionError(
-                    "add rejected pre-merge: KeyPackage leaf carries no \
-                     scp_wrapping_key extension; a member no peer can HPKE-seal \
-                     a sender key to must not be admitted (§9.16.1, ADR-057 \
-                     sender-key distribution INVARIANT 3)"
-                        .to_owned(),
-                )
-            })?;
-        added_wrapping_keys.push(wrapping_key);
-    }
-    Ok((added_dids, added_wrapping_keys))
 }
 
 /// Decrypts an inbound MLS message and, for a Commit, surfaces the membership
@@ -756,7 +670,7 @@ pub fn decrypt_with_membership_changes(
         return Err(MlsError::GroupDestroyed);
     }
 
-    let message_in = MlsMessageIn::tls_deserialize(&mut &*ciphertext)
+    let message_in = crate::wire::parse_mls_message_in(ciphertext)
         .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?;
 
     let protocol_message = message_in
@@ -776,23 +690,8 @@ pub fn decrypt_with_membership_changes(
 
     // Resolve the sender DID from their leaf credential before consuming the
     // ProcessedMessage.
-    let sender = processed.sender().clone();
-    let Sender::Member(sender_leaf_index) = sender else {
-        return Err(MlsError::DecryptionFailed(
-            "sender is not a group member".to_string(),
-        ));
-    };
     let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
-    let sender_credential = g
-        .members()
-        .find(|m| m.index == sender_leaf_index)
-        .map(|m| m.credential)
-        .ok_or_else(|| {
-            MlsError::DecryptionFailed(format!(
-                "sender leaf index {sender_leaf_index:?} not found in group members"
-            ))
-        })?;
-    let sender_did = credential_to_did(&sender_credential)?;
+    let (sender_leaf_index, sender_did) = sender_member(g, processed.sender())?;
 
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app_msg) => {
@@ -872,8 +771,20 @@ pub fn decrypt_with_membership_changes(
             // `scp_wrapping_key` leaf extension — so a bystander can HPKE-seal its
             // sender key to the new member (§9.16.1). An Add with no wrapping key is
             // rejected pre-merge (via `?`), leaving the group on its current epoch.
-            let (added_dids, added_wrapping_keys) =
-                recover_added_members_pre_merge(&staged_commit)?;
+            let admission = {
+                let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+                admit_staged_commit(
+                    g,
+                    &staged_commit,
+                    sender_leaf_index,
+                    crate::admission::LifetimeCheck::Receiver,
+                )?
+            };
+            let (added_dids, added_wrapping_keys): (Vec<_>, Vec<_>) = admission
+                .added
+                .into_iter()
+                .map(|leaf| (leaf.did, leaf.wrapping_key))
+                .unzip();
 
             // ADR-057: only an add-Commit stamps convergent MemberJoined leaves,
             // so only an add-Commit binds a convergent timestamp. Decode it from
@@ -904,6 +815,7 @@ pub fn decrypt_with_membership_changes(
                 sender_did,
                 added_dids,
                 added_wrapping_keys,
+                members: admission.members,
                 committer_timestamp_secs,
             })
         }
@@ -945,7 +857,7 @@ mod tests {
     use crate::credential::ScpCredential;
     use crate::group::{
         add_member, add_member_with_convergent_timestamp, create_group, generate_key_package,
-        generate_key_package_with_wrapping_key, join_group, propose_add_member_bare,
+        join_group, propose_add_member_bare,
     };
     use openmls_basic_credential::SignatureKeyPair;
     use scp_clock::{Clock, SystemClock, TestClock};
@@ -965,11 +877,20 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn setup_alice_bob() -> (ScpMlsGroup, ScpMlsGroup) {
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
+        let mut alice_group = create_group(
+            &alice_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
         let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
@@ -1023,7 +944,12 @@ mod tests {
         // Alice/Bob's group) and encrypt a message there. This produces
         // a ciphertext with a membership tag from wrong epoch secrets.
         let charlie_cred = test_credential("charlie");
-        let mut charlie_group = create_group(&charlie_cred, &SystemClock).unwrap();
+        let mut charlie_group = create_group(
+            &charlie_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&charlie_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Add a dummy member so Charlie can encrypt (OpenMLS may require
         // at least 2 members, but single-member encrypt should work too).
@@ -1235,7 +1161,8 @@ mod tests {
     }
 
     /// A member that processes its own application ciphertext (the relay's
-    /// echo) gets the typed `CannotDecryptOwnMessage` from every decrypt entry
+    /// echo) gets the typed `CannotDecryptOwnMessage` from each of the three
+    /// decrypt entry
     /// point, not a wildcard `NotApplicationMessage` or a sender lookup on its
     /// own leaf.
     ///
@@ -1249,13 +1176,10 @@ mod tests {
     /// `PublicMessage` (openmls's `OwnPendingCommit`).
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn own_echo_is_rejected_by_all_four_decrypt_functions() {
+    fn own_echo_is_rejected_by_every_decrypt_function() {
         type DecryptFn = fn(&mut ScpMlsGroup, &[u8]) -> Result<(), MlsError>;
-        let entry_points: [(&str, DecryptFn); 4] = [
+        let entry_points: [(&str, DecryptFn); 3] = [
             ("decrypt", |g, ct| decrypt(g, ct).map(drop)),
-            ("decrypt_with_sender_key", |g, ct| {
-                decrypt_with_sender_key(g, ct).map(drop)
-            }),
             ("decrypt_with_sender_did", |g, ct| {
                 decrypt_with_sender_did(g, ct).map(drop)
             }),
@@ -1282,7 +1206,7 @@ mod tests {
             ("PublicMessage", &mut public_group),
         ] {
             let epoch_before = group.epoch().unwrap();
-            // One staged Commit serves all four entry points: a rejected echo
+            // One staged Commit serves every entry point: a rejected echo
             // neither merges nor clears the pending Commit.
             let commit_bytes = unmerged_self_update_bytes(group);
             for (name, decrypt_fn) in entry_points {
@@ -1358,11 +1282,20 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn decrypt_with_sender_did_handles_commit_without_corruption() {
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
+        let mut alice_group = create_group(
+            &alice_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
         let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
@@ -1396,7 +1329,15 @@ mod tests {
             matches!(&content, DecryptedContent::Commit { .. }),
             "expected Commit variant"
         );
-        if let DecryptedContent::Commit { sender_did } = &content {
+        if let DecryptedContent::Commit {
+            sender_did,
+            members,
+        } = &content
+        {
+            assert!(
+                members.rotated().is_empty(),
+                "an Update keeping its key changes none"
+            );
             assert!(
                 sender_did.starts_with("did:dht:z6Mk"),
                 "sender_did must be a DID, got: {sender_did}"
@@ -1433,11 +1374,20 @@ mod tests {
         // DID (recovered from the Add proposal's KeyPackage), so an existing
         // member can mirror the committer's MemberJoined leaf and converge.
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
+        let mut alice_group = create_group(
+            &alice_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
         let add_bob = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
         let mut bob_group =
@@ -1447,10 +1397,9 @@ mod tests {
         // ADR-057 sender-key distribution: Carol's KeyPackage must publish an
         // scp_wrapping_key leaf extension, or the fail-closed add-extraction in
         // decrypt_with_membership_changes rejects the add pre-merge (INVARIANT 3).
-        let carol_wk = [0xCC_u8; 32];
+        let carol_wk = scp_crypto::p256::testing::valid_uncompressed_point(0xCC);
         let (carol_kp_bundle, _carol_signer, _carol_provider) =
-            generate_key_package_with_wrapping_key(&carol_cred, Some(&carol_wk), &SystemClock)
-                .unwrap();
+            generate_key_package(&carol_cred, &carol_wk, &SystemClock).unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
         // ADR-057: the add-Carol commit binds a convergent timestamp into
         // its AAD; Bob recovers + validates it on receive.
@@ -1467,8 +1416,13 @@ mod tests {
                 sender_did,
                 added_dids,
                 added_wrapping_keys,
+                members,
                 committer_timestamp_secs,
             } => {
+                assert!(
+                    members.rotated().is_empty(),
+                    "an Add changes no recorded key"
+                );
                 assert_eq!(sender_did, "did:dht:z6Mkalice", "committer is Alice");
                 assert_eq!(
                     added_dids,
@@ -1477,7 +1431,7 @@ mod tests {
                 );
                 assert_eq!(
                     added_wrapping_keys,
-                    vec![carol_wk],
+                    vec![scp_protocol::crypto::hpke::p256::P256Point::try_from(carol_wk).unwrap()],
                     "the seam surfaces Carol's scp_wrapping_key from the Add proposal's leaf, \
                      1:1 with added_dids (ADR-057 sender-key distribution)"
                 );
@@ -1495,58 +1449,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
-    fn decrypt_with_membership_changes_rejects_add_without_wrapping_key() {
-        // ADR-057 sender-key distribution INVARIANT 3: an add whose KeyPackage
-        // leaf carries NO scp_wrapping_key extension must be rejected pre-merge —
-        // admitting a member no peer can HPKE-seal a sender key to would silently
-        // break §9.16 distribution. The rejection is fail-closed: the group is
-        // left on its current epoch (no half-merge).
-        let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
-
-        let bob_cred = test_credential("bob");
-        let bob_wk = [0xBB_u8; 32];
-        let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package_with_wrapping_key(&bob_cred, Some(&bob_wk), &SystemClock).unwrap();
-        let add_bob = add_member(
-            &mut alice_group,
-            bob_kp_bundle.key_package().clone().into(),
-            &SystemClock,
-        )
-        .unwrap();
-        let mut bob_group =
-            join_group(&add_bob.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
-
-        // Carol's KeyPackage has NO wrapping key (plain generate_key_package).
-        let carol_cred = test_credential("carol");
-        let (carol_kp_bundle, _carol_signer, _carol_provider) =
-            generate_key_package(&carol_cred, &SystemClock).unwrap();
-        let add_carol = add_member_with_convergent_timestamp(
-            &mut alice_group,
-            carol_kp_bundle.key_package().clone().into(),
-            &SystemClock,
-            SystemClock.now_secs(),
-        )
-        .unwrap();
-        let add_carol_bytes = add_carol.commit.tls_serialize_detached().unwrap();
-
-        let bob_epoch_before = bob_group.epoch().unwrap();
-        let err = decrypt_with_membership_changes(&mut bob_group, &add_carol_bytes)
-            .expect_err("an add with no scp_wrapping_key must be rejected pre-merge");
-        assert!(
-            matches!(err, MlsError::ExtensionError(_)),
-            "expected a fail-closed ExtensionError, got: {err:?}"
-        );
-        // FAIL-CLOSED: the rejected add did NOT advance Bob's epoch (no half-merge).
-        assert_eq!(
-            bob_group.epoch().unwrap(),
-            bob_epoch_before,
-            "a rejected add-Commit must NOT advance the MLS epoch"
-        );
-    }
-
-    #[test]
     #[allow(clippy::unwrap_used, clippy::panic)]
     fn decrypt_with_membership_changes_rejects_remove_without_merging() {
         // Alice creates, adds Bob and Carol, then removes Carol. The existing
@@ -1555,11 +1457,20 @@ mod tests {
         // tree) WITHOUT merging — so Bob's MLS group stays on its current epoch
         // and is left consistent (fail-closed, not half-applied).
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
+        let mut alice_group = create_group(
+            &alice_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let add_bob = add_member(
             &mut alice_group,
             bob_kp_bundle.key_package().clone().into(),
@@ -1573,9 +1484,12 @@ mod tests {
         // ADR-057 sender-key distribution INVARIANT 3: Carol's KeyPackage must
         // publish an scp_wrapping_key leaf extension so Bob's add-Carol receive
         // (a Commit-arm decrypt) accepts pre-merge.
-        let (carol_kp_bundle, _carol_signer, _carol_provider) =
-            generate_key_package_with_wrapping_key(&carol_cred, Some(&[0xCC_u8; 32]), &SystemClock)
-                .unwrap();
+        let (carol_kp_bundle, _carol_signer, _carol_provider) = generate_key_package(
+            &carol_cred,
+            &scp_crypto::p256::testing::valid_uncompressed_point(0xCC),
+            &SystemClock,
+        )
+        .unwrap();
         // ADR-057: bind a convergent timestamp so Bob's add-Carol receive
         // (a Commit-arm decrypt) accepts.
         let add_carol = add_member_with_convergent_timestamp(
@@ -1602,7 +1516,9 @@ mod tests {
                 }
             })
             .unwrap();
-        let remove = crate::group::remove_member(&mut alice_group, carol_member.index).unwrap();
+        let remove =
+            crate::group::remove_member(&mut alice_group, carol_member.index, &SystemClock)
+                .unwrap();
         let remove_bytes = remove.commit.tls_serialize_detached().unwrap();
 
         // Bob is on epoch 2 (create + add-Bob + add-Carol = two epoch advances
@@ -1757,6 +1673,17 @@ mod tests {
             signature_key: signer.to_public_vec().into(),
         };
         KeyPackage::builder()
+            .leaf_node_capabilities(crate::wrapping_extension::scp_capabilities_with_wrapping_key())
+            .leaf_node_extensions(
+                openmls::prelude::Extensions::single(
+                    crate::wrapping_extension::make_wrapping_key_extension(
+                        &scp_crypto::p256::testing::uncompressed_point_for(
+                            &test_credential("carol").did,
+                        ),
+                    ),
+                )
+                .unwrap(),
+            )
             .key_package_lifetime(Lifetime::init(
                 real_now - 3600,
                 real_now + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS + 3600,
@@ -1791,9 +1718,9 @@ mod tests {
         let real_now = SystemClock.now_secs();
         let not_after = real_now + DAY;
         let carol_clock = TestClock::new(not_after - KEY_PACKAGE_LIFETIME_SECS);
-        let (bundle, _s, _p) = generate_key_package_with_wrapping_key(
+        let (bundle, _s, _p) = generate_key_package(
             &test_credential("carol"),
-            Some(&[0xCC_u8; 32]),
+            &scp_crypto::p256::testing::uncompressed_point_for(&test_credential("carol").did),
             &carol_clock,
         )
         .unwrap();
@@ -1972,9 +1899,12 @@ mod tests {
         // Carol carries a wrapping key (an otherwise-valid add), so the Commit
         // reaches the convergent-timestamp AAD check rather than the fail-closed
         // wrapping-key check that precedes it (both are pre-merge).
-        let (carol_kp_bundle, _s, _p) =
-            generate_key_package_with_wrapping_key(&carol_cred, Some(&[0xCC_u8; 32]), &SystemClock)
-                .unwrap();
+        let (carol_kp_bundle, _s, _p) = generate_key_package(
+            &carol_cred,
+            &scp_crypto::p256::testing::valid_uncompressed_point(0xCC),
+            &SystemClock,
+        )
+        .unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
         // Plain add_member — binds NO convergent-timestamp AAD.
         let add_carol = add_member(&mut alice_group, carol_kp, &SystemClock).unwrap();
@@ -2007,7 +1937,12 @@ mod tests {
         let bob_epoch_before = bob_group.epoch().unwrap();
 
         let carol_cred = test_credential("carol");
-        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
+        let (carol_kp_bundle, _s, _p) = generate_key_package(
+            &carol_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&carol_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
         let ts = SystemClock.now_secs();
         let add_carol =
@@ -2046,7 +1981,12 @@ mod tests {
         let bob_epoch_before = bob_group.epoch().unwrap();
 
         let carol_cred = test_credential("carol");
-        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
+        let (carol_kp_bundle, _s, _p) = generate_key_package(
+            &carol_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&carol_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
         // A distinctive timestamp so its encoded AAD blob is unambiguously
         // locatable in the cleartext `authenticated_data` on the wire.

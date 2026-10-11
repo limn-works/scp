@@ -762,8 +762,11 @@ async fn blocked_subscriber_key_request_denied() {
     ctx.block_subscriber("did:key:author1", "did:key:subscriber1")
         .unwrap();
 
-    // Key request from blocked subscriber should be denied
-    let decision = ctx.handle_key_request("did:key:author1", "did:key:subscriber1", &[0u8; 32]);
+    // Key request from blocked subscriber should be denied; the wrapping key is
+    // a valid point, so the Deny can only come from the block.
+    let (subscriber_pub, _secret) = scp_core::crypto::sender_keys::generate_wrapping_keypair();
+    let decision =
+        ctx.handle_key_request("did:key:author1", "did:key:subscriber1", &subscriber_pub);
     match decision {
         KeyRequestDecision::Deny { reason } => {
             assert!(

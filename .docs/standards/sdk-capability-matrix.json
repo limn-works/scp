@@ -1811,7 +1811,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::drain_and_deliver_sender_keys (scp-runtime/src/context/manager/lifecycle.rs:2015) drains pending HPKE-wrapped sender-key distributions and delivers them through transport. Invoked transitively from join_context and create_context after MLS commits.",
+          "notes": "Internal: drain_and_deliver_sender_keys (crates/scp-runtime/src/context/lifecycle_helpers.rs) drains pending HPKE (DHKEM(P-256), §9.5) wrapped sender-key distributions and delivers them through transport. Invoked transitively from join_context and create_context after MLS commits.",
           "exemptions": {
             "python": "internal sender-key delivery loop, not a standalone SDK operation",
             "typescript": "internal sender-key delivery loop, not a standalone SDK operation",

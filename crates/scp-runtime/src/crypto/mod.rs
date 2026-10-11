@@ -6,11 +6,13 @@
 pub mod mls;
 
 pub mod access_keys;
-pub mod hpke_backend;
 pub mod sender_keys;
 pub mod ucan;
+pub mod wrapping;
 
 #[cfg(test)]
 mod agent_binding_tests;
+#[cfg(test)]
+pub(crate) mod dh_counting_custody;
 #[cfg(test)]
 pub(crate) mod key_loss_custody;

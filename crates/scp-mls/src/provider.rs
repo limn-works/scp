@@ -1039,7 +1039,12 @@ mod tests {
             scp_did::SigningKeyId::Active,
         )
         .unwrap();
-        let group = crate::group::create_group(&credential, &scp_clock::SystemClock).unwrap();
+        let group = crate::group::create_group(
+            &credential,
+            &scp_crypto::p256::testing::uncompressed_point_for(&credential.did),
+            &scp_clock::SystemClock,
+        )
+        .unwrap();
         let group_keys: Vec<Vec<u8>> = group
             .provider()
             .storage()

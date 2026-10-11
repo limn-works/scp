@@ -102,6 +102,9 @@ scp-testing = { path = ".", features = ["testing"] }
 # module in this library names the items they gate.
 scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage", "testing"] }
 scp-core = { path = "../scp-core", features = ["testing"] }
+# `p256::testing::uncompressed_point_for`, the wrapping public key every MLS
+# group and KeyPackage fixture publishes in its leaf (spec 09 §9.16.1).
+scp-crypto = { path = "../scp-crypto", features = ["testing"] }
 # The SDK-usability integration test builds relay wire messages directly; the
 # types live in the wasm-safe scp-relay-client leaf (ADR-057 Slice 3, D5).
 scp-relay-client = { path = "../scp-relay-client" }
@@ -157,7 +160,6 @@ syn = { version = "2", features = ["full", "visit"] }
 proc-macro2 = "1"
 rmp-serde = { workspace = true }
 tempfile = "3"
-x25519-dalek = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 axum = { workspace = true, features = ["ws"] }
 tower = { version = "0.5", features = ["util"] }

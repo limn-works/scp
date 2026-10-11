@@ -56,7 +56,7 @@
 //!
 //! Members share their §9.16 sender keys **in-tab**, over the MLS
 //! `scp_wrapping_key` leaf extension — there is no out-of-band hand-off. Each
-//! member publishes a stable X25519 **wrapping key** in its `KeyPackage` / creator
+//! member publishes a stable DHKEM(P-256) **wrapping key** in its `KeyPackage` / creator
 //! leaf; peers HPKE-seal their per-member sender keys to it and deliver the
 //! sealed key as an MLS-authenticated **management message** (SCPM-tagged,
 //! §9.16.1) over the same wire path as an application message. The wrapping-key

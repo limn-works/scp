@@ -234,15 +234,19 @@ pub async fn recovery_advance_epoch(
     //    (SCP-CRYPTOMOVE-001): now driven on the actor `state.mode` via
     //    `commit_class_s_keep` -> `rest_mut` — §9 Class-S, the ratchet is durable
     //    before the Commit is broadcast (this is the highest-stakes safety-gated
-    //    advance; see the broadcast note below). `wrapping_public_key` from the
-    //    retained `deps.crypto.wrapping_keypair()`. If this fails (or its
+    //    advance; see the broadcast note below). The Update keeps publishing
+    //    the identity's wrapping key (spec 09 §9.16.1); with none loaded it
+    //    fails closed before anything ratchets. If this fails (or its
     //    fail-closed persist fails) the error `?`-propagates and the bookkeeping
     //    counter is NOT incremented — disposition preserved.
-    let wrapping_public_key = deps.crypto.wrapping_keypair().0;
+    let wrapping_public_key = *deps
+        .supervisor
+        .my_wrapping_keypair(&deps.owned_identity)?
+        .public();
     let epoch_commit_bytes = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
             v.rest_mut()
-                .advance_epoch(wrapping_public_key)
+                .advance_epoch(wrapping_public_key, deps.clock.as_ref())
                 .map(|out| out.commit_bytes)
         })
         .await?;

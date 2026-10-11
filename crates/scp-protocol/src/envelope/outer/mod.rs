@@ -1,12 +1,12 @@
-//! Outer envelope construction, serialization, and high-level seal/open
-//! operations.
+//! Outer envelope construction and serialization.
 //!
 //! The outer envelope is the wire format visible to relays and the network.
 //! It is deliberately minimal to limit metadata exposure: relays see only a
 //! pseudonym-based `routing_id`, an optional `recipient_hint`, a `blob_ttl`,
 //! and an opaque `encrypted_blob`.
 //!
-//! The async `ops` module (`seal_envelope`, `open_envelope`) stays in scp-runtime.
+//! Sealing and opening run only in the scp-runtime context actor
+//! (`ContextCryptoState::seal` and `ContextCryptoState::open`).
 //!
 //! See ADR-002 in `.docs/adrs/phase-1.md` for the full outer envelope design.
 

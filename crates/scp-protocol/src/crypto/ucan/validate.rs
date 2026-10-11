@@ -191,6 +191,12 @@ pub trait ProofResolver {
 ///
 /// Maps DID strings to Ed25519 public key bytes. Supports both default key
 /// resolution and `kid`-based resolution for shared-DID models (ADR-039).
+///
+/// Restricted to test builds: it answers from a fixed map in place of resolving
+/// a DID. That makes it an in-memory identity-resolution backend, which the
+/// persistence spec §17.17.3 SCP-CAPSEL-8013 calls a security nullifier and
+/// SCP-CAPSEL-8012 forbids from being present in a shipped artifact.
+#[cfg(any(test, feature = "testing"))]
 pub struct InMemoryDidResolver {
     /// Map of DID string to 32-byte Ed25519 public key (default / `#active`).
     pub keys: std::collections::HashMap<String, [u8; 32]>,
@@ -200,6 +206,7 @@ pub struct InMemoryDidResolver {
     pub kid_keys: std::collections::HashMap<(String, String), [u8; 32]>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl InMemoryDidResolver {
     /// Creates a new resolver with the given default keys and no kid-specific keys.
     #[must_use]
@@ -211,6 +218,7 @@ impl InMemoryDidResolver {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl DidResolver for InMemoryDidResolver {
     fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], UcanError> {
         self.keys

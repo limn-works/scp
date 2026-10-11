@@ -9,8 +9,8 @@
 //! # Purpose
 //!
 //! This module hosts broadcast-domain helpers that operate on actor-owned
-//! [`PerContextState`](crate::context::actor::state::PerContextState) and
-//! capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
+//! [`PerContextState`] and
+//! capability-reduced [`ActorDeps`].
 //! The pre-migration `&Supervisor` lock-and-call bodies have been removed
 //! (Phase 2A finalization); this module is the sole home for these helpers.
 //!
@@ -875,7 +875,7 @@ pub fn handle_broadcast_key_request(
     deps: &ActorDeps,
     author_did: &DID,
     requester_did: &DID,
-    wrapping_pubkey: &[u8; 32],
+    wrapping_pubkey: &scp_protocol::crypto::hpke::p256::P256Point,
 ) -> Result<KeyRequestDecision, ContextError> {
     if !deps.local_dids.load().contains(author_did) {
         return Err(ContextError::PermissionDenied(format!(
