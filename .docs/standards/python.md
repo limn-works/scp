@@ -143,10 +143,13 @@ This avoids needing `@pytest.mark.asyncio` on every async test.
 # tests/conftest.py
 import pytest
 from scp_sdk import Identity, Context
+from tests.harness_custody import create_in_memory_identity
 
 @pytest.fixture
-async def alice():
-    return await Identity.create(custody="in_memory")
+async def alice(scp):
+    # CustodyType has no in-memory member (spec 03 section 3.2.2); the
+    # test-only helper passes the raw string to a `testing` bridge build.
+    return await create_in_memory_identity(scp)
 
 @pytest.fixture
 async def context(alice):

@@ -6,10 +6,10 @@ to live on :class:`Context` is now a method on :class:`scp_sdk.SCP`.
 
 Typical call-sites shape::
 
-    from scp_sdk import SCP
+    from scp_sdk import SCP, CustodyType
 
     with SCP(storage={"type": "in_memory"}) as scp:
-        identity = await scp.identity_create("in_memory")
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
         ctx = await scp.context_create(identity.did, {"ceiling": ["core:send_message"]})
         await scp.context_send(ctx, identity.did, b"hello")
 

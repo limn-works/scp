@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 
 from tests.conftest import skip_reason_if_extension_absent
+from tests.harness_custody import create_in_memory_identity
 
 try:
     from scp_sdk import _scp_core  # noqa: F401 — confirms native module is available
@@ -48,9 +49,7 @@ async def test_suspend_and_resume_roundtrip_after_init(scp: SCP) -> None:
     triggers the "real BridgeInstance" code path rather than an
     entirely-inert instance.
     """
-    from scp_sdk.types import CustodyType
-
-    _identity = await scp.identity_create(CustodyType.IN_MEMORY)
+    _identity = await create_in_memory_identity(scp)
     scp.suspend()
     await scp.resume()
 
@@ -58,9 +57,7 @@ async def test_suspend_and_resume_roundtrip_after_init(scp: SCP) -> None:
 @pytest.mark.asyncio
 async def test_multiple_suspend_resume_cycles_are_idempotent(scp: SCP) -> None:
     """Multiple suspend/resume cycles are safe; neither raises."""
-    from scp_sdk.types import CustodyType
-
-    _identity = await scp.identity_create(CustodyType.IN_MEMORY)
+    _identity = await create_in_memory_identity(scp)
     scp.suspend()
     scp.suspend()
     await scp.resume()
