@@ -1926,11 +1926,14 @@ pub struct Supervisor {
     /// `persistence_ref().is_some()` for those harnesses.
     helper_persistence: OnceLock<Arc<dyn ContextPersistence>>,
     /// Ids whose [`Self::discard_joined_context`] removed the actor and has
-    /// not yet finished its teardown. Marked under `write_lock` together with
-    /// the registry removal, cleared once the teardown has run (or when the
-    /// discarding call is dropped before handing the wait to a task). A
-    /// discard of a marked id is refused, so it cannot delete the snapshot
-    /// while the first discard's actor can still write it.
+    /// not yet finished its teardown. Marked under `bootstrap_spawn_lock` and
+    /// `write_lock` together with the registry removal, cleared once the
+    /// teardown has run (or when the discarding call is dropped before
+    /// handing the wait to a task). A discard of a marked id is refused, so it
+    /// cannot delete the snapshot while the first discard's actor can still
+    /// write it, and a respawn of a marked id is refused
+    /// (`refuse_pending_discard`), so it cannot restore the context from the
+    /// snapshot the discard is about to delete.
     pending_discards: dashmap::DashSet<String>,
     /// Wall-clock source. Populated by [`Self::with_providers_and_journal`] (or
     /// defaulted to [`scp_clock::SystemClock`] when the caller
@@ -5223,8 +5226,16 @@ impl Supervisor {
         // intentionally NOT respawned (anti-resurrection) and surfaces
         // `ContextClosed` — that is an expected dormancy, not a respawn
         // failure, so it logs at info.
-        match self.respawn_from_snapshot(&ctx_id, &owning_did).await {
+        match self.respawn_crashed_actor(&ctx_id, &owning_did).await {
             Ok(()) => {}
+            Err(e @ ContextError::ContextNotRegistered(_)) => {
+                tracing::info!(
+                    actor_kind = "context_actor",
+                    context_id = %ctx_id,
+                    reason = %e,
+                    "context actor crashed after its id was released or replaced; not respawned"
+                );
+            }
             Err(ContextError::ContextClosed) => {
                 tracing::info!(
                     actor_kind = "context_actor",
@@ -5386,9 +5397,12 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::ActorCrashed`] when no snapshot exists.
+    /// - [`ContextError::ContextNotRegistered`] when a
+    ///   [`Self::discard_joined_context`] of the id is in progress; the
+    ///   snapshot is not read.
     /// - Any error surfaced by [`Self::persistence_ref`] /
     ///   `restore_context` (persistence failure, validation failure, etc.).
-    async fn respawn_from_snapshot(
+    pub(in crate::context::supervisor) async fn respawn_from_snapshot(
         self: &Arc<Self>,
         ctx_id: &str,
         owning_did: &DID,
@@ -5413,6 +5427,71 @@ impl Supervisor {
             .await
     }
 
+    /// The crash watchdog's respawn: [`Self::respawn_from_snapshot`] for the
+    /// actor that crashed, run only while that actor still holds the id's
+    /// registry slot.
+    ///
+    /// Under `bootstrap_spawn_lock`, the slot must hold a handle whose inbox
+    /// is closed. A panicking actor's unwind drops its inbox receiver before
+    /// its `JoinHandle` resolves, so the crashed actor's handle reads closed
+    /// by the time the watchdog runs. An empty slot means another path
+    /// removed the crashed actor before the watchdog took the lock, such as
+    /// a [`Self::discard_joined_context`] that has already deleted the
+    /// snapshot; an open handle means a later bootstrap registered a new
+    /// actor for the id. Respawning in either case would restore a context
+    /// that path tore down, or replace the new actor. The discard's removal
+    /// and every bootstrap spawn hold the same lock, so neither lands between
+    /// this check and the respawn.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ContextNotRegistered`] when the crashed actor no longer
+    /// holds the slot or a discard of the id is in progress; otherwise any
+    /// error of [`Self::respawn_from_snapshot`].
+    async fn respawn_crashed_actor(
+        self: &Arc<Self>,
+        ctx_id: &str,
+        owning_did: &DID,
+    ) -> Result<(), ContextError> {
+        let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        // The `Ref` drops at the end of this statement, before any await.
+        let crashed_actor_registered = self
+            .actors
+            .get(ctx_id)
+            .is_some_and(|handle| handle.is_closed());
+        if !crashed_actor_registered {
+            return Err(ContextError::ContextNotRegistered(format!(
+                "{ctx_id} (the crashed actor no longer holds the id; not respawned)"
+            )));
+        }
+        self.respawn_from_snapshot_locked(ctx_id, owning_did, &bootstrap_guard)
+            .await
+    }
+
+    /// Refuses a respawn of `context_id` while a
+    /// [`Self::discard_joined_context`] of it is in progress.
+    ///
+    /// The discard inserts its mark under `bootstrap_spawn_lock`, and the
+    /// guard parameter proves the caller holds that lock, so the answer
+    /// cannot change until the caller releases it.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ContextNotRegistered`] when a discard of the id is in
+    /// progress.
+    fn refuse_pending_discard(
+        &self,
+        context_id: &str,
+        _bootstrap_guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), ContextError> {
+        if self.pending_discards.contains(context_id) {
+            return Err(ContextError::ContextNotRegistered(format!(
+                "{context_id} (a discard of the joined context is in progress; not respawned)"
+            )));
+        }
+        Ok(())
+    }
+
     /// Body of [`Self::respawn_from_snapshot`], run by a caller that already
     /// holds `bootstrap_spawn_lock`; the guard parameter proves it.
     /// [`Self::clear_poison`] takes the lock itself so that it clears the
@@ -5421,8 +5500,12 @@ impl Supervisor {
         self: &Arc<Self>,
         ctx_id: &str,
         owning_did: &DID,
-        _bootstrap_guard: &tokio::sync::MutexGuard<'_, ()>,
+        bootstrap_guard: &tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<(), ContextError> {
+        // A context whose discard is in progress must not come back: its
+        // snapshot is about to be deleted, and an actor restored from it would
+        // keep running for a context the bridge released.
+        self.refuse_pending_discard(ctx_id, bootstrap_guard)?;
         // Mark the transient respawn window BEFORE despawning the stale actor.
         // Between the despawn below and re-registration, a concurrent
         // per-context dispatch would `lookup`-miss a context that genuinely
@@ -5847,7 +5930,10 @@ impl Supervisor {
     /// [`ContextError::ActorCrashed`] when no snapshot exists). On a failed
     /// respawn the freshly-cleared window records the failure as a crash —
     /// a context that cannot be respawned does not silently re-poison from
-    /// stale history, but also does not loop.
+    /// stale history, but also does not loop. While a
+    /// [`Self::discard_joined_context`] of the id is in progress it returns
+    /// [`ContextError::ContextNotRegistered`] and leaves the poison record
+    /// untouched.
     pub(in crate::context) async fn clear_poison(
         self: &Arc<Self>,
         ctx_id: &str,
@@ -5862,6 +5948,9 @@ impl Supervisor {
         // create, import, or join bootstrap for the same id can clear the
         // marker set below.
         let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        // Refuse before touching the window, so a refused call leaves the
+        // poison record as it found it.
+        self.refuse_pending_discard(ctx_id, &bootstrap_guard)?;
         // Clear the window so the single retry starts from a clean budget.
         // `entry().or_default()` then `clear()` resets both the deque and the
         // sticky flag, and the same guard sets the respawn marker, so no read
@@ -6028,9 +6117,14 @@ impl Supervisor {
     /// restart. Until the delete, the join's snapshot stays in place, so
     /// Precheck D refuses a re-join of the id in the meantime.
     ///
-    /// The registry removal runs under `write_lock`, atomic with respect to
-    /// concurrent register/despawn. The exit wait runs outside it, because an
-    /// actor handler can take `write_lock` (a TTL exit's self-despawn).
+    /// The registry removal runs under `bootstrap_spawn_lock` and then
+    /// `write_lock`, atomic with respect to concurrent register/despawn and
+    /// to any respawn of the id. From the removal until the teardown
+    /// finishes, the id is marked pending and every respawn of it refuses, so
+    /// a crash watchdog cannot restore the context from the snapshot this
+    /// call is about to delete. The exit wait runs outside both locks,
+    /// because an actor handler can take `write_lock` (a TTL exit's
+    /// self-despawn).
     ///
     /// When the actor has not exited within the reply bound, the wait moves to
     /// a task on the Supervisor's tracker that stops the actor with no time
@@ -6064,7 +6158,17 @@ impl Supervisor {
         //    (the deleted `destroy_mls_group` arm). Another clone of the handle
         //    (a bridge's cached one) keeps the actor alive, so step 2 stops it
         //    explicitly.
+        //
+        //    The removal and the pending mark run under `bootstrap_spawn_lock`
+        //    as well as `write_lock` (the spawn paths' order), so they land
+        //    either wholly before or wholly after any respawn of the id. A
+        //    respawn that runs after them finds the mark and refuses
+        //    (`refuse_pending_discard`); the watchdog's respawn also finds the
+        //    crashed actor gone from the registry and stops
+        //    (`respawn_crashed_actor`). A respawn that ran before them
+        //    registered its actor first, and this removal takes that actor.
         let (handle, mark) = {
+            let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
             let guard = self.write_lock.lock().await;
             if self.pending_discards.contains(context_id) {
                 return Err(ContextError::ActorBusy(format!(
@@ -6074,6 +6178,7 @@ impl Supervisor {
             }
             let Some((_, handle)) = self.actors.remove(context_id) else {
                 drop(guard);
+                drop(bootstrap_guard);
                 self.finish_discard(context_id).await?;
                 return Ok(false);
             };

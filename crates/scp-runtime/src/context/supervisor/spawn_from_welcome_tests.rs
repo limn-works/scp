@@ -3315,6 +3315,7 @@ struct GatedPersistence {
     armed: Arc<std::sync::atomic::AtomicBool>,
     gate: Arc<tokio::sync::Semaphore>,
     entered: Arc<tokio::sync::Notify>,
+    loads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl GatedPersistence {
@@ -3324,6 +3325,7 @@ impl GatedPersistence {
             armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             gate: Arc::new(tokio::sync::Semaphore::new(0)),
             entered: Arc::new(tokio::sync::Notify::new()),
+            loads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -3383,6 +3385,7 @@ impl ContextPersistence for GatedPersistence {
         Option<crate::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
+        self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.load_context(context_id).await
     }
     async fn delete_context(
@@ -3555,6 +3558,187 @@ async fn a_discard_that_finds_a_full_mailbox_deletes_the_snapshot_after_the_last
     }
     await_exit(&held).await;
     gated.await_deleted(&j.ctx_id).await;
+}
+
+/// Panics `held`'s actor through the testing-only seam. The send errors once
+/// the actor has unwound, so its result carries nothing.
+#[cfg(feature = "testing")]
+async fn induce_actor_panic(held: &crate::context::actor::handle::ContextActorHandle) {
+    let cmd = crate::context::actor::commands::ContextCommand::LifecycleControl(
+        crate::context::actor::commands::LifecycleControlCommand::TestInducePanic {
+            sentinel: "discard-race".to_owned(),
+        },
+    );
+    let _sent = held
+        .send_with_timeout(cmd, std::time::Duration::from_secs(5))
+        .await;
+}
+
+/// Yields until the crash watchdog has recorded a crash for `context_id`. The
+/// watchdog records the crash and reaches its respawn's
+/// `bootstrap_spawn_lock` wait in one poll, so on this current-thread runtime
+/// a recorded crash means the watchdog is queued on that lock.
+#[cfg(feature = "testing")]
+async fn await_crash_recorded(sup: &Supervisor, context_id: &str) {
+    for _ in 0..10_000 {
+        if sup.crash_windows.contains_key(context_id) {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        sup.crash_windows.contains_key(context_id),
+        "the watchdog records the actor's panic"
+    );
+}
+
+/// The crash watchdog's respawn and a discard of the same joined context race
+/// for `bootstrap_spawn_lock`. Here the watchdog queues on the lock first: the
+/// test holds the lock while the actor panics and while the discard starts.
+/// The respawn then restores the context before the discard can delete its
+/// snapshot. The discard must still end with no actor and no snapshot: it
+/// waits for the respawn and tears down the actor the respawn registered.
+/// Removing the discard's registry entry outside `bootstrap_spawn_lock` lets
+/// the respawn register a live actor after the removal, which the discard
+/// then leaves running with its snapshot.
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn a_crash_respawn_queued_before_a_discard_leaves_no_actor_and_no_snapshot() {
+    let rec = RecordingPersistence::default();
+    let (result, j) = join_bob(0x71, Some(Box::new(rec.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    let crashed = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+
+    let spawn_guard = j.sup.bootstrap_spawn_lock.lock().await;
+    induce_actor_panic(&crashed).await;
+    await_crash_recorded(&j.sup, &j.ctx_id).await;
+    drop(crashed);
+
+    let sup = Arc::clone(&j.sup);
+    let id = j.ctx_id.clone();
+    let discard = tokio::spawn(async move { sup.discard_joined_context(&id).await });
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    drop(spawn_guard);
+
+    let outcome = discard.await.expect("the discard task does not panic");
+    assert!(
+        matches!(outcome, Ok(true)),
+        "the discard tears down the actor the respawn registered, got {outcome:?}"
+    );
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_none(),
+        "no actor runs for the discarded context"
+    );
+    assert!(
+        rec.load_context(&j.ctx_id)
+            .await
+            .expect("load never errors")
+            .is_none(),
+        "no snapshot of the discarded context remains"
+    );
+}
+
+/// A respawn that starts while a discard of the id is in progress refuses
+/// with a typed error before it reads the snapshot, and registers no actor.
+/// The discard then finishes and deletes the snapshot. A respawn that
+/// ignored the discard would restore the context from the snapshot the
+/// discard is about to delete, and the discard would leave that actor running.
+#[tokio::test]
+async fn a_respawn_during_a_discard_reads_no_snapshot_and_registers_no_actor() {
+    let gated = GatedPersistence::new();
+    let (result, j) = join_bob(0x72, Some(Box::new(gated.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    let held = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    gated.arm();
+
+    // The drain write after the discard's `Shutdown` waits at the gate, so
+    // the discard has removed the actor and is waiting for its exit.
+    let sup = Arc::clone(&j.sup);
+    let id = j.ctx_id.clone();
+    let discard = tokio::spawn(async move { sup.discard_joined_context(&id).await });
+    gated.entered.notified().await;
+
+    let loads_before = gated.loads.load(std::sync::atomic::Ordering::SeqCst);
+    let refused = j
+        .sup
+        .respawn_from_snapshot(&j.ctx_id, &DID(BOB_DID.to_owned()))
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(crate::context::ContextError::ContextNotRegistered(_))
+        ),
+        "a respawn during the discard is refused with a typed error, got {refused:?}"
+    );
+    assert_eq!(
+        gated.loads.load(std::sync::atomic::Ordering::SeqCst),
+        loads_before,
+        "the refused respawn reads no snapshot"
+    );
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_none(),
+        "the refused respawn registers no actor"
+    );
+
+    gated.release();
+    let removed = discard
+        .await
+        .expect("the discard task does not panic")
+        .expect("the discard stops the actor and deletes the snapshot");
+    assert!(removed, "the discard removed the live actor handle");
+    await_exit(&held).await;
+    assert!(
+        !gated.has_snapshot(&j.ctx_id).await,
+        "no snapshot of the discarded context remains"
+    );
+}
+
+/// The crash watchdog respawns only the actor it watched. When another path
+/// removes the crashed actor from the registry before the watchdog takes
+/// `bootstrap_spawn_lock`, as a discard that finished first does, the
+/// watchdog reads no snapshot and registers no actor.
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn the_watchdog_does_not_respawn_a_crashed_actor_another_path_removed() {
+    let gated = GatedPersistence::new();
+    let (result, j) = join_bob(0x73, Some(Box::new(gated.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    let crashed = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+
+    let spawn_guard = j.sup.bootstrap_spawn_lock.lock().await;
+    induce_actor_panic(&crashed).await;
+    await_crash_recorded(&j.sup, &j.ctx_id).await;
+    drop(crashed);
+    assert!(
+        j.sup.despawn_actor(&j.ctx_id).await,
+        "the crashed actor's handle was still registered"
+    );
+    let loads_before = gated.loads.load(std::sync::atomic::Ordering::SeqCst);
+    drop(spawn_guard);
+
+    // The watchdog takes the lock, finds no crashed actor, and returns
+    // without a respawn; after that the lock is free again.
+    drop(j.sup.bootstrap_spawn_lock.lock().await);
+    assert_eq!(
+        gated.loads.load(std::sync::atomic::Ordering::SeqCst),
+        loads_before,
+        "the watchdog reads no snapshot for an actor another path removed"
+    );
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_none(),
+        "the watchdog registers no actor for an actor another path removed"
+    );
 }
 
 // ---------------------------------------------------------------------------
