@@ -938,7 +938,8 @@ fn sync_parent_dir(dir: &Path) {
 
 /// Encrypted file-backed implementation of [`KeyCustody`].
 ///
-/// Stores Ed25519 and X25519 private keys encrypted at rest using
+/// Stores Ed25519, X25519, P-256 signing and P-256 HPKE private keys
+/// encrypted at rest using
 /// AES-256-GCM with a key derived from a user-provided passphrase via
 /// Argon2id. This is the universal fallback custody for non-HSM platforms.
 ///
@@ -1238,7 +1239,7 @@ impl FileKeyCustody {
     /// decrypting is what stops [`SigningKey::from_bytes`] from turning an
     /// X25519 static secret into an Ed25519 signing key, which it does without
     /// complaint for any 32 bytes. The associated data this function rebuilds —
-    /// `key_type | entry_id`, per §17.8 of
+    /// `key_type | role | entry_id`, per §17.8 of
     /// `.docs/specs/17-persistence-and-storage.md` — then makes AES-256-GCM
     /// reject a ciphertext that a writer placed behind another identifier,
     /// another type byte or another role byte. The role comparison is what
