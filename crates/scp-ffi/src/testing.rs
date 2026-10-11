@@ -133,6 +133,7 @@ fn fullstack_reset_network_impl(bi: &PyBridgeInstance) {
 }
 
 fn fullstack_create_context_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     node: &PyFullStackNode,
     context_id: String,
@@ -171,10 +172,9 @@ fn fullstack_create_context_impl(
         ..ContextParams::default()
     };
 
-    let rt = crate::runtime()?;
-    let handle = rt
-        .block_on(node.inner.create_context(&context_id, params))
-        .map_err(|e| {
+    let handle =
+        crate::actor_wait::block_on_released(py, node.inner.create_context(&context_id, params))?
+            .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("failed to create context: {e}"))
         })?;
 
@@ -190,13 +190,13 @@ fn fullstack_create_context_impl(
 }
 
 fn fullstack_add_member_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     node: &PyFullStackNode,
     context_id: String,
     member_did: String,
 ) -> PyResult<()> {
     crate::pyscp_check_handle!(&bi.core, node);
-    let rt = crate::runtime()?;
 
     let handle = {
         let handles = node
@@ -210,10 +210,9 @@ fn fullstack_add_member_impl(
         })?
     };
 
-    rt.block_on(node.inner.add_member(&handle, &member_did))
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to add member: {e}"))
-        })
+    crate::actor_wait::block_on_released(py, node.inner.add_member(&handle, &member_did))?.map_err(
+        |e| pyo3::exceptions::PyRuntimeError::new_err(format!("failed to add member: {e}")),
+    )
 }
 
 /// Joins a context from the sealed invitation the creator deposited in the
@@ -226,12 +225,12 @@ fn fullstack_add_member_impl(
 /// joiner IS now a registered, send-capable participant — a subsequent
 /// `fullstack_send_message` on a Welcome-joined node succeeds (bidirectional).
 fn fullstack_join_from_welcome_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     node: &PyFullStackNode,
     context_id: String,
 ) -> PyResult<()> {
     crate::pyscp_check_handle!(&bi.core, node);
-    let rt = crate::runtime()?;
     // ADR-056: key the shared crypto under the canonical digest via the
     // chokepoint, never the raw routing primitive (which double-hashes a real
     // 64-hex id and would diverge from the creator's deposit slot).
@@ -243,11 +242,13 @@ fn fullstack_join_from_welcome_impl(
     // returned `ContextHandle` is stored in the node's handle map so a
     // subsequent `fullstack_send_message` on this joiner resolves it — the
     // joiner is now a bidirectional, send-capable participant.
-    let handle = rt
-        .block_on(node.inner.join_from_welcome(&context_id, &ctx_bytes))
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to join from Welcome: {e}"))
-        })?;
+    let handle = crate::actor_wait::block_on_released(
+        py,
+        node.inner.join_from_welcome(&context_id, &ctx_bytes),
+    )?
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to join from Welcome: {e}"))
+    })?;
     node.handles
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -289,7 +290,6 @@ fn fullstack_send_message_impl<'py>(
     payload: &[u8],
 ) -> PyResult<Bound<'py, PyBytes>> {
     crate::pyscp_check_handle!(&bi.core, node);
-    let rt = crate::runtime()?;
 
     let handle = {
         let handles = node
@@ -303,10 +303,9 @@ fn fullstack_send_message_impl<'py>(
         })?
     };
 
-    rt.block_on(node.inner.send_message(&handle, payload))
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to send message: {e}"))
-        })?;
+    crate::actor_wait::block_on_released(py, node.inner.send_message(&handle, payload))?.map_err(
+        |e| pyo3::exceptions::PyRuntimeError::new_err(format!("failed to send message: {e}")),
+    )?;
 
     let sent = node.inner.take_sent_ciphertexts();
     if sent.is_empty() {
@@ -334,27 +333,26 @@ fn fullstack_decrypt_message_impl<'py>(
     // ADR-056: key decryption under the canonical digest via the chokepoint,
     // never the raw routing primitive.
     let ctx_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
-    let rt = crate::runtime()?;
-    let plaintext = rt
-        .block_on(
-            node.inner
-                .decrypt_message(&context_id, &ctx_bytes, ciphertext, &sender_did),
-        )
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to decrypt message: {e}"))
-        })?;
+    let plaintext = crate::actor_wait::block_on_released(
+        py,
+        node.inner
+            .decrypt_message(&context_id, &ctx_bytes, ciphertext, &sender_did),
+    )?
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to decrypt message: {e}"))
+    })?;
 
     Ok(PyBytes::new(py, &plaintext))
 }
 
 fn fullstack_remove_member_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     node: &PyFullStackNode,
     context_id: String,
     member_did: String,
 ) -> PyResult<()> {
     crate::pyscp_check_handle!(&bi.core, node);
-    let rt = crate::runtime()?;
 
     let handle = {
         let handles = node
@@ -368,11 +366,14 @@ fn fullstack_remove_member_impl(
         })?
     };
 
-    rt.block_on(node.inner.manager.leave_context(
-        &handle,
-        &node.inner.did,
-        &scp_did::DID::from(member_did.as_str()),
-    ))
+    crate::actor_wait::block_on_released(
+        py,
+        node.inner.manager.leave_context(
+            &handle,
+            &node.inner.did,
+            &scp_did::DID::from(member_did.as_str()),
+        ),
+    )?
     .map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("failed to remove member: {e}"))
     })?;
@@ -397,6 +398,7 @@ fn fullstack_remove_member_impl(
 /// closed with `SCP-CTX-2095`. Mirrors the runtime
 /// `Supervisor::seed_peer_pseudonym` test helper.
 fn fullstack_seed_peer_pseudonym_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     node: &PyFullStackNode,
     context_id: String,
@@ -414,12 +416,14 @@ fn fullstack_seed_peer_pseudonym_impl(
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&pseudonym);
 
-    let rt = crate::runtime()?;
-    rt.block_on(node.inner.manager.seed_peer_pseudonym(
-        &context_id,
-        scp_did::DID::from(peer_did.as_str()),
-        arr,
-    ))
+    crate::actor_wait::block_on_released(
+        py,
+        node.inner.manager.seed_peer_pseudonym(
+            &context_id,
+            scp_did::DID::from(peer_did.as_str()),
+            arr,
+        ),
+    )?
     .map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("failed to seed peer pseudonym: {e}"))
     })?;
@@ -457,38 +461,41 @@ impl crate::scp::PyScp {
     #[pyo3(name = "fullstack_create_context")]
     pub fn fullstack_create_context(
         &self,
+        py: Python<'_>,
         node: &PyFullStackNode,
         context_id: String,
         ceiling_json: String,
     ) -> PyResult<String> {
         crate::pyscp_check_handle!(&self.inner.core, node);
         let bi = &*self.inner;
-        fullstack_create_context_impl(bi, node, context_id, ceiling_json)
+        fullstack_create_context_impl(py, bi, node, context_id, ceiling_json)
     }
 
     /// Adds a member to the context (admin-side operation).
     #[pyo3(name = "fullstack_add_member")]
     pub fn fullstack_add_member(
         &self,
+        py: Python<'_>,
         node: &PyFullStackNode,
         context_id: String,
         member_did: String,
     ) -> PyResult<()> {
         crate::pyscp_check_handle!(&self.inner.core, node);
         let bi = &*self.inner;
-        fullstack_add_member_impl(bi, node, context_id, member_did)
+        fullstack_add_member_impl(py, bi, node, context_id, member_did)
     }
 
     /// Joins a context by retrieving the Welcome from the shared `KeyExchange`.
     #[pyo3(name = "fullstack_join_from_welcome")]
     pub fn fullstack_join_from_welcome(
         &self,
+        py: Python<'_>,
         node: &PyFullStackNode,
         context_id: String,
     ) -> PyResult<()> {
         crate::pyscp_check_handle!(&self.inner.core, node);
         let bi = &*self.inner;
-        fullstack_join_from_welcome_impl(bi, node, context_id)
+        fullstack_join_from_welcome_impl(py, bi, node, context_id)
     }
 
     /// Synchronises sender keys between two nodes for a given context.
@@ -539,13 +546,14 @@ impl crate::scp::PyScp {
     #[pyo3(name = "fullstack_remove_member")]
     pub fn fullstack_remove_member(
         &self,
+        py: Python<'_>,
         node: &PyFullStackNode,
         context_id: String,
         member_did: String,
     ) -> PyResult<()> {
         crate::pyscp_check_handle!(&self.inner.core, node);
         let bi = &*self.inner;
-        fullstack_remove_member_impl(bi, node, context_id, member_did)
+        fullstack_remove_member_impl(py, bi, node, context_id, member_did)
     }
 
     /// Test-only: seed a peer's per-context pseudonym routing ID (§9.10.4)
@@ -555,6 +563,7 @@ impl crate::scp::PyScp {
     #[pyo3(name = "fullstack_seed_peer_pseudonym")]
     pub fn fullstack_seed_peer_pseudonym(
         &self,
+        py: Python<'_>,
         node: &PyFullStackNode,
         context_id: String,
         peer_did: String,
@@ -562,7 +571,7 @@ impl crate::scp::PyScp {
     ) -> PyResult<()> {
         crate::pyscp_check_handle!(&self.inner.core, node);
         let bi = &*self.inner;
-        fullstack_seed_peer_pseudonym_impl(bi, node, context_id, peer_did, pseudonym)
+        fullstack_seed_peer_pseudonym_impl(py, bi, node, context_id, peer_did, pseudonym)
     }
 }
 
@@ -658,68 +667,77 @@ mod handle_affinity_tests {
 
         pyo3::prepare_freethreaded_python();
 
-        // 1. fullstack_create_context_impl
-        let r1 = fullstack_create_context_impl(bi_b, &node_a, ctx.clone(), ceiling);
-        assert_perm_3030(r1, "fullstack_create_context_impl");
-
-        // 2. fullstack_add_member_impl
-        let r2 =
-            fullstack_add_member_impl(bi_b, &node_a, ctx.clone(), "did:dht:z6MkMember".to_owned());
-        assert_perm_3030(r2, "fullstack_add_member_impl");
-
-        // 3. fullstack_join_from_welcome_impl
-        let r3 = fullstack_join_from_welcome_impl(bi_b, &node_a, ctx.clone());
-        assert_perm_3030(r3, "fullstack_join_from_welcome_impl");
-
-        // 4. fullstack_sync_sender_keys_impl — both nodes from bi_a,
-        // check against bi_b must fail on the FIRST node_a (short-
-        // circuit evaluation of the macro's expansion).
-        let r4 = fullstack_sync_sender_keys_impl(bi_b, &node_a, &node_a2, ctx.clone());
-        assert_perm_3030(r4, "fullstack_sync_sender_keys_impl (first node)");
-
-        // Mint a node on bi_b to verify the SECOND-arg check: the first
-        // node matches bi_b, the second does not.
-        let node_b = fullstack_create_node_impl(bi_b, "did:dht:z6MkTestB".to_owned());
-        let r4b = fullstack_sync_sender_keys_impl(bi_b, &node_b, &node_a, ctx.clone());
-        assert_perm_3030(r4b, "fullstack_sync_sender_keys_impl (second node)");
-
-        // 5. fullstack_send_message_impl
         pyo3::Python::with_gil(|py| {
-            let r5 = fullstack_send_message_impl(py, bi_b, &node_a, ctx.clone(), b"payload");
-            assert_perm_3030(r5, "fullstack_send_message_impl");
-        });
+            // 1. fullstack_create_context_impl
+            let r1 = fullstack_create_context_impl(py, bi_b, &node_a, ctx.clone(), ceiling);
+            assert_perm_3030(r1, "fullstack_create_context_impl");
 
-        // 6. fullstack_decrypt_message_impl
-        pyo3::Python::with_gil(|py| {
-            let r6 = fullstack_decrypt_message_impl(
+            // 2. fullstack_add_member_impl
+            let r2 = fullstack_add_member_impl(
                 py,
                 bi_b,
                 &node_a,
                 ctx.clone(),
-                b"ciphertext",
-                "did:dht:z6MkSender".to_owned(),
+                "did:dht:z6MkMember".to_owned(),
             );
-            assert_perm_3030(r6, "fullstack_decrypt_message_impl");
+            assert_perm_3030(r2, "fullstack_add_member_impl");
+
+            // 3. fullstack_join_from_welcome_impl
+            let r3 = fullstack_join_from_welcome_impl(py, bi_b, &node_a, ctx.clone());
+            assert_perm_3030(r3, "fullstack_join_from_welcome_impl");
+
+            // 4. fullstack_sync_sender_keys_impl — both nodes from bi_a,
+            // check against bi_b must fail on the FIRST node_a (short-
+            // circuit evaluation of the macro's expansion).
+            let r4 = fullstack_sync_sender_keys_impl(bi_b, &node_a, &node_a2, ctx.clone());
+            assert_perm_3030(r4, "fullstack_sync_sender_keys_impl (first node)");
+
+            // Mint a node on bi_b to verify the SECOND-arg check: the first
+            // node matches bi_b, the second does not.
+            let node_b = fullstack_create_node_impl(bi_b, "did:dht:z6MkTestB".to_owned());
+            let r4b = fullstack_sync_sender_keys_impl(bi_b, &node_b, &node_a, ctx.clone());
+            assert_perm_3030(r4b, "fullstack_sync_sender_keys_impl (second node)");
+
+            // 5. fullstack_send_message_impl
+            pyo3::Python::with_gil(|py| {
+                let r5 = fullstack_send_message_impl(py, bi_b, &node_a, ctx.clone(), b"payload");
+                assert_perm_3030(r5, "fullstack_send_message_impl");
+            });
+
+            // 6. fullstack_decrypt_message_impl
+            pyo3::Python::with_gil(|py| {
+                let r6 = fullstack_decrypt_message_impl(
+                    py,
+                    bi_b,
+                    &node_a,
+                    ctx.clone(),
+                    b"ciphertext",
+                    "did:dht:z6MkSender".to_owned(),
+                );
+                assert_perm_3030(r6, "fullstack_decrypt_message_impl");
+            });
+
+            // 7. fullstack_remove_member_impl
+            let r7 = fullstack_remove_member_impl(
+                py,
+                bi_b,
+                &node_a,
+                ctx.clone(),
+                "did:dht:z6MkMember".to_owned(),
+            );
+            assert_perm_3030(r7, "fullstack_remove_member_impl");
+
+            // 8. fullstack_seed_peer_pseudonym_impl
+            let r8 = fullstack_seed_peer_pseudonym_impl(
+                py,
+                bi_b,
+                &node_a,
+                ctx,
+                "did:dht:z6MkPeer".to_owned(),
+                vec![0u8; 32],
+            );
+            assert_perm_3030(r8, "fullstack_seed_peer_pseudonym_impl");
         });
-
-        // 7. fullstack_remove_member_impl
-        let r7 = fullstack_remove_member_impl(
-            bi_b,
-            &node_a,
-            ctx.clone(),
-            "did:dht:z6MkMember".to_owned(),
-        );
-        assert_perm_3030(r7, "fullstack_remove_member_impl");
-
-        // 8. fullstack_seed_peer_pseudonym_impl
-        let r8 = fullstack_seed_peer_pseudonym_impl(
-            bi_b,
-            &node_a,
-            ctx,
-            "did:dht:z6MkPeer".to_owned(),
-            vec![0u8; 32],
-        );
-        assert_perm_3030(r8, "fullstack_seed_peer_pseudonym_impl");
     }
 
     /// Sanity check: a node used against its own bridge instance passes
@@ -734,30 +752,33 @@ mod handle_affinity_tests {
     #[test]
     #[cfg(feature = "testing")]
     fn fullstack_helpers_accept_same_instance_node() {
-        let bi_arc = std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py());
-        let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
-        let node = fullstack_create_node_impl(bi, "did:dht:z6MkSameTest".to_owned());
+        pyo3::Python::with_gil(|py| {
+            let bi_arc = std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py());
+            let bi = &*bi_arc;
+            init_context_manager_for_test(bi);
+            let node = fullstack_create_node_impl(bi, "did:dht:z6MkSameTest".to_owned());
 
-        // Direct check against the matching instance: must not error
-        // with PERM_3030. Downstream work (create_context etc.) may
-        // still fail for OTHER reasons (no relay, etc.), but the error
-        // must not be the handle-affinity one.
-        let r = fullstack_create_context_impl(
-            bi,
-            &node,
-            "same-instance-context".to_owned(),
-            "{}".to_owned(),
-        );
-        pyo3::prepare_freethreaded_python();
-        if let Err(e) = r {
-            let msg = e.to_string();
-            assert!(
-                !msg.contains(codes::PERM_3030),
-                "same-instance call must NOT fail with PERM_3030, got: {msg}"
+            // Direct check against the matching instance: must not error
+            // with PERM_3030. Downstream work (create_context etc.) may
+            // still fail for OTHER reasons (no relay, etc.), but the error
+            // must not be the handle-affinity one.
+            let r = fullstack_create_context_impl(
+                py,
+                bi,
+                &node,
+                "same-instance-context".to_owned(),
+                "{}".to_owned(),
             );
-        }
-        // Ok() or non-PERM_3030 Err both acceptable — the assertion
-        // above is the one that catches regressions.
+            pyo3::prepare_freethreaded_python();
+            if let Err(e) = r {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains(codes::PERM_3030),
+                    "same-instance call must NOT fail with PERM_3030, got: {msg}"
+                );
+            }
+            // Ok() or non-PERM_3030 Err both acceptable — the assertion
+            // above is the one that catches regressions.
+        });
     }
 }

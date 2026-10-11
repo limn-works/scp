@@ -130,11 +130,13 @@ impl crate::scp::PyScp {
                 code: codes::IDENT_1038.to_string(),
             })?;
 
-        let rt = crate::runtime()?;
-
-        Ok(py.allow_threads(|| {
-            with_identity(bi, &did, |entry| {
-                let key_handle = match key_id {
+        // Resolve the custody handle and key under the registry guard, then
+        // sign with the guard released: a GIL-released wait that held a
+        // registry shard lock would deadlock against a Python thread that
+        // blocks on that shard while holding the GIL.
+        let (custody, key_handle) = with_identity(bi, &did, |entry| {
+            let key_handle =
+                match key_id {
                     SigningKeyId::Active => entry.identity.active_signing_key,
                     SigningKeyId::Agent => entry.identity.agent_signing_key.ok_or_else(|| {
                         ScpPyError::IdentityError {
@@ -146,27 +148,31 @@ impl crate::scp::PyScp {
                         }
                     })?,
                 };
+            Ok((std::sync::Arc::clone(&entry.custody), key_handle))
+        })?;
 
-                let response = rt.block_on(scpid_sign(
-                    entry.custody.as_ref(),
-                    &key_handle,
-                    &did,
-                    key_id,
-                    &challenge,
-                    signed_at_override,
-                ));
+        let response = crate::actor_wait::block_on_released(
+            py,
+            scpid_sign(
+                custody.as_ref(),
+                &key_handle,
+                &did,
+                key_id,
+                &challenge,
+                signed_at_override,
+            ),
+        )?
+        .map_err(|e| ScpPyError::IdentityError {
+            message: e.to_string(),
+            code: codes::IDENT_1037.to_string(),
+        })?;
 
-                let response = response.map_err(|e| ScpPyError::IdentityError {
-                    message: e.to_string(),
-                    code: codes::IDENT_1037.to_string(),
-                })?;
-
-                serde_json::to_string(&response).map_err(|e| ScpPyError::IdentityError {
-                    message: format!("failed to serialize SCPID response: {e}"),
-                    code: codes::IDENT_1037.to_string(),
-                })
-            })
-        })?)
+        Ok(
+            serde_json::to_string(&response).map_err(|e| ScpPyError::IdentityError {
+                message: format!("failed to serialize SCPID response: {e}"),
+                code: codes::IDENT_1037.to_string(),
+            })?,
+        )
     }
 
     /// Verifies a signed SCPID response against the original challenge (§3.11.4).
@@ -207,9 +213,7 @@ impl crate::scp::PyScp {
                 code: codes::IDENT_1038.to_string(),
             })?;
 
-        let rt = crate::runtime()?;
-
-        py.allow_threads(|| {
+        crate::actor_wait::block_on_released(py, async {
             let resolver =
                 crate::runtime::did_resolver(bi).ok_or_else(|| ScpPyError::IdentityError {
                     message: "DID resolver not initialized — create an identity with \
@@ -218,8 +222,8 @@ impl crate::scp::PyScp {
                     code: codes::IDENT_1033.to_string(),
                 })?;
 
-            let auth = rt
-                .block_on(scpid_verify(resolver.as_ref(), &response, &challenge))
+            let auth = scpid_verify(resolver.as_ref(), &response, &challenge)
+                .await
                 .map_err(|e| ScpPyError::IdentityError {
                     message: e.to_string(),
                     code: scpid_error_code(&e).to_string(),
@@ -232,7 +236,7 @@ impl crate::scp::PyScp {
                 }
                 .into()
             })
-        })
+        })?
     }
 }
 

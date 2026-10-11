@@ -952,22 +952,15 @@ impl Scp {
 
         let mut attestation = built.attestation;
 
-        let rt = tokio::runtime::Handle::try_current().map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("no tokio runtime: {e}"),
-                code: codes::IDENT_1041.to_owned(),
-            })
-        })?;
-
-        let sig = tokio::task::block_in_place(|| {
-            rt.block_on(custody.sign(&key_handle, &built.canonical_bytes))
-        })
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::custody_failure(
-                format!("link attestation signing failed: {e}"),
-                &scp_crypto::CustodyFailure::from(&e),
-            ))
-        })?;
+        let sig = custody
+            .sign(&key_handle, &built.canonical_bytes)
+            .await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::custody_failure(
+                    format!("link attestation signing failed: {e}"),
+                    &scp_crypto::CustodyFailure::from(&e),
+                ))
+            })?;
         attestation.signature = sig.as_bytes().to_vec();
 
         crate::runtime::with_identity_mut(bi, &did, |entry| {
@@ -1406,8 +1399,8 @@ impl Scp {
 
         // Drive the async orchestrator on the module-local tokio runtime
         // (crate::runtime()). Same rationale as identity_execute_recovery:
-        // the napi-rs worker thread has no tokio context (round-2
-        // bug-catcher finding).
+        // the napi-rs worker thread has no tokio context.
+        // ci-allow: bridge-block-on: drives custody migration against the NotConfigured backend; waits on no context actor and no host callback
         let result = crate::runtime()
             .block_on(orchestrator.execute(&backend, &scp_clock::SystemClock))
             .map_err(|e| {
@@ -3859,11 +3852,14 @@ impl Scp {
     ///
     /// Verifies a JSON array of payment receipts against the supervisor and
     /// returns a JSON `{"results":[...]}` document with one entry per receipt.
-    /// Synchronous: the supervisor dispatch is driven on the shared runtime
-    /// inside the helper, since libuv worker threads carry no tokio context.
+    /// Async: the supervisor reply is awaited, never waited on from the JS
+    /// thread.
     #[napi(js_name = "economyVerifyPaymentReceipts")]
-    pub fn economy_verify_payment_receipts(&self, receipts_json: String) -> napi::Result<String> {
-        crate::economy::economy_verify_payment_receipts_on(&self.inner, receipts_json)
+    pub async fn economy_verify_payment_receipts(
+        &self,
+        receipts_json: String,
+    ) -> napi::Result<String> {
+        crate::economy::economy_verify_payment_receipts_on(&self.inner, receipts_json).await
     }
 
     // -------------------------------------------------------------------

@@ -3812,13 +3812,13 @@ export class SCP {
    * @returns Typed {@link PaymentReceiptVerificationResult} with `allValid`
    *   and per-receipt `results`.
    */
-  economyVerifyPaymentReceipts(
+  async economyVerifyPaymentReceipts(
     receipts: readonly Record<string, unknown>[],
-  ): PaymentReceiptVerificationResult {
+  ): Promise<PaymentReceiptVerificationResult> {
     try {
-      const raw = (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(
-        JSON.stringify(receipts),
-      );
+      const raw = await (
+        this.#native.economyVerifyPaymentReceipts as (r: string) => Promise<string>
+      )(JSON.stringify(receipts));
       // The Rust bridge emits snake_case keys; map to the SDK's camelCase convention.
       const parsed = JSON.parse(raw) as {
         all_valid: boolean;

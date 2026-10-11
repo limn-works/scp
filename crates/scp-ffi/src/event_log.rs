@@ -379,9 +379,8 @@ fn query_storage_fallback(
     let Ok(storage) = crate::runtime::get_storage(bi) else {
         return Ok(None);
     };
-    let rt = crate::runtime()?;
     let prefix = format!("context/{context_id}/event_data/");
-    let Ok(keys) = rt.block_on(storage.list_keys(&prefix)) else {
+    let Ok(keys) = crate::actor_wait::block_on_released(py, storage.list_keys(&prefix))? else {
         return Ok(None);
     };
 
@@ -401,7 +400,7 @@ fn query_storage_fallback(
         if seq_str < start_suffix.as_str() {
             continue;
         }
-        if let Ok(Some(data)) = rt.block_on(storage.retrieve(key))
+        if let Ok(Some(data)) = crate::actor_wait::block_on_released(py, storage.retrieve(key))?
             && let Ok(event) = rmp_serde::from_slice::<scp_event_log::Event>(&data)
         {
             // Apply additional filters.
@@ -724,6 +723,7 @@ fn event_log_verify_impl(
 /// this implementation — they are distinct public surface but identical in
 /// behavior.
 fn event_log_checkpoint_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     did: &str,
@@ -731,32 +731,38 @@ fn event_log_checkpoint_impl(
 ) -> PyResult<PyCheckpoint> {
     validate::validate_context_id(context_id)?;
     validate::validate_did(did)?;
-    let rt = crate::runtime()?;
 
     let context_id_owned = context_id.to_owned();
     let did_owned = did.to_owned();
 
     let sender_did = scp_did::DID(did_owned.clone());
 
-    let checkpoint = crate::runtime::with_identity(bi, &did_owned, |entry| {
-        crate::runtime::with_context(bi, &context_id_owned, |ctx_rt| {
-            let result = rt.block_on(async {
-                let signer = scp_core::event_log::KeyCustodySigner {
-                    custody: entry.custody.as_ref(),
-                    key: &entry.identity.active_signing_key,
-                };
-                scp_event_log::checkpoint::generate_checkpoint(
-                    &ctx_rt.event_log,
-                    &sender_did,
-                    epoch,
-                    &signer,
-                )
-                .await
-            });
-
-            result.map_err(|e| ScpPyError::checkpoint_error(&e))
-        })
+    // Read the custody handle and the log snapshot under their registry
+    // guards, then sign with every guard released: a GIL-released wait that
+    // held a registry shard lock would stall any Python thread that blocks
+    // on that shard while holding the GIL, including a custody callback's.
+    let (custody, key) = crate::runtime::with_identity(bi, &did_owned, |entry| {
+        Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })?;
+    let snapshot = crate::runtime::with_context(bi, &context_id_owned, |ctx_rt| {
+        Ok(scp_event_log::checkpoint::CheckpointSnapshot::of(
+            &ctx_rt.event_log,
+        ))
+    })?;
+    let checkpoint = crate::actor_wait::block_on_released(py, async {
+        let signer = scp_core::event_log::KeyCustodySigner {
+            custody: custody.as_ref(),
+            key: &key,
+        };
+        scp_event_log::checkpoint::generate_checkpoint_from_snapshot(
+            snapshot,
+            &sender_did,
+            epoch,
+            &signer,
+        )
+        .await
+    })?
+    .map_err(|e| ScpPyError::checkpoint_error(&e))?;
 
     Ok(PyCheckpoint {
         context_id: checkpoint.context_id,
@@ -892,12 +898,13 @@ impl crate::scp::PyScp {
     #[pyo3(name = "event_log_checkpoint")]
     pub fn event_log_checkpoint(
         &self,
+        py: Python<'_>,
         context_id: &str,
         identity_did: &str,
         epoch: u64,
     ) -> PyResult<PyCheckpoint> {
         let bi = &*self.inner;
-        event_log_checkpoint_impl(bi, context_id, identity_did, epoch)
+        event_log_checkpoint_impl(py, bi, context_id, identity_did, epoch)
     }
 
     /// Generates a signed consistency checkpoint scoped to a member DID.
@@ -928,12 +935,13 @@ impl crate::scp::PyScp {
     #[pyo3(name = "event_log_checkpoint_by_did")]
     pub fn event_log_checkpoint_by_did(
         &self,
+        py: Python<'_>,
         context_id: &str,
         did: &str,
         epoch: u64,
     ) -> PyResult<PyCheckpoint> {
         let bi = &*self.inner;
-        event_log_checkpoint_impl(bi, context_id, did, epoch)
+        event_log_checkpoint_impl(py, bi, context_id, did, epoch)
     }
 }
 

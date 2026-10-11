@@ -252,11 +252,12 @@ fn require_revocable_ucan_context(
 /// actor serves, refuse here with `SCP-CTX-2023`. The refusal withholds the
 /// lifecycle state, because the gate runs before the caller is authorized.
 fn active_ucan_role_state(
+    py: Python<'_>,
     bi: &crate::runtime::PyBridgeInstance,
     context_id: &str,
     verb: &str,
 ) -> PyResult<scp_core::context::roles::ContextRoleState> {
-    crate::runtime::active_role_state_before_authz(bi, context_id, verb, |message| {
+    crate::runtime::active_role_state_before_authz(py, bi, context_id, verb, |message| {
         ScpPyError::ContextError {
             message,
             code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
@@ -312,6 +313,7 @@ impl crate::scp::PyScp {
     #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>> for method arguments.
     pub fn ucan_validate(
         &self,
+        py: Python<'_>,
         context_id: &str,
         token: &str,
         capability: &str,
@@ -341,7 +343,7 @@ impl crate::scp::PyScp {
         // Read BEFORE the token parse: an unknown or actor-less context
         // refuses on its own account rather than on the shape of a
         // caller-supplied token.
-        let role_state = active_ucan_role_state(bi, context_id, "validate a UCAN in context")?;
+        let role_state = active_ucan_role_state(py, bi, context_id, "validate a UCAN in context")?;
         let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
         // Step 1: Parse the UCAN token using scp-core's parser.
@@ -450,6 +452,7 @@ impl crate::scp::PyScp {
     #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>> for method arguments.
     pub fn ucan_evaluate(
         &self,
+        py: Python<'_>,
         context_id: &str,
         token: &str,
         capability: Option<&str>,
@@ -481,7 +484,7 @@ impl crate::scp::PyScp {
         // Same two supervisor-owned inputs the enforcing `ucan_validate` reads, and
         // read at the same point, so the diagnostic report and the gate agree on
         // the ceiling, on the creator, and on when a context refuses outright.
-        let role_state = active_ucan_role_state(bi, context_id, "evaluate a UCAN in context")?;
+        let role_state = active_ucan_role_state(py, bi, context_id, "evaluate a UCAN in context")?;
         let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
         // Step 1: Parse the UCAN token using scp-core's parser.
@@ -579,6 +582,7 @@ impl crate::scp::PyScp {
     #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec/Option<Vec> for method arguments.
     pub fn ucan_mint(
         &self,
+        py: Python<'_>,
         context_id: &str,
         member_did: &str,
         capabilities: Vec<String>,
@@ -598,40 +602,39 @@ impl crate::scp::PyScp {
         // The issuer is the context creator, and the ceiling bounds what may be
         // minted. Both come from the supervisor actor: a `ModifyCeiling`
         // narrows what a mint may grant, and a context no actor serves refuses.
-        let live_role_state = active_ucan_role_state(bi, context_id, "mint a UCAN in context")?;
+        let live_role_state = active_ucan_role_state(py, bi, context_id, "mint a UCAN in context")?;
         require_revocable_ucan_context(bi, context_id)?;
         let creator_did = live_role_state.creator_did.clone();
         let live_ceiling_strings = live_role_state.ceiling().to_ucan_string_set();
 
-        let rt = crate::runtime()?;
         let context_id_owned = context_id.to_owned();
         let _nonce = scp_core::crypto::ucan::nonce::generate_nonce(&scp_clock::SystemClock);
 
         // Mint using real scp_core::mint_ucan with Ed25519 signing via
         // the retained KeyCustody. See SCP-214 criterion 7.
-        let token = crate::runtime::with_identity(bi, &creator_did, |entry| {
-            let ceiling_strings = live_ceiling_strings.clone();
-
-            let params = MintParams {
-                issuer_did: &creator_did,
-                issuer_key: &entry.identity.active_signing_key,
-                audience_did: member_did,
-                context_id: &context_id_owned,
-                capabilities: &capabilities,
-                lifetime_secs: 3600,
-                not_before: None,
-                proofs: proofs.unwrap_or_default(),
-                facts: None,
-                key_scope: None,
-                signing_key_id: None,
-                ceiling: Some(ceiling_strings),
-            };
-
-            let result = rt.block_on(async {
-                mint_ucan(&params, entry.custody.as_ref(), &scp_clock::SystemClock).await
-            });
-            result.map_err(ScpPyError::from)
+        // Clone the custody handle out of the registry guard before the wait,
+        // so a GIL-released wait never holds the identity map's shard lock.
+        let (custody, issuer_key) = crate::runtime::with_identity(bi, &creator_did, |entry| {
+            Ok((entry.custody.clone(), entry.identity.active_signing_key))
         })?;
+        let params = MintParams {
+            issuer_did: &creator_did,
+            issuer_key: &issuer_key,
+            audience_did: member_did,
+            context_id: &context_id_owned,
+            capabilities: &capabilities,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: proofs.unwrap_or_default(),
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(live_ceiling_strings),
+        };
+        let token = crate::actor_wait::block_on_released(py, async {
+            mint_ucan(&params, custody.as_ref(), &scp_clock::SystemClock).await
+        })?
+        .map_err(ScpPyError::from)?;
 
         // Convert capability attestations to URI strings for Python.
         let capability_uris: Vec<String> =
@@ -695,6 +698,7 @@ impl crate::scp::PyScp {
     #[allow(clippy::needless_pass_by_value)]
     pub fn ucan_delegate(
         &self,
+        py: Python<'_>,
         context_id: &str,
         delegator_did: &str,
         delegatee_did: &str,
@@ -712,9 +716,10 @@ impl crate::scp::PyScp {
         // The ceiling bounds what a delegation may carry. Read BEFORE the
         // parent parse: an unknown or actor-less context refuses on its
         // own account rather than on the shape of a caller-supplied token.
-        let ceiling_strings = active_ucan_role_state(bi, context_id, "delegate a UCAN in context")?
-            .ceiling()
-            .to_ucan_string_set();
+        let ceiling_strings =
+            active_ucan_role_state(py, bi, context_id, "delegate a UCAN in context")?
+                .ceiling()
+                .to_ucan_string_set();
         require_revocable_ucan_context(bi, context_id)?;
 
         // Parse the parent token.
@@ -743,27 +748,27 @@ impl crate::scp::PyScp {
             })
             .collect();
 
-        let rt = crate::runtime()?;
-
-        let token = crate::runtime::with_identity(bi, delegator_did, |entry| {
-            let params = DelegateParams {
-                parent_token: &parsed_parent,
-                delegator_did,
-                delegator_key: &entry.identity.active_signing_key,
-                delegatee_did,
-                attenuated_capabilities: &attenuations,
-                lifetime_secs: 3600,
-                facts: None,
-                key_scope: None,
-                signing_key_id: None,
-                ceiling: Some(ceiling_strings.clone()),
-            };
-
-            let result = rt.block_on(async {
-                delegate_ucan(&params, entry.custody.as_ref(), &scp_clock::SystemClock).await
-            });
-            result.map_err(ScpPyError::from)
+        // Clone the custody handle out of the registry guard before the wait,
+        // so a GIL-released wait never holds the identity map's shard lock.
+        let (custody, delegator_key) = crate::runtime::with_identity(bi, delegator_did, |entry| {
+            Ok((entry.custody.clone(), entry.identity.active_signing_key))
         })?;
+        let params = DelegateParams {
+            parent_token: &parsed_parent,
+            delegator_did,
+            delegator_key: &delegator_key,
+            delegatee_did,
+            attenuated_capabilities: &attenuations,
+            lifetime_secs: 3600,
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(ceiling_strings),
+        };
+        let token = crate::actor_wait::block_on_released(py, async {
+            delegate_ucan(&params, custody.as_ref(), &scp_clock::SystemClock).await
+        })?
+        .map_err(ScpPyError::from)?;
 
         let capability_uris: Vec<String> =
             token.payload.att.iter().map(|a| a.with.clone()).collect();
@@ -816,7 +821,13 @@ impl crate::scp::PyScp {
     /// context but this bridge holds no state for it.
     ///
     /// See ADR-016 acceptance criterion 5. Closes #499.
-    pub fn ucan_revoke(&self, context_id: &str, token: &str, revoker_did: &str) -> PyResult<()> {
+    pub fn ucan_revoke(
+        &self,
+        py: Python<'_>,
+        context_id: &str,
+        token: &str,
+        revoker_did: &str,
+    ) -> PyResult<()> {
         let bi = &*self.inner;
         validate::validate_context_id(context_id)?;
         validate::validate_ucan_token(token)?;
@@ -828,7 +839,7 @@ impl crate::scp::PyScp {
         // context refuses on its own account rather than on the shape of a
         // caller-supplied token.
         let creator_did =
-            active_ucan_role_state(bi, context_id, "revoke a UCAN in context")?.creator_did;
+            active_ucan_role_state(py, bi, context_id, "revoke a UCAN in context")?.creator_did;
         // A context this bridge holds no state for also refuses before the parse.
         require_revocable_ucan_context(bi, context_id)?;
 
@@ -1200,46 +1211,52 @@ mod tests {
 
     #[test]
     fn ucan_revoke_marks_token_revoked_and_logs_event() {
-        let (scp, context_id) = revocable_context();
-        let events_before = revoke_event_count(&scp, &context_id);
+        pyo3::Python::with_gil(|py| {
+            let (scp, context_id) = revocable_context();
+            let events_before = revoke_event_count(&scp, &context_id);
 
-        scp.ucan_revoke(&context_id, REVOKE_TEST_TOKEN, REVOKE_CREATOR_DID)
-            .expect("ucan_revoke must accept a context creator as revoker");
+            scp.ucan_revoke(py, &context_id, REVOKE_TEST_TOKEN, REVOKE_CREATOR_DID)
+                .expect("ucan_revoke must accept a context creator as revoker");
 
-        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(REVOKE_TEST_TOKEN);
-        assert!(
-            revoke_checker_reports_revoked(&scp, &context_id, &token_cid),
-            "a token revoked through PyScp::ucan_revoke must be reported as revoked by \
+            let token_cid =
+                scp_core::crypto::ucan::revoke::compute_revocation_cid(REVOKE_TEST_TOKEN);
+            assert!(
+                revoke_checker_reports_revoked(&scp, &context_id, &token_cid),
+                "a token revoked through PyScp::ucan_revoke must be reported as revoked by \
              BridgeRevocationChecker, which ucan_validate reads"
-        );
+            );
 
-        let events_after = revoke_event_count(&scp, &context_id);
-        assert!(
-            events_after > events_before,
-            "ucan_revoke must append a TokenRevoked event: this log held {events_before} \
+            let events_after = revoke_event_count(&scp, &context_id);
+            assert!(
+                events_after > events_before,
+                "ucan_revoke must append a TokenRevoked event: this log held {events_before} \
              leaves before that call and {events_after} after"
-        );
+            );
+        });
     }
 
     #[test]
     fn ucan_revoke_rejects_unauthorized_revoker() {
-        let (scp, context_id) = revocable_context();
+        pyo3::Python::with_gil(|py| {
+            let (scp, context_id) = revocable_context();
 
-        let error = scp
-            .ucan_revoke(&context_id, REVOKE_TEST_TOKEN, REVOKE_OUTSIDER_DID)
-            .expect_err("ucan_revoke must reject a revoker it never authorized");
+            let error = scp
+                .ucan_revoke(py, &context_id, REVOKE_TEST_TOKEN, REVOKE_OUTSIDER_DID)
+                .expect_err("ucan_revoke must reject a revoker it never authorized");
 
-        let message = error.to_string();
-        assert!(
-            message.contains(REVOKE_OUTSIDER_DID),
-            "this rejection must name whichever revoker it refused, got: {message}"
-        );
+            let message = error.to_string();
+            assert!(
+                message.contains(REVOKE_OUTSIDER_DID),
+                "this rejection must name whichever revoker it refused, got: {message}"
+            );
 
-        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(REVOKE_TEST_TOKEN);
-        assert!(
-            !revoke_checker_reports_revoked(&scp, &context_id, &token_cid),
-            "a rejected revocation must leave its token unrevoked"
-        );
+            let token_cid =
+                scp_core::crypto::ucan::revoke::compute_revocation_cid(REVOKE_TEST_TOKEN);
+            assert!(
+                !revoke_checker_reports_revoked(&scp, &context_id, &token_cid),
+                "a rejected revocation must leave its token unrevoked"
+            );
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -1288,19 +1305,21 @@ mod tests {
     /// The check fires before context lookup, so no registered context is needed.
     #[test]
     fn ucan_evaluate_rejects_empty_presenting_agent_did() {
-        let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let error = scp
-            .ucan_evaluate("ctx-1", "header.payload.sig", None, "   ", None)
-            .expect_err("ucan_evaluate must fail closed on an empty presenting_agent_did");
-        // Pin this rejection to `validate_did`, not to any later failure.
-        // With that DID gate deleted, this call would still fail — on a
-        // malformed token, or on an unregistered context — so a bare `is_err`
-        // assertion would certify a removed gate.
-        let message = error.to_string();
-        assert!(
-            message.contains("DID must not be empty"),
-            "rejection must come from validate_did, got: {message}"
-        );
+        pyo3::Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let error = scp
+                .ucan_evaluate(py, "ctx-1", "header.payload.sig", None, "   ", None)
+                .expect_err("ucan_evaluate must fail closed on an empty presenting_agent_did");
+            // Pin this rejection to `validate_did`, not to any later failure.
+            // With that DID gate deleted, this call would still fail — on a
+            // malformed token, or on an unregistered context — so a bare `is_err`
+            // assertion would certify a removed gate.
+            let message = error.to_string();
+            assert!(
+                message.contains("DID must not be empty"),
+                "rejection must come from validate_did, got: {message}"
+            );
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -1313,18 +1332,27 @@ mod tests {
     /// non-`Option` `&str`, so the type system enforces presence.
     #[test]
     fn ucan_validate_rejects_empty_presenting_agent_did() {
-        let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let error = scp
-            .ucan_validate("ctx-1", "header.payload.sig", "messages:write", "   ", None)
-            .expect_err("ucan_validate must fail closed on an empty presenting_agent_did");
-        // Pin this rejection to `validate_did` — see a sibling
-        // `ucan_evaluate` test for why a bare `is_err` assertion passes even
-        // with that gate deleted.
-        let message = error.to_string();
-        assert!(
-            message.contains("DID must not be empty"),
-            "rejection must come from validate_did, got: {message}"
-        );
+        pyo3::Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let error = scp
+                .ucan_validate(
+                    py,
+                    "ctx-1",
+                    "header.payload.sig",
+                    "messages:write",
+                    "   ",
+                    None,
+                )
+                .expect_err("ucan_validate must fail closed on an empty presenting_agent_did");
+            // Pin this rejection to `validate_did` — see a sibling
+            // `ucan_evaluate` test for why a bare `is_err` assertion passes even
+            // with that gate deleted.
+            let message = error.to_string();
+            assert!(
+                message.contains("DID must not be empty"),
+                "rejection must come from validate_did, got: {message}"
+            );
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -1361,22 +1389,24 @@ mod tests {
     /// touches bridge-owned UCAN state.
     #[test]
     fn ucan_validate_refuses_without_supervisor_role_state() {
-        let creator = "did:dht:z6MkUcanValidateNoActor";
-        let (scp, ctx_id) = scp_without_supervisor_context("ucan-validate-no-actor", creator);
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkUcanValidateNoActor";
+            let (scp, ctx_id) = scp_without_supervisor_context("ucan-validate-no-actor", creator);
 
-        // A token that passes the non-empty, no-control-character input check
-        // but does not parse: the call must refuse at the lifecycle gate, before
-        // any parse-level verdict, so a parse error here means the parse ran first.
-        let err = scp
-            .ucan_validate(&ctx_id, "aaa.bbb.ccc", "messages:write", creator, None)
-            .expect_err("no supervisor role state must refuse the validation");
-        let message = format!("{err}");
-        assert!(
-            message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
-                && message.contains("SCP-CTX-2023"),
-            "the refusal must come from the lifecycle gate: {message}"
-        );
-        crate::runtime::remove_context(&scp.inner, &ctx_id);
+            // A token that passes the non-empty, no-control-character input check
+            // but does not parse: the call must refuse at the lifecycle gate, before
+            // any parse-level verdict, so a parse error here means the parse ran first.
+            let err = scp
+                .ucan_validate(py, &ctx_id, "aaa.bbb.ccc", "messages:write", creator, None)
+                .expect_err("no supervisor role state must refuse the validation");
+            let message = format!("{err}");
+            assert!(
+                message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                    && message.contains("SCP-CTX-2023"),
+                "the refusal must come from the lifecycle gate: {message}"
+            );
+            crate::runtime::remove_context(&scp.inner, &ctx_id);
+        });
     }
 
     /// `ucan_mint`, `ucan_delegate` and `ucan_revoke` refuse a context the
@@ -1387,61 +1417,68 @@ mod tests {
     /// revoked on this bridge.
     #[test]
     fn ucan_mint_delegate_and_revoke_refuse_a_context_this_bridge_holds_no_state_for() {
-        let creator = "did:dht:z6MkUcanNoBridgeState";
-        crate::init_runtime().ok();
-        let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let bi = &*scp.inner;
-        let ctx_id = format!("ucan-no-bridge-state-{}", uuid::Uuid::new_v4());
-        crate::runtime::init_context_manager_for_test(bi);
-        crate::runtime::create_supervisor_context_for_test(
-            bi,
-            &ctx_id,
-            creator,
-            &["messages:read".to_owned(), "messages:write".to_owned()],
-        );
-        assert!(
-            matches!(
-                crate::runtime::read_live_context_state(bi, &ctx_id),
-                Ok(Some(scp_core::context::ContextState::Active))
-            ),
-            "the fixture must leave the actor Active, so only the state check refuses"
-        );
-
-        let refusals: [(&str, PyResult<()>); 3] = [
-            (
-                "mint",
-                scp.ucan_mint(
-                    &ctx_id,
-                    "did:dht:z6MkUcanNoBridgeStateAudience",
-                    vec!["messages:write".to_owned()],
-                    None,
-                )
-                .map(drop),
-            ),
-            (
-                "delegate",
-                scp.ucan_delegate(
-                    &ctx_id,
-                    creator,
-                    "did:dht:z6MkUcanNoBridgeStateAudience",
-                    "aaa.bbb.ccc",
-                    vec!["messages:write".to_owned()],
-                )
-                .map(drop),
-            ),
-            ("revoke", scp.ucan_revoke(&ctx_id, "aaa.bbb.ccc", creator)),
-        ];
-        for (entry_point, result) in refusals {
-            let message = format!(
-                "{}",
-                result.expect_err("a context with no bridge state must refuse")
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkUcanNoBridgeState";
+            crate::init_runtime().ok();
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = &*scp.inner;
+            let ctx_id = format!("ucan-no-bridge-state-{}", uuid::Uuid::new_v4());
+            crate::runtime::init_context_manager_for_test(bi);
+            crate::runtime::create_supervisor_context_for_test(
+                bi,
+                &ctx_id,
+                creator,
+                &["messages:read".to_owned(), "messages:write".to_owned()],
             );
             assert!(
-                message.contains("SCP-CTX-2001")
-                    && message.contains("not found in FFI state registry"),
-                "{entry_point} must refuse at the bridge-state check: {message}"
+                matches!(
+                    crate::runtime::read_live_context_state(py, bi, &ctx_id),
+                    Ok(Some(scp_core::context::ContextState::Active))
+                ),
+                "the fixture must leave the actor Active, so only the state check refuses"
             );
-        }
+
+            let refusals: [(&str, PyResult<()>); 3] = [
+                (
+                    "mint",
+                    scp.ucan_mint(
+                        py,
+                        &ctx_id,
+                        "did:dht:z6MkUcanNoBridgeStateAudience",
+                        vec!["messages:write".to_owned()],
+                        None,
+                    )
+                    .map(drop),
+                ),
+                (
+                    "delegate",
+                    scp.ucan_delegate(
+                        py,
+                        &ctx_id,
+                        creator,
+                        "did:dht:z6MkUcanNoBridgeStateAudience",
+                        "aaa.bbb.ccc",
+                        vec!["messages:write".to_owned()],
+                    )
+                    .map(drop),
+                ),
+                (
+                    "revoke",
+                    scp.ucan_revoke(py, &ctx_id, "aaa.bbb.ccc", creator),
+                ),
+            ];
+            for (entry_point, result) in refusals {
+                let message = format!(
+                    "{}",
+                    result.expect_err("a context with no bridge state must refuse")
+                );
+                assert!(
+                    message.contains("SCP-CTX-2001")
+                        && message.contains("not found in FFI state registry"),
+                    "{entry_point} must refuse at the bridge-state check: {message}"
+                );
+            }
+        });
     }
 
     /// Drives `context_id`'s supervisor actor from `Active` to `Closing` through
@@ -1483,90 +1520,157 @@ mod tests {
     /// `ucan_mint` included.
     #[test]
     fn every_ucan_entry_point_refuses_a_resident_actor_that_is_not_active() {
-        let creator = "did:dht:z6MkUcanGateClosing";
-        crate::init_runtime().ok();
-        let closing = crate::scp::PyScp::new_in_memory_for_test();
-        let bi = &*closing.inner;
-        let ctx_id = format!("ucan-gate-closing-{}", uuid::Uuid::new_v4());
-        crate::runtime::register_context(bi, &ctx_id, creator, &[]).unwrap();
-        crate::runtime::create_supervisor_context_for_test(
-            bi,
-            &ctx_id,
-            creator,
-            &[
-                "messages:read".to_owned(),
-                "messages:write".to_owned(),
-                "context:close".to_owned(),
-            ],
-        );
-        close_supervisor_context(bi, &ctx_id, creator);
-        assert!(
-            matches!(
-                crate::runtime::read_live_context_state(bi, &ctx_id),
-                Ok(Some(scp_core::context::ContextState::Closing))
-            ),
-            "the fixture must leave the actor resident in Closing"
-        );
-        assert!(
-            crate::runtime::live_role_state(bi, &ctx_id).is_ok(),
-            "the fixture must leave the role state readable, so only the gate refuses"
-        );
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkUcanGateClosing";
+            crate::init_runtime().ok();
+            let closing = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = &*closing.inner;
+            let ctx_id = format!("ucan-gate-closing-{}", uuid::Uuid::new_v4());
+            crate::runtime::register_context(bi, &ctx_id, creator, &[]).unwrap();
+            crate::runtime::create_supervisor_context_for_test(
+                bi,
+                &ctx_id,
+                creator,
+                &[
+                    "messages:read".to_owned(),
+                    "messages:write".to_owned(),
+                    "context:close".to_owned(),
+                ],
+            );
+            close_supervisor_context(bi, &ctx_id, creator);
+            assert!(
+                matches!(
+                    crate::runtime::read_live_context_state(py, bi, &ctx_id),
+                    Ok(Some(scp_core::context::ContextState::Closing))
+                ),
+                "the fixture must leave the actor resident in Closing"
+            );
+            assert!(
+                crate::runtime::live_role_state(py, bi, &ctx_id).is_ok(),
+                "the fixture must leave the role state readable, so only the gate refuses"
+            );
 
-        let (absent, absent_ctx) =
-            scp_without_supervisor_context("ucan-gate-absent", "did:dht:z6MkUcanGateAbsent");
+            let (absent, absent_ctx) =
+                scp_without_supervisor_context("ucan-gate-absent", "did:dht:z6MkUcanGateAbsent");
 
-        for (fixture, scp, ctx) in [
-            ("closing", &closing, &ctx_id),
-            ("absent", &absent, &absent_ctx),
-        ] {
-            let refusals: [(&str, PyResult<()>); 5] = [
-                (
-                    "validate",
-                    scp.ucan_validate(ctx, "aaa.bbb.ccc", "messages:write", creator, None)
+            for (fixture, scp, ctx) in [
+                ("closing", &closing, &ctx_id),
+                ("absent", &absent, &absent_ctx),
+            ] {
+                let refusals: [(&str, PyResult<()>); 5] = [
+                    (
+                        "validate",
+                        scp.ucan_validate(py, ctx, "aaa.bbb.ccc", "messages:write", creator, None)
+                            .map(drop),
+                    ),
+                    (
+                        "evaluate",
+                        scp.ucan_evaluate(
+                            py,
+                            ctx,
+                            "aaa.bbb.ccc",
+                            Some("messages:write"),
+                            creator,
+                            None,
+                        )
                         .map(drop),
-                ),
-                (
-                    "evaluate",
-                    scp.ucan_evaluate(ctx, "aaa.bbb.ccc", Some("messages:write"), creator, None)
+                    ),
+                    (
+                        "mint",
+                        scp.ucan_mint(
+                            py,
+                            ctx,
+                            "did:dht:z6MkUcanGateAudience",
+                            vec!["messages:write".to_owned()],
+                            None,
+                        )
                         .map(drop),
-                ),
-                (
-                    "mint",
-                    scp.ucan_mint(
-                        ctx,
-                        "did:dht:z6MkUcanGateAudience",
-                        vec!["messages:write".to_owned()],
-                        None,
-                    )
-                    .map(drop),
-                ),
-                (
-                    "delegate",
-                    scp.ucan_delegate(
-                        ctx,
-                        creator,
-                        "did:dht:z6MkUcanGateAudience",
-                        "aaa.bbb.ccc",
-                        vec!["messages:write".to_owned()],
-                    )
-                    .map(drop),
-                ),
-                ("revoke", scp.ucan_revoke(ctx, "aaa.bbb.ccc", creator)),
-            ];
-            for (entry_point, result) in refusals {
-                let message = format!(
-                    "{}",
-                    result.expect_err("a non-Active context must refuse every UCAN call")
-                );
-                assert!(
-                    message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
-                        && message.contains("SCP-CTX-2023"),
-                    "{entry_point} ({fixture}) must refuse at the lifecycle gate: {message}"
-                );
+                    ),
+                    (
+                        "delegate",
+                        scp.ucan_delegate(
+                            py,
+                            ctx,
+                            creator,
+                            "did:dht:z6MkUcanGateAudience",
+                            "aaa.bbb.ccc",
+                            vec!["messages:write".to_owned()],
+                        )
+                        .map(drop),
+                    ),
+                    ("revoke", scp.ucan_revoke(py, ctx, "aaa.bbb.ccc", creator)),
+                ];
+                for (entry_point, result) in refusals {
+                    let message = format!(
+                        "{}",
+                        result.expect_err("a non-Active context must refuse every UCAN call")
+                    );
+                    assert!(
+                        message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                            && message.contains("SCP-CTX-2023"),
+                        "{entry_point} ({fixture}) must refuse at the lifecycle gate: {message}"
+                    );
+                }
             }
-        }
-        crate::runtime::remove_context(&absent.inner, &absent_ctx);
-        crate::runtime::remove_context(bi, &ctx_id);
+            crate::runtime::remove_context(&absent.inner, &absent_ctx);
+            crate::runtime::remove_context(bi, &ctx_id);
+        });
+    }
+
+    /// Calls every UCAN entry point against `ctx_id`, for
+    /// `every_ucan_entry_point_withholds_a_faulted_actor`.
+    fn faulted_ucan_refusals(
+        py: Python<'_>,
+        scp: &crate::scp::PyScp,
+        ctx_id: &str,
+        creator: &str,
+    ) -> [(&'static str, PyResult<()>); 5] {
+        [
+            (
+                "validate",
+                scp.ucan_validate(py, ctx_id, "aaa.bbb.ccc", "messages:write", creator, None)
+                    .map(drop),
+            ),
+            (
+                "evaluate",
+                scp.ucan_evaluate(
+                    py,
+                    ctx_id,
+                    "aaa.bbb.ccc",
+                    Some("messages:write"),
+                    creator,
+                    None,
+                )
+                .map(drop),
+            ),
+            (
+                "mint",
+                scp.ucan_mint(
+                    py,
+                    ctx_id,
+                    "did:dht:z6MkUcanGateFaultedAudience",
+                    vec!["messages:write".to_owned()],
+                    None,
+                )
+                .map(drop),
+            ),
+            (
+                "delegate",
+                scp.ucan_delegate(
+                    py,
+                    ctx_id,
+                    creator,
+                    "did:dht:z6MkUcanGateFaultedAudience",
+                    "aaa.bbb.ccc",
+                    vec!["messages:write".to_owned()],
+                )
+                .map(drop),
+            ),
+            (
+                "revoke",
+                scp.ucan_revoke(py, ctx_id, "aaa.bbb.ccc", creator),
+            ),
+        ]
     }
 
     /// Every UCAN entry point refuses a context whose actor crashed, was
@@ -1607,52 +1711,13 @@ mod tests {
             }
             assert!(
                 !matches!(
-                    crate::runtime::read_live_context_state(bi, &ctx_id),
+                    Python::with_gil(|py| crate::runtime::read_live_context_state(py, bi, &ctx_id)),
                     Ok(Some(scp_core::context::ContextState::Active))
                 ),
                 "the fixture must leave the context unable to read Active ({fault})"
             );
 
-            let refusals: [(&str, PyResult<()>); 5] = [
-                (
-                    "validate",
-                    scp.ucan_validate(&ctx_id, "aaa.bbb.ccc", "messages:write", creator, None)
-                        .map(drop),
-                ),
-                (
-                    "evaluate",
-                    scp.ucan_evaluate(
-                        &ctx_id,
-                        "aaa.bbb.ccc",
-                        Some("messages:write"),
-                        creator,
-                        None,
-                    )
-                    .map(drop),
-                ),
-                (
-                    "mint",
-                    scp.ucan_mint(
-                        &ctx_id,
-                        "did:dht:z6MkUcanGateFaultedAudience",
-                        vec!["messages:write".to_owned()],
-                        None,
-                    )
-                    .map(drop),
-                ),
-                (
-                    "delegate",
-                    scp.ucan_delegate(
-                        &ctx_id,
-                        creator,
-                        "did:dht:z6MkUcanGateFaultedAudience",
-                        "aaa.bbb.ccc",
-                        vec!["messages:write".to_owned()],
-                    )
-                    .map(drop),
-                ),
-                ("revoke", scp.ucan_revoke(&ctx_id, "aaa.bbb.ccc", creator)),
-            ];
+            let refusals = Python::with_gil(|py| faulted_ucan_refusals(py, &scp, &ctx_id, creator));
             for (entry_point, result) in refusals {
                 let message = format!(
                     "{}",
@@ -1684,147 +1749,175 @@ mod tests {
     /// comes from the suspend and not from the context.
     #[test]
     fn every_ucan_entry_point_returns_a_bridge_instance_error_unchanged() {
-        let creator = "did:dht:z6MkUcanGateSuspended";
-        let calls = |scp: &crate::scp::PyScp, ctx_id: &str| -> [(&'static str, PyResult<()>); 5] {
-            [
-                (
-                    "validate",
-                    scp.ucan_validate(ctx_id, "aaa.bbb.ccc", "messages:write", creator, None)
-                        .map(drop),
-                ),
-                (
-                    "evaluate",
-                    scp.ucan_evaluate(ctx_id, "aaa.bbb.ccc", Some("messages:write"), creator, None)
-                        .map(drop),
-                ),
-                (
-                    "mint",
-                    scp.ucan_mint(
-                        ctx_id,
-                        "did:dht:z6MkUcanGateSuspendedAudience",
-                        vec!["messages:write".to_owned()],
-                        None,
-                    )
-                    .map(drop),
-                ),
-                (
-                    "delegate",
-                    scp.ucan_delegate(
-                        ctx_id,
-                        creator,
-                        "did:dht:z6MkUcanGateSuspendedAudience",
-                        "aaa.bbb.ccc",
-                        vec!["messages:write".to_owned()],
-                    )
-                    .map(drop),
-                ),
-                ("revoke", scp.ucan_revoke(ctx_id, "aaa.bbb.ccc", creator)),
-            ]
-        };
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkUcanGateSuspended";
+            let calls =
+                |scp: &crate::scp::PyScp, ctx_id: &str| -> [(&'static str, PyResult<()>); 5] {
+                    [
+                        (
+                            "validate",
+                            scp.ucan_validate(
+                                py,
+                                ctx_id,
+                                "aaa.bbb.ccc",
+                                "messages:write",
+                                creator,
+                                None,
+                            )
+                            .map(drop),
+                        ),
+                        (
+                            "evaluate",
+                            scp.ucan_evaluate(
+                                py,
+                                ctx_id,
+                                "aaa.bbb.ccc",
+                                Some("messages:write"),
+                                creator,
+                                None,
+                            )
+                            .map(drop),
+                        ),
+                        (
+                            "mint",
+                            scp.ucan_mint(
+                                py,
+                                ctx_id,
+                                "did:dht:z6MkUcanGateSuspendedAudience",
+                                vec!["messages:write".to_owned()],
+                                None,
+                            )
+                            .map(drop),
+                        ),
+                        (
+                            "delegate",
+                            scp.ucan_delegate(
+                                py,
+                                ctx_id,
+                                creator,
+                                "did:dht:z6MkUcanGateSuspendedAudience",
+                                "aaa.bbb.ccc",
+                                vec!["messages:write".to_owned()],
+                            )
+                            .map(drop),
+                        ),
+                        (
+                            "revoke",
+                            scp.ucan_revoke(py, ctx_id, "aaa.bbb.ccc", creator),
+                        ),
+                    ]
+                };
 
-        crate::init_runtime().ok();
-        let suspended = crate::scp::PyScp::new_in_memory_for_test();
-        let ctx_id = format!("ucan-gate-suspended-{}", uuid::Uuid::new_v4());
-        crate::runtime::register_context(&suspended.inner, &ctx_id, creator, &[]).unwrap();
-        crate::runtime::create_supervisor_context_for_test(
-            &suspended.inner,
-            &ctx_id,
-            creator,
-            &["messages:read".to_owned(), "messages:write".to_owned()],
-        );
-        active_ucan_role_state(&suspended.inner, &ctx_id, "validate a UCAN in context")
-            .expect("the gate must admit the Active context before the suspend");
-        suspended.suspend().expect("suspend");
+            crate::init_runtime().ok();
+            let suspended = crate::scp::PyScp::new_in_memory_for_test();
+            let ctx_id = format!("ucan-gate-suspended-{}", uuid::Uuid::new_v4());
+            crate::runtime::register_context(&suspended.inner, &ctx_id, creator, &[]).unwrap();
+            crate::runtime::create_supervisor_context_for_test(
+                &suspended.inner,
+                &ctx_id,
+                creator,
+                &["messages:read".to_owned(), "messages:write".to_owned()],
+            );
+            active_ucan_role_state(py, &suspended.inner, &ctx_id, "validate a UCAN in context")
+                .expect("the gate must admit the Active context before the suspend");
+            suspended.suspend().expect("suspend");
 
-        let unattached = crate::scp::PyScp::new_in_memory_for_test();
-        assert!(
-            !unattached.inner.core.has_supervisor(),
-            "the fixture must leave the bridge with no ContextManager attached"
-        );
+            let unattached = crate::scp::PyScp::new_in_memory_for_test();
+            assert!(
+                !unattached.inner.core.has_supervisor(),
+                "the fixture must leave the bridge with no ContextManager attached"
+            );
 
-        for (bridge, scp, expected) in [
-            ("suspended", &suspended, "bridge is suspended"),
-            ("unattached", &unattached, "ContextManager not yet attached"),
-        ] {
-            for (entry_point, result) in calls(scp, &ctx_id) {
-                let message = format!(
-                    "{}",
-                    result.expect_err("a bridge that cannot reach its supervisor must refuse")
-                );
-                assert!(
-                    message.contains(expected),
-                    "{entry_point} ({bridge}) must return the bridge's own error: {message}"
-                );
-                assert!(
-                    !message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
-                        && !message.contains("SCP-CTX-2023"),
-                    "{entry_point} ({bridge}) must not report bridge state as the withheld \
+            for (bridge, scp, expected) in [
+                ("suspended", &suspended, "bridge is suspended"),
+                ("unattached", &unattached, "ContextManager not yet attached"),
+            ] {
+                for (entry_point, result) in calls(scp, &ctx_id) {
+                    let message = format!(
+                        "{}",
+                        result.expect_err("a bridge that cannot reach its supervisor must refuse")
+                    );
+                    assert!(
+                        message.contains(expected),
+                        "{entry_point} ({bridge}) must return the bridge's own error: {message}"
+                    );
+                    assert!(
+                        !message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                            && !message.contains("SCP-CTX-2023"),
+                        "{entry_point} ({bridge}) must not report bridge state as the withheld \
                      context refusal: {message}"
-                );
+                    );
+                }
             }
-        }
-        crate::runtime::remove_context(&suspended.inner, &ctx_id);
+            crate::runtime::remove_context(&suspended.inner, &ctx_id);
+        });
     }
 
     /// `ucan_evaluate` reads the same two supervisor-owned inputs the enforcing
     /// `ucan_validate` reads, so the diagnostic refuses on the same condition.
     #[test]
     fn ucan_evaluate_refuses_without_supervisor_role_state() {
-        let creator = "did:dht:z6MkUcanEvaluateNoActor";
-        let (scp, ctx_id) = scp_without_supervisor_context("ucan-evaluate-no-actor", creator);
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkUcanEvaluateNoActor";
+            let (scp, ctx_id) = scp_without_supervisor_context("ucan-evaluate-no-actor", creator);
 
-        let err = scp
-            .ucan_evaluate(
-                &ctx_id,
-                "aaa.bbb.ccc",
-                Some("messages:write"),
-                creator,
-                None,
-            )
-            .expect_err("no supervisor role state must refuse the evaluation");
-        let message = format!("{err}");
-        assert!(
-            message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
-                && message.contains("SCP-CTX-2023"),
-            "the refusal must come from the lifecycle gate: {message}"
-        );
-        crate::runtime::remove_context(&scp.inner, &ctx_id);
+            let err = scp
+                .ucan_evaluate(
+                    py,
+                    &ctx_id,
+                    "aaa.bbb.ccc",
+                    Some("messages:write"),
+                    creator,
+                    None,
+                )
+                .expect_err("no supervisor role state must refuse the evaluation");
+            let message = format!("{err}");
+            assert!(
+                message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                    && message.contains("SCP-CTX-2023"),
+                "the refusal must come from the lifecycle gate: {message}"
+            );
+            crate::runtime::remove_context(&scp.inner, &ctx_id);
+        });
     }
 
     /// `ucan_mint` takes its issuer and its mint-time ceiling from the
     /// supervisor, so the DID named in the refusal is the supervisor's creator.
     #[test]
     fn ucan_mint_reads_the_supervisor_creator_as_issuer() {
-        crate::init_runtime().ok();
-        let ffi_creator = "did:dht:z6MkUcanMintFfiCreator";
-        let supervisor_creator = "did:dht:z6MkUcanMintSupervisorCreator";
-        let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let bi = &*scp.inner;
-        let ctx_id = format!("ucan-mint-{}", uuid::Uuid::new_v4());
-        crate::runtime::register_context(bi, &ctx_id, ffi_creator, &[]).unwrap();
-        crate::runtime::create_supervisor_context_for_test(
-            bi,
-            &ctx_id,
-            supervisor_creator,
-            &["messages:read".to_owned(), "messages:write".to_owned()],
-        );
-
-        // Neither DID is custodied on this instance, so the identity lookup
-        // refuses and names the issuer the mint selected.
-        let err = scp
-            .ucan_mint(
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let ffi_creator = "did:dht:z6MkUcanMintFfiCreator";
+            let supervisor_creator = "did:dht:z6MkUcanMintSupervisorCreator";
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = &*scp.inner;
+            let ctx_id = format!("ucan-mint-{}", uuid::Uuid::new_v4());
+            crate::runtime::register_context(bi, &ctx_id, ffi_creator, &[]).unwrap();
+            crate::runtime::create_supervisor_context_for_test(
+                bi,
                 &ctx_id,
-                "did:dht:z6MkUcanMintAudience",
-                vec!["messages:write".to_owned()],
-                None,
-            )
-            .expect_err("an uncustodied issuer DID must refuse");
-        let message = format!("{err}");
-        assert!(
-            message.contains(supervisor_creator),
-            "the mint must issue as the supervisor's creator DID: {message}"
-        );
-        crate::runtime::remove_context(bi, &ctx_id);
+                supervisor_creator,
+                &["messages:read".to_owned(), "messages:write".to_owned()],
+            );
+
+            // Neither DID is custodied on this instance, so the identity lookup
+            // refuses and names the issuer the mint selected.
+            let err = scp
+                .ucan_mint(
+                    py,
+                    &ctx_id,
+                    "did:dht:z6MkUcanMintAudience",
+                    vec!["messages:write".to_owned()],
+                    None,
+                )
+                .expect_err("an uncustodied issuer DID must refuse");
+            let message = format!("{err}");
+            assert!(
+                message.contains(supervisor_creator),
+                "the mint must issue as the supervisor's creator DID: {message}"
+            );
+            crate::runtime::remove_context(bi, &ctx_id);
+        });
     }
 
     /// `ucan_delegate` takes its delegation-time ceiling from the supervisor, so
@@ -1832,25 +1925,28 @@ mod tests {
     /// parent token.
     #[test]
     fn ucan_delegate_refuses_without_supervisor_role_state() {
-        let creator = "did:dht:z6MkUcanDelegateNoActor";
-        let (scp, ctx_id) = scp_without_supervisor_context("ucan-delegate-no-actor", creator);
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkUcanDelegateNoActor";
+            let (scp, ctx_id) = scp_without_supervisor_context("ucan-delegate-no-actor", creator);
 
-        let err = scp
-            .ucan_delegate(
-                &ctx_id,
-                creator,
-                "did:dht:z6MkUcanDelegateAudience",
-                "aaa.bbb.ccc",
-                vec!["messages:write".to_owned()],
-            )
-            .expect_err("no supervisor role state must refuse the delegation");
-        let message = format!("{err}");
-        assert!(
-            message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
-                && message.contains("SCP-CTX-2023"),
-            "the refusal must come from the lifecycle gate: {message}"
-        );
-        crate::runtime::remove_context(&scp.inner, &ctx_id);
+            let err = scp
+                .ucan_delegate(
+                    py,
+                    &ctx_id,
+                    creator,
+                    "did:dht:z6MkUcanDelegateAudience",
+                    "aaa.bbb.ccc",
+                    vec!["messages:write".to_owned()],
+                )
+                .expect_err("no supervisor role state must refuse the delegation");
+            let message = format!("{err}");
+            assert!(
+                message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                    && message.contains("SCP-CTX-2023"),
+                "the refusal must come from the lifecycle gate: {message}"
+            );
+            crate::runtime::remove_context(&scp.inner, &ctx_id);
+        });
     }
 
     /// `ucan_revoke` decides who may revoke by comparing the revoker against the
@@ -1859,51 +1955,56 @@ mod tests {
     /// touches the bridge-owned revocation list.
     #[test]
     fn ucan_revoke_refuses_without_supervisor_role_state() {
-        let creator = "did:dht:z6MkUcanRevokeNoActor";
-        let (scp, ctx_id) = scp_without_supervisor_context("ucan-revoke-no-actor", creator);
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkUcanRevokeNoActor";
+            let (scp, ctx_id) = scp_without_supervisor_context("ucan-revoke-no-actor", creator);
 
-        let err = scp
-            .ucan_revoke(&ctx_id, "aaa.bbb.ccc", creator)
-            .expect_err("no supervisor role state must refuse the revocation");
-        let message = format!("{err}");
-        assert!(
-            message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
-                && message.contains("SCP-CTX-2023"),
-            "the refusal must come from the lifecycle gate: {message}"
-        );
-        crate::runtime::remove_context(&scp.inner, &ctx_id);
+            let err = scp
+                .ucan_revoke(py, &ctx_id, "aaa.bbb.ccc", creator)
+                .expect_err("no supervisor role state must refuse the revocation");
+            let message = format!("{err}");
+            assert!(
+                message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                    && message.contains("SCP-CTX-2023"),
+                "the refusal must come from the lifecycle gate: {message}"
+            );
+            crate::runtime::remove_context(&scp.inner, &ctx_id);
+        });
     }
 
     /// `ucan_revoke` admits the context creator the SUPERVISOR holds.
     #[test]
     fn ucan_revoke_authorizes_the_supervisor_creator() {
-        crate::init_runtime().ok();
-        let ffi_creator = "did:dht:z6MkUcanRevokeFfiCreator";
-        let supervisor_creator = "did:dht:z6MkUcanRevokeSupervisorCreator";
-        let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let bi = &*scp.inner;
-        let ctx_id = format!("ucan-revoke-creator-{}", uuid::Uuid::new_v4());
-        crate::runtime::register_context(bi, &ctx_id, ffi_creator, &[]).unwrap();
-        crate::runtime::create_supervisor_context_for_test(
-            bi,
-            &ctx_id,
-            supervisor_creator,
-            &["messages:read".to_owned()],
-        );
-        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(REVOKE_TEST_TOKEN);
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let ffi_creator = "did:dht:z6MkUcanRevokeFfiCreator";
+            let supervisor_creator = "did:dht:z6MkUcanRevokeSupervisorCreator";
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = &*scp.inner;
+            let ctx_id = format!("ucan-revoke-creator-{}", uuid::Uuid::new_v4());
+            crate::runtime::register_context(bi, &ctx_id, ffi_creator, &[]).unwrap();
+            crate::runtime::create_supervisor_context_for_test(
+                bi,
+                &ctx_id,
+                supervisor_creator,
+                &["messages:read".to_owned()],
+            );
+            let token_cid =
+                scp_core::crypto::ucan::revoke::compute_revocation_cid(REVOKE_TEST_TOKEN);
 
-        let refused = scp
-            .ucan_revoke(&ctx_id, REVOKE_TEST_TOKEN, ffi_creator)
-            .expect_err("a revoker the supervisor does not name as creator must be refused");
-        assert!(
-            refused.to_string().contains(ffi_creator),
-            "the refusal must name the revoker it refused: {refused}"
-        );
-        assert!(!revoke_checker_reports_revoked(&scp, &ctx_id, &token_cid));
+            let refused = scp
+                .ucan_revoke(py, &ctx_id, REVOKE_TEST_TOKEN, ffi_creator)
+                .expect_err("a revoker the supervisor does not name as creator must be refused");
+            assert!(
+                refused.to_string().contains(ffi_creator),
+                "the refusal must name the revoker it refused: {refused}"
+            );
+            assert!(!revoke_checker_reports_revoked(&scp, &ctx_id, &token_cid));
 
-        scp.ucan_revoke(&ctx_id, REVOKE_TEST_TOKEN, supervisor_creator)
-            .expect("the supervisor's creator may revoke any token in its context");
-        assert!(revoke_checker_reports_revoked(&scp, &ctx_id, &token_cid));
-        crate::runtime::remove_context(bi, &ctx_id);
+            scp.ucan_revoke(py, &ctx_id, REVOKE_TEST_TOKEN, supervisor_creator)
+                .expect("the supervisor's creator may revoke any token in its context");
+            assert!(revoke_checker_reports_revoked(&scp, &ctx_id, &token_cid));
+            crate::runtime::remove_context(bi, &ctx_id);
+        });
     }
 }

@@ -621,7 +621,7 @@ export interface Bridge {
     floor: bigint | null,
     cap: bigint | null,
   ): bigint;
-  economyVerifyPaymentReceipts(receiptsJson: string): string;
+  economyVerifyPaymentReceipts(receiptsJson: string): Promise<string>;
 
   // Media (ADR-024)
   mediaCheckCapability(ceiling: string[], capability: string): boolean;

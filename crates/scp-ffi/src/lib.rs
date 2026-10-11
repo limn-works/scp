@@ -18,9 +18,10 @@
 //! # Async runtime
 //!
 //! A single tokio `Runtime` is created at module import time and stored in a
-//! [`OnceLock`]. Most async bridge functions use synchronous `#[pyfunction]`
-//! with `py.allow_threads(|| rt.block_on(...))` to run tokio futures while
-//! releasing the Python GIL.
+//! [`OnceLock`]. Every synchronous bridge function waits on a tokio future
+//! through `actor_wait::block_on_released`, which releases the Python GIL for
+//! the whole wait (ADR-049 Decision 7a); `scripts/check-bridge-block-on.py`
+//! fails any other production `.block_on(`.
 //!
 //! The exception is `PyMessageReceiver::__anext__`, which returns an
 //! `asyncio.Future` and spawns the recv on the tokio runtime, resolving the
@@ -61,6 +62,7 @@ compile_error!(
      release wheel WITHOUT `testing`. See ADR-049 PR-7 BLACK-P7-5."
 );
 
+pub(crate) mod actor_wait;
 pub mod context;
 pub mod economy;
 
@@ -201,13 +203,16 @@ fn version() -> &'static str {
 /// shut down (or before it was initialized) is a no-op. `timeout_millis`
 /// is retained for API stability and ignored post-demolition.
 #[pyfunction]
-fn shutdown_runtime(_timeout_millis: u64) {
+fn shutdown_runtime(py: Python<'_>, _timeout_millis: u64) {
     // Give in-flight tokio tasks a brief drain window. 100ms is sufficient
-    // for cooperative tasks to observe shutdown; anything longer blocks the
-    // Python GIL unnecessarily.
+    // for cooperative tasks to observe shutdown. The GIL is released for the
+    // drain so a task that calls back into Python can finish. An absent
+    // runtime is a no-op, so this does not go through `block_on_released`,
+    // which fails on an absent runtime.
     if let Some(rt) = RUNTIME.get() {
-        rt.block_on(async {
-            tokio::time::sleep(SHUTDOWN_DRAIN).await;
+        py.allow_threads(|| {
+            // ci-allow: bridge-block-on: the atexit drain sleeps with the GIL released and waits on no context actor
+            rt.block_on(tokio::time::sleep(SHUTDOWN_DRAIN));
         });
     }
 }

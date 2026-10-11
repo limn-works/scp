@@ -689,6 +689,7 @@ pub(crate) async fn ucan_delegate_on(
         // `tokio::task::block_in_place` to avoid nesting block_on calls.
         let rt_handle = tokio::runtime::Handle::current();
         let result = tokio::task::block_in_place(|| {
+            // ci-allow: bridge-block-on: runs in an async napi function on a tokio worker under block_in_place; waits on no context actor
             rt_handle.block_on(async {
                 delegate_ucan(&params, entry.custody.as_ref(), &scp_clock::SystemClock).await
             })

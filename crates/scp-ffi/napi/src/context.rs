@@ -152,9 +152,9 @@ pub struct NapiContextHandle {
     pub(crate) subscription_active: Arc<std::sync::atomic::AtomicBool>,
     /// The `NapiBridgeInstance` that minted this handle.
     ///
-    /// Retained so getter methods on the handle (e.g. `memberCount`) can
-    /// reach the `ContextManager` without depending on the process-global
-    /// default bridge. Phase D (#1695).
+    /// Retained so bridge functions that take the handle can reach the
+    /// `ContextManager` without depending on the process-global default
+    /// bridge.
     pub(crate) bi: Arc<NapiBridgeInstance>,
     /// Identifier of the `NapiBridgeInstance` that minted this handle.
     /// Checked at every FFI entry point that accepts the handle via the
@@ -258,37 +258,6 @@ impl NapiContextHandle {
     #[must_use]
     pub fn governance(&self) -> String {
         self.governance.clone()
-    }
-
-    /// Returns the current member count by querying the `ContextManager`.
-    ///
-    /// This is a live query — the count always reflects the actual
-    /// membership state, not a cached snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the `ContextManager` is not initialised.
-    #[napi(getter, js_name = "memberCount")]
-    pub fn member_count(&self) -> napi::Result<u32> {
-        use scp_core::context::actor::commands::QueriesCommand;
-        let sup = crate::runtime::supervisor(&self.bi)?;
-        let sup = Arc::clone(sup);
-        let context_id = self.context_id.clone();
-        let count = crate::runtime().block_on(async move {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let cmd = QueriesCommand::MemberCount {
-                context_id,
-                reply: tx,
-            };
-            if sup.dispatch_query(cmd).await.is_err() {
-                return 0usize;
-            }
-            match rx.await {
-                Ok(Ok(Some(n))) => n,
-                _ => 0,
-            }
-        });
-        Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
     /// Returns the optional economic policy string.
@@ -783,8 +752,8 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
 /// Per-bridge-instance implementation of `context_create`.
 ///
 /// Takes an `Arc<NapiBridgeInstance>` so the returned handle can retain a
-/// clone for subsequent bridge-scoped operations (e.g. `memberCount`
-/// getter) without depending on the process-global default bridge.
+/// clone for subsequent bridge-scoped operations without depending on the
+/// process-global default bridge.
 pub(crate) async fn context_create_on(
     bi: &Arc<NapiBridgeInstance>,
     identity: &NapiIdentity,
@@ -4991,6 +4960,7 @@ pub(crate) async fn context_export_on(
     let export = sup
         .export_context(&handle.context_id, exporter_did, |hash: &[u8; 32]| {
             let signature =
+                // ci-allow: bridge-block-on: runs in the async export on a tokio worker; the JS thread stays free to serve a JS custody callback
                 tokio::task::block_in_place(|| rt.block_on(custody.sign(&key_handle, hash)))?;
             let bytes: [u8; 64] = signature.as_bytes().try_into().map_err(|_| {
                 scp_platform::PlatformError::CustodyError(format!(

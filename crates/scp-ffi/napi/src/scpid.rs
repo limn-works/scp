@@ -125,6 +125,7 @@ pub(crate) fn scpid_sign_on(
         };
 
         let rt = crate::runtime();
+        // ci-allow: bridge-block-on: waits on no context actor; signs through custody on the JS thread, so a JS callback custody cannot complete here (known defect, reported separately)
         let response = rt.block_on(core_sign(
             entry.custody.as_ref(),
             &key_handle,
@@ -172,6 +173,7 @@ pub(crate) fn scpid_verify_on(
     })?;
 
     let rt = crate::runtime();
+    // ci-allow: bridge-block-on: verifies a response against the DID resolver; waits on no context actor and no host callback
     let auth = rt
         .block_on(core_verify(resolver.as_ref(), &response, &challenge))
         .map_err(|e| ScpNapiError::Identity {

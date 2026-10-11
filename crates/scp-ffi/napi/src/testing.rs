@@ -168,6 +168,7 @@ pub(crate) fn fullstack_create_context_on(
     };
 
     let rt = crate::runtime();
+    // ci-allow: bridge-block-on: testing feature; FullStackNode signs with in-process custody; no host callback, so no deadlock
     let handle = rt
         .block_on(node.inner.create_context(&context_id, params))
         .map_err(|e| {
@@ -212,6 +213,7 @@ pub(crate) fn fullstack_add_member_on(
         })?
     };
 
+    // ci-allow: bridge-block-on: testing feature; FullStackNode signs with in-process custody; no host callback, so no deadlock
     rt.block_on(node.inner.add_member(&handle, &member_did))
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
@@ -248,6 +250,7 @@ pub(crate) fn fullstack_join_from_welcome_on(
     // returned `ContextHandle` is stored in the node's handle map so a
     // subsequent `fullstack_send_message` on this joiner resolves it — the
     // joiner is now a bidirectional, send-capable participant.
+    // ci-allow: bridge-block-on: testing feature; FullStackNode signs with in-process custody; no host callback, so no deadlock
     let handle = rt
         .block_on(node.inner.join_from_welcome(&context_id, &ctx_bytes))
         .map_err(|e| {
@@ -312,6 +315,7 @@ pub(crate) fn fullstack_send_message_on(
         })?
     };
 
+    // ci-allow: bridge-block-on: testing feature; FullStackNode signs with in-process custody; no host callback, so no deadlock
     rt.block_on(node.inner.send_message(&handle, &payload))
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
@@ -349,6 +353,7 @@ pub(crate) fn fullstack_decrypt_message_on(
     // never the raw routing primitive.
     let ctx_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
     let rt = crate::runtime();
+    // ci-allow: bridge-block-on: testing feature; FullStackNode signs with in-process custody; no host callback, so no deadlock
     let plaintext = rt
         .block_on(
             node.inner
@@ -387,6 +392,7 @@ pub(crate) fn fullstack_remove_member_on(
         })?
     };
 
+    // ci-allow: bridge-block-on: testing feature; FullStackNode signs with in-process custody; no host callback, so no deadlock
     rt.block_on(node.inner.manager.leave_context(
         &handle,
         &node.inner.did,
@@ -437,6 +443,7 @@ pub(crate) fn fullstack_seed_peer_pseudonym_on(
     arr.copy_from_slice(pseudonym_bytes);
 
     let rt = crate::runtime();
+    // ci-allow: bridge-block-on: testing feature; FullStackNode signs with in-process custody; no host callback, so no deadlock
     rt.block_on(node.inner.manager.seed_peer_pseudonym(
         &context_id,
         scp_did::DID::from(peer_did.as_str()),

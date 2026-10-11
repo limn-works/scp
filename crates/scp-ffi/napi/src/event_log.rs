@@ -491,9 +491,7 @@ pub(crate) fn event_log_checkpoint_on(
                 key: &scp_id.active_signing_key,
             };
 
-            // generate_checkpoint is async — this sync NAPI function runs on
-            // a libuv worker thread (not inside tokio), so we use the stored
-            // runtime to block_on the future.
+            // ci-allow: bridge-block-on: waits on no context actor; signs through custody on the JS thread, so a JS callback custody cannot complete here (known defect, reported separately)
             crate::runtime().block_on(async {
                 scp_event_log::checkpoint::generate_checkpoint(
                     &rt.core.event_log,
@@ -550,6 +548,7 @@ pub(crate) fn event_log_checkpoint_by_did_on(
                 key: &scp_id.active_signing_key,
             };
 
+            // ci-allow: bridge-block-on: waits on no context actor; signs through custody on the JS thread, so a JS callback custody cannot complete here (known defect, reported separately)
             crate::runtime().block_on(async {
                 scp_event_log::checkpoint::generate_checkpoint(
                     &rt.core.event_log,

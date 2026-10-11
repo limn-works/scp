@@ -70,14 +70,18 @@ fn node_err(e: NodeError) -> PyErr {
 ///
 /// Best-effort: logs a warning if the relay connection fails rather than
 /// blocking node startup.
+///
+/// # Errors
+///
+/// Returns an error only when the bridge cannot drive a wait at all (the
+/// shared runtime is absent or a private wait runtime fails to start).
 fn auto_wire_context_manager(
     bi: &crate::runtime::PyBridgeInstance,
     py: Python<'_>,
-    rt: &tokio::runtime::Runtime,
     did: &str,
     relay_url: &str,
     bridge_token: Zeroizing<String>,
-) {
+) -> Result<(), crate::error::ScpPyError> {
     let sourced = SourcedRelayUrl {
         url: relay_url.to_owned(),
         source: RelayUrlSource::Explicit,
@@ -92,13 +96,11 @@ fn auto_wire_context_manager(
     // selection layer.
     let selector = scp_transport::TransportSelector::new();
     let selector2 = scp_transport::TransportSelector::new();
-    match py.allow_threads(|| {
-        rt.block_on(selector.select_and_connect_with_bearer(
-            &sourced,
-            Some(bridge_token),
-            Some(&profile),
-        ))
-    }) {
+    match crate::actor_wait::block_on_released(py, async {
+        selector
+            .select_and_connect_with_bearer(&sourced, Some(bridge_token), Some(&profile))
+            .await
+    })? {
         Ok(adapter) => {
             let crypto = std::sync::Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
                 did_owned.clone(),
@@ -121,13 +123,11 @@ fn auto_wire_context_manager(
             // work without a separate `transport_connect` call. This requires
             // a second WebSocket connection because NativeRelayAdapter is not
             // Clone and the first was consumed by RelayTransportProvider.
-            match py.allow_threads(|| {
-                rt.block_on(selector2.select_and_connect_with_bearer(
-                    &sourced,
-                    Some(token2),
-                    Some(&profile),
-                ))
-            }) {
+            match crate::actor_wait::block_on_released(py, async {
+                selector2
+                    .select_and_connect_with_bearer(&sourced, Some(token2), Some(&profile))
+                    .await
+            })? {
                 Ok(relay_adapter) => {
                     let manager = scp_transport::TransportManager::new(relay_adapter);
                     let _ = crate::runtime::set_transport_manager(bi, manager);
@@ -156,20 +156,20 @@ fn auto_wire_context_manager(
         }
     }
     // Always register the node's DID as a local DID for defense-in-depth.
-    py.allow_threads(|| {
+    crate::actor_wait::block_on_released(py, async {
         // Best-effort: log and continue if the supervisor reports
         // `NotInitialized` (no manager attached yet) — the caller
         // path above already attempted attach, and a duplicate
         // failure is non-fatal for defense-in-depth registration.
         if let Ok(supervisor) = crate::runtime::supervisor(bi)
-            && let Err(e) = rt.block_on(supervisor.register_local_did(did_owned.into()))
+            && let Err(e) = supervisor.register_local_did(did_owned.into()).await
         {
             tracing::debug!(
                 error = %e,
                 "auto_wire_context_manager: register_local_did skipped (supervisor not ready)"
             );
         }
-    });
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +344,6 @@ impl PyNodeHandle {
         if let Some(ref did) = author_did {
             crate::validate::validate_did(did)?;
         }
-        let rt = crate::runtime()?;
 
         // Resolve broadcast key: explicit or auto-lookup via Supervisor.
         // `PyNodeHandle` carries a reference to the bridge instance that
@@ -354,16 +353,17 @@ impl PyNodeHandle {
                 "broadcast key auto-lookup failed: {e}"
             ))
         })?);
-        let resolved = py.allow_threads(|| {
-            rt.block_on(server::resolve_broadcast_key(
+        let resolved = crate::actor_wait::block_on_released(py, async {
+            server::resolve_broadcast_key(
                 broadcast_key_hex,
                 author_did,
                 self.inner.did(),
                 &supervisor,
                 &context_id,
-            ))
+            )
+            .await
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-        })?;
+        })??;
         let broadcast_key = resolved.into_broadcast_key();
 
         let adm = match admission.to_lowercase().as_str() {
@@ -391,15 +391,17 @@ impl PyNodeHandle {
             csp_override,
         };
 
-        py.allow_threads(|| {
-            rt.block_on(self.inner.enable_broadcast_projection_with_site(
-                &context_id,
-                broadcast_key,
-                adm,
-                Some(site_config),
-            ))
-            .map_err(node_err)
-        })
+        crate::actor_wait::block_on_released(py, async {
+            self.inner
+                .enable_broadcast_projection_with_site(
+                    &context_id,
+                    broadcast_key,
+                    adm,
+                    Some(site_config),
+                )
+                .await
+                .map_err(node_err)
+        })?
     }
 
     /// Commits a deploy for a projected context (§18.11.11).
@@ -417,11 +419,12 @@ impl PyNodeHandle {
     ) -> PyResult<usize> {
         crate::validate::validate_context_id(&context_id)?;
         crate::validate::validate_deploy_id(&deploy_id)?;
-        let rt = crate::runtime()?;
-        py.allow_threads(|| {
-            rt.block_on(self.inner.commit_deploy(&context_id, &deploy_id))
+        crate::actor_wait::block_on_released(py, async {
+            self.inner
+                .commit_deploy(&context_id, &deploy_id)
+                .await
                 .map_err(node_err)
-        })
+        })?
     }
 
     /// Rolls back to a previous deploy for a projected context (§18.11.11).
@@ -436,11 +439,12 @@ impl PyNodeHandle {
     ) -> PyResult<()> {
         crate::validate::validate_context_id(&context_id)?;
         crate::validate::validate_deploy_id(&deploy_id)?;
-        let rt = crate::runtime()?;
-        py.allow_threads(|| {
-            rt.block_on(self.inner.rollback_deploy(&context_id, &deploy_id))
+        crate::actor_wait::block_on_released(py, async {
+            self.inner
+                .rollback_deploy(&context_id, &deploy_id)
+                .await
                 .map_err(node_err)
-        })
+        })?
     }
 
     /// Deactivates HTTP broadcast projection for the given context.
@@ -449,11 +453,10 @@ impl PyNodeHandle {
     /// retained epoch keys.
     fn disable_site_projection(&self, py: Python<'_>, context_id: String) -> PyResult<()> {
         crate::validate::validate_context_id(&context_id)?;
-        let rt = crate::runtime()?;
-        py.allow_threads(|| {
-            rt.block_on(self.inner.disable_broadcast_projection(&context_id));
+        crate::actor_wait::block_on_released(py, async {
+            self.inner.disable_broadcast_projection(&context_id).await;
             Ok(())
-        })
+        })?
     }
 
     /// Starts the HTTP server in the background on the given bind address.
@@ -486,12 +489,13 @@ impl PyNodeHandle {
                 })
             })
             .transpose()?;
-        let rt = crate::runtime()?;
-        py.allow_threads(|| {
-            rt.block_on(self.inner.serve_background(addr))
+        crate::actor_wait::block_on_released(py, async {
+            self.inner
+                .serve_background(addr)
+                .await
                 .map(|a| a.to_string())
                 .map_err(node_err)
-        })
+        })?
     }
 
     /// Returns the HTTP URL of the background server, or ``None`` if not serving.
@@ -500,8 +504,9 @@ impl PyNodeHandle {
     /// server was bound to the unspecified address.
     #[pyo3(name = "http_url")]
     fn http_url(&self, py: Python<'_>) -> PyResult<Option<String>> {
-        let rt = crate::runtime()?;
-        Ok(py.allow_threads(|| rt.block_on(self.inner.http_url())))
+        Ok(crate::actor_wait::block_on_released(py, async {
+            self.inner.http_url().await
+        })?)
     }
 
     fn __repr__(&self) -> String {
@@ -574,17 +579,14 @@ impl crate::scp::PyScp {
     #[pyo3(name = "relay_start_in_memory")]
     pub fn relay_start_in_memory(&self, py: Python<'_>) -> PyResult<PyRelayHandle> {
         let bi = &*self.inner;
-        let rt = crate::runtime()?;
-        py.allow_threads(|| {
-            let relay = rt
-                .block_on(server::start_relay_in_memory())
-                .map_err(server_err)?;
+        crate::actor_wait::block_on_released(py, async {
+            let relay = server::start_relay_in_memory().await.map_err(server_err)?;
             let instance_id = bi.core.instance_id();
             Ok(PyRelayHandle {
                 inner: relay,
                 instance_id,
             })
-        })
+        })?
     }
 
     /// Starts a relay with redb-backed blob storage on an OS-assigned port.
@@ -593,17 +595,16 @@ impl crate::scp::PyScp {
     #[pyo3(name = "relay_start_local")]
     pub fn relay_start_local(&self, py: Python<'_>, data_dir: String) -> PyResult<PyRelayHandle> {
         let bi = &*self.inner;
-        let rt = crate::runtime()?;
-        py.allow_threads(|| {
-            let relay = rt
-                .block_on(server::start_relay_local(std::path::Path::new(&data_dir)))
+        crate::actor_wait::block_on_released(py, async {
+            let relay = server::start_relay_local(std::path::Path::new(&data_dir))
+                .await
                 .map_err(server_err)?;
             let instance_id = bi.core.instance_id();
             Ok(PyRelayHandle {
                 inner: relay,
                 instance_id,
             })
-        })
+        })?
     }
 
     /// Starts a full application node with encrypted in-memory storage.
@@ -628,7 +629,6 @@ impl crate::scp::PyScp {
         identity_did: Option<String>,
     ) -> PyResult<PyNodeHandle> {
         let bi = &*self.inner;
-        let rt = crate::runtime()?;
         let node_identity = match identity_did {
             Some(ref did) => {
                 crate::validate::validate_did(did)?;
@@ -636,10 +636,11 @@ impl crate::scp::PyScp {
             }
             None => None,
         };
-        let node = py.allow_threads(|| {
-            rt.block_on(server::start_node_in_memory(node_identity))
+        let node = crate::actor_wait::block_on_released(py, async {
+            server::start_node_in_memory(node_identity)
+                .await
                 .map_err(server_err)
-        })?;
+        })??;
 
         // Auto-wire the ContextManager with relay transport so that
         // context operations work immediately after node startup.
@@ -651,7 +652,7 @@ impl crate::scp::PyScp {
         let did = node.identity().did().to_owned();
         let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
         let bridge_token = node.bridge_token_hex();
-        auto_wire_context_manager(bi, py, rt, &did, &relay_url, bridge_token);
+        auto_wire_context_manager(bi, py, &did, &relay_url, bridge_token)?;
 
         // Register this node as a borrower of this instance's resources, so
         // `SCP.shutdown()` stops it before `bridge_specific_shutdown` releases
@@ -695,7 +696,6 @@ impl crate::scp::PyScp {
         passphrase: Option<String>,
     ) -> PyResult<PyNodeHandle> {
         let bi = &*self.inner;
-        let rt = crate::runtime()?;
         let node_identity = match identity_did {
             Some(ref did) => {
                 crate::validate::validate_did(did)?;
@@ -709,28 +709,22 @@ impl crate::scp::PyScp {
         // instance was built without a storage selection, rather than letting a
         // node open a store of its own (SCP-CAPSEL-8000, spec §17.6).
         let storage = crate::runtime::get_storage(bi)?.clone();
-        let inner = py.allow_threads(|| {
+        let inner = crate::actor_wait::block_on_released(py, async {
             let data_dir = std::path::Path::new(&data_dir);
             match storage {
-                crate::runtime::StorageProvider::InMemoryEncrypted(s) => rt
-                    .block_on(server::start_node_local(
-                        data_dir,
-                        s,
-                        node_identity,
-                        zeroized_passphrase,
-                    ))
-                    .map(RunningNode::InMemoryEncrypted),
-                crate::runtime::StorageProvider::Sqlite(s) => rt
-                    .block_on(server::start_node_local(
-                        data_dir,
-                        s,
-                        node_identity,
-                        zeroized_passphrase,
-                    ))
-                    .map(RunningNode::Sqlite),
+                crate::runtime::StorageProvider::InMemoryEncrypted(s) => {
+                    server::start_node_local(data_dir, s, node_identity, zeroized_passphrase)
+                        .await
+                        .map(RunningNode::InMemoryEncrypted)
+                }
+                crate::runtime::StorageProvider::Sqlite(s) => {
+                    server::start_node_local(data_dir, s, node_identity, zeroized_passphrase)
+                        .await
+                        .map(RunningNode::Sqlite)
+                }
             }
             .map_err(server_err)
-        })?;
+        })??;
         // This node holds a clone of this instance's storage `Arc`, so register
         // it before anything else: `SCP.shutdown()` must stop this node before
         // the durable store closer closes that `SQLCipher` handle and drops
@@ -744,7 +738,7 @@ impl crate::scp::PyScp {
         let did = inner.did().to_owned();
         let relay_url = inner.internal_relay_url();
         let bridge_token = inner.bridge_token_hex();
-        auto_wire_context_manager(bi, py, rt, &did, &relay_url, bridge_token);
+        auto_wire_context_manager(bi, py, &did, &relay_url, bridge_token)?;
 
         let instance_id = bi.core.instance_id();
         Ok(PyNodeHandle {

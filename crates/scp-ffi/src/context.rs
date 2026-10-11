@@ -117,6 +117,7 @@ fn close_decision(
 /// the supervisor reports the context `Active` again after the dispatch or the
 /// skipped dispatch.
 fn close_context_on(
+    py: Python<'_>,
     bi: &crate::runtime::PyBridgeInstance,
     handle: &PyContextHandle,
     identity_did: &str,
@@ -164,7 +165,6 @@ fn close_context_on(
     // checks the `ContextClose` capability.
     if decision == CloseDecision::Dispatch {
         let initiator_did = scp_did::DID(identity_did.to_owned());
-        let rt = crate::runtime()?;
         let sup = std::sync::Arc::clone(sup);
         let context_id = handle.context_id.clone();
 
@@ -184,19 +184,19 @@ fn close_context_on(
         let dispatch_outcome: Result<
             Result<scp_core::context::ttl::CloseResult, scp_core::context::ContextError>,
             tokio::sync::oneshot::error::RecvError,
-        > = rt.block_on(async move {
+        > = crate::actor_wait::block_on_released(py, async move {
             if let Err(e) = sup.dispatch_lifecycle_command(cmd).await {
                 return Ok(Err(e));
             }
             rx.await
-        });
+        })?;
         // A failed dispatch returns its error here and releases nothing.
         check_close_dispatch_outcome(dispatch_outcome)?;
     }
 
     // Remove the FFI bridge state, so bridge outlet dispatch fails closed for
     // this id, unless the supervisor reports the context `Active` again.
-    if !crate::runtime::release_context_unless_readmitted(bi, sup, &handle.context_id) {
+    if !crate::runtime::release_context_unless_readmitted(py, bi, sup, &handle.context_id) {
         return Err(crate::error::ScpPyError::ContextError {
             message: "the context returned to Active while this close ran; it stays open and \
                       keeps its state on this bridge"
@@ -225,7 +225,7 @@ fn close_context_on(
     // removal, so an active receiver still observes the close (#332).
     // The FFI state is already gone, so delivery cannot go through
     // `with_context`; it uses the captured sender directly.
-    drain_and_deliver_via_sender(bi, &handle.context_id, close_channel);
+    drain_and_deliver_via_sender(py, bi, &handle.context_id, close_channel);
 
     Ok(())
 }
@@ -257,7 +257,7 @@ fn check_close_dispatch_outcome(
 /// Rejects an operation unless a context's supervisor actor reports `Active`.
 ///
 /// `verb` names the operation in the error a caller receives, so
-/// `require_active_context(bi, id, "join", codes::CTX_2013)` produces a
+/// `require_active_context(py, bi, id, "join", codes::CTX_2013)` produces a
 /// `ContextError` carrying `SCP-CTX-2013` and "cannot join context in
 /// 'closed' state -- context must be 'active'". `code` is the operation's own
 /// code, and a context no supervisor actor serves is refused with it too.
@@ -276,12 +276,13 @@ fn check_close_dispatch_outcome(
 /// poison had already taken out of service, because that string only records a
 /// transition this bridge itself observed.
 fn require_active_context(
+    py: Python<'_>,
     bi: &crate::runtime::PyBridgeInstance,
     context_id: &str,
     verb: &str,
     code: &str,
 ) -> PyResult<()> {
-    let state = crate::runtime::live_context_state(bi, context_id, code)?;
+    let state = crate::runtime::live_context_state(py, bi, context_id, code)?;
     if matches!(state, scp_core::context::ContextState::Active) {
         return Ok(());
     }
@@ -1592,16 +1593,15 @@ fn convert_context_event(
     }
 }
 
-fn drain_and_deliver(bi: &crate::runtime::PyBridgeInstance, context_id: &str) {
-    let Ok(rt) = crate::runtime() else {
-        return;
-    };
+fn drain_and_deliver(py: Python<'_>, bi: &crate::runtime::PyBridgeInstance, context_id: &str) {
     let sup = match crate::runtime::supervisor(bi) {
         Ok(sup) => sup.clone(),
         Err(_) => return,
     };
 
-    let events = rt.block_on(sup.drain_events(context_id));
+    let Ok(events) = crate::actor_wait::block_on_released(py, sup.drain_events(context_id)) else {
+        return;
+    };
 
     for event in events {
         let (sender_did, payload, timestamp) = convert_context_event(event);
@@ -1627,19 +1627,19 @@ fn drain_and_deliver(bi: &crate::runtime::PyBridgeInstance, context_id: &str) {
 /// threaded here. No-op (events drained, delivery skipped) when no channel
 /// was open.
 fn drain_and_deliver_via_sender(
+    py: Python<'_>,
     bi: &crate::runtime::PyBridgeInstance,
     context_id: &str,
     channel: Option<crate::runtime::ReceiveChannelHandles>,
 ) {
-    let Ok(rt) = crate::runtime() else {
-        return;
-    };
     let sup = match crate::runtime::supervisor(bi) {
         Ok(sup) => sup.clone(),
         Err(_) => return,
     };
 
-    let events = rt.block_on(sup.drain_events(context_id));
+    let Ok(events) = crate::actor_wait::block_on_released(py, sup.drain_events(context_id)) else {
+        return;
+    };
 
     // No receiver was subscribed — drain the supervisor buffer (above) so
     // it does not leak, but there is nowhere to deliver. Matches the
@@ -1747,10 +1747,10 @@ pub(crate) fn default_ceiling_strings() -> Vec<String> {
 /// each co-resident participant context's Active Signing Key (via that
 /// context's `creator_did`) without re-implementing the custody-export path.
 pub(crate) fn resolve_signing_key(
+    py: Python<'_>,
     bi: &crate::runtime::PyBridgeInstance,
     identity_did: &str,
 ) -> PyResult<ed25519_dalek::SigningKey> {
-    let rt = crate::runtime()?;
     // Copy the key handle and clone the custody `Arc` OUT of the `with_identity`
     // closure, then DROP the DashMap identity-registry shard guard (by exiting
     // the closure) BEFORE the blocking async export. The `block_on` at the FFI
@@ -1765,10 +1765,12 @@ pub(crate) fn resolve_signing_key(
         Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    rt.block_on(async move { custody.export_ed25519_signing_key(&handle).await })
-        .map_err(|e| {
-            PyRuntimeError::new_err(format!("failed to export signing key for governance: {e}"))
-        })
+    crate::actor_wait::block_on_released(py, async move {
+        custody.export_ed25519_signing_key(&handle).await
+    })?
+    .map_err(|e| {
+        PyRuntimeError::new_err(format!("failed to export signing key for governance: {e}"))
+    })
 }
 
 /// Resolves the [`ResolvedMessageSigner`](scp_ffi_common::persona::ResolvedMessageSigner)
@@ -1790,11 +1792,11 @@ pub(crate) fn resolve_signing_key(
 /// closure before the blocking export, mirroring [`resolve_signing_key`] so no
 /// `DashMap` shard guard is held across the async export (#1940).
 fn resolve_message_signer(
+    py: Python<'_>,
     bi: &crate::runtime::PyBridgeInstance,
     identity_did: &str,
     persona: scp_did::SigningKeyId,
 ) -> PyResult<scp_ffi_common::persona::ResolvedMessageSigner> {
-    let rt = crate::runtime()?;
     let (custody, handle) = crate::runtime::with_identity(bi, identity_did, |entry| {
         let handle = match persona {
             scp_did::SigningKeyId::Active => entry.identity.active_signing_key,
@@ -1811,11 +1813,10 @@ fn resolve_message_signer(
         Ok((entry.custody.clone(), handle))
     })
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let key = rt
-        .block_on(async move { custody.export_ed25519_signing_key(&handle).await })
-        .map_err(|e| {
-            PyRuntimeError::new_err(format!("failed to export signing key for send: {e}"))
-        })?;
+    let key = crate::actor_wait::block_on_released(py, async move {
+        custody.export_ed25519_signing_key(&handle).await
+    })?
+    .map_err(|e| PyRuntimeError::new_err(format!("failed to export signing key for send: {e}")))?;
     Ok(scp_ffi_common::persona::ResolvedMessageSigner::new(
         key, persona,
     ))
@@ -1829,33 +1830,41 @@ fn resolve_message_signer(
 /// custody — only the public verifying key is returned. Used by the
 /// snapshot-signature import path, where only the public half is needed.
 fn resolve_verifying_key(
+    py: Python<'_>,
     bi: &crate::runtime::PyBridgeInstance,
     identity_did: &str,
 ) -> PyResult<ed25519_dalek::VerifyingKey> {
-    let rt = crate::runtime()?;
-    crate::runtime::with_identity(bi, identity_did, |entry| {
-        let handle = entry.identity.active_signing_key;
-        let custody = entry.custody.clone();
-        let public_key = rt
-            .block_on(async move { custody.public_key(&handle).await })
+    // Clone the custody and handle out of the registry closure first: the
+    // wait below releases the GIL, and a registry shard guard held across it
+    // would deadlock against a thread that holds the GIL and wants the same
+    // shard.
+    let (custody, handle) = crate::runtime::with_identity(bi, identity_did, |entry| {
+        Ok((entry.custody.clone(), entry.identity.active_signing_key))
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let public_key =
+        crate::actor_wait::block_on_released(py, async move { custody.public_key(&handle).await })?
             .map_err(|e| {
-                crate::error::ScpPyError::custody_failure(
-                    format!("failed to resolve verifying key: {e}"),
-                    &scp_crypto::CustodyFailure::from(&e),
+                PyRuntimeError::new_err(
+                    crate::error::ScpPyError::custody_failure(
+                        format!("failed to resolve verifying key: {e}"),
+                        &scp_crypto::CustodyFailure::from(&e),
+                    )
+                    .to_string(),
                 )
             })?;
-        // 32-byte length + canonical-point decode: the shared conversion tail
-        // in scp-ffi-common, identical across all FFI bridges. A `None`
-        // (wrong length or non-canonical point) is the fail-closed signal that
-        // this DID has no usable local verifying key.
-        scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key).ok_or_else(|| {
+    // 32-byte length + canonical-point decode: the shared conversion tail
+    // in scp-ffi-common, identical across all FFI bridges. A `None`
+    // (wrong length or non-canonical point) is the fail-closed signal that
+    // this DID has no usable local verifying key.
+    scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key).ok_or_else(|| {
+        PyRuntimeError::new_err(
             crate::error::ScpPyError::context(
-                "active signing-key public key is not a valid 32-byte Ed25519 verifying key"
-                    .to_owned(),
+                "active signing-key public key is not a valid 32-byte Ed25519 verifying key",
             )
-        })
+            .to_string(),
+        )
     })
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 /// Resolves the snapshot creator's Ed25519 verification key for
@@ -1884,6 +1893,7 @@ fn resolve_verifying_key(
 /// rejected with [`scp_ffi_common::error_codes::CTX_2093`] rather than
 /// proceeding unverified.
 fn resolve_creator_verifying_key(
+    py: Python<'_>,
     bi: &crate::runtime::PyBridgeInstance,
     creator_did: &str,
 ) -> PyResult<ed25519_dalek::VerifyingKey> {
@@ -1895,7 +1905,7 @@ fn resolve_creator_verifying_key(
         // `KeyCustody::public_key` when the DID is a local identity (ADR-006).
         // Private key material never leaves custody — only the public key is
         // returned.
-        |did| resolve_verifying_key(bi, did).ok(),
+        |did| resolve_verifying_key(py, bi, did).ok(),
         creator_did,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("{}: {e}", scp_ffi_common::error_codes::CTX_2093)))
@@ -1919,18 +1929,15 @@ fn resolve_creator_verifying_key(
 /// path branches on the context mode and only calls this for encrypted
 /// contexts.
 fn derive_member_pseudonym(
+    py: Python<'_>,
     bi: &crate::runtime::PyBridgeInstance,
     importer_did: &str,
     context_id: &str,
 ) -> Result<[u8; 32], crate::error::ScpPyError> {
-    crate::runtime::with_identity(bi, importer_did, |entry| {
-        let rt = crate::runtime().map_err(|e| {
-            crate::error::ScpPyError::identity_with_code(
-                format!("runtime not available: {e}"),
-                codes::IDENT_1055,
-            )
-        })?;
-        pseudonym_routing_id_on(rt, &entry.custody, entry.identity.identity_key, context_id)
+    // Clone the custody handle out of the registry guard before the wait, so
+    // a GIL-released wait never holds the identity map's shard lock.
+    let (custody, identity_key) = crate::runtime::with_identity(bi, importer_did, |entry| {
+        Ok((Arc::clone(&entry.custody), entry.identity.identity_key))
     })
     .map_err(|e| {
         // A registry miss surfaces `with_identity`'s generic SCP-IDENT-1001;
@@ -1949,7 +1956,8 @@ fn derive_member_pseudonym(
             }
             other => other,
         }
-    })
+    })?;
+    pseudonym_routing_id_on(py, &custody, identity_key, context_id)
 }
 
 /// Derives the §9.10.4 routing id of `identity_key`'s pseudonym in
@@ -1959,16 +1967,22 @@ fn derive_member_pseudonym(
 /// assigns; a key destroyed mid-derivation fails as key-not-found
 /// (§9.10.4.A).
 pub(crate) fn pseudonym_routing_id_on(
-    rt: &tokio::runtime::Runtime,
+    py: Python<'_>,
     custody: &crate::custody::FfiKeyCustody,
     identity_key: scp_platform::KeyHandle,
     context_id: &str,
 ) -> Result<[u8; 32], crate::error::ScpPyError> {
-    let pseudonym = rt.block_on(async {
+    let pseudonym = crate::actor_wait::block_on_released(py, async {
         custody
             .derive_pseudonym(&identity_key, context_id.as_bytes())
             .await
-    });
+    })
+    .map_err(|e| {
+        crate::error::ScpPyError::identity_with_code(
+            format!("pseudonym derivation could not run: {e}"),
+            codes::IDENT_1055,
+        )
+    })?;
     // §9.10.4: the routing axis carries the 32-byte routing id of the
     // 33-byte P-256 pseudonym. `Pseudonym::from_point` already rejected a
     // malformed host-returned point, which surfaces here as SCP-IDENT-1055.
@@ -2568,6 +2582,7 @@ impl crate::scp::PyScp {
     #[allow(clippy::too_many_lines)] // orchestration: validates, registers FFI state, delegates to ContextManager, returns handle
     pub fn context_create(
         &self,
+        py: Python<'_>,
         identity_did: &str,
         params: &Bound<'_, PyDict>,
     ) -> PyResult<PyContextHandle> {
@@ -2620,19 +2635,18 @@ impl crate::scp::PyScp {
         let local_pseudonym: Option<[u8; 32]> = if create_is_broadcast {
             None
         } else {
-            Some(derive_member_pseudonym(bi, identity_did, &context_id)?)
+            Some(derive_member_pseudonym(py, bi, identity_did, &context_id)?)
         };
 
         // Create the context via the shared ContextManager.
         {
             let creator_did_owned = scp_did::DID(identity_did.to_owned());
-            let rt = crate::runtime()?;
             let sup = crate::runtime::supervisor(bi)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let sup = sup.clone();
             let ctx_id = context_id.clone();
             let creator_did_for_register = scp_did::DID(identity_did.to_owned());
-            rt.block_on(async move {
+            crate::actor_wait::block_on_released(py, async move {
                 sup.create_context(ctx_id, core_params, creator_did_owned, local_pseudonym)
                     .await
                     .map_err(create_context_failure)?;
@@ -2648,7 +2662,7 @@ impl crate::scp::PyScp {
                         ))
                     })?;
                 Ok::<(), scp_core::context::ContextError>(())
-            })
+            })?
             .map_err(|e| {
                 // Clean up FFI state on ContextManager failure.
                 crate::runtime::remove_context(bi, &context_id);
@@ -2665,9 +2679,8 @@ impl crate::scp::PyScp {
         // contexts this is a no-op (no recipients), but on restored/imported
         // contexts with existing members the announcement is needed.
         if local_pseudonym.is_some()
-            && let Ok(sk) = resolve_signing_key(bi, identity_did)
+            && let Ok(sk) = resolve_signing_key(py, bi, identity_did)
         {
-            let rt = crate::runtime()?;
             let sup = crate::runtime::supervisor(bi)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let sup = sup.clone();
@@ -2677,7 +2690,7 @@ impl crate::scp::PyScp {
             let sender_did = scp_did::DID(identity_did.to_owned());
             let core_params = build_core_context_params(&handle.params)?;
             let ann_ctx_id = context_id.clone();
-            rt.block_on(async move {
+            crate::actor_wait::block_on_released(py, async move {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let cmd = MessagingCommand::SendPseudonymAnnouncement {
                     payload: Box::new(SendPseudonymAnnouncementPayload {
@@ -2691,7 +2704,7 @@ impl crate::scp::PyScp {
                 if sup.dispatch_command(&ann_ctx_id, cmd).await.is_ok() {
                     let _ = rx.await;
                 }
-            });
+            })?;
         }
 
         // Register in the known-contexts registry for discovery via
@@ -2762,6 +2775,7 @@ impl crate::scp::PyScp {
     #[allow(clippy::too_many_lines)] // orchestration: validates, UCAN gate, delegates to ContextManager
     pub fn context_join(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         identity_did: &str,
         spending_ucan_jwt: Option<&str>,
@@ -2769,7 +2783,7 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        require_active_context(bi, &handle.context_id, "join", codes::CTX_2013)?;
+        require_active_context(py, bi, &handle.context_id, "join", codes::CTX_2013)?;
 
         // Parse optional spending UCAN JWT for AND-composition (join cost).
         let spending_ucan = spending_ucan_jwt
@@ -2793,7 +2807,6 @@ impl crate::scp::PyScp {
         {
             let context_id = handle.context_id.clone();
             let member_did = identity_did.to_owned();
-            let rt = crate::runtime()?;
             let sup = crate::runtime::supervisor(bi)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let sup = sup.clone();
@@ -2802,9 +2815,11 @@ impl crate::scp::PyScp {
             // The key package contains the joiner's SCP credential (DID) and is
             // validated by NodeMlsFactory::validate_key_package before MLS
             // group addition.
-            let wrapping_public = rt
-                .block_on(sup.wrapping_public_key(&scp_did::DID(member_did.clone())))
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let wrapping_public = crate::actor_wait::block_on_released(
+                py,
+                sup.wrapping_public_key(&scp_did::DID(member_did.clone())),
+            )?
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let kp_bytes = generate_mls_key_package_bytes(identity_did, &wrapping_public)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
@@ -2839,14 +2854,14 @@ impl crate::scp::PyScp {
             let local_pseudonym: Option<[u8; 32]> = if join_is_broadcast {
                 None
             } else {
-                Some(derive_member_pseudonym(bi, identity_did, &context_id)?)
+                Some(derive_member_pseudonym(py, bi, identity_did, &context_id)?)
             };
             let temp_handle =
                 scp_core::context::ContextHandle::new(context_id.clone(), core_params);
             // Transition the temp handle to Active to match the real state.
             // §9.10.4: pass the pseudonym to join_context so it is stored in
             // PerContextState for subsequent send_message fan-out.
-            rt.block_on(async {
+            crate::actor_wait::block_on_released(py, async {
                 let _ = temp_handle.transition_to(&scp_core::context::ContextState::Active);
                 sup.join_context(
                     &temp_handle,
@@ -2855,7 +2870,7 @@ impl crate::scp::PyScp {
                     local_pseudonym,
                 )
                 .await
-            })
+            })?
             .map_err(|e| {
                 if keeps_join_failure_code(&e) {
                     PyErr::from(crate::error::ScpPyError::from(e))
@@ -2866,7 +2881,7 @@ impl crate::scp::PyScp {
 
             // §9.10.4: Send pseudonym announcement to inform existing members.
             if local_pseudonym.is_some()
-                && let Ok(sk) = resolve_signing_key(bi, identity_did)
+                && let Ok(sk) = resolve_signing_key(py, bi, identity_did)
             {
                 use scp_core::context::actor::commands::{
                     MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
@@ -2874,7 +2889,7 @@ impl crate::scp::PyScp {
                 let sender_did = scp_did::DID(member_did.clone());
                 let ann_ctx_id = context_id.clone();
                 let core_params = build_core_context_params(&handle.params)?;
-                rt.block_on(async move {
+                crate::actor_wait::block_on_released(py, async move {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let cmd = MessagingCommand::SendPseudonymAnnouncement {
                         payload: Box::new(SendPseudonymAnnouncementPayload {
@@ -2888,12 +2903,12 @@ impl crate::scp::PyScp {
                     if sup.dispatch_command(&ann_ctx_id, cmd).await.is_ok() {
                         let _ = rx.await;
                     }
-                });
+                })?;
             }
 
             // Bridge: drain events (MemberJoined) from ContextManager's receive
             // buffer and deliver to the FFI receive channel (#332).
-            drain_and_deliver(bi, &context_id);
+            drain_and_deliver(py, bi, &context_id);
 
             // Register the joined context in the known-contexts registry so the
             // JOINER surfaces its own plain-joined context via
@@ -2966,7 +2981,11 @@ impl crate::scp::PyScp {
     /// Returns `RuntimeError` if `owning_did` is not a locally-custodied
     /// identity, or if the reservation fails (providers not wired, empty pool).
     #[pyo3(name = "reserve_key_package", signature = (owning_did))]
-    pub fn reserve_key_package(&self, owning_did: &str) -> PyResult<(String, Vec<u8>)> {
+    pub fn reserve_key_package(
+        &self,
+        py: Python<'_>,
+        owning_did: &str,
+    ) -> PyResult<(String, Vec<u8>)> {
         let bi = &*self.inner;
         validate::validate_did(owning_did)?;
         // Local-custody gate — same trust model as context_create.
@@ -2980,14 +2999,14 @@ impl crate::scp::PyScp {
         #[cfg(not(test))]
         crate::runtime::init_context_manager(bi, owning_did);
 
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
         let owning = scp_did::DID(owning_did.to_owned());
-        let (reservation_id, kp_public) = rt
-            .block_on(async move { sup.reserve_key_package(owning).await })
-            .map_err(|e| typed_supervisor_failure("reserve_key_package", &e))?;
+        let (reservation_id, kp_public) = crate::actor_wait::block_on_released(py, async move {
+            sup.reserve_key_package(owning).await
+        })?
+        .map_err(|e| typed_supervisor_failure("reserve_key_package", &e))?;
         Ok((reservation_id.to_string(), kp_public))
     }
 
@@ -3050,6 +3069,7 @@ impl crate::scp::PyScp {
     )]
     pub fn context_join_from_welcome(
         &self,
+        py: Python<'_>,
         owning_did: String,
         sealed: PySealedInvitation,
         reservation_id: String,
@@ -3080,7 +3100,7 @@ impl crate::scp::PyScp {
         // This is the SAME custody gate context_create uses; a non-custodied
         // joiner hard-fails here with SCP-IDENT-1054 before the single-use
         // KeyPackage is consumed.
-        let local_pseudonym = derive_member_pseudonym(bi, &owning_did, &sealed.context_id)?;
+        let local_pseudonym = derive_member_pseudonym(py, bi, &owning_did, &sealed.context_id)?;
 
         // Fail-closed: the HPKE encapsulated key (`enc`) MUST be exactly 32
         // bytes. Reject a malformed length BEFORE any registry mutation or the
@@ -3101,7 +3121,6 @@ impl crate::scp::PyScp {
 
         // Resolve the tokio runtime + supervisor handle. Neither lookup needs
         // registered bridge state.
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
@@ -3139,9 +3158,11 @@ impl crate::scp::PyScp {
         // state and release mark as they were.
         // A typed custody failure keeps its custody code (a destroyed
         // `#active` key is `SCP-CRYPTO-4006`) through `typed_supervisor_failure`.
-        let joined = rt
-            .block_on(sup.spawn_actor_from_welcome(owning, &*custody, &active_handle, req))
-            .map_err(|e| typed_supervisor_failure("context_join_from_welcome", &e))?;
+        let joined = crate::actor_wait::block_on_released(
+            py,
+            sup.spawn_actor_from_welcome(owning, &*custody, &active_handle, req),
+        )?
+        .map_err(|e| typed_supervisor_failure("context_join_from_welcome", &e))?;
 
         // Clearing the id's release mark and registering its FFI state run in
         // one critical section. When the entry is occupied, the mark stays and
@@ -3150,8 +3171,11 @@ impl crate::scp::PyScp {
         {
             // A failed discard outranks the registration error: the teardown
             // did not finish, and the caller has to see that.
-            rt.block_on(sup.discard_joined_context(&sealed.context_id))
-                .map_err(|discard| PyErr::from(crate::error::ScpPyError::from(discard)))?;
+            crate::actor_wait::block_on_released(
+                py,
+                sup.discard_joined_context(&sealed.context_id),
+            )?
+            .map_err(|discard| PyErr::from(crate::error::ScpPyError::from(discard)))?;
             return Err(PyErr::from(e));
         }
 
@@ -3230,6 +3254,7 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (context_id, creator_did, invitee_did, invitee_key_package, relay_urls))]
     pub fn invite_member(
         &self,
+        py: Python<'_>,
         context_id: String,
         creator_did: String,
         invitee_did: String,
@@ -3241,7 +3266,6 @@ impl crate::scp::PyScp {
         validate::validate_did(&creator_did)?;
         validate::validate_did(&invitee_did)?;
 
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
@@ -3250,15 +3274,18 @@ impl crate::scp::PyScp {
         // its own `block_on` and returns BEFORE the invite `block_on` below, so
         // the two calls are sequential (not nested — nesting would deadlock the
         // multi-threaded runtime).
-        let signing_key = resolve_signing_key(bi, &creator_did)?;
-        let outcome = rt.block_on(sup.invite_member(
-            context_id,
-            scp_did::DID(creator_did),
-            scp_did::DID(invitee_did),
-            invitee_key_package,
-            relay_urls,
-            &signing_key,
-        ));
+        let signing_key = resolve_signing_key(py, bi, &creator_did)?;
+        let outcome = crate::actor_wait::block_on_released(
+            py,
+            sup.invite_member(
+                context_id,
+                scp_did::DID(creator_did),
+                scp_did::DID(invitee_did),
+                invitee_key_package,
+                relay_urls,
+                &signing_key,
+            ),
+        )?;
         // Defense-in-depth: wipe the raw signing key the moment the invite is
         // produced, rather than letting it linger to end-of-scope. `SigningKey`
         // is `ZeroizeOnDrop` (ed25519-dalek `zeroize` feature) but does NOT
@@ -3291,6 +3318,7 @@ impl crate::scp::PyScp {
     #[cfg(feature = "testing")]
     pub fn context_seed_peer_pseudonym(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         peer_did: &str,
         pseudonym: &[u8],
@@ -3309,19 +3337,18 @@ impl crate::scp::PyScp {
 
         let context_id = handle.context_id.clone();
         let peer_did_owned = peer_did.to_owned();
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             sup.seed_peer_pseudonym(
                 &context_id,
                 scp_did::DID::from(peer_did_owned.as_str()),
                 arr,
             )
             .await
-        })
+        })?
         .map_err(|e| typed_supervisor_failure("ContextManager seed_peer_pseudonym", &e))?;
 
         Ok(())
@@ -3341,17 +3368,21 @@ impl crate::scp::PyScp {
     /// `SCP-CTX-2134` when the crash watchdog poisoned it, and `SCP-CTX-2135`
     /// when its actor crashed or is mid-respawn.
     #[pyo3(signature = (handle, identity_did))]
-    pub fn context_leave(&self, handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
+    pub fn context_leave(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+        identity_did: &str,
+    ) -> PyResult<()> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        require_active_context(bi, &handle.context_id, "leave", codes::CTX_2015)?;
+        require_active_context(py, bi, &handle.context_id, "leave", codes::CTX_2015)?;
 
         // Delegate leave to the shared ContextManager for membership tracking.
         {
             let context_id = handle.context_id.clone();
             let member_did = scp_did::DID(identity_did.to_owned());
-            let rt = crate::runtime()?;
             let sup = crate::runtime::supervisor(bi)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let sup = sup.clone();
@@ -3359,17 +3390,17 @@ impl crate::scp::PyScp {
             let core_params = build_core_context_params(&handle.params)?;
             let temp_handle =
                 scp_core::context::ContextHandle::new(context_id.clone(), core_params);
-            rt.block_on(async {
+            crate::actor_wait::block_on_released(py, async {
                 let _ = temp_handle.transition_to(&scp_core::context::ContextState::Active);
                 // Self-removal: caller_did == member_did.
                 sup.leave_context(&temp_handle, &member_did, &member_did)
                     .await
-            })
+            })?
             .map_err(|e| typed_supervisor_failure("ContextManager leave_context", &e))?;
 
             // Bridge: drain events (MemberLeft) from ContextManager's receive
             // buffer and deliver BEFORE closing the channel (#332).
-            drain_and_deliver(bi, &context_id);
+            drain_and_deliver(py, bi, &context_id);
         }
 
         // Close the receive channel so any active PyMessageReceiver raises
@@ -3420,7 +3451,12 @@ impl crate::scp::PyScp {
     /// bridge is suspended or has no `ContextManager` attached.
     /// Returns `ContextError` if the caller lacks the `ContextClose` capability.
     #[pyo3(signature = (handle, identity_did))]
-    pub fn context_close(&self, handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
+    pub fn context_close(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+        identity_did: &str,
+    ) -> PyResult<()> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
@@ -3429,10 +3465,11 @@ impl crate::scp::PyScp {
         // use that one supervisor.
         let sup = std::sync::Arc::clone(crate::runtime::supervisor(bi)?);
         let live = crate::runtime::read_live_context_state_on(
+            py,
             std::sync::Arc::clone(&sup),
             &handle.context_id,
         )?;
-        close_context_on(bi, handle, identity_did, &sup, live.as_ref())
+        close_context_on(py, bi, handle, identity_did, &sup, live.as_ref())
     }
 
     /// Sends a message to an SCP context.
@@ -3453,6 +3490,7 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, identity_did, payload, spending_ucan_jwt=None))]
     pub fn context_send(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         identity_did: &str,
         payload: &Bound<'_, PyAny>,
@@ -3461,7 +3499,7 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        require_active_context(bi, &handle.context_id, "send to", codes::CTX_2019)?;
+        require_active_context(py, bi, &handle.context_id, "send to", codes::CTX_2019)?;
 
         // Extract payload bytes: must be bytes or str.
         let payload_bytes: Vec<u8> = if payload.is_instance_of::<pyo3::types::PyBytes>() {
@@ -3486,7 +3524,6 @@ impl crate::scp::PyScp {
         // encrypts via the crypto provider, and sends via the transport provider.
         let context_id = handle.context_id.clone();
         let identity_did_owned = identity_did.to_owned();
-        let rt = crate::runtime()?;
 
         // ADR-039 Enforcement-Stack Layer 2: consult the per-instance
         // persona-source seam to choose the send persona (default `#active`;
@@ -3496,7 +3533,7 @@ impl crate::scp::PyScp {
         // `#agent` request with no agent key. Passing no signer would cause the
         // encrypted send path to fail with "signing key required".
         let persona = (bi.core.persona_source())();
-        let resolved_signer = resolve_message_signer(bi, &identity_did_owned, persona)?;
+        let resolved_signer = resolve_message_signer(py, bi, &identity_did_owned, persona)?;
 
         // Delegate to ContextManager for message delivery through the transport.
         let context_id_for_drain = context_id.clone();
@@ -3508,7 +3545,7 @@ impl crate::scp::PyScp {
 
             let core_params = build_core_context_params(&handle.params)?;
             let temp_handle = scp_core::context::ContextHandle::new(context_id, core_params);
-            rt.block_on(async {
+            crate::actor_wait::block_on_released(py, async {
                 let _ = temp_handle.transition_to(&scp_core::context::ContextState::Active);
                 sup.send_message(
                     &temp_handle,
@@ -3523,14 +3560,14 @@ impl crate::scp::PyScp {
                     spending_ucan.as_ref(),
                 )
                 .await
-            })
+            })?
             .map_err(|e| typed_supervisor_failure("ContextManager send_message", &e))?;
         }
 
         // Bridge: drain events from ContextManager's receive buffer and deliver
         // them to the FFI bridge's mpsc channel so that py_context_receive yields
         // them to Python consumers. This is the producer half of #332.
-        drain_and_deliver(bi, &context_id_for_drain);
+        drain_and_deliver(py, bi, &context_id_for_drain);
 
         Ok(())
     }
@@ -3553,10 +3590,14 @@ impl crate::scp::PyScp {
     /// `SCP-CTX-2134` when the crash watchdog poisoned it, and `SCP-CTX-2135`
     /// when its actor crashed or is mid-respawn.
     #[pyo3(signature = (handle,))]
-    pub fn context_receive(&self, handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
+    pub fn context_receive(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+    ) -> PyResult<PyMessageReceiver> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        require_active_context(bi, &handle.context_id, "receive from", codes::CTX_2021)?;
+        require_active_context(py, bi, &handle.context_id, "receive from", codes::CTX_2021)?;
 
         let (tx, rx) = mpsc::channel::<PyMessage>(crate::runtime::RECEIVE_BUFFER_CAPACITY);
         let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
@@ -3631,7 +3672,6 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (context_id,))]
     pub fn context_export(&self, py: Python<'_>, context_id: &str) -> PyResult<Vec<u8>> {
         let bi = &*self.inner;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -3641,14 +3681,14 @@ impl crate::scp::PyScp {
         // `exporter_did == role_state.creator_did` (§23.16.8 step 2), so the
         // bridge resolves the authoritative creator DID from the context's
         // role state — never a nondeterministic membership-map iteration.
-        let exporter_did = rt
-            .block_on(async { sup.get_role_state(&ctx_id).await })
-            .map(|role_state| scp_did::DID::from(role_state.creator_did))
-            .ok_or_else(|| {
-                PyRuntimeError::new_err(format!(
-                    "context export failed: context '{ctx_id}' not found"
-                ))
-            })?;
+        let exporter_did =
+            crate::actor_wait::block_on_released(py, async { sup.get_role_state(&ctx_id).await })?
+                .map(|role_state| scp_did::DID::from(role_state.creator_did))
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "context export failed: context '{ctx_id}' not found"
+                    ))
+                })?;
 
         // Resolve the creator's custody provider and `#active` signing-key
         // handle (NOT a raw exported private key). Signing the §23.16.8
@@ -3670,7 +3710,7 @@ impl crate::scp::PyScp {
 
         // `export_context`'s `sign` closure is synchronous, but custody `sign`
         // is async (a Python callback custody re-acquires the GIL). The whole
-        // export runs inside `rt.block_on(...)`, so a nested
+        // export runs inside `block_on_released`, so a nested
         // `block_on`/`block_in_place` on the SAME runtime would panic ("Cannot
         // start a runtime from within a runtime"), and `block_in_place` is
         // unavailable on the current-thread fallback runtime (see `init_runtime`
@@ -3681,51 +3721,48 @@ impl crate::scp::PyScp {
         // nests `block_on`.
         //
         // Crucially, the entire export (including that signing thread `join`) is
-        // run under `Python::allow_threads`: the calling Python thread holds the
-        // GIL, and a `Callback` custody's `sign` re-acquires the GIL on the
+        // run under `block_on_released`, which releases the GIL: the calling
+        // Python thread holds the GIL, and a `Callback` custody's `sign` re-acquires the GIL on the
         // signing thread. Releasing the GIL here lets the signing thread acquire
         // it; otherwise the main thread would block on `join` while holding the
         // GIL, deadlocking against the signing thread (in-memory/file custody
         // never touch the GIL, but releasing it for them is harmless).
-        let export = py
-            .allow_threads(|| {
-                rt.block_on(
-                    sup.export_context(&ctx_id, exporter_did, |hash: &[u8; 32]| {
-                        let hash = *hash;
-                        let custody = Arc::clone(&custody);
-                        let signature = std::thread::scope(|scope| {
-                            scope
-                                .spawn(move || {
-                                    let sign_rt = tokio::runtime::Builder::new_current_thread()
-                                        .enable_all()
-                                        .build()
-                                        .map_err(|e| {
-                                            scp_platform::error::PlatformError::CustodyError(
-                                                format!(
-                                                "context export: failed to build signing runtime: {e}"
-                                            ),
-                                            )
-                                        })?;
-                                    sign_rt.block_on(custody.sign(&signing_handle, &hash))
-                                })
-                                .join()
-                                .map_err(|_| {
-                                    scp_platform::error::PlatformError::CustodyError(
-                                        "context export: signing thread panicked".to_owned(),
-                                    )
-                                })?
-                        })?;
-                        let bytes: [u8; 64] = signature.as_bytes().try_into().map_err(|_| {
-                            scp_platform::error::PlatformError::CustodyError(format!(
-                                "custody sign returned {} bytes, expected 64 (Ed25519)",
-                                signature.as_bytes().len()
-                            ))
-                        })?;
-                        Ok::<[u8; 64], scp_platform::error::PlatformError>(bytes)
-                    }),
-                )
-            })
-            .map_err(|e| typed_supervisor_failure("context export", &e))?;
+        let export = crate::actor_wait::block_on_released(
+            py,
+            sup.export_context(&ctx_id, exporter_did, |hash: &[u8; 32]| {
+                let hash = *hash;
+                let custody = Arc::clone(&custody);
+                let signature = std::thread::scope(|scope| {
+                    scope
+                        .spawn(move || {
+                            let sign_rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .map_err(|e| {
+                                    scp_platform::error::PlatformError::CustodyError(format!(
+                                        "context export: failed to build signing runtime: {e}"
+                                    ))
+                                })?;
+                            // ci-allow: bridge-block-on: runs on a scoped signing thread with its own runtime while the enclosing block_on_released holds the GIL released
+                            sign_rt.block_on(custody.sign(&signing_handle, &hash))
+                        })
+                        .join()
+                        .map_err(|_| {
+                            scp_platform::error::PlatformError::CustodyError(
+                                "context export: signing thread panicked".to_owned(),
+                            )
+                        })?
+                })?;
+                let bytes: [u8; 64] = signature.as_bytes().try_into().map_err(|_| {
+                    scp_platform::error::PlatformError::CustodyError(format!(
+                        "custody sign returned {} bytes, expected 64 (Ed25519)",
+                        signature.as_bytes().len()
+                    ))
+                })?;
+                Ok::<[u8; 64], scp_platform::error::PlatformError>(bytes)
+            }),
+        )?
+        .map_err(|e| typed_supervisor_failure("context export", &e))?;
 
         scp_core::context::export_import::serialize_export(&export)
             .map_err(|e| PyRuntimeError::new_err(format!("export serialization failed: {e}")))
@@ -3754,7 +3791,12 @@ impl crate::scp::PyScp {
     /// - `RuntimeError` if deserialization, validation, or import fails.
     /// - `ValueError` if the data is malformed.
     #[pyo3(signature = (data, importer_did))]
-    pub fn context_import(&self, data: &[u8], importer_did: &str) -> PyResult<String> {
+    pub fn context_import(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        importer_did: &str,
+    ) -> PyResult<String> {
         let bi = &*self.inner;
         let export = scp_core::context::export_import::deserialize_export(data).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid export data: {e}"))
@@ -3774,7 +3816,7 @@ impl crate::scp::PyScp {
         // derive this member's own per-context pseudonym. Validate it up front,
         // before any state mutation.
         validate::validate_did(importer_did)?;
-        let verifying_key = resolve_creator_verifying_key(bi, &creator_did)?;
+        let verifying_key = resolve_creator_verifying_key(py, bi, &creator_did)?;
 
         // Verify-before-init: validate the snapshot signature, signer binding,
         // version gate, and Merkle chain BEFORE touching the bridge's
@@ -3809,7 +3851,6 @@ impl crate::scp::PyScp {
         #[cfg(not(test))]
         crate::runtime::init_context_manager(bi, &creator_did);
 
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -3818,7 +3859,7 @@ impl crate::scp::PyScp {
         // runtime import. See `derive_member_pseudonym` for the hard-error /
         // no-fallback rationale. DISTINCT from `creator_did` — this is the
         // local member re-homing the context, not the snapshot creator.
-        let local_pseudonym: [u8; 32] = derive_member_pseudonym(bi, importer_did, &context_id)?;
+        let local_pseudonym: [u8; 32] = derive_member_pseudonym(py, bi, importer_did, &context_id)?;
 
         // §9.10.4: capture the imported context's params + mode before `export`
         // is moved into the import call, so the post-import pseudonym
@@ -3831,11 +3872,11 @@ impl crate::scp::PyScp {
         // Resolve the importer's signing key for the post-import announcement
         // (best-effort — a missing key just skips the announcement, which peers
         // recover on the importer's next explicit announcement).
-        let announce_signing_key = resolve_signing_key(bi, importer_did).ok();
+        let announce_signing_key = resolve_signing_key(py, bi, importer_did).ok();
         let context_id_for_announce = context_id.clone();
 
         let admitted_at = std::time::Instant::now();
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             // Dispatch the import carrying BOTH the creator verifying key
             // (verify-before-init, §23.16.8) and the importer's derived
             // pseudonym (§9.10.4). `import_context` re-runs the authoritative
@@ -3873,7 +3914,7 @@ impl crate::scp::PyScp {
                 }
             }
             Ok::<(), PyErr>(())
-        })?;
+        })??;
 
         Ok(context_id)
     }
@@ -3904,12 +3945,12 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, proposal_id_hex))]
     pub fn governance_execute(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         proposal_id_hex: &str,
     ) -> PyResult<String> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -3917,7 +3958,7 @@ impl crate::scp::PyScp {
         let handle_state = handle.state.clone();
         let proposal_id = parse_proposal_id(proposal_id_hex)?;
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::{
                 ExecuteGovernanceActionPayload, GovernanceCommand,
             };
@@ -3966,7 +4007,7 @@ impl crate::scp::PyScp {
             }
 
             Ok(result_str.to_owned())
-        })
+        })?
     }
 
     /// Tombstones a migrated context after its grace period has expired (§5.11A.5).
@@ -3984,17 +4025,20 @@ impl crate::scp::PyScp {
     /// Returns `RuntimeError` if the context is not migrating or the grace
     /// period has not expired.
     #[pyo3(signature = (handle,))]
-    pub fn tombstone_migrated_context(&self, handle: &PyContextHandle) -> PyResult<()> {
+    pub fn tombstone_migrated_context(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+    ) -> PyResult<()> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
         let handle_state = handle.state.clone();
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::GovernanceCommand;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = GovernanceCommand::TombstoneMigratedContext {
@@ -4014,7 +4058,7 @@ impl crate::scp::PyScp {
             }
 
             Ok(())
-        })
+        })?
     }
 
     /// Returns the migration state for a context, if any (§5.11A).
@@ -4032,16 +4076,19 @@ impl crate::scp::PyScp {
     /// "reason": str, "grace_period_end": int, "auto_invite": bool,
     /// "proposal_id": hex }`, or `None`.
     #[pyo3(signature = (handle,))]
-    pub fn migration_state(&self, handle: &PyContextHandle) -> PyResult<Option<String>> {
+    pub fn migration_state(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+    ) -> PyResult<Option<String>> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::GovernanceCommand;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = GovernanceCommand::MigrationState {
@@ -4070,7 +4117,7 @@ impl crate::scp::PyScp {
                 }
                 None => Ok(None),
             }
-        })
+        })?
     }
 
     /// Proposes a governance action for voting.
@@ -4101,22 +4148,22 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, identity_did, action_json))]
     pub fn governance_propose(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         identity_did: &str,
         action_json: &str,
     ) -> PyResult<String> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
         let action_json_owned = action_json.to_owned();
-        let signing_key = resolve_signing_key(bi, identity_did)?;
+        let signing_key = resolve_signing_key(py, bi, identity_did)?;
         let proposer_did = scp_did::DID(identity_did.to_owned());
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             let action: scp_core::context::governance::GovernanceAction =
                 serde_json::from_str(&action_json_owned).map_err(|e| {
                     PyValueError::new_err(format!(
@@ -4139,7 +4186,7 @@ impl crate::scp::PyScp {
                     outcome.execution_result.as_ref(),
                 ),
             )
-        })
+        })?
     }
 
     /// Casts an approval vote on a pending governance proposal.
@@ -4166,22 +4213,22 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, identity_did, proposal_id_hex))]
     pub fn governance_approve(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         identity_did: &str,
         proposal_id_hex: &str,
     ) -> PyResult<String> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
-        let signing_key = resolve_signing_key(bi, identity_did)?;
+        let signing_key = resolve_signing_key(py, bi, identity_did)?;
         let voter_did = scp_did::DID(identity_did.to_owned());
         let proposal_id = parse_proposal_id(proposal_id_hex)?;
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::{
                 GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
             };
@@ -4211,7 +4258,7 @@ impl crate::scp::PyScp {
             Ok(scp_ffi_common::governance_result::proposal_status_response(
                 &status,
             ))
-        })
+        })?
     }
 
     /// Casts a rejection vote on a pending governance proposal.
@@ -4236,22 +4283,22 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, identity_did, proposal_id_hex))]
     pub fn governance_reject(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         identity_did: &str,
         proposal_id_hex: &str,
     ) -> PyResult<String> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
-        let signing_key = resolve_signing_key(bi, identity_did)?;
+        let signing_key = resolve_signing_key(py, bi, identity_did)?;
         let voter_did = scp_did::DID(identity_did.to_owned());
         let proposal_id = parse_proposal_id(proposal_id_hex)?;
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::{
                 GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
             };
@@ -4281,7 +4328,7 @@ impl crate::scp::PyScp {
             Ok(scp_ffi_common::governance_result::proposal_status_response(
                 &status,
             ))
-        })
+        })?
     }
 
     /// Withdraws a previously cast vote on a pending governance proposal.
@@ -4306,13 +4353,13 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, identity_did, proposal_id_hex))]
     pub fn governance_withdraw(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         identity_did: &str,
         proposal_id_hex: &str,
     ) -> PyResult<String> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -4320,7 +4367,7 @@ impl crate::scp::PyScp {
         let voter_did = scp_did::DID(identity_did.to_owned());
         let proposal_id = parse_proposal_id(proposal_id_hex)?;
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             let status = sup
                 .withdraw_governance_vote(&context_id, &proposal_id, &voter_did)
                 .await
@@ -4331,7 +4378,7 @@ impl crate::scp::PyScp {
             Ok(scp_ffi_common::governance_result::proposal_status_response(
                 &status,
             ))
-        })
+        })?
     }
 
     /// Retrieves a single governance proposal by hex-encoded ID.
@@ -4342,6 +4389,7 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, proposal_id_hex))]
     pub fn governance_get_proposal(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         proposal_id_hex: String,
     ) -> PyResult<String> {
@@ -4352,10 +4400,8 @@ impl crate::scp::PyScp {
 
         let sup = crate::runtime::supervisor(bi)
             .map_err(|e| PyRuntimeError::new_err(format!("SCP-CTX-2040: {e}")))?;
-        let rt =
-            crate::runtime().map_err(|e| PyRuntimeError::new_err(format!("SCP-CTX-2040: {e}")))?;
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             let proposal = sup
                 .get_proposal(&context_id, &proposal_id)
                 .await
@@ -4364,7 +4410,7 @@ impl crate::scp::PyScp {
             serde_json::to_string(&proposal).map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2045: serialization failed: {e}"))
             })
-        })
+        })?
     }
 
     /// Lists all governance proposals for a context.
@@ -4373,17 +4419,19 @@ impl crate::scp::PyScp {
     ///
     /// Returns `RuntimeError` (SCP-CTX-2046) if listing fails.
     #[pyo3(signature = (handle,))]
-    pub fn governance_list_proposals(&self, handle: &PyContextHandle) -> PyResult<String> {
+    pub fn governance_list_proposals(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+    ) -> PyResult<String> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         let context_id = handle.context_id.clone();
 
         let sup = crate::runtime::supervisor(bi)
             .map_err(|e| PyRuntimeError::new_err(format!("SCP-CTX-2040: {e}")))?;
-        let rt =
-            crate::runtime().map_err(|e| PyRuntimeError::new_err(format!("SCP-CTX-2040: {e}")))?;
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             let proposals = sup
                 .list_proposals(&context_id)
                 .await
@@ -4392,7 +4440,7 @@ impl crate::scp::PyScp {
             serde_json::to_string(&proposals).map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2046: serialization failed: {e}"))
             })
-        })
+        })?
     }
 
     /// Applies a pending ceiling modification if the notification period has elapsed.
@@ -4416,18 +4464,18 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, current_timestamp))]
     pub fn apply_pending_ceiling_modification(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         current_timestamp: u64,
     ) -> PyResult<bool> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::GovernanceCommand;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = GovernanceCommand::ApplyPendingCeilingModification {
@@ -4447,7 +4495,7 @@ impl crate::scp::PyScp {
                 .map_err(|e| {
                     typed_supervisor_failure("SCP-CTX-2060: apply_pending_ceiling_modification", &e)
                 })
-        })
+        })?
     }
 
     /// Finalizes the cooperative close flow for a context in `Closing` state.
@@ -4465,17 +4513,16 @@ impl crate::scp::PyScp {
     /// Returns `RuntimeError` (SCP-CTX-2061) if the context is not in
     /// `Closing` state or finalization fails.
     #[pyo3(signature = (handle,))]
-    pub fn finalize_close(&self, handle: &PyContextHandle) -> PyResult<()> {
+    pub fn finalize_close(&self, py: Python<'_>, handle: &PyContextHandle) -> PyResult<()> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let core_params = build_core_context_params(&handle.params)?;
         let context_id = handle.context_id.clone();
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::{TtlCloseCommand, TtlContextPayload};
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = TtlCloseCommand::FinalizeClose {
@@ -4495,7 +4542,7 @@ impl crate::scp::PyScp {
                     ))
                 })?
                 .map_err(|e| typed_supervisor_failure("SCP-CTX-2061: finalize_close", &e))
-        })?;
+        })??;
 
         // Update FFI handle state to reflect close.
         let mut state = handle
@@ -4533,6 +4580,7 @@ impl crate::scp::PyScp {
     #[allow(clippy::too_many_arguments)]
     pub fn create_governance_checkpoint(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         checkpoint_seq: u64,
         merkle_root_hex: &str,
@@ -4544,7 +4592,6 @@ impl crate::scp::PyScp {
     ) -> PyResult<String> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -4558,7 +4605,7 @@ impl crate::scp::PyScp {
         })?;
         let did = scp_did::DID(creator_did.to_owned());
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::{
                 CreateGovernanceCheckpointPayload, TrustRecoveryCommand,
             };
@@ -4598,7 +4645,7 @@ impl crate::scp::PyScp {
             serde_json::to_string(&checkpoint).map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2062: serialization failed: {e}"))
             })
-        })
+        })?
     }
 
     /// Adds a cosignature to an existing governance checkpoint (ADR-031 §9).
@@ -4622,6 +4669,7 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, checkpoint_json, signer_did, signature_hex))]
     pub fn add_checkpoint_cosignature(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         checkpoint_json: &str,
         signer_did: &str,
@@ -4629,7 +4677,6 @@ impl crate::scp::PyScp {
     ) -> PyResult<String> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -4649,7 +4696,7 @@ impl crate::scp::PyScp {
             signature,
         };
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::TrustRecoveryCommand;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = TrustRecoveryCommand::AddCheckpointCosignature {
@@ -4686,7 +4733,7 @@ impl crate::scp::PyScp {
                     "SCP-CTX-2063: add_checkpoint_cosignature failed to encode checkpoint: {e}"
                 ))
             })
-        })
+        })?
     }
 
     /// Restores a single persisted context from storage.
@@ -4704,16 +4751,15 @@ impl crate::scp::PyScp {
     /// restore because shutdown began, and `RuntimeError` (SCP-CTX-2064) if
     /// restoration fails otherwise.
     #[pyo3(signature = (context_id,))]
-    pub fn restore_context(&self, context_id: &str) -> PyResult<()> {
+    pub fn restore_context(&self, py: Python<'_>, context_id: &str) -> PyResult<()> {
         let bi = &*self.inner;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id_owned = context_id.to_owned();
 
         let admitted_at = std::time::Instant::now();
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             // Route through the ADR-049 commit-9 lifecycle shim. The handler
             // reconstructs an ephemeral ContextHandle and delegates to the
             // manager's restore_context, which loads its own snapshot from
@@ -4740,7 +4786,7 @@ impl crate::scp::PyScp {
                     ))
                 })?
                 .map_err(|e| restore_context_failure("restore_context", e))
-        })?;
+        })??;
         crate::runtime::clear_release_mark_set_by(bi, context_id, admitted_at);
         Ok(())
     }
@@ -4762,15 +4808,14 @@ impl crate::scp::PyScp {
     /// Returns `RuntimeError` (SCP-CTX-2065) if restoration fails (e.g., no
     /// persistence provider configured).
     #[pyo3(signature = ())]
-    pub fn restore_all_contexts(&self) -> PyResult<String> {
+    pub fn restore_all_contexts(&self, py: Python<'_>) -> PyResult<String> {
         let bi = &*self.inner;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
 
         let admitted_at = std::time::Instant::now();
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             let restored = sup
                 .restore_on_startup()
                 .await
@@ -4782,7 +4827,7 @@ impl crate::scp::PyScp {
             serde_json::to_string(&restored).map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2065: serialization failed: {e}"))
             })
-        })
+        })?
     }
 
     /// Subscribes a DID to a broadcast context.
@@ -4801,6 +4846,7 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, subscriber_did, messages_read_ucan_jwt=None))]
     pub fn broadcast_subscribe(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         subscriber_did: &str,
         messages_read_ucan_jwt: Option<&str>,
@@ -4818,7 +4864,6 @@ impl crate::scp::PyScp {
                 })
             })
             .transpose()?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -4826,7 +4871,7 @@ impl crate::scp::PyScp {
         let did: scp_did::DID = subscriber_did.to_owned().into();
         let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::{BroadcastCommand, SubscribeBroadcastPayload};
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = BroadcastCommand::SubscribeBroadcast {
@@ -4845,7 +4890,7 @@ impl crate::scp::PyScp {
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
                 .map_err(|e| typed_supervisor_failure("broadcast subscribe", &e))?;
             Ok(())
-        })
+        })?
     }
 
     /// Unsubscribes a DID from a broadcast context.
@@ -4856,6 +4901,7 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, subscriber_did, rotate_keys=false))]
     pub fn broadcast_unsubscribe(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         subscriber_did: &str,
         rotate_keys: bool,
@@ -4863,14 +4909,13 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(subscriber_did)?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
         let did: scp_did::DID = subscriber_did.to_owned().into();
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::{
                 BroadcastCommand, UnsubscribeBroadcastPayload,
             };
@@ -4890,7 +4935,7 @@ impl crate::scp::PyScp {
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
                 .map_err(|e| typed_supervisor_failure("broadcast unsubscribe", &e))?;
             Ok(())
-        })
+        })?
     }
 
     /// Publishes a message to a broadcast context.
@@ -4906,6 +4951,7 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, author_did, payload))]
     pub fn broadcast_publish(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         author_did: &str,
         payload: Vec<u8>,
@@ -4914,41 +4960,41 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(author_did)?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
         let author_did_owned = author_did.to_owned();
 
-        crate::runtime::with_identity(bi, &author_did_owned, |entry| {
-            let custody = entry.custody.clone();
-            let signing_key_handle = entry.identity.active_signing_key;
-            let did: scp_did::DID = author_did_owned.clone().into();
+        // Clone the custody handle out of the registry guard before the wait,
+        // so a GIL-released wait never holds the identity map's shard lock.
+        let (custody, signing_key_handle) =
+            crate::runtime::with_identity(bi, &author_did_owned, |entry| {
+                Ok((entry.custody.clone(), entry.identity.active_signing_key))
+            })?;
+        let did: scp_did::DID = author_did_owned.into();
 
-            rt.block_on(async move {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let cmd = BroadcastCommand::PublishBroadcast {
-                    payload: Box::new(PublishBroadcastPayload {
-                        context_id,
-                        author_did: did,
-                        payload,
-                        signing_key_handle,
-                    }),
-                    reply: tx,
-                };
-                sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
-                    .await
-                    .map_err(crate::error::ScpPyError::from)?;
-                rx.await
-                    .map_err(|e| {
-                        crate::error::ScpPyError::context(format!("shim reply dropped: {e}"))
-                    })?
-                    .map_err(crate::error::ScpPyError::from)?;
-                Ok(())
-            })
+        crate::actor_wait::block_on_released(py, async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::PublishBroadcast {
+                payload: Box::new(PublishBroadcastPayload {
+                    context_id,
+                    author_did: did,
+                    payload,
+                    signing_key_handle,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
+                .await
+                .map_err(crate::error::ScpPyError::from)?;
+            rx.await
+                .map_err(|e| crate::error::ScpPyError::context(format!("shim reply dropped: {e}")))?
+                .map_err(crate::error::ScpPyError::from)?;
+            Ok(())
         })
-        .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })
+        .and_then(std::convert::identity)
+        .map_err(PyErr::from)
     }
 
     /// Publishes a single asset to a broadcast context as structured content (SCP-290).
@@ -4968,7 +5014,7 @@ impl crate::scp::PyScp {
     #[allow(clippy::too_many_lines)]
     #[pyo3(signature = (handle, author_did, path, content_type, body, deploy_id = None))]
     pub fn broadcast_publish_asset(
-        &self,
+        slf: PyRef<'_, Self>,
         handle: &PyContextHandle,
         author_did: &str,
         path: &str,
@@ -4979,10 +5025,12 @@ impl crate::scp::PyScp {
         use scp_core::context::actor::commands::{
             BroadcastCommand, PublishBroadcastContentPayload,
         };
-        let bi = &*self.inner;
+        // `slf` carries the GIL token, which keeps the method at seven
+        // parameters.
+        let py = slf.py();
+        let bi = &*slf.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(author_did)?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -5007,78 +5055,78 @@ impl crate::scp::PyScp {
             str::to_owned,
         ));
 
-        crate::runtime::with_identity(bi, &author_did_owned, |entry| {
-            let custody = entry.custody.clone();
-            let signing_key_handle = entry.identity.active_signing_key;
-            let did: scp_did::DID = author_did_owned.clone().into();
-
-            // Validate and construct BroadcastContent.
-            let content_path = scp_core::context::ContentPath::new(path_owned)
-                .map_err(|e| crate::error::ScpPyError::context(format!("invalid path: {e}")))?;
-            let mime_type = scp_core::context::MimeType::new(content_type_owned).map_err(|e| {
-                crate::error::ScpPyError::context(format!("invalid content_type: {e}"))
+        // Clone the custody handle out of the registry guard before the wait,
+        // so a GIL-released wait never holds the identity map's shard lock.
+        let (custody, signing_key_handle) =
+            crate::runtime::with_identity(bi, &author_did_owned, |entry| {
+                Ok((entry.custody.clone(), entry.identity.active_signing_key))
             })?;
-            if let Some(ref did_str) = deploy_id_owned {
-                scp_core::context::validate_deploy_id(did_str).map_err(|e| {
-                    crate::error::ScpPyError::context(format!("invalid deploy_id: {e}"))
-                })?;
-            }
+        let did: scp_did::DID = author_did_owned.into();
 
-            let etag = scp_core::context::compute_etag(&body);
-            let content = scp_core::context::BroadcastContent {
-                version: scp_core::context::BROADCAST_CONTENT_VERSION,
-                metadata: scp_core::context::ContentMetadata {
-                    path: Some(content_path),
-                    content_type: Some(mime_type),
-                    deploy_id: deploy_id_owned.clone(),
-                    etag: Some(etag.clone()),
-                    immutable: false,
-                },
-                body,
+        // Validate and construct BroadcastContent.
+        let content_path = scp_core::context::ContentPath::new(path_owned)
+            .map_err(|e| crate::error::ScpPyError::context(format!("invalid path: {e}")))?;
+        let mime_type = scp_core::context::MimeType::new(content_type_owned)
+            .map_err(|e| crate::error::ScpPyError::context(format!("invalid content_type: {e}")))?;
+        if let Some(ref did_str) = deploy_id_owned {
+            scp_core::context::validate_deploy_id(did_str).map_err(|e| {
+                crate::error::ScpPyError::context(format!("invalid deploy_id: {e}"))
+            })?;
+        }
+
+        let etag = scp_core::context::compute_etag(&body);
+        let content = scp_core::context::BroadcastContent {
+            version: scp_core::context::BROADCAST_CONTENT_VERSION,
+            metadata: scp_core::context::ContentMetadata {
+                path: Some(content_path),
+                content_type: Some(mime_type),
+                deploy_id: deploy_id_owned.clone(),
+                etag: Some(etag.clone()),
+                immutable: false,
+            },
+            body,
+        };
+
+        crate::actor_wait::block_on_released(py, async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::PublishBroadcastContent {
+                payload: Box::new(PublishBroadcastContentPayload {
+                    context_id,
+                    author_did: did,
+                    content,
+                    signing_key_handle,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
+                .await
+                .map_err(crate::error::ScpPyError::from)?;
+            let envelope = rx
+                .await
+                .map_err(|e| crate::error::ScpPyError::context(format!("shim reply dropped: {e}")))?
+                .map_err(crate::error::ScpPyError::from)?;
+
+            // Compute blob_id as SHA-256 of the serialized envelope.
+            let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
+                crate::error::ScpPyError::context(format!(
+                    "failed to serialize envelope for blob_id: {e}"
+                ))
+            })?;
+            let blob_id = {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(&envelope_bytes))
             };
 
-            rt.block_on(async move {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let cmd = BroadcastCommand::PublishBroadcastContent {
-                    payload: Box::new(PublishBroadcastContentPayload {
-                        context_id,
-                        author_did: did,
-                        content,
-                        signing_key_handle,
-                    }),
-                    reply: tx,
-                };
-                sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
-                    .await
-                    .map_err(crate::error::ScpPyError::from)?;
-                let envelope = rx
-                    .await
-                    .map_err(|e| {
-                        crate::error::ScpPyError::context(format!("shim reply dropped: {e}"))
-                    })?
-                    .map_err(crate::error::ScpPyError::from)?;
-
-                // Compute blob_id as SHA-256 of the serialized envelope.
-                let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
-                    crate::error::ScpPyError::context(format!(
-                        "failed to serialize envelope for blob_id: {e}"
-                    ))
-                })?;
-                let blob_id = {
-                    use sha2::{Digest, Sha256};
-                    hex::encode(Sha256::digest(&envelope_bytes))
-                };
-
-                let mut result = HashMap::new();
-                result.insert("blob_id".to_owned(), blob_id);
-                result.insert("etag".to_owned(), etag);
-                if let Some(ref did) = deploy_id_owned {
-                    result.insert("deploy_id".to_owned(), did.clone());
-                }
-                Ok(result)
-            })
+            let mut result = HashMap::new();
+            result.insert("blob_id".to_owned(), blob_id);
+            result.insert("etag".to_owned(), etag);
+            if let Some(ref did) = deploy_id_owned {
+                result.insert("deploy_id".to_owned(), did.clone());
+            }
+            Ok(result)
         })
-        .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })
+        .and_then(std::convert::identity)
+        .map_err(PyErr::from)
     }
 
     /// Publishes multiple assets to a broadcast context as structured content (SCP-290).
@@ -5097,6 +5145,7 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, author_did, assets, deploy_id = None))]
     pub fn broadcast_publish_assets(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         author_did: &str,
         assets: Vec<(String, String, Vec<u8>)>,
@@ -5116,7 +5165,6 @@ impl crate::scp::PyScp {
         }
 
         validate::validate_did(author_did)?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -5144,78 +5192,82 @@ impl crate::scp::PyScp {
             return Err(PyRuntimeError::new_err(format!("invalid deploy_id: {e}")));
         }
 
-        crate::runtime::with_identity(bi, &author_did_owned, |entry| {
-            let custody = entry.custody.clone();
-            let signing_key_handle = entry.identity.active_signing_key;
-            let did: scp_did::DID = author_did_owned.clone().into();
+        // Clone the custody handle out of the registry guard before the wait,
+        // so a GIL-released wait never holds the identity map's shard lock.
+        let (custody, signing_key_handle) =
+            crate::runtime::with_identity(bi, &author_did_owned, |entry| {
+                Ok((entry.custody.clone(), entry.identity.active_signing_key))
+            })?;
+        let did: scp_did::DID = author_did_owned.into();
+        let deploy_id_batch = deploy_id_owned.clone();
 
-            rt.block_on(async move {
-                let mut results = Vec::with_capacity(assets.len());
-                for (path, content_type, body) in assets {
-                    let content_path = scp_core::context::ContentPath::new(path).map_err(|e| {
-                        crate::error::ScpPyError::context(format!("invalid path: {e}"))
-                    })?;
-                    let mime_type =
-                        scp_core::context::MimeType::new(content_type).map_err(|e| {
-                            crate::error::ScpPyError::context(format!("invalid content_type: {e}"))
-                        })?;
+        crate::actor_wait::block_on_released(py, async move {
+            let mut results = Vec::with_capacity(assets.len());
+            for (path, content_type, body) in assets {
+                let content_path = scp_core::context::ContentPath::new(path)
+                    .map_err(|e| crate::error::ScpPyError::context(format!("invalid path: {e}")))?;
+                let mime_type = scp_core::context::MimeType::new(content_type).map_err(|e| {
+                    crate::error::ScpPyError::context(format!("invalid content_type: {e}"))
+                })?;
 
-                    let etag = scp_core::context::compute_etag(&body);
-                    let content = scp_core::context::BroadcastContent {
-                        version: scp_core::context::BROADCAST_CONTENT_VERSION,
-                        metadata: scp_core::context::ContentMetadata {
-                            path: Some(content_path),
-                            content_type: Some(mime_type),
-                            deploy_id: Some(deploy_id_owned.clone()),
-                            etag: Some(etag.clone()),
-                            immutable: false,
-                        },
-                        body,
-                    };
+                let etag = scp_core::context::compute_etag(&body);
+                let content = scp_core::context::BroadcastContent {
+                    version: scp_core::context::BROADCAST_CONTENT_VERSION,
+                    metadata: scp_core::context::ContentMetadata {
+                        path: Some(content_path),
+                        content_type: Some(mime_type),
+                        deploy_id: Some(deploy_id_owned.clone()),
+                        etag: Some(etag.clone()),
+                        immutable: false,
+                    },
+                    body,
+                };
 
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let cmd = BroadcastCommand::PublishBroadcastContent {
-                        payload: Box::new(PublishBroadcastContentPayload {
-                            context_id: context_id.clone(),
-                            author_did: did.clone(),
-                            content,
-                            signing_key_handle,
-                        }),
-                        reply: tx,
-                    };
-                    sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
-                        .await
-                        .map_err(crate::error::ScpPyError::from)?;
-                    let envelope = rx
-                        .await
-                        .map_err(|e| {
-                            crate::error::ScpPyError::context(format!("shim reply dropped: {e}"))
-                        })?
-                        .map_err(crate::error::ScpPyError::from)?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = BroadcastCommand::PublishBroadcastContent {
+                    payload: Box::new(PublishBroadcastContentPayload {
+                        context_id: context_id.clone(),
+                        author_did: did.clone(),
+                        content,
+                        signing_key_handle,
+                    }),
+                    reply: tx,
+                };
+                sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
+                    .await
+                    .map_err(crate::error::ScpPyError::from)?;
+                let envelope = rx
+                    .await
+                    .map_err(|e| {
+                        crate::error::ScpPyError::context(format!("shim reply dropped: {e}"))
+                    })?
+                    .map_err(crate::error::ScpPyError::from)?;
 
-                    let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
-                        crate::error::ScpPyError::context(format!(
-                            "failed to serialize envelope for blob_id: {e}"
-                        ))
-                    })?;
-                    let blob_id = {
-                        use sha2::{Digest, Sha256};
-                        hex::encode(Sha256::digest(&envelope_bytes))
-                    };
+                let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
+                    crate::error::ScpPyError::context(format!(
+                        "failed to serialize envelope for blob_id: {e}"
+                    ))
+                })?;
+                let blob_id = {
+                    use sha2::{Digest, Sha256};
+                    hex::encode(Sha256::digest(&envelope_bytes))
+                };
 
-                    let mut result = HashMap::new();
-                    result.insert("blob_id".to_owned(), blob_id);
-                    result.insert("etag".to_owned(), etag);
-                    result.insert("deploy_id".to_owned(), deploy_id_owned.clone());
-                    results.push(result);
-                }
-
-                // Return {"results": [...], "deploy_id": "..."} matching NAPI/UniFFI.
-                let outer = build_batch_publish_dict(results, &deploy_id_owned)?;
-                Ok(outer)
-            })
+                let mut result = HashMap::new();
+                result.insert("blob_id".to_owned(), blob_id);
+                result.insert("etag".to_owned(), etag);
+                result.insert("deploy_id".to_owned(), deploy_id_owned.clone());
+                results.push(result);
+            }
+            Ok(results)
         })
-        .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })
+        .and_then(std::convert::identity)
+        .and_then(|results| {
+            // Return {"results": [...], "deploy_id": "..."} matching
+            // NAPI/UniFFI. Built after the wait, with the GIL held.
+            build_batch_publish_dict(results, &deploy_id_batch)
+        })
+        .map_err(PyErr::from)
     }
 
     /// Blocks a subscriber's read access in a broadcast context.
@@ -5226,6 +5278,7 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, subscriber_did, blocker_did))]
     pub fn broadcast_block_subscriber(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         subscriber_did: &str,
         blocker_did: &str,
@@ -5234,7 +5287,6 @@ impl crate::scp::PyScp {
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(subscriber_did)?;
         validate::validate_did(blocker_did)?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -5242,7 +5294,7 @@ impl crate::scp::PyScp {
         let subscriber: scp_did::DID = subscriber_did.to_owned().into();
         let blocker: scp_did::DID = blocker_did.to_owned().into();
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::{BroadcastBlockPayload, BroadcastCommand};
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = BroadcastCommand::BlockBroadcastSubscriber {
@@ -5260,7 +5312,7 @@ impl crate::scp::PyScp {
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
                 .map_err(|e| typed_supervisor_failure("broadcast block", &e))?;
             Ok(())
-        })
+        })?
     }
 
     /// Unblocks a previously blocked subscriber in a broadcast context (§9.16.8).
@@ -5274,6 +5326,7 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, subscriber_did, unblocker_did))]
     pub fn broadcast_unblock_subscriber(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         subscriber_did: &str,
         unblocker_did: &str,
@@ -5282,7 +5335,6 @@ impl crate::scp::PyScp {
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(subscriber_did)?;
         validate::validate_did(unblocker_did)?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -5290,7 +5342,7 @@ impl crate::scp::PyScp {
         let subscriber: scp_did::DID = subscriber_did.to_owned().into();
         let unblocker: scp_did::DID = unblocker_did.to_owned().into();
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::{BroadcastBlockPayload, BroadcastCommand};
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = BroadcastCommand::UnblockBroadcastSubscriber {
@@ -5308,7 +5360,7 @@ impl crate::scp::PyScp {
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
                 .map_err(|e| typed_supervisor_failure("broadcast unblock", &e))?;
             Ok(())
-        })
+        })?
     }
 
     /// Handles a broadcast key request from a subscriber, sealing the author's
@@ -5332,6 +5384,7 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, author_did, requester_did, wrapping_pubkey))]
     pub fn broadcast_handle_key_request(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         author_did: &str,
         requester_did: &str,
@@ -5348,7 +5401,6 @@ impl crate::scp::PyScp {
                     code: e.error_code().to_owned(),
                 }
             })?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -5358,7 +5410,7 @@ impl crate::scp::PyScp {
         let author: scp_did::DID = author_did.to_owned().into();
         let requester: scp_did::DID = requester_did.to_owned().into();
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::BroadcastCommand;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = BroadcastCommand::HandleBroadcastKeyRequest {
@@ -5383,7 +5435,7 @@ impl crate::scp::PyScp {
                 &context_id_for_seal,
             )
             .map_err(|e| PyRuntimeError::new_err(format!("serialize sealed broadcast key: {e}")))
-        })
+        })?
     }
 
     /// Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held
@@ -5426,15 +5478,18 @@ impl crate::scp::PyScp {
     ///
     /// Returns `None` if the context is not registered or not a broadcast context.
     #[pyo3(signature = (handle,))]
-    pub fn broadcast_subscriber_count(&self, handle: &PyContextHandle) -> PyResult<Option<u64>> {
+    pub fn broadcast_subscriber_count(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+    ) -> PyResult<Option<u64>> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
         let context_id = handle.context_id.clone();
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::BroadcastCommand;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = BroadcastCommand::BroadcastSubscriberCount {
@@ -5448,22 +5503,26 @@ impl crate::scp::PyScp {
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
                 .map(|opt| opt.map(|n| n as u64))
-        })
+        })?
     }
 
     /// Returns `True` if the given DID is a broadcast subscriber.
     #[pyo3(signature = (handle, did))]
-    pub fn broadcast_is_subscriber(&self, handle: &PyContextHandle, did: &str) -> PyResult<bool> {
+    pub fn broadcast_is_subscriber(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+        did: &str,
+    ) -> PyResult<bool> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(did)?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
         let context_id = handle.context_id.clone();
         let did_owned = did.to_owned();
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::BroadcastCommand;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = BroadcastCommand::IsBroadcastSubscriber {
@@ -5477,7 +5536,7 @@ impl crate::scp::PyScp {
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-        })
+        })?
     }
 
     /// Returns the broadcast admission policy for a context.
@@ -5485,15 +5544,18 @@ impl crate::scp::PyScp {
     /// Returns the policy as a string: `"Open"` or `"Gated"`.
     /// Returns `None` if the context is not a broadcast context.
     #[pyo3(signature = (handle,))]
-    pub fn broadcast_admission(&self, handle: &PyContextHandle) -> PyResult<Option<String>> {
+    pub fn broadcast_admission(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+    ) -> PyResult<Option<String>> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
         let context_id = handle.context_id.clone();
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::BroadcastCommand;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = BroadcastCommand::BroadcastAdmission {
@@ -5509,21 +5571,27 @@ impl crate::scp::PyScp {
                 .map(|opt| {
                     opt.map(|a| scp_ffi_common::broadcast::broadcast_admission_name(a).to_owned())
                 })
-        })
+        })?
     }
 
     /// Returns the current member count for a context.
     ///
     /// Returns `None` if the context is not registered.
     #[pyo3(signature = (handle,))]
-    pub fn context_member_count(&self, handle: &PyContextHandle) -> PyResult<Option<u64>> {
+    pub fn context_member_count(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+    ) -> PyResult<Option<u64>> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let context_id = handle.context_id.clone();
-        Ok(rt.block_on(sup.member_count(&context_id)).map(|n| n as u64))
+        Ok(
+            crate::actor_wait::block_on_released(py, sup.member_count(&context_id))?
+                .map(|n| n as u64),
+        )
     }
 
     /// Reconnects all of `identity_did`'s contexts after an offline
@@ -5550,13 +5618,13 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (identity_did, context_ids, last_relay_contacts=None))]
     pub fn context_reconnect(
         &self,
+        py: Python<'_>,
         identity_did: &str,
         context_ids: Vec<String>,
         last_relay_contacts: Option<HashMap<String, u64>>,
     ) -> PyResult<PyReconnectReport> {
         let bi = &*self.inner;
         validate::validate_did(identity_did)?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let transport = bi.core.get_transport_arc().ok().flatten().ok_or_else(|| {
@@ -5570,48 +5638,64 @@ impl crate::scp::PyScp {
         // beyond this in-process driver call. The 32-byte seed is held in
         // `Zeroizing` so it is wiped when this call returns rather than
         // lingering on the stack/heap.
-        let signing_key = resolve_signing_key(bi, identity_did)?;
+        let signing_key = resolve_signing_key(py, bi, identity_did)?;
         let signing_key_bytes = zeroize::Zeroizing::new(signing_key.to_bytes());
 
         let contacts = last_relay_contacts.unwrap_or_default();
         let now = scp_clock::SystemClock.now_secs();
 
-        let report = rt.block_on(scp_ffi_common::reconnect::reconnect_contexts_no_drain(
-            &transport,
-            sup,
-            scp_did::DID(identity_did.to_owned()),
-            signing_key_bytes,
-            context_ids,
-            contacts,
-            now,
-            scp_core::sync::SyncPolicy::default(),
-        ));
+        let report = crate::actor_wait::block_on_released(
+            py,
+            scp_ffi_common::reconnect::reconnect_contexts_no_drain(
+                &transport,
+                sup,
+                scp_did::DID(identity_did.to_owned()),
+                signing_key_bytes,
+                context_ids,
+                contacts,
+                now,
+                scp_core::sync::SyncPolicy::default(),
+            ),
+        )?;
         Ok(report.into())
     }
 
     /// Returns `True` if the given DID is a member of the context.
     #[pyo3(signature = (handle, did))]
-    pub fn context_is_member(&self, handle: &PyContextHandle, did: &str) -> PyResult<bool> {
+    pub fn context_is_member(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+        did: &str,
+    ) -> PyResult<bool> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(did)?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let context_id = handle.context_id.clone();
-        Ok(rt.block_on(sup.is_member(&context_id, did)))
+        Ok(crate::actor_wait::block_on_released(
+            py,
+            sup.is_member(&context_id, did),
+        )?)
     }
 
     /// Returns all member DIDs for a context.
     #[pyo3(signature = (handle,))]
-    pub fn context_member_dids(&self, handle: &PyContextHandle) -> PyResult<Vec<String>> {
+    pub fn context_member_dids(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+    ) -> PyResult<Vec<String>> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let context_id = handle.context_id.clone();
-        Ok(rt.block_on(sup.member_dids(&context_id)))
+        Ok(crate::actor_wait::block_on_released(
+            py,
+            sup.member_dids(&context_id),
+        )?)
     }
 
     /// Returns a member's assigned role name (`RoleAssignment.role_name`, such
@@ -5621,19 +5705,20 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, did))]
     pub fn context_member_role(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         did: &str,
     ) -> PyResult<Option<String>> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(did)?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let context_id = handle.context_id.clone();
-        Ok(rt
-            .block_on(sup.member_role(&context_id, did))
-            .map(|r| r.role_name))
+        Ok(
+            crate::actor_wait::block_on_released(py, sup.member_role(&context_id, did))?
+                .map(|r| r.role_name),
+        )
     }
 
     /// Drains all pending events from the context's receive buffer.
@@ -5641,19 +5726,23 @@ impl crate::scp::PyScp {
     /// Returns one [`context_event_wire_string`](scp_ffi_common::context_event::context_event_wire_string)
     /// per event. Returns empty if the context is not registered.
     #[pyo3(signature = (handle,))]
-    pub fn context_drain_events(&self, handle: &PyContextHandle) -> PyResult<Vec<String>> {
+    pub fn context_drain_events(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+    ) -> PyResult<Vec<String>> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
-        Ok(rt
-            .block_on(sup.drain_events(&context_id))
-            .into_iter()
-            .map(|e| scp_ffi_common::context_event::context_event_wire_string(&e))
-            .collect())
+        Ok(
+            crate::actor_wait::block_on_released(py, sup.drain_events(&context_id))?
+                .into_iter()
+                .map(|e| scp_ffi_common::context_event::context_event_wire_string(&e))
+                .collect(),
+        )
     }
 
     /// Handles TTL expiry for a context.
@@ -5664,17 +5753,20 @@ impl crate::scp::PyScp {
     ///
     /// Returns `RuntimeError` if the context is not active.
     #[pyo3(signature = (handle,))]
-    pub fn context_handle_ttl_expiry(&self, handle: &PyContextHandle) -> PyResult<()> {
+    pub fn context_handle_ttl_expiry(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+    ) -> PyResult<()> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
         let core_params = build_core_context_params(&handle.params)?;
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::{TtlCloseCommand, TtlContextPayload};
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = TtlCloseCommand::ExecuteTtlClose {
@@ -5691,7 +5783,7 @@ impl crate::scp::PyScp {
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
                 .map_err(|e| typed_supervisor_failure("TTL expiry handling", &e))?;
             Ok::<(), PyErr>(())
-        })?;
+        })??;
 
         // Update FFI handle state to reflect expiry.
         let mut state = handle
@@ -5714,6 +5806,7 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, member_did, proposed_seconds))]
     pub fn context_propose_ttl_extension(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         member_did: &str,
         proposed_seconds: u64,
@@ -5721,7 +5814,6 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(member_did)?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -5729,7 +5821,7 @@ impl crate::scp::PyScp {
         let did: scp_did::DID = member_did.to_owned().into();
         let duration = std::time::Duration::from_secs(proposed_seconds);
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::TtlCloseCommand;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = TtlCloseCommand::ExtendTtl {
@@ -5744,7 +5836,7 @@ impl crate::scp::PyScp {
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
                 .map_err(|e| typed_supervisor_failure("TTL extension proposal", &e))
-        })
+        })?
     }
 
     /// Resets the TTL timer after a successful unanimous extension.
@@ -5763,12 +5855,12 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (handle, new_seconds))]
     pub fn context_reset_ttl_timer(
         &self,
+        py: Python<'_>,
         handle: &PyContextHandle,
         new_seconds: u64,
     ) -> PyResult<()> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -5776,7 +5868,7 @@ impl crate::scp::PyScp {
         let core_params = build_core_context_params(&handle.params)?;
         let duration = std::time::Duration::from_secs(new_seconds);
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::{TtlCloseCommand, TtlTimerPayload};
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = TtlCloseCommand::ResetTtlTimer {
@@ -5798,7 +5890,7 @@ impl crate::scp::PyScp {
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
                 .map_err(|e| typed_supervisor_failure("TTL reset", &e))?;
             Ok::<(), PyErr>(())
-        })?;
+        })??;
         Ok(())
     }
 
@@ -5928,6 +6020,7 @@ impl crate::scp::PyScp {
     #[pyo3(name = "access_key_generate", signature = (context_id, member_did, caller_did))]
     pub fn access_key_generate(
         &self,
+        py: Python<'_>,
         context_id: &str,
         member_did: &str,
         caller_did: &str,
@@ -5936,14 +6029,13 @@ impl crate::scp::PyScp {
         validate::validate_context_id(context_id)?;
         validate::validate_did(member_did)?;
         validate::validate_did(caller_did)?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
         let context_id_owned = context_id.to_owned();
         let member_did_owned = member_did.to_owned();
         let caller_did_owned = caller_did.to_owned();
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::LifecycleCommand;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = LifecycleCommand::GenerateContextAccessKey {
@@ -5960,7 +6052,7 @@ impl crate::scp::PyScp {
                     PyRuntimeError::new_err(format!("[SCP-CTX-2070] shim reply dropped: {e}"))
                 })?
                 .map_err(|e| typed_supervisor_failure("[SCP-CTX-2070] access key generation", &e))
-        })
+        })?
     }
 
     /// Revokes (removes) a member's access key from the context's access key
@@ -5975,6 +6067,7 @@ impl crate::scp::PyScp {
     #[pyo3(name = "access_key_revoke", signature = (context_id, member_did, caller_did))]
     pub fn access_key_revoke(
         &self,
+        py: Python<'_>,
         context_id: &str,
         member_did: &str,
         caller_did: &str,
@@ -5983,14 +6076,13 @@ impl crate::scp::PyScp {
         validate::validate_context_id(context_id)?;
         validate::validate_did(member_did)?;
         validate::validate_did(caller_did)?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
         let context_id_owned = context_id.to_owned();
         let member_did_owned = member_did.to_owned();
         let caller_did_owned = caller_did.to_owned();
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::LifecycleCommand;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = LifecycleCommand::RevokeContextAccessKey {
@@ -6007,7 +6099,7 @@ impl crate::scp::PyScp {
                     PyRuntimeError::new_err(format!("[SCP-CTX-2071] shim reply dropped: {e}"))
                 })?
                 .map_err(|e| typed_supervisor_failure("[SCP-CTX-2071] access key revocation", &e))
-        })
+        })?
     }
 
     /// Restores a member's access key by generating a new key at the next
@@ -6022,6 +6114,7 @@ impl crate::scp::PyScp {
     #[pyo3(name = "access_key_restore", signature = (context_id, member_did, caller_did))]
     pub fn access_key_restore(
         &self,
+        py: Python<'_>,
         context_id: &str,
         member_did: &str,
         caller_did: &str,
@@ -6030,14 +6123,13 @@ impl crate::scp::PyScp {
         validate::validate_context_id(context_id)?;
         validate::validate_did(member_did)?;
         validate::validate_did(caller_did)?;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
         let context_id_owned = context_id.to_owned();
         let member_did_owned = member_did.to_owned();
         let caller_did_owned = caller_did.to_owned();
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::LifecycleCommand;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = LifecycleCommand::RestoreContextAccessKey {
@@ -6054,7 +6146,7 @@ impl crate::scp::PyScp {
                     PyRuntimeError::new_err(format!("[SCP-CTX-2072] shim reply dropped: {e}"))
                 })?
                 .map_err(|e| typed_supervisor_failure("[SCP-CTX-2072] access key restoration", &e))
-        })
+        })?
     }
 }
 
@@ -6220,10 +6312,13 @@ mod tests {
     /// exact seam the create/import/join paths share.
     #[test]
     fn encrypted_create_hard_fails_pseudonym_derivation_with_typed_code() {
-        let bi = __bi();
-        let err = derive_member_pseudonym(&bi, "did:dht:z6MkNoSuchIdentity", "ctx-encrypted")
-            .expect_err("encrypted derivation without key material must hard-fail");
-        assert_identity_code(err, codes::IDENT_1054);
+        pyo3::Python::with_gil(|py| {
+            let bi = __bi();
+            let err =
+                derive_member_pseudonym(py, &bi, "did:dht:z6MkNoSuchIdentity", "ctx-encrypted")
+                    .expect_err("encrypted derivation without key material must hard-fail");
+            assert_identity_code(err, codes::IDENT_1054);
+        });
     }
 
     /// Asserts that `err` is an identity error carrying `code`; tests assert
@@ -6288,19 +6383,21 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn member_pseudonym_is_the_routing_id_of_the_host_point() {
-        let bi = __bi();
-        let did = "did:dht:z6MkPseudonymRoutingValue";
-        let key_id = register_fake_callback_identity(&bi, did, None);
-        let routing_id = derive_member_pseudonym(&bi, did, "ctx-routing").expect("derives");
-        let point = crate::custody::test_fakes::fake_pseudonym_point(
-            &crate::custody::test_fakes::fake_context_seed(key_id, b"ctx-routing", None),
-        );
-        assert_eq!(
-            routing_id,
-            scp_crypto::pseudonym::pseudonym_routing_id(
-                &scp_crypto::p256::P256PublicKey::from_sec1(&point).expect("valid point")
-            )
-        );
+        pyo3::Python::with_gil(|py| {
+            let bi = __bi();
+            let did = "did:dht:z6MkPseudonymRoutingValue";
+            let key_id = register_fake_callback_identity(&bi, did, None);
+            let routing_id = derive_member_pseudonym(py, &bi, did, "ctx-routing").expect("derives");
+            let point = crate::custody::test_fakes::fake_pseudonym_point(
+                &crate::custody::test_fakes::fake_context_seed(key_id, b"ctx-routing", None),
+            );
+            assert_eq!(
+                routing_id,
+                scp_crypto::pseudonym::pseudonym_routing_id(
+                    &scp_crypto::p256::P256PublicKey::from_sec1(&point).expect("valid point")
+                )
+            );
+        });
     }
 
     /// A host still returning a 32-byte (Ed25519-era) pseudonym key fails with
@@ -6308,16 +6405,20 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn legacy_host_pseudonym_is_ident_1055_on_point_length() {
-        let bi = __bi();
-        let did = "did:dht:z6MkPseudonymLegacyHost";
-        register_fake_callback_identity(&bi, did, Some("legacy32"));
-        match derive_member_pseudonym(&bi, did, "ctx").expect_err("legacy host key rejected") {
-            crate::error::ScpPyError::IdentityError { code, message } => {
-                assert_eq!(code, codes::IDENT_1055);
-                assert!(message.contains("got 32 bytes"), "{message}");
+        pyo3::Python::with_gil(|py| {
+            let bi = __bi();
+            let did = "did:dht:z6MkPseudonymLegacyHost";
+            register_fake_callback_identity(&bi, did, Some("legacy32"));
+            match derive_member_pseudonym(py, &bi, did, "ctx")
+                .expect_err("legacy host key rejected")
+            {
+                crate::error::ScpPyError::IdentityError { code, message } => {
+                    assert_eq!(code, codes::IDENT_1055);
+                    assert!(message.contains("got 32 bytes"), "{message}");
+                }
+                other => panic!("expected identity error IDENT_1055, got {other:?}"),
             }
-            other => panic!("expected identity error IDENT_1055, got {other:?}"),
-        }
+        });
     }
 
     /// §9.10.4.A: a host that reports key-not-found (`SCP-CRYPTO-4006`) while
@@ -6345,7 +6446,7 @@ mod tests {
             let dict = PyDict::new(py);
             dict.set_item("mode", "encrypted").unwrap();
             dict.set_item("ceiling", vec!["messages:read"]).unwrap();
-            scp.context_create(did, &dict)
+            scp.context_create(py, did, &dict)
                 .expect_err("derivation under a destroyed key must fail")
                 .to_string()
         });
@@ -6428,7 +6529,7 @@ mod tests {
             // Broadcast contexts require MemoryScope::Full (spec §5.14).
             dict.set_item("memory_scope", "full").unwrap();
             let handle = scp
-                .context_create(&creator, &dict)
+                .context_create(py, &creator, &dict)
                 .expect("broadcast context_create should succeed");
             let (custody, key) = crate::runtime::with_identity(&bi, &creator, |entry| {
                 Ok((
@@ -6443,7 +6544,7 @@ mod tests {
                 .expect("destroy_key should succeed");
 
             let err = scp
-                .broadcast_publish(&handle, &creator, b"hi".to_vec())
+                .broadcast_publish(py, &handle, &creator, b"hi".to_vec())
                 .expect_err("broadcast publish with a destroyed signing key must fail")
                 .to_string();
             assert!(
@@ -6472,7 +6573,7 @@ mod tests {
         dict.set_item("memory_scope", "full").unwrap();
         dict.set_item("ceiling", vec!["messages:write"]).unwrap();
         let handle = scp
-            .context_create(&creator, &dict)
+            .context_create(py, &creator, &dict)
             .expect("broadcast context_create should succeed");
         let (custody, key) = crate::runtime::with_identity(&bi, &creator, |entry| {
             Ok((
@@ -6501,6 +6602,7 @@ mod tests {
             let (_bi, _creator, context_id) = broadcast_context_with_destroyed_active_key(py, &scp);
             let err = scp
                 .ucan_mint(
+                    py,
                     &context_id,
                     "did:dht:z6MkMember",
                     vec!["messages:write".to_owned()],
@@ -6528,7 +6630,7 @@ mod tests {
             let scp = crate::scp::PyScp::new_in_memory_for_test();
             let (_bi, creator, context_id) = broadcast_context_with_destroyed_active_key(py, &scp);
             let err = scp
-                .event_log_checkpoint(&context_id, &creator, 0)
+                .event_log_checkpoint(py, &context_id, &creator, 0)
                 .expect_err("a checkpoint under a destroyed signing key must fail")
                 .to_string();
             assert!(
@@ -6597,21 +6699,23 @@ mod tests {
     /// raising 1054.
     #[test]
     fn encrypted_join_hard_fails_pseudonym_derivation_with_typed_code() {
-        crate::init_runtime().ok();
-        let bi_arc = __bi();
-        let scp = crate::scp::PyScp {
-            inner: std::sync::Arc::clone(&bi_arc),
-        };
-        let handle =
-            active_handle_for_mode(&bi_arc, "did:dht:z6MkEncryptedJoinCreator", "encrypted");
-        let err = scp
-            .context_join(&handle, "did:dht:z6MkNoSuchJoinerIdentity", None)
-            .expect_err("encrypted join without joiner key material must hard-fail");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("SCP-IDENT-1054"),
-            "expected encrypted-join missing-key-material code SCP-IDENT-1054, got: {msg}"
-        );
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi_arc = __bi();
+            let scp = crate::scp::PyScp {
+                inner: std::sync::Arc::clone(&bi_arc),
+            };
+            let handle =
+                active_handle_for_mode(&bi_arc, "did:dht:z6MkEncryptedJoinCreator", "encrypted");
+            let err = scp
+                .context_join(py, &handle, "did:dht:z6MkNoSuchJoinerIdentity", None)
+                .expect_err("encrypted join without joiner key material must hard-fail");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("SCP-IDENT-1054"),
+                "expected encrypted-join missing-key-material code SCP-IDENT-1054, got: {msg}"
+            );
+        });
     }
 
     /// §5.14 / §9.10.4: a BROADCAST `context_join` SKIPS pseudonym derivation.
@@ -6633,29 +6737,31 @@ mod tests {
     /// test above, the pair fully pins the mode branch at `context.rs:2017`.
     #[test]
     fn broadcast_join_skips_pseudonym_derivation() {
-        crate::init_runtime().ok();
-        let bi_arc = __bi();
-        let scp = crate::scp::PyScp {
-            inner: std::sync::Arc::clone(&bi_arc),
-        };
-        let handle =
-            active_handle_for_mode(&bi_arc, "did:dht:z6MkBroadcastJoinCreator", "broadcast");
-        // The join MUST get past the lifecycle gate and MUST NOT fail at the
-        // derivation seam.
-        let result = scp.context_join(&handle, "did:dht:z6MkNoSuchJoinerIdentity", None);
-        if let Err(err) = result {
-            let msg = err.to_string();
-            assert!(
-                !msg.contains("SCP-CTX-2013") && !msg.contains("has no live supervisor state"),
-                "broadcast join must pass the lifecycle gate to reach the mode gate: {msg}"
-            );
-            assert!(
-                !msg.contains("SCP-IDENT-1054")
-                    && !msg.contains("SCP-IDENT-1055")
-                    && !msg.contains("SCP-IDENT-1057"),
-                "broadcast join must skip derivation — got a derivation-code error: {msg}"
-            );
-        }
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi_arc = __bi();
+            let scp = crate::scp::PyScp {
+                inner: std::sync::Arc::clone(&bi_arc),
+            };
+            let handle =
+                active_handle_for_mode(&bi_arc, "did:dht:z6MkBroadcastJoinCreator", "broadcast");
+            // The join MUST get past the lifecycle gate and MUST NOT fail at the
+            // derivation seam.
+            let result = scp.context_join(py, &handle, "did:dht:z6MkNoSuchJoinerIdentity", None);
+            if let Err(err) = result {
+                let msg = err.to_string();
+                assert!(
+                    !msg.contains("SCP-CTX-2013") && !msg.contains("has no live supervisor state"),
+                    "broadcast join must pass the lifecycle gate to reach the mode gate: {msg}"
+                );
+                assert!(
+                    !msg.contains("SCP-IDENT-1054")
+                        && !msg.contains("SCP-IDENT-1055")
+                        && !msg.contains("SCP-IDENT-1057"),
+                    "broadcast join must skip derivation — got a derivation-code error: {msg}"
+                );
+            }
+        });
     }
 
     /// §5.14 / §9.10.4: the `context_create` MODE GATE at `context.rs:1799`
@@ -6692,7 +6798,7 @@ mod tests {
             let dict = PyDict::new(py);
             dict.set_item("mode", "encrypted").unwrap();
             dict.set_item("ceiling", vec!["messages:read"]).unwrap();
-            scp.context_create("did:dht:z6MkNoSuchCreateCreatorEnc", &dict)
+            scp.context_create(py, "did:dht:z6MkNoSuchCreateCreatorEnc", &dict)
                 .expect_err("encrypted create without creator key material must hard-fail")
                 .to_string()
         });
@@ -6709,7 +6815,7 @@ mod tests {
             // Broadcast contexts require MemoryScope::Full (spec §5.14).
             dict.set_item("memory_scope", "full").unwrap();
             dict.set_item("ceiling", vec!["messages:read"]).unwrap();
-            scp.context_create("did:dht:z6MkNoSuchCreateCreatorBcast", &dict)
+            scp.context_create(py, "did:dht:z6MkNoSuchCreateCreatorBcast", &dict)
                 .expect("broadcast create must succeed without pseudonym derivation")
         });
         assert_eq!(
@@ -6734,19 +6840,21 @@ mod tests {
     /// `spawn_from_welcome_tests.rs` and by the Python E2E harness.
     #[test]
     fn reserve_key_package_rejects_non_locally_custodied_identity() {
-        crate::init_runtime().ok();
-        let bi_arc = __bi();
-        let scp = crate::scp::PyScp {
-            inner: std::sync::Arc::clone(&bi_arc),
-        };
-        let err = scp
-            .reserve_key_package("did:dht:z6MkNoSuchReserveIdentity")
-            .expect_err("reserve for a non-locally-custodied identity must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("not found in registry"),
-            "expected local-custody rejection (identity not found in registry), got: {msg}"
-        );
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi_arc = __bi();
+            let scp = crate::scp::PyScp {
+                inner: std::sync::Arc::clone(&bi_arc),
+            };
+            let err = scp
+                .reserve_key_package(py, "did:dht:z6MkNoSuchReserveIdentity")
+                .expect_err("reserve for a non-locally-custodied identity must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not found in registry"),
+                "expected local-custody rejection (identity not found in registry), got: {msg}"
+            );
+        });
     }
 
     /// ADR-049 Phase 2J: `context_join_from_welcome` enforces local custody of
@@ -6765,33 +6873,36 @@ mod tests {
     /// (a bogus reservation / bundle), not with `SCP-IDENT-1054`.
     #[test]
     fn context_join_from_welcome_rejects_non_locally_custodied_joiner() {
-        crate::init_runtime().ok();
-        let bi_arc = __bi();
-        let scp = crate::scp::PyScp {
-            inner: std::sync::Arc::clone(&bi_arc),
-        };
-        let err = Python::with_gil(|_py| {
-            // A well-formed 32-byte `enc` so the failure isolates the custody
-            // gate (which runs BEFORE the enc-length check), not a length
-            // rejection.
-            let sealed = __sealed(
-                &"0".repeat(64),
-                "did:dht:z6MkSomeCreator",
-                vec![0u8; 32],
-                b"not-a-real-bundle".to_vec(),
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi_arc = __bi();
+            let scp = crate::scp::PyScp {
+                inner: std::sync::Arc::clone(&bi_arc),
+            };
+            let err = Python::with_gil(|_py| {
+                // A well-formed 32-byte `enc` so the failure isolates the custody
+                // gate (which runs BEFORE the enc-length check), not a length
+                // rejection.
+                let sealed = __sealed(
+                    &"0".repeat(64),
+                    "did:dht:z6MkSomeCreator",
+                    vec![0u8; 32],
+                    b"not-a-real-bundle".to_vec(),
+                );
+                scp.context_join_from_welcome(
+                    py,
+                    "did:dht:z6MkNoSuchJoinFromWelcomeJoiner".to_owned(),
+                    sealed,
+                    "not-a-real-reservation".to_owned(),
+                )
+                .expect_err("join-from-Welcome for a non-locally-custodied joiner must be rejected")
+                .to_string()
+            });
+            assert!(
+                err.contains("SCP-IDENT-1054"),
+                "expected joiner local-custody hard-fail SCP-IDENT-1054, got: {err}"
             );
-            scp.context_join_from_welcome(
-                "did:dht:z6MkNoSuchJoinFromWelcomeJoiner".to_owned(),
-                sealed,
-                "not-a-real-reservation".to_owned(),
-            )
-            .expect_err("join-from-Welcome for a non-locally-custodied joiner must be rejected")
-            .to_string()
         });
-        assert!(
-            err.contains("SCP-IDENT-1054"),
-            "expected joiner local-custody hard-fail SCP-IDENT-1054, got: {err}"
-        );
     }
 
     /// ADR-049 Phase 2J / FFI-02 Option A (reshape): the reshaped
@@ -6828,7 +6939,12 @@ mod tests {
                 b"bogus-ciphertext".to_vec(),
             );
             let err = scp
-                .context_join_from_welcome(joiner_did, sealed, "bogus-reservation-id".to_owned())
+                .context_join_from_welcome(
+                    py,
+                    joiner_did,
+                    sealed,
+                    "bogus-reservation-id".to_owned(),
+                )
                 .expect_err("a non-32-byte HPKE enc must be rejected at the bridge boundary")
                 .to_string();
             assert!(
@@ -6887,7 +7003,12 @@ mod tests {
             );
 
             let err = scp
-                .context_join_from_welcome(joiner_did, sealed, "bogus-reservation-id".to_owned())
+                .context_join_from_welcome(
+                    py,
+                    joiner_did,
+                    sealed,
+                    "bogus-reservation-id".to_owned(),
+                )
                 .expect_err("join with a bogus sealed bundle must fail at the runtime layer");
             let msg = err.to_string();
             assert!(
@@ -6954,7 +7075,12 @@ mod tests {
                 b"bogus-bundle-ciphertext".to_vec(),
             );
             let err = scp
-                .context_join_from_welcome(joiner_did, sealed, "bogus-reservation-id".to_owned())
+                .context_join_from_welcome(
+                    py,
+                    joiner_did,
+                    sealed,
+                    "bogus-reservation-id".to_owned(),
+                )
                 .expect_err("a join under a destroyed #active key must fail")
                 .to_string();
             assert!(
@@ -7007,7 +7133,12 @@ mod tests {
             );
 
             let err = scp
-                .context_join_from_welcome(joiner_did, sealed, "bogus-reservation-id".to_owned())
+                .context_join_from_welcome(
+                    py,
+                    joiner_did,
+                    sealed,
+                    "bogus-reservation-id".to_owned(),
+                )
                 .expect_err("join into an already-registered context must be rejected");
             let msg = err.to_string();
             assert!(
@@ -7082,7 +7213,7 @@ mod tests {
                 .unwrap();
             params.set_item("governance", "single_admin").unwrap();
             let _handle = scp
-                .context_create(&creator_did, &params)
+                .context_create(py, &creator_did, &params)
                 .expect("encrypted single-admin context_create succeeds");
 
             // (a) A custodied inviter into a NON-EXISTENT context: signing-key
@@ -7090,6 +7221,7 @@ mod tests {
             let unknown_ctx = "d".repeat(64);
             let err_unknown = scp
                 .invite_member(
+                    py,
                     unknown_ctx,
                     creator_did,
                     "did:dht:z6MkInviteeUnknownCtx".to_owned(),
@@ -7107,6 +7239,7 @@ mod tests {
             // resolution, before any context lookup.
             let err_uncustodied = scp
                 .invite_member(
+                    py,
                     "e".repeat(64),
                     "did:dht:z6MkNoSuchInviterIdentity".to_owned(),
                     "did:dht:z6MkInviteeUncustodied".to_owned(),
@@ -7173,11 +7306,11 @@ mod tests {
                 )
                 .unwrap();
             let handle = scp
-                .context_create(&creator_did, &params)
+                .context_create(py, &creator_did, &params)
                 .expect("encrypted context_create with a custodied creator succeeds");
             let ctx_id = handle.context_id.clone();
 
-            scp.context_join(&handle, &joiner_did, None)
+            scp.context_join(py, &handle, &joiner_did, None)
                 .expect("plain encrypted join with a custodied joiner succeeds");
 
             // The joiner's own known-context discovery entry now exists, keyed to
@@ -7937,36 +8070,38 @@ mod tests {
     /// — the forgery cannot apply a phantom action as a side effect.
     #[test]
     fn direct_execute_rejection_does_not_mutate_state() {
-        crate::init_runtime().ok();
-        let creator = "did:key:z6MkCreatorForgery2";
-        let victim = "did:key:z6MkVictimNeverAdded";
-        let (bi, ctx_id) = setup_singleadmin_ctx(creator, "exec-forgery-state");
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let creator = "did:key:z6MkCreatorForgery2";
+            let victim = "did:key:z6MkVictimNeverAdded";
+            let (bi, ctx_id) = setup_singleadmin_ctx(creator, "exec-forgery-state");
 
-        // Snapshot membership before the forged execute.
-        assert!(
-            !crate::runtime::live_role_state(&bi, &ctx_id)
-                .unwrap()
-                .members
-                .contains(victim),
-            "victim must not be a member before the forged execute"
-        );
+            // Snapshot membership before the forged execute.
+            assert!(
+                !crate::runtime::live_role_state(py, &bi, &ctx_id)
+                    .unwrap()
+                    .members
+                    .contains(victim),
+                "victim must not be a member before the forged execute"
+            );
 
-        let fabricated = [0x11u8; 32];
-        let result = test_dispatch_execute_by_id(&bi, &ctx_id, fabricated);
-        assert!(
-            result.is_err(),
-            "forged direct-execute must be rejected, got: {result:?}"
-        );
+            let fabricated = [0x11u8; 32];
+            let result = test_dispatch_execute_by_id(&bi, &ctx_id, fabricated);
+            assert!(
+                result.is_err(),
+                "forged direct-execute must be rejected, got: {result:?}"
+            );
 
-        // Membership must be unchanged: no phantom AddMember took effect.
-        assert!(
-            !crate::runtime::live_role_state(&bi, &ctx_id)
-                .unwrap()
-                .members
-                .contains(victim),
-            "rejected forgery must not have added the victim as a member"
-        );
-        crate::runtime::remove_context(&bi, &ctx_id);
+            // Membership must be unchanged: no phantom AddMember took effect.
+            assert!(
+                !crate::runtime::live_role_state(py, &bi, &ctx_id)
+                    .unwrap()
+                    .members
+                    .contains(victim),
+                "rejected forgery must not have added the victim as a member"
+            );
+            crate::runtime::remove_context(&bi, &ctx_id);
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -7981,64 +8116,66 @@ mod tests {
     /// close removes the state.
     #[test]
     fn unauthorized_close_leaves_ffi_state_intact() {
-        crate::init_runtime().ok();
-        let ctx_id = format!("close-auth-{}", uuid::Uuid::new_v4());
-        let creator = "did:key:z6MkCloseCreator1";
-        let intruder = "did:key:z6MkCloseIntruder1";
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let ctx_id = format!("close-auth-{}", uuid::Uuid::new_v4());
+            let creator = "did:key:z6MkCloseCreator1";
+            let intruder = "did:key:z6MkCloseIntruder1";
 
-        // Use the SAME bridge instance for FFI-state registration, actor
-        // creation, the handle stamp, and the `context_close` call — the
-        // handle-affinity check rejects a mismatched instance.
-        let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let bi = scp.inner.clone();
+            // Use the SAME bridge instance for FFI-state registration, actor
+            // creation, the handle stamp, and the `context_close` call — the
+            // handle-affinity check rejects a mismatched instance.
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = scp.inner.clone();
 
-        crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
-        let sup = crate::runtime::supervisor(&bi).unwrap();
-        let rt = crate::runtime().unwrap();
-        rt.block_on(sup.create_context(
-            ctx_id.clone(),
-            scp_core::context::ContextParams {
-                ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
-                ..scp_core::context::ContextParams::default()
-            },
-            scp_did::DID(creator.to_owned()),
-            None,
-        ))
-        .unwrap();
+            crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
+            let sup = crate::runtime::supervisor(&bi).unwrap();
+            let rt = crate::runtime().unwrap();
+            rt.block_on(sup.create_context(
+                ctx_id.clone(),
+                scp_core::context::ContextParams {
+                    ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
+                    ..scp_core::context::ContextParams::default()
+                },
+                scp_did::DID(creator.to_owned()),
+                None,
+            ))
+            .unwrap();
 
-        // Mint the handle off the same instance and mark it active so the
-        // close passes the bridge-side state gate and reaches the dispatch.
-        let handle =
-            PyContextHandle::new(&bi, ctx_id.clone(), creator.to_owned(), default_params());
-        "active".clone_into(&mut handle.state.lock().unwrap());
+            // Mint the handle off the same instance and mark it active so the
+            // close passes the bridge-side state gate and reaches the dispatch.
+            let handle =
+                PyContextHandle::new(&bi, ctx_id.clone(), creator.to_owned(), default_params());
+            "active".clone_into(&mut handle.state.lock().unwrap());
 
-        // The intruder is not a member and holds no `ContextClose`
-        // capability → the actor close handler rejects with
-        // `PermissionDenied`.
-        let result = scp.context_close(&handle, intruder);
-        assert!(
-            result.is_err(),
-            "unauthorized close must be rejected by the supervisor"
-        );
-
-        // The FFI bridge state must still be present — the context is usable
-        // through the bridge. `with_context` succeeding proves the state was
-        // not torn down by the failed close.
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert_eq!(
-                st.event_log.context_id(),
-                ctx_id,
-                "FFI bridge state must survive a failed close"
+            // The intruder is not a member and holds no `ContextClose`
+            // capability → the actor close handler rejects with
+            // `PermissionDenied`.
+            let result = scp.context_close(py, &handle, intruder);
+            assert!(
+                result.is_err(),
+                "unauthorized close must be rejected by the supervisor"
             );
-            Ok(())
-        })
-        .expect("FFI bridge state must remain registered after a failed close");
 
-        // The bridge handle state must also remain "active" (the failed
-        // close returned before the transition to "closed").
-        assert_eq!(*handle.state.lock().unwrap(), "active");
+            // The FFI bridge state must still be present — the context is usable
+            // through the bridge. `with_context` succeeding proves the state was
+            // not torn down by the failed close.
+            crate::runtime::with_context(&bi, &ctx_id, |st| {
+                assert_eq!(
+                    st.event_log.context_id(),
+                    ctx_id,
+                    "FFI bridge state must survive a failed close"
+                );
+                Ok(())
+            })
+            .expect("FFI bridge state must remain registered after a failed close");
 
-        crate::runtime::remove_context(&bi, &ctx_id);
+            // The bridge handle state must also remain "active" (the failed
+            // close returned before the transition to "closed").
+            assert_eq!(*handle.state.lock().unwrap(), "active");
+
+            crate::runtime::remove_context(&bi, &ctx_id);
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -8290,12 +8427,13 @@ mod tests {
     /// that divergence with the bridge's own entry point rather than by writing
     /// supervisor state directly.
     fn close_context_behind_the_handle(
+        py: Python<'_>,
         scp: &crate::scp::PyScp,
         handle: &PyContextHandle,
         creator_did: &str,
     ) {
         let closer = active_handle_for(&scp.inner, &handle.context_id, creator_did);
-        scp.context_close(&closer, creator_did)
+        scp.context_close(py, &closer, creator_did)
             .expect("fixture close");
         assert_eq!(
             *handle.state.lock().unwrap(),
@@ -8421,29 +8559,31 @@ mod tests {
     /// success also shows that no `CloseContext` dispatch ran.
     #[test]
     fn close_releases_a_closed_context_without_a_dispatch() {
-        let creator = "did:dht:z6MkClosedReleaseCreator";
-        let outsider = "did:dht:z6MkClosedReleaseOutsider";
-        let (scp, handle) = lifecycle_fixture("a9", creator);
-        close_context_behind_the_handle(&scp, &handle, creator);
-        scp.finalize_close(&handle).expect("finalize_close");
-        // The fixture close left a release mark, so the test readmits the id
-        // and rebuilds its bridge state in one step.
-        crate::runtime::readmit_and_register_ffi_state(&scp.inner, handle.context_id(), &[])
-            .expect("re-register the bridge state the fixture close released");
-        assert_eq!(
-            crate::runtime::read_live_context_state(&scp.inner, handle.context_id())
-                .expect("state read"),
-            Some(scp_core::context::ContextState::Closed),
-            "the fixture must leave the supervisor reporting Closed"
-        );
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkClosedReleaseCreator";
+            let outsider = "did:dht:z6MkClosedReleaseOutsider";
+            let (scp, handle) = lifecycle_fixture("a9", creator);
+            close_context_behind_the_handle(py, &scp, &handle, creator);
+            scp.finalize_close(py, &handle).expect("finalize_close");
+            // The fixture close left a release mark, so the test readmits the id
+            // and rebuilds its bridge state in one step.
+            crate::runtime::readmit_and_register_ffi_state(&scp.inner, handle.context_id(), &[])
+                .expect("re-register the bridge state the fixture close released");
+            assert_eq!(
+                crate::runtime::read_live_context_state(py, &scp.inner, handle.context_id())
+                    .expect("state read"),
+                Some(scp_core::context::ContextState::Closed),
+                "the fixture must leave the supervisor reporting Closed"
+            );
 
-        scp.context_close(&handle, outsider)
-            .expect("close must release a Closed context");
-        assert!(
-            !crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
-            "a close of a Closed context must release the bridge state"
-        );
-        assert_eq!(handle.state().expect("state"), "closed");
+            scp.context_close(py, &handle, outsider)
+                .expect("close must release a Closed context");
+            assert!(
+                !crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
+                "a close of a Closed context must release the bridge state"
+            );
+            assert_eq!(handle.state().expect("state"), "closed");
+        });
     }
 
     /// A close whose dispatch succeeds finishes, and writes the handle's
@@ -8454,33 +8594,35 @@ mod tests {
     /// ran, and this case would fail.
     #[test]
     fn close_finishes_when_the_handle_state_lock_is_poisoned() {
-        let creator = "did:dht:z6MkPoisonedLockCreator";
-        let (scp, handle) = lifecycle_fixture("ab", creator);
-        let state = Arc::clone(&handle.state);
-        std::thread::spawn(move || {
-            let _guard = state.lock().unwrap();
-            panic!("poison the handle's state lock");
-        })
-        .join()
-        .expect_err("the poisoning thread must panic");
-        assert!(
-            handle.state.is_poisoned(),
-            "the fixture must poison the lock"
-        );
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkPoisonedLockCreator";
+            let (scp, handle) = lifecycle_fixture("ab", creator);
+            let state = Arc::clone(&handle.state);
+            std::thread::spawn(move || {
+                let _guard = state.lock().unwrap();
+                panic!("poison the handle's state lock");
+            })
+            .join()
+            .expect_err("the poisoning thread must panic");
+            assert!(
+                handle.state.is_poisoned(),
+                "the fixture must poison the lock"
+            );
 
-        scp.context_close(&handle, creator)
-            .expect("close must finish on a poisoned state lock");
-        assert!(
-            !crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
-            "the close must release the bridge state"
-        );
-        assert_eq!(
-            *handle
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            "closed"
-        );
+            scp.context_close(py, &handle, creator)
+                .expect("close must finish on a poisoned state lock");
+            assert!(
+                !crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
+                "the close must release the bridge state"
+            );
+            assert_eq!(
+                *handle
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                "closed"
+            );
+        });
     }
 
     /// A close whose lifecycle read reports `Expired` or `Tombstoned` succeeds
@@ -8491,28 +8633,31 @@ mod tests {
     /// `close_decision` fails this case.
     #[test]
     fn close_releases_an_expired_or_tombstoned_context_without_a_dispatch() {
-        for (prefix, state) in [
-            ("b1", scp_core::context::ContextState::Expired),
-            ("b2", scp_core::context::ContextState::Tombstoned),
-        ] {
-            crate::init_runtime().ok();
-            let bi = __bi();
-            let creator = "did:dht:z6MkTerminalReleaseCreator";
-            let context_id = format!("{prefix}{}", "0".repeat(56));
-            crate::runtime::init_context_manager_for_test(&bi);
-            crate::runtime::register_context(&bi, &context_id, creator, &[])
-                .expect("fixture registration");
-            let handle = active_handle_for(&bi, &context_id, creator);
-            let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        pyo3::Python::with_gil(|py| {
+            for (prefix, state) in [
+                ("b1", scp_core::context::ContextState::Expired),
+                ("b2", scp_core::context::ContextState::Tombstoned),
+            ] {
+                crate::init_runtime().ok();
+                let bi = __bi();
+                let creator = "did:dht:z6MkTerminalReleaseCreator";
+                let context_id = format!("{prefix}{}", "0".repeat(56));
+                crate::runtime::init_context_manager_for_test(&bi);
+                crate::runtime::register_context(&bi, &context_id, creator, &[])
+                    .expect("fixture registration");
+                let handle = active_handle_for(&bi, &context_id, creator);
+                let sup =
+                    std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
 
-            super::close_context_on(&bi, &handle, creator, &sup, Some(&state))
-                .unwrap_or_else(|e| panic!("close must release a {state:?} context: {e}"));
-            assert!(
-                !crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
-                "a close of a {state:?} context must release the bridge state"
-            );
-            assert_eq!(handle.state().expect("state"), "closed");
-        }
+                super::close_context_on(py, &bi, &handle, creator, &sup, Some(&state))
+                    .unwrap_or_else(|e| panic!("close must release a {state:?} context: {e}"));
+                assert!(
+                    !crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+                    "a close of a {state:?} context must release the bridge state"
+                );
+                assert_eq!(handle.state().expect("state"), "closed");
+            }
+        });
     }
 
     /// Every lifecycle-gated entry point refuses once the supervisor reports a
@@ -8530,68 +8675,70 @@ mod tests {
     /// hides.
     #[test]
     fn lifecycle_gates_refuse_a_context_the_supervisor_closed() {
-        let creator = "did:dht:z6MkLifecycleGateCreator";
-        let member = "did:dht:z6MkLifecycleGateMember";
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkLifecycleGateCreator";
+            let member = "did:dht:z6MkLifecycleGateMember";
 
-        let (scp, handle) = lifecycle_fixture("a1", creator);
-        close_context_behind_the_handle(&scp, &handle, creator);
+            let (scp, handle) = lifecycle_fixture("a1", creator);
+            close_context_behind_the_handle(py, &scp, &handle, creator);
 
-        let join = scp
-            .context_join(&handle, member, None)
-            .expect_err("join must refuse a closed context");
-        assert!(
-            join.to_string()
-                .contains("cannot join context in 'closing'")
-                && join.to_string().contains(codes::CTX_2013),
-            "join reported: {join}"
-        );
+            let join = scp
+                .context_join(py, &handle, member, None)
+                .expect_err("join must refuse a closed context");
+            assert!(
+                join.to_string()
+                    .contains("cannot join context in 'closing'")
+                    && join.to_string().contains(codes::CTX_2013),
+                "join reported: {join}"
+            );
 
-        let leave = scp
-            .context_leave(&handle, member)
-            .expect_err("leave must refuse a closed context");
-        assert!(
-            leave
-                .to_string()
-                .contains("cannot leave context in 'closing'")
-                && leave.to_string().contains(codes::CTX_2015),
-            "leave reported: {leave}"
-        );
+            let leave = scp
+                .context_leave(py, &handle, member)
+                .expect_err("leave must refuse a closed context");
+            assert!(
+                leave
+                    .to_string()
+                    .contains("cannot leave context in 'closing'")
+                    && leave.to_string().contains(codes::CTX_2015),
+                "leave reported: {leave}"
+            );
 
-        let send = Python::with_gil(|py| {
-            let payload = pyo3::types::PyBytes::new(py, b"hello");
-            scp.context_send(&handle, creator, payload.as_any(), None)
-                .expect_err("send must refuse a closed context")
+            let send = Python::with_gil(|py| {
+                let payload = pyo3::types::PyBytes::new(py, b"hello");
+                scp.context_send(py, &handle, creator, payload.as_any(), None)
+                    .expect_err("send must refuse a closed context")
+            });
+            assert!(
+                send.to_string()
+                    .contains("cannot send to context in 'closing'")
+                    && send.to_string().contains(codes::CTX_2019),
+                "send reported: {send}"
+            );
+
+            let receive = scp
+                .context_receive(py, &handle)
+                .err()
+                .expect("receive must refuse a closed context");
+            assert!(
+                receive
+                    .to_string()
+                    .contains("cannot receive from context in 'closing'")
+                    && receive.to_string().contains(codes::CTX_2021),
+                "receive reported: {receive}"
+            );
+
+            // Close refuses the closing window too.
+            let close = scp
+                .context_close(py, &handle, creator)
+                .expect_err("close must refuse a context inside its closing window");
+            assert!(
+                close
+                    .to_string()
+                    .contains("cannot close context in 'closing'")
+                    && close.to_string().contains(codes::CTX_2017),
+                "close reported: {close}"
+            );
         });
-        assert!(
-            send.to_string()
-                .contains("cannot send to context in 'closing'")
-                && send.to_string().contains(codes::CTX_2019),
-            "send reported: {send}"
-        );
-
-        let receive = scp
-            .context_receive(&handle)
-            .err()
-            .expect("receive must refuse a closed context");
-        assert!(
-            receive
-                .to_string()
-                .contains("cannot receive from context in 'closing'")
-                && receive.to_string().contains(codes::CTX_2021),
-            "receive reported: {receive}"
-        );
-
-        // Close refuses the closing window too.
-        let close = scp
-            .context_close(&handle, creator)
-            .expect_err("close must refuse a context inside its closing window");
-        assert!(
-            close
-                .to_string()
-                .contains("cannot close context in 'closing'")
-                && close.to_string().contains(codes::CTX_2017),
-            "close reported: {close}"
-        );
     }
 
     /// A `CloseContext` dispatch that fails releases none of the context's
@@ -8604,62 +8751,67 @@ mod tests {
     /// dispatch removes the bridge state here and fails this case.
     #[test]
     fn close_whose_dispatch_fails_keeps_bridge_state() {
-        let creator = "did:dht:z6MkFailedDispatchCreator";
-        let (scp, handle) = lifecycle_fixture("c1", creator);
-        close_context_behind_the_handle(&scp, &handle, creator);
-        // The fixture close left a release mark, so the test readmits the id
-        // and rebuilds its bridge state in one step.
-        crate::runtime::readmit_and_register_ffi_state(&scp.inner, handle.context_id(), &[])
-            .expect("re-register the bridge state the fixture close released");
-        assert_eq!(
-            crate::runtime::read_live_context_state(&scp.inner, handle.context_id())
-                .expect("state read"),
-            Some(scp_core::context::ContextState::Closing),
-            "the fixture must leave the supervisor reporting Closing"
-        );
-        let sup =
-            std::sync::Arc::clone(crate::runtime::supervisor(&scp.inner).expect("supervisor"));
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkFailedDispatchCreator";
+            let (scp, handle) = lifecycle_fixture("c1", creator);
+            close_context_behind_the_handle(py, &scp, &handle, creator);
+            // The fixture close left a release mark, so the test readmits the id
+            // and rebuilds its bridge state in one step.
+            crate::runtime::readmit_and_register_ffi_state(&scp.inner, handle.context_id(), &[])
+                .expect("re-register the bridge state the fixture close released");
+            assert_eq!(
+                crate::runtime::read_live_context_state(py, &scp.inner, handle.context_id())
+                    .expect("state read"),
+                Some(scp_core::context::ContextState::Closing),
+                "the fixture must leave the supervisor reporting Closing"
+            );
+            let sup =
+                std::sync::Arc::clone(crate::runtime::supervisor(&scp.inner).expect("supervisor"));
 
-        let err = super::close_context_on(
-            &scp.inner,
-            &handle,
-            creator,
-            &sup,
-            Some(&scp_core::context::ContextState::Active),
-        )
-        .expect_err("a close whose dispatch fails must fail");
-        assert!(
-            err.to_string().contains(codes::CTX_2001),
-            "close reported: {err}"
-        );
-        assert!(
-            crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
-            "a failed dispatch must keep the bridge state"
-        );
-        assert_eq!(handle.state().expect("state"), "active");
+            let err = super::close_context_on(
+                py,
+                &scp.inner,
+                &handle,
+                creator,
+                &sup,
+                Some(&scp_core::context::ContextState::Active),
+            )
+            .expect_err("a close whose dispatch fails must fail");
+            assert!(
+                err.to_string().contains(codes::CTX_2001),
+                "close reported: {err}"
+            );
+            assert!(
+                crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
+                "a failed dispatch must keep the bridge state"
+            );
+            assert_eq!(handle.state().expect("state"), "active");
+        });
     }
 
     /// A close that skips its dispatch refuses, and releases nothing, when the
     /// supervisor reports the context `Active` on the read after the skip.
     #[test]
     fn close_keeps_bridge_state_of_a_context_reported_active_after_the_skip() {
-        let creator = "did:dht:z6MkReadmittedCloseCreator";
-        let (scp, handle) = lifecycle_fixture("c2", creator);
-        let sup =
-            std::sync::Arc::clone(crate::runtime::supervisor(&scp.inner).expect("supervisor"));
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkReadmittedCloseCreator";
+            let (scp, handle) = lifecycle_fixture("c2", creator);
+            let sup =
+                std::sync::Arc::clone(crate::runtime::supervisor(&scp.inner).expect("supervisor"));
 
-        let err = super::close_context_on(&scp.inner, &handle, creator, &sup, None)
-            .expect_err("an Active re-read must fail the close");
-        assert!(
-            err.to_string().contains("returned to Active")
-                && err.to_string().contains(codes::CTX_2017),
-            "close reported: {err}"
-        );
-        assert!(
-            crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
-            "an Active re-read must keep the bridge state"
-        );
-        assert_eq!(handle.state().expect("state"), "active");
+            let err = super::close_context_on(py, &scp.inner, &handle, creator, &sup, None)
+                .expect_err("an Active re-read must fail the close");
+            assert!(
+                err.to_string().contains("returned to Active")
+                    && err.to_string().contains(codes::CTX_2017),
+                "close reported: {err}"
+            );
+            assert!(
+                crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
+                "an Active re-read must keep the bridge state"
+            );
+            assert_eq!(handle.state().expect("state"), "active");
+        });
     }
 
     /// `release_context_unless_readmitted` keeps the state of a context the
@@ -8667,45 +8819,49 @@ mod tests {
     /// serves and for one in its closing window.
     #[test]
     fn release_unless_readmitted_keeps_only_an_active_context() {
-        let creator = "did:dht:z6MkReleaseUnlessReadmitted";
-        let (scp, active) = lifecycle_fixture("c3", creator);
-        let sup =
-            std::sync::Arc::clone(crate::runtime::supervisor(&scp.inner).expect("supervisor"));
-        let registry = || crate::runtime::ffi_state_registry(&scp.inner);
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkReleaseUnlessReadmitted";
+            let (scp, active) = lifecycle_fixture("c3", creator);
+            let sup =
+                std::sync::Arc::clone(crate::runtime::supervisor(&scp.inner).expect("supervisor"));
+            let registry = || crate::runtime::ffi_state_registry(&scp.inner);
 
-        assert!(
-            !crate::runtime::release_context_unless_readmitted(
-                &scp.inner,
-                &sup,
-                active.context_id()
-            ),
-            "an Active context must not be released"
-        );
-        assert!(registry().contains_key(active.context_id()));
+            assert!(
+                !crate::runtime::release_context_unless_readmitted(
+                    py,
+                    &scp.inner,
+                    &sup,
+                    active.context_id()
+                ),
+                "an Active context must not be released"
+            );
+            assert!(registry().contains_key(active.context_id()));
 
-        let absent = format!("c4{}", "0".repeat(56));
-        crate::runtime::register_context(&scp.inner, &absent, creator, &[])
-            .expect("fixture registration");
-        assert!(
-            crate::runtime::release_context_unless_readmitted(&scp.inner, &sup, &absent),
-            "a context no actor serves must be released"
-        );
-        assert!(!registry().contains_key(&absent));
+            let absent = format!("c4{}", "0".repeat(56));
+            crate::runtime::register_context(&scp.inner, &absent, creator, &[])
+                .expect("fixture registration");
+            assert!(
+                crate::runtime::release_context_unless_readmitted(py, &scp.inner, &sup, &absent),
+                "a context no actor serves must be released"
+            );
+            assert!(!registry().contains_key(&absent));
 
-        close_context_behind_the_handle(&scp, &active, creator);
-        // The fixture close left a release mark, so the test readmits the id
-        // and rebuilds its bridge state in one step.
-        crate::runtime::readmit_and_register_ffi_state(&scp.inner, active.context_id(), &[])
-            .expect("re-register the bridge state the fixture close released");
-        assert!(
-            crate::runtime::release_context_unless_readmitted(
-                &scp.inner,
-                &sup,
-                active.context_id()
-            ),
-            "a Closing context must be released"
-        );
-        assert!(!registry().contains_key(active.context_id()));
+            close_context_behind_the_handle(py, &scp, &active, creator);
+            // The fixture close left a release mark, so the test readmits the id
+            // and rebuilds its bridge state in one step.
+            crate::runtime::readmit_and_register_ffi_state(&scp.inner, active.context_id(), &[])
+                .expect("re-register the bridge state the fixture close released");
+            assert!(
+                crate::runtime::release_context_unless_readmitted(
+                    py,
+                    &scp.inner,
+                    &sup,
+                    active.context_id()
+                ),
+                "a Closing context must be released"
+            );
+            assert!(!registry().contains_key(active.context_id()));
+        });
     }
 
     /// `release_context_unless_readmitted` removes this bridge's state and
@@ -8714,38 +8870,43 @@ mod tests {
     #[test]
     #[cfg(feature = "testing")]
     fn release_unless_readmitted_releases_on_a_failed_re_read() {
-        crate::init_runtime().ok();
-        let bi = __bi();
-        let creator = "did:dht:z6MkReleaseOnFailedReRead";
-        let context_id = format!("c5{}", "0".repeat(56));
-        crate::runtime::init_context_manager_for_test(&bi);
-        crate::runtime::register_context(&bi, &context_id, creator, &[])
-            .expect("fixture registration");
-        crate::runtime::create_supervisor_context_for_test(
-            &bi,
-            &context_id,
-            creator,
-            &super::default_ceiling_strings(),
-        );
-        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
-        sup.test_make_actor_unreachable(&context_id);
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi = __bi();
+            let creator = "did:dht:z6MkReleaseOnFailedReRead";
+            let context_id = format!("c5{}", "0".repeat(56));
+            crate::runtime::init_context_manager_for_test(&bi);
+            crate::runtime::register_context(&bi, &context_id, creator, &[])
+                .expect("fixture registration");
+            crate::runtime::create_supervisor_context_for_test(
+                &bi,
+                &context_id,
+                creator,
+                &super::default_ceiling_strings(),
+            );
+            let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+            sup.test_make_actor_unreachable(&context_id);
 
-        let read_err =
-            crate::runtime::read_live_context_state_on(std::sync::Arc::clone(&sup), &context_id)
-                .expect_err("the re-read of an unreachable actor must fail");
-        assert!(
-            read_err.to_string().contains("SCP-CTX-2130"),
-            "the re-read must fail with the actor-busy code, got: {read_err}"
-        );
+            let read_err = crate::runtime::read_live_context_state_on(
+                py,
+                std::sync::Arc::clone(&sup),
+                &context_id,
+            )
+            .expect_err("the re-read of an unreachable actor must fail");
+            assert!(
+                read_err.to_string().contains("SCP-CTX-2130"),
+                "the re-read must fail with the actor-busy code, got: {read_err}"
+            );
 
-        assert!(
-            crate::runtime::release_context_unless_readmitted(&bi, &sup, &context_id),
-            "a failed re-read must release"
-        );
-        assert!(
-            !crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
-            "a failed re-read must remove this bridge's state"
-        );
+            assert!(
+                crate::runtime::release_context_unless_readmitted(py, &bi, &sup, &context_id),
+                "a failed re-read must release"
+            );
+            assert!(
+                !crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+                "a failed re-read must remove this bridge's state"
+            );
+        });
     }
 
     /// A close refuses a context the supervisor holds in the cooperative
@@ -8759,43 +8920,45 @@ mod tests {
     /// state refusal, not a capability check.
     #[test]
     fn close_refuses_a_closing_context_and_keeps_its_bridge_state() {
-        let creator = "did:dht:z6MkClosingWindowCreator";
-        let outsider = "did:dht:z6MkClosingWindowOutsider";
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkClosingWindowCreator";
+            let outsider = "did:dht:z6MkClosingWindowOutsider";
 
-        let (scp, handle) = lifecycle_fixture("a5", creator);
-        // A close through a second handle leaves the supervisor in `Closing`
-        // and releases the bridge state, so re-register the state: this case
-        // asks what a close does to a LIVE entry, not to an absent one.
-        close_context_behind_the_handle(&scp, &handle, creator);
-        // The fixture close left a release mark, so the test readmits the id
-        // and rebuilds its bridge state in one step.
-        crate::runtime::readmit_and_register_ffi_state(&scp.inner, handle.context_id(), &[])
-            .expect("re-register the bridge state the fixture close released");
-        assert_eq!(
-            crate::runtime::read_live_context_state(&scp.inner, handle.context_id())
-                .expect("state read"),
-            Some(scp_core::context::ContextState::Closing),
-            "the fixture must leave the supervisor inside the cooperative closing window"
-        );
+            let (scp, handle) = lifecycle_fixture("a5", creator);
+            // A close through a second handle leaves the supervisor in `Closing`
+            // and releases the bridge state, so re-register the state: this case
+            // asks what a close does to a LIVE entry, not to an absent one.
+            close_context_behind_the_handle(py, &scp, &handle, creator);
+            // The fixture close left a release mark, so the test readmits the id
+            // and rebuilds its bridge state in one step.
+            crate::runtime::readmit_and_register_ffi_state(&scp.inner, handle.context_id(), &[])
+                .expect("re-register the bridge state the fixture close released");
+            assert_eq!(
+                crate::runtime::read_live_context_state(py, &scp.inner, handle.context_id())
+                    .expect("state read"),
+                Some(scp_core::context::ContextState::Closing),
+                "the fixture must leave the supervisor inside the cooperative closing window"
+            );
 
-        let err = scp
-            .context_close(&handle, outsider)
-            .expect_err("close must refuse a context inside its closing window");
-        assert!(
-            err.to_string()
-                .contains("cannot close context in 'closing'")
-                && err.to_string().contains(codes::CTX_2017),
-            "close reported: {err}"
-        );
-        assert!(
-            crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
-            "a refused close must leave the bridge state registered"
-        );
-        assert_eq!(
-            *handle.state.lock().unwrap(),
-            "active",
-            "a refused close must not write the handle's cached string"
-        );
+            let err = scp
+                .context_close(py, &handle, outsider)
+                .expect_err("close must refuse a context inside its closing window");
+            assert!(
+                err.to_string()
+                    .contains("cannot close context in 'closing'")
+                    && err.to_string().contains(codes::CTX_2017),
+                "close reported: {err}"
+            );
+            assert!(
+                crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
+                "a refused close must leave the bridge state registered"
+            );
+            assert_eq!(
+                *handle.state.lock().unwrap(),
+                "active",
+                "a refused close must not write the handle's cached string"
+            );
+        });
     }
 
     /// A close of a context whose actor the supervisor despawned succeeds
@@ -8807,39 +8970,42 @@ mod tests {
     /// the `FfiBridgeState`.
     #[test]
     fn close_after_the_supervisor_despawned_the_actor_releases_bridge_state() {
-        crate::init_runtime().ok();
-        let bi = __bi();
-        let creator = "did:dht:z6MkDespawnedCloseCreator";
-        let context_id = format!("a3{}", "0".repeat(56));
-        crate::runtime::init_context_manager_for_test(&bi);
-        crate::runtime::register_context(&bi, &context_id, creator, &[])
-            .expect("fixture registration");
-        // No `create_supervisor_context_for_test`: this context has no actor,
-        // which is the state a completed TTL expiry leaves behind.
-        assert!(crate::runtime::ffi_state_registry(&bi).contains_key(&context_id));
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi = __bi();
+            let creator = "did:dht:z6MkDespawnedCloseCreator";
+            let context_id = format!("a3{}", "0".repeat(56));
+            crate::runtime::init_context_manager_for_test(&bi);
+            crate::runtime::register_context(&bi, &context_id, creator, &[])
+                .expect("fixture registration");
+            // No `create_supervisor_context_for_test`: this context has no actor,
+            // which is the state a completed TTL expiry leaves behind.
+            assert!(crate::runtime::ffi_state_registry(&bi).contains_key(&context_id));
 
-        let handle = active_handle_for(&bi, &context_id, creator);
-        let scp = crate::scp::PyScp {
-            inner: std::sync::Arc::clone(&bi),
-        };
+            let handle = active_handle_for(&bi, &context_id, creator);
+            let scp = crate::scp::PyScp {
+                inner: std::sync::Arc::clone(&bi),
+            };
 
-        scp.context_close(&handle, creator)
-            .expect("close of a despawned context must succeed idempotently");
-        assert!(
-            !crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
-            "close must release the bridge state for a despawned context"
-        );
-        assert_eq!(handle.state().expect("state"), "closed");
+            scp.context_close(py, &handle, creator)
+                .expect("close of a despawned context must succeed idempotently");
+            assert!(
+                !crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+                "close must release the bridge state for a despawned context"
+            );
+            assert_eq!(handle.state().expect("state"), "closed");
 
-        // A second close stays idempotent: no state to release, no error.
-        scp.context_close(&handle, creator)
-            .expect("a repeated close must stay idempotent");
+            // A second close stays idempotent: no state to release, no error.
+            scp.context_close(py, &handle, creator)
+                .expect("a repeated close must stay idempotent");
+        });
     }
 
     /// Persists a supervisor context, despawns its actor, and marks the id
     /// released on this bridge, the state `restore_context` and
     /// `restore_all_contexts` start from in the tests below.
     fn marked_persisted_context(
+        py: Python<'_>,
         prefix: &str,
     ) -> (std::sync::Arc<crate::runtime::PyBridgeInstance>, String) {
         crate::init_runtime().ok();
@@ -8855,7 +9021,7 @@ mod tests {
         let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
         let rt = crate::runtime().expect("runtime");
         assert!(rt.block_on(sup.despawn_actor(&context_id)));
-        crate::runtime::release_context_unless_readmitted(&bi, &sup, &context_id);
+        crate::runtime::release_context_unless_readmitted(py, &bi, &sup, &context_id);
         assert!(crate::runtime::lock_release_marks(&bi).contains_key(&context_id));
         (bi, context_id)
     }
@@ -8864,28 +9030,32 @@ mod tests {
     /// and leaves the id unmarked.
     #[test]
     fn restore_of_a_marked_context_succeeds_and_clears_the_mark() {
-        let (bi, context_id) = marked_persisted_context("a4");
-        let scp = crate::scp::PyScp {
-            inner: std::sync::Arc::clone(&bi),
-        };
-        scp.restore_context(&context_id)
-            .expect("restoring a marked persisted context must succeed");
-        assert!(!crate::runtime::lock_release_marks(&bi).contains_key(&context_id));
+        pyo3::Python::with_gil(|py| {
+            let (bi, context_id) = marked_persisted_context(py, "a4");
+            let scp = crate::scp::PyScp {
+                inner: std::sync::Arc::clone(&bi),
+            };
+            scp.restore_context(py, &context_id)
+                .expect("restoring a marked persisted context must succeed");
+            assert!(!crate::runtime::lock_release_marks(&bi).contains_key(&context_id));
+        });
     }
 
     /// `restore_all_contexts` lists an id this bridge marked released and
     /// leaves it unmarked.
     #[test]
     fn restore_all_of_a_marked_context_clears_the_mark() {
-        let (bi, context_id) = marked_persisted_context("a5");
-        let scp = crate::scp::PyScp {
-            inner: std::sync::Arc::clone(&bi),
-        };
-        let restored = scp
-            .restore_all_contexts()
-            .expect("restoring persisted contexts must succeed");
-        assert!(restored.contains(&context_id), "{restored}");
-        assert!(!crate::runtime::lock_release_marks(&bi).contains_key(&context_id));
+        pyo3::Python::with_gil(|py| {
+            let (bi, context_id) = marked_persisted_context(py, "a5");
+            let scp = crate::scp::PyScp {
+                inner: std::sync::Arc::clone(&bi),
+            };
+            let restored = scp
+                .restore_all_contexts(py)
+                .expect("restoring persisted contexts must succeed");
+            assert!(restored.contains(&context_id), "{restored}");
+            assert!(!crate::runtime::lock_release_marks(&bi).contains_key(&context_id));
+        });
     }
 
     /// `context_import` of an id this bridge marked released returns the id
@@ -8927,12 +9097,12 @@ mod tests {
 
             assert!(rt.block_on(sup.despawn_actor(&ctx_id)));
             assert!(crate::runtime::release_context_unless_readmitted(
-                &bi, &sup, &ctx_id
+                py, &bi, &sup, &ctx_id
             ));
             assert!(crate::runtime::lock_release_marks(&bi).contains_key(&ctx_id));
 
             let imported = scp
-                .context_import(&exported, &creator)
+                .context_import(py, &exported, &creator)
                 .expect("importing a marked context must succeed");
             assert_eq!(imported, ctx_id);
             assert!(
@@ -8959,44 +9129,46 @@ mod tests {
     #[test]
     #[cfg(feature = "testing")]
     fn close_refuses_a_context_whose_actor_this_bridge_cannot_reach() {
-        crate::init_runtime().ok();
-        let bi = __bi();
-        let creator = "did:dht:z6MkUnreachableActorCreator";
-        let context_id = format!("a6{}", "0".repeat(56));
-        crate::runtime::init_context_manager_for_test(&bi);
-        crate::runtime::register_context(&bi, &context_id, creator, &[])
-            .expect("fixture registration");
-        crate::runtime::create_supervisor_context_for_test(
-            &bi,
-            &context_id,
-            creator,
-            &super::default_ceiling_strings(),
-        );
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi = __bi();
+            let creator = "did:dht:z6MkUnreachableActorCreator";
+            let context_id = format!("a6{}", "0".repeat(56));
+            crate::runtime::init_context_manager_for_test(&bi);
+            crate::runtime::register_context(&bi, &context_id, creator, &[])
+                .expect("fixture registration");
+            crate::runtime::create_supervisor_context_for_test(
+                &bi,
+                &context_id,
+                creator,
+                &super::default_ceiling_strings(),
+            );
 
-        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
-        sup.test_make_actor_unreachable(&context_id);
+            let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+            sup.test_make_actor_unreachable(&context_id);
 
-        let handle = active_handle_for(&bi, &context_id, creator);
-        let scp = crate::scp::PyScp {
-            inner: std::sync::Arc::clone(&bi),
-        };
+            let handle = active_handle_for(&bi, &context_id, creator);
+            let scp = crate::scp::PyScp {
+                inner: std::sync::Arc::clone(&bi),
+            };
 
-        let err = scp
-            .context_close(&handle, creator)
-            .expect_err("a close must refuse a context whose actor did not answer");
-        assert!(
-            err.to_string().contains("SCP-CTX-2130"),
-            "the refusal must report the actor-busy code, got: {err}"
-        );
-        assert!(
-            crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
-            "a refused close must leave the bridge state registered"
-        );
-        assert_eq!(
-            *handle.state.lock().unwrap(),
-            "active",
-            "a refused close must not write the handle's cached string"
-        );
+            let err = scp
+                .context_close(py, &handle, creator)
+                .expect_err("a close must refuse a context whose actor did not answer");
+            assert!(
+                err.to_string().contains("SCP-CTX-2130"),
+                "the refusal must report the actor-busy code, got: {err}"
+            );
+            assert!(
+                crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+                "a refused close must leave the bridge state registered"
+            );
+            assert_eq!(
+                *handle.state.lock().unwrap(),
+                "active",
+                "a refused close must not write the handle's cached string"
+            );
+        });
     }
 
     /// A close refuses a context whose actor the crash watchdog is respawning,
@@ -9013,51 +9185,53 @@ mod tests {
     #[test]
     #[cfg(feature = "testing")]
     fn close_refuses_a_context_the_crash_watchdog_has_not_recovered() {
-        crate::init_runtime().ok();
-        let bi = __bi();
-        let creator = "did:dht:z6MkCrashedCloseCreator";
-        crate::runtime::init_context_manager_for_test(&bi);
-        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
-        let scp = crate::scp::PyScp {
-            inner: std::sync::Arc::clone(&bi),
-        };
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi = __bi();
+            let creator = "did:dht:z6MkCrashedCloseCreator";
+            crate::runtime::init_context_manager_for_test(&bi);
+            let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+            let scp = crate::scp::PyScp {
+                inner: std::sync::Arc::clone(&bi),
+            };
 
-        for (prefix, mid_respawn) in [("a7", true), ("a8", false)] {
-            let context_id = format!("{prefix}{}", "0".repeat(56));
-            crate::runtime::register_context(&bi, &context_id, creator, &[])
-                .expect("fixture registration");
-            crate::runtime::create_supervisor_context_for_test(
-                &bi,
-                &context_id,
-                creator,
-                &super::default_ceiling_strings(),
-            );
-            let tokio_rt = crate::runtime().expect("tokio runtime");
-            if mid_respawn {
-                tokio_rt.block_on(sup.test_hold_context_mid_respawn(&context_id));
-            } else {
-                tokio_rt.block_on(sup.test_fail_context_respawn(&context_id));
-            }
+            for (prefix, mid_respawn) in [("a7", true), ("a8", false)] {
+                let context_id = format!("{prefix}{}", "0".repeat(56));
+                crate::runtime::register_context(&bi, &context_id, creator, &[])
+                    .expect("fixture registration");
+                crate::runtime::create_supervisor_context_for_test(
+                    &bi,
+                    &context_id,
+                    creator,
+                    &super::default_ceiling_strings(),
+                );
+                let tokio_rt = crate::runtime().expect("tokio runtime");
+                if mid_respawn {
+                    tokio_rt.block_on(sup.test_hold_context_mid_respawn(&context_id));
+                } else {
+                    tokio_rt.block_on(sup.test_fail_context_respawn(&context_id));
+                }
 
-            let handle = active_handle_for(&bi, &context_id, creator);
-            let err = scp
-                .context_close(&handle, creator)
-                .expect_err("a close must refuse a context the watchdog has not recovered");
-            assert!(
-                err.to_string().contains("SCP-CTX-2135"),
-                "the refusal must report the actor-crashed code (mid_respawn={mid_respawn}), \
+                let handle = active_handle_for(&bi, &context_id, creator);
+                let err = scp
+                    .context_close(py, &handle, creator)
+                    .expect_err("a close must refuse a context the watchdog has not recovered");
+                assert!(
+                    err.to_string().contains("SCP-CTX-2135"),
+                    "the refusal must report the actor-crashed code (mid_respawn={mid_respawn}), \
                  got: {err}"
-            );
-            assert!(
-                crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
-                "a refused close must leave the bridge state registered (mid_respawn={mid_respawn})"
-            );
-            assert_eq!(
-                *handle.state.lock().unwrap(),
-                "active",
-                "a refused close must not write the handle's cached string"
-            );
-        }
+                );
+                assert!(
+                    crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+                    "a refused close must leave the bridge state registered (mid_respawn={mid_respawn})"
+                );
+                assert_eq!(
+                    *handle.state.lock().unwrap(),
+                    "active",
+                    "a refused close must not write the handle's cached string"
+                );
+            }
+        });
     }
 
     /// A close of a poisoned context refuses and keeps the bridge state for
@@ -9072,52 +9246,54 @@ mod tests {
     #[test]
     #[cfg(feature = "testing")]
     fn close_refuses_a_poisoned_context_and_keeps_its_bridge_state() {
-        crate::init_runtime().ok();
-        let bi = __bi();
-        let creator = "did:dht:z6MkPoisonedCloseCreator";
-        let context_id = format!("a4{}", "0".repeat(56));
-        crate::runtime::init_context_manager_for_test(&bi);
-        crate::runtime::register_context(&bi, &context_id, creator, &[])
-            .expect("fixture registration");
-        crate::runtime::create_supervisor_context_for_test(
-            &bi,
-            &context_id,
-            creator,
-            &super::default_ceiling_strings(),
-        );
-        assert!(crate::runtime::ffi_state_registry(&bi).contains_key(&context_id));
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi = __bi();
+            let creator = "did:dht:z6MkPoisonedCloseCreator";
+            let context_id = format!("a4{}", "0".repeat(56));
+            crate::runtime::init_context_manager_for_test(&bi);
+            crate::runtime::register_context(&bi, &context_id, creator, &[])
+                .expect("fixture registration");
+            crate::runtime::create_supervisor_context_for_test(
+                &bi,
+                &context_id,
+                creator,
+                &super::default_ceiling_strings(),
+            );
+            assert!(crate::runtime::ffi_state_registry(&bi).contains_key(&context_id));
 
-        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
-        crate::runtime()
-            .expect("tokio runtime")
-            .block_on(sup.test_poison_context(&context_id));
-        assert_eq!(
-            crate::runtime::read_live_context_state(&bi, &context_id).expect("state read"),
-            Some(scp_core::context::ContextState::Poisoned),
-            "the fixture must leave the supervisor reporting Poisoned"
-        );
+            let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+            crate::runtime()
+                .expect("tokio runtime")
+                .block_on(sup.test_poison_context(&context_id));
+            assert_eq!(
+                crate::runtime::read_live_context_state(py, &bi, &context_id).expect("state read"),
+                Some(scp_core::context::ContextState::Poisoned),
+                "the fixture must leave the supervisor reporting Poisoned"
+            );
 
-        let handle = active_handle_for(&bi, &context_id, creator);
-        let scp = crate::scp::PyScp {
-            inner: std::sync::Arc::clone(&bi),
-        };
+            let handle = active_handle_for(&bi, &context_id, creator);
+            let scp = crate::scp::PyScp {
+                inner: std::sync::Arc::clone(&bi),
+            };
 
-        let err = scp
-            .context_close(&handle, creator)
-            .expect_err("close of a poisoned context must refuse");
-        assert!(
-            err.to_string().contains(codes::CTX_2134),
-            "a poisoned context must refuse with ContextPoisoned: {err}"
-        );
-        assert!(
-            crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
-            "a refused close must keep the bridge state for a poisoned context"
-        );
-        assert_eq!(
-            handle.state().expect("state"),
-            "active",
-            "a refused close must not write the handle's cached string"
-        );
+            let err = scp
+                .context_close(py, &handle, creator)
+                .expect_err("close of a poisoned context must refuse");
+            assert!(
+                err.to_string().contains(codes::CTX_2134),
+                "a poisoned context must refuse with ContextPoisoned: {err}"
+            );
+            assert!(
+                crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+                "a refused close must keep the bridge state for a poisoned context"
+            );
+            assert_eq!(
+                handle.state().expect("state"),
+                "active",
+                "a refused close must not write the handle's cached string"
+            );
+        });
     }
 
     /// A context no supervisor actor serves fails every lifecycle gate closed.
@@ -9131,53 +9307,55 @@ mod tests {
     /// from an absent answer.
     #[test]
     fn lifecycle_gates_fail_closed_without_a_supervisor_actor() {
-        crate::init_runtime().ok();
-        let bi = __bi();
-        let creator = "did:dht:z6MkNoActorCreator";
-        let context_id = format!("a2{}", "0".repeat(56));
-        crate::runtime::init_context_manager_for_test(&bi);
-        crate::runtime::register_context(&bi, &context_id, creator, &[])
-            .expect("fixture registration");
-        // No `create_supervisor_context_for_test`: this context has no actor.
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi = __bi();
+            let creator = "did:dht:z6MkNoActorCreator";
+            let context_id = format!("a2{}", "0".repeat(56));
+            crate::runtime::init_context_manager_for_test(&bi);
+            crate::runtime::register_context(&bi, &context_id, creator, &[])
+                .expect("fixture registration");
+            // No `create_supervisor_context_for_test`: this context has no actor.
 
-        let handle = active_handle_for(&bi, &context_id, creator);
-        let scp = crate::scp::PyScp {
-            inner: std::sync::Arc::clone(&bi),
-        };
+            let handle = active_handle_for(&bi, &context_id, creator);
+            let scp = crate::scp::PyScp {
+                inner: std::sync::Arc::clone(&bi),
+            };
 
-        // Each refusal carries the gate's own code, not the generic
-        // `SCP-CTX-2001`, so a caller branching on the per-operation code sees
-        // it.
-        let member = "did:dht:z6MkNoActorMember";
-        let join = scp
-            .context_join(&handle, member, None)
-            .expect_err("join must refuse a context no actor serves");
-        let leave = scp
-            .context_leave(&handle, member)
-            .expect_err("leave must refuse a context no actor serves");
-        let send = Python::with_gil(|py| {
-            let payload = pyo3::types::PyBytes::new(py, b"hello");
-            scp.context_send(&handle, creator, payload.as_any(), None)
-                .expect_err("send must refuse a context no actor serves")
+            // Each refusal carries the gate's own code, not the generic
+            // `SCP-CTX-2001`, so a caller branching on the per-operation code sees
+            // it.
+            let member = "did:dht:z6MkNoActorMember";
+            let join = scp
+                .context_join(py, &handle, member, None)
+                .expect_err("join must refuse a context no actor serves");
+            let leave = scp
+                .context_leave(py, &handle, member)
+                .expect_err("leave must refuse a context no actor serves");
+            let send = Python::with_gil(|py| {
+                let payload = pyo3::types::PyBytes::new(py, b"hello");
+                scp.context_send(py, &handle, creator, payload.as_any(), None)
+                    .expect_err("send must refuse a context no actor serves")
+            });
+            let receive = scp
+                .context_receive(py, &handle)
+                .err()
+                .expect("receive must refuse a context no actor serves");
+            for (name, err, code) in [
+                ("join", join, codes::CTX_2013),
+                ("leave", leave, codes::CTX_2015),
+                ("send", send, codes::CTX_2019),
+                ("receive", receive, codes::CTX_2021),
+            ] {
+                let text = err.to_string();
+                assert!(
+                    text.contains("has no live supervisor state")
+                        && text.contains(code)
+                        && !text.contains(codes::CTX_2001),
+                    "{name} reported: {text}"
+                );
+            }
         });
-        let receive = scp
-            .context_receive(&handle)
-            .err()
-            .expect("receive must refuse a context no actor serves");
-        for (name, err, code) in [
-            ("join", join, codes::CTX_2013),
-            ("leave", leave, codes::CTX_2015),
-            ("send", send, codes::CTX_2019),
-            ("receive", receive, codes::CTX_2021),
-        ] {
-            let text = err.to_string();
-            assert!(
-                text.contains("has no live supervisor state")
-                    && text.contains(code)
-                    && !text.contains(codes::CTX_2001),
-                "{name} reported: {text}"
-            );
-        }
     }
 
     /// Every lifecycle gate admits its operation while the supervisor reports
@@ -9205,19 +9383,21 @@ mod tests {
             }
         }
 
-        let creator = "did:dht:z6MkActiveGateCreator";
-        let member = "did:dht:z6MkActiveGateMember";
-        let (scp, handle) = lifecycle_fixture("a3", creator);
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkActiveGateCreator";
+            let member = "did:dht:z6MkActiveGateMember";
+            let (scp, handle) = lifecycle_fixture("a3", creator);
 
-        assert_admitted("join", scp.context_join(&handle, member, None));
-        let send = Python::with_gil(|py| {
-            let payload = pyo3::types::PyBytes::new(py, b"hello");
-            scp.context_send(&handle, creator, payload.as_any(), None)
+            assert_admitted("join", scp.context_join(py, &handle, member, None));
+            let send = Python::with_gil(|py| {
+                let payload = pyo3::types::PyBytes::new(py, b"hello");
+                scp.context_send(py, &handle, creator, payload.as_any(), None)
+            });
+            assert_admitted("send", send);
+            scp.context_receive(py, &handle)
+                .expect("receive must pass the gate for an active context");
+            assert_admitted("leave", scp.context_leave(py, &handle, member));
         });
-        assert_admitted("send", send);
-        scp.context_receive(&handle)
-            .expect("receive must pass the gate for an active context");
-        assert_admitted("leave", scp.context_leave(&handle, member));
     }
 
     /// Every lifecycle gate refuses a context the crash watchdog poisoned with
@@ -9231,41 +9411,43 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn lifecycle_gates_report_a_poisoned_context_as_context_poisoned() {
-        let creator = "did:dht:z6MkPoisonGateCreator";
-        let member = "did:dht:z6MkPoisonGateMember";
-        let (scp, handle) = lifecycle_fixture("a4", creator);
-        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&scp.inner).unwrap());
-        crate::runtime()
-            .unwrap()
-            .block_on(sup.test_poison_context(&handle.context_id));
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkPoisonGateCreator";
+            let member = "did:dht:z6MkPoisonGateMember";
+            let (scp, handle) = lifecycle_fixture("a4", creator);
+            let sup = std::sync::Arc::clone(crate::runtime::supervisor(&scp.inner).unwrap());
+            crate::runtime()
+                .unwrap()
+                .block_on(sup.test_poison_context(&handle.context_id));
 
-        let join = scp
-            .context_join(&handle, member, None)
-            .expect_err("join must refuse a poisoned context");
-        let leave = scp
-            .context_leave(&handle, member)
-            .expect_err("leave must refuse a poisoned context");
-        let send = Python::with_gil(|py| {
-            let payload = pyo3::types::PyBytes::new(py, b"hello");
-            scp.context_send(&handle, creator, payload.as_any(), None)
-                .expect_err("send must refuse a poisoned context")
+            let join = scp
+                .context_join(py, &handle, member, None)
+                .expect_err("join must refuse a poisoned context");
+            let leave = scp
+                .context_leave(py, &handle, member)
+                .expect_err("leave must refuse a poisoned context");
+            let send = Python::with_gil(|py| {
+                let payload = pyo3::types::PyBytes::new(py, b"hello");
+                scp.context_send(py, &handle, creator, payload.as_any(), None)
+                    .expect_err("send must refuse a poisoned context")
+            });
+            let receive = scp
+                .context_receive(py, &handle)
+                .err()
+                .expect("receive must refuse a poisoned context");
+            for (name, err, gate_code) in [
+                ("join", join, codes::CTX_2013),
+                ("leave", leave, codes::CTX_2015),
+                ("send", send, codes::CTX_2019),
+                ("receive", receive, codes::CTX_2021),
+            ] {
+                let text = err.to_string();
+                assert!(
+                    text.contains(codes::CTX_2134) && !text.contains(gate_code),
+                    "{name} reported: {text}"
+                );
+            }
         });
-        let receive = scp
-            .context_receive(&handle)
-            .err()
-            .expect("receive must refuse a poisoned context");
-        for (name, err, gate_code) in [
-            ("join", join, codes::CTX_2013),
-            ("leave", leave, codes::CTX_2015),
-            ("send", send, codes::CTX_2019),
-            ("receive", receive, codes::CTX_2021),
-        ] {
-            let text = err.to_string();
-            assert!(
-                text.contains(codes::CTX_2134) && !text.contains(gate_code),
-                "{name} reported: {text}"
-            );
-        }
     }
 
     // -------------------------------------------------------------------
@@ -9417,10 +9599,10 @@ mod tests {
             dict.set_item("memory_scope", "full").unwrap();
             dict.set_item("ceiling", vec!["messages:read"]).unwrap();
             let create = scp
-                .context_create("did:dht:z6MkShutDownCreator", &dict)
+                .context_create(py, "did:dht:z6MkShutDownCreator", &dict)
                 .expect_err("a create after shutdown must be refused");
             let restore = scp
-                .restore_context(&"0".repeat(64))
+                .restore_context(py, &"0".repeat(64))
                 .expect_err("a restore after shutdown must be refused");
             for (name, err) in [("restore", restore), ("create", create)] {
                 assert!(
@@ -9577,7 +9759,7 @@ mod tests {
                 ),
             ] {
                 assert_ceiling_required(
-                    scp.context_create(&creator_did, &params_with(ceiling)),
+                    scp.context_create(py, &creator_did, &params_with(ceiling)),
                     code,
                     detail,
                 );
@@ -9586,6 +9768,7 @@ mod tests {
             let declared = vec!["messages:write".to_owned()];
             let handle = scp
                 .context_create(
+                    py,
                     &creator_did,
                     &params_with(Some(declared.into_pyobject(py).unwrap().into_any())),
                 )
@@ -9964,7 +10147,7 @@ mod tests {
             // import advances past signature verification to the idempotent
             // already-exists rejection — proving the signer binding is correct.
             let import_err = scp
-                .context_import(&exported, &creator)
+                .context_import(py, &exported, &creator)
                 .expect_err("re-importing a live context must be rejected (already exists)");
             let msg = import_err.to_string();
             assert!(
@@ -10395,38 +10578,42 @@ class SignOnlyCustody:
     #[cfg(feature = "testing")]
     #[test]
     fn resolve_message_signer_binds_stamp_and_key_atomically() {
-        use scp_core::context::supervisor::MessageSigner;
-        let bi = __bi();
-        let (did, active_key, agent_key) = register_persona_test_identity(&bi, true);
-        let agent_key = agent_key.expect("agent-keyed identity has an agent key");
-        assert_ne!(
-            active_key.to_bytes(),
-            agent_key.to_bytes(),
-            "test identity must have distinct active and agent keys"
-        );
+        pyo3::Python::with_gil(|py| {
+            use scp_core::context::supervisor::MessageSigner;
+            let bi = __bi();
+            let (did, active_key, agent_key) = register_persona_test_identity(&bi, true);
+            let agent_key = agent_key.expect("agent-keyed identity has an agent key");
+            assert_ne!(
+                active_key.to_bytes(),
+                agent_key.to_bytes(),
+                "test identity must have distinct active and agent keys"
+            );
 
-        // #agent persona → agent key + #agent stamp.
-        let signer = resolve_message_signer(&bi, &did, scp_did::SigningKeyId::Agent).unwrap();
-        assert_eq!(signer.persona(), scp_did::SigningKeyId::Agent);
-        assert!(matches!(signer.message_signer(), MessageSigner::Agent(_)));
-        assert_eq!(
-            signer.message_signer().signing_key_id(),
-            scp_did::SigningKeyId::Agent
-        );
-        assert_eq!(
-            signer.message_signer().key().to_bytes(),
-            agent_key.to_bytes(),
-            "#agent persona MUST resolve the agent key, never the active key"
-        );
+            // #agent persona → agent key + #agent stamp.
+            let signer =
+                resolve_message_signer(py, &bi, &did, scp_did::SigningKeyId::Agent).unwrap();
+            assert_eq!(signer.persona(), scp_did::SigningKeyId::Agent);
+            assert!(matches!(signer.message_signer(), MessageSigner::Agent(_)));
+            assert_eq!(
+                signer.message_signer().signing_key_id(),
+                scp_did::SigningKeyId::Agent
+            );
+            assert_eq!(
+                signer.message_signer().key().to_bytes(),
+                agent_key.to_bytes(),
+                "#agent persona MUST resolve the agent key, never the active key"
+            );
 
-        // #active persona → active key + #active stamp (default path unchanged).
-        let signer = resolve_message_signer(&bi, &did, scp_did::SigningKeyId::Active).unwrap();
-        assert_eq!(signer.persona(), scp_did::SigningKeyId::Active);
-        assert!(matches!(signer.message_signer(), MessageSigner::Active(_)));
-        assert_eq!(
-            signer.message_signer().key().to_bytes(),
-            active_key.to_bytes()
-        );
+            // #active persona → active key + #active stamp (default path unchanged).
+            let signer =
+                resolve_message_signer(py, &bi, &did, scp_did::SigningKeyId::Active).unwrap();
+            assert_eq!(signer.persona(), scp_did::SigningKeyId::Active);
+            assert!(matches!(signer.message_signer(), MessageSigner::Active(_)));
+            assert_eq!(
+                signer.message_signer().key().to_bytes(),
+                active_key.to_bytes()
+            );
+        });
     }
 
     /// Fail-closed: `#agent` requested for an identity with NO agent key returns
@@ -10434,24 +10621,27 @@ class SignOnlyCustody:
     #[cfg(feature = "testing")]
     #[test]
     fn resolve_message_signer_agent_without_agent_key_fails_closed() {
-        let bi = __bi();
-        let (did, active_key, agent_key) = register_persona_test_identity(&bi, false);
-        assert!(agent_key.is_none(), "active-only identity has no agent key");
+        pyo3::Python::with_gil(|py| {
+            let bi = __bi();
+            let (did, active_key, agent_key) = register_persona_test_identity(&bi, false);
+            assert!(agent_key.is_none(), "active-only identity has no agent key");
 
-        let err = resolve_message_signer(&bi, &did, scp_did::SigningKeyId::Agent)
-            .expect_err("#agent send without an agent key must fail closed");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("SCP-IDENT-1023"),
-            "expected fail-closed no-agent-key code SCP-IDENT-1023, got: {msg}"
-        );
+            let err = resolve_message_signer(py, &bi, &did, scp_did::SigningKeyId::Agent)
+                .expect_err("#agent send without an agent key must fail closed");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("SCP-IDENT-1023"),
+                "expected fail-closed no-agent-key code SCP-IDENT-1023, got: {msg}"
+            );
 
-        // The active path still resolves — the failure is specific to #agent,
-        // not a broken identity.
-        let signer = resolve_message_signer(&bi, &did, scp_did::SigningKeyId::Active).unwrap();
-        assert_eq!(
-            signer.message_signer().key().to_bytes(),
-            active_key.to_bytes()
-        );
+            // The active path still resolves — the failure is specific to #agent,
+            // not a broken identity.
+            let signer =
+                resolve_message_signer(py, &bi, &did, scp_did::SigningKeyId::Active).unwrap();
+            assert_eq!(
+                signer.message_signer().key().to_bytes(),
+                active_key.to_bytes()
+            );
+        });
     }
 }

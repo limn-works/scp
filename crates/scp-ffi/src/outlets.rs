@@ -201,12 +201,13 @@ impl PySagaResult {
 /// sync-to-async bridge return the error of
 /// [`crate::runtime::active_role_state_before_authz`] unchanged.
 pub(crate) fn active_outlet_role_state(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     verb: &str,
     code: &str,
 ) -> PyResult<scp_core::context::roles::ContextRoleState> {
-    crate::runtime::active_role_state_before_authz(bi, context_id, verb, |message| {
+    crate::runtime::active_role_state_before_authz(py, bi, context_id, verb, |message| {
         ScpPyError::ContextError {
             message,
             code: code.to_owned(),
@@ -219,6 +220,7 @@ pub(crate) fn active_outlet_role_state(
 ///
 /// See ADR-013 §4.
 fn outlet_register_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     registration: &Bound<'_, PyDict>,
@@ -332,6 +334,7 @@ fn outlet_register_impl(
     // identity, so the check does not ask whether the caller holds the
     // capability.
     let role_state = active_outlet_role_state(
+        py,
         bi,
         context_id,
         "register outlet in context",
@@ -528,6 +531,7 @@ fn outlet_invoke_impl(
     let input_json = py_dict_to_json(input)?;
 
     let role_state = active_outlet_role_state(
+        py,
         bi,
         context_id,
         "invoke outlet in context",
@@ -655,24 +659,22 @@ fn outlet_invoke_impl(
     let supervisor = crate::runtime::supervisor(bi)?;
     let invoker_did_typed: scp_did::DID = identity_did_owned.into();
     let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id_owned.as_str());
-    let rt = crate::runtime()?;
-    let outcome = rt
-        .block_on(async {
-            supervisor
-                .invoke_outlet_with_economy(
-                    &ctx_id_owned,
-                    &registry,
-                    &outlet_id_typed,
-                    input_json,
-                    &invoker_did_typed,
-                    spending_ucan_token.as_ref(),
-                    caveat_binding,
-                    None,
-                    executor,
-                )
-                .await
-        })
-        .map_err(ScpPyError::from)?;
+    let outcome = crate::actor_wait::block_on_released(py, async {
+        supervisor
+            .invoke_outlet_with_economy(
+                &ctx_id_owned,
+                &registry,
+                &outlet_id_typed,
+                input_json,
+                &invoker_did_typed,
+                spending_ucan_token.as_ref(),
+                caveat_binding,
+                None,
+                executor,
+            )
+            .await
+    })?
+    .map_err(ScpPyError::from)?;
 
     // Mark the time of last successful invocation for any future
     // observability hooks. (`outcome.event` carries the canonical
@@ -702,6 +704,7 @@ fn outlet_invoke_impl(
 ///
 /// See ADR-013 §4.
 fn outlet_verify_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     outlet_id: &str,
@@ -709,6 +712,7 @@ fn outlet_verify_impl(
     validate::validate_context_id(context_id)?;
     validate::validate_outlet_id(outlet_id)?;
     active_outlet_role_state(
+        py,
         bi,
         context_id,
         "verify outlet in context",
@@ -1013,12 +1017,14 @@ fn outlet_invoke_cross_context_impl(
     // source-capability check below and the target role state answers the
     // UCAN validation.
     let source_role = active_outlet_role_state(
+        py,
         bi,
         source_context_id,
         "invoke cross-context outlet from source context",
         codes::OUTLET_6010,
     )?;
     let target_role = active_outlet_role_state(
+        py,
         bi,
         target_context_id,
         "invoke cross-context outlet in target context",
@@ -1080,10 +1086,9 @@ fn outlet_invoke_cross_context_impl(
     // Validate chain depth (context-configurable, default 8 per ADR-043).
     let max_chain_depth = {
         let supervisor = crate::runtime::supervisor(bi)?;
-        let tokio_rt = crate::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
-        let source_max = tokio_rt
-            .block_on(supervisor.context_params(source_context_id))
-            .and_then(|p| p.max_chain_depth);
+        let source_max =
+            crate::actor_wait::block_on_released(py, supervisor.context_params(source_context_id))?
+                .and_then(|p| p.max_chain_depth);
         scp_core::provenance::attach::effective_max_chain_depth(source_max)
     };
     if chain_depth > max_chain_depth {
@@ -1204,11 +1209,12 @@ pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> S
 /// holds no role state for `context_id` or cannot answer, and the
 /// `resolve_signing_key` error when the creator's key cannot be exported.
 pub(crate) fn resolve_context_signing_key(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
 ) -> PyResult<ed25519_dalek::SigningKey> {
-    let creator_did = crate::runtime::live_role_state(bi, context_id)?.creator_did;
-    crate::context::resolve_signing_key(bi, &creator_did)
+    let creator_did = crate::runtime::live_role_state(py, bi, context_id)?.creator_did;
+    crate::context::resolve_signing_key(py, bi, &creator_did)
 }
 
 /// Decodes the §6.2.4 envelope nonce from its canonical 32-char hex form into
@@ -1259,9 +1265,9 @@ pub(crate) fn decode_asserted_nonce(asserted_nonce_hex: &str) -> PyResult<[u8; 1
 /// load-bearing addition this seam contributes. Enforcing here, before the
 /// entry point, also means the saga never observes an unauthenticated caller.
 pub(crate) fn enforce_caller_principal_binding(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     supervisor: &std::sync::Arc<scp_core::context::supervisor::Supervisor>,
-    tokio_rt: &tokio::runtime::Runtime,
     caller_context_id: &str,
     caller_did: &str,
 ) -> PyResult<()> {
@@ -1279,7 +1285,10 @@ pub(crate) fn enforce_caller_principal_binding(
         .into());
     }
 
-    let caller_is_member = tokio_rt.block_on(supervisor.is_member(caller_context_id, caller_did));
+    let caller_is_member = crate::actor_wait::block_on_released(
+        py,
+        supervisor.is_member(caller_context_id, caller_did),
+    )?;
     if !caller_is_member {
         return Err(ScpPyError::SagaAborted {
             message: format!(
@@ -1331,6 +1340,7 @@ pub(crate) fn enforce_caller_principal_binding(
 ///    [`PySagaResult`].
 #[allow(clippy::too_many_arguments)] // Flat §6.2.4 envelope — agent-first named params, no builder.
 fn outlet_invoke_cross_context_saga_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     caller_context_id: &str,
     target_context_id: &str,
@@ -1353,19 +1363,20 @@ fn outlet_invoke_cross_context_saga_impl(
     let input_json = py_dict_to_json(input)?;
 
     let supervisor = crate::runtime::supervisor(bi)?;
-    let tokio_rt = crate::runtime()?;
 
     // Lifecycle gate: both contexts MUST be Active, read from each context's
     // supervisor actor. A context no actor serves counts as non-active. Both gates run before the
     // caller-principal binding, so both withhold the lifecycle state, and each
     // role state's creator names the key that context signs under below.
     let caller_role = active_outlet_role_state(
+        py,
         bi,
         caller_context_id,
         "start cross-context saga from caller context",
         codes::OUTLET_6010,
     )?;
     let target_role = active_outlet_role_state(
+        py,
         bi,
         target_context_id,
         "start cross-context saga into target context",
@@ -1374,7 +1385,7 @@ fn outlet_invoke_cross_context_saga_impl(
 
     // Caller-principal binding (§6.2.4 *Caller authentication*) — BEFORE the
     // saga runs, so the supervisor never observes an unauthenticated caller.
-    enforce_caller_principal_binding(bi, supervisor, tokio_rt, caller_context_id, caller_did)?;
+    enforce_caller_principal_binding(py, bi, supervisor, caller_context_id, caller_did)?;
 
     // ----- Chokepoint (ADR-056): id STRING → [u8; 32] ------------------------
     //
@@ -1389,8 +1400,8 @@ fn outlet_invoke_cross_context_saga_impl(
     // ----- Signing keys: each context's Active Signing Key -------------------
     //
     // Each key belongs to the creator in the role state the gate above read.
-    let target_signing_key = crate::context::resolve_signing_key(bi, &target_role.creator_did)?;
-    let caller_signing_key = crate::context::resolve_signing_key(bi, &caller_role.creator_did)?;
+    let target_signing_key = crate::context::resolve_signing_key(py, bi, &target_role.creator_did)?;
+    let caller_signing_key = crate::context::resolve_signing_key(py, bi, &caller_role.creator_did)?;
 
     // ----- Executor: snapshot the TARGET context's outlet handler --------------
     //
@@ -1450,20 +1461,19 @@ fn outlet_invoke_cross_context_saga_impl(
     // are sync; the Python SDK wrapper invokes us off `asyncio.to_thread`, so
     // we are NOT inside a tokio context and `block_on` is safe (matches
     // `outlet_invoke_impl`). The saga blocks until a terminal state.
-    let output = tokio_rt
-        .block_on(async {
-            supervisor
-                .start_cross_context_outlet_invocation_saga(
-                    request,
-                    SagaSigningKeys {
-                        target: &target_signing_key,
-                        caller: &caller_signing_key,
-                    },
-                    executor,
-                )
-                .await
-        })
-        .map_err(map_saga_error)?;
+    let output = crate::actor_wait::block_on_released(py, async {
+        supervisor
+            .start_cross_context_outlet_invocation_saga(
+                request,
+                SagaSigningKeys {
+                    target: &target_signing_key,
+                    caller: &caller_signing_key,
+                },
+                executor,
+            )
+            .await
+    })?
+    .map_err(map_saga_error)?;
 
     Ok(PySagaResult {
         saga_id: output.saga_id.0,
@@ -1500,6 +1510,7 @@ fn outlet_invoke_cross_context_saga_impl(
 /// Raises `ContextError` if the context is not connected, the outlet is
 /// not found, or the per-caller session cap is exceeded.
 fn outlet_session_create_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     outlet_id: &str,
@@ -1511,11 +1522,21 @@ fn outlet_session_create_impl(
     validate::validate_context_id(source_context_id)?;
 
     active_outlet_role_state(
+        py,
         bi,
         context_id,
         "create session in context",
         codes::OUTLET_6014,
     )?;
+
+    // Per-caller session cap (context-configured, default 1000, ADR-043).
+    // Read before the registry guard is taken: a GIL-released wait must
+    // never hold a registry shard lock.
+    let supervisor = crate::runtime::supervisor(bi)?.clone();
+    let cap = crate::actor_wait::block_on_released(py, supervisor.context_params(context_id))?
+        .and_then(|p| p.session_cap)
+        .unwrap_or(scp_core::context::outlets::DEFAULT_SESSION_CAP_PER_CALLER)
+        as usize;
 
     let session_id = crate::runtime::with_context(bi, context_id, |rt| {
         // Validate outlet exists.
@@ -1525,16 +1546,6 @@ fn outlet_session_create_impl(
             )));
         }
 
-        // Enforce per-caller session cap (context-configured, default 1000, ADR-043).
-        let cap = {
-            let supervisor = crate::runtime::supervisor(bi)?;
-            let tokio_rt = crate::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
-            tokio_rt
-                .block_on(supervisor.context_params(context_id))
-                .and_then(|p| p.session_cap)
-                .unwrap_or(scp_core::context::outlets::DEFAULT_SESSION_CAP_PER_CALLER)
-                as usize
-        };
         let current = rt.session_store.count_by_source(source_context_id);
         if current >= cap {
             return Err(ScpPyError::context(format!(
@@ -1616,6 +1627,7 @@ fn outlet_session_invoke_impl(
     let input_json = py_dict_to_json(input)?;
 
     let role_state = active_outlet_role_state(
+        py,
         bi,
         context_id,
         "invoke session in context",
@@ -1787,6 +1799,7 @@ fn outlet_session_close_impl(
 ///
 /// Raises `OutletError` if the caller is not an admin or the outlet is not found.
 fn outlet_interface_expose_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     outlet_id: &str,
@@ -1798,6 +1811,7 @@ fn outlet_interface_expose_impl(
     validate::validate_context_id(target_context_id)?;
 
     let role_state = active_outlet_role_state(
+        py,
         bi,
         context_id,
         "expose outlet interface in context",
@@ -1873,6 +1887,7 @@ fn outlet_interface_expose_impl(
 /// Raises `OutletError` if the caller is not an admin or the interface's target
 /// context does not match `context_id`.
 fn outlet_interface_accept_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     interface_json: &str,
@@ -1880,6 +1895,7 @@ fn outlet_interface_accept_impl(
     validate::validate_context_id(context_id)?;
 
     let role_state = active_outlet_role_state(
+        py,
         bi,
         context_id,
         "accept outlet interface in context",
@@ -2006,11 +2022,12 @@ impl crate::scp::PyScp {
     #[pyo3(name = "outlet_register")]
     pub fn outlet_register(
         &self,
+        py: Python<'_>,
         context_id: &str,
         registration: &Bound<'_, PyDict>,
     ) -> PyResult<String> {
         let bi = &*self.inner;
-        outlet_register_impl(bi, context_id, registration)
+        outlet_register_impl(py, bi, context_id, registration)
     }
 
     /// Invokes an outlet within an SCP context, fully wired through the
@@ -2093,11 +2110,12 @@ impl crate::scp::PyScp {
     #[pyo3(name = "outlet_verify")]
     pub fn outlet_verify(
         &self,
+        py: Python<'_>,
         context_id: &str,
         outlet_id: &str,
     ) -> PyResult<PyOutletVerificationResult> {
         let bi = &*self.inner;
-        outlet_verify_impl(bi, context_id, outlet_id)
+        outlet_verify_impl(py, bi, context_id, outlet_id)
     }
 
     /// Invokes an outlet across context boundaries.
@@ -2242,6 +2260,7 @@ impl crate::scp::PyScp {
     #[allow(clippy::too_many_arguments)] // Flat §6.2.4 envelope — agent-first named params.
     pub fn outlet_invoke_cross_context_saga(
         &self,
+        py: Python<'_>,
         caller_context_id: &str,
         target_context_id: &str,
         caller_did: &str,
@@ -2254,6 +2273,7 @@ impl crate::scp::PyScp {
     ) -> PyResult<PySagaResult> {
         let bi = &*self.inner;
         outlet_invoke_cross_context_saga_impl(
+            py,
             bi,
             caller_context_id,
             target_context_id,
@@ -2280,13 +2300,21 @@ impl crate::scp::PyScp {
     #[pyo3(name = "outlet_session_create", signature = (context_id, outlet_id, source_context_id, ttl_seconds=None))]
     pub fn outlet_session_create(
         &self,
+        py: Python<'_>,
         context_id: &str,
         outlet_id: &str,
         source_context_id: &str,
         ttl_seconds: Option<u64>,
     ) -> PyResult<String> {
         let bi = &*self.inner;
-        outlet_session_create_impl(bi, context_id, outlet_id, source_context_id, ttl_seconds)
+        outlet_session_create_impl(
+            py,
+            bi,
+            context_id,
+            outlet_id,
+            source_context_id,
+            ttl_seconds,
+        )
     }
 
     /// Invokes an outlet within an active session.
@@ -2349,6 +2377,7 @@ impl crate::scp::PyScp {
     #[pyo3(name = "outlet_interface_expose", signature = (context_id, outlet_id, target_context_id, rate_limit_json=None))]
     pub fn outlet_interface_expose(
         &self,
+        py: Python<'_>,
         context_id: &str,
         outlet_id: &str,
         target_context_id: &str,
@@ -2356,6 +2385,7 @@ impl crate::scp::PyScp {
     ) -> PyResult<String> {
         let bi = &*self.inner;
         outlet_interface_expose_impl(
+            py,
             bi,
             context_id,
             outlet_id,
@@ -2374,11 +2404,12 @@ impl crate::scp::PyScp {
     #[pyo3(name = "outlet_interface_accept")]
     pub fn outlet_interface_accept(
         &self,
+        py: Python<'_>,
         context_id: &str,
         interface_json: &str,
     ) -> PyResult<String> {
         let bi = &*self.inner;
-        outlet_interface_accept_impl(bi, context_id, interface_json)
+        outlet_interface_accept_impl(py, bi, context_id, interface_json)
     }
 
     /// Revokes a cross-context outlet interface (§6.2.0.1 step 5).
@@ -2464,7 +2495,8 @@ mod tests {
             schema.set_item("output_schema", PyDict::new(py)).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result =
+                default_scp().outlet_register(py, "ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject missing input_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -2496,7 +2528,8 @@ mod tests {
             schema.set_item("input_schema", inner).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result =
+                default_scp().outlet_register(py, "ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject missing output_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -2529,7 +2562,8 @@ mod tests {
             schema.set_item("output_schema", output).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result =
+                default_scp().outlet_register(py, "ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject non-object input_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -2559,7 +2593,8 @@ mod tests {
             schema.set_item("output_schema", output_list).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result =
+                default_scp().outlet_register(py, "ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject non-object output_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -2601,7 +2636,8 @@ mod tests {
             let dict = valid_registration_dict(py);
             dict.set_item("test_vectors", "not-a-list").unwrap();
 
-            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result =
+                default_scp().outlet_register(py, "ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject non-list test_vectors");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -2624,7 +2660,8 @@ mod tests {
             let vectors = pyo3::types::PyList::new(py, [42i32]).unwrap();
             dict.set_item("test_vectors", vectors).unwrap();
 
-            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result =
+                default_scp().outlet_register(py, "ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject non-dict items in test_vectors"
@@ -2651,7 +2688,8 @@ mod tests {
             wrong_type.set_item("not", "a list").unwrap();
             dict.set_item("test_vectors", wrong_type).unwrap();
 
-            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result =
+                default_scp().outlet_register(py, "ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject dict as test_vectors");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -2762,7 +2800,8 @@ mod tests {
             let dict = valid_registration_dict(py);
             dict.set_item("implementation_hash", 12345).unwrap();
 
-            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result =
+                default_scp().outlet_register(py, "ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject non-string implementation_hash"
@@ -2789,7 +2828,8 @@ mod tests {
             dict.set_item("implementation_hash", "abcdef0123456789abcdef0123456789")
                 .unwrap();
 
-            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result =
+                default_scp().outlet_register(py, "ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject wrong-length implementation_hash"
@@ -2819,7 +2859,8 @@ mod tests {
             )
             .unwrap();
 
-            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result =
+                default_scp().outlet_register(py, "ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject invalid hex in implementation_hash"
@@ -2925,7 +2966,7 @@ mod tests {
             dict.set_item("schema", schema).unwrap();
 
             let outlet_id = scp
-                .outlet_register(&ctx_id, &dict.as_borrowed())
+                .outlet_register(py, &ctx_id, &dict.as_borrowed())
                 .expect("outlet_register should succeed");
 
             // Read the stored registration back from the runtime registry.
@@ -3113,7 +3154,7 @@ mod tests {
         Python::with_gil(|py| {
             let dict = registration_dict(py, "narrow-ceiling-probe", creator);
             let err = scp
-                .outlet_register(&ctx_id, &dict.as_borrowed())
+                .outlet_register(py, &ctx_id, &dict.as_borrowed())
                 .expect_err("a ceiling without outlet:register must refuse registration");
             let message = format!("{err}");
             assert!(
@@ -3139,7 +3180,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dict = registration_dict(py, "wide-ceiling-probe", creator);
-            scp.outlet_register(&ctx_id, &dict.as_borrowed())
+            scp.outlet_register(py, &ctx_id, &dict.as_borrowed())
                 .expect("a ceiling carrying outlet:register must admit registration");
         });
         crate::runtime::remove_context(&scp.inner, &ctx_id);
@@ -3156,6 +3197,7 @@ mod tests {
 
         let err = Python::with_gil(|py| {
             scp.outlet_stream_open(
+                py,
                 &ctx_id,
                 "some-outlet",
                 &PyDict::new(py),
@@ -3184,30 +3226,32 @@ mod tests {
     /// `resolve_context_signing_key` resolves the SUPERVISOR's `creator_did`.
     #[test]
     fn resolve_context_signing_key_reads_the_supervisor_creator() {
-        crate::init_runtime().ok();
-        let ffi_creator = "did:dht:z6MkSigningKeyFfiCreator";
-        let supervisor_creator = "did:dht:z6MkSigningKeySupervisorCreator";
-        let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let bi = &*scp.inner;
-        let ctx_id = format!("signing-key-{}", uuid::Uuid::new_v4());
-        crate::runtime::register_context(bi, &ctx_id, ffi_creator, &[]).unwrap();
-        crate::runtime::create_supervisor_context_for_test(
-            bi,
-            &ctx_id,
-            supervisor_creator,
-            &["messages:write".to_owned()],
-        );
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let ffi_creator = "did:dht:z6MkSigningKeyFfiCreator";
+            let supervisor_creator = "did:dht:z6MkSigningKeySupervisorCreator";
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = &*scp.inner;
+            let ctx_id = format!("signing-key-{}", uuid::Uuid::new_v4());
+            crate::runtime::register_context(bi, &ctx_id, ffi_creator, &[]).unwrap();
+            crate::runtime::create_supervisor_context_for_test(
+                bi,
+                &ctx_id,
+                supervisor_creator,
+                &["messages:write".to_owned()],
+            );
 
-        // Neither DID is custodied on this instance, so the resolver refuses and
-        // names the DID it tried.
-        let err = resolve_context_signing_key(bi, &ctx_id)
-            .expect_err("an uncustodied creator DID must refuse");
-        let message = format!("{err}");
-        assert!(
-            message.contains(supervisor_creator),
-            "the resolver must name the supervisor's creator DID: {message}"
-        );
-        crate::runtime::remove_context(bi, &ctx_id);
+            // Neither DID is custodied on this instance, so the resolver refuses and
+            // names the DID it tried.
+            let err = resolve_context_signing_key(py, bi, &ctx_id)
+                .expect_err("an uncustodied creator DID must refuse");
+            let message = format!("{err}");
+            assert!(
+                message.contains(supervisor_creator),
+                "the resolver must name the supervisor's creator DID: {message}"
+            );
+            crate::runtime::remove_context(bi, &ctx_id);
+        });
     }
 
     /// `outlet_interface_expose` reads the lifecycle state, the roles, and the
@@ -3215,19 +3259,21 @@ mod tests {
     /// refuses at the lifecycle gate with `SCP-OUTLET-6030`.
     #[test]
     fn interface_expose_refuses_without_supervisor_role_state() {
-        let creator = "did:dht:z6MkExposeNoActor";
-        let (scp, ctx_id) = scp_without_supervisor_context("expose-no-actor", creator);
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkExposeNoActor";
+            let (scp, ctx_id) = scp_without_supervisor_context("expose-no-actor", creator);
 
-        let err = scp
-            .outlet_interface_expose(&ctx_id, "some-outlet", "target-context", None)
-            .expect_err("no supervisor actor must refuse the expose");
-        let message = format!("{err}");
-        assert!(
-            message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
-                && message.contains("SCP-OUTLET-6030"),
-            "the refusal must come from the lifecycle gate: {message}"
-        );
-        crate::runtime::remove_context(&scp.inner, &ctx_id);
+            let err = scp
+                .outlet_interface_expose(py, &ctx_id, "some-outlet", "target-context", None)
+                .expect_err("no supervisor actor must refuse the expose");
+            let message = format!("{err}");
+            assert!(
+                message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                    && message.contains("SCP-OUTLET-6030"),
+                "the refusal must come from the lifecycle gate: {message}"
+            );
+            crate::runtime::remove_context(&scp.inner, &ctx_id);
+        });
     }
 
     /// `outlet_interface_accept` reads the lifecycle state, the roles, and the
@@ -3235,33 +3281,35 @@ mod tests {
     /// refuses at the lifecycle gate with `SCP-OUTLET-6032`.
     #[test]
     fn interface_accept_refuses_without_supervisor_role_state() {
-        let creator = "did:dht:z6MkAcceptNoActor";
-        let (scp, ctx_id) = scp_without_supervisor_context("accept-no-actor", creator);
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkAcceptNoActor";
+            let (scp, ctx_id) = scp_without_supervisor_context("accept-no-actor", creator);
 
-        let interface_json = serde_json::json!({
-            "source_context": "some-source",
-            "target_context": ctx_id,
-            "outlet_id": "some-outlet",
-            "rate_limit": null,
-            "inbound_rate_limit": null,
-            "per_caller_rate_limit": null,
-            "approved_by_source": true,
-            "approved_by_target": false,
-            "outbound_policy": null,
-            "inbound_policy": null,
-        })
-        .to_string();
+            let interface_json = serde_json::json!({
+                "source_context": "some-source",
+                "target_context": ctx_id,
+                "outlet_id": "some-outlet",
+                "rate_limit": null,
+                "inbound_rate_limit": null,
+                "per_caller_rate_limit": null,
+                "approved_by_source": true,
+                "approved_by_target": false,
+                "outbound_policy": null,
+                "inbound_policy": null,
+            })
+            .to_string();
 
-        let err = scp
-            .outlet_interface_accept(&ctx_id, &interface_json)
-            .expect_err("no supervisor actor must refuse the accept");
-        let message = format!("{err}");
-        assert!(
-            message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
-                && message.contains("SCP-OUTLET-6032"),
-            "the refusal must come from the lifecycle gate: {message}"
-        );
-        crate::runtime::remove_context(&scp.inner, &ctx_id);
+            let err = scp
+                .outlet_interface_accept(py, &ctx_id, &interface_json)
+                .expect_err("no supervisor actor must refuse the accept");
+            let message = format!("{err}");
+            assert!(
+                message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                    && message.contains("SCP-OUTLET-6032"),
+                "the refusal must come from the lifecycle gate: {message}"
+            );
+            crate::runtime::remove_context(&scp.inner, &ctx_id);
+        });
     }
 
     /// Builds the interface JSON `outlet_interface_accept` takes, offered from
@@ -3287,37 +3335,39 @@ mod tests {
     /// creator lacks `RoleAssign` there. Both entry points must refuse.
     #[test]
     fn interface_expose_and_accept_refuse_when_the_supervisor_ceiling_omits_role_assign() {
-        let creator = "did:dht:z6MkInterfaceNoRoleAssign";
-        let (scp, ctx_id) = live_scp(
-            "interface-no-role-assign",
-            creator,
-            &["messages:write", "outlet:register"],
-        );
-        pyo3::prepare_freethreaded_python();
-        let outlet_id = Python::with_gil(|py| {
-            let dict = registration_dict(py, "no-role-assign-probe", creator);
-            scp.outlet_register(&ctx_id, &dict.as_borrowed())
-                .expect("a ceiling carrying outlet:register must admit registration")
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkInterfaceNoRoleAssign";
+            let (scp, ctx_id) = live_scp(
+                "interface-no-role-assign",
+                creator,
+                &["messages:write", "outlet:register"],
+            );
+            pyo3::prepare_freethreaded_python();
+            let outlet_id = Python::with_gil(|py| {
+                let dict = registration_dict(py, "no-role-assign-probe", creator);
+                scp.outlet_register(py, &ctx_id, &dict.as_borrowed())
+                    .expect("a ceiling carrying outlet:register must admit registration")
+            });
+
+            let expose_err = scp
+                .outlet_interface_expose(py, &ctx_id, &outlet_id, "target-context", None)
+                .expect_err("a creator without RoleAssign in the supervisor must not expose")
+                .to_string();
+            assert!(
+                expose_err.contains("admin capability required") && expose_err.contains(creator),
+                "the expose refusal must be the admin check on the creator: {expose_err}"
+            );
+
+            let accept_err = scp
+                .outlet_interface_accept(py, &ctx_id, &offered_interface_json(&ctx_id, &outlet_id))
+                .expect_err("a creator without RoleAssign in the supervisor must not accept")
+                .to_string();
+            assert!(
+                accept_err.contains("admin capability required") && accept_err.contains(creator),
+                "the accept refusal must be the admin check on the creator: {accept_err}"
+            );
+            crate::runtime::remove_context(&scp.inner, &ctx_id);
         });
-
-        let expose_err = scp
-            .outlet_interface_expose(&ctx_id, &outlet_id, "target-context", None)
-            .expect_err("a creator without RoleAssign in the supervisor must not expose")
-            .to_string();
-        assert!(
-            expose_err.contains("admin capability required") && expose_err.contains(creator),
-            "the expose refusal must be the admin check on the creator: {expose_err}"
-        );
-
-        let accept_err = scp
-            .outlet_interface_accept(&ctx_id, &offered_interface_json(&ctx_id, &outlet_id))
-            .expect_err("a creator without RoleAssign in the supervisor must not accept")
-            .to_string();
-        assert!(
-            accept_err.contains("admin capability required") && accept_err.contains(creator),
-            "the accept refusal must be the admin check on the creator: {accept_err}"
-        );
-        crate::runtime::remove_context(&scp.inner, &ctx_id);
     }
 
     /// `outlet_interface_expose` and `outlet_interface_accept` pass the
@@ -3325,46 +3375,48 @@ mod tests {
     /// the supervisor's creator.
     #[test]
     fn interface_expose_and_accept_admit_the_supervisor_creator() {
-        crate::init_runtime().ok();
-        let ffi_creator = "did:dht:z6MkInterfaceFfiCreator";
-        let supervisor_creator = "did:dht:z6MkInterfaceSupervisorCreator";
-        let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let bi = &*scp.inner;
-        let ctx_id = format!("interface-creator-{}", uuid::Uuid::new_v4());
-        crate::runtime::register_context(bi, &ctx_id, ffi_creator, &[]).unwrap();
-        crate::runtime::create_supervisor_context_for_test(
-            bi,
-            &ctx_id,
-            supervisor_creator,
-            &[
-                "messages:write".to_owned(),
-                "outlet:register".to_owned(),
-                "role:assign".to_owned(),
-            ],
-        );
-        pyo3::prepare_freethreaded_python();
-        let outlet_id = Python::with_gil(|py| {
-            let dict = registration_dict(py, "supervisor-creator-probe", supervisor_creator);
-            scp.outlet_register(&ctx_id, &dict.as_borrowed())
-                .expect("a ceiling carrying outlet:register must admit registration")
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let ffi_creator = "did:dht:z6MkInterfaceFfiCreator";
+            let supervisor_creator = "did:dht:z6MkInterfaceSupervisorCreator";
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = &*scp.inner;
+            let ctx_id = format!("interface-creator-{}", uuid::Uuid::new_v4());
+            crate::runtime::register_context(bi, &ctx_id, ffi_creator, &[]).unwrap();
+            crate::runtime::create_supervisor_context_for_test(
+                bi,
+                &ctx_id,
+                supervisor_creator,
+                &[
+                    "messages:write".to_owned(),
+                    "outlet:register".to_owned(),
+                    "role:assign".to_owned(),
+                ],
+            );
+            pyo3::prepare_freethreaded_python();
+            let outlet_id = Python::with_gil(|py| {
+                let dict = registration_dict(py, "supervisor-creator-probe", supervisor_creator);
+                scp.outlet_register(py, &ctx_id, &dict.as_borrowed())
+                    .expect("a ceiling carrying outlet:register must admit registration")
+            });
+
+            let exposed = scp
+                .outlet_interface_expose(py, &ctx_id, &outlet_id, "target-context", None)
+                .expect("the supervisor's creator holds RoleAssign and must expose");
+            assert!(
+                exposed.contains("\"approved_by_source\":true"),
+                "the exposed interface must carry the source approval: {exposed}"
+            );
+
+            let accepted = scp
+                .outlet_interface_accept(py, &ctx_id, &offered_interface_json(&ctx_id, &outlet_id))
+                .expect("the supervisor's creator holds RoleAssign and must accept");
+            assert!(
+                accepted.contains("\"approved_by_target\":true"),
+                "the accepted interface must carry the target approval: {accepted}"
+            );
+            crate::runtime::remove_context(bi, &ctx_id);
         });
-
-        let exposed = scp
-            .outlet_interface_expose(&ctx_id, &outlet_id, "target-context", None)
-            .expect("the supervisor's creator holds RoleAssign and must expose");
-        assert!(
-            exposed.contains("\"approved_by_source\":true"),
-            "the exposed interface must carry the source approval: {exposed}"
-        );
-
-        let accepted = scp
-            .outlet_interface_accept(&ctx_id, &offered_interface_json(&ctx_id, &outlet_id))
-            .expect("the supervisor's creator holds RoleAssign and must accept");
-        assert!(
-            accepted.contains("\"approved_by_target\":true"),
-            "the accepted interface must carry the target approval: {accepted}"
-        );
-        crate::runtime::remove_context(bi, &ctx_id);
     }
 
     /// Seven single-context outlet entry points refuse a context whose
@@ -3395,6 +3447,7 @@ mod tests {
                     "register",
                     "SCP-OUTLET-6003",
                     scp.outlet_register(
+                        py,
                         &ctx_id,
                         &registration_dict(py, "despawned-probe", creator),
                     )
@@ -3418,12 +3471,12 @@ mod tests {
                 (
                     "verify",
                     "SCP-OUTLET-6007",
-                    scp.outlet_verify(&ctx_id, "probe-outlet").map(drop),
+                    scp.outlet_verify(py, &ctx_id, "probe-outlet").map(drop),
                 ),
                 (
                     "session_create",
                     "SCP-OUTLET-6014",
-                    scp.outlet_session_create(&ctx_id, "probe-outlet", &ctx_id, None)
+                    scp.outlet_session_create(py, &ctx_id, "probe-outlet", &ctx_id, None)
                         .map(drop),
                 ),
                 (
@@ -3443,13 +3496,19 @@ mod tests {
                 (
                     "interface_expose",
                     "SCP-OUTLET-6030",
-                    scp.outlet_interface_expose(&ctx_id, "probe-outlet", "target-context", None)
-                        .map(drop),
+                    scp.outlet_interface_expose(
+                        py,
+                        &ctx_id,
+                        "probe-outlet",
+                        "target-context",
+                        None,
+                    )
+                    .map(drop),
                 ),
                 (
                     "interface_accept",
                     "SCP-OUTLET-6032",
-                    scp.outlet_interface_accept(&ctx_id, "{}").map(drop),
+                    scp.outlet_interface_accept(py, &ctx_id, "{}").map(drop),
                 ),
             ];
             for (entry_point, code, result) in refusals {

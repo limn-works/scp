@@ -295,24 +295,25 @@ pub fn py_context_discover<'py>(py: Python<'py>, query: &str) -> PyResult<Bound<
         // Validate DID format.
         crate::validate::validate_did(query)?;
 
-        let rt = crate::runtime()?;
         let query_owned = query.to_owned();
 
-        let results: Vec<scp_core::discovery::ContextDiscoveryResult> = py.allow_threads(|| {
-            rt.block_on(async {
-                // No bridge instance is in scope for this free-function
-                // discovery entrypoint, so build the shipped DHT client
-                // fail-closed (real Mainline Pkarr in a shipped build; the
-                // in-memory test seam only under `testing`). Never a silent
-                // in-memory nullifier on a production path (ADR-062 §Decision 1).
-                let did_dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
-                    crate::identity::build_ffi_dht_client()?,
-                ));
-                scp_core::discovery::resolve_contexts_from_did(&query_owned, &did_dht)
-                    .await
-                    .map_err(ScpPyError::from)
-            })
-        })?;
+        let results: Vec<scp_core::discovery::ContextDiscoveryResult> =
+            crate::actor_wait::block_on_released(py, async {
+                async {
+                    // No bridge instance is in scope for this free-function
+                    // discovery entrypoint, so build the shipped DHT client
+                    // fail-closed (real Mainline Pkarr in a shipped build; the
+                    // in-memory test seam only under `testing`). Never a silent
+                    // in-memory nullifier on a production path (ADR-062 §Decision 1).
+                    let did_dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
+                        crate::identity::build_ffi_dht_client()?,
+                    ));
+                    scp_core::discovery::resolve_contexts_from_did(&query_owned, &did_dht)
+                        .await
+                        .map_err(ScpPyError::from)
+                }
+                .await
+            })??;
 
         let list = PyList::empty(py);
         for result in &results {
@@ -1178,6 +1179,7 @@ impl crate::scp::PyScp {
     #[pyo3(signature = (owner_did, address, known_contexts_json=None))]
     pub fn address_resolve(
         &self,
+        py: Python<'_>,
         owner_did: &str,
         address: &str,
         known_contexts_json: Option<&str>,
@@ -1231,8 +1233,7 @@ impl crate::scp::PyScp {
             guard.get(owner_did).cloned().unwrap_or_default()
         };
 
-        let rt = crate::runtime()?;
-        let outcome = rt.block_on(async {
+        let outcome = crate::actor_wait::block_on_released(py, async {
             let mut resolver = scp_core::discovery::AddressResolver::new();
             let querier = LocalHandleQuerier::new(&bi.core);
             resolver
@@ -1249,7 +1250,7 @@ impl crate::scp::PyScp {
                     message: format!("address resolution failed: {e}"),
                     code: petname_helpers::address_resolution_error_code(&e).to_owned(),
                 })
-        })?;
+        })??;
 
         // §22.8.2 ranks results by trust level, so a caller reads
         // `unavailable_layers` to learn which higher-trust layers this build
@@ -1674,23 +1675,25 @@ mod tests {
 
     #[test]
     fn address_resolve_via_petname() {
-        let owner = "did:dht:zTestResolver1";
-        reset_petname_map_for(owner);
-        // Initialize the tokio runtime required by PyO3 bridge functions
-        crate::init_runtime().ok();
-        let scp = default_scp();
-        scp.petname_set(owner, "did:dht:zAlice", "alice").unwrap();
+        pyo3::Python::with_gil(|py| {
+            let owner = "did:dht:zTestResolver1";
+            reset_petname_map_for(owner);
+            // Initialize the tokio runtime required by PyO3 bridge functions
+            crate::init_runtime().ok();
+            let scp = default_scp();
+            scp.petname_set(owner, "did:dht:zAlice", "alice").unwrap();
 
-        let result = scp.address_resolve(owner, "alice", None).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        let resolutions = parsed["resolutions"].as_array().unwrap();
-        assert!(!resolutions.is_empty());
-        assert_eq!(resolutions[0]["type"], "Identity");
-        assert_eq!(resolutions[0]["did"], "did:dht:zAlice");
-        assert_eq!(resolutions[0]["trust_level"]["kind"], "LocalPetname");
-        // §22.8.2 step 1 stops at a petname hit, so no handle layer was
-        // queried and none reported unavailability.
-        assert_eq!(parsed["unavailable_layers"].as_array().unwrap().len(), 0);
+            let result = scp.address_resolve(py, owner, "alice", None).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+            let resolutions = parsed["resolutions"].as_array().unwrap();
+            assert!(!resolutions.is_empty());
+            assert_eq!(resolutions[0]["type"], "Identity");
+            assert_eq!(resolutions[0]["did"], "did:dht:zAlice");
+            assert_eq!(resolutions[0]["trust_level"]["kind"], "LocalPetname");
+            // §22.8.2 step 1 stops at a petname hit, so no handle layer was
+            // queried and none reported unavailability.
+            assert_eq!(parsed["unavailable_layers"].as_array().unwrap().len(), 0);
+        });
     }
 
     /// A resolution that reaches the handle layers names every layer this
@@ -1699,67 +1702,69 @@ mod tests {
     /// `attestation_lookup` outlet, so both layers report unavailable.
     #[test]
     fn address_resolve_names_the_layers_this_bridge_never_queried() {
-        let owner = "did:dht:zTestResolver2";
-        let ctx = "ctx-unavailable-layers";
-        reset_petname_map_for(owner);
-        reset_handle_registry_for(ctx);
-        crate::init_runtime().ok();
-        let scp = default_scp();
-        scp.handle_register(
-            ctx,
-            "alice",
-            r#"{"type": "identity", "did": "did:dht:zAlice"}"#,
-            "did:dht:zAlice",
-            None,
-            None,
-        )
-        .unwrap();
+        pyo3::Python::with_gil(|py| {
+            let owner = "did:dht:zTestResolver2";
+            let ctx = "ctx-unavailable-layers";
+            reset_petname_map_for(owner);
+            reset_handle_registry_for(ctx);
+            crate::init_runtime().ok();
+            let scp = default_scp();
+            scp.handle_register(
+                ctx,
+                "alice",
+                r#"{"type": "identity", "did": "did:dht:zAlice"}"#,
+                "did:dht:zAlice",
+                None,
+                None,
+            )
+            .unwrap();
 
-        let result = scp.address_resolve(owner, "alice", None).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+            let result = scp.address_resolve(py, owner, "alice", None).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
-        let resolutions = parsed["resolutions"].as_array().unwrap();
-        assert_eq!(resolutions.len(), 1);
-        assert_eq!(resolutions[0]["did"], "did:dht:zAlice");
-        assert_eq!(
-            resolutions[0]["trust_level"]["kind"],
-            "HandleRegistryVerified"
-        );
+            let resolutions = parsed["resolutions"].as_array().unwrap();
+            assert_eq!(resolutions.len(), 1);
+            assert_eq!(resolutions[0]["did"], "did:dht:zAlice");
+            assert_eq!(
+                resolutions[0]["trust_level"]["kind"],
+                "HandleRegistryVerified"
+            );
 
-        // This bridge invokes no `attestation_lookup` outlet, so nobody read
-        // an attestation index. §22.8.2 step 2a queries one domain per
-        // configured domain and this bridge configures none, so nobody read a
-        // `.well-known/scp` document either. Both layers therefore appear
-        // here, which is what §22.8.2a requires: a caller acting on the
-        // handle-registry binding learns that two other layers went unread.
-        let unavailable = parsed["unavailable_layers"].as_array().unwrap();
-        let layers: Vec<&str> = unavailable
-            .iter()
-            .map(|entry| entry["layer"].as_str().unwrap())
-            .collect();
-        assert_eq!(unavailable.len(), 2, "got layers: {layers:?}");
-        assert!(layers.contains(&"Attestation"), "got layers: {layers:?}");
-        assert!(layers.contains(&"Domain"), "got layers: {layers:?}");
+            // This bridge invokes no `attestation_lookup` outlet, so nobody read
+            // an attestation index. §22.8.2 step 2a queries one domain per
+            // configured domain and this bridge configures none, so nobody read a
+            // `.well-known/scp` document either. Both layers therefore appear
+            // here, which is what §22.8.2a requires: a caller acting on the
+            // handle-registry binding learns that two other layers went unread.
+            let unavailable = parsed["unavailable_layers"].as_array().unwrap();
+            let layers: Vec<&str> = unavailable
+                .iter()
+                .map(|entry| entry["layer"].as_str().unwrap())
+                .collect();
+            assert_eq!(unavailable.len(), 2, "got layers: {layers:?}");
+            assert!(layers.contains(&"Attestation"), "got layers: {layers:?}");
+            assert!(layers.contains(&"Domain"), "got layers: {layers:?}");
 
-        let attestation_reason = unavailable
-            .iter()
-            .find(|entry| entry["layer"] == "Attestation")
-            .and_then(|entry| entry["reason"].as_str())
-            .expect("the attestation entry carries a reason");
-        assert!(
-            attestation_reason.contains("attestation_lookup"),
-            "the reason must name the outlet this bridge never invokes: {attestation_reason}"
-        );
+            let attestation_reason = unavailable
+                .iter()
+                .find(|entry| entry["layer"] == "Attestation")
+                .and_then(|entry| entry["reason"].as_str())
+                .expect("the attestation entry carries a reason");
+            assert!(
+                attestation_reason.contains("attestation_lookup"),
+                "the reason must name the outlet this bridge never invokes: {attestation_reason}"
+            );
 
-        let domain_reason = unavailable
-            .iter()
-            .find(|entry| entry["layer"] == "Domain")
-            .and_then(|entry| entry["reason"].as_str())
-            .expect("the domain entry carries a reason");
-        assert!(
-            domain_reason.contains("no domain"),
-            "the reason must name the missing configuration: {domain_reason}"
-        );
+            let domain_reason = unavailable
+                .iter()
+                .find(|entry| entry["layer"] == "Domain")
+                .and_then(|entry| entry["reason"].as_str())
+                .expect("the domain entry carries a reason");
+            assert!(
+                domain_reason.contains("no domain"),
+                "the reason must name the missing configuration: {domain_reason}"
+            );
+        });
     }
 
     /// A domain-scoped address reaches two layers, and this bridge queries
@@ -1767,19 +1772,21 @@ mod tests {
     /// DID registered that handle.
     #[test]
     fn address_resolve_domain_handle_reports_both_unqueried_layers() {
-        let owner = "did:dht:zTestResolver3";
-        reset_petname_map_for(owner);
-        crate::init_runtime().ok();
-        let scp = default_scp();
+        pyo3::Python::with_gil(|py| {
+            let owner = "did:dht:zTestResolver3";
+            reset_petname_map_for(owner);
+            crate::init_runtime().ok();
+            let scp = default_scp();
 
-        let error = scp
-            .address_resolve(owner, "alice@example.com", None)
-            .expect_err("this bridge queries neither the domain nor the attestation layer");
-        let message = error.to_string();
-        assert!(
-            message.contains("Domain") && message.contains("Attestation"),
-            "the error must name both layers that never answered: {message}"
-        );
+            let error = scp
+                .address_resolve(py, owner, "alice@example.com", None)
+                .expect_err("this bridge queries neither the domain nor the attestation layer");
+            let message = error.to_string();
+            assert!(
+                message.contains("Domain") && message.contains("Attestation"),
+                "the error must name both layers that never answered: {message}"
+            );
+        });
     }
 
     // -- JSON conversion helper tests ----------------------------------------
