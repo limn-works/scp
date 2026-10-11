@@ -24,13 +24,12 @@ swift run
 3. Opens an encrypted single-admin context
 4. Closes the context and shuts the instance down
 
-`makeKeyCustodyProvider()` in `Sources/main.swift` throws
-`ScaffoldError.keyCustodyProviderMissing` until you implement it over your app's
-key store. The SDK ships no `KeyCustodyProvider` implementation. A build
-without the bridge's `testing` feature has no pre-rotation custody backend and
-throws `SCP-IDENT-1059` for `CustodyType.encryptedFile`, and
-`CustodyType.osKeystore` needs the provider that
-`identityCreateWithCustody(provider:)` takes (`SCP-IDENT-1003`).
+`Sources/main.swift` passes `AppleKeyCustody()`, the SDK's `KeyCustodyProvider`
+over the Keychain, to `identityCreateWithCustody(provider:)`: the `os_keystore`
+custody request of spec 03 §3.2.2. A build without the bridge's `testing`
+feature has no pre-rotation custody backend and throws `SCP-IDENT-1059` from
+that call; the custody paragraph of `docs/guides/sdk-quickstart.md` states which
+identity creations a shipped build refuses.
 
 ## Next Steps
 

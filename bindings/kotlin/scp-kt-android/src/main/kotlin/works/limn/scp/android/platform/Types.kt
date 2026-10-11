@@ -2,13 +2,14 @@
 //
 // These types are the Kotlin-side contract of the Android adapters. Each interface's KDoc states
 // how it differs from the Rust `scp-platform` trait (crates/scp-platform/src/traits.rs) and from
-// the UniFFI callback interface (crates/scp-ffi/uniffi/src/lib.rs) for the same capability. No
-// code passes an Android adapter to the Rust engine. The UniFFI bridge has no function that
-// accepts a storage, push or device attestation provider. `SCP.identityCreateWithCustody` in
-// `scp-kt` accepts a key custody provider, but only the UniFFI-generated
-// `uniffi.scp.KeyCustodyProvider`, which these interfaces are not. ADR-021 (the UniFFI bridge)
-// and ADR-027 require each Android adapter to implement its UniFFI callback interface and to be
-// injected into the Rust engine, so these interfaces diverge from both ADRs. Stories SCP-110 to
+// the UniFFI callback interface (crates/scp-ffi/uniffi/src/lib.rs) for the same capability. The
+// UniFFI bridge has no function that accepts a storage, push or device attestation provider, so
+// no code passes those adapters to the Rust engine. `SCP.identityCreateWithCustody` in `scp-kt`
+// accepts the UniFFI-generated `uniffi.scp.KeyCustodyProvider`, which these interfaces are not;
+// [UniffiKeyCustody] implements it over [AndroidKeyCustody]. ADR-021 (the UniFFI bridge) and
+// ADR-027 require each Android adapter to implement its UniFFI callback interface and to be
+// injected into the Rust engine, so the storage, push and device attestation interfaces diverge
+// from both ADRs. Stories SCP-110 to
 // SCP-113 of `.docs/prds/main.json` stay in progress while any acceptance criterion their
 // descriptions record as unmet stands; each adapter's trait criterion is one of them. Story
 // SCP-214 tracks injecting a key custody provider into the Rust engine.
@@ -32,6 +33,21 @@ enum class KeyType {
 
     /** X25519 key agreement key (HPKE wrapping keys). */
     X25519,
+}
+
+/**
+ * The role a key was minted in, recorded by [AndroidKeyCustody] for the key's lifetime.
+ *
+ * Mirrors the UniFFI `CustodyKeyRole`: the bridge names the role when it generates a key
+ * and reads it back from `getPublicKey`, binding a key it has not seen as an identity only
+ * when the reported role is [IDENTITY] (`crates/scp-ffi/uniffi/src/lib.rs`).
+ */
+enum class KeyRole {
+    /** The participant's identity key, the only pseudonym-derivation source. */
+    IDENTITY,
+
+    /** Any other key. */
+    OPERATIONAL,
 }
 
 /**
@@ -104,7 +120,7 @@ data class KeyHandle(
  *   call inserts the same id between the removal and the check. Apart from its constructor,
  *   which restores the ids of persisted software Ed25519 seeds before any
  *   [KeyCustodyProvider.destroyKey] call can run, [AndroidKeyCustody] inserts only fresh random
- *   UUIDs. It does not read the EncryptedSharedPreferences entry that holds
+ *   `ULong` ids that name no live key. It does not read the EncryptedSharedPreferences entry that holds
  *   the seed of a software Ed25519 key that [KeyCustodyProvider.generateKeypair] creates
  *   (API 26-32). [AndroidKeyCustody] removes that entry with
  *   `apply()`, which returns before the removal reaches disk, so `confirmed` is `true` while the
@@ -288,8 +304,8 @@ interface PushProvider {
  * tracks both moves.
  *
  * This interface matches neither Rust declaration. It is not the `scp-ffi-uniffi`
- * `KeyCustodyProvider` callback protocol, whose key ids are u64 strings, and no in-tree Kotlin
- * host implements that bridge protocol yet.
+ * `KeyCustodyProvider` callback protocol, whose key ids are u64 strings; [UniffiKeyCustody]
+ * implements that protocol over [AndroidKeyCustody], whose key ids are decimal u64 strings.
  *
  * - Method set: it declares the methods of the UniFFI `KeyCustodyProvider` callback interface in
  *   `crates/scp-ffi/uniffi/src/lib.rs` except `custody_type`, and it names the callback's
@@ -382,9 +398,9 @@ interface KeyCustodyProvider {
      * X25519 wrapping keys are always software-managed (Bouncy Castle) and held in process
      * memory only, which diverges from ADR-027's P-256 agreement key (see the interface KDoc).
      *
-     * [AndroidKeyCustody] throws no [ScpException] from this method. A Keystore or
-     * EncryptedSharedPreferences failure escapes as the original exception, listed in the
-     * interface KDoc.
+     * [AndroidKeyCustody] throws [ScpException] from this method only with `SCP-CRYPTO-4060`,
+     * when every key id it draws is taken. A Keystore or EncryptedSharedPreferences failure
+     * escapes as the original exception, listed in the interface KDoc.
      *
      * @param keyType The type of key to generate.
      * @return An opaque [KeyHandle] referencing the generated key.
@@ -460,14 +476,16 @@ interface KeyCustodyProvider {
      * key: [exportSigningKeyBytes] throws `SCP-CRYPTO-4003` for an X25519 handle. See
      * [AndroidKeyCustody.dhAgree] for where the software implementation holds the key.
      *
-     * @param keyHandle Handle to an X25519 key.
+     * @param keyHandle Handle to an X25519 key, or to a software Ed25519 key, which agrees
+     *   through its X25519 scalar `SHA-512(seed)[0..32]`.
      * @param peerPublic 32-byte X25519 public key of the peer.
      * @return 32-byte X25519 shared secret.
-     * @throws ScpException with code `SCP-CRYPTO-4006` if [peerPublic] is 32 bytes long and no
-     *   software key sits under [keyHandle]: a destroyed or unknown handle, or a Keystore
-     *   Ed25519 handle.
      * @throws ScpException with code `SCP-CRYPTO-4003` if [peerPublic] is not 32 bytes long,
-     *   checked before any key lookup, or [keyHandle] names a software Ed25519 key.
+     *   checked before any key lookup.
+     * @throws ScpException with code `SCP-CRYPTO-4005` for a Keystore Ed25519 handle
+     *   ([CustodyType.HARDWARE]): Keystore never releases the seed the scalar comes from.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if no software key sits under
+     *   [keyHandle].
      * @throws IllegalStateException from Bouncy Castle ("X25519 agreement failed") if
      *   [peerPublic] is 32 bytes long but a low-order point, such as 32 zero bytes, which makes
      *   the shared secret all zero. No point order is checked, so a `catch (e: ScpException)`
@@ -563,8 +581,9 @@ interface KeyCustodyProvider {
      * the custody adapters and all three bridges. That slice has not landed, so this method
      * still exports the seed of a software key. ADR-027 acceptance criterion 14 (private key
      * isolation) says the Rust engine receives only signatures and public keys, never private
-     * key material, and the UniFFI `KeyCustodyProvider` callback's `export_signing_key_bytes`
-     * would carry this seed to Rust, so this method's design diverges from criterion 14.
+     * key material, and through [UniffiKeyCustody] the UniFFI `KeyCustodyProvider` callback's
+     * `export_signing_key_bytes` carries this seed to Rust, so this method's design diverges
+     * from criterion 14.
      *
      * @param keyHandle Handle to an Ed25519 key.
      * @return 32-byte raw Ed25519 private key bytes.

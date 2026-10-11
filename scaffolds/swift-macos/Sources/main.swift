@@ -1,29 +1,20 @@
 /// Minimal SCP macOS app scaffold.
 ///
-/// Creates a DID identity through a caller-supplied key custody provider and
-/// opens an encrypted context.
+/// Passes `AppleKeyCustody`, the SDK's `KeyCustodyProvider` over the Keychain
+/// (the `os_keystore` custody request, spec 03 §3.2.2), to
+/// `identityCreateWithCustody(provider:)`, then opens an encrypted context.
 ///
-/// The Swift SDK ships no key store that `identityCreate(custody:)` reaches in
-/// a shipped build: a build without the bridge's `testing` feature has no
-/// pre-rotation custody backend and throws `SCP-IDENT-1059` for
-/// `CustodyType.encryptedFile`, and `CustodyType.osKeystore` needs the
-/// provider that `identityCreateWithCustody(provider:)` takes
-/// (`SCP-IDENT-1003`). Implement `makeKeyCustodyProvider()` over your app's key
-/// store before running.
+/// A build without the bridge's `testing` feature has no pre-rotation custody
+/// backend, so step 1 throws `SCP-IDENT-1059` in a shipped build. The custody
+/// paragraph of `docs/guides/sdk-quickstart.md` states which identity creations
+/// a shipped build refuses.
 
 import Foundation
 import SCP
 
 enum ScaffoldError: Error {
-    /// `makeKeyCustodyProvider()` has not been implemented yet.
-    case keyCustodyProviderMissing
     /// `SCP_STORAGE_PASSPHRASE` is not set.
     case storagePassphraseMissing
-}
-
-/// Returns the `KeyCustodyProvider` over your app's key store.
-func makeKeyCustodyProvider() throws -> KeyCustodyProvider {
-    throw ScaffoldError.keyCustodyProviderMissing
 }
 
 guard let passphrase = ProcessInfo.processInfo.environment["SCP_STORAGE_PASSPHRASE"] else {
@@ -34,8 +25,9 @@ let storageDir = try FileManager.default
     .appendingPathComponent("SCPmacOSApp")
 let scp = try SCP.withStorage(sqliteDir: storageDir, passphrase: passphrase)
 
-// 1. Create a DID identity whose keys the provider holds.
-let identity = try await scp.identityCreateWithCustody(provider: try makeKeyCustodyProvider())
+// 1. Create a DID identity whose keys the Keychain holds. A shipped build
+//    throws `SCP-IDENT-1059` here.
+let identity = try await scp.identityCreateWithCustody(provider: AppleKeyCustody())
 print("Created identity: \(identity.did())")
 
 // 2. Create an encrypted single-admin context.

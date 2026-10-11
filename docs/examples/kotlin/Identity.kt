@@ -8,9 +8,11 @@
  * 3.2.2. `identityCreate(custody)` answers `OS_KEYSTORE` with `SCP-IDENT-1003`,
  * because only a [uniffi.scp.KeyCustodyProvider] reaches the host key store.
  * The KDoc of [works.limn.scp.CustodyType] states which identity creations a
- * build without the `testing` feature refuses.
- * This example implements the provider over the caller's own key store and
- * passes it to `identityCreateWithCustody`.
+ * build without the `testing` feature refuses; `identityCreateWithCustody` is
+ * one of them.
+ * This example passes the caller's provider to `identityCreateWithCustody`;
+ * on Android, `UniffiKeyCustody(AndroidKeyCustody(context))` from
+ * `works.limn:scp-kt-android` is that provider over Android Keystore.
  *
  * Prerequisites:
  *   implementation("works.limn:scp-kt:0.1.0")

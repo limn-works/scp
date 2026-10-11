@@ -14641,9 +14641,10 @@ public func FfiConverterCallbackInterfaceDeviceAttestationProvider_lower(_ v: De
 /**
  * Callback for platform cryptographic key management.
  *
- * Implemented by host code and injected into the Rust engine. No in-tree
- * Swift or Kotlin host implements this protocol yet: `AppleKeyCustody` and
- * `AndroidKeyCustody` implement their SDKs' own custody interfaces.
+ * Implemented by host code and injected into the Rust engine. The Swift SDK's
+ * `AppleKeyCustody` conforms to it over the Keychain, and the Kotlin SDK's
+ * `UniffiKeyCustody` implements it over `AndroidKeyCustody`; either is the
+ * provider the `os_keystore` custody request reaches (spec 03 §3.2.2).
  *
  * A method reports failure by returning an [`ScpError`]. Return one whose
  * code is `SCP-CRYPTO-4006` (key not found) for a key id that was destroyed or
@@ -14827,10 +14828,9 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * # Default
      *
      * Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-     * implemented. A host that needs it overrides it. No Kotlin class
-     * implements this callback: the Kotlin `AndroidKeyCustody` implements the
-     * Kotlin SDK's own `KeyCustodyProvider` interface, and no code passes it
-     * to the Rust engine. Third-party
+     * implemented. A host that needs it overrides it. `AppleKeyCustody` and
+     * `UniffiKeyCustody` override it for a software Ed25519 key, and fail
+     * for a key Android Keystore holds. Third-party
      * `KeyCustodyProvider` implementations that do not need governance vote
      * signing may rely on the default until they add support.
      *
@@ -18320,7 +18320,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 54334) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 56607) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 33720) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 30807) {

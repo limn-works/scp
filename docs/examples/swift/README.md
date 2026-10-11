@@ -28,10 +28,13 @@ Each example is an `enum` with one `static func run` that your app calls. Every
 example that creates an identity takes a `KeyCustodyProvider`. The SDK ships no
 key store that `identityCreate(custody:)` reaches in a shipped build; the doc
 comment on `CustodyType` in `Sources/SCP/Types.swift` states how a shipped
-build answers each case. Implement
-`KeyCustodyProvider` over your own key store and pass it in:
+build answers each case, and a shipped build refuses every identity creation,
+`identityCreateWithCustody` included, with `SCP-IDENT-1059`. `AppleKeyCustody`
+is the SDK's `KeyCustodyProvider` over the Keychain, the `os_keystore` custody
+request of spec 03 §3.2.2:
 
 ```swift
+let myProvider = AppleKeyCustody()
 let passphrase = "..."  // from the user or your app's keychain item
 try await IdentityExample.run(provider: myProvider, storagePassphrase: passphrase)
 try await ContextExample.run(

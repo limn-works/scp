@@ -32,14 +32,17 @@ context lifecycle, messaging, and tool invocation.
 ## Running the Examples
 
 Each example is one top-level function that your app calls. Every example that
-creates an identity takes a `uniffi.scp.KeyCustodyProvider`. The SDK ships no
-key store that `identityCreate(custody)` reaches in a shipped build; the KDoc
-on `works.limn.scp.CustodyType` states how a shipped build answers each entry.
-`AndroidKeyCustody` implements a different interface,
-`works.limn.scp.android.platform.KeyCustodyProvider`, so it cannot be passed
-here. Implement `uniffi.scp.KeyCustodyProvider` over your own key store:
+creates an identity takes a `uniffi.scp.KeyCustodyProvider`, the provider that
+the `os_keystore` custody request reaches (spec section 3.2.2); the KDoc on
+`works.limn.scp.CustodyType` states how a shipped build answers each entry,
+and a shipped build refuses every identity creation, `identityCreateWithCustody`
+included, with `SCP-IDENT-1059`.
+On Android, `scp-kt-android` ships that provider over Android Keystore:
+`UniffiKeyCustody` wraps an `AndroidKeyCustody`. On another JVM, implement
+`uniffi.scp.KeyCustodyProvider` over your own key store.
 
 ```kotlin
+val myProvider = UniffiKeyCustody(AndroidKeyCustody(applicationContext))
 identityExample(myProvider, File(filesDir, "scp-identity"), passphrase)
 contextExample(aliceProvider, bobProvider, filesDir, passphrase)
 messagingExample(aliceProvider, bobProvider, "wss://relay.example.com", filesDir, passphrase)

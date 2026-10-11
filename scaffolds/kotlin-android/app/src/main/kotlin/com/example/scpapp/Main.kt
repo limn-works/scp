@@ -20,7 +20,11 @@ import uniffi.scp.MemoryScope
 import works.limn.scp.SCP
 import java.io.File
 
-/** Returns the [KeyCustodyProvider] over your app's key store. */
+/**
+ * Returns the [KeyCustodyProvider] over your app's key store. In an Android
+ * app, return `UniffiKeyCustody(AndroidKeyCustody(applicationContext))` from
+ * `works.limn:scp-kt-android`; this JVM scaffold has no Android `Context`.
+ */
 fun makeKeyCustodyProvider(): KeyCustodyProvider =
     throw UnsupportedOperationException("implement makeKeyCustodyProvider over your app's key store")
 

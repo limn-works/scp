@@ -143,18 +143,37 @@ public nonisolated enum DestructionMethod: String, Sendable {
 /// Internal metadata stored alongside a Keychain key item.
 ///
 /// Encoded as a compact JSON blob and stored in `kSecAttrLabel`. This allows
-/// type-checking and public key retrieval without accessing key material
-/// (which would trigger biometric prompts on gated keys).
+/// type-checking, role reporting and public key retrieval without accessing
+/// key material (which would trigger biometric prompts on gated keys).
 private nonisolated struct KeyMetadata: Codable {
     /// The ``KeyType`` of the stored key.
     let keyType: String
     /// Base64-encoded 32-byte public key bytes, stored at generation time.
     /// `nil` for legacy items created before metadata caching was added.
     let publicKeyBase64: String?
+    /// The ``KeyRole`` raw value the key was minted in. Required: an item
+    /// without it fails to decode, so a role is never guessed.
+    let role: String
+}
 
-    init(keyType: String, publicKeyBase64: String? = nil) {
-        self.keyType = keyType
-        self.publicKeyBase64 = publicKeyBase64
+/// The role a key was minted in, stored in ``KeyMetadata`` and reported as
+/// the UniFFI `CustodyKeyRole` from `getPublicKey(keyId:)`.
+private nonisolated enum KeyRole: String {
+    case identity
+    case operational
+
+    init(_ role: CustodyKeyRole) {
+        switch role {
+        case .identity: self = .identity
+        case .operational: self = .operational
+        }
+    }
+
+    var custodyKeyRole: CustodyKeyRole {
+        switch self {
+        case .identity: .identity
+        case .operational: .operational
+        }
     }
 }
 
@@ -162,15 +181,29 @@ private nonisolated struct KeyMetadata: Codable {
 
 /// Apple Keychain-backed key custody provider for SCP Ed25519 and X25519 keys.
 ///
-/// ADR-025, the Apple platform adapter, requires this class to conform to the
-/// UniFFI `KeyCustodyProvider` callback interface in
-/// `crates/scp-ffi/uniffi/src/lib.rs`. This class does not conform yet.
+/// The class conforms to the UniFFI `KeyCustodyProvider` callback interface
+/// (`crates/scp-ffi/uniffi/src/lib.rs`), as ADR-025 requires, so an instance
+/// passes directly to `identityCreateWithCustody(provider:)` and every other
+/// bridge call that takes a provider. The `os_keystore` custody of spec 03
+/// §3.2.2 reaches the Keychain through it with no caller glue.
+///
+/// ## Key ids
+///
+/// A key id is the canonical decimal form of a random `UInt64`, as
+/// `String(n)` writes it, which is the only id shape the bridge accepts.
+/// Generation adds the Keychain item without replacing an existing one and
+/// draws a fresh id on `errSecDuplicateItem`, so a live key never shares an
+/// id. An id that names a destroyed key is drawn again with probability
+/// 2^-64 per earlier key.
 ///
 /// ## Key storage
 ///
 /// Each key is stored as a `kSecClassGenericPassword` Keychain item:
-/// - `kSecAttrAccount`: `"scp.key.<uuid>"` where `<uuid>` is the opaque handle.
-/// - `kSecAttrLabel`: JSON-encoded ``KeyMetadata`` (type + cached public key).
+/// - `kSecAttrAccount`: `"scp.key.<id>"` where `<id>` is the key id.
+/// - `kSecAttrLabel`: JSON-encoded ``KeyMetadata`` (type, role and cached
+///   public key).
+/// - `kSecAttrGeneric`: the raw public key bytes, so a key is found by its
+///   public key with an exact-match query.
 /// - `kSecAttrAccessGroup`: `"\(appIdentifierPrefix).dev.limn.scp"`.
 /// - `kSecAttrAccessible`: `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`.
 /// - `kSecValueData`: 32-byte raw private key bytes.
@@ -237,8 +270,11 @@ public final class AppleKeyCustody: Sendable {
 
     /// Returns the `kSecAttrAccount` value for a key handle.
     private nonisolated func account(for handle: String) -> String {
-        "scp.key.\(handle)"
+        Self.accountPrefix + handle
     }
+
+    /// The `kSecAttrAccount` prefix every SCP key item carries.
+    private nonisolated static let accountPrefix = "scp.key."
 
     // MARK: - Initialization
 
@@ -276,14 +312,70 @@ public final class AppleKeyCustody: Sendable {
     /// All operations (add, fetch, delete) start from this base and extend it
     /// with operation-specific keys.
     private nonisolated func baseQuery(for handle: String) -> [String: Any] {
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: account(for: handle)
-        ]
+        var query = itemQuery()
+        query[kSecAttrAccount as String] = account(for: handle)
+        return query
+    }
+
+    /// The class and access group every SCP key item is stored under.
+    private nonisolated func itemQuery() -> [String: Any] {
+        var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword]
         if let group = accessGroup {
             query[kSecAttrAccessGroup as String] = group
         }
         return query
+    }
+
+    /// Decodes the ``KeyMetadata`` label from a Keychain attribute dictionary.
+    private nonisolated static func metadata(from attrs: [String: Any]) -> KeyMetadata? {
+        guard
+            let labelString = attrs[kSecAttrLabel as String] as? String,
+            let labelData = labelString.data(using: .utf8)
+        else { return nil }
+        return try? JSONDecoder().decode(KeyMetadata.self, from: labelData)
+    }
+
+    /// The ids of every key item this adapter holds whose cached public key
+    /// is `publicKey`.
+    ///
+    /// Matches `kSecAttrGeneric`, which generation sets to the public key,
+    /// so the Keychain answers an exact-match query instead of enumerating
+    /// every item; an unfiltered `kSecMatchLimitAll` search on the macOS
+    /// file keychain ends early when another thread deletes an item mid-scan.
+    /// Each match is confirmed against the public key in its decoded
+    /// ``KeyMetadata`` label. Reads attributes only, so a biometric-gated
+    /// item raises no prompt.
+    ///
+    /// - Throws: ``PlatformError/keychainError(_:)`` for any Keychain failure
+    ///   other than finding no items.
+    nonisolated func keyIds(cachingPublicKey publicKey: Data) throws -> [String] {
+        var query = itemQuery()
+        query[kSecAttrGeneric as String] = publicKey as CFData
+        query[kSecReturnAttributes as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitAll
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        switch status {
+        case errSecSuccess:
+            break
+        case errSecItemNotFound:
+            return []
+        default:
+            throw PlatformError.keychainError(status)
+        }
+        guard let items = result as? [[String: Any]] else {
+            throw PlatformError.custodyError("Keychain returned no attribute list")
+        }
+        return items.compactMap { attrs in
+            guard
+                let account = attrs[kSecAttrAccount as String] as? String,
+                account.hasPrefix(Self.accountPrefix),
+                let cached = Self.metadata(from: attrs)?.publicKeyBase64,
+                Data(base64Encoded: cached) == publicKey
+            else { return nil }
+            return String(account.dropFirst(Self.accountPrefix.count))
+        }
     }
 
     /// Reads the full ``KeyMetadata`` for `handle` from Keychain attributes.
@@ -302,9 +394,7 @@ public final class AppleKeyCustody: Sendable {
         case errSecSuccess:
             guard
                 let attrs = result as? [String: Any],
-                let labelString = attrs[kSecAttrLabel as String] as? String,
-                let labelData = labelString.data(using: .utf8),
-                let metadata = try? JSONDecoder().decode(KeyMetadata.self, from: labelData)
+                let metadata = Self.metadata(from: attrs)
             else {
                 throw PlatformError.custodyError(
                     "Could not decode key metadata for handle '\(handle)'"
@@ -320,7 +410,7 @@ public final class AppleKeyCustody: Sendable {
 
     /// Reads the raw 32-byte private key bytes for `handle` from the Keychain.
     ///
-    /// - Parameter handle: The opaque UUID handle returned by
+    /// - Parameter handle: The key id returned by
     ///   ``generateKeypair(keyType:)``.
     /// - Returns: The raw private key bytes.
     /// - Throws: ``PlatformError/keyNotFound(_:)`` if the item does not exist,
@@ -368,6 +458,18 @@ public final class AppleKeyCustody: Sendable {
         return keyType
     }
 
+    /// Reads the role `handle` was minted in from its metadata label.
+    /// Does NOT trigger biometric prompts (reads attributes only).
+    private nonisolated func fetchRole(for handle: String) throws -> KeyRole {
+        let metadata = try fetchMetadata(for: handle)
+        guard let role = KeyRole(rawValue: metadata.role) else {
+            throw PlatformError.custodyError(
+                "Unknown key role '\(metadata.role)' for handle '\(handle)'"
+            )
+        }
+        return role
+    }
+
     /// A `SecAccessControl` requiring the currently enrolled biometric set.
     /// `.biometryCurrentSet` invalidates access if biometrics change (new
     /// fingerprint enrolled, Face ID reset), which triggers key rotation per
@@ -400,21 +502,51 @@ public final class AppleKeyCustody: Sendable {
     /// `SecAccessControl` requiring `.biometryCurrentSet`. When `.none`,
     /// the item uses `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`.
     ///
+    /// An existing item under `handle` is replaced. Key generation does not
+    /// use this method: it must never overwrite a key, so it adds through
+    /// ``mintKey(keyType:role:)``.
+    ///
     /// - Parameters:
     ///   - bytes: The raw 32-byte private key bytes.
-    ///   - handle: The opaque UUID handle that will reference this key.
+    ///   - handle: The key id that will reference this key.
     ///   - keyType: The ``KeyType`` to tag this item with.
+    ///   - role: The role to record for the key's lifetime.
     ///   - publicKeyBytes: The public key bytes to cache in metadata.
     /// - Throws: ``PlatformError/keychainError(_:)`` if the add operation fails.
     nonisolated func storePrivateKeyBytes(
         _ bytes: Data,
         for handle: String,
         keyType: KeyType,
+        role: CustodyKeyRole,
         publicKeyBytes: Data
     ) throws {
+        let query = try addQuery(
+            bytes, for: handle, keyType: keyType, role: role, publicKeyBytes: publicKeyBytes
+        )
+        let status = SecItemAdd(query as CFDictionary, nil)
+        switch status {
+        case errSecSuccess:
+            break
+        case errSecDuplicateItem:
+            try replaceExisting(handle: handle, query: query)
+        default:
+            throw PlatformError.keychainError(status)
+        }
+    }
+
+    /// Builds the `SecItemAdd` query that stores `bytes` under `handle` with
+    /// its metadata label and the access control of ``biometricPolicy``.
+    private nonisolated func addQuery(
+        _ bytes: Data,
+        for handle: String,
+        keyType: KeyType,
+        role: CustodyKeyRole,
+        publicKeyBytes: Data
+    ) throws -> [String: Any] {
         let metadata = KeyMetadata(
             keyType: keyType.rawValue,
-            publicKeyBase64: publicKeyBytes.base64EncodedString()
+            publicKeyBase64: publicKeyBytes.base64EncodedString(),
+            role: KeyRole(role).rawValue
         )
         guard
             let metadataData = try? JSONEncoder().encode(metadata),
@@ -427,6 +559,7 @@ public final class AppleKeyCustody: Sendable {
 
         var query = baseQuery(for: handle)
         query[kSecAttrLabel as String] = metadataLabel
+        query[kSecAttrGeneric as String] = publicKeyBytes as CFData
         query[kSecValueData as String] = bytes as CFData
         query[kSecAttrDescription as String] = policyTag
 
@@ -437,15 +570,55 @@ public final class AppleKeyCustody: Sendable {
         case .required:
             query[kSecAttrAccessControl as String] = try biometricAccessControl(for: handle)
         }
-        let status = SecItemAdd(query as CFDictionary, nil)
-        switch status {
-        case errSecSuccess:
-            break
-        case errSecDuplicateItem:
-            try replaceExisting(handle: handle, query: query)
-        default:
-            throw PlatformError.keychainError(status)
+        return query
+    }
+
+    /// The number of fresh ids ``mintKey(keyType:role:)`` draws before it
+    /// gives up. Eight collisions in a row among random 64-bit ids means the
+    /// Keychain is not behaving as a store, not bad luck.
+    private nonisolated static let mintAttempts = 8
+
+    /// Generates a `keyType` keypair minted in `role`, adds it under a fresh
+    /// random decimal `UInt64` id, and returns that id.
+    ///
+    /// The add never replaces an item: `errSecDuplicateItem` draws another
+    /// id, so a live key is never overwritten and never shares its id.
+    ///
+    /// - Throws: ``PlatformError/keychainError(_:)`` if the add fails,
+    ///   ``PlatformError/custodyError(_:)`` if every drawn id is taken.
+    nonisolated func mintKey(keyType: KeyType, role: CustodyKeyRole) throws -> String {
+        var privateKeyBytes: Data
+        let publicKeyBytes: Data
+        switch keyType {
+        case .ed25519:
+            let signingKey = Curve25519.Signing.PrivateKey()
+            privateKeyBytes = signingKey.rawRepresentation
+            publicKeyBytes = signingKey.publicKey.rawRepresentation
+        case .x25519:
+            let agreementKey = Curve25519.KeyAgreement.PrivateKey()
+            privateKeyBytes = agreementKey.rawRepresentation
+            publicKeyBytes = agreementKey.publicKey.rawRepresentation
         }
+        defer { privateKeyBytes.resetBytes(in: 0 ..< privateKeyBytes.count) }
+
+        for _ in 0 ..< Self.mintAttempts {
+            let handle = String(UInt64.random(in: .min ... .max))
+            let query = try addQuery(
+                privateKeyBytes, for: handle, keyType: keyType, role: role, publicKeyBytes: publicKeyBytes
+            )
+            let status = SecItemAdd(query as CFDictionary, nil)
+            switch status {
+            case errSecSuccess:
+                return handle
+            case errSecDuplicateItem:
+                continue
+            default:
+                throw PlatformError.keychainError(status)
+            }
+        }
+        throw PlatformError.custodyError(
+            "No free key id after \(Self.mintAttempts) draws"
+        )
     }
 
     /// Resolves an `errSecDuplicateItem` from storing `query` under `handle`:
@@ -463,6 +636,22 @@ public final class AppleKeyCustody: Sendable {
         guard retryStatus == errSecSuccess else {
             throw PlatformError.keychainError(retryStatus)
         }
+    }
+}
+
+// MARK: - Ed25519 to X25519
+
+extension AppleKeyCustody {
+    /// The X25519 scalar of an Ed25519 key: the first 32 bytes of
+    /// `SHA-512(seed)`, unclamped (X25519 clamps when it multiplies). The
+    /// 64-byte hash buffer is wiped before return.
+    nonisolated static func x25519Scalar(fromEd25519Seed seed: Data) -> Data {
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA512_DIGEST_LENGTH))
+        defer { digest.withUnsafeMutableBytes { _ = memset_s($0.baseAddress, $0.count, 0, $0.count) } }
+        seed.withUnsafeBytes { buffer in
+            _ = CC_SHA512(buffer.baseAddress, CC_LONG(buffer.count), &digest)
+        }
+        return Data(digest[0 ..< 32])
     }
 }
 
@@ -521,9 +710,13 @@ public extension AppleKeyCustody {
     /// never leaves the Keychain after generation; all operations retrieve
     /// it on demand and operate in-process.
     ///
+    /// The key is minted in the operational role. An identity key comes from
+    /// the bridge through `generateKeypair(keyType:role:)`, which records the
+    /// role the bridge names.
+    ///
     /// - Parameter keyType: `"ed25519"` or `"x25519"`.
-    /// - Returns: An opaque UUID string handle. Pass this to other methods on
-    ///   this instance to perform operations with the key.
+    /// - Returns: The key id, a canonical decimal `UInt64` string. Pass this
+    ///   to other methods on this instance to perform operations with the key.
     /// - Throws: ``PlatformError/keychainError(_:)`` if the Keychain add fails,
     ///   ``PlatformError/custodyError(_:)`` for an unknown `keyType` string.
     ///
@@ -533,26 +726,7 @@ public extension AppleKeyCustody {
         guard let parsedType = KeyType(rawValue: keyType) else {
             throw PlatformError.custodyError("Unknown key type '\(keyType)'")
         }
-
-        let handle = UUID().uuidString
-        let privateKeyBytes: Data
-        let publicKeyBytes: Data
-
-        switch parsedType {
-        case .ed25519:
-            let signingKey = Curve25519.Signing.PrivateKey()
-            privateKeyBytes = signingKey.rawRepresentation
-            publicKeyBytes = signingKey.publicKey.rawRepresentation
-        case .x25519:
-            let agreementKey = Curve25519.KeyAgreement.PrivateKey()
-            privateKeyBytes = agreementKey.rawRepresentation
-            publicKeyBytes = agreementKey.publicKey.rawRepresentation
-        }
-
-        try storePrivateKeyBytes(
-            privateKeyBytes, for: handle, keyType: parsedType, publicKeyBytes: publicKeyBytes
-        )
-        return handle
+        return try mintKey(keyType: parsedType, role: .operational)
     }
 
     // MARK: sign
@@ -564,7 +738,7 @@ public extension AppleKeyCustody {
     /// call. They are not cached, logged, or returned across the FFI boundary.
     ///
     /// - Parameters:
-    ///   - keyHandle: The UUID handle returned by ``generateKeypair(keyType:)``
+    ///   - keyHandle: The key id returned by ``generateKeypair(keyType:)``
     ///     for an `"ed25519"` key.
     ///   - data: The bytes to sign.
     /// - Returns: A 64-byte signature.
@@ -610,7 +784,7 @@ public extension AppleKeyCustody {
     /// prompts on gated keys. Falls back to private-key derivation for legacy
     /// items that predate the metadata cache.
     ///
-    /// - Parameter keyHandle: The UUID handle returned by
+    /// - Parameter keyHandle: The key id returned by
     ///   ``generateKeypair(keyType:)``.
     /// - Returns: The raw public key bytes.
     /// - Throws: ``PlatformError/keyNotFound(_:)`` if the handle is unknown,
@@ -685,7 +859,7 @@ public extension AppleKeyCustody {
     /// Attest P-256 keys managed by `DCAppAttestService`. See 9.15 of the
     /// SCP specification.
     ///
-    /// - Parameter keyHandle: The UUID handle returned by
+    /// - Parameter keyHandle: The key id returned by
     ///   ``generateKeypair(keyType:)``.
     /// - Returns: A ``DestructionAttestation`` confirming software deletion.
     /// - Throws: ``PlatformError/keyNotFound(_:)`` if the handle is already
@@ -729,18 +903,22 @@ public extension AppleKeyCustody {
 
     /// Performs X25519 Diffie-Hellman key agreement.
     ///
-    /// Retrieves the X25519 private key bytes from Keychain and computes the
-    /// shared secret with `peerPublic`. The private key never crosses the
-    /// `AppleKeyCustody` boundary -- the scalar multiplication happens entirely
-    /// within this method.
+    /// Retrieves the private key bytes from Keychain and computes the shared
+    /// secret with `peerPublic`. For an X25519 key the stored bytes are the
+    /// scalar. For an Ed25519 key the scalar is `SHA-512(seed)[0..32]`, the
+    /// birational Ed25519-to-X25519 conversion the bridge's
+    /// `ed25519_to_x25519_agree` asks for and Rust's
+    /// `x25519_agree_from_ed25519` computes (`SigningKey::to_scalar_bytes`).
+    /// The private key never crosses the `AppleKeyCustody` boundary -- the
+    /// scalar multiplication happens entirely within this method, and every
+    /// local copy of the seed, hash and scalar is wiped.
     ///
     /// - Parameters:
-    ///   - keyHandle: The UUID handle returned by ``generateKeypair(keyType:)``
-    ///     for an `"x25519"` key.
+    ///   - keyHandle: The key id returned by ``generateKeypair(keyType:)``
+    ///     for an `"x25519"` or `"ed25519"` key.
     ///   - peerPublic: The 32-byte X25519 public key of the peer.
     /// - Returns: 32-byte X25519 shared secret.
-    /// - Throws: ``PlatformError/wrongKeyType(_:)`` if `keyHandle` refers to
-    ///   an Ed25519 key, ``PlatformError/keyNotFound(_:)`` if the handle is
+    /// - Throws: ``PlatformError/keyNotFound(_:)`` if the handle is
     ///   unknown, ``PlatformError/biometricAuthenticationFailed(_:)`` if
     ///   biometric gating is active and authentication fails,
     ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
@@ -751,18 +929,22 @@ public extension AppleKeyCustody {
     @concurrent
     func dhAgree(_ keyHandle: String, peerPublic: Data) async throws -> Data {
         let storedType = try fetchKeyType(for: keyHandle)
-        guard storedType == .x25519 else {
-            throw PlatformError.wrongKeyType(
-                "dhAgree requires an X25519 key; handle '\(keyHandle)' is Ed25519"
-            )
-        }
 
         var privateKeyBytes = try fetchPrivateKeyBytes(for: keyHandle)
         defer { privateKeyBytes.resetBytes(in: 0 ..< privateKeyBytes.count) }
 
+        var scalar: Data
+        switch storedType {
+        case .x25519:
+            scalar = Data(privateKeyBytes)
+        case .ed25519:
+            scalar = Self.x25519Scalar(fromEd25519Seed: privateKeyBytes)
+        }
+        defer { scalar.resetBytes(in: 0 ..< scalar.count) }
+
         do {
             let agreementKey = try Curve25519.KeyAgreement.PrivateKey(
-                rawRepresentation: privateKeyBytes
+                rawRepresentation: scalar
             )
             let peerPublicKey = try Curve25519.KeyAgreement.PublicKey(
                 rawRepresentation: peerPublic
@@ -871,7 +1053,7 @@ public extension AppleKeyCustody {
     /// Keychain-backed (software) because the Secure Enclave only supports
     /// P-256. See ADR-025 Rationale.
     ///
-    /// - Parameter keyId: The UUID handle returned by
+    /// - Parameter keyId: The key id returned by
     ///   ``generateKeypair(keyType:)``.
     /// - Returns: 32-byte raw Ed25519 private key bytes.
     /// - Throws: ``PlatformError/wrongKeyType(_:)`` if the key is X25519,
@@ -896,25 +1078,136 @@ public extension AppleKeyCustody {
 
     // MARK: custodyType
 
-    /// Returns the custody type for any key handle managed by this instance.
+    /// Returns the custody type of the key `keyHandle` names.
     ///
-    /// Returns `"software"` when no biometric policy is active, or
-    /// `"software_biometric"` when biometric gating is enabled. Both are
-    /// Keychain-backed (software) -- the Secure Enclave is NOT used for
-    /// Ed25519/X25519 SCP keys (hardware supports P-256 only).
+    /// For a key the Keychain holds, returns `"software"` when no biometric
+    /// policy is active, or `"software_biometric"` when biometric gating is
+    /// enabled. Both are Keychain-backed (software) -- the Secure Enclave is
+    /// NOT used for Ed25519/X25519 SCP keys (hardware supports P-256 only).
+    /// For an id whose metadata the Keychain does not return, returns
+    /// `"unknown"`, as `UniffiKeyCustody` does on Android; the bridge reads it
+    /// as its weakest custody. The lookup reads attributes only and never
+    /// prompts.
     ///
     /// See ADR-025 Rationale, Biometric gating, and 17.8 of the SCP
     /// specification.
     ///
-    /// - Parameter keyHandle: The UUID handle (not inspected; the custody type
-    ///   is determined by the instance's ``biometricPolicy``).
-    /// - Returns: `"software"` or `"software_biometric"` -- mirroring
-    ///   `CustodyType::Software` in `scp-platform/src/traits.rs` with an
-    ///   additional biometric qualifier when applicable.
-    nonisolated func custodyType(_: String) -> String {
-        switch biometricPolicy {
+    /// - Parameter keyHandle: The key id.
+    /// - Returns: `"software"`, `"software_biometric"` or `"unknown"`.
+    nonisolated func custodyType(_ keyHandle: String) -> String {
+        guard (try? fetchKeyType(for: keyHandle)) != nil else { return "unknown" }
+        return switch biometricPolicy {
         case .none: "software"
         case .required: "software_biometric"
         }
+    }
+}
+
+// MARK: - UniFFI KeyCustodyProvider conformance
+
+/// `AppleKeyCustody` as the bridge's `KeyCustodyProvider` (ADR-025): each
+/// witness forwards to the Swift-idiomatic method above and converts every
+/// failure into the one error type UniFFI accepts from a callback, `ScpError`.
+///
+/// Error mapping follows the host contract on `KeyCustodyProvider` in
+/// `crates/scp-ffi/uniffi/src/lib.rs`:
+/// - an `ScpError` from the shared Rust helpers passes through unchanged;
+/// - ``PlatformError/keyNotFound(_:)`` becomes `SCP-CRYPTO-4006`, which the
+///   bridge reports as key-not-found;
+/// - every other failure becomes `SCP-CRYPTO-4060`, the custody error,
+///   carrying the adapter's description.
+///
+/// The adapter holds Ed25519 and X25519 keys. A P-256 or HPKE P-256 request
+/// fails closed with `SCP-CRYPTO-4060`.
+extension AppleKeyCustody: KeyCustodyProvider {
+    /// Code the bridge reports as key-not-found.
+    private nonisolated static let keyNotFoundCode = "SCP-CRYPTO-4006"
+    /// Code the bridge reports as a custody failure.
+    private nonisolated static let custodyErrorCode = "SCP-CRYPTO-4060"
+
+    /// Converts any adapter failure into the `ScpError` the bridge accepts.
+    private nonisolated static func providerError(_ error: Error) -> ScpError {
+        switch error {
+        case let scpError as ScpError:
+            return scpError
+        case let PlatformError.keyNotFound(handle):
+            return .Crypto(msg: "Key not found for key id '\(handle)'", code: keyNotFoundCode)
+        default:
+            return .Crypto(msg: error.localizedDescription, code: custodyErrorCode)
+        }
+    }
+
+    /// Runs `body` and rethrows its failure as an `ScpError`.
+    private nonisolated static func bridged<T>(_ body: () async throws -> T) async throws -> T {
+        do {
+            return try await body()
+        } catch {
+            throw providerError(error)
+        }
+    }
+
+    public func sign(keyId: String, message: Data) async throws -> Data {
+        try await Self.bridged { try await sign(keyId, data: message) }
+    }
+
+    public func getPublicKey(keyId: String) async throws -> CustodyPublicKey {
+        try await Self.bridged {
+            let keyType: CustodyKeyType = switch try fetchKeyType(for: keyId) {
+            case .ed25519: .ed25519
+            case .x25519: .x25519
+            }
+            let role = try fetchRole(for: keyId).custodyKeyRole
+            let publicKey = try await publicKey(keyId)
+            return CustodyPublicKey(keyType: keyType, publicKey: publicKey, role: role)
+        }
+    }
+
+    public func destroyKey(keyId: String) async throws {
+        try await Self.bridged { _ = try await destroyKey(keyId) }
+    }
+
+    public func generateKeypair(keyType: CustodyKeyType, role: CustodyKeyRole) async throws -> String {
+        try await Self.bridged {
+            let adapterType: KeyType
+            switch keyType {
+            case .ed25519:
+                adapterType = .ed25519
+            case .x25519:
+                adapterType = .x25519
+            case .p256, .hpkeP256:
+                // Stub — see SCP-307
+                throw ScpError.Crypto(
+                    msg: "AppleKeyCustody holds Ed25519 and X25519 keys only; \(keyType) is not supported",
+                    code: Self.custodyErrorCode
+                )
+            }
+            return try mintKey(keyType: adapterType, role: role)
+        }
+    }
+
+    public func dhAgree(keyId: String, peerPublic: Data) async throws -> Data {
+        try await Self.bridged { try await dhAgree(keyId, peerPublic: peerPublic) }
+    }
+
+    public func derivePseudonym(keyId: String, contextId: Data) async throws -> Data {
+        try await Self.bridged { try await derivePseudonym(keyId, contextId: contextId) }
+    }
+
+    public func deriveRotatablePseudonym(
+        keyId: String,
+        contextId: Data,
+        pseudonymEpoch: UInt64
+    ) async throws -> Data {
+        try await Self.bridged {
+            try await deriveRotatablePseudonym(keyId, contextId: contextId, pseudonymEpoch: pseudonymEpoch)
+        }
+    }
+
+    public func exportSigningKeyBytes(keyId: String) async throws -> Data {
+        try await Self.bridged { try await exportSigningKeyBytes(keyId) }
+    }
+
+    public nonisolated func custodyType(keyId: String) -> String {
+        custodyType(keyId)
     }
 }

@@ -147,7 +147,7 @@ dependencies {
 
 Every SCP participant starts by creating a cryptographic identity -- a DID (Decentralized Identifier) backed by Ed25519 keys. The identity is the root of trust for all protocol operations.
 
-Every SDK takes the custody choice as a required argument, from the custody request vocabulary of `03-identity.md` §3.2.2. Python's `CustodyType` carries `ENCRYPTED_FILE` and `OS_KEYSTORE`, TypeScript's carries `"encrypted_file"` and `"os_keystore"`, and Kotlin's carries `ENCRYPTED_FILE` and `OS_KEYSTORE`, and no other value. Swift's `CustodyType` carries `.encryptedFile` and `.osKeystore`, and no other value. `encrypted_file` keeps the keys in `$HOME/.scp/keys.bin`, sealed under the `SCP_KEY_PASSPHRASE` environment variable; a build without the bridge's `testing` feature has no pre-rotation custody backend and refuses every identity creation, `identityCreateWithCustody` included, with `SCP-IDENT-1059`, in every SDK (ADR-062 §Decision 6). `identityCreate` answers `os_keystore` with `SCP-IDENT-1003`, because only a `KeyCustodyProvider` reaches the host key store. In TypeScript, Swift and Kotlin a production caller implements `KeyCustodyProvider` over its own key store and passes it to `identityCreateWithCustody`.
+Every SDK takes the custody choice as a required argument, from the custody request vocabulary of `03-identity.md` §3.2.2. Python's `CustodyType` carries `ENCRYPTED_FILE` and `OS_KEYSTORE`, TypeScript's carries `"encrypted_file"` and `"os_keystore"`, and Kotlin's carries `ENCRYPTED_FILE` and `OS_KEYSTORE`, and no other value. Swift's `CustodyType` carries `.encryptedFile` and `.osKeystore`, and no other value. `encrypted_file` keeps the keys in `$HOME/.scp/keys.bin`, sealed under the `SCP_KEY_PASSPHRASE` environment variable; a build without the bridge's `testing` feature has no pre-rotation custody backend and refuses every identity creation, `identityCreateWithCustody` included, with `SCP-IDENT-1059`, in every SDK (ADR-062 §Decision 6). `identityCreate` answers `os_keystore` with `SCP-IDENT-1003`, because only a `KeyCustodyProvider` reaches the host key store. In TypeScript a production caller implements `KeyCustodyProvider` over its own key store and passes it to `identityCreateWithCustody`. Swift ships that provider over the Keychain as `AppleKeyCustody`, and Android ships it over Android Keystore as `UniffiKeyCustody(AndroidKeyCustody(context))` in `scp-kt-android`; both reach `identityCreateWithCustody`, so a shipped build refuses them with `SCP-IDENT-1059` as well.
 
 ### Python
 
@@ -184,21 +184,24 @@ console.log(`DID: ${identity.did}`);
 ```swift
 import SCP
 
-let provider: KeyCustodyProvider = MyKeyStore()  // your key store
+let provider: KeyCustodyProvider = AppleKeyCustody()  // the Keychain
 let scp = try SCP.withStorage(sqliteDir: storageDir, passphrase: "change me")
-let identity = try await scp.identityCreateWithCustody(provider: provider)
+let identity = try await scp.identityCreateWithCustody(provider: provider)  // SCP-IDENT-1059 in a shipped build
 print("DID: \(identity.did())")
 ```
 
 ### Kotlin
 
 ```kotlin
-import uniffi.scp.KeyCustodyProvider
+import android.content.Context
 import works.limn.scp.SCP
+import works.limn.scp.android.platform.AndroidKeyCustody
+import works.limn.scp.android.platform.UniffiKeyCustody
 
-suspend fun createIdentity(provider: KeyCustodyProvider, storageDir: java.io.File) {
+suspend fun createIdentity(context: Context, storageDir: java.io.File) {
     val scp = SCP.withSqlite(storageDir, "change me")
-    val identity = scp.identityCreateWithCustody(provider)
+    // A shipped build throws SCP-IDENT-1059 here.
+    val identity = scp.identityCreateWithCustody(UniffiKeyCustody(AndroidKeyCustody(context)))
     println("DID: ${identity.did()}")
 }
 ```
