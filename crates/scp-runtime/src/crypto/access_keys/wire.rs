@@ -3,7 +3,7 @@
 //! Access keys are distributed via the same pull-based RFC 9180 HPKE protocol
 //! as sender keys (§9.16.2), but with a distinct domain separator
 //! (`"scp-access-key-v1"`) to prevent cross-protocol key confusion. Sealing and
-//! opening go through the shared [`scp_protocol::crypto::hpke`] core.
+//! opening go through the shared [`scp_protocol::crypto::hpke::p256`] suite.
 //!
 //! Protocol flow:
 //! 1. New member sends [`AccessKeyRequest`] with an ephemeral DHKEM(P-256)
@@ -395,7 +395,7 @@ pub fn handle_access_key_request(
 /// `key_custody.public_key(wrapping_key_handle)`. DHKEM Decap
 /// (`ExtractAndExpand(dh, enc || pkRm)`), `KeySchedule_base`, and the AEAD open
 /// then complete in software via
-/// [`scp_protocol::crypto::hpke::custody::open_with_external_dh`].
+/// [`scp_protocol::crypto::hpke::p256::custody::open_with_external_dh`].
 ///
 /// # Errors
 ///
