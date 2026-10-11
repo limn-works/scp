@@ -14,8 +14,7 @@ pip install scp-python
 
 ```python
 import asyncio
-from scp_sdk import SCP
-from scp_sdk.types import Capability, CustodyType, MemoryScope
+from scp_sdk import SCP, Context, CustodyType
 
 
 async def main():
@@ -27,24 +26,20 @@ async def main():
     print(f"DID: {identity.did}")
 
     # Create an encrypted context
-    ctx = await scp.context_create(
-        identity.did,
-        {
-            "ceiling": [
-                Capability.MESSAGES_READ.value,
-                Capability.MESSAGES_WRITE.value,
-                Capability.MEMBER_INVITE.value,
-            ],
-            "memory_scope": MemoryScope.EPHEMERAL.value,
-            "governance": "single_admin",
-            "ttl": 3600.0,
-        },
+    ctx = await Context.create(
+        identity=identity,
+        params={"ceiling": ["msg:send", "msg:receive"], "ttl": 3600},
     )
 
     # Send a message (MLS-encrypted, signed, provenance-tagged)
-    await scp.context_send(ctx._raw_handle, identity.did, b"Hello from SCP")
+    await ctx.send(b"Hello from SCP")
 
-    await scp.context_close(ctx._raw_handle, identity.did)
+    # Receive messages
+    async for msg in ctx.receive():
+        print(f"{msg.sender_did}: {msg.content}")
+        break
+
+    await ctx.close()
 
 
 asyncio.run(main())
@@ -94,7 +89,7 @@ All errors inherit from `ScpError` with a machine-readable `code` field:
 from scp_sdk import ScpError, ContextError
 
 try:
-    await scp.context_send(ctx._raw_handle, identity.did, b"data")
+    await ctx.send(b"data")
 except ContextError as e:
     print(f"[{e.code}] {e}")
 ```

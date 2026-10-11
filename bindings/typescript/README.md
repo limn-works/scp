@@ -15,33 +15,28 @@ bun add @limn-works/scp-ts
 ## Quick Start
 
 ```typescript
-import { SCP } from "@limn-works/scp-ts";
+import { Identity, Context } from "@limn-works/scp-ts";
 
-const scp = new SCP({ storage: { type: "in_memory" } });
-try {
-  // "in_memory" is the one custody string this bridge builds a key store from, in
-  // an addon built with its testing feature; pass a KeyCustodyProvider to
-  // identityCreateWithCustody() for any other key store.
-  const identity = await scp.identityCreate("in_memory");
+// Create a cryptographic identity (DID)
+const identity = await Identity.create({ custody: "platform" });
+console.log(`DID: ${identity.did}`);
 
-  // Create an encrypted context
-  const ctx = await scp.contextCreate(
-    identity,
-    JSON.stringify({
-      ceiling: ["messages:read", "messages:write", "member:invite"],
-      memoryScope: "ephemeral",
-      governance: "single_admin",
-      ttl: 3600,
-    }),
-  );
+// Create an encrypted context
+const ctx = await Context.create(identity, {
+  ceiling: ["msg:send", "msg:receive"],
+  ttl: 3600,
+});
 
-  // Send a message (MLS-encrypted, signed, provenance-tagged)
-  await scp.contextSend(ctx._rawHandle, identity.did, new TextEncoder().encode("Hello from SCP"), null);
+// Send a message (MLS-encrypted, signed, provenance-tagged)
+await ctx.send(new TextEncoder().encode("Hello from SCP"));
 
-  await scp.contextClose(ctx._rawHandle, identity.did);
-} finally {
-  await scp.shutdown(5);
+// Receive messages
+for await (const msg of ctx.receive()) {
+  console.log(`${msg.senderDid}: ${msg.content}`);
+  break;
 }
+
+await ctx.close();
 ```
 
 ## Runtime Support
@@ -102,7 +97,7 @@ All errors extend `ScpError` with a machine-readable `code` field:
 import { ScpError, ContextError } from "@limn-works/scp-ts";
 
 try {
-  await scp.contextSend(ctx._rawHandle, identity.did, payload, null);
+  await ctx.send(payload);
 } catch (e) {
   if (e instanceof ContextError) {
     console.error(`[${e.code}] ${e.message}`);
