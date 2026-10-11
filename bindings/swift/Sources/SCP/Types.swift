@@ -32,8 +32,7 @@ import Foundation
 /// until a production pre-rotation custody backend exists (ADR-062
 /// §Decision 6).
 ///
-/// The Kotlin SDK's `works.limn.scp.CustodyType` carries the same cases. This
-/// type is a pure Swift type and conflicts with no UniFFI-generated type.
+/// This type is a pure Swift type and conflicts with no UniFFI-generated type.
 ///
 /// ## Provenance
 ///
