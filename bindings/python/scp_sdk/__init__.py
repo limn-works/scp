@@ -21,9 +21,8 @@ Phase 4 PR 5 (#1549) collapsed the module-level namespace classes onto
 :class:`Relay`, :class:`Node`, :class:`McpServer`, :class:`McpClient`,
 and :class:`UcanToken` are now pure handle / data wrappers. Every
 operation that previously lived as a namespace static or instance method
-is a method on the :class:`SCP` instance — pass ``obj._raw_handle`` (or
-the handle-holding wrapper directly) where the bridge expects an opaque
-handle.
+is a method on the :class:`SCP` instance, and it takes the wrapper object
+itself; a raw native handle raises ``ValidationError`` (SCP-VALID-7005).
 """
 
 from __future__ import annotations
@@ -112,6 +111,7 @@ from scp_sdk.errors import (
     ValidationError,
 )
 from scp_sdk.event_log import Checkpoint, Event, Proof, SignedCheckpoint
+from scp_sdk.fullstack import FullStackNode
 from scp_sdk.governance import GovernanceActionResult, ProposalStatus, RejectionReason
 from scp_sdk.identity import DIDDocument, Identity, IdentityAttestation, RevocationStatus
 from scp_sdk.mcp import (
@@ -277,6 +277,7 @@ __all__ = [
     "Event",
     "EventLogEntry",
     "EventLogEntryPayload",
+    "FullStackNode",
     "GovernanceActionResult",
     "GovernanceError",
     "Identity",

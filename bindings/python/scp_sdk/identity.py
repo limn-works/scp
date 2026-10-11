@@ -14,7 +14,7 @@ Call sites shape::
     with SCP(storage={"type": "in_memory"}) as scp:
         identity = await scp.identity_create(CustodyType.IN_MEMORY)
         # identity is an Identity wrapper — use identity.did / identity.custody_type
-        rotated = await scp.identity_rotate_key(identity._raw_handle)
+        rotated = await scp.identity_rotate_key(identity)
 
 :class:`DIDDocument`, :class:`IdentityAttestation`, and
 :class:`RevocationStatus` are pure data classes; they hold no SCP
@@ -29,10 +29,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from scp_sdk._extension import native_module
 from scp_sdk.errors import ValidationError
 from scp_sdk.types import CustodyType
 
 if TYPE_CHECKING:
+    from scp_sdk._scp_core import PyIdentity
     from scp_sdk.scp import SCP
 
 
@@ -103,8 +105,8 @@ class Identity:
 
     All mutating/effectful operations (``rotate_key``, ``add_agent_key``,
     ``attest_device``, ``execute_recovery``, attestation lifecycle, etc.)
-    live as methods on :class:`scp_sdk.SCP`. Pass ``identity._raw_handle``
-    when the SCP-level method needs the opaque bridge handle.
+    live as methods on :class:`scp_sdk.SCP`, which take the ``Identity``
+    object itself.
 
     The ``rotation_event_json`` attribute is populated only on handles
     produced by :meth:`scp_sdk.SCP.identity_migrate` (spec §9.12,
@@ -120,9 +122,17 @@ class Identity:
         """Wrap a ``PyIdentity`` bridge handle.
 
         Users should not call this directly — use the ``scp.identity_*``
-        factory methods.
+        factory methods. Raises :class:`~scp_sdk.errors.ValidationError`
+        (``SCP-VALID-7005``) unless ``handle`` is the extension's ``PyIdentity``.
         """
-        self._raw_handle = handle
+        native_class = native_module().PyIdentity
+        if not isinstance(handle, native_class):
+            raise ValidationError(
+                "Identity(): handle must be a native PyIdentity, got "
+                f"{type(handle).__module__}.{type(handle).__qualname__}",
+                "SCP-VALID-7005",
+            )
+        self._raw_handle: PyIdentity = handle
         self.rotation_event_json = rotation_event_json
 
     @classmethod

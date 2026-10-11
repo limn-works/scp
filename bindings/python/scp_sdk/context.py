@@ -11,7 +11,7 @@ Typical call-sites shape::
     with SCP(storage={"type": "in_memory"}) as scp:
         identity = await scp.identity_create("in_memory")
         ctx = await scp.context_create(identity.did, {"ceiling": ["core:send_message"]})
-        await scp.context_send(ctx._raw_handle, identity.did, b"hello")
+        await scp.context_send(ctx, identity.did, b"hello")
 
 Data classes (:class:`AssetEntry`, :class:`BatchPublishResult`,
 :class:`Membership`, :class:`PublishResult`, :class:`SiteConfig`) and
@@ -36,6 +36,7 @@ from scp_sdk._extension import native_module
 from scp_sdk.errors import ContextError, ValidationError
 
 if TYPE_CHECKING:
+    from scp_sdk._scp_core import PyContextHandle
     from scp_sdk.outlets import Outlets
     from scp_sdk.scp import SCP
 
@@ -510,8 +511,7 @@ class Context:
     Pure handle wrapper. The underlying ``PyContextHandle`` is produced by
     :meth:`scp_sdk.SCP.context_create` (and related factory methods). All
     lifecycle, messaging, outlet, broadcast, and governance operations now
-    live on :class:`scp_sdk.SCP` — pass ``ctx._raw_handle`` into the
-    per-op methods.
+    live on :class:`scp_sdk.SCP` and take the ``Context`` object itself.
 
     Attributes:
         context_id: Unique identifier for this context.
@@ -529,14 +529,24 @@ class Context:
 
         Users should not call this directly. Use
         :meth:`scp_sdk.SCP.context_create`,
-        :meth:`scp_sdk.SCP.context_import`, or related factories.
+        :meth:`scp_sdk.SCP.context_join_from_welcome`, or related factories.
+
+        Raises :class:`~scp_sdk.errors.ValidationError` (``SCP-VALID-7005``)
+        unless ``handle`` is the extension's ``PyContextHandle``.
 
         ``scp`` is the owning :class:`scp_sdk.SCP` instance; it backs the
         :attr:`outlets` accessor (whose control plane dispatches to the SCP
         native bridge). Factory methods pass it; a bare ``Context(handle)`` for
         pure handle inspection may omit it.
         """
-        self._raw_handle = handle
+        native_class = native_module().PyContextHandle
+        if not isinstance(handle, native_class):
+            raise ValidationError(
+                "Context(): handle must be a native PyContextHandle, got "
+                f"{type(handle).__module__}.{type(handle).__qualname__}",
+                "SCP-VALID-7005",
+            )
+        self._raw_handle: PyContextHandle = handle
         self.identity_did = identity_did
         self._scp = scp
 

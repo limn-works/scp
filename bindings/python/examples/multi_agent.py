@@ -7,19 +7,19 @@ context handle explicitly.
 
 import asyncio
 
-from scp_sdk import SCP
+from scp_sdk import SCP, Context, Identity
 from scp_sdk.types import Capability, CustodyType, MemoryScope
 
 
-async def run_agent(scp: SCP, name: str, identity, ctx) -> None:  # type: ignore[no-untyped-def]
+async def run_agent(scp: SCP, name: str, identity: Identity, ctx: Context) -> None:
     """Agent loop: join context, listen for messages, respond."""
-    await scp.context_join(ctx._raw_handle, identity.did)
+    await scp.context_join(ctx, identity.did)
     print(f"[{name}] Joined context {ctx.context_id}")
 
-    await scp.context_send(ctx._raw_handle, identity.did, f"[{name}] reporting in".encode())
+    await scp.context_send(ctx, identity.did, f"[{name}] reporting in".encode())
 
     count = 0
-    receiver = await scp.context_receive(ctx._raw_handle)
+    receiver = await scp.context_receive(ctx)
     async for msg in receiver:
         sender = msg.sender_did[:16]
         print(f"[{name}] Received from {sender}...: {msg.payload!r}")
@@ -27,7 +27,7 @@ async def run_agent(scp: SCP, name: str, identity, ctx) -> None:  # type: ignore
         if count >= 2:
             break
 
-    await scp.context_leave(ctx._raw_handle, identity.did)
+    await scp.context_leave(ctx, identity.did)
     print(f"[{name}] Left context")
 
 
@@ -75,7 +75,7 @@ async def main() -> None:
             run_agent(scp, "Agent-B", agent_b, ctx),
         )
 
-        await scp.context_close(ctx._raw_handle, coordinator.did)
+        await scp.context_close(ctx, coordinator.did)
 
 
 if __name__ == "__main__":
