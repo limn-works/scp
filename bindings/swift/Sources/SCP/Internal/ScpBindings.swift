@@ -2581,8 +2581,8 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * is backed by a deterministic RNG so subsequent `generate_keypair`
      * calls produce byte-identical Ed25519 keys across bridges — the
      * basis of the cross-bridge parity test (ADR-046). `testing_seed`
-     * is only valid for `"in_memory"` custody, and every other custody
-     * string returns an error before the seed is read.
+     * is only valid for `"in_memory"` custody; other custody types
+     * reject it with `SCP-VALID-7009` before the custody string is read.
      */
     func identityCreate(custody: String, testingSeed: Data?) async throws  -> Identity
     
@@ -5359,8 +5359,8 @@ open func identityAttestDevice(identity: Identity)async throws  -> String  {
      * is backed by a deterministic RNG so subsequent `generate_keypair`
      * calls produce byte-identical Ed25519 keys across bridges — the
      * basis of the cross-bridge parity test (ADR-046). `testing_seed`
-     * is only valid for `"in_memory"` custody, and every other custody
-     * string returns an error before the seed is read.
+     * is only valid for `"in_memory"` custody; other custody types
+     * reject it with `SCP-VALID-7009` before the custody string is read.
      */
 open func identityCreate(custody: String, testingSeed: Data?)async throws  -> Identity  {
     return
