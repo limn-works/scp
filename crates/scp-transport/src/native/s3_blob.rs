@@ -50,6 +50,10 @@
 //!
 //! Set `S3_TEST_ENDPOINT` and `S3_TEST_BUCKET` environment variables.
 //!
+//! The construction failure path needs no endpoint:
+//! `crates/scp-transport/tests/s3_blob_fail_closed.rs` opens the store against
+//! an address nothing listens on and asserts `StorageError::Internal`.
+//!
 //! See SCP-PERSIST-068 for the full story.
 
 use std::collections::HashMap;
@@ -122,6 +126,12 @@ impl Clone for S3BlobStore {
     }
 }
 
+/// Returns the key prefix `purge_expired` lists and the construction probe
+/// lists, so both requests need the same permission.
+fn expiry_list_prefix(prefix: &str) -> String {
+    format!("{prefix}/expiry/")
+}
+
 impl S3BlobStore {
     /// Creates an `S3BlobStore` using the default AWS credential chain.
     ///
@@ -130,8 +140,11 @@ impl S3BlobStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Internal`] if the AWS SDK configuration
-    /// cannot be loaded.
+    /// Returns [`StorageError::Internal`] when the `ListObjectsV2` probe every
+    /// construction path issues under `{prefix}/expiry/` does not succeed: the
+    /// endpoint refuses or does not answer, the credential chain resolves no
+    /// credentials, the credentials are rejected, no region is configured, the
+    /// bucket does not exist, or the caller may not list that prefix.
     pub async fn open(bucket: &str, prefix: &str) -> Result<Self, StorageError> {
         Self::open_with_clock(bucket, prefix, system_clock()).await
     }
@@ -144,8 +157,11 @@ impl S3BlobStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Internal`] if the AWS SDK configuration
-    /// cannot be loaded.
+    /// Returns [`StorageError::Internal`] when the `ListObjectsV2` probe every
+    /// construction path issues under `{prefix}/expiry/` does not succeed: the
+    /// endpoint refuses or does not answer, the credential chain resolves no
+    /// credentials, the credentials are rejected, no region is configured, the
+    /// bucket does not exist, or the caller may not list that prefix.
     pub async fn open_with_clock(
         bucket: &str,
         prefix: &str,
@@ -153,12 +169,7 @@ impl S3BlobStore {
     ) -> Result<Self, StorageError> {
         let config = load_ring_backed_aws_config().await;
         let client = Client::new(&config);
-        Ok(Self {
-            client,
-            bucket: bucket.to_owned(),
-            prefix: prefix.to_owned(),
-            clock,
-        })
+        Self::from_client(client, bucket, prefix, clock).await
     }
 
     /// Creates an `S3BlobStore` with a custom S3-compatible endpoint URL.
@@ -168,8 +179,11 @@ impl S3BlobStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Internal`] if the AWS SDK configuration
-    /// cannot be loaded.
+    /// Returns [`StorageError::Internal`] when the `ListObjectsV2` probe every
+    /// construction path issues under `{prefix}/expiry/` does not succeed: the
+    /// endpoint refuses or does not answer, the credential chain resolves no
+    /// credentials, the credentials are rejected, no region is configured, the
+    /// bucket does not exist, or the caller may not list that prefix.
     pub async fn open_with_endpoint(
         bucket: &str,
         prefix: &str,
@@ -182,6 +196,50 @@ impl S3BlobStore {
             .force_path_style(true)
             .build();
         let client = Client::from_conf(s3_config);
+        Self::from_client(client, bucket, prefix, clock).await
+    }
+
+    /// Probes `bucket` with one `ListObjectsV2` request, then builds the store.
+    ///
+    /// The probe is the request `purge_expired` sends, limited to one key: the
+    /// same bucket, the same `{prefix}/expiry/` prefix, and so the same
+    /// `s3:ListBucket` permission and `s3:prefix` condition key. A credential
+    /// scoped to the store's prefix passes it, and a `HeadBucket` request,
+    /// which carries no `s3:prefix`, would not.
+    ///
+    /// Both constructors go through here, so neither can skip the probe.
+    /// Loading the SDK configuration and building a `Client` perform no I/O,
+    /// so without this request a constructor returned `Ok` for an endpoint
+    /// nothing listens on, a missing bucket, or absent credentials, and the
+    /// relay learned of it on its first `store`. A selected production backend
+    /// that cannot be satisfied is a terminal error at the construction
+    /// boundary (`.docs/specs/17-persistence-and-storage.md` §17.17.1
+    /// SCP-CAPSEL-8001, §17.7).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Internal`] carrying the SDK's error context when
+    /// the `ListObjectsV2` request does not succeed.
+    async fn from_client(
+        client: Client,
+        bucket: &str,
+        prefix: &str,
+        clock: ClockFn,
+    ) -> Result<Self, StorageError> {
+        let probe_prefix = expiry_list_prefix(prefix);
+        client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(&probe_prefix)
+            .max_keys(1)
+            .send()
+            .await
+            .map_err(|e| {
+                StorageError::Internal(format!(
+                    "S3 list probe failed for {bucket} under {probe_prefix}: {}",
+                    aws_sdk_s3::error::DisplayErrorContext(&e)
+                ))
+            })?;
         Ok(Self {
             client,
             bucket: bucket.to_owned(),
@@ -614,7 +672,7 @@ impl BlobStorage for S3BlobStore {
 
     async fn purge_expired(&self) -> Result<usize, StorageError> {
         let now = self.now();
-        let prefix = format!("{}/expiry/", self.prefix);
+        let prefix = expiry_list_prefix(&self.prefix);
 
         // List all expiry index entries.
         let mut expired_entries: Vec<(u64, [u8; 32], [u8; 32])> = Vec::new();
@@ -1395,5 +1453,133 @@ mod tests {
         // Get should return None for expired blobs.
         let result = store.get(&blob_id).await.unwrap();
         assert!(result.is_none());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod probe_tests {
+    //! The construction probe needs only the permission the store's runtime
+    //! list calls need. A loopback endpoint stands in for an S3 policy that
+    //! grants `s3:ListBucket` under one `s3:prefix` and denies everything else.
+
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves an endpoint that answers an empty listing to a `ListObjectsV2`
+    /// request whose `prefix` is `allowed_prefix`, and 403 `AccessDenied` to
+    /// every other request, `HeadBucket` included.
+    async fn prefix_scoped_endpoint(allowed_prefix: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&head);
+                let line = text
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .replace("%2F", "/")
+                    .replace("%2f", "/");
+                let allowed = line.starts_with("GET ")
+                    && line.contains("list-type=2")
+                    && (line.contains(&format!("prefix={allowed_prefix}&"))
+                        || line.contains(&format!("prefix={allowed_prefix} ")));
+                let (status, body) = if allowed {
+                    (
+                        "200 OK",
+                        format!(
+                            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult \
+                             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>b</Name>\
+                             <Prefix>{allowed_prefix}</Prefix><KeyCount>0</KeyCount>\
+                             <MaxKeys>1</MaxKeys><IsTruncated>false</IsTruncated>\
+                             </ListBucketResult>"
+                        ),
+                    )
+                } else {
+                    (
+                        "403 Forbidden",
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error>\
+                         <Code>AccessDenied</Code><Message>Access Denied</Message></Error>"
+                            .to_owned(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Builds a client with static credentials against `endpoint`, so the
+    /// endpoint's answer alone decides the probe.
+    fn client_for(endpoint: &str) -> Client {
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "probe-test-key",
+                "probe-test-secret",
+                None,
+                None,
+                "probe-test",
+            ))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .http_client(
+                aws_smithy_http_client::Builder::new()
+                    .tls_provider(tls::Provider::Rustls(CryptoMode::Ring))
+                    .build_https(),
+            )
+            .build();
+        Client::from_conf(config)
+    }
+
+    /// A credential that may list only under the store's prefix opens the
+    /// store. A `HeadBucket` probe carries no `s3:prefix`, so it would get 403
+    /// here and fail this test.
+    #[tokio::test]
+    async fn probe_passes_with_list_permission_scoped_to_the_store_prefix() {
+        let endpoint = prefix_scoped_endpoint("relay/expiry/").await;
+        let result =
+            S3BlobStore::from_client(client_for(&endpoint), "bucket", "relay", system_clock())
+                .await;
+        assert!(
+            result.is_ok(),
+            "a prefix-scoped credential must open the store: {:?}",
+            result.err()
+        );
+    }
+
+    /// A credential that may not list under the store's prefix fails at
+    /// construction with `StorageError::Internal` naming the probe.
+    #[tokio::test]
+    async fn probe_fails_closed_when_the_store_prefix_is_not_listable() {
+        let endpoint = prefix_scoped_endpoint("other/expiry/").await;
+        match S3BlobStore::from_client(client_for(&endpoint), "bucket", "relay", system_clock())
+            .await
+        {
+            Err(StorageError::Internal(message)) => assert!(
+                message.contains("S3 list probe failed for bucket under relay/expiry/"),
+                "the error must name the probe: {message}"
+            ),
+            Err(other) => panic!("expected StorageError::Internal, got {other:?}"),
+            Ok(_) => panic!("a credential that cannot list the store prefix must not open it"),
+        }
     }
 }
