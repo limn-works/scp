@@ -14,30 +14,33 @@ bun add @limn-works/scp-ts
 
 ## Quick Start
 
-```typescript
-import { Identity, Context } from "@limn-works/scp-ts";
+This quick start runs only with a native addon built with the `testing` feature (`cargo build -p scp-ffi-napi --features testing`), because a published addon rejects `"in_memory"` custody.
 
-// Create a cryptographic identity (DID)
-const identity = await Identity.create({ custody: "platform" });
+```typescript
+import { SCP } from "@limn-works/scp-ts";
+
+// Every call goes through an SCP instance, which takes a required storage backend.
+const scp = new SCP({ storage: { type: "in_memory" } });
+
+// Create a cryptographic identity (DID) whose keys live in process memory.
+const identity = await scp.identityCreate("in_memory");
 console.log(`DID: ${identity.did}`);
 
-// Create an encrypted context
-const ctx = await Context.create(identity, {
-  ceiling: ["msg:send", "msg:receive"],
-  ttl: 3600,
-});
+// Create an encrypted context that this identity administers.
+const ctx = await scp.contextCreate(
+  identity,
+  JSON.stringify({
+    ceiling: ["messages:read", "messages:write", "context:close"],
+    memoryScope: "ephemeral",
+    governance: "single_admin",
+  }),
+);
+console.log(`Context: ${ctx.contextId}`);
 
-// Send a message (MLS-encrypted, signed, provenance-tagged)
-await ctx.send(new TextEncoder().encode("Hello from SCP"));
-
-// Receive messages
-for await (const msg of ctx.receive()) {
-  console.log(`${msg.senderDid}: ${msg.content}`);
-  break;
-}
-
-await ctx.close();
+await scp.shutdown(5);
 ```
+
+`tests/readme-quickstart.test.ts` reads the block above from this file and runs it.
 
 ## Runtime Support
 

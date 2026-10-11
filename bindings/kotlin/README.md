@@ -15,35 +15,62 @@ dependencies {
 
 ## Quick Start
 
+This quick start runs only with a native library built with the `testing` feature (`./gradlew :scp-kt:test -Pscp.uniffi.cargoFeatures=testing` builds one), because a release build rejects `CustodyType.IN_MEMORY`.
+
 ```kotlin
-import works.limn.scp.Identity
-import works.limn.scp.Context
-import kotlinx.coroutines.flow.first
+import uniffi.scp.CeilingPolicy
+import uniffi.scp.ContextMode
+import uniffi.scp.ContextParams
+import uniffi.scp.GovernanceModel
+import uniffi.scp.MemoryScope
+import uniffi.scp.StorageConfig
+import works.limn.scp.CustodyType
+import works.limn.scp.SCP
 
 suspend fun main() {
-    // Create a cryptographic identity (DID)
-    val identity = Identity.create(custody = "platform")
-    println("DID: ${identity.did}")
+    // Every call goes through an SCP instance, which takes a required storage backend.
+    val scp = SCP(StorageConfig.InMemory)
 
-    // Create an encrypted context
-    val ctx = Context.create(
+    // Create a cryptographic identity (DID) whose keys live in process memory.
+    val identity = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+    println("DID: ${identity.did()}")
+
+    // Create an encrypted context that this identity administers.
+    val ctx =
+        scp.contextCreate(
+            identity = identity,
+            params =
+                ContextParams(
+                    mode = ContextMode.ENCRYPTED,
+                    ceiling = listOf("messages:read", "messages:write", "context:close"),
+                    ceilingPolicy = CeilingPolicy.IMMUTABLE,
+                    governance = GovernanceModel.SINGLE_ADMIN,
+                    memoryScope = MemoryScope.EPHEMERAL,
+                    ttlSeconds = 3600uL,
+                    promotable = false,
+                    minProtocolVersion = 0.toUShort(),
+                    maxChainDepth = null,
+                    maxNestingDepth = null,
+                    sessionCap = null,
+                    economicPolicy = null,
+                    consequenceRulesJson = null,
+                    consequenceConfigJson = null,
+                ),
+        )
+
+    // Send a message (MLS-encrypted, signed, provenance-tagged).
+    scp.contextSend(
+        handle = ctx,
         identity = identity,
-        params = mapOf(
-            "ceiling" to listOf("msg:send", "msg:receive"),
-            "ttl" to 3600,
-        ),
+        payload = "Hello from SCP".toByteArray(),
+        spendingUcanJwt = null,
     )
 
-    // Send a message (MLS-encrypted, signed, provenance-tagged)
-    ctx.send("Hello from SCP".toByteArray())
-
-    // Receive messages
-    val msg = ctx.receiveFlow().first()
-    println("${msg.senderDid}: ${String(msg.content)}")
-
-    ctx.close()
+    scp.contextClose(handle = ctx, identity = identity)
 }
 ```
+
+`scp-kt/src/test/kotlin/works/limn/scp/quickstart/ReadmeQuickStart.kt` holds a copy of the block above, and `ReadmeQuickStartTest` checks that the copy matches this file and runs it.
 
 ## Requirements
 

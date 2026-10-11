@@ -12,38 +12,40 @@ pip install scp-python
 
 ## Quick Start
 
+This quick start runs only in a build compiled with the `testing` feature (`maturin develop --features testing` in `bindings/python`), because a published wheel rejects `CustodyType.IN_MEMORY`.
+
 ```python
 import asyncio
-from scp_sdk import SCP, Context, CustodyType
+
+from scp_sdk import SCP, CustodyType
 
 
 async def main():
-    # Create a cryptographic identity (DID)
-    scp = SCP({"type": "sqlite", "path": "./scp-data", "passphrase": "change me"})
-    # CustodyType.FILE keeps the keys in $HOME/.scp/keys.bin, encrypted under
-    # the SCP_KEY_PASSPHRASE environment variable.
-    identity = await scp.identity_create(CustodyType.FILE)
+    # Every call goes through an SCP instance, which takes a required storage backend.
+    scp = SCP({"type": "in_memory"})
+
+    # Create a cryptographic identity (DID) whose keys live in process memory.
+    identity = await scp.identity_create(CustodyType.IN_MEMORY)
     print(f"DID: {identity.did}")
 
-    # Create an encrypted context
-    ctx = await Context.create(
-        identity=identity,
-        params={"ceiling": ["msg:send", "msg:receive"], "ttl": 3600},
+    # Create an encrypted context that this identity administers.
+    ctx = await scp.context_create(
+        identity.did,
+        {
+            "ceiling": ["messages:read", "messages:write", "context:close"],
+            "memory_scope": "ephemeral",
+            "governance": "single_admin",
+        },
     )
+    print(f"Context: {ctx.context_id} ({ctx.state})")
 
-    # Send a message (MLS-encrypted, signed, provenance-tagged)
-    await ctx.send(b"Hello from SCP")
-
-    # Receive messages
-    async for msg in ctx.receive():
-        print(f"{msg.sender_did}: {msg.content}")
-        break
-
-    await ctx.close()
+    await scp.shutdown(5.0)
 
 
 asyncio.run(main())
 ```
+
+`tests/test_readme_quickstart.py` reads the block above from this file and runs it.
 
 ## Requirements
 

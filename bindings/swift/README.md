@@ -16,33 +16,55 @@ dependencies: [
 
 ## Quick Start
 
+This quick start runs only against an XCFramework built with the `testing` feature (`./build-xcframework.sh --dev`), because a release build rejects `CustodyType.inMemory`.
+
 ```swift
+import Foundation
 import SCP
 
-// Create a cryptographic identity (DID)
-let identity = try await Identity.create(custody: "platform")
-print("DID: \(identity.did)")
+func runQuickStart() async throws {
+    // Every call goes through an SCP instance, which takes a required storage backend.
+    let scp = try SCP(storage: .inMemory)
 
-// Create an encrypted context
-let ctx = try await Context.create(
-    identity: identity,
-    params: ContextParams(
-        ceiling: ["msg:send", "msg:receive"],
-        ttl: 3600
+    // Create a cryptographic identity (DID) whose keys live in process memory.
+    let identity = try await scp.identityCreate(custody: .inMemory)
+    print("DID: \(identity.did())")
+
+    // Create an encrypted context that this identity administers.
+    let ctx = try await scp.contextCreate(
+        identity: identity,
+        params: ContextParams(
+            mode: .encrypted,
+            ceiling: ["messages:read", "messages:write", "context:close"],
+            ceilingPolicy: .immutable,
+            governance: .singleAdmin,
+            memoryScope: .ephemeral,
+            ttlSeconds: 3600,
+            promotable: false,
+            minProtocolVersion: 0,
+            maxChainDepth: nil,
+            maxNestingDepth: nil,
+            sessionCap: nil,
+            economicPolicy: nil,
+            consequenceRulesJson: nil,
+            consequenceConfigJson: nil
+        )
     )
-)
 
-// Send a message (MLS-encrypted, signed, provenance-tagged)
-try await ctx.send(Data("Hello from SCP".utf8))
+    // Send a message (MLS-encrypted, signed, provenance-tagged).
+    try await scp.contextSend(
+        handle: ctx,
+        identity: identity,
+        payload: Data("Hello from SCP".utf8),
+        spendingUcanJwt: nil
+    )
 
-// Receive messages
-for await msg in ctx.messages {
-    print("\(msg.senderDid): \(String(data: msg.content, encoding: .utf8)!)")
-    break
+    try await scp.contextClose(handle: ctx, identity: identity)
+    try await scp.shutdown()
 }
-
-try await ctx.close()
 ```
+
+`Tests/SCPTests/ReadmeQuickStart.swift` holds a copy of the block above, and `ReadmeQuickStartTests` checks that the copy matches this file and runs it.
 
 ## Platform Support
 

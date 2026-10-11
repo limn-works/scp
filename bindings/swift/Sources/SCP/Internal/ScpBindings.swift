@@ -17915,7 +17915,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_attest_device() != 36607) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 17057) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 30085) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_link_attestation() != 29874) {
