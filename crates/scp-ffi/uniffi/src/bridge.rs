@@ -28847,7 +28847,7 @@ mod tests {
 
     /// `identity_create` rejects `"platform"` and `"software"` with
     /// `SCP-IDENT-1003` (SCP-294), and a seed paired with either with
-    /// `SCP-VALID-7009` first, as the PyO3 and NAPI bridges do.
+    /// `SCP-VALID-7009` first, as the `PyO3` and NAPI bridges do.
     #[test]
     fn identity_create_rejects_host_custody_strings_after_the_seed() {
         for custody in ["platform", "software"] {
