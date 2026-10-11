@@ -67,7 +67,9 @@
 
 use std::time::Duration;
 
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
+#[cfg(any(test, feature = "testing"))]
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -516,6 +518,7 @@ pub fn compute_chunk_sig_preimage(
 /// # Errors
 ///
 /// Returns the JCS error string if `payload` cannot be canonicalized.
+#[cfg(any(test, feature = "testing"))]
 pub fn sign_chunk(
     signing_key: &SigningKey,
     context_id: &str,
@@ -672,6 +675,7 @@ pub struct CreditGrantSigningInputs<'a> {
 
 /// Signs a credit grant's preimage with the invoker's Ed25519 signing
 /// key.
+#[cfg(any(test, feature = "testing"))]
 #[must_use]
 pub fn sign_credit_grant(
     signing_key: &SigningKey,
@@ -806,6 +810,7 @@ pub struct CancelSigningInputs<'a> {
 /// Signs a streaming-cancel preimage with the invoker's Ed25519 signing
 /// key. Returns the 64-byte signature — caller composes it into an
 /// [`OutletStreamCancel`].
+#[cfg(any(test, feature = "testing"))]
 #[must_use]
 pub fn sign_cancel(signing_key: &SigningKey, inputs: &CancelSigningInputs<'_>) -> Ed25519Signature {
     let preimage = compute_cancel_sig_preimage(

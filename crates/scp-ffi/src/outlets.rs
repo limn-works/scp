@@ -1196,25 +1196,26 @@ pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> S
     }
 }
 
-/// Resolves the Active Signing Key a streaming saga's reconnect recovery seals
-/// its receipt under for the target context `context_id`: the key of the
+/// Builds the custody signer a streaming saga's reconnect recovery seals its
+/// receipt with for the target context `context_id`: the signer of the
 /// context's creator, read from the supervisor actor's
-/// `role_state.creator_did` and exported via the shared custody path (spec
-/// §6.2.4 "Signer authorization": the receipt key MUST be the one authorized
-/// to act for `target_context_id`).
+/// `role_state.creator_did` (spec §6.2.4 "Signer authorization": the receipt
+/// key MUST be the one authorized to act for `target_context_id`). The private
+/// key stays in custody (ADR-049 Decision 7a).
 ///
 /// # Errors
 ///
 /// Returns the [`crate::runtime::live_role_state`] error when the supervisor
 /// holds no role state for `context_id` or cannot answer, and the
-/// `resolve_signing_key` error when the creator's key cannot be exported.
-pub(crate) fn resolve_context_signing_key(
+/// `resolve_signer` error when the creator is not hosted here or its signer
+/// cannot be built.
+pub(crate) fn resolve_context_signer(
     py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
-) -> PyResult<ed25519_dalek::SigningKey> {
+) -> PyResult<scp_core::context::actor::CommandSigner> {
     let creator_did = crate::runtime::live_role_state(py, bi, context_id)?.creator_did;
-    crate::context::resolve_signing_key(py, bi, &creator_did)
+    crate::context::resolve_signer(py, bi, &creator_did)
 }
 
 /// Decodes the §6.2.4 envelope nonce from its canonical 32-char hex form into
@@ -1352,7 +1353,7 @@ fn outlet_invoke_cross_context_saga_impl(
     asserted_chain_depth: u8,
     ucan_proof_id: Option<String>,
 ) -> PyResult<PySagaResult> {
-    use scp_core::context::supervisor::{CrossContextOutletInvocationRequest, SagaSigningKeys};
+    use scp_core::context::supervisor::{CrossContextOutletInvocationRequest, SagaSigners};
 
     validate::validate_context_id(caller_context_id)?;
     validate::validate_context_id(target_context_id)?;
@@ -1400,8 +1401,8 @@ fn outlet_invoke_cross_context_saga_impl(
     // ----- Signing keys: each context's Active Signing Key -------------------
     //
     // Each key belongs to the creator in the role state the gate above read.
-    let target_signing_key = crate::context::resolve_signing_key(py, bi, &target_role.creator_did)?;
-    let caller_signing_key = crate::context::resolve_signing_key(py, bi, &caller_role.creator_did)?;
+    let target_signer = crate::context::resolve_signer(py, bi, &target_role.creator_did)?;
+    let caller_signer = crate::context::resolve_signer(py, bi, &caller_role.creator_did)?;
 
     // ----- Executor: snapshot the TARGET context's outlet handler --------------
     //
@@ -1465,9 +1466,9 @@ fn outlet_invoke_cross_context_saga_impl(
         supervisor
             .start_cross_context_outlet_invocation_saga(
                 request,
-                SagaSigningKeys {
-                    target: &target_signing_key,
-                    caller: &caller_signing_key,
+                SagaSigners {
+                    target: target_signer,
+                    caller: caller_signer,
                 },
                 executor,
             )
@@ -3223,9 +3224,9 @@ mod tests {
         crate::runtime::remove_context(&scp.inner, &ctx_id);
     }
 
-    /// `resolve_context_signing_key` resolves the SUPERVISOR's `creator_did`.
+    /// `resolve_context_signer` resolves the SUPERVISOR's `creator_did`.
     #[test]
-    fn resolve_context_signing_key_reads_the_supervisor_creator() {
+    fn resolve_context_signer_reads_the_supervisor_creator() {
         pyo3::Python::with_gil(|py| {
             crate::init_runtime().ok();
             let ffi_creator = "did:dht:z6MkSigningKeyFfiCreator";
@@ -3243,7 +3244,7 @@ mod tests {
 
             // Neither DID is custodied on this instance, so the resolver refuses and
             // names the DID it tried.
-            let err = resolve_context_signing_key(py, bi, &ctx_id)
+            let err = resolve_context_signer(py, bi, &ctx_id)
                 .expect_err("an uncustodied creator DID must refuse");
             let message = format!("{err}");
             assert!(

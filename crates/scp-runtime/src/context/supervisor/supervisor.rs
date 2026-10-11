@@ -648,15 +648,15 @@ enum CallerAbortReversal {
 
 /// The owned per-side plan [`Supervisor::divergence_marker_plan`] produces for
 /// a `NeedsRepair` divergence: `(committed_event_id, nonce, [(side-label,
-/// context_id, that side's Active Signing Key); 2])`. Each side signs + appends
-/// its OWN marker (spec §6.2.4 "Dual event-log recording").
+/// context_id, that side's Active Signing Key signer); 2])`. Each side signs +
+/// appends its OWN marker (spec §6.2.4 "Dual event-log recording").
 type DivergenceMarkerPlan = (
     String,
     [u8; 16],
     [(
         &'static str,
         [u8; 32],
-        crate::context::actor::commands::SigningKeyBytes,
+        crate::context::actor::signer::CommandSigner,
     ); 2],
     // CONVERGENT committer-assigned leaf-timestamp (seconds) for the
     // divergence-marker leaf: B's staged `recorded_timestamp_ms / 1000`, the
@@ -715,18 +715,18 @@ struct CrossContextSagaCtx<'a> {
     /// real role (spec §6.2.4 "Caller authentication"). `None` ⇒ no explicit
     /// role assignment.
     caller_source_role: Option<String>,
-    /// The target context's Active Signing Key — receipt + divergence-marker
-    /// signing (Commit-B / NeedsRepair). The actor holds no custody key
-    /// (ADR-049); the FSM rebuilds a `SigningKeyBytes` (zeroizes on drop) per
-    /// command from this caller-supplied key.
-    target_signing_key: ed25519_dalek::SigningKey,
-    /// The caller context's Active Signing Key — used ONLY to sign the
-    /// caller-side `CrossContextDivergenceMarker` on a `NeedsRepair` outcome
-    /// (spec §6.2.4 "Dual event-log recording"). The actor holds no custody
-    /// key (ADR-049); the FSM rebuilds a `SigningKeyBytes` per command from
-    /// this caller-supplied key. Distinct from `target_signing_key`: each side
-    /// signs its OWN marker into its OWN log under its OWN Active Signing Key.
-    caller_signing_key: ed25519_dalek::SigningKey,
+    /// The signer for the target context's Active Signing Key — receipt +
+    /// divergence-marker signing (Commit-B / NeedsRepair). The actor holds no
+    /// custody key (ADR-049); the FSM passes a clone of this caller-supplied
+    /// signer with each command, and the actor signs through it in the turn
+    /// (Decision 7a).
+    target_signer: crate::context::actor::signer::CommandSigner,
+    /// The signer for the caller context's Active Signing Key — used ONLY to
+    /// sign the caller-side `CrossContextDivergenceMarker` on a `NeedsRepair`
+    /// outcome (spec §6.2.4 "Dual event-log recording"). Distinct from
+    /// `target_signer`: each side signs its OWN marker into its OWN log under
+    /// its OWN Active Signing Key.
+    caller_signer: crate::context::actor::signer::CommandSigner,
     /// The supervisor-side outlet executor, taken once at Commit-B.
     executor: Option<SagaOutletExecutor<'a>>,
     /// The captured outlet output bytes, stashed the moment the executor runs
@@ -1477,7 +1477,7 @@ fn in_tracked_task(tracker: &tokio_util::task::TaskTracker) -> bool {
 /// named fields foreclose. Per the project's Agent-first API tenet: one flat
 /// config object, every field named, no builder, no ordering to track.
 ///
-/// The two Active Signing Keys (carried in the named-field [`SagaSigningKeys`])
+/// The two Active Signing Key signers (carried in the named-field [`SagaSigners`])
 /// and the supervisor-side outlet executor stay explicit parameters of the entry
 /// point — they are not envelope data (the keys are custody material the actor
 /// never holds; the executor is a non-`Send` closure), so folding them onto the
@@ -1587,31 +1587,32 @@ pub struct WelcomeJoinRequest {
     pub local_pseudonym: Option<[u8; 32]>,
 }
 
-/// The two Active Signing Keys a §6.2.4 cross-context saga signs under, named by
-/// role so the call site cannot transpose them.
+/// The signers for the two Active Signing Keys a §6.2.4 cross-context saga
+/// signs under, named by role so the call site cannot transpose them.
 ///
-/// `target` and `caller` are both `&SigningKey` of the SAME type; passed as two
-/// adjacent positional `&SigningKey` parameters a swap would compile and stay
-/// self-consistent (verification uses whichever key was supplied), silently
-/// signing each side's divergence marker under the wrong key — the same
-/// confused-deputy footgun the named-field [`CrossContextOutletInvocationRequest`]
-/// foreclosed one layer up for the `[u8; 32]` ids. Naming the role at the call
-/// site (`SagaSigningKeys { target: &…, caller: &… }`) makes a swap a visible
-/// field-name error, not a silent miscapture. Per the Agent-first API tenet:
-/// one flat named-field object, no ordering to track.
+/// `target` and `caller` are the SAME type; passed as two adjacent positional
+/// parameters a swap would compile and stay self-consistent (verification uses
+/// whichever key was supplied), silently signing each side's divergence marker
+/// under the wrong key — the same confused-deputy footgun the named-field
+/// [`CrossContextOutletInvocationRequest`] foreclosed one layer up for the
+/// `[u8; 32]` ids. Naming the role at the call site (`SagaSigners { target: …,
+/// caller: … }`) makes a swap a visible field-name error, not a silent
+/// miscapture. Per the Agent-first API tenet: one flat named-field object, no
+/// ordering to track.
 ///
-/// The keys are held by reference (the entry point clones each into the
-/// FSM-carried context); they are capabilities, NOT envelope data, so they stay
-/// off the wire [`CrossContextOutletInvocationRequest`].
-#[derive(Debug, Clone, Copy)]
-pub struct SagaSigningKeys<'a> {
-    /// The target context's Active Signing Key. Signs the
+/// Each signer reaches its key through custody (ADR-049 Decision 7a): the
+/// runtime never holds the key bytes. The signers are capabilities, NOT
+/// envelope data, so they stay off the wire
+/// [`CrossContextOutletInvocationRequest`].
+#[derive(Debug, Clone)]
+pub struct SagaSigners {
+    /// The target context's Active Signing Key signer. Signs the
     /// [`CrossContextOutletReceipt`]
     /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`.
-    pub target: &'a ed25519_dalek::SigningKey,
-    /// The caller context's Active Signing Key. Signs the CALLER-side divergence
-    /// marker on `NeedsRepair`.
-    pub caller: &'a ed25519_dalek::SigningKey,
+    pub target: crate::context::actor::signer::CommandSigner,
+    /// The caller context's Active Signing Key signer. Signs the CALLER-side
+    /// divergence marker on `NeedsRepair`.
+    pub caller: crate::context::actor::signer::CommandSigner,
 }
 
 /// The Phase-1 (pre-pump) outputs of an outlet-stream open, shared by
@@ -6443,7 +6444,7 @@ impl Supervisor {
     /// outlet-invocation saga (spec §6.2.4) is produced directly by
     /// [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_outlet_invocation_saga),
     /// not via the actor mailbox: that saga's
-    /// [`SagaSigningKeys`]
+    /// [`SagaSigners`]
     /// are borrowed (non-`'static`) `&ed25519_dalek::SigningKey`
     /// references that cannot move into a `'static` mailbox message,
     /// even though its executor is itself `Send + 'static`. Note that
@@ -6783,13 +6784,13 @@ impl Supervisor {
     /// **exactly once** supervisor-side between the two Commit-B round-trips
     /// (the non-`Send` executor cannot cross the actor mailbox per ADR-049 §3).
     ///
-    /// `signing_keys` carries the two Active Signing Keys named by role
-    /// ([`SagaSigningKeys`]): `target` signs the
+    /// `signers` carries the two Active Signing Key signers named by role
+    /// ([`SagaSigners`]): `target` signs the
     /// [`CrossContextOutletReceipt`]
     /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`;
     /// `caller` signs the CALLER-side divergence marker on `NeedsRepair`. Each
     /// side signs its own marker into its own log. The named fields make a
-    /// same-typed `&SigningKey` swap a compile-visible field-name error rather
+    /// same-typed signer swap a compile-visible field-name error rather
     /// than a silent miscapture. The actor holds no custody key (ADR-049), so
     /// the caller supplies both per-call exactly as [`Self::send_heartbeat`] /
     /// [`Self::build_local_checkpoint`] do.
@@ -6877,7 +6878,7 @@ impl Supervisor {
     pub async fn start_cross_context_outlet_invocation_saga<F, Fut>(
         &self,
         request: CrossContextOutletInvocationRequest,
-        signing_keys: SagaSigningKeys<'_>,
+        signers: SagaSigners,
         executor: F,
     ) -> Result<SagaOutput, SagaError>
     where
@@ -6973,8 +6974,8 @@ impl Supervisor {
             asserted_nonce,
             asserted_timestamp_ms,
             caller_source_role,
-            target_signing_key: signing_keys.target.clone(),
-            caller_signing_key: signing_keys.caller.clone(),
+            target_signer: signers.target,
+            caller_signer: signers.caller,
             executor: Some(boxed_executor),
             executor_output: None,
             prepared_a: None,
@@ -7049,7 +7050,7 @@ impl Supervisor {
     ///
     /// `caller_context_id` is the RECEIVING context A (the invoker's context);
     /// `target_context_id` is the OPERATING context B (which hosts the streaming
-    /// outlet registration). `signing_keys.target` signs the SCP-OUT-043
+    /// outlet registration). `signers.target` signs the SCP-OUT-043
     /// streaming receipt at seal-close.
     ///
     /// # Errors
@@ -7075,14 +7076,14 @@ impl Supervisor {
         timeout_ms: Option<u32>,
         executor: Arc<E>,
         caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
-        signing_keys: SagaSigningKeys<'_>,
+        signers: SagaSigners,
         params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<StreamingSagaHandle, SagaError>
     where
         E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
     {
         use crate::context::actor::commands::{
-            PrepareBOutcome, PrepareBStreamingFields, SagaPhaseMessage, SigningKeyBytes,
+            PrepareBOutcome, PrepareBStreamingFields, SagaPhaseMessage,
         };
 
         // Taken before any reserve, so a saga refused by shutdown has staged
@@ -7507,7 +7508,7 @@ impl Supervisor {
                 Arc::downgrade(self),
                 target_hex.clone(),
                 saga_id.clone(),
-                SigningKeyBytes::from_signing_key(signing_keys.target),
+                signers.target,
                 inner_rx,
                 outer_tx,
                 escrow_ticket,
@@ -7589,7 +7590,7 @@ impl Supervisor {
         self: &Arc<Self>,
         saga_id: SagaId,
         target_context_id: [u8; 32],
-        target_signing_key: crate::context::actor::commands::SigningKeyBytes,
+        target_signer: crate::context::actor::signer::CommandSigner,
     ) -> Result<(), SagaError> {
         use crate::context::actor::commands::SagaPhaseMessage;
         use scp_protocol::context::outlets::stream::StreamTerminalStatus;
@@ -7619,7 +7620,7 @@ impl Supervisor {
                             .to_owned(),
                     ),
                     cancel_ack_seq: None,
-                    target_signing_key,
+                    target_signer,
                     reply,
                 })
             })
@@ -9618,7 +9619,7 @@ impl Supervisor {
     /// 2. **Run the executor supervisor-side** — the non-`Send` outlet executor
     ///    runs off the actor mailbox (ADR-049 §3), producing the output.
     /// 3. **Commit-B settle** — hand the output to the target actor, which
-    ///    signs the receipt with `target_signing_key`, appends `OutletInvoked`,
+    ///    signs the receipt through `target_signer`, appends `OutletInvoked`,
     ///    and durably captures the output keyed by `SagaId`.
     /// 4. **Commit-A** — hand the receipt/output + the held Prepare-A
     ///    reservation to the caller actor, which settles escrow and records
@@ -9639,7 +9640,7 @@ impl Supervisor {
         // Verify-before-settle (spec §6.2.4 "Signer authorization"): before
         // Commit-A settles escrow + records the provenance edge, the FSM
         // re-verifies B's signature over the receipt against the SAME key it
-        // gave B to sign with (`ctx.target_signing_key`). This is an in-saga
+        // gave B to sign with (`ctx.target_signer`). This is an in-saga
         // integrity check — it proves the receipt was not corrupted/forged in
         // transit back from Commit-B — NOT the spec's independent
         // signer-authorization (governance-resolution) step. That step — confirm
@@ -9667,7 +9668,7 @@ impl Supervisor {
     /// authorization", normative MUST) and return the parsed receipt for the
     /// Commit-A binding.
     ///
-    /// The FSM holds the resolved target key (`ctx.target_signing_key` — the key
+    /// The FSM holds the resolved target signer (`ctx.target_signer` — the one
     /// it supplied to Commit-B for signing), so verifying the receipt's
     /// signature against `verifying_key()` is exactly "signed by the key
     /// authorized for `target_context_id`". On a parse or signature failure this
@@ -9686,7 +9687,7 @@ impl Supervisor {
                     saga_id.0
                 ))
             })?;
-        let authorized_target_key = ctx.target_signing_key.verifying_key();
+        let authorized_target_key = ctx.target_signer.verifying_key()?;
         receipt.verify(&authorized_target_key).map_err(|e| {
             ContextError::CryptoFailed(format!(
                 "SCP-SAGA-13064: cross-context saga Commit — target receipt signature for saga \
@@ -9810,9 +9811,7 @@ impl Supervisor {
             ))
         })?;
         let settle_saga_id = saga_id.clone();
-        let target_signing_key = crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-            &ctx.target_signing_key,
-        );
+        let target_signer = ctx.target_signer.clone();
         let CommitBSettleOutcome {
             receipt,
             output_bytes,
@@ -9822,7 +9821,7 @@ impl Supervisor {
                 ContextCommand::SagaPhase(SagaPhaseMessage::CommitBSettle {
                     saga_id: settle_saga_id,
                     output_bytes: exec_output_bytes,
-                    target_signing_key,
+                    target_signer,
                     reply,
                 })
             })
@@ -10076,7 +10075,7 @@ impl Supervisor {
         let (committed_event_id, nonce, sides, committed_timestamp_secs) = plan;
         let committed_side = CommittedSide::Target;
 
-        for (label, context_id, signing_key_bytes) in sides {
+        for (label, context_id, signer) in sides {
             let context_hex = hex::encode(context_id);
             if let Some(actor) = self.lookup(&context_hex) {
                 let marker_saga_id = saga_id.clone();
@@ -10089,7 +10088,7 @@ impl Supervisor {
                             committed_side,
                             committed_event_id: committed_event_id_for_send,
                             committed_timestamp_secs,
-                            signing_key: signing_key_bytes,
+                            signer,
                             reply,
                         })
                     })
@@ -10151,7 +10150,6 @@ impl Supervisor {
     /// (rather than across the caller's `.await`s) keeps the caller future
     /// `Send` despite the ctx's non-`Sync` boxed executor.
     fn divergence_marker_plan(ctx: &CrossContextSagaCtx<'_>) -> Option<DivergenceMarkerPlan> {
-        use crate::context::actor::commands::SigningKeyBytes;
         let committed_event_id = ctx.committed_b_outlet_invoked_event_id.clone()?;
         // B's VERIFIED staged provenance is the ONLY admissible source for the
         // convergent marker-leaf nonce + timestamp. In the current FSM a
@@ -10181,16 +10179,8 @@ impl Supervisor {
         // mirroring `commit_b_first_settle`'s witness-persist-before-append
         // ordering. A one-sided divergence is therefore always Target-committed.
         let sides = [
-            (
-                "target",
-                ctx.target_context_id,
-                SigningKeyBytes::from_signing_key(&ctx.target_signing_key),
-            ),
-            (
-                "caller",
-                ctx.caller_context_id,
-                SigningKeyBytes::from_signing_key(&ctx.caller_signing_key),
-            ),
+            ("target", ctx.target_context_id, ctx.target_signer.clone()),
+            ("caller", ctx.caller_context_id, ctx.caller_signer.clone()),
         ];
         // Source the STAGED `recorded_nonce` (B's captured copy of the wire
         // value) for symmetry with the signed receipt, which draws its `nonce`
@@ -17342,6 +17332,7 @@ fn reply_with_error(cmd: QueriesCommand, err: ContextError) {
 )]
 mod tests {
     use super::*;
+    use crate::context::actor::signer::CommandSigner;
     use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
     use scp_platform::in_memory::InMemoryStorage;
 
@@ -23077,7 +23068,6 @@ mod tests {
     #[tokio::test]
     async fn publish_broadcast_dispatches_through_mailbox() {
         use crate::context::actor::commands::PublishBroadcastPayload;
-        use crate::context::actor::signer::CommandSigner;
 
         let supervisor_arc = supervisor_with_providers();
         let mut deps = test_actor_deps(&supervisor_arc).await;
@@ -23159,7 +23149,6 @@ mod tests {
     #[tokio::test]
     async fn publish_broadcast_without_actor_replies_not_registered() {
         use crate::context::actor::commands::PublishBroadcastPayload;
-        use crate::context::actor::signer::CommandSigner;
 
         let supervisor_arc = supervisor_with_providers();
         let ctx_key = hex::encode([0xC1u8; 32]);
@@ -25336,8 +25325,7 @@ mod tests {
                 Self::BOB.to_owned(),
                 self.bob_access_key.clone(),
             )]);
-            let signer =
-                crate::context::actor::signer::CommandSigner::local_ed25519(signing_key.clone());
+            let signer = CommandSigner::local_ed25519(signing_key.clone());
             let crypto = self
                 .alice_state
                 .mode
@@ -25375,7 +25363,7 @@ mod tests {
                 Self::BOB.to_owned(),
                 self.bob_access_key.clone(),
             )]);
-            let signer = crate::context::actor::signer::CommandSigner::local_ed25519(
+            let signer = CommandSigner::local_ed25519(
                 crate::crypto::mls::two_party_test_support::alice_signing_key(),
             );
             self.rt
@@ -25777,7 +25765,7 @@ mod tests {
             let heartbeat = MessagingCommand::SendHeartbeat {
                 context_id: ctx_str.to_owned(),
                 sender_did: DID::from(ALICE),
-                signer: crate::context::actor::signer::CommandSigner::local_ed25519(
+                signer: CommandSigner::local_ed25519(
                     crate::crypto::mls::two_party_test_support::alice_signing_key(),
                 ),
                 reply: htx,
@@ -25812,7 +25800,7 @@ mod tests {
     fn stalled_custody_fails_signing_handler_with_custody_timeout() {
         use crate::context::actor::class_s::ClassSCell;
         use crate::context::actor::commands::MessagingCommand;
-        use crate::context::actor::signer::{CommandSigner, SIGN_TIMEOUT};
+        use crate::context::actor::signer::SIGN_TIMEOUT;
         use scp_crypto::{CustodyFailure, CustodyFailureKind, DynScpSigner, SigAlg, SignFuture};
         use scp_protocol::context::ContextState;
         use scp_protocol::context::roles::Capability;
@@ -26176,9 +26164,8 @@ mod tests {
             .expect("create the real 64-hex context under the digest");
         assert_eq!(created.context_id(), context_id);
 
-        let signing_key = crate::context::actor::signer::CommandSigner::local_ed25519(
-            ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]),
-        );
+        let signing_key =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]));
         let result = sup
             .recovery_send_notification_direct(
                 &context_id,
@@ -28250,9 +28237,8 @@ mod tests {
             .handle
             .transition_to(&crate::context::ContextState::Active)
             .unwrap();
-        let signing_key = crate::context::actor::signer::CommandSigner::local_ed25519(
-            ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]),
-        );
+        let signing_key =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]));
 
         // `finalize_send` is actor-shape (ADR-049 §9): it takes the owning
         // `ClassSCell` so it can drive the Class-S fail-closed persist (via the
@@ -28951,9 +28937,8 @@ mod tests {
                 seed_entries,
             );
         let deps = test_actor_deps(&sup).await;
-        let signing_key = crate::context::actor::signer::CommandSigner::local_ed25519(
-            ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]),
-        );
+        let signing_key =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]));
         // `finalize_send` is actor-shape (ADR-049 §9): wrap the state in the
         // owning `ClassSCell` for the call, then reclaim it via `into_inner` to
         // hand off to `spawn_actor_with_state`.
@@ -29406,9 +29391,8 @@ mod tests {
             .handle
             .transition_to(&crate::context::ContextState::Active)
             .unwrap();
-        let signing_key = crate::context::actor::signer::CommandSigner::local_ed25519(
-            ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]),
-        );
+        let signing_key =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]));
 
         // Baseline: the sender's sequence counter before any reservation.
         let baseline = state
@@ -30025,9 +30009,9 @@ mod tests {
         supervisor
             .start_cross_context_outlet_invocation_saga(
                 xctx_request(caller_did, now_ms, nonce),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -30287,9 +30271,9 @@ mod tests {
         let result = supervisor
             .start_cross_context_outlet_invocation_saga(
                 xctx_request(caller_did, now_ms, [0x44u8; 16]),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -30507,9 +30491,9 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -30649,9 +30633,9 @@ mod tests {
                     asserted_nonce: [0x43u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -30767,9 +30751,9 @@ mod tests {
                     asserted_nonce: [0x43u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -30809,9 +30793,9 @@ mod tests {
                     asserted_nonce: [0x44u8; 16],
                     asserted_timestamp_ms: now_ms2,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({})) },
             )
@@ -30878,9 +30862,9 @@ mod tests {
                     asserted_nonce: [0x4Du8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({})) },
             )
@@ -30966,9 +30950,9 @@ mod tests {
                     asserted_nonce: [0x4Au8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) },
             )
@@ -31060,9 +31044,9 @@ mod tests {
                     asserted_nonce: [0x45u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) },
             )
@@ -31572,9 +31556,9 @@ mod tests {
                     asserted_nonce: [0x46u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -31664,8 +31648,8 @@ mod tests {
             asserted_nonce: nonce,
             asserted_timestamp_ms: 1_700_000_000,
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({})) }) as _
             })),
@@ -32445,9 +32429,9 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -32546,9 +32530,9 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -32653,9 +32637,9 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -32863,9 +32847,9 @@ mod tests {
                     asserted_nonce: [0x42u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -32925,8 +32909,8 @@ mod tests {
             asserted_nonce: nonce,
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -33037,8 +33021,8 @@ mod tests {
             asserted_nonce: nonce,
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -33275,8 +33259,8 @@ mod tests {
             asserted_nonce: nonce,
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -33548,8 +33532,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -33666,8 +33650,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -33805,8 +33789,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -34251,8 +34235,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -34397,8 +34381,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -34539,8 +34523,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -36590,6 +36574,7 @@ mod open_outlet_stream_tests {
     clippy::disallowed_types
 )]
 mod streaming_saga_tests {
+    use crate::context::actor::signer::CommandSigner;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -36610,9 +36595,9 @@ mod streaming_saga_tests {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
     use scp_protocol::trust::caveats::InvocationCaveats;
 
-    use super::{DurableProviders, SagaAbortReason, SagaError, SagaSigningKeys, Supervisor};
+    use super::{DurableProviders, SagaAbortReason, SagaError, SagaSigners, Supervisor};
     use crate::context::actor::ContextCommand;
-    use crate::context::actor::commands::{QueriesCommand, SagaPhaseMessage, SigningKeyBytes};
+    use crate::context::actor::commands::{QueriesCommand, SagaPhaseMessage};
     use crate::context::actor::state::PerContextState;
     use crate::context::builder::ContextEventLogProvider;
     use crate::context::outlets::dispatch::OpenStreamParams;
@@ -37206,9 +37191,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -37312,7 +37297,7 @@ mod streaming_saga_tests {
         // receipt bytes to verify.
         let outcome = {
             let sid = saga_id.clone();
-            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            let target_key_signer = CommandSigner::local_ed25519(target_signing.clone());
             actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
@@ -37320,7 +37305,7 @@ mod streaming_saga_tests {
                         terminal_status:
                             scp_protocol::context::outlets::stream::StreamTerminalStatus::Ok,
                         cancel_ack_seq: None,
-                        target_signing_key: target_key_bytes,
+                        target_signer: target_key_signer,
                         reply,
                     })
                 })
@@ -37564,9 +37549,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -37731,9 +37716,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -37937,9 +37922,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -38052,7 +38037,7 @@ mod streaming_saga_tests {
             .recover_streaming_saga_truncated_close(
                 saga_id.clone(),
                 SS_TARGET,
-                SigningKeyBytes::from_signing_key(&target_signing),
+                CommandSigner::local_ed25519(target_signing.clone()),
             )
             .await
             .expect("AC7 (key-bearing): the truncated close seals the durable prefix");
@@ -38095,7 +38080,7 @@ mod streaming_saga_tests {
         // attests the manifest over the durable PREFIX (never the full stream).
         let outcome = {
             let sid = saga_id.clone();
-            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            let target_key_signer = CommandSigner::local_ed25519(target_signing.clone());
             actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
@@ -38105,7 +38090,7 @@ mod streaming_saga_tests {
                                 "replay".to_owned(),
                             ),
                         cancel_ack_seq: None,
-                        target_signing_key: target_key_bytes,
+                        target_signer: target_key_signer,
                         reply,
                     })
                 })
@@ -38199,9 +38184,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -38243,7 +38228,7 @@ mod streaming_saga_tests {
         // DO NOT apply it (the seal task "died" before settle_outlet_stream_via_actor).
         let outcome = {
             let sid = saga_id.clone();
-            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            let target_key_signer = CommandSigner::local_ed25519(target_signing.clone());
             actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
@@ -38253,7 +38238,7 @@ mod streaming_saga_tests {
                                 "crash-window seal".to_owned(),
                             ),
                         cancel_ack_seq: None,
-                        target_signing_key: target_key_bytes,
+                        target_signer: target_key_signer,
                         reply,
                     })
                 })
@@ -38447,9 +38432,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -38491,7 +38476,7 @@ mod streaming_saga_tests {
         // handoff point).
         let outcome = {
             let sid = saga_id.clone();
-            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            let target_key_signer = CommandSigner::local_ed25519(target_signing.clone());
             actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
@@ -38501,7 +38486,7 @@ mod streaming_saga_tests {
                                 "concurrent-settle seal".to_owned(),
                             ),
                         cancel_ack_seq: None,
-                        target_signing_key: target_key_bytes,
+                        target_signer: target_key_signer,
                         reply,
                     })
                 })
@@ -38711,9 +38696,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 s1_executor,
                 Some(s1_binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 s1_params,
             )
@@ -38760,9 +38745,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 s2_executor,
                 Some(s2_binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 s2_params,
             )

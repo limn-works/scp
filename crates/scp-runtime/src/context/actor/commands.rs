@@ -2200,8 +2200,7 @@ pub enum TtlCloseCommand {
 /// cross the actor mailbox. The cross-context saga itself is wired (§6.2.4,
 /// reached via
 /// [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_outlet_invocation_saga), whose
-/// borrowed (non-`'static`) [`SagaSigningKeys`](crate::context::supervisor::SagaSigningKeys)
-/// keep it off the `'static` mailbox); what remains
+/// generic executor closure keeps it off the `'static` mailbox); what remains
 /// deferred is its FFI export, pending per-participant-set saga gating
 /// (ADR-049 §3a).
 ///
@@ -3423,7 +3422,7 @@ pub enum SagaPhaseMessage {
     /// [`CrossContextOutletReceipt`](scp_protocol::context::outlets::CrossContextOutletReceipt)
     /// over the
     /// staged `recorded_nonce` / `recorded_chain_depth` / `recorded_timestamp_ms`
-    /// plus `output_hash` plus the event id using `target_signing_key`, Class-S
+    /// plus `output_hash` plus the event id through `target_signer`, Class-S
     /// sync-persists fail-closed, and replies the receipt + output bytes. A
     /// replayed `CommitBSettle` (output already captured) re-emits the stored
     /// bytes verbatim and does NOT re-append or re-sign.
@@ -3434,12 +3433,11 @@ pub enum SagaPhaseMessage {
         /// supervisor-side between reserve and settle). Hashed into the
         /// receipt's `output_hash` and carried as the receipt's JCS output.
         output_bytes: Vec<u8>,
-        /// The target context's Active Signing Key (§6.2.4 receipt signing).
-        /// The actor holds NO signing key (ADR-049): the FSM resolves the key
-        /// authorized for `target_context_id` and passes it per-call, exactly
-        /// like [`MessagingCommand::SendHeartbeat`] /
-        /// [`MessagingCommand::BuildLocalCheckpoint`]. Zeroizes on drop.
-        target_signing_key: SigningKeyBytes,
+        /// The signer for the target context's Active Signing Key (§6.2.4
+        /// receipt signing). The actor holds no key (ADR-049): the FSM passes
+        /// the signer authorized for `target_context_id` per call, and the
+        /// receipt is signed through it inside the turn (Decision 7a).
+        target_signer: crate::context::actor::signer::CommandSigner,
         /// Oneshot reply channel. See [`CommitBSettleReply`].
         reply: CommitBSettleReply,
     },
@@ -3531,10 +3529,10 @@ pub enum SagaPhaseMessage {
         /// marker leaf is byte-identical across honest members (§9.9.3), never a
         /// per-member actor-local clock read.
         committed_timestamp_secs: u64,
-        /// The local (emitting) side's Active Signing Key. The actor holds no
-        /// key (ADR-049); the FSM passes the key authorized for this context
-        /// per-call. Zeroizes on drop.
-        signing_key: SigningKeyBytes,
+        /// The signer for the local (emitting) side's Active Signing Key. The
+        /// actor holds no key (ADR-049); the FSM passes the signer authorized
+        /// for this context per call (Decision 7a).
+        signer: crate::context::actor::signer::CommandSigner,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
@@ -3599,11 +3597,10 @@ pub enum SagaPhaseMessage {
         /// the cancel-ack billing boundary because the seal task never pushes an
         /// above-ceiling chunk (the pump drops them before emission).
         cancel_ack_seq: Option<u64>,
-        /// The target context's Active Signing Key (§6.2.5 receipt signing). The
-        /// actor holds NO signing key (ADR-049): the FSM resolves the key
-        /// authorized for `target_context_id` and passes it per-call. Zeroizes on
-        /// drop.
-        target_signing_key: SigningKeyBytes,
+        /// The signer for the target context's Active Signing Key (§6.2.5
+        /// receipt signing). The actor holds no key (ADR-049): the FSM passes
+        /// the signer authorized for `target_context_id` per call (Decision 7a).
+        target_signer: crate::context::actor::signer::CommandSigner,
         /// Oneshot reply channel. See [`CommitBStreamSettleReply`].
         reply: CommitBStreamSettleReply,
     },

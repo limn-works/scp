@@ -963,6 +963,8 @@ impl KeyCustody for CallbackKeyCustody {
     }
 }
 
+// Test-only since no production path exports a key (ADR-049 Decision 7a).
+#[cfg(test)]
 impl CallbackKeyCustody {
     /// Exports the raw Ed25519 signing key for the given handle.
     ///
@@ -1038,30 +1040,6 @@ impl fmt::Debug for UniffiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(_) => f.write_str("UniffiKeyCustody::InMemory([redacted])"),
             Self::Callback(_) => f.write_str("UniffiKeyCustody::Callback([platform])"),
-        }
-    }
-}
-
-impl UniffiKeyCustody {
-    /// Exports the raw Ed25519 signing key for `handle` by dispatching to the
-    /// active backend — the enum analogue of the per-backend
-    /// `export_ed25519_signing_key` used by [`resolve_uniffi_signing_key`].
-    ///
-    /// Needed by the streaming-saga in-session reconnect/repair recover path
-    /// (SCP-OUT-047), which resolves the TARGET context creator's Active Signing
-    /// Key from the
-    /// per-instance identity custody registry (a `UniffiKeyCustody`) by DID —
-    /// there is no `ContextHandle` on the reconnect leg. Private key material
-    /// never crosses the FFI boundary; it is used in-process to seal the durable
-    /// prefix and dropped (ADR-006).
-    pub(crate) async fn export_ed25519_signing_key(
-        &self,
-        handle: &KeyHandle,
-    ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
-        match self {
-            #[cfg(feature = "testing")]
-            Self::InMemory(imc) => imc.0.export_ed25519_signing_key(handle).await,
-            Self::Callback(cb) => cb.export_ed25519_signing_key(handle).await,
         }
     }
 }
@@ -6691,7 +6669,7 @@ async fn resolve_identity_signer(
 /// - `SCP-CTX-2040` when the handle holds no custody or no key handle.
 /// - The custody's own code through `ScpError::from(PlatformError)` when the
 ///   signer cannot be built; a destroyed key is `SCP-CRYPTO-4006`.
-async fn resolve_uniffi_signer(
+pub(crate) async fn resolve_uniffi_signer(
     handle: &ContextHandle,
 ) -> Result<scp_core::context::actor::CommandSigner, ScpError> {
     let key_handle = handle.signing_key.ok_or_else(|| ScpError::Context {
@@ -6709,45 +6687,6 @@ async fn resolve_uniffi_signer(
     scp_ffi_common::signer::identity_command_signer(Arc::clone(custody), key_handle)
         .await
         .map_err(ScpError::from)
-}
-
-/// Resolves the raw Ed25519 signing key from a `UniFFI` `ContextHandle`, for
-/// the runtime paths that still take `&SigningKey`. Governance signs through
-/// [`resolve_uniffi_signer`].
-pub(crate) async fn resolve_uniffi_signing_key(
-    handle: &ContextHandle,
-) -> Result<ed25519_dalek::SigningKey, ScpError> {
-    let key_handle = handle.signing_key.ok_or_else(|| ScpError::Context {
-        msg: "no signing key on context handle — governance lifecycle \
-                  requires an identity with an active signing key"
-            .to_owned(),
-        code: codes::CTX_2040.to_owned(),
-    })?;
-
-    match handle.custody.as_deref() {
-        Some(UniffiKeyCustody::Callback(cb)) => cb
-            .export_ed25519_signing_key(&key_handle)
-            .await
-            .map_err(|e| ScpError::Context {
-                msg: format!("failed to export signing key from platform custody: {e}"),
-                code: codes::CTX_2040.to_owned(),
-            }),
-        #[cfg(feature = "testing")]
-        Some(UniffiKeyCustody::InMemory(imc)) => imc
-            .0
-            .export_ed25519_signing_key(&key_handle)
-            .await
-            .map_err(|e| ScpError::Context {
-                msg: format!("failed to export signing key from in-memory custody: {e}"),
-                code: codes::CTX_2040.to_owned(),
-            }),
-        None => Err(ScpError::Context {
-            msg: "no custody provider on context handle — governance lifecycle \
-                  requires an identity created with custody"
-                .to_owned(),
-            code: codes::CTX_2040.to_owned(),
-        }),
-    }
 }
 
 /// Resolves the [`ResolvedMessageSigner`](scp_ffi_common::persona::ResolvedMessageSigner)
@@ -6967,7 +6906,7 @@ fn export_signing_key(handle: &ContextHandle) -> Result<KeyHandle, ScpError> {
 /// handle (platform/software callback custody OR in-memory custody) — instead
 /// of extracting a raw Ed25519 signing key.
 ///
-/// This is the export-path analogue of [`resolve_uniffi_signing_key`]: the
+/// This is the export-path analogue of [`resolve_uniffi_signer`]: the
 /// governance lifecycle paths still extract a raw key (they sign with
 /// `ed25519_dalek::Signer` directly), but context export only needs a detached
 /// signature over the canonical snapshot digest, so it can route through
@@ -13834,7 +13773,7 @@ impl Scp {
         chain_depth: u8,
         ucan_proof_id: Option<String>,
     ) -> Result<SagaResult, ScpError> {
-        use scp_core::context::supervisor::{CrossContextOutletInvocationRequest, SagaSigningKeys};
+        use scp_core::context::supervisor::{CrossContextOutletInvocationRequest, SagaSigners};
 
         // Per-instance handle affinity: both participant handles MUST have been
         // minted by THIS bridge instance (mirrors `outlet_invoke_cross_context`).
@@ -13922,8 +13861,8 @@ impl Scp {
                 // no `context_handle_registry` lookup. Each context signs its
                 // own side (target → receipt; each → its own divergence
                 // marker) under its registered Active Signing Key.
-                let target_signing_key = resolve_uniffi_signing_key(&target_handle).await?;
-                let caller_signing_key = resolve_uniffi_signing_key(&source_handle).await?;
+                let target_signer = resolve_uniffi_signer(&target_handle).await?;
+                let caller_signer = resolve_uniffi_signer(&source_handle).await?;
 
                 // ----- Executor: snapshot the TARGET context's outlet handler --
                 //
@@ -13989,9 +13928,9 @@ impl Scp {
                 let output = supervisor
                     .start_cross_context_outlet_invocation_saga(
                         request,
-                        SagaSigningKeys {
-                            target: &target_signing_key,
-                            caller: &caller_signing_key,
+                        SagaSigners {
+                            target: target_signer,
+                            caller: caller_signer,
                         },
                         executor,
                     )

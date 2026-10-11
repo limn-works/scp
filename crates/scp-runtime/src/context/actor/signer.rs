@@ -85,12 +85,7 @@ impl CommandSigner {
     /// [`ContextError::CryptoFailed`] when the signer is not Ed25519 or its
     /// public key is not a valid Ed25519 point.
     pub fn verifying_key(&self) -> Result<ed25519_dalek::VerifyingKey, ContextError> {
-        if self.0.algorithm() != SigAlg::Ed25519 {
-            return Err(ContextError::CryptoFailed(format!(
-                "signer algorithm is {:?}, not Ed25519",
-                self.0.algorithm()
-            )));
-        }
+        self.require_ed25519()?;
         let public_key = self.0.public_key();
         let bytes: [u8; 32] = public_key.as_slice().try_into().map_err(|_| {
             ContextError::CryptoFailed(format!(
@@ -100,6 +95,26 @@ impl CommandSigner {
         })?;
         ed25519_dalek::VerifyingKey::from_bytes(&bytes)
             .map_err(|e| ContextError::CryptoFailed(format!("invalid Ed25519 public key: {e}")))
+    }
+}
+
+impl CommandSigner {
+    /// Fails unless this signer makes Ed25519 signatures. Every artifact whose
+    /// format fixes Ed25519 (a saga receipt, a divergence marker, a broadcast
+    /// envelope) checks this before it asks custody to sign.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] naming the signer's algorithm.
+    pub fn require_ed25519(&self) -> Result<(), ContextError> {
+        if self.0.algorithm() == SigAlg::Ed25519 {
+            Ok(())
+        } else {
+            Err(ContextError::CryptoFailed(format!(
+                "signer algorithm is {:?}, not Ed25519",
+                self.0.algorithm()
+            )))
+        }
     }
 }
 

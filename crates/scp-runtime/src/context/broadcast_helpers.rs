@@ -374,12 +374,7 @@ pub async fn publish_broadcast_in_turn(
 ) -> Result<BroadcastEnvelope, ContextError> {
     // Broadcast envelopes carry an Ed25519 signature (§5.14.5). Reject any
     // other signer before a sequence is reserved.
-    if signer.algorithm() != scp_crypto::SigAlg::Ed25519 {
-        return Err(ContextError::CryptoFailed(format!(
-            "broadcast envelopes are Ed25519-signed; the signer is {:?}",
-            signer.algorithm()
-        )));
-    }
+    signer.require_ed25519()?;
 
     let (pending, signing_payload) = reserve_publish(cell, deps, author_did)?;
 

@@ -738,6 +738,7 @@ pub struct InterfaceSaltRotated {
 /// own ordering) so peers reciprocally rotate with `(local, peer)`
 /// swapped on the other side per §6.2.0.1 "Atomic removal+rotation —
 /// peer-side semantics".
+#[cfg(any(test, feature = "testing"))]
 #[must_use]
 #[allow(clippy::similar_names, clippy::too_many_arguments)]
 pub fn sign_interface_rotation(

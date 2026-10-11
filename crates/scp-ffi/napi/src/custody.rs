@@ -493,6 +493,7 @@ pub(crate) struct CallbackTsfns {
         napi::Status,
         false,
     >,
+    #[cfg(test)]
     export_signing_key_bytes:
         ThreadsafeFunction<String, HostBytesResult, String, napi::Status, false>,
     custody_type: ThreadsafeFunction<String, HostStringResult, String, napi::Status, false>,
@@ -535,6 +536,8 @@ pub(crate) trait JsCustodyHost: Send + Sync {
         context_id: Vec<u8>,
         epoch: u64,
     ) -> impl Future<Output = Result<Vec<u8>, PlatformError>> + Send;
+    /// Test-only since no production path exports a key (ADR-049 Decision 7a).
+    #[cfg(test)]
     fn export_signing_key_bytes(
         &self,
         key_id: String,
@@ -605,6 +608,7 @@ impl JsCustodyHost for CallbackTsfns {
         .await
     }
 
+    #[cfg(test)]
     async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, PlatformError> {
         call_host(
             "export_signing_key_bytes",
@@ -701,6 +705,7 @@ impl NapiCallbackKeyCustody {
                 .build_threadsafe_function()
                 .weak::<false>()
                 .build()?,
+            #[cfg(test)]
             export_signing_key_bytes: provider
                 .export_signing_key_bytes
                 .build_threadsafe_function()
@@ -715,6 +720,8 @@ impl NapiCallbackKeyCustody {
     }
 }
 
+// Test-only since no production path exports a key (ADR-049 Decision 7a).
+#[cfg(test)]
 impl<H: JsCustodyHost> CallbackAdapter<H> {
     /// Exports the raw Ed25519 signing key via the provider's
     /// `exportSigningKeyBytes` callback through
@@ -960,7 +967,9 @@ impl NapiKeyCustody {
     /// # Errors
     ///
     /// Returns [`PlatformError`] if the handle is invalid or (for callback
-    /// custody) the JS `exportSigningKeyBytes` callback fails.
+    /// custody) the JS `exportSigningKeyBytes` callback fails. Test-only since
+    /// no production path exports a key (ADR-049 Decision 7a).
+    #[cfg(test)]
     pub async fn export_ed25519_signing_key(
         &self,
         handle: &KeyHandle,

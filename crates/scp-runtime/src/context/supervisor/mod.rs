@@ -165,6 +165,6 @@ pub use supervisor::SagaSetReservation;
 pub use supervisor::{
     ACTOR_MAILBOX_CAPACITY, CrashWindow, CrossContextOutletInvocationRequest, DrainWithDeadline,
     DurableProviders, InviteMemberOutcome, JoinFailure, MessageSigner, RestoredContexts,
-    SagaAbortReason, SagaDivergenceRepairRecord, SagaError, SagaInput, SagaOutput, SagaSigningKeys,
+    SagaAbortReason, SagaDivergenceRepairRecord, SagaError, SagaInput, SagaOutput, SagaSigners,
     Supervisor, SupervisorConfig, WelcomeJoinRequest,
 };

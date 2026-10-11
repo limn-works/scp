@@ -2340,12 +2340,12 @@ fn out047_pyo3_streaming_saga_recover_reaches_truncated_close() {
          channel-authenticated principal (§6.2.4)."
     );
     assert!(
-        body.contains("resolve_context_signing_key"),
-        "PyO3 streaming-saga recover must SURFACE the target context's Active \
-         Signing Key per-call from custody (resolve_context_signing_key) before \
-         sealing — the recovery receipt is signed with a custody-resolved key, \
-         NEVER an envelope-asserted one (§6.2.4). Structurally pins the \
-         FFI-layer key-surfacing, not just the runtime seal."
+        body.contains("resolve_context_signer"),
+        "PyO3 streaming-saga recover must build the target context's Active \
+         Signing Key custody signer per-call (resolve_context_signer) before \
+         sealing — the recovery receipt is signed through a custody-resolved \
+         signer, NEVER an envelope-asserted key (§6.2.4). Structurally pins the \
+         FFI-layer signer resolution, not just the runtime seal."
     );
 }
 

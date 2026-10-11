@@ -186,7 +186,7 @@ impl StreamSigner for BridgeCustodyStreamSigner {
 /// Clones the custody `Arc` + key handle OUT of the identity-registry shard
 /// guard, then performs the (potentially slow) `public_key` export OFF the
 /// guard — the same clone-then-drop discipline as
-/// [`crate::context::resolve_signing_key`] (issue #1940).
+/// [`crate::context::resolve_signer`].
 fn resolve_stream_signer(
     py: Python<'_>,
     bi: &PyBridgeInstance,
@@ -1200,9 +1200,9 @@ fn no_active_saga_err(saga_id: &str) -> ScpPyError {
 ///   (c) `validate_outlet_ucan` against the TARGET context B (where the outlet
 ///       is registered), then resolve the effective §7.3.8 caveats + `ucan_cid`
 ///       and compute the §5.4.5 `caveats_binding` from a FRESH `request_id`;
-///   (d) resolve `SagaSigningKeys { target, caller }` from each context's
-///       Active Signing Key (via custody — the key never enters the runtime,
-///       ADR-006);
+///   (d) resolve `SagaSigners { target, caller }`, each context's Active
+///       Signing Key custody signer (the key stays in custody, ADR-049
+///       Decision 7a);
 ///   (e) build the executor over the TARGET handler;
 ///   (f) drive the saga to the Commit-transition;
 ///   (g) register the receiver and return the `saga_id`.
@@ -1466,8 +1466,8 @@ fn outlet_streaming_saga_open_impl(
     };
 
     // ----- (d) signing keys: each co-resident context's Active Signing Key ----
-    let target_signing_key = crate::context::resolve_signing_key(py, bi, &target_role.creator_did)?;
-    let caller_signing_key = crate::context::resolve_signing_key(py, bi, &caller_role.creator_did)?;
+    let target_signer = crate::context::resolve_signer(py, bi, &target_role.creator_did)?;
+    let caller_signer = crate::context::resolve_signer(py, bi, &caller_role.creator_did)?;
 
     // ----- Chokepoint (ADR-056): id STRING → [u8; 32] -------------------------
     let caller_context_bytes = scp_core::context::state::context_id_to_bytes(caller_context_id);
@@ -1501,9 +1501,9 @@ fn outlet_streaming_saga_open_impl(
                 timeout_ms,
                 executor,
                 value_caveat_binding,
-                scp_core::context::supervisor::SagaSigningKeys {
-                    target: &target_signing_key,
-                    caller: &caller_signing_key,
+                scp_core::context::supervisor::SagaSigners {
+                    target: target_signer,
+                    caller: caller_signer,
                 },
                 params,
             )
@@ -1675,16 +1675,14 @@ fn outlet_streaming_saga_recover_truncated_close_impl(
 
     // Resolve the TARGET context's Active Signing Key per-call from custody
     // (never envelope-asserted) and seal via the shared recovery driver.
-    let target_key = crate::outlets::resolve_context_signing_key(py, bi, &target_context_id)?;
-    let signing_key =
-        scp_core::context::actor::commands::SigningKeyBytes::from_signing_key(&target_key);
+    let target_signer = crate::outlets::resolve_context_signer(py, bi, &target_context_id)?;
     let supervisor = crate::runtime::supervisor(bi)?.clone();
     crate::actor_wait::block_on_released(py, async {
         scp_ffi_common::streaming_saga::drive_recover_truncated_close(
             &supervisor,
             saga_id_typed,
             &target_context_id,
-            signing_key,
+            target_signer,
         )
         .await
     })?

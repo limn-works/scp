@@ -1736,43 +1736,6 @@ pub(crate) fn default_ceiling_strings() -> Vec<String> {
 // Governance proposal lifecycle (#621)
 // ---------------------------------------------------------------------------
 
-/// Helper: resolve the raw Ed25519 signing key for an identity DID.
-///
-/// Looks up the identity in the global registry, retrieves the custody
-/// provider and active signing key handle, and exports the raw
-/// `ed25519_dalek::SigningKey`, for the runtime paths that still take
-/// `&SigningKey`. Governance and invite sign through [`resolve_signer`].
-///
-/// `pub(crate)` so the cross-context saga export in `outlets.rs` can resolve
-/// each co-resident participant context's Active Signing Key (via that
-/// context's `creator_did`) without re-implementing the custody-export path.
-pub(crate) fn resolve_signing_key(
-    py: Python<'_>,
-    bi: &crate::runtime::PyBridgeInstance,
-    identity_did: &str,
-) -> PyResult<ed25519_dalek::SigningKey> {
-    // Copy the key handle and clone the custody `Arc` OUT of the `with_identity`
-    // closure, then DROP the DashMap identity-registry shard guard (by exiting
-    // the closure) BEFORE the blocking async export. The `block_on` at the FFI
-    // sync boundary is the ADR-049 §12-14-exempt class and stays; the hazard is
-    // holding a sharded read guard across a (potentially slow / HSM-backed /
-    // callback) async export, which pins a runtime worker and blocks any writer
-    // of the same shard for its duration. The export operates only on the cloned
-    // `custody`/`handle` and never re-touches the registry, so the clone-then-drop
-    // reorder is sufficient — same shape as the DashMap-ref-before-await fixes
-    // elsewhere. See GitHub issue #1940.
-    let (custody, handle) = crate::runtime::with_identity(bi, identity_did, |entry| {
-        Ok((entry.custody.clone(), entry.identity.active_signing_key))
-    })
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    crate::actor_wait::block_on_released(py, async move {
-        custody.export_ed25519_signing_key(&handle).await
-    })?
-    .map_err(|e| {
-        PyRuntimeError::new_err(format!("failed to export signing key for governance: {e}"))
-    })
-}
-
 /// Builds the identity's `#active` [`CommandSigner`] (ADR-049 Decision 7a).
 ///
 /// The private key stays in custody: the signer signs each digest through it.
@@ -1805,7 +1768,7 @@ pub(crate) fn resolve_signer(
 /// for a **message send** under the requested persona (ADR-039 Enforcement-Stack
 /// Layer 2).
 ///
-/// This is the persona-aware counterpart of [`resolve_signing_key`] (which
+/// This is the persona-aware counterpart of [`resolve_signer`] (which
 /// stays hard-`#active` for governance / Category-A signing). It selects BOTH
 /// the key handle AND the persona in a single match, so the `#active`/`#agent`
 /// stamp and the signing key are chosen together and cannot diverge:
@@ -10077,7 +10040,7 @@ mod tests {
             let scp = crate::scp::PyScp::new_in_memory_for_test();
             let bi = Arc::clone(&scp.inner);
 
-            // Real identity with in-memory custody so `resolve_signing_key`
+            // Real identity with in-memory custody so `resolve_signer`
             // (creator-side) and `resolve_creator_verifying_key` (import-side)
             // both succeed.
             let creator_identity = scp.identity_create(py, "in_memory", None).unwrap();

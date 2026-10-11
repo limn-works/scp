@@ -5242,7 +5242,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
     supervisor: std::sync::Weak<crate::context::supervisor::Supervisor>,
     target_context_hex: String,
     saga_id: crate::context::supervisor::saga_journal::SagaId,
-    target_signing_key: crate::context::actor::commands::SigningKeyBytes,
+    target_signer: crate::context::actor::signer::CommandSigner,
     mut inner_rx: mpsc::Receiver<OutletStreamChunk>,
     outer_tx: mpsc::Sender<OutletStreamChunk>,
     escrow_ticket: crate::context::outlets::dispatch::StreamEscrowTicket,
@@ -5483,7 +5483,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
                         saga_id: settle_saga_id,
                         terminal_status,
                         cancel_ack_seq: None,
-                        target_signing_key,
+                        target_signer,
                         reply,
                     })
                 })
@@ -9775,9 +9775,7 @@ mod tests {
                     std::sync::Weak::new(),
                     B_CTX.to_owned(),
                     crate::context::supervisor::saga_journal::SagaId("saga-dropped-sup".to_owned()),
-                    crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                        &operator_key(),
-                    ),
+                    crate::context::actor::signer::CommandSigner::local_ed25519(operator_key()),
                     inner_rx,
                     outer_tx,
                     ticket,

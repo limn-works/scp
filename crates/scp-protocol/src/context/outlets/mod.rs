@@ -94,9 +94,11 @@ pub use stream::{
     SCP_OUTLET_CHUNK_V1, SCP_OUTLET_CREDIT_V1, SessionState, StreamRejection, StreamTerminalStatus,
     compute_cancel_sig_preimage, compute_caveats_binding, compute_chunk_sig_preimage,
     compute_credit_sig_preimage, evaluate_open_pinning, evaluate_revocation_recheck,
-    evaluate_session_open, sign_cancel, sign_chunk, sign_credit_grant, verify_cancel_signature,
-    verify_chunk_signature, verify_credit_signature,
+    evaluate_session_open, verify_cancel_signature, verify_chunk_signature,
+    verify_credit_signature,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use stream::{sign_cancel, sign_chunk, sign_credit_grant};
 
 // ---------------------------------------------------------------------------
 // OutletKind
