@@ -608,15 +608,17 @@ fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity
         code: codes::IDENT_1011.to_owned(),
     })?;
 
-    let custody = id
-        .in_memory_custody
-        .as_ref()
-        .ok_or_else(|| ScpError::Identity {
-            msg: "identity does not have in-memory custody — only in-memory custody \
+    let custody = match id.custody.as_deref() {
+        Some(crate::bridge::UniffiKeyCustody::InMemory(custody)) => custody,
+        Some(crate::bridge::UniffiKeyCustody::Callback(_)) | None => {
+            return Err(ScpError::Identity {
+                msg: "identity does not have in-memory custody — only in-memory custody \
               identities can be used for node startup in this build"
-                .to_owned(),
-            code: codes::IDENT_1012.to_owned(),
-        })?;
+                    .to_owned(),
+                code: codes::IDENT_1012.to_owned(),
+            });
+        }
+    };
 
     // Hand-rolled sign_fn because `OpaqueInMemoryKeyCustody` does not
     // implement `KeyCustody` (it wraps `InMemoryKeyCustody` in `.0`).
