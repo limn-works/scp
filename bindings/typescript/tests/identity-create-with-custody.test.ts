@@ -272,11 +272,11 @@ if (!scpAvailable) {
           }),
         );
 
-        const data = await scp.contextExport(ctx._rawHandle);
+        const data = await scp.contextExport(ctx);
         expect(data.length).toBeGreaterThan(0);
 
         // Close so import_context sees a terminal state and allows reimport.
-        await scp.contextClose(ctx._rawHandle, identity.did);
+        await scp.contextClose(ctx, identity.did);
 
         // Import verifies the snapshot signature against the creator's #active
         // verifying key. Success proves the callback-custody-produced signature
@@ -308,10 +308,10 @@ if (!scpAvailable) {
 
         // Must NOT throw: signing the §23.16.8 digest goes through the `sign`
         // callback, never through the throwing `exportSigningKeyBytes`.
-        const data = await scp.contextExport(ctx._rawHandle);
+        const data = await scp.contextExport(ctx);
         expect(data.length).toBeGreaterThan(0);
 
-        await scp.contextClose(ctx._rawHandle, identity.did);
+        await scp.contextClose(ctx, identity.did);
 
         const importedContextId = await scp.contextImport(data, identity.did);
         expect(typeof importedContextId).toBe("string");

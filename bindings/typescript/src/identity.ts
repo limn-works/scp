@@ -110,13 +110,30 @@ export class Identity {
   /** The custody type used at identity creation. */
   readonly custodyType: string;
 
-  /** @internal Opaque bridge handle — not part of the public API. */
-  readonly _rawHandle: BridgeIdentityHandle;
+  /** The opaque bridge handle; private, so it also brands real instances. */
+  readonly #rawHandle: BridgeIdentityHandle;
 
   private constructor(did: string, custodyType: string, rawHandle: BridgeIdentityHandle) {
     this.did = did;
     this.custodyType = custodyType;
-    this._rawHandle = rawHandle;
+    this.#rawHandle = rawHandle;
+  }
+
+  /** @internal Opaque bridge handle — not part of the public API. */
+  get _rawHandle(): BridgeIdentityHandle {
+    return this.#rawHandle;
+  }
+
+  /**
+   * Reports whether `value` is an `Identity` this SDK constructed. The check
+   * reads a private field, so an object that copies an `Identity`'s public
+   * fields, or one built from `Identity.prototype`, does not pass.
+   *
+   * @internal Used by the `SCP` methods to reject a wrong argument with
+   *   `SCP-VALID-7005` before any bridge call.
+   */
+  static _isIdentity(value: unknown): value is Identity {
+    return typeof value === "object" && value !== null && #rawHandle in value;
   }
 
   /**

@@ -12,7 +12,7 @@ import { describe, expect, it } from "bun:test";
 import { ContextError } from "../src/errors";
 import type { Bridge } from "../src/internal/bridge";
 import { __setBridgeForTests, wrapBridgeErrors } from "../src/internal/bridge";
-import { mountMockScp } from "./mock-bridge";
+import { mockContext, mountMockScp } from "./mock-bridge";
 
 const INACTIVE = (verb: string): Error =>
   new Error(
@@ -58,21 +58,28 @@ describe("UCAN operations on an inactive context", () => {
     const { scp } = mountMockScp();
     __setBridgeForTests(scp, rejectingBridge("ucanValidate", INACTIVE("validate")));
     await expectInactiveContextError(() =>
-      scp.ucanValidate({}, "token", "scp:ctx:c/messages:read", "did:key:z6MkPresenter"),
+      scp.ucanValidate(
+        mockContext(scp),
+        "token",
+        "scp:ctx:c/messages:read",
+        "did:key:z6MkPresenter",
+      ),
     );
   });
 
   it("ucanEvaluate throws ContextError SCP-CTX-2023", async () => {
     const { scp, native } = mountMockScp();
     native.__stub("ucanEvaluate", () => Promise.reject(INACTIVE("evaluate")));
-    await expectInactiveContextError(() => scp.ucanEvaluate({}, "token", "did:key:z6MkPresenter"));
+    await expectInactiveContextError(() =>
+      scp.ucanEvaluate(mockContext(scp), "token", "did:key:z6MkPresenter"),
+    );
   });
 
   it("ucanMint throws ContextError SCP-CTX-2023", async () => {
     const { scp, native } = mountMockScp();
     native.__stub("ucanMint", () => Promise.reject(INACTIVE("mint")));
     await expectInactiveContextError(() =>
-      scp.ucanMint({}, "did:key:z6MkMember", ["messages:read"]),
+      scp.ucanMint(mockContext(scp), "did:key:z6MkMember", ["messages:read"]),
     );
   });
 
@@ -80,7 +87,7 @@ describe("UCAN operations on an inactive context", () => {
     const { scp, native } = mountMockScp();
     native.__stub("ucanDelegate", () => Promise.reject(INACTIVE("delegate")));
     await expectInactiveContextError(() =>
-      scp.ucanDelegate({}, "did:key:z6MkFrom", "did:key:z6MkTo", "parent", [
+      scp.ucanDelegate(mockContext(scp), "did:key:z6MkFrom", "did:key:z6MkTo", "parent", [
         "scp:ctx:c/messages:read",
       ]),
     );
@@ -89,12 +96,16 @@ describe("UCAN operations on an inactive context", () => {
   it("ucanRevoke throws ContextError SCP-CTX-2023", async () => {
     const { scp, native } = mountMockScp();
     native.__stub("ucanRevoke", () => Promise.reject(INACTIVE("revoke")));
-    await expectInactiveContextError(() => scp.ucanRevoke({}, "token", "did:key:z6MkRevoker"));
+    await expectInactiveContextError(() =>
+      scp.ucanRevoke(mockContext(scp), "token", "did:key:z6MkRevoker"),
+    );
   });
 
   it("evaluateTrust propagates the ucanEvaluate refusal as ContextError SCP-CTX-2023", async () => {
     const { scp, native } = mountMockScp();
     native.__stub("ucanEvaluate", () => Promise.reject(INACTIVE("evaluate")));
-    await expectInactiveContextError(() => scp.evaluateTrust({}, "did:key:z6MkSubject", ["token"]));
+    await expectInactiveContextError(() =>
+      scp.evaluateTrust(mockContext(scp), "did:key:z6MkSubject", ["token"]),
+    );
   });
 });

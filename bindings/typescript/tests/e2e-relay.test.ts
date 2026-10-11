@@ -35,6 +35,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { Context } from "../src/context";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 import { skipReasonIfAddonAbsent } from "./napi-guard";
@@ -359,9 +360,13 @@ if (bridge === null || scp === null) {
       // caller-owned `scp.contextSubscribe(handle, did, onMessage)`
       // method; the raw-handle callback also receives a `null` when
       // the subscription completes (we ignore that here).
-      await scpInstance.contextSubscribe(ctx, alice.did, (_msg: unknown) => {
-        // Callback may or may not fire depending on relay delivery.
-      });
+      await scpInstance.contextSubscribe(
+        Context._fromHandle(scpInstance, ctx, alice.did),
+        alice.did,
+        (_msg: unknown) => {
+          // Callback may or may not fire depending on relay delivery.
+        },
+      );
 
       // Track for cleanup in afterAll.
       subscribedContexts.push({ handle: ctx, did: alice.did });
@@ -380,15 +385,23 @@ if (bridge === null || scp === null) {
       );
 
       // First subscription succeeds.
-      await scpInstance.contextSubscribe(ctx, alice.did, () => {});
+      await scpInstance.contextSubscribe(
+        Context._fromHandle(scpInstance, ctx, alice.did),
+        alice.did,
+        () => {},
+      );
       subscribedContexts.push({ handle: ctx, did: alice.did });
 
       // Second subscription to the same context must fail. Async
       // rejection — use `.rejects.toThrow()` rather than
       // sync `.toThrow()`.
-      await expect(scpInstance.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow(
-        /already subscribed/,
-      );
+      await expect(
+        scpInstance.contextSubscribe(
+          Context._fromHandle(scpInstance, ctx, alice.did),
+          alice.did,
+          () => {},
+        ),
+      ).rejects.toThrow(/already subscribed/);
     });
 
     test("subscription rejected on non-active context", async () => {
@@ -411,9 +424,13 @@ if (bridge === null || scp === null) {
       // not synchronous throw. The message names `closing`, the state the
       // supervisor reports, so the assertion fails if the subscribe gate is
       // removed or reads the handle's cached string instead of the supervisor.
-      await expect(scpInstance.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow(
-        /cannot subscribe to context in 'closing' state/,
-      );
+      await expect(
+        scpInstance.contextSubscribe(
+          Context._fromHandle(scpInstance, ctx, alice.did),
+          alice.did,
+          () => {},
+        ),
+      ).rejects.toThrow(/cannot subscribe to context in 'closing' state/);
     });
   });
 

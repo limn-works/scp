@@ -129,10 +129,16 @@ export { evaluateTrust } from "./trust";
 // ADR-048). `UcanToken` lives in `./types` and is re-exported below.
 
 // ---------------------------------------------------------------------------
-// MCP — types only (entry points moved to SCP)
+// MCP — handle types (entry points live on SCP)
 // ---------------------------------------------------------------------------
 
-export type { McpClient, McpServer, NativeMcpClientHandle, NativeMcpServerHandle } from "./mcp";
+export { McpClient, McpServer } from "./mcp";
+
+// ---------------------------------------------------------------------------
+// Transport — handle type (entry points live on SCP)
+// ---------------------------------------------------------------------------
+
+export { TransportManager } from "./transport";
 
 // ---------------------------------------------------------------------------
 // Discovery — types + pure helpers (entry points for stateful ops moved to SCP)

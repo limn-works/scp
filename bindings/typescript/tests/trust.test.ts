@@ -48,7 +48,7 @@ import {
   encodeRequireParticipation,
   encodeThresholdRequirements,
 } from "../src/types";
-import { createMockNativeScp, mountMockScp } from "./mock-bridge";
+import { createMockNativeScp, mockContext, mountMockScp } from "./mock-bridge";
 
 /** A fully-passing CapabilityValidation — the all-`true` identity element. */
 const ALL_PASS: CapabilityValidation = {
@@ -123,13 +123,13 @@ function statefulUcanEvaluate(
  */
 function mountWithContext() {
   const { scp, native } = mountMockScp();
-  const context = { _rawHandle: {} as object, contextId: "ctx-test" } as unknown as Context;
+  const context = mockContext(scp, "ctx-test");
   return { scp, native, context };
 }
 
 /**
  * Thin wrapper so tests can call `evaluateTrust(scp, did, ctx, tokens?)` rather
- * than `scp.evaluateTrust(ctx._rawHandle, did, tokens?)` — mirrors Python's
+ * than `scp.evaluateTrust(ctx, did, tokens?)` — mirrors Python's
  * standalone `evaluate_trust(scp, did, ctx, tokens)` helper convention.
  */
 function evaluateTrust(
@@ -138,7 +138,7 @@ function evaluateTrust(
   context: Context,
   tokens?: readonly string[],
 ): ReturnType<SCP["evaluateTrust"]> {
-  return scp.evaluateTrust(context._rawHandle, subjectDid, tokens);
+  return scp.evaluateTrust(context, subjectDid, tokens);
 }
 
 describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
@@ -160,7 +160,12 @@ describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
       timeBoundsValid: true,
     }));
 
-    const result = await scp.ucanEvaluate("handle", "token-a", "did:dht:agent", "outlet:call:*");
+    const result = await scp.ucanEvaluate(
+      mockContext(scp),
+      "token-a",
+      "did:dht:agent",
+      "outlet:call:*",
+    );
     expect(result).toEqual({
       tokensValid: true,
       signaturesValid: false,
@@ -176,7 +181,7 @@ describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
     cleanup = () => scp.shutdown(0);
     native.__stub("ucanEvaluate", async () => ALL_PASS);
 
-    await scp.ucanEvaluate("handle", "token-a", "did:dht:agent", "*", ["proof-1"]);
+    await scp.ucanEvaluate(mockContext(scp), "token-a", "did:dht:agent", "*", ["proof-1"]);
     const call = native.__lastCall("ucanEvaluate");
     expect(call).toBeDefined();
     // Native wire order: handle, token, capability, presentingAgentDid, proofTokens
@@ -191,7 +196,7 @@ describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
     native.__stub("ucanEvaluate", async () => ALL_PASS);
 
     // presentingAgentDid is required; capability and proofTokens are omitted.
-    await scp.ucanEvaluate("handle", "token-a", "did:dht:agent");
+    await scp.ucanEvaluate(mockContext(scp), "token-a", "did:dht:agent");
     const call = native.__lastCall("ucanEvaluate");
     expect(call?.args[2]).toBeNull();
     expect(call?.args[3]).toBe("did:dht:agent");
@@ -236,8 +241,12 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     native.__stub("ucanEvaluate", probe.fn);
     native.__stub("participationRecord", () => fakeParticipationRecord());
 
-    const first = await scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject", ["token-a"]);
-    const second = await scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject", ["token-a"]);
+    const first = await scp.evaluateTrust(mockContext(scp, "ctx-1"), "did:dht:subject", [
+      "token-a",
+    ]);
+    const second = await scp.evaluateTrust(mockContext(scp, "ctx-1"), "did:dht:subject", [
+      "token-a",
+    ]);
 
     // The read-only diagnostic records nothing: the same token probed twice
     // reports nonceValid:true both times, so the aggregate is stable.
@@ -259,7 +268,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     native.__stub("ucanEvaluate", probe.fn);
     native.__stub("participationRecord", () => fakeParticipationRecord());
 
-    const result = await scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject", [
+    const result = await scp.evaluateTrust(mockContext(scp, "ctx-1"), "did:dht:subject", [
       "token-a",
       "token-b",
     ]);
@@ -284,7 +293,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     // unstubbed (strict mode would throw if it were called).
     native.__stub("participationRecord", () => fakeParticipationRecord());
 
-    const result = await scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject");
+    const result = await scp.evaluateTrust(mockContext(scp, "ctx-1"), "did:dht:subject");
     expect(result.capabilityValidation).toEqual({
       tokensValid: false,
       signaturesValid: false,
@@ -316,7 +325,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
       }),
     );
 
-    const result = await scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject");
+    const result = await scp.evaluateTrust(mockContext(scp, "ctx-1"), "did:dht:subject");
     expect(result.behavioralRecord.subjectDid).toBe("did:dht:subject");
     expect(result.behavioralRecord.participationDurationSecs).toBe(300);
     expect(result.behavioralRecord.governanceActionsAgainst).toBe(2);
@@ -340,7 +349,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     cleanup = () => scp.shutdown(0);
     mock.__stub("participationRecord", () => fakeParticipationRecord());
 
-    await scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject");
+    await scp.evaluateTrust(mockContext(scp, "ctx-1"), "did:dht:subject");
     const call = mock.__lastCall("participationRecord");
     expect(call).toBeDefined();
     // participationRecord(contextId, subjectDid, cachedAttestationsJson)
@@ -360,8 +369,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     // context-id argument exists, matching Swift/Kotlin). The returned record
     // is labeled with that resolved context AND the Layer-2 lookup is keyed by
     // it, so the two can never disagree.
-    const handle = { contextId: "ctx-A" } as unknown;
-    const result = await scp.evaluateTrust(handle, "did:dht:subject");
+    const result = await scp.evaluateTrust(mockContext(scp, "ctx-A"), "did:dht:subject");
     expect(result.contextId).toBe("ctx-A");
 
     // The Layer-2 lookup hits the resolved context.
@@ -398,7 +406,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
       throw new Error("[SCP-CTX-2076] context error: no recorded participation facts");
     });
 
-    const result = await scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject");
+    const result = await scp.evaluateTrust(mockContext(scp, "ctx-1"), "did:dht:subject");
     const record = result.behavioralRecord;
     // Non-null, fully-zeroed record — identical shape to the populated case.
     expect(record.subjectDid).toBe("did:dht:subject");
@@ -424,7 +432,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
       throw new Error("[SCP-CTX-2001] context error: not initialized");
     });
 
-    await expect(scp.evaluateTrust({ contextId: "ctx-1" }, "did:dht:subject")).rejects.toThrow(
+    await expect(scp.evaluateTrust(mockContext(scp, "ctx-1"), "did:dht:subject")).rejects.toThrow(
       /not initialized/i,
     );
   });

@@ -520,13 +520,13 @@ const ALL_LAYER1_FIELDS_FALSE: CapabilityValidation = {
  */
 async function validateOneCapUri(
   scp: SCP,
-  handle: unknown,
+  context: Context,
   token: string,
   capUri: string,
   presentingAgentDid: string,
 ): Promise<CapabilityValidation | null> {
   try {
-    await scp.ucanValidate(handle, token, capUri, presentingAgentDid);
+    await scp.ucanValidate(context, token, capUri, presentingAgentDid);
     return null; // success
   } catch (error) {
     // The NAPI bridge emits UCAN errors in the form
@@ -599,12 +599,12 @@ async function validateOneCapUri(
  * token's OWN first declared capability (`att[0].with`). Layer 1 does NOT
  * answer "does this token authorize action X?" Callers that need to verify
  * authority for a specific operation must call
- * `scp.ucanValidate(handle, token, uri)` directly with a caller-supplied
+ * `scp.ucanValidate(context, token, uri)` directly with a caller-supplied
  * `uri`.
  */
 async function evaluateLayer1(
   scp: SCP,
-  handle: unknown,
+  context: Context,
   capabilityTokens: readonly string[] | undefined,
   presentingAgentDid: string,
 ): Promise<CapabilityValidation> {
@@ -632,7 +632,7 @@ async function evaluateLayer1(
       return { ...ALL_LAYER1_FIELDS_FALSE };
     }
 
-    const narrowed = await validateOneCapUri(scp, handle, token, capUri, presentingAgentDid);
+    const narrowed = await validateOneCapUri(scp, context, token, capUri, presentingAgentDid);
     if (narrowed !== null) {
       // Fail-fast: return the narrowed verdict immediately.
       return narrowed;
@@ -688,11 +688,10 @@ export async function evaluateTrust(
   context: Context,
   capabilityTokens?: readonly string[],
 ): Promise<TrustEvaluation> {
-  const handle = context._rawHandle;
   const contextId = context.contextId;
 
-  // Layer 1: validate capability tokens (if any) against the context handle.
-  const capabilityValidation = await evaluateLayer1(scp, handle, capabilityTokens, subjectDid);
+  // Layer 1: validate capability tokens (if any) against the context.
+  const capabilityValidation = await evaluateLayer1(scp, context, capabilityTokens, subjectDid);
 
   // Layer 2: query behavioral record from the event log.
   let behavioralRecord: BehavioralRecord | null = null;
@@ -700,7 +699,7 @@ export async function evaluateTrust(
     // `scp.eventLogQuery` returns the raw NAPI event objects, which carry an
     // `eventType` field (the only field this layer reads). The filter JSON
     // uses snake_case `actor_did`, the key the bridge's filter parser expects.
-    const raw = await scp.eventLogQuery(handle, JSON.stringify({ actor_did: subjectDid }));
+    const raw = await scp.eventLogQuery(context, JSON.stringify({ actor_did: subjectDid }));
     const events = raw as readonly { readonly eventType: string }[];
     // This thin facade only computes outletInvocations from the raw event
     // stream. contextsParticipated, totalDuration, and governanceActionsAgainst

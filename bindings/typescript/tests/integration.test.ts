@@ -55,7 +55,7 @@ import { IdentityAttestation, RevocationStatus } from "../src/identity";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 import type { ConsequenceRule as ConsequenceRuleTypeAlias, OutletDefinition } from "../src/types";
-import { createMockNativeScp, mountMockScp } from "./mock-bridge";
+import { createMockNativeScp, mockContext, mountMockScp } from "./mock-bridge";
 import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 /**
@@ -361,12 +361,13 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
     const { scp, native } = mountMockScp();
     native.__stub("contextSend", () => Promise.resolve(undefined));
 
-    // Synthesize a bare handle shape — the SDK forwards the reference
-    // verbatim; the Proxy dispatcher sees the exact object.
-    const handle = { contextId: "ctx-abc" };
+    // The SDK forwards the Context's raw handle verbatim; the Proxy
+    // dispatcher sees the exact object.
+    const ctx = mockContext(scp, "ctx-abc");
+    const handle = ctx._rawHandle;
     const payload = new Uint8Array([1, 2, 3, 255]);
 
-    await scp.contextSend(handle, "did:dht:z6MkSender", payload);
+    await scp.contextSend(ctx, "did:dht:z6MkSender", payload);
 
     const call = native.__lastCall("contextSend");
     expect(call).toBeDefined();
@@ -382,9 +383,9 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
     const { scp, native } = mountMockScp();
     native.__stub("contextSend", () => Promise.resolve(undefined));
 
-    const handle = { contextId: "ctx-paid" };
+    const ctx = mockContext(scp, "ctx-paid");
     await scp.contextSend(
-      handle,
+      ctx,
       "did:dht:z6MkSender",
       new Uint8Array([0]),
       "eyJhbGciOiJFZERTQSJ9.spending.jwt",
@@ -397,8 +398,9 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
     const { scp, native } = mountMockScp();
     native.__stub("contextJoin", () => Promise.resolve(undefined));
 
-    const handle = { contextId: "ctx-join" };
-    await scp.contextJoin(handle, "did:dht:z6MkJoiner");
+    const ctx = mockContext(scp, "ctx-join");
+    const handle = ctx._rawHandle;
+    await scp.contextJoin(ctx, "did:dht:z6MkJoiner");
 
     expect(native.__lastCall("contextJoin")?.args).toEqual([handle, "did:dht:z6MkJoiner", null]);
   });
@@ -472,8 +474,9 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
     const { scp, native } = mountMockScp();
     native.__stub("ucanValidate", () => Promise.resolve(undefined));
 
-    const handle = { contextId: "ctx-ucan" };
-    await scp.ucanValidate(handle, "token.jwt", "messages:read", "did:dht:z6MkAgent", ["proof1"]);
+    const ctx = mockContext(scp, "ctx-ucan");
+    const handle = ctx._rawHandle;
+    await scp.ucanValidate(ctx, "token.jwt", "messages:read", "did:dht:z6MkAgent", ["proof1"]);
 
     const call = native.__lastCall("ucanValidate");
     expect(call?.args).toEqual([
@@ -489,8 +492,9 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
     const { scp, native } = mountMockScp();
     native.__stub("ucanMint", () => Promise.resolve({ id: "ucan-1", capabilities: ["read"] }));
 
-    const handle = { contextId: "ctx-mint" };
-    await scp.ucanMint(handle, "did:dht:z6MkMember", ["messages:read"]);
+    const ctx = mockContext(scp, "ctx-mint");
+    const handle = ctx._rawHandle;
+    await scp.ucanMint(ctx, "did:dht:z6MkMember", ["messages:read"]);
 
     const call = native.__lastCall("ucanMint");
     expect(call?.args[0]).toBe(handle);
@@ -1052,8 +1056,8 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         creator,
         JSON.stringify({ ceiling: ["messages:read", "role:assign"] }),
       );
-      await scp.contextJoin(ctx._rawHandle, joiner.did);
-      expect(await scp.contextMemberCount(ctx._rawHandle)).toBe(2);
+      await scp.contextJoin(ctx, joiner.did);
+      expect(await scp.contextMemberCount(ctx)).toBe(2);
     });
 
     it("scp.contextSend publishes through the relay without error", async () => {
@@ -1063,7 +1067,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
       );
       const payload = new TextEncoder().encode("hello via SCP class");
-      await scp.contextSend(ctx._rawHandle, identity.did, payload);
+      await scp.contextSend(ctx, identity.did, payload);
     });
 
     it("scp.contextLeave succeeds for a joined non-creator", async () => {
@@ -1076,10 +1080,10 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           governance: "single_admin",
         }),
       );
-      await scp.contextJoin(ctx._rawHandle, member.did);
-      expect(await scp.contextMemberCount(ctx._rawHandle)).toBe(2);
-      await scp.contextLeave(ctx._rawHandle, member.did);
-      expect(await scp.contextMemberCount(ctx._rawHandle)).toBe(1);
+      await scp.contextJoin(ctx, member.did);
+      expect(await scp.contextMemberCount(ctx)).toBe(2);
+      await scp.contextLeave(ctx, member.did);
+      expect(await scp.contextMemberCount(ctx)).toBe(1);
     });
 
     it("scp.contextClose by the admin transitions the context out of Active", async () => {
@@ -1091,11 +1095,11 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           governance: "single_admin",
         }),
       );
-      await scp.contextClose(ctx._rawHandle, admin.did);
+      await scp.contextClose(ctx, admin.did);
       // After close, contextSend must fail.
       let sendAfterCloseErr: unknown;
       try {
-        await scp.contextSend(ctx._rawHandle, admin.did, new TextEncoder().encode("late"));
+        await scp.contextSend(ctx, admin.did, new TextEncoder().encode("late"));
       } catch (e) {
         sendAfterCloseErr = e;
       }
@@ -1106,14 +1110,14 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const identity = await scp.identityCreate("in_memory");
       const outsider = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
-      expect(await scp.contextIsMember(ctx._rawHandle, identity.did)).toBe(true);
-      expect(await scp.contextIsMember(ctx._rawHandle, outsider.did)).toBe(false);
+      expect(await scp.contextIsMember(ctx, identity.did)).toBe(true);
+      expect(await scp.contextIsMember(ctx, outsider.did)).toBe(false);
     });
 
     it("scp.contextMemberDids lists the creator DID", async () => {
       const identity = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
-      const dids = await scp.contextMemberDids(ctx._rawHandle);
+      const dids = await scp.contextMemberDids(ctx);
       expect(dids).toContain(identity.did);
     });
 
@@ -1123,7 +1127,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         identity,
         JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
       );
-      const role = await scp.contextMemberRole(ctx._rawHandle, identity.did);
+      const role = await scp.contextMemberRole(ctx, identity.did);
       expect(role).toBe("Admin");
     });
 
@@ -1158,7 +1162,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       expect(ctx.contextId).toBeTruthy();
       // Subscriber count on a fresh broadcast context starts at 0
       // (creator is an author, not a subscriber).
-      expect(await scp.contextBroadcastSubscriberCount(ctx._rawHandle)).toBe(0);
+      expect(await scp.contextBroadcastSubscriberCount(ctx)).toBe(0);
     });
 
     it("scp.contextSend fails after the context is closed", async () => {
@@ -1167,10 +1171,10 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         identity,
         JSON.stringify({ ceiling: ["messages:read", "messages:write", "context:close"] }),
       );
-      await scp.contextClose(ctx._rawHandle, identity.did);
+      await scp.contextClose(ctx, identity.did);
       let closedSendErr: unknown;
       try {
-        await scp.contextSend(ctx._rawHandle, identity.did, new TextEncoder().encode("late"));
+        await scp.contextSend(ctx, identity.did, new TextEncoder().encode("late"));
       } catch (e) {
         closedSendErr = e;
       }
@@ -1187,10 +1191,10 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           governance: "single_admin",
         }),
       );
-      await scp.contextJoin(ctx._rawHandle, member.did);
+      await scp.contextJoin(ctx, member.did);
       let nonAdminCloseErr: unknown;
       try {
-        await scp.contextClose(ctx._rawHandle, member.did);
+        await scp.contextClose(ctx, member.did);
       } catch (e) {
         nonAdminCloseErr = e;
       }
@@ -1212,7 +1216,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const admin = await scp.identityCreate("in_memory");
       const member = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
-      const raw = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
+      const raw = (await scp.ucanMint(ctx, member.did, ["messages:read"])) as {
         encoded: string;
         capabilities: string[];
         audience: string;
@@ -1226,26 +1230,26 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const admin = await scp.identityCreate("in_memory");
       const member = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
-      const token = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
+      const token = (await scp.ucanMint(ctx, member.did, ["messages:read"])) as {
         encoded: string;
         capabilities: string[];
       };
       const fullCap = token.capabilities[0];
       expect(fullCap).toBeDefined();
       // Must not throw.
-      await scp.ucanValidate(ctx._rawHandle, token.encoded, fullCap as string, member.did);
+      await scp.ucanValidate(ctx, token.encoded, fullCap as string, member.did);
     });
 
     it("scp.ucanValidate rejects a capability that was not granted", async () => {
       const admin = await scp.identityCreate("in_memory");
       const member = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
-      const token = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
+      const token = (await scp.ucanMint(ctx, member.did, ["messages:read"])) as {
         encoded: string;
       };
       let notGrantedErr: unknown;
       try {
-        await scp.ucanValidate(ctx._rawHandle, token.encoded, "messages:write", member.did);
+        await scp.ucanValidate(ctx, token.encoded, "messages:write", member.did);
       } catch (e) {
         notGrantedErr = e;
       }
@@ -1256,17 +1260,17 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const admin = await scp.identityCreate("in_memory");
       const member = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
-      const token = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
+      const token = (await scp.ucanMint(ctx, member.did, ["messages:read"])) as {
         encoded: string;
         capabilities: string[];
       };
       const cap = token.capabilities[0] as string;
       // First validation succeeds — nonce consumed.
-      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
+      await scp.ucanValidate(ctx, token.encoded, cap, member.did);
       // Second presentation of the same token must be rejected.
       let nonceReplayErr: unknown;
       try {
-        await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
+        await scp.ucanValidate(ctx, token.encoded, cap, member.did);
       } catch (e) {
         nonceReplayErr = e;
       }
@@ -1277,15 +1281,15 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const admin = await scp.identityCreate("in_memory");
       const member = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
-      const token = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
+      const token = (await scp.ucanMint(ctx, member.did, ["messages:read"])) as {
         encoded: string;
         capabilities: string[];
       };
       const cap = token.capabilities[0] as string;
-      await scp.ucanRevoke(ctx._rawHandle, token.encoded, admin.did);
+      await scp.ucanRevoke(ctx, token.encoded, admin.did);
       let revokedErr: unknown;
       try {
-        await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
+        await scp.ucanValidate(ctx, token.encoded, cap, member.did);
       } catch (e) {
         revokedErr = e;
       }
@@ -1300,17 +1304,12 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         admin,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
       );
-      const parent = (await scp.ucanMint(ctx._rawHandle, member.did, [
+      const parent = (await scp.ucanMint(ctx, member.did, ["messages:read", "messages:write"])) as {
+        encoded: string;
+      };
+      const delegated = (await scp.ucanDelegate(ctx, member.did, delegate.did, parent.encoded, [
         "messages:read",
-        "messages:write",
-      ])) as { encoded: string };
-      const delegated = (await scp.ucanDelegate(
-        ctx._rawHandle,
-        member.did,
-        delegate.did,
-        parent.encoded,
-        ["messages:read"],
-      )) as { audience: string; capabilities: string[] };
+      ])) as { audience: string; capabilities: string[] };
       expect(delegated.audience).toBe(delegate.did);
       expect(delegated.capabilities.length).toBe(1);
     });
@@ -1320,14 +1319,12 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const member = await scp.identityCreate("in_memory");
       const other = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
-      const token = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
+      const token = (await scp.ucanMint(ctx, member.did, ["messages:read"])) as {
         encoded: string;
       };
       let delegateCeilingErr: unknown;
       try {
-        await scp.ucanDelegate(ctx._rawHandle, other.did, admin.did, token.encoded, [
-          "messages:read",
-        ]);
+        await scp.ucanDelegate(ctx, other.did, admin.did, token.encoded, ["messages:read"]);
       } catch (e) {
         delegateCeilingErr = e;
       }
@@ -1382,7 +1379,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         JSON.stringify({ ceiling: ["outlet:register"] }),
       );
       const outletId = await scp.outletRegister(
-        ctx._rawHandle,
+        ctx,
         makeOutletDef({
           name: "scp-class-echo",
           description: "Echoes via SCP class",
@@ -1400,16 +1397,16 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         admin,
         JSON.stringify({ ceiling: ["outlet:register", "outlet:call:*"] }),
       );
-      await scp.contextJoin(ctx._rawHandle, member.did);
+      await scp.contextJoin(ctx, member.did);
       const outletId = await scp.outletRegister(
-        ctx._rawHandle,
+        ctx,
         makeOutletDef({ name: "scp-class-add", description: "Adds", operator: admin.did }),
       );
-      const ucan = (await scp.ucanMint(ctx._rawHandle, member.did, ["outlet:call:*"])) as {
+      const ucan = (await scp.ucanMint(ctx, member.did, ["outlet:call:*"])) as {
         encoded: string;
       };
       const result = await scp.outletInvoke(
-        ctx._rawHandle,
+        ctx,
         outletId,
         JSON.stringify({ x: 7, mode: "double" }),
         member.did,
@@ -1428,7 +1425,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         JSON.stringify({ ceiling: ["outlet:register", "outlet:call:*"] }),
       );
       const outletId = await scp.outletRegister(
-        ctx._rawHandle,
+        ctx,
         makeOutletDef({
           name: "scp-class-denied",
           description: "Unreachable",
@@ -1437,7 +1434,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       );
       let threw = false;
       try {
-        await scp.outletInvoke(ctx._rawHandle, outletId, "{}", outsider.did, "");
+        await scp.outletInvoke(ctx, outletId, "{}", outsider.did, "");
       } catch {
         threw = true;
       }
@@ -1451,7 +1448,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         JSON.stringify({ ceiling: ["outlet:register"] }),
       );
       const outletId = await scp.outletRegister(
-        ctx._rawHandle,
+        ctx,
         makeOutletDef({
           name: "scp-class-verify-me",
           description: "Verifiable",
@@ -1466,7 +1463,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           },
         }),
       );
-      const verification = (await scp.outletVerify(ctx._rawHandle, outletId)) as {
+      const verification = (await scp.outletVerify(ctx, outletId)) as {
         passed: boolean;
         failures: unknown[];
       };
@@ -1499,34 +1496,34 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     it("scp.broadcastSubscribe adds a subscriber", async () => {
       const { ctx } = await makeBroadcast();
       const subscriber = await scp.identityCreate("in_memory");
-      await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
-      expect(await scp.contextIsBroadcastSubscriber(ctx._rawHandle, subscriber.did)).toBe(true);
-      expect(await scp.contextBroadcastSubscriberCount(ctx._rawHandle)).toBe(1);
+      await scp.broadcastSubscribe(ctx, subscriber.did);
+      expect(await scp.contextIsBroadcastSubscriber(ctx, subscriber.did)).toBe(true);
+      expect(await scp.contextBroadcastSubscriberCount(ctx)).toBe(1);
     });
 
     it("scp.broadcastUnsubscribe removes a subscriber", async () => {
       const { ctx } = await makeBroadcast();
       const subscriber = await scp.identityCreate("in_memory");
-      await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
-      await scp.broadcastUnsubscribe(ctx._rawHandle, subscriber.did);
-      expect(await scp.contextIsBroadcastSubscriber(ctx._rawHandle, subscriber.did)).toBe(false);
-      expect(await scp.contextBroadcastSubscriberCount(ctx._rawHandle)).toBe(0);
+      await scp.broadcastSubscribe(ctx, subscriber.did);
+      await scp.broadcastUnsubscribe(ctx, subscriber.did);
+      expect(await scp.contextIsBroadcastSubscriber(ctx, subscriber.did)).toBe(false);
+      expect(await scp.contextBroadcastSubscriberCount(ctx)).toBe(0);
     });
 
     it("scp.broadcastUnsubscribe with rotateKeys=true succeeds", async () => {
       const { ctx } = await makeBroadcast();
       const subscriber = await scp.identityCreate("in_memory");
-      await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
+      await scp.broadcastSubscribe(ctx, subscriber.did);
       // The Rust path emits a BroadcastKeyRotated event when rotateKeys=true.
       // We only assert the call path doesn't throw — content of the event
       // log is covered via the eventLogQuery surface below.
-      await scp.broadcastUnsubscribe(ctx._rawHandle, subscriber.did, true);
+      await scp.broadcastUnsubscribe(ctx, subscriber.did, true);
     });
 
     it("scp.broadcastPublish publishes from the author (relay transport)", async () => {
       const { ctx, identity } = await makeBroadcast();
       await scp.broadcastPublish(
-        ctx._rawHandle,
+        ctx,
         identity.did,
         new TextEncoder().encode("broadcast via SCP class"),
       );
@@ -1535,30 +1532,30 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     it("scp.broadcastBlockSubscriber keeps the DID in the roster per §5.14.8", async () => {
       const { ctx, identity } = await makeBroadcast();
       const subscriber = await scp.identityCreate("in_memory");
-      await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
-      await scp.broadcastBlockSubscriber(ctx._rawHandle, subscriber.did, identity.did);
+      await scp.broadcastSubscribe(ctx, subscriber.did);
+      await scp.broadcastBlockSubscriber(ctx, subscriber.did, identity.did);
       // Per §5.14.8, per-author blocking does NOT remove from the
       // context-wide subscriber roster. Only governance_ban removes.
-      expect(await scp.contextIsBroadcastSubscriber(ctx._rawHandle, subscriber.did)).toBe(true);
+      expect(await scp.contextIsBroadcastSubscriber(ctx, subscriber.did)).toBe(true);
     });
 
     it("scp.broadcastUnblockSubscriber returns the subscriber to unblocked state", async () => {
       const { ctx, identity } = await makeBroadcast();
       const subscriber = await scp.identityCreate("in_memory");
-      await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
-      await scp.broadcastBlockSubscriber(ctx._rawHandle, subscriber.did, identity.did);
-      await scp.broadcastUnblockSubscriber(ctx._rawHandle, subscriber.did, identity.did);
+      await scp.broadcastSubscribe(ctx, subscriber.did);
+      await scp.broadcastBlockSubscriber(ctx, subscriber.did, identity.did);
+      await scp.broadcastUnblockSubscriber(ctx, subscriber.did, identity.did);
       // Unblock should not throw; subscriber remains in roster.
-      expect(await scp.contextIsBroadcastSubscriber(ctx._rawHandle, subscriber.did)).toBe(true);
+      expect(await scp.contextIsBroadcastSubscriber(ctx, subscriber.did)).toBe(true);
     });
 
     it("scp.broadcastHandleKeyRequest grants and scp.broadcastOpenKey opens the key", async () => {
       const { ctx, identity } = await makeBroadcast();
       const subscriber = await scp.identityCreate("in_memory");
-      await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
+      await scp.broadcastSubscribe(ctx, subscriber.did);
       const { secret, publicKey } = generateX25519KeyPair();
       const sealedJson = await scp.broadcastHandleKeyRequest(
-        ctx._rawHandle,
+        ctx,
         identity.did,
         subscriber.did,
         publicKey,
@@ -1576,7 +1573,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const stranger = await scp.identityCreate("in_memory");
       const { publicKey } = generateX25519KeyPair();
       const decision = await scp.broadcastHandleKeyRequest(
-        ctx._rawHandle,
+        ctx,
         identity.did,
         stranger.did,
         publicKey,
@@ -1586,7 +1583,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
     it("scp.contextBroadcastAdmission returns a policy for a broadcast context", async () => {
       const { ctx } = await makeBroadcast();
-      const admission = await scp.contextBroadcastAdmission(ctx._rawHandle);
+      const admission = await scp.contextBroadcastAdmission(ctx);
       expect(admission).not.toBeNull();
       expect(typeof admission).toBe("string");
     });
@@ -1596,7 +1593,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
       // Encrypted mode (the default) — subscriber count is a broadcast-only
       // notion. The bridge returns null to indicate inapplicability.
-      const count = await scp.contextBroadcastSubscriberCount(ctx._rawHandle);
+      const count = await scp.contextBroadcastSubscriberCount(ctx);
       expect(count).toBeNull();
     });
 
@@ -1604,7 +1601,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const { ctx, identity } = await makeBroadcast();
       const body = Array.from(new TextEncoder().encode("<h1>SCP class integration</h1>"));
       const result = (await scp.broadcastPublishAsset(
-        ctx._rawHandle,
+        ctx,
         identity.did,
         { path: "/index.html", contentType: "text/html", body },
         "deploy-scp-class-1",
@@ -1629,7 +1626,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         },
       ];
       const batch = (await scp.broadcastPublishAssets(
-        ctx._rawHandle,
+        ctx,
         identity.did,
         assets,
         "deploy-scp-class-batch",
@@ -1660,9 +1657,9 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           governance: "single_admin",
         }),
       );
-      await scp.contextJoin(ctx._rawHandle, member.did);
+      await scp.contextJoin(ctx, member.did);
       const proposeResult = await scp.contextGovernancePropose(
-        ctx._rawHandle,
+        ctx,
         JSON.stringify({ ChangeRole: { did: member.did, new_role: "moderator" } }),
         admin.did,
       );
@@ -1675,7 +1672,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         execution_result: string | null;
       };
       expect(typeof proposeJson.proposal_id).toBe("string");
-      const newRole = await scp.contextMemberRole(ctx._rawHandle, member.did);
+      const newRole = await scp.contextMemberRole(ctx, member.did);
       expect(newRole).toBe("Moderator");
     });
 
@@ -1695,17 +1692,17 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           governance: "single_admin",
         }),
       );
-      await scp.contextJoin(ctx._rawHandle, member.did);
-      expect(await scp.contextIsMember(ctx._rawHandle, member.did)).toBe(true);
+      await scp.contextJoin(ctx, member.did);
+      expect(await scp.contextIsMember(ctx, member.did)).toBe(true);
       // For single_admin governance, contextGovernancePropose auto-approves
       // and auto-executes the action in one call. The proposal_id is returned
       // in the JSON result but execute is not needed separately.
       await scp.contextGovernancePropose(
-        ctx._rawHandle,
+        ctx,
         JSON.stringify({ RemoveMember: { did: member.did, reason: null } }),
         admin.did,
       );
-      expect(await scp.contextIsMember(ctx._rawHandle, member.did)).toBe(false);
+      expect(await scp.contextIsMember(ctx, member.did)).toBe(false);
     });
 
     it("scp.contextExecuteGovernanceAction rejects invalid JSON", async () => {
@@ -1716,7 +1713,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       );
       let threw = false;
       try {
-        await scp.contextExecuteGovernanceAction(ctx._rawHandle, "{not-json");
+        await scp.contextExecuteGovernanceAction(ctx, "{not-json");
       } catch {
         threw = true;
       }
@@ -1729,7 +1726,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         admin,
         JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
       );
-      const listJson = await scp.contextGovernanceListProposals(ctx._rawHandle);
+      const listJson = await scp.contextGovernanceListProposals(ctx);
       const list = JSON.parse(listJson);
       expect(Array.isArray(list)).toBe(true);
       // Fresh context has no pending proposals.
@@ -1745,7 +1742,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     it("scp.eventLogQuery returns at least one event after create", async () => {
       const identity = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
-      const events = await scp.eventLogQuery(ctx._rawHandle);
+      const events = await scp.eventLogQuery(ctx);
       expect(events.length).toBeGreaterThanOrEqual(1);
       const first = events[0] as { eventType: string; actorDid: string };
       expect(first.eventType).toBe("ContextCreated");
@@ -1766,29 +1763,26 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // §9.10.4: a lone-member encrypted send is a no-op that records no
       // MessageSent event. Add a peer and seed its per-member pseudonym so the
       // send actually fans out and the MessageSent event is emitted.
-      await scp.contextJoin(ctx._rawHandle, bob.did);
-      await scp.contextSeedPeerPseudonym(ctx._rawHandle, bob.did, new Uint8Array(32).fill(0x42));
+      await scp.contextJoin(ctx, bob.did);
+      await scp.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
       // Clear the join/create ContextEvents so the only event observed below is
       // the one produced by the send.
-      await scp.contextDrainEvents(ctx._rawHandle);
+      await scp.contextDrainEvents(ctx);
 
-      await scp.contextSend(ctx._rawHandle, identity.did, new TextEncoder().encode("one"));
+      await scp.contextSend(ctx, identity.did, new TextEncoder().encode("one"));
 
       // ADR-011 amendment (phase-2.md:907-934): MessageSent is per-author,
       // non-convergent application activity surfaced only as a local
       // `ContextEvent::MessageSent` on the in-process buffer — never a durable
       // Merkle leaf.
-      const drained = await scp.contextDrainEvents(ctx._rawHandle);
+      const drained = await scp.contextDrainEvents(ctx);
       expect(drained.some((e) => e.startsWith("message_sent:"))).toBe(true);
 
       // The durable event log (read by eventLogQuery) deliberately excludes
       // MessageSent so two honest members derive the same merkle_root (§9.9.3).
       // The SCP surface dispatches the filter JSON verbatim; the Rust bridge
       // deserializes with snake_case, so we supply `event_type`.
-      const durable = await scp.eventLogQuery(
-        ctx._rawHandle,
-        JSON.stringify({ event_type: "MessageSent" }),
-      );
+      const durable = await scp.eventLogQuery(ctx, JSON.stringify({ event_type: "MessageSent" }));
       expect(durable.length).toBe(0);
     });
 
@@ -1799,7 +1793,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // does not transform the argument, so the caller must pass
       // `leaf_index` directly.
       const proof = (await scp.eventLogVerify(
-        ctx._rawHandle,
+        ctx,
         JSON.stringify({ type: "inclusion", leaf_index: 0 }),
       )) as { verified: boolean; proofType: string };
       expect(proof.verified).toBe(true);
@@ -1814,7 +1808,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // `internal/native.ts` surfaces the same `merkleRoot` key on the
       // SDK-facing `Checkpoint`. Callers of the SCP class see the NAPI
       // shape as-is.
-      const checkpoint = scp.eventLogCheckpoint(ctx._rawHandle, identity, 0) as {
+      const checkpoint = scp.eventLogCheckpoint(ctx, identity, 0) as {
         merkleRoot: string;
         eventCount: number;
         timestamp: number;
@@ -1828,7 +1822,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     it("scp.eventLogCheckpointByDid accepts a DID string and returns the same shape", async () => {
       const identity = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
-      const checkpoint = scp.eventLogCheckpointByDid(ctx._rawHandle, identity.did, 0) as {
+      const checkpoint = scp.eventLogCheckpointByDid(ctx, identity.did, 0) as {
         merkleRoot: string;
         eventCount: number;
       };
@@ -1839,9 +1833,9 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     it("scp.contextDrainEvents returns events and is idempotent on a second call", async () => {
       const identity = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
-      const first = await scp.contextDrainEvents(ctx._rawHandle);
+      const first = await scp.contextDrainEvents(ctx);
       expect(Array.isArray(first)).toBe(true);
-      const second = await scp.contextDrainEvents(ctx._rawHandle);
+      const second = await scp.contextDrainEvents(ctx);
       expect(second.length).toBe(0);
     });
   });
@@ -1859,7 +1853,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       );
       // Should not throw — the context is not yet expired so this
       // reports "still active".
-      await scp.contextHandleTtlExpiry(ctx._rawHandle);
+      await scp.contextHandleTtlExpiry(ctx);
     });
 
     it("scp.contextProposeTtlExtension returns a boolean (unanimous with one member)", async () => {
@@ -1868,7 +1862,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         identity,
         JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 3600 }),
       );
-      const approved = await scp.contextProposeTtlExtension(ctx._rawHandle, identity.did, 7200);
+      const approved = await scp.contextProposeTtlExtension(ctx, identity.did, 7200);
       expect(typeof approved).toBe("boolean");
     });
 
@@ -1878,7 +1872,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         identity,
         JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 3600 }),
       );
-      await scp.contextResetTtlTimer(ctx._rawHandle, 7200);
+      await scp.contextResetTtlTimer(ctx, 7200);
     });
   });
 
@@ -1893,7 +1887,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         identity,
         JSON.stringify({ ceiling: ["messages:read"], memoryScope: "ephemeral" }),
       );
-      const bytes = await scp.contextExport(ctx._rawHandle);
+      const bytes = await scp.contextExport(ctx);
       expect(bytes).toBeInstanceOf(Uint8Array);
       expect(bytes.length).toBeGreaterThan(0);
     });
@@ -1907,10 +1901,10 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           memoryScope: "ephemeral",
         }),
       );
-      const data = await scp.contextExport(ctx._rawHandle);
+      const data = await scp.contextExport(ctx);
       // Close the context first so import_context's TOCTOU gate (see
       // #1479) treats the existing entry as terminal and allows reimport.
-      await scp.contextClose(ctx._rawHandle, identity.did);
+      await scp.contextClose(ctx, identity.did);
       const importedId = await scp.contextImport(data, identity.did);
       expect(importedId.length).toBeGreaterThan(0);
     });
@@ -1946,7 +1940,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         pricing_formula: null,
         payee: identity.did,
       });
-      expect(() => scp.contextSetEconomicPolicy(ctx._rawHandle, policy)).toThrow(
+      expect(() => scp.contextSetEconomicPolicy(ctx, policy)).toThrow(
         /SCP-CTX-2013|§19\.3|governance/,
       );
     });
@@ -1954,7 +1948,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     it("scp.contextGetEconomicPolicy returns null when none is set", async () => {
       const identity = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["messages:read"] }));
-      expect(scp.contextGetEconomicPolicy(ctx._rawHandle)).toBeNull();
+      expect(scp.contextGetEconomicPolicy(ctx)).toBeNull();
     });
 
     it("scp.economyPolicyRequiresPayment (stateless helper) returns boolean", () => {
@@ -2040,11 +2034,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         // Cross the handle into the other SCP.
         let threw = false;
         try {
-          await other.contextSend(
-            ourCtx._rawHandle,
-            ours.did,
-            new TextEncoder().encode("cross-instance"),
-          );
+          await other.contextSend(ourCtx, ours.did, new TextEncoder().encode("cross-instance"));
         } catch (err) {
           threw = true;
           expect(String(err)).toMatch(/SCP-PERM-3030/);
@@ -2078,23 +2068,23 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           memoryScope: "ephemeral",
         }),
       );
-      expect(await scp.contextMemberCount(ctx._rawHandle)).toBe(1);
-      await scp.contextJoin(ctx._rawHandle, bob.did);
-      expect(await scp.contextMemberCount(ctx._rawHandle)).toBe(2);
-      expect(await scp.contextIsMember(ctx._rawHandle, bob.did)).toBe(true);
+      expect(await scp.contextMemberCount(ctx)).toBe(1);
+      await scp.contextJoin(ctx, bob.did);
+      expect(await scp.contextMemberCount(ctx)).toBe(2);
+      expect(await scp.contextIsMember(ctx, bob.did)).toBe(true);
 
       // Seed Bob's per-member pseudonym so the multi-member fan-out is
       // registered; otherwise the send fails closed with SCP-CTX-2095
       // ("pseudonym registry empty") per §9.10.4.
-      await scp.contextSeedPeerPseudonym(ctx._rawHandle, bob.did, new Uint8Array(32).fill(0x42));
+      await scp.contextSeedPeerPseudonym(ctx, bob.did, new Uint8Array(32).fill(0x42));
 
-      await scp.contextSend(ctx._rawHandle, alice.did, new TextEncoder().encode("hello bob"));
+      await scp.contextSend(ctx, alice.did, new TextEncoder().encode("hello bob"));
 
-      const events = await scp.eventLogQuery(ctx._rawHandle);
+      const events = await scp.eventLogQuery(ctx);
       expect(events.length).toBeGreaterThanOrEqual(1);
 
-      await scp.contextLeave(ctx._rawHandle, bob.did);
-      await scp.contextClose(ctx._rawHandle, alice.did);
+      await scp.contextLeave(ctx, bob.did);
+      await scp.contextClose(ctx, alice.did);
     });
 
     it("E2E UCAN lifecycle: mint -> validate -> revoke -> validation fails", async () => {
@@ -2104,16 +2094,16 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         admin,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
       );
-      const token = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
+      const token = (await scp.ucanMint(ctx, member.did, ["messages:read"])) as {
         encoded: string;
         capabilities: string[];
       };
       const cap = token.capabilities[0] as string;
-      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
-      await scp.ucanRevoke(ctx._rawHandle, token.encoded, admin.did);
+      await scp.ucanValidate(ctx, token.encoded, cap, member.did);
+      await scp.ucanRevoke(ctx, token.encoded, admin.did);
       let e2eRevokedErr: unknown;
       try {
-        await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
+        await scp.ucanValidate(ctx, token.encoded, cap, member.did);
       } catch (e) {
         e2eRevokedErr = e;
       }
@@ -2131,12 +2121,12 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           memoryScope: "full",
         }),
       );
-      expect(await scp.contextBroadcastSubscriberCount(ctx._rawHandle)).toBe(0);
-      await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
-      expect(await scp.contextBroadcastSubscriberCount(ctx._rawHandle)).toBe(1);
-      await scp.broadcastPublish(ctx._rawHandle, author.did, new TextEncoder().encode("hi subs"));
-      await scp.broadcastUnsubscribe(ctx._rawHandle, subscriber.did);
-      expect(await scp.contextBroadcastSubscriberCount(ctx._rawHandle)).toBe(0);
+      expect(await scp.contextBroadcastSubscriberCount(ctx)).toBe(0);
+      await scp.broadcastSubscribe(ctx, subscriber.did);
+      expect(await scp.contextBroadcastSubscriberCount(ctx)).toBe(1);
+      await scp.broadcastPublish(ctx, author.did, new TextEncoder().encode("hi subs"));
+      await scp.broadcastUnsubscribe(ctx, subscriber.did);
+      expect(await scp.contextBroadcastSubscriberCount(ctx)).toBe(0);
     });
   });
 });

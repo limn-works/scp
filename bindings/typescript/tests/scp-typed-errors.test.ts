@@ -27,7 +27,7 @@ import {
 } from "../src/errors";
 import type { Bridge } from "../src/internal/bridge";
 import { __setBridgeForTests, wrapBridgeErrors } from "../src/internal/bridge";
-import { mountMockScp } from "./mock-bridge";
+import { mockContext, mountMockScp } from "./mock-bridge";
 
 /** Build a plain NAPI-style error: a bare `Error` carrying a code prefix. */
 function rawBridgeError(message: string): Error {
@@ -85,7 +85,7 @@ describe("SCP typed-error mapping", () => {
 
     let thrown: unknown;
     try {
-      await scp.contextSend({}, "did:dht:z6MkAlice", new Uint8Array([1, 2, 3]));
+      await scp.contextSend(mockContext(scp), "did:dht:z6MkAlice", new Uint8Array([1, 2, 3]));
     } catch (err) {
       thrown = err;
     }
@@ -105,7 +105,7 @@ describe("SCP typed-error mapping", () => {
 
     let thrown: unknown;
     try {
-      await scp.contextGovernancePropose({}, "{}", "did:dht:z6MkAlice");
+      await scp.contextGovernancePropose(mockContext(scp), "{}", "did:dht:z6MkAlice");
     } catch (err) {
       thrown = err;
     }
@@ -125,7 +125,13 @@ describe("SCP typed-error mapping", () => {
 
     let thrown: unknown;
     try {
-      await scp.outletInvoke({}, "calculator", "{}", "did:dht:z6MkAlice", "ucan-token");
+      await scp.outletInvoke(
+        mockContext(scp),
+        "calculator",
+        "{}",
+        "did:dht:z6MkAlice",
+        "ucan-token",
+      );
     } catch (err) {
       thrown = err;
     }
@@ -183,7 +189,7 @@ describe("SCP typed-error mapping", () => {
 
     let thrown: unknown;
     try {
-      await scp.contextMemberCount({});
+      await scp.contextMemberCount(mockContext(scp));
     } catch (err) {
       thrown = err;
     }
@@ -202,7 +208,7 @@ describe("SCP typed-error mapping (trust.ts consumers)", () => {
 
     let thrown: unknown;
     try {
-      await scp.ucanValidate({}, "token", "*", "did:key:testpresenter");
+      await scp.ucanValidate(mockContext(scp), "token", "*", "did:key:testpresenter");
     } catch (err) {
       thrown = err;
     }
@@ -221,7 +227,7 @@ describe("SCP typed-error mapping (trust.ts consumers)", () => {
 
     let thrown: unknown;
     try {
-      await scp.eventLogQuery({});
+      await scp.eventLogQuery(mockContext(scp));
     } catch (err) {
       thrown = err;
     }
