@@ -38,10 +38,10 @@ def node_storage(name: str) -> StorageConfig:
 async def main() -> None:
     async with SCP(storage=node_storage("identity-example")) as scp:
         # 1. Create a new identity whose keys live in the encrypted key file.
-        #    CustodyType.FILE keeps them in $HOME/.scp/keys.bin, sealed under
+        #    CustodyType.ENCRYPTED_FILE keeps them in $HOME/.scp/keys.bin, sealed under
         #    the passphrase in SCP_KEY_PASSPHRASE. An unset passphrase raises
         #    SCP-VALID-7001.
-        identity = await scp.identity_create(CustodyType.FILE)
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
 
         print(f"DID: {identity.did}")
         print(f"Custody type: {identity.custody_type}")
@@ -62,7 +62,9 @@ async def main() -> None:
 
         # 3. Create an identity with an agent signing key (ADR-039).
         #    Agent keys enable human+agent shared DID patterns.
-        agent_identity = await scp.identity_create_with_agent_key(CustodyType.FILE)
+        agent_identity = await scp.identity_create_with_agent_key(
+            CustodyType.ENCRYPTED_FILE
+        )
         print(f"Agent identity DID: {agent_identity.did}")
         print(f"  Agent public key: {agent_identity.agent_public_key_multibase}")
 

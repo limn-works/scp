@@ -178,7 +178,7 @@ async def run_publisher(subscriber_did: str | None, wrapping_key: bytes | None) 
 
     async with SCP(storage=node_storage("broadcast-feed-publisher")) as node:
         # 1. Create the publisher identity.
-        publisher = await node.identity_create(CustodyType.FILE)
+        publisher = await node.identity_create(CustodyType.ENCRYPTED_FILE)
         print(f"Publisher DID: {publisher.did}")
 
         # 2. Attach the relay transport before creating the feed: the context

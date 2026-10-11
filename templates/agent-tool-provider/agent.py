@@ -274,7 +274,7 @@ async def run_agent(*, enable_mcp: bool = False) -> None:
         }
     ) as scp:
         # 1. Create an identity whose keys live in the passphrase-sealed key file.
-        identity = await scp.identity_create(CustodyType.FILE)
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
         logger.info("Created identity: %s", identity.did)
 
         # 2. Create a context with outlet and messaging capabilities.

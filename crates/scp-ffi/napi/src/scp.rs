@@ -5458,8 +5458,7 @@ mod custody_string_message_tests {
 
     /// A seed paired with `"platform"`, `"software"`, or an unknown string
     /// reports the seed misuse (`SCP-VALID-7009`) before the custody string
-    /// is read, as the `PyO3` and `UniFFI` bridges do; without a seed the
-    /// same strings keep their custody codes.
+    /// is read; without a seed the same strings keep their custody codes.
     #[test]
     fn seed_misuse_is_reported_before_the_custody_string() {
         for (custody, unseeded) in [

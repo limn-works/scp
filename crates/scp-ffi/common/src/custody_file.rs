@@ -1,8 +1,8 @@
-//! Resolves and opens the encrypted key file that backs `"file"` custody.
+//! Resolves and opens the encrypted key file that backs `"encrypted_file"` custody.
 //!
 //! `FileKeyCustody` (Argon2id + AES-256-GCM, spec §17.8) holds a process's keys
 //! in one encrypted file at `$HOME/.scp/keys.bin`, sealed under the passphrase
-//! `SCP_KEY_PASSPHRASE` carries. A bridge that offers `"file"` custody resolves
+//! `SCP_KEY_PASSPHRASE` carries. A bridge that offers `"encrypted_file"` custody resolves
 //! those two inputs here, so every bridge reads one path and rejects one set of
 //! bad inputs.
 //!
@@ -68,19 +68,19 @@ impl std::fmt::Display for FileCustodyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::HomeUnset => f.write_str(
-                "file custody requires the HOME environment variable to name an absolute \
+                "custody \"encrypted_file\" requires the HOME environment variable to name an absolute \
                  directory; it is unset or empty, and the encrypted key file lives at \
                  $HOME/.scp/keys.bin",
             ),
             Self::HomeNotAbsolute { home } => write!(
                 f,
-                "file custody requires HOME to name an absolute directory, but HOME is {:?}; \
+                "custody \"encrypted_file\" requires HOME to name an absolute directory, but HOME is {:?}; \
                  a relative HOME places the encrypted key file $HOME/.scp/keys.bin under \
                  whichever directory the process started in",
                 home.display().to_string()
             ),
             Self::PassphraseUnset => f.write_str(
-                "file custody requires the SCP_KEY_PASSPHRASE environment variable to be \
+                "custody \"encrypted_file\" requires the SCP_KEY_PASSPHRASE environment variable to be \
                  set to a non-empty value; this passphrase protects the encrypted key file",
             ),
             Self::DirectoryCreate { path, message } => write!(
@@ -99,7 +99,7 @@ impl std::fmt::Display for FileCustodyError {
 
 impl std::error::Error for FileCustodyError {}
 
-/// The key directory and passphrase `"file"` custody opens, resolved from the
+/// The key directory and passphrase `"encrypted_file"` custody opens, resolved from the
 /// environment without touching any file.
 pub struct FileCustodyInputs {
     key_dir: PathBuf,

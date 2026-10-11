@@ -1145,6 +1145,13 @@ class WrongLengthCustody(P256Custody):
         fake_py_host_of(c"FakeCustody", fault)
     }
 
+    /// A `PyKeyCustodyProvider` over a fresh `FakeCustody`, for a test that
+    /// passes the provider itself rather than the custody built over it.
+    pub fn fake_py_provider() -> PyKeyCustodyProvider {
+        let (_, host) = fake_py_host_of(c"FakeCustody", None);
+        Python::with_gil(|py| PyKeyCustodyProvider::new(py, host).expect("valid provider"))
+    }
+
     /// [`fake_py_custody_of`], also returning the host object.
     fn fake_py_host_of(
         class: &std::ffi::CStr,

@@ -2277,7 +2277,7 @@ mod prod_fail_closed_tests {
     /// AC5 (napi `identity_create` string-custody surface): on a shipped build the
     /// `identity_create(kind)` string entry point mints no identity — every custody
     /// kind fails closed *before* any DID creation, so the pre-rotation nullifier is
-    /// unreachable via this surface. Unlike `PyO3` (which exposes a `"file"` custody
+    /// unreachable via this surface. Unlike `PyO3` (which exposes an `"encrypted_file"` custody
     /// kind that reaches the shared `scp-identity::config::create_inner` lowering and
     /// returns `SCP-IDENT-1059`), napi's real production key custody is the callback
     /// `KeyCustodyProvider` (keychain/HSM) reached only via `identity_create_with_custody`,
@@ -2296,7 +2296,7 @@ mod prod_fail_closed_tests {
     /// is absent from the shipped graph. The shared `create_inner` lowering that the
     /// `PyO3` bridge reaches is separately proven fail-closed by scp-identity's
     /// `config::tests::ephemeral_create_fails_closed_without_pre_rotation_backend` and
-    /// the `PyO3` `"file"`-custody test.
+    /// the `PyO3` `identity_create_fails_closed_without_pre_rotation_backend` test.
     ///
     /// `identity_create` is `async`; the crate tokio runtime drives it, mirroring the
     /// napi-rs worker's `block_on`.

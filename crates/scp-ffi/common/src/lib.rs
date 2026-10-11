@@ -121,7 +121,7 @@ pub mod custody_parse;
 #[cfg(feature = "custody")]
 pub mod callback_custody;
 
-// Resolves `$HOME/.scp/keys.bin` and `SCP_KEY_PASSPHRASE` for `"file"`
+// Resolves `$HOME/.scp/keys.bin` and `SCP_KEY_PASSPHRASE` for `"encrypted_file"`
 // custody, rejecting an unset, empty or relative HOME and an empty passphrase,
 // then opens the key file. See ADR-006 and spec §17.8.
 #[cfg(feature = "custody")]

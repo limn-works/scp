@@ -744,15 +744,13 @@ impl From<scp_ffi_common::bridge_instance::HandleAffinityError> for ScpNapiError
 // ---------------------------------------------------------------------------
 
 /// The custody strings this bridge builds a key custody from, stated in every
-/// custody rejection so the three bridges name their accepted sets the same way
-/// (SCP-294).
+/// custody rejection (SCP-294).
 pub(crate) const ACCEPTED_CUSTODY: &str = "this bridge accepts \"in_memory\" only in a build \
      carrying the testing feature; inject a KeyCustodyProvider through \
      identityCreateWithCustody() for any other key store";
 
 /// The error for a custody string that names no key store on this bridge
-/// (`"platform"`, `"software"`): `SCP-IDENT-1003`, as on the `PyO3` and
-/// `UniFFI` bridges.
+/// (`"platform"`, `"software"`): `SCP-IDENT-1003`.
 pub(crate) fn custody_without_backend(custody: &str) -> ScpNapiError {
     ScpNapiError::Identity {
         message: format!(
