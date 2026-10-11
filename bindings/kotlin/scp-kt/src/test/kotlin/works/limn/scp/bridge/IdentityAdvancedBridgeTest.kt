@@ -16,6 +16,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import works.limn.scp.CustodyType
 import works.limn.scp.IdentityAdvancedBindings
 import works.limn.scp.IdentityAdvancedBridge
 import kotlin.test.assertEquals
@@ -200,9 +201,9 @@ class IdentityAdvancedBridgeTest {
     @Nested
     inner class CreateWithAgentKey {
         @Test
-        fun `createWithAgentKey delegates to bindings with custody string`() =
+        fun `createWithAgentKey sends the custody choice's raw value to bindings`() =
             runTest(testDispatcher) {
-                val result = advancedBridge.createWithAgentKey("in_memory")
+                val result = advancedBridge.createWithAgentKey(CustodyType.IN_MEMORY)
                 assertTrue(stubAdvanced.createWithAgentKeyCalled)
                 assertEquals("in_memory", stubAdvanced.lastCustody)
                 assertEquals(100L, result)
@@ -213,7 +214,7 @@ class IdentityAdvancedBridgeTest {
             runTest(testDispatcher) {
                 stubAdvanced.createWithAgentKeyError = BridgeException("custody not available", "SCP-IDENT-1020")
                 assertFailsWith<BridgeException> {
-                    advancedBridge.createWithAgentKey("platform")
+                    advancedBridge.createWithAgentKey(CustodyType.IN_MEMORY)
                 }
             }
     }

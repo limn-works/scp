@@ -76,30 +76,38 @@ object Capability {
 }
 
 /**
- * Key custody method for identity key management (spec section 3.2).
+ * The custody choice a caller passes to [SCP.identityCreate],
+ * [SCP.identityCreateWithAgentKey], [works.limn.scp.bridge.IdentityBridge.create],
+ * and [IdentityAdvancedBridge.createWithAgentKey] (spec section 3.2).
  *
- * Determines where cryptographic keys are stored and managed. The
- * [rawValue] property returns the string expected by the FFI bridge.
+ * Its entries are exactly the custody strings the UniFFI bridge accepts
+ * (`parse_custody_method` in `crates/scp-ffi/uniffi/src/bridge.rs`), so the
+ * compiler rejects a custody value the bridge would refuse. None of those
+ * methods gives the parameter a default: which key store holds a private key
+ * decides who can reach that key, so the caller states it.
+ *
+ * No entry reaches Android Keystore or any other host key store. A caller
+ * reaches one by injecting a `KeyCustodyProvider` through
+ * [SCP.identityCreateWithCustody].
+ *
+ * The Swift SDK's `CustodyType` carries the same cases.
+ * `works.limn.scp.android.platform.CustodyType` in `scp-kt-android` is a
+ * different enum: it reports where an Android key already lives.
+ *
+ * Provenance: spec section 3.2 (Key Custody); `.docs/standards/construction.md`
+ * (consequential choices are enums, required choices are required); SCP-294 in
+ * `.docs/prds/http-features.json`.
  *
  * @property rawValue Wire-format string passed to the FFI bridge.
  */
 enum class CustodyType(val rawValue: String) {
     /**
-     * Platform-native secure storage (Keychain on macOS/iOS, Keystore
-     * on Android, credential manager on Windows/Linux). Default.
-     */
-    PLATFORM("platform"),
-
-    /**
-     * Ephemeral in-memory key store, suitable for testing or
-     * short-lived agents. Keys are lost on process exit.
+     * An in-memory key store that loses every key when the process exits.
+     *
+     * The UniFFI bridge builds it only under its `testing` feature; a shipped
+     * build answers it with `SCP-IDENT-1008` and builds no other key store.
      */
     IN_MEMORY("in_memory"),
-
-    /**
-     * Software-backed file-based key store with passphrase protection.
-     */
-    SOFTWARE("software"),
     ;
 
     companion object {

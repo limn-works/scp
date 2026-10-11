@@ -14,6 +14,7 @@ import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.CoroutineBridge
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -63,36 +64,39 @@ class IdentityConformanceTest {
             }
 
         @Test
-        fun `identity_create with platform custody returns handle`() =
+        fun `identity_create with a custody string CustodyType lacks never reaches the bindings`() =
             runTest(testDispatcher) {
-                stubBindings.identityCreateResult = 1L
-                val result =
-                    dispatcher.dispatch(
-                        "identity_create",
-                        mapOf("custody" to "platform"),
-                    )
-                assertEquals("1", result["handle"])
-                assertEquals("platform", result["custody_type"])
+                for (custody in listOf("platform", "software")) {
+                    val result =
+                        dispatcher.dispatch(
+                            "identity_create",
+                            mapOf("custody" to custody),
+                        )
+                    assertEquals("unsupported_custody", result["error"], custody)
+                }
+                assertNull(stubBindings.identityCreateCustody)
             }
 
         @Test
-        fun `identity_create defaults to in_memory when custody not specified`() =
+        fun `identity_create without custody picks no default and never reaches the bindings`() =
             runTest(testDispatcher) {
                 val result = dispatcher.dispatch("identity_create", emptyMap())
-                assertEquals("in_memory", result["custody_type"])
+                assertEquals("unsupported_custody", result["error"])
+                assertNull(result["custody_type"])
+                assertNull(stubBindings.identityCreateCustody)
             }
 
         @Test
         fun `identity_create propagates bridge error`() =
             runTest(testDispatcher) {
                 stubBindings.identityCreateError =
-                    BridgeException("Custody not available", "SCP-IDENT-1001")
+                    BridgeException("Identity load failed", "SCP-IDENT-1008")
                 val result =
                     dispatcher.dispatch(
                         "identity_create",
-                        mapOf("custody" to "platform"),
+                        mapOf("custody" to "in_memory"),
                     )
-                assertEquals("SCP-IDENT-1001", result["error"])
+                assertEquals("SCP-IDENT-1008", result["error"])
             }
     }
 
@@ -145,13 +149,13 @@ class IdentityConformanceTest {
         fun `identity_resolve propagates resolution failure`() =
             runTest(testDispatcher) {
                 stubBindings.identityResolveError =
-                    BridgeException("Resolution failed", "SCP-IDENT-1003")
+                    BridgeException("Identity resolution failed", "SCP-IDENT-1005")
                 val result =
                     dispatcher.dispatch(
                         "identity_resolve",
                         mapOf("did" to "did:dht:unreachable"),
                     )
-                assertEquals("SCP-IDENT-1003", result["error"])
+                assertEquals("SCP-IDENT-1005", result["error"])
             }
     }
 
