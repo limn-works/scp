@@ -84,9 +84,10 @@ pub trait SequenceStore: Send + Sync {
 
 /// In-memory [`SequenceStore`] for testing.
 ///
-/// Compiled only under `cfg(test)` or the `testing` feature: a §17.17 test
-/// stand-in (it forgets every sequence number on restart) never reaches a
-/// shipped build (ADR-062 §Decision 1).
+/// Compiled only under `cfg(test)` or the `testing` feature: it forgets every
+/// sequence number on restart, so it is an in-memory backend the root
+/// AGENTS.md tenet "No dev/test-only stand-ins in production" keeps off every
+/// shipped path.
 ///
 /// Stores sequence numbers in a `HashMap` behind a `tokio::sync::Mutex`.
 /// Not suitable for production (no persistence across restarts).

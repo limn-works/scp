@@ -219,9 +219,11 @@ pub(crate) fn verify_relay_record(
 ///
 /// Multiple records may be stored at the same key (co-located candidates) via
 /// repeated `insert` calls; they are returned by `query` in insertion order.
-/// Compiled only under `cfg(test)` or the `testing` feature: it is a §17.17
-/// test stand-in that answers from a local map in place of a relay, so it must
-/// never reach a shipped build (ADR-062 §Decision 1). The production querier is
+/// Compiled only under `cfg(test)` or the `testing` feature: it answers from a
+/// local map in place of a relay, so it is an in-memory identity-resolution
+/// backend, which the persistence spec §17.17.3 SCP-CAPSEL-8013 calls a
+/// security nullifier and SCP-CAPSEL-8012 forbids from being present in a
+/// shipped artifact. The production querier is
 /// `TransportRelayQuerier` in `scp-transport` (SCP-RELAYRES-002).
 #[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]

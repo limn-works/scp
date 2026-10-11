@@ -193,8 +193,9 @@ pub trait ProofResolver {
 /// resolution and `kid`-based resolution for shared-DID models (ADR-039).
 ///
 /// Restricted to test builds: it answers from a fixed map in place of resolving
-/// a DID, a §17.17 test stand-in that must never reach a shipped path (ADR-062
-/// §Decision 1).
+/// a DID. That makes it an in-memory identity-resolution backend, which the
+/// persistence spec §17.17.3 SCP-CAPSEL-8013 calls a security nullifier and
+/// SCP-CAPSEL-8012 forbids from being present in a shipped artifact.
 #[cfg(any(test, feature = "testing"))]
 pub struct InMemoryDidResolver {
     /// Map of DID string to 32-byte Ed25519 public key (default / `#active`).
