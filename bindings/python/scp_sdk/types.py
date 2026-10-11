@@ -31,9 +31,10 @@ class CustodyType(enum.Enum):
     :meth:`scp_sdk.SCP.identity_create` and
     :meth:`scp_sdk.SCP.identity_create_with_agent_key` send the value to the
     PyO3 bridge, and :attr:`scp_sdk.Identity.custody_type` reports the value an
-    identity was created with.  The bridge answers every string outside the
-    vocabulary, ``"platform"``, ``"software"``, ``"file"`` and ``"callback"``
-    included, with ``SCP-VALID-7005``, and falls back to no other backend.
+    identity was created with.  The bridge answers ``SCP-VALID-7005`` to every
+    string outside the vocabulary except ``"in_memory"``, so ``"platform"``,
+    ``"software"``, ``"file"`` and ``"callback"`` each get that answer, and it
+    falls back to no other backend.
 
     The type has two members, ``ENCRYPTED_FILE`` and ``OS_KEYSTORE``, and no
     other (spec 03 section 3.2.2).
@@ -46,7 +47,9 @@ class CustodyType(enum.Enum):
     message opens with the code:
 
     - ``ValidationError`` with ``SCP-VALID-7005`` for a string outside the
-      vocabulary.
+      vocabulary other than ``"in_memory"``.
+    - ``IdentityError`` with ``SCP-IDENT-1008`` for the string ``"in_memory"``
+      on a build without the bridge's ``testing`` feature.
     - ``IdentityError`` with ``SCP-IDENT-1003`` for ``OS_KEYSTORE`` without a
       provider.
     - ``ValidationError`` with ``SCP-VALID-7001`` for ``ENCRYPTED_FILE`` when

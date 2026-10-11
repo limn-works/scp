@@ -7,10 +7,10 @@ unable to run fails here. The child process is the reader's shell: each block
 ends in ``asyncio.run(main())``, which cannot run inside the event loop
 pytest-asyncio owns.
 
-Both blocks use in-memory storage, which only a ``testing`` build accepts, and
-every SDK test run builds the extension with that feature. The quick start uses
-``CustodyType.ENCRYPTED_FILE``, so the child runs with ``HOME`` set to the test's
-scratch directory and ``SCP_KEY_PASSPHRASE`` set, and the key file lands there.
+Every SDK test run builds the extension with the ``testing`` feature. The
+quick start uses ``CustodyType.ENCRYPTED_FILE``, so the child runs with
+``HOME`` set to the test's scratch directory and ``SCP_KEY_PASSPHRASE`` set,
+and the key file lands there.
 """
 
 from __future__ import annotations

@@ -12,7 +12,7 @@ pip install scp-python
 
 ## Quick Start
 
-This quick start runs only in a build compiled with the `testing` feature (`maturin develop --features testing` in `bindings/python`). A published wheel rejects in-memory storage, and it has no pre-rotation custody backend, so it raises `SCP-IDENT-1059` for `CustodyType.ENCRYPTED_FILE`. Set `SCP_KEY_PASSPHRASE` before you run it: the identity's keys go to `$HOME/.scp/keys.bin`, sealed under that passphrase.
+This quick start runs only in a build compiled with the `testing` feature (`maturin develop --features testing` in `bindings/python`). A published wheel has no pre-rotation custody backend, so it raises `SCP-IDENT-1059` for `CustodyType.ENCRYPTED_FILE`. Set `SCP_KEY_PASSPHRASE` before you run it: the identity's keys go to `$HOME/.scp/keys.bin`, sealed under that passphrase.
 
 ```python
 import asyncio
