@@ -419,11 +419,11 @@
             let account = "scp.key.\(handle)"
             let first = Data(repeating: 0x11, count: 32)
             let second = Data(repeating: 0x22, count: 32)
-            try custody.storePrivateKeyBytes(first, for: handle, keyType: .ed25519, publicKeyBytes: first)
+            try custody.storePrivateKeyBytes(first, for: handle, keyType: .ed25519, role: .identity, publicKeyBytes: first)
             // A kept item would still carry this mark.
             #expect(updateKeychainItem(account, [kSecAttrComment as String: "kept"]) == errSecSuccess)
 
-            try custody.storePrivateKeyBytes(second, for: handle, keyType: .ed25519, publicKeyBytes: second)
+            try custody.storePrivateKeyBytes(second, for: handle, keyType: .ed25519, role: .identity, publicKeyBytes: second)
             #expect(keychainComment(account) == nil)
             let query: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
@@ -548,7 +548,7 @@
                 let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: ikm)
                 let handle = UUID().uuidString
                 try custody.storePrivateKeyBytes(
-                    ikm, for: handle, keyType: .ed25519,
+                    ikm, for: handle, keyType: .ed25519, role: .identity,
                     publicKeyBytes: signingKey.publicKey.rawRepresentation
                 )
 
@@ -712,6 +712,227 @@
             let custodyReq = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
             #expect(custodyNone.biometricPolicy == .none)
             #expect(custodyReq.biometricPolicy == .required)
+        }
+    }
+
+    // MARK: - UniFFI KeyCustodyProvider conformance
+
+    /// Calls every member of the UniFFI `KeyCustodyProvider` protocol through a
+    /// value typed `any KeyCustodyProvider`, so each test exercises exactly the
+    /// surface the bridge calls (`crates/scp-ffi/uniffi/src/lib.rs`).
+    struct AppleKeyCustodyProviderConformanceTests {
+        private let adapter = AppleKeyCustody(accessGroup: nil)
+        private var provider: any KeyCustodyProvider {
+            adapter
+        }
+
+        /// Runs `body` and returns the code of the `ScpError.Crypto` it threw,
+        /// or a description of whatever else happened.
+        private func cryptoCode(_ body: () async throws -> Void) async -> String {
+            do {
+                try await body()
+                return "no error"
+            } catch let error as ScpError {
+                if case let .Crypto(_, code) = error {
+                    return code
+                }
+                return "non-crypto ScpError: \(error)"
+            } catch {
+                return "non-ScpError: \(error)"
+            }
+        }
+
+        /// Stores `seed` as an identity Ed25519 key under a fresh decimal id.
+        private func storeIdentitySeed(_ seed: Data) throws -> String {
+            let handle = String(UInt64.random(in: .min ... .max))
+            let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seed)
+            try adapter.storePrivateKeyBytes(
+                seed, for: handle, keyType: .ed25519, role: .identity,
+                publicKeyBytes: signingKey.publicKey.rawRepresentation
+            )
+            return handle
+        }
+
+        @Test("generateKeypair returns a canonical decimal UInt64 id")
+        func generatedIdIsCanonicalDecimal() async throws {
+            let keyId = try await provider.generateKeypair(keyType: .ed25519, role: .identity)
+            let parsed = try #require(UInt64(keyId))
+            #expect(String(parsed) == keyId, "id must be the canonical decimal form")
+            try await provider.destroyKey(keyId: keyId)
+        }
+
+        @Test("an identity Ed25519 key reports its type, role and 32-byte public key, and signs")
+        func identityKeyRoundTrip() async throws {
+            let keyId = try await provider.generateKeypair(keyType: .ed25519, role: .identity)
+            let reported = try await provider.getPublicKey(keyId: keyId)
+            #expect(reported.keyType == .ed25519)
+            #expect(reported.role == .identity)
+            #expect(reported.publicKey.count == 32)
+
+            let message = Data("conformance".utf8)
+            let signature = try await provider.sign(keyId: keyId, message: message)
+            let verifier = try Curve25519.Signing.PublicKey(rawRepresentation: reported.publicKey)
+            #expect(verifier.isValidSignature(signature, for: message))
+
+            let exported = try await provider.exportSigningKeyBytes(keyId: keyId)
+            let rebuilt = try Curve25519.Signing.PrivateKey(rawRepresentation: exported)
+            #expect(rebuilt.publicKey.rawRepresentation == reported.publicKey)
+
+            #expect(provider.custodyType(keyId: keyId) == "software")
+            try await provider.destroyKey(keyId: keyId)
+        }
+
+        @Test("an operational X25519 key reports its role and agrees with a CryptoKit peer")
+        func operationalX25519Agreement() async throws {
+            let keyId = try await provider.generateKeypair(keyType: .x25519, role: .operational)
+            let reported = try await provider.getPublicKey(keyId: keyId)
+            #expect(reported.keyType == .x25519)
+            #expect(reported.role == .operational)
+
+            let peer = Curve25519.KeyAgreement.PrivateKey()
+            let shared = try await provider.dhAgree(keyId: keyId, peerPublic: peer.publicKey.rawRepresentation)
+            let expected = try peer.sharedSecretFromKeyAgreement(
+                with: Curve25519.KeyAgreement.PublicKey(rawRepresentation: reported.publicKey)
+            ).withUnsafeBytes { Data($0) }
+            #expect(shared == expected)
+            try await provider.destroyKey(keyId: keyId)
+        }
+
+        /// The bridge's `ed25519_to_x25519_agree` calls `dhAgree` with an
+        /// Ed25519 key id. The seed is RFC 8032 §7.1 test 1 and the peer is
+        /// RFC 7748 §6.1 Alice; the expected secret is X25519 of Alice's
+        /// scalar and the seed's converted public key, computed independently.
+        @Test("dhAgree on an Ed25519 key uses the SHA-512(seed) X25519 scalar")
+        func ed25519AgreementMatchesConversionVector() async throws {
+            let seed = try hexToData("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+            let peerPublic = try hexToData("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+            let expected = try hexToData("90f395580ca33f3c54390ac1d7210220b6a336de2c47a61ac90ff56e6be11f18")
+            let keyId = try storeIdentitySeed(seed)
+
+            let shared = try await provider.dhAgree(keyId: keyId, peerPublic: peerPublic)
+            #expect(shared == expected)
+
+            // The peer side: Alice's scalar against the converted public key.
+            let alice = try Curve25519.KeyAgreement.PrivateKey(
+                rawRepresentation: hexToData("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+            )
+            let convertedPublic = try Curve25519.KeyAgreement.PublicKey(
+                rawRepresentation: hexToData("d85e07ec22b0ad881537c2f44d662d1a143cf830c57aca4305d85c7a90f6b62e")
+            )
+            let peerShared = try alice.sharedSecretFromKeyAgreement(with: convertedPublic)
+                .withUnsafeBytes { Data($0) }
+            #expect(peerShared == expected)
+            try await provider.destroyKey(keyId: keyId)
+        }
+
+        @Test("both pseudonym members return the 33-byte §25.19 point unchanged")
+        func pseudonymOutputIsTheCompressedPoint() async throws {
+            let contextId = Data("context-alpha".utf8)
+            for vector in AppleKeyCustodyRotatablePseudonymTests.pseudonymVectors {
+                let keyId = try storeIdentitySeed(hexToData(vector.scalar))
+                let staticPoint = try await provider.derivePseudonym(keyId: keyId, contextId: contextId)
+                let rotatedPoint = try await provider.deriveRotatablePseudonym(
+                    keyId: keyId, contextId: contextId, pseudonymEpoch: 1
+                )
+                #expect(staticPoint.count == 33)
+                #expect(try staticPoint == hexToData(vector.staticPoint))
+                #expect(rotatedPoint.count == 33)
+                #expect(try rotatedPoint == hexToData(vector.rotatedPoint))
+                try await provider.destroyKey(keyId: keyId)
+            }
+        }
+
+        @Test("every keyed member reports an unknown id as SCP-CRYPTO-4006")
+        func unknownIdIsKeyNotFound() async {
+            let unknown = String(UInt64.random(in: .min ... .max))
+            let peer = Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation
+            let context = Data("ctx".utf8)
+            let notFound = "SCP-CRYPTO-4006"
+            #expect(await cryptoCode { _ = try await provider.sign(keyId: unknown, message: context) } == notFound)
+            #expect(await cryptoCode { _ = try await provider.getPublicKey(keyId: unknown) } == notFound)
+            #expect(await cryptoCode { try await provider.destroyKey(keyId: unknown) } == notFound)
+            #expect(await cryptoCode { _ = try await provider.dhAgree(keyId: unknown, peerPublic: peer) } == notFound)
+            #expect(await cryptoCode { _ = try await provider.derivePseudonym(keyId: unknown, contextId: context) } == notFound)
+            #expect(await cryptoCode {
+                _ = try await provider.deriveRotatablePseudonym(keyId: unknown, contextId: context, pseudonymEpoch: 1)
+            } == notFound)
+            #expect(await cryptoCode { _ = try await provider.exportSigningKeyBytes(keyId: unknown) } == notFound)
+        }
+
+        @Test("a destroyed key is not found afterwards")
+        func destroyedKeyIsKeyNotFound() async throws {
+            let keyId = try await provider.generateKeypair(keyType: .ed25519, role: .identity)
+            try await provider.destroyKey(keyId: keyId)
+            let code = await cryptoCode {
+                _ = try await provider.derivePseudonym(keyId: keyId, contextId: Data("ctx".utf8))
+            }
+            #expect(code == "SCP-CRYPTO-4006")
+        }
+
+        @Test("a wrong-type operation is the custody error SCP-CRYPTO-4060")
+        func wrongTypeIsCustodyError() async throws {
+            let keyId = try await provider.generateKeypair(keyType: .x25519, role: .operational)
+            let code = await cryptoCode { _ = try await provider.sign(keyId: keyId, message: Data("m".utf8)) }
+            #expect(code == "SCP-CRYPTO-4060")
+            try await provider.destroyKey(keyId: keyId)
+        }
+
+        @Test("P-256 and HPKE P-256 generation fails closed with SCP-CRYPTO-4060")
+        func p256GenerationFailsClosed() async {
+            for keyType in [CustodyKeyType.p256, .hpkeP256] {
+                let code = await cryptoCode { _ = try await provider.generateKeypair(keyType: keyType, role: .operational) }
+                #expect(code == "SCP-CRYPTO-4060")
+            }
+        }
+
+        /// The ids of every SCP key item whose cached public key is
+        /// `publicKey`, read from the Keychain attributes alone.
+        private func keyIds(cachingPublicKey publicKey: Data) -> [String] {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecReturnAttributes as String: true,
+                kSecMatchLimit as String: kSecMatchLimitAll
+            ]
+            var result: AnyObject?
+            guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+                  let items = result as? [[String: Any]]
+            else { return [] }
+            let cached = publicKey.base64EncodedString()
+            return items.compactMap { attrs in
+                guard let account = attrs[kSecAttrAccount as String] as? String,
+                      account.hasPrefix("scp.key."),
+                      let label = attrs[kSecAttrLabel as String] as? String,
+                      label.contains(cached)
+                else { return nil }
+                return String(account.dropFirst("scp.key.".count))
+            }
+        }
+
+        /// The adapter itself is the provider: `identityCreateWithCustody`
+        /// mints the identity key through it, and the key it reports is the
+        /// one the Keychain holds in the identity role.
+        @Test("identityCreateWithCustody takes the adapter as its provider")
+        func identityCreateWithCustodyTakesTheAdapter() async throws {
+            let scp = try SCP(storage: .inMemory)
+            let identity = try await scp.identityCreateWithCustody(provider: adapter)
+            #expect(identity.custodyType() == "os_keystore")
+            let verifyingKey = try hexToData(#require(identity.verifyingKey()))
+            let matches = keyIds(cachingPublicKey: verifyingKey)
+            #expect(matches.count == 1, "exactly one Keychain item holds the identity key")
+            for keyId in matches {
+                let reported = try await provider.getPublicKey(keyId: keyId)
+                #expect(reported.keyType == .ed25519)
+                #expect(reported.role == .identity)
+                #expect(reported.publicKey == verifyingKey)
+                try await provider.destroyKey(keyId: keyId)
+            }
+            try await scp.shutdown(timeoutMillis: 1000)
+        }
+
+        @Test("custodyType reports software_biometric under a biometric policy")
+        func biometricCustodyType() {
+            let gated: any KeyCustodyProvider = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
+            #expect(gated.custodyType(keyId: "1") == "software_biometric")
         }
     }
 

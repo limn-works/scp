@@ -27,13 +27,12 @@ For a full Android app, import into Android Studio and add the SCP SDK as a depe
 3. Opens an encrypted single-admin context
 4. Closes the context
 
-`makeKeyCustodyProvider()` in `Main.kt` throws until you implement it over your
-app's key store. The SDK ships no `uniffi.scp.KeyCustodyProvider`
-implementation, and its one `CustodyType`, `IN_MEMORY`, works only in a build
-compiled with the `testing` feature; a shipped build rejects it with
-`SCP-IDENT-1008`. `AndroidKeyCustody` implements a different interface,
-`works.limn.scp.android.platform.KeyCustodyProvider`, so it cannot be passed to
-`identityCreateWithCustody`.
+`makeKeyCustodyProvider()` in `Main.kt` returns the
+`uniffi.scp.KeyCustodyProvider` that `identityCreateWithCustody` takes. In an
+Android app, return `UniffiKeyCustody(AndroidKeyCustody(applicationContext))`
+from `works.limn:scp-kt-android`, which holds the identity in Android Keystore.
+This scaffold runs on the JVM with no Android `Context`, so the function throws
+until you implement it over your key store.
 
 The scaffold does not call `SCP.shutdown`: it takes a `CoroutineBridge`, and the
 SDK ships no `NativeBindings` implementation to build one with.

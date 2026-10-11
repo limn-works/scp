@@ -5,8 +5,9 @@
 ///
 /// The Swift SDK ships no production key store that `identityCreate(custody:)`
 /// reaches; the doc comment on ``CustodyType`` states how a shipped build
-/// answers each case. A production caller implements ``KeyCustodyProvider``
-/// over its own key store and passes it to `identityCreateWithCustody`.
+/// answers each case. A production caller passes ``AppleKeyCustody``, the
+/// SDK's ``KeyCustodyProvider`` over the Keychain, to
+/// `identityCreateWithCustody`.
 ///
 /// Prerequisites:
 ///   - Add the SCP Swift package to your project

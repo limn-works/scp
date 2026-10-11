@@ -24,11 +24,11 @@ swift run
 3. Opens an encrypted single-admin context
 4. Closes the context and shuts the instance down
 
-`makeKeyCustodyProvider()` in `Sources/main.swift` throws
-`ScaffoldError.keyCustodyProviderMissing` until you implement it over your app's
-key store. The SDK ships no `KeyCustodyProvider` implementation, and its one
-`CustodyType`, `.inMemory`, works only in a build compiled with the `testing`
-feature; a shipped build rejects it with `SCP-IDENT-1008`.
+`Sources/main.swift` passes `AppleKeyCustody()`, the SDK's `KeyCustodyProvider`
+over the Keychain, to `identityCreateWithCustody(provider:)`: the `os_keystore`
+custody request of spec 03 §3.2.2. The SDK's `CustodyType` case `.inMemory`
+works only in a build compiled with the `testing` feature; a shipped build
+rejects it with `SCP-IDENT-1008`.
 
 ## Next Steps
 

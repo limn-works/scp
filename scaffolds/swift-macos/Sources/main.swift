@@ -1,28 +1,23 @@
 /// Minimal SCP macOS app scaffold.
 ///
-/// Creates a DID identity through a caller-supplied key custody provider and
-/// opens an encrypted context.
+/// Creates a DID identity whose keys `AppleKeyCustody` holds in the Keychain
+/// (the `os_keystore` custody request, spec 03 §3.2.2) and opens an encrypted
+/// context.
 ///
 /// The Swift SDK ships no key store that `identityCreate(custody:)` reaches in
 /// a shipped build: its one `CustodyType`, `.inMemory`, works only in a build
 /// compiled with the `testing` feature, and a shipped build rejects it with
-/// `SCP-IDENT-1008`. Implement `makeKeyCustodyProvider()` over your app's key
-/// store before running.
+/// `SCP-IDENT-1008`. `AppleKeyCustody` is the SDK's `KeyCustodyProvider`, which
+/// `identityCreateWithCustody(provider:)` takes.
 
 import Foundation
 import SCP
 
 enum ScaffoldError: Error {
-    /// `makeKeyCustodyProvider()` has not been implemented yet.
-    case keyCustodyProviderMissing
     /// `SCP_STORAGE_PASSPHRASE` is not set.
     case storagePassphraseMissing
 }
 
-/// Returns the `KeyCustodyProvider` over your app's key store.
-func makeKeyCustodyProvider() throws -> KeyCustodyProvider {
-    throw ScaffoldError.keyCustodyProviderMissing
-}
 
 guard let passphrase = ProcessInfo.processInfo.environment["SCP_STORAGE_PASSPHRASE"] else {
     throw ScaffoldError.storagePassphraseMissing
@@ -32,8 +27,8 @@ let storageDir = try FileManager.default
     .appendingPathComponent("SCPmacOSApp")
 let scp = try SCP.withStorage(sqliteDir: storageDir, passphrase: passphrase)
 
-// 1. Create a DID identity whose keys the provider holds.
-let identity = try await scp.identityCreateWithCustody(provider: try makeKeyCustodyProvider())
+// 1. Create a DID identity whose keys the Keychain holds.
+let identity = try await scp.identityCreateWithCustody(provider: AppleKeyCustody())
 print("Created identity: \(identity.did())")
 
 // 2. Create an encrypted single-admin context.
