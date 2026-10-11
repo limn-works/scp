@@ -56,6 +56,14 @@ pub const IDENT_1001: &str = "SCP-IDENT-1001";
 /// Identity not found.
 pub const IDENT_1002: &str = "SCP-IDENT-1002";
 /// Identity already exists.
+///
+/// Also the code every bridge returns when a caller names a custody string
+/// that reaches no key store on that bridge (SCP-294): `"platform"` on all
+/// three bridges, `"software"` on the NAPI and `UniFFI` bridges, and
+/// `"callback"` on the `UniFFI` bridge. A caller reaches a host key store
+/// (Secure Enclave, Android Keystore, or any other) by injecting a
+/// `KeyCustodyProvider` through `identity_create_with_custody`, never by
+/// naming a custody string.
 pub const IDENT_1003: &str = "SCP-IDENT-1003";
 /// Identity key generation failed.
 pub const IDENT_1004: &str = "SCP-IDENT-1004";

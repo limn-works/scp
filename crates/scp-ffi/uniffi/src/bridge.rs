@@ -667,7 +667,7 @@ fn resolve_identity_custody(identity: &Identity) -> Option<Arc<UniffiKeyCustody>
 // `KeyCustody` uses RPITIT (return-position `impl Trait` in trait) and is
 // therefore NOT object-safe. This adapter provides a concrete type that
 // implements `KeyCustody` by delegating to the UniFFI `KeyCustodyProvider`
-// callback interface. Used for `"platform"` and `"software"` custody paths.
+// callback interface. Used by `identity_create_with_custody`.
 //
 // Private key material never crosses the FFI boundary (ADR-006). The adapter
 // translates between scp-platform's typed API (KeyHandle, Signature, PublicKey)
@@ -1831,11 +1831,12 @@ impl From<serde_json::Error> for ScpError {
 pub enum CustodyMethod {
     /// Key material stored in memory only (testing / in-process).
     InMemory,
-    /// Key material protected by hardware security module
-    /// (Secure Enclave on iOS, Android Keystore on Android).
-    Platform,
-    /// Key material in software-managed encrypted storage (not HSM-backed).
-    Software,
+    /// Key material held by a host `KeyCustodyProvider` (Secure Enclave,
+    /// Android Keystore, or any other host key store) injected through
+    /// `identity_create_with_custody`. No custody string selects it:
+    /// `identity_create` answers `"callback"`, `"platform"`, and
+    /// `"software"` with `SCP-IDENT-1003` (SCP-294).
+    Callback,
     /// Identity loaded by DID string without local key material.
     ///
     /// Used by `identity_load` to represent an identity whose keys are
@@ -2833,13 +2834,12 @@ impl Identity {
 
     /// Returns the custody method string for this identity.
     ///
-    /// One of: `"in_memory"`, `"platform"`, `"software"`, `"external"`.
+    /// One of: `"in_memory"`, `"callback"`, `"external"`.
     #[must_use]
     pub fn custody_type(&self) -> String {
         match self.custody_type {
             CustodyMethod::InMemory => "in_memory".to_owned(),
-            CustodyMethod::Platform => "platform".to_owned(),
-            CustodyMethod::Software => "software".to_owned(),
+            CustodyMethod::Callback => "callback".to_owned(),
             CustodyMethod::External => "external".to_owned(),
         }
     }
@@ -7297,7 +7297,19 @@ fn bridge_params_to_core(
     })
 }
 
+/// The custody strings this bridge builds a key custody from, stated in every
+/// custody rejection so the three bridges name their accepted sets the same way
+/// (SCP-294).
+pub(crate) const ACCEPTED_CUSTODY: &str = "this bridge accepts \"in_memory\" only in a build \
+     carrying the testing feature; inject a KeyCustodyProvider through \
+     identity_create_with_custody() for any other key store";
+
 /// Parses a custody type string into a `CustodyMethod`.
+///
+/// Only `"in_memory"` parses, and only in a `testing` build. `"callback"`,
+/// `"platform"`, and `"software"` name a host key store that a string cannot
+/// reach, so they return `SCP-IDENT-1003` here, before any seed or resolver is
+/// read; every other string returns `SCP-VALID-7005`.
 pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpError> {
     match custody {
         // `"in_memory"` custody is a dev/test affordance gated on the `testing`
@@ -7310,25 +7322,24 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
         "in_memory" => Ok(CustodyMethod::InMemory),
         #[cfg(not(feature = "testing"))]
         "in_memory" => Err(ScpError::Identity {
-            msg: "\"in_memory\" custody is not available in this build — enable the \
-                  \"testing\" feature for dev/desktop use. Production mobile builds must \
-                  use \"platform\" custody (Secure Enclave / Android Keystore)."
-                .to_owned(),
+            msg: format!(
+                "\"in_memory\" custody is not available in this build — {ACCEPTED_CUSTODY}"
+            ),
             code: codes::IDENT_1008.to_owned(),
         }),
-        "platform" => Ok(CustodyMethod::Platform),
-        "software" => Ok(CustodyMethod::Software),
+        "callback" | "platform" | "software" => Err(ScpError::Identity {
+            msg: format!(
+                "custody type {custody:?} names no key store on this bridge — {ACCEPTED_CUSTODY}"
+            ),
+            code: codes::IDENT_1003.to_owned(),
+        }),
         // VALID_7005 ("invalid field value") matches the semantic: an
         // unrecognized enum string is a wrong-value error, not the
         // malformed/wrong-shape byte input that VALID_7007 is reserved
-        // for (api-design J2, M1). PyO3's `parse_custody_inner` emits
-        // the same class of error (VALID_7001 via
-        // `ScpPyError::validation`), both distinct from the narrower
-        // 7007.
+        // for (api-design J2, M1). The PyO3 and NAPI bridges emit the
+        // same code for an unknown custody string.
         other => Err(ScpError::Validation {
-            msg: format!(
-                "unknown custody type: {other:?} — expected \"in_memory\", \"platform\", or \"software\""
-            ),
+            msg: format!("unknown custody type: {other:?} — {ACCEPTED_CUSTODY}"),
             code: codes::VALID_7005.to_owned(),
         }),
     }
@@ -9578,8 +9589,8 @@ impl Scp {
     /// is backed by a deterministic RNG so subsequent `generate_keypair`
     /// calls produce byte-identical Ed25519 keys across bridges — the
     /// basis of the cross-bridge parity test (ADR-046). `testing_seed`
-    /// is only valid for `"in_memory"` custody; other custody types
-    /// reject it with `SCP-VALID-7009`.
+    /// is only valid for `"in_memory"` custody, and every other custody
+    /// string returns an error before the seed is read.
     pub async fn identity_create(
         &self,
         custody: String,
@@ -9594,8 +9605,8 @@ impl Scp {
         // forbids fixed-size arrays, so the wire type stays
         // `Option<Vec<u8>>`; we immediately narrow to `[u8; 32]` via
         // `TryFrom` and surface a length mismatch as `SCP-VALID-7007`.
-        // A seed paired with a non-InMemory custody type is caught
-        // below as `SCP-VALID-7009`. Wrap the narrowed array in
+        // `parse_custody_method` admits only `"in_memory"`, so no other
+        // custody type reaches the seed. Wrap the narrowed array in
         // `Zeroizing` so the seed bytes are wiped when dropped — they
         // feed `Ed25519 SigningKey::from_bytes` inside the custody's
         // RNG.
@@ -9645,11 +9656,10 @@ impl Scp {
                                 });
                             }
                             Err(ScpError::Identity {
-                                msg: "\"in_memory\" custody is not available in this build \
-                                      — enable the \"testing\" feature for \
-                                      dev/desktop use. Production mobile builds must use \
-                                      \"platform\" custody (Secure Enclave / Android Keystore)."
-                                    .to_owned(),
+                                msg: format!(
+                                    "\"in_memory\" custody is not available in this build — \
+                                     {ACCEPTED_CUSTODY}"
+                                ),
                                 code: codes::IDENT_1008.to_owned(),
                             })
                         }
@@ -9658,8 +9668,8 @@ impl Scp {
                         {
                             // Wire to real scp-core using InMemoryKeyCustody.
                             // The `testing` feature is available in dev/test/desktop
-                            // builds; production mobile builds use the "platform"
-                            // custody path via KeyCustodyProvider callback.
+                            // builds; production mobile builds inject a
+                            // KeyCustodyProvider through identity_create_with_custody.
                             //
                             // IMPORTANT: both `core_identity` and `key_custody` must be
                             // retained in the handle. `ScpIdentity` holds `KeyHandle`s
@@ -9673,10 +9683,11 @@ impl Scp {
                             // bytes are wiped at end-of-scope. `from_seed_bytes`
                             // consumes a by-value Copy of the inner array,
                             // discarded inside `StdRng::from_seed`.
-                            let in_memory = testing_seed_bytes.as_ref().map_or_else(
-                                InMemoryKeyCustody::new,
-                                |seed| InMemoryKeyCustody::from_seed_bytes(**seed),
-                            );
+                            let in_memory = testing_seed_bytes
+                                .as_ref()
+                                .map_or_else(InMemoryKeyCustody::new, |seed| {
+                                    InMemoryKeyCustody::from_seed_bytes(**seed)
+                                });
                             let key_custody = Arc::new(OpaqueInMemoryKeyCustody(in_memory));
                             // Initialize the production DID resolver + shared DHT
                             // client on this instance BEFORE minting so `create`
@@ -9702,7 +9713,8 @@ impl Scp {
 
                             // Snapshot the #0 (identity) verifying key for ADR-046 parity.
                             let verifying_key_hex =
-                                snapshot_verifying_key_hex(&key_custody.0, &identity.identity_key).await;
+                                snapshot_verifying_key_hex(&key_custody.0, &identity.identity_key)
+                                    .await;
 
                             // Register the freshly created in-memory identity
                             // in the per-instance custody registry, keyed by DID,
@@ -9723,13 +9735,8 @@ impl Scp {
                             // resolver DHT client so the DID is resolvable by
                             // UCAN validation / governance vote verification
                             // (mirrors PyO3/NAPI). Best-effort.
-                            publish_to_resolver_dht_for(
-                                &bi,
-                                &identity,
-                                &document,
-                                &key_custody.0,
-                            )
-                            .await;
+                            publish_to_resolver_dht_for(&bi, &identity, &document, &key_custody.0)
+                                .await;
 
                             let handle = Arc::new(Identity {
                                 did: identity.did.clone(),
@@ -9749,38 +9756,15 @@ impl Scp {
                             Ok(handle)
                         }
                     }
-                    CustodyMethod::Platform | CustodyMethod::Software => {
-                        if testing_seed_bytes.is_some() {
-                            return Err(ScpError::Validation {
-                                msg:
-                                    "`testing_seed` parameter is only valid for custody=\"in_memory\""
-                                        .to_owned(),
-                                code: codes::VALID_7009.to_owned(),
-                            });
-                        }
-                        // Platform and software custody require a wired
-                        // KeyCustodyProvider (ADR-006 platform abstraction).
-                        // Use `identity_create_with_custody` to inject a
-                        // platform-backed KeyCustodyProvider callback.
+                    CustodyMethod::Callback | CustodyMethod::External => {
+                        // `parse_custody_method` produces neither: `identity_create_with_custody`
+                        // builds Callback handles and `identity_load` builds External ones.
+                        // Reaching this arm in `identity_create` is a bridge-layer bug.
                         Err(ScpError::Identity {
                             msg: format!(
-                                "custody type {custody:?} requires a KeyCustodyProvider — \
-                             use identity_create_with_custody() to inject a Secure \
-                             Enclave (iOS) or Android Keystore (Android) backed \
-                             custody provider"
+                                "internal: {custody:?} parsed to a custody method \
+                                 identity_create cannot build — this is a bug in the bridge layer"
                             ),
-                            code: codes::IDENT_1003.to_owned(),
-                        })
-                    }
-                    CustodyMethod::External => {
-                        // `parse_custody_method` never produces External — it is only
-                        // constructed internally by `identity_load` for DID-string-only
-                        // handles that have no local key material. Reaching this arm
-                        // in `identity_create` is a bridge-layer bug.
-                        Err(ScpError::Identity {
-                            msg: "internal: CustodyMethod::External cannot be used with \
-                                  identity_create — use identity_load for external DID handles"
-                                .to_owned(),
                             code: codes::IDENT_1005.to_owned(),
                         })
                     }
@@ -9886,7 +9870,7 @@ impl Scp {
 
                     let handle = Arc::new(Identity {
                         did: identity.did.clone(),
-                        custody_type: CustodyMethod::Platform,
+                        custody_type: CustodyMethod::Callback,
                         core_id: Some(identity),
                         core_document: Some(document),
                         #[cfg(feature = "testing")]
@@ -17491,11 +17475,10 @@ impl Scp {
                         {
                             let _ = &bi;
                             Err(ScpError::Identity {
-                                msg: "\"in_memory\" custody is not available in this build \
-                                      — enable the \"testing\" feature for \
-                                      dev/desktop use. Production mobile builds must use \
-                                      \"platform\" custody (Secure Enclave / Android Keystore)."
-                                    .to_owned(),
+                                msg: format!(
+                                    "\"in_memory\" custody is not available in this build — \
+                                     {ACCEPTED_CUSTODY}"
+                                ),
                                 code: codes::IDENT_1008.to_owned(),
                             })
                         }
@@ -17568,19 +17551,12 @@ impl Scp {
                             Ok(handle)
                         }
                     }
-                    CustodyMethod::Platform | CustodyMethod::Software => Err(ScpError::Identity {
+                    CustodyMethod::Callback | CustodyMethod::External => Err(ScpError::Identity {
                         msg: format!(
-                            "custody type {custody:?} requires a KeyCustodyProvider — \
-                                 use identity_create_with_custody() + add_agent_key() to create \
-                                 an identity with an agent key using platform custody"
+                            "internal: {custody:?} parsed to a custody method \
+                             identity_create_with_agent_key cannot build — this is a bug in \
+                             the bridge layer"
                         ),
-                        code: codes::IDENT_1003.to_owned(),
-                    }),
-                    CustodyMethod::External => Err(ScpError::Identity {
-                        msg: "internal: CustodyMethod::External cannot be used with \
-                                      identity_create_with_agent_key — use identity_load for \
-                                      external DID handles"
-                            .to_owned(),
                         code: codes::IDENT_1005.to_owned(),
                     }),
                 }
@@ -28854,6 +28830,43 @@ mod tests {
             Err(ScpError::Crypto { code, .. }) => assert_eq!(code, codes::CRYPTO_4006),
             Err(other) => panic!("expected CRYPTO_4006, got {other:?}"),
             Ok(_) => panic!("context_create succeeded without the creator's key"),
+        }
+    }
+
+    /// An identity over an injected `KeyCustodyProvider` reports `"callback"`
+    /// custody, never the `"platform"` string that `identity_create` rejects
+    /// (SCP-294).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn identity_create_with_custody_reports_callback_custody() {
+        let identity = runtime()
+            .block_on(scp_test().identity_create_with_custody(Box::new(
+                ProdLikeCustody::with_fault(HostFault::None),
+            )))
+            .expect("identity_create_with_custody");
+        assert_eq!(identity.custody_type(), "callback");
+    }
+
+    /// `identity_create` rejects `"platform"` and `"software"` at parse time
+    /// with `SCP-IDENT-1003`, before it reads a `testing_seed` (SCP-294).
+    #[test]
+    fn identity_create_rejects_host_custody_strings_before_the_seed() {
+        for custody in ["platform", "software"] {
+            for seed in [None, Some(vec![7u8; 32])] {
+                let outcome = match runtime()
+                    .block_on(scp_test().identity_create(custody.to_owned(), seed.clone()))
+                {
+                    Err(ScpError::Identity { code, msg }) => (code, msg),
+                    Err(other) => (String::new(), format!("{other:?}")),
+                    Ok(_) => (String::new(), "created an identity".to_owned()),
+                };
+                assert_eq!(
+                    outcome.0,
+                    codes::IDENT_1003,
+                    "{custody} {seed:?}: {}",
+                    outcome.1
+                );
+            }
         }
     }
 

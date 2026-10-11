@@ -38,7 +38,7 @@ use crate::context::{
     NapiInviteMemberOutcome, NapiKeyPackageReservation, NapiMessage, NapiPublishResult,
     NapiSealedInvitation,
 };
-use crate::error::{ScpNapiError, validate_custody_type};
+use crate::error::{ScpNapiError, custody_without_backend, validate_custody_type};
 use crate::event_log::{NapiCheckpoint, NapiEvent, NapiProof};
 use crate::identity::NapiIdentity;
 use crate::mcp::{
@@ -511,9 +511,10 @@ impl Scp {
                     }));
                 }
                 Err(ScpNapiError::Identity {
-                    message: "in_memory custody is not available in this build -- use \
-                              \"software\" or \"platform\" custody for production key storage"
-                        .to_owned(),
+                    message: format!(
+                        "in_memory custody is not available in this build — {}",
+                        crate::error::ACCEPTED_CUSTODY
+                    ),
                     code: codes::IDENT_1008.to_owned(),
                 }
                 .into())
@@ -526,16 +527,7 @@ impl Scp {
                         code: codes::VALID_7009.to_owned(),
                     }));
                 }
-                Err(ScpNapiError::Identity {
-                    message: format!(
-                        "custody type {custody:?} requires a wired platform \
-                         KeyCustodyProvider — use the KeyCustodyProvider callback \
-                         interface to inject Secure Enclave (iOS) or Android \
-                         Keystore (Android) backed custody"
-                    ),
-                    code: codes::IDENT_1003.to_owned(),
-                }
-                .into())
+                Err(custody_without_backend(&custody).into())
             }
             _ => Err(ScpNapiError::Identity {
                 code: codes::IDENT_1005.to_owned(),
@@ -626,22 +618,14 @@ impl Scp {
             }
             #[cfg(not(feature = "testing"))]
             "in_memory" => Err(ScpNapiError::Identity {
-                message: "in_memory custody is not available in this build -- use \
-                          \"software\" or \"platform\" custody for production key storage"
-                    .to_owned(),
+                message: format!(
+                    "in_memory custody is not available in this build — {}",
+                    crate::error::ACCEPTED_CUSTODY
+                ),
                 code: codes::IDENT_1008.to_owned(),
             }
             .into()),
-            "platform" | "software" => Err(ScpNapiError::Identity {
-                message: format!(
-                    "custody type {custody:?} requires a wired platform \
-                     KeyCustodyProvider — use the KeyCustodyProvider callback \
-                     interface to inject Secure Enclave (iOS) or Android \
-                     Keystore (Android) backed custody"
-                ),
-                code: codes::IDENT_1003.to_owned(),
-            }
-            .into()),
+            "platform" | "software" => Err(custody_without_backend(&custody).into()),
             _ => Err(ScpNapiError::Identity {
                 code: codes::IDENT_1005.to_owned(),
                 message: format!(
@@ -5447,5 +5431,82 @@ mod identity_remove_validation_tests {
                 .expect("valid DID must not be rejected by identity_remove_if_present"),
             "removing an unregistered DID must report false"
         );
+    }
+}
+
+/// Every custody-string rejection on this bridge names the strings it accepts,
+/// and none of them sends the caller to `"platform"` or `"software"` (SCP-294).
+#[cfg(test)]
+mod custody_string_message_tests {
+    use super::*;
+    use crate::error::ACCEPTED_CUSTODY;
+
+    fn create_error(custody: &str) -> String {
+        let scp = Scp::new_in_memory_for_test();
+        crate::runtime()
+            .block_on(scp.identity_create(custody.to_owned(), None))
+            .err()
+            .map_or_else(
+                || format!("{custody:?} created an identity"),
+                |e| e.to_string(),
+            )
+    }
+
+    fn create_with_agent_key_error(custody: &str) -> String {
+        let scp = Scp::new_in_memory_for_test();
+        crate::runtime()
+            .block_on(scp.identity_create_with_agent_key(custody.to_owned()))
+            .err()
+            .map_or_else(
+                || format!("{custody:?} created an identity"),
+                |e| e.to_string(),
+            )
+    }
+
+    /// `"platform"` and `"software"` return `SCP-IDENT-1003` on both string
+    /// create paths, with a message naming the accepted set.
+    #[test]
+    fn platform_and_software_reject_with_ident_1003_naming_the_accepted_set() {
+        for custody in ["platform", "software"] {
+            for msg in [create_error(custody), create_with_agent_key_error(custody)] {
+                assert!(msg.contains(codes::IDENT_1003), "{custody}: {msg}");
+                assert!(msg.contains(ACCEPTED_CUSTODY), "{custody}: {msg}");
+            }
+        }
+    }
+
+    /// An unknown string returns `SCP-VALID-7005` naming the accepted set,
+    /// which lists neither rejected string as expected.
+    #[test]
+    fn unknown_custody_rejects_with_valid_7005_naming_the_accepted_set() {
+        for msg in [
+            create_error("keychain"),
+            create_with_agent_key_error("keychain"),
+        ] {
+            assert!(msg.contains(codes::VALID_7005), "{msg}");
+            assert!(msg.contains(ACCEPTED_CUSTODY), "{msg}");
+            assert!(
+                !msg.contains("\"platform\"") && !msg.contains("\"software\""),
+                "{msg}"
+            );
+        }
+    }
+
+    /// A shipped build refuses `"in_memory"` with `SCP-IDENT-1008` and names
+    /// the accepted set instead of `"software"` or `"platform"`.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn in_memory_on_a_shipped_build_names_the_accepted_set() {
+        for msg in [
+            create_error("in_memory"),
+            create_with_agent_key_error("in_memory"),
+        ] {
+            assert!(msg.contains(codes::IDENT_1008), "{msg}");
+            assert!(msg.contains(ACCEPTED_CUSTODY), "{msg}");
+            assert!(
+                !msg.contains("\"platform\"") && !msg.contains("\"software\""),
+                "{msg}"
+            );
+        }
     }
 }

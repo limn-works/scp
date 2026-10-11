@@ -2219,7 +2219,7 @@ jobs:
           # `std::env::set_var` calls on, and `--no-tests=fail` exits 4 rather
           # than 0 if a feature flip selects zero tests.
           cargo nextest run --no-tests=fail -p scp-ffi --features server --lib \
-            -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed)'
+            -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed) + test(parse_custody_rejects_in_memory_on_a_shipped_build_naming_the_accepted_set)'
       - name: Check the PyPI wheel's features vendor OpenSSL on non-Apple targets only
         run: |
           # `crates/scp-platform/Cargo.toml` declares the libsqlite3-sys edge that

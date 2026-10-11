@@ -701,21 +701,32 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 4);
     }
 
-    /// `"platform"` and `"software"` are production custody kinds, so both
-    /// parse in every build. `"in_memory"` names the `InMemoryKeyCustody`
-    /// nullifier, so its arm is asserted per build configuration below.
+    /// `"callback"`, `"platform"`, and `"software"` name a host key store that
+    /// no custody string reaches, so every build rejects them at parse time
+    /// with `SCP-IDENT-1003` and a message naming the accepted set (SCP-294).
+    /// `"in_memory"` names the `InMemoryKeyCustody` nullifier, so its arm is
+    /// asserted per build configuration below.
     #[test]
-    fn parse_custody_method_accepts_known_values() {
-        use crate::bridge::parse_custody_method;
+    fn parse_custody_method_rejects_host_custody_strings_with_ident_1003() {
+        use crate::bridge::{ACCEPTED_CUSTODY, parse_custody_method};
 
-        assert!(matches!(
-            parse_custody_method("platform"),
-            Ok(bridge::CustodyMethod::Platform)
-        ));
-        assert!(matches!(
-            parse_custody_method("software"),
-            Ok(bridge::CustodyMethod::Software)
-        ));
+        for custody in ["callback", "platform", "software"] {
+            let outcome = match parse_custody_method(custody) {
+                Err(ScpError::Identity { code, msg }) => (code, msg),
+                other => (String::new(), format!("{other:?}")),
+            };
+            assert_eq!(
+                outcome.0,
+                scp_ffi_common::error_codes::IDENT_1003,
+                "{custody}: {}",
+                outcome.1
+            );
+            assert!(
+                outcome.1.contains(ACCEPTED_CUSTODY),
+                "{custody}: {}",
+                outcome.1
+            );
+        }
     }
 
     /// A `testing` build admits `"in_memory"`, because that feature is the sole
@@ -742,25 +753,41 @@ mod tests {
     #[cfg(not(feature = "testing"))]
     #[test]
     fn parse_custody_method_rejects_in_memory_on_a_shipped_build() {
-        use crate::bridge::parse_custody_method;
+        use crate::bridge::{ACCEPTED_CUSTODY, parse_custody_method};
 
         match parse_custody_method("in_memory") {
-            Err(ScpError::Identity { code, msg }) => assert_eq!(
-                code,
-                scp_ffi_common::error_codes::IDENT_1008,
-                "expected the custody-unavailable code SCP-IDENT-1008, got code \
-                 {code} with message: {msg}"
-            ),
+            Err(ScpError::Identity { code, msg }) => {
+                assert_eq!(
+                    code,
+                    scp_ffi_common::error_codes::IDENT_1008,
+                    "expected the custody-unavailable code SCP-IDENT-1008, got code \
+                     {code} with message: {msg}"
+                );
+                assert!(msg.contains(ACCEPTED_CUSTODY), "{msg}");
+                assert!(!msg.contains("\"platform\""), "{msg}");
+            }
             other => panic!("a shipped build must reject \"in_memory\" custody, got: {other:?}"),
         }
     }
 
+    /// An unknown string returns `SCP-VALID-7005` naming the accepted set,
+    /// which lists no rejected string as expected.
     #[test]
     fn parse_custody_method_rejects_unknown_value() {
-        use crate::bridge::parse_custody_method;
+        use crate::bridge::{ACCEPTED_CUSTODY, parse_custody_method};
 
-        let result = parse_custody_method("unknown");
-        assert!(matches!(result, Err(ScpError::Validation { .. })));
+        let outcome = match parse_custody_method("unknown") {
+            Err(ScpError::Validation { code, msg }) => (code, msg),
+            other => (String::new(), format!("{other:?}")),
+        };
+        assert_eq!(
+            outcome.0,
+            scp_ffi_common::error_codes::VALID_7005,
+            "{}",
+            outcome.1
+        );
+        assert!(outcome.1.contains(ACCEPTED_CUSTODY), "{}", outcome.1);
+        assert!(!outcome.1.contains("\"platform\""), "{}", outcome.1);
     }
 
     #[test]

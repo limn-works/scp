@@ -816,7 +816,7 @@ public protocol IdentityProtocol: AnyObject, Sendable {
     /**
      * Returns the custody method string for this identity.
      *
-     * One of: `"in_memory"`, `"platform"`, `"software"`, `"external"`.
+     * One of: `"in_memory"`, `"callback"`, `"external"`.
      */
     func custodyType()  -> String
     
@@ -1043,7 +1043,7 @@ open func addAgentKey()async throws  -> Identity  {
     /**
      * Returns the custody method string for this identity.
      *
-     * One of: `"in_memory"`, `"platform"`, `"software"`, `"external"`.
+     * One of: `"in_memory"`, `"callback"`, `"external"`.
      */
 open func custodyType() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -2581,8 +2581,8 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * is backed by a deterministic RNG so subsequent `generate_keypair`
      * calls produce byte-identical Ed25519 keys across bridges — the
      * basis of the cross-bridge parity test (ADR-046). `testing_seed`
-     * is only valid for `"in_memory"` custody; other custody types
-     * reject it with `SCP-VALID-7009`.
+     * is only valid for `"in_memory"` custody, and every other custody
+     * string returns an error before the seed is read.
      */
     func identityCreate(custody: String, testingSeed: Data?) async throws  -> Identity
     
@@ -5359,8 +5359,8 @@ open func identityAttestDevice(identity: Identity)async throws  -> String  {
      * is backed by a deterministic RNG so subsequent `generate_keypair`
      * calls produce byte-identical Ed25519 keys across bridges — the
      * basis of the cross-bridge parity test (ADR-046). `testing_seed`
-     * is only valid for `"in_memory"` custody; other custody types
-     * reject it with `SCP-VALID-7009`.
+     * is only valid for `"in_memory"` custody, and every other custody
+     * string returns an error before the seed is read.
      */
 open func identityCreate(custody: String, testingSeed: Data?)async throws  -> Identity  {
     return
@@ -12909,14 +12909,13 @@ public enum CustodyMethod {
      */
     case inMemory
     /**
-     * Key material protected by hardware security module
-     * (Secure Enclave on iOS, Android Keystore on Android).
+     * Key material held by a host `KeyCustodyProvider` (Secure Enclave,
+     * Android Keystore, or any other host key store) injected through
+     * `identity_create_with_custody`. No custody string selects it:
+     * `identity_create` answers `"callback"`, `"platform"`, and
+     * `"software"` with `SCP-IDENT-1003` (SCP-294).
      */
-    case platform
-    /**
-     * Key material in software-managed encrypted storage (not HSM-backed).
-     */
-    case software
+    case callback
     /**
      * Identity loaded by DID string without local key material.
      *
@@ -12943,11 +12942,9 @@ public struct FfiConverterTypeCustodyMethod: FfiConverterRustBuffer {
         
         case 1: return .inMemory
         
-        case 2: return .platform
+        case 2: return .callback
         
-        case 3: return .software
-        
-        case 4: return .external
+        case 3: return .external
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -12961,16 +12958,12 @@ public struct FfiConverterTypeCustodyMethod: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
         
         
-        case .platform:
+        case .callback:
             writeInt(&buf, Int32(2))
         
         
-        case .software:
-            writeInt(&buf, Int32(3))
-        
-        
         case .external:
-            writeInt(&buf, Int32(4))
+            writeInt(&buf, Int32(3))
         
         }
     }
@@ -17344,7 +17337,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_add_agent_key() != 23309) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_identity_custody_type() != 7777) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_custody_type() != 16200) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_did() != 6016) {
@@ -17608,7 +17601,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_attest_device() != 36607) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 25630) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 17057) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_link_attestation() != 29874) {
