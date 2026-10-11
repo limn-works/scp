@@ -19093,6 +19093,66 @@ mod tests {
         }
     }
 
+    /// `file_custody_error` gives each encrypted-key-file failure the code
+    /// `.docs/standards/sdk-common.md` §Custody request assigns: a missing or
+    /// relative variable is `SCP-VALID-7001`, and a key directory that cannot
+    /// be created is `SCP-IDENT-1008`. The inputs go through
+    /// `resolve_file_custody_inputs_from`, so the test sets no environment
+    /// variable and runs on every build.
+    #[test]
+    fn file_custody_error_codes_every_encrypted_file_failure() {
+        use scp_ffi_common::custody_file::resolve_file_custody_inputs_from;
+        let passphrase = || Some(Zeroizing::new("uniffi-file-custody-passphrase".to_owned()));
+        let base = tempfile::tempdir().expect("tempdir");
+        let home_is_a_file = base.path().join("not-a-directory");
+        std::fs::write(&home_is_a_file, b"x").expect("write the file HOME names");
+
+        let resolve_failures = [
+            (
+                "no passphrase",
+                resolve_file_custody_inputs_from(None, Some(base.path().as_os_str())),
+            ),
+            (
+                "empty passphrase",
+                resolve_file_custody_inputs_from(
+                    Some(Zeroizing::new(String::new())),
+                    Some(base.path().as_os_str()),
+                ),
+            ),
+            (
+                "no HOME",
+                resolve_file_custody_inputs_from(passphrase(), None),
+            ),
+            (
+                "relative HOME",
+                resolve_file_custody_inputs_from(
+                    passphrase(),
+                    Some(std::ffi::OsStr::new("rel/home")),
+                ),
+            ),
+        ];
+        for (case, resolved) in resolve_failures {
+            let error = resolved.expect_err(case);
+            match file_custody_error(&error) {
+                ScpError::Validation { code, msg } => {
+                    assert_eq!(code, codes::VALID_7001, "{case}: {msg}");
+                    assert!(msg.contains("encrypted_file"), "{case}: {msg}");
+                }
+                other => panic!("{case}: expected SCP-VALID-7001, got {other:?}"),
+            }
+        }
+
+        let error =
+            resolve_file_custody_inputs_from(passphrase(), Some(home_is_a_file.as_os_str()))
+                .expect("an absolute HOME and a passphrase resolve")
+                .open()
+                .expect_err("a HOME naming a file holds no key directory");
+        match file_custody_error(&error) {
+            ScpError::Identity { code, msg } => assert_eq!(code, codes::IDENT_1008, "{msg}"),
+            other => panic!("expected SCP-IDENT-1008, got {other:?}"),
+        }
+    }
+
     /// Every runtime error that carries a custody failure reaches the caller
     /// with the code `custody_failure_code` assigns (checked here for
     /// key-not-found, a generic custody failure and a rejected host
