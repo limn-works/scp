@@ -36,6 +36,35 @@ Custody migration moves the operational signing capability from one custody prov
 
 **Invariant.** At no point during migration are there zero valid signing keys for the identity, and at no point is the service record left signed by a key no reader will accept, because step 3 republishes it under the new key before step 5 destroys the replaced one. A peer that adopted the `KeyState` before step 3's Update reaches one of its contexts waits out `LEAF_REPLACEMENT_GRACE` before it proposes Remove for the not-yet-replaced leaf (`09-security-model.md` §9.12 step 1a, §9.18.17); without that wait the overlap would evict the migrating member from its own context.
 
+### 3.2.2 Custody Request Vocabulary
+
+**A caller that creates an identity through the PyO3, napi-rs or UniFFI bridge names the backend that holds the identity's private keys with one of two request values, `encrypted_file` and `os_keystore`, and every bridge MUST accept both on every identity-creating entry point.** Alec accepted this two-value vocabulary on 2026-08-28. A request value is a local choice of backend. It is not the key-state `CustodyType` that `09-security-model.md` §9.7.4.2 defines, which a key entry carries inside the inception preimage.
+
+- **`encrypted_file`** selects `FileKeyCustody`, the software-key backend of `17-persistence-and-storage.md` §17.8. Argon2id over a passphrase derives the key that AES-256-GCM wraps each stored private key under, and the file carries the HMAC-SHA-256 commitment and file tag that §17.8's FileKeyCustody Key-File Format defines. The key file is `$HOME/.scp/keys.bin`, and the passphrase is the value of the environment variable `SCP_KEY_PASSPHRASE`.
+- **`os_keystore`** selects the host operating system's own key store, which SCP does not implement and reaches only through a `KeyCustodyProvider` the caller passes to `identity_create_with_custody`. The provider generates every private key, holds it, and performs every signature and key agreement on it, so no private key crosses the FFI boundary (ADR-006, platform abstraction with an in-memory testing adapter). ADR-025's `AppleKeyCustody` and ADR-027's `AndroidKeyCustody` hold the keys on Apple and Android hosts.
+
+An identity handle's custody accessor MUST return the request value the identity was created with, `encrypted_file` or `os_keystore`. A provider could front a store other than the operating system's, and the accessor still returns `os_keystore`, because the accessor reports what the caller requested.
+
+**The vocabulary has no `platform` value and no `software` value.** Each value names a backend, because a caller choosing custody chooses which backend SCP dispatches to, and SCP dispatches to backends it does not own: the Apple Keychain and the Android Keystore. `platform` already carries two other meanings: W3C WebAuthn §5.4.5 defines a "platform" authenticator as one physically bound to a client device, and Windows CNG names the TPM `MS_PLATFORM_CRYPTO_PROVIDER`. A caller reading `platform` therefore cannot tell whether it asked for a device-bound key, a TPM key or the operating system's key store. `software` names where key bytes sit, which is a property of a key, not a backend: `encrypted_file` always holds software keys, and `os_keystore` holds software keys for any key its store cannot operate on in hardware.
+
+**`in_memory` is a testing-build affordance and never a peer of the two request values.** `InMemoryKeyCustody` holds plaintext keys, so `17-persistence-and-storage.md` §17.8 classifies it as a security nullifier that a shipped artifact must not contain. A bridge built with the `testing` feature accepts the string `in_memory`. A bridge built without the `testing` feature answers `in_memory` with `SCP-IDENT-1008`. An SDK's custody type MUST carry `encrypted_file` and `os_keystore` and no other member, so a test harness that needs in-memory custody reaches it outside the SDK's custody type.
+
+**`os_keystore` promises that the keys sit in the host's store and that every use of them goes through the provider. It promises no hardware backing.** Which keys a host store holds in hardware depends on the host, the key's algorithm and the provider: ADR-025 records that the Apple Secure Enclave performs P-256 operations and no others, and the platform table of `17-persistence-and-storage.md` §17.8 records that an HPKE keypair the enclave cannot agree on sits software-backed in the Keychain. No reader may infer hardware backing from a request value.
+
+**Every request outside the vocabulary fails closed with a typed error, and no bridge falls back to another backend.** A bridge MUST check the `testing_seed` argument before it reads the request value, so one input yields one code on every bridge.
+
+| Request | Code |
+|---|---|
+| A `testing_seed` with any value other than `in_memory` | `SCP-VALID-7009` |
+| `os_keystore` with no `KeyCustodyProvider` | `SCP-IDENT-1003` |
+| A `KeyCustodyProvider` with any value other than `os_keystore` | `SCP-IDENT-1005` |
+| `in_memory` on a bridge built without the `testing` feature | `SCP-IDENT-1008` |
+| Any other string, including `platform`, `software`, `file` and `callback` | `SCP-VALID-7005` |
+
+Every rejection message names `encrypted_file` and `os_keystore` as the values the bridge accepts. `.docs/standards/sdk-common.md` §Custody request lists the codes a bad `encrypted_file` input returns.
+
+**Scope.** This section governs only the request strings an FFI caller passes to create an identity. It does not govern the key-state `CustodyType` of `09-security-model.md` §9.7.4.2, the custody value an identity publishes, or the target custody provider of a custody migration (§3.2.1).
+
 ## 3.3 Recovery
 
 **Where the root cannot be recovered by key material at all, the person establishes a new identity**, and `09-security-model.md` §9.7.4.1's failure-mode table states that outcome, so a reader of this section does not look here for a mechanism that re-establishes custody of the same identity.

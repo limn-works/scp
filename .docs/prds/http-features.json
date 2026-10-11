@@ -911,49 +911,61 @@
     },
     {
       "id": "SCP-294",
-      "title": "Fail closed on the custody string 'platform' on every bridge, and normalize the identity parameter across SDKs",
+      "title": "Accept the custody request values encrypted_file and os_keystore on every bridge, and normalize the identity parameter across SDKs",
       "gate": "gate-http-3",
       "priority": "P1",
       "severity": "moderate",
       "status": "pending",
       "files": [
+        "crates/scp-ffi/common/src/custody_request.rs",
+        "crates/scp-ffi/common/src/custody_file.rs",
+        "crates/scp-ffi/common/src/error_codes.rs",
+        "crates/scp-ffi/common/src/validate.rs",
         "crates/scp-ffi/src/identity.rs",
         "crates/scp-ffi/napi/src/error.rs",
         "crates/scp-ffi/napi/src/scp.rs",
+        "crates/scp-ffi/napi/src/custody.rs",
         "crates/scp-ffi/uniffi/src/bridge.rs",
         "crates/scp-ffi/uniffi/src/lib.rs",
-        "crates/scp-ffi/common/src/error_codes.rs",
         "bindings/swift/Sources/SCP/Internal/ScpBindings.swift",
-        "bindings/python/scp_sdk/identity.py",
+        "bindings/python/scp_sdk/types.py",
+        "bindings/typescript/src/identity.ts",
+        "bindings/swift/Sources/SCP/Types.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Types.kt",
         "bindings/swift/Sources/SCP/Governance.swift",
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/bridge/CoroutineBridge.kt"
       ],
-      "description": "Two SDK fixes. (a) The PyO3 bridge built a FileKeyCustody when a caller passed custody='platform', so 'platform' meant an encrypted file at $HOME/.scp/keys.bin rather than a platform key store, and the UniFFI bridge parsed 'platform' and 'software' into CustodyMethod variants that no string path could build. No custody string reaches Apple Keychain or Android Keystore on any bridge; a caller reaches a host key store by injecting a KeyCustodyProvider through identity_create_with_custody. parse_custody_inner in crates/scp-ffi/src/identity.rs therefore returns SCP-IDENT-1003 for 'platform', as the NAPI bridge already did, with no backward-compatible alias, because nothing has shipped. The UniFFI bridge rejects 'platform' and 'software' at parse time with SCP-IDENT-1003, its CustodyMethod names the injected-provider case Callback, and every custody rejection on the three bridges names the strings that bridge accepts. The PyO3 bridge keeps 'file' and 'in_memory'; update the Python CustodyType enum and docstrings in identity.py. (b) Swift and Kotlin demand identity/identityHandle on publish methods, while Python and TypeScript default to the context creator. Make identity optional in Swift and Kotlin publish methods, defaulting to the context creator. Per §3.2 (key custody), §3.10 (identity resolution) and ADR-006 (platform adapter).",
+      "description": "Two SDK fixes. (a) The custody request vocabulary of \u00a73.2.2 names the two values a caller passes to create an identity: 'encrypted_file' selects FileKeyCustody at $HOME/.scp/keys.bin sealed under SCP_KEY_PASSPHRASE, and 'os_keystore' selects the host key store reached through a KeyCustodyProvider the caller passes to identity_create_with_custody. Every PyO3, NAPI and UniFFI identity-creating entry point accepts both and fails closed on every other input with the code \u00a73.2.2 states: SCP-IDENT-1003 for 'os_keystore' with no provider, SCP-IDENT-1005 for a provider with any other value, SCP-VALID-7005 for every other string ('file', 'platform', 'software' and 'callback' included), SCP-IDENT-1008 for 'in_memory' in a build without the testing feature, and SCP-VALID-7009 for a testing_seed with any value other than 'in_memory'. No backward-compatible alias exists for 'file', 'platform' or 'callback', because nothing has shipped. An identity created through identity_create_with_custody reports the custody label 'os_keystore'. The four SDK custody types carry the two values and no other member. (b) Swift and Kotlin demand identity/identityHandle on publish methods, while Python and TypeScript default to the context creator. Make identity optional in Swift and Kotlin publish methods, defaulting to the context creator. Per \u00a73.2.2 (custody request vocabulary), \u00a73.10 (identity resolution), ADR-006 (platform adapter), and ADR-025 (Apple platform adapter) and ADR-027 (Android platform adapter), whose 2026-10-10 amendments name 'os_keystore'. Amended 2026-10-10: this story previously kept 'file' on the PyO3 bridge, returned SCP-IDENT-1003 for 'platform', 'software' and 'callback', and labelled a provider-backed identity 'callback'.",
       "acceptanceCriteria": [
-        "PyO3 parse_custody_inner resolves custody='file' to a FileKeyCustody selection",
-        "PyO3 parse_custody_inner returns SCP-IDENT-1003 for custody='platform' and resolves no key custody",
-        "NAPI identity_create and identity_create_with_agent_key return SCP-IDENT-1003 for custody='platform' and custody='software'",
-        "UniFFI parse_custody_method returns SCP-IDENT-1003 for 'callback', 'platform', and 'software'; CustodyMethod has no Platform or Software variant, and an identity created through identity_create_with_custody reports custody_type 'callback'",
-        "Every custody-string rejection on the PyO3, NAPI, and UniFFI bridges (SCP-IDENT-1003, SCP-IDENT-1008, SCP-VALID-7005) names the strings that bridge accepts and names identity_create_with_custody for any other key store, and none names 'platform' or 'software' as a string to pass",
-        "Python CustodyType enum includes FILE variant",
-        "Python identity.py docstrings name 'file' as preferred",
-        "Identity.create(custody='file') works in Python and creates FileKeyCustody",
+        "The PyO3, NAPI and UniFFI identity_create entry points, in a build with the testing feature, resolve custody='encrypted_file' to a FileKeyCustody at $HOME/.scp/keys.bin sealed under SCP_KEY_PASSPHRASE",
+        "On the PyO3, NAPI and UniFFI bridges, custody='os_keystore' with no KeyCustodyProvider returns SCP-IDENT-1003 and builds no key custody",
+        "On the PyO3, NAPI and UniFFI bridges, the custody factory returns SCP-IDENT-1005 when it receives a KeyCustodyProvider together with any request value other than 'os_keystore'",
+        "On the PyO3, NAPI and UniFFI bridges, custody='file', custody='platform', custody='software' and custody='callback' each return SCP-VALID-7005 and build no key custody",
+        "On the PyO3, NAPI and UniFFI bridges, every custody string other than 'encrypted_file', 'os_keystore' and (in a build with the testing feature) 'in_memory' returns SCP-VALID-7005",
+        "On the PyO3, NAPI and UniFFI bridges, custody='in_memory' returns SCP-IDENT-1008 in a build without the testing feature",
+        "On the PyO3, NAPI and UniFFI bridges, a testing_seed with any custody value other than 'in_memory' returns SCP-VALID-7009 before the custody value is read",
+        "An identity created through identity_create_with_custody reports custody_type 'os_keystore' on the PyO3, NAPI and UniFFI bridges",
+        "An identity created with custody='encrypted_file' reports custody_type 'encrypted_file' on the PyO3, NAPI and UniFFI bridges",
+        "Every custody-string rejection on the PyO3, NAPI and UniFFI bridges names 'encrypted_file' and 'os_keystore' as the accepted values and names identity_create_with_custody for 'os_keystore', and none names 'file', 'platform', 'software' or 'callback' as a value to pass",
+        "The doc comment of IDENT_1003 in crates/scp-ffi/common/src/error_codes.rs names one condition: 'os_keystore' requested with no KeyCustodyProvider",
+        "The Python CustodyType in bindings/python/scp_sdk/types.py, the TypeScript CustodyType in bindings/typescript/src/identity.ts, the Swift CustodyType in bindings/swift/Sources/SCP/Types.swift and the Kotlin CustodyType in bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Types.kt each carry exactly the members encrypted_file and os_keystore",
         "Swift publish methods accept optional identity parameter (defaults to context creator)",
         "Kotlin publish methods accept optional identityHandle parameter (defaults to context creator)",
-        "Unit test: Python custody='file' creates identity successfully",
-        "Unit test: Python custody='platform' raises an error carrying SCP-IDENT-1003",
+        "Unit test on each of the PyO3, NAPI and UniFFI bridges: each row of the \u00a73.2.2 fail-closed table returns that row's code",
+        "Unit test: Python custody=CustodyType.ENCRYPTED_FILE creates an identity in a build with the testing feature",
+        "Unit test: Python custody='platform' raises an error carrying SCP-VALID-7005",
         "Unit test: Swift publish without explicit identity succeeds",
         "Unit test: Kotlin publish without explicit identityHandle succeeds"
       ],
       "actionItems": [
-        "Make parse_custody_inner in crates/scp-ffi/src/identity.rs reject 'platform' with SCP-IDENT-1003",
-        "Reject 'platform' and 'software' in UniFFI parse_custody_method, rename CustodyMethod::Platform to Callback, delete Software, and regenerate the Swift bindings",
-        "Make every custody-string rejection message on the three bridges name that bridge's accepted strings",
-        "Add FILE variant to Python CustodyType enum in identity.py",
-        "Update Python identity.py docstrings to document 'file' as preferred",
+        "Add one shared custody request parser to scp-ffi-common that accepts 'encrypted_file' and 'os_keystore', accepts 'in_memory' only in a testing build, and returns the \u00a73.2.2 code for every other input",
+        "Route the PyO3, NAPI and UniFFI identity-creating entry points through that parser and one custody factory, adding an encrypted_file arm on NAPI and UniFFI",
+        "Label a provider-backed identity 'os_keystore' and a file-backed identity 'encrypted_file' on every bridge",
+        "Rewrite the IDENT_1003 doc comment and every custody rejection message to name the two request values",
+        "Rename the SDK custody type members in Python, TypeScript, Swift and Kotlin to the two request values, and regenerate the Swift bindings",
         "Make identity parameter optional in Swift Governance.swift publish methods",
         "Make identityHandle parameter optional in Kotlin CoroutineBridge.kt publish methods",
-        "Add unit tests for the custody-string rejections on each bridge and in Python",
+        "Add unit tests for every row of the \u00a73.2.2 fail-closed table on each bridge and in Python",
         "Add unit tests for optional identity in Swift and Kotlin"
       ],
       "blockedBy": [
@@ -962,7 +974,7 @@
       "sources": [
         {
           "file": ".docs/specs/03-identity.md",
-          "section": "## 3.2 Key Custody"
+          "section": "### 3.2.2 Custody Request Vocabulary"
         },
         {
           "file": ".docs/specs/03-identity.md",
@@ -971,12 +983,27 @@
         {
           "file": ".docs/adrs/phase-1.md",
           "section": "## ADR-006: Platform Abstraction (In-Memory Testing Adapter)"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-025: Apple Platform Adapter"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-027: Android Platform Adapter"
         }
       ],
       "details": {
         "phase": 2,
-        "crates": ["scp-ffi"],
-        "bindings": ["python", "swift", "kotlin"]
+        "crates": [
+          "scp-ffi"
+        ],
+        "bindings": [
+          "python",
+          "typescript",
+          "swift",
+          "kotlin"
+        ]
       }
     },
     {

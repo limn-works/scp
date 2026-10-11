@@ -132,7 +132,7 @@ class Identity:
         return cls(raw)
 
 # IdentityConfig(backend=IdentityBackendConfig.RELAY_NETWORK,
-#                custody=KeyCustodyConfig.PLATFORM,   # required; no default
+#                custody=KeyCustodyConfig.ENCRYPTED_FILE,  # required; no default (03-identity.md §3.2.2)
 #                persistence=None)                    # ephemeral
 ```
 
