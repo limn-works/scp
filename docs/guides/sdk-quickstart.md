@@ -177,10 +177,13 @@ println!("DID: {}", identity.did);
 
 ```python
 import asyncio
-from scp_sdk import Identity
+from scp_sdk import SCP, CustodyType
 
 async def main():
-    identity = await Identity.create(custody="platform")
+    scp = SCP({"type": "sqlite", "path": "./scp-data", "passphrase": "change me"})
+    # CustodyType.FILE keeps the keys in $HOME/.scp/keys.bin, encrypted under
+    # the SCP_KEY_PASSPHRASE environment variable.
+    identity = await scp.identity_create(CustodyType.FILE)
     print(f"DID: {identity.did}")
 
 asyncio.run(main())
@@ -189,9 +192,13 @@ asyncio.run(main())
 ### TypeScript
 
 ```typescript
-import { Identity } from "@limn-works/scp-ts";
+import { SCP } from "@limn-works/scp-ts";
 
-const identity = await Identity.create({ custody: "platform" });
+const scp = new SCP({ storage: { type: "in_memory" } });
+// "in_memory" is the one custody string this bridge builds a key store from, in
+// an addon built with its testing feature; pass a KeyCustodyProvider to
+// identityCreateWithCustody() for any other key store.
+const identity = await scp.identityCreate("in_memory");
 console.log(`DID: ${identity.did}`);
 ```
 
