@@ -3,7 +3,22 @@
 // it to the bridge; the bridge-check tests drive the same record through the
 // napi `TestingCallbackCustody` hook.
 
-import type { KeyCustodyProvider } from "../scp";
+import type { CustodyKeyRole, CustodyKeyType, CustodyPublicKey, KeyCustodyProvider } from "../scp";
+
+/** The shape napi-rs marshals for a `CustodyPublicKey`: bytes as a number array. */
+export interface NativeCustodyPublicKey {
+  keyType: CustodyKeyType;
+  publicKey: number[];
+  role: CustodyKeyRole;
+}
+
+const KEY_TYPES: readonly unknown[] = [
+  "ed25519",
+  "x25519",
+  "p256",
+  "hpke-p256",
+] satisfies CustodyKeyType[];
+const KEY_ROLES: readonly unknown[] = ["identity", "operational"] satisfies CustodyKeyRole[];
 
 /**
  * The one outcome shape every custody callback hands the bridge. A host
@@ -102,6 +117,29 @@ function asBytes(method: string): (raw: unknown) => number[] {
   };
 }
 
+function asPublicKey(method: string): (raw: unknown) => NativeCustodyPublicKey {
+  return (raw) => {
+    const result = raw as Partial<CustodyPublicKey> | null;
+    if (
+      typeof raw !== "object" ||
+      result === null ||
+      !KEY_TYPES.includes(result.keyType) ||
+      !(result.publicKey instanceof Uint8Array) ||
+      !KEY_ROLES.includes(result.role)
+    ) {
+      throw wrongType(
+        method,
+        "a { keyType: CustodyKeyType, publicKey: Uint8Array, role: CustodyKeyRole } result",
+      );
+    }
+    return {
+      keyType: result.keyType as CustodyKeyType,
+      publicKey: Array.from(result.publicKey),
+      role: result.role as CustodyKeyRole,
+    };
+  };
+}
+
 /**
  * `asBytes` for key material (`dhAgree`, `exportSigningKeyBytes`). napi-rs
  * reads a Rust `Vec<u8>` only from a JS `Array<number>`, so the adapter must
@@ -135,19 +173,23 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
   // wrongly typed return each reach Rust as a structured failure. napi-rs delivers a multi-element Rust tuple
   // (`(String, Vec<u8>)`) to the JS callback as a SINGLE `[keyId, bytes]`
   // array argument, not as two positional args, so the tuple callbacks
-  // (`sign`, `dhAgree`, `derivePseudonym`, `deriveRotatablePseudonym`) accept
+  // (`generateKeypair`, `sign`, `dhAgree`, `derivePseudonym`,
+  // `deriveRotatablePseudonym`) accept
   // one array and destructure it.
   return {
-    generateKeypair: (keyType: string): NativeHostResult<string> =>
+    generateKeypair: ([keyType, role]: [
+      CustodyKeyType,
+      CustodyKeyRole,
+    ]): NativeHostResult<string> =>
       hostCall(
         "generateKeypair",
-        () => provider.generateKeypair(keyType),
+        () => provider.generateKeypair(keyType, role),
         asString("generateKeypair"),
       ),
     sign: ([keyId, message]: [string, number[]]): NativeHostResult<number[]> =>
       hostCall("sign", () => provider.sign(keyId, Uint8Array.from(message)), asBytes("sign")),
-    getPublicKey: (keyId: string): NativeHostResult<number[]> =>
-      hostCall("getPublicKey", () => provider.getPublicKey(keyId), asBytes("getPublicKey")),
+    getPublicKey: (keyId: string): NativeHostResult<NativeCustodyPublicKey> =>
+      hostCall("getPublicKey", () => provider.getPublicKey(keyId), asPublicKey("getPublicKey")),
     // `destroyKey` returns nothing the bridge reads, so any non-thenable
     // return (a `Map.delete` boolean, say) is accepted.
     destroyKey: (keyId: string): NativeHostResult<undefined> =>

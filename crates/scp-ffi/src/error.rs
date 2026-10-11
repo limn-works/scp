@@ -1376,6 +1376,7 @@ mod tests {
                 expected: scp_platform::traits::KeyType::Ed25519,
                 actual: scp_platform::traits::KeyType::X25519,
             },
+            scp_platform::PlatformError::NotIdentityKey,
             scp_platform::PlatformError::StorageError("io".to_owned()),
             scp_platform::PlatformError::AttestationError("x".to_owned()),
             scp_platform::PlatformError::PushError("x".to_owned()),

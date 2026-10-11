@@ -111,6 +111,12 @@ pub fn html_escape_event_string(s: &str) -> String {
 #[cfg(feature = "custody")]
 pub mod custody_parse;
 
+// Shared key-type registry and P-256 host-return validation for the three
+// callback-custody adapters (behind the `custody` feature, like
+// `custody_parse`). See ADR-006.
+#[cfg(feature = "custody")]
+pub mod callback_custody;
+
 // Resolves `$HOME/.scp/keys.bin` and `SCP_KEY_PASSPHRASE` for `"file"`
 // custody, rejecting an unset, empty or relative HOME and an empty passphrase,
 // then opens the key file. See ADR-006 and spec §17.8.

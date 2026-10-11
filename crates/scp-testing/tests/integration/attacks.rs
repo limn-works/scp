@@ -834,7 +834,7 @@ async fn broadcast_wrong_key_decryption_fails() {
 #[tokio::test]
 async fn pseudonym_unlinkability() {
     let custody = InMemoryKeyCustody::new();
-    let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+    let key_handle = custody.generate_identity_keypair().await.unwrap();
 
     // Same identity, different contexts -> different routing_ids
     let p1 = derive_pseudonym(&custody, &key_handle, b"context-alpha")

@@ -5415,6 +5415,7 @@ dependencies = [
  "rmp-serde",
  "scp-clock",
  "scp-core",
+ "scp-crypto",
  "scp-dht",
  "scp-did",
  "scp-event-log",

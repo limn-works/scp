@@ -1115,7 +1115,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ) -> Result<(ScpIdentity, DidDocument, PreRotationKeyHandle), IdentityError> {
         // Step 1: Operational keypairs (#0, #active, #agent).
         let identity_key = key_custody
-            .generate_keypair(KeyType::Ed25519)
+            .generate_identity_keypair()
             .await
             .map_err(IdentityError::Platform)?;
 
@@ -1477,8 +1477,8 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         // Step 0: Pre-flight `import_ed25519_signing_key` capability on
         // the operational custody. Step 6 below imports the OLD
         // pre-rotation private bytes (returned by step 5's
-        // `destroy_after_migration`) into operational custody as the
-        // new `#0`. If `import_ed25519_signing_key` is unsupported on
+        // `destroy_after_migration`) into `key_custody` as the new
+        // identity key `#0`, in the identity role. If `import_ed25519_signing_key` is unsupported on
         // this backend (e.g., HSM-bound `CallbackKeyCustody` today),
         // step 6 would fail BEFORE any DHT publish (steps 7 and 8) —
         // but only AFTER step 5 has already consumed the OLD
@@ -1586,8 +1586,8 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             .map_err(IdentityError::PreRotation)?;
 
         // Step 5: Consume the OLD pre-rotation key from cold custody —
-        // returning its private bytes — and import them into operational
-        // custody as the new `#0`. Per spec §9.7.4.1 item 6
+        // returning its private bytes — and import them into `key_custody`
+        // as the new identity key `#0`, in the identity role. Per spec §9.7.4.1 item 6
         // ("post-rotation key cycling"), the old pre-rotation key is
         // destroyed after migration completes; here we destroy-and-export
         // atomically (the trait method's documented contract). This is
@@ -2055,7 +2055,7 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
             // Step 1: Generate the operational keypairs in `key_custody`
             // (Identity Key #0, Active Signing Key #active).
             let identity_key = key_custody
-                .generate_keypair(KeyType::Ed25519)
+                .generate_identity_keypair()
                 .await
                 .map_err(IdentityError::Platform)?;
 

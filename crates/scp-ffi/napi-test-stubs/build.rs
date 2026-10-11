@@ -26,6 +26,14 @@ napi_status napi_release_threadsafe_function(napi_threadsafe_function f, int32_t
 napi_status napi_acquire_threadsafe_function(napi_threadsafe_function f) { (void)f; return 0; }
 napi_status napi_ref_threadsafe_function(napi_env env, napi_threadsafe_function f) { (void)env; (void)f; return 0; }
 napi_status napi_unref_threadsafe_function(napi_env env, napi_threadsafe_function f) { (void)env; (void)f; return 0; }
+napi_status napi_call_function(napi_env env, napi_value recv, napi_value func, size_t argc, const napi_value* argv, napi_value* r) { (void)env; (void)recv; (void)func; (void)argc; (void)argv; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_coerce_to_object(napi_env env, napi_value v, napi_value* r) { (void)env; (void)v; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_coerce_to_string(napi_env env, napi_value v, napi_value* r) { (void)env; (void)v; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_get_global(napi_env env, napi_value* r) { (void)env; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_get_named_property(napi_env env, napi_value o, const char* n, napi_value* r) { (void)env; (void)o; (void)n; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_get_undefined(napi_env env, napi_value* r) { (void)env; if (r) *r = (napi_value)0; return 0; }
+napi_status napi_get_value_string_utf8(napi_env env, napi_value v, char* buf, size_t size, size_t* r) { (void)env; (void)v; if (buf && size) buf[0] = 0; if (r) *r = 0; return 0; }
+napi_status napi_typeof(napi_env env, napi_value v, int32_t* r) { (void)env; (void)v; if (r) *r = 0; return 0; }
 napi_status napi_create_threadsafe_function(napi_env env, napi_value func, napi_value res, napi_value name, size_t max_queue, size_t initial_thread, void* ctx, void* finalize_cb, void* finalize_data, void* call_js_cb, napi_threadsafe_function* r) { (void)env; (void)func; (void)res; (void)name; (void)max_queue; (void)initial_thread; (void)ctx; (void)finalize_cb; (void)finalize_data; (void)call_js_cb; if (r) *r = (napi_threadsafe_function)0; return 0; }
 ";
 

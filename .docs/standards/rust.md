@@ -211,11 +211,11 @@ Every crate defines errors via `thiserror`, following the hierarchy in `sdk-comm
 
 ## Clippy Configuration
 
-`.clippy.toml` at workspace root:
+`.clippy.toml` at workspace root sets the thresholds (`cognitive-complexity-threshold = 25`, plus the stack-size and future-size thresholds) and the workspace `disallowed-methods` bans.
 
-```toml
-cognitive-complexity-threshold = 25
-```
+Clippy reads only the nearest configuration file. A crate-level `clippy.toml` therefore replaces the workspace file for that crate and repeats every workspace entry it keeps, as `crates/scp-runtime/clippy.toml` does. An exemption from a workspace ban is a crate-level `clippy.toml`, never an `#[allow]`.
+
+P-256 arithmetic is confined by `deny.toml`, not by clippy: its `[bans]` table lets only `scp-crypto` and the upstream wrapper crates depend on `p256`, `elliptic-curve` and `primeorder`, so no other workspace crate can name a P-256 point, scalar or ECDH item. Every P-256 scalar multiplication on a peer point goes through `scp_crypto::p256::ecdh_p256`, whose peer is a `P256PublicKey`; the one constructor that takes bytes is `from_sec1`, which applies the `09-security-model.md` §9.5 point validation.
 
 `Cargo.toml` workspace-level lint configuration:
 

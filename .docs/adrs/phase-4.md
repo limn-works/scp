@@ -637,7 +637,7 @@ agent_deregister(did) -> { removed }
 
 ## ADR-021: UniFFI Bridge Definitions
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-09-29 (SCP-307, `derive_pseudonym` returns the pseudonym point).
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-09-29 (SCP-307, `derive_pseudonym` returns the pseudonym point); 2026-10-10 (SCP-307, the host records each key's type and role, and the adapter caches them).
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, gave an identity a root set, one operational key, and a pre-rotation commitment, and resolution returns a key state (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
 
@@ -648,6 +648,8 @@ agent_deregister(did) -> { removed }
 - `p256_software_pseudonym_point(ikm, context_id, epoch)` is for a software host. It runs the whole §9.10.4.A recipe from the identity's private key material (the Ed25519 seed until the identity key moves to P-256, SCP-315) and returns the point. An absent epoch selects v1, and a present one selects v2 (§9.10.4.1). The helper receives key material the host's software custody already holds, and it wipes its own copy.
 
 Neither helper returns a private scalar. The `bytes derive_pseudonym` line in the interface definition below, which returned `[pseudonym_public_key_bytes(32) || key_id_utf8_bytes]`, is kept as history.
+
+**Amendment (2026-10-10 — SCP-307, the host records each key's type and role).** This amendment binds the UniFFI `KeyCustodyProvider`, the PyO3 custody protocol and the napi custody interface alike, and supersedes the `generate_keypair` and `get_public_key` lines of the interface definition below. `generate_keypair(CustodyKeyType, CustodyKeyRole)` asks the host for a key of one of four types (`ed25519`, `x25519`, `p256`, `hpke-p256`) in one of two roles (`identity`, `operational`), and each bridge declares both as enums: a UniFFI enum, a napi string enum, and a Python `Literal`. The bridge chooses the role inside the flow it runs: `generate_identity_keypair` asks for `identity`, and `generate_keypair` asks for `operational`, so no bridge passes a role of its own. The host records the role for the key's lifetime. `get_public_key` returns a `CustodyPublicKey { key_type, public_key, role }` record (a frozen dataclass in Python). After a generation, the bridge destroys the new host key when the reported type or role differs from the request, and returns an error. The adapter caches each key's type, public key and role, and nothing else. The host is the only authority on whether a key exists, and the cache is not one: the adapter keeps no tombstone, and the host's `SCP-CRYPTO-4006` becomes key-not-found. A `destroy_key` drops the cache entry when the host confirms the destroy or reports the key absent, and keeps it when the host fails. The cache can still hold a destroyed key: a resolution of an uncached id awaits the host's `get_public_key`, a `destroy_key` of the same id completes meanwhile, and the resolution then caches the key the host has just destroyed. No operation succeeds from that entry alone. `sign`, `public_key`, `dh_agree`, `ed25519_to_x25519_agree`, the seed export and `derive_pseudonym` each call the host, which answers key-not-found; a request the cached type or role refuses fails with `WrongKeyType` or `NotIdentityKey` before any host call; and a later `destroy_key` of the id reaches the host, which reports the key absent, and drops the entry. A generation the caller drops after the host returns its key id may leave an unreferenced key on the host, which no adapter destroys.
 
 ### Context
 
@@ -835,13 +837,13 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
         bytes sign(string key_id, bytes message);
 
         [Throws=ScpError]
-        bytes get_public_key(string key_id);
+        bytes get_public_key(string key_id);  // amended 2026-10-10: returns CustodyPublicKey
 
         [Throws=ScpError]
         void destroy_key(string key_id);
 
         [Throws=ScpError]
-        string generate_keypair(string key_type);
+        string generate_keypair(string key_type);  // amended 2026-10-10: (CustodyKeyType, CustodyKeyRole)
 
         [Throws=ScpError]
         bytes dh_agree(string key_id, bytes peer_public);

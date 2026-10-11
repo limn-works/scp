@@ -99,6 +99,20 @@ export class CryptoError extends ScpError {
   }
 }
 
+/**
+ * Thrown by a `KeyCustodyProvider` callback that holds no key for the
+ * key id it was given. The native bridge reads the thrown error's `code`
+ * (`"SCP-CRYPTO-4006"`) and reports a typed key-not-found; any other throw is
+ * a custody error (`SCP-CRYPTO-4060`). A provider may equally throw any error
+ * with that `code`.
+ */
+export class KeyNotFoundError extends CryptoError {
+  constructor(message = "key not found") {
+    super(message, "SCP-CRYPTO-4006");
+    this.name = "KeyNotFoundError";
+  }
+}
+
 /** Network, relay, connection failures. */
 export class TransportError extends ScpError {
   constructor(message: string, code: string) {

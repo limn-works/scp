@@ -89,6 +89,20 @@ class CryptoError(ScpError):
     _default_code: str = "SCP-CRYPTO-4000"
 
 
+class KeyNotFoundError(CryptoError):
+    """A ``KeyCustodyProvider`` has no key for the given key id.
+
+    The custody-provider protocol's typed not-found: a provider raises it when
+    it holds no key for the key id it was given. The native bridge reads the
+    exception's ``code``, ``SCP-CRYPTO-4006``, and reports ``KeyNotFound``, as
+    it does for any exception carrying that code; any other exception a
+    provider raises is a custody error. The match is by code, never by message
+    text.
+    """
+
+    _default_code: str = "SCP-CRYPTO-4006"
+
+
 class TransportError(ScpError):
     """Network or relay communication failure."""
 

@@ -19,8 +19,13 @@
 import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 
-import { CryptoError, ScpError } from "../src/errors";
-import type { KeyCustodyProvider } from "../src/scp";
+import { CryptoError, KeyNotFoundError, ScpError } from "../src/errors";
+import type {
+  CustodyKeyRole,
+  CustodyKeyType,
+  CustodyPublicKey,
+  KeyCustodyProvider,
+} from "../src/scp";
 import { p256SoftwarePseudonymPoint, SCP } from "../src/scp";
 import { skipReasonIfAddonAbsent } from "./napi-guard";
 
@@ -47,6 +52,8 @@ type PseudonymFault = "legacy32" | "deriveKeyNotFound";
 
 class CryptoKeychain implements KeyCustodyProvider {
   #seeds = new Map<string, Uint8Array>();
+  // Key id -> the role generateKeypair minted it in.
+  #roles = new Map<string, CustodyKeyRole>();
   #next = 1;
   readonly #fault: PseudonymFault | undefined;
 
@@ -54,10 +61,11 @@ class CryptoKeychain implements KeyCustodyProvider {
     this.#fault = fault;
   }
 
-  generateKeypair(_keyType: string): string {
+  generateKeypair(_keyType: CustodyKeyType, role: CustodyKeyRole): string {
     const { privateKey } = crypto.generateKeyPairSync("ed25519");
     const jwk = privateKey.export({ format: "jwk" }) as { d: string };
     const kid = String(this.#next++);
+    this.#roles.set(kid, role);
     this.#seeds.set(kid, new Uint8Array(Buffer.from(jwk.d, "base64url")));
     return kid;
   }
@@ -76,7 +84,7 @@ class CryptoKeychain implements KeyCustodyProvider {
 
   #keyObject(keyId: string): crypto.KeyObject {
     const seed = this.#seeds.get(keyId);
-    if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
+    if (seed === undefined) throw new KeyNotFoundError(`unknown key id: ${keyId}`);
     return this.#keyObjectFromSeed(seed);
   }
 
@@ -84,14 +92,25 @@ class CryptoKeychain implements KeyCustodyProvider {
     return new Uint8Array(crypto.sign(null, Buffer.from(message), this.#keyObject(keyId)));
   }
 
-  getPublicKey(keyId: string): Uint8Array {
+  getPublicKey(keyId: string): CustodyPublicKey {
     const pub = crypto.createPublicKey(this.#keyObject(keyId));
     const jwk = pub.export({ format: "jwk" }) as { x: string };
-    return new Uint8Array(Buffer.from(jwk.x, "base64url"));
+    return {
+      keyType: "ed25519",
+      publicKey: new Uint8Array(Buffer.from(jwk.x, "base64url")),
+      role: this.#role(keyId),
+    };
+  }
+
+  #role(keyId: string): CustodyKeyRole {
+    const role = this.#roles.get(keyId);
+    if (role === undefined) throw new KeyNotFoundError(`no role recorded for ${keyId}`);
+    return role;
   }
 
   destroyKey(keyId: string): void {
     this.#seeds.delete(keyId);
+    this.#roles.delete(keyId);
   }
 
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array {
@@ -106,7 +125,7 @@ class CryptoKeychain implements KeyCustodyProvider {
 
   #identitySeed(keyId: string): Uint8Array {
     const seed = this.#seeds.get(keyId);
-    if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
+    if (seed === undefined) throw new KeyNotFoundError(`unknown key id: ${keyId}`);
     return seed;
   }
 

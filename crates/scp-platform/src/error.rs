@@ -29,6 +29,16 @@ pub enum PlatformError {
         actual: KeyType,
     },
 
+    /// A pseudonym derivation named a key that is not an identity key.
+    ///
+    /// Only the identity key (`#0`, minted by
+    /// [`KeyCustody::generate_identity_keypair`](crate::traits::KeyCustody::generate_identity_keypair))
+    /// may be the source of a pseudonym (`09-security-model.md` §9.10.4.A); an
+    /// operational key of any type fails with this error before its type is
+    /// checked.
+    #[error("not an identity key: only the identity key is a pseudonym-derivation source")]
+    NotIdentityKey,
+
     /// A storage operation failed.
     #[error("storage error: {0}")]
     StorageError(String),
@@ -113,6 +123,7 @@ impl From<&PlatformError> for scp_crypto::CustodyFailure {
                 scp_crypto::CustodyFailureKind::StorageLockHeld
             }
             PlatformError::WrongKeyType { .. }
+            | PlatformError::NotIdentityKey
             | PlatformError::StorageError(_)
             | PlatformError::AttestationError(_)
             | PlatformError::PushError(_)
