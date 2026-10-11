@@ -8,8 +8,8 @@
  * The creator and the joiner each run their own [SCP] instance with its own
  * database, as two devices would, and each passes its own
  * [KeyCustodyProvider], because only a provider reaches the host key store
- * (spec section 3.2.2), and a build without the `testing` feature raises
- * `SCP-IDENT-1059` for `CustodyType.ENCRYPTED_FILE`.
+ * (spec section 3.2.2). [works.limn.scp.CustodyType] states which identity
+ * creations a build without the `testing` feature refuses.
  *
  * Prerequisites:
  *   implementation("works.limn:scp-kt:0.1.0")

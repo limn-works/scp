@@ -29,11 +29,8 @@ For a full Android app, import into Android Studio and add the SCP SDK as a depe
 
 `makeKeyCustodyProvider()` in `Main.kt` throws until you implement it over your
 app's key store. The SDK ships no `uniffi.scp.KeyCustodyProvider`
-implementation. Its `CustodyType` carries `ENCRYPTED_FILE` and `OS_KEYSTORE`:
-a shipped build has no pre-rotation custody backend and raises `SCP-IDENT-1059`
-for `ENCRYPTED_FILE`, and `identityCreate` answers `OS_KEYSTORE` with
-`SCP-IDENT-1003`, because only a `KeyCustodyProvider` reaches the host key
-store. `AndroidKeyCustody` implements a different interface,
+implementation. The KDoc of `works.limn.scp.CustodyType` states which identity
+creations a build without the `testing` feature refuses. `AndroidKeyCustody` implements a different interface,
 `works.limn.scp.android.platform.KeyCustodyProvider`, so it cannot be passed to
 `identityCreateWithCustody`.
 
