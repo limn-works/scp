@@ -258,25 +258,33 @@ println!("Context ID: {}", handle.context_id());
 ### Python
 
 ```python
-from scp_sdk import Capability, Context, CustodyType, MemoryScope
+from scp_sdk.types import Capability, MemoryScope
 
-ctx = await Context.create(
-    creator=identity,
-    ceiling=[Capability.MESSAGES_READ, Capability.MESSAGES_WRITE, Capability.MEMBER_INVITE],
-    memory_scope=MemoryScope.FULL,
-    governance="single_admin",
-    ttl=3600.0,
+ctx = await scp.context_create(
+    identity.did,
+    {
+        "ceiling": [
+            Capability.MESSAGES_READ.value,
+            Capability.MESSAGES_WRITE.value,
+            Capability.MEMBER_INVITE.value,
+        ],
+        "memory_scope": MemoryScope.FULL.value,
+        "governance": "single_admin",
+        "ttl": 3600.0,
+    },
 )
 ```
 
 ### TypeScript
 
 ```typescript
-const ctx = await Context.create(identity, {
-  ceiling: ["messages:read", "messages:write", "member:invite"],
-  mode: "Encrypted",
-  governance: "single_admin",
-});
+const ctx = await scp.contextCreate(
+  identity,
+  JSON.stringify({
+    ceiling: ["messages:read", "messages:write", "member:invite"],
+    governance: "single_admin",
+  }),
+);
 ```
 
 ### Swift
@@ -337,31 +345,17 @@ for event in &events {
 ### Python
 
 ```python
-# Send
-await ctx.send(b"Hello from SCP", identity=identity)
+await scp.context_send(ctx._raw_handle, identity.did, b"Hello from SCP")
 
-# Receive
-receiver = await ctx.receive()
-async for msg in receiver:
-    print(f"{msg.sender_did}: {msg.content}")
-    break
-
-await ctx.close(identity)
+await scp.context_close(ctx._raw_handle, identity.did)
 ```
 
 ### TypeScript
 
 ```typescript
-// Send
-await ctx.send(new TextEncoder().encode("Hello from SCP"));
+await scp.contextSend(ctx._rawHandle, identity.did, new TextEncoder().encode("Hello from SCP"), null);
 
-// Receive
-for await (const msg of ctx.receive()) {
-  console.log(`${msg.senderDid}: ${msg.content}`);
-  break;
-}
-
-await ctx.close();
+await scp.contextClose(ctx._rawHandle, identity.did);
 ```
 
 ### Swift
@@ -423,7 +417,7 @@ match ctx.send(payload).await {
 from scp_sdk import ScpError, ContextError
 
 try:
-    await ctx.send(b"data")
+    await scp.context_send(ctx._raw_handle, identity.did, b"data")
 except ContextError as e:
     print(f"[{e.code}] {e}")
 ```
@@ -434,7 +428,7 @@ except ContextError as e:
 import { ScpError, ContextError } from "@limn-works/scp-ts";
 
 try {
-  await ctx.send(payload);
+  await scp.contextSend(ctx._rawHandle, identity.did, payload, null);
 } catch (e) {
   if (e instanceof ContextError) {
     console.error(`[${e.code}] ${e.message}`);

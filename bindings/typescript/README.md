@@ -102,7 +102,7 @@ All errors extend `ScpError` with a machine-readable `code` field:
 import { ScpError, ContextError } from "@limn-works/scp-ts";
 
 try {
-  await ctx.send(payload);
+  await scp.contextSend(ctx._rawHandle, identity.did, payload, null);
 } catch (e) {
   if (e instanceof ContextError) {
     console.error(`[${e.code}] ${e.message}`);
