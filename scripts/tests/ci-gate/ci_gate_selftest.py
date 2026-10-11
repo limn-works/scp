@@ -8379,6 +8379,8 @@ SHIPPED_CONFIG_FULL_RUN_LANES = {
 # Flags a full-run command may carry: none selects a target or a test. A full
 # run is a command made only of these, so any selector (`--lib`, `--test X`,
 # `--doc`, `-E`, a name, `-- --skip X`) fails it without being listed.
+# LINT_FULL_RUN_SWITCHES adds `--all-targets` for a lint only: on `cargo test`
+# it selects every target but the doctests.
 FULL_RUN_VALUE_FLAGS = {
     "-p",
     "--package",
@@ -8391,7 +8393,6 @@ FULL_RUN_VALUE_FLAGS = {
     "--target-dir",
 }
 FULL_RUN_SWITCHES = {
-    "--all-targets",
     "--locked",
     "--frozen",
     "--offline",
@@ -8401,6 +8402,7 @@ FULL_RUN_SWITCHES = {
     "-v",
     "--verbose",
 }
+LINT_FULL_RUN_SWITCHES = FULL_RUN_SWITCHES | {"--all-targets"}
 HARNESS_FULL_RUN_VALUE_FLAGS = {"--test-threads"}
 HARNESS_FULL_RUN_SWITCHES = {"--nocapture", "--show-output"}
 
@@ -8430,7 +8432,8 @@ def selects_every_target(tokens: list[str], lint: bool = False) -> bool:
                 return False
         return not take_next
 
-    return only(rest, FULL_RUN_VALUE_FLAGS, FULL_RUN_SWITCHES) and only(
+    switches = LINT_FULL_RUN_SWITCHES if lint else FULL_RUN_SWITCHES
+    return only(rest, FULL_RUN_VALUE_FLAGS, switches) and only(
         harness_side, HARNESS_FULL_RUN_VALUE_FLAGS, HARNESS_FULL_RUN_SWITCHES
     )
 
@@ -8519,6 +8522,7 @@ def check_shipped_config_full_runs(jobs: dict) -> None:
         "--bins",
         "--doc",
         "--examples",
+        "--all-targets",
         "lifecycle",
         "-- conformance",
         "-- --skip e2e",
