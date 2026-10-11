@@ -23,9 +23,9 @@ import works.limn.scp.CustodyType
 import works.limn.scp.bridge.CoroutineBridge
 
 fun basicMessagingExample(bridge: CoroutineBridge) = runBlocking {
-    // Create two identities (in_memory custody for examples)
-    val aliceHandle = bridge.identity.create(CustodyType.IN_MEMORY)
-    val bobHandle = bridge.identity.create(CustodyType.IN_MEMORY)
+    // Create two identities whose keys live in $HOME/.scp/keys.bin (encrypted_file custody)
+    val aliceHandle = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
+    val bobHandle = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
     println("Alice identity handle: $aliceHandle")
     println("Bob identity handle: $bobHandle")
 

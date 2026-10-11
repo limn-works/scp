@@ -6,8 +6,8 @@
  * minting the UCAN token a caller presents to invoke it.
  *
  * The operator's identity comes from a caller-supplied [KeyCustodyProvider].
- * `CustodyType.IN_MEMORY` works only in a build compiled with the `testing`
- * feature.
+ * [works.limn.scp.CustodyType] states which identity creations a build
+ * without the `testing` feature refuses.
  *
  * Prerequisites:
  *   implementation("works.limn:scp-kt:0.1.0")

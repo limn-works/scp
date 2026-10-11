@@ -9,23 +9,29 @@
 // stops compiling or misbehaves. The test task declares `README.md` as an
 // input, so an edit to the README alone reruns these tests.
 //
-// Both examples use `CustodyType.IN_MEMORY`, which only a native library built
-// with the `testing` feature accepts; the test task builds it with
-// `-Pscp.uniffi.cargoFeatures=testing`, as CI does. A native library that is
-// absent or fails to load fails the run tests, matching ScpClassTest.
+// The quick start uses `CustodyType.ENCRYPTED_FILE`, for which a native library
+// built without the `testing` feature has no pre-rotation custody backend
+// (`SCP-IDENT-1059`); the test task builds it with
+// `-Pscp.uniffi.cargoFeatures=testing`, as CI does, and the run test points
+// `HOME` and `SCP_KEY_PASSPHRASE` at a temporary key file. The error-handling
+// test creates its identity through the test-harness in-memory key store
+// (`TestHarnessCustody.kt`). A native library that is absent or fails to load
+// fails the run tests, matching ScpClassTest.
 
 package works.limn.scp.quickstart
 
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
 import uniffi.scp.CeilingPolicy
 import uniffi.scp.ContextMode
 import uniffi.scp.ContextParams
 import uniffi.scp.GovernanceModel
 import uniffi.scp.MemoryScope
 import uniffi.scp.StorageConfig
-import works.limn.scp.CustodyType
 import works.limn.scp.SCP
+import works.limn.scp.identityCreateInMemory
+import works.limn.scp.withKeyFileEnvironment
 import java.io.File
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -54,8 +60,14 @@ class ReadmeQuickStartTest {
     }
 
     @Test
-    fun `the README quick start runs`() {
-        runBlocking { main() }
+    fun `the README quick start runs`(
+        @TempDir home: File,
+    ) {
+        withKeyFileEnvironment(home, "kotlin-readme-quick-start") {
+            runBlocking { main() }
+        }
+        val keyFile = File(home, ".scp/keys.bin")
+        assertTrue(keyFile.isFile, "the quick start wrote no key file at ${keyFile.path}")
     }
 
     // The README function returns a code only from its `catch (e: ScpException.Context)`
@@ -65,7 +77,7 @@ class ReadmeQuickStartTest {
     fun `the README error handling catches the context exception`() {
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
-            val identity = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+            val identity = scp.identityCreateInMemory()
             val ctx = scp.contextCreate(identity = identity, params = contextParams())
             scp.contextClose(handle = ctx, identity = identity)
 

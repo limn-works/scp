@@ -6,8 +6,9 @@
  *
  * [works.limn.scp.CustodyType] names the custody request of spec section
  * 3.2.2. `identityCreate(custody)` answers `OS_KEYSTORE` with `SCP-IDENT-1003`,
- * because only a [uniffi.scp.KeyCustodyProvider] reaches the host key store,
- * and `IN_MEMORY` works only in a build compiled with the `testing` feature.
+ * because only a [uniffi.scp.KeyCustodyProvider] reaches the host key store.
+ * The KDoc of [works.limn.scp.CustodyType] states which identity creations a
+ * build without the `testing` feature refuses.
  * This example implements the provider over the caller's own key store and
  * passes it to `identityCreateWithCustody`.
  *

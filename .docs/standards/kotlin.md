@@ -38,7 +38,7 @@ All I/O operations are `suspend` functions. Streaming uses `Flow<T>`. Blocking F
 class IdentityTest {
     @Test
     fun `create identity returns a 32-byte identifier`() = runTest {
-        val identity = Identity.create(custody = "in_memory")
+        val identity = scp.identityCreateInMemory() // test-harness helper, spec 03 §3.2.2
         // 09-security-model.md §9.7.4.2 R13
         assertEquals(32, identity.identifier.size)
     }

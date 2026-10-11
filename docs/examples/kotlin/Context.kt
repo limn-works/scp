@@ -7,8 +7,9 @@
  *
  * The creator and the joiner each run their own [SCP] instance with its own
  * database, as two devices would, and each passes its own
- * [KeyCustodyProvider]. `CustodyType.IN_MEMORY` works only in a build
- * compiled with the `testing` feature.
+ * [KeyCustodyProvider], because only a provider reaches the host key store
+ * (spec section 3.2.2). [works.limn.scp.CustodyType] states which identity
+ * creations a build without the `testing` feature refuses.
  *
  * Prerequisites:
  *   implementation("works.limn:scp-kt:0.1.0")

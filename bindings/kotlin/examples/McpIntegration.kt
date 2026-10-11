@@ -24,7 +24,7 @@ import works.limn.scp.OutletDefinition
 import works.limn.scp.bridge.CoroutineBridge
 
 fun mcpIntegrationExample(bridge: CoroutineBridge) = runBlocking {
-    val operatorHandle = bridge.identity.create(CustodyType.IN_MEMORY)
+    val operatorHandle = bridge.identity.create(CustodyType.ENCRYPTED_FILE)
     println("Operator handle: $operatorHandle")
 
     // Create a context with outlet capabilities
