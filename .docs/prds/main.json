@@ -3708,10 +3708,10 @@
         "check_attestation_freshness(attestation) -> FreshnessStatus returns Fresh, Stale { since }, or Expired",
         "check_attestation_freshness evaluates renewal interval — stale attestations (past renewal interval but not expired) are degraded, not revoked",
         "check_threshold_attestation(&ThresholdCheckInput) -> ThresholdResult counts attestations of the given type from the attestor set",
-        "ThresholdCheckInput carries attestation_type, attestors, requirement, subject_did, resolver (DidPublicKeyResolver), clock (Clock), and revocation_checker (Option<&dyn AttestationRevocationChecker>) as named fields",
+        "ThresholdCheckInput carries attestation_type, attestors, requirement, subject_did, resolver (DidPublicKeyResolver), clock (Clock), and revocation_checker (&dyn AttestationRevocationChecker) as named fields",
         "check_threshold_attestation counts an attestor only when that attestor's attestation names subject_did as its subject",
         "check_threshold_attestation counts an attestor only when that attestation's issuer equals that attestor's own identifier",
-        "check_threshold_attestation counts an attestor only when verify_attestation_with_revocation returns Ok for that attestation",
+        "check_threshold_attestation counts an attestor only when verify_attestation returns Ok for that attestation",
         "check_threshold_attestation deduplicates counted attestors by identifier per spec §7.3.5 rule 1, so N copies of one attestor yield valid_count == 1, and deduplication runs after verification so a rejected duplicate never consumes a slot",
         "check_threshold_attestation verifies independence: shared context memberships and mutual endorsements reduce independence score",
         "check_threshold_attestation returns whether the N-of-M threshold is met with sufficient independence"
