@@ -1,3 +1,8 @@
+import java.lang.reflect.InvocationHandler
+import java.lang.reflect.Method
+import java.lang.reflect.Proxy
+import java.net.URLClassLoader
+
 plugins {
     id("com.android.library")
     kotlin("android")
@@ -39,6 +44,190 @@ class JnaLibraryPath(
         val dir = cargoTargetDir.get()
         return listOf("-Djna.library.path=$dir/debug${File.pathSeparator}$dir/release")
     }
+}
+
+// Robolectric offline mode (robolectric.org/configuring, "Offline mode"). By
+// default Robolectric downloads the `android-all-instrumented` jar for each SDK a
+// test runs against from Maven Central at test time, through its own
+// `MavenArtifactFetcher`, outside Gradle's resolution, cache, and retries, so a
+// failed download failed every Robolectric test. Gradle now resolves those jars
+// through `robolectricAndroidAll`, syncs them into one directory, and the test JVM
+// runs with `robolectric.offline=true` and `robolectric.dependency.dir` set to it.
+// In offline mode a jar missing from that directory fails the test with
+// `IllegalArgumentException: Path is not a file: <dir>/<jar>`.
+val robolectricVersion = "4.14.1"
+
+// Every SDK level a Robolectric test runs against, read from the test sources.
+// Robolectric takes a test's SDK from its `@Config(sdk = ...)`, else from an
+// `sdk=` line in a `robolectric.properties` test resource, else from the
+// manifest's targetSdkVersion (`DefaultSdkPicker`). That last default does not
+// come from `compileSdk`: under `manifest = Config.NONE`, which every test here
+// sets, Robolectric's `AndroidManifest` has no manifest to read and reports its
+// built-in fallback, 21; without it, the merged test manifest's targetSdkVersion
+// decides. Rather than mirror that rule, the build requires each Robolectric test
+// class to name its SDK in `@Config` or `robolectric.properties`, and this
+// function fails the build when one does not.
+// A level this scan misses still fails closed at test time with the
+// `Path is not a file` error above, never a download.
+fun robolectricSdkLevels(): Set<Int> {
+    val sources =
+        fileTree("src").matching { include("test*/**/*.kt", "test*/**/*.java") }.files
+    val propertyFiles =
+        fileTree("src").matching { include("test*/resources/**/robolectric.properties") }.files
+    val levels = sortedSetOf<Int>()
+    fun parseLevels(
+        text: String,
+        where: String,
+    ): List<Int> =
+        text.split(',').map { it.trim() }.filter { it.isNotEmpty() }.map {
+            it.toIntOrNull()
+                ?: throw GradleException(
+                    "$where: Robolectric SDK `$it` is not an integer literal; the build " +
+                        "resolves the android-all jar for each level and reads only literals",
+                )
+        }
+    var propertiesNameSdk = false
+    propertyFiles.forEach { file ->
+        file.readLines().map { it.trim() }.filter { it.startsWith("sdk=") }.forEach {
+            levels += parseLevels(it.removePrefix("sdk="), file.path)
+            propertiesNameSdk = true
+        }
+    }
+    val runner = Regex("""@RunWith\(\s*\w*RobolectricTestRunner::class""")
+    val sdkArgument = Regex("""\bsdk\s*=\s*(?:\[([^\]]*)]|intArrayOf\(([^)]*)\)|\{([^}]*)}|(\d+))""")
+    sources.forEach { file ->
+        val text = file.readText()
+        var sdkConfigs = 0
+        var start = text.indexOf("@Config(")
+        while (start >= 0) {
+            var depth = 0
+            var end = start + "@Config".length
+            do {
+                when (text[end]) {
+                    '(' -> depth++
+                    ')' -> depth--
+                }
+                end++
+            } while (depth > 0 && end < text.length)
+            val annotation = text.substring(start, end)
+            if (Regex("""\b(minSdk|maxSdk)\s*=""").containsMatchIn(annotation)) {
+                throw GradleException(
+                    "${file.path}: `$annotation` uses minSdk/maxSdk; name each level in `sdk`",
+                )
+            }
+            sdkArgument.find(annotation)?.let { match ->
+                levels += parseLevels(match.groupValues.drop(1).first { it.isNotEmpty() }, file.path)
+                sdkConfigs++
+            }
+            start = text.indexOf("@Config(", end)
+        }
+        val runners = runner.findAll(text).count()
+        if (runners > sdkConfigs && !propertiesNameSdk) {
+            throw GradleException(
+                "${file.path}: $runners Robolectric test class(es) but $sdkConfigs `@Config(sdk = ...)`; " +
+                    "name the SDK level in each class's `@Config` so the build resolves its android-all jar",
+            )
+        }
+    }
+    return levels
+}
+
+// The Maven coordinates of the android-all jar Robolectric loads for each level,
+// asked of Robolectric's own `DefaultSdkProvider` on the unit-test classpath, so
+// they match the table the test JVM reads and follow a Robolectric upgrade. The
+// provider calls its `DependencyResolver` with the jar it wants; the proxy below
+// records that jar and answers with an existing file so `getJarPath` returns.
+fun robolectricAndroidAllCoordinates(
+    classpath: Set<File>,
+    levels: Set<Int>,
+): List<String> {
+    val loader =
+        URLClassLoader(
+            classpath.map { it.toURI().toURL() }.toTypedArray(),
+            ClassLoader.getPlatformClassLoader(),
+        )
+    return loader.use { robolectric ->
+        val dependencyJar = robolectric.loadClass("org.robolectric.internal.dependency.DependencyJar")
+        val resolverType = robolectric.loadClass("org.robolectric.internal.dependency.DependencyResolver")
+        val anyExistingFile = classpath.first { file -> file.isFile }.toURI().toURL()
+        val requested = mutableListOf<String>()
+        val handler =
+            InvocationHandler { proxy: Any, method: Method, args: Array<Any?>? ->
+                when (method.name) {
+                    "getLocalArtifactUrl" -> {
+                        val jar = args?.firstOrNull()
+                        val part = { name: String -> dependencyJar.getMethod(name).invoke(jar).toString() }
+                        requested += "${part("getGroupId")}:${part("getArtifactId")}:${part("getVersion")}"
+                        anyExistingFile
+                    }
+                    "toString" -> "robolectricAndroidAllCoordinates resolver"
+                    "hashCode" -> System.identityHashCode(proxy)
+                    "equals" -> proxy === args?.firstOrNull()
+                    else -> throw GradleException("unexpected DependencyResolver call ${method.name}")
+                }
+            }
+        val resolver = Proxy.newProxyInstance(robolectric, arrayOf(resolverType), handler)
+        val provider =
+            robolectric
+                .loadClass("org.robolectric.plugins.DefaultSdkProvider")
+                .getConstructor(resolverType)
+                .newInstance(resolver)
+        val sdks = (provider.javaClass.getMethod("getSdks").invoke(provider) as Collection<*>).filterNotNull()
+        val byLevel = sdks.associateBy { sdk -> sdk.javaClass.getMethod("getApiLevel").invoke(sdk) as Int }
+        levels.forEach { level ->
+            val sdk =
+                byLevel[level]
+                    ?: throw GradleException(
+                        "Robolectric $robolectricVersion knows no SDK $level (known: ${byLevel.keys.sorted()})",
+                    )
+            sdk.javaClass.getMethod("getJarPath").invoke(sdk)
+        }
+        requested.distinct()
+    }
+}
+
+// One detached configuration per jar: the jars share `group:artifact` and differ
+// only in version, so a single configuration would keep only the highest version
+// through Gradle's conflict resolution and drop every other SDK's jar.
+val robolectricAndroidAll: Provider<List<Configuration>> =
+    provider {
+        // External jars only: Robolectric's classes need no project output, so
+        // resolving them must not compile this module or `:scp-kt`.
+        val classpath =
+            configurations
+                .getByName("debugUnitTestRuntimeClasspath")
+                .incoming
+                .artifactView {
+                    attributes { attribute(Attribute.of("artifactType", String::class.java), "android-classes-jar") }
+                    componentFilter { it is ModuleComponentIdentifier }
+                }.files
+                .files
+        val levels = robolectricSdkLevels()
+        val coordinates = robolectricAndroidAllCoordinates(classpath, levels)
+        logger.info("Robolectric SDK levels {} resolve to {}", levels, coordinates)
+        coordinates.map { coordinate ->
+            configurations.detachedConfiguration(dependencies.create(coordinate)).apply { isTransitive = false }
+        }
+    }
+
+val robolectricDependencyDir: Provider<Directory> = layout.buildDirectory.dir("robolectric/android-all")
+
+val syncRobolectricAndroidAll =
+    tasks.register<Sync>("syncRobolectricAndroidAll") {
+        from(robolectricAndroidAll)
+        into(robolectricDependencyDir)
+    }
+
+// Passes the offline-mode properties to the unit-test JVM. The directory is a task
+// input, so a changed jar set reruns the tests.
+class RobolectricOffline(
+    @get:InputFiles @get:PathSensitive(PathSensitivity.NAME_ONLY) val dependencyDir: Provider<Directory>,
+) : CommandLineArgumentProvider {
+    override fun asArguments(): Iterable<String> =
+        listOf(
+            "-Drobolectric.offline=true",
+            "-Drobolectric.dependency.dir=${dependencyDir.get().asFile.absolutePath}",
+        )
 }
 
 group = "works.limn"
@@ -95,6 +284,10 @@ android {
                 // The pseudonym tests call the `scp-ffi-uniffi` P-256 exports (§9.5,
                 // §9.10.4) through the `:scp-kt` bindings, so JNA must find the cdylib.
                 it.jvmArgumentProviders.add(JnaLibraryPath(cargoTargetDir))
+                // Robolectric reads its android-all jars from the directory Gradle
+                // fills, never from the network (see `robolectricAndroidAll`).
+                it.dependsOn(syncRobolectricAndroidAll)
+                it.jvmArgumentProviders.add(RobolectricOffline(robolectricDependencyDir))
             }
         }
     }
@@ -153,7 +346,7 @@ dependencies {
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit5")
     testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.11.4")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
-    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("org.robolectric:robolectric:$robolectricVersion")
     testImplementation("androidx.test:core:1.6.1")
     testImplementation("androidx.lifecycle:lifecycle-runtime-testing:2.8.7")
     testImplementation("junit:junit:4.13.2")
