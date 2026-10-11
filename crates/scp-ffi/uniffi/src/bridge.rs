@@ -19262,6 +19262,32 @@ mod tests {
     #[test]
     fn identity_create_with_custody_fails_closed_without_pre_rotation_backend() {
         let scp = scp_test();
+        if let Some(case) = crate::test_env::child_case() {
+            let (result, want) = match case.as_str() {
+                "identity_create" => (
+                    runtime().block_on(scp.identity_create("encrypted_file".to_owned(), None)),
+                    codes::IDENT_1059,
+                ),
+                "identity_create_with_agent_key" => (
+                    runtime()
+                        .block_on(scp.identity_create_with_agent_key("encrypted_file".to_owned())),
+                    codes::IDENT_1059,
+                ),
+                "identity_create without a passphrase" => (
+                    runtime().block_on(scp.identity_create("encrypted_file".to_owned(), None)),
+                    codes::VALID_7001,
+                ),
+                other => panic!("unknown case {other}"),
+            };
+            match result {
+                Err(ScpError::Identity { code, msg } | ScpError::Validation { code, msg }) => {
+                    assert_eq!(code, want, "{case}(encrypted_file): {msg}");
+                }
+                Err(other) => panic!("{case}(encrypted_file): expected {want}, got {other:?}"),
+                Ok(_) => panic!("{case}(encrypted_file) must FAIL CLOSED on a shipped build"),
+            }
+            return;
+        }
         let result = runtime()
             .block_on(scp.identity_create_with_custody(Box::new(NeverAnsweringCustodyProvider)));
         match result {
@@ -19285,50 +19311,26 @@ mod tests {
         // `encrypted_file` resolves HOME and SCP_KEY_PASSPHRASE on a shipped
         // build, so a bad variable is SCP-VALID-7001, and then refuses with
         // SCP-IDENT-1059 before the key file opens, so a refused call leaves
-        // no `$HOME/.scp` (spec 03 §3.2.2, ADR-062 §Decision 6).
+        // no `$HOME/.scp` (spec 03 §3.2.2, ADR-062 §Decision 6). Each case
+        // runs in a child process that `test_env::run_case` starts with its
+        // own HOME and SCP_KEY_PASSPHRASE, so this test sets no environment
+        // variable in a process where other tests run.
         let home = tempfile::tempdir().expect("tempdir");
-        let saved_home = std::env::var_os("HOME");
-        let saved_passphrase = std::env::var_os("SCP_KEY_PASSPHRASE");
-        let mut outcomes = Vec::new();
-        // SAFETY: nextest runs each test in its own process, and no other test
-        // in this binary reads HOME or SCP_KEY_PASSPHRASE; both are restored
-        // below before any assertion can panic.
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("SCP_KEY_PASSPHRASE", "fail-closed-test-passphrase");
-            outcomes.push((
-                "identity_create",
-                codes::IDENT_1059,
-                runtime().block_on(scp.identity_create("encrypted_file".to_owned(), None)),
-            ));
-            outcomes.push((
-                "identity_create_with_agent_key",
-                codes::IDENT_1059,
-                runtime().block_on(scp.identity_create_with_agent_key("encrypted_file".to_owned())),
-            ));
-            std::env::remove_var("SCP_KEY_PASSPHRASE");
-            outcomes.push((
-                "identity_create without a passphrase",
-                codes::VALID_7001,
-                runtime().block_on(scp.identity_create("encrypted_file".to_owned(), None)),
-            ));
-            match &saved_home {
-                Some(saved) => std::env::set_var("HOME", saved),
-                None => std::env::remove_var("HOME"),
-            }
-            match &saved_passphrase {
-                Some(saved) => std::env::set_var("SCP_KEY_PASSPHRASE", saved),
-                None => std::env::remove_var("SCP_KEY_PASSPHRASE"),
-            }
-        }
-        for (entry, want, result) in outcomes {
-            match result {
-                Err(ScpError::Identity { code, msg } | ScpError::Validation { code, msg }) => {
-                    assert_eq!(code, want, "{entry}(encrypted_file): {msg}");
-                }
-                Err(other) => panic!("{entry}(encrypted_file): expected {want}, got {other:?}"),
-                Ok(_) => panic!("{entry}(encrypted_file) must FAIL CLOSED on a shipped build"),
-            }
+        let passphrase = std::ffi::OsStr::new("fail-closed-test-passphrase");
+        for (case, passphrase) in [
+            ("identity_create", Some(passphrase)),
+            ("identity_create_with_agent_key", Some(passphrase)),
+            ("identity_create without a passphrase", None),
+        ] {
+            crate::test_env::run_case(
+                module_path!(),
+                "identity_create_with_custody_fails_closed_without_pre_rotation_backend",
+                case,
+                &[
+                    ("HOME", Some(home.path().as_os_str())),
+                    ("SCP_KEY_PASSPHRASE", passphrase),
+                ],
+            );
         }
         let key_dir = home.path().join(".scp");
         assert!(

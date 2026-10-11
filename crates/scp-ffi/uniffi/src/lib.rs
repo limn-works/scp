@@ -756,11 +756,93 @@ pub trait DeviceAttestationProvider: Send + Sync {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Runs a test case in a child process with its own environment, so no test
+/// mutates the environment of a process whose other threads may read it.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod test_env {
+    use std::ffi::OsStr;
+
+    /// The variable that carries the case name into the child process.
+    const CASE_VAR: &str = "SCP_UNIFFI_TEST_ENV_CASE";
+
+    /// The case this process runs, or `None` in the parent test process.
+    pub fn child_case() -> Option<String> {
+        std::env::var(CASE_VAR).ok()
+    }
+
+    /// Re-runs the test `test_fn` of module `module` (pass `module_path!()`)
+    /// in a fresh process of this test binary with `CASE_VAR` set to `case`,
+    /// each `(name, Some(value))` variable set and each `(name, None)` removed.
+    /// Panics unless the child ran exactly that one test and it passed.
+    pub fn run_case(module: &str, test_fn: &str, case: &str, vars: &[(&str, Option<&OsStr>)]) {
+        let module = module.split_once("::").map_or("", |(_, rest)| rest);
+        let name = format!("{module}::{test_fn}");
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+        cmd.args([name.as_str(), "--exact", "--test-threads=1"])
+            .env(CASE_VAR, case);
+        for (var, value) in vars {
+            match value {
+                Some(value) => cmd.env(var, value),
+                None => cmd.env_remove(var),
+            };
+        }
+        let out = cmd.output().expect("spawn the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // libtest exits 0 when the filter matches no test, so require the
+        // count of tests that ran as well as the exit status.
+        assert!(
+            out.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "case {case} of {name} did not pass in its child process:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use scp_ffi_common::error_codes as codes;
+
+    /// `test_env::run_case` passes for a case that ran and passed.
+    #[test]
+    fn run_case_passes_when_the_child_case_passes() {
+        if test_env::child_case().is_some() {
+            return;
+        }
+        test_env::run_case(
+            module_path!(),
+            "run_case_passes_when_the_child_case_passes",
+            "noop",
+            &[],
+        );
+    }
+
+    /// `test_env::run_case` fails for a test name no test carries, because
+    /// libtest exits 0 when its filter matches nothing.
+    #[test]
+    #[should_panic(expected = "did not pass in its child process")]
+    fn run_case_fails_when_no_test_matches() {
+        test_env::run_case(module_path!(), "no_test_has_this_name", "noop", &[]);
+    }
+
+    /// `test_env::run_case` fails when the child case fails. The child exits
+    /// nonzero rather than panicking, because `should_panic` would turn a
+    /// panic in the child into a pass.
+    #[test]
+    #[should_panic(expected = "did not pass in its child process")]
+    fn run_case_fails_when_the_child_case_fails() {
+        if test_env::child_case().is_some() {
+            std::process::exit(1);
+        }
+        test_env::run_case(
+            module_path!(),
+            "run_case_fails_when_the_child_case_fails",
+            "fail",
+            &[],
+        );
+    }
 
     /// Returns a fresh `Scp` instance for tests. Phase 4 PR 4 demolition
     /// (#1549) deleted the free-function façade.
@@ -899,7 +981,7 @@ mod tests {
     /// Swift/Kotlin SDK compiles.
     #[cfg(not(feature = "testing"))]
     #[test]
-    fn parse_custody_method_rejects_in_memory_on_a_shipped_build() {
+    fn identity_create_entry_points_reject_in_memory_on_a_shipped_build() {
         use scp_ffi_common::custody_request::ACCEPTED_CUSTODY;
 
         let rt = runtime();
@@ -936,97 +1018,89 @@ mod tests {
     /// and a key directory or key file this process cannot open is
     /// `SCP-IDENT-1008` (`.docs/standards/sdk-common.md` §Custody request).
     ///
-    /// The test mutates `HOME` and `SCP_KEY_PASSPHRASE`, so every case runs in
-    /// this one function and the variables are restored before the assertions.
-    /// No other test in this binary reads either variable.
+    /// Each case runs in a child process that `test_env::run_case` starts with
+    /// its own `HOME` and `SCP_KEY_PASSPHRASE`, so this test sets no
+    /// environment variable in a process where other tests run. The cases run
+    /// in order, because the wrong-passphrase case reads the key file the
+    /// first case sealed.
     #[cfg(feature = "testing")]
     #[test]
     fn identity_create_with_encrypted_file_custody_opens_the_key_file() {
         use scp_ffi_common::error_codes::{IDENT_1008, VALID_7001};
+        use std::ffi::OsStr;
 
-        let rt = runtime();
-        let scp = scp_test();
+        if let Some(case) = test_env::child_case() {
+            // (uses identity_create_with_agent_key, expected code or None for success)
+            let (agent_key, want) = match case.as_str() {
+                "create" => (false, None),
+                "agent key" => (true, None),
+                "wrong passphrase" | "HOME names a file" => (false, Some(IDENT_1008)),
+                "relative HOME" => (false, Some(VALID_7001)),
+                "unset passphrase" => (true, Some(VALID_7001)),
+                other => panic!("unknown case {other}"),
+            };
+            let rt = runtime();
+            let scp = scp_test();
+            let result = if agent_key {
+                rt.block_on(scp.identity_create_with_agent_key("encrypted_file".to_owned()))
+            } else {
+                rt.block_on(scp.identity_create("encrypted_file".to_owned(), None))
+            };
+            match want {
+                None => {
+                    let identity = result.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+                    assert_eq!(identity.custody_type(), "encrypted_file", "{case}");
+                    assert!(identity.did().starts_with("did:dht:"), "{case}");
+                }
+                Some(want) => {
+                    let outcome = create_outcome(result);
+                    assert_eq!(outcome.0, want, "{case}: {}", outcome.1);
+                }
+            }
+            return;
+        }
+
         let base = tempfile::tempdir().expect("tempdir");
         let home_create = base.path().join("create");
         let home_agent = base.path().join("agent");
         let home_is_a_file = base.path().join("plain-file");
         std::fs::write(&home_is_a_file, b"not a directory").expect("write plain file");
-        let saved_home = std::env::var_os("HOME");
-        let saved_passphrase = std::env::var_os("SCP_KEY_PASSPHRASE");
-
-        let mut created = Vec::new();
-        let mut rejected = Vec::new();
-        // SAFETY: nextest runs each test in its own process, and no other test
-        // in this binary reads HOME or SCP_KEY_PASSPHRASE; both are restored
-        // below before any assertion can panic.
-        unsafe {
-            std::env::set_var("SCP_KEY_PASSPHRASE", "encrypted-file-test-passphrase");
-            std::env::set_var("HOME", &home_create);
-            created.push((
-                "identity_create",
-                home_create.clone(),
-                rt.block_on(scp.identity_create("encrypted_file".to_owned(), None)),
-            ));
-            std::env::set_var("HOME", &home_agent);
-            created.push((
-                "identity_create_with_agent_key",
-                home_agent,
-                rt.block_on(scp.identity_create_with_agent_key("encrypted_file".to_owned())),
-            ));
-
-            // A wrong passphrase over the key file the first create sealed.
-            std::env::set_var("HOME", &home_create);
-            std::env::set_var("SCP_KEY_PASSPHRASE", "a-different-passphrase");
-            rejected.push((
+        let passphrase = OsStr::new("encrypted-file-test-passphrase");
+        let cases: [(&str, &OsStr, Option<&OsStr>); 6] = [
+            ("create", home_create.as_os_str(), Some(passphrase)),
+            ("agent key", home_agent.as_os_str(), Some(passphrase)),
+            (
                 "wrong passphrase",
-                IDENT_1008,
-                rt.block_on(scp.identity_create("encrypted_file".to_owned(), None)),
-            ));
-            // `$HOME/.scp` cannot be created under a regular file.
-            std::env::set_var("HOME", &home_is_a_file);
-            rejected.push((
+                home_create.as_os_str(),
+                Some(OsStr::new("a-different-passphrase")),
+            ),
+            (
                 "HOME names a file",
-                IDENT_1008,
-                rt.block_on(scp.identity_create("encrypted_file".to_owned(), None)),
-            ));
-            std::env::set_var("HOME", "relative-home");
-            rejected.push((
+                home_is_a_file.as_os_str(),
+                Some(passphrase),
+            ),
+            (
                 "relative HOME",
-                VALID_7001,
-                rt.block_on(scp.identity_create("encrypted_file".to_owned(), None)),
-            ));
-            std::env::set_var("HOME", &home_create);
-            std::env::remove_var("SCP_KEY_PASSPHRASE");
-            rejected.push((
-                "unset passphrase",
-                VALID_7001,
-                rt.block_on(scp.identity_create_with_agent_key("encrypted_file".to_owned())),
-            ));
-
-            match &saved_home {
-                Some(home) => std::env::set_var("HOME", home),
-                None => std::env::remove_var("HOME"),
-            }
-            match &saved_passphrase {
-                Some(passphrase) => std::env::set_var("SCP_KEY_PASSPHRASE", passphrase),
-                None => std::env::remove_var("SCP_KEY_PASSPHRASE"),
-            }
+                OsStr::new("relative-home"),
+                Some(passphrase),
+            ),
+            ("unset passphrase", home_create.as_os_str(), None),
+        ];
+        for (case, home, passphrase) in cases {
+            test_env::run_case(
+                module_path!(),
+                "identity_create_with_encrypted_file_custody_opens_the_key_file",
+                case,
+                &[("HOME", Some(home)), ("SCP_KEY_PASSPHRASE", passphrase)],
+            );
         }
-
-        for (entry, home, result) in created {
-            let identity = result.unwrap_or_else(|e| panic!("{entry}(encrypted_file): {e:?}"));
-            assert_eq!(identity.custody_type(), "encrypted_file", "{entry}");
-            assert!(identity.did().starts_with("did:dht:"), "{entry}");
+        for home in [&home_create, &home_agent] {
             let key_file = home.join(".scp").join("keys.bin");
             assert!(
                 key_file.is_file(),
-                "{entry} must create {}",
+                "a create must make {}",
                 key_file.display()
             );
-        }
-        for (case, want, result) in rejected {
-            let outcome = create_outcome(result);
-            assert_eq!(outcome.0, want, "{case}: {}", outcome.1);
         }
         assert!(
             !std::path::Path::new("relative-home").exists(),

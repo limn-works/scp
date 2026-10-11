@@ -4,9 +4,8 @@
 /// inspecting the resulting DID document, and resolving it.
 ///
 /// The Swift SDK ships no production key store that `identityCreate(custody:)`
-/// reaches: its one ``CustodyType``, `.inMemory`, works only in a build
-/// compiled with the `testing` feature, and a shipped build rejects it with
-/// `SCP-IDENT-1008`. A production caller implements ``KeyCustodyProvider``
+/// reaches; the doc comment on ``CustodyType`` states how a shipped build
+/// answers each case. A production caller implements ``KeyCustodyProvider``
 /// over its own key store and passes it to `identityCreateWithCustody`.
 ///
 /// Prerequisites:

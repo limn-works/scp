@@ -26,9 +26,9 @@ context lifecycle, messaging, and tool invocation.
 
 Each example is an `enum` with one `static func run` that your app calls. Every
 example that creates an identity takes a `KeyCustodyProvider`. The SDK ships no
-key store that `identityCreate(custody:)` reaches in a shipped build: its one
-`CustodyType`, `.inMemory`, works only in a build compiled with the `testing`
-feature, and a shipped build rejects it with `SCP-IDENT-1008`. Implement
+key store that `identityCreate(custody:)` reaches in a shipped build; the doc
+comment on `CustodyType` in `Sources/SCP/Types.swift` states how a shipped
+build answers each case. Implement
 `KeyCustodyProvider` over your own key store and pass it in:
 
 ```swift
