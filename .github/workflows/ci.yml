@@ -3351,11 +3351,14 @@ jobs:
       # the object fails here with an arg-type error instead of raising
       # SCP-VALID-7005 for the first reader who runs it. `--follow-imports=silent`
       # checks the examples against scp_sdk's types without reporting scp_sdk's
-      # own errors, which this step does not gate.
+      # own errors, which this step does not gate. A `type: ignore` comment in an
+      # example fails the step, because it can hide an untyped value from the
+      # arg-type check.
       - name: Type-check the SDK examples
         run: |
           source .venv/bin/activate
           cd bindings/python
+          if git grep -nE 'type: *ignore' -- examples; then exit 1; fi
           mypy --follow-imports=silent examples
       # `cd bindings/python` above resolves `tests/` to `bindings/python/tests/`,
       # so this step runs no pytest suite that lives elsewhere in this

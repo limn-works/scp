@@ -7,11 +7,11 @@ context handle explicitly.
 
 import asyncio
 
-from scp_sdk import SCP
+from scp_sdk import SCP, Context, Identity
 from scp_sdk.types import Capability, CustodyType, MemoryScope
 
 
-async def run_agent(scp: SCP, name: str, identity, ctx) -> None:  # type: ignore[no-untyped-def]
+async def run_agent(scp: SCP, name: str, identity: Identity, ctx: Context) -> None:
     """Agent loop: join context, listen for messages, respond."""
     await scp.context_join(ctx, identity.did)
     print(f"[{name}] Joined context {ctx.context_id}")

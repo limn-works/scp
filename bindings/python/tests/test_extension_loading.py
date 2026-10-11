@@ -344,15 +344,37 @@ EXTENSION_LEAF = "_scp_core"
 #: and hands the failure to ``reject_load_failure``, which tells a load failure
 #: apart from an absence. This mapping is the whole permission: a file it does
 #: not name, and a second import inside a file it does name, are both offenders.
-# `context.py` and `identity.py` each import one stub type under
-# `if TYPE_CHECKING:` to annotate `_raw_handle`. That import never runs, so it
-# cannot swallow a load failure.
-PERMITTED_EXTENSION_IMPORTS = {
-    "__init__.py": 1,
-    "_extension.py": 1,
-    "context.py": 1,
-    "identity.py": 1,
-}
+PERMITTED_EXTENSION_IMPORTS = {"__init__.py": 1, "_extension.py": 1}
+
+
+def _is_type_checking_test(test: ast.expr) -> bool:
+    """True when ``test`` is the bare name ``TYPE_CHECKING`` or ``typing.TYPE_CHECKING``."""
+    if isinstance(test, ast.Name):
+        return test.id == "TYPE_CHECKING"
+    return (
+        isinstance(test, ast.Attribute)
+        and test.attr == "TYPE_CHECKING"
+        and isinstance(test.value, ast.Name)
+        and test.value.id == "typing"
+    )
+
+
+def _runtime_nodes(tree: ast.AST) -> list[ast.AST]:
+    """Every node of ``tree`` except those in the body of an ``if TYPE_CHECKING:``.
+
+    That body never runs, so an import in it cannot swallow a load failure. The
+    block's ``else`` branch does run, so the walk still reads it.
+    """
+    nodes: list[ast.AST] = []
+    pending: list[ast.AST] = [tree]
+    while pending:
+        node = pending.pop()
+        nodes.append(node)
+        if isinstance(node, ast.If) and _is_type_checking_test(node.test):
+            pending.extend(node.orelse)
+            continue
+        pending.extend(ast.iter_child_nodes(node))
+    return nodes
 
 
 def _count_extension_imports(source: str) -> int:
@@ -368,10 +390,11 @@ def _count_extension_imports(source: str) -> int:
     The walk reads ``ast.Import`` and ``ast.ImportFrom`` nodes only. It does not
     count a call such as ``importlib.import_module("scp_sdk._scp_core")`` or
     ``__import__("scp_sdk._scp_core")``, because the module name in such a call
-    can be any expression and no syntax-tree walk decides its value.
+    can be any expression and no syntax-tree walk decides its value. It skips
+    the body of an ``if TYPE_CHECKING:`` block, which never runs.
     """
     total = 0
-    for node in ast.walk(ast.parse(source)):
+    for node in _runtime_nodes(ast.parse(source)):
         if isinstance(node, ast.Import):
             names = [alias.name for alias in node.names]
         elif isinstance(node, ast.ImportFrom):
@@ -486,6 +509,10 @@ def test_the_bare_name_detector_separates_bare_from_qualified_imports(
         "from scp_sdk._scp_core import SCP\n",
         "from _scp_core import SCP\n",
         "def _bridge():\n    from scp_sdk import _scp_core\n    return _scp_core\n",
+        "try:\n    from scp_sdk._scp_core import PyContextHandle\nexcept ImportError:\n    pass\n",
+        "if TYPE_CHECKING:\n    pass\nelse:\n    from scp_sdk._scp_core import PyIdentity\n",
+        "if not TYPE_CHECKING:\n    from scp_sdk._scp_core import PyIdentity\n",
+        "if DEBUG:\n    from scp_sdk._scp_core import PyIdentity\n",
     ],
 )
 def test_the_detector_counts_every_spelling_of_the_import(source: str) -> None:
@@ -513,6 +540,21 @@ def test_the_detector_counts_every_spelling_of_the_import(source: str) -> None:
 def test_the_detector_counts_no_statement_that_imports_something_else(source: str) -> None:
     """A name that starts with the extension's name is a different module, and
     prose that quotes the statement imports nothing."""
+    assert _count_extension_imports(source) == 0
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "if TYPE_CHECKING:\n    from scp_sdk._scp_core import PyContextHandle\n",
+        "if typing.TYPE_CHECKING:\n    from scp_sdk._scp_core import PyIdentity\n",
+    ],
+)
+def test_the_detector_skips_an_import_that_only_type_checkers_run(source: str) -> None:
+    """The body of an ``if TYPE_CHECKING:`` block never runs, so an import in it
+    cannot swallow a load failure. The same import outside that body, in its
+    ``else`` branch or under ``try``/``except ImportError``, counts 1 in the
+    spellings test above."""
     assert _count_extension_imports(source) == 0
 
 
