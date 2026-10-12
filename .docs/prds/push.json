@@ -74,12 +74,14 @@
         "crates/scp-protocol/src/discovery/push.rs",
         "crates/scp-platform/src/android/push_provider.rs",
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidPushProvider.kt",
-        "bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/platform/AndroidPushProviderTest.kt"
+        "bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/platform/AndroidPushProviderTest.kt",
+        ".docs/specs/16-test-infrastructure.md"
       ],
       "description": "Step 5 of \u00a710.7.1, the push registration protocol, fixed the relay's push payload as one byte string, `{ \"scp\": 1 }`, while ADR-025, the Apple platform adapter, fixed the APNs payload as `{\"aps\": {\"content-available\": 1}}`. Both texts claimed to define the exact bytes the relay sends to APNs, and iOS wakes a background app only for a payload that carries `aps.content-available`, so the \u00a710.7.1 text was wrong for APNs. ADR-027, the Android platform adapter, gave the FCM sender a body that addressed the device through the legacy FCM API's top-level `to` field, which the FCM HTTP v1 API rejects. ADR-025 acceptance criterion 4 also made `handleNotification` compare raw bytes, which no code on the iOS delivery path can run, because iOS hands the app a parsed `userInfo` dictionary.\n\nThis story replaces \u00a710.7.1 step 5 with a wake-signal table holding one request per platform (APNs and FCM; PUSH-021 adds the WebPush row) and adds a device receipt rule per platform. The plan's decisions D1, D2 and D10 govern: D1b, the device accepts an APNs wake only when the parsed dictionary has exactly the key `aps`, and `aps` has exactly `content-available` = 1; D2b, every FCM wake carries `android.priority: HIGH`; D10, the app calls the Rust core and the Rust core calls the UniFFI `PushProvider` callback. ADR-006, the in-memory platform adapter, and ADR-025 cite the \u00a710.7.1 table rather than restating the bytes. The SCP-096 action item that asked for an encrypted context identifier in the APNs payload contradicted \u00a710.7, which forbids any context in a push payload, so this story removes it. Doc comments in `scp-protocol`, `scp-platform` and the Kotlin Android adapter that restated `{ \"scp\": 1 }` or the legacy FCM body now cite the table. Swift and Kotlin code changes belong to PUSH-017 and PUSH-018.",
       "acceptanceCriteria": [
         "\u00a710.7.1 step 5 contains one table with the rows APNs and FCM, each giving the request body and the headers.",
         "The string `{ \"scp\": 1 }` no longer appears in \u00a710.7.1.",
+        "`git grep -n '\"scp\": 1' -- .docs/specs` returns nothing; \u00a716.12.5 cites the \u00a710.7.1 step 5 table instead of restating payload bytes.",
         "ADR-025 acceptance criterion 4 checks a parsed dictionary and contains no \"whitespace outside string literals\" clause.",
         "ADR-027 contains no `\"to\":` key.",
         "ADR-006 and ADR-025 cite \u00a710.7.1 rather than restating the bytes.",
@@ -1100,7 +1102,7 @@
       "description": "`AndroidPushProvider` implements the UniFFI `PushProvider` interface, following the pattern in `UniffiKeyCustody.kt`. `AndroidPlatformAdapter.make(context)` passes the provider to `push_enable`. The SDK gives the app `Scp.onMessageReceived(data: Map<String,String>)`, which serializes the data map to JSON and runs `push_handle_wake` in an expedited WorkManager job (indicator). PUSH-001 already replaced the legacy FCM body comment in `AndroidPushProvider.kt`. The SDK wrapper file path is an indicator. Push does not depend on the other Android adapters, so their conformance gaps stay outside this story.",
       "acceptanceCriteria": [
         "`AndroidPushProvider` implements the UniFFI interface.",
-        "A data map without `scp` raises SCP-TRANS-5001, and a wrong value raises SCP-TRANS-5002.",
+        "A data map without `scp` and a data map whose `scp` value is not `\"1\"` both raise SCP-TRANS-5080 (the invalid wake payload code PUSH-019 registers), and the message names which of the two cases occurred.",
         "`make(context)` calls `push_enable` exactly once.",
         "The Kotlin mutable-globals check passes."
       ],
