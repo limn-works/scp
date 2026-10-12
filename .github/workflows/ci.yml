@@ -1697,6 +1697,10 @@ jobs:
           # would compile the backends for scp-relay even when scp-relay's own
           # `cloud-blobs` no longer enables them.
           cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
+          # The relay push registration store compiles only under `push-store`,
+          # with and without its `testing`-only in-memory arm.
+          cargo clippy -p scp-transport --features push-store --all-targets -- -D warnings
+          cargo clippy -p scp-transport --features push-store,testing --all-targets -- -D warnings
           cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
           cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
       # Runs scripts/check-examples-compile.sh against throwaway one- and two-crate
@@ -1971,6 +1975,14 @@ jobs:
           # builds them. Each `--test` names one target; a target that stops
           # existing fails this command.
           cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --test postgres_blob_fail_closed --test s3_blob_fail_closed
+          # The relay push registration store (spec §10.7.1, PUSH-006) compiles
+          # only under `push-store`, and its in-memory arm only under `testing`,
+          # which --workspace leaves off. The first run takes the shared suite
+          # over both arms and the SQLite reopen test; the second takes the
+          # build without `testing`, whose unit test matches the store enum on
+          # its SQLite arm alone and stops compiling if another arm appears.
+          cargo nextest run --no-tests=fail -p scp-transport --features push-store,testing --test push_store_conformance
+          cargo nextest run --no-tests=fail -p scp-transport --features push-store --lib -E 'test(store_without_testing_has_only_the_sqlite_arm)'
       - name: Run node and relay tests
         if: matrix.group == 'node-relay'
         run: |
