@@ -630,18 +630,12 @@ impl Scp {
     ///
     /// `provider` is a JS object implementing the `KeyCustodyProvider` record
     /// (`generateKeypair`, `sign`, `getPublicKey`, `destroyKey`, `dhAgree`,
-    /// `derivePseudonym`, `exportSigningKeyBytes`, `custodyType`). Sign,
-    /// Diffie-Hellman, and pseudonym-derivation operations keep the private key
-    /// inside the caller's custody — those keys are never imported into the Rust
-    /// core (ADR-006); each such op is marshalled back to the Node.js event loop
-    /// via threadsafe functions and awaited. The `exportSigningKeyBytes` callback
-    /// is the exception: the `SigningKeyBytes`-based signing paths (UCAN mint,
-    /// SCPID, event-log checkpoint, and the join-time pseudonym announcement)
-    /// currently pull the raw 32-byte Ed25519 seed into Rust ownership, where it
-    /// is held in `Zeroizing` for the duration of the operation and wiped on
-    /// drop. That raw-export surface is tracked for migration to
-    /// `KeyCustody::sign`; context export already signs via `KeyCustody::sign`
-    /// (§23.16.8) and never exports the raw seed. This is the Node/Bun equivalent
+    /// `derivePseudonym`, `deriveRotatablePseudonym`, `custodyType`). Every
+    /// operation keeps the private key inside the caller's custody — no key is
+    /// imported into or exported to the Rust core (ADR-006); each operation is
+    /// marshalled back to the Node.js event loop via threadsafe functions and
+    /// awaited, and every signing path signs through `KeyCustody::sign`
+    /// (ADR-049 Decision 7a). This is the Node/Bun equivalent
     /// of the `UniFFI` bridge's `identity_create_with_custody`, used to back a DID
     /// with an OS keychain, hardware token, or HSM wrapper.
     ///
@@ -676,13 +670,9 @@ impl Scp {
         // capability injection and prove-absent dev backends, §Decision 6). A
         // shipped build of this entry point therefore fails closed with
         // `codes::IDENT_1059` below rather than minting a pre-rotation key at
-        // all. Sign / Diffie-Hellman /
-        // pseudonym-derivation operations keep the caller's private keys in
-        // custody (never imported into Rust) per ADR-006; the
-        // `SigningKeyBytes`-based paths (UCAN mint, SCPID, event-log checkpoint,
-        // join-time pseudonym announcement) are the exception — they export the
-        // raw seed into Rust (held in `Zeroizing`, wiped on drop), a surface
-        // tracked for migration to `KeyCustody::sign`.
+        // all. Every custody operation keeps the caller's private keys in
+        // custody (never imported into Rust) per ADR-006, and every signing
+        // path signs through `KeyCustody::sign` (ADR-049 Decision 7a).
 
         // Both names are used only in the `testing`-gated success arm below;
         // the shipped build fails closed before minting a handle (ADR-062

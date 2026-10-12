@@ -244,7 +244,7 @@ impl PyKeyCustodyProvider {
     /// up-front by [`Self::validate`] so a malformed provider fails fast at
     /// the FFI boundary with a clear `ValidationError` rather than deep
     /// inside an async DID-creation flow.
-    const REQUIRED_METHODS: [&'static str; 9] = [
+    const REQUIRED_METHODS: [&'static str; 8] = [
         "sign",
         "get_public_key",
         "destroy_key",
@@ -252,7 +252,6 @@ impl PyKeyCustodyProvider {
         "dh_agree",
         "derive_pseudonym",
         "derive_rotatable_pseudonym",
-        "export_signing_key_bytes",
         "custody_type",
     ];
 
@@ -432,32 +431,6 @@ impl PyKeyCustodyProvider {
     }
 }
 
-impl FfiKeyCustody {
-    /// Exports the raw Ed25519 signing key for the given handle.
-    ///
-    /// Required by the governance lifecycle bridge functions
-    /// (`propose_governance_action`, `approve_governance_proposal`,
-    /// `reject_governance_proposal`) which delegate to core functions
-    /// that accept `&ed25519_dalek::SigningKey` directly.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
-    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an
-    /// X25519 key.
-    pub async fn export_ed25519_signing_key(
-        &self,
-        handle: &KeyHandle,
-    ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
-        match self {
-            #[cfg(feature = "testing")]
-            Self::InMemory(kc) => kc.export_ed25519_signing_key(handle).await,
-            Self::File(kc) => kc.export_ed25519_signing_key(handle).await,
-            Self::Callback(kc) => kc.export_ed25519_signing_key(handle).await,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // PyCallbackKeyCustody — concrete `KeyCustody` adapter over a Python provider
 //
@@ -517,7 +490,6 @@ impl FfiKeyCustody {
 ///   provider performs the canonical v2 derivation (HMAC key is the
 ///   private-derived `pseudonym_secret`, domain `"scp-pseudonym-v2"`); the
 ///   bridge does NOT synthesize the preimage.
-/// - `export_signing_key_bytes(key_id: str) -> bytes` — 32 private seed bytes.
 /// - `custody_type(key_id: str) -> str` — `"hardware"` / `"software"` /
 ///   `"in_memory"`.
 pub struct PyCallbackKeyCustody {
@@ -584,33 +556,6 @@ impl PyCallbackKeyCustody {
             provider,
             registry: scp_ffi_common::callback_custody::CallbackKeyRegistry::new(),
         }
-    }
-
-    /// Exports the raw Ed25519 signing key via the provider's
-    /// `export_signing_key_bytes`.
-    ///
-    /// `async` for signature uniformity with the [`FfiKeyCustody`] enum
-    /// dispatch (the `InMemory` / `File` arms are genuinely async); the
-    /// `PyO3` callback path re-acquires the GIL synchronously under the hood.
-    ///
-    /// # Errors
-    ///
-    /// [`PlatformError::WrongKeyType`] for a handle of another type, before
-    /// any export call; [`PlatformError::KeyNotFound`] for a handle the host
-    /// does not hold; [`PlatformError::CustodyError`] if the provider raises,
-    /// returns a non-32-byte value, or returns a seed for another key.
-    pub async fn export_ed25519_signing_key(
-        &self,
-        handle: &KeyHandle,
-    ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
-        let p = &self.provider;
-        scp_ffi_common::callback_custody::export_ed25519_signing_key(
-            &self.registry,
-            handle,
-            |key_id| std::future::ready(p.call_str("export_signing_key_bytes", &key_id)),
-            |key_id| p.host_public_key(&key_id),
-        )
-        .await
     }
 }
 
@@ -1022,10 +967,6 @@ class FakeCustody:
         self._count('derive_rotatable_pseudonym')
         preimage = bytes(context_id) + pseudonym_epoch.to_bytes(8, 'big') + b'scp-pseudonym-v2'
         return self._point(hmac.new(self._seed(key_id), preimage, hashlib.sha256).digest())
-
-    def export_signing_key_bytes(self, key_id):
-        self._count('export_signing_key_bytes')
-        return self._seed(key_id)
 
     def custody_type(self, key_id):
         return 'software'
@@ -1733,10 +1674,6 @@ mod tests {
             Err(PlatformError::KeyNotFound)
         ));
         assert!(matches!(
-            custody.export_ed25519_signing_key(&unknown).await,
-            Err(PlatformError::KeyNotFound)
-        ));
-        assert!(matches!(
             custody.ed25519_to_x25519_agree(&unknown, &[9u8; 32]).await,
             Err(PlatformError::KeyNotFound)
         ));
@@ -1810,9 +1747,9 @@ mod tests {
         assert_eq!(fake_calls(&transport, "sign"), 1);
     }
 
-    /// `export_ed25519_signing_key` and `ed25519_to_x25519_agree` refuse a
-    /// P-256 handle, minted or resolved, with `WrongKeyType` before any host
-    /// export or agreement call; an Ed25519 handle reaches the host.
+    /// `ed25519_to_x25519_agree` refuses a P-256 handle, minted or resolved,
+    /// with `WrongKeyType` before any host agreement call; an Ed25519 handle
+    /// reaches the host.
     #[tokio::test]
     async fn ffi_custody_callback_ed25519_only_paths_refuse_p256() {
         let custody = fake_py_custody_of(c"P256Custody", None);
@@ -1834,14 +1771,9 @@ mod tests {
         let resolved = KeyHandle::new(resolved.parse().expect("numeric id"));
         for (c, handle) in [(&custody, minted), (&fresh, resolved)] {
             assert!(matches!(
-                c.export_ed25519_signing_key(&handle).await,
-                Err(PlatformError::WrongKeyType { .. })
-            ));
-            assert!(matches!(
                 c.ed25519_to_x25519_agree(&handle, &[9u8; 32]).await,
                 Err(PlatformError::WrongKeyType { .. })
             ));
-            assert_eq!(fake_calls(c, "export_signing_key_bytes"), 0);
             assert_eq!(fake_calls(c, "dh_agree"), 0);
         }
 
@@ -1850,10 +1782,10 @@ mod tests {
             .await
             .expect("ed25519 key");
         custody
-            .export_ed25519_signing_key(&ed)
+            .ed25519_to_x25519_agree(&ed, &[9u8; 32])
             .await
-            .expect("an Ed25519 key exports");
-        assert_eq!(fake_calls(&custody, "export_signing_key_bytes"), 1);
+            .expect("an Ed25519 key agrees");
+        assert_eq!(fake_calls(&custody, "dh_agree"), 1);
     }
 
     /// An operational Ed25519 key is not a derive source; the host is

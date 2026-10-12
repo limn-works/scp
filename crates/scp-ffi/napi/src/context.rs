@@ -887,9 +887,8 @@ pub(crate) async fn context_create_on(
     // no-op on create. The routing ID is already registered with the
     // ContextManager via `local_pseudonym` in the create payload, and is
     // announced on `context_join` where existing members must learn it.
-    // Emitting it here would also require resolving the signing key (a raw
-    // `export_ed25519_signing_key`), which a sign-only keychain/HSM custody
-    // (ADR-006) cannot satisfy. PyO3's `py_context_create` still emits this
+    // Emitting it here would sign an announcement that no member receives.
+    // PyO3's `py_context_create` still emits this
     // no-op announcement; not replicating it here is intentional. Converging
     // the reference bridge is tracked separately.
 
@@ -4862,9 +4861,9 @@ pub(crate) async fn context_reset_ttl_timer_on(
 /// Signs the exported snapshot's §23.16.8 canonical digest by delegating to the
 /// exporter identity's [`KeyCustody::sign`], which dispatches to whichever
 /// backend backs that identity — in-memory OR a JS callback custody
-/// (`identityCreateWithCustody`). The raw private key is never exported, so
-/// keychain/HSM-shaped callback providers that implement `sign` but not
-/// `exportSigningKeyBytes` can still produce a signed export. The signature is
+/// (`identityCreateWithCustody`). The raw private key never leaves custody, so
+/// a keychain/HSM-shaped callback provider, which only signs, produces a
+/// signed export. The signature is
 /// applied at this dispatch boundary because the runtime holds no custody key;
 /// `Supervisor::export_context` captures the unsigned snapshot from the actor
 /// and signs it here via the supplied closure (§23.16.8, ADR-050).
@@ -4886,10 +4885,9 @@ pub(crate) async fn context_export_on(
     // key handle (NOT a raw exported key). Signing the §23.16.8 snapshot
     // digest is delegated to `KeyCustody::sign`, which dispatches to whichever
     // backend backs this identity — in-memory OR a JS callback custody
-    // (`identityCreateWithCustody`). This lets keychain/HSM-shaped callback
-    // providers — which implement `sign` but intentionally do NOT implement
-    // `exportSigningKeyBytes` — produce a signed export. Private key material
-    // never crosses the FFI boundary (ADR-006).
+    // (`identityCreateWithCustody`). This lets a keychain/HSM-shaped callback
+    // provider, which only signs, produce a signed export. Private key
+    // material never crosses the FFI boundary (ADR-006).
     let (custody, key_handle) = resolve_napi_export_signer(handle)?;
 
     // `export_context`'s `sign` closure is synchronous, but custody `sign` is
@@ -5742,20 +5740,28 @@ mod tests {
     // from ONE persona (fail-closed on `#agent` with no agent key).
     // -----------------------------------------------------------------------
 
+    /// The 32-byte public key `custody` reports for `handle`.
+    #[cfg(feature = "testing")]
+    async fn persona_public_key(
+        custody: &crate::custody::NapiKeyCustody,
+        handle: &scp_platform::KeyHandle,
+    ) -> [u8; 32] {
+        let key = scp_platform::KeyCustody::public_key(custody, handle)
+            .await
+            .expect("custody reports the public key");
+        <[u8; 32]>::try_from(key.as_bytes()).expect("an Ed25519 public key")
+    }
+
     /// Registers a fresh in-memory identity (optionally carrying an `#agent`
     /// signing key) and returns `(did, active_key, agent_key, handle)` with the
-    /// two keys exported for byte-comparison and a context handle carrying the
-    /// identity's custody + active key so the `#active` resolution path works.
+    /// two keys' public keys, as custody reports them, for byte-comparison and
+    /// a context handle carrying the identity's custody + active key so the
+    /// `#active` resolution path works.
     #[cfg(feature = "testing")]
     async fn register_persona_test_identity(
         bi: &Arc<crate::runtime::NapiBridgeInstance>,
         with_agent_key: bool,
-    ) -> (
-        String,
-        ed25519_dalek::SigningKey,
-        Option<ed25519_dalek::SigningKey>,
-        super::NapiContextHandle,
-    ) {
+    ) -> (String, [u8; 32], Option<[u8; 32]>, super::NapiContextHandle) {
         use crate::identity::OpaqueInMemoryKeyCustody;
         use scp_identity::{DidDht, DidMethod};
         use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
@@ -5777,17 +5783,9 @@ mod tests {
         let did = identity.did.clone();
         // `KeyHandle` is `Copy` — read the handles before moving `identity`.
         let active_handle = identity.active_signing_key;
-        let active_key = custody
-            .export_ed25519_signing_key(&active_handle)
-            .await
-            .expect("export active key");
+        let active_key = persona_public_key(&custody, &active_handle).await;
         let agent_key = match identity.agent_signing_key {
-            Some(h) => Some(
-                custody
-                    .export_ed25519_signing_key(&h)
-                    .await
-                    .expect("export agent key"),
-            ),
+            Some(h) => Some(persona_public_key(&custody, &h).await),
             None => None,
         };
         crate::runtime::register_identity(
@@ -5839,8 +5837,7 @@ mod tests {
         let (did, active_key, agent_key, handle) = register_persona_test_identity(&bi, true).await;
         let agent_key = agent_key.expect("agent-keyed identity has an agent key");
         assert_ne!(
-            active_key.to_bytes(),
-            agent_key.to_bytes(),
+            active_key, agent_key,
             "test identity must have distinct active and agent keys"
         );
 
@@ -5857,7 +5854,7 @@ mod tests {
         );
         assert_eq!(
             signer.message_signer().signer().public_key(),
-            agent_key.verifying_key().to_bytes(),
+            agent_key,
             "#agent persona MUST resolve the agent key, never the active key"
         );
 
@@ -5868,10 +5865,7 @@ mod tests {
                 .unwrap();
         assert_eq!(signer.persona(), scp_did::SigningKeyId::Active);
         assert!(matches!(signer.message_signer(), MessageSigner::Active(_)));
-        assert_eq!(
-            signer.message_signer().signer().public_key(),
-            active_key.verifying_key().to_bytes()
-        );
+        assert_eq!(signer.message_signer().signer().public_key(), active_key);
     }
 
     /// Fail-closed: `#agent` requested for an identity with NO agent key returns
@@ -5899,10 +5893,7 @@ mod tests {
             super::resolve_napi_message_signer(&bi, &handle, &did, scp_did::SigningKeyId::Active)
                 .await
                 .unwrap();
-        assert_eq!(
-            signer.message_signer().signer().public_key(),
-            active_key.verifying_key().to_bytes()
-        );
+        assert_eq!(signer.message_signer().signer().public_key(), active_key);
     }
 
     /// REGRESSION GUARD (fix 3): the `#agent` arm MUST export the agent key
@@ -5943,10 +5934,7 @@ mod tests {
         let agent_handle = identity
             .agent_signing_key
             .expect("agent-keyed identity has an agent key handle");
-        let agent_key = custody_a
-            .export_ed25519_signing_key(&agent_handle)
-            .await
-            .expect("export agent key from custody_A");
+        let agent_key = persona_public_key(&custody_a, &agent_handle).await;
         crate::runtime::register_identity(
             &bi,
             &did,
@@ -5998,7 +5986,7 @@ mod tests {
                 );
         assert_eq!(
             signer.message_signer().signer().public_key(),
-            agent_key.verifying_key().to_bytes(),
+            agent_key,
             "#agent MUST sign with the agent key through the sender identity's own custody \
              (custody_A); sourcing from the context handle's custody_B would sign with the wrong \
              key or fail closed"
@@ -9504,23 +9492,34 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn derive_pseudonym_bytes_is_the_recipe_routing_id() {
         use crate::identity::OpaqueInMemoryKeyCustody;
+        use rand::{RngCore as _, SeedableRng as _};
         use scp_platform::KeyCustody as _;
         use scp_platform::testing::InMemoryKeyCustody;
         use sha2::{Digest, Sha256};
 
+        // `from_seed_bytes` mints its first key from the first 32 bytes of
+        // `StdRng::from_seed(RNG_SEED)` (ADR-046), so the identity seed is
+        // recomputed here and pinned to the public key custody reports.
+        const RNG_SEED: [u8; 32] = [0x5a; 32];
         let custody = crate::custody::NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(
-            InMemoryKeyCustody::new(),
+            InMemoryKeyCustody::from_seed_bytes(RNG_SEED),
         )));
         let handle = custody
             .generate_identity_keypair()
             .await
             .expect("generate identity key");
-        let seed = zeroize::Zeroizing::new(
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+        rand::rngs::StdRng::from_seed(RNG_SEED).fill_bytes(seed.as_mut());
+        assert_eq!(
             custody
-                .export_ed25519_signing_key(&handle)
+                .public_key(&handle)
                 .await
-                .expect("export identity seed")
-                .to_bytes(),
+                .expect("public key")
+                .as_bytes(),
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .as_bytes(),
+            "the recomputed seed is the identity key"
         );
         let routing_id = super::derive_pseudonym_bytes(&custody, &handle, "ctx-napi-kat")
             .await

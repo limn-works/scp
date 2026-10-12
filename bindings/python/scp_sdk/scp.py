@@ -296,19 +296,6 @@ class KeyCustodyProvider(Protocol):
         """
         ...
 
-    def export_signing_key_bytes(self, key_id: str) -> bytes:
-        """Return the 32 raw Ed25519 private-seed bytes for ``key_id``.
-
-        Hardware-bound / sign-only custody that cannot export raw bytes should
-        raise an exception. The exception is handled per call site: best-effort
-        callers (the §9.10.4 pseudonym announcement emitted on context
-        join/import) catch it and skip the announcement — peers recover on the
-        next explicit announcement — whereas callers that strictly require the
-        raw key (governance vote signing via ``identity_create_with_custody``)
-        surface a hard error.
-        """
-        ...
-
     def custody_type(self, key_id: str) -> str:
         """Return ``"hardware"``, ``"software"``, or ``"in_memory"``."""
         ...

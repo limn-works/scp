@@ -10139,14 +10139,13 @@ mod tests {
 
     /// Python source for a SIGN-ONLY custody provider: it signs and reports a
     /// public key using a REAL Ed25519 keypair (via the pure-Rust `_scp_core`
-    /// test signer exposed below), but `export_signing_key_bytes` RAISES —
-    /// modelling a keychain/HSM-shaped custody that refuses raw private-key
-    /// export. The provider's `sign`/`get_public_key` delegate to a
-    /// process-local Rust Ed25519 signer keyed by an opaque id, so the
-    /// signatures are cryptographically valid and verifiable. Only `sign`,
-    /// `get_public_key`, and `export_signing_key_bytes` are load-bearing here;
-    /// the remaining methods exist solely to satisfy the provider protocol
-    /// surface (`PyKeyCustodyProvider::REQUIRED_METHODS`).
+    /// test signer exposed below) and holds no private key, modelling a
+    /// keychain/HSM-shaped custody. The provider's `sign`/`get_public_key`
+    /// delegate to a process-local Rust Ed25519 signer keyed by an opaque id,
+    /// so the signatures are cryptographically valid and verifiable. Only
+    /// `sign` and `get_public_key` are load-bearing here; the remaining methods
+    /// exist solely to satisfy the provider protocol surface
+    /// (`PyKeyCustodyProvider::REQUIRED_METHODS`).
     #[cfg(feature = "testing")]
     const SIGN_ONLY_PROVIDER_PY: &std::ffi::CStr = c"
 import types
@@ -10156,7 +10155,6 @@ from _scp_core_export_signer import ed25519_sign, ed25519_public_key
 class SignOnlyCustody:
     def __init__(self, key_id):
         self._key_id = str(key_id)
-        self.export_calls = 0
 
     def generate_keypair(self, key_type, role):
         return self._key_id
@@ -10186,35 +10184,16 @@ class SignOnlyCustody:
     def derive_rotatable_pseudonym(self, key_id, context_id, pseudonym_epoch):
         raise RuntimeError('sign-only custody: derive_rotatable_pseudonym unsupported')
 
-    def export_signing_key_bytes(self, key_id):
-        # The defining property: raw private-key export is REFUSED. A correct
-        # context export must never call this path.
-        self.export_calls += 1
-        raise RuntimeError('sign-only custody refuses raw key export')
-
     def custody_type(self, key_id):
         return 'hardware'
 ";
 
-    /// Context export must sign via `KeyCustody::sign`, NOT by exporting the raw
-    /// Ed25519 private key — so a sign-only custody (one that signs but refuses
-    /// `export_signing_key_bytes`) can still produce a valid, verifiable export.
-    ///
-    /// This is the cross-bridge capability-parity guard: the `NAPI` and `UniFFI`
-    /// export paths already delegate to `KeyCustody::sign`; `PyO3` previously
-    /// exported the raw private key, which would fail closed for keychain/HSM
-    /// custody. The test installs a Rust-backed sign-only callback custody whose
-    /// `export_signing_key_bytes` RAISES, runs the real `context_export`, and
-    /// asserts (a) the export SUCCEEDS — proving the raw-export path is not
-    /// taken — and (b) the produced §23.16.8 signature VERIFIES against the
-    /// public key the same custody reports.
     /// Installs a SIGN-ONLY callback custody on the identity `did`, replacing
     /// whatever custody was registered. The custody signs and reports a public
     /// key using a process-local REAL Ed25519 signer (the private key lives only
-    /// in Rust, never surfaced to Python — exactly like a keychain), but its
-    /// `export_signing_key_bytes` RAISES. Returns the signer's verifying key so
-    /// the caller can verify the resulting export signature, the custody, and
-    /// the provider object so the caller can read its `export_calls`.
+    /// in Rust, never surfaced to Python — exactly like a keychain). Returns the
+    /// signer's verifying key, so the caller can verify the resulting export
+    /// signature, and the custody.
     #[cfg(feature = "testing")]
     fn install_sign_only_custody(
         py: Python<'_>,
@@ -10223,7 +10202,6 @@ class SignOnlyCustody:
     ) -> (
         ed25519_dalek::VerifyingKey,
         std::sync::Arc<crate::custody::FfiKeyCustody>,
-        Py<PyAny>,
     ) {
         use pyo3::types::PyModule;
 
@@ -10285,7 +10263,6 @@ class SignOnlyCustody:
             .unwrap()
             .call1((active_handle_id,))
             .unwrap();
-        let host = obj.clone().unbind();
         let provider = crate::custody::PyKeyCustodyProvider::new(py, obj.unbind()).unwrap();
         // The adapter resolves the identity's existing active handle through
         // the provider's structured `get_public_key` on first use, as it does
@@ -10300,9 +10277,15 @@ class SignOnlyCustody:
         })
         .unwrap();
 
-        (signer_pk, sign_only_custody, host)
+        (signer_pk, sign_only_custody)
     }
 
+    /// Context export signs via `KeyCustody::sign`, so a sign-only custody,
+    /// which holds no private key, still produces a valid, verifiable export.
+    /// The test installs a Rust-backed sign-only callback custody, runs the
+    /// real `context_export`, and asserts that the export succeeds and that
+    /// its §23.16.8 signature verifies against the public key the same
+    /// custody reports.
     #[test]
     #[cfg(feature = "testing")]
     fn context_export_signs_via_sign_only_custody() {
@@ -10320,29 +10303,15 @@ class SignOnlyCustody:
             let creator_identity = scp.identity_create(py, "in_memory", None).unwrap();
             let creator = creator_identity.did().to_owned();
 
-            let (signer_pk, sign_only_custody, host) = install_sign_only_custody(py, &bi, &creator);
+            let (signer_pk, sign_only_custody) = install_sign_only_custody(py, &bi, &creator);
 
-            // Sanity: the swapped custody REFUSES raw key export but CAN sign.
+            // Sanity: the swapped custody signs.
             let rt = crate::runtime().unwrap();
             let active_handle_id = crate::runtime::with_identity(&bi, &creator, |entry| {
                 Ok(entry.identity.active_signing_key.id())
             })
             .unwrap();
             let handle = scp_platform::KeyHandle::new(active_handle_id);
-            // The refusal is the host's own, reached after the adapter
-            // resolved the handle as Ed25519; a host that exported would
-            // return Ok.
-            match rt.block_on(sign_only_custody.export_ed25519_signing_key(&handle)) {
-                Err(scp_platform::error::PlatformError::CustodyError(_)) => {}
-                other => panic!("expected the host's export refusal, got {other:?}"),
-            }
-            let export_calls = |py| {
-                host.bind(py)
-                    .getattr("export_calls")
-                    .and_then(|n| n.extract::<usize>())
-                    .unwrap()
-            };
-            assert_eq!(export_calls(py), 1, "the export reached the host");
             assert!(
                 rt.block_on(sign_only_custody.sign(&handle, b"probe"))
                     .is_ok(),
@@ -10365,16 +10334,11 @@ class SignOnlyCustody:
             ))
             .unwrap();
 
-            // The export MUST succeed even though raw key export is refused —
-            // proving the signature is produced via `KeyCustody::sign`.
+            // The export MUST succeed although the custody holds no private
+            // key — the signature is produced via `KeyCustody::sign`.
             let exported = scp.context_export(py, &ctx_id).expect(
                 "context export must succeed under sign-only custody (signing via \
-                 KeyCustody::sign, never raw key export)",
-            );
-            assert_eq!(
-                export_calls(py),
-                1,
-                "the context export never asks for the raw key"
+                 KeyCustody::sign)",
             );
 
             // The produced §23.16.8 signature must verify against the public key
@@ -10463,17 +10427,14 @@ class SignOnlyCustody:
     // -----------------------------------------------------------------------
 
     /// Registers a fresh identity in `bi` (optionally carrying an `#agent`
-    /// signing key) and returns `(did, active_key, agent_key)` with the two keys
-    /// exported so the resolver's output can be byte-compared against them.
+    /// signing key) and returns `(did, active_key, agent_key)`, the two keys'
+    /// public keys as custody reports them, so the resolver's output can be
+    /// byte-compared against them.
     #[cfg(feature = "testing")]
     fn register_persona_test_identity(
         bi: &crate::runtime::PyBridgeInstance,
         with_agent_key: bool,
-    ) -> (
-        String,
-        ed25519_dalek::SigningKey,
-        Option<ed25519_dalek::SigningKey>,
-    ) {
+    ) -> (String, [u8; 32], Option<[u8; 32]>) {
         crate::init_runtime().ok();
         let rt = crate::runtime().unwrap();
         let custody = std::sync::Arc::new(crate::custody::FfiKeyCustody::InMemory(
@@ -10501,14 +10462,19 @@ class SignOnlyCustody:
             }
         });
         let did = identity.did.clone();
-        // Export the raw keys BEFORE moving `identity` into the registry entry
-        // (`KeyHandle` is `Copy`).
-        let active_key = rt
-            .block_on(custody.export_ed25519_signing_key(&identity.active_signing_key))
-            .unwrap();
-        let agent_key = identity
-            .agent_signing_key
-            .map(|h| rt.block_on(custody.export_ed25519_signing_key(&h)).unwrap());
+        // Read the public keys BEFORE moving `identity` and `custody` into the
+        // registry entry (`KeyHandle` is `Copy`).
+        let public_key = |handle: &scp_platform::KeyHandle| -> [u8; 32] {
+            let key = rt
+                .block_on(scp_platform::KeyCustody::public_key(
+                    custody.as_ref(),
+                    handle,
+                ))
+                .unwrap();
+            <[u8; 32]>::try_from(key.as_bytes()).unwrap()
+        };
+        let active_key = public_key(&identity.active_signing_key);
+        let agent_key = identity.agent_signing_key.map(|h| public_key(&h));
         crate::runtime::register_identity(
             bi,
             &did,
@@ -10561,8 +10527,7 @@ class SignOnlyCustody:
             let (did, active_key, agent_key) = register_persona_test_identity(&bi, true);
             let agent_key = agent_key.expect("agent-keyed identity has an agent key");
             assert_ne!(
-                active_key.to_bytes(),
-                agent_key.to_bytes(),
+                active_key, agent_key,
                 "test identity must have distinct active and agent keys"
             );
 
@@ -10577,7 +10542,7 @@ class SignOnlyCustody:
             );
             assert_eq!(
                 signer.message_signer().signer().public_key(),
-                agent_key.verifying_key().to_bytes(),
+                agent_key,
                 "#agent persona MUST resolve the agent key, never the active key"
             );
 
@@ -10586,10 +10551,7 @@ class SignOnlyCustody:
                 resolve_message_signer(py, &bi, &did, scp_did::SigningKeyId::Active).unwrap();
             assert_eq!(signer.persona(), scp_did::SigningKeyId::Active);
             assert!(matches!(signer.message_signer(), MessageSigner::Active(_)));
-            assert_eq!(
-                signer.message_signer().signer().public_key(),
-                active_key.verifying_key().to_bytes()
-            );
+            assert_eq!(signer.message_signer().signer().public_key(), active_key);
         });
     }
 
@@ -10615,10 +10577,7 @@ class SignOnlyCustody:
             // not a broken identity.
             let signer =
                 resolve_message_signer(py, &bi, &did, scp_did::SigningKeyId::Active).unwrap();
-            assert_eq!(
-                signer.message_signer().signer().public_key(),
-                active_key.verifying_key().to_bytes()
-            );
+            assert_eq!(signer.message_signer().signer().public_key(), active_key);
         });
     }
 }

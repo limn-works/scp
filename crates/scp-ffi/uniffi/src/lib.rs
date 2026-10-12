@@ -573,45 +573,6 @@ pub trait KeyCustodyProvider: Send + Sync {
         })
     }
 
-    /// Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
-    ///
-    /// The bridge's signing paths that sign with an `ed25519_dalek::SigningKey`,
-    /// governance vote signing among them, build that key from the returned
-    /// bytes. A key held in hardware or in Android Keystore does not export its
-    /// bytes, and ADR-063 requires every key-export accessor, this callback
-    /// included, to leave the custody adapters and all three bridges, because
-    /// hardware custody on the governance path is impossible until then.
-    ///
-    /// # Default
-    ///
-    /// Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-    /// implemented. A host that needs it overrides it. No Kotlin class
-    /// implements this callback: the Kotlin `AndroidKeyCustody` implements the
-    /// Kotlin SDK's own `KeyCustodyProvider` interface, and no code passes it
-    /// to the Rust engine. Third-party
-    /// `KeyCustodyProvider` implementations that do not need governance vote
-    /// signing may rely on the default until they add support.
-    ///
-    /// **Note:** `UniFFI` callback interfaces require foreign implementations to
-    /// define all methods. The generated Swift protocol / Kotlin interface will
-    /// include this method. The default here applies only to Rust-side callers.
-    ///
-    /// # Errors
-    ///
-    /// The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
-    /// destroyed or never existed, and the caller receives key-not-found
-    /// (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
-    /// `SCP-CTX-2050` and a key that is not exportable or not Ed25519, reaches
-    /// the caller as the custody error `SCP-CRYPTO-4060` carrying the host's
-    /// code and message.
-    async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, ScpError> {
-        let _ = key_id;
-        Err(ScpError::Context {
-            msg: "export_signing_key_bytes not implemented by this KeyCustodyProvider".to_owned(),
-            code: codes::CTX_2050.to_owned(),
-        })
-    }
-
     /// Return the custody type for `key_id`: `"hardware"`, `"software"`, or
     /// `"in_memory"`. Stays sync — no I/O required.
     fn custody_type(&self, key_id: String) -> String;

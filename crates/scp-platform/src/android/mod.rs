@@ -34,8 +34,7 @@
 //!   `KeyCustodyProvider` callback except `custody_type`, and it names the
 //!   callback's `get_public_key` `publicKey`, the name the Rust trait's
 //!   `public_key` takes in Kotlin. The [`crate::traits::KeyCustody`] trait
-//!   does not declare `export_signing_key_bytes`, and it also declares
-//!   `custody_type`,
+//!   also declares `custody_type`,
 //!   `ed25519_to_x25519_agree`, `import_ed25519_signing_key` and
 //!   `generate_ephemeral_ed25519_seed`, which the Kotlin interface lacks. The
 //!   Kotlin methods name a key by a Kotlin `KeyHandle`, a data class of a

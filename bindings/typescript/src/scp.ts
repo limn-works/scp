@@ -814,17 +814,6 @@ export interface KeyCustodyProvider {
     contextId: Uint8Array,
     pseudonymEpoch: bigint,
   ): Uint8Array;
-  /**
-   * Return the 32 raw Ed25519 private-seed bytes for `keyId`.
-   *
-   * Hardware-bound / sign-only custody that cannot surface raw bytes should
-   * throw. The throw is handled differently per call site: best-effort callers
-   * (the §9.10.4 pseudonym announcement emitted on context join/import) catch it
-   * and silently skip the announcement — peers recover on the next explicit
-   * announcement — whereas callers that strictly require the raw key (governance
-   * vote signing via {@link SCP.identityCreateWithCustody}) surface a hard error.
-   */
-  exportSigningKeyBytes(keyId: string): Uint8Array;
   /** Return `"hardware"`, `"software"`, or `"in_memory"`. */
   custodyType(keyId: string): string;
 }
@@ -1118,10 +1107,10 @@ export class SCP {
       throw custodyRequiredError("identityCreateWithCustody", CUSTODY_PROVIDER_REMEDY);
     }
     // Validate provider completeness up front. The byte-converting adapter
-    // below always supplies all nine closures, so a provider missing a method
+    // below always supplies all eight closures, so a provider missing a method
     // would otherwise surface only later as a cryptic native "oneshot canceled"
     // failure. Checking here makes the returned promise reject early with a
-    // clear, actionable error. Mirrors the nine methods on KeyCustodyProvider.
+    // clear, actionable error. Mirrors the eight methods on KeyCustodyProvider.
     const REQUIRED = [
       "generateKeypair",
       "sign",
@@ -1130,7 +1119,6 @@ export class SCP {
       "dhAgree",
       "derivePseudonym",
       "deriveRotatablePseudonym",
-      "exportSigningKeyBytes",
       "custodyType",
     ] as const;
     for (const method of REQUIRED) {

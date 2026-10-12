@@ -963,34 +963,6 @@ impl KeyCustody for CallbackKeyCustody {
     }
 }
 
-// Test-only since no production path exports a key (ADR-049 Decision 7a).
-#[cfg(test)]
-impl CallbackKeyCustody {
-    /// Exports the raw Ed25519 signing key for the given handle.
-    ///
-    /// Delegates to [`KeyCustodyProvider::export_signing_key_bytes`](crate::KeyCustodyProvider::export_signing_key_bytes)
-    /// on the platform callback through the shared flow, which requires the
-    /// seed to produce the handle's verifying key. Required for governance
-    /// vote signing.
-    pub(crate) async fn export_ed25519_signing_key(
-        &self,
-        handle: &KeyHandle,
-    ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
-        let p = &*self.provider;
-        scp_ffi_common::callback_custody::export_ed25519_signing_key(
-            &self.registry,
-            handle,
-            |key_id| async move {
-                p.export_signing_key_bytes(key_id)
-                    .await
-                    .map_err(host_err("export_signing_key_bytes"))
-            },
-            |key_id| host_public_key(p, key_id),
-        )
-        .await
-    }
-}
-
 // ---------------------------------------------------------------------------
 // UniffiKeyCustody — enum dispatch over the retained custody backends
 //
@@ -6906,15 +6878,12 @@ fn export_signing_key(handle: &ContextHandle) -> Result<KeyHandle, ScpError> {
 /// handle (platform/software callback custody OR in-memory custody) — instead
 /// of extracting a raw Ed25519 signing key.
 ///
-/// This is the export-path analogue of [`resolve_uniffi_signer`]: the
-/// governance lifecycle paths still extract a raw key (they sign with
-/// `ed25519_dalek::Signer` directly), but context export only needs a detached
-/// signature over the canonical snapshot digest, so it can route through
-/// `custody.sign` and never materialize private key bytes. A sign-only /
-/// keychain / HSM-shaped callback custody — one that implements `sign` but
-/// intentionally does NOT implement `export_ed25519_signing_key` — can
-/// therefore still produce a verifiable signed export. Private key material
-/// never crosses the FFI boundary (ADR-006).
+/// This is the export-path analogue of [`resolve_uniffi_signer`]: context
+/// export needs only a detached signature over the canonical snapshot digest,
+/// so it routes through `custody.sign` and never materializes private key
+/// bytes. A sign-only / keychain / HSM-shaped callback custody therefore
+/// produces a verifiable signed export. Private key material never crosses
+/// the FFI boundary (ADR-006).
 ///
 /// Matches the handle's single retained `custody` exhaustively, like every
 /// other key-bearing `UniFFI` path.
@@ -23034,23 +23003,28 @@ mod tests {
     // handle from ONE persona (fail-closed on `#agent` with no agent key).
     // -----------------------------------------------------------------------
 
+    /// The 32-byte public key `custody` reports for `handle`.
+    #[cfg(feature = "testing")]
+    async fn persona_public_key(custody: &InMemoryKeyCustody, handle: &KeyHandle) -> [u8; 32] {
+        let key = scp_platform::KeyCustody::public_key(custody, handle)
+            .await
+            .expect("custody reports the public key");
+        <[u8; 32]>::try_from(key.as_bytes()).expect("an Ed25519 public key")
+    }
+
     /// Builds a fresh in-memory `Identity` (optionally carrying an `#agent`
     /// signing key) plus a `ContextHandle` that shares the identity's custody +
     /// active key handle, returning `(identity, handle, active_key, agent_key)`
-    /// with the two keys exported for byte-comparison. The `#active` resolution
-    /// path exports through the handle's custody; the `#agent` path exports
-    /// through the identity's OWN custody — both wrap the SAME in-memory custody
-    /// instance here so the resolved keys can be compared against the exports.
+    /// with the two keys' public keys, as custody reports them, for
+    /// byte-comparison. The `#active` resolution path signs through the
+    /// handle's custody; the `#agent` path signs through the identity's OWN
+    /// custody — both wrap the SAME in-memory custody instance here so the
+    /// resolved keys can be compared against the reported public keys.
     #[cfg(feature = "testing")]
     async fn build_persona_test_identity(
         scp: &Arc<crate::scp::Scp>,
         with_agent_key: bool,
-    ) -> (
-        Identity,
-        ContextHandle,
-        ed25519_dalek::SigningKey,
-        Option<ed25519_dalek::SigningKey>,
-    ) {
+    ) -> (Identity, ContextHandle, [u8; 32], Option<[u8; 32]>) {
         let instance_id = scp.instance_id();
         let custody = InMemoryKeyCustody::new();
         let pre_rotation_custody =
@@ -23068,17 +23042,9 @@ mod tests {
         let did = core_id.did.clone();
         // `KeyHandle` is `Copy` — read handles before moving `core_id`/`custody`.
         let active_handle = core_id.active_signing_key;
-        let active_key = custody
-            .export_ed25519_signing_key(&active_handle)
-            .await
-            .expect("export active key");
+        let active_key = persona_public_key(&custody, &active_handle).await;
         let agent_key = match core_id.agent_signing_key {
-            Some(h) => Some(
-                custody
-                    .export_ed25519_signing_key(&h)
-                    .await
-                    .expect("export agent key"),
-            ),
+            Some(h) => Some(persona_public_key(&custody, &h).await),
             None => None,
         };
         // Wrap the SAME custody instance so identity + handle share key material.
@@ -23127,8 +23093,7 @@ mod tests {
             build_persona_test_identity(&scp, true).await;
         let agent_key = agent_key.expect("agent-keyed identity has an agent key");
         assert_ne!(
-            active_key.to_bytes(),
-            agent_key.to_bytes(),
+            active_key, agent_key,
             "test identity must have distinct active and agent keys"
         );
 
@@ -23145,7 +23110,7 @@ mod tests {
         );
         assert_eq!(
             signer.message_signer().signer().public_key(),
-            agent_key.verifying_key().to_bytes(),
+            agent_key,
             "#agent persona MUST resolve the agent key, never the active key"
         );
 
@@ -23156,10 +23121,7 @@ mod tests {
                 .unwrap();
         assert_eq!(signer.persona(), scp_did::SigningKeyId::Active);
         assert!(matches!(signer.message_signer(), MessageSigner::Active(_)));
-        assert_eq!(
-            signer.message_signer().signer().public_key(),
-            active_key.verifying_key().to_bytes()
-        );
+        assert_eq!(signer.message_signer().signer().public_key(), active_key);
     }
 
     /// Fail-closed: `#agent` requested for an identity with NO agent key returns
@@ -23191,10 +23153,7 @@ mod tests {
             super::resolve_uniffi_message_signer(&handle, &identity, scp_did::SigningKeyId::Active)
                 .await
                 .unwrap();
-        assert_eq!(
-            signer.message_signer().signer().public_key(),
-            active_key.verifying_key().to_bytes()
-        );
+        assert_eq!(signer.message_signer().signer().public_key(), active_key);
     }
 
     /// REGRESSION GUARD (fix 3): the `#agent` arm MUST export the agent key
@@ -23231,10 +23190,7 @@ mod tests {
         let agent_handle = core_id
             .agent_signing_key
             .expect("agent-keyed identity has an agent key handle");
-        let agent_key = custody_a
-            .export_ed25519_signing_key(&agent_handle)
-            .await
-            .expect("export agent key from custody_A");
+        let agent_key = persona_public_key(&custody_a, &agent_handle).await;
 
         let opaque_a = Arc::new(OpaqueInMemoryKeyCustody(custody_a));
         let identity = Identity {
@@ -23280,7 +23236,7 @@ mod tests {
                 );
         assert_eq!(
             signer.message_signer().signer().public_key(),
-            agent_key.verifying_key().to_bytes(),
+            agent_key,
             "#agent MUST sign with the agent key through the sender identity's own custody \
              (custody_A); sourcing from the context handle's custody_B would sign with the \
              wrong key or fail closed"
@@ -23443,12 +23399,6 @@ mod tests {
         ) -> Result<Vec<u8>, ScpError> {
             self.host
                 .derive_pseudonym(&key_id, &context_id, Some(pseudonym_epoch))
-                .map_err(|e| fake_host_err(&e))
-        }
-
-        async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, ScpError> {
-            self.host
-                .export_signing_key_bytes(&key_id)
                 .map_err(|e| fake_host_err(&e))
         }
 
@@ -23683,9 +23633,9 @@ mod tests {
             .expect("an identity derives");
     }
 
-    /// `export_ed25519_signing_key` and `ed25519_to_x25519_agree` refuse a
-    /// P-256 handle with `WrongKeyType` before any host export or agreement
-    /// call, whether the adapter minted the handle or resolves it.
+    /// `ed25519_to_x25519_agree` refuses a P-256 handle with `WrongKeyType`
+    /// before any host agreement call, whether the adapter minted the handle
+    /// or resolves it.
     #[tokio::test]
     async fn callback_custody_ed25519_only_paths_refuse_p256() {
         use scp_platform::KeyCustody;
@@ -23705,27 +23655,24 @@ mod tests {
         );
         for handle in [minted, resolved] {
             assert!(matches!(
-                custody.export_ed25519_signing_key(&handle).await,
-                Err(PlatformError::WrongKeyType { .. })
-            ));
-            assert!(matches!(
                 custody.ed25519_to_x25519_agree(&handle, &[9u8; 32]).await,
                 Err(PlatformError::WrongKeyType { .. })
             ));
         }
-        assert_eq!(host.calls("export_signing_key_bytes"), 0);
         assert_eq!(host.calls("dh_agree"), 0);
 
-        // The Ed25519 control: the same paths reach the host.
+        // The Ed25519 control: the same path reaches the host. The fake host
+        // agrees with HPKE keys only, so its refusal is a custody error.
         let ed = custody
             .generate_keypair(KeyType::Ed25519)
             .await
             .expect("ed25519 generation");
-        custody
-            .export_ed25519_signing_key(&ed)
-            .await
-            .expect("an Ed25519 key exports");
-        assert_eq!(host.calls("export_signing_key_bytes"), 1);
+        let agreed = custody.ed25519_to_x25519_agree(&ed, &[9u8; 32]).await;
+        assert!(
+            matches!(agreed, Err(PlatformError::CustodyError(_))),
+            "{agreed:?}"
+        );
+        assert_eq!(host.calls("dh_agree"), 1);
     }
 
     /// For `UniFFI`: the rotatable derivation reaches the host's
@@ -23746,13 +23693,17 @@ mod tests {
             .expect("rotatable derive");
         assert_eq!(host.calls("derive_rotatable_pseudonym"), 1);
         assert_eq!(host.calls("derive_pseudonym"), 0);
-        let seed = zeroize::Zeroizing::new(
-            <[u8; 32]>::try_from(
-                host.export_signing_key_bytes(&identity.id().to_string())
-                    .expect("seed")
-                    .as_slice(),
-            )
-            .expect("32 bytes"),
+        let seed = scp_ffi_common::callback_custody::fake_host::scalar_for(identity.id());
+        assert_eq!(
+            custody
+                .public_key(&identity)
+                .await
+                .expect("public key")
+                .as_bytes(),
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .as_bytes(),
+            "the recomputed seed is the host's key"
         );
         let expected = scp_crypto::pseudonym::derive_pseudonym(
             &seed,
@@ -23770,12 +23721,10 @@ mod tests {
     // ----- Context export signing via sign-only custody (§23.16.8) -----
 
     /// A deliberately **sign-only** `KeyCustodyProvider`: it signs and exposes a
-    /// public key, but does NOT override `export_signing_key_bytes`, so the
-    /// trait default (CTX-2050 "not implemented") applies. This models a
-    /// keychain / Secure-Enclave / HSM-shaped custody whose raw private key is
-    /// non-exportable — the exact case the prior raw-key export path could not
-    /// sign a context export for. Backed by a fixed Ed25519 key so the produced
-    /// signature is independently verifiable against the public key.
+    /// public key and nothing more. This models a keychain / Secure-Enclave /
+    /// HSM-shaped custody whose raw private key never leaves it. Backed by a
+    /// fixed Ed25519 key so the produced signature is independently verifiable
+    /// against the public key.
     struct SignOnlyCustody {
         signing_key: ed25519_dalek::SigningKey,
     }
@@ -23842,22 +23791,15 @@ mod tests {
             })
         }
 
-        // NOTE: `export_signing_key_bytes` is intentionally NOT overridden —
-        // the trait default returns CTX-2050, which is what makes this custody
-        // "sign-only". `CallbackKeyCustody::export_ed25519_signing_key` (the old
-        // export-signing path) therefore fails for this custody.
-
         fn custody_type(&self, _key_id: String) -> String {
             "hardware".to_owned()
         }
     }
 
-    /// A sign-only custody (whose raw key cannot be exported) must still be able
-    /// to sign a context-export snapshot digest via `KeyCustody::sign`
-    /// (§23.16.8), producing a 64-byte Ed25519 signature that verifies against
-    /// the custody's public key. This is the `UniFFI` parity fix for the `NAPI`
-    /// callback-custody export path: the prior raw-key export path
-    /// (`export_ed25519_signing_key`) cannot serve this custody.
+    /// A sign-only custody (whose raw key never leaves it) signs a
+    /// context-export snapshot digest via `KeyCustody::sign` (§23.16.8),
+    /// producing a 64-byte Ed25519 signature that verifies against the
+    /// custody's public key.
     #[tokio::test]
     async fn sign_only_custody_signs_export_snapshot_and_verifies() {
         use ed25519_dalek::Verifier;
@@ -23868,19 +23810,6 @@ mod tests {
 
         let callback = Arc::new(CallbackKeyCustody::new(Box::new(provider)));
         let key_handle = KeyHandle::new(1);
-
-        // Sanity: the old raw-key export path must FAIL for a sign-only custody,
-        // proving the new `custody.sign` path is load-bearing (not redundant
-        // with the still-extant governance raw-key path).
-        // The refusal must be the host's own (the trait default,
-        // CTX-2050), reached after the adapter resolved handle 1 through
-        // `get_public_key`; a host that exported its key would return Ok.
-        match callback.export_ed25519_signing_key(&key_handle).await {
-            Err(PlatformError::CustodyError(msg)) => {
-                assert!(msg.contains(codes::CTX_2050), "{msg}");
-            }
-            other => panic!("expected the host's CTX-2050 refusal, got {other:?}"),
-        }
 
         // Build a context handle carrying the sign-only callback custody and the
         // `#active` key handle, exactly as `context_create` would for a
@@ -32470,8 +32399,8 @@ mod tests {
         }
 
         /// ADR-049 Decision 7a: governance signs through custody, so a host
-        /// custody whose raw key cannot be exported (`ProdLikeCustody` keeps
-        /// the trait's `export_signing_key_bytes` refusal) still proposes, and
+        /// custody whose raw key never leaves it (`ProdLikeCustody`) still
+        /// proposes, and
         /// the single-admin proposal auto-executes after the engine verifies
         /// the custody's signature.
         #[tokio::test]
@@ -32500,12 +32429,12 @@ mod tests {
             assert_governance_executed(&result, "RegisterOutlet");
         }
 
-        /// ADR-049 Decision 7a: a send signs its inner envelope through
-        /// custody, so a host custody whose raw key cannot be exported
-        /// (`ProdLikeCustody` keeps the trait's `export_signing_key_bytes`
-        /// refusal) still sends.
+        /// ADR-049 Decision 7a: a send builds its `CommandSigner` from
+        /// custody's public key, so a host custody whose raw key never leaves
+        /// it (`ProdLikeCustody`) still sends. A group-context send signs no
+        /// envelope with the identity key; only a broadcast envelope does.
         #[tokio::test]
-        async fn context_send_signs_through_sign_only_custody() {
+        async fn context_send_succeeds_with_sign_only_custody() {
             let scp = scp_test();
             let bi = Arc::clone(&scp.inner);
             install_seedable_resolver(&bi);

@@ -380,9 +380,8 @@ fn governance_propose_execution_result_is_a_wire_name() {
 }
 
 /// Python source for a sign-only custody provider. `sign` and `get_public_key`
-/// call the Rust functions it is constructed with, and
-/// `export_signing_key_bytes` raises, as a keychain or HSM custody that never
-/// releases its private key would.
+/// call the Rust functions it is constructed with. Like a keychain or HSM
+/// custody, it holds no private key it could release.
 const SIGN_ONLY_GOVERNANCE_PROVIDER_PY: &std::ffi::CStr = c"
 import types
 
@@ -391,7 +390,6 @@ class SignOnlyCustody:
         self._key_id = str(key_id)
         self._sign_fn = sign_fn
         self._public_key = bytes(public_key)
-        self.export_calls = 0
         self.sign_calls = 0
 
     def generate_keypair(self, key_type, role):
@@ -417,18 +415,14 @@ class SignOnlyCustody:
     def derive_rotatable_pseudonym(self, key_id, context_id, pseudonym_epoch):
         raise RuntimeError('sign-only custody: derive_rotatable_pseudonym unsupported')
 
-    def export_signing_key_bytes(self, key_id):
-        self.export_calls += 1
-        raise RuntimeError('sign-only custody refuses raw key export')
-
     def custody_type(self, key_id):
         return 'hardware'
 ";
 
 /// Replaces `did`'s custody with a sign-only Python provider that signs
 /// through the identity's original custody, so its signatures verify under
-/// the DID's published key while its raw key can never be exported. Returns
-/// the provider object, whose `export_calls` and `sign_calls` the caller reads.
+/// the DID's published key while the provider holds no private key. Returns
+/// the provider object, whose `sign_calls` the caller reads.
 fn install_sign_only_governance_custody(
     py: Python<'_>,
     bi: &PyBridgeInstance,
@@ -527,7 +521,6 @@ fn governance_propose_signs_through_sign_only_custody() {
                 .and_then(|n| n.extract::<usize>())
                 .unwrap()
         };
-        assert_eq!(calls("export_calls"), 0, "the raw key is never requested");
         assert!(
             calls("sign_calls") >= 1,
             "the proposal signed through the host"
@@ -535,23 +528,19 @@ fn governance_propose_signs_through_sign_only_custody() {
     });
 }
 
-/// ADR-049 Decision 7a: a send signs its inner envelope through custody, so a
-/// custody that refuses raw key export still sends, and the host is never
-/// asked for its key.
+/// ADR-049 Decision 7a: a send builds its `CommandSigner` from custody's
+/// public key, so a custody that only signs and reports public keys (no DH,
+/// no pseudonym derivation, no private key) still sends. A group-context send
+/// signs no envelope with the identity key; only a broadcast envelope does, so
+/// the provider's sign count is not asserted here.
 #[test]
-fn context_send_signs_through_sign_only_custody() {
+fn context_send_succeeds_with_sign_only_custody() {
     Python::with_gil(|py| {
         let (scp, owner, handle) = single_admin_owner_and_context(py);
-        let host = install_sign_only_governance_custody(py, scp.bridge_instance(), &owner);
+        let _host = install_sign_only_governance_custody(py, scp.bridge_instance(), &owner);
         let payload = pyo3::types::PyBytes::new(py, b"sign-only send");
         scp.context_send(py, &handle, &owner, payload.as_any(), None)
             .expect("a sign-only custody sends through CommandSigner");
-        let export_calls = host
-            .bind(py)
-            .getattr("export_calls")
-            .and_then(|n| n.extract::<usize>())
-            .unwrap();
-        assert_eq!(export_calls, 0, "the raw key is never requested");
     });
 }
 

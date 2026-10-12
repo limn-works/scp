@@ -699,46 +699,6 @@ pub struct SendPseudonymAnnouncementPayload {
     pub signer: crate::context::actor::signer::CommandSigner,
 }
 
-/// Owned Ed25519 signing key bytes used inside
-/// [`MessagingCommand::SendMessage`]. Wraps the 32-byte seed in
-/// [`Zeroizing`](zeroize::Zeroizing) so the private key zeroes on drop
-/// even if the command is dropped mid-mailbox without being dispatched
-/// (cancellation path). The handler reconstructs
-/// [`ed25519_dalek::SigningKey`] from the bytes on the receive side.
-pub struct SigningKeyBytes(pub zeroize::Zeroizing<[u8; 32]>);
-
-/// Redacting `Debug` (security def-in-depth): the seed bytes are NEVER formatted
-/// into a log line. `SigningKeyBytes` deliberately does not `derive(Debug)`, but
-/// providing a redacting impl means a FUTURE enclosing enum/struct that DOES
-/// `derive(Debug)` (a command variant carrying this key) prints `<redacted>`
-/// instead of failing to compile OR dumping the key bytes.
-impl std::fmt::Debug for SigningKeyBytes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("SigningKeyBytes")
-            .field(&"<redacted>")
-            .finish()
-    }
-}
-
-impl SigningKeyBytes {
-    /// Construct from an [`ed25519_dalek::SigningKey`] borrowed from
-    /// the caller. Copies the 32-byte seed so the caller's key can be
-    /// dropped while the command is in flight.
-    #[must_use]
-    pub fn from_signing_key(sk: &ed25519_dalek::SigningKey) -> Self {
-        Self(zeroize::Zeroizing::new(sk.to_bytes()))
-    }
-
-    /// Rebuild the [`ed25519_dalek::SigningKey`] on the handler side.
-    /// The returned value is NOT wrapped in `Zeroizing`; callers take
-    /// responsibility for zeroizing it after use (the command's own
-    /// bytes zero on drop regardless).
-    #[must_use]
-    pub fn to_signing_key(&self) -> ed25519_dalek::SigningKey {
-        ed25519_dalek::SigningKey::from_bytes(&self.0)
-    }
-}
-
 /// Reply-channel type alias for [`LifecycleCommand::CreateContext`]. The
 /// reply carries the [`ContextHandle`](crate::context::ContextHandle) of
 /// the freshly-created context. Factored out to satisfy

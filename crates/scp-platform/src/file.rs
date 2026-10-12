@@ -1583,25 +1583,6 @@ impl FileKeyCustody {
 
         Ok(handle)
     }
-
-    /// Exports a clone of the Ed25519 signing key for the given handle.
-    ///
-    /// Required by FFI bridges that need the raw `ed25519_dalek::SigningKey`
-    /// for core governance functions (`propose_governance_action`,
-    /// `approve_governance_proposal`, etc.) which take `&SigningKey` directly.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
-    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an
-    /// X25519 key.
-    pub async fn export_ed25519_signing_key(
-        &self,
-        handle: &KeyHandle,
-    ) -> Result<SigningKey, PlatformError> {
-        let (_key_bytes, signing_key) = self.decrypt_ed25519_key(handle).await?;
-        Ok(signing_key)
-    }
 }
 
 use scp_crypto::p256::P256SecretKey;
@@ -4402,13 +4383,6 @@ mod tests {
             custody.sign(&hpke_handle, &digest).await,
             Err(PlatformError::WrongKeyType {
                 expected: KeyType::P256Signing,
-                actual: KeyType::HpkeP256
-            })
-        ));
-        assert!(matches!(
-            custody.export_ed25519_signing_key(&hpke_handle).await,
-            Err(PlatformError::WrongKeyType {
-                expected: KeyType::Ed25519,
                 actual: KeyType::HpkeP256
             })
         ));

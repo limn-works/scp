@@ -154,24 +154,8 @@ class CryptoKeychain implements KeyCustodyProvider {
     return this.#pseudonymPoint(keyId, contextId, pseudonymEpoch);
   }
 
-  exportSigningKeyBytes(keyId: string): Uint8Array {
-    const seed = this.#seeds.get(keyId);
-    if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
-    return seed;
-  }
-
   custodyType(_keyId: string): string {
     return "software";
-  }
-}
-
-// A keychain that signs but REFUSES to export raw key bytes — the shape of a
-// real OS keychain / HSM / secure-enclave custody. `exportSigningKeyBytes`
-// throws, so any operation that depends on extracting the raw private key would
-// fail; only operations routed through the `sign` callback can succeed.
-class SignOnlyKeychain extends CryptoKeychain {
-  override exportSigningKeyBytes(_keyId: string): Uint8Array {
-    throw new Error("sign-only custody: raw key export is not permitted");
   }
 }
 
@@ -289,45 +273,13 @@ if (!scpAvailable) {
       }
     });
 
-    // The decisive regression guard: with a custody that signs but REFUSES to
-    // export raw key bytes (the keychain/HSM shape), export still succeeds
-    // because signing is routed through `KeyCustody::sign`. Under the previous
-    // raw-key-extraction path this export would have failed with an
-    // exportSigningKeyBytes error.
-    test("sign-only (no raw-key-export) custody can still produce a signed export", async () => {
-      const scp = new SCP({ storage: { type: "in_memory" } });
-      try {
-        const identity = await scp.identityCreateWithCustody(new SignOnlyKeychain());
-        const ctx = await scp.contextCreate(
-          identity,
-          JSON.stringify({
-            ceiling: ["messages:read", "context:close"],
-            memoryScope: "ephemeral",
-          }),
-        );
-
-        // Must NOT throw: signing the §23.16.8 digest goes through the `sign`
-        // callback, never through the throwing `exportSigningKeyBytes`.
-        const data = await scp.contextExport(ctx);
-        expect(data.length).toBeGreaterThan(0);
-
-        await scp.contextClose(ctx, identity.did);
-
-        const importedContextId = await scp.contextImport(data, identity.did);
-        expect(typeof importedContextId).toBe("string");
-        expect(importedContextId.length).toBeGreaterThan(0);
-      } finally {
-        await scp.shutdown(1000).catch(() => {});
-      }
-    });
-
     // ADR-049 Decision 7a: governance signs through `KeyCustody::sign`, so a
-    // custody that refuses raw key export still proposes, and the single-admin
+    // callback custody, which only signs, proposes, and the single-admin
     // proposal auto-executes after the engine verifies the custody signature.
-    test("sign-only (no raw-key-export) custody can still propose governance", async () => {
+    test("callback custody proposes governance through sign", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
-        const identity = await scp.identityCreateWithCustody(new SignOnlyKeychain());
+        const identity = await scp.identityCreateWithCustody(new CryptoKeychain());
         const ctx = await scp.contextCreate(
           identity,
           JSON.stringify({
@@ -350,11 +302,11 @@ if (!scpAvailable) {
     });
 
     // ADR-049 Decision 7a: a send signs its inner envelope through
-    // `KeyCustody::sign`, so a custody that refuses raw key export still sends.
-    test("sign-only (no raw-key-export) custody can still send", async () => {
+    // `KeyCustody::sign`, so a callback custody, which only signs, sends.
+    test("callback custody sends through sign", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
-        const identity = await scp.identityCreateWithCustody(new SignOnlyKeychain());
+        const identity = await scp.identityCreateWithCustody(new CryptoKeychain());
         const ctx = await scp.contextCreate(
           identity,
           JSON.stringify({

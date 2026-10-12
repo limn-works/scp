@@ -14749,41 +14749,6 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     func deriveRotatablePseudonym(keyId: String, contextId: Data, pseudonymEpoch: UInt64) async throws  -> Data
     
     /**
-     * Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
-     *
-     * The bridge's signing paths that sign with an `ed25519_dalek::SigningKey`,
-     * governance vote signing among them, build that key from the returned
-     * bytes. A key held in hardware or in Android Keystore does not export its
-     * bytes, and ADR-063 requires every key-export accessor, this callback
-     * included, to leave the custody adapters and all three bridges, because
-     * hardware custody on the governance path is impossible until then.
-     *
-     * # Default
-     *
-     * Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-     * implemented. A host that needs it overrides it. No Kotlin class
-     * implements this callback: the Kotlin `AndroidKeyCustody` implements the
-     * Kotlin SDK's own `KeyCustodyProvider` interface, and no code passes it
-     * to the Rust engine. Third-party
-     * `KeyCustodyProvider` implementations that do not need governance vote
-     * signing may rely on the default until they add support.
-     *
-     * **Note:** `UniFFI` callback interfaces require foreign implementations to
-     * define all methods. The generated Swift protocol / Kotlin interface will
-     * include this method. The default here applies only to Rust-side callers.
-     *
-     * # Errors
-     *
-     * The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
-     * destroyed or never existed, and the caller receives key-not-found
-     * (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
-     * `SCP-CTX-2050` and a key that is not exportable or not Ed25519, reaches
-     * the caller as the custody error `SCP-CRYPTO-4060` carrying the host's
-     * code and message.
-     */
-    func exportSigningKeyBytes(keyId: String) async throws  -> Data
-    
-    /**
      * Return the custody type for `key_id`: `"hardware"`, `"software"`, or
      * `"in_memory"`. Stays sync — no I/O required.
      */
@@ -15083,49 +15048,6 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                      keyId: try FfiConverterString.lift(keyId),
                      contextId: try FfiConverterData.lift(contextId),
                      pseudonymEpoch: try FfiConverterUInt64.lift(pseudonymEpoch)
-                )
-            }
-
-            let uniffiHandleSuccess = { (returnValue: Data) in
-                uniffiFutureCallback(
-                    uniffiCallbackData,
-                    UniffiForeignFutureStructRustBuffer(
-                        returnValue: FfiConverterData.lower(returnValue),
-                        callStatus: RustCallStatus()
-                    )
-                )
-            }
-            let uniffiHandleError = { (statusCode, errorBuf) in
-                uniffiFutureCallback(
-                    uniffiCallbackData,
-                    UniffiForeignFutureStructRustBuffer(
-                        returnValue: RustBuffer.empty(),
-                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
-                    )
-                )
-            }
-            let uniffiForeignFuture = uniffiTraitInterfaceCallAsyncWithError(
-                makeCall: makeCall,
-                handleSuccess: uniffiHandleSuccess,
-                handleError: uniffiHandleError,
-                lowerError: FfiConverterTypeScpError_lower
-            )
-            uniffiOutReturn.pointee = uniffiForeignFuture
-        },
-        exportSigningKeyBytes: { (
-            uniffiHandle: UInt64,
-            keyId: RustBuffer,
-            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
-            uniffiCallbackData: UInt64,
-            uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
-        ) in
-            let makeCall = {
-                () async throws -> Data in
-                guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
-                    throw UniffiInternalError.unexpectedStaleHandle
-                }
-                return try await uniffiObj.exportSigningKeyBytes(
-                     keyId: try FfiConverterString.lift(keyId)
                 )
             }
 
@@ -18267,10 +18189,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 54334) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 56607) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 30807) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 59116) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_messagelistener_on_message() != 11557) {

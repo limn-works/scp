@@ -3,10 +3,10 @@
 // These tests exercise the software fallback path (Bouncy Castle) since Android Keystore
 // is not available in JVM unit tests. AndroidKeyCustodyPseudonymLifecycleTest runs the
 // Keystore path (API 33+, CustodyType.HARDWARE) against a fake KeystoreKeys; no on-device
-// test of the real Keystore exists yet. Three checks on a hardware handle throw before they
-// read Keystore, so a JVM test reaches them: exportSigningKeyBytes's SCP-CRYPTO-4005,
-// dhAgree's SCP-CRYPTO-4003 for a peer key that is not 32 bytes, and dhAgree's
-// SCP-CRYPTO-4006 for a 32-byte peer key, because a Keystore handle never enters softwareKeys.
+// test of the real Keystore exists yet. Two checks on a hardware handle throw before they
+// read Keystore, so a JVM test reaches them: dhAgree's SCP-CRYPTO-4003 for a peer key that
+// is not 32 bytes, and dhAgree's SCP-CRYPTO-4006 for a 32-byte peer key, because a Keystore
+// handle never enters softwareKeys.
 //
 // Uses InMemorySharedPreferences to inject a test double for EncryptedSharedPreferences,
 // allowing verification of Ed25519 key persistence without the Android framework.
@@ -109,9 +109,6 @@ internal class InMemorySharedPreferences : SharedPreferences {
  *   [CustodyType.HARDWARE] handle, each thrown before it reads Keystore
  * - Pseudonym derivation determinism
  * - Key destruction, and the error codes a destroyed handle yields
- * - Signing-key export: the seed of a software Ed25519 key, `SCP-CRYPTO-4003` for an X25519
- *   key, `SCP-CRYPTO-4006` for a missing key, and
- *   `SCP-CRYPTO-4005` for a [CustodyType.HARDWARE] handle, which throws before it reads Keystore
  * - Error handling (key not found, wrong key type)
  * - Ed25519 key persistence to EncryptedSharedPreferences
  *
@@ -574,66 +571,6 @@ class AndroidKeyCustodyTest {
             )
             assertEquals(33, pubKey.size)
             assertTrue(pubKey[0] == 0x02.toByte() || pubKey[0] == 0x03.toByte())
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // Signing-key export
-    // -------------------------------------------------------------------
-
-    @Nested
-    inner class ExportSigningKeyBytes {
-
-        @Test
-        fun `exportSigningKeyBytes rejects a hardware handle with SCP-CRYPTO-4005 citing ADR-063`() {
-            // The hardware branch throws before it reads Android Keystore, so a JVM test reaches it.
-            val hardwareHandle = KeyHandle(id = "keystore-key", custodyType = CustodyType.HARDWARE)
-            val exception = assertThrows<ScpException> {
-                custody.exportSigningKeyBytes(hardwareHandle)
-            }
-            assertEquals("SCP-CRYPTO-4005", exception.code)
-            val message = exception.message.orEmpty()
-            assertTrue(message.contains("ADR-063's curve slice"), message)
-            // ADR-063 requires every key-export accessor to leave the custody adapters and all
-            // three bridges, not only for governance signing, so the message may not narrow the
-            // clause.
-            assertTrue(message.contains("every key-export accessor"), message)
-            assertTrue(!message.contains("for governance signing"), message)
-            // The curve slice has not landed, so the message may not state its signer path as current.
-            assertTrue(message.contains("has not landed"), message)
-            assertTrue(!message.contains("replaces raw-key export"), message)
-            assertTrue(!message.contains("GitHub issue"), message)
-            // The adapter never reads KeyInfo.securityLevel, so the message may not claim a TEE.
-            assertTrue(message.contains("Android Keystore custody"), message)
-            assertTrue(!message.contains("TEE"), message)
-        }
-
-        @Test
-        fun `exportSigningKeyBytes returns the 32-byte seed of a software Ed25519 key`() {
-            val handle = custody.generateKeypair(KeyType.ED25519)
-            val seed = custody.exportSigningKeyBytes(handle)
-            assertEquals(32, seed.size)
-            // The exported seed regenerates the handle's public key, so it is that key's seed.
-            val derivedPublic = Ed25519PrivateKeyParameters(seed, 0).generatePublicKey().encoded
-            assertArrayEquals(custody.publicKey(handle), derivedPublic)
-        }
-
-        @Test
-        fun `exportSigningKeyBytes throws SCP-CRYPTO-4003 for an X25519 key`() {
-            val x25519Handle = custody.generateKeypair(KeyType.X25519)
-            val exception = assertThrows<ScpException> {
-                custody.exportSigningKeyBytes(x25519Handle)
-            }
-            assertEquals("SCP-CRYPTO-4003", exception.code)
-        }
-
-        @Test
-        fun `exportSigningKeyBytes throws SCP-CRYPTO-4006 for a missing software key`() {
-            val missing = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
-            val exception = assertThrows<ScpException> {
-                custody.exportSigningKeyBytes(missing)
-            }
-            assertEquals("SCP-CRYPTO-4006", exception.code)
         }
     }
 

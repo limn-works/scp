@@ -1497,7 +1497,7 @@ impl crate::scp::PyScp {
     /// The `provider` is a Python object implementing the
     /// [`KeyCustodyProvider`](scp_sdk.scp.KeyCustodyProvider) protocol
     /// (`sign`, `get_public_key`, `destroy_key`, `generate_keypair`,
-    /// `dh_agree`, `derive_pseudonym`, `export_signing_key_bytes`,
+    /// `dh_agree`, `derive_pseudonym`, `derive_rotatable_pseudonym`,
     /// `custody_type`). The private key material never crosses into Rust
     /// ownership — every cryptographic operation re-enters Python under a
     /// fresh GIL (ADR-006). This is the desktop/server equivalent of the
