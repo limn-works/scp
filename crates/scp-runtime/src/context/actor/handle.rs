@@ -456,6 +456,13 @@ impl ContextActorHandle {
         }
     }
 
+    /// How many commands wait in the actor's mailbox, not counting the one
+    /// the actor is processing (`testing` only).
+    #[cfg(any(test, feature = "testing"))]
+    pub(in crate::context) fn queued_commands(&self) -> usize {
+        self.inbox.max_capacity() - self.inbox.capacity()
+    }
+
     /// Whether the actor's inbox receiver has dropped, which happens when its
     /// `run()` returns or its task unwinds from a panic.
     pub(in crate::context) fn is_closed(&self) -> bool {

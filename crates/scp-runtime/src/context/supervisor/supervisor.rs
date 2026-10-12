@@ -3149,7 +3149,8 @@ impl Supervisor {
     ///   has no custody for `owner`.
     /// - [`ContextError::NotInitialized`] if the supervisor has no storage.
     /// - [`ContextError::PersistenceFailed`] if the read or write fails; a key
-    ///   generated for a record that could not be written is destroyed.
+    ///   generated for a record that could not be written is destroyed once
+    ///   its record is removed, and kept when the removal fails too.
     /// - [`ContextError::CryptoFailed`] if the stored value is not a version-1
     ///   handle record; the stored value is left as it is and no key is created
     ///   over it.
@@ -3193,13 +3194,15 @@ impl Supervisor {
     /// custody and stores its record. Runs under `owner`'s load lock only,
     /// whose guard `load_guard` is, and returns that guard with the key.
     ///
-    /// Generate, store, and destroy-on-store-failure run in a spawned task
-    /// that holds `load_guard`, so a caller dropped mid-sequence (a UniFFI
-    /// async cancellation drops the Rust future) cannot cut it: the task
-    /// either stores the key's record or destroys the key, and no other load
-    /// of `owner` reads the record before it finishes. A generate that times
-    /// out can still orphan a key (see
-    /// [`custody_bounded`](crate::crypto::wrapping::custody_bounded)).
+    /// Generate, store, and the cleanup of a failed store run in a spawned
+    /// task that holds `load_guard`, so a caller dropped mid-sequence (a
+    /// UniFFI async cancellation drops the Rust future) cannot cut it, and no
+    /// other load of `owner` reads the record before the task finishes. When
+    /// the store reports an error, the task removes the record before it
+    /// destroys the key, because the write may have committed; a record it
+    /// cannot remove keeps its key. A stored record therefore never names a
+    /// key this task destroyed. The cases that can still orphan a key are
+    /// listed at [`custody_bounded`](crate::crypto::wrapping::custody_bounded).
     ///
     /// # Errors
     ///
@@ -3247,7 +3250,27 @@ impl Supervisor {
             )
             .await
             {
-                key.destroy().await;
+                // A write that reports an error may still have committed, so
+                // the key is destroyed only once its record is gone: a stored
+                // record never names a destroyed key, which a later load
+                // would refuse forever as `WrappingKeyHandleInvalid`. When the
+                // record cannot be removed either, the key stays: a committed
+                // record then names a live key and the next load uses it, and
+                // an uncommitted one leaves an orphan the next load does not
+                // see.
+                match crate::store::wrapping_key::delete_wrapping_key_handle(
+                    storage.as_ref(),
+                    &owner,
+                )
+                .await
+                {
+                    Ok(()) => key.destroy().await,
+                    Err(delete_error) => tracing::warn!(
+                        error = %delete_error,
+                        "wrapping key record write failed and its removal failed; \
+                         keeping the key in custody"
+                    ),
+                }
                 return Err(e);
             }
             Ok((key, load_guard))
@@ -18462,8 +18485,9 @@ mod tests {
         assert!(sup.wrapping_keys.get(&did).is_none());
     }
 
-    /// A generated key whose record cannot be written is destroyed in custody
-    /// and the load fails with `PersistenceFailed`.
+    /// A generated key whose record write is refused is destroyed in custody
+    /// once the record is removed, no record remains, and the load fails with
+    /// `PersistenceFailed`.
     #[tokio::test]
     async fn load_wrapping_key_destroys_the_generated_key_when_its_record_cannot_be_stored() {
         let storage = Arc::new(
@@ -18471,7 +18495,7 @@ mod tests {
                 InMemoryStorage::new(),
             )),
         );
-        storage.fail_prefix("wrapping_key/");
+        storage.fail_store_prefix("wrapping_key/");
         let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
         let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
         let did = DID("did:example:wrap-store-fails".to_owned());
@@ -18488,7 +18512,95 @@ mod tests {
             matches!(gone, Err(scp_platform::PlatformError::KeyNotFound)),
             "the unrecorded key is destroyed: {gone:?}"
         );
+        assert!(stored_wrapping_record(&sup, &did.0).await.is_none());
         assert!(sup.wrapping_keys.get(&did).is_none());
+    }
+
+    /// Whether custody still holds `handle`.
+    async fn custody_holds(
+        custody: &crate::crypto::dh_counting_custody::DhCountingCustody,
+        handle: &scp_platform::KeyHandle,
+    ) -> bool {
+        use scp_platform::traits::KeyCustody as _;
+        match custody.inner.public_key(handle).await {
+            Ok(_) => true,
+            Err(scp_platform::PlatformError::KeyNotFound) => false,
+            Err(e) => panic!("custody public_key: {e:?}"),
+        }
+    }
+
+    /// A record write that commits and then reports an error leaves no record
+    /// naming the destroyed key: the load removes the record, then destroys
+    /// the key, and fails with `PersistenceFailed`. The next load generates
+    /// and stores a key instead of refusing a record whose handle is gone.
+    #[tokio::test]
+    async fn a_record_write_that_commits_and_errors_is_removed_before_its_key_is_destroyed() {
+        let storage = Arc::new(
+            crate::context::supervisor::faulty_storage::FaultyStorage::new(Arc::new(
+                InMemoryStorage::new(),
+            )),
+        );
+        storage.fail_after_commit_prefix("wrapping_key/");
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let did = DID("did:example:wrap-store-commits-then-fails".to_owned());
+
+        let err = sup.load_wrapping_key(&did).await.unwrap_err();
+        assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
+        let generated = custody.generated_handles();
+        assert_eq!(generated.len(), 1, "one key was generated");
+        assert!(
+            stored_wrapping_record(&sup, &did.0).await.is_none(),
+            "the committed record is removed"
+        );
+        assert!(
+            !custody_holds(&custody, &generated[0]).await,
+            "the unrecorded key is destroyed"
+        );
+
+        storage.clear_fail();
+        let key = sup.load_wrapping_key(&did).await.unwrap();
+        assert_eq!(custody.generate_calls(), 2, "the next load creates a key");
+        let record = crate::store::wrapping_key::load_wrapping_key_handle(
+            sup.mls_storage_ref().unwrap().as_ref(),
+            &did,
+        )
+        .await
+        .unwrap()
+        .expect("the next load stores its record");
+        assert_eq!(record.handle, *key.handle());
+        assert!(custody_holds(&custody, key.handle()).await);
+    }
+
+    /// When a record write commits and errors and the record cannot be
+    /// removed either, the key is kept: the committed record names a live
+    /// key, and the next load returns that key without generating one.
+    #[tokio::test]
+    async fn a_committed_record_that_cannot_be_removed_keeps_its_key() {
+        let storage = Arc::new(
+            crate::context::supervisor::faulty_storage::FaultyStorage::new(Arc::new(
+                InMemoryStorage::new(),
+            )),
+        );
+        storage.fail_after_commit_prefix("wrapping_key/");
+        storage.fail_delete_prefix("wrapping_key/");
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let did = DID("did:example:wrap-store-commits-delete-fails".to_owned());
+
+        let err = sup.load_wrapping_key(&did).await.unwrap_err();
+        assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
+        let generated = custody.generated_handles();
+        assert_eq!(generated.len(), 1, "one key was generated");
+        assert!(
+            custody_holds(&custody, &generated[0]).await,
+            "the key a committed record may name is kept"
+        );
+
+        storage.clear_fail();
+        let key = sup.load_wrapping_key(&did).await.unwrap();
+        assert_eq!(*key.handle(), generated[0], "the recorded key loads");
+        assert_eq!(custody.generate_calls(), 1, "nothing is regenerated");
     }
 
     /// A custody refusal that is not key-not-found, met while checking a
@@ -26418,11 +26530,13 @@ mod tests {
         assert!(sup.wrapping_keys.is_empty(), "no key is loaded");
     }
 
-    /// A wrapping-key load failure ends CreateContext and RestoreContext
-    /// before either takes `bootstrap_spawn_lock`: with that lock held
-    /// elsewhere, both return the load error without waiting on it.
+    /// A wrapping-key load failure ends CreateContext, RestoreContext and
+    /// ImportContext before any of them takes `bootstrap_spawn_lock`: with
+    /// that lock held elsewhere, each returns the load error without waiting
+    /// on it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn create_and_restore_return_a_wrapping_key_load_failure_before_any_lock() {
+    async fn create_restore_and_import_return_a_wrapping_key_load_failure_before_any_lock() {
+        use ed25519_dalek::Signer as _;
         let none: WrappingCustodySource = Arc::new(|_: &DID| None);
         let sup = supervisor_with_persistence_and_custody_source(
             Box::new(MapPersistence::default()),
@@ -26434,6 +26548,27 @@ mod tests {
             ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
             ..Default::default()
         };
+        // A valid export from a supervisor that has custody, so the import
+        // passes its export check and reaches the wrapping-key load.
+        let (exporter, _exporter_custody) = lock_checking_supervisor();
+        let exporter_identity = exporter.node_identity().unwrap();
+        let exported_ctx = hex::encode([0xC7u8; 32]);
+        exporter
+            .create_context(
+                exported_ctx.clone(),
+                params.clone(),
+                exporter_identity.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let export = exporter
+            .export_context(&exported_ctx, exporter_identity, |hash: &[u8; 32]| {
+                Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
+            })
+            .await
+            .unwrap();
         let budget = std::time::Duration::from_secs(5);
         let _held = sup.bootstrap_spawn_lock.lock().await;
 
@@ -26464,6 +26599,68 @@ mod tests {
             "{err:?}"
         );
         assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+
+        let err = tokio::time::timeout(
+            budget,
+            Box::pin(sup.import_context(export, &signing_key.verifying_key(), None)),
+        )
+        .await
+        .expect("import returns without taking bootstrap_spawn_lock")
+        .unwrap_err();
+        assert!(
+            matches!(err, ContextError::WrappingKeyCustodyUnavailable),
+            "{err:?}"
+        );
+        assert!(
+            sup.lookup(&exported_ctx).is_none(),
+            "no imported actor is registered"
+        );
+        assert!(sup.wrapping_keys.is_empty(), "no key is loaded");
+    }
+
+    /// Shutdown closes the spawn gate before it clears the wrapping-key map,
+    /// so a `wrapping_key` call that misses the map has already met the
+    /// closed gate and reports `SupervisorShutDown`, never `InvalidState`.
+    /// The map holds the only reference to the loaded key and through it to
+    /// its custody, so the clear drops that custody, which records whether
+    /// the gate was closed at that moment.
+    #[tokio::test]
+    async fn shutdown_closes_the_spawn_gate_before_it_clears_the_wrapping_keys() {
+        let custody = Arc::new(LockCheckingCustody::new());
+        let gate_closed_at_drop = Arc::clone(&custody.gate_closed_at_drop);
+        // The source hands the custody out once, so after the load the loaded
+        // key holds the only reference to it.
+        let slot = std::sync::RwLock::new(Some(Arc::clone(&custody)));
+        let source: WrappingCustodySource = Arc::new(move |_: &DID| {
+            slot.write().unwrap().take().map(
+                |c| -> Arc<dyn crate::crypto::wrapping::WrappingCustody> {
+                    Arc::new(crate::crypto::wrapping::ErasedCustody(c))
+                },
+            )
+        });
+        let sup = supervisor_with_persistence_and_custody_source(
+            Box::new(MapPersistence::default()),
+            source,
+        );
+        custody
+            .supervisor
+            .set(Arc::downgrade(&sup))
+            .unwrap_or_else(|_| unreachable!("set once"));
+        drop(custody);
+        let did = DID("did:example:wrap-shutdown-order".to_owned());
+        drop(sup.load_wrapping_key(&did).await.unwrap());
+        assert!(
+            gate_closed_at_drop.get().is_none(),
+            "the map keeps the loaded key's custody alive"
+        );
+
+        sup.shutdown_all_contexts().await;
+        assert!(sup.wrapping_keys.is_empty(), "shutdown clears the map");
+        assert_eq!(
+            gate_closed_at_drop.get(),
+            Some(&true),
+            "the gate is closed when the clear drops the key"
+        );
     }
 
     /// In-memory custody that, on every wrapping-key call, tries the
@@ -26475,6 +26672,9 @@ mod tests {
         supervisor: std::sync::OnceLock<std::sync::Weak<Supervisor>>,
         calls: std::sync::atomic::AtomicUsize,
         held: std::sync::Mutex<Vec<String>>,
+        /// Set when this custody drops, while its supervisor is alive, to
+        /// whether that supervisor's spawn gate was closed at the drop.
+        gate_closed_at_drop: Arc<std::sync::OnceLock<bool>>,
     }
 
     impl LockCheckingCustody {
@@ -26484,6 +26684,7 @@ mod tests {
                 supervisor: std::sync::OnceLock::new(),
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 held: std::sync::Mutex::new(Vec::new()),
+                gate_closed_at_drop: Arc::new(std::sync::OnceLock::new()),
             }
         }
 
@@ -26587,6 +26788,16 @@ mod tests {
 
         fn custody_type(&self, key: &scp_platform::KeyHandle) -> scp_platform::traits::CustodyType {
             self.inner.custody_type(key)
+        }
+    }
+
+    impl Drop for LockCheckingCustody {
+        fn drop(&mut self) {
+            if let Some(sup) = self.supervisor.get().and_then(std::sync::Weak::upgrade) {
+                let _ = self
+                    .gate_closed_at_drop
+                    .set(sup.refuse_if_shut_down("custody drop probe").is_err());
+            }
         }
     }
 
