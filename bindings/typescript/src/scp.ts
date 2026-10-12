@@ -81,6 +81,7 @@ import type {
   ChallengeResponse,
   ChallengeVerification,
   ConsequenceRule,
+  CreatedChallenge,
   EventLogEntry,
   GovernanceActionResult,
   InviteMemberOutcome,
@@ -90,11 +91,13 @@ import type {
   RequireParticipation,
   SagaResult,
   SealedInvitation,
+  TestCase,
   ThresholdRequirement,
   TrustEvaluation,
 } from "./types";
 import {
   checkProposalResponse,
+  decodeChallengeVerification,
   encodeAttestation,
   encodeAttestorSets,
   encodeCachedAttestations,
@@ -107,6 +110,7 @@ import {
   encodeMerkleRoot,
   encodeParticipationProfile,
   encodeRequireParticipation,
+  encodeTestCases,
   encodeThresholdRequirements,
   governanceActionResultFromBridge,
   memberRoleFromBridge,
@@ -3865,32 +3869,89 @@ export class SCP {
     }
   }
 
-  trustCreateChallenge(targetDid: string): unknown {
+  /**
+   * Issue a challenge request signed with `verifier`'s `#active` key (spec 07
+   * §7.3.4, ADR-017).
+   *
+   * The verifier writes the test cases. A protocol capability URI
+   * (`scp:capability:*`) must be in the protocol capability list, and the
+   * request must meet its standard's minimum case count.
+   *
+   * @param verifier DID of an identity of this instance; its custody signs.
+   * @param subject DID of the identity being challenged.
+   * @param capabilityUri The capability URI under test, in canonical form.
+   * @param testCases The verifier-written cases; their weights sum to 10000.
+   * @param timeoutSecs Seconds the subject has to complete every case.
+   * @throws ValidationError `SCP-VALID-7013` for a malformed DID;
+   *   {@link CHALLENGE_SUITE_BELOW_MINIMUM_CODE} (`SCP-VALID-7039`) for too few
+   *   cases; `SCP-VALID-7003` for any other refusal.
+   * @throws ScpError `SCP-CRYPTO-4006` when the verifier's key is destroyed,
+   *   or another custody failure.
+   */
+  async trustCreateChallenge(
+    verifier: string,
+    subject: string,
+    capabilityUri: string,
+    testCases: readonly TestCase[],
+    timeoutSecs: number = 300,
+  ): Promise<CreatedChallenge> {
+    const testCasesJson = encodeTestCases(testCases);
     try {
-      return (this.#native.trustCreateChallenge as (d: string) => unknown)(targetDid);
+      return await (
+        this.#native.trustCreateChallenge as (
+          v: string,
+          s: string,
+          u: string,
+          t: string,
+          secs: number,
+        ) => Promise<CreatedChallenge>
+      )(verifier, subject, capabilityUri, testCasesJson, timeoutSecs);
     } catch (err) {
       throw mapBridgeError(err);
     }
   }
 
   /**
-   * Verify a challenge response against its original challenge request
-   * (ADR-017, §7.3.4).
+   * Check `response` against `challenge` and return the record, signed with
+   * `verifier`'s `#active` key (spec 07 §7.3.4, ADR-017).
    *
-   * Takes the typed {@link ChallengeRequest} / {@link ChallengeResponse} and
-   * serializes them to the serde wire shapes internally (ADR-058) before
-   * crossing FFI. Returns `true` if the response is valid (correct
-   * responder, within timeout, valid signature), `false` otherwise.
+   * The request's and the response's signatures are checked against keys
+   * this instance's DID resolver returns.
+   *
+   * @param verifier DID of the identity that issued `challenge`; it must be an
+   *   identity of this instance.
+   * @param challenge The signed request ({@link decodeChallengeRequest} of
+   *   {@link CreatedChallenge.challengeJson}).
+   * @param response The subject's signed response.
+   * @param contextId The context where the challenge was administered.
+   * @throws ValidationError `SCP-VALID-7013` for a malformed DID,
+   *   `SCP-VALID-7011` for an empty `contextId`, `SCP-VALID-7003` when a check
+   *   fails.
+   * @throws IdentityError `SCP-IDENT-1033` when this instance has no DID
+   *   resolver.
    */
-  trustVerifyResponse(challenge: ChallengeRequest, response: ChallengeResponse): boolean {
+  async trustVerifyResponse(
+    verifier: string,
+    challenge: ChallengeRequest,
+    response: ChallengeResponse,
+    contextId: string,
+  ): Promise<ChallengeVerification> {
+    const challengeJson = encodeChallengeRequest(challenge);
+    const responseJson = encodeChallengeResponse(response);
+    let recordJson: string;
     try {
-      return (this.#native.trustVerifyResponse as (c: string, r: string) => boolean)(
-        encodeChallengeRequest(challenge),
-        encodeChallengeResponse(response),
-      );
+      recordJson = await (
+        this.#native.trustVerifyResponse as (
+          v: string,
+          c: string,
+          r: string,
+          ctx: string,
+        ) => Promise<string>
+      )(verifier, challengeJson, responseJson, contextId);
     } catch (err) {
       throw mapBridgeError(err);
     }
+    return decodeChallengeVerification(recordJson);
   }
 
   /**

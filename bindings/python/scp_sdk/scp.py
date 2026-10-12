@@ -82,8 +82,12 @@ if TYPE_CHECKING:
         BehavioralRecord,
         CachedAttestation,
         CapabilityValidation,
+        ChallengeRequest,
+        ChallengeResponse,
+        ChallengeResult,
         ChallengeVerification,
         EventLogEntry,
+        TestCase,
         ThresholdRequirement,
         TrustEvaluation,
     )
@@ -2811,6 +2815,102 @@ class SCP:
     async def trust_query_score(self, did: str, context_id: str) -> Any:
         """Delegate to ``_scp_core.SCP.trust_query_score``."""
         return await asyncio.to_thread(self._native.trust_query_score, did, context_id)
+
+    async def trust_create_challenge(
+        self,
+        verifier: str,
+        subject: str,
+        capability_uri: str,
+        test_cases: list[TestCase],
+        timeout_secs: int = 300,
+    ) -> ChallengeResult:
+        """Issue a challenge request signed with ``verifier``'s ``#active`` key
+        (spec 07 §7.3.4, ADR-017).
+
+        The verifier writes the test cases. A protocol capability URI
+        (``scp:capability:*``) must be in the protocol capability list, and
+        the request must meet its standard's minimum case count.
+
+        Args:
+            verifier: DID of an identity of this instance; its custody signs.
+            subject: DID of the identity being challenged.
+            capability_uri: The capability URI under test, in canonical form.
+            test_cases: The verifier-written cases; their weights sum to 10000.
+            timeout_secs: Seconds the subject has to complete every case.
+
+        Returns:
+            The request's hex ``challenge_id`` and the signed request JSON.
+
+        Raises:
+            ValidationError: ``SCP-VALID-7013`` for a malformed ``verifier`` or
+                ``subject`` DID; :data:`scp_sdk.trust.CHALLENGE_SUITE_BELOW_MINIMUM_CODE`
+                (``SCP-VALID-7039``) for too few cases; ``SCP-VALID-7003`` for
+                any other refusal (unknown protocol URI, weights not summing to
+                10000, a duplicate ``test_id``, a number outside I-JSON range).
+            ScpError: ``SCP-CRYPTO-4006`` when the verifier's key is destroyed,
+                or another custody failure.
+        """
+        import json
+
+        test_cases_json = json.dumps([case._to_wire() for case in test_cases])
+        try:
+            return await asyncio.to_thread(
+                self._native.trust_create_challenge,
+                verifier,
+                subject,
+                capability_uri,
+                test_cases_json,
+                timeout_secs,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
+
+    async def trust_verify_response(
+        self,
+        verifier: str,
+        challenge: ChallengeRequest,
+        response: ChallengeResponse,
+        context_id: str,
+    ) -> ChallengeVerification:
+        """Check ``response`` against ``challenge`` and return the record,
+        signed with ``verifier``'s ``#active`` key (spec 07 §7.3.4, ADR-017).
+
+        The request's signature and the response's signature are checked
+        against keys this instance's DID resolver returns.
+
+        Args:
+            verifier: DID of the identity that issued ``challenge``; it must be
+                an identity of this instance.
+            challenge: The signed request, ``json.loads`` of
+                ``trust_create_challenge``'s ``challenge_json``.
+            response: The subject's signed response.
+            context_id: The context where the challenge was administered.
+
+        Raises:
+            ValidationError: ``SCP-VALID-7013`` for a malformed ``verifier``
+                DID; ``SCP-VALID-7011`` for an empty ``context_id``;
+                ``SCP-VALID-7003`` when a check fails (signature, verifier,
+                challenge id, timeout, counts or score).
+            IdentityError: ``SCP-IDENT-1033`` when this instance has no DID
+                resolver (no identity was created on it).
+            ScpError: ``SCP-CRYPTO-4006`` when the verifier's key is destroyed,
+                or another custody failure.
+        """
+        import json
+
+        from scp_sdk.trust import ChallengeVerification as _ChallengeVerification
+
+        try:
+            record_json = await asyncio.to_thread(
+                self._native.trust_verify_response,
+                verifier,
+                json.dumps(challenge),
+                json.dumps(response),
+                context_id,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
+        return _ChallengeVerification.from_dict(json.loads(record_json))
 
     async def evaluate_trust(
         self,

@@ -185,6 +185,11 @@ pub mod event_log;
 
 // Trust store shared across PyO3, napi-rs, and UniFFI bridges.
 // Requires scp-core (behind `resolvers` feature).
+/// The challenge create and verify operations the three bridges share
+/// (spec 07 §7.3.4).
+#[cfg(feature = "resolvers")]
+pub mod challenge;
+
 #[cfg(feature = "resolvers")]
 pub mod trust_store;
 

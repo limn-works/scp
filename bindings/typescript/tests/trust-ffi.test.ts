@@ -3,7 +3,7 @@
  * spec §7.3 / §7.3.4).
  *
  * These drive `scp.aggregateTrustInput`, `scp.trustVerifyAttestation`, and
- * `scp.trustVerifyResponse` against the real NAPI addon, proving the
+ * `scp.trustCreateChallenge` and `scp.trustVerifyResponse` against the real NAPI addon, proving the
  * types.ts-serialized JSON parses and evaluates on the real Rust
  * deserializers — not just that the encoders emit the pinned shapes
  * (`trust.test.ts` covers that with the mock bridge). Mirrors the Kotlin
@@ -14,13 +14,31 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { ScpError } from "../src/errors";
 import { SCP } from "../src/scp";
 import type {
   CachedAttestationEnvelope,
   ChallengeRequest,
   ChallengeResponse,
   EventLogEntry,
+  TestCase,
 } from "../src/types";
+import { CHALLENGE_SUITE_BELOW_MINIMUM_CODE, decodeChallengeRequest } from "../src/types";
+
+const SCHEMA_URI = "scp:capability:schema-validation/v1";
+
+/** `n` exact-match cases whose weights sum to 10000. */
+function testCases(n: number): TestCase[] {
+  const weight = Math.floor(10_000 / n);
+  return Array.from({ length: n }, (_, i) => ({
+    testId: `t${i}`,
+    input: { i },
+    expected: { kind: "ExactMatch", value: { ok: true } },
+    category: "basic",
+    weight: i === 0 ? 10_000 - weight * (n - 1) : weight,
+  }));
+}
+
 import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
@@ -113,27 +131,46 @@ if (scp === null) {
       expect(result.errorMessage.length).toBeGreaterThan(0);
     });
 
-    test("a typed challenge pair parses and verification runs (invalid signature)", () => {
-      const challenge: ChallengeRequest = {
-        challengeId: "chal-ffi-1",
-        challengeType: "scp:capability:schema-validation/v1",
-        challengerDid: "did:dht:zChallenger",
-        subjectDid: "did:dht:zSubject",
-        capabilityUri: "scp:capability:schema-validation/v1",
-        parameters: {},
-        timeout: { secs: 300, nanos: 0 },
-        signature: Array.from({ length: 64 }, () => 0),
-      };
+    test("trustCreateChallenge refuses a protocol suite below its minimum with SCP-VALID-7039", async () => {
+      const verifier = await live.identityCreate("in_memory");
+      const subject = await live.identityCreate("in_memory");
+      let caught: unknown;
+      try {
+        await live.trustCreateChallenge(verifier.did, subject.did, SCHEMA_URI, testCases(19));
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(ScpError);
+      expect((caught as ScpError).code).toBe(CHALLENGE_SUITE_BELOW_MINIMUM_CODE);
+    });
+
+    test("a created request decodes into the SDK types; a forged response is refused", async () => {
+      const verifier = await live.identityCreate("in_memory");
+      const subject = await live.identityCreate("in_memory");
+      const cases = testCases(20);
+      const created = await live.trustCreateChallenge(verifier.did, subject.did, SCHEMA_URI, cases);
+      const challenge: ChallengeRequest = decodeChallengeRequest(created.challengeJson);
+      expect(challenge.challengeId).toBe(created.challengeId);
+      expect(challenge.verifier).toBe(verifier.did);
+      expect(challenge.subject).toBe(subject.did);
+      expect(challenge.testCases).toEqual(cases);
+      expect(challenge.verifierSignature).toHaveLength(64);
+
       const response: ChallengeResponse = {
-        challengeId: "chal-ffi-1",
-        responderDid: "did:dht:zSubject",
-        result: { passed: true },
-        completedAt: 1_700_000_100,
+        challengeId: challenge.challengeId,
+        responderDid: subject.did,
+        result: { passed: true, score: 10_000, test_count: 20, pass_count: 20 },
+        completedAt: Math.floor(Date.now() / 1000),
         signature: Array.from({ length: 64 }, () => 0),
       };
-      // Dummy signatures cannot verify — the structured `false` (not a parse
-      // error) proves both serialized records reached the real verifier.
-      expect(live.trustVerifyResponse(challenge, response)).toBe(false);
+      let caught: unknown;
+      try {
+        await live.trustVerifyResponse(verifier.did, challenge, response, "ctx-ffi");
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(ScpError);
+      expect((caught as ScpError).code).toBe("SCP-VALID-7003");
     });
   });
 }

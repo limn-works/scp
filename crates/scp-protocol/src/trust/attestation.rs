@@ -1284,16 +1284,17 @@ pub fn check_threshold_attestation(input: &ThresholdCheckInput<'_>) -> Threshold
 /// same f64 rounding class (e.g. `9007199254740993` and `9007199254740992`)
 /// canonicalize to identical bytes, producing identical preimages — a
 /// signature over one validly covers the other, and the substitution is
-/// undetectable. Callers MUST keep claim numeric values within |n| ≤ 2^53 and
-/// string-encode larger identifiers (snowflake IDs, u64 counters). This
-/// function does not reject out-of-range integers — the coercion is inherent
-/// to RFC 8785 and is pinned by test.
+/// undetectable. This function therefore rejects a claim that carries, at any
+/// depth, an integer of magnitude above 2^53 or a non-finite number
+/// ([`crate::jcs::require_i_json`]); string-encode larger identifiers
+/// (snowflake IDs, u64 counters). Signing and verification both build this
+/// preimage, so such a claim can be neither signed nor verified.
 ///
 /// # Errors
 ///
-/// Returns [`TrustError::CanonicalizationFailed`] if evidence, claim, or
-/// revocation-status serialization fails, or if the canonical hash cannot be
-/// constructed.
+/// Returns [`TrustError::CanonicalizationFailed`] if the claim breaks the
+/// I-JSON numeric constraint, if evidence, claim, or revocation-status
+/// serialization fails, or if the canonical hash cannot be constructed.
 pub fn canonical_attestation_bytes(attestation: &Attestation) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
@@ -1325,6 +1326,11 @@ pub fn canonical_attestation_bytes(attestation: &Attestation) -> Result<Vec<u8>,
     // that compact form with deterministic (sorted) key ordering — the same
     // implementation of the same spec phrase as `compute_proposal_id`
     // (`action_bytes`) and `vote_signing_digest` (`vote_type`).
+    crate::jcs::require_i_json(&attestation.claim).map_err(|v| {
+        TrustError::CanonicalizationFailed {
+            reason: format!("claim: {v}"),
+        }
+    })?;
     let claim_bytes = crate::jcs::to_vec(&attestation.claim).map_err(|err| {
         TrustError::CanonicalizationFailed {
             reason: format!("claim serialization failed: {err}"),
@@ -2658,21 +2664,8 @@ mod tests {
         );
     }
 
-    /// Pins the documented RFC 8785 f64 rounding class for claim integers
-    /// beyond 2^53 (§9.5.2 I-JSON constraint, RFC 7493).
-    ///
-    /// RFC 8785 serializes JSON numbers as ES6 IEEE-754 doubles, so distinct
-    /// claim integers in the same f64 rounding class canonicalize to
-    /// IDENTICAL bytes — a signature over one validly covers the other. This
-    /// is inherent to RFC 8785 (not a defect in this implementation, and not
-    /// something to "fix" here): it is why §9.5.2 requires claim numeric
-    /// values to stay within |n| ≤ 2^53 and large identifiers (snowflake IDs,
-    /// u64 counters) to be string-encoded. The test makes the hazard visible
-    /// and pins the current behavior; the string-encoded forms of the same
-    /// values remain distinct.
-    #[test]
-    fn canonical_attestation_claim_integers_beyond_2_53_collide_per_rfc8785() {
-        let make = |claim: serde_json::Value| Attestation {
+    fn numeric_claim_attestation(claim: serde_json::Value) -> Attestation {
+        Attestation {
             id: "att-claim-numeric".to_owned(),
             attestation_type: AttestationType::Endorsement,
             issuer: "did:key:issuer".into(),
@@ -2685,35 +2678,44 @@ mod tests {
             renewed_at: None,
             revocation_status: RevocationStatus::Active,
             signature: vec![],
-        };
+        }
+    }
 
-        // 2^53 = 9007199254740992 is exactly representable as an f64;
-        // 2^53 + 1 = 9007199254740993 is NOT, and rounds to 2^53 under
-        // RFC 8785 / ES6 number serialization.
-        let att_exact = make(serde_json::json!({"id": 9_007_199_254_740_992_u64}));
-        let att_plus_one = make(serde_json::json!({"id": 9_007_199_254_740_993_u64}));
+    /// RFC 8785 serializes numbers as IEEE-754 doubles, so 2^53 + 1 and 2^53
+    /// would canonicalize to the same bytes and one signature would cover
+    /// both (§9.5.2 I-JSON constraint). The preimage refuses such a claim.
+    #[test]
+    fn canonical_attestation_rejects_claim_integer_beyond_2_53() {
+        for claim in [
+            serde_json::json!({"id": 9_007_199_254_740_993_u64}),
+            serde_json::json!({"nested": [{"id": -9_007_199_254_740_993_i64}]}),
+        ] {
+            let err =
+                canonical_attestation_bytes(&numeric_claim_attestation(claim.clone())).unwrap_err();
+            assert!(
+                matches!(&err, TrustError::CanonicalizationFailed { reason } if reason.contains("I-JSON")),
+                "{claim}: {err:?}"
+            );
+        }
+    }
 
-        let canonical_exact = canonical_attestation_bytes(&att_exact).unwrap();
-        let canonical_plus_one = canonical_attestation_bytes(&att_plus_one).unwrap();
-
-        // Documented rounding-class collision: distinct claims differing only
-        // beyond f64 precision produce IDENTICAL canonical bytes, so one
-        // signature covers both. This is why §9.5.2 mandates string-encoding
-        // for identifiers beyond 2^53.
-        assert_eq!(
-            canonical_exact, canonical_plus_one,
-            "claim integers in the same f64 rounding class must canonicalize \
-             identically per RFC 8785 (documented §9.5.2 hazard)"
-        );
-
-        // The mandated mitigation preserves injectivity: string-encoded forms
-        // of the same two values yield distinct canonical bytes.
-        let att_exact_str = make(serde_json::json!({"id": "9007199254740992"}));
-        let att_plus_one_str = make(serde_json::json!({"id": "9007199254740993"}));
+    /// Control: 2^53 is exactly representable, and the string-encoded forms
+    /// of 2^53 and 2^53 + 1 stay distinct in the preimage.
+    #[test]
+    fn canonical_attestation_accepts_claim_integer_at_2_53() {
+        canonical_attestation_bytes(&numeric_claim_attestation(
+            serde_json::json!({"id": 9_007_199_254_740_992_u64, "neg": -9_007_199_254_740_992_i64}),
+        ))
+        .unwrap();
         assert_ne!(
-            canonical_attestation_bytes(&att_exact_str).unwrap(),
-            canonical_attestation_bytes(&att_plus_one_str).unwrap(),
-            "string-encoded identifiers must remain distinct in the preimage"
+            canonical_attestation_bytes(&numeric_claim_attestation(
+                serde_json::json!({"id": "9007199254740992"})
+            ))
+            .unwrap(),
+            canonical_attestation_bytes(&numeric_claim_attestation(
+                serde_json::json!({"id": "9007199254740993"})
+            ))
+            .unwrap(),
         );
     }
 

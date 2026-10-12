@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::attestation::DidPublicKeyResolver;
 use super::capability_uri::CapabilityUri;
-use super::challenge::{ChallengeType, ChallengeVerification, verify_challenge_verification};
+use super::challenge::{ChallengeVerification, verify_challenge_verification};
 
 // ---------------------------------------------------------------------------
 // VerificationLevel
@@ -70,7 +70,7 @@ pub enum AdmissionError {
     ///
     /// An empty subject is invalid input, not a "no match" condition: a
     /// [`ChallengeVerification`] can only satisfy a requirement when its signed
-    /// `subject_did` equals this value, so an empty subject could only ever be
+    /// `subject` equals this value, so an empty subject could only ever be
     /// matched by a record bound to `""`. Reject it up front at the trust
     /// boundary — mirroring [`ParticipationAdmissionError::EmptyExpectedSubject`]
     /// in the sibling `verify_participation_requirements` — so a future
@@ -79,6 +79,16 @@ pub enum AdmissionError {
     /// [`ParticipationAdmissionError::EmptyExpectedSubject`]: crate::trust::participation::ParticipationAdmissionError::EmptyExpectedSubject
     #[error("subject_did must not be empty")]
     EmptySubjectDid,
+
+    /// A supplied [`ChallengeVerification`] could not be checked because the
+    /// check itself failed, for example because the verifier's key could not
+    /// be resolved. This is not a judgment on the record: the admission
+    /// decision is unknown, so it fails closed instead of dropping the record.
+    #[error("challenge verification could not be checked: {reason}")]
+    VerificationUnavailable {
+        /// The underlying failure.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +104,7 @@ pub enum AdmissionError {
 /// canonical bytes + context binding + subject binding + expiry, all
 /// clock-relative) before it can satisfy any requirement. It does NOT establish
 /// that the verifier is
-/// *authorized/trusted*: the `verifier_did` is self-certifying, so a subject can
+/// *authorized/trusted*: the `verifier` DID is self-certifying, so a subject can
 /// present a genuinely-signed result from a verifier it controls. Callers MUST
 /// establish verifier legitimacy separately (e.g. a trusted-signer set or
 /// context-membership proof). See spec §7.4.
@@ -104,8 +114,9 @@ pub enum AdmissionError {
 /// - [`VerificationLevel::SelfAttested`]: the capability URI must appear in
 ///   `agent_capabilities`, OR a matching verified record with `passed == true`
 ///   must exist (challenge-verified implies self-attested).
-/// - [`VerificationLevel::ChallengeVerified`]: a verified record with a matching
-///   `challenge_type` and `passed == true` must exist.
+/// - [`VerificationLevel::ChallengeVerified`]: a verified record whose signed
+///   `capability_uri` equals the requirement's URI and with `passed == true`
+///   must exist.
 ///
 /// Returns `Ok(())` if all requirements are met, or the first unmet
 /// requirement as an [`AdmissionError`].
@@ -121,11 +132,11 @@ pub enum AdmissionError {
 ///   context-agnostic `None` result) MUST NOT satisfy admission here, enforced by
 ///   [`verify_challenge_verification`].
 /// - `subject_did` — The DID of the agent being admitted. A challenge
-///   verification only satisfies a requirement when its signed `subject_did`
+///   verification only satisfies a requirement when its signed `subject`
 ///   equals this value: a genuine result minted for another subject MUST NOT
 ///   satisfy this agent's admission (cross-subject attribution), enforced by
 ///   [`verify_challenge_verification`].
-/// - `resolver` — Resolves a `verifier_did` to its Ed25519 public key for
+/// - `resolver` — Resolves a record's `verifier` DID to its Ed25519 public key for
 ///   signature verification.
 /// - `clock` — Injected clock; `verify_challenge_verification` rejects records
 ///   whose `expires_at <= now`.
@@ -135,7 +146,11 @@ pub enum AdmissionError {
 /// Returns [`AdmissionError::MissingCapability`] if a self-attested capability
 /// is not declared, or [`AdmissionError::VerificationRequired`] if a
 /// challenge-verified capability lacks a valid (signature-verified, passed,
-/// non-expired, in-context, in-subject) verification record.
+/// non-expired, in-context, in-subject) verification record. Returns
+/// [`AdmissionError::VerificationUnavailable`] if checking any supplied record
+/// fails for a reason other than the record itself
+/// ([`TrustError::is_record_rejection`](super::TrustError::is_record_rejection)
+/// is `false`).
 pub fn check_capability_requirements(
     requirements: &[CapabilityRequirement],
     agent_capabilities: &[CapabilityUri],
@@ -147,7 +162,7 @@ pub fn check_capability_requirements(
 ) -> Result<(), AdmissionError> {
     // Reject an empty subject up front: it is invalid input, not a "no match"
     // condition. A ChallengeVerification only satisfies a requirement when its
-    // signed `subject_did` equals `subject_did`, so an empty subject could only
+    // signed `subject` equals `subject_did`, so an empty subject could only
     // ever be matched by a record bound to "" — reject it here at the trust
     // boundary (mirrors the sibling `verify_participation_requirements`).
     if subject_did.is_empty() {
@@ -156,22 +171,31 @@ pub fn check_capability_requirements(
 
     // Verify-on-use: a caller-supplied ChallengeVerification only counts if the
     // verifier's signature is authentic AND the record is bound to this context
-    // and unexpired. Verify all up front (mirrors
-    // `verify_participation_requirements`), keeping only authentic records. A
-    // record that fails verification is simply not considered — it falls through
-    // to the MissingCapability / VerificationRequired outcome.
-    let verified: Vec<&ChallengeVerification> = challenge_verifications
-        .iter()
-        .filter(|cv| {
-            verify_challenge_verification(cv, resolver, context_id, subject_did, clock).is_ok()
-        })
-        .collect();
+    // and subject and unexpired. Verify all up front (mirrors
+    // `verify_participation_requirements`). A record the check rejects is not
+    // considered and falls through to the MissingCapability /
+    // VerificationRequired outcome; a check that could not run fails closed.
+    let mut verified: Vec<&ChallengeVerification> =
+        Vec::with_capacity(challenge_verifications.len());
+    for cv in challenge_verifications {
+        match verify_challenge_verification(cv, resolver, context_id, subject_did, clock) {
+            Ok(()) => verified.push(cv),
+            Err(e) if e.is_record_rejection() => {}
+            Err(e) => {
+                return Err(AdmissionError::VerificationUnavailable {
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
 
     for req in requirements {
-        let has_verification = verified.iter().any(|cv| {
-            let ChallengeType::Uri(ref uri) = cv.challenge_type;
-            *uri == req.capability && cv.passed
-        });
+        // The signed `capability_uri` is the record's claim; compare its
+        // canonical text form with the requirement's.
+        let required_uri = req.capability.to_string();
+        let has_verification = verified
+            .iter()
+            .any(|cv| cv.capability_uri == required_uri && cv.passed);
 
         match req.verification_level {
             VerificationLevel::SelfAttested => {
@@ -209,7 +233,12 @@ mod tests {
 
     use super::*;
     use crate::trust::TrustError;
-    use crate::trust::challenge::{VerificationMethod, canonical_challenge_verification_bytes};
+    use scp_did::DID;
+
+    use crate::trust::challenge::{
+        ChallengeType, VerificationMethod, challenge_verification_id,
+        challenge_verification_signing_digest,
+    };
 
     /// A current time that is before the verification's `expires_at`.
     const NOW: u64 = 1_700_000_100;
@@ -221,7 +250,7 @@ mod tests {
 
     /// The subject all admission checks below are evaluated for. The verification
     /// records produced by `make_verification` are bound to this subject (their
-    /// signed `subject_did`), so they satisfy requirements here.
+    /// signed `subject`), so they satisfy requirements here.
     const SUBJECT: &str = "did:dht:zResponder";
 
     /// Deterministic verifier signing key used by `make_verification`.
@@ -256,43 +285,49 @@ mod tests {
     }
 
     /// Helper: build a GENUINELY verifier-signed `ChallengeVerification` for a
-    /// given capability URI, bound to [`CTX`].
+    /// given capability URI, bound to [`CTX`] and [`SUBJECT`], with a derived
+    /// `verification_id` and the signature over `D_v`.
     fn make_verification(uri: &CapabilityUri) -> ChallengeVerification {
-        let verifier_key = verifier_key();
-        let verifier_pub = verifier_key.verifying_key().to_bytes();
-        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
-
+        let verifier_pub = verifier_key().verifying_key().to_bytes();
+        let verifier = scp_did::did_dht_from_public_key(&verifier_pub);
+        let subject = DID::from(SUBJECT);
+        let capability_uri = uri.to_string();
+        let timestamp = 1_700_000_000;
         let mut cv = ChallengeVerification {
-            verification_id: "test-challenge-id".to_owned(),
-            verifier_did,
-            subject_did: "did:dht:zResponder".into(),
-            capability_uri: uri.to_string(),
-            challenge_type: ChallengeType::Uri(uri.clone()),
-            verification_method: VerificationMethod::ChallengeVerified {
-                challenge_type: ChallengeType::Uri(uri.clone()),
-            },
+            verification_id: challenge_verification_id(
+                &verifier,
+                &subject,
+                &capability_uri,
+                timestamp,
+            )
+            .unwrap(),
+            verifier,
+            subject,
+            capability_uri,
+            suite_digest: [7u8; 32],
             passed: true,
             score: None,
             test_count: 1,
             pass_count: 1,
-            result: serde_json::Value::Bool(true),
-            completed_at: 1_700_000_000,
-            verified_at: 1_700_000_000,
+            timestamp,
             expires_at: 1_700_086_400,
             context_id: Some(CTX.to_owned()),
             verifier_signature: Vec::new(),
+            verification_method: VerificationMethod::ChallengeVerified {
+                challenge_type: ChallengeType::Uri(uri.clone()),
+            },
+            result: serde_json::Value::Bool(true),
+            completed_at: timestamp,
         };
-        let canonical = canonical_challenge_verification_bytes(&cv).unwrap();
-        cv.verifier_signature = verifier_key.sign(&canonical).to_bytes().to_vec();
+        resign(&mut cv);
         cv
     }
 
     /// Re-signs a mutated verification so its signature stays authentic over the
     /// new field values (used by tests that flip `passed`).
     fn resign(cv: &mut ChallengeVerification) {
-        cv.verifier_signature.clear();
-        let canonical = canonical_challenge_verification_bytes(cv).unwrap();
-        cv.verifier_signature = verifier_key().sign(&canonical).to_bytes().to_vec();
+        let digest = challenge_verification_signing_digest(cv).unwrap();
+        cv.verifier_signature = verifier_key().sign(&digest).to_bytes().to_vec();
     }
 
     fn cap(s: &str) -> CapabilityUri {
@@ -608,7 +643,7 @@ mod tests {
         }];
 
         // A genuine, passed, unexpired, in-context verification — but its signed
-        // `subject_did` is SUBJECT, not the agent being admitted here. It must NOT
+        // `subject` is SUBJECT, not the agent being admitted here. It must NOT
         // satisfy admission for a DIFFERENT subject (cross-subject attribution).
         let verifications = vec![make_verification(&uri)];
         let result = check_capability_requirements(
@@ -646,5 +681,92 @@ mod tests {
             result,
             Err(AdmissionError::VerificationRequired { .. })
         ));
+    }
+
+    #[test]
+    fn admission_matches_on_capability_uri() {
+        // The signed `capability_uri` decides which requirement a record
+        // satisfies. The unsigned `verification_method` naming another URI
+        // must not make the record count for that other URI.
+        let (resolver, clock) = resolver_and_clock();
+        let signed_uri = cap("scp:capability:prompt-injection-resistance/v1");
+        let unsigned_uri = cap("scp:capability:schema-validation/v1");
+        let mut cv = make_verification(&signed_uri);
+        cv.verification_method = VerificationMethod::ChallengeVerified {
+            challenge_type: ChallengeType::Uri(unsigned_uri.clone()),
+        };
+        let records = [cv];
+
+        let require = |uri: &CapabilityUri| {
+            vec![CapabilityRequirement {
+                capability: uri.clone(),
+                verification_level: VerificationLevel::ChallengeVerified,
+            }]
+        };
+        assert_eq!(
+            check_capability_requirements(
+                &require(&signed_uri),
+                &[],
+                &records,
+                CTX,
+                SUBJECT,
+                &resolver,
+                &clock,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_capability_requirements(
+                &require(&unsigned_uri),
+                &[],
+                &records,
+                CTX,
+                SUBJECT,
+                &resolver,
+                &clock,
+            ),
+            Err(AdmissionError::VerificationRequired {
+                uri: unsigned_uri.to_string()
+            })
+        );
+    }
+
+    /// A resolver whose backend is down: every lookup is an infrastructure
+    /// failure, not a judgment on the record.
+    struct UnavailableResolver;
+
+    impl DidPublicKeyResolver for UnavailableResolver {
+        fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+            Err(TrustError::KeyResolutionUnavailable {
+                did: did.to_owned(),
+                reason: "resolver offline".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn admission_fails_closed_when_verifier_key_unavailable() {
+        // A record that cannot be checked is neither accepted nor silently
+        // dropped: the admission decision is unknown, so it is an error. With
+        // empty requirements a silently dropped record would return Ok(()).
+        let (_, clock) = resolver_and_clock();
+        let uri = cap("scp:capability:prompt-injection-resistance/v1");
+        let result = check_capability_requirements(
+            &[],
+            &[],
+            &[make_verification(&uri)],
+            CTX,
+            SUBJECT,
+            &UnavailableResolver,
+            &clock,
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(AdmissionError::VerificationUnavailable { reason })
+                if reason.contains("resolver offline")
+            ),
+            "got {result:?}"
+        );
     }
 }

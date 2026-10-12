@@ -14,6 +14,8 @@ package works.limn.scp
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import org.junit.jupiter.api.Test
 import kotlin.test.assertEquals
@@ -249,22 +251,33 @@ class ChallengeTrustInputTest {
         )
 
     /** A structurally-valid ChallengeRequest with a real 64-byte signature. */
-    private fun makeChallenge(signature: List<UByte> = List(64) { 8.toUByte() }): ChallengeRequest =
+    private fun makeChallenge(
+        signature: List<UByte> = List(64) { 8.toUByte() },
+        expected: ExpectedOutput = ExpectedOutput.ExactMatch(buildJsonObject { put("ok", true) }),
+    ): ChallengeRequest =
         ChallengeRequest(
-            challengeId = "chal-1",
-            challengeType = "scp:capability:schema-validation/v1",
-            challengerDid = "did:dht:zChallenger",
-            subjectDid = "did:dht:zSubject",
+            challengeId = "ab".repeat(32),
             capabilityUri = "scp:capability:schema-validation/v1",
-            parameters = buildJsonObject { put("schema", "object") },
-            timeout = CachedAttestationDuration(secs = 300uL, nanos = 0u),
-            signature = signature,
+            testCases =
+                listOf(
+                    TestCase(
+                        testId = "t0",
+                        input = buildJsonObject { put("i", 0) },
+                        expected = expected,
+                        category = "basic",
+                        weight = 10_000u,
+                    ),
+                ),
+            timeoutSecs = 300u,
+            verifier = "did:dht:zVerifier",
+            subject = "did:dht:zSubject",
+            verifierSignature = signature,
         )
 
     /** A structurally-valid ChallengeResponse with a real 64-byte signature. */
     private fun makeResponse(signature: List<UByte> = List(64) { 4.toUByte() }): ChallengeResponse =
         ChallengeResponse(
-            challengeId = "chal-1",
+            challengeId = "ab".repeat(32),
             responderDid = "did:dht:zSubject",
             result = buildJsonObject { put("passed", true) },
             completedAt = 1_700_000_100uL,
@@ -301,27 +314,63 @@ class ChallengeTrustInputTest {
     }
 
     @Test
-    fun `challenge request encodes the full 8-field snake_case record`() {
+    fun `challenge request encodes the full 7-field snake_case record`() {
         assertJsonEquals(
             """
-            {"challenge_id":"chal-1",
-             "challenge_type":"scp:capability:schema-validation/v1",
-             "challenger_did":"did:dht:zChallenger",
-             "subject_did":"did:dht:zSubject",
+            {"challenge_id":"${"ab".repeat(32)}",
              "capability_uri":"scp:capability:schema-validation/v1",
-             "parameters":{"schema":"object"},
-             "timeout":{"secs":300,"nanos":0},
-             "signature":[${List(64) { 8 }.joinToString(",")}]}
+             "test_cases":[{"test_id":"t0","input":{"i":0},
+               "expected":{"ExactMatch":{"value":{"ok":true}}},
+               "category":"basic","weight":10000}],
+             "timeout_secs":300,
+             "verifier":"did:dht:zVerifier",
+             "subject":"did:dht:zSubject",
+             "verifier_signature":[${List(64) { 8 }.joinToString(",")}]}
             """.trimIndent(),
             encodeChallengeRequestJson(makeChallenge()),
         )
     }
 
     @Test
+    fun `every ExpectedOutput variant encodes externally tagged and decodes back`() {
+        val variants =
+            listOf(
+                ExpectedOutput.ExactMatch(Json.parseToJsonElement("[1,\"a\"]")) to
+                    """{"ExactMatch":{"value":[1,"a"]}}""",
+                ExpectedOutput.SchemaMatch(buildJsonObject { put("type", "object") }) to
+                    """{"SchemaMatch":{"schema":{"type":"object"}}}""",
+                ExpectedOutput.ContainsAll(listOf("a", "b")) to """{"ContainsAll":{"required":["a","b"]}}""",
+                ExpectedOutput.ContainsNone(listOf("x")) to """{"ContainsNone":{"forbidden":["x"]}}""",
+                ExpectedOutput.CustomEval("o-1") to """{"CustomEval":{"evaluator_outlet_id":"o-1"}}""",
+            )
+        for ((expected, wire) in variants) {
+            val request = makeChallenge(expected = expected)
+            val encoded = encodeChallengeRequestJson(request)
+            assertEquals(
+                Json.parseToJsonElement(wire),
+                Json.parseToJsonElement(encoded).jsonObject["test_cases"]!!.jsonArray[0].jsonObject["expected"],
+            )
+            assertEquals(request, decodeChallengeRequestJson(encoded))
+            assertEquals(
+                Json.parseToJsonElement(encodeTestCasesJson(request.testCases)),
+                Json.parseToJsonElement(encoded).jsonObject["test_cases"],
+            )
+        }
+    }
+
+    @Test
+    fun `challenge request decode refuses an unknown ExpectedOutput variant`() {
+        val encoded = encodeChallengeRequestJson(makeChallenge())
+        val bad = encoded.replace("\"ExactMatch\"", "\"Nope\"")
+        val error = assertFailsWith<IllegalArgumentException> { decodeChallengeRequestJson(bad) }
+        assertEquals("unknown ExpectedOutput variant \"Nope\"", error.message)
+    }
+
+    @Test
     fun `challenge response encodes the full 5-field snake_case record`() {
         assertJsonEquals(
             """
-            {"challenge_id":"chal-1",
+            {"challenge_id":"${"ab".repeat(32)}",
              "responder_did":"did:dht:zSubject",
              "result":{"passed":true},
              "completed_at":1700000100,
@@ -339,8 +388,14 @@ class ChallengeTrustInputTest {
             }
         assertTrue(
             requestError.message!!.contains(
-                "ChallengeRequest.signature must be exactly 64 elements, got 3",
+                "ChallengeRequest.verifierSignature must be exactly 64 elements, got 3",
             ),
+        )
+        assertEquals(
+            "ChallengeRequest.challengeId must be 64 lowercase hex characters",
+            assertFailsWith<IllegalArgumentException> {
+                encodeChallengeRequestJson(makeChallenge().copy(challengeId = "chal-1"))
+            }.message,
         )
 
         val responseError =

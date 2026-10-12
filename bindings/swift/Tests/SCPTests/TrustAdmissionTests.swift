@@ -160,43 +160,55 @@ final class TrustAdmissionEncoderTests: XCTestCase {
 
     // MARK: - ChallengeVerification encoder
 
-    func testChallengeVerificationSelfAttestedEncodesSixteenFields() throws {
-        let verification = ChallengeVerification(
-            verificationId: "ver-1",
-            verifierDid: "did:key:zVerifier",
-            subjectDid: "did:key:zSubject",
+    private func makeVerification(
+        verificationMethod: ChallengeVerificationMethod = .selfAttested,
+        verifierSignature: [UInt8] = Array(repeating: 7, count: 64),
+        suiteDigest: String = String(repeating: "cd", count: 32),
+        score: UInt32? = nil,
+        contextId: String? = nil
+    ) -> ChallengeVerification {
+        ChallengeVerification(
+            verificationId: String(repeating: "ab", count: 32),
+            verifier: "did:key:zVerifier",
+            subject: "did:key:zSubject",
             capabilityUri: "scp:capability:schema-validation/v1",
-            challengeType: "scp:capability:schema-validation/v1",
-            verificationMethod: .selfAttested,
+            suiteDigest: suiteDigest,
             passed: true,
-            testCount: 10,
-            passCount: 10,
+            testCount: 20,
+            passCount: 20,
+            timestamp: 1_700_000_100,
+            expiresAt: 1_700_086_500,
+            verifierSignature: verifierSignature,
+            verificationMethod: verificationMethod,
             result: ["passed": true],
             completedAt: 1_700_000_050,
-            verifiedAt: 1_700_000_100,
-            expiresAt: 1_800_000_000,
-            verifierSignature: Array(repeating: 7, count: 64)
+            score: score,
+            contextId: contextId
         )
-        let json = try encodeChallengeVerificationsJson([verification])
+    }
+
+    func testChallengeVerificationSelfAttestedEncodesSixteenFields() throws {
+        let json = try encodeChallengeVerificationsJson([makeVerification()])
 
         guard let array = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]],
               let first = array.first else {
             return XCTFail("expected a JSON array of one verification object")
         }
-        XCTAssertEqual(first["verification_id"] as? String, "ver-1")
-        XCTAssertEqual(first["verifier_did"] as? String, "did:key:zVerifier")
-        XCTAssertEqual(first["subject_did"] as? String, "did:key:zSubject")
+        XCTAssertEqual(first.count, 16)
+        XCTAssertEqual(first["verification_id"] as? String, String(repeating: "ab", count: 32))
+        XCTAssertEqual(first["verifier"] as? String, "did:key:zVerifier")
+        XCTAssertEqual(first["subject"] as? String, "did:key:zSubject")
         XCTAssertEqual(first["capability_uri"] as? String, "scp:capability:schema-validation/v1")
-        XCTAssertEqual(first["challenge_type"] as? String, "scp:capability:schema-validation/v1")
+        XCTAssertEqual(first["suite_digest"] as? String, String(repeating: "cd", count: 32))
         // Self-attested method serializes as the bare string.
         XCTAssertEqual(first["verification_method"] as? String, "SelfAttested")
         XCTAssertEqual(first["passed"] as? Bool, true)
-        XCTAssertEqual(first["test_count"] as? Int, 10)
-        XCTAssertEqual(first["pass_count"] as? Int, 10)
+        XCTAssertEqual(first["test_count"] as? Int, 20)
+        XCTAssertEqual(first["pass_count"] as? Int, 20)
         XCTAssertNotNil(first["result"])
         XCTAssertEqual(first["completed_at"] as? Int, 1_700_000_050)
-        XCTAssertEqual(first["verified_at"] as? Int, 1_700_000_100)
-        XCTAssertEqual(first["expires_at"] as? Int, 1_800_000_000)
+        XCTAssertEqual(first["timestamp"] as? Int, 1_700_000_100)
+        XCTAssertEqual(first["expires_at"] as? Int, 1_700_086_500)
         XCTAssertEqual((first["verifier_signature"] as? [Any])?.count, 64)
         // Absent optionals serialize as explicit JSON null (present as keys).
         XCTAssertTrue(first.keys.contains("score"))
@@ -206,24 +218,9 @@ final class TrustAdmissionEncoderTests: XCTestCase {
     }
 
     func testChallengeVerificationChallengeVerifiedMethodIsTagged() throws {
-        let verification = ChallengeVerification(
-            verificationId: "ver-2",
-            verifierDid: "did:key:zVerifier",
-            subjectDid: "did:key:zSubject",
-            capabilityUri: "scp:capability:schema-validation/v1",
-            challengeType: "scp:capability:schema-validation/v1",
-            verificationMethod: .challengeVerified(
-                challengeType: "scp:capability:schema-validation/v1"
-            ),
-            passed: true,
-            testCount: 5,
-            passCount: 5,
-            result: JSONValue.null,
-            completedAt: 1,
-            verifiedAt: 2,
-            expiresAt: 3,
-            verifierSignature: Array(repeating: 0, count: 64),
-            score: 87,
+        let verification = makeVerification(
+            verificationMethod: .challengeVerified(challengeType: "scp:capability:schema-validation/v1"),
+            score: 8700,
             contextId: "ctx-1"
         )
         let json = try encodeChallengeVerificationsJson([verification])
@@ -236,8 +233,41 @@ final class TrustAdmissionEncoderTests: XCTestCase {
         let inner = method?["ChallengeVerified"] as? [String: Any]
         XCTAssertEqual(inner?["challenge_type"] as? String, "scp:capability:schema-validation/v1")
         // Present optionals carry their values.
-        XCTAssertEqual(first["score"] as? Int, 87)
+        XCTAssertEqual(first["score"] as? Int, 8700)
         XCTAssertEqual(first["context_id"] as? String, "ctx-1")
+    }
+
+    func testChallengeVerificationDecodesTheBridgeRecord() throws {
+        let verification = makeVerification(score: 10000, contextId: "ctx-1")
+        let encoded = try encodeChallengeVerificationsJson([verification])
+        let record = String(encoded.dropFirst().dropLast())
+        XCTAssertEqual(try decodeChallengeVerificationJson(record), verification)
+    }
+
+    func testChallengeVerificationDecodeRefusesMalformedRecords() throws {
+        let encoded = try encodeChallengeVerificationsJson([makeVerification(score: 10000)])
+        let record = String(encoded.dropFirst().dropLast())
+        for (bad, message) in [
+            (
+                record.replacingOccurrences(of: "\"score\":10000", with: "\"score\":10001"),
+                "ChallengeVerification.score must be in [0, 10000], got 10001"
+            ),
+            (
+                record.replacingOccurrences(
+                    of: String(repeating: "ab", count: 32), with: String(repeating: "AB", count: 32)
+                ),
+                "ChallengeVerification.verificationId must be 64 lowercase hex characters"
+            )
+        ] {
+            XCTAssertNotEqual(bad, record)
+            XCTAssertThrowsError(try decodeChallengeVerificationJson(bad)) { error in
+                guard case let ScpError.Validation(msg, code) = error else {
+                    return XCTFail("expected ScpError.Validation, got \(error)")
+                }
+                XCTAssertEqual(msg, message)
+                XCTAssertEqual(code, "SCP-VALID-7096")
+            }
+        }
     }
 
     // MARK: - Byte-length validation (encode-time, before any bridge call)
@@ -271,22 +301,15 @@ final class TrustAdmissionEncoderTests: XCTestCase {
     }
 
     func testWrongLengthVerifierSignatureThrowsValidationBeforeBridgeCall() throws {
-        let badVerification = ChallengeVerification(
-            verificationId: "ver-bad",
-            verifierDid: "did:key:zVerifier",
-            subjectDid: "did:key:zSubject",
-            capabilityUri: "scp:capability:schema-validation/v1",
-            challengeType: "scp:capability:schema-validation/v1",
-            verificationMethod: .selfAttested,
-            passed: true,
-            testCount: 1,
-            passCount: 1,
-            result: JSONValue.null,
-            completedAt: 1,
-            verifiedAt: 2,
-            expiresAt: 3,
-            verifierSignature: Array(repeating: 9, count: 63)
-        )
+        let badVerification = makeVerification(verifierSignature: Array(repeating: 9, count: 63))
+        XCTAssertThrowsError(
+            try encodeChallengeVerificationsJson([makeVerification(suiteDigest: "cd")])
+        ) { error in
+            guard case let ScpError.Validation(msg, _) = error else {
+                return XCTFail("expected ScpError.Validation, got \(error)")
+            }
+            XCTAssertEqual(msg, "ChallengeVerification.suiteDigest must be 64 lowercase hex characters")
+        }
         XCTAssertThrowsError(try encodeChallengeVerificationsJson([badVerification])) { error in
             guard case let ScpError.Validation(msg, code) = error else {
                 return XCTFail("expected ScpError.Validation, got \(error)")

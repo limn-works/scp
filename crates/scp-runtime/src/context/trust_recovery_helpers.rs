@@ -28,10 +28,11 @@
 //!
 //! # Not migrated as commands
 //!
-//! `verify_attestation`, `create_challenge`, `verify_challenge_response`
-//! are pure-CPU helpers with no state mutation; they live elsewhere in
-//! the runtime (DID resolver + clock only) and are not exercised through
-//! the actor mailbox.
+//! The trust operations read and mutate no per-context state, so none goes
+//! through the actor mailbox. `verify_attestation` (`scp-protocol`) is a
+//! pure-CPU check over a DID resolver and a clock. The challenge operations,
+//! `create_challenge` and `verify_response_and_sign` (`scp-ffi-common`),
+//! sign the request or record digest through the verifier's custody.
 
 // Module-level allow:
 //

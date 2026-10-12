@@ -1703,6 +1703,15 @@ impl From<scp_core::provenance::ProvenanceError> for ScpError {
 
 impl From<scp_core::trust::TrustError> for ScpError {
     fn from(e: scp_core::trust::TrustError) -> Self {
+        if matches!(
+            e,
+            scp_core::trust::TrustError::ChallengeSuiteBelowMinimum { .. }
+        ) {
+            return Self::Validation {
+                msg: format!("{e} — supply at least the standard's minimum test cases"),
+                code: codes::VALID_7039.to_owned(),
+            };
+        }
         Self::Validation {
             msg: format!(
                 "trust evaluation failed: {e} — check event log data and attestation validity"
@@ -7393,9 +7402,9 @@ pub struct AttestationVerificationResult {
 /// Result of creating a challenge request.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ChallengeResult {
-    /// The unique challenge ID (UUID v4).
+    /// The challenge ID: lowercase hex of its 32 random bytes.
     pub challenge_id: String,
-    /// The serialized challenge request (JSON).
+    /// The signed `ChallengeRequest` (JSON).
     pub challenge_json: String,
 }
 
@@ -7467,43 +7476,48 @@ pub fn trust_verify_attestation(
     }
 }
 
-/// Creates a challenge request for capability verification.
-///
-/// See ADR-017 Layer 3 (Challenge-Response).
-#[uniffi::export]
-pub fn trust_create_challenge(target_did: String) -> Result<ChallengeResult, ScpError> {
-    if target_did.is_empty() {
-        return Err(ScpError::Validation {
-            msg: "target DID must not be empty".to_owned(),
+/// Maps a shared challenge-operation failure to the bridge error, with the
+/// same code on every bridge.
+fn challenge_op_error(e: scp_ffi_common::challenge::ChallengeOpError) -> ScpError {
+    use scp_ffi_common::challenge::ChallengeOpError;
+    match e {
+        ChallengeOpError::MalformedTestCases(reason) => ScpError::Validation {
+            msg: format!("failed to parse test_cases_json: {reason}"),
+            code: codes::VALID_7002.to_owned(),
+        },
+        ChallengeOpError::Trust(e) => ScpError::from(e),
+        ChallengeOpError::Sign(e) => ScpError::from(e),
+    }
+}
+
+/// Implementation of [`Scp::trust_create_challenge`] (spec 07 §7.3.4,
+/// ADR-017).
+async fn trust_create_challenge_impl(
+    verifier: &Identity,
+    subject: String,
+    capability_uri: String,
+    test_cases_json: String,
+    timeout_secs: u32,
+) -> Result<ChallengeResult, ScpError> {
+    // VALID_7013 for an invalid verifier or subject DID, on every bridge.
+    for did in [&verifier.did, &subject] {
+        scp_ffi_common::validate::validate_did(did).map_err(|e| ScpError::Validation {
+            msg: e.message,
             code: codes::VALID_7013.to_owned(),
-        });
+        })?;
     }
+    let signer = resolve_identity_signer(verifier).await?;
 
-    struct EphemeralSigner(ed25519_dalek::SigningKey);
-    impl scp_core::trust::ChallengeSigner for EphemeralSigner {
-        fn sign(&self, data: &[u8]) -> Result<Vec<u8>, scp_core::trust::TrustError> {
-            use ed25519_dalek::Signer;
-            let sig = self.0.sign(data);
-            Ok(sig.to_bytes().to_vec())
-        }
-    }
-
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let signer = EphemeralSigner(signing_key);
-
-    let request = scp_core::trust::issue_challenge(
-        "did:key:ephemeral-challenger".into(),
-        target_did.into(),
-        scp_core::trust::ChallengeType::schema_validation(),
-        "scp:capability:schema-validation/v1".to_string(),
-        serde_json::json!({}),
-        std::time::Duration::from_mins(5),
+    let request = scp_ffi_common::challenge::create_challenge(
         &signer,
+        verifier.did.as_str().into(),
+        subject.into(),
+        capability_uri,
+        &test_cases_json,
+        timeout_secs,
     )
-    .map_err(|e| ScpError::Validation {
-        msg: format!("challenge creation failed: {e}"),
-        code: codes::VALID_7014.to_owned(),
-    })?;
+    .await
+    .map_err(challenge_op_error)?;
 
     let challenge_json = serde_json::to_string(&request).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize challenge: {e}"),
@@ -7511,55 +7525,66 @@ pub fn trust_create_challenge(target_did: String) -> Result<ChallengeResult, Scp
     })?;
 
     Ok(ChallengeResult {
-        challenge_id: request.challenge_id,
+        challenge_id: hex::encode(request.challenge_id),
         challenge_json,
     })
 }
 
-/// Verifies a challenge response against its original challenge request.
-///
-/// See ADR-017 Layer 3 (Challenge-Response).
-#[uniffi::export]
-pub fn trust_verify_response(
+/// Implementation of [`Scp::trust_verify_response`] (spec 07 §7.3.4,
+/// ADR-017).
+async fn trust_verify_response_impl(
+    bi: &crate::runtime::UniffiBridgeInstance,
+    verifier: &Identity,
     challenge_json: String,
     response_json: String,
-) -> Result<bool, ScpError> {
+    context_id: String,
+) -> Result<String, ScpError> {
+    scp_ffi_common::validate::validate_did(&verifier.did).map_err(|e| ScpError::Validation {
+        msg: e.message,
+        code: codes::VALID_7013.to_owned(),
+    })?;
+    if context_id.is_empty() {
+        return Err(ScpError::Validation {
+            msg: "context_id must not be empty".to_owned(),
+            code: codes::VALID_7011.to_owned(),
+        });
+    }
+    // VALID_7016 (challenge position) / VALID_7017 (response position) match
+    // the napi and PyO3 bridges' per-case codes for malformed JSON.
     let request: scp_core::trust::ChallengeRequest = serde_json::from_str(&challenge_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("failed to parse challenge JSON: {e}"),
             code: codes::VALID_7016.to_owned(),
         })?;
-
     let response: scp_core::trust::ChallengeResponse = serde_json::from_str(&response_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("failed to parse response JSON: {e}"),
             code: codes::VALID_7017.to_owned(),
         })?;
 
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_clock::SystemClock;
+    let resolver = bi.did_resolver().ok_or_else(|| ScpError::Identity {
+        msg: "DID resolver not initialized — create an identity with \
+              identityCreate before calling trustVerifyResponse"
+            .to_owned(),
+        code: codes::IDENT_1033.to_owned(),
+    })?;
+    let signer = resolve_identity_signer(verifier).await?;
 
-    struct EphemeralVerifySigner(ed25519_dalek::SigningKey);
-    impl scp_core::trust::ChallengeSigner for EphemeralVerifySigner {
-        fn sign(&self, data: &[u8]) -> Result<Vec<u8>, scp_core::trust::TrustError> {
-            use ed25519_dalek::Signer;
-            let sig = self.0.sign(data);
-            Ok(sig.to_bytes().to_vec())
-        }
-    }
-
-    let verify_signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let verify_signer = EphemeralVerifySigner(verify_signing_key);
-
-    Ok(scp_core::trust::verify_challenge_response(
-        &request,
-        &response,
-        &resolver,
-        &clock,
-        &verify_signer,
-        None,
+    let record = scp_ffi_common::challenge::verify_response_and_sign(
+        &signer,
+        resolver,
+        verifier.did.as_str().into(),
+        request,
+        response,
+        context_id,
     )
-    .is_ok())
+    .await
+    .map_err(challenge_op_error)?;
+
+    serde_json::to_string(&record).map_err(|e| ScpError::Validation {
+        msg: format!("failed to serialize challenge verification: {e}"),
+        code: codes::VALID_7015.to_owned(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -7706,6 +7731,10 @@ pub fn check_capability_requirements(
         | scp_core::trust::AdmissionError::VerificationRequired { .. } => ScpError::Validation {
             msg: format!("capability admission verification failed: {e}"),
             code: codes::VALID_7076.to_owned(),
+        },
+        scp_core::trust::AdmissionError::VerificationUnavailable { .. } => ScpError::Identity {
+            msg: format!("capability admission verification failed: {e}"),
+            code: codes::IDENT_1033.to_owned(),
         },
     })?;
 
@@ -16540,98 +16569,80 @@ impl Scp {
         crate::server::node_start_local_on(&self.inner, data_dir, identity, passphrase).await
     }
 
-    /// Per-instance equivalent of the free-function [`trust_create_challenge`].
+    /// Creates a challenge request for capability verification (spec 07
+    /// §7.3.4).
     ///
-    /// Stateless helper — uses an ephemeral signing key per call.
-    pub fn trust_create_challenge(&self, target_did: String) -> Result<ChallengeResult, ScpError> {
-        if target_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "target DID must not be empty".to_owned(),
-                code: codes::VALID_7013.to_owned(),
-            });
-        }
-
-        struct EphemeralSigner(ed25519_dalek::SigningKey);
-        impl scp_core::trust::ChallengeSigner for EphemeralSigner {
-            fn sign(&self, data: &[u8]) -> Result<Vec<u8>, scp_core::trust::TrustError> {
-                use ed25519_dalek::Signer;
-                let sig = self.0.sign(data);
-                Ok(sig.to_bytes().to_vec())
-            }
-        }
-
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let signer = EphemeralSigner(signing_key);
-
-        let request = scp_core::trust::issue_challenge(
-            "did:key:ephemeral-challenger".into(),
-            target_did.into(),
-            scp_core::trust::ChallengeType::schema_validation(),
-            "scp:capability:schema-validation/v1".to_string(),
-            serde_json::json!({}),
-            std::time::Duration::from_mins(5),
-            &signer,
+    /// The request is signed with `verifier`'s `#active` key through its
+    /// custody. `test_cases_json` is the challenger-written JSON array of test
+    /// cases.
+    ///
+    /// # Errors
+    ///
+    /// - The handle check's error when `verifier` belongs to another `Scp`.
+    /// - `SCP-VALID-7013` for an invalid subject DID.
+    /// - `SCP-VALID-7002` for malformed `test_cases_json`.
+    /// - `SCP-VALID-7039` when a protocol capability URI carries fewer cases
+    ///   than its standard's minimum; `SCP-VALID-7003` for any other refusal.
+    /// - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
+    ///   error when signing fails (`SCP-CRYPTO-4006` for a destroyed key).
+    pub async fn trust_create_challenge(
+        &self,
+        verifier: Arc<Identity>,
+        subject: String,
+        capability_uri: String,
+        test_cases_json: String,
+        timeout_secs: u32,
+    ) -> Result<ChallengeResult, ScpError> {
+        self.inner
+            .core
+            .check_handle(verifier.instance_id())
+            .map_err(ScpError::from)?;
+        trust_create_challenge_impl(
+            &verifier,
+            subject,
+            capability_uri,
+            test_cases_json,
+            timeout_secs,
         )
-        .map_err(|e| ScpError::Validation {
-            msg: format!("challenge creation failed: {e}"),
-            code: codes::VALID_7014.to_owned(),
-        })?;
-
-        let challenge_json = serde_json::to_string(&request).map_err(|e| ScpError::Validation {
-            msg: format!("failed to serialize challenge: {e}"),
-            code: codes::VALID_7015.to_owned(),
-        })?;
-
-        Ok(ChallengeResult {
-            challenge_id: request.challenge_id,
-            challenge_json,
-        })
+        .await
     }
 
-    /// Per-instance equivalent of the free-function [`trust_verify_response`].
+    /// Verifies a challenge response and returns the signed
+    /// `ChallengeVerification` JSON (spec 07 §7.3.4).
     ///
-    /// Stateless helper — uses an ephemeral verification signer per call.
-    pub fn trust_verify_response(
+    /// The request and response signatures are checked through this
+    /// instance's DID resolver; the record is bound to `context_id` and signed
+    /// with `verifier`'s `#active` key through its custody.
+    ///
+    /// # Errors
+    ///
+    /// - The handle check's error when `verifier` belongs to another `Scp`.
+    /// - `SCP-VALID-7011` for an empty `context_id`.
+    /// - `SCP-VALID-7016` / `SCP-VALID-7017` for malformed challenge / response
+    ///   JSON.
+    /// - `SCP-IDENT-1033` when this instance has no DID resolver.
+    /// - `SCP-VALID-7003` when the response is refused.
+    /// - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
+    ///   error when signing fails.
+    pub async fn trust_verify_response(
         &self,
+        verifier: Arc<Identity>,
         challenge_json: String,
         response_json: String,
-    ) -> Result<bool, ScpError> {
-        let request: scp_core::trust::ChallengeRequest = serde_json::from_str(&challenge_json)
-            .map_err(|e| ScpError::Validation {
-                msg: format!("failed to parse challenge JSON: {e}"),
-                code: codes::VALID_7016.to_owned(),
-            })?;
-
-        let response: scp_core::trust::ChallengeResponse = serde_json::from_str(&response_json)
-            .map_err(|e| ScpError::Validation {
-                msg: format!("failed to parse response JSON: {e}"),
-                code: codes::VALID_7017.to_owned(),
-            })?;
-
-        let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-        let clock = scp_clock::SystemClock;
-
-        struct EphemeralVerifySigner(ed25519_dalek::SigningKey);
-        impl scp_core::trust::ChallengeSigner for EphemeralVerifySigner {
-            fn sign(&self, data: &[u8]) -> Result<Vec<u8>, scp_core::trust::TrustError> {
-                use ed25519_dalek::Signer;
-                let sig = self.0.sign(data);
-                Ok(sig.to_bytes().to_vec())
-            }
-        }
-
-        let verify_signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let verify_signer = EphemeralVerifySigner(verify_signing_key);
-
-        Ok(scp_core::trust::verify_challenge_response(
-            &request,
-            &response,
-            &resolver,
-            &clock,
-            &verify_signer,
-            None,
+        context_id: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(verifier.instance_id())
+            .map_err(ScpError::from)?;
+        trust_verify_response_impl(
+            &self.inner,
+            &verifier,
+            challenge_json,
+            response_json,
+            context_id,
         )
-        .is_ok())
+        .await
     }
 
     /// Per-instance equivalent of the free-function `aggregate_trust_input`.
@@ -16721,6 +16732,10 @@ impl Scp {
                 code: codes::VALID_7049.to_owned(),
             })?;
 
+        // The instance resolver verifies each challenge record's `#active`
+        // signature; without one, a supplied record fails closed.
+        let challenge_resolver = self.inner.did_resolver();
+
         // Route trust aggregation through THIS instance's
         // `ProtocolRepository` variant. Falls back to an ephemeral
         // in-memory store when no repository is attached yet.
@@ -16733,6 +16748,7 @@ impl Scp {
                 );
                 scp_ffi_common::trust_store::populate_and_aggregate(
                     bridge,
+                    scp_ffi_common::instance_challenge_resolver(challenge_resolver.as_ref()),
                     &context_id,
                     &subject_did,
                     cached_attestations,
@@ -16756,6 +16772,7 @@ impl Scp {
                 );
                 scp_ffi_common::trust_store::populate_and_aggregate(
                     bridge,
+                    scp_ffi_common::instance_challenge_resolver(challenge_resolver.as_ref()),
                     &context_id,
                     &subject_did,
                     cached_attestations,
@@ -22399,26 +22416,284 @@ mod tests {
         assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7012);
     }
 
-    #[test]
-    fn trust_create_challenge_rejects_empty_did_with_code() {
-        let result = trust_create_challenge(String::new());
-        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7013);
+    const SCHEMA_URI: &str = "scp:capability:schema-validation/v1";
+
+    /// `n` exact-match test cases whose weights sum to 10000.
+    fn challenge_cases_json(n: usize) -> String {
+        let weight = 10_000 / n;
+        let cases: Vec<scp_core::trust::TestCase> = (0..n)
+            .map(|i| scp_core::trust::TestCase {
+                test_id: format!("t{i}"),
+                input: serde_json::json!({ "i": i }),
+                expected: scp_core::trust::ExpectedOutput::ExactMatch {
+                    value: serde_json::json!({ "ok": true }),
+                },
+                category: "basic".to_owned(),
+                weight: u32::try_from(if i == 0 {
+                    10_000 - weight * (n - 1)
+                } else {
+                    weight
+                })
+                .unwrap(),
+            })
+            .collect();
+        serde_json::to_string(&cases).unwrap()
+    }
+
+    fn assert_error_code<T: std::fmt::Debug>(result: Result<T, ScpError>, code: &str) {
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(err.contains(code), "expected {code}, got: {err}");
+    }
+
+    /// A request that parses, for the response-position parse test.
+    fn parseable_challenge_json() -> String {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let verifier = scp_did::did_dht_from_public_key(&key.verifying_key().to_bytes());
+        let cases: Vec<scp_core::trust::TestCase> =
+            serde_json::from_str(&challenge_cases_json(20)).unwrap();
+        let request = scp_core::trust::challenge_request_unsigned(
+            verifier.clone(),
+            verifier,
+            SCHEMA_URI.to_owned(),
+            cases,
+            300,
+        )
+        .unwrap()
+        .with_verifier_signature(vec![0; 64]);
+        serde_json::to_string(&request).unwrap()
+    }
+
+    #[cfg(feature = "testing")]
+    fn challenge_identity(scp: &crate::scp::Scp) -> Arc<Identity> {
+        runtime()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed")
     }
 
     #[test]
-    fn trust_verify_response_rejects_invalid_challenge_json_with_code() {
+    #[cfg(feature = "testing")]
+    fn trust_create_challenge_rejects_empty_subject_did_with_code() {
+        let scp = scp_test();
+        let v = challenge_identity(&scp);
+        let result = runtime().block_on(scp.trust_create_challenge(
+            v,
+            String::new(),
+            SCHEMA_URI.to_owned(),
+            challenge_cases_json(20),
+            300,
+        ));
+        assert_error_code(result, codes::VALID_7013);
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn trust_create_challenge_below_minimum_is_valid_7039() {
+        let scp = scp_test();
+        let v = challenge_identity(&scp);
+        let result = runtime().block_on(scp.trust_create_challenge(
+            Arc::clone(&v),
+            v.did.clone(),
+            SCHEMA_URI.to_owned(),
+            challenge_cases_json(19),
+            300,
+        ));
+        assert_error_code(result, codes::VALID_7039);
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn trust_create_challenge_rejects_malformed_test_cases_json() {
+        let scp = scp_test();
+        let v = challenge_identity(&scp);
+        let result = runtime().block_on(scp.trust_create_challenge(
+            Arc::clone(&v),
+            v.did.clone(),
+            SCHEMA_URI.to_owned(),
+            r#"{"not":"an array"}"#.to_owned(),
+            300,
+        ));
+        assert_error_code(result, codes::VALID_7002);
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn trust_create_challenge_destroyed_key_is_crypto_4006() {
+        let scp = scp_test();
+        let v = challenge_identity(&scp);
+        let active = v.core_id.as_ref().unwrap().active_signing_key;
+        runtime()
+            .block_on(v.custody.as_ref().unwrap().destroy_key(&active))
+            .unwrap();
+        let result = runtime().block_on(scp.trust_create_challenge(
+            Arc::clone(&v),
+            v.did.clone(),
+            SCHEMA_URI.to_owned(),
+            challenge_cases_json(20),
+            300,
+        ));
+        assert_error_code(result, codes::CRYPTO_4006);
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn trust_create_challenge_rejects_identity_of_another_instance() {
+        let scp = scp_test();
+        let other = scp_test();
+        let v = challenge_identity(&other);
+        let result = runtime().block_on(scp.trust_create_challenge(
+            Arc::clone(&v),
+            v.did.clone(),
+            SCHEMA_URI.to_owned(),
+            challenge_cases_json(20),
+            300,
+        ));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn trust_verify_response_rejects_invalid_json_with_codes() {
+        let scp = scp_test();
+        let v = challenge_identity(&scp);
         // Malformed JSON in the CHALLENGE position.
-        let result = trust_verify_response("bad".to_owned(), "bad".to_owned());
-        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7016);
+        assert_error_code(
+            runtime().block_on(scp.trust_verify_response(
+                Arc::clone(&v),
+                "bad".to_owned(),
+                "bad".to_owned(),
+                "ctx".to_owned(),
+            )),
+            codes::VALID_7016,
+        );
+        // The challenge parses, so the failure is attributed to the response.
+        assert_error_code(
+            runtime().block_on(scp.trust_verify_response(
+                Arc::clone(&v),
+                parseable_challenge_json(),
+                "bad".to_owned(),
+                "ctx".to_owned(),
+            )),
+            codes::VALID_7017,
+        );
+        assert_error_code(
+            runtime().block_on(scp.trust_verify_response(
+                v,
+                parseable_challenge_json(),
+                "{}".to_owned(),
+                String::new(),
+            )),
+            codes::VALID_7011,
+        );
     }
 
     #[test]
-    fn trust_verify_response_rejects_invalid_response_json_with_code() {
-        // Malformed JSON in the RESPONSE position: the challenge parses, so
-        // the failure is attributed to the response argument.
-        let challenge = trust_create_challenge("did:key:target".to_owned()).unwrap();
-        let result = trust_verify_response(challenge.challenge_json, "bad".to_owned());
-        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7017);
+    #[cfg(feature = "testing")]
+    fn trust_verify_response_without_resolver_is_ident_1033() {
+        let scp = scp_test();
+        let other = scp_test();
+        // `other` mints the identity, so `scp` never initializes a resolver.
+        // The impl runs after the handle check, so it is called directly.
+        let v = challenge_identity(&other);
+        assert!(scp.inner.did_resolver().is_none());
+        let response = serde_json::json!({
+            "challenge_id": "00".repeat(32),
+            "responder_did": v.did,
+            "result": {},
+            "completed_at": 0,
+            "signature": [],
+        })
+        .to_string();
+        let result = runtime().block_on(trust_verify_response_impl(
+            &scp.inner,
+            &v,
+            parseable_challenge_json(),
+            response,
+            "ctx".to_owned(),
+        ));
+        assert_error_code(result, codes::IDENT_1033);
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn trust_create_then_verify_round_trip_with_production_resolver() {
+        let rt = runtime();
+        let scp = scp_test();
+        let v = challenge_identity(&scp);
+        let s = challenge_identity(&scp);
+        let v_id = v.core_id.as_ref().unwrap();
+        let s_id = s.core_id.as_ref().unwrap();
+        // `#0` and `#active` differ, so only an `#active` lookup verifies.
+        assert_ne!(v_id.identity_key, v_id.active_signing_key);
+        assert_ne!(s_id.identity_key, s_id.active_signing_key);
+
+        let created = rt
+            .block_on(scp.trust_create_challenge(
+                Arc::clone(&v),
+                s.did.clone(),
+                SCHEMA_URI.to_owned(),
+                challenge_cases_json(20),
+                300,
+            ))
+            .unwrap();
+        assert_eq!(created.challenge_id.len(), 64);
+        assert_eq!(created.challenge_id, created.challenge_id.to_lowercase());
+
+        let mut response = scp_core::trust::ChallengeResponse {
+            challenge_id: created.challenge_id.clone(),
+            responder_did: s.did.as_str().into(),
+            result: serde_json::json!({
+                "passed": true, "score": 10_000, "test_count": 20, "pass_count": 20
+            }),
+            completed_at: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+            signature: Vec::new(),
+        };
+        let bytes = scp_core::trust::canonical_challenge_response_bytes(&response).unwrap();
+        response.signature = rt
+            .block_on(
+                s.custody
+                    .as_ref()
+                    .unwrap()
+                    .sign(&s_id.active_signing_key, &bytes),
+            )
+            .unwrap()
+            .into_bytes();
+
+        let record_json = rt
+            .block_on(scp.trust_verify_response(
+                Arc::clone(&v),
+                created.challenge_json,
+                serde_json::to_string(&response).unwrap(),
+                "ctx-e2e".to_owned(),
+            ))
+            .unwrap();
+        let record: scp_core::trust::ChallengeVerification =
+            serde_json::from_str(&record_json).unwrap();
+        assert_eq!(record.subject, s.did);
+
+        let resolver = scp.inner.did_resolver().unwrap();
+        scp_core::trust::verify_challenge_verification(
+            &record,
+            resolver.as_ref(),
+            "ctx-e2e",
+            &s.did,
+            &scp_clock::SystemClock,
+        )
+        .unwrap();
+        // Negative: the `#0` key does not verify the record.
+        let identity_key = scp_core::trust::verify_challenge_verification(
+            &record,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
+            "ctx-e2e",
+            &s.did,
+            &scp_clock::SystemClock,
+        );
+        assert!(
+            matches!(
+                identity_key,
+                Err(scp_core::trust::TrustError::ChallengeVerificationSignatureInvalid { .. })
+            ),
+            "{identity_key:?}"
+        );
     }
 
     #[test]
@@ -22803,7 +23078,7 @@ mod tests {
     }
 
     /// Builds a genuinely verifier-signed `ChallengeVerification` JSON array
-    /// bound to `subject_did`/`context_id`, far-future expiry, verifier DID
+    /// bound to `subject_did`/`context_id`, a one-day expiry, verifier DID
     /// derived from a fixed key (did:dht:z, offline-resolvable by the production
     /// `IdentityDidPublicKeyResolver`).
     fn signed_cv_json(uri: &str, subject_did: &str, context_id: &str) -> String {
@@ -22813,29 +23088,37 @@ mod tests {
         let verifier_pub = verifier_key.verifying_key().to_bytes();
         let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
         let cap: scp_core::trust::CapabilityUri = uri.parse().unwrap();
+        let subject: scp_did::DID = subject_did.into();
+        let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         let mut cv = scp_core::trust::ChallengeVerification {
-            verification_id: "bridge-test-challenge".to_owned(),
-            verifier_did,
-            subject_did: subject_did.into(),
+            verification_id: scp_core::trust::challenge_verification_id(
+                &verifier_did,
+                &subject,
+                uri,
+                timestamp,
+            )
+            .unwrap(),
+            verifier: verifier_did,
+            subject,
             capability_uri: uri.to_owned(),
-            challenge_type: scp_core::trust::ChallengeType::Uri(cap.clone()),
-            verification_method: scp_core::trust::VerificationMethod::ChallengeVerified {
-                challenge_type: scp_core::trust::ChallengeType::Uri(cap),
-            },
+            suite_digest: [0; 32],
             passed: true,
             score: None,
             test_count: 1,
             pass_count: 1,
-            result: serde_json::Value::Bool(true),
-            completed_at: 1_700_000_000,
-            verified_at: 1_700_000_000,
-            expires_at: 4_000_000_000,
+            timestamp,
+            expires_at: timestamp + 86_400,
             context_id: Some(context_id.to_owned()),
             verifier_signature: Vec::new(),
+            verification_method: scp_core::trust::VerificationMethod::ChallengeVerified {
+                challenge_type: scp_core::trust::ChallengeType::Uri(cap),
+            },
+            result: serde_json::Value::Bool(true),
+            completed_at: timestamp,
         };
-        let canonical = scp_core::trust::canonical_challenge_verification_bytes(&cv).unwrap();
-        cv.verifier_signature = verifier_key.sign(&canonical).to_bytes().to_vec();
+        let digest = scp_core::trust::challenge_verification_signing_digest(&cv).unwrap();
+        cv.verifier_signature = verifier_key.sign(&digest).to_bytes().to_vec();
         serde_json::to_string(&vec![cv]).unwrap()
     }
 

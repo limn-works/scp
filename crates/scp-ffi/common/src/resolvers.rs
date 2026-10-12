@@ -128,11 +128,26 @@ impl From<ResolutionError> for CoreUcanError {
     }
 }
 
-impl From<ResolutionError> for TrustError {
-    fn from(e: ResolutionError) -> Self {
-        Self::AttestationSignatureInvalid {
-            attestation_id: String::new(),
-            reason: e.to_string(),
+impl ResolutionError {
+    /// Converts a failure to resolve `did`'s key into a [`TrustError`].
+    ///
+    /// Only [`Self::NetworkUnavailable`] says nothing about the record being
+    /// verified, so only it becomes the infrastructure error
+    /// [`TrustError::KeyResolutionUnavailable`], which a verify-on-ingest or
+    /// read path propagates. A DID that is absent, invalid or downgraded makes
+    /// the record unauthenticatable, which is a rejection of that record.
+    fn into_trust_error(self, did: &str) -> TrustError {
+        match self {
+            Self::NetworkUnavailable(reason) => TrustError::KeyResolutionUnavailable {
+                did: did.to_owned(),
+                reason,
+            },
+            other @ (Self::NotFound(_) | Self::InvalidDocument(_) | Self::Revoked(_)) => {
+                TrustError::AttestationSignatureInvalid {
+                    attestation_id: String::new(),
+                    reason: other.to_string(),
+                }
+            }
         }
     }
 }
@@ -621,18 +636,52 @@ impl DidResolver for IdentityBackedDidResolver {
     }
 }
 
+/// The challenge-record resolver of a bridge instance whose DID resolver is
+/// not initialized: every lookup fails with
+/// [`TrustError::KeyResolutionUnavailable`], so no record is admitted or
+/// dropped without a resolver.
+struct DidResolverNotInitialized;
+
+impl DidPublicKeyResolver for DidResolverNotInitialized {
+    fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+        Err(TrustError::KeyResolutionUnavailable {
+            did: did.to_owned(),
+            reason: "the DID resolver is not initialized; create an identity first".to_owned(),
+        })
+    }
+}
+
+/// The resolver a bridge verifies challenge records with.
+///
+/// It is the instance's [`IdentityBackedDidResolver`], or, when the instance
+/// has not initialized one, a resolver whose every lookup fails with
+/// [`TrustError::KeyResolutionUnavailable`]. A call with no record to verify
+/// therefore needs no resolver, and a call with one fails closed.
+#[must_use]
+pub fn instance_challenge_resolver(
+    resolver: Option<&Arc<IdentityBackedDidResolver>>,
+) -> &dyn DidPublicKeyResolver {
+    match resolver {
+        Some(r) => r.as_ref(),
+        None => &DidResolverNotInitialized,
+    }
+}
+
 /// Implements `scp_core::trust::attestation::DidPublicKeyResolver` for
 /// production attestation verification via the identity layer.
 impl DidPublicKeyResolver for IdentityBackedDidResolver {
     fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
         debug!(did = %did, "resolving DID public key for attestation verification via identity layer");
 
-        let resolved = self.resolve_sync(did).map_err(TrustError::from)?;
+        let resolved = self
+            .resolve_sync(did)
+            .map_err(|e| e.into_trust_error(did))?;
         self.check_sequence(did, resolved.seq)
-            .map_err(TrustError::from)?;
+            .map_err(|e| e.into_trust_error(did))?;
 
-        // Attestation verification uses the #active key by default.
-        let key = Self::extract_public_key(&resolved, "active").map_err(TrustError::from)?;
+        // Attestation and challenge verification use the #active key.
+        let key =
+            Self::extract_public_key(&resolved, "active").map_err(|e| e.into_trust_error(did))?;
         Ok(key.to_vec())
     }
 }
@@ -977,6 +1026,22 @@ impl scp_core::crypto::ucan::revoke::RevocationEventLogger for BridgeRevocationE
 mod tests {
     use super::*;
     use scp_core::crypto::ucan::validate::DidResolver as CoreDidResolver;
+
+    #[test]
+    fn network_unavailable_maps_to_key_resolution_unavailable() {
+        // An outage is infrastructure, not a judgment on the record.
+        let err = ResolutionError::NetworkUnavailable("all layers down".to_owned())
+            .into_trust_error("did:dht:zX");
+        assert!(
+            matches!(&err, TrustError::KeyResolutionUnavailable { did, reason }
+                if did == "did:dht:zX" && reason == "all layers down"),
+            "{err:?}"
+        );
+        assert!(!err.is_record_rejection());
+        // Control: an absent DID makes the record unauthenticatable.
+        let err = ResolutionError::NotFound("did:dht:zX".to_owned()).into_trust_error("did:dht:zX");
+        assert!(err.is_record_rejection(), "{err:?}");
+    }
     use scp_dht::InMemoryDhtClient;
     use scp_did::DidDocument;
     use scp_identity::cache::DidCache;

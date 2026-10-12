@@ -144,6 +144,43 @@ async def test_broadcast_publish_signs_through_a_python_provider(scp) -> None:
 
 
 @pytest.mark.asyncio
+async def test_trust_create_challenge_signs_through_a_python_provider(scp) -> None:
+    """A challenge request is signed through the verifier's provider, whose
+    ``sign`` runs in Python, within the deadline (spec 07 §7.3.4)."""
+    from scp_sdk.trust import ExactMatch, TestCase
+
+    provider = _SlowSignKeychain()
+    verifier = await scp.identity_create_with_custody(provider)
+    # Not a second _FakeKeychain: its seeds derive from the key id, so it
+    # would mint the verifier's DID and replace the verifier's registry entry.
+    subject = await scp.identity_create("in_memory")
+    assert subject.did != verifier.did
+    cases = [
+        TestCase(
+            test_id=f"t{i}",
+            input={"i": i},
+            expected=ExactMatch(value=True),
+            category="basic",
+            weight=500,
+        )
+        for i in range(20)
+    ]
+    provider.armed = True
+    before = provider.sign_calls
+
+    result = await asyncio.wait_for(
+        scp.trust_create_challenge(
+            verifier.did, subject.did, "scp:capability:schema-validation/v1", cases
+        ),
+        timeout=_DEADLINE_S,
+    )
+
+    assert provider.sign_calls > before, "the request never reached the provider's sign"
+    assert provider.signing.is_set()
+    assert json.loads(result["challenge_json"])["verifier"] == verifier.did
+
+
+@pytest.mark.asyncio
 async def test_non_signing_call_proceeds_while_another_thread_signs(scp) -> None:
     """Thread A proposes; its ``sign`` sleeps in Python. Thread B, started once
     A is inside ``sign``, reads the member count. Both finish within the

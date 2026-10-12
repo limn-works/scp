@@ -3876,20 +3876,47 @@ impl Scp {
         crate::trust::trust_verify_attestation_on(&self.inner, attestation_json)
     }
 
-    /// Per-instance equivalent of the free-function `trust_create_challenge`.
+    /// Creates a challenge for `subject` from the challenger-written test cases
+    /// (`testCasesJson`, a JSON array of `TestCase`) and signs it with
+    /// `verifier`'s `#active` key (spec 07 §7.3.4).
     #[napi(js_name = "trustCreateChallenge")]
-    pub fn trust_create_challenge(&self, target_did: String) -> napi::Result<NapiChallengeResult> {
-        crate::trust::trust_create_challenge_on(&self.inner, target_did)
+    pub async fn trust_create_challenge(
+        &self,
+        verifier: String,
+        subject: String,
+        capability_uri: String,
+        test_cases_json: String,
+        timeout_secs: u32,
+    ) -> napi::Result<NapiChallengeResult> {
+        crate::trust::trust_create_challenge_on(
+            &self.inner,
+            verifier,
+            subject,
+            capability_uri,
+            test_cases_json,
+            timeout_secs,
+        )
+        .await
     }
 
-    /// Per-instance equivalent of the free-function `trust_verify_response`.
+    /// Checks a challenge response and returns the `ChallengeVerification`
+    /// JSON signed with `verifier`'s `#active` key (spec 07 §7.3.4).
     #[napi(js_name = "trustVerifyResponse")]
-    pub fn trust_verify_response(
+    pub async fn trust_verify_response(
         &self,
+        verifier: String,
         challenge_json: String,
         response_json: String,
-    ) -> napi::Result<bool> {
-        crate::trust::trust_verify_response_on(&self.inner, challenge_json, response_json)
+        context_id: String,
+    ) -> napi::Result<String> {
+        crate::trust::trust_verify_response_on(
+            &self.inner,
+            verifier,
+            challenge_json,
+            response_json,
+            context_id,
+        )
+        .await
     }
 
     /// Per-instance equivalent of the free-function `verify_participation_requirements`.

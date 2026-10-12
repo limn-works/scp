@@ -471,11 +471,11 @@ class TestCheckCapabilityRequirements:
             ),
         ]
         verification = ChallengeVerification(
-            verification_id="chal-1",
-            verifier_did="did:dht:z6MkVerifier",
-            subject_did="did:dht:z6MkAlice",
+            verification_id="01" * 32,
+            verifier="did:dht:z6MkVerifier",
+            subject="did:dht:z6MkAlice",
             capability_uri="scp:capability:code-review/v1",
-            challenge_type="scp:capability:code-review/v1",
+            suite_digest="02" * 32,
             verification_method=ChallengeVerificationMethod(
                 "ChallengeVerified", challenge_type="scp:capability:code-review/v1"
             ),
@@ -484,10 +484,10 @@ class TestCheckCapabilityRequirements:
             pass_count=10,
             result={"detail": "ok"},
             completed_at=1_700_000_000,
-            verified_at=1_700_000_001,
-            expires_at=1_800_000_000,
+            timestamp=1_700_000_001,
+            expires_at=1_700_086_401,
             verifier_signature=list(range(64)),
-            score=95,
+            score=9_500,
             context_id="ctx-1",
         )
 
@@ -511,22 +511,22 @@ class TestCheckCapabilityRequirements:
         ]
         assert json.loads(call_args[0][4]) == [
             {
-                "verification_id": "chal-1",
-                "verifier_did": "did:dht:z6MkVerifier",
-                "subject_did": "did:dht:z6MkAlice",
+                "verification_id": "01" * 32,
+                "verifier": "did:dht:z6MkVerifier",
+                "subject": "did:dht:z6MkAlice",
                 "capability_uri": "scp:capability:code-review/v1",
-                "challenge_type": "scp:capability:code-review/v1",
+                "suite_digest": "02" * 32,
                 "verification_method": {
                     "ChallengeVerified": {"challenge_type": "scp:capability:code-review/v1"}
                 },
                 "passed": True,
-                "score": 95,
+                "score": 9_500,
                 "test_count": 10,
                 "pass_count": 10,
                 "result": {"detail": "ok"},
                 "completed_at": 1_700_000_000,
-                "verified_at": 1_700_000_001,
-                "expires_at": 1_800_000_000,
+                "timestamp": 1_700_000_001,
+                "expires_at": 1_700_086_401,
                 "context_id": "ctx-1",
                 "verifier_signature": list(range(64)),
             },
@@ -545,18 +545,18 @@ class TestCheckCapabilityRequirements:
     def test_rejects_wrong_signature_length(self) -> None:
         with pytest.raises(ValueError, match="verifier_signature must be exactly 64"):
             ChallengeVerification(
-                verification_id="chal-1",
-                verifier_did="did:dht:z6MkVerifier",
-                subject_did="did:dht:z6MkAlice",
+                verification_id="01" * 32,
+                verifier="did:dht:z6MkVerifier",
+                subject="did:dht:z6MkAlice",
                 capability_uri="scp:capability:code-review/v1",
-                challenge_type="scp:capability:code-review/v1",
+                suite_digest="02" * 32,
                 verification_method=ChallengeVerificationMethod("SelfAttested"),
                 passed=True,
                 test_count=1,
                 pass_count=1,
                 result=None,
                 completed_at=1,
-                verified_at=1,
+                timestamp=1,
                 expires_at=2,
                 verifier_signature=[0, 1, 2],
             )

@@ -38,6 +38,11 @@ use scp_protocol::envelope::inner::compute_canonical_hash;
 use scp_protocol::envelope::padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
 use scp_protocol::envelope::{InnerEnvelopeParams, MessageType};
 use scp_protocol::identity::attestation::IdentityLinkAttestation;
+use scp_protocol::trust::challenge::{
+    ChallengeRequest, ChallengeType, ChallengeVerification, ExpectedOutput, TestCase,
+    VerificationMethod, canonical_challenge_verification_bytes, challenge_request_signing_digest,
+    challenge_suite_digest, challenge_verification_id, challenge_verification_signing_digest,
+};
 use scp_runtime::sync::weeks_offline::{ResetReason, ResetRequest};
 
 // ---------------------------------------------------------------------------
@@ -1047,6 +1052,51 @@ fn assert_challenge_verification_vector(
     let preimage = challenge_verification_preimage(input, &verification_id);
     assert_eq!(hex::encode(&preimage), preimage_hex, "{label}: R_v");
     assert_eq!(hex::encode(sha256(&preimage)), digest_hex, "{label}: D_v");
+
+    // The production encoders reproduce the bytes rebuilt above.
+    let verifier = DID(ID_VERIFIER.to_owned());
+    let subject = DID(ID_SUBJECT.to_owned());
+    assert_eq!(
+        challenge_verification_id(
+            &verifier,
+            &subject,
+            CHALLENGE_CAPABILITY_URI,
+            input.timestamp
+        )
+        .unwrap(),
+        verification_id,
+        "{label}: challenge_verification_id"
+    );
+    let challenge_type: ChallengeType =
+        serde_json::from_value(serde_json::json!(CHALLENGE_CAPABILITY_URI)).unwrap();
+    let record = ChallengeVerification {
+        verification_id,
+        verifier,
+        subject,
+        capability_uri: CHALLENGE_CAPABILITY_URI.to_owned(),
+        suite_digest: unhex32(CHALLENGE_SUITE_DIGEST_HEX),
+        passed: input.passed,
+        score: input.score,
+        test_count: 1,
+        pass_count: input.pass_count,
+        timestamp: input.timestamp,
+        expires_at: input.timestamp + 7_776_000,
+        context_id: input.context_id.map(str::to_owned),
+        verifier_signature: Vec::new(),
+        verification_method: VerificationMethod::ChallengeVerified { challenge_type },
+        result: serde_json::json!({}),
+        completed_at: input.timestamp,
+    };
+    assert_eq!(
+        canonical_challenge_verification_bytes(&record).unwrap(),
+        preimage,
+        "{label}: canonical_challenge_verification_bytes"
+    );
+    assert_eq!(
+        hex::encode(challenge_verification_signing_digest(&record).unwrap()),
+        digest_hex,
+        "{label}: challenge_verification_signing_digest"
+    );
     preimage
 }
 
@@ -1119,6 +1169,35 @@ fn vector_58_challenge_request() {
     assert_eq!(
         hex::encode(sha256(&preimage)),
         "9425a8bca59a96ea6f400233a247fb9aa4b0d4bbb98b7e8b1e756297e7e2a91f"
+    );
+
+    // The production encoders reproduce `suite_digest` and `D`.
+    let request = ChallengeRequest {
+        challenge_id,
+        capability_uri: CHALLENGE_CAPABILITY_URI.to_owned(),
+        test_cases: vec![TestCase {
+            test_id: "schema-validation-001".to_owned(),
+            input: serde_json::json!({"name": "widget", "count": 3}),
+            expected: ExpectedOutput::SchemaMatch {
+                schema: serde_json::json!({"type": "object", "required": ["name", "count"]}),
+            },
+            category: "schema".to_owned(),
+            weight: 10_000,
+        }],
+        timeout_secs: 300,
+        verifier: DID(ID_VERIFIER.to_owned()),
+        subject: DID(ID_SUBJECT.to_owned()),
+        verifier_signature: Vec::new(),
+    };
+    assert_eq!(
+        hex::encode(challenge_suite_digest(&request.test_cases).unwrap()),
+        CHALLENGE_SUITE_DIGEST_HEX,
+        "challenge_suite_digest"
+    );
+    assert_eq!(
+        challenge_request_signing_digest(&request).unwrap(),
+        sha256(&preimage),
+        "challenge_request_signing_digest"
     );
 }
 

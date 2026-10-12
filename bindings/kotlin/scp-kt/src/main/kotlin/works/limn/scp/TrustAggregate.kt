@@ -25,6 +25,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -328,36 +329,80 @@ private fun encodeOptionalEnvelopeElement(envelope: CachedAttestationEnvelope?):
 // ---------------------------------------------------------------------------
 
 /**
- * A challenge request for capability verification (ADR-017, spec §7.3.4).
+ * The error code the bridges raise when a challenge for a protocol capability
+ * URI has fewer test cases than its standard's minimum (spec 07 §7.3.4.3).
+ */
+const val CHALLENGE_SUITE_BELOW_MINIMUM_CODE: String = "SCP-VALID-7039"
+
+/**
+ * How a test case's output is judged (spec 07 §7.3.4.2).
  *
- * The serde wire shape of the Rust `ChallengeRequest` (`scp-core`) the bridge
- * deserializes for [SCP.trustVerifyResponse]. [challengeType] is a bare
- * capability URI string (the Rust `ChallengeType` serializes as its URI
- * string); [timeout] is the Rust `std::time::Duration` serde shape
- * ([CachedAttestationDuration]). Mirrors the Swift SDK `ChallengeRequest`
- * and the TypeScript/Python models 1:1.
+ * Encodes to the Rust `ExpectedOutput` enum's externally tagged serde shape,
+ * for example `{"ExactMatch":{"value":...}}`. Mirrors the Swift SDK
+ * `ExpectedOutput`, the TypeScript `ExpectedOutput` union and the Python
+ * variant classes 1:1.
+ */
+sealed class ExpectedOutput {
+    /** The output must equal [value]. */
+    data class ExactMatch(val value: JsonElement) : ExpectedOutput()
+
+    /** The output must validate against the JSON Schema [schema]. */
+    data class SchemaMatch(val schema: JsonElement) : ExpectedOutput()
+
+    /** The output must contain every string in [required]. */
+    data class ContainsAll(val required: List<String>) : ExpectedOutput()
+
+    /** The output must contain none of the strings in [forbidden]. */
+    data class ContainsNone(val forbidden: List<String>) : ExpectedOutput()
+
+    /** An outlet the verifier names judges the output. */
+    data class CustomEval(val evaluatorOutletId: String) : ExpectedOutput()
+}
+
+/**
+ * One challenger-written test case (spec 07 §7.3.4.2).
  *
- * @property challengeId Unique challenge identifier (UUID v4).
- * @property challengeType The type of challenge being issued (a capability
- *   URI string).
- * @property challengerDid DID of the entity issuing the challenge.
- * @property subjectDid DID of the entity being challenged.
+ * @property testId Identifier unique within the challenge.
+ * @property input The input the subject runs.
+ * @property expected How the output is judged.
+ * @property category The case's category; a BCP 47 language tag for
+ *   `multilingual/v1`.
+ * @property weight The case's weight in basis points; a protocol suite's
+ *   weights sum to 10000.
+ */
+data class TestCase(
+    val testId: String,
+    val input: JsonElement,
+    val expected: ExpectedOutput,
+    val category: String,
+    val weight: UInt,
+)
+
+/**
+ * A signed challenge request (ADR-017, spec 07 §7.3.4).
+ *
+ * [SCP.trustCreateChallenge] returns one as JSON; [decodeChallengeRequestJson]
+ * reads it and [encodeChallengeRequestJson] writes the serde wire shape
+ * [SCP.trustVerifyResponse] takes. Mirrors the Swift SDK `ChallengeRequest` and
+ * the TypeScript and Python models 1:1.
+ *
+ * @property challengeId 64 lowercase hex characters (32 random bytes).
  * @property capabilityUri The capability URI being tested (§7.3.4.1).
- * @property parameters Challenge-specific parameters (schema, test vectors,
- *   limits, etc.).
- * @property timeout Maximum time allowed for the subject to respond.
- * @property signature Ed25519 signature over the canonical challenge bytes
- *   (64 bytes).
+ * @property testCases The challenger-written test cases.
+ * @property timeoutSecs Seconds the subject has to respond.
+ * @property verifier DID of the verifier issuing the challenge.
+ * @property subject DID of the entity being challenged.
+ * @property verifierSignature Ed25519 signature by the verifier's `#active`
+ *   key over the request digest (64 bytes).
  */
 data class ChallengeRequest(
     val challengeId: String,
-    val challengeType: String,
-    val challengerDid: String,
-    val subjectDid: String,
     val capabilityUri: String,
-    val parameters: JsonElement,
-    val timeout: CachedAttestationDuration,
-    val signature: List<UByte>,
+    val testCases: List<TestCase>,
+    val timeoutSecs: UInt,
+    val verifier: String,
+    val subject: String,
+    val verifierSignature: List<UByte>,
 )
 
 /**
@@ -367,7 +412,8 @@ data class ChallengeRequest(
  * bridge deserializes for [SCP.trustVerifyResponse]. Mirrors the Swift SDK
  * `ChallengeResponse` and the TypeScript/Python models 1:1.
  *
- * @property challengeId The challenge ID this response corresponds to.
+ * @property challengeId The challenge id this response answers: 64 lowercase
+ *   hex characters.
  * @property responderDid DID of the entity responding to the challenge.
  * @property result Challenge-specific result data (pass/fail, metrics,
  *   evidence, etc.).
@@ -393,39 +439,216 @@ data class ChallengeResponse(
 fun encodeAttestationJson(attestation: CachedAttestationEnvelope): String =
     Json.encodeToString(JsonObject.serializer(), encodeEnvelopeElement(attestation))
 
+private const val HEX_32_LENGTH = 64
+
+/**
+ * Requires [value] to be 64 lowercase hex characters, the wire form of a
+ * 32-byte challenge id, verification id or suite digest.
+ *
+ * @throws IllegalArgumentException naming `typeName.fieldName` otherwise.
+ */
+internal fun requireLowerHex32(
+    typeName: String,
+    fieldName: String,
+    value: String,
+) {
+    require(value.length == HEX_32_LENGTH && value.all { it in '0'..'9' || it in 'a'..'f' }) {
+        "$typeName.$fieldName must be 64 lowercase hex characters"
+    }
+}
+
+private fun encodeExpectedOutputElement(expected: ExpectedOutput): JsonObject =
+    when (expected) {
+        is ExpectedOutput.ExactMatch ->
+            buildJsonObject { put("ExactMatch", buildJsonObject { put("value", expected.value) }) }
+        is ExpectedOutput.SchemaMatch ->
+            buildJsonObject { put("SchemaMatch", buildJsonObject { put("schema", expected.schema) }) }
+        is ExpectedOutput.ContainsAll ->
+            buildJsonObject {
+                put(
+                    "ContainsAll",
+                    buildJsonObject {
+                        put("required", buildJsonArray { expected.required.forEach { add(it) } })
+                    },
+                )
+            }
+        is ExpectedOutput.ContainsNone ->
+            buildJsonObject {
+                put(
+                    "ContainsNone",
+                    buildJsonObject {
+                        put("forbidden", buildJsonArray { expected.forbidden.forEach { add(it) } })
+                    },
+                )
+            }
+        is ExpectedOutput.CustomEval ->
+            buildJsonObject {
+                put(
+                    "CustomEval",
+                    buildJsonObject { put("evaluator_outlet_id", expected.evaluatorOutletId) },
+                )
+            }
+    }
+
+private fun encodeTestCasesElement(testCases: List<TestCase>): JsonArray =
+    buildJsonArray {
+        for (case in testCases) {
+            add(
+                buildJsonObject {
+                    put("test_id", case.testId)
+                    put("input", case.input)
+                    put("expected", encodeExpectedOutputElement(case.expected))
+                    put("category", case.category)
+                    put("weight", case.weight.toLong())
+                },
+            )
+        }
+    }
+
+/**
+ * Encodes typed test cases to the JSON array [SCP.trustCreateChallenge] passes
+ * to the bridge (`Vec<TestCase>`).
+ */
+fun encodeTestCasesJson(testCases: List<TestCase>): String {
+    val element = encodeTestCasesElement(testCases)
+    return Json.encodeToString(JsonArray.serializer(), element)
+}
+
 /**
  * Encodes a typed [ChallengeRequest] to the JSON wire shape the bridge
  * deserializes (`ChallengeRequest`).
  *
- * @throws IllegalArgumentException if [ChallengeRequest.signature] is not
- *   exactly 64 elements (before any bridge call).
+ * @throws IllegalArgumentException if [ChallengeRequest.verifierSignature] is
+ *   not exactly 64 elements or [ChallengeRequest.challengeId] is not 64
+ *   lowercase hex characters (before any bridge call).
  */
 fun encodeChallengeRequestJson(challenge: ChallengeRequest): String {
+    requireLowerHex32("ChallengeRequest", "challengeId", challenge.challengeId)
     requireAggregateByteLength(
         "ChallengeRequest",
-        "signature",
+        "verifierSignature",
         AGGREGATE_BYTES_64,
-        challenge.signature,
+        challenge.verifierSignature,
     )
     return Json.encodeToString(
         JsonObject.serializer(),
         buildJsonObject {
             put("challenge_id", challenge.challengeId)
-            put("challenge_type", challenge.challengeType)
-            put("challenger_did", challenge.challengerDid)
-            put("subject_did", challenge.subjectDid)
             put("capability_uri", challenge.capabilityUri)
-            put("parameters", challenge.parameters)
+            put("test_cases", encodeTestCasesElement(challenge.testCases))
+            put("timeout_secs", challenge.timeoutSecs.toLong())
+            put("verifier", challenge.verifier)
+            put("subject", challenge.subject)
             put(
-                "timeout",
-                buildJsonObject {
-                    put("secs", challenge.timeout.secs.toLong())
-                    put("nanos", challenge.timeout.nanos.toLong())
-                },
+                "verifier_signature",
+                buildJsonArray { challenge.verifierSignature.forEach { add(it.toInt()) } },
             )
-            put("signature", buildJsonArray { challenge.signature.forEach { add(it.toInt()) } })
         },
     )
+}
+
+private fun JsonObject.field(
+    typeName: String,
+    name: String,
+): JsonElement = this[name] ?: throw IllegalArgumentException("$typeName.$name is missing")
+
+private fun JsonElement.string(path: String): String {
+    val primitive = this as? JsonPrimitive
+    require(primitive != null && primitive.isString) { "$path must be a string" }
+    return primitive.content
+}
+
+private fun JsonElement.uint(path: String): UInt {
+    val value = (this as? JsonPrimitive)?.takeIf { !it.isString }?.content?.toUIntOrNull()
+    return requireNotNull(value) { "$path must be an unsigned 32-bit integer" }
+}
+
+private fun JsonElement.obj(path: String): JsonObject {
+    require(this is JsonObject) { "$path must be an object" }
+    return this
+}
+
+private fun JsonElement.array(path: String): JsonArray {
+    require(this is JsonArray) { "$path must be an array" }
+    return this
+}
+
+private fun decodeExpectedOutput(element: JsonElement): ExpectedOutput {
+    val tagged = element.obj("TestCase.expected")
+    require(tagged.size == 1) { "TestCase.expected must have exactly one variant key" }
+    val (variant, body) = tagged.entries.first()
+    val fields = body.obj("TestCase.expected.$variant")
+    return when (variant) {
+        "ExactMatch" -> ExpectedOutput.ExactMatch(fields.field(variant, "value"))
+        "SchemaMatch" -> ExpectedOutput.SchemaMatch(fields.field(variant, "schema"))
+        "ContainsAll" ->
+            ExpectedOutput.ContainsAll(
+                fields.field(variant, "required").array("$variant.required").map {
+                    it.string("$variant.required[]")
+                },
+            )
+        "ContainsNone" ->
+            ExpectedOutput.ContainsNone(
+                fields.field(variant, "forbidden").array("$variant.forbidden").map {
+                    it.string("$variant.forbidden[]")
+                },
+            )
+        "CustomEval" ->
+            ExpectedOutput.CustomEval(
+                fields.field(variant, "evaluator_outlet_id").string("$variant.evaluator_outlet_id"),
+            )
+        else -> throw IllegalArgumentException("unknown ExpectedOutput variant \"$variant\"")
+    }
+}
+
+private const val BYTE_MAX = 255u
+
+/**
+ * Decodes the challenge JSON [SCP.trustCreateChallenge] returns into a typed
+ * [ChallengeRequest].
+ *
+ * @throws IllegalArgumentException if the JSON is not a challenge request, an
+ *   expected output names an unknown variant, the id is not 64 lowercase hex
+ *   characters, or the signature is not 64 bytes.
+ */
+fun decodeChallengeRequestJson(json: String): ChallengeRequest {
+    val root =
+        try {
+            Json.parseToJsonElement(json)
+        } catch (e: kotlinx.serialization.SerializationException) {
+            throw IllegalArgumentException("malformed ChallengeRequest JSON: ${e.message}", e)
+        }.obj("ChallengeRequest")
+    val type = "ChallengeRequest"
+    val testCases =
+        root.field(type, "test_cases").array("$type.test_cases").map { element ->
+            val case = element.obj("$type.test_cases[]")
+            TestCase(
+                testId = case.field("TestCase", "test_id").string("TestCase.test_id"),
+                input = case.field("TestCase", "input"),
+                expected = decodeExpectedOutput(case.field("TestCase", "expected")),
+                category = case.field("TestCase", "category").string("TestCase.category"),
+                weight = case.field("TestCase", "weight").uint("TestCase.weight"),
+            )
+        }
+    val signature =
+        root.field(type, "verifier_signature").array("$type.verifier_signature").map {
+            val byte = it.uint("$type.verifier_signature[]")
+            require(byte <= BYTE_MAX) { "$type.verifier_signature[] must be a byte" }
+            byte.toUByte()
+        }
+    val request =
+        ChallengeRequest(
+            challengeId = root.field(type, "challenge_id").string("$type.challenge_id"),
+            capabilityUri = root.field(type, "capability_uri").string("$type.capability_uri"),
+            testCases = testCases,
+            timeoutSecs = root.field(type, "timeout_secs").uint("$type.timeout_secs"),
+            verifier = root.field(type, "verifier").string("$type.verifier"),
+            subject = root.field(type, "subject").string("$type.subject"),
+            verifierSignature = signature,
+        )
+    requireLowerHex32(type, "challengeId", request.challengeId)
+    requireAggregateByteLength(type, "verifierSignature", AGGREGATE_BYTES_64, request.verifierSignature)
+    return request
 }
 
 /**

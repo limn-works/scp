@@ -3648,18 +3648,45 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func transportStatus(manager: TransportManager) async throws  -> TransportStatus
     
     /**
-     * Per-instance equivalent of the free-function [`trust_create_challenge`].
+     * Creates a challenge request for capability verification (spec 07
+     * §7.3.4).
      *
-     * Stateless helper — uses an ephemeral signing key per call.
+     * The request is signed with `verifier`'s `#active` key through its
+     * custody. `test_cases_json` is the challenger-written JSON array of test
+     * cases.
+     *
+     * # Errors
+     *
+     * - The handle check's error when `verifier` belongs to another `Scp`.
+     * - `SCP-VALID-7013` for an invalid subject DID.
+     * - `SCP-VALID-7002` for malformed `test_cases_json`.
+     * - `SCP-VALID-7039` when a protocol capability URI carries fewer cases
+     * than its standard's minimum; `SCP-VALID-7003` for any other refusal.
+     * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
+     * error when signing fails (`SCP-CRYPTO-4006` for a destroyed key).
      */
-    func trustCreateChallenge(targetDid: String) throws  -> ChallengeResult
+    func trustCreateChallenge(verifier: Identity, subject: String, capabilityUri: String, testCasesJson: String, timeoutSecs: UInt32) async throws  -> ChallengeResult
     
     /**
-     * Per-instance equivalent of the free-function [`trust_verify_response`].
+     * Verifies a challenge response and returns the signed
+     * `ChallengeVerification` JSON (spec 07 §7.3.4).
      *
-     * Stateless helper — uses an ephemeral verification signer per call.
+     * The request and response signatures are checked through this
+     * instance's DID resolver; the record is bound to `context_id` and signed
+     * with `verifier`'s `#active` key through its custody.
+     *
+     * # Errors
+     *
+     * - The handle check's error when `verifier` belongs to another `Scp`.
+     * - `SCP-VALID-7011` for an empty `context_id`.
+     * - `SCP-VALID-7016` / `SCP-VALID-7017` for malformed challenge / response
+     * JSON.
+     * - `SCP-IDENT-1033` when this instance has no DID resolver.
+     * - `SCP-VALID-7003` when the response is refused.
+     * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
+     * error when signing fails.
      */
-    func trustVerifyResponse(challengeJson: String, responseJson: String) throws  -> Bool
+    func trustVerifyResponse(verifier: Identity, challengeJson: String, responseJson: String, contextId: String) async throws  -> String
     
     /**
      * Per-instance equivalent of the free-function `ucan_delegate`.
@@ -7445,30 +7472,74 @@ open func transportStatus(manager: TransportManager)async throws  -> TransportSt
 }
     
     /**
-     * Per-instance equivalent of the free-function [`trust_create_challenge`].
+     * Creates a challenge request for capability verification (spec 07
+     * §7.3.4).
      *
-     * Stateless helper — uses an ephemeral signing key per call.
+     * The request is signed with `verifier`'s `#active` key through its
+     * custody. `test_cases_json` is the challenger-written JSON array of test
+     * cases.
+     *
+     * # Errors
+     *
+     * - The handle check's error when `verifier` belongs to another `Scp`.
+     * - `SCP-VALID-7013` for an invalid subject DID.
+     * - `SCP-VALID-7002` for malformed `test_cases_json`.
+     * - `SCP-VALID-7039` when a protocol capability URI carries fewer cases
+     * than its standard's minimum; `SCP-VALID-7003` for any other refusal.
+     * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
+     * error when signing fails (`SCP-CRYPTO-4006` for a destroyed key).
      */
-open func trustCreateChallenge(targetDid: String)throws  -> ChallengeResult  {
-    return try  FfiConverterTypeChallengeResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_trust_create_challenge(self.uniffiClonePointer(),
-        FfiConverterString.lower(targetDid),$0
-    )
-})
+open func trustCreateChallenge(verifier: Identity, subject: String, capabilityUri: String, testCasesJson: String, timeoutSecs: UInt32)async throws  -> ChallengeResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_trust_create_challenge(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(verifier),FfiConverterString.lower(subject),FfiConverterString.lower(capabilityUri),FfiConverterString.lower(testCasesJson),FfiConverterUInt32.lower(timeoutSecs)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeChallengeResult_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
-     * Per-instance equivalent of the free-function [`trust_verify_response`].
+     * Verifies a challenge response and returns the signed
+     * `ChallengeVerification` JSON (spec 07 §7.3.4).
      *
-     * Stateless helper — uses an ephemeral verification signer per call.
+     * The request and response signatures are checked through this
+     * instance's DID resolver; the record is bound to `context_id` and signed
+     * with `verifier`'s `#active` key through its custody.
+     *
+     * # Errors
+     *
+     * - The handle check's error when `verifier` belongs to another `Scp`.
+     * - `SCP-VALID-7011` for an empty `context_id`.
+     * - `SCP-VALID-7016` / `SCP-VALID-7017` for malformed challenge / response
+     * JSON.
+     * - `SCP-IDENT-1033` when this instance has no DID resolver.
+     * - `SCP-VALID-7003` when the response is refused.
+     * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
+     * error when signing fails.
      */
-open func trustVerifyResponse(challengeJson: String, responseJson: String)throws  -> Bool  {
-    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_trust_verify_response(self.uniffiClonePointer(),
-        FfiConverterString.lower(challengeJson),
-        FfiConverterString.lower(responseJson),$0
-    )
-})
+open func trustVerifyResponse(verifier: Identity, challengeJson: String, responseJson: String, contextId: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_trust_verify_response(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(verifier),FfiConverterString.lower(challengeJson),FfiConverterString.lower(responseJson),FfiConverterString.lower(contextId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -8672,11 +8743,11 @@ public func FfiConverterTypeCapabilityValidationRecord_lower(_ value: Capability
  */
 public struct ChallengeResult {
     /**
-     * The unique challenge ID (UUID v4).
+     * The challenge ID: lowercase hex of its 32 random bytes.
      */
     public var challengeId: String
     /**
-     * The serialized challenge request (JSON).
+     * The signed `ChallengeRequest` (JSON).
      */
     public var challengeJson: String
 
@@ -8684,10 +8755,10 @@ public struct ChallengeResult {
     // declare one manually.
     public init(
         /**
-         * The unique challenge ID (UUID v4).
+         * The challenge ID: lowercase hex of its 32 random bytes.
          */challengeId: String, 
         /**
-         * The serialized challenge request (JSON).
+         * The signed `ChallengeRequest` (JSON).
          */challengeJson: String) {
         self.challengeId = challengeId
         self.challengeJson = challengeJson
@@ -17297,18 +17368,6 @@ public func templateGetParams(templateId: String)throws  -> String  {
 })
 }
 /**
- * Creates a challenge request for capability verification.
- *
- * See ADR-017 Layer 3 (Challenge-Response).
- */
-public func trustCreateChallenge(targetDid: String)throws  -> ChallengeResult  {
-    return try  FfiConverterTypeChallengeResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_trust_create_challenge(
-        FfiConverterString.lower(targetDid),$0
-    )
-})
-}
-/**
  * Queries a trust score for the given DID in the given context.
  *
  * Trust event counts are queried from the module-level helper (a
@@ -17336,19 +17395,6 @@ public func trustVerifyAttestation(attestationJson: String)throws  -> Attestatio
     return try  FfiConverterTypeAttestationVerificationResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_func_trust_verify_attestation(
         FfiConverterString.lower(attestationJson),$0
-    )
-})
-}
-/**
- * Verifies a challenge response against its original challenge request.
- *
- * See ADR-017 Layer 3 (Challenge-Response).
- */
-public func trustVerifyResponse(challengeJson: String, responseJson: String)throws  -> Bool  {
-    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_trust_verify_response(
-        FfiConverterString.lower(challengeJson),
-        FfiConverterString.lower(responseJson),$0
     )
 })
 }
@@ -17544,16 +17590,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_template_get_params() != 28014) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_trust_create_challenge() != 37813) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_query_score() != 58685) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_verify_attestation() != 50772) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_trust_verify_response() != 47639) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_validate_against_template() != 37474) {
@@ -18099,10 +18139,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_status() != 20055) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_create_challenge() != 25481) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_create_challenge() != 10459) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 16753) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 4984) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 59265) {

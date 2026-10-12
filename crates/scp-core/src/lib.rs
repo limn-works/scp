@@ -177,10 +177,20 @@ pub mod trust {
     // re-export carries the same `testing` gate as its definition.
     #[cfg(feature = "testing")]
     pub use scp_protocol::trust::attestation::NoOpRevocationChecker;
+    pub use scp_protocol::trust::capability_registry::{ChallengeStandard, MinCases};
     pub use scp_protocol::trust::challenge::{
-        ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
-        VerificationMethod, canonical_challenge_verification_bytes, issue_challenge,
-        verify_challenge_response, verify_challenge_verification,
+        ChallengeRequest, ChallengeResponse, ChallengeType, ChallengeVerification, ExpectedOutput,
+        TestCase, UnsignedChallengeRequest, UnsignedChallengeVerification, VerificationMethod,
+        canonical_challenge_response_bytes, canonical_challenge_verification_bytes,
+        challenge_request_signing_digest, challenge_request_unsigned, challenge_suite_digest,
+        challenge_verification_id, challenge_verification_signing_digest, check_challenge_response,
+        verify_challenge_verification,
+    };
+    // The verifier-side helpers that sign with a raw key in-process carry the
+    // same `testing` gate as their definitions.
+    #[cfg(feature = "testing")]
+    pub use scp_protocol::trust::challenge::{
+        ChallengeSigner, issue_challenge, verify_challenge_response,
     };
     pub use scp_protocol::trust::consequence::{
         ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,

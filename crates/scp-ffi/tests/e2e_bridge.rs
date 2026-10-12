@@ -1468,22 +1468,6 @@ fn trust_query_score_validates_empty_did() {
 }
 
 #[test]
-fn trust_create_challenge_returns_dict() {
-    setup();
-    Python::with_gil(|py| {
-        let r = _scp_core::trust::py_trust_create_challenge(py, "did:key:target").unwrap();
-        let d = r.bind(py);
-        let cid: String = d
-            .get_item("challenge_id")
-            .unwrap()
-            .unwrap()
-            .extract()
-            .unwrap();
-        assert!(!cid.is_empty());
-    });
-}
-
-#[test]
 fn trust_verify_attestation_rejects_invalid_json() {
     setup();
     Python::with_gil(|py| {
@@ -1492,9 +1476,20 @@ fn trust_verify_attestation_rejects_invalid_json() {
 }
 
 #[test]
-fn trust_verify_response_rejects_invalid_json() {
+fn trust_verify_response_rejects_invalid_challenge_json_with_valid_7016() {
     setup();
-    assert!(_scp_core::trust::py_trust_verify_response("bad", "bad").is_err());
+    Python::with_gil(|py| {
+        let err = _scp_core::scp::PyScp::new_in_memory_for_test()
+            .trust_verify_response(
+                py,
+                "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+                "bad",
+                "bad",
+                "ctx",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("SCP-VALID-7016"), "{err}");
+    });
 }
 
 #[test]

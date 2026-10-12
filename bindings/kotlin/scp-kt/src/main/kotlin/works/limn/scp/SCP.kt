@@ -69,6 +69,9 @@ import uniffi.scp.Scp as NativeScp
 /** The code an SDK `shutdown` raises when the durable store still holds its advisory lock. */
 private const val STORAGE_LOCK_HELD_CODE = "SCP-STORAGE-8005"
 
+/** The challenge response window [SCP.trustCreateChallenge] uses by default. */
+private const val DEFAULT_CHALLENGE_TIMEOUT_SECS = 300u
+
 /**
  * Caller-owned SCP instance — the SDK entry point.
  *
@@ -2057,8 +2060,32 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.transportStatus] on [inner]. */
     suspend fun transportStatus(manager: TransportManager): TransportStatus = inner.transportStatus(manager = manager)
 
-    /** Forwards to [NativeScp.trustCreateChallenge] on [inner]. */
-    fun trustCreateChallenge(targetDid: String): ChallengeResult = inner.trustCreateChallenge(targetDid = targetDid)
+    /**
+     * Builds a challenge request for [capabilityUri] from the challenger-written
+     * [testCases] and signs it with [verifier]'s `#active` key through custody
+     * (spec 07 §7.3.4, ADR-017). Returns the challenge id and the signed
+     * request JSON; read it with [decodeChallengeRequestJson].
+     *
+     * @throws uniffi.scp.ScpException.Validation with code
+     *   [CHALLENGE_SUITE_BELOW_MINIMUM_CODE] when a protocol capability URI's
+     *   suite has fewer cases than its standard's minimum, `SCP-VALID-7002` for
+     *   malformed test cases, `SCP-VALID-7013` for an invalid subject DID, and
+     *   `SCP-VALID-7003` for any other refusal.
+     */
+    suspend fun trustCreateChallenge(
+        verifier: Identity,
+        subject: String,
+        capabilityUri: String,
+        testCases: List<TestCase>,
+        timeoutSecs: UInt = DEFAULT_CHALLENGE_TIMEOUT_SECS,
+    ): ChallengeResult =
+        inner.trustCreateChallenge(
+            verifier = verifier,
+            subject = subject,
+            capabilityUri = capabilityUri,
+            testCasesJson = encodeTestCasesJson(testCases),
+            timeoutSecs = timeoutSecs,
+        )
 
     /**
      * Routes through the UniFFI-generated free function
@@ -2087,23 +2114,30 @@ class SCP internal constructor(
         )
 
     /**
-     * Verifies a challenge response against its original challenge request
-     * (ADR-017, §7.3.4). Takes the typed [ChallengeRequest] /
-     * [ChallengeResponse] and serializes them to the serde wire shapes
-     * internally (ADR-058), then forwards to [NativeScp.trustVerifyResponse]
-     * on [inner] unchanged. Returns `true` if the response is valid (correct
-     * responder, within timeout, valid signature), `false` otherwise.
+     * Checks the subject's [response] against [challenge] and returns the
+     * [ChallengeVerification] record signed with [verifier]'s `#active` key
+     * (spec 07 §7.3.4, ADR-017). The bridge resolves the verifier and responder
+     * keys through this instance's DID resolver.
      *
-     * @throws IllegalArgumentException on a wrong-length signature (before
-     *   any bridge call).
+     * @throws IllegalArgumentException on a wrong-length signature or a non-hex
+     *   challenge id, before any bridge call, or when the returned record is
+     *   malformed.
+     * @throws uniffi.scp.ScpException.Validation with code `SCP-VALID-7003` when
+     *   the response is refused and `SCP-VALID-7011` for an empty [contextId].
      */
-    fun trustVerifyResponse(
+    suspend fun trustVerifyResponse(
+        verifier: Identity,
         challenge: ChallengeRequest,
         response: ChallengeResponse,
-    ): Boolean =
-        inner.trustVerifyResponse(
-            challengeJson = encodeChallengeRequestJson(challenge),
-            responseJson = encodeChallengeResponseJson(response),
+        contextId: String,
+    ): ChallengeVerification =
+        decodeChallengeVerificationJson(
+            inner.trustVerifyResponse(
+                verifier = verifier,
+                challengeJson = encodeChallengeRequestJson(challenge),
+                responseJson = encodeChallengeResponseJson(response),
+                contextId = contextId,
+            ),
         )
 
     /**

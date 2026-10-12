@@ -1294,8 +1294,20 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/trustCreateChallenge`` on ``inner``.
-    func trustCreateChallenge(targetDid: String) throws -> ChallengeResult {
-        try inner.trustCreateChallenge(targetDid: targetDid)
+    func trustCreateChallenge(
+        verifier: Identity,
+        subject: String,
+        capabilityUri: String,
+        testCasesJson: String,
+        timeoutSecs: UInt32
+    ) async throws -> ChallengeResult {
+        try await inner.trustCreateChallenge(
+            verifier: verifier,
+            subject: subject,
+            capabilityUri: capabilityUri,
+            testCasesJson: testCasesJson,
+            timeoutSecs: timeoutSecs
+        )
     }
 
     // `trustQueryScore` and `trustVerifyAttestation` moved to UniFFI-generated
@@ -1305,8 +1317,18 @@ public extension SCP {
     //   `try trustVerifyAttestation(attestationJson:)`
 
     /// Forwards to ``Scp/trustVerifyResponse`` on ``inner``.
-    func trustVerifyResponse(challengeJson: String, responseJson: String) throws -> Bool {
-        try inner.trustVerifyResponse(challengeJson: challengeJson, responseJson: responseJson)
+    func trustVerifyResponse(
+        verifier: Identity,
+        challengeJson: String,
+        responseJson: String,
+        contextId: String
+    ) async throws -> String {
+        try await inner.trustVerifyResponse(
+            verifier: verifier,
+            challengeJson: challengeJson,
+            responseJson: responseJson,
+            contextId: contextId
+        )
     }
 
     /// Forwards to ``Scp/ucanDelegate`` on ``inner``.

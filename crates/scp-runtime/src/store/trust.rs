@@ -267,8 +267,9 @@ impl<S: Storage> ProtocolRepository<S> {
 
     /// Stores a challenge verification result.
     ///
-    /// The key includes the subject DID and verification ID, so storing the
-    /// same verification ID again replaces the previous entry (idempotent).
+    /// The key includes the subject DID and the lowercase-hex verification
+    /// ID, so storing the same verification ID again replaces the previous
+    /// entry (idempotent).
     ///
     /// # Errors
     ///
@@ -281,8 +282,8 @@ impl<S: Storage> ProtocolRepository<S> {
     ) -> Result<(), StoreError> {
         let key = challenge_key(
             context_id,
-            result.subject_did.as_ref(),
-            &result.verification_id,
+            result.subject.as_ref(),
+            &hex::encode(result.verification_id),
         )?;
         self.store_value(&key, result).await
     }
@@ -295,7 +296,9 @@ impl<S: Storage> ProtocolRepository<S> {
     /// # Errors
     ///
     /// Returns [`StoreError`] if key sanitization, storage enumeration, or
-    /// deserialization fails.
+    /// deserialization fails. A stored record in any shape other than the
+    /// current [`ChallengeVerification`] fails the whole load; it is never
+    /// skipped.
     pub async fn load_trust_challenge_results(
         &self,
         context_id: &str,
@@ -457,6 +460,12 @@ mod tests {
     use super::*;
     use scp_protocol::trust::attestation::RevocationStatus;
     use scp_protocol::trust::challenge::{ChallengeType, VerificationMethod};
+
+    /// The verification id `make_challenge_result(n, ..)` stores, as the
+    /// lowercase hex its storage key uses.
+    fn vid(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
     use scp_protocol::trust::{Attestation, AttestationType};
 
     fn make_attestation(id: &str, subject: &str) -> Attestation {
@@ -484,26 +493,26 @@ mod tests {
         }
     }
 
-    fn make_challenge_result(id: &str, subject: &str) -> ChallengeVerification {
+    fn make_challenge_result(n: u8, subject: &str) -> ChallengeVerification {
         ChallengeVerification {
-            verification_id: id.to_owned(),
-            verifier_did: "did:key:verifier".into(),
-            subject_did: subject.into(),
+            verification_id: vid(n),
+            verifier: "did:key:verifier".into(),
+            subject: subject.into(),
             capability_uri: "scp:capability:schema-validation/v1".to_owned(),
-            challenge_type: ChallengeType::schema_validation(),
-            verification_method: VerificationMethod::ChallengeVerified {
-                challenge_type: ChallengeType::schema_validation(),
-            },
+            suite_digest: [0xab; 32],
             passed: true,
-            score: Some(95),
+            score: Some(9500),
             test_count: 10,
             pass_count: 9,
-            result: serde_json::json!({"passed": true}),
-            completed_at: 1800,
-            verified_at: 1801,
+            timestamp: 1801,
             expires_at: 88_200,
             context_id: Some("ctx-test".to_owned()),
             verifier_signature: vec![0u8; 64],
+            verification_method: VerificationMethod::ChallengeVerified {
+                challenge_type: ChallengeType::schema_validation(),
+            },
+            result: serde_json::json!({"passed": true}),
+            completed_at: 1800,
         }
     }
 
@@ -772,7 +781,7 @@ mod tests {
     #[tokio::test]
     async fn challenge_result_roundtrip() {
         let store = new_store();
-        let result = make_challenge_result("cv-1", "did:key:alice");
+        let result = make_challenge_result(1, "did:key:alice");
 
         store
             .store_trust_challenge_result("ctx-1", &result)
@@ -784,7 +793,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].verification_id, "cv-1");
+        assert_eq!(loaded[0].verification_id, vid(1));
         assert!(loaded[0].passed);
     }
 
@@ -792,9 +801,9 @@ mod tests {
     async fn challenge_result_accumulation() {
         let store = new_store();
 
-        let r1 = make_challenge_result("cv-1", "did:key:alice");
+        let r1 = make_challenge_result(1, "did:key:alice");
         let r2 = {
-            let mut r = make_challenge_result("cv-2", "did:key:alice");
+            let mut r = make_challenge_result(2, "did:key:alice");
             r.passed = false;
             r.score = Some(40);
             r
@@ -814,6 +823,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn challenge_result_key_is_lowercase_hex_verification_id() {
+        let store = new_store();
+        store
+            .store_trust_challenge_result("ctx-1", &make_challenge_result(0xab, "did:key:alice"))
+            .await
+            .unwrap();
+        let keys = store
+            .storage()
+            .list_keys("trust/ctx-1/challenge/")
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(
+            keys[0].ends_with(&"ab".repeat(32)),
+            "key {} must end with the lowercase-hex verification id",
+            keys[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn load_trust_challenge_results_fails_closed_on_old_shape() {
+        // A record written in the pre-digest shape (string id, `verifier_did`,
+        // `subject_did`, `challenge_type`, `verified_at`, no `suite_digest`)
+        // must fail the load with a store error, never be skipped.
+        let store = new_store();
+        let old = serde_json::json!({
+            "verification_id": "cv-old",
+            "verifier_did": "did:key:verifier",
+            "subject_did": "did:key:alice",
+            "capability_uri": "scp:capability:schema-validation/v1",
+            "challenge_type": "scp:capability:schema-validation/v1",
+            "verification_method": {"ChallengeVerified": {
+                "challenge_type": "scp:capability:schema-validation/v1"
+            }},
+            "passed": true,
+            "score": null,
+            "test_count": 1,
+            "pass_count": 1,
+            "result": true,
+            "completed_at": 1800,
+            "verified_at": 1801,
+            "expires_at": 88_200,
+            "context_id": "ctx-1",
+            "verifier_signature": [0, 0]
+        });
+        let key = challenge_key("ctx-1", "did:key:alice", "cv-old").unwrap();
+        store.store_value(&key, &old).await.unwrap();
+        // Control: a current-shape record alone loads.
+        store
+            .store_trust_challenge_result("ctx-2", &make_challenge_result(1, "did:key:alice"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_trust_challenge_results("ctx-2", "did:key:alice")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let err = store
+            .load_trust_challenge_results("ctx-1", "did:key:alice")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::DeserializationFailed(_)),
+            "expected a deserialization store error, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -920,7 +1001,7 @@ mod tests {
         let handle = tokio::runtime::Handle::current();
         let bridge = ProtocolRepositoryTrustBridge::new(store, handle);
 
-        let result = make_challenge_result("cv-1", "did:key:alice");
+        let result = make_challenge_result(1, "did:key:alice");
 
         // Call from blocking thread (simulates FFI caller context).
         tokio::task::spawn_blocking(move || {
@@ -929,7 +1010,7 @@ mod tests {
                 .get_challenge_results("ctx-1", "did:key:alice")
                 .unwrap();
             assert_eq!(loaded.len(), 1);
-            assert_eq!(loaded[0].verification_id, "cv-1");
+            assert_eq!(loaded[0].verification_id, vid(1));
         })
         .await
         .unwrap();
@@ -1007,7 +1088,7 @@ mod tests {
             .await
             .unwrap();
 
-        let cr = make_challenge_result("cv-ns", "did:key:alice");
+        let cr = make_challenge_result(3, "did:key:alice");
         store
             .store_trust_challenge_result("ctx-ns", &cr)
             .await
@@ -1051,7 +1132,7 @@ mod tests {
             .await
             .unwrap();
 
-        let cr = make_challenge_result("cv-del", "did:key:alice");
+        let cr = make_challenge_result(4, "did:key:alice");
         store
             .store_trust_challenge_result("ctx-del", &cr)
             .await

@@ -671,8 +671,8 @@ pub struct ContextParams {
     ///
     /// SECURITY (verifier legitimacy): a `ChallengeVerified` requirement is
     /// satisfied only by a `ChallengeVerification` whose verifier signature is
-    /// authentic and whose signed `subject_did`/`context_id` match the agent and
-    /// context being admitted — but a `verifier_did` is self-certifying, so
+    /// authentic and whose signed `subject`/`context_id` match the agent and
+    /// context being admitted — but a `verifier` DID is self-certifying, so
     /// signature authenticity does NOT establish that the verifier is
     /// *authorized/trusted*. A context that needs verifier legitimacy must
     /// establish it separately (a trusted-verifier set, a context-membership

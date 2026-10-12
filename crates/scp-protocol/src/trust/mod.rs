@@ -12,6 +12,7 @@ pub mod caveats;
 pub mod challenge;
 pub mod consequence;
 pub mod custody_violation;
+mod language_tag;
 pub mod participation;
 pub mod renewal;
 pub mod sybil;
@@ -26,6 +27,7 @@ pub use attestation::{
     RevocationStatus, canonical_attestation_bytes, verify_attestation,
     verify_attestation_with_revocation,
 };
+pub use capability_registry::{ChallengeStandard, MinCases};
 pub use capability_uri::{CapabilityUri, CapabilityUriError};
 pub use caveats::{
     AttenuationViolation, CAVEAT_MINT_LIMIT_EXCEEDED_CODE, CaveatMintError, CaveatSerError,
@@ -34,10 +36,15 @@ pub use caveats::{
     MAX_RATE_WINDOW_SECS, MaskWidthError, RateWindow, assert_mask_widths,
 };
 pub use challenge::{
-    ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
-    canonical_challenge_verification_bytes, issue_challenge, verify_challenge_response,
+    ChallengeRequest, ChallengeResponse, ChallengeType, ChallengeVerification, ExpectedOutput,
+    TestCase, UnsignedChallengeRequest, UnsignedChallengeVerification,
+    canonical_challenge_response_bytes, canonical_challenge_verification_bytes,
+    challenge_request_signing_digest, challenge_request_unsigned, challenge_suite_digest,
+    challenge_verification_id, challenge_verification_signing_digest, check_challenge_response,
     verify_challenge_verification,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use challenge::{ChallengeSigner, issue_challenge, verify_challenge_response};
 pub use custody_violation::{
     ActionCategory, COUNTER_ATTESTATION_DOMAIN, CUSTODY_VIOLATION_DOMAIN, CounterAttestation,
     CustodyViolationError, CustodyViolationResult, CustodyViolationType,
@@ -209,7 +216,7 @@ pub enum TrustError {
     /// The challenge responder is not the challenged subject.
     #[error("challenge responder mismatch: expected {expected}, got {got}")]
     ChallengeResponderMismatch {
-        /// The expected responder DID (the `subject_did` from the request).
+        /// The expected responder DID (the `subject` from the request).
         expected: String,
         /// The actual responder DID (from the response).
         got: String,
@@ -252,7 +259,7 @@ pub enum TrustError {
     /// serialization or the canonical hash itself).
     ///
     /// Purpose-built so the verify-on-ingest rejection allowlist
-    /// (`is_verification_rejection`) can be keyed on a variant that NO
+    /// ([`TrustError::is_record_rejection`]) can be keyed on a variant that NO
     /// infrastructure path ever produces — a credential whose own bytes cannot
     /// be canonicalized cannot be authenticated, so it is a REJECTION of that one
     /// entry (drop it), never a transient backend fault (which uses
@@ -274,13 +281,88 @@ pub enum TrustError {
         uri: String,
     },
 
-    /// The challenge parameters do not conform to the capability's parameter
-    /// schema.
-    #[error("invalid challenge parameters for {uri}: {reason}")]
-    InvalidChallengeParameters {
-        /// The capability URI whose schema was violated.
+    /// The challenge's test cases break a suite rule of spec 07 §7.3.4: the
+    /// list is empty, a `test_id` repeats, the weights do not sum to 10000, an
+    /// `input` or `expected` breaks the I-JSON numeric constraint, or a
+    /// `multilingual/v1` `category` is not a well-formed BCP 47 tag.
+    #[error("invalid challenge suite: {reason}")]
+    InvalidChallengeSuite {
+        /// Which rule the suite breaks.
+        reason: String,
+    },
+
+    /// A challenge for a protocol capability URI carries fewer test cases than
+    /// its standard's minimum (spec 07 §7.3.4.3).
+    #[error(
+        "challenge for {uri} carries {supplied} test cases{}, below the standard's minimum of {minimum}",
+        category.as_deref().map(|c| format!(" in category '{c}'")).unwrap_or_default()
+    )]
+    ChallengeSuiteBelowMinimum {
+        /// The protocol capability URI.
         uri: String,
-        /// Human-readable description of the validation failure.
+        /// The standard's minimum: for the whole request, or per `category`.
+        minimum: u32,
+        /// How many cases the request carries (in `category`, when set).
+        supplied: u32,
+        /// The deficient category, when the standard counts per `category`
+        /// (`multilingual/v1`); `None` when it counts the whole request.
+        category: Option<String>,
+    },
+
+    /// The caller asked to check a response to a request another verifier
+    /// issued: the request's signed `verifier` is not the caller.
+    #[error("challenge verifier mismatch: request names {expected}, caller is {got}")]
+    ChallengeVerifierMismatch {
+        /// The request's signed `verifier`.
+        expected: String,
+        /// The verifier the caller passed.
+        got: String,
+    },
+
+    /// The challenge response's self-reported counts or score are malformed or
+    /// out of range for its request.
+    #[error("challenge {challenge_id}: invalid response: {reason}")]
+    InvalidChallengeResponse {
+        /// The challenge ID (lowercase hex).
+        challenge_id: String,
+        /// Which field is malformed or out of range.
+        reason: String,
+    },
+
+    /// The record's `verification_id` is not the spec 07 §7.3.4 derivation
+    /// from its signed `verifier`, `subject`, `capability_uri` and `timestamp`.
+    #[error("challenge verification {verification_id}: not the derived id {expected}")]
+    ChallengeVerificationIdMismatch {
+        /// The record's `verification_id` (lowercase hex).
+        verification_id: String,
+        /// The derived id (lowercase hex).
+        expected: String,
+    },
+
+    /// The record's `expires_at` exceeds its `timestamp` by more than the
+    /// 90-day maximum of spec 07 §7.3.4.
+    #[error(
+        "challenge verification {verification_id}: validity {validity_secs}s exceeds the maximum {max_secs}s"
+    )]
+    ChallengeVerificationValidityTooLong {
+        /// The record's `verification_id` (lowercase hex).
+        verification_id: String,
+        /// `expires_at - timestamp`, in seconds.
+        validity_secs: u64,
+        /// The maximum validity, in seconds (90 days).
+        max_secs: u64,
+    },
+
+    /// A public key could not be resolved because every resolution layer was
+    /// unreachable. This is an infrastructure fault, not a judgement on the
+    /// credential being verified: a caller retries, and a verify-on-ingest
+    /// loop propagates it instead of dropping the credential
+    /// ([`TrustError::is_record_rejection`] is `false`).
+    #[error("key resolution unavailable for {did}: {reason}")]
+    KeyResolutionUnavailable {
+        /// The DID whose key could not be resolved.
+        did: String,
+        /// Why every layer was unreachable.
         reason: String,
     },
 
@@ -296,7 +378,7 @@ pub enum TrustError {
 
     /// The challenge request's Ed25519 signature is invalid, indicating the
     /// request may have been tampered with (e.g., extended timeout, changed
-    /// `subject_did`).
+    /// `subject`).
     #[error("challenge request signature invalid: {reason}")]
     ChallengeRequestSignatureInvalid {
         /// Human-readable description of the failure.
@@ -306,7 +388,7 @@ pub enum TrustError {
     /// The challenge verification record's verifier Ed25519 signature is
     /// invalid, indicating a forged or tampered `passed`/`score` trust signal.
     /// The verifier signature binds every consumed field (`passed`, `score`,
-    /// `expires_at`, `subject_did`, `verifier_did`, `capability_uri`), so a
+    /// `expires_at`, `subject`, `verifier`, `capability_uri`, `suite_digest`), so a
     /// failure here means the record cannot be trusted as a verifier's claim.
     #[error("challenge verification {verification_id}: verifier signature invalid: {reason}")]
     ChallengeVerificationSignatureInvalid {
@@ -346,8 +428,8 @@ pub enum TrustError {
         expected_context: String,
     },
 
-    /// The challenge verification record's signed `subject_did` does not match
-    /// the subject it is being aggregated/checked for. `subject_did` is part of
+    /// The challenge verification record's signed `subject` does not match
+    /// the subject it is being aggregated/checked for. `subject` is part of
     /// the canonical preimage, so the binding is cryptographically authentic; a
     /// genuine, in-context, unexpired result minted for subject A MUST NOT be
     /// counted toward subject B's trust signal or admission. This closes
@@ -359,7 +441,7 @@ pub enum TrustError {
     ChallengeSubjectMismatch {
         /// The verification record ID.
         verification_id: String,
-        /// The signed `subject_did` carried by the record.
+        /// The signed `subject` carried by the record.
         record_subject: String,
         /// The subject the record is being consumed for.
         expected_subject: String,
@@ -385,6 +467,62 @@ pub enum TrustError {
         /// Human-readable description of the storage failure.
         reason: String,
     },
+}
+
+impl TrustError {
+    /// Reports whether this error rejects the one credential being verified,
+    /// as opposed to a fault in the machinery verifying it.
+    ///
+    /// `true` means the caller-supplied record is itself invalid (a bad
+    /// signature, expired, revoked, a malformed revocation or evidence, the
+    /// wrong context or subject, an underived id, an over-long validity, or
+    /// bytes that cannot be canonicalized): a verify-on-ingest or read-path
+    /// loop drops that record and continues. `false` means an infrastructure
+    /// fault (store failure, unreachable key resolution) or an error no record
+    /// check produces: the loop propagates it, because dropping every record
+    /// on a transient fault would zero a subject's trust without signal.
+    ///
+    /// The match names every variant with no wildcard arm, so a new variant
+    /// does not compile until it is classified here.
+    #[must_use]
+    pub const fn is_record_rejection(&self) -> bool {
+        match self {
+            Self::AttestationSignatureInvalid { .. }
+            | Self::AttestationExpired { .. }
+            | Self::AttestationRevoked { .. }
+            | Self::AttestationRevocationInvalid { .. }
+            | Self::AttestationEvidenceInvalid { .. }
+            | Self::ChallengeVerificationSignatureInvalid { .. }
+            | Self::ChallengeVerificationExpired { .. }
+            | Self::ChallengeContextMismatch { .. }
+            | Self::ChallengeSubjectMismatch { .. }
+            | Self::ChallengeVerificationIdMismatch { .. }
+            | Self::ChallengeVerificationValidityTooLong { .. }
+            | Self::CanonicalizationFailed { .. } => true,
+            // `InvalidEventData` and `ChallengeSigningFailed` are excluded on
+            // purpose: no record-verification path raises them, so treating
+            // them as rejections would swallow an unrelated fault.
+            Self::NoEventsForSubject { .. }
+            | Self::EmptyEventLog
+            | Self::InvalidEventData { .. }
+            | Self::ChallengeIdMismatch { .. }
+            | Self::ChallengeResponderMismatch { .. }
+            | Self::ChallengeTimeout { .. }
+            | Self::ChallengeSignatureInvalid { .. }
+            | Self::ChallengeSigningFailed { .. }
+            | Self::UnknownChallengeCapability { .. }
+            | Self::InvalidChallengeSuite { .. }
+            | Self::ChallengeSuiteBelowMinimum { .. }
+            | Self::NotChallengeable { .. }
+            | Self::ChallengeRequestSignatureInvalid { .. }
+            | Self::ChallengeVerifierMismatch { .. }
+            | Self::InvalidChallengeResponse { .. }
+            | Self::KeyResolutionUnavailable { .. }
+            | Self::NotAMember { .. }
+            | Self::NotOptedIn { .. }
+            | Self::StoreError { .. } => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

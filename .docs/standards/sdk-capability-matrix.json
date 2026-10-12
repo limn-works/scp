@@ -700,7 +700,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Challenge-issuance op (ADR-017, §7.3.4): all four SDKs expose an idiomatic wrapper over the bridge free function (Python scp_sdk.trust_create_challenge, TypeScript SCP.trustCreateChallenge, Kotlin SCP.trustCreateChallenge, Swift SCP.trustCreateChallenge)."
+          "notes": "Challenge-issuance op (ADR-017, spec 07 §7.3.4): all four SDKs expose an async method taking the verifier identity, the subject, the capability URI, the challenger-written test cases and timeout_secs; the request is signed through the verifier's #active custody and returned (Python SCP.trust_create_challenge, TypeScript SCP.trustCreateChallenge, Kotlin suspend SCP.trustCreateChallenge, Swift async SCP.trustCreateChallenge). A protocol capability URI with fewer cases than its standard's minimum is refused with SCP-VALID-7039."
         },
         {
           "name": "trust_verify_attestation",
@@ -716,7 +716,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Challenge-response verification op (ADR-017, §7.3.4): all four SDKs expose an idiomatic typed wrapper taking the ChallengeRequest/ChallengeResponse wire DTOs (Python scp_sdk.trust_verify_response, TypeScript SCP.trustVerifyResponse, Kotlin SCP.trustVerifyResponse, Swift SCP.trustVerifyResponse)."
+          "notes": "Challenge-response verification op (ADR-017, spec 07 §7.3.4): all four SDKs expose an async method taking the verifier identity, the ChallengeRequest/ChallengeResponse wire DTOs and a required context_id, returning the ChallengeVerification (with suite_digest) signed through the verifier's #active custody (Python SCP.trust_verify_response, TypeScript SCP.trustVerifyResponse, Kotlin suspend SCP.trustVerifyResponse, Swift async SCP.trustVerifyResponse)."
         },
         {
           "name": "verify_participation_requirements",

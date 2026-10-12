@@ -116,23 +116,23 @@ class TrustAdmissionFfiTest {
                 challengeVerifications =
                     listOf(
                         ChallengeVerification(
-                            verificationId = "bridge-test-challenge",
-                            verifierDid = "did:key:zVerifier",
-                            subjectDid = "did:key:zSubject",
+                            verificationId = "ab".repeat(32),
+                            verifier = "did:key:zVerifier",
+                            subject = "did:key:zSubject",
                             capabilityUri = "scp:capability:prompt-injection-resistance/v1",
-                            challengeType = "scp:capability:prompt-injection-resistance/v1",
+                            suiteDigest = "cd".repeat(32),
                             verificationMethod =
                                 ChallengeVerificationMethod.ChallengeVerified(
                                     challengeType =
                                         "scp:capability:prompt-injection-resistance/v1",
                                 ),
                             passed = true,
-                            testCount = 1u,
-                            passCount = 1u,
+                            testCount = 20u,
+                            passCount = 20u,
                             result = JsonNull,
                             completedAt = 1_700_000_000uL,
-                            verifiedAt = 1_700_000_000uL,
-                            expiresAt = 4_000_000_000uL,
+                            timestamp = 1_700_000_000uL,
+                            expiresAt = 1_700_086_400uL,
                             contextId = "ctx-admission",
                             verifierSignature = List(64) { 0.toUByte() },
                         ),

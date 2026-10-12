@@ -145,51 +145,86 @@ class TrustAdmissionTest {
         assertEquals(64, profile["signature"]?.jsonArray?.size)
     }
 
+    private val pirUri = "scp:capability:prompt-injection-resistance/v1"
+
+    private fun makeVerification(): ChallengeVerification =
+        ChallengeVerification(
+            verificationId = "ab".repeat(32),
+            verifier = "did:dht:zVerifier",
+            subject = "did:dht:zResponder",
+            capabilityUri = pirUri,
+            suiteDigest = "cd".repeat(32),
+            passed = true,
+            testCount = 20u,
+            passCount = 20u,
+            timestamp = 1_700_000_000uL,
+            expiresAt = 1_700_086_400uL,
+            contextId = "ctx-admission",
+            verifierSignature = List(64) { 9.toUByte() },
+            verificationMethod = ChallengeVerificationMethod.ChallengeVerified(challengeType = pirUri),
+            result = Json.parseToJsonElement("true"),
+            completedAt = 1_700_000_000uL,
+        )
+
+    private val verificationWire =
+        """
+        {"verification_id":"${"ab".repeat(32)}",
+         "verifier":"did:dht:zVerifier",
+         "subject":"did:dht:zResponder",
+         "capability_uri":"scp:capability:prompt-injection-resistance/v1",
+         "suite_digest":"${"cd".repeat(32)}",
+         "passed":true,
+         "score":null,
+         "test_count":20,
+         "pass_count":20,
+         "timestamp":1700000000,
+         "expires_at":1700086400,
+         "context_id":"ctx-admission",
+         "verifier_signature":${List(64) { 9 }.joinToString(",", "[", "]")},
+         "verification_method":{"ChallengeVerified":
+           {"challenge_type":"scp:capability:prompt-injection-resistance/v1"}},
+         "result":true,
+         "completed_at":1700000000}
+        """.trimIndent()
+
     @Test
     fun `challenge verification encodes the full 16-field snake_case record`() {
-        val verification =
-            ChallengeVerification(
-                verificationId = "bridge-test-challenge",
-                verifierDid = "did:dht:zVerifier",
-                subjectDid = "did:dht:zResponder",
-                capabilityUri = "scp:capability:prompt-injection-resistance/v1",
-                challengeType = "scp:capability:prompt-injection-resistance/v1",
-                verificationMethod =
-                    ChallengeVerificationMethod.ChallengeVerified(
-                        challengeType = "scp:capability:prompt-injection-resistance/v1",
-                    ),
-                passed = true,
-                testCount = 1u,
-                passCount = 1u,
-                result = Json.parseToJsonElement("true"),
-                completedAt = 1_700_000_000uL,
-                verifiedAt = 1_700_000_000uL,
-                expiresAt = 4_000_000_000uL,
-                contextId = "ctx-admission",
-                verifierSignature = List(64) { 9.toUByte() },
+        assertJsonEquals("[$verificationWire]", encodeChallengeVerificationsJson(listOf(makeVerification())))
+    }
+
+    @Test
+    fun `challenge verification decodes the bridge record`() {
+        assertEquals(makeVerification(), decodeChallengeVerificationJson(verificationWire))
+    }
+
+    @Test
+    fun `challenge verification decode refuses a malformed record`() {
+        val record = Json.parseToJsonElement(verificationWire).jsonObject
+
+        fun with(
+            key: String,
+            value: String,
+        ): String =
+            Json.encodeToString(
+                kotlinx.serialization.json.JsonObject.serializer(),
+                kotlinx.serialization.json.JsonObject(record + (key to Json.parseToJsonElement(value))),
             )
-        assertJsonEquals(
-            """
-            [{"verification_id":"bridge-test-challenge",
-              "verifier_did":"did:dht:zVerifier",
-              "subject_did":"did:dht:zResponder",
-              "capability_uri":"scp:capability:prompt-injection-resistance/v1",
-              "challenge_type":"scp:capability:prompt-injection-resistance/v1",
-              "verification_method":{"ChallengeVerified":
-                {"challenge_type":"scp:capability:prompt-injection-resistance/v1"}},
-              "passed":true,
-              "score":null,
-              "test_count":1,
-              "pass_count":1,
-              "result":true,
-              "completed_at":1700000000,
-              "verified_at":1700000000,
-              "expires_at":4000000000,
-              "context_id":"ctx-admission",
-              "verifier_signature":${List(64) { 9 }.joinToString(",", "[", "]")}}]
-            """.trimIndent(),
-            encodeChallengeVerificationsJson(listOf(verification)),
+        assertEquals(
+            "ChallengeVerification.verificationId must be 64 lowercase hex characters",
+            assertFailsWith<IllegalArgumentException> {
+                decodeChallengeVerificationJson(with("verification_id", "\"${"AB".repeat(32)}\""))
+            }.message,
         )
+        assertEquals(
+            "ChallengeVerification.score must be in [0, 10000], got 10001",
+            assertFailsWith<IllegalArgumentException> {
+                decodeChallengeVerificationJson(with("score", "10001"))
+            }.message,
+        )
+        assertEquals(10_000u, decodeChallengeVerificationJson(with("score", "10000")).score)
+        assertFailsWith<IllegalArgumentException> {
+            decodeChallengeVerificationJson(with("verification_method", "{\"Nope\":{}}"))
+        }
     }
 
     @Test
@@ -197,21 +232,9 @@ class TrustAdmissionTest {
         val encoded =
             encodeChallengeVerificationsJson(
                 listOf(
-                    ChallengeVerification(
-                        verificationId = "v-1",
-                        verifierDid = "did:dht:zVerifier",
-                        subjectDid = "did:dht:zResponder",
-                        capabilityUri = "scp:capability:outlet-integrity/v1",
-                        challengeType = "scp:capability:outlet-integrity/v1",
+                    makeVerification().copy(
                         verificationMethod = ChallengeVerificationMethod.SelfAttested,
-                        passed = false,
-                        testCount = 3u,
-                        passCount = 0u,
-                        result = JsonNull,
-                        completedAt = 1uL,
-                        verifiedAt = 2uL,
-                        expiresAt = 3uL,
-                        verifierSignature = List(64) { 0.toUByte() },
+                        contextId = null,
                     ),
                 ),
             )
@@ -239,30 +262,21 @@ class TrustAdmissionTest {
             profileError.message,
         )
 
-        val badVerification =
-            ChallengeVerification(
-                verificationId = "v-bad",
-                verifierDid = "did:dht:zVerifier",
-                subjectDid = "did:dht:zResponder",
-                capabilityUri = "scp:capability:outlet-integrity/v1",
-                challengeType = "scp:capability:outlet-integrity/v1",
-                verificationMethod = ChallengeVerificationMethod.SelfAttested,
-                passed = true,
-                testCount = 1u,
-                passCount = 1u,
-                result = JsonNull,
-                completedAt = 1uL,
-                verifiedAt = 2uL,
-                expiresAt = 3uL,
-                verifierSignature = List(63) { 9.toUByte() },
-            )
         val verificationError =
             assertFailsWith<IllegalArgumentException> {
-                encodeChallengeVerificationsJson(listOf(badVerification))
+                encodeChallengeVerificationsJson(
+                    listOf(makeVerification().copy(verifierSignature = List(63) { 9.toUByte() })),
+                )
             }
         assertEquals(
             "ChallengeVerification.verifierSignature must be exactly 64 elements, got 63",
             verificationError.message,
+        )
+        assertEquals(
+            "ChallengeVerification.suiteDigest must be 64 lowercase hex characters",
+            assertFailsWith<IllegalArgumentException> {
+                encodeChallengeVerificationsJson(listOf(makeVerification().copy(suiteDigest = "cd")))
+            }.message,
         )
     }
 

@@ -838,6 +838,15 @@ impl From<scp_core::provenance::ProvenanceError> for ScpPyError {
 
 impl From<scp_core::trust::TrustError> for ScpPyError {
     fn from(e: scp_core::trust::TrustError) -> Self {
+        if matches!(
+            e,
+            scp_core::trust::TrustError::ChallengeSuiteBelowMinimum { .. }
+        ) {
+            return Self::ValidationError {
+                message: format!("{e} — supply at least the standard's minimum test cases"),
+                code: codes::VALID_7039.to_owned(),
+            };
+        }
         Self::ValidationError {
             message: format!(
                 "trust evaluation failed: {e} — check event log data and attestation validity"

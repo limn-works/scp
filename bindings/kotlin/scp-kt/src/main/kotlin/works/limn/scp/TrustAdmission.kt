@@ -178,69 +178,65 @@ object ChallengeVerificationMethodSerializer : KSerializer<ChallengeVerification
 }
 
 /**
- * A signed record that a specific verifier tested a capability and the agent
- * passed (spec §7.3.4.2, ADR-017).
+ * A signed record that a specific verifier tested a capability (spec 07
+ * §7.3.4.2, ADR-017).
  *
  * Pass a list of these to [SCP.checkCapabilityRequirements] to satisfy
- * `ChallengeVerified` requirements. The serial names are the serde-canonical
- * snake_case the Rust core deserializes (`Vec<ChallengeVerification>`);
+ * `ChallengeVerified` requirements; [SCP.trustVerifyResponse] returns one. The
+ * serial names are the serde-canonical snake_case the Rust core deserializes;
  * [verifierSignature] is a 64-byte JSON number array. Mirrors the Swift SDK
  * `ChallengeVerification`, the TypeScript SDK `ChallengeVerification`, and the
  * Rust struct 1:1.
  *
- * SECURITY (ADR-017 caveat): only the *signed* fields bind trust —
- * `verification_id`, `verifier_did`, `subject_did`, `capability_uri`,
- * `challenge_type`, `passed`, `score`, `test_count`, `pass_count`,
- * `verified_at`, `expires_at`, `context_id`. The `result`, `completed_at`, and
- * `verification_method` fields are NOT signed and can be altered after minting
- * without invalidating the signature. Consumers MUST NOT key trust decisions
- * on those unsigned fields.
+ * SECURITY (ADR-017): the verifier signs the SHA-256 of the canonical record
+ * over `verification_id`, `verifier`, `subject`, `capability_uri`,
+ * `suite_digest`, `passed`, `score`, `test_count`, `pass_count`, `timestamp`,
+ * `expires_at` and `context_id`. [verificationMethod], [result] and
+ * [completedAt] are NOT signed and can be altered without invalidating the
+ * signature; never key a trust decision on them.
  *
- * @property verificationId Unique verification identifier (derived from the
- *   challenge ID).
- * @property verifierDid DID of the verifier who issued and verified the
- *   challenge.
- * @property subjectDid DID of the subject who answered the challenge.
+ * @property verificationId 64 lowercase hex characters, derived from the
+ *   challenge ID.
+ * @property verifier DID of the verifier who issued and checked the challenge.
+ * @property subject DID of the subject who answered the challenge.
  * @property capabilityUri The capability URI that was verified.
- * @property challengeType The type of challenge that was verified (a
- *   capability URI string).
- * @property verificationMethod How the capability was verified (unsigned
- *   metadata).
+ * @property suiteDigest 64 lowercase hex characters: the SHA-256 of the
+ *   canonical test-case list the challenge request signed.
  * @property passed Whether the subject passed the challenge overall.
- * @property score Optional numeric score (0–100) for graded challenges.
- *   Serializes as explicit `null` when absent.
+ * @property score Optional score in basis points, 0 to 10000. Serializes as
+ *   explicit `null` when absent.
  * @property testCount Total number of test cases in the challenge.
  * @property passCount Number of test cases the subject passed.
- * @property result The challenge-specific result from the response (arbitrary
- *   JSON, unsigned).
- * @property completedAt Unix timestamp (seconds) when the response was
- *   completed (unsigned).
- * @property verifiedAt Unix timestamp (seconds) when the verification was
- *   performed.
- * @property expiresAt Unix timestamp (seconds) when this verification expires.
+ * @property timestamp Unix seconds when the verifier checked the response.
+ * @property expiresAt Unix seconds when this record expires; at most 90 days
+ *   after [timestamp].
  * @property contextId Context in which the challenge was issued, if any.
  *   Serializes as explicit `null` when absent.
- * @property verifierSignature Ed25519 signature by the verifier over the
- *   verification record (64 bytes).
+ * @property verifierSignature Ed25519 signature by the verifier's `#active` key
+ *   over the record digest (64 bytes).
+ * @property verificationMethod How the capability was verified (unsigned).
+ * @property result The challenge-specific result from the response (unsigned).
+ * @property completedAt Unix seconds when the response was completed
+ *   (unsigned).
  */
 @Serializable
 data class ChallengeVerification(
     @SerialName("verification_id") val verificationId: String,
-    @SerialName("verifier_did") val verifierDid: String,
-    @SerialName("subject_did") val subjectDid: String,
+    val verifier: String,
+    val subject: String,
     @SerialName("capability_uri") val capabilityUri: String,
-    @SerialName("challenge_type") val challengeType: String,
-    @SerialName("verification_method") val verificationMethod: ChallengeVerificationMethod,
+    @SerialName("suite_digest") val suiteDigest: String,
     val passed: Boolean,
     val score: UInt? = null,
     @SerialName("test_count") val testCount: UInt,
     @SerialName("pass_count") val passCount: UInt,
-    val result: JsonElement,
-    @SerialName("completed_at") val completedAt: ULong,
-    @SerialName("verified_at") val verifiedAt: ULong,
+    val timestamp: ULong,
     @SerialName("expires_at") val expiresAt: ULong,
     @SerialName("context_id") val contextId: String? = null,
     @SerialName("verifier_signature") val verifierSignature: List<UByte>,
+    @SerialName("verification_method") val verificationMethod: ChallengeVerificationMethod,
+    val result: JsonElement,
+    @SerialName("completed_at") val completedAt: ULong,
 )
 
 // ---------------------------------------------------------------------------
@@ -505,16 +501,47 @@ private fun requireByteLength(
  */
 fun encodeChallengeVerificationsJson(verifications: List<ChallengeVerification>): String {
     for (verification in verifications) {
-        requireByteLength(
-            "ChallengeVerification",
-            "verifierSignature",
-            BYTES_64,
-            verification.verifierSignature,
-        )
+        requireChallengeVerification(verification)
     }
     return trustAdmissionJson.encodeToString(
         ListSerializer(ChallengeVerification.serializer()),
         verifications,
+    )
+}
+
+/**
+ * Decodes the record JSON [SCP.trustVerifyResponse]'s bridge returns.
+ *
+ * @throws IllegalArgumentException if the JSON is not a record, an id or
+ *   digest is not 64 lowercase hex characters, [ChallengeVerification.score]
+ *   exceeds 10000, or the signature is not 64 bytes.
+ */
+fun decodeChallengeVerificationJson(json: String): ChallengeVerification {
+    val verification =
+        try {
+            trustAdmissionJson.decodeFromString(ChallengeVerification.serializer(), json)
+        } catch (e: SerializationException) {
+            throw IllegalArgumentException("malformed ChallengeVerification JSON: ${e.message}", e)
+        }
+    requireChallengeVerification(verification)
+    return verification
+}
+
+private const val MAX_SCORE_BASIS_POINTS = 10_000u
+
+private fun requireChallengeVerification(verification: ChallengeVerification) {
+    requireLowerHex32("ChallengeVerification", "verificationId", verification.verificationId)
+    requireLowerHex32("ChallengeVerification", "suiteDigest", verification.suiteDigest)
+    verification.score?.let {
+        require(it <= MAX_SCORE_BASIS_POINTS) {
+            "ChallengeVerification.score must be in [0, 10000], got $it"
+        }
+    }
+    requireByteLength(
+        "ChallengeVerification",
+        "verifierSignature",
+        BYTES_64,
+        verification.verifierSignature,
     )
 }
 

@@ -22,9 +22,12 @@ import kotlinx.serialization.json.put
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import uniffi.scp.ScpException
 import uniffi.scp.StorageConfig
 import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.conformance.ConformanceStubBindings
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
@@ -152,35 +155,72 @@ class TrustAggregateFfiTest {
         assertTrue(result.errorMessage.isNotEmpty())
     }
 
+    private val schemaUri = "scp:capability:schema-validation/v1"
+
+    /** [n] exact-match cases whose weights sum to 10000. */
+    private fun testCases(n: Int): List<TestCase> {
+        val weight = 10_000 / n
+        return List(n) { i ->
+            TestCase(
+                testId = "t$i",
+                input = buildJsonObject { put("i", i) },
+                expected = ExpectedOutput.ExactMatch(buildJsonObject { put("ok", true) }),
+                category = "basic",
+                weight = (if (i == 0) 10_000 - weight * (n - 1) else weight).toUInt(),
+            )
+        }
+    }
+
+    /** A protocol suite one case short of its standard's minimum is refused. */
+    @Test
+    fun `trustCreateChallenge - suite below minimum is SCP-VALID-7039`() {
+        runBlocking {
+            val verifier = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+            val subject = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+            val error =
+                assertFailsWith<ScpException.Validation> {
+                    scp.trustCreateChallenge(verifier, subject.did(), schemaUri, testCases(19))
+                }
+            assertEquals(CHALLENGE_SUITE_BELOW_MINIMUM_CODE, error.code)
+        }
+    }
+
     /**
-     * The typed challenge pair's serialized JSON parses on the REAL Rust
-     * `ChallengeRequest` / `ChallengeResponse` deserializers: dummy
-     * signatures yield a structured `false`, never a parse error.
+     * A created request decodes into the SDK types, and a response with a
+     * forged signature is refused by the real verifier.
      */
     @Test
-    fun `trustVerifyResponse - typed challenge pair reaches the real verifier`() {
-        val valid =
-            scp.trustVerifyResponse(
-                challenge =
-                    ChallengeRequest(
-                        challengeId = "chal-ffi-1",
-                        challengeType = "scp:capability:schema-validation/v1",
-                        challengerDid = "did:dht:zChallenger",
-                        subjectDid = "did:dht:zSubject",
-                        capabilityUri = "scp:capability:schema-validation/v1",
-                        parameters = buildJsonObject { },
-                        timeout = CachedAttestationDuration(secs = 300uL, nanos = 0u),
-                        signature = List(64) { 0.toUByte() },
-                    ),
-                response =
-                    ChallengeResponse(
-                        challengeId = "chal-ffi-1",
-                        responderDid = "did:dht:zSubject",
-                        result = buildJsonObject { put("passed", true) },
-                        completedAt = 1_700_000_100uL,
-                        signature = List(64) { 0.toUByte() },
-                    ),
-            )
-        assertFalse(valid)
+    fun `trustCreateChallenge then trustVerifyResponse - forged response is refused`() {
+        runBlocking {
+            val verifier = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+            val subject = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+            val cases = testCases(20)
+            val created = scp.trustCreateChallenge(verifier, subject.did(), schemaUri, cases)
+            val challenge = decodeChallengeRequestJson(created.challengeJson)
+            assertEquals(created.challengeId, challenge.challengeId)
+            assertEquals(verifier.did(), challenge.verifier)
+            assertEquals(subject.did(), challenge.subject)
+            assertEquals(cases, challenge.testCases)
+
+            val response =
+                ChallengeResponse(
+                    challengeId = challenge.challengeId,
+                    responderDid = subject.did(),
+                    result =
+                        buildJsonObject {
+                            put("passed", true)
+                            put("score", 10_000)
+                            put("test_count", 20)
+                            put("pass_count", 20)
+                        },
+                    completedAt = (System.currentTimeMillis() / 1000).toULong(),
+                    signature = List(64) { 0.toUByte() },
+                )
+            val error =
+                assertFailsWith<ScpException.Validation> {
+                    scp.trustVerifyResponse(verifier, challenge, response, "ctx-ffi")
+                }
+            assertEquals("SCP-VALID-7003", error.code)
+        }
     }
 }

@@ -31,11 +31,15 @@ import type {
   ChallengeResponse,
   ChallengeVerification,
   EventLogEntry,
+  ExpectedOutput,
   ParticipationProfile,
   RequireParticipation,
+  TestCase,
   ThresholdRequirement,
 } from "../src/types";
 import {
+  decodeChallengeRequest,
+  decodeChallengeVerification,
   encodeAttestation,
   encodeAttestorSets,
   encodeCapabilityRequirements,
@@ -46,6 +50,7 @@ import {
   encodeMerkleRoot,
   encodeParticipationProfile,
   encodeRequireParticipation,
+  encodeTestCases,
   encodeThresholdRequirements,
 } from "../src/types";
 import { createMockNativeScp, mockContext, mountMockScp } from "./mock-bridge";
@@ -744,55 +749,77 @@ describe("encodeParticipationProfile", () => {
   });
 });
 
-describe("encodeChallengeVerifications", () => {
+describe("encodeChallengeVerifications / decodeChallengeVerification", () => {
   const base: ChallengeVerification = {
-    verificationId: "bridge-test-challenge",
-    verifierDid: "did:dht:zVerifier",
-    subjectDid: "did:dht:zResponder",
+    verificationId: "ab".repeat(32),
+    verifier: "did:dht:zVerifier",
+    subject: "did:dht:zResponder",
     capabilityUri: "scp:capability:prompt-injection-resistance/v1",
-    challengeType: "scp:capability:prompt-injection-resistance/v1",
+    suiteDigest: "cd".repeat(32),
     verificationMethod: {
       kind: "ChallengeVerified",
       challengeType: "scp:capability:prompt-injection-resistance/v1",
     },
     passed: true,
-    testCount: 1,
-    passCount: 1,
+    testCount: 20,
+    passCount: 20,
     result: true,
     completedAt: 1_700_000_000,
-    verifiedAt: 1_700_000_000,
-    expiresAt: 4_000_000_000,
+    timestamp: 1_700_000_000,
+    expiresAt: 1_700_086_400,
     verifierSignature: Array.from({ length: 64 }, () => 9),
     score: null,
     contextId: "ctx-admission",
   };
 
-  it("emits the full 16-field snake_case record with a tagged verification_method", () => {
-    const parsed = JSON.parse(encodeChallengeVerifications([base]));
-    expect(parsed).toEqual([
-      {
-        verification_id: "bridge-test-challenge",
-        verifier_did: "did:dht:zVerifier",
-        subject_did: "did:dht:zResponder",
-        capability_uri: "scp:capability:prompt-injection-resistance/v1",
+  const wire = {
+    verification_id: "ab".repeat(32),
+    verifier: "did:dht:zVerifier",
+    subject: "did:dht:zResponder",
+    capability_uri: "scp:capability:prompt-injection-resistance/v1",
+    suite_digest: "cd".repeat(32),
+    passed: true,
+    score: null,
+    test_count: 20,
+    pass_count: 20,
+    timestamp: 1_700_000_000,
+    expires_at: 1_700_086_400,
+    context_id: "ctx-admission",
+    verifier_signature: Array.from({ length: 64 }, () => 9),
+    verification_method: {
+      ChallengeVerified: {
         challenge_type: "scp:capability:prompt-injection-resistance/v1",
-        verification_method: {
-          ChallengeVerified: {
-            challenge_type: "scp:capability:prompt-injection-resistance/v1",
-          },
-        },
-        passed: true,
-        score: null,
-        test_count: 1,
-        pass_count: 1,
-        result: true,
-        completed_at: 1_700_000_000,
-        verified_at: 1_700_000_000,
-        expires_at: 4_000_000_000,
-        context_id: "ctx-admission",
-        verifier_signature: Array.from({ length: 64 }, () => 9),
       },
-    ]);
+    },
+    result: true,
+    completed_at: 1_700_000_000,
+  };
+
+  it("emits the full 16-field snake_case record with a tagged verification_method", () => {
+    expect(JSON.parse(encodeChallengeVerifications([base]))).toEqual([wire]);
+  });
+
+  it("decodes the bridge record back to the typed record", () => {
+    expect(decodeChallengeVerification(JSON.stringify(wire))).toEqual(base);
+    expect(
+      decodeChallengeVerification(JSON.stringify({ ...wire, verification_method: "SelfAttested" }))
+        .verificationMethod,
+    ).toEqual({ kind: "SelfAttested" });
+  });
+
+  it("decode rejects a non-hex id, a score above 10000 and a short signature", () => {
+    expect(() =>
+      decodeChallengeVerification(JSON.stringify({ ...wire, verification_id: "AB".repeat(32) })),
+    ).toThrow("ChallengeVerification.verification_id must be 64 lowercase hex characters");
+    expect(() => decodeChallengeVerification(JSON.stringify({ ...wire, score: 10_001 }))).toThrow(
+      "ChallengeVerification.score must be an integer in [0, 10000]",
+    );
+    expect(decodeChallengeVerification(JSON.stringify({ ...wire, score: 10_000 })).score).toBe(
+      10_000,
+    );
+    expect(() =>
+      decodeChallengeVerification(JSON.stringify({ ...wire, verifier_signature: [1, 2] })),
+    ).toThrow("ChallengeVerification.verifier_signature must be exactly 64 byte values");
   });
 
   it("encodes a SelfAttested verification_method as the bare variant string", () => {
@@ -809,10 +836,13 @@ describe("encodeChallengeVerifications", () => {
     expect(parsed[0].context_id).toBeNull();
   });
 
-  it("rejects a wrong-length verifierSignature before any bridge call", () => {
+  it("rejects a wrong-length verifierSignature or a non-hex digest before any bridge call", () => {
     expect(() =>
       encodeChallengeVerifications([{ ...base, verifierSignature: Array(63).fill(9) }]),
     ).toThrow("ChallengeVerification.verifierSignature must be exactly 64 elements, got 63");
+    expect(() => encodeChallengeVerifications([{ ...base, suiteDigest: "cd" }])).toThrow(
+      "ChallengeVerification.suiteDigest must be 64 lowercase hex characters",
+    );
   });
 });
 
@@ -981,19 +1011,19 @@ describe("scp.aggregateTrustInput — typed trust-aggregation inputs (§7.3)", (
     const merkleRoot = Array.from({ length: 32 }, () => 7);
     const challengeResults: readonly ChallengeVerification[] = [
       {
-        verificationId: "v-1",
-        verifierDid: "did:dht:zVerifier",
-        subjectDid: "did:dht:subject",
+        verificationId: "01".repeat(32),
+        verifier: "did:dht:zVerifier",
+        subject: "did:dht:subject",
         capabilityUri: "scp:capability:schema-validation/v1",
-        challengeType: "scp:capability:schema-validation/v1",
+        suiteDigest: "02".repeat(32),
         verificationMethod: { kind: "SelfAttested" },
         passed: true,
         testCount: 1,
         passCount: 1,
         result: true,
         completedAt: 1_700_000_000,
-        verifiedAt: 1_700_000_000,
-        expiresAt: 4_000_000_000,
+        timestamp: 1_700_000_000,
+        expiresAt: 1_700_086_400,
         verifierSignature: Array.from({ length: 64 }, () => 9),
       },
     ];
@@ -1079,17 +1109,30 @@ const attestationEnvelope: CachedAttestationEnvelope = {
   signature: Array.from({ length: 64 }, () => 3),
 };
 
+const SCHEMA_URI = "scp:capability:schema-validation/v1";
+
+/** `n` exact-match cases whose weights sum to 10000. */
+function makeTestCases(n: number): TestCase[] {
+  const weight = Math.floor(10_000 / n);
+  return Array.from({ length: n }, (_, i) => ({
+    testId: `t${i}`,
+    input: { i },
+    expected: { kind: "ExactMatch", value: { ok: true } },
+    category: "basic",
+    weight: i === 0 ? 10_000 - weight * (n - 1) : weight,
+  }));
+}
+
 /** A structurally-valid ChallengeRequest with a real 64-byte signature. */
 function makeChallengeRequest(overrides: Partial<ChallengeRequest> = {}): ChallengeRequest {
   return {
-    challengeId: "chal-1",
-    challengeType: "scp:capability:schema-validation/v1",
-    challengerDid: "did:dht:challenger",
-    subjectDid: "did:dht:subject",
-    capabilityUri: "scp:capability:schema-validation/v1",
-    parameters: { schema: "object" },
-    timeout: { secs: 300, nanos: 0 },
-    signature: Array.from({ length: 64 }, () => 8),
+    challengeId: "ab".repeat(32),
+    capabilityUri: SCHEMA_URI,
+    testCases: makeTestCases(20),
+    timeoutSecs: 300,
+    verifier: "did:dht:verifier",
+    subject: "did:dht:subject",
+    verifierSignature: Array.from({ length: 64 }, () => 8),
     ...overrides,
   };
 }
@@ -1097,7 +1140,7 @@ function makeChallengeRequest(overrides: Partial<ChallengeRequest> = {}): Challe
 /** A structurally-valid ChallengeResponse with a real 64-byte signature. */
 function makeChallengeResponse(overrides: Partial<ChallengeResponse> = {}): ChallengeResponse {
   return {
-    challengeId: "chal-1",
+    challengeId: "ab".repeat(32),
     responderDid: "did:dht:subject",
     result: { passed: true },
     completedAt: 1_700_000_100,
@@ -1121,23 +1164,65 @@ describe("encodeAttestation", () => {
   });
 });
 
-describe("encodeChallengeRequest", () => {
-  it("emits the full 8-field snake_case record with a Duration timeout", () => {
-    expect(JSON.parse(encodeChallengeRequest(makeChallengeRequest()))).toEqual({
-      challenge_id: "chal-1",
-      challenge_type: "scp:capability:schema-validation/v1",
-      challenger_did: "did:dht:challenger",
-      subject_did: "did:dht:subject",
-      capability_uri: "scp:capability:schema-validation/v1",
-      parameters: { schema: "object" },
-      timeout: { secs: 300, nanos: 0 },
-      signature: Array.from({ length: 64 }, () => 8),
+describe("encodeChallengeRequest / decodeChallengeRequest / encodeTestCases", () => {
+  it("emits the 7-field snake_case record with externally tagged expected outputs", () => {
+    const encoded = JSON.parse(encodeChallengeRequest(makeChallengeRequest()));
+    expect(Object.keys(encoded).sort()).toEqual([
+      "capability_uri",
+      "challenge_id",
+      "subject",
+      "test_cases",
+      "timeout_secs",
+      "verifier",
+      "verifier_signature",
+    ]);
+    expect(encoded.test_cases[1]).toEqual({
+      test_id: "t1",
+      input: { i: 1 },
+      expected: { ExactMatch: { value: { ok: true } } },
+      category: "basic",
+      weight: 500,
     });
   });
 
-  it("rejects a wrong-length signature before any bridge call", () => {
-    expect(() => encodeChallengeRequest(makeChallengeRequest({ signature: [1, 2, 3] }))).toThrow(
-      "ChallengeRequest.signature must be exactly 64 elements, got 3",
+  it("encodes every ExpectedOutput variant and decodes it back", () => {
+    const variants: [ExpectedOutput, unknown][] = [
+      [{ kind: "ExactMatch", value: [1, "a"] }, { ExactMatch: { value: [1, "a"] } }],
+      [
+        { kind: "SchemaMatch", schema: { type: "object" } },
+        { SchemaMatch: { schema: { type: "object" } } },
+      ],
+      [{ kind: "ContainsAll", required: ["a", "b"] }, { ContainsAll: { required: ["a", "b"] } }],
+      [{ kind: "ContainsNone", forbidden: ["x"] }, { ContainsNone: { forbidden: ["x"] } }],
+      [
+        { kind: "CustomEval", evaluatorOutletId: "o-1" },
+        { CustomEval: { evaluator_outlet_id: "o-1" } },
+      ],
+    ];
+    for (const [expected, wire] of variants) {
+      const testCases: TestCase[] = [
+        { testId: "t", input: null, expected, category: "c", weight: 10_000 },
+      ];
+      expect(JSON.parse(encodeTestCases(testCases))[0].expected).toEqual(wire);
+      const request = makeChallengeRequest({ testCases });
+      expect(decodeChallengeRequest(encodeChallengeRequest(request))).toEqual(request);
+    }
+  });
+
+  it("rejects a wrong-length signature or a non-hex id before any bridge call", () => {
+    expect(() =>
+      encodeChallengeRequest(makeChallengeRequest({ verifierSignature: [1, 2, 3] })),
+    ).toThrow("ChallengeRequest.verifierSignature must be exactly 64 elements, got 3");
+    expect(() => encodeChallengeRequest(makeChallengeRequest({ challengeId: "chal-1" }))).toThrow(
+      "ChallengeRequest.challengeId must be 64 lowercase hex characters",
+    );
+  });
+
+  it("decode rejects an unknown ExpectedOutput variant", () => {
+    const wire = JSON.parse(encodeChallengeRequest(makeChallengeRequest()));
+    wire.test_cases[0].expected = { Nope: {} };
+    expect(() => decodeChallengeRequest(JSON.stringify(wire))).toThrow(
+      'unknown ExpectedOutput variant "Nope"',
     );
   });
 });
@@ -1145,7 +1230,7 @@ describe("encodeChallengeRequest", () => {
 describe("encodeChallengeResponse", () => {
   it("emits the full 5-field snake_case record", () => {
     expect(JSON.parse(encodeChallengeResponse(makeChallengeResponse()))).toEqual({
-      challenge_id: "chal-1",
+      challenge_id: "ab".repeat(32),
       responder_did: "did:dht:subject",
       result: { passed: true },
       completed_at: 1_700_000_100,
@@ -1181,20 +1266,62 @@ describe("scp.trustVerifyAttestation / scp.trustVerifyResponse — typed challen
     expect(call?.args).toEqual([encodeAttestation(attestationEnvelope)]);
   });
 
-  it("serializes the typed challenge request and response before crossing FFI", async () => {
+  it("trustVerifyResponse serializes both records and decodes the signed record", async () => {
     const { scp, native } = mountMockScp();
     cleanup = () => scp.shutdown(0);
-    native.__stub("trustVerifyResponse", () => false);
+    const record = {
+      verification_id: "ab".repeat(32),
+      verifier: "did:dht:verifier",
+      subject: "did:dht:subject",
+      capability_uri: SCHEMA_URI,
+      suite_digest: "cd".repeat(32),
+      passed: true,
+      score: 9_500,
+      test_count: 20,
+      pass_count: 19,
+      timestamp: 1_700_000_000,
+      expires_at: 1_700_086_400,
+      context_id: "ctx-1",
+      verifier_signature: Array.from({ length: 64 }, () => 7),
+      verification_method: { ChallengeVerified: { challenge_type: SCHEMA_URI } },
+      result: { passed: true },
+      completed_at: 1_699_999_990,
+    };
+    native.__stub("trustVerifyResponse", async () => JSON.stringify(record));
 
     const challenge = makeChallengeRequest();
     const response = makeChallengeResponse();
-    const result = scp.trustVerifyResponse(challenge, response);
-    expect(result).toBe(false);
+    const result = await scp.trustVerifyResponse("did:dht:verifier", challenge, response, "ctx-1");
+    expect(result).toEqual(decodeChallengeVerification(JSON.stringify(record)));
+    expect(result.suiteDigest).toBe("cd".repeat(32));
 
     const call = native.__lastCall("trustVerifyResponse");
     expect(call?.args).toEqual([
+      "did:dht:verifier",
       encodeChallengeRequest(challenge),
       encodeChallengeResponse(response),
+      "ctx-1",
+    ]);
+  });
+
+  it("trustCreateChallenge serializes the typed cases before crossing FFI", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("trustCreateChallenge", async () => ({
+      challengeId: "ab".repeat(32),
+      challengeJson: "{}",
+    }));
+
+    const testCases = makeTestCases(20);
+    const created = await scp.trustCreateChallenge("did:dht:v", "did:dht:s", SCHEMA_URI, testCases);
+    expect(created.challengeId).toBe("ab".repeat(32));
+    const call = native.__lastCall("trustCreateChallenge");
+    expect(call?.args).toEqual([
+      "did:dht:v",
+      "did:dht:s",
+      SCHEMA_URI,
+      encodeTestCases(testCases),
+      300,
     ]);
   });
 });

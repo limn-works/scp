@@ -997,6 +997,9 @@ pub const VALID_7036: &str = "SCP-VALID-7036";
 pub const VALID_7037: &str = "SCP-VALID-7037";
 /// Outlet verify input validation error.
 pub const VALID_7038: &str = "SCP-VALID-7038";
+/// A challenge for a protocol capability URI carries fewer test cases than its
+/// standard's minimum (spec 07 §7.3.4.3).
+pub const VALID_7039: &str = "SCP-VALID-7039";
 /// Event log input validation error.
 pub const VALID_7040: &str = "SCP-VALID-7040";
 /// Outlet verify register output validation.

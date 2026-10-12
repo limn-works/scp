@@ -513,6 +513,11 @@ pub struct AggregationContext<'a, S, R, C> {
     /// DID public key resolver for attestation verification.
     pub resolver: &'a R,
 
+    /// DID public key resolver for re-verifying stored challenge results.
+    /// It resolves the verifier's `#active` key, which an attestation
+    /// resolver need not cover.
+    pub challenge_resolver: &'a dyn DidPublicKeyResolver,
+
     /// Clock for timestamp operations.
     pub clock: &'a C,
 }
@@ -579,35 +584,28 @@ where
     //    ([`AttestationCache::get_verified_attestations`]), which likewise re-
     //    validates persisted entries on every read.
     //
-    //    INVARIANT: `.is_ok()` drops the one entry on ANY non-Ok result — a
-    //    verification rejection (bad signature / wrong context / wrong subject /
-    //    expired) OR a resolver infra fault. This is sound (conservative: it can
-    //    only ever DROP an entry, never inflate trust) ONLY because the injected
-    //    `resolver` is total and pure — `IdentityDidPublicKeyResolver` is a
-    //    deterministic DID-string parse with no network I/O, so it cannot raise a
-    //    transient fault that would spuriously drop a valid record. If a
-    //    networked/fallible resolver is ever substituted here, this filter MUST be
-    //    revisited to distinguish verification rejections from infra faults (the
-    //    `is_verification_rejection` classifier on the ingest path does exactly
-    //    this) so a transient resolver outage does not silently zero a subject's
-    //    challenge signal. The store read above still propagates its faults via
-    //    `?`.
-    let challenge_results: Vec<ChallengeVerification> = ctx
+    //    Only a rejection of the record itself
+    //    ([`TrustError::is_record_rejection`]) drops it. Any other failure, such
+    //    as a resolver outage, propagates: dropping a valid record on a
+    //    transient fault would silently zero the subject's challenge signal.
+    let stored = ctx
         .cache
         .store()
-        .get_challenge_results(ctx.context_id, ctx.subject_did)?
-        .into_iter()
-        .filter(|cv| {
-            verify_challenge_verification(
-                cv,
-                ctx.resolver,
-                ctx.context_id,
-                ctx.subject_did,
-                ctx.clock,
-            )
-            .is_ok()
-        })
-        .collect();
+        .get_challenge_results(ctx.context_id, ctx.subject_did)?;
+    let mut challenge_results: Vec<ChallengeVerification> = Vec::with_capacity(stored.len());
+    for cv in stored {
+        match verify_challenge_verification(
+            &cv,
+            ctx.challenge_resolver,
+            ctx.context_id,
+            ctx.subject_did,
+            ctx.clock,
+        ) {
+            Ok(()) => challenge_results.push(cv),
+            Err(e) if e.is_record_rejection() => {}
+            Err(e) => return Err(e),
+        }
+    }
 
     // 4. Consequence structure comes directly from context params.
     let consequence_structure: Vec<ConsequenceRule> = ctx.consequence_rules.to_vec();
@@ -866,7 +864,7 @@ mod tests {
                     sequence: 0,
                     reason: "lock poisoned".to_owned(),
                 })?;
-            let key = (context_id.to_owned(), result.subject_did.to_string());
+            let key = (context_id.to_owned(), result.subject.to_string());
             store.entry(key).or_default().push(result.clone());
             Ok(())
         }
@@ -1023,6 +1021,7 @@ mod tests {
             attestor_sets,
             cache: &cache,
             resolver,
+            challenge_resolver: resolver,
             clock: &clock,
         };
 
@@ -1040,44 +1039,55 @@ mod tests {
     /// the canonical bytes, so it passes `verify_challenge_verification` when the
     /// resolver is seeded via [`seed_challenge_verifier`].
     fn make_challenge_verification(
-        challenge_id: &str,
+        capability_uri: &str,
         responder: &str,
         completed_at: u64,
         context_id: Option<&str>,
     ) -> ChallengeVerification {
         use crate::trust::challenge::{
-            ChallengeType, VerificationMethod, canonical_challenge_verification_bytes,
+            ChallengeType, VerificationMethod, challenge_verification_id,
+            challenge_verification_signing_digest,
         };
         use ed25519_dalek::Signer;
 
-        let verifier_key = challenge_verifier_key();
-        let verifier_pub = verifier_key.verifying_key().to_bytes();
-        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
-
+        let verifier_pub = challenge_verifier_key().verifying_key().to_bytes();
+        let verifier = scp_did::did_dht_from_public_key(&verifier_pub);
+        let subject = DID::from(responder);
+        let timestamp = completed_at + 1;
         let mut cv = ChallengeVerification {
-            verification_id: challenge_id.to_owned(),
-            verifier_did,
-            subject_did: responder.into(),
-            capability_uri: String::new(),
-            challenge_type: ChallengeType::schema_validation(),
-            verification_method: VerificationMethod::ChallengeVerified {
-                challenge_type: ChallengeType::schema_validation(),
-            },
+            verification_id: challenge_verification_id(
+                &verifier,
+                &subject,
+                capability_uri,
+                timestamp,
+            )
+            .unwrap(),
+            verifier,
+            subject,
+            capability_uri: capability_uri.to_owned(),
+            suite_digest: [3u8; 32],
             passed: true,
             score: None,
             test_count: 1,
             pass_count: 1,
-            result: serde_json::json!({"passed": true}),
-            completed_at,
-            verified_at: completed_at + 1,
+            timestamp,
             expires_at: completed_at + 86400,
             context_id: context_id.map(ToOwned::to_owned),
             verifier_signature: vec![],
+            verification_method: VerificationMethod::ChallengeVerified {
+                challenge_type: ChallengeType::schema_validation(),
+            },
+            result: serde_json::json!({"passed": true}),
+            completed_at,
         };
-        let canonical = canonical_challenge_verification_bytes(&cv).unwrap();
-        cv.verifier_signature = verifier_key.sign(&canonical).to_bytes().to_vec();
+        let digest = challenge_verification_signing_digest(&cv).unwrap();
+        cv.verifier_signature = challenge_verifier_key().sign(&digest).to_bytes().to_vec();
         cv
     }
+
+    /// Capability URIs the challenge-result tests record.
+    const SCHEMA_URI: &str = "scp:capability:schema-validation/v1";
+    const RATE_URI: &str = "scp:capability:rate-limit-compliance/v1";
 
     /// Seeds `resolver` with the public key for the verifier DID used by
     /// [`make_challenge_verification`], so the genuine signature resolves and
@@ -1256,14 +1266,14 @@ mod tests {
     fn store_persists_and_retrieves_challenge_results() {
         let store = InMemoryTrustStore::new();
 
-        let cv = make_challenge_verification("ch-1", "did:key:alice", 1000, Some("ctx-1"));
+        let cv = make_challenge_verification(SCHEMA_URI, "did:key:alice", 1000, Some("ctx-1"));
         store.store_challenge_result("ctx-1", &cv).unwrap();
 
         let results = store
             .get_challenge_results("ctx-1", "did:key:alice")
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].verification_id, "ch-1");
+        assert_eq!(results[0].capability_uri, SCHEMA_URI);
         assert_eq!(results[0].completed_at, 1000);
     }
 
@@ -1271,8 +1281,8 @@ mod tests {
     fn store_accumulates_multiple_challenge_results() {
         let store = InMemoryTrustStore::new();
 
-        let cv1 = make_challenge_verification("ch-1", "did:key:alice", 1000, Some("ctx-1"));
-        let cv2 = make_challenge_verification("ch-2", "did:key:alice", 2000, Some("ctx-1"));
+        let cv1 = make_challenge_verification(SCHEMA_URI, "did:key:alice", 1000, Some("ctx-1"));
+        let cv2 = make_challenge_verification(RATE_URI, "did:key:alice", 2000, Some("ctx-1"));
 
         store.store_challenge_result("ctx-1", &cv1).unwrap();
         store.store_challenge_result("ctx-1", &cv2).unwrap();
@@ -1402,7 +1412,7 @@ mod tests {
         store.store_cached_attestation("ctx-1", entry).unwrap();
 
         // Seed the store with a genuinely-signed, in-context challenge result.
-        let cv = make_challenge_verification("ch-1", "did:key:alice", 1500, Some("ctx-1"));
+        let cv = make_challenge_verification(SCHEMA_URI, "did:key:alice", 1500, Some("ctx-1"));
         store.store_challenge_result("ctx-1", &cv).unwrap();
 
         let cache = AttestationCache::new(store);
@@ -1445,6 +1455,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            challenge_resolver: &resolver,
             clock: &clock,
         };
 
@@ -1468,7 +1479,7 @@ mod tests {
 
         // Challenge results.
         assert_eq!(input.challenge_results.len(), 1);
-        assert_eq!(input.challenge_results[0].verification_id, "ch-1");
+        assert_eq!(input.challenge_results[0].capability_uri, SCHEMA_URI);
 
         // Consequence structure.
         assert_eq!(input.consequence_structure.len(), 1);
@@ -1488,7 +1499,7 @@ mod tests {
         seed_challenge_verifier(&mut resolver);
 
         // completed_at = 1500 → expires_at = 1500 + 86400 = 87_900.
-        let cv = make_challenge_verification("ch-expiring", "did:key:alice", 1500, Some("ctx-1"));
+        let cv = make_challenge_verification(SCHEMA_URI, "did:key:alice", 1500, Some("ctx-1"));
         store.store_challenge_result("ctx-1", &cv).unwrap();
 
         let events = vec![make_event(
@@ -1515,6 +1526,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            challenge_resolver: &resolver,
             clock: &before_clock,
         };
         let input_before = aggregate_trust_input(&ctx_before).unwrap();
@@ -1536,12 +1548,93 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            challenge_resolver: &resolver,
             clock: &after_clock,
         };
         let input_after = aggregate_trust_input(&ctx_after).unwrap();
         assert!(
             input_after.challenge_results.is_empty(),
             "an expired persisted challenge result must be excluded on the read path"
+        );
+    }
+
+    /// Runs `aggregate_trust_input` over one stored, genuinely signed,
+    /// in-context challenge result for `did:key:alice`, with the attestation
+    /// and challenge resolvers given separately.
+    fn aggregate_one_challenge(
+        resolver: &TestResolver,
+        challenge_resolver: &dyn DidPublicKeyResolver,
+    ) -> Result<TrustInput, TrustError> {
+        let store = InMemoryTrustStore::new();
+        let cv = make_challenge_verification(SCHEMA_URI, "did:key:alice", 1500, Some("ctx-1"));
+        store.store_challenge_result("ctx-1", &cv).unwrap();
+        let events = vec![make_event(
+            EventType::MessageSent,
+            "did:key:alice",
+            1000,
+            0,
+            vec![],
+        )];
+        let threshold_requirements = HashMap::new();
+        let attestor_sets = HashMap::new();
+        let cache = AttestationCache::new(store);
+        let clock = TestClock::new(2000);
+        let ctx = AggregationContext {
+            context_id: "ctx-1",
+            subject_did: "did:key:alice",
+            events: &events,
+            merkle_root: [0u8; 32],
+            consequence_rules: &[],
+            threshold_requirements: &threshold_requirements,
+            attestor_sets: &attestor_sets,
+            cache: &cache,
+            resolver,
+            challenge_resolver,
+            clock: &clock,
+        };
+        aggregate_trust_input(&ctx)
+    }
+
+    #[test]
+    fn aggregate_reverifies_challenges_with_challenge_resolver() {
+        // The attestation resolver knows no key; the challenge resolver knows
+        // the verifier's. The stored challenge result must be re-verified with
+        // the challenge resolver and kept.
+        let rejects_everything = TestResolver::new();
+        let mut challenge_resolver = TestResolver::new();
+        seed_challenge_verifier(&mut challenge_resolver);
+
+        let input = aggregate_one_challenge(&rejects_everything, &challenge_resolver).unwrap();
+        assert_eq!(input.challenge_results.len(), 1);
+        assert_eq!(input.challenge_results[0].capability_uri, SCHEMA_URI);
+
+        // Control: with the challenge resolver also empty, the record's
+        // signature cannot be authenticated, so it is dropped.
+        let input = aggregate_one_challenge(&rejects_everything, &rejects_everything).unwrap();
+        assert!(input.challenge_results.is_empty());
+    }
+
+    /// A challenge resolver whose backend is down.
+    struct UnavailableResolver;
+
+    impl DidPublicKeyResolver for UnavailableResolver {
+        fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+            Err(TrustError::KeyResolutionUnavailable {
+                did: did.to_owned(),
+                reason: "resolver offline".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn aggregate_propagates_challenge_resolver_outage() {
+        // A resolver outage is not a judgment on the record: aggregation fails
+        // instead of silently dropping a possibly valid challenge result.
+        let resolver = TestResolver::new();
+        let result = aggregate_one_challenge(&resolver, &UnavailableResolver);
+        assert!(
+            matches!(&result, Err(TrustError::KeyResolutionUnavailable { did, .. }) if did.starts_with("did:dht:")),
+            "got {result:?}"
         );
     }
 
@@ -1611,6 +1704,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            challenge_resolver: &resolver,
             clock: &clock,
         };
 
@@ -1652,6 +1746,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            challenge_resolver: &resolver,
             clock: &clock,
         };
 
@@ -1712,6 +1807,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            challenge_resolver: &resolver,
             clock: &clock,
         };
 
