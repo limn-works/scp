@@ -9479,10 +9479,12 @@ class SlowAgreeCustody(P256Custody):
         (ctx_id, alice_handle, published, bob)
     }
 
-    /// Alice receives in X as a local member holding her access key. The
-    /// server wiring, which the test does not run, registers a joiner as
-    /// local; the access key arrives out of band (spec 09 §9.17.2), so the
-    /// test copies the one Bob holds for Alice, as the full-stack harness does.
+    /// Alice receives in X as a local member holding her access key. No join
+    /// path registers the joiner as a local DID yet, and the access key
+    /// reaches a new member by the pull-based HPKE distribution of spec 09
+    /// §9.17.2 item 1 (§9.16.2), which no bridge runs yet; so the test
+    /// registers Alice and copies the key Bob holds for her, as the
+    /// full-stack harness does.
     #[cfg(feature = "testing")]
     fn make_alice_a_receiving_member(
         rt: &tokio::runtime::Runtime,

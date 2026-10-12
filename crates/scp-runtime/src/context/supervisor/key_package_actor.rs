@@ -1807,8 +1807,10 @@ impl KeyPackageStoreActor {
         let mut generated = 0usize;
         let mut first_err: Option<ContextError> = None;
         for _ in 0..deficit {
-            // Read the identity's current key per KeyPackage (load → copy →
-            // drop), so a rotation is published by the next one generated.
+            // The identity's wrapping public key, published as the `0xFF01`
+            // leaf extension. The supervisor's entry never changes once
+            // inserted, so every KeyPackage this store generates carries the
+            // same key.
             let wrapping_public_key = *self.wrapping_key.public();
             match self
                 .mls

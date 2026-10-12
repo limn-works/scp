@@ -1621,10 +1621,6 @@ mod tests {
         );
     }
 
-    /// Every entry point resolves an unregistered handle the same way,
-    /// with one host lookup, and binds the same operational entry, whichever
-    /// runs first. Before this, `dh_agree` and the Ed25519-only operations
-    /// returned `KeyNotFound` for a handle `sign` would have resolved.
     /// An HPKE P-256 agreement hands the host exactly the 65-byte
     /// uncompressed peer point and returns the host's ECDH x-coordinate,
     /// which equals `ecdh_p256` from the pinned vector's scalar. A peer of the
@@ -1699,6 +1695,10 @@ mod tests {
         }
     }
 
+    /// Every entry point resolves an unregistered handle the same way,
+    /// with one host lookup, and binds the same operational entry, whichever
+    /// runs first. Before this, `dh_agree` and the Ed25519-only operations
+    /// returned `KeyNotFound` for a handle `sign` would have resolved.
     #[tokio::test]
     async fn every_entry_point_resolves_an_unregistered_handle() {
         let e = ed(0x71);

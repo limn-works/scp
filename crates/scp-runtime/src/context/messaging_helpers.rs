@@ -1537,7 +1537,7 @@ pub async fn deliver_incoming(
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's field-granular
     // Class-C `&mut ContextCryptoState` (`mode_mut().crypto_mut()`). Broadcast
     // contexts carry no crypto sub-state (`None`), matching the retained provider
-    // fallback; the `&mut` view is released as soon as the sync call returns, so
+    // fallback; the `&mut` view is released when the awaited call returns, so
     // `view` is free for the dispatch cascade below.
     let Some(opened_envelope) = decrypt_and_dispatch(
         deps,
