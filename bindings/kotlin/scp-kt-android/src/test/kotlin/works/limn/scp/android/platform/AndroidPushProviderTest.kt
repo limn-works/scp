@@ -179,7 +179,8 @@ class AndroidPushProviderTest {
         // handleNotification checks only the "scp" field, so a payload with
         // other fields returns Pull. §10.7 requires a push payload to carry a
         // wake signal and nothing else; §10.7.1 step 5 puts that on the sender
-        // (the relay sends exactly { "scp": 1 }), and FCM has carried every
+        // (the relay sends exactly the FCM request of its wake-signal table),
+        // and FCM has carried every
         // field before the handler sees it. §16.12.5 push_conformance lets an
         // adapter accept such a payload with a byte-identical WakeSignal or
         // reject it. This test pins the accept path this adapter takes.

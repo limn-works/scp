@@ -4,10 +4,10 @@
 //! spec §10.7.1. Clients register for push notifications with relays so that
 //! mobile devices can be woken on new message arrival.
 //!
-//! Push payloads are fully opaque — the relay sends exactly `{ "scp": 1 }`
-//! as a wake signal. No context ID, no sender DID, no message preview.
-//! Apple/Google learn only that the device received a notification at a
-//! specific time.
+//! Push payloads are fully opaque: the relay sends each platform the wake
+//! signal that the wake-signal table of spec §10.7.1 step 5 gives, and no
+//! context ID, sender DID or message preview. Apple/Google learn only that
+//! the device received a notification at a specific time.
 
 use serde::{Deserialize, Serialize};
 
