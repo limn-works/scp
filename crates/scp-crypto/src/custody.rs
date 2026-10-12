@@ -9,8 +9,12 @@
 //! registers. A pseudonym whose identity key was destroyed fails with
 //! key-not-found (`09-security-model.md` §9.10.4.A).
 
-/// Which custody failure occurred. The kind alone decides the error code a
-/// bridge reports.
+/// Which custody failure occurred.
+///
+/// The kind alone decides the error code a bridge reports. A `PlatformError`
+/// from a sibling platform trait (device attestation, push) or an unsupported
+/// operation keeps its own kind, so its code never reads as a key custody
+/// failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CustodyFailureKind {
     /// The key handle is unknown or its key was destroyed.
@@ -23,6 +27,25 @@ pub enum CustodyFailureKind {
     /// The custody backend's durable directory lock is still held (spec §17.6
     /// "One Opener per Durable Directory").
     StorageLockHeld,
+    /// A device attestation operation failed
+    /// (`PlatformError::AttestationError`).
+    AttestationFailed,
+    /// The backend does not support an optional operation
+    /// (`PlatformError::Unsupported`).
+    Unsupported,
+    /// A received push payload is not the platform's wake signal. The five
+    /// `Push*` kinds mirror `PushFailureKind` (ADR-006 2026-10-12 amendment).
+    PushWakePayloadInvalid,
+    /// The relay rejected a push registration: its signature, key state or
+    /// encoding is invalid.
+    PushRegistrationRejected,
+    /// The relay cannot verify a push registration's signature yet.
+    PushVerifierUnavailable,
+    /// The relay has no push sender for the registration's platform.
+    PushPlatformUnavailable,
+    /// The device's push provider (APNs, FCM) failed, such as a failed token
+    /// registration.
+    PushProviderFailed,
     /// The custody backend failed for any other reason.
     Failed,
 }

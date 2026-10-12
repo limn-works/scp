@@ -643,13 +643,13 @@ impl ScpNapiError {
     /// [`CustodyFailure`](scp_crypto::CustodyFailure), coded by
     /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code).
     pub(crate) fn custody_failure(message: String, e: &scp_crypto::CustodyFailure) -> Self {
-        let code = scp_ffi_common::error_codes::custody_failure_code(e).to_owned();
-        match e.kind {
-            scp_crypto::CustodyFailureKind::PseudonymRejected => Self::Identity { message, code },
-            scp_crypto::CustodyFailureKind::StorageClosed
-            | scp_crypto::CustodyFailureKind::StorageLockHeld => Self::Validation { message, code },
-            scp_crypto::CustodyFailureKind::KeyNotFound
-            | scp_crypto::CustodyFailureKind::Failed => Self::Crypto { message, code },
+        use scp_ffi_common::error_codes::{self as ec, CustodyFailureClass as Class};
+        let code = ec::custody_failure_code(e).to_owned();
+        match ec::custody_failure_class(e.kind) {
+            Class::Identity => Self::Identity { message, code },
+            Class::Validation => Self::Validation { message, code },
+            Class::Crypto => Self::Crypto { message, code },
+            Class::Transport => Self::Transport { message, code },
         }
     }
 }
@@ -690,20 +690,15 @@ impl ScpNapiError {
 
 impl From<scp_platform::PlatformError> for ScpNapiError {
     fn from(e: scp_platform::PlatformError) -> Self {
-        // Every variant, the two §17.6 storage conditions included, takes its
-        // code from `custody_failure_code`, so a bare and a wrapped
-        // `PlatformError` report the same code. A storage call raises the two
-        // §17.6 conditions too, so their message is the error's own text and
-        // never blames key custody.
+        // Every variant takes its code from `custody_failure_code`, so a bare
+        // and a wrapped `PlatformError` report the same code. A storage,
+        // attestation or push failure is not a key custody failure, so its
+        // message is the error's own text and never blames key custody.
         let failure = scp_crypto::CustodyFailure::from(&e);
-        let message = match failure.kind {
-            scp_crypto::CustodyFailureKind::StorageClosed
-            | scp_crypto::CustodyFailureKind::StorageLockHeld => e.to_string(),
-            scp_crypto::CustodyFailureKind::KeyNotFound
-            | scp_crypto::CustodyFailureKind::PseudonymRejected
-            | scp_crypto::CustodyFailureKind::Failed => {
-                format!("platform key operation failed: {e} — check key custody configuration")
-            }
+        let message = if scp_ffi_common::error_codes::is_key_custody_failure(failure.kind) {
+            format!("platform key operation failed: {e} — check key custody configuration")
+        } else {
+            e.to_string()
         };
         Self::custody_failure(message, &failure)
     }
@@ -1068,6 +1063,82 @@ mod tests {
         );
     }
 
+    /// ADR-006's 2026-10-12 amendment: a device attestation failure, each
+    /// push failure kind and an unsupported operation reach the caller with
+    /// their own registered code, never the key custody code
+    /// `SCP-CRYPTO-4060`, and an attestation or push failure's message does
+    /// not blame key custody.
+    #[test]
+    fn attestation_push_and_unsupported_platform_errors_carry_their_own_codes() {
+        use scp_platform::{PlatformError, PushFailureKind};
+        let push = |kind| PlatformError::PushError {
+            kind,
+            detail: "x".to_owned(),
+        };
+        for (error, variant, expected_code, blames_custody) in [
+            (
+                PlatformError::AttestationError("x".to_owned()),
+                "identity",
+                codes::ATTEST_9001,
+                false,
+            ),
+            (
+                push(PushFailureKind::WakePayloadInvalid),
+                "transport",
+                codes::TRANS_5080,
+                false,
+            ),
+            (
+                push(PushFailureKind::RegistrationRejected),
+                "transport",
+                codes::TRANS_5081,
+                false,
+            ),
+            (
+                push(PushFailureKind::VerifierUnavailable),
+                "transport",
+                codes::TRANS_5082,
+                false,
+            ),
+            (
+                push(PushFailureKind::PlatformUnavailable),
+                "transport",
+                codes::TRANS_5083,
+                false,
+            ),
+            (
+                push(PushFailureKind::ProviderFailed),
+                "transport",
+                codes::TRANS_5084,
+                false,
+            ),
+            (
+                PlatformError::Unsupported("x"),
+                "crypto",
+                codes::CRYPTO_4061,
+                true,
+            ),
+        ] {
+            let debug = format!("{error:?}");
+            let (got_variant, message, code) = match ScpNapiError::from(error) {
+                ScpNapiError::Identity { message, code } => ("identity", message, code),
+                ScpNapiError::Transport { message, code } => ("transport", message, code),
+                ScpNapiError::Crypto { message, code } => ("crypto", message, code),
+                other => panic!("{debug}: unexpected variant {other:?}"),
+            };
+            assert_eq!(
+                (got_variant, code.as_str()),
+                (variant, expected_code),
+                "{debug}"
+            );
+            assert_eq!(
+                message.contains("key custody"),
+                blames_custody,
+                "{debug}: {message}"
+            );
+        }
+    }
+
     /// Spec §17.6 and ADR-006's SCP-307 amendment: every `PlatformError`
     /// variant reaches the caller with one code, whether it arrives bare or
     /// wrapped in a `CustodyFailure` (here inside `ContextError::Custody`). A
@@ -1081,7 +1152,14 @@ mod tests {
                 ScpNapiError::Identity { code, .. } => ("identity", code.clone()),
                 ScpNapiError::Crypto { code, .. } => ("crypto", code.clone()),
                 ScpNapiError::Validation { code, .. } => ("validation", code.clone()),
+                ScpNapiError::Transport { code, .. } => ("transport", code.clone()),
                 other => panic!("unexpected custody error variant: {other:?}"),
+            }
+        }
+        fn push(kind: scp_platform::PushFailureKind) -> scp_platform::PlatformError {
+            scp_platform::PlatformError::PushError {
+                kind,
+                detail: "x".to_owned(),
             }
         }
         fn wrapped(e: &scp_platform::PlatformError) -> ScpNapiError {
@@ -1126,7 +1204,11 @@ mod tests {
             scp_platform::PlatformError::NotIdentityKey,
             scp_platform::PlatformError::StorageError("io".to_owned()),
             scp_platform::PlatformError::AttestationError("x".to_owned()),
-            scp_platform::PlatformError::PushError("x".to_owned()),
+            push(scp_platform::PushFailureKind::WakePayloadInvalid),
+            push(scp_platform::PushFailureKind::RegistrationRejected),
+            push(scp_platform::PushFailureKind::VerifierUnavailable),
+            push(scp_platform::PushFailureKind::PlatformUnavailable),
+            push(scp_platform::PushFailureKind::ProviderFailed),
             scp_platform::PlatformError::CustodyError("x".to_owned()),
             scp_platform::PlatformError::Unsupported("x"),
         ] {

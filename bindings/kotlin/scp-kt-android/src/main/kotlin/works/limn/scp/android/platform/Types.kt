@@ -165,8 +165,8 @@ enum class DestructionMethod {
  * - `SCP-CRYPTO-4005`: Signing key export refused, because the handle is a Keystore handle
  *   (thrown only by [KeyCustodyProvider.exportSigningKeyBytes], from [KeyHandle.custodyType]
  *   before any key lookup, so a destroyed Keystore handle also gets it; retrying cannot succeed)
- * - `SCP-TRANS-5001`: Push payload has no `scp` field
- * - `SCP-TRANS-5002`: Push payload `scp` field is not `"1"`
+ * - `SCP-TRANS-5080`: Wake payload invalid: the push payload has no `scp` field, or its
+ *   `scp` field is not `"1"`
  * - `SCP-STORAGE-8001`: Storage key not found. Defined as `AndroidStorage.ERROR_KEY_NOT_FOUND`
  *   but thrown by no adapter: a missing key makes [StorageProvider.get] return `null`
  * - `SCP-STORAGE-8002`: Storage operation failed
@@ -281,8 +281,8 @@ interface PushProvider {
      *
      * @param payload The push notification data payload as a key-value map.
      * @return [WakeSignal] indicating the action the caller should take.
-     * @throws ScpException with code `SCP-TRANS-5001` if the payload has no `scp` field.
-     * @throws ScpException with code `SCP-TRANS-5002` if the `scp` field is not `"1"`.
+     * @throws ScpException with code `SCP-TRANS-5080` (wake payload invalid) if the payload
+     *   has no `scp` field or its `scp` field is not `"1"`.
      *   [AndroidPushProvider] checks no other property of the payload: it returns
      *   [WakeSignal.PULL] for a payload that carries other fields beside `"scp": "1"`. §10.7
      *   opacity is the sender's obligation (§10.7.1 step 5).

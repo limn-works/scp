@@ -61,88 +61,88 @@ class AndroidPushProviderTest {
     }
 
     // -----------------------------------------------------------------------
-    // Missing field tests — error code SCP-TRANS-5001
+    // Missing field tests — error code SCP-TRANS-5080 (wake payload invalid)
     // -----------------------------------------------------------------------
 
     @Test
-    fun `empty payload throws ScpException with code SCP-TRANS-5001`() {
+    fun `empty payload throws ScpException with code SCP-TRANS-5080`() {
         val payload = emptyMap<String, String>()
         val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
-        assertEquals("SCP-TRANS-5001", exception.code)
+        assertEquals("SCP-TRANS-5080", exception.code)
         assertEquals("FCM payload missing 'scp' field", exception.message)
     }
 
     @Test
-    fun `payload without scp field throws ScpException with code SCP-TRANS-5001`() {
+    fun `payload without scp field throws ScpException with code SCP-TRANS-5080`() {
         val payload = mapOf("other" to "value")
         val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
-        assertEquals("SCP-TRANS-5001", exception.code)
+        assertEquals("SCP-TRANS-5080", exception.code)
     }
 
     @Test
-    fun `payload with wrong key name throws ScpException with code SCP-TRANS-5001`() {
+    fun `payload with wrong key name throws ScpException with code SCP-TRANS-5080`() {
         // Case-sensitive: "SCP" is not "scp"
         val payload = mapOf("SCP" to "1")
         val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
-        assertEquals("SCP-TRANS-5001", exception.code)
+        assertEquals("SCP-TRANS-5080", exception.code)
     }
 
     // -----------------------------------------------------------------------
-    // Unexpected value tests — error code SCP-TRANS-5002
+    // Unexpected value tests — error code SCP-TRANS-5080 (wake payload invalid)
     // -----------------------------------------------------------------------
 
     @Test
-    fun `scp field with value 0 throws ScpException with code SCP-TRANS-5002`() {
+    fun `scp field with value 0 throws ScpException with code SCP-TRANS-5080`() {
         val payload = mapOf("scp" to "0")
         val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
-        assertEquals("SCP-TRANS-5002", exception.code)
+        assertEquals("SCP-TRANS-5080", exception.code)
         assertEquals("FCM payload 'scp' field has unexpected value: 0", exception.message)
     }
 
     @Test
-    fun `scp field with value 2 throws ScpException with code SCP-TRANS-5002`() {
+    fun `scp field with value 2 throws ScpException with code SCP-TRANS-5080`() {
         val payload = mapOf("scp" to "2")
         val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
-        assertEquals("SCP-TRANS-5002", exception.code)
+        assertEquals("SCP-TRANS-5080", exception.code)
     }
 
     @Test
-    fun `scp field with empty value throws ScpException with code SCP-TRANS-5002`() {
+    fun `scp field with empty value throws ScpException with code SCP-TRANS-5080`() {
         val payload = mapOf("scp" to "")
         val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
-        assertEquals("SCP-TRANS-5002", exception.code)
+        assertEquals("SCP-TRANS-5080", exception.code)
     }
 
     @Test
-    fun `scp field with arbitrary string throws ScpException with code SCP-TRANS-5002`() {
+    fun `scp field with arbitrary string throws ScpException with code SCP-TRANS-5080`() {
         val payload = mapOf("scp" to "wake")
         val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
-        assertEquals("SCP-TRANS-5002", exception.code)
+        assertEquals("SCP-TRANS-5080", exception.code)
         assertEquals("FCM payload 'scp' field has unexpected value: wake", exception.message)
     }
 
     @Test
-    fun `scp field with whitespace-padded value throws ScpException with code SCP-TRANS-5002`() {
+    fun `scp field with whitespace-padded value throws ScpException with code SCP-TRANS-5080`() {
         // "1 " is not "1"
         val payload = mapOf("scp" to " 1")
         val exception = assertFailsWith<ScpException> {
             provider.handleNotification(payload)
         }
-        assertEquals("SCP-TRANS-5002", exception.code)
+        assertEquals("SCP-TRANS-5080", exception.code)
     }
 
     // -----------------------------------------------------------------------

@@ -150,7 +150,7 @@ macro_rules! push_conformance {
 #[cfg(test)]
 mod tests {
     use scp_platform::PushToken;
-    use scp_platform::error::PlatformError;
+    use scp_platform::error::{PlatformError, PushFailureKind};
     use scp_platform::testing::InMemoryPush;
 
     use super::*;
@@ -167,7 +167,10 @@ mod tests {
             if payload == self.0 {
                 Ok(WakeSignal::new(b"wake"))
             } else {
-                Err(PlatformError::PushError("opaque payload violation".into()))
+                Err(PlatformError::PushError {
+                    kind: PushFailureKind::WakePayloadInvalid,
+                    detail: "opaque payload violation".into(),
+                })
             }
         }
     }
@@ -202,7 +205,10 @@ mod tests {
             if payload.trim_ascii_end() == PERMITTED_PAYLOADS[0] {
                 Ok(WakeSignal::new(payload.to_vec().leak()))
             } else {
-                Err(PlatformError::PushError("opaque payload violation".into()))
+                Err(PlatformError::PushError {
+                    kind: PushFailureKind::WakePayloadInvalid,
+                    detail: "opaque payload violation".into(),
+                })
             }
         }
     }
@@ -302,7 +308,10 @@ mod tests {
                 &self,
                 _payload: &[u8],
             ) -> Result<WakeSignal, PlatformError> {
-                Err(PlatformError::PushError("refused".into()))
+                Err(PlatformError::PushError {
+                    kind: PushFailureKind::WakePayloadInvalid,
+                    detail: "refused".into(),
+                })
             }
         }
         check_fixed_wake_signal(&RefusingPush).await;

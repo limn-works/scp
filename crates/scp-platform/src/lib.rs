@@ -82,7 +82,7 @@ pub mod traits;
 
 // Re-export all public types for ergonomic access.
 pub use encrypted::EncryptedStorage;
-pub use error::PlatformError;
+pub use error::{PlatformError, PushFailureKind};
 pub use store_value::{
     CURRENT_STORE_VERSION, StoreValueError, StoredValue, from_stored_value_bytes,
     identity_document_key, sanitize_key_component, to_stored_value_bytes,
