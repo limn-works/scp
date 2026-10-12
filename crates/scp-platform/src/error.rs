@@ -109,8 +109,8 @@ pub enum PlatformError {
     Unsupported(&'static str),
 }
 
-/// Which push failure occurred (spec `10-infrastructure-and-self-hosting.md`
-/// §10.7.1). The kind alone decides the error code a bridge reports.
+/// Which push failure occurred (ADR-006 2026-10-12 amendment in
+/// `.docs/adrs/phase-1.md`). The kind alone decides the error code a bridge reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushFailureKind {
     /// A received push payload is not the platform's wake signal.

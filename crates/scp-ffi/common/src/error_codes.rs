@@ -832,7 +832,7 @@ pub const TRANS_5063: &str = "SCP-TRANS-5063";
 /// `UniFFI` transport broadcast error.
 pub const TRANS_5070: &str = "SCP-TRANS-5070";
 
-// Push (spec `10-infrastructure-and-self-hosting.md` §10.7.1): one code per
+// Push (ADR-006 2026-10-12 amendment): one code per
 // `PlatformError::PushError` kind, assigned by [`custody_failure_code`].
 
 /// Push wake payload invalid: a received push payload is not the platform's
@@ -1490,7 +1490,7 @@ pub enum CustodyFailureClass {
     /// A crypto error: key-not-found, an unsupported operation, or any other
     /// key custody failure.
     Crypto,
-    /// A transport error: a push failure (spec §10.7.1).
+    /// A transport error: a push failure (ADR-006 2026-10-12 amendment).
     Transport,
 }
 

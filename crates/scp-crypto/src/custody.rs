@@ -33,15 +33,15 @@ pub enum CustodyFailureKind {
     /// The backend does not support an optional operation
     /// (`PlatformError::Unsupported`).
     Unsupported,
-    /// A received push payload is not the platform's wake signal (spec
-    /// `10-infrastructure-and-self-hosting.md` §10.7.1).
+    /// A received push payload is not the platform's wake signal. The five
+    /// `Push*` kinds mirror `PushFailureKind` (ADR-006 2026-10-12 amendment).
     PushWakePayloadInvalid,
     /// The relay rejected a push registration: its signature, key state or
-    /// encoding is invalid (§10.7.1).
+    /// encoding is invalid.
     PushRegistrationRejected,
-    /// The relay cannot verify a push registration's signature yet (§10.7.1).
+    /// The relay cannot verify a push registration's signature yet.
     PushVerifierUnavailable,
-    /// The relay has no push sender for the registration's platform (§10.7.1).
+    /// The relay has no push sender for the registration's platform.
     PushPlatformUnavailable,
     /// The device's push provider (APNs, FCM) failed, such as a failed token
     /// registration.
