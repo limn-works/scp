@@ -1772,7 +1772,7 @@ pub struct Supervisor {
     /// author-DID-controlled gate on broadcast key requests.
     pub(in crate::context::supervisor) local_dids: Arc<ArcSwap<HashSet<DID>>>,
     /// Per-identity DHKEM(P-256) wrapping keys (spec 09 §9.16.1), the only
-    /// owner of each identity's key. [`Self::load_wrapping_key`] fills an
+    /// writer of each identity's key. [`Self::load_wrapping_key`] fills an
     /// entry from durable storage (or generates and stores one) at every entry
     /// point that builds an actor for the identity, before any lock is taken;
     /// [`Self::wrapping_key`] reads it. An entry never changes once inserted,
@@ -3092,7 +3092,7 @@ impl Supervisor {
     // Per-identity wrapping key (spec 09 §9.16.1; spec 10 §10.8.1(4)).
     //
     // One key per identity, shared by every context the identity joins. The
-    // supervisor's `wrapping_keys` map is its only owner; actors read it
+    // supervisor's `wrapping_keys` map is its only writer; actors read it
     // through `SupervisorHandle::my_wrapping_key`, and the identity's
     // `KeyPackageStoreActor` holds the same `Arc`. Context snapshots carry no
     // wrapping key, so restoring a context never changes it.
@@ -3447,57 +3447,6 @@ impl Supervisor {
             })
     }
 
-    /// Build an [`ActorDeps`](crate::context::actor::deps::ActorDeps)
-    /// bundle entirely from the supervisor's own provider slots
-    /// (ADR-049 §1 / ADR-049 §15), scoped to `owning_did`.
-    ///
-    /// Self-sources every collaborator from the `OnceLock`s populated by
-    /// [`Self::with_providers_and_journal`]: the `MlsBackend` is read transitively
-    /// through `crypto.mls_backend()` (the [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory)
-    /// owns the only instance — no second supervisor field, so there is
-    /// one source of truth per ADR §6). The OpenMLS storage adapter is
-    /// the supervisor's `mls_storage` slot. The `KeyPackageStoreHandle`
-    /// is resolved (get-or-spawn) for `owning_did` via
-    /// [`Self::key_package_store_for`]. Persistence falls back to the
-    /// no-op stub when no helper-side backend is wired.
-    ///
-    /// # `owning_did` scope (ADR-049 §10 respawn safety)
-    ///
-    /// `owning_did` selects the per-identity `KeyPackageStore` actor and the
-    /// identity's wrapping keypair (spec 09 §9.16.1) that this context's deps
-    /// read, and the capability token the actor carries. Crypto, transport,
-    /// event-log, key-resolver, payment-adapter, and `mls_storage` are the
-    /// supervisor-wide shared providers (read from the `OnceLock` slots), and
-    /// `local_dids` is the SHARED swap cell (`local_dids_shared()`), i.e. the
-    /// node's FULL set of local DIDs — not a snapshot of `owning_did`. Because
-    /// the wrapping keypair is keyed on `owning_did`, a caller passes the
-    /// identity the context acts as: the joining or creating DID, or
-    /// [`Self::node_identity`] for a snapshot-rehydrated bootstrap; a watchdog
-    /// respawn reuses the DID the crashed actor's deps were built for. See the
-    /// `respawn_preserves_owning_identity_on_multi_did_node` test.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError::NotInitialized`] if any required provider
-    /// slot is empty (i.e. [`Self::with_providers_and_journal`] was not used).
-    ///
-    /// # Method receiver
-    ///
-    /// Takes `self: &Arc<Self>` so the returned
-    /// [`SupervisorHandle`](crate::context::supervisor::handle::SupervisorHandle)
-    /// wraps a cloned `Arc` of the same supervisor instance — not a
-    /// fresh `Supervisor::for_query_shim()`. Without this the handle
-    /// would point at a dangling second supervisor and
-    /// [`SupervisorHandle::local_dids`](crate::context::supervisor::SupervisorHandle::local_dids)
-    /// / [`SupervisorHandle::standing_peer`](crate::context::supervisor::SupervisorHandle::standing_peer)
-    /// would read empty state.
-    // Non-test callers land when `dispatch_lifecycle_direct` switches to
-    // actor-shape (storage-foundation Step 5); until then this is reached
-    // only from the supervisor + actor test fixtures.
-    // `pub(crate)` (widened from `pub(in crate::context)`): the shared two-party
-    // test fixture in `crate::crypto::mls::two_party_test_support` drives a
-    // provider-resident join (`ConfirmConsume` → `install_joined_group`) through
-    // Bob's `key_package_store` handle, reached via these deps.
     /// [`Self::build_actor_deps`] after [`Self::load_wrapping_key`], for tests
     /// that build deps without going through an entry point.
     ///
@@ -3530,6 +3479,61 @@ impl Supervisor {
         self.key_package_store_for(owner).await
     }
 
+    /// Build an [`ActorDeps`](crate::context::actor::deps::ActorDeps)
+    /// bundle entirely from the supervisor's own provider slots
+    /// (ADR-049 §1 / ADR-049 §15), scoped to `owning_did`.
+    ///
+    /// Self-sources every collaborator from the `OnceLock`s populated by
+    /// [`Self::with_providers_and_journal`]: the `MlsBackend` is read transitively
+    /// through `crypto.mls_backend()` (the [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory)
+    /// owns the only instance — no second supervisor field, so there is
+    /// one source of truth per ADR §6). The OpenMLS storage adapter is
+    /// the supervisor's `mls_storage` slot. The `KeyPackageStoreHandle`
+    /// is resolved (get-or-spawn) for `owning_did` via
+    /// [`Self::key_package_store_for`]. Persistence falls back to the
+    /// no-op stub when no helper-side backend is wired.
+    ///
+    /// # `owning_did` scope (ADR-049 §10 respawn safety)
+    ///
+    /// `owning_did` selects the per-identity `KeyPackageStore` actor and the
+    /// identity's wrapping keypair (spec 09 §9.16.1) that this context's deps
+    /// read, and the capability token the actor carries. Crypto, transport,
+    /// event-log, key-resolver, payment-adapter, and `mls_storage` are the
+    /// supervisor-wide shared providers (read from the `OnceLock` slots), and
+    /// `local_dids` is the SHARED swap cell (`local_dids_shared()`), i.e. the
+    /// node's FULL set of local DIDs — not a snapshot of `owning_did`. Because
+    /// the wrapping keypair is keyed on `owning_did`, a caller passes the
+    /// identity the context acts as: the joining or creating DID, or
+    /// [`Self::node_identity`] for a snapshot-rehydrated bootstrap; a watchdog
+    /// respawn reuses the DID the crashed actor's deps were built for. See the
+    /// `respawn_preserves_owning_identity_on_multi_did_node` test.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if any required provider slot is
+    ///   empty (i.e. [`Self::with_providers_and_journal`] was not used).
+    /// - [`ContextError::InvalidState`] if no entry point has loaded
+    ///   `owning_did`'s wrapping key ([`Self::load_wrapping_key`]).
+    /// - [`ContextError::SupervisorShutDown`] once shutdown has begun.
+    /// - The errors of [`Self::key_package_store_for`] otherwise.
+    ///
+    /// # Method receiver
+    ///
+    /// Takes `self: &Arc<Self>` so the returned
+    /// [`SupervisorHandle`](crate::context::supervisor::handle::SupervisorHandle)
+    /// wraps a cloned `Arc` of the same supervisor instance — not a
+    /// fresh `Supervisor::for_query_shim()`. Without this the handle
+    /// would point at a dangling second supervisor and
+    /// [`SupervisorHandle::local_dids`](crate::context::supervisor::SupervisorHandle::local_dids)
+    /// / [`SupervisorHandle::standing_peer`](crate::context::supervisor::SupervisorHandle::standing_peer)
+    /// would read empty state.
+    // Non-test callers land when `dispatch_lifecycle_direct` switches to
+    // actor-shape (storage-foundation Step 5); until then this is reached
+    // only from the supervisor + actor test fixtures.
+    // `pub(crate)` (widened from `pub(in crate::context)`): the shared two-party
+    // test fixture in `crate::crypto::mls::two_party_test_support` drives a
+    // provider-resident join (`ConfirmConsume` → `install_joined_group`) through
+    // Bob's `key_package_store` handle, reached via these deps.
     #[cfg_attr(not(test), allow(dead_code))]
     // `redundant_pub_crate` is a false positive here: this method is defined in a
     // private module but is genuinely reached crate-wide (the shared two-party

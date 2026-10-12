@@ -1,16 +1,19 @@
 //! The identity's DHKEM(P-256) wrapping key (spec 09 §9.16.1).
 //!
 //! One identity has one wrapping key, published as the `0xFF01` leaf
-//! extension in every context the identity joins and used to open the
-//! HPKE-sealed sender keys, access keys and invitations addressed to it. The
-//! supervisor holds it as an [`IdentityWrappingKey`]: a custody, the custody's
-//! opaque handle, and the public point.
+//! extension in every context the identity joins. Today the runtime uses it
+//! to open the HPKE-sealed sender keys addressed to the identity (§9.16.2).
+//! Spec 05 §5.12.3.1 also seals the invitation bundle to it; the Welcome join
+//! still opens that bundle with the `#active` key until the join moves to
+//! this key. The supervisor holds it as an [`IdentityWrappingKey`]: a
+//! custody, the custody's opaque handle, and the public point.
 //!
 //! `KeyCustody` uses return-position `impl Trait`, so it is not object safe.
-//! [`WrappingCustody`] is the object-safe slice of it the wrapping key needs,
-//! sealed so that [`ErasedCustody`] over a real `KeyCustody` is the only way
-//! to supply one from outside this module. A bridge hands the supervisor a
-//! [`WrappingCustodySource`] that finds an identity's custody by DID.
+//! [`WrappingCustody`] is the object-safe slice of it the wrapping key needs.
+//! The trait is sealed, so [`ErasedCustody`] is its only implementation and
+//! any `KeyCustody` (test fakes included) reaches the supervisor through that
+//! adapter. A bridge hands the supervisor a [`WrappingCustodySource`] that
+//! finds an identity's custody by DID.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -36,9 +39,10 @@ mod sealed {
 
 /// The object-safe slice of `KeyCustody` the identity wrapping key uses.
 ///
-/// Sealed: every implementation lives in this module, so every wrapping key
-/// the supervisor holds is backed by a real `KeyCustody` through
-/// [`ErasedCustody`].
+/// Sealed: [`ErasedCustody`] is the only implementation, so every wrapping
+/// key the supervisor holds goes through that adapter over some `KeyCustody`.
+/// The seal says nothing about which `KeyCustody`: the adapter's field is
+/// public and accepts any implementation, test custodies included.
 pub trait WrappingCustody: sealed::Sealed + Send + Sync {
     /// Generates a [`KeyType::HpkeP256`] key in the operational role.
     fn generate_hpke_p256(&self) -> WrappingCustodyFuture<'_, Result<KeyHandle, PlatformError>>;

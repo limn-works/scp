@@ -761,10 +761,11 @@ pub async fn testing_admit_joined_member(
 ///
 /// Makes `member_did`, which joined `context_id` from a Welcome on `bi`, a
 /// receiving member there: `bi`'s supervisor treats the DID as local, and it
-/// holds the access key `inviter`'s supervisor minted for the member. The
-/// server wiring registers a joiner as local, and access keys arrive out of
-/// band (spec 09 §9.17.2); this stands in for both, as the full-stack harness
-/// does.
+/// holds the access key `inviter`'s supervisor minted for the member. No join
+/// path registers the joiner as a local DID yet, and the access key reaches a
+/// new member by the pull-based HPKE distribution of spec 09 §9.17.2 item 1
+/// (§9.16.2), which no bridge runs yet; this stands in for both, as the
+/// full-stack harness does.
 ///
 /// # Errors
 ///

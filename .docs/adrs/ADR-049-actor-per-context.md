@@ -44,10 +44,11 @@ Lookups are on the hot path of every public API call. Making the supervisor an a
 - `DashMap<String, ContextActorHandle>` for actor registry
 - `ArcSwap<HashMap<String, DID>>` for standing contexts
 - `ArcSwap<HashSet<DID>>` for local identities
-- `DashMap<DID, ArcSwap<WrappingKeyPair>>` for per-identity wrapping keys
-- `tokio::sync::Mutex<()>` write-lock serializing all mutations of the above
+- `DashMap<DID, Arc<IdentityWrappingKey>>` for per-identity wrapping keys: each entry names a key held in the identity's `KeyCustody` by handle and public point, never a private scalar, and is never replaced once inserted
+- `DashMap<DID, Arc<tokio::sync::Mutex<()>>>` (`wrapping_key_loads`), one load lock per identity, which serializes the first load of that identity's wrapping key
+- `tokio::sync::Mutex<()>` write-lock serializing every mutation of the first four (`wrapping_key_loads` entries are created on demand without it)
 
-Read path is lock-free via `DashMap::get` + `ArcSwap::load`. Write path acquires `write_lock` before touching any ArcSwap/DashMap.
+Read path is lock-free via `DashMap::get` + `ArcSwap::load`. Write path acquires `write_lock` before mutating the actor registry, the standing contexts, the local identities or `wrapping_keys`. A wrapping-key load takes `wrapping_key_loads[owner]` first, runs its custody calls (record read, generate, public key, store) under that lock alone, and takes `write_lock` only for the final insert, so no custody call runs under `write_lock`.
 
 Strict hierarchy, no cycles: Supervisor → ContextActor → (KeyPackageStoreActor | KeyCustody | TransportActor). Never ContextActor → ContextActor directly. Every reference from a task in this hierarchy back to the Supervisor is a `Weak<Supervisor>` (Decision 16), so the hierarchy holds no reference cycle while the Supervisor runs.
 
@@ -474,7 +475,7 @@ Proposed on the grounds that the rest of the supervisor's mutable state lives be
 
 - **50ms coalesced-persistence rollback window on actor crash.** Not a security regression (all authorization-downward operations are sync-persisted), but a behavioral change for participation counters, velocity trackers, and non-critical state. Documented in release notes.
 - **`async_trait` heap allocation per trait method call.** Negligible vs MLS crypto operation cost.
-- **Per-identity state scattered.** Reader-side discipline required for `Arc<WrappingKeyPair>` (load → use → drop within same poll), enforced by CI.
+- **Per-identity state scattered.** The wrapping key lives in the identity's `KeyCustody`; the supervisor's `wrapping_keys` map holds an `Arc<IdentityWrappingKey>` (custody, handle, public point) that is never replaced once inserted, so a reader clones the `Arc` and needs no load → use → drop discipline. No gate checks readers, and none is needed: the entry carries no secret.
 - **Saga `NeedsRepair` requires operator action.** Detection (`saga_repair_needed` metric), inspection, and `repair_saga(saga_id)` admin command are documented in a runbook that ships with the implementation commits (per the plan's doc-deliverables list), at `.docs/runbooks/saga-needs-repair.md`.
 - **Pre-existing dev-database snapshots do not load.** The schema-version check fails with `ContextError::UnsupportedSnapshotVersion`. No migration code; pre-1.0 has no deployed state to preserve.
 - **Test infrastructure (as built).** The plan called for the ~20 existing `impl ContextCryptoProvider` mocks to migrate onto the new `MlsBackend` trait (and a since-deleted `HpkeBackend` trait). What was actually built diverges and is recorded here so a fresh agent is not misled:

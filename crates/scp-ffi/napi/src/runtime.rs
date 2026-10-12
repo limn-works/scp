@@ -1629,7 +1629,10 @@ pub(crate) fn register_identity(bi: &NapiBridgeInstance, did: &str, entry: NapiI
 /// Removes an identity from the bridge instance's identity registry.
 ///
 /// Called when an identity is migrated to a new DID or during cleanup.
-/// The old entry is removed and its key material is dropped.
+/// The registry's entry (its custody `Arc` and retained state) is dropped.
+/// The supervisor's loaded wrapping key for the DID still holds the same
+/// custody `Arc` and is released only at supervisor shutdown, so removal
+/// destroys no key material in custody.
 ///
 /// Idempotent: no-op if the DID is not present.
 pub(crate) fn remove_identity(bi: &NapiBridgeInstance, did: &str) {
