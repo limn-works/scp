@@ -376,6 +376,19 @@ pub enum ContextError {
     #[error(transparent)]
     Custody(#[from] scp_crypto::CustodyFailure),
 
+    /// No key custody is registered for the identity whose wrapping key
+    /// (`09-security-model.md` §9.16.1) an actor build needs, so the actor is
+    /// not built. The caller holds the identity, so the error names none.
+    #[error("no key custody is registered for the identity's wrapping key")]
+    WrappingKeyCustodyUnavailable,
+
+    /// The identity's stored wrapping key record names a custody handle that
+    /// the identity's custody does not hold, or whose public key differs from
+    /// the record (`09-security-model.md` §9.16.1). Nothing is regenerated over
+    /// the record. The caller holds the identity, so the error names none.
+    #[error("the stored wrapping key handle is not held by the identity's custody")]
+    WrappingKeyHandleInvalid,
+
     /// A transport operation failed during messaging.
     #[error("transport operation failed: {0}")]
     TransportFailed(String),

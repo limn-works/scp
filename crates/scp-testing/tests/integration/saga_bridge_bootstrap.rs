@@ -143,6 +143,9 @@ fn bridge_supervisor(
     persistence: Arc<SharedPersistence>,
     journal: Arc<dyn SagaJournal>,
     mls_storage: Arc<dyn OpenMlsStorageAdapter>,
+    // The custody that holds the wrapping keys. A restart test passes the
+    // same custody to every supervisor, as a host's custody outlives a process.
+    wrapping_custody: &Arc<scp_platform::testing::InMemoryKeyCustody>,
 ) -> Arc<Supervisor> {
     let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
     Supervisor::with_providers_and_journal(
@@ -161,6 +164,7 @@ fn bridge_supervisor(
         // caller-supplied shared store, then pairs them via the test-only
         // `for_test` constructor — production sites use `from_handle`.
         scp_core::context::supervisor::DurableProviders::for_test(journal, mls_storage),
+        scp_core::context::supervisor::single_custody_source(Arc::clone(wrapping_custody)),
     )
 }
 
@@ -194,6 +198,7 @@ impl ContextPersistence for SharedPersistenceArc {
 /// restore-then-replay startup sweep.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bridge_restore_entry_runs_restore_and_replay_legs() {
+    let wrapping_custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let creator_did = "did:dht:z6MkSagaBridgeBootstrapCreator";
     let ctx_id = "ctx-saga-bridge-bootstrap";
 
@@ -216,6 +221,7 @@ async fn bridge_restore_entry_runs_restore_and_replay_legs() {
             Arc::clone(&persistence),
             journal1,
             Arc::clone(&mls_storage),
+            &wrapping_custody,
         );
         sup1.register_local_did(DID::from(creator_did))
             .await
@@ -298,6 +304,7 @@ async fn bridge_restore_entry_runs_restore_and_replay_legs() {
         Arc::clone(&persistence),
         Arc::clone(&journal2_for_probe),
         Arc::clone(&mls_storage),
+        &wrapping_custody,
     );
     sup2.register_local_did(DID::from(creator_did))
         .await

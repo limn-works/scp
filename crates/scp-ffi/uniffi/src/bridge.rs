@@ -18955,7 +18955,10 @@ mod tests {
     /// (#1549) deleted the free-function façade; tests now drive bridge
     /// logic through an owned `Scp` instance.
     fn scp_test() -> Arc<crate::scp::Scp> {
-        crate::scp::Scp::new_in_memory_for_test()
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        // Fixtures create contexts for DIDs they never register.
+        crate::runtime::serve_unregistered_wrapping_keys_from_test_custody(&scp.inner);
+        scp
     }
 
     /// A declaration that is not valid JSON fails with `SCP-VALID-7000`, the
@@ -27675,6 +27678,7 @@ mod tests {
     /// Supervisor role state, so a bare instance would serve nothing.
     async fn live_context(bi: &Arc<crate::runtime::UniffiBridgeInstance>, context_id: &str) {
         bi.init_context_manager_with_did("did:dht:z6MkSubscriber");
+        crate::runtime::serve_unregistered_wrapping_keys_from_test_custody(bi);
         let supervisor = bi
             .context_manager_or_error()
             .expect("supervisor must be attached")
@@ -28786,7 +28790,9 @@ mod tests {
     /// supports every required protocol method so `identity_create_with_custody`
     /// (which runs `DidDht::create`) and `scpid_sign` (which signs + exposes the
     /// public key) both work. Signatures are real, so a signed SCPID response
-    /// verifies against the exposed public key. Pseudonyms follow the §9.10.4
+    /// verifies against the exposed public key. An `HpkeP256` key is a real
+    /// P-256 key that `dh_agree` agrees with by ECDH; an Ed25519 key refuses
+    /// to agree. Pseudonyms follow the §9.10.4
     /// P-256 recipe over the identity seed and are stored nowhere; `fault`
     /// makes the host misbehave in one specific way so a test can reach each
     /// bridge rejection.
@@ -28802,6 +28808,9 @@ mod tests {
         destroy_probe: Option<DestroyProbe>,
         /// The role each key id was minted in, as `get_public_key` reports it.
         roles: std::sync::Mutex<std::collections::HashMap<String, crate::CustodyKeyRole>>,
+        /// The `HpkeP256` keys, by key id.
+        hpke_keys:
+            std::sync::Mutex<std::collections::HashMap<String, scp_crypto::p256::P256SecretKey>>,
     }
 
     /// One derivation call a host received: identity key id, context, epoch.
@@ -28849,6 +28858,18 @@ mod tests {
                 received: Arc::new(std::sync::Mutex::new(Vec::new())),
                 destroy_probe: None,
                 roles: std::sync::Mutex::new(std::collections::HashMap::new()),
+                hpke_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        /// The key id this host mints next.
+        fn next_key_id(&self) -> String {
+            if self.fault == HostFault::NonCanonicalKeypairId {
+                "007".to_owned()
+            } else {
+                self.next
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    .to_string()
             }
         }
 
@@ -28915,6 +28936,19 @@ mod tests {
             &self,
             key_id: String,
         ) -> Result<crate::CustodyPublicKey, ScpError> {
+            if let Some(sk) = self.hpke_keys.lock().expect("hpke mutex").get(&key_id) {
+                return Ok(crate::CustodyPublicKey {
+                    key_type: crate::CustodyKeyType::HpkeP256,
+                    public_key: sk.public_key().to_uncompressed().to_vec(),
+                    role: self
+                        .roles
+                        .lock()
+                        .expect("role mutex")
+                        .get(&key_id)
+                        .copied()
+                        .expect("every hpke key has a recorded role"),
+                });
+            }
             let sk = self.key_for(&key_id)?;
             let role = self
                 .roles
@@ -28939,12 +28973,13 @@ mod tests {
             }
             self.keys.lock().expect("keystore mutex").remove(&key_id);
             self.roles.lock().expect("role mutex").remove(&key_id);
+            self.hpke_keys.lock().expect("hpke mutex").remove(&key_id);
             Ok(())
         }
 
         async fn generate_keypair(
             &self,
-            _key_type: crate::CustodyKeyType,
+            key_type: crate::CustodyKeyType,
             role: crate::CustodyKeyRole,
         ) -> Result<String, ScpError> {
             use rand::RngCore;
@@ -28952,14 +28987,22 @@ mod tests {
             // distinct (a fresh `#0`, `#active`, … per identity).
             let mut seed = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut seed);
+            if matches!(key_type, crate::CustodyKeyType::HpkeP256) {
+                let sk = scp_crypto::p256::P256SecretKey::from_scalar_bytes(&seed)
+                    .expect("a uniform 32-byte draw is a valid P-256 scalar");
+                let id = self.next_key_id();
+                self.hpke_keys
+                    .lock()
+                    .expect("hpke mutex")
+                    .insert(id.clone(), sk);
+                self.roles
+                    .lock()
+                    .expect("role mutex")
+                    .insert(id.clone(), role);
+                return Ok(id);
+            }
             let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-            let id = if self.fault == HostFault::NonCanonicalKeypairId {
-                "007".to_owned()
-            } else {
-                self.next
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    .to_string()
-            };
+            let id = self.next_key_id();
             self.keys
                 .lock()
                 .expect("keystore mutex")
@@ -28973,12 +29016,26 @@ mod tests {
 
         async fn dh_agree(
             &self,
-            _key_id: String,
+            key_id: String,
             peer_public: Vec<u8>,
         ) -> Result<Vec<u8>, ScpError> {
-            // Deterministic 32-byte digest of the peer key — exercises the path
-            // without modelling real X25519 (not needed by these tests).
-            Ok(sha2::Sha256::digest(&peer_public).to_vec())
+            let hpke = self.hpke_keys.lock().expect("hpke mutex");
+            let Some(sk) = hpke.get(&key_id) else {
+                // An Ed25519 key refuses to agree; an unknown id is not found.
+                self.key_for(&key_id)?;
+                return Err(ScpError::Crypto {
+                    msg: format!("key {key_id} is not an HPKE key"),
+                    code: codes::CRYPTO_4001.to_owned(),
+                });
+            };
+            let peer =
+                scp_crypto::p256::P256PublicKey::from_uncompressed(&peer_public).map_err(|e| {
+                    ScpError::Crypto {
+                        msg: e.to_string(),
+                        code: codes::CRYPTO_4001.to_owned(),
+                    }
+                })?;
+            Ok(scp_crypto::p256::ecdh_p256(sk, &peer).to_vec())
         }
 
         async fn derive_pseudonym(

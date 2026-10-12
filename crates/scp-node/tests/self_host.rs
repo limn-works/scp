@@ -38,6 +38,7 @@ use tower::ServiceExt;
 use zeroize::Zeroizing;
 
 use scp_clock::SystemClock;
+use scp_core::context::supervisor::single_custody_source;
 use scp_dht::InMemoryDhtClient;
 use scp_identity::DidCache;
 use scp_identity::dht::DidDht;
@@ -300,6 +301,7 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
         custody: &custody,
         durable,
         persistence: persistence_over(&mls_inner),
+        wrapping_custody: single_custody_source(Arc::clone(&custody)),
         assets: &assets,
     };
 
@@ -399,6 +401,7 @@ async fn build_deployer(built: &BuiltNode, context_id: &str) -> scp_node::SelfHo
         built.key_resolver(),
         durable,
         persistence_over(&mls_inner),
+        single_custody_source(Arc::clone(&built.custody)),
     )
     .await
     .expect("deployer setup should succeed")
@@ -1013,6 +1016,7 @@ async fn deploy_embedded_and_assert_serves<S>(
             custody,
             durable,
             persistence,
+            wrapping_custody: single_custody_source(Arc::clone(custody)),
             assets: &assets,
         },
     )
@@ -1616,6 +1620,7 @@ async fn self_host_deployer_shutdown_drains_before_store_close() {
         built.key_resolver(),
         durable,
         persistence_over(&mls_inner),
+        single_custody_source(Arc::clone(&built.custody)),
     )
     .await
     .expect("deployer setup should succeed");

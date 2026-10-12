@@ -9035,6 +9035,458 @@ mod tests {
         });
     }
 
+    /// Records every payload a supervisor sends to a context.
+    #[cfg(feature = "testing")]
+    struct CapturingTransport(Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+    #[cfg(feature = "testing")]
+    #[async_trait::async_trait]
+    impl scp_core::context::builder::ContextTransportProvider for CapturingTransport {
+        fn is_connected(&self) -> bool {
+            true
+        }
+        async fn publish_context(
+            &self,
+            _context_id: &[u8; 32],
+            _params: &scp_core::context::ContextParams,
+        ) -> Result<(), scp_core::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn delete_published(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), scp_core::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn send_message(
+            &self,
+            _context_id: &[u8; 32],
+            encrypted_payload: &[u8],
+        ) -> Result<(), scp_core::context::ContextError> {
+            self.0
+                .lock()
+                .expect("capture mutex")
+                .push(encrypted_payload.to_vec());
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    const SLOW_AGREE_PY: &std::ffi::CStr = c"
+import threading, time
+from fake_custody import P256Custody, ed_expand
+
+def x25519(k, u):
+    # RFC 7748 Montgomery ladder; k is already clamped.
+    p, a24 = 2**255 - 19, 121665
+    x1 = int.from_bytes(bytes(u), 'little') & ((1 << 255) - 1)
+    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+    for t in reversed(range(255)):
+        bit = (k >> t) & 1
+        if swap ^ bit:
+            x2, x3, z2, z3 = x3, x2, z3, z2
+        swap = bit
+        a, b, c, d = x2 + z2, x2 - z2, x3 + z3, x3 - z3
+        aa, bb, da, cb = a * a % p, b * b % p, d * a % p, c * b % p
+        e = aa - bb
+        x3, z3 = (da + cb) ** 2 % p, x1 * (da - cb) ** 2 % p
+        x2, z2 = aa * bb % p, e * (aa + a24 * e) % p
+    if swap:
+        x2, z2 = x3, z3
+    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, 'little')
+
+class SlowAgreeCustody(P256Custody):
+    # Signals when an HPKE dh_agree starts, holds it for 0.2 s, then answers
+    # with the P-256 ECDH of its d = 1 key. The #active Ed25519 key agrees by
+    # real X25519, so this identity can open a Welcome.
+
+    def __init__(self):
+        super().__init__()
+        self.agree_started = threading.Event()
+
+    def dh_agree(self, key_id, peer_public):
+        if self._types.get(key_id) == 'hpke-p256':
+            self.agree_started.set()
+            time.sleep(0.2)
+        elif self._key_types.get(key_id) == 'ed25519':
+            return x25519(ed_expand(self._seed(key_id))[0], peer_public)
+        return super().dh_agree(key_id, peer_public)
+";
+
+    /// Alice's side of the two-thread test: her instance, her Python host,
+    /// and her DID.
+    #[cfg(feature = "testing")]
+    struct SlowAgreeAlice {
+        scp: crate::scp::PyScp,
+        host: Py<PyAny>,
+        did: String,
+    }
+
+    /// Alice, with every key in a [`SLOW_AGREE_PY`] host.
+    #[cfg(feature = "testing")]
+    fn slow_agree_alice() -> SlowAgreeAlice {
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        Python::with_gil(|py| {
+            crate::custody::test_fakes::fake_custody_module(py);
+            let host = PyModule::from_code(py, SLOW_AGREE_PY, c"slow_agree.py", c"slow_agree")
+                .expect("slow-agree host compiles")
+                .getattr("SlowAgreeCustody")
+                .and_then(|cls| cls.call0())
+                .expect("slow-agree host")
+                .unbind();
+            let did = scp
+                .identity_create_with_custody(py, host.clone_ref(py))
+                .expect("alice's identity over the Python host")
+                .did()
+                .to_owned();
+            SlowAgreeAlice { scp, host, did }
+        })
+    }
+
+    /// Bob creates X and adds Alice, whose join opens the Welcome through her
+    /// host; then Bob sends `hello alice`. Returns X's id, Alice's handle, and
+    /// what Bob published after creating X: the add's Commit, his
+    /// `KeyResponse` sealed to Alice's wrapping key, and his message.
+    #[cfg(feature = "testing")]
+    fn bob_adds_alice_and_sends(
+        alice: &SlowAgreeAlice,
+    ) -> (String, PyContextHandle, Vec<Vec<u8>>, crate::scp::PyScp) {
+        let bob = crate::scp::PyScp::new_in_memory_for_test();
+        // One DHT for both instances, so each resolves the other's DID.
+        crate::runtime::set_resolver_dht_client(
+            &bob.inner,
+            crate::runtime::resolver_dht_client(&alice.scp.inner).expect("alice's DHT client"),
+        );
+        let bob_did = Python::with_gil(|py| {
+            bob.identity_create(py, "in_memory", None)
+                .expect("bob's identity")
+                .did()
+                .to_owned()
+        });
+        // Built after Bob's identity, so his supervisor resolves DIDs; it
+        // sends into a capture, so the test holds the exact bytes.
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::runtime::init_context_manager_for_test_with_transport(
+            &bob.inner,
+            &bob_did,
+            Box::new(CapturingTransport(Arc::clone(&sent))),
+        );
+        let (ctx_id, alice_handle) = Python::with_gil(|py| {
+            let params = PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+            let ceiling = [
+                "messages:read",
+                "messages:write",
+                "role:assign",
+                "member:invite",
+            ];
+            let ceiling = [&ceiling[..], &["governance:propose", "governance:vote"]].concat();
+            params.set_item("ceiling", ceiling).unwrap();
+            params.set_item("governance", "single_admin").unwrap();
+            let bob_handle = bob
+                .context_create(py, &bob_did, &params)
+                .expect("bob creates X");
+            // What Bob published before Alice's epoch never reaches her.
+            sent.lock().expect("capture mutex").clear();
+            let ctx_id = bob_handle.context_id.clone();
+            let (reservation, key_package) = alice
+                .scp
+                .reserve_key_package(py, &alice.did)
+                .expect("alice reserves a KeyPackage");
+            let invite = bob
+                .invite_member(
+                    py,
+                    ctx_id.clone(),
+                    bob_did.clone(),
+                    alice.did.clone(),
+                    key_package,
+                    Vec::new(),
+                )
+                .expect("bob invites alice");
+            let alice_handle = alice
+                .scp
+                .context_join_from_welcome(py, alice.did.clone(), invite.bundle, reservation)
+                .expect("alice joins X from the Welcome");
+            // No relay carries Alice's routing announcement in this test.
+            bob.context_seed_peer_pseudonym(py, &bob_handle, &alice.did, &[0x41; 32])
+                .expect("bob learns alice's routing pseudonym");
+            let hello = pyo3::types::PyBytes::new(py, b"hello alice");
+            bob.context_send(py, &bob_handle, &bob_did, hello.as_any(), None)
+                .expect("bob sends");
+            (ctx_id, alice_handle)
+        });
+        let published = std::mem::take(&mut *sent.lock().expect("capture mutex"));
+        (ctx_id, alice_handle, published, bob)
+    }
+
+    /// Alice receives in X as a local member holding her access key. The
+    /// server wiring, which the test does not run, registers a joiner as
+    /// local; the access key arrives out of band (spec 09 §9.17.2), so the
+    /// test copies the one Bob holds for Alice, as the full-stack harness does.
+    #[cfg(feature = "testing")]
+    fn make_alice_a_receiving_member(
+        rt: &tokio::runtime::Runtime,
+        alice: &SlowAgreeAlice,
+        bob: &crate::scp::PyScp,
+        ctx_id: &str,
+    ) {
+        let alice_sup =
+            Arc::clone(crate::runtime::supervisor(&alice.scp.inner).expect("supervisor"));
+        let bob_sup = Arc::clone(crate::runtime::supervisor(&bob.inner).expect("supervisor"));
+        let (ctx_id, did) = (ctx_id.to_owned(), alice.did.clone());
+        rt.block_on(async move {
+            alice_sup
+                .register_local_did(scp_did::DID(did.clone()))
+                .await?;
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let query = scp_core::context::actor::QueriesCommand::GetAllAccessKeys {
+                context_id: ctx_id.clone(),
+                reply,
+            };
+            bob_sup.dispatch_query(query).await?;
+            let keys = rx.await.expect("bob's actor replies")?;
+            let key = keys
+                .get(&did)
+                .cloned()
+                .expect("bob holds alice's access key");
+            alice_sup.test_install_access_key(&ctx_id, &did, key).await
+        })
+        .expect("alice receives as a member of X");
+    }
+
+    /// Delivers each payload to the actor for `ctx_id` from a runtime task, as
+    /// a relay subscription would, so no host thread carries the delivery.
+    #[cfg(feature = "testing")]
+    fn deliver_from_a_runtime_task(
+        rt: &'static tokio::runtime::Runtime,
+        sup: Arc<scp_core::context::supervisor::Supervisor>,
+        ctx_id: String,
+        deliveries: Vec<Vec<u8>>,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<
+            Vec<
+                Result<
+                    scp_core::context::actor::commands::DeliverOutcome,
+                    scp_core::context::ContextError,
+                >,
+            >,
+        >,
+    ) {
+        use scp_core::context::actor::commands::MessagingCommand;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let outcomes = rt.block_on(rt.spawn(async move {
+                let mut outcomes = Vec::new();
+                for envelope_bytes in deliveries {
+                    let (reply, rx) = tokio::sync::oneshot::channel();
+                    let context_id = ctx_id.clone();
+                    let deliver = MessagingCommand::DeliverIncoming {
+                        context_id,
+                        envelope_bytes,
+                        reply,
+                    };
+                    sup.dispatch_command(&ctx_id, deliver)
+                        .await
+                        .expect("dispatch to alice's actor");
+                    outcomes.push(rx.await.expect("actor replies"));
+                }
+                outcomes
+            }));
+            let _ = tx.send(outcomes.expect("delivery task"));
+        });
+        (thread, rx)
+    }
+
+    /// Waits for `who` until `deadline`; the caller holds no GIL meanwhile.
+    #[cfg(feature = "testing")]
+    fn recv_by<T>(rx: &std::sync::mpsc::Receiver<T>, deadline: std::time::Instant, who: &str) -> T {
+        use std::sync::mpsc::RecvTimeoutError;
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(v) => v,
+            Err(RecvTimeoutError::Timeout) => panic!("{who} did not finish within 10 s"),
+            Err(RecvTimeoutError::Disconnected) => panic!("{who} panicked"),
+        }
+    }
+
+    /// Spec 09 §9.16.1 with a host custody: Alice's wrapping key lives in a
+    /// Python callback custody, so the actor turn that opens Bob's sender-key
+    /// `KeyResponse` waits on the Python `dh_agree`. While that callback runs,
+    /// a second host thread holding the GIL asks the same actor for its member
+    /// count. The count waits with the GIL released, so the callback takes the
+    /// GIL, answers, and the `KeyResponse` installs Bob's key: both threads
+    /// finish within 10 s and Bob's message opens for Alice. Were the count to
+    /// wait holding the GIL, the callback could not run and the `KeyResponse`
+    /// would fail after the 30 s custody timeout.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn python_callback_custody_answers_a_key_response_while_another_thread_waits_on_the_actor() {
+        use scp_core::context::actor::commands::DeliverOutcome;
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        let rt = crate::runtime().expect("runtime");
+        let alice = slow_agree_alice();
+        let (ctx_id, alice_handle, published, bob) = bob_adds_alice_and_sends(&alice);
+        let [commit, key_response, message]: [Vec<u8>; 3] =
+            published.try_into().unwrap_or_else(|p: Vec<Vec<u8>>| {
+                panic!(
+                    "bob publishes a Commit, a KeyResponse and a message: {}",
+                    p.len()
+                )
+            });
+        make_alice_a_receiving_member(rt, &alice, &bob, &ctx_id);
+        // The join may already have called the host; thread B must wait on
+        // the agree inside the delivery turn.
+        let agree_started = Python::with_gil(|py| {
+            let event = alice
+                .host
+                .bind(py)
+                .getattr("agree_started")
+                .expect("agree_started");
+            event.call_method0("clear").expect("reset agree_started");
+            event.unbind()
+        });
+
+        // Thread A delivers Bob's three payloads to Alice's actor.
+        let alice_sup =
+            Arc::clone(crate::runtime::supervisor(&alice.scp.inner).expect("supervisor"));
+        let deliveries = vec![commit, key_response, message];
+        let (thread_a, a_rx) = deliver_from_a_runtime_task(rt, alice_sup, ctx_id, deliveries);
+
+        // Thread B: once the callback has started, ask the same actor for its
+        // member count while holding the GIL.
+        let (b_tx, b_rx) = std::sync::mpsc::channel();
+        let b_scp = crate::scp::PyScp {
+            inner: Arc::clone(&alice.scp.inner),
+        };
+        let thread_b = std::thread::spawn(move || {
+            let count = Python::with_gil(|py| {
+                let started = agree_started
+                    .bind(py)
+                    .call_method1("wait", (10.0,))
+                    .and_then(|set| set.extract::<bool>())
+                    .expect("wait on agree_started");
+                assert!(started, "alice's actor calls the Python dh_agree");
+                b_scp.context_member_count(py, &alice_handle)
+            });
+            let _ = b_tx.send(count.map_err(|e| e.to_string()));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let count = recv_by(&b_rx, deadline, "thread B");
+        let outcomes = recv_by(&a_rx, deadline, "thread A");
+        thread_a.join().expect("thread A");
+        thread_b.join().expect("thread B");
+
+        assert_eq!(count.expect("member count"), Some(2));
+        let [commit, key_response, message]: [_; 3] =
+            outcomes.try_into().expect("three deliveries");
+        // Alice already holds the Commit's epoch through her Welcome.
+        assert!(commit.is_err(), "alice rejects the Commit she joined past");
+        assert!(
+            matches!(key_response, Ok(DeliverOutcome::Handled)),
+            "{key_response:?}"
+        );
+        // Bob's message opens only under his sender key, so it opening shows
+        // the KeyResponse installed that key. Alice never saw the message Bob
+        // sent when he created X (sequence 1), so this one (sequence 2) is
+        // held in her reorder buffer rather than surfaced.
+        assert!(
+            matches!(
+                message,
+                Ok(DeliverOutcome::Handled | DeliverOutcome::Application(_))
+            ),
+            "bob's message opens under his installed sender key: {message:?}"
+        );
+    }
+
+    /// Spec 09 §9.16.1, fail-closed restore order: after a restart, a context
+    /// whose owner's identity is not yet loaded does not restore, because the
+    /// owner's wrapping key lives in that identity's custody. `restore_context`
+    /// refuses with the `WrappingKeyCustodyUnavailable` text and
+    /// `restore_all_contexts` leaves the context out; once the identity is
+    /// registered again, `restore_all_contexts` restores it.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn restore_all_contexts_before_identity_load_fails_with_wrapping_custody_unavailable() {
+        use crate::runtime::{PyBridgeInstance, SqliteKeyMaterial, StorageConfig};
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        let rt = crate::runtime().expect("runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let open = || {
+            Arc::new(
+                PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+                    path: tmp.path().to_path_buf(),
+                    key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x6Bu8; 32])),
+                })
+                .expect("SQLCipher open must succeed"),
+            )
+        };
+
+        let first = crate::scp::PyScp { inner: open() };
+        let did = Python::with_gil(|py| {
+            first
+                .identity_create(py, "in_memory", None)
+                .expect("identity_create")
+                .did()
+                .to_owned()
+        });
+        let ctx_id = format!("restore-order-{}", uuid::Uuid::new_v4());
+        crate::runtime::init_context_manager(&first.inner, &did);
+        let sup = Arc::clone(crate::runtime::supervisor(&first.inner).expect("supervisor"));
+        rt.block_on(sup.create_context(
+            ctx_id.clone(),
+            scp_core::context::ContextParams {
+                ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
+                ..scp_core::context::ContextParams::default()
+            },
+            scp_did::DID(did.clone()),
+            None,
+        ))
+        .expect("create_context");
+        drop(sup);
+        // The identity's custody outlives the process, as a platform custody
+        // would; the next instance only learns of it when the app loads it.
+        let (_, entry) = first
+            .inner
+            .identity_registry
+            .remove(&did)
+            .expect("the creator is registered");
+        rt.block_on(first.inner.shutdown(std::time::Duration::from_secs(10)))
+            .expect("shutdown must release the store");
+        drop(first);
+
+        let reopened = crate::scp::PyScp { inner: open() };
+        crate::runtime::init_context_manager(&reopened.inner, &did);
+        let unavailable =
+            scp_core::context::ContextError::WrappingKeyCustodyUnavailable.to_string();
+        Python::with_gil(|py| {
+            let err = reopened
+                .restore_context(py, &ctx_id)
+                .expect_err("restore before the owner's identity is loaded fails closed");
+            assert!(err.to_string().contains(&unavailable), "{err}");
+            let restored = reopened
+                .restore_all_contexts(py)
+                .expect("restore_all_contexts returns the contexts it restored");
+            assert!(!restored.contains(&ctx_id), "{restored}");
+            let sup = Arc::clone(crate::runtime::supervisor(&reopened.inner).expect("supervisor"));
+            assert_eq!(
+                rt.block_on(sup.member_count(&ctx_id)),
+                None,
+                "no actor runs without the owner's wrapping key"
+            );
+
+            crate::runtime::register_identity(&reopened.inner, &did, entry);
+            let restored = reopened
+                .restore_all_contexts(py)
+                .expect("restore_all_contexts after the identity is loaded");
+            assert!(restored.contains(&ctx_id), "{restored}");
+        });
+    }
+
     /// `context_import` of an id this bridge marked released returns the id
     /// and leaves it unmarked.
     #[test]
@@ -10319,11 +10771,29 @@ class SignOnlyCustody:
             // is forced through `KeyCustody::sign`.
             let creator_identity = scp.identity_create(py, "in_memory", None).unwrap();
             let creator = creator_identity.did().to_owned();
+            let rt = crate::runtime().unwrap();
+
+            // Build the context as the creator before the swap: creation loads
+            // the creator's wrapping key from the in-memory custody, which a
+            // sign-only custody cannot hold.
+            let ctx_id = format!("export-sign-only-{}", uuid::Uuid::new_v4());
+            crate::runtime::register_context(&bi, &ctx_id, &creator, &[]).unwrap();
+            let sup = crate::runtime::supervisor(&bi).unwrap();
+            let sup = Arc::clone(sup);
+            rt.block_on(sup.create_context(
+                ctx_id.clone(),
+                scp_core::context::ContextParams {
+                    ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
+                    ..scp_core::context::ContextParams::default()
+                },
+                scp_did::DID(creator.clone()),
+                None,
+            ))
+            .unwrap();
 
             let (signer_pk, sign_only_custody, host) = install_sign_only_custody(py, &bi, &creator);
 
             // Sanity: the swapped custody REFUSES raw key export but CAN sign.
-            let rt = crate::runtime().unwrap();
             let active_handle_id = crate::runtime::with_identity(&bi, &creator, |entry| {
                 Ok(entry.identity.active_signing_key.id())
             })
@@ -10348,22 +10818,6 @@ class SignOnlyCustody:
                     .is_ok(),
                 "sign-only custody must still sign"
             );
-
-            // Build the context as the creator.
-            let ctx_id = format!("export-sign-only-{}", uuid::Uuid::new_v4());
-            crate::runtime::register_context(&bi, &ctx_id, &creator, &[]).unwrap();
-            let sup = crate::runtime::supervisor(&bi).unwrap();
-            let sup = Arc::clone(sup);
-            rt.block_on(sup.create_context(
-                ctx_id.clone(),
-                scp_core::context::ContextParams {
-                    ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
-                    ..scp_core::context::ContextParams::default()
-                },
-                scp_did::DID(creator.clone()),
-                None,
-            ))
-            .unwrap();
 
             // The export MUST succeed even though raw key export is refused —
             // proving the signature is produced via `KeyCustody::sign`.

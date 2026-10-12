@@ -57,7 +57,7 @@ use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::context::supervisor::saga_journal::{
     JournalEntry, SagaId, SagaJournal, SagaState, SagaTerminalState,
 };
-use crate::crypto::wrapping::{IdentityWrappingKey, WrappingKeyPair};
+use crate::crypto::wrapping::{IdentityWrappingKey, WrappingCustodySource};
 use crate::economy::adapter::PaymentAdapterDyn;
 use scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt;
 use serde::{Deserialize, Serialize};
@@ -1788,6 +1788,14 @@ pub struct Supervisor {
     )]
     pub(in crate::context::supervisor) wrapping_key_loads:
         DashMap<DID, Arc<tokio::sync::Mutex<()>>>,
+    /// Finds the custody that holds each identity's wrapping key. Every
+    /// constructor takes it from its caller, except the test-only ones, which
+    /// install one shared in-memory custody ([`Self::testing_wrapping_custody`]).
+    pub(in crate::context::supervisor) wrapping_custody: WrappingCustodySource,
+    /// The in-memory custody a test-only constructor installed behind
+    /// [`Self::wrapping_custody`]; empty when the caller supplied the source.
+    #[cfg(any(test, feature = "testing"))]
+    testing_wrapping_custody: OnceLock<Arc<scp_platform::testing::InMemoryKeyCustody>>,
     /// Persistence backend. [`Self::build_actor_deps`] hands it to every actor
     /// as `ActorDeps::persistence`. Every shipped constructor fills it with the
     /// caller's required backend.
@@ -2261,6 +2269,11 @@ struct ProviderBootstrap {
     event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
     clock: Option<Arc<dyn Clock>>,
     durable: DurableProviders,
+    wrapping_custody: WrappingCustodySource,
+    /// The in-memory custody behind `wrapping_custody` when the test-only
+    /// `Supervisor::with_providers` built it.
+    #[cfg(any(test, feature = "testing"))]
+    testing_wrapping_custody: Option<Arc<scp_platform::testing::InMemoryKeyCustody>>,
 }
 
 impl Supervisor {
@@ -2290,7 +2303,38 @@ impl Supervisor {
         saga_journal: Arc<dyn SagaJournal>,
         health_config: SupervisorConfig,
     ) -> Self {
-        Self::new_inner(persistence, saga_journal, health_config)
+        Self::with_in_memory_wrapping_custody(persistence, saga_journal, health_config)
+    }
+
+    /// `new_inner` over one shared in-memory wrapping custody, which
+    /// [`Self::testing_wrapping_custody`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    fn with_in_memory_wrapping_custody(
+        persistence: Arc<dyn ContextPersistence>,
+        saga_journal: Arc<dyn SagaJournal>,
+        health_config: SupervisorConfig,
+    ) -> Self {
+        let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
+        let supervisor = Self::new_inner(
+            persistence,
+            saga_journal,
+            health_config,
+            crate::crypto::wrapping::single_custody_source(Arc::clone(&custody)),
+        );
+        let _ = supervisor.testing_wrapping_custody.set(custody);
+        supervisor
+    }
+
+    /// The in-memory custody behind this supervisor's wrapping keys when a
+    /// test-only constructor chose it; `None` when the caller supplied the
+    /// source. Tests generate keys in it so the supervisor and the test share
+    /// one custody.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn testing_wrapping_custody(
+        &self,
+    ) -> Option<Arc<scp_platform::testing::InMemoryKeyCustody>> {
+        self.testing_wrapping_custody.get().cloned()
     }
 
     /// Internal constructor reachable from production builds. The public
@@ -2302,6 +2346,7 @@ impl Supervisor {
         persistence: Arc<dyn ContextPersistence>,
         saga_journal: Arc<dyn SagaJournal>,
         health_config: SupervisorConfig,
+        wrapping_custody: WrappingCustodySource,
     ) -> Self {
         // Synchronous critical section only; the guard is provably never held
         // across an `.await` (check-disjoint + insert, or remove-on-drop, are
@@ -2339,6 +2384,9 @@ impl Supervisor {
             local_dids: Arc::new(ArcSwap::new(Arc::new(HashSet::new()))),
             wrapping_keys: DashMap::new(),
             wrapping_key_loads: DashMap::new(),
+            wrapping_custody,
+            #[cfg(any(test, feature = "testing"))]
+            testing_wrapping_custody: OnceLock::new(),
             persistence,
             write_lock,
             bootstrap_spawn_lock,
@@ -2429,7 +2477,11 @@ impl Supervisor {
         let persistence: Arc<dyn ContextPersistence> =
             Arc::new(crate::context::persistence::NoOpContextPersistence);
         let saga_journal: Arc<dyn SagaJournal> = Arc::new(NoOpSagaJournal);
-        Self::new_inner(persistence, saga_journal, SupervisorConfig::default())
+        Self::with_in_memory_wrapping_custody(
+            persistence,
+            saga_journal,
+            SupervisorConfig::default(),
+        )
     }
 
     /// Test-only constructor: builds a supervisor over the given providers with
@@ -2450,7 +2502,9 @@ impl Supervisor {
     /// returns `PersistenceFailed`.
     ///
     /// The other arguments match [`Self::with_providers_and_journal`], except
-    /// that `mls_storage` arrives alone and is paired with the no-op journal.
+    /// that `mls_storage` arrives alone and is paired with the no-op journal,
+    /// and that the wrapping custody is one shared in-memory custody, which
+    /// [`Self::testing_wrapping_custody`] returns.
     #[must_use]
     #[cfg(any(test, feature = "testing"))]
     #[allow(clippy::too_many_arguments)] // mirrors the provider bootstrap of `with_providers_and_journal`
@@ -2464,6 +2518,73 @@ impl Supervisor {
         event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
         clock: Option<Arc<dyn Clock>>,
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    ) -> Arc<Self> {
+        let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
+        let wrapping_custody = crate::crypto::wrapping::single_custody_source(Arc::clone(&custody));
+        Self::with_test_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            persistence,
+            payment_adapter,
+            event_tx,
+            clock,
+            mls_storage,
+            wrapping_custody,
+            Some(custody),
+        )
+    }
+
+    /// [`Self::with_providers`] over the caller's wrapping custody source,
+    /// for a test whose supervisor custody must be a wrapper (a counting or
+    /// key-losing custody) or must outlive one supervisor (a restart).
+    /// [`Self::testing_wrapping_custody`] returns `None`.
+    #[must_use]
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(clippy::too_many_arguments)] // mirrors the provider bootstrap of `with_providers_and_journal`
+    pub fn with_providers_and_wrapping_custody(
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
+        transport: Box<dyn ContextTransportProvider>,
+        event_log: Box<dyn ContextEventLogProvider>,
+        key_resolver: KeyResolver,
+        persistence: Option<Box<dyn ContextPersistence>>,
+        payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+        clock: Option<Arc<dyn Clock>>,
+        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        wrapping_custody: WrappingCustodySource,
+    ) -> Arc<Self> {
+        Self::with_test_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            persistence,
+            payment_adapter,
+            event_tx,
+            clock,
+            mls_storage,
+            wrapping_custody,
+            None,
+        )
+    }
+
+    /// The body of the two test-only provider constructors.
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(clippy::too_many_arguments)] // mirrors the provider bootstrap of `with_providers_and_journal`
+    fn with_test_providers(
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
+        transport: Box<dyn ContextTransportProvider>,
+        event_log: Box<dyn ContextEventLogProvider>,
+        key_resolver: KeyResolver,
+        persistence: Option<Box<dyn ContextPersistence>>,
+        payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+        clock: Option<Arc<dyn Clock>>,
+        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        wrapping_custody: WrappingCustodySource,
+        testing_wrapping_custody: Option<Arc<scp_platform::testing::InMemoryKeyCustody>>,
     ) -> Arc<Self> {
         let helper_persistence: Option<Arc<dyn ContextPersistence>> = persistence.map(Arc::from);
         let persistence: Arc<dyn ContextPersistence> = helper_persistence.as_ref().map_or_else(
@@ -2481,6 +2602,8 @@ impl Supervisor {
             event_tx,
             clock,
             durable: DurableProviders::with_noop_journal(mls_storage),
+            wrapping_custody,
+            testing_wrapping_custody,
         })
     }
 
@@ -2525,6 +2648,10 @@ impl Supervisor {
     ///   [`scp_clock::SystemClock`] when `None`.
     /// * `durable` — **required** saga journal + `mls_storage` pair over one
     ///   `Storage` backend. The runtime never defaults storage.
+    /// * `wrapping_custody` — **required** source of the custody that holds
+    ///   each identity's wrapping key (spec 09 §9.16.1). An actor whose owner
+    ///   it answers `None` for is not built
+    ///   ([`ContextError::WrappingKeyCustodyUnavailable`]).
     ///
     /// A `None` persistence does not compile:
     ///
@@ -2537,11 +2664,12 @@ impl Supervisor {
     /// #     event_log: Box<dyn scp_runtime::context::builder::ContextEventLogProvider>,
     /// #     key_resolver: scp_protocol::context::governance::KeyResolver,
     /// #     durable: DurableProviders,
+    /// #     wrapping_custody: scp_runtime::context::supervisor::WrappingCustodySource,
     /// # ) {
     /// let _ = Supervisor::with_providers_and_journal(
     ///     crypto, transport, event_log, key_resolver,
     ///     None, // E0308: expected `Box<dyn ContextPersistence>`
-    ///     None, None, None, durable,
+    ///     None, None, None, durable, wrapping_custody,
     /// );
     /// # }
     /// ```
@@ -2557,6 +2685,7 @@ impl Supervisor {
         event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
         clock: Option<Arc<dyn Clock>>,
         durable: DurableProviders,
+        wrapping_custody: WrappingCustodySource,
     ) -> Arc<Self> {
         let persistence: Arc<dyn ContextPersistence> = Arc::from(persistence);
         Self::bootstrap(ProviderBootstrap {
@@ -2570,6 +2699,9 @@ impl Supervisor {
             event_tx,
             clock,
             durable,
+            wrapping_custody,
+            #[cfg(any(test, feature = "testing"))]
+            testing_wrapping_custody: None,
         })
     }
 
@@ -2577,6 +2709,8 @@ impl Supervisor {
     /// behind [`Self::with_providers_and_journal`] and the test-only
     /// `Self::with_providers`.
     fn bootstrap(providers: ProviderBootstrap) -> Arc<Self> {
+        #[cfg(any(test, feature = "testing"))]
+        let testing_wrapping_custody = providers.testing_wrapping_custody.clone();
         let ProviderBootstrap {
             crypto,
             transport,
@@ -2588,6 +2722,8 @@ impl Supervisor {
             event_tx,
             clock,
             durable,
+            wrapping_custody,
+            ..
         } = providers;
         // `into_parts` is `pub(crate)`, so this is the single in-crate site that
         // decomposes the same-backend journal + `mls_storage` pair.
@@ -2596,7 +2732,12 @@ impl Supervisor {
             persistence,
             saga_journal,
             SupervisorConfig::default(),
+            wrapping_custody,
         ));
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(custody) = testing_wrapping_custody {
+            let _ = supervisor.testing_wrapping_custody.set(custody);
+        }
 
         // Populate provider OnceLocks. Each `set(...)` fails only when the slot
         // is already populated, which is impossible on this freshly-constructed
@@ -3004,11 +3145,19 @@ impl Supervisor {
     ///
     /// # Errors
     ///
+    /// - [`ContextError::WrappingKeyCustodyUnavailable`] if the custody source
+    ///   has no custody for `owner`.
     /// - [`ContextError::NotInitialized`] if the supervisor has no storage.
-    /// - [`ContextError::PersistenceFailed`] if the read or write fails.
-    /// - [`ContextError::CryptoFailed`] if the stored value is not a valid
-    ///   record; the stored value is left as it is and no key is created over
-    ///   it.
+    /// - [`ContextError::PersistenceFailed`] if the read or write fails; a key
+    ///   generated for a record that could not be written is destroyed.
+    /// - [`ContextError::CryptoFailed`] if the stored value is not a version-1
+    ///   handle record; the stored value is left as it is and no key is created
+    ///   over it.
+    /// - [`ContextError::WrappingKeyHandleInvalid`] if custody does not hold
+    ///   the recorded handle or its public key differs from the record; nothing
+    ///   is regenerated over the record.
+    /// - [`ContextError::Custody`] if custody fails otherwise or does not
+    ///   answer within the custody budget (`SCP-CRYPTO-4061`).
     /// - [`ContextError::SupervisorShutDown`] once shutdown has begun, whether
     ///   the gate closes before the call or while it loads.
     pub(crate) async fn load_wrapping_key(
@@ -3033,8 +3182,9 @@ impl Supervisor {
         Ok(key)
     }
 
-    /// Reads `owner`'s stored wrapping key or, when none is stored, creates
-    /// one and stores it. Runs under `owner`'s load lock only.
+    /// Reads `owner`'s stored wrapping key record and checks it against
+    /// `owner`'s custody or, when none is stored, generates a key in that
+    /// custody and stores its record. Runs under `owner`'s load lock only.
     ///
     /// # Errors
     ///
@@ -3043,20 +3193,44 @@ impl Supervisor {
         &self,
         owner: &DID,
     ) -> Result<IdentityWrappingKey, ContextError> {
+        let custody =
+            (self.wrapping_custody)(owner).ok_or(ContextError::WrappingKeyCustodyUnavailable)?;
         let storage = self.mls_storage_ref().ok_or_else(|| {
             ContextError::NotInitialized(
                 crate::context::manager_methods::PROVIDER_NOT_INITIALIZED.to_owned(),
             )
         })?;
-        let stored = crate::store::wrapping_key::load_wrapping_key(storage.as_ref(), owner).await?;
-        let pair = if let Some(pair) = stored {
-            pair
-        } else {
-            let pair = WrappingKeyPair::generate();
-            crate::store::wrapping_key::store_wrapping_key(storage.as_ref(), owner, &pair).await?;
-            pair
-        };
-        Ok(IdentityWrappingKey::from_scalar(pair))
+        if let Some(record) =
+            crate::store::wrapping_key::load_wrapping_key_handle(storage.as_ref(), owner).await?
+        {
+            let key = IdentityWrappingKey::new(custody, record.handle, record.public);
+            return match key.read_public().await {
+                Ok(public) if public == record.public => Ok(key),
+                // Custody answered, and the handle is not this key: lost,
+                // destroyed, or replaced. A custody that did not answer says
+                // nothing about the handle, so its failure passes through.
+                Ok(_) | Err(ContextError::CryptoFailed(_)) => {
+                    Err(ContextError::WrappingKeyHandleInvalid)
+                }
+                Err(ContextError::Custody(failure)) if failure.is_key_not_found() => {
+                    Err(ContextError::WrappingKeyHandleInvalid)
+                }
+                Err(e) => Err(e),
+            };
+        }
+        let key = IdentityWrappingKey::generate(custody).await?;
+        if let Err(e) = crate::store::wrapping_key::store_wrapping_key_handle(
+            storage.as_ref(),
+            owner,
+            key.handle(),
+            key.public(),
+        )
+        .await
+        {
+            key.destroy().await;
+            return Err(e);
+        }
+        Ok(key)
     }
 
     /// `owner`'s loaded wrapping key: a map read with no custody or storage
@@ -3676,6 +3850,11 @@ impl Supervisor {
                 // to `lifecycle_helpers::create_context`, which spawns the
                 // per-context actor that OWNS the fresh state (no legacy
                 // `contexts` DashMap write).
+                // A wrapping-key load failure reaches the caller as the
+                // `ContextError` it is (spec 09 §9.16.1), never as a message
+                // string: a `Custody` failure keeps its custody code at the
+                // bridges, and the two wrapping-key variants keep their names.
+                let wrapping_load_failed = wrapping_load.is_err();
                 let deps_result = match wrapping_load {
                     Ok(_) => self.build_actor_deps(&p.creator_did).await,
                     Err(e) => Err(e),
@@ -3688,6 +3867,9 @@ impl Supervisor {
                         // (ADR-049 Decision 16 item 2), as the import and
                         // restore arms pass `e` through unchanged.
                         let err = match e {
+                            e if wrapping_load_failed => {
+                                scp_protocol::context::builder::ContextCreationError::StateTransition(e)
+                            }
                             ContextError::SupervisorShutDown(_) => {
                                 scp_protocol::context::builder::ContextCreationError::StateTransition(e)
                             }
@@ -17846,9 +18028,13 @@ mod tests {
         s.reap_stream_admission("never-existed");
     }
 
-    /// A supervisor whose `mls_storage` view is over `storage`, so two
-    /// supervisors built on one store model a node restart.
-    fn supervisor_over_storage(storage: Arc<InMemoryStorage>) -> Arc<Supervisor> {
+    /// A supervisor whose `mls_storage` view is over `storage` and whose
+    /// wrapping keys live in `custody`, so two supervisors built on one store
+    /// and one custody model a node restart.
+    fn supervisor_over_storage<C: scp_platform::traits::KeyCustody + 'static>(
+        storage: Arc<InMemoryStorage>,
+        custody: &Arc<C>,
+    ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestDoNotRely".to_owned(),
             Arc::new(scp_clock::SystemClock),
@@ -17857,7 +18043,7 @@ mod tests {
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(storage),
             );
-        Supervisor::with_providers(
+        Supervisor::with_providers_and_wrapping_custody(
             crypto,
             Box::new(crate::context::builder::NotConfiguredTransportProvider),
             Box::new(TestEventLog),
@@ -17867,43 +18053,184 @@ mod tests {
             None,
             None,
             mls_storage,
+            crate::crypto::wrapping::single_custody_source(Arc::clone(custody)),
         )
     }
 
-    /// The first load of an identity creates one key and stores it; later
-    /// loads return the same key; a supervisor restarted over the same store
-    /// loads that key instead of creating another (spec 09 §9.16.1: one
-    /// wrapping key per identity). Another identity gets its own key.
+    /// The raw bytes stored under `did`'s wrapping key record.
+    async fn stored_wrapping_record(sup: &Supervisor, did: &str) -> Option<Vec<u8>> {
+        sup.mls_storage_ref()
+            .unwrap()
+            .retrieve(&format!("wrapping_key/{did}"))
+            .await
+            .unwrap()
+    }
+
+    /// The public point custody reports for `handle`.
+    async fn custody_public(
+        custody: &crate::crypto::dh_counting_custody::DhCountingCustody,
+        handle: &scp_platform::KeyHandle,
+    ) -> [u8; 65] {
+        use scp_platform::traits::KeyCustody as _;
+        custody
+            .inner
+            .public_key(handle)
+            .await
+            .unwrap()
+            .as_bytes()
+            .try_into()
+            .unwrap()
+    }
+
+    /// The first load of an identity generates a P-256 key in custody and
+    /// stores only its handle and public point (spec 09 §9.16.1): the record
+    /// names the custody's handle, carries the public point custody reports
+    /// for it, and holds no field for key material. Later loads return the
+    /// same key, and another identity gets its own.
     #[tokio::test]
-    async fn load_wrapping_key_creates_once_and_reloads_after_restart() {
+    async fn load_wrapping_key_generates_a_custody_handle_and_stores_only_the_handle() {
         let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
         let alice = DID("did:example:wrap-alice".to_owned());
         let bob = DID("did:example:wrap-bob".to_owned());
 
-        let first = supervisor_over_storage(Arc::clone(&storage));
-        let key = first.load_wrapping_key(&alice).await.unwrap();
-        let public = *key.public();
-        let again = first.load_wrapping_key(&alice).await.unwrap();
+        let key = sup.load_wrapping_key(&alice).await.unwrap();
+        assert_eq!(custody.generate_calls(), 1, "one key is generated");
+        assert_eq!(*key.public(), custody_public(&custody, key.handle()).await);
+        let again = sup.load_wrapping_key(&alice).await.unwrap();
         assert!(Arc::ptr_eq(&key, &again), "one key per identity");
-        let stored = crate::store::wrapping_key::load_wrapping_key(
-            first.mls_storage_ref().unwrap().as_ref(),
+        assert_eq!(
+            custody.generate_calls(),
+            1,
+            "a second load generates nothing"
+        );
+
+        let bytes = stored_wrapping_record(&sup, &alice.0)
+            .await
+            .expect("the handle is stored before use");
+        let stored: crate::store::wrapping_key::StoredWrappingKeyHandle =
+            scp_platform::store_value::from_stored_value_bytes(&bytes).unwrap();
+        assert_eq!(stored.v, 1);
+        assert_eq!(&stored.handle, key.handle());
+        assert_eq!(stored.public.as_slice(), key.public().as_slice());
+        let record = crate::store::wrapping_key::load_wrapping_key_handle(
+            sup.mls_storage_ref().unwrap().as_ref(),
             &alice,
         )
         .await
         .unwrap()
-        .expect("the generated pair is stored before use");
-        assert_eq!(*stored.public(), public);
-        let bob_public = *first.load_wrapping_key(&bob).await.unwrap().public();
-        assert_ne!(bob_public, public, "each identity has its own pair");
+        .unwrap();
+        assert_eq!(&record.handle, key.handle());
+        assert_eq!(record.public, *key.public());
+
+        let bob_key = sup.load_wrapping_key(&bob).await.unwrap();
+        assert_ne!(
+            bob_key.handle(),
+            key.handle(),
+            "each identity has its own key"
+        );
+        assert_ne!(bob_key.public(), key.public());
+    }
+
+    /// A supervisor restarted over the same storage and the same custody
+    /// loads the stored handle: the handle and public point are unchanged and
+    /// custody generated one key across both supervisors.
+    #[tokio::test]
+    async fn load_wrapping_key_reloads_the_same_handle_after_restart() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let alice = DID("did:example:wrap-restart".to_owned());
+
+        let first = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let key = first.load_wrapping_key(&alice).await.unwrap();
+        let (handle, public) = (*key.handle(), *key.public());
+        drop(key);
+        first.shutdown_all_contexts().await;
         drop(first);
 
-        let restarted = supervisor_over_storage(storage);
+        let restarted = supervisor_over_storage(storage, &custody);
         let reloaded = restarted.load_wrapping_key(&alice).await.unwrap();
         assert_eq!(
-            *reloaded.public(),
-            public,
-            "a restart loads the stored pair, never a fresh one"
+            reloaded.handle(),
+            &handle,
+            "a restart loads the stored handle"
         );
+        assert_eq!(*reloaded.public(), public);
+        assert_eq!(
+            custody.generate_calls(),
+            1,
+            "a restart never generates a fresh key"
+        );
+    }
+
+    /// A stored record whose handle the custody does not hold fails closed
+    /// with `WrappingKeyHandleInvalid`: no key is generated over it, the record
+    /// stays as it was, and no key is loaded.
+    #[tokio::test]
+    async fn load_wrapping_key_refuses_a_record_whose_handle_the_custody_does_not_hold() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let did = DID("did:example:wrap-lost-custody".to_owned());
+        let original = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let first = supervisor_over_storage(Arc::clone(&storage), &original);
+        first.load_wrapping_key(&did).await.unwrap();
+        let before = stored_wrapping_record(&first, &did.0).await;
+        first.shutdown_all_contexts().await;
+        drop(first);
+
+        let other = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let sup = supervisor_over_storage(storage, &other);
+        let err = sup.load_wrapping_key(&did).await.unwrap_err();
+        assert!(
+            matches!(err, ContextError::WrappingKeyHandleInvalid),
+            "{err:?}"
+        );
+        assert_eq!(
+            other.generate_calls(),
+            0,
+            "no key is generated over the record"
+        );
+        assert_eq!(stored_wrapping_record(&sup, &did.0).await, before);
+        assert!(sup.wrapping_keys.get(&did).is_none());
+    }
+
+    /// A stored record whose public point differs from the point custody
+    /// reports for its handle fails closed with `WrappingKeyHandleInvalid`,
+    /// and no key is generated.
+    #[tokio::test]
+    async fn load_wrapping_key_refuses_a_record_whose_public_key_differs_from_the_record() {
+        use scp_platform::traits::KeyCustody as _;
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let did = DID("did:example:wrap-swapped".to_owned());
+        let held = custody
+            .inner
+            .generate_keypair(scp_platform::traits::KeyType::HpkeP256)
+            .await
+            .unwrap();
+        let other = custody
+            .inner
+            .generate_keypair(scp_platform::traits::KeyType::HpkeP256)
+            .await
+            .unwrap();
+        let swapped = custody_public(&custody, &other).await;
+        crate::store::wrapping_key::store_wrapping_key_handle(
+            sup.mls_storage_ref().unwrap().as_ref(),
+            &did,
+            &held,
+            &swapped,
+        )
+        .await
+        .unwrap();
+
+        let err = sup.load_wrapping_key(&did).await.unwrap_err();
+        assert!(
+            matches!(err, ContextError::WrappingKeyHandleInvalid),
+            "{err:?}"
+        );
+        assert_eq!(custody.generate_calls(), 0, "no key is generated");
+        assert!(sup.wrapping_keys.get(&did).is_none());
     }
 
     /// The `0xFF01` key the own leaf publishes in a context's persisted
@@ -18006,17 +18333,23 @@ mod tests {
         assert_eq!(key_package_wrapping_key(&kp_bytes), Some(owner));
     }
 
-    /// A stored value that is not a valid scalar fails closed with
-    /// `CryptoFailed`: no key is created over it, the stored bytes stay, and
+    /// A record in the format that stored the scalar itself fails closed with
+    /// `CryptoFailed`: no key is generated over it, the stored bytes stay, and
     /// the identity has no loaded key afterwards.
     #[tokio::test]
-    async fn load_wrapping_key_fails_closed_on_a_corrupt_stored_key() {
+    async fn load_wrapping_key_fails_closed_on_an_old_format_record() {
+        /// The record shape that held the 32-byte secret scalar.
+        #[derive(serde::Serialize)]
+        struct OldScalarRecord {
+            key: Vec<u8>,
+        }
         let storage = Arc::new(InMemoryStorage::new());
-        let sup = supervisor_over_storage(Arc::clone(&storage));
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
         let did = DID("did:example:wrap-corrupt".to_owned());
-        let bytes = scp_platform::store_value::to_stored_value_bytes(
-            &crate::store::wrapping_key::StoredWrappingSecretKey { key: vec![0u8; 32] },
-        )
+        let bytes = scp_platform::store_value::to_stored_value_bytes(&OldScalarRecord {
+            key: vec![7u8; 32],
+        })
         .unwrap();
         let adapter = sup.mls_storage_ref().unwrap();
         adapter
@@ -18026,13 +18359,10 @@ mod tests {
 
         let err = sup.load_wrapping_key(&did).await.unwrap_err();
         assert!(matches!(err, ContextError::CryptoFailed(_)), "{err:?}");
+        assert_eq!(custody.generate_calls(), 0, "no key is generated over it");
         assert!(sup.wrapping_keys.get(&did).is_none());
         assert_eq!(
-            adapter
-                .retrieve("wrapping_key/did:example:wrap-corrupt")
-                .await
-                .unwrap()
-                .as_deref(),
+            stored_wrapping_record(&sup, &did.0).await.as_deref(),
             Some(bytes.as_slice()),
             "the stored value is not overwritten"
         );
@@ -25394,6 +25724,557 @@ mod tests {
         );
     }
 
+    /// A supervisor over `crypto` whose `mls_storage` view is over `storage`
+    /// and whose wrapping keys live in `custody`.
+    fn supervisor_with_crypto_storage_and_custody<C: scp_platform::traits::KeyCustody + 'static>(
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
+        storage: &Arc<InMemoryStorage>,
+        custody: &Arc<C>,
+    ) -> Arc<Supervisor> {
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::clone(
+                    storage,
+                )),
+            );
+        Supervisor::with_providers_and_wrapping_custody(
+            crypto,
+            Box::new(crate::context::builder::NotConfiguredTransportProvider),
+            Box::new(TestEventLog),
+            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
+            None,
+            None,
+            None,
+            None,
+            mls_storage,
+            crate::crypto::wrapping::single_custody_source(Arc::clone(custody)),
+        )
+    }
+
+    /// Alice and Bob in one two-party context, with Bob's wrapping key loaded
+    /// by `bob_sup` from `storage` and `custody`, and published to Alice.
+    struct KeyResponseToBob {
+        alice_actor: crate::context::actor::PerContextState,
+        bob_actor: crate::context::actor::PerContextState,
+        bob_crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
+        bob_sup: Arc<Supervisor>,
+        bob_deps: crate::context::actor::deps::ActorDeps,
+        ctx_bytes: [u8; 32],
+    }
+
+    const KR_ALICE: &str = "did:dht:z6MkAliceKeyLossAliceKeyLossAliceKeyLos1";
+    const KR_BOB: &str = "did:dht:z6MkBobKeyLossBobKeyLossBobKeyLossBobKe1";
+
+    async fn key_response_to_bob<C: scp_platform::traits::KeyCustody + 'static>(
+        ctx_str: &str,
+        storage: &Arc<InMemoryStorage>,
+        custody: &Arc<C>,
+    ) -> KeyResponseToBob {
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_state: mut alice_actor,
+            bob_provider: bob_crypto,
+            bob_state: bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(
+            ctx_str, KR_ALICE, KR_BOB,
+        );
+        let bob_sup =
+            supervisor_with_crypto_storage_and_custody(Arc::clone(&bob_crypto), storage, custody);
+        let bob_key = bob_sup
+            .load_wrapping_key(&DID::from(KR_BOB))
+            .await
+            .expect("bob's wrapping key loads from custody");
+        let bob_deps = bob_sup
+            .build_actor_deps(&DID::from(KR_BOB))
+            .await
+            .expect("build bob's actor deps over his loaded key");
+        alice_actor
+            .mode
+            .crypto_mut()
+            .expect("encrypted context")
+            .member_wrapping_keys
+            .insert(
+                KR_BOB.to_owned(),
+                scp_protocol::crypto::hpke::p256::P256Point::try_from(*bob_key.public()).unwrap(),
+            );
+        KeyResponseToBob {
+            alice_actor,
+            bob_actor,
+            bob_crypto,
+            bob_sup,
+            bob_deps,
+            ctx_bytes,
+        }
+    }
+
+    /// Alice rotates and MLS-wraps the KeyResponse that seals her new sender
+    /// key to Bob; returns it with the rotated epoch.
+    fn alice_rotates_for_bob(
+        alice_actor: &mut crate::context::actor::PerContextState,
+        ctx_str: &str,
+    ) -> (Vec<u8>, u64) {
+        alice_actor.rotate_sender_key(KR_ALICE).unwrap();
+        let epoch = alice_actor.local_sender_key_epoch();
+        let msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
+        assert_eq!(msgs.len(), 1, "one KeyResponse for Bob");
+        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
+        let sealed = alice_actor
+            .mode
+            .crypto_mut()
+            .expect("encrypted context")
+            .mls_encrypt_management(&msgs[0].1, &routing_id, 3600)
+            .expect("alice MLS-wraps the KeyResponse");
+        (sealed, epoch)
+    }
+
+    /// Spec 09 §9.16.1: when custody cannot agree with Bob's wrapping key, the
+    /// KeyResponse fails closed with `ContextError::Custody`: no sender key is
+    /// installed (Alice's message at the rotated epoch does not open) and the
+    /// registry's sender-epoch floor is unchanged.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn key_response_fails_closed_when_custody_cannot_agree() {
+        let ctx_str = "e2e-key-response-custody-cannot-agree";
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(crate::crypto::key_loss_custody::KeyLossCustody::new(
+            crate::crypto::key_loss_custody::KeyLoss::OnDhAgree,
+        ));
+        let KeyResponseToBob {
+            mut alice_actor,
+            mut bob_actor,
+            bob_sup,
+            bob_deps,
+            ctx_bytes,
+            ..
+        } = key_response_to_bob(ctx_str, &storage, &custody).await;
+        let floors_before = bob_sup.export_sender_key_epochs(&ctx_bytes);
+
+        let (sealed, rotated_epoch) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
+        let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
+        let err = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &sealed,
+        )
+        .await
+        .expect_err("a KeyResponse custody cannot open fails closed");
+        assert!(matches!(err, ContextError::Custody(_)), "{err:?}");
+        assert_eq!(
+            bob_sup.export_sender_key_epochs(&ctx_bytes),
+            floors_before,
+            "the sender-epoch floor is unchanged"
+        );
+
+        let app = alice_seals_content(
+            &mut alice_actor,
+            ctx_str,
+            KR_ALICE,
+            rotated_epoch,
+            b"after-refused-key-response",
+        );
+        let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &app,
+        )
+        .await;
+        assert!(
+            !matches!(opened, Ok(Some(_))),
+            "no rotated sender key was installed: {opened:?}"
+        );
+    }
+
+    /// Spec 09 §9.16.1: custody that loses Bob's wrapping key after agreeing
+    /// lets that KeyResponse open and install, because no custody call follows
+    /// the agree. The next KeyResponse fails closed with `Custody`, and a
+    /// supervisor rebuilt over the same storage and custody reports
+    /// `WrappingKeyHandleInvalid` from its first load.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn key_response_opens_then_a_reload_reports_the_wrapping_handle_invalid() {
+        let ctx_str = "e2e-key-response-then-handle-invalid";
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(crate::crypto::key_loss_custody::KeyLossCustody::new(
+            crate::crypto::key_loss_custody::KeyLoss::AfterDhAgree,
+        ));
+        let KeyResponseToBob {
+            mut alice_actor,
+            mut bob_actor,
+            bob_crypto,
+            bob_sup,
+            bob_deps,
+            ctx_bytes,
+        } = key_response_to_bob(ctx_str, &storage, &custody).await;
+
+        let (sealed, rotated_epoch) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
+        let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
+        crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &sealed,
+        )
+        .await
+        .expect("the KeyResponse opens before the key is lost");
+        let app = alice_seals_content(
+            &mut alice_actor,
+            ctx_str,
+            KR_ALICE,
+            rotated_epoch,
+            b"after-key-response",
+        );
+        let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &app,
+        )
+        .await
+        .expect("the installed sender key opens alice's message")
+        .expect("an Application envelope surfaces");
+        assert_eq!(opened.receive_floor.epoch, rotated_epoch);
+
+        let (second, _) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
+        let err = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &second,
+        )
+        .await
+        .expect_err("the lost key cannot open the next KeyResponse");
+        assert!(matches!(err, ContextError::Custody(_)), "{err:?}");
+
+        drop(bob_deps);
+        bob_sup.shutdown_all_contexts().await;
+        drop(bob_sup);
+        let rebuilt = supervisor_with_crypto_storage_and_custody(bob_crypto, &storage, &custody);
+        let err = rebuilt
+            .load_wrapping_key(&DID::from(KR_BOB))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ContextError::WrappingKeyHandleInvalid),
+            "{err:?}"
+        );
+    }
+
+    /// A supervisor with a clock and `persistence` whose wrapping keys come
+    /// from `wrapping_custody`.
+    fn supervisor_with_persistence_and_custody_source(
+        persistence: Box<dyn ContextPersistence>,
+        wrapping_custody: WrappingCustodySource,
+    ) -> Arc<Supervisor> {
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+            "did:dht:z6MktestDoNotRely".to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        ));
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        Supervisor::with_providers_and_wrapping_custody(
+            crypto,
+            Box::new(crate::context::builder::NotConfiguredTransportProvider),
+            Box::new(TestEventLog),
+            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
+            Some(persistence),
+            None,
+            None,
+            Some(Arc::new(TestClock::new(1_700_000_000))),
+            mls_storage,
+            wrapping_custody,
+        )
+    }
+
+    /// Spec 09 §9.16.1: with no custody registered for the owner's wrapping
+    /// key, CreateContext fails closed with `WrappingKeyCustodyUnavailable`
+    /// and registers no actor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_context_fails_closed_without_the_owners_wrapping_custody() {
+        let none: WrappingCustodySource = Arc::new(|_: &DID| None);
+        let sup = supervisor_with_persistence_and_custody_source(
+            Box::new(MapPersistence::default()),
+            none,
+        );
+        let identity = sup.node_identity().unwrap();
+        let ctx = hex::encode([0xC5u8; 32]);
+        let err = sup
+            .create_context(
+                ctx.clone(),
+                scp_protocol::context::ContextParams {
+                    ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                    ..Default::default()
+                },
+                identity,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                scp_protocol::context::builder::ContextCreationError::StateTransition(
+                    ContextError::WrappingKeyCustodyUnavailable
+                )
+            ),
+            "{err:?}"
+        );
+        assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+        assert!(sup.wrapping_keys.is_empty(), "no key is loaded");
+    }
+
+    /// In-memory custody that, on every wrapping-key call, tries the
+    /// supervisor's `write_lock` and `bootstrap_spawn_lock` and records each
+    /// one it finds held: a host custody call may wait on a prompt, so no
+    /// such call may run while either lock is held.
+    struct LockCheckingCustody {
+        inner: scp_platform::testing::InMemoryKeyCustody,
+        supervisor: std::sync::OnceLock<std::sync::Weak<Supervisor>>,
+        calls: std::sync::atomic::AtomicUsize,
+        held: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl LockCheckingCustody {
+        fn new() -> Self {
+            Self {
+                inner: scp_platform::testing::InMemoryKeyCustody::new(),
+                supervisor: std::sync::OnceLock::new(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                held: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn check(&self, call: &str) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let Some(sup) = self.supervisor.get().and_then(std::sync::Weak::upgrade) else {
+                return;
+            };
+            let under_write = sup.write_lock.try_lock().is_err();
+            let under_spawn = sup.bootstrap_spawn_lock.try_lock().is_err();
+            let found = [
+                under_write.then(|| format!("{call} under write_lock")),
+                under_spawn.then(|| format!("{call} under bootstrap_spawn_lock")),
+            ];
+            self.held
+                .lock()
+                .unwrap()
+                .extend(found.into_iter().flatten());
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl scp_platform::traits::KeyCustody for LockCheckingCustody {
+        async fn generate_keypair(
+            &self,
+            key_type: scp_platform::traits::KeyType,
+        ) -> Result<scp_platform::KeyHandle, scp_platform::PlatformError> {
+            self.check("generate_keypair");
+            self.inner.generate_keypair(key_type).await
+        }
+
+        async fn generate_identity_keypair(
+            &self,
+        ) -> Result<scp_platform::KeyHandle, scp_platform::PlatformError> {
+            self.inner.generate_identity_keypair().await
+        }
+
+        async fn sign(
+            &self,
+            key: &scp_platform::KeyHandle,
+            data: &[u8],
+        ) -> Result<scp_platform::traits::Signature, scp_platform::PlatformError> {
+            self.inner.sign(key, data).await
+        }
+
+        async fn public_key(
+            &self,
+            key: &scp_platform::KeyHandle,
+        ) -> Result<scp_platform::traits::PublicKey, scp_platform::PlatformError> {
+            self.check("public_key");
+            self.inner.public_key(key).await
+        }
+
+        async fn destroy_key(
+            &self,
+            key: &scp_platform::KeyHandle,
+        ) -> Result<(), scp_platform::PlatformError> {
+            self.inner.destroy_key(key).await
+        }
+
+        async fn dh_agree(
+            &self,
+            key: &scp_platform::KeyHandle,
+            peer_public: &[u8],
+        ) -> Result<scp_platform::traits::SharedSecret, scp_platform::PlatformError> {
+            self.check("dh_agree");
+            self.inner.dh_agree(key, peer_public).await
+        }
+
+        async fn derive_pseudonym(
+            &self,
+            key: &scp_platform::KeyHandle,
+            context_id: &[u8],
+        ) -> Result<scp_platform::traits::Pseudonym, scp_platform::PlatformError> {
+            self.inner.derive_pseudonym(key, context_id).await
+        }
+
+        async fn derive_rotatable_pseudonym(
+            &self,
+            key: &scp_platform::KeyHandle,
+            context_id: &[u8],
+            pseudonym_epoch: u64,
+        ) -> Result<scp_platform::traits::Pseudonym, scp_platform::PlatformError> {
+            self.inner
+                .derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
+                .await
+        }
+
+        async fn ed25519_to_x25519_agree(
+            &self,
+            ed25519_handle: &scp_platform::KeyHandle,
+            peer_x25519_public: &[u8; 32],
+        ) -> Result<scp_platform::traits::SharedSecret, scp_platform::PlatformError> {
+            self.inner
+                .ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
+                .await
+        }
+
+        fn custody_type(&self, key: &scp_platform::KeyHandle) -> scp_platform::traits::CustodyType {
+            self.inner.custody_type(key)
+        }
+    }
+
+    /// A supervisor whose wrapping custody is a [`LockCheckingCustody`] bound
+    /// to it.
+    fn lock_checking_supervisor() -> (Arc<Supervisor>, Arc<LockCheckingCustody>) {
+        let custody = Arc::new(LockCheckingCustody::new());
+        let sup = supervisor_with_persistence_and_custody_source(
+            Box::new(MapPersistence::default()),
+            crate::crypto::wrapping::single_custody_source(Arc::clone(&custody)),
+        );
+        custody
+            .supervisor
+            .set(Arc::downgrade(&sup))
+            .unwrap_or_else(|_| unreachable!("set once"));
+        (sup, custody)
+    }
+
+    /// Runs `driver`, then asserts it made at least one wrapping custody call
+    /// and returns its result.
+    async fn assert_custody_called<T>(
+        custody: &LockCheckingCustody,
+        driver: &str,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        let before = custody.calls();
+        let out = fut.await;
+        assert!(
+            custody.calls() > before,
+            "{driver} must reach wrapping custody for this test to check it"
+        );
+        out
+    }
+
+    /// Spec 09 §9.16.1 and ADR-049: a host custody call may wait on a user
+    /// prompt, so no wrapping custody call runs under `write_lock` or
+    /// `bootstrap_spawn_lock`. Each driver below starts with no key loaded, so
+    /// it reaches custody: CreateContext, Restore, Import, `standing_context`
+    /// and `reserve_key_package`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_wrapping_custody_call_runs_under_write_lock_or_bootstrap_spawn_lock() {
+        use ed25519_dalek::Signer as _;
+        let (sup, custody) = lock_checking_supervisor();
+        // Control: a call made while `write_lock` is held is recorded.
+        {
+            let _guard = sup.write_lock.lock().await;
+            custody.check("control");
+        }
+        assert_eq!(
+            std::mem::take(&mut *custody.held.lock().unwrap()),
+            vec!["control under write_lock".to_owned()],
+            "the custody detects a held lock"
+        );
+        let identity = sup.node_identity().unwrap();
+        let params = scp_protocol::context::ContextParams {
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..Default::default()
+        };
+
+        let ctx = hex::encode([0xD1u8; 32]);
+        let handle = assert_custody_called(
+            &custody,
+            "CreateContext",
+            sup.create_context(ctx.clone(), params.clone(), identity.clone(), None),
+        )
+        .await
+        .unwrap();
+
+        assert!(sup.despawn_actor(&ctx).await);
+        sup.wrapping_keys.clear();
+        assert_custody_called(&custody, "Restore", sup.restore_context(&ctx, &handle))
+            .await
+            .unwrap();
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let export = sup
+            .export_context(&ctx, identity.clone(), |hash: &[u8; 32]| {
+                Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
+            })
+            .await
+            .unwrap();
+        let (importer, importer_custody) = lock_checking_supervisor();
+        assert_custody_called(
+            &importer_custody,
+            "Import",
+            Box::pin(importer.import_context(export, &signing_key.verifying_key(), None)),
+        )
+        .await
+        .unwrap();
+
+        sup.wrapping_keys.clear();
+        let peer = DID("did:example:lock-discipline-peer".to_owned());
+        assert_custody_called(
+            &custody,
+            "standing_context",
+            sup.standing_context(&identity, &peer),
+        )
+        .await
+        .unwrap();
+
+        let fresh = DID("did:dht:z6MkLockDisciplineKpOwner".to_owned());
+        assert_custody_called(
+            &custody,
+            "reserve_key_package",
+            sup.reserve_key_package(fresh),
+        )
+        .await
+        .unwrap();
+
+        let held: Vec<String> = custody
+            .held
+            .lock()
+            .unwrap()
+            .iter()
+            .chain(importer_custody.held.lock().unwrap().iter())
+            .cloned()
+            .collect();
+        assert!(held.is_empty(), "custody calls ran under a lock: {held:?}");
+    }
+
     /// With no wrapping key loaded for an owner, building its actor deps and
     /// resolving its KeyPackage store fail closed with `InvalidState` and
     /// load nothing; once shutdown begins, the same lookup reports
@@ -30108,6 +30989,7 @@ mod tests {
         journal: Arc<dyn SagaJournal>,
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
         persistence: Box<dyn ContextPersistence>,
+        wrapping_custody: WrappingCustodySource,
     ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestXctxFaultJournal".to_owned(),
@@ -30135,6 +31017,7 @@ mod tests {
             None,
             None,
             crate::context::supervisor::DurableProviders::for_test(journal, mls_storage),
+            wrapping_custody,
         )
     }
 
@@ -30194,6 +31077,9 @@ mod tests {
             journal,
             mls_storage,
             Box::new(persistence),
+            crate::crypto::wrapping::single_custody_source(Arc::new(
+                scp_platform::testing::InMemoryKeyCustody::new(),
+            )),
         );
         let caller_state = xctx_caller_state(caller_did, creator_did);
         let target_state = xctx_target_state(caller_did, creator_did);
@@ -30422,6 +31308,7 @@ mod tests {
         CapturingPersistence,
         Arc<std::sync::atomic::AtomicUsize>,
         Result<SagaOutput, SagaError>,
+        WrappingCustodySource,
     ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -30443,12 +31330,19 @@ mod tests {
                     &mls_inner,
                 )),
             );
+        // The wrapping keys' custody outlives supervisor #1, as the host's
+        // custody outlives a process restart.
+        let wrapping_custody: WrappingCustodySource =
+            crate::crypto::wrapping::single_custody_source(Arc::new(
+                scp_platform::testing::InMemoryKeyCustody::new(),
+            ));
         let supervisor = xctx_supervisor_with_journal(
             creator_did.clone(),
             creator_key,
             journal,
             mls_storage,
             Box::new(persistence.clone()),
+            Arc::clone(&wrapping_custody),
         );
         let caller_did = "did:dht:z6MkXctxOkArmCaller";
         let caller_state = xctx_caller_state(caller_did, &creator_did);
@@ -30485,7 +31379,14 @@ mod tests {
         // snapshots) survives — exactly what a process restart leaves behind.
         drop(supervisor);
 
-        (journal_storage, mls_inner, persistence, calls, result)
+        (
+            journal_storage,
+            mls_inner,
+            persistence,
+            calls,
+            result,
+            wrapping_custody,
+        )
     }
 
     /// LIVE Ok-arm coverage (spec §6.2.4): after a FULLY successful dual-commit
@@ -30499,7 +31400,7 @@ mod tests {
     async fn xctx_saga_ok_arm_mark_resolved_fault_is_needs_repair_not_aborted() {
         use std::sync::atomic::Ordering;
 
-        let (journal_storage, _mls_inner, _persistence, calls, result) =
+        let (journal_storage, _mls_inner, _persistence, calls, result, _wrapping_custody) =
             Box::pin(drive_xctx_mark_resolved_committed_fault()).await;
 
         let err = result.expect_err(
@@ -30550,7 +31451,7 @@ mod tests {
     async fn xctx_saga_committing_self_heals_to_committed_on_reopen() {
         use std::sync::atomic::Ordering;
 
-        let (journal_storage, mls_inner, persistence, calls, result) =
+        let (journal_storage, mls_inner, persistence, calls, result, wrapping_custody) =
             Box::pin(drive_xctx_mark_resolved_committed_fault()).await;
         assert!(
             matches!(result, Err(SagaError::NeedsRepair { .. })),
@@ -30599,6 +31500,7 @@ mod tests {
             Arc::clone(&journal),
             mls_storage,
             Box::new(persistence.clone()),
+            wrapping_custody,
         );
 
         // Restore-then-replay: restores both actors (resident, carrying their
@@ -32353,6 +33255,9 @@ mod tests {
                 Arc::clone(&journal),
                 mls_storage,
             ),
+            crate::crypto::wrapping::single_custody_source(Arc::new(
+                scp_platform::testing::InMemoryKeyCustody::new(),
+            )),
         );
         (supervisor, journal)
     }
@@ -33432,6 +34337,9 @@ mod tests {
             None,
             None,
             crate::context::supervisor::DurableProviders::for_test(journal, mls_storage),
+            crate::crypto::wrapping::single_custody_source(Arc::new(
+                scp_platform::testing::InMemoryKeyCustody::new(),
+            )),
         );
         let caller_did = "did:dht:z6MkXctxWave8Caller";
         let caller_state = xctx_caller_state(caller_did, &creator_did);
@@ -33672,6 +34580,9 @@ mod tests {
             None,
             None,
             crate::context::supervisor::DurableProviders::for_test(journal, mls_storage),
+            crate::crypto::wrapping::single_custody_source(Arc::new(
+                scp_platform::testing::InMemoryKeyCustody::new(),
+            )),
         );
         (supervisor, persistence)
     }
@@ -37033,6 +37944,9 @@ mod streaming_saga_tests {
             None,
             Some(clock),
             DurableProviders::for_test(journal, mls_storage),
+            crate::crypto::wrapping::single_custody_source(Arc::new(
+                scp_platform::testing::InMemoryKeyCustody::new(),
+            )),
         )
     }
 

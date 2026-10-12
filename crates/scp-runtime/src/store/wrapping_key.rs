@@ -1,35 +1,37 @@
-//! Durable storage of an identity's DHKEM(P-256) wrapping keypair.
+//! Durable record of an identity's DHKEM(P-256) wrapping key handle.
 //!
-//! One keypair per identity (spec 09 §9.16.1), stored under the key from
-//! spec 17 §17.3:
+//! One wrapping key per identity (spec 09 §9.16.1). The private key lives in
+//! the identity's `KeyCustody`; this record holds only the custody's opaque
+//! handle and the 65-byte public point, under the key from spec 17 §17.3:
 //!
 //! ```text
 //! wrapping_key/{did}
 //! ```
 //!
-//! The supervisor is the only reader and writer: it loads the pair when an
-//! identity's first actor is built and, when none is stored, generates one and
-//! stores it once. The functions take the supervisor's storage view
-//! ([`OpenMlsStorageAdapter`]), which is the same `Storage` handle the rest of
-//! the node persists through, and encode the value with the shared
-//! [`scp_platform::store_value`] envelope, so the bytes match what
+//! The supervisor is the only reader and writer: it reads the record when an
+//! identity's first actor is built and, when none is stored, generates a key
+//! in custody and stores its record once. The functions take the supervisor's
+//! storage view ([`OpenMlsStorageAdapter`]), which is the same `Storage`
+//! handle the rest of the node persists through, and encode the value with the
+//! shared [`scp_platform::store_value`] envelope, so the bytes match what
 //! `ProtocolRepository` writes for any other key.
 //!
-//! Only the 32-byte scalar is stored, in one write; the public point is
-//! derived on load by [`WrappingKeyPair::from_secret`]. A store therefore
-//! cannot be torn between two halves, and a loaded pair cannot disagree with
-//! itself. A stored value that is not a scalar in `[1, n − 1]` fails the load
-//! with [`ContextError::CryptoFailed`]; nothing is regenerated over it.
+//! The record is written in one store. A record whose version is not
+//! [`RECORD_VERSION`], whose public point is not 65 bytes, or that is not a
+//! record at all (an old 32-byte scalar) fails the load with
+//! [`ContextError::CryptoFailed`]; nothing is regenerated over it.
 
 use scp_did::DID;
+use scp_platform::traits::KeyHandle;
 use scp_protocol::context::ContextError;
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
-use crate::crypto::wrapping::WrappingKeyPair;
 
-/// Builds the storage key for an identity's wrapping scalar.
+/// The only record version this build reads and writes.
+const RECORD_VERSION: u8 = 1;
+
+/// Builds the storage key for an identity's wrapping key record.
 ///
 /// Format: `wrapping_key/{did}`
 fn wrapping_key_path(did: &DID) -> Result<String, ContextError> {
@@ -38,92 +40,106 @@ fn wrapping_key_path(did: &DID) -> Result<String, ContextError> {
     Ok(format!("wrapping_key/{d}"))
 }
 
-/// Stored wrapping secret key (32-byte P-256 scalar).
-///
-/// Implements `Zeroize` and `Drop` for defense-in-depth key material cleanup.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
-pub struct StoredWrappingSecretKey {
-    /// Raw 32-byte P-256 scalar.
+/// The stored wrapping key: the custody handle of the private key and its
+/// 65-byte uncompressed public point. It carries no key material and no
+/// identity; the storage key names the identity.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StoredWrappingKeyHandle {
+    /// The record version, [`RECORD_VERSION`].
+    pub v: u8,
+    /// The custody handle of the private key.
+    pub handle: KeyHandle,
+    /// The 65-byte uncompressed public point.
     #[serde(with = "serde_bytes")]
-    pub key: Vec<u8>,
+    pub public: Vec<u8>,
 }
 
-impl Drop for StoredWrappingSecretKey {
-    fn drop(&mut self) {
-        self.key.zeroize();
-    }
+/// A loaded wrapping key record whose shape has been checked. `Debug` prints
+/// only the public point; the handle stays out of logs.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct WrappingKeyRecord {
+    /// The custody handle of the private key.
+    pub handle: KeyHandle,
+    /// The 65-byte uncompressed public point.
+    pub public: [u8; 65],
 }
 
-impl std::fmt::Debug for StoredWrappingSecretKey {
+impl std::fmt::Debug for WrappingKeyRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StoredWrappingSecretKey")
-            .field("key", &"[REDACTED]")
-            .finish()
+        f.debug_struct("WrappingKeyRecord")
+            .field("public", &hex::encode(self.public))
+            .finish_non_exhaustive()
     }
 }
 
-/// Stores `pair`'s scalar as the wrapping key of `did`, replacing any stored
-/// one. The serialized buffer is zeroized after the write.
+/// Stores `handle` and `public` as the wrapping key record of `did`,
+/// replacing any stored one.
 ///
 /// # Errors
 ///
 /// [`ContextError::PersistenceFailed`] if `did` is not a valid key component,
 /// or if serialization or the storage write fails.
-pub(crate) async fn store_wrapping_key(
+pub(crate) async fn store_wrapping_key_handle(
     storage: &dyn OpenMlsStorageAdapter,
     did: &DID,
-    pair: &WrappingKeyPair,
+    handle: &KeyHandle,
+    public: &[u8; 65],
 ) -> Result<(), ContextError> {
     let path = wrapping_key_path(did)?;
-    let value = StoredWrappingSecretKey {
-        key: pair.secret().to_vec(),
+    let value = StoredWrappingKeyHandle {
+        v: RECORD_VERSION,
+        handle: *handle,
+        public: public.to_vec(),
     };
-    let mut bytes = scp_platform::store_value::to_stored_value_bytes(&value)
+    let bytes = scp_platform::store_value::to_stored_value_bytes(&value)
         .map_err(|e| ContextError::PersistenceFailed(format!("wrapping key encode: {e}")))?;
-    let result = storage
+    storage
         .store(&path, &bytes)
         .await
-        .map_err(|e| ContextError::PersistenceFailed(format!("wrapping key write: {e}")));
-    bytes.zeroize();
-    result
+        .map_err(|e| ContextError::PersistenceFailed(format!("wrapping key write: {e}")))
 }
 
-/// Loads the wrapping keypair of `did`, deriving its public point from the
-/// stored scalar. Returns `None` if none is stored.
+/// Loads the wrapping key record of `did`. Returns `None` if none is stored.
 ///
 /// # Errors
 ///
-/// - [`ContextError::PersistenceFailed`] if the storage read fails or the
-///   stored bytes are not a well-formed envelope.
-/// - [`ContextError::CryptoFailed`] if the stored value is not a 32-byte
-///   P-256 scalar in `[1, n − 1]`.
-pub(crate) async fn load_wrapping_key(
+/// - [`ContextError::PersistenceFailed`] if `did` is not a valid key
+///   component or the storage read fails.
+/// - [`ContextError::CryptoFailed`] if the stored bytes are not a version-1
+///   record with a 65-byte public point, including bytes that are no record
+///   at all and the old 32-byte scalar record.
+pub(crate) async fn load_wrapping_key_handle(
     storage: &dyn OpenMlsStorageAdapter,
     did: &DID,
-) -> Result<Option<WrappingKeyPair>, ContextError> {
+) -> Result<Option<WrappingKeyRecord>, ContextError> {
     let path = wrapping_key_path(did)?;
-    let Some(mut bytes) = storage
+    let Some(bytes) = storage
         .retrieve(&path)
         .await
         .map_err(|e| ContextError::PersistenceFailed(format!("wrapping key read: {e}")))?
     else {
         return Ok(None);
     };
-    let decoded: Result<StoredWrappingSecretKey, _> =
-        scp_platform::store_value::from_stored_value_bytes(&bytes);
-    bytes.zeroize();
-    let stored = decoded
-        .map_err(|e| ContextError::PersistenceFailed(format!("wrapping key decode: {e}")))?;
-    let secret: Zeroizing<[u8; 32]> =
-        Zeroizing::new(stored.key.as_slice().try_into().map_err(|_| {
-            ContextError::CryptoFailed(format!(
-                "stored wrapping secret key must be 32 bytes, got {}",
-                stored.key.len()
-            ))
-        })?);
-    WrappingKeyPair::from_secret(secret)
-        .map(Some)
-        .map_err(|e| ContextError::CryptoFailed(format!("stored wrapping secret key: {e}")))
+    let stored: StoredWrappingKeyHandle =
+        scp_platform::store_value::from_stored_value_bytes(&bytes).map_err(|e| {
+            ContextError::CryptoFailed(format!("stored wrapping key is not a handle record: {e}"))
+        })?;
+    if stored.v != RECORD_VERSION {
+        return Err(ContextError::CryptoFailed(format!(
+            "stored wrapping key record version {} is not {RECORD_VERSION}",
+            stored.v
+        )));
+    }
+    let public: [u8; 65] = stored.public.as_slice().try_into().map_err(|_| {
+        ContextError::CryptoFailed(format!(
+            "stored wrapping public key must be 65 bytes, got {}",
+            stored.public.len()
+        ))
+    })?;
+    Ok(Some(WrappingKeyRecord {
+        handle: stored.handle,
+        public,
+    }))
 }
 
 #[cfg(test)]
@@ -132,6 +148,7 @@ mod tests {
     use std::sync::Arc;
 
     use scp_platform::in_memory::InMemoryStorage;
+    use scp_platform::traits::Storage as _;
 
     use super::*;
     use crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter;
@@ -144,71 +161,132 @@ mod tests {
         DID(s.to_owned())
     }
 
-    async fn write_raw(storage: &dyn OpenMlsStorageAdapter, d: &DID, key: Vec<u8>) {
-        let bytes =
-            scp_platform::store_value::to_stored_value_bytes(&StoredWrappingSecretKey { key })
-                .unwrap();
+    fn public(fill: u8) -> [u8; 65] {
+        let mut p = [fill; 65];
+        p[0] = 0x04;
+        p
+    }
+
+    async fn write_raw<T: Serialize + Sync>(
+        storage: &dyn OpenMlsStorageAdapter,
+        d: &DID,
+        value: &T,
+    ) {
+        let bytes = scp_platform::store_value::to_stored_value_bytes(value).unwrap();
         storage
             .store(&wrapping_key_path(d).unwrap(), &bytes)
             .await
             .unwrap();
     }
 
-    /// A stored pair loads back with the same scalar and the same point, and
-    /// the store wrote exactly one entry: the scalar under `wrapping_key/{did}`,
-    /// in the shared `StoredValue` envelope.
+    /// A stored record loads back with the same handle and public point, and
+    /// the store wrote exactly one entry: the version-1 handle record under
+    /// `wrapping_key/{did}`, in the shared `StoredValue` envelope, with no
+    /// key material in it.
     #[tokio::test]
-    async fn store_and_load_round_trips_through_one_scalar_entry() {
+    async fn store_and_load_round_trips_through_one_handle_entry() {
         let storage = adapter();
         let alice = did("did:dht:alice");
-        let pair = WrappingKeyPair::generate();
+        let handle = KeyHandle::new(7);
 
-        store_wrapping_key(&storage, &alice, &pair).await.unwrap();
+        store_wrapping_key_handle(&storage, &alice, &handle, &public(0x11))
+            .await
+            .unwrap();
 
-        let loaded = load_wrapping_key(&storage, &alice).await.unwrap().unwrap();
-        assert_eq!(loaded.public(), pair.public());
-        assert_eq!(**loaded.secret(), **pair.secret());
+        let loaded = load_wrapping_key_handle(&storage, &alice)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded,
+            WrappingKeyRecord {
+                handle,
+                public: public(0x11)
+            }
+        );
 
         let path = wrapping_key_path(&alice).unwrap();
         assert_eq!(path, "wrapping_key/did:dht:alice");
         let raw = storage.retrieve(&path).await.unwrap().unwrap();
-        let stored: StoredWrappingSecretKey =
+        let stored: StoredWrappingKeyHandle =
             scp_platform::store_value::from_stored_value_bytes(&raw).unwrap();
-        assert_eq!(stored.key.as_slice(), pair.secret().as_slice());
+        assert!(
+            stored
+                == StoredWrappingKeyHandle {
+                    v: RECORD_VERSION,
+                    handle,
+                    public: public(0x11).to_vec(),
+                }
+        );
+        let entries = storage.inner().list_keys("").await.unwrap();
+        assert_eq!(entries, vec![path], "exactly one entry is written");
     }
 
-    /// A stored value that is not a valid P-256 scalar (wrong length, zero,
-    /// or at least the group order) fails to load with `CryptoFailed`, and
-    /// bytes that are not an envelope fail with `PersistenceFailed`.
+    /// The scalar record of earlier builds, a record of another version, a
+    /// public point that is not 65 bytes, and bytes that are no record all
+    /// fail with `CryptoFailed`.
     #[tokio::test]
-    async fn load_rejects_invalid_stored_secret_key() {
+    async fn load_rejects_records_that_are_not_version_1_handles() {
+        #[derive(Serialize)]
+        struct OldScalarRecord {
+            #[serde(with = "serde_bytes")]
+            key: Vec<u8>,
+        }
         let storage = adapter();
         let alice = did("did:dht:alice");
-        for (case, key) in [
-            ("16 bytes", vec![1u8; 16]),
-            ("zero scalar", vec![0u8; 32]),
-            ("all-ones scalar", vec![0xFFu8; 32]),
+
+        write_raw(&storage, &alice, &OldScalarRecord { key: vec![1; 32] }).await;
+        let err = load_wrapping_key_handle(&storage, &alice)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ContextError::CryptoFailed(_)),
+            "old scalar: {err:?}"
+        );
+
+        for (case, record) in [
+            (
+                "version 2",
+                StoredWrappingKeyHandle {
+                    v: 2,
+                    handle: KeyHandle::new(1),
+                    public: public(0x22).to_vec(),
+                },
+            ),
+            (
+                "64-byte public",
+                StoredWrappingKeyHandle {
+                    v: RECORD_VERSION,
+                    handle: KeyHandle::new(1),
+                    public: vec![4; 64],
+                },
+            ),
         ] {
-            write_raw(&storage, &alice, key).await;
-            let err = load_wrapping_key(&storage, &alice).await.unwrap_err();
+            write_raw(&storage, &alice, &record).await;
+            let err = load_wrapping_key_handle(&storage, &alice)
+                .await
+                .unwrap_err();
             assert!(
                 matches!(err, ContextError::CryptoFailed(_)),
                 "{case}: {err:?}"
             );
         }
+
         storage
             .store(&wrapping_key_path(&alice).unwrap(), b"not msgpack")
             .await
             .unwrap();
-        let err = load_wrapping_key(&storage, &alice).await.unwrap_err();
-        assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
+        let err = load_wrapping_key_handle(&storage, &alice)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ContextError::CryptoFailed(_)), "{err:?}");
     }
 
     #[tokio::test]
     async fn load_returns_none_when_not_stored() {
         let storage = adapter();
         assert!(
-            load_wrapping_key(&storage, &did("did:dht:nobody"))
+            load_wrapping_key_handle(&storage, &did("did:dht:nobody"))
                 .await
                 .unwrap()
                 .is_none()
@@ -220,41 +298,62 @@ mod tests {
     async fn path_traversal_did_is_refused() {
         let storage = adapter();
         let evil = did("../identity/victim");
-        let err = load_wrapping_key(&storage, &evil).await.unwrap_err();
+        let err = load_wrapping_key_handle(&storage, &evil).await.unwrap_err();
         assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
-        let err = store_wrapping_key(&storage, &evil, &WrappingKeyPair::generate())
+        let err = store_wrapping_key_handle(&storage, &evil, &KeyHandle::new(1), &public(1))
             .await
             .unwrap_err();
         assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
+        assert!(storage.inner().list_keys("").await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn different_identities_are_isolated() {
         let storage = adapter();
-        let alice = WrappingKeyPair::generate();
-        let bob = WrappingKeyPair::generate();
-        store_wrapping_key(&storage, &did("did:dht:alice"), &alice)
-            .await
-            .unwrap();
-        store_wrapping_key(&storage, &did("did:dht:bob"), &bob)
-            .await
-            .unwrap();
-        let got_alice = load_wrapping_key(&storage, &did("did:dht:alice"))
+        store_wrapping_key_handle(
+            &storage,
+            &did("did:dht:alice"),
+            &KeyHandle::new(1),
+            &public(1),
+        )
+        .await
+        .unwrap();
+        store_wrapping_key_handle(
+            &storage,
+            &did("did:dht:bob"),
+            &KeyHandle::new(2),
+            &public(2),
+        )
+        .await
+        .unwrap();
+        let got_alice = load_wrapping_key_handle(&storage, &did("did:dht:alice"))
             .await
             .unwrap()
             .unwrap();
-        let got_bob = load_wrapping_key(&storage, &did("did:dht:bob"))
+        let got_bob = load_wrapping_key_handle(&storage, &did("did:dht:bob"))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(got_alice.public(), alice.public());
-        assert_eq!(got_bob.public(), bob.public());
+        assert_eq!(
+            (got_alice.handle, got_alice.public),
+            (KeyHandle::new(1), public(1))
+        );
+        assert_eq!(
+            (got_bob.handle, got_bob.public),
+            (KeyHandle::new(2), public(2))
+        );
     }
 
+    /// `Debug` prints the public point and not the handle.
     #[test]
-    fn stored_wrapping_secret_key_debug_redacts() {
-        let key = StoredWrappingSecretKey { key: vec![1; 32] };
-        let debug = format!("{key:?}");
-        assert!(debug.contains("REDACTED"));
+    fn record_debug_hides_the_handle() {
+        let record = WrappingKeyRecord {
+            handle: KeyHandle::new(0xDEAD_BEEF),
+            public: public(0x33),
+        };
+        let debug = format!("{record:?}");
+        assert!(debug.contains(&hex::encode(public(0x33))), "{debug}");
+        assert!(!debug.contains("handle"), "{debug}");
+        assert!(!debug.contains(&0xDEAD_BEEF_u64.to_string()), "{debug}");
     }
 }
