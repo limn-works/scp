@@ -121,9 +121,17 @@ guide_ts=()
 while IFS= read -r f; do guide_py+=("$f"); done < <(command find "$tmp/guides/py" -name '*.py' | sort)
 while IFS= read -r f; do guide_ts+=("$f"); done < <(command find "$tmp/guides/ts" -name '*.ts' | sort)
 
+# mypy writes its cache even under --no-incremental, by default to the SQLite file
+# `.mypy_cache/<python_version>/cache.db` under the working directory, which is $ROOT. Two
+# runs of this gate in one checkout, such as the concurrent cases of
+# scripts/tests/fix-round-check/run-tests.sh, then contend for that file's lock, and the
+# loser dies with an INTERNAL ERROR (`sqlite3.OperationalError: database is locked`). Each
+# run keeps its cache in its own temporary directory, so no run shares one. --show-traceback
+# makes any mypy crash print its cause.
 echo "check-examples-typecheck: mypy over ${#py_files[@]} Python site(s) and ${#guide_py[@]} Python guide block(s)"
 if ! MYPYPATH="$ROOT/bindings/python" "$PY" -m mypy --config-file "$CONF_DIR/mypy.ini" \
-    --no-incremental "${py_files[@]}" ${guide_py[@]+"${guide_py[@]}"}; then
+    --no-incremental --cache-dir "$tmp/mypy-cache" --show-traceback \
+    "${py_files[@]}" ${guide_py[@]+"${guide_py[@]}"}; then
     fail=1
 fi
 

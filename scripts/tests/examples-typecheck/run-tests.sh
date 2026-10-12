@@ -7,8 +7,8 @@
 # holds a backtick, when a fence run follows a blockquote or list marker, when a skip marker has no reason or
 # does not sit directly above a Python or TypeScript fence, or when no guide exists; and it
 # exits 0 when every block it checks type-checks, printing one line for every block it
-# skipped, every block in a language it does not check, and every guide that is not live.
-# Each case builds a repository in `mktemp -d`, copies the real gate and its
+# skipped, every block in a language it does not check, and every guide that is not live,
+# including while another process holds the lock on the checkout's shared mypy cache. Each case builds a repository in `mktemp -d`, copies the real gate and its
 # `scripts/examples-typecheck/` files into it, links `bindings/python` and
 # `bindings/typescript` to this tree's SDK sources, and asserts the exit code and the
 # output line that names the outcome, so a case cannot pass on the wrong outcome.
@@ -27,7 +27,8 @@
 # `fenceforms`. Type-checking a guide
 # that is not live, or a skipped block, makes the gate exit 1 on `pass`, whose not-live guide
 # and skipped blocks call removed API; and silencing the SKIP, NOT CHECKED or GUIDE NOT LIVE
-# lines fails `pass` on its output assertions.
+# lines fails `pass` on its output assertions. Running mypy on the checkout's shared
+# `.mypy_cache` makes the gate exit 1 on `lockedcache`.
 #
 # Setup: the gate's own (mypy and pytest for python3.12, and `bun install` in
 # `bindings/typescript`).
@@ -316,6 +317,41 @@ contained_case contained_blockquote '> '
 contained_case contained_nestedquote '> > '
 contained_case contained_bullet '- '
 contained_case contained_ordered '1. '
+
+# lockedcache: another mypy run holds the repository's `.mypy_cache/3.10/cache.db`. mypy
+# 1.20 keeps its cache in that SQLite file by default, and two gate runs in one checkout,
+# as `scripts/tests/fix-round-check/run-tests.sh` starts in its concurrent cases 3 and 5,
+# collide on it: the run that loses the lock dies with `INTERNAL ERROR` and
+# `OperationalError: database is locked` in `SqliteMetadataStore.__init__`. The holder below
+# takes that lock and keeps it for the whole gate run, so a gate that reads or writes the
+# shared cache exits 1 here on every run. The gate passes only when each run keeps its mypy
+# cache to itself.
+repo=$(new_repo lockedcache)
+printf '%s\n```python\nx: int = 1\n```\n' "$LIVE" > "$repo/.docs/migration/guide.md"
+commit "$repo"
+mkdir -p "$repo/.mypy_cache/3.10"
+python3.12 -c '
+import pathlib, sqlite3, sys, time
+db = sqlite3.connect(sys.argv[1], isolation_level=None)
+db.execute("BEGIN EXCLUSIVE")
+db.execute("CREATE TABLE IF NOT EXISTS held (x)")
+pathlib.Path(sys.argv[2]).touch()
+deadline = time.monotonic() + 300
+while not pathlib.Path(sys.argv[3]).exists() and time.monotonic() < deadline:
+    time.sleep(0.1)
+' "$repo/.mypy_cache/3.10/cache.db" "$WORK/lockedcache.held" "$WORK/lockedcache.done" &
+holder=$!
+while [[ ! -e "$WORK/lockedcache.held" ]] && kill -0 "$holder" 2>/dev/null; do sleep 0.1; done
+if [[ -e "$WORK/lockedcache.held" ]]; then
+    run_case lockedcache "$repo" 0 \
+        "CHECK .docs/migration/guide.md:5 (python) as guide_guide_L5.py" \
+        "1 Python and 0 TypeScript guide block(s), type-check against the SDK"
+else
+    echo "FAIL lockedcache: the holder never took the cache lock, so the case proved nothing"
+    FAILED=$((FAILED + 1))
+fi
+touch "$WORK/lockedcache.done"
+wait "$holder" || true
 
 # noguide: no guide under .docs/migration/.
 repo=$(new_repo noguide)
