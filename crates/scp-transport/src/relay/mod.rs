@@ -22,7 +22,7 @@
 //!   `DID→routing_id` binding → BEP44 signature). The OPTIONAL validating
 //!   SCP-native-relay path (§3.10.2). Stateful single-slot / slot-exclusivity
 //!   bookkeeping lives in `native::did_slot`.
-//! - [`push_store`] -- the relay's push registration store (spec section
+//! - `push_store` -- the relay's push registration store (spec section
 //!   10.7.1 step 4), indexed by registration key and by routing ID. Behind
 //!   the `push-store` feature.
 //!
