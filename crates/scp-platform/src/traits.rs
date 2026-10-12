@@ -438,9 +438,11 @@ impl PushToken {
 /// slice a `static` table at an index read from the payload. The conformance
 /// check `scp_testing::conformance::push::check_fixed_wake_signal` is what
 /// rejects an adapter whose signal differs across the payloads it sends,
-/// however the signal was built. `InMemoryPush`, the test double behind the
-/// `testing` feature (ADR-062 §0), returns the fixed bytes
-/// `{"aps":{"content-available":1}}` for every payload. See ADR-006.
+/// however the signal was built, and fails an adapter that accepts a payload
+/// no device receipt rule of §10.7.1 step 5 accepts. `InMemoryPush`, the test
+/// double behind the `testing` feature (ADR-062 §0), accepts only the wake
+/// bodies of the §10.7.1 step 5 wake-signal table and returns the APNs body's
+/// bytes for each. See ADR-006.
 ///
 /// ```
 /// use scp_platform::WakeSignal;
@@ -1104,8 +1106,7 @@ pub trait DeviceAttestation: Send + Sync {
 /// Push notification trait.
 ///
 /// Abstracts platform-specific push notification registration and handling
-/// (APNs, FCM). The in-memory implementation returns synthetic tokens and one
-/// fixed wake signal for every payload. See ADR-006.
+/// (APNs, FCM). See ADR-006.
 pub trait Push: Send + Sync {
     /// Register for push notifications and return a platform-specific token.
     ///

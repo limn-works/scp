@@ -390,7 +390,7 @@
         "InMemoryDeviceAttestation.attest() returns a synthetic attestation (always valid)",
         "InMemoryDeviceAttestation.verify(attestation) always returns true for attestations produced by this adapter",
         "InMemoryPush.register() returns a synthetic push token (UUID)",
-        "InMemoryPush.handle_notification(payload) returns the fixed wake signal {\"aps\":{\"content-available\":1}} for every payload and copies no byte of the payload into it (ADR-006, amended 2026-09-29; spec §10.7 opacity)",
+        "InMemoryPush.handle_notification(payload) accepts only the APNs body and the FCM data map of the wake-signal table in spec §10.7.1 step 5, returns the fixed wake signal (the APNs body) for each and copies no byte of the payload into it, and rejects every other payload with a WakePayloadInvalid push error (ADR-006, amended 2026-09-29 and 2026-10-12; spec §10.7 opacity)",
         "InMemoryStorage.store(key, data) stores bytes in internal HashMap<String, Vec<u8>>",
         "InMemoryStorage.retrieve(key) returns stored data or None",
         "InMemoryStorage.delete(key) removes data from the map",

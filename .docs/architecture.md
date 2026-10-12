@@ -760,7 +760,6 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 
 **`Push`** (scp-platform) — `Send + Sync`, async methods.
 - `register` obtains a platform push token. `handle_notification` returns one fixed `WakeSignal` for every payload it accepts (§10.7 opacity, ADR-006).
-- The in-memory adapter returns a synthetic UUID token and, for every payload, the fixed wake signal `{"aps":{"content-available":1}}`, so no payload byte reaches the caller (§10.7 opacity, ADR-006).
 
 **`TransportAdapter`** (scp-transport) — `Send + Sync`, dyn-compatible (boxed futures).
 - Five methods: `send`, `subscribe`, `unsubscribe`, `query`, `delete`.

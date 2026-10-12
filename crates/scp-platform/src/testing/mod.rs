@@ -51,4 +51,4 @@ pub use pre_rotation_custody::InMemoryPreRotationCustody;
 // the gate because scp-testing's `test_double_gating` test parses each file
 // alone and fails on a re-export of `InMemoryPush` that carries no gate.
 #[cfg(feature = "testing")]
-pub use push::InMemoryPush;
+pub use push::{APNS_WAKE_BODY, FCM_WAKE_DATA, InMemoryPush};
