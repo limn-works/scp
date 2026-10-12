@@ -45,32 +45,54 @@ instance is gone (PR 4). Post-PR-5 the per-domain namespace classes
 `Transport`, `EventLog`) are pure handle types with no methods — stateful
 operations are **methods on `SCP`** (see [ADR-048 §7](../adrs/ADR-048-scp-multi-instance.md#7-per-sdk-idiomatic-shape--language-constraints-stay-local)).
 Callers construct an `SCP` at process start and invoke it directly.
+The "After" blocks below create the identity with `encrypted_file`
+custody, which seals the keys into `$HOME/.scp/keys.bin` under the
+passphrase in `SCP_KEY_PASSPHRASE` (spec `03-identity.md` §3.2.2). The
+`in_memory` custody value of the "Before" blocks no longer exists.
 
+<!-- examples-typecheck: skip: Before Phase 4, showing the module-level Identity.create and Context.create that PR 4 deleted -->
 ```python
 # Before Phase 4
 from scp_sdk import Identity, Context
 identity = await Identity.create(custody="in_memory")
 ctx = await Context.create(creator=identity, ...)
-
-# After Phase 4 PR 5 — storage selection is required (spec §17.6)
-from scp_sdk import SCP
-with SCP(storage={"type": "in_memory"}) as scp:
-    identity = await scp.identity_create("in_memory")
-    ctx = await scp.context_create(identity.did, {...})
 ```
 
+```python
+# After Phase 4 PR 5 — storage selection is required (spec §17.6)
+from typing import Any
+
+from scp_sdk import SCP, CustodyType
+
+
+async def create_context(params: dict[str, Any]) -> None:
+    async with SCP(storage={"type": "in_memory"}) as scp:
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
+        ctx = await scp.context_create(identity.did, params)
+```
+
+<!-- examples-typecheck: skip: Before Phase 4, showing the static Identity.create and Context.create that PR 4 deleted -->
 ```typescript
 // Before Phase 4
 import { Identity, Context } from "@limn-works/scp-ts";
 const identity = await Identity.create({ custody: "in_memory" });
 const ctx = await Context.create(identity, { ceiling, memoryScope });
+```
 
+```typescript
 // After Phase 4 PR 5 — storage selection is required (spec §17.6)
-import { SCP } from "@limn-works/scp-ts";
+import { SCP, type ContextParams } from "@limn-works/scp-ts";
+
+const params: ContextParams = {
+  ceiling: ["messages:read", "messages:write"],
+  memoryScope: "ephemeral",
+  mode: "Encrypted",
+  governance: "single_admin",
+};
 const scp = new SCP({ storage: { type: "in_memory" } });
 try {
   const identity = await scp.identityCreate("encrypted_file");
-  const ctx = await scp.contextCreate(identity, paramsJson);
+  const ctx = await scp.contextCreate(identity, JSON.stringify(params));
 } finally {
   await scp.shutdown(5);
 }
@@ -118,9 +140,10 @@ semantics".
 internally. Outstanding work gets the full timeout to drain; ADR-048
 §5 states what the bridge aborts at the deadline.
 
-- **Python** — `scp.shutdown(5.0)` (seconds as `float`; the SDK wrapper
-  converts to milliseconds and clamps to `u64::MAX`). Also runs
-  automatically on `with SCP() as scp: ...` scope exit.
+- **Python** — `await scp.shutdown(5.0)` (seconds as `float`; the SDK
+  wrapper converts to milliseconds and clamps to `u64::MAX`). Exit from an
+  `async with SCP(storage=...) as scp:` or a `with SCP(storage=...) as scp:`
+  scope also shuts the instance down.
 - **TypeScript** — `await scp.shutdown(5)` (seconds as `number`; the SDK
   wrapper converts to milliseconds and clamps to
   `Number.MAX_SAFE_INTEGER`).
@@ -215,11 +238,15 @@ ContextManager, transport manager, and monotonic `instance_id`.
 ```python
 from scp_sdk import SCP
 
+
 # Storage selection is REQUIRED — there is no default (spec §17.6).
-scp = SCP(storage={"type": "in_memory"})       # development / test
-scp = SCP(storage={"type": "sqlite",
-                    "path": "/var/scp.db",
-                    "key": sqlcipher_key_32b})  # production
+def development_scp() -> SCP:
+    return SCP(storage={"type": "in_memory"})
+
+
+def production_scp(sqlcipher_key_32b: bytes) -> SCP:
+    # `path` names the directory the bridge opens `scp.db` inside.
+    return SCP(storage={"type": "sqlite", "path": "/var/lib/scp", "key": sqlcipher_key_32b})
 ```
 
 ### `instance_id: u64`
@@ -255,9 +282,10 @@ processes get legible log output.
 ### Per-instance lifecycle methods
 
 `suspend()`, `resume()`, and `shutdown(timeoutMillis)` are instance
-methods on `SCP`. The Python wrapper also exposes synchronous context
-manager semantics (`with SCP() as scp: ...`) that call `shutdown(5.0)`
-on exit.
+methods on `SCP`. The Python wrapper also exposes context manager
+semantics: `async with SCP(storage=...) as scp:` and
+`with SCP(storage=...) as scp:` each shut the instance down with a
+five-second timeout on exit.
 
 ---
 
@@ -276,29 +304,37 @@ This is the canonical test pattern. Every SDK test constructs its own
 
 ```python
 # tests/conftest.py
+from collections.abc import Iterator
+
 import pytest
 import scp_sdk
 
 
 @pytest.fixture
-def scp() -> scp_sdk.SCP:
+def scp() -> Iterator[scp_sdk.SCP]:
     """Per-test SCP instance. Function-scope ⇒ fresh per test."""
-    instance = scp_sdk.SCP(storage={"type": "in_memory"})
-    yield instance
-    instance.shutdown(5.0)
+    with scp_sdk.SCP(storage={"type": "in_memory"}) as instance:
+        yield instance
 ```
 
 ```python
 # tests/test_whatever.py
+import pytest
+import scp_sdk
+
+
 async def test_context_create(scp: scp_sdk.SCP) -> None:
-    identity = await scp_sdk.Identity.create(scp, custody="in_memory")
-    ctx = await scp_sdk.Context.create(scp, creator=identity, ...)
+    identity = await scp.identity_create(scp_sdk.CustodyType.ENCRYPTED_FILE)
+    ctx = await scp.context_create(
+        identity.did,
+        {"ceiling": ["messages:read", "messages:write"], "memory_scope": "ephemeral"},
+    )
     # Handles expose no instanceId getter (ADR-048); affinity is observed
     # via misuse — a handle from one SCP is rejected by another.
-    other = scp_sdk.SCP()
-    with pytest.raises(scp_sdk.ScpError, match="SCP-PERM-3030"):
-        await scp_sdk.Context.send(other, ctx, payload)
-    other.shutdown(5.0)
+    async with scp_sdk.SCP(storage={"type": "in_memory"}) as other:
+        with pytest.raises(scp_sdk.ScpError) as caught:
+            await other.context_send(ctx, identity.did, b"hello")
+        assert caught.value.code == "SCP-PERM-3030"
 ```
 
 ### TypeScript (bun test)

@@ -8074,12 +8074,16 @@ def check_macos_bridge_mutants(doc: dict) -> None:
 
 # CRITERION for unrouted_paths: a tracked path is routed when the `code` output
 # of job `changes` selects it or when it is prose. Prose is every path under
-# `.docs/` or `.claude/`, every `*.md` file at the repository root, and every
-# `*.md` file under `docs/guides/`. A pull request that changes only prose skips
-# every job the `code` output guards, so a path that is neither reaches no such
-# job when it alone changes, whatever that job reads.
+# `.docs/` or `.claude/` except `.docs/migration/`, every `*.md` file at the
+# repository root, and every `*.md` file under `docs/guides/`. A pull request that
+# changes only prose skips every job the `code` output guards, so a path that is
+# neither reaches no such job when it alone changes, whatever that job reads. The
+# guides under `.docs/migration/` are not prose, because job examples-typecheck
+# type-checks their code blocks.
 def is_prose(path: str) -> bool:
     """Report whether a tracked path is prose, which no `code`-guarded job reads."""
+    if path.startswith(".docs/migration/"):
+        return False
     if path.startswith((".docs/", ".claude/")):
         return True
     if path.endswith(".md"):
@@ -8205,6 +8209,12 @@ def check_every_path_routed(doc: dict) -> None:
     check(
         "a `code` filter that drops scripts/** reports scripts/ci-aggregate-result.py",
         "scripts/ci-aggregate-result.py" in unrouted_paths(mutant, paths),
+    )
+    filters["code"] = [entry for entry in filters["code"] if entry != ".docs/migration/**"]
+    step["with"]["filters"] = yaml.safe_dump(filters)
+    check(
+        "a `code` filter that drops .docs/migration/** reports .docs/migration/phase-4.md",
+        ".docs/migration/phase-4.md" in unrouted_paths(mutant, paths),
     )
     sources = crate_sources(paths)
     reads = rust_test_reads(sources)
