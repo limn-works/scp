@@ -108,6 +108,17 @@ use crate::context::ttl::{self, CloseResult, TtlTimer};
 // §9.10.4 routing construction helpers
 // ---------------------------------------------------------------------------
 
+/// Deduplicates a context's relay set (§5.12.3.1 `relay_urls`), keeping each
+/// URL's first position, so the stored set lists each relay once whichever
+/// source supplied it (the creator, an invitation bundle, or a snapshot).
+pub fn normalize_relay_urls(relay_urls: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::with_capacity(relay_urls.len());
+    relay_urls
+        .into_iter()
+        .filter(|url| seen.insert(url.clone()))
+        .collect()
+}
+
 /// Builds the [`ContextRouting`] axis for a context from its broadcast flag
 /// and the FFI-derived local pseudonym (§9.10.4, §5.14).
 ///
@@ -128,17 +139,6 @@ use crate::context::ttl::{self, CloseResult, TtlTimer};
 /// shared routing ID into app-data fan-out — so a zero local pseudonym cannot
 /// reopen the relay-correlation hole. It simply means "this member has not
 /// derived/announced its pseudonym yet."
-/// Deduplicates a context's relay set (§5.12.3.1 `relay_urls`), keeping each
-/// URL's first position, so the stored set lists each relay once whichever
-/// source supplied it (the creator, an invitation bundle, or a snapshot).
-pub fn normalize_relay_urls(relay_urls: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::with_capacity(relay_urls.len());
-    relay_urls
-        .into_iter()
-        .filter(|url| seen.insert(url.clone()))
-        .collect()
-}
-
 fn build_routing(is_broadcast: bool, local_pseudonym: Option<[u8; 32]>) -> ContextRouting {
     ContextRouting::for_mode(is_broadcast, local_pseudonym.unwrap_or([0u8; 32]))
 }
