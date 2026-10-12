@@ -1122,25 +1122,26 @@ Admin removal via governance produces standard governance events (§5.9), not `S
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `did` | identifier | Yes | The registrant. |
+| `registrant` | `Identifier` | Yes | The registering identity's identifier (`03-identity.md` §3.1), which SCP-308, the key-event data model story of architecture slice S1, implements as the type `Identifier`. |
 | `platform` | `PushPlatform` | Yes | Target push platform. |
 | `token` | `Vec<u8>` (serde_bytes) | Yes | Platform-specific device token. |
-| `contexts` | `Vec<String>` | Yes | Context IDs to receive notifications for. |
+| `routing_ids` | `Vec<[u8; 32]>` | Yes | The relay routing IDs to receive wake signals for, each a 32-byte routing ID: each context's `context_routing_id` and the device's own `pseudonym_routing_id` (`09-security-model.md` §9.10.4). The message carries no context ID. An empty list is invalid, and the relay rejects it with `4060` PUSH_REGISTRATION_REJECTED. |
 | `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
 | `signature` | `Vec<u8>` (64 bytes) | Yes | P-256 signature — see construction below. |
 
-**Signature construction.** Per §9.5.1 canonical signed structure format, the signed bytes are the concatenation: `"SCP-PUSH-REGISTER-V1:" || BE32(len(did_bytes)) || did_bytes || platform_tag (1 byte) || BE32(len(token_bytes)) || token_bytes || contexts_encoded || timestamp (8-byte BE u64)`, where `contexts_encoded` is each context ID string prefixed by its 4-byte big-endian length. All variable-length fields use `BE32(len())` prefixes to prevent boundary-shift collisions (§9.5.1). Registrations are idempotent; re-registering with the same token replaces the previous registration for that identity and platform.
+**Signature construction.** The signature covers the §9.5.1 canonical hash of `"SCP-PUSH-REGISTER-V1:" || BE32(56) || registrant_text || platform_tag (1 byte) || BE32(len(token)) || token || BE32(count(routing_ids)) || routing_ids_encoded || timestamp (8-byte BE u64) || BE32(len(relay_url)) || relay_url`. `registrant_text` is the 56-byte `scp:` text form of the identifier that `03-identity.md` §3.1 fixes. `BE32(count(routing_ids))` is the number of entries in `routing_ids`, which is the 4-byte big-endian element count §9.5.1 requires before every repeated field. `routing_ids_encoded` is each 32-byte routing ID in list order, with no length prefix, because each element is fixed-length. `relay_url` is the UTF-8 canonical URL (`09-security-model.md` §9.18.2) of the relay the message is published to; no field of the message carries it. The relay verifies against its own canonical URL, the one from which it derived the reserved push routing ID the PUBLISH arrived at, so a message signed for a different relay URL fails verification and the relay rejects it with `4060` PUSH_REGISTRATION_REJECTED. The `PushRegistration` table of `09-security-model.md` §9.5.2 lists the same fields in the same order. Re-registration, and what a relay keeps when a registration matches a stored one, follow `10-infrastructure-and-self-hosting.md` §10.7.1.
 
 **`PushDeregistration`** — Removes push notification registration.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `did` | identifier | Yes | The registrant. |
+| `registrant` | `Identifier` | Yes | The deregistering identity's identifier (`03-identity.md` §3.1), which SCP-308, the key-event data model story of architecture slice S1, implements as the type `Identifier`. |
 | `platform` | `PushPlatform` | Yes | Platform to deregister from. |
+| `token` | `Vec<u8>` (serde_bytes) | Yes | The device token whose registration is removed. With `registrant` and `platform` it names one registration key (`10-infrastructure-and-self-hosting.md` §10.7.1), so deregistering one device leaves the identity's other devices registered. |
 | `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
 | `signature` | `Vec<u8>` (64 bytes) | Yes | P-256 signature — see construction below. |
 
-**Signature construction.** Per §9.5.1 canonical signed structure format, the signed bytes are the concatenation: `"SCP-PUSH-DEREGISTER-V1:" || BE32(len(did_bytes)) || did_bytes || platform_tag (1 byte) || timestamp (8-byte BE u64)`. All variable-length fields use `BE32(len())` prefixes to prevent boundary-shift collisions (§9.5.1). The domain separator prevents replay of registration signatures as deregistrations and vice versa.
+**Signature construction.** The signature covers the §9.5.1 canonical hash of `"SCP-PUSH-DEREGISTER-V1:" || BE32(56) || registrant_text || platform_tag (1 byte) || BE32(len(token)) || token || timestamp (8-byte BE u64) || BE32(len(relay_url)) || relay_url`, where `relay_url` is the canonical URL that `PushRegistration` defines and the relay verifies against its own canonical URL in the same way, rejecting a deregistration signed for a different relay URL with `4060`. The `PushDeregistration` table of `09-security-model.md` §9.5.2 lists the same fields in the same order. The two domain separators differ, so a registration signature never verifies as a deregistration signature, and a deregistration signature never verifies as a registration signature.
 
 ### 22.11.5 Petname Events (Identity Private State)
 
