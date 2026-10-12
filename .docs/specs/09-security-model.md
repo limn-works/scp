@@ -782,7 +782,7 @@ Note: ADR-039 assigns a counter-attestation signature to `#active` rather than t
 | 1 | `registrant` | 4-byte BE length + UTF-8 bytes (the 56-byte `scp:` text form of the identifier, `03-identity.md` §3.1) |
 | 2 | `platform` | 1-byte U8 tag (`0x01` = `Apns`, `0x02` = `Fcm`, `0x03` = `WebPush`) |
 | 3 | `token` | 4-byte BE length + raw bytes |
-| 4 | `contexts` | 4-byte BE element count, then each context ID as 4-byte BE length + UTF-8 bytes, in list order |
+| 4 | `routing_ids` | 4-byte BE element count (at least 1), then each 32-byte routing ID, fixed-length with no prefix, in list order |
 | 5 | `timestamp` | 8-byte BE u64 (Unix seconds) |
 | 6 | `relay_url` | 4-byte BE length + UTF-8 bytes (the canonical URL, §9.18.2, of the relay the message is published to; carried in no message field) |
 
@@ -792,10 +792,11 @@ Note: ADR-039 assigns a counter-attestation signature to `#active` rather than t
 |-------|-------|----------|
 | 1 | `registrant` | 4-byte BE length + UTF-8 bytes (the 56-byte `scp:` text form of the identifier, `03-identity.md` §3.1) |
 | 2 | `platform` | 1-byte U8 tag (`0x01` = `Apns`, `0x02` = `Fcm`, `0x03` = `WebPush`) |
-| 3 | `timestamp` | 8-byte BE u64 (Unix seconds) |
-| 4 | `relay_url` | 4-byte BE length + UTF-8 bytes (the canonical URL, §9.18.2, of the relay the message is published to; carried in no message field) |
+| 3 | `token` | 4-byte BE length + raw bytes |
+| 4 | `timestamp` | 8-byte BE u64 (Unix seconds) |
+| 5 | `relay_url` | 4-byte BE length + UTF-8 bytes (the canonical URL, §9.18.2, of the relay the message is published to; carried in no message field) |
 
-Note: `22-human-readable-addressing.md` §22.11.4 defines both messages' fields, and `10-infrastructure-and-self-hosting.md` §10.7.1 states how a relay verifies and stores them. The registrant signs both preimages with the key its key state lists `Current` in the `#active` role, under the attestation class of §9.7.1. **`relay_url` binds each signature to one relay.** The signer places the canonical URL of the relay it publishes to; the relay rebuilds the preimage with the canonical URL from which it derived the reserved push routing ID the PUBLISH arrived at, never with a URL the message names. A message signed for another relay's URL therefore fails verification at this relay, and a client that registers with several relays signs one message per relay. **Both separators stay `-V1:` although this table changed the encoding they name**, which §9.5.1's version rule would otherwise forbid: the `contexts` element count and the `relay_url` field are new, and no code had produced a signature under either separator before they were added, so no signature exists for the change to invalidate. **Both separators also stay `-V1:` when SCP-308, the key-event data model story of architecture slice S1, changes the bytes inside the `registrant` length prefix** from a DID string to the `scp:` text form: this table already specifies the `scp:` form, so S1 brings the code to this table and changes no field's encoding.
+Note: `22-human-readable-addressing.md` §22.11.4 defines both messages' fields, and `10-infrastructure-and-self-hosting.md` §10.7.1 states how a relay verifies and stores them. The registrant signs both preimages with the key its key state lists `Current` in the `#active` role, under the attestation class of §9.7.1. **`relay_url` binds each signature to one relay.** The signer places the canonical URL of the relay it publishes to; the relay rebuilds the preimage with the canonical URL from which it derived the reserved push routing ID the PUBLISH arrived at, never with a URL the message names. A message signed for another relay's URL therefore fails verification at this relay, and a client that registers with several relays signs one message per relay. **Both separators stay `-V1:` although this table changed the encoding they name**, which §9.5.1's version rule would otherwise forbid: the `routing_ids` field, which replaced a list of context IDs, the deregistration `token` and the `relay_url` field are new, and no code had produced a signature under either separator before they were added, so no signature exists for the change to invalidate. **Both separators also stay `-V1:` when SCP-308, the key-event data model story of architecture slice S1, changes the bytes inside the `registrant` length prefix** from a DID string to the `scp:` text form: this table already specifies the `scp:` form, so S1 brings the code to this table and changes no field's encoding.
 
 **UCAN signing:** ES256 — ECDSA on P-256 with SHA-256, the JOSE algorithm identifier the UCAN specification takes for this curve. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction. **UCAN revocation** is per-context via `RevocationList` — an append-only map of token CIDs to revocation states (Active, RevocationPending, Revoked). Revocations are distributed as MLS application messages to all context members. Revocation check is step 10 of the 11-step validation pipeline (ADR-016) and is performed on every capability exercise. The system is **fail-closed**: tokens in `RevocationPending` state (revocation initiated but not yet confirmed via MLS) are denied. See ADR-016 criterion 7 and `scp-core/crypto/ucan/revoke.rs` for the full specification.
 
@@ -3025,6 +3026,7 @@ Both seeds go through the `"SCP-PSEUDONYM-P256-V1"` seed-to-scalar step above. T
 | Push platform tag: FCM | `0x02` | Platform tag byte for Firebase Cloud Messaging | §10.7.1 |
 | Push platform tag: WebPush | `0x03` | Platform tag byte for Web Push API | §10.7.1 |
 | Push timestamp skew window | 300s | A relay rejects a push registration or deregistration whose `timestamp` differs from the relay's clock by more than this many seconds, in either direction | §10.7.1 |
+| Push registrations per identity identifier per relay | 16 | A relay rejects a registration under a new registration key once the identity identifier already holds this many registrations on that relay | §10.7.1 |
 
 #### 9.18.14 Version Constants
 
