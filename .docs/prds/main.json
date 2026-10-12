@@ -5255,7 +5255,7 @@
       "actionItems": [
         "Implement PushProvider::register() for APNs device token registration",
         "Implement PushProvider::handle_notification() for processing incoming push payloads",
-        "Design opaque APNs payload format satisfying §10.7 (encrypted context_id + wake signal, no plaintext content)",
+        "Accept only the APNs wake signal of the §10.7.1 step 5 wake-signal table, which carries a wake signal and nothing else, as §10.7 requires",
         "Implement token refresh on invalidation callback",
         "Handle APNs payload size limits (4KB for standard, 5KB for VoIP)",
         "Write integration tests using APNs sandbox"
