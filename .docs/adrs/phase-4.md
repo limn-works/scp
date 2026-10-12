@@ -29,7 +29,7 @@ Build order: ADR-017 + ADR-019 (parallel, both depend on Phase 1-3) --> ADR-018 
 
 **Amendment (2026-09-10 — trust-layer signature verification is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The three signed structures this ADR defines carry `P256Signature` fields, its signature-verification step verifies an ECDSA signature on P-256 against the issuer's resolved public key, and its dependency list names the `p256` crate. The four evaluation layers, their ordering, and the fail-closed direction are untouched.
 
-**Amendment (2026-10-12 — challenge request and record converge on spec 07 §7.3.4).** The challenge request takes the field set of `07-trust-validation-and-capabilities.md` §7.3.4 plus `subject`, and carries a `verifier_signature`. The request and the `ChallengeVerification` record are each signed over the SHA-256 digest of their §9.5.1 canonical preimages, through the custody of the verifier's `#active` key, and the record is returned signed. `challenge_id` is 32 bytes, carried as 64-character lowercase hex at the bridges. All three challenge separators keep their `-V1` suffix while their encodings change before release (Alec, 2026-10-12). Aligning the challenge response with spec 07 and having the verifier score each test result follow in a named follow-up PR.
+**Amendment (2026-10-12 — challenge request and record converge on spec 07 §7.3.4).** The challenge request takes the field set of `07-trust-validation-and-capabilities.md` §7.3.4 plus `subject`, and carries a `verifier_signature`. The request and the `ChallengeVerification` record are each signed over the SHA-256 digest of their §9.5.1 canonical preimages, through the custody of the verifier's `#active` key, and the record is returned signed. The request carries no suite label; the record carries `suite_digest`, the SHA-256 of the request's test-case encoding. A challenge for a protocol capability URI with fewer cases than its standard's minimum is refused. `challenge_id` is 32 bytes, carried as 64-character lowercase hex at the bridges. All three challenge separators keep their `-V1` suffix while their encodings change before release (Alec, 2026-10-12). Aligning the challenge response with spec 07 and having the verifier score each test result follow in a named follow-up PR.
 
 ### Context
 
@@ -109,7 +109,6 @@ pub enum AttestationType {
 pub struct ChallengeRequest {
     pub challenge_id: [u8; 32],
     pub capability_uri: String,
-    pub suite_version: String,
     pub test_cases: Vec<TestCase>,
     pub timeout_secs: u32,
     pub verifier: Identifier,
@@ -174,9 +173,9 @@ pub struct TrustInput {
    - Checks revocation: queries revocation status.
    - Returns specific error variant on failure.
 
-4. **`create_challenge(verifier, subject, capability_uri, suite_version, test_cases, timeout_secs) -> ChallengeRequest` (signed through the verifier's `#active` custody)**
+4. **`create_challenge(verifier, subject, capability_uri, test_cases, timeout_secs) -> ChallengeRequest` (signed through the verifier's `#active` custody)**
    - Constructs a challenge request over the given suite and signs its canonical digest through the custody of the verifier's `#active` key.
-   - Standard challenge suites: prompt injection resistance, schema validation, rate limit compliance.
+   - The challenger supplies the test cases; a protocol capability URI sets a minimum count (spec 07 §7.3.4.3).
 
 5. **`verify_challenge_response(request, response) -> Result<ChallengeVerification, TrustError>`**
    - Verifies the response signature against the responder's operational key.
@@ -1568,6 +1567,8 @@ This is the only structural shape that respects the "one implementation" invaria
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, made a self-asserted capability URI an `SCPCapabilities` entry of the declaring identity's service record (`03-identity.md` §3.10.13), and the identity-scoped custom namespace resolves through the identity resolution of §3.10.4.
 
+**Amended 2026-10-12.** The protocol capability list is a protocol constant compiled into each SDK, with no signing key, fetch or suite documents (`07-trust-validation-and-capabilities.md` §7.3.4.3.1). Each protocol URI defines a standard (what is tested, minimum cases, threshold, scoring), and the challenger writes the cases. An identifier-scoped URI's prefix is the `03-identity.md` §3.1 text form; a parser rejects a `did:` authority, and the check is syntactic.
+
 ### Context
 
 The protocol specifies agent capability metadata in §4.4 and challenge-response verification in §7.3.4. The existing implementation has two problems:
@@ -1576,7 +1577,7 @@ The protocol specifies agent capability metadata in §4.4 and challenge-response
 
 2. **No anti-spoofing.** Any agent can declare any capability string in its service record. There is no reserved namespace for protocol-defined capabilities, no mechanism to reject unknown protocol-scoped URIs, and no way to distinguish a self-attested claim from a challenge-verified capability at the identifier level.
 
-The challenge suite standards open question (00-open-questions.md) identified these gaps. The design decision resolves them with a structured URI namespace, a signed protocol registry, and clear authority boundaries.
+The challenge suite standards open question (00-open-questions.md) identified these gaps. The design decision resolves them with a structured URI namespace, a protocol-constant capability list, and clear authority boundaries.
 
 ### Decision
 
@@ -1588,9 +1589,9 @@ Define a three-authority URI namespace for agent capabilities:
 scp:capability:{kebab-case-name}/v{integer}
 ```
 
-Reserved prefix. SDKs MUST reject any `scp:capability:*` URI not present in the signed protocol registry. Fixed structure: no deeper nesting. Capabilities are atomic — exact string equality for matching.
+Reserved prefix. SDKs MUST reject any `scp:capability:*` URI not in the protocol capability list (a protocol constant). Fixed structure: no deeper nesting. Capabilities are atomic — exact string equality for matching.
 
-Initial protocol registry defines 28 challenge capabilities across 10 categories:
+The protocol capability list defines 28 challenge capabilities across 10 categories:
 
 | Category | Capabilities |
 |----------|-------------|
@@ -1611,7 +1612,7 @@ Initial protocol registry defines 28 challenge capabilities across 10 categories
 {identifier}:capability:{kebab-case-name}/v{integer}
 ```
 
-The identifier's textual encoding waits on a later revision of `09-security-model.md` §9.7.4.2 R13, so this ADR fixes the suffix and not the prefix. Anyone can define capabilities under their own identifier. Authority is the definer's identity. Verifiers evaluate the capability based on who defined it — trust in the capability is trust in the definer.
+The identifier takes the text form of `03-identity.md` §3.1. A parser rejects a `did:` authority with `NonCanonicalIdentifier`; it does not resolve the definer. Anyone can define capabilities under their own identifier. Authority is the definer's identity. Verifiers evaluate the capability based on who defined it — trust in the capability is trust in the definer.
 
 **3. System capabilities (`scp:system:*`):**
 
@@ -1633,7 +1634,7 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 - **Structured URIs over free-form strings:** Free-form strings (the `Custom(String)` approach) provide no authority boundary, no versioning, and no way to distinguish protocol-defined from user-defined capabilities. URI structure solves all three: the prefix identifies authority, `/v{N}` provides versioning, and kebab-case enforces naming consistency.
 - **Identity-scoped custom namespace over centralized registry:** A centralized registry (maintained by Limn or a standards body) would violate the "protocol requires no operator" tenet. Identity-scoped custom capabilities are self-sovereign — anyone can define them under their own identifier without permission from any authority.
 - **SDK-enforced prefix reservation over social convention:** Social convention ("please don't use `scp:capability:*` for your own capabilities") is unenforceable. SDK-level rejection of unknown `scp:capability:*` URIs makes spoofing mechanically impossible for conformant implementations.
-- **Versioned capabilities over unversioned:** Challenge suites will evolve as attack vectors and verification techniques improve. Version numbers enable breaking changes without invalidating existing verifications.
+- **Versioned capabilities over unversioned:** Capability standards will evolve as attack vectors and verification techniques improve. Version numbers enable breaking changes without invalidating existing verifications.
 - **System capabilities as separate namespace:** System capabilities (`scp:system:*`) describe node roles, not agent behaviors. They are not challenge-testable. Mixing them with challenge capabilities would create confusion about what can and cannot be verified.
 
 ### Alternatives Considered
@@ -1649,8 +1650,8 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 - `ChallengeType` enum evolves to support URI-based matching: existing variants map to `scp:capability:*` URIs, and `Custom(String)` is replaced by URI-validated custom types.
 - `CapabilityEntry` in `did_capabilities.rs` adopts the URI format for capability strings.
 - Context admission requirements can reference specific capability URIs (e.g., "requires `scp:capability:prompt-injection-resistance/v1` challenge-verified").
-- SDK implementations across all languages must include the protocol registry and reject unknown `scp:capability:*` URIs.
-- The protocol registry is versioned and signed. Adding new `scp:capability:*` URIs requires a protocol version bump.
+- SDK implementations across all languages must compile in the protocol capability list and reject unknown `scp:capability:*` URIs.
+- The list is a protocol constant: adding a `scp:capability:*` URI is a revision of spec 07 §7.3.4.3 shipped in an SDK release.
 - Identity-scoped custom capabilities enable ecosystem-driven extension without protocol changes.
 
 ### Dependencies
@@ -1664,7 +1665,7 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 
 1. **URI parser** validates `scp:capability:{kebab-case}/v{N}`, `{identifier}:capability:{kebab-case}/v{N}`, and `scp:system:{kebab-case}`. Rejects malformed URIs with specific error variants.
 
-2. **Protocol registry** contains all 28 challenge capability URIs and 4 system capability URIs. Lookup by URI returns registry metadata (category, description, parameter schema). Unknown `scp:capability:*` URIs return `Err(UnknownProtocolCapability)`.
+2. **Protocol registry** contains all 28 challenge capability URIs and 4 system capability URIs. Lookup by URI returns registry metadata (category, description, and for a challenge capability its standard). Unknown `scp:capability:*` URIs return `Err(UnknownProtocolCapability)`.
 
 3. **`ChallengeType` unification:** existing `PromptInjectionResistance` maps to `scp:capability:prompt-injection-resistance/v1`, `SchemaValidation` maps to `scp:capability:schema-validation/v1`, `RateLimitCompliance` maps to `scp:capability:rate-limit-compliance/v1`. `Custom(String)` is replaced by `Uri(CapabilityUri)` which must be a valid identity-scoped or protocol-scoped URI.
 

@@ -12,7 +12,7 @@ python3.12 scripts/gen-test-vectors-p256.py
 
 The script uses nothing outside the Python standard library, and it self-gates before it prints a byte: it checks itself against `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, and the Vector 35 `DataProvenance` hash, which the Rust KAT that §25.8 names computes independently through `rmp_serde`, and it computes every public key twice by two scalar multiplications sharing no arithmetic, and a third time through the `cryptography` package where that package imports. A mismatch raises before anything prints.
 
-**Identifier strings in the fixtures.** Where a signed or hashed structure takes a fixture party's identifier as UTF-8 bytes, the vectors print it in the `scp:` text form that Vector 57 of §25.29 pins: `"scp:"` followed by the lowercase, unpadded RFC 4648 base32 of the 32-byte identifier, 56 characters in all, so each such field carries the length prefix `BE32(56)` or the MessagePack header `0xd9 0x38`. Each fixture party's 32-byte identifier is `SHA-256("SCP test vector identifier <role>")` over the ASCII label, with one role per party, following the precedent of §25.9. The 24 roles, each `<role>` exactly as the label spells it, are `a`, `agent`, `alice`, `announcing member`, `app`, `b`, `bob`, `carol`, `dave`, `event-log actor`, `hpke member`, `hpke sender`, `issuer`, `leaf attester`, `m`, `new member`, `other member`, `proposer`, `pseudonymized member`, `sender`, `subject`, `sync member`, `verifier`, `voter`. A fixture identifier is bound to no key: the vectors that carry one pin a preimage, not a binding between an identifier and the key that signs it. The rule covers the fixture parties only: Vector 52's signed export preimage carries the literal snapshot string `"creator_did":"<scp-identifier:creator>"`, which is not an identifier in the `scp:` form, and Vectors 41 through 57 are unchanged by it.
+**Identifier strings in the fixtures.** Where a signed or hashed structure takes a fixture party's identifier as UTF-8 bytes, the vectors print it in the `scp:` text form that Vector 57 of §25.29 pins: `"scp:"` followed by the lowercase, unpadded RFC 4648 base32 of the 32-byte identifier, 56 characters in all, so each such field carries the length prefix `BE32(56)` or the MessagePack header `0xd9 0x38`. Each fixture party's 32-byte identifier is `SHA-256("SCP test vector identifier <role>")` over the ASCII label, with one role per party, following the precedent of §25.9. The 25 roles, each `<role>` exactly as the label spells it, are `a`, `agent`, `alice`, `announcing member`, `app`, `b`, `bob`, `carol`, `dave`, `definer`, `event-log actor`, `hpke member`, `hpke sender`, `issuer`, `leaf attester`, `m`, `new member`, `other member`, `proposer`, `pseudonymized member`, `sender`, `subject`, `sync member`, `verifier`, `voter`. A fixture identifier is bound to no key: the vectors that carry one pin a preimage, not a binding between an identifier and the key that signs it. The rule covers the fixture parties only: Vector 52's signed export preimage carries the literal snapshot string `"creator_did":"<scp-identifier:creator>"`, which is not an identifier in the `scp:` form, and Vectors 41 through 57 are unchanged by it.
 
 **What a signature covers.** Every SCP signature here is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 reaches it. The vectors run RFC 6979 with `h1` set to that same digest, because §9.5 fixes RFC 6979 with SHA-256 for a software signer and states no value for `h1` under a prehashed digest. An implementation that hashes the digest a second time reproduces none of the signature bytes below.
 
@@ -2037,15 +2037,14 @@ rejected, padded:
 
 ## 25.30 Trust Challenge Vectors (§7.3.4)
 
-The request and verification preimages below are the encodings now in force under `SCP-CHALLENGE-REQ-V1:` and `SCP-CHALLENGE-VERIFY-V1:`; each encoding changed under the same separator, and no earlier encoding has a vector. `07-trust-validation-and-capabilities.md` §7.3.4 fixes both field orders and the `verification_id` derivation. None of these vectors carries a key or a signature: each pins a preimage and its SHA-256 digest, which the verifier's `#active` key signs, so none depends on the curve. `verifier` and `subject` are the §25.1 fixture identifiers of those roles, in the `scp:` text form, so each carries the length prefix `00000038`.
+The request and verification preimages below are the encodings now in force under `SCP-CHALLENGE-REQ-V1:` and `SCP-CHALLENGE-VERIFY-V1:`; each encoding changed under the same separator, and no earlier encoding has a vector. `07-trust-validation-and-capabilities.md` §7.3.4 fixes both field orders, the `verification_id` derivation and the `suite_digest` derivation. None of these vectors carries a key or a signature: each pins a preimage and its SHA-256 digest, which the verifier's `#active` key signs, so none depends on the curve. `verifier` and `subject` are the §25.1 fixture identifiers of those roles, in the `scp:` text form, so each carries the length prefix `00000038`. `capability_uri` is an identifier-scoped URI whose definer is the fixture identifier `definer`. A protocol capability URI would need at least the minimum number of test cases §7.3.4.3 sets for it, 20 for `schema-validation/v1`, and a conforming SDK refuses a one-case request for one.
 
 ### Vector 58: the challenge request
 
 Inputs:
 
 - `challenge_id`: the 32 bytes `01` through `20`;
-- `capability_uri`: `scp:capability:schema-validation/v1`;
-- `suite_version`: `2026.1`;
+- `capability_uri`: `scp:tfgiiao36zlseo2tzfoi32knfx6topped3qloxcsube5gdvfrqgq:capability:schema-validation/v1`, whose definer `scp:tfgiiao36zlseo2tzfoi32knfx6topped3qloxcsube5gdvfrqgq` ends in `q`, so the last base32 character carries four zero bits (§7.3.4.1);
 - `test_cases`: one element, with `test_id` `schema-validation-001`, `input` `{"name":"widget","count":3}`, `expected` `SchemaMatch { schema: {"type":"object","required":["name","count"]} }`, `category` `schema` and `weight` 10000;
 - `timeout_secs`: 300;
 - `verifier` and `subject`: the fixture identifiers `verifier` and `subject`.
@@ -2060,7 +2059,7 @@ JCS(input):     {"count":3,"name":"widget"}
 JCS(expected):  {"SchemaMatch":{"schema":{"required":["name","count"],"type":"object"}}}
 ```
 
-**`test_cases` field (the count, then the one element):**
+**`test_cases` field `T` (the count, then the one element; 150 bytes):**
 
 ```
   0000000100000015736368656d612d76616c69646174696f6e2d303031000000
@@ -2070,30 +2069,38 @@ JCS(expected):  {"SchemaMatch":{"schema":{"required":["name","count"],"type":"ob
   6a656374227d7d7d00000006736368656d6100002710
 ```
 
-**`R` (376 bytes):**
+`suite_digest` is `SHA-256(T)` with no domain prefix, and Vectors 59 and 60 carry it:
+
+```
+suite_digest = SHA-256(T):  728fca93ec869b96f4f784cb46ad1b2aa68a4a39d7c4b60b66707586914fdcfc
+```
+
+**`R` (419 bytes):**
 
 ```
   5343502d4348414c4c454e47452d5245512d56313a0102030405060708090a0b
-  0c0d0e0f101112131415161718191a1b1c1d1e1f20000000237363703a636170
-  6162696c6974793a736368656d612d76616c69646174696f6e2f763100000006
-  323032362e310000000100000015736368656d612d76616c69646174696f6e2d
-  3030310000001b7b22636f756e74223a332c226e616d65223a22776964676574
-  227d000000487b22536368656d614d61746368223a7b22736368656d61223a7b
-  227265717569726564223a5b226e616d65222c22636f756e74225d2c22747970
-  65223a226f626a656374227d7d7d00000006736368656d61000027100000012c
-  000000387363703a7673726d736f626632757a656a7362646161673374787761
-  7561736a72706e7435776c6b756c686168626266777464666161706100000038
-  7363703a6b7461726736617174736a75366d6832777333686b3774356b6d7376
-  6d636b71376435657177736d617735646933653370347461
+  0c0d0e0f101112131415161718191a1b1c1d1e1f20000000587363703a746667
+  6969616f33367a6c73656f32747a666f6933326b6e667836746f707065643371
+  6c6f7863737562653567647666727167713a6361706162696c6974793a736368
+  656d612d76616c69646174696f6e2f76310000000100000015736368656d612d
+  76616c69646174696f6e2d3030310000001b7b22636f756e74223a332c226e61
+  6d65223a22776964676574227d000000487b22536368656d614d61746368223a
+  7b22736368656d61223a7b227265717569726564223a5b226e616d65222c2263
+  6f756e74225d2c2274797065223a226f626a656374227d7d7d00000006736368
+  656d61000027100000012c000000387363703a7673726d736f626632757a656a
+  73626461616733747877617561736a72706e7435776c6b756c68616862626677
+  74646661617061000000387363703a6b7461726736617174736a75366d683277
+  7333686b3774356b6d73766d636b71376435657177736d617735646933653370
+  347461
 ```
 
 ```
-D = SHA-256(R):  b08ddd6a074630d5c0f1846ca43842d2bacb2c28554389ea816eb1bd2520d96e
+D = SHA-256(R):  9425a8bca59a96ea6f400233a247fb9aa4b0d4bbb98b7e8b1e756297e7e2a91f
 ```
 
 ### Vector 59: the verification record, with every optional field present
 
-Inputs: `verifier`, `subject` and `capability_uri` as in Vector 58; `suite_version` `2026.1`; `timestamp` 1700000000 (`0x6553f100`); `verification_id` derived as §7.3.4 states from those inputs; `passed` true; `score` 10000 basis points (100.00%), present, so its field is `00 00 00 04` followed by `00 00 27 10`; `test_count` 1 and `pass_count` 1; `expires_at` 1707776000, `timestamp` plus 7776000 seconds (90 days); `context_id` `test-context-01`.
+Inputs: `verifier`, `subject` and `capability_uri` as in Vector 58; `suite_digest` the Vector 58 value, 32 fixed bytes; `timestamp` 1700000000 (`0x6553f100`); `verification_id` derived as §7.3.4 states from those inputs; `passed` true; `score` 10000 basis points (100.00%), present, so its field is `00 00 00 04` followed by `00 00 27 10`; `test_count` 1 and `pass_count` 1; `expires_at` 1707776000, `timestamp` plus 7776000 seconds (90 days); `context_id` `test-context-01`.
 
 ```
 timestamp:                     1700000000
@@ -2101,37 +2108,40 @@ expires_at:                    1707776000
 score field:                   0000000400002710
 ```
 
-**`verification_id` preimage (167 bytes):**
+**`verification_id` preimage (220 bytes):**
 
 ```
   000000387363703a7673726d736f626632757a656a7362646161673374787761
   7561736a72706e7435776c6b756c686168626266777464666161706100000038
   7363703a6b7461726736617174736a75366d6832777333686b3774356b6d7376
-  6d636b71376435657177736d617735646933653370347461000000237363703a
-  6361706162696c6974793a736368656d612d76616c69646174696f6e2f763100
-  0000006553f100
+  6d636b71376435657177736d617735646933653370347461000000587363703a
+  7466676969616f33367a6c73656f32747a666f6933326b6e667836746f707065
+  6433716c6f7863737562653567647666727167713a6361706162696c6974793a
+  736368656d612d76616c69646174696f6e2f7631000000006553f100
 ```
 
 ```
-verification_id:               c439f835731e3c11566708082fff41d9069babe86526d0cd88b297e07941c0d1
+verification_id:               2334382d57e941658fc2c2a2457010918c9eec0ec822a85f74e2370b0e09fcb8
 ```
 
-**`R_v` (277 bytes):**
+**`R_v` (352 bytes):**
 
 ```
-  5343502d4348414c4c454e47452d5645524946592d56313ac439f835731e3c11
-  566708082fff41d9069babe86526d0cd88b297e07941c0d1000000387363703a
+  5343502d4348414c4c454e47452d5645524946592d56313a2334382d57e94165
+  8fc2c2a2457010918c9eec0ec822a85f74e2370b0e09fcb8000000387363703a
   7673726d736f626632757a656a73626461616733747877617561736a72706e74
   35776c6b756c6861686262667774646661617061000000387363703a6b746172
   6736617174736a75366d6832777333686b3774356b6d73766d636b7137643565
-  7177736d617735646933653370347461000000237363703a6361706162696c69
-  74793a736368656d612d76616c69646174696f6e2f763100000006323032362e
-  310100000004000027100000000100000001000000006553f1000000000065ca
-  98000000000f746573742d636f6e746578742d3031
+  7177736d617735646933653370347461000000587363703a7466676969616f33
+  367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f786373
+  7562653567647666727167713a6361706162696c6974793a736368656d612d76
+  616c69646174696f6e2f7631728fca93ec869b96f4f784cb46ad1b2aa68a4a39
+  d7c4b60b66707586914fdcfc0100000004000027100000000100000001000000
+  006553f1000000000065ca98000000000f746573742d636f6e746578742d3031
 ```
 
 ```
-D_v = SHA-256(R_v):            88a395688b5ddc964f6a609c7923e6f1b7e7f3923ce0f8001a09b582f72fed0a
+D_v = SHA-256(R_v):            ac0cd969cbbeb08ca4021ad9f852fdef1bf80db83039fe0c9c5347d73e8027a9
 ```
 
 ### Vector 60: the verification record, with `score` and `context_id` both absent
@@ -2146,37 +2156,40 @@ expires_at:                    1707776060
 score field:                   000000206e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d
 ```
 
-**`verification_id` preimage (167 bytes):**
+**`verification_id` preimage (220 bytes):**
 
 ```
   000000387363703a7673726d736f626632757a656a7362646161673374787761
   7561736a72706e7435776c6b756c686168626266777464666161706100000038
   7363703a6b7461726736617174736a75366d6832777333686b3774356b6d7376
-  6d636b71376435657177736d617735646933653370347461000000237363703a
-  6361706162696c6974793a736368656d612d76616c69646174696f6e2f763100
-  0000006553f13c
+  6d636b71376435657177736d617735646933653370347461000000587363703a
+  7466676969616f33367a6c73656f32747a666f6933326b6e667836746f707065
+  6433716c6f7863737562653567647666727167713a6361706162696c6974793a
+  736368656d612d76616c69646174696f6e2f7631000000006553f13c
 ```
 
 ```
-verification_id:               f4317e9ec8576534aab47b2297921be67a1ae523f74283626c66f8b54997bb14
+verification_id:               ced1d4c2b8d32ac88258a172f9d48bd402fb88687d7285f800dc90c1655046e4
 ```
 
-**`R_v` (322 bytes):**
+**`R_v` (397 bytes):**
 
 ```
-  5343502d4348414c4c454e47452d5645524946592d56313af4317e9ec8576534
-  aab47b2297921be67a1ae523f74283626c66f8b54997bb14000000387363703a
+  5343502d4348414c4c454e47452d5645524946592d56313aced1d4c2b8d32ac8
+  8258a172f9d48bd402fb88687d7285f800dc90c1655046e4000000387363703a
   7673726d736f626632757a656a73626461616733747877617561736a72706e74
   35776c6b756c6861686262667774646661617061000000387363703a6b746172
   6736617174736a75366d6832777333686b3774356b6d73766d636b7137643565
-  7177736d617735646933653370347461000000237363703a6361706162696c69
-  74793a736368656d612d76616c69646174696f6e2f763100000006323032362e
-  3100000000206e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511
-  a30617afa01d0000000100000000000000006553f13c0000000065ca983c0000
-  00206e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617af
-  a01d
+  7177736d617735646933653370347461000000587363703a7466676969616f33
+  367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f786373
+  7562653567647666727167713a6361706162696c6974793a736368656d612d76
+  616c69646174696f6e2f7631728fca93ec869b96f4f784cb46ad1b2aa68a4a39
+  d7c4b60b66707586914fdcfc00000000206e340b9cffb37a989ca544e6bb780a
+  2c78901d3fb33738768511a30617afa01d0000000100000000000000006553f1
+  3c0000000065ca983c000000206e340b9cffb37a989ca544e6bb780a2c78901d
+  3fb33738768511a30617afa01d
 ```
 
 ```
-D_v = SHA-256(R_v):            0b12ecf86ae6048a154cf4867f67b5f85ed7fe20643f2ff288a574a90cc0c2ba
+D_v = SHA-256(R_v):            127c1d21606c26ab60ee8bcd691f3c776c677cb600f2b9d0a94333b50bb3472d
 ```

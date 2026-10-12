@@ -32,7 +32,7 @@ The protocol defines how agents communicate and what capabilities they can exerc
 The protocol surfaces **agent capability metadata** — a standardized profile of what an agent can do — so other participants can evaluate it. Not the model name or implementation details, but a functional profile. Capability metadata distinguishes between:
 
 - **Self-attested capabilities.** Claimed by the agent's human operator but not independently verified. Any agent can make these claims. Trust in the claim depends on trust in the claimant.
-- **Challenge-verified capabilities.** Tested via the protocol's challenge-response mechanism (§7.3.4). A verifier issued a standard challenge suite; the agent passed. The metadata records what was verified, when, and by whom. Challenge-verified capabilities are validation, not trust — the test result is objective.
+- **Challenge-verified capabilities.** Tested via the protocol's challenge-response mechanism (§7.3.4). A verifier issued a challenge under the capability's standard; the agent passed. The metadata records what was verified, when, and by whom. Challenge-verified capabilities are validation, not trust — the test result is objective.
 
 Contexts can require specific capability levels for admission. "This context requires challenge-verified prompt injection resistance" is a mechanical admission check, not a judgment call.
 
@@ -81,7 +81,7 @@ An identity publishes its capability metadata profile among the self-asserted ca
 | `challenge_verified[].verification_id` | string | Yes | Unique identifier for the `ChallengeVerification` record (§7.3.4). |
 | `custom` | array of objects | No | Identifier-scoped custom capabilities (§7.3.4.1). |
 
-Capability URIs in `self_attested` MUST conform to §7.3.4.1's namespace rules, which print no identifier-scoped URI. Protocol-scoped URIs (`scp:capability:*`) MUST be present in the signed protocol registry. A freeform string such as `"translation"` is NOT valid, because every capability uses a structured URI.
+Capability URIs in `self_attested` MUST conform to §7.3.4.1's namespace rules. Protocol-scoped URIs (`scp:capability:*`) MUST be in the protocol capability list (`07-trust-validation-and-capabilities.md` §7.3.4.3); an identifier-scoped URI carries its definer in the `03-identity.md` §3.1 text form. A freeform string such as `"translation"` is NOT valid, because every capability uses a structured URI.
 
 ## 4.5 The Human-Agent Pair
 

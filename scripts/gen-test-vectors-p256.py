@@ -475,6 +475,7 @@ ID_HPKE_MEMBER = fixture_identifier("hpke member")
 ID_ISSUER = fixture_identifier("issuer")
 ID_SUBJECT = fixture_identifier("subject")
 ID_VERIFIER = fixture_identifier("verifier")
+ID_DEFINER = fixture_identifier("definer")
 ID_PSEUDONYMIZED_MEMBER = fixture_identifier("pseudonymized member")
 ID_ANNOUNCING_MEMBER = fixture_identifier("announcing member")
 ID_OTHER_MEMBER = fixture_identifier("other member")
@@ -2587,7 +2588,7 @@ def challenge_verification_preimage(
     verifier: str,
     subject: str,
     capability_uri: str,
-    suite_version: str,
+    suite_digest: bytes,
     passed: bool,
     score: int | None,
     test_count: int,
@@ -2603,7 +2604,7 @@ def challenge_verification_preimage(
         var_field(verifier),
         var_field(subject),
         var_field(capability_uri),
-        var_field(suite_version),
+        fixed_field(suite_digest),
         u8(1 if passed else 0),
         (u32(4) + u32(score)) if score is not None else absent_var(),
         u32(test_count),
@@ -2616,8 +2617,10 @@ def challenge_verification_preimage(
 
 def emit_challenge_vectors() -> None:
     section("§25.30 Trust challenge request and verification record (§7.3.4)")
-    capability_uri = "scp:capability:schema-validation/v1"
-    suite_version = "2026.1"
+    # An identifier-scoped URI: a protocol URI with one case is a request a
+    # conforming SDK refuses, because `schema-validation/v1` sets a minimum of
+    # 20 cases (§7.3.4.3).
+    capability_uri = ID_DEFINER + ":capability:schema-validation/v1"
 
     # --- Vector 58: the challenge request. ---
     challenge_id = bytes(range(1, 33))
@@ -2638,7 +2641,6 @@ def emit_challenge_vectors() -> None:
         "SCP-CHALLENGE-REQ-V1:",
         fixed_field(challenge_id),
         var_field(capability_uri),
-        var_field(suite_version),
         u32(1),
         test_case,
         u32(300),
@@ -2647,10 +2649,15 @@ def emit_challenge_vectors() -> None:
     )
     emit_hex("vector_58.challenge_id", challenge_id)
     emit("vector_58.verifier", ID_VERIFIER)
+    emit("vector_58.definer", ID_DEFINER)
+    emit("vector_58.capability_uri", capability_uri)
     emit("vector_58.subject", ID_SUBJECT)
     emit("vector_58.input_jcs", input_jcs.decode())
     emit("vector_58.expected_jcs", expected_jcs.decode())
-    emit_hex("vector_58.test_case_field", u32(1) + test_case)
+    test_cases_field = u32(1) + test_case
+    suite_digest = sha256(test_cases_field)
+    emit_hex("vector_58.test_case_field", test_cases_field)
+    emit_hex("vector_58.suite_digest", suite_digest)
     emit("vector_58.preimage_len", len(pre58))
     emit_hex("vector_58.preimage", pre58)
     emit_hex("vector_58.digest", sha256(pre58))
@@ -2669,7 +2676,7 @@ def emit_challenge_vectors() -> None:
             ID_VERIFIER,
             ID_SUBJECT,
             capability_uri,
-            suite_version,
+            suite_digest,
             passed,
             score,
             1,
