@@ -678,6 +678,8 @@ impl ContextActor {
             // exists (the prior locked-DashMap shim was deleted in the
             // Phase 2A finalization queries+lifecycle session).
             ContextCommand::Queries(sub) => handlers::queries::dispatch(cell, deps, sub).await,
+            // Push domain (§10.7.1): read-only, answered from owned state.
+            ContextCommand::Push(sub) => handlers::push::dispatch(cell, sub),
             // SagaPhase + LifecycleControl already migrated to the
             // state-owning signature.
             ContextCommand::SagaPhase(msg) => handlers::saga::dispatch(cell, deps, msg).await,

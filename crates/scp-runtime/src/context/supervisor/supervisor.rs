@@ -43,8 +43,9 @@ use scp_protocol::context::membership::ContextEvent;
 
 use crate::context::actor::commands::{
     BroadcastCommand, ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand,
-    MessagingCommand, OutletsCommand, PrepareAOutcome, PrepareBOutcome, QueriesCommand, SagaReject,
-    StandingCommand, TrustRecoveryCommand, TtlCloseCommand, saga_reject,
+    MessagingCommand, OutletsCommand, PrepareAOutcome, PrepareBOutcome, PushCommand,
+    QueriesCommand, SagaReject, StandingCommand, TrustRecoveryCommand, TtlCloseCommand,
+    saga_reject,
 };
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
@@ -16926,6 +16927,87 @@ impl Supervisor {
         })?
     }
 
+    /// Dispatch a read-only [`PushCommand`] to `ctx_id`'s actor mailbox, where
+    /// `handlers::push::dispatch` answers it from `push_helpers`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`], [`ContextError::ContextPoisoned`]
+    ///   or [`ContextError::ActorCrashed`] when no actor serves `ctx_id`.
+    /// - [`ContextError::ActorBusy`] from the mailbox send.
+    pub async fn dispatch_push_command(
+        &self,
+        ctx_id: &str,
+        cmd: PushCommand,
+    ) -> Result<Outcome<()>, ContextError> {
+        let actor = self.lookup(ctx_id).ok_or_else(|| {
+            self.lookup_miss_error(
+                ctx_id,
+                format!("dispatch_push_command — no actor registered for context_id `{ctx_id}`"),
+            )
+        })?;
+        Self::dispatch_via_mailbox(&actor, ContextCommand::Push(cmd)).await
+    }
+
+    /// Returns the routing IDs this device registers for push wakes, grouped by
+    /// relay URL (`10-infrastructure-and-self-hosting.md` §10.7.1).
+    ///
+    /// Asks every context actor for its push routes through
+    /// [`Self::dispatch_push_command`], concurrently. Each context adds its
+    /// shared routing ID and, in an encrypted context, this device's current
+    /// pseudonym routing ID (§9.10.4) under every relay in its relay set. The
+    /// result holds no context ID. A context that is `Closed`, `Expired` or
+    /// `Tombstoned`, or whose actor despawned after the registry was read,
+    /// adds nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails rather than return a partial set, because a registration built
+    /// from a partial set would silently drop the wakes for the missing
+    /// contexts:
+    /// - [`ContextError::ContextPoisoned`] or [`ContextError::ActorCrashed`]
+    ///   when a context's actor is down;
+    /// - [`ContextError::ActorBusy`] from a mailbox send;
+    /// - [`ContextError::TransportFailed`] when an actor drops its reply or
+    ///   does not answer within the reply bound.
+    pub async fn push_routing_ids(
+        &self,
+    ) -> Result<
+        std::collections::BTreeMap<String, std::collections::BTreeSet<[u8; 32]>>,
+        ContextError,
+    > {
+        let replies =
+            futures::future::join_all(self.actor_ids().into_iter().map(|ctx_id| async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                match self
+                    .dispatch_push_command(&ctx_id, PushCommand::Routes { reply: tx })
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(ContextError::ContextNotRegistered(_)) => return Ok(None),
+                    Err(err) => return Err(err),
+                }
+                bounded_reply_await(rx).await.map_err(|_| {
+                    ContextError::TransportFailed(format!(
+                        "Supervisor::push_routing_ids — no reply from the actor of `{ctx_id}`"
+                    ))
+                })
+            }))
+            .await;
+        let mut by_relay =
+            std::collections::BTreeMap::<String, std::collections::BTreeSet<[u8; 32]>>::new();
+        for routes in replies {
+            let Some(routes) = routes? else { continue };
+            for relay_url in routes.relay_urls {
+                by_relay
+                    .entry(relay_url)
+                    .or_default()
+                    .extend(routes.routing_ids.iter().copied());
+            }
+        }
+        Ok(by_relay)
+    }
+
     /// Returns every commit currently in the per-context retry queue.
     /// Soft-default contract: empty `Vec` on unknown context or
     /// mailbox failure. Routes through the actor mailbox via
@@ -18363,6 +18445,100 @@ mod tests {
             Some(vec![RELAY_C.to_owned()]),
             "restore installs the stored relay set on the live actor"
         );
+    }
+
+    /// PUSH-013: with two contexts on two relays, one of them on both,
+    /// `push_routing_ids` maps each relay to exactly the routing IDs of the
+    /// contexts on it, and holds this
+    /// device's current local pseudonym routing ID for each context. After the
+    /// local pseudonym changes through the join path, the next query returns
+    /// the new one and not the old one.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_routing_ids_group_by_relay_and_follow_the_local_pseudonym() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        const RELAY_A: &str = "wss://relay-a.example/scp/v1";
+        const RELAY_B: &str = "wss://relay-b.example/scp/v1";
+        const PSEUDONYM_A: [u8; 32] = [0xA1; 32];
+        const PSEUDONYM_B: [u8; 32] = [0xB1; 32];
+        const PSEUDONYM_A_NEW: [u8; 32] = [0xA2; 32];
+        let sup = supervisor_with_providers();
+        let identity = sup.node_identity().unwrap();
+        let params = || scp_protocol::context::ContextParams {
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..Default::default()
+        };
+        let ctx_a = hex::encode([0xA0u8; 32]);
+        let ctx_b = hex::encode([0xB0u8; 32]);
+        let handle_a = sup
+            .create_context(
+                ctx_a.clone(),
+                params(),
+                identity.clone(),
+                Some(PSEUDONYM_A),
+                vec![RELAY_A.to_owned()],
+            )
+            .await
+            .unwrap();
+        sup.create_context(
+            ctx_b.clone(),
+            params(),
+            identity,
+            Some(PSEUDONYM_B),
+            vec![RELAY_B.to_owned(), RELAY_A.to_owned()],
+        )
+        .await
+        .unwrap();
+        let shared_a = scp_protocol::context::context_routing_id(&ctx_a);
+        let shared_b = scp_protocol::context::context_routing_id(&ctx_b);
+
+        assert_eq!(
+            sup.push_routing_ids().await.unwrap(),
+            BTreeMap::from([
+                (
+                    RELAY_A.to_owned(),
+                    BTreeSet::from([shared_a, PSEUDONYM_A, shared_b, PSEUDONYM_B]),
+                ),
+                (RELAY_B.to_owned(), BTreeSet::from([shared_b, PSEUDONYM_B])),
+            ]),
+            "each relay maps to exactly the routing IDs of the contexts on it"
+        );
+
+        sup.join_context(
+            &handle_a,
+            scp_protocol::context::membership::KeyPackage::mock(DID(
+                "did:dht:z6MkPushRoutingJoiner".to_owned(),
+            )),
+            None,
+            Some(PSEUDONYM_A_NEW),
+        )
+        .await
+        .unwrap();
+
+        let after = sup.push_routing_ids().await.unwrap();
+        assert_eq!(
+            after.get(RELAY_A),
+            Some(&BTreeSet::from([
+                shared_a,
+                PSEUDONYM_A_NEW,
+                shared_b,
+                PSEUDONYM_B
+            ])),
+            "the next query returns the new local pseudonym and not the old one"
+        );
+        assert_eq!(
+            after.get(RELAY_B),
+            Some(&BTreeSet::from([shared_b, PSEUDONYM_B])),
+            "the other context's routing IDs are unchanged"
+        );
+    }
+
+    /// A supervisor with no context actors returns an empty map.
+    #[tokio::test]
+    async fn push_routing_ids_is_empty_without_contexts() {
+        let sup = supervisor_with_providers();
+        assert!(sup.push_routing_ids().await.unwrap().is_empty());
     }
 
     /// The `0xFF01` wrapping key a KeyPackage's leaf publishes.

@@ -53,6 +53,7 @@ pub(crate) mod outlets_helpers;
 pub mod persistence;
 pub mod policy;
 pub mod providers;
+pub(crate) mod push_helpers;
 pub(crate) mod queries_helpers;
 pub(crate) mod standing_helpers;
 pub mod state;
@@ -77,6 +78,9 @@ pub use config::{ContextConfig, ContextCreation};
 // only member the bridges must NAME, so it is re-exported here (and through
 // `scp_core::context::outlets`) while the rest of the helpers stay internal.
 pub use outlets_helpers::InvocationCaveatBinding;
+// §10.7.1: the per-context reply `PushCommand::Routes` carries. The enclosing
+// `push_helpers` module is `pub(crate)`; the public command enum names this type.
+pub use push_helpers::ContextPushRoutes;
 
 // ---------------------------------------------------------------------------
 // ContextHandle
