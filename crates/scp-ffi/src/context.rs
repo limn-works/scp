@@ -6307,6 +6307,20 @@ mod tests {
         }
     }
 
+    /// Drives a custody call to completion with the GIL released, whether or
+    /// not the calling thread holds it. A callback custody's host call takes
+    /// the GIL on tokio's blocking pool, so a test thread that blocks on one
+    /// while holding the GIL deadlocks against it.
+    #[cfg(feature = "testing")]
+    fn custody_wait<F>(fut: F) -> F::Output
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        Python::with_gil(|py| crate::actor_wait::block_on_released(py, fut))
+            .expect("the shared runtime drives the custody call")
+    }
+
     /// Registers `did` with callback custody over the fake Python provider,
     /// its identity key freshly generated there. Returns the identity key id.
     #[cfg(feature = "testing")]
@@ -6320,10 +6334,7 @@ mod tests {
         let custody = std::sync::Arc::new(crate::custody::FfiKeyCustody::Callback(
             crate::custody::test_fakes::fake_py_custody(fault),
         ));
-        let identity_key = crate::runtime()
-            .unwrap()
-            .block_on(custody.generate_identity_keypair())
-            .unwrap();
+        let identity_key = custody_wait(custody.generate_identity_keypair()).unwrap();
         crate::runtime::register_identity(
             bi,
             did,
@@ -6412,9 +6423,7 @@ mod tests {
         let custody =
             crate::runtime::with_identity(&bi_arc, did, |entry| Ok(entry.custody.clone()))
                 .expect("registered identity");
-        crate::runtime()
-            .expect("runtime")
-            .block_on(custody.destroy_key(&scp_platform::KeyHandle::new(key_id)))
+        custody_wait(custody.destroy_key(&scp_platform::KeyHandle::new(key_id)))
             .expect("host destroys the identity key");
         let scp = crate::scp::PyScp {
             inner: std::sync::Arc::clone(&bi_arc),
@@ -10804,7 +10813,7 @@ class SignOnlyCustody:
             // The refusal is the host's own, reached after the adapter
             // resolved the handle as Ed25519; a host that exported would
             // return Ok.
-            match rt.block_on(sign_only_custody.export_ed25519_signing_key(&handle)) {
+            match custody_wait(sign_only_custody.export_ed25519_signing_key(&handle)) {
                 Err(scp_platform::error::PlatformError::CustodyError(_)) => {}
                 other => panic!("expected the host's export refusal, got {other:?}"),
             }
@@ -10816,8 +10825,7 @@ class SignOnlyCustody:
             };
             assert_eq!(export_calls(py), 1, "the export reached the host");
             assert!(
-                rt.block_on(sign_only_custody.sign(&handle, b"probe"))
-                    .is_ok(),
+                custody_wait(sign_only_custody.sign(&handle, b"probe")).is_ok(),
                 "sign-only custody must still sign"
             );
 
