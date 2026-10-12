@@ -2160,36 +2160,45 @@ fn build_supervisor(
     )
 }
 
-/// The supervisor's wrapping custody source for this bridge instance: an
-/// identity's wrapping key (spec 09 §9.16.1) lives in the custody registered
-/// for that identity. It reads the identity registry through a `Weak`, so the
-/// supervisor does not keep the registry alive, and answers `None` for an
-/// identity that is not registered, which fails the actor build closed with
-/// `WrappingKeyCustodyUnavailable`. Under `testing`, an instance on which
-/// `serve_unregistered_wrapping_keys_from_test_custody` ran answers an
-/// unregistered identity from its test custody instead.
+/// The supervisor's wrapping custody source for this bridge instance (spec 09
+/// §9.16.1): the custody registered for the identity, through
+/// [`registry_wrapping_custody_source`](scp_ffi_common::wrapping_custody::registry_wrapping_custody_source).
+/// An unregistered identity gets `None`, which fails the actor build closed
+/// with `WrappingKeyCustodyUnavailable`.
+#[cfg(not(feature = "testing"))]
 fn wrapping_custody_source(
     bi: &UniffiBridgeInstance,
 ) -> scp_core::context::supervisor::WrappingCustodySource {
-    let registry = Arc::downgrade(&bi.identity_custody_registry);
-    #[cfg(feature = "testing")]
-    let unregistered = Arc::downgrade(&bi.unregistered_identity_wrapping_custody);
-    Arc::new(move |owner: &scp_did::DID| {
-        let registry = registry.upgrade()?;
-        if let Some(entry) = registry.get(owner.0.as_str()) {
-            let custody: Arc<dyn scp_core::context::supervisor::WrappingCustody> = Arc::new(
-                scp_core::context::supervisor::ErasedCustody(Arc::clone(&entry.0)),
-            );
-            return Some(custody);
-        }
-        #[cfg(feature = "testing")]
-        if let Some(test_custody) = unregistered.upgrade().and_then(|slot| slot.get().cloned()) {
-            let custody: Arc<dyn scp_core::context::supervisor::WrappingCustody> =
-                Arc::new(scp_core::context::supervisor::ErasedCustody(test_custody));
-            return Some(custody);
-        }
-        None
-    })
+    scp_ffi_common::wrapping_custody::registry_wrapping_custody_source(
+        &bi.identity_custody_registry,
+        entry_custody,
+    )
+}
+
+/// As the shipped source, wrapped so that an instance on which
+/// `serve_unregistered_wrapping_keys_from_test_custody` ran answers an
+/// unregistered identity from its test custody.
+#[cfg(feature = "testing")]
+fn wrapping_custody_source(
+    bi: &UniffiBridgeInstance,
+) -> scp_core::context::supervisor::WrappingCustodySource {
+    scp_ffi_common::wrapping_custody::with_unregistered_test_custody(
+        scp_ffi_common::wrapping_custody::registry_wrapping_custody_source(
+            &bi.identity_custody_registry,
+            entry_custody,
+        ),
+        &bi.unregistered_identity_wrapping_custody,
+    )
+}
+
+/// The custody of one identity-registry entry.
+const fn entry_custody(
+    entry: &(
+        Arc<crate::bridge::UniffiKeyCustody>,
+        scp_platform::KeyHandle,
+    ),
+) -> &Arc<crate::bridge::UniffiKeyCustody> {
+    &entry.0
 }
 
 /// Test seam: serves unregistered identities' wrapping keys from one custody.

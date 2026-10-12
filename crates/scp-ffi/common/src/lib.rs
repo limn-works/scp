@@ -185,6 +185,12 @@ pub mod streaming_saga;
 #[cfg(feature = "resolvers")]
 pub mod signer;
 
+// The supervisor's wrapping custody source over a bridge's identity registry
+// (spec 09 §9.16.1), shared so the refusal of an unregistered identity is
+// written once. Requires scp-core + scp-platform (behind `resolvers`).
+#[cfg(feature = "resolvers")]
+pub mod wrapping_custody;
+
 // Shared context-parameter builder for all FFI bridges.
 // Requires scp-core (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
