@@ -86,13 +86,27 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 3: Builder — cook deps then build
 FROM chef AS builder
+# The CI fetch step's own script, so a container build downloads its crates the way every
+# CI job does: one `cargo fetch --locked` that retries far longer than cargo's default,
+# then cargo offline for every later command. Without it, `cargo chef cook` downloads on
+# demand and a DNS failure reaching index.crates.io fails the build mid-compile. The two
+# files the script writes for a runner are throwaway files here; `ENV` below does what
+# its `$GITHUB_ENV` line does in a CI job. `.dockerignore` admits this one file from
+# `.github/`.
+COPY .github/actions/cargo-fetch/fetch.sh /usr/local/bin/cargo-fetch.sh
 COPY --from=planner /app/recipe.json recipe.json
+# `--no-build` writes the workspace skeleton (every manifest and Cargo.lock) and compiles
+# nothing, so the fetch below has a lockfile to read. This layer and the fetch layer
+# rebuild only when recipe.json changes.
+RUN cargo chef cook --release --recipe-path recipe.json --no-build
+RUN GITHUB_ENV="$(mktemp)" GITHUB_OUTPUT="$(mktemp)" bash /usr/local/bin/cargo-fetch.sh /app
+ENV CARGO_NET_OFFLINE=true
 # Cook only the two binaries' dependencies. Cooking the whole workspace pulls in
 # `scp-ffi`, whose `pyo3-build-config` build script fails with "no Python 3.x
 # interpreter found" — and this image ships neither Python bindings nor a Python.
-RUN cargo chef cook --release --recipe-path recipe.json -p scp-relay -p scp-node
+RUN cargo chef cook --release --offline --recipe-path recipe.json -p scp-relay -p scp-node
 COPY . .
-RUN cargo build --release -p scp-relay -p scp-node
+RUN cargo build --release --offline -p scp-relay -p scp-node
 
 # Stage 4: Runtime — minimal Debian with both binaries
 #

@@ -125,6 +125,9 @@ jobs:
             toolchain:
               - 'rust-toolchain.toml'
               - '.cargo/**'
+              # The step that downloads every crate `rust-docs` compiles and takes cargo
+              # offline before `cargo doc` runs.
+              - '.github/actions/cargo-fetch/**'
               # This file itself. `rust-docs` takes its `cargo doc` command and its
               # feature list from this file, so a pull request that rewrites that
               # command and changes nothing else would otherwise leave the `docs`
@@ -164,6 +167,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+      # Every crate Cargo.lock names, downloaded once with retries; `cargo doc` below
+      # runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
+      - uses: ./.github/actions/cargo-fetch
       - name: Generate rustdoc
         # FFI bridge methods like `scpid_sign` and `identity_*_link_attestation`
         # on `impl Scp` are feature-gated by `testing` so that

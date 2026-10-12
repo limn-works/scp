@@ -19,6 +19,11 @@ jobs:
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # The toolchain step below refuses to run without it: with rustup's auto-install on,
+    # a cargo command outside that step's override would download 1.98.0 with every
+    # component and target rust-toolchain.toml lists, in one attempt.
+    env:
+      RUSTUP_AUTO_INSTALL: "0"
 
     strategy:
       fail-fast: false
@@ -34,6 +39,21 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # The Rust extractor runs `cargo metadata` and the workspace's build scripts while
+      # it loads the manifests, and cargo downloads the index and every crate on demand
+      # there, with three retries. These two steps download them first in one step that
+      # retries for minutes and then take cargo offline, as every Rust job in ci.yml does.
+      # They run on every leg, because a step skipped on the other legs would leave the
+      # Rust leg's analysis step, which every leg shares, with no step that proves it ran
+      # after a fetch; the other legs run in parallel with the longer Rust leg, so the
+      # run's wall time does not grow. Check `offline-cargo` of
+      # scripts/tests/ci-gate/ci_gate_selftest.py holds this job to that order.
+      - name: Install the pinned toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Fetch crates, then take cargo offline
+        uses: ./.github/actions/cargo-fetch
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
