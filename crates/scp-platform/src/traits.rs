@@ -1106,8 +1106,7 @@ pub trait DeviceAttestation: Send + Sync {
 /// Push notification trait.
 ///
 /// Abstracts platform-specific push notification registration and handling
-/// (APNs, FCM). The in-memory implementation returns synthetic tokens and one
-/// fixed wake signal for every payload. See ADR-006.
+/// (APNs, FCM). See ADR-006.
 pub trait Push: Send + Sync {
     /// Register for push notifications and return a platform-specific token.
     ///
