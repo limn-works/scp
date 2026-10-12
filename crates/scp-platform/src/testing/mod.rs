@@ -1,4 +1,4 @@
-//! Test-only, security-nullifier platform adapter implementations.
+//! Test-only platform adapter implementations.
 //!
 //! This module provides in-memory versions of the platform traits whose
 //! in-memory arm is a **security nullifier** (spec §17.17.2
@@ -12,11 +12,15 @@
 //! - [`InMemoryDeviceAttestation`] — always attests (nullifies attestation).
 //! - [`InMemoryPreRotationCustody`] — in-memory pre-rotation commitment store.
 //!
+//! It also provides [`InMemoryPush`], a test double for the
+//! [`Push`](crate::traits::Push) trait: its token is a UUID that no push
+//! service issued, so it delivers no wake, and only tests construct it.
+//!
 //! They are gated behind the `testing` feature so production builds compiling
-//! `software_platform` (for crypto primitives) do NOT compile these nullifier
-//! doubles. The durability-only in-memory storage and push adapters live in
-//! the [`in_memory`](crate::in_memory) module instead — see ADR-062 §0 for the
-//! honest-module-structure split.
+//! `software_platform` (for crypto primitives) do NOT compile these doubles.
+//! The durability-only in-memory storage adapter lives in the
+//! [`in_memory`](crate::in_memory) module instead — see ADR-062 §0 (amended
+//! 2026-10-12) for the honest-module-structure split.
 //!
 //! See ADR-006 in `.docs/adrs/phase-1.md` for the full design rationale.
 //!
@@ -38,7 +42,13 @@
 mod attestation;
 mod key_custody;
 mod pre_rotation_custody;
+mod push;
 
 pub use attestation::InMemoryDeviceAttestation;
 pub use key_custody::InMemoryKeyCustody;
 pub use pre_rotation_custody::InMemoryPreRotationCustody;
+// `lib.rs` already gates this module behind `testing`. The re-export repeats
+// the gate because scp-testing's `test_double_gating` test parses each file
+// alone and fails on a re-export of `InMemoryPush` that carries no gate.
+#[cfg(feature = "testing")]
+pub use push::InMemoryPush;

@@ -1,6 +1,6 @@
-//! In-memory, durability-only platform adapter implementations.
+//! In-memory, durability-only platform adapter implementation.
 //!
-//! This module houses the two platform adapters whose in-memory arm is a
+//! This module houses the one platform adapter whose in-memory arm is a
 //! **durability-only affordance** (spec §17.17.2 durability-only-vs-nullifier
 //! classification), not a security nullifier:
 //!
@@ -9,20 +9,20 @@
 //!   security or verifiability property: a restarted process with lost state
 //!   cannot present a false guarantee, it simply has no state (it fails
 //!   **closed**, not open).
-//! - [`InMemoryPush`] — an in-memory [`Push`](crate::traits::Push) backend
-//!   that mints synthetic tokens and returns one fixed wake signal for every
-//!   payload, copying no byte of the notification payload into it.
 //!
-//! Because they destroy no guarantee, spec §17.17 governs them as
-//! durability-only arms: they MAY be compiled into any build and selected
+//! The in-memory [`Push`](crate::traits::Push) adapter, `InMemoryPush`, is not
+//! here: its token is a UUID that no push service issued, so it delivers no
+//! wake, and it lives in `testing` behind the `testing` feature (ADR-062 §0,
+//! amended 2026-10-12).
+//!
+//! Because it destroys no guarantee, spec §17.17 governs `InMemoryStorage` as
+//! a durability-only arm: it MAY be compiled into any build and selected
 //! **explicitly** (e.g. via `StorageConfig`), but MUST NOT be a default
 //! (selection is mandatory / no silent default), a fallback from a failed
-//! production selection, or the sole reachable arm for their capability in a
-//! shipped SDK. Each type is gated behind its own durability-only cargo
-//! feature (`in-memory-storage` / `in-memory-push`) so a crate may compile in
-//! the durable dev affordance **without** pulling in the test-only nullifier
-//! doubles that live in [`testing`](crate::testing) behind the `testing`
-//! feature.
+//! production selection, or the sole reachable arm for its capability in a
+//! shipped SDK. The `in-memory-storage` cargo feature gates it, so a crate may
+//! compile in the durable dev affordance **without** pulling in the test-only
+//! doubles that live in `testing` behind the `testing` feature.
 //!
 //! The durability-vs-nullifier split is *not* inferable from the module name
 //! alone (ADR-062 §0 Module-naming note): `in_memory/` encodes only
@@ -46,8 +46,3 @@
 mod storage;
 #[cfg(feature = "in-memory-storage")]
 pub use storage::InMemoryStorage;
-
-#[cfg(feature = "in-memory-push")]
-mod push;
-#[cfg(feature = "in-memory-push")]
-pub use push::InMemoryPush;

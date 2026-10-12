@@ -47,23 +47,21 @@ pub mod error;
 pub mod file;
 #[cfg(feature = "filesystem")]
 pub mod filesystem;
-// Durability-only in-memory adapters (`InMemoryStorage`, `InMemoryPush`) —
-// each gated behind its own durability-only feature (`in-memory-storage` /
-// `in-memory-push`), NOT `testing`. These arms lose state but nullify no
-// security property (spec §17.17.2 durability-only-vs-nullifier
-// classification), so they are shippable and selected explicitly (e.g. via
-// `StorageConfig`), never a default or fallback (spec §17.17 selection
-// mandatory / never-default / never-fallback). Kept separate from the
-// `testing`-gated nullifier doubles so a build can compile the durable dev
-// affordance without pulling in `InMemoryKeyCustody`. See ADR-062 §0.
-#[cfg(any(feature = "in-memory-storage", feature = "in-memory-push"))]
+// The one durability-only in-memory adapter, `InMemoryStorage`, gated by the
+// `in-memory-storage` feature, NOT `testing`. It loses state on restart but
+// nullifies no security property (spec §17.17.2 durability-only-vs-nullifier
+// classification), so a shipped build may compile it and select it
+// explicitly (e.g. via `StorageConfig`), never as a default or fallback (spec
+// §17.17 selection mandatory / never-default / never-fallback). See ADR-062 §0.
+#[cfg(feature = "in-memory-storage")]
 pub mod in_memory;
-// Test-only nullifier doubles (`InMemoryKeyCustody`,
-// `InMemoryDeviceAttestation`, `InMemoryPreRotationCustody`) — gated by the
-// `testing` feature, NOT by `software_platform`. This ensures production
-// mobile builds can enable `software_platform` (for crypto primitives)
-// without compiling in insecure in-memory key storage. See GitHub issue #88,
-// ADR-006, and the honest-module-structure split in ADR-062 §0.
+// Test-only doubles, gated by the `testing` feature, NOT by
+// `software_platform`: the nullifiers `InMemoryKeyCustody`,
+// `InMemoryDeviceAttestation`, and `InMemoryPreRotationCustody`, and
+// `InMemoryPush`, whose UUID token no push service issued, so it delivers no
+// wake. Production mobile builds enable `software_platform` (for crypto
+// primitives) and compile none of these doubles. See GitHub issue #88,
+// ADR-006, and ADR-062 §0 (amended 2026-10-12).
 #[cfg(feature = "testing")]
 pub mod testing;
 // Shared Argon2id passphrase→key derivation (spec §17.6 / §17.8). Single

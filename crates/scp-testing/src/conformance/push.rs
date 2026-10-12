@@ -151,7 +151,7 @@ macro_rules! push_conformance {
 mod tests {
     use scp_platform::PushToken;
     use scp_platform::error::PlatformError;
-    use scp_platform::in_memory::InMemoryPush;
+    use scp_platform::testing::InMemoryPush;
 
     use super::*;
 

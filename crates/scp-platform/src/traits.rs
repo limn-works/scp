@@ -438,8 +438,8 @@ impl PushToken {
 /// slice a `static` table at an index read from the payload. The conformance
 /// check `scp_testing::conformance::push::check_fixed_wake_signal` is what
 /// rejects an adapter whose signal differs across the payloads it sends,
-/// however the signal was built. `InMemoryPush`, the durability-only adapter behind the
-/// `in-memory-push` feature (ADR-062 §0), returns the fixed bytes
+/// however the signal was built. `InMemoryPush`, the test double behind the
+/// `testing` feature (ADR-062 §0), returns the fixed bytes
 /// `{"aps":{"content-available":1}}` for every payload. See ADR-006.
 ///
 /// ```

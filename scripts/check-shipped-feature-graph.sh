@@ -174,12 +174,7 @@ cd "$REPO_ROOT"
 # NULLIFIER_CONTROL_FEATURES entry is added, so a future edit cannot quietly add
 # a nullifier exception.
 #
-# `scp-platform/in-memory-push` is an intentionally-permitted, currently-unused
-# durability-only entry: no shipped artifact resolves it today, but a superset
-# allowlist may carry permitted-but-unresolved rows (it is durability-only, not a
-# nullifier, so its presence widens nothing that matters).
-#
-# `scp-platform/filesystem` was such a row until three FFI bridges stopped
+# `scp-platform/filesystem` was a row here until three FFI bridges stopped
 # depending on it: `start_node_local` no longer opens a plaintext
 # `FilesystemStorage` under its data directory, so no shipped artifact resolves
 # that feature. Its row is dropped rather than kept, because keeping it would let
@@ -270,7 +265,6 @@ scp-node/default
 scp-platform/default
 scp-platform/encrypting
 scp-platform/file
-scp-platform/in-memory-push
 scp-platform/in-memory-storage
 scp-platform/software_platform
 scp-platform/sqlite
