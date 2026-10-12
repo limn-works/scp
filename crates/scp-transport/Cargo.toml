@@ -16,6 +16,12 @@ redb-blob = ["dep:redb"]
 local-cache = []
 combined = ["dep:rusqlite", "dep:scp-sqlite-pools", "dep:scp-platform"]
 relay-persistence = ["dep:scp-platform"]
+# The relay push registration store (spec §10.7.1, PUSH-006). Its one shipped
+# arm is SQLite through scp-sqlite-pools.
+push-store = ["dep:rusqlite", "dep:scp-sqlite-pools"]
+# Compiles test-only arms: today the push store's in-memory arm, which is
+# durability-only (spec §17.17.2) and absent from every build without it.
+testing = []
 postgres-blob = ["dep:sqlx"]
 s3-blob = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-http-client", "dep:http-body"]
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots", "dep:reqwest"]
@@ -199,6 +205,11 @@ required-features = ["postgres-blob"]
 name = "combined_conformance"
 path = "tests/combined_conformance.rs"
 required-features = ["combined"]
+
+[[test]]
+name = "push_store_conformance"
+path = "tests/push_store_conformance.rs"
+required-features = ["push-store", "testing"]
 
 [[test]]
 name = "local_cache_conformance"
