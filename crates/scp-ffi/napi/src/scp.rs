@@ -4719,6 +4719,38 @@ impl Scp {
         crate::testing::fullstack_create_node_on(&self.inner, did)
     }
 
+    /// Test seam: attaches this instance's supervisor with `localDid` as its
+    /// MLS identity and captures every payload it sends to a context.
+    ///
+    /// Call it before the first context operation, which would otherwise
+    /// attach a supervisor with no transport.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-CTX-2000` when a supervisor is already attached or none can be.
+    #[napi(js_name = "testingCaptureContextSends")]
+    pub fn testing_capture_context_sends(
+        &self,
+        local_did: String,
+    ) -> napi::Result<crate::testing::NapiContextSendCapture> {
+        crate::testing::capture_context_sends_on(&self.inner, &local_did)
+    }
+
+    /// Test seam: delivers `payloads`, in order, to `contextId`'s actor as a
+    /// relay subscription would, and resolves with each payload's result.
+    ///
+    /// # Errors
+    ///
+    /// A context error when the supervisor or actor is gone.
+    #[napi(js_name = "testingDeliverIncoming")]
+    pub async fn testing_deliver_incoming(
+        &self,
+        context_id: String,
+        payloads: Vec<Buffer>,
+    ) -> napi::Result<Vec<crate::testing::NapiDeliveryResult>> {
+        crate::testing::deliver_incoming_on(&self.inner, context_id, payloads).await
+    }
+
     /// Per-instance equivalent of the free-function `fullstack_reset_network`.
     #[napi(js_name = "fullstackResetNetwork")]
     pub fn fullstack_reset_network(&self) {

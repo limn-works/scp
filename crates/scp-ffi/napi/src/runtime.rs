@@ -1459,6 +1459,23 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
     // Test fixtures create contexts for DIDs they never register.
     #[cfg(feature = "testing")]
     serve_unregistered_wrapping_keys_from_test_custody(bi);
+    init_supervisor_with_transport_for_test(
+        bi,
+        local_did,
+        Box::new(scp_core::context::LocalTransportProvider),
+    );
+}
+
+/// Test seam: attaches a `Supervisor` whose context sends go to `transport`.
+///
+/// `local_did` is the MLS credential identity. First call wins via
+/// `has_supervisor`; a missing storage backend attaches nothing.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn init_supervisor_with_transport_for_test(
+    bi: &NapiBridgeInstance,
+    local_did: &str,
+    transport: Box<dyn ContextTransportProvider>,
+) {
     if bi.core.has_supervisor() {
         return;
     }
@@ -1466,7 +1483,7 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
     let Some(durable) = bi.durable_providers_ref().cloned() else {
         tracing::error!(
             local_did,
-            "init_supervisor_for_test_on: storage-before-supervisor precondition failed — \
+            "init_supervisor_with_transport_for_test: storage-before-supervisor precondition failed — \
              no durable providers (saga journal + mls_storage) on the bridge instance"
         );
         return;
@@ -1474,7 +1491,7 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
     let Some(persistence) = persistence_box_for_init(bi) else {
         tracing::error!(
             local_did,
-            "init_supervisor_for_test_on: storage-before-supervisor precondition failed — \
+            "init_supervisor_with_transport_for_test: storage-before-supervisor precondition failed — \
              no context persistence on the bridge instance"
         );
         return;
@@ -1484,7 +1501,7 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
             local_did.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),
-        Box::new(scp_core::context::LocalTransportProvider),
+        transport,
         event_log,
         persistence,
         durable,
