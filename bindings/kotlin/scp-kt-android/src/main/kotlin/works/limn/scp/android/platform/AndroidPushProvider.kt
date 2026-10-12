@@ -20,10 +20,10 @@
  * push: the caller does both when [handleNotification] returns [WakeSignal.PULL].
  *
  * [handleNotification] checks only the `scp` field. It rejects a payload that lacks the
- * field with [ScpException] code `SCP-TRANS-5001`, and a payload whose field is not
- * `"1"` with code `SCP-TRANS-5002`. It accepts a payload that carries other fields
- * beside `"scp": "1"` and returns the same [WakeSignal.PULL] for it, reading nothing
- * else from the payload.
+ * field, and a payload whose field is not `"1"`, with [ScpException] code
+ * `SCP-TRANS-5080` (wake payload invalid); the message says which of the two it was.
+ * It accepts a payload that carries other fields beside `"scp": "1"` and returns the
+ * same [WakeSignal.PULL] for it, reading nothing else from the payload.
  *
  * Opacity is an obligation on the sender: §10.7.1 step 5 has the relay send exactly
  * `{ "scp": 1 }`. FCM has already carried every field of a payload before
@@ -128,9 +128,8 @@ class AndroidPushProvider(
      *   `RemoteMessage.getData()`). Expected: `{"scp": "1"}`.
      * @return [WakeSignal.PULL] — tells the caller to connect to the relay
      *   and pull all pending encrypted envelopes.
-     * @throws ScpException with code `SCP-TRANS-5001` if the `scp` field is missing.
-     * @throws ScpException with code `SCP-TRANS-5002` if the `scp` field has an
-     *   unexpected value.
+     * @throws ScpException with code `SCP-TRANS-5080` (wake payload invalid) if the
+     *   `scp` field is missing or has a value other than `"1"`.
      */
     override fun handleNotification(payload: Map<String, String>): WakeSignal {
         // ADR-027's FCM data payload is {"scp": "1"}; the value "1" is the wake signal.
@@ -138,12 +137,12 @@ class AndroidPushProvider(
         val scpField = payload["scp"]
             ?: throw ScpException(
                 "FCM payload missing 'scp' field",
-                "SCP-TRANS-5001"
+                "SCP-TRANS-5080"
             )
         if (scpField != "1") {
             throw ScpException(
                 "FCM payload 'scp' field has unexpected value: $scpField",
-                "SCP-TRANS-5002"
+                "SCP-TRANS-5080"
             )
         }
         return WakeSignal.PULL // connect to relay and pull pending envelopes
