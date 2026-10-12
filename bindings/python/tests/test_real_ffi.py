@@ -1083,30 +1083,34 @@ class TestTrust:
         7.3.4.4): asserts the anchor op's codes stay recoverable the same way
         the participation sibling's now are.
         """
-        from scp_sdk.trust import check_capability_requirements
+        from scp_sdk.errors import ValidationError
+        from scp_sdk.trust import CapabilityRequirement, VerificationLevel
 
         # SDK wrapper: a malformed subject DID fails boundary validation with
         # the generic validation code shared by all three bridges.
-        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7000"):
-            check_capability_requirements("ctx-real-ffi", "not-a-did", [], [], [])
+        with pytest.raises(ValidationError, match="SCP-VALID-7000"):
+            await scp.check_capability_requirements("ctx-real-ffi", "not-a-did", [], [], [])
 
         # SDK wrapper: a self-attested requirement the agent lacks fails the
         # admission check itself, which carries its own per-case code.
-        from scp_sdk.trust import CapabilityRequirement, VerificationLevel
-
         requirement = CapabilityRequirement(
             capability="scp:capability:schema-validation/v1",
             verification_level=VerificationLevel("SelfAttested"),
         )
-        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7076"):
-            check_capability_requirements("ctx-real-ffi", "did:key:alice", [requirement], [], [])
+        with pytest.raises(ValidationError, match="SCP-VALID-7076"):
+            await scp.check_capability_requirements(
+                "ctx-real-ffi", "did:key:alice", [requirement], [], []
+            )
 
         # Raw bridge: the per-position JSON parse code (unreachable through
         # the typed SDK wrapper, which always serializes valid JSON).
         with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7073"):
-            _scp_core.check_capability_requirements(
+            scp._native.check_capability_requirements(
                 "ctx-real-ffi", "did:key:alice", "not json", "[]", "[]"
             )
+
+        # The free function is gone; the check reads the instance resolver.
+        assert not hasattr(_scp_core, "check_capability_requirements")
 
     async def test_participation_record_reflects_governance_real_ffi(self, scp: SCP):
         """The typed participation record (§7.3.2) RECEIVES real leaf-derived facts.

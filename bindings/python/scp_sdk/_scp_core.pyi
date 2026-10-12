@@ -832,6 +832,14 @@ class SCP:
     def trust_verify_response(
         self, verifier: Any, challenge_json: Any, response_json: Any, context_id: Any
     ) -> Any: ...
+    def check_capability_requirements(
+        self,
+        context_id: str,
+        subject_did: str,
+        requirements_json: str,
+        agent_capabilities_json: str,
+        challenge_verifications_json: str,
+    ) -> None: ...
     def participation_record(
         self, context_id: Any, subject_did: Any, cached_attestations_json: Any = ...
     ) -> Any: ...
@@ -944,13 +952,6 @@ def economy_evaluate_formula(formula_json: str, metrics: dict[str, int] | None) 
 def trust_verify_attestation(*args: Any, **kwargs: Any) -> Any: ...
 def verify_participation_requirements(
     expected_subject: str, requirements_json: str, profile_json: str
-) -> None: ...
-def check_capability_requirements(
-    context_id: str,
-    subject_did: str,
-    requirements_json: str,
-    agent_capabilities_json: str,
-    challenge_verifications_json: str,
 ) -> None: ...
 
 # -- sync (pure) --

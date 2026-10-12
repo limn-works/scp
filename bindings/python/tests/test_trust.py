@@ -1535,7 +1535,11 @@ class TestChallengeWireTypes:
         import scp_sdk
         import scp_sdk.trust
 
-        for name in ("trust_create_challenge", "trust_verify_response"):
+        for name in (
+            "trust_create_challenge",
+            "trust_verify_response",
+            "check_capability_requirements",
+        ):
             assert not hasattr(scp_sdk.trust, name)
             assert not hasattr(scp_sdk, name)
 

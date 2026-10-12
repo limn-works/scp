@@ -252,8 +252,8 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // Raised 52 -> 55 (merge with origin/main) when the capability-admission op
 // `check_capability_requirements` (§7.3.4.4, SCP-ACR-008) was wired through all
 // three native bridges: one per-bridge assertion pins each export body to the
-// core `scp_core::trust::check_capability_requirements` call and the production
-// `IdentityDidPublicKeyResolver`. The 2J joiner (+4) and capability-admission
+// core `scp_core::trust::check_capability_requirements` call and the instance
+// DID resolver. The 2J joiner (+4) and capability-admission
 // (+3) additions are disjoint, so the merged floor is 48 + 4 + 3 = 55.
 const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 55;
 
@@ -5019,28 +5019,29 @@ fn uniffi_participation_record_routes_to_supervisor() {
 // Each native bridge's capability-admission export MUST delegate to the shared
 // core `scp_protocol::trust::check_capability_requirements` (re-exported as
 // `scp_core::trust::check_capability_requirements`) rather than re-implementing
-// the admission decision locally, AND MUST wire the production
-// `IdentityDidPublicKeyResolver` so each `ChallengeVerification` is
+// the admission decision locally, AND MUST wire the instance's DID resolver
+// (`instance_challenge_resolver` over the instance `IdentityBackedDidResolver`),
+// which reads the verifier's `#active` key, so each `ChallengeVerification` is
 // signature/subject/context/expiry verified. Pinning the fully-qualified
 // `scp_core::trust::check_capability_requirements(` call (not the bare leaf,
 // which the bridge fn shares its name with) plus the resolver makes a
 // self-satisfying substring impossible.
 
-/// The PyO3 `check_capability_requirements` bridge op must route to core.
+/// The PyO3 `SCP.check_capability_requirements` method must route to core.
 #[test]
 fn pyo3_check_capability_requirements_routes_to_core() {
     assert!(
         fn_body_contains(
             PYO3_TRUST_SRC,
-            "py_check_capability_requirements",
+            "check_capability_requirements",
             "scp_core::trust::check_capability_requirements("
         ) && fn_body_contains(
             PYO3_TRUST_SRC,
-            "py_check_capability_requirements",
-            "IdentityDidPublicKeyResolver"
+            "check_capability_requirements",
+            "instance_challenge_resolver(crate::runtime::did_resolver(bi))"
         ),
-        "PyO3 py_check_capability_requirements must call core \
-         check_capability_requirements with the production DID resolver"
+        "PyO3 check_capability_requirements must call core \
+         check_capability_requirements with the instance DID resolver"
     );
 }
 
@@ -5056,14 +5057,14 @@ fn napi_check_capability_requirements_routes_to_core() {
         ) && fn_body_contains(
             NAPI_TRUST_SRC,
             "check_capability_requirements_on",
-            "IdentityDidPublicKeyResolver"
+            "instance_challenge_resolver(crate::runtime::did_resolver(bi))"
         ),
         "NAPI check_capability_requirements_on must call core \
-         check_capability_requirements with the production DID resolver"
+         check_capability_requirements with the instance DID resolver"
     );
 }
 
-/// The UniFFI `check_capability_requirements` bridge op must route to core.
+/// The UniFFI `Scp::check_capability_requirements` method must route to core.
 #[test]
 fn uniffi_check_capability_requirements_routes_to_core() {
     assert!(
@@ -5074,10 +5075,14 @@ fn uniffi_check_capability_requirements_routes_to_core() {
         ) && fn_body_contains(
             UNIFFI_BRIDGE_SRC,
             "check_capability_requirements",
-            "IdentityDidPublicKeyResolver"
+            "let did_resolver = self.inner.did_resolver();"
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "check_capability_requirements",
+            "instance_challenge_resolver(did_resolver.as_ref())"
         ),
         "UniFFI check_capability_requirements must call core \
-         check_capability_requirements with the production DID resolver"
+         check_capability_requirements with the instance DID resolver"
     );
 }
 

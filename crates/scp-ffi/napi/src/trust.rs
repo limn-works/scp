@@ -426,9 +426,10 @@ pub(crate) fn verify_participation_requirements_on(
 /// Per-bridge-instance implementation of `check_capability_requirements`.
 ///
 /// Verifies that an agent meets a context's capability requirements for
-/// admission. Pure verification — the bridge instance is unused (the production
-/// `IdentityDidPublicKeyResolver` is stateless) but accepted for API symmetry
-/// with the other `_on` helpers in this module.
+/// admission. Each record's signature is checked against the verifier's
+/// `#active` key, resolved through `bi`'s DID resolver; with none, a supplied
+/// record fails closed with `SCP-IDENT-1033`. The lookup blocks the calling
+/// thread.
 ///
 /// `subject_did` is the DID of the agent being admitted and `context_id` the
 /// context: a `ChallengeVerification` only satisfies a requirement when its
@@ -1147,10 +1148,32 @@ mod tests {
             .unwrap();
         }
 
+        /// Which key signs a test `ChallengeVerification`.
+        enum CvSigner {
+            /// The verifier's `#active` key, through its custody.
+            Active,
+            /// The verifier's self-certifying identity key `#0`, through its
+            /// custody.
+            IdentityKey,
+            /// A key unrelated to the verifier's DID.
+            Unrelated,
+        }
+
         /// A record over `subject` in `context_id`, signed over its digest with
         /// `verifier`'s `#active` key.
         async fn signed_record_json(
             verifier: &crate::identity::NapiIdentity,
+            subject: &str,
+            context_id: &str,
+        ) -> String {
+            signed_record_json_by(verifier, &CvSigner::Active, subject, context_id).await
+        }
+
+        /// A record issued by `verifier` over `subject` in `context_id`,
+        /// signed over its digest by `signer`.
+        async fn signed_record_json_by(
+            verifier: &crate::identity::NapiIdentity,
+            signer: &CvSigner,
             subject: &str,
             context_id: &str,
         ) -> String {
@@ -1187,15 +1210,26 @@ mod tests {
                 completed_at: timestamp,
             };
             let digest = scp_core::trust::challenge_verification_signing_digest(&record).unwrap();
-            record.verifier_signature = verifier
-                .inner
-                .in_memory_custody
-                .as_ref()
-                .unwrap()
-                .sign(&v_id.active_signing_key, &digest)
-                .await
-                .unwrap()
-                .into_bytes();
+            let custody = verifier.inner.in_memory_custody.as_ref().unwrap();
+            record.verifier_signature = match signer {
+                CvSigner::Active => custody
+                    .sign(&v_id.active_signing_key, &digest)
+                    .await
+                    .unwrap()
+                    .into_bytes(),
+                CvSigner::IdentityKey => custody
+                    .sign(&v_id.identity_key, &digest)
+                    .await
+                    .unwrap()
+                    .into_bytes(),
+                CvSigner::Unrelated => {
+                    use ed25519_dalek::Signer;
+                    ed25519_dalek::SigningKey::from_bytes(&[42; 32])
+                        .sign(&digest)
+                        .to_bytes()
+                        .to_vec()
+                }
+            };
             serde_json::to_string(&vec![record]).unwrap()
         }
 
@@ -1223,6 +1257,32 @@ mod tests {
             })
             .await
             .unwrap()
+        }
+
+        /// A record signed by the verifier's `#active` key, which differs from
+        /// `#0`, is admitted through the instance resolver; the same record
+        /// signed by an unrelated key or by `#0` is dropped.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn check_capability_requirements_admits_only_active_key_records() {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let dht = install_resolver(&scp.inner);
+            let v = identity(&scp).await;
+            publish(&v, &dht).await;
+            let v_id = v.inner.scp_identity.as_ref().unwrap();
+            assert_ne!(v_id.identity_key, v_id.active_signing_key);
+
+            let active =
+                signed_record_json_by(&v, &CvSigner::Active, VALID_DID, "ctx-admission").await;
+            admit(&scp.inner, VALID_DID, "ctx-admission", active)
+                .await
+                .unwrap();
+            for signer in [CvSigner::Unrelated, CvSigner::IdentityKey] {
+                let record = signed_record_json_by(&v, &signer, VALID_DID, "ctx-admission").await;
+                assert_code(
+                    admit(&scp.inner, VALID_DID, "ctx-admission", record).await,
+                    codes::VALID_7076,
+                );
+            }
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

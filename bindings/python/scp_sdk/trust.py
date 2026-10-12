@@ -685,7 +685,7 @@ class ChallengeVerification:
 
     Mirrors the Rust ``ChallengeVerification`` struct (``scp-core``).
     :meth:`scp_sdk.SCP.trust_verify_response` returns one; pass a list of them
-    to :func:`check_capability_requirements` to satisfy ``ChallengeVerified``
+    to :meth:`scp_sdk.SCP.check_capability_requirements` to satisfy ``ChallengeVerified``
     requirements.
 
     SECURITY: the verifier's signature covers the SHA-256 digest of twelve
@@ -1551,78 +1551,6 @@ def verify_participation_requirements(
     bridge.verify_participation_requirements(expected_subject, requirements_json, profile_json)
 
 
-def check_capability_requirements(
-    context_id: str,
-    subject_did: str,
-    requirements: list[CapabilityRequirement],
-    agent_capabilities: list[str],
-    challenge_verifications: list[ChallengeVerification],
-) -> None:
-    """Verify an agent's capabilities against a context's admission requirements.
-
-    Delegates to the Rust ``scp-core`` implementation via the PyO3 bridge
-    (spec §7.3.4.4, SCP-ACR-008). For each requirement the agent must either
-    self-attest the capability (``SelfAttested``) or present a valid
-    ``ChallengeVerification`` record (``ChallengeVerified``). Each supplied
-    verification is signature-verified against the production DID resolver and
-    only counts if it is authentic and its signed ``subject_did``/``context_id``
-    equal ``subject_did``/``context_id`` — a genuine result minted for another
-    subject or context cannot admit this agent.
-
-    Security caveat — authenticity is not authorization: a passing
-    ``ChallengeVerified`` check proves the verifier's signature is authentic and
-    bound to this subject/context, NOT that the verifier is trusted. A
-    ``verifier_did`` is self-certifying, so a subject can present a genuinely
-    signed result from a verifier it controls. Establish verifier legitimacy
-    separately (a trusted-verifier set, a context-membership proof, or the
-    §7.3.5 threshold/independence path) and do NOT treat success as an
-    authorization decision.
-
-    Success is indicated by returning without exception. Failures raise the
-    bridge's native coded ``ValidationError`` (rooted at ``ScpError``); the
-    structured per-case ``SCP-VALID-*`` code is recoverable from the
-    exception's string form (the ``[CODE]``-prefixed message), so callers
-    branch on the code — never on error prose.
-
-    Args:
-        context_id: The context the agent is being admitted to.
-        subject_did: The DID of the agent being admitted. Must be a valid DID.
-        requirements: Typed :class:`CapabilityRequirement` values. Serialized
-            internally to the serde wire shape (ADR-058).
-        agent_capabilities: The agent's self-attested capability URIs.
-        challenge_verifications: The agent's typed :class:`ChallengeVerification`
-            records. Serialized internally to the serde wire shape (ADR-058).
-
-    Raises:
-        ScpError: If the bridge module is not available.
-        ValidationError: Native bridge exception whose ``[SCP-VALID-NNNN]``-
-            prefixed message carries the per-case structured code:
-            ``SCP-VALID-7000`` for a malformed ``subject_did``;
-            ``SCP-VALID-7073`` / ``SCP-VALID-7074`` / ``SCP-VALID-7075`` for
-            malformed requirements / agent-capabilities /
-            challenge-verifications JSON (unreachable through this typed
-            wrapper, which always serializes valid JSON); ``SCP-VALID-7076``
-            for an unmet admission requirement, with the specific failure
-            reason from ``AdmissionError``; and ``SCP-VALID-7077`` for its
-            empty-subject variant.
-    """
-    bridge = _bridge()
-
-    requirements_json = json.dumps([r._to_bridge_dict() for r in requirements])
-    agent_capabilities_json = json.dumps(agent_capabilities)
-    challenge_verifications_json = json.dumps(
-        [c._to_bridge_dict() for c in challenge_verifications]
-    )
-
-    bridge.check_capability_requirements(
-        context_id,
-        subject_did,
-        requirements_json,
-        agent_capabilities_json,
-        challenge_verifications_json,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Challenge trust-input wire DTOs + typed verification wrappers (§7.3.4,
 # ADR-058)
@@ -1894,7 +1822,6 @@ __all__ = [
     "TrustEvaluation",
     "VerificationLevel",
     "aggregate_trust_input",
-    "check_capability_requirements",
     "evaluate_trust",
     "participation_record",
     "trust_verify_attestation",

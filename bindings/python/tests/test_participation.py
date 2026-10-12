@@ -13,10 +13,13 @@ See spec section 7.3.2.1 and SCP-BA-004.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from scp_sdk.errors import ValidationError
+from scp_sdk.scp import SCP
 from scp_sdk.trust import (
     PARTICIPATION_FACT_VARIANTS,
     PARTICIPATION_THRESHOLD_OPERATORS,
@@ -28,7 +31,6 @@ from scp_sdk.trust import (
     ParticipationThreshold,
     RequireParticipation,
     VerificationLevel,
-    check_capability_requirements,
     verify_participation_requirements,
 )
 
@@ -414,7 +416,8 @@ class TestVerifyParticipationRequirements:
 
 
 class TestCheckCapabilityRequirements:
-    """Tests that check_capability_requirements delegates to the Rust bridge.
+    """Tests that ``SCP.check_capability_requirements`` delegates to the
+    instance's bridge handle.
 
     The typed input (ADR-058) serializes internally to the exact serde
     snake_case JSON the ``scp-core`` ``CapabilityRequirement`` /
@@ -422,7 +425,8 @@ class TestCheckCapabilityRequirements:
     """
 
     def test_delegates_to_bridge(self) -> None:
-        mock_bridge = MagicMock()
+        scp = MagicMock()
+        mock_bridge = scp._native
         mock_bridge.check_capability_requirements.return_value = None
 
         requirements = [
@@ -433,10 +437,11 @@ class TestCheckCapabilityRequirements:
         ]
         capabilities = ["scp:capability:schema-validation/v1"]
 
-        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = check_capability_requirements(
-                "ctx-1", "did:dht:z6MkAlice", requirements, capabilities, []
+        result = asyncio.run(
+            SCP.check_capability_requirements(
+                scp, "ctx-1", "did:dht:z6MkAlice", requirements, capabilities, []
             )
+        )
 
         assert result is None
         mock_bridge.check_capability_requirements.assert_called_once()
@@ -461,7 +466,8 @@ class TestCheckCapabilityRequirements:
     def test_serializes_challenge_verified_requirement_and_verification(self) -> None:
         """A ChallengeVerified requirement + a typed ChallengeVerification
         serialize to the exact snake_case serde wire shape."""
-        mock_bridge = MagicMock()
+        scp = MagicMock()
+        mock_bridge = scp._native
         mock_bridge.check_capability_requirements.return_value = None
 
         requirements = [
@@ -491,14 +497,16 @@ class TestCheckCapabilityRequirements:
             context_id="ctx-1",
         )
 
-        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            check_capability_requirements(
+        asyncio.run(
+            SCP.check_capability_requirements(
+                scp,
                 "ctx-1",
                 "did:dht:z6MkAlice",
                 requirements,
                 ["scp:capability:code-review/v1"],
                 [verification],
             )
+        )
 
         import json
 
@@ -562,9 +570,10 @@ class TestCheckCapabilityRequirements:
             )
 
     def test_raises_on_bridge_failure(self) -> None:
-        mock_bridge = MagicMock()
+        scp = MagicMock()
+        mock_bridge = scp._native
         mock_bridge.check_capability_requirements.side_effect = RuntimeError(
-            "missing required capability"
+            "[SCP-VALID-7076] missing required capability"
         )
 
         requirements = [
@@ -574,16 +583,21 @@ class TestCheckCapabilityRequirements:
             ),
         ]
 
-        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            with pytest.raises(RuntimeError, match="missing required capability"):
-                check_capability_requirements("ctx-1", "did:dht:z6MkBob", requirements, [], [])
+        with pytest.raises(ValidationError, match="SCP-VALID-7076"):
+            asyncio.run(
+                SCP.check_capability_requirements(
+                    scp, "ctx-1", "did:dht:z6MkBob", requirements, [], []
+                )
+            )
 
     def test_empty_inputs(self) -> None:
-        mock_bridge = MagicMock()
+        scp = MagicMock()
+        mock_bridge = scp._native
         mock_bridge.check_capability_requirements.return_value = None
 
-        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = check_capability_requirements("ctx-1", "did:dht:z6MkAlice", [], [], [])
+        result = asyncio.run(
+            SCP.check_capability_requirements(scp, "ctx-1", "did:dht:z6MkAlice", [], [], [])
+        )
 
         assert result is None
         import json

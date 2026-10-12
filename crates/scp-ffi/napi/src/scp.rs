@@ -3935,11 +3935,11 @@ impl Scp {
         )
     }
 
-    /// Per-instance equivalent of the free-function `check_capability_requirements`.
-    ///
     /// Verifies that an agent meets a context's capability requirements for
     /// admission (spec §7.3.4.4). `subjectDid`/`contextId` bind challenge
-    /// verifications to the agent and context being admitted. Returns normally
+    /// verifications to the agent and context being admitted, and each
+    /// record's signature is checked against the verifier's `#active` key
+    /// through this instance's DID resolver. Returns normally
     /// when all requirements are satisfied; throws on any unmet requirement or
     /// malformed JSON.
     #[napi(js_name = "checkCapabilityRequirements")]

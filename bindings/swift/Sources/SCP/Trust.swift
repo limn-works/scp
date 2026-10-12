@@ -1273,7 +1273,7 @@ public nonisolated enum ChallengeVerificationMethod: Codable, Sendable, Equatabl
 /// §7.3.4.2, ADR-017).
 ///
 /// Pass a list of these to
-/// ``checkCapabilityRequirements(contextId:subjectDid:requirements:agentCapabilities:challengeVerifications:)``
+/// ``SCP/checkCapabilityRequirements(contextId:subjectDid:requirements:agentCapabilities:challengeVerifications:)``
 /// to satisfy `ChallengeVerified` requirements;
 /// ``SCP/trustVerifyResponse(verifier:challenge:response:contextId:)`` returns
 /// one. The `CodingKeys` are the serde-canonical snake_case the Rust core
@@ -1856,50 +1856,58 @@ public func verifyParticipationRequirements(
     )
 }
 
-/// Verify that an agent meets a context's capability requirements for admission
-/// (spec §7.3.4.4).
-///
-/// Typed counterpart to the generated
-/// ``checkCapabilityRequirements(contextId:subjectDid:requirementsJson:agentCapabilitiesJson:challengeVerificationsJson:)``
-/// free function: it serializes the typed ``CapabilityRequirement`` /
-/// ``ChallengeVerification`` values (and the agent capability URIs) to the serde
-/// wire shape (ADR-058) and calls the bridge unchanged. `subjectDid`/`contextId`
-/// bind challenge verifications to the agent and context being admitted — a
-/// `ChallengeVerification` only satisfies a requirement when its signed
-/// `subjectDid`/`contextId` equal these values, closing cross-subject and
-/// cross-context attribution. Returns normally when all requirements are
-/// satisfied; throws on any unmet requirement or malformed input.
-///
-/// Security caveat — authenticity is not authorization: a passing
-/// `ChallengeVerified` check proves the verifier's signature is authentic and
-/// bound to this subject/context, NOT that the verifier is *trusted*. Because
-/// `verifierDid` is self-certifying, a subject can present a genuinely-signed
-/// result from a verifier it controls. Establish verifier legitimacy separately;
-/// do NOT treat success as an authorization decision.
-///
-/// - Parameters:
-///   - contextId: The context the agent is being admitted to.
-///   - subjectDid: DID of the agent being admitted.
-///   - requirements: Typed ``CapabilityRequirement`` values, serialized
-///     internally.
-///   - agentCapabilities: The agent's self-attested capability URIs.
-///   - challengeVerifications: Typed ``ChallengeVerification`` records,
-///     serialized internally.
-/// - Throws: ``ScpError`` on any unmet requirement or a serialization failure.
-public func checkCapabilityRequirements(
-    contextId: String,
-    subjectDid: String,
-    requirements: [CapabilityRequirement],
-    agentCapabilities: [String],
-    challengeVerifications: [ChallengeVerification]
-) throws {
-    try checkCapabilityRequirements(
-        contextId: contextId,
-        subjectDid: subjectDid,
-        requirementsJson: encodeCapabilityRequirementsJson(requirements),
-        agentCapabilitiesJson: encodeAgentCapabilitiesJson(agentCapabilities),
-        challengeVerificationsJson: encodeChallengeVerificationsJson(challengeVerifications)
-    )
+public extension SCP {
+    /// Verify that an agent meets a context's capability requirements for
+    /// admission (spec §7.3.4.4).
+    ///
+    /// Typed counterpart to
+    /// ``SCP/checkCapabilityRequirements(contextId:subjectDid:requirementsJson:agentCapabilitiesJson:challengeVerificationsJson:)``:
+    /// it serializes the typed ``CapabilityRequirement`` /
+    /// ``ChallengeVerification`` values (and the agent capability URIs) to the
+    /// serde wire shape (ADR-058). `subjectDid`/`contextId` bind challenge
+    /// verifications to the agent and context being admitted — a
+    /// `ChallengeVerification` only satisfies a requirement when its signed
+    /// `subject`/`contextId` equal these values, closing cross-subject and
+    /// cross-context attribution. Each record's signature is checked against
+    /// the verifier's `#active` key, resolved through this instance's DID
+    /// resolver; the lookup blocks, so call this off the main thread. Returns
+    /// normally when all requirements are satisfied.
+    ///
+    /// Security caveat — authenticity is not authorization: a passing
+    /// `ChallengeVerified` check proves the verifier's signature is authentic
+    /// and bound to this subject/context, NOT that the verifier is *trusted*.
+    /// Because `verifierDid` is self-certifying, a subject can present a
+    /// genuinely-signed result from a verifier it controls. Establish verifier
+    /// legitimacy separately; do NOT treat success as an authorization
+    /// decision.
+    ///
+    /// - Parameters:
+    ///   - contextId: The context the agent is being admitted to.
+    ///   - subjectDid: DID of the agent being admitted.
+    ///   - requirements: Typed ``CapabilityRequirement`` values, serialized
+    ///     internally.
+    ///   - agentCapabilities: The agent's self-attested capability URIs.
+    ///   - challengeVerifications: Typed ``ChallengeVerification`` records,
+    ///     serialized internally.
+    /// - Throws: ``ScpError/Validation(msg:code:)`` with `SCP-VALID-7076` for an
+    ///   unmet requirement; ``ScpError/Identity(msg:code:)`` with
+    ///   `SCP-IDENT-1033` when a record must be verified and this instance has
+    ///   no DID resolver; or a serialization failure.
+    func checkCapabilityRequirements(
+        contextId: String,
+        subjectDid: String,
+        requirements: [CapabilityRequirement],
+        agentCapabilities: [String],
+        challengeVerifications: [ChallengeVerification]
+    ) throws {
+        try checkCapabilityRequirements(
+            contextId: contextId,
+            subjectDid: subjectDid,
+            requirementsJson: encodeCapabilityRequirementsJson(requirements),
+            agentCapabilitiesJson: encodeAgentCapabilitiesJson(agentCapabilities),
+            challengeVerificationsJson: encodeChallengeVerificationsJson(challengeVerifications)
+        )
+    }
 }
 
 // MARK: - Challenge trust inputs (§7.3.4, ADR-058)

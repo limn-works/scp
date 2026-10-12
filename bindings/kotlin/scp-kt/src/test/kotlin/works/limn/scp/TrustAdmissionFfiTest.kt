@@ -1,7 +1,8 @@
 // TrustAdmissionFfiTest.kt — Real-FFI call-through tests for the typed
 // trust-input wrappers (ADR-058, spec §7.3.2.1 / §7.3.4.4).
 //
-// These invoke the generated UniFFI free functions through the typed
+// These invoke the generated UniFFI bindings (the `Scp` instance method and
+// the participation free function) through the typed
 // [SCP.checkCapabilityRequirements] / [SCP.verifyParticipationRequirements]
 // wrappers, proving the TrustAdmission.kt-serialized JSON parses and evaluates
 // on the real Rust deserializers — not just that the encoders emit the pinned

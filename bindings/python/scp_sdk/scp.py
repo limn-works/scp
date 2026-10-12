@@ -81,6 +81,7 @@ if TYPE_CHECKING:
         AttestorInfo,
         BehavioralRecord,
         CachedAttestation,
+        CapabilityRequirement,
         CapabilityValidation,
         ChallengeRequest,
         ChallengeResponse,
@@ -2911,6 +2912,68 @@ class SCP:
         except Exception as exc:
             raise _coded_bridge_error(exc) from exc
         return _ChallengeVerification.from_dict(json.loads(record_json))
+
+    async def check_capability_requirements(
+        self,
+        context_id: str,
+        subject_did: str,
+        requirements: list[CapabilityRequirement],
+        agent_capabilities: list[str],
+        challenge_verifications: list[ChallengeVerification],
+    ) -> None:
+        """Verify an agent's capabilities against a context's admission
+        requirements (spec 07 §7.3.4.4, SCP-ACR-008).
+
+        For each requirement the agent must either self-attest the capability
+        (``SelfAttested``) or present a valid :class:`ChallengeVerification`
+        (``ChallengeVerified``). A record counts only if its signature verifies
+        against the verifier's ``#active`` key, resolved through this
+        instance's DID resolver, and its signed ``subject``/``context_id``
+        equal ``subject_did``/``context_id``, so a result minted for another
+        subject or context cannot admit this agent.
+
+        SECURITY: authenticity is not authorization. A passing
+        ``ChallengeVerified`` check proves the verifier's signature, NOT that
+        the verifier is trusted; a subject can present a genuinely signed
+        result from a verifier it controls. Establish verifier legitimacy
+        separately (a trusted-verifier set, a context-membership proof, or the
+        §7.3.5 threshold/independence path).
+
+        Success is returning without exception.
+
+        Args:
+            context_id: The context the agent is being admitted to.
+            subject_did: The DID of the agent being admitted.
+            requirements: The context's typed capability requirements.
+            agent_capabilities: The agent's self-attested capability URIs.
+            challenge_verifications: The agent's typed challenge records.
+
+        Raises:
+            ValidationError: ``SCP-VALID-7000`` for a malformed
+                ``subject_did``; ``SCP-VALID-7076`` for an unmet requirement;
+                ``SCP-VALID-7077`` for an empty subject.
+            IdentityError: ``SCP-IDENT-1033`` when a record must be verified
+                and this instance has no DID resolver (no identity was created
+                on it), or its resolver backend is unreachable.
+        """
+        import json
+
+        requirements_json = json.dumps([r._to_bridge_dict() for r in requirements])
+        agent_capabilities_json = json.dumps(agent_capabilities)
+        challenge_verifications_json = json.dumps(
+            [c._to_bridge_dict() for c in challenge_verifications]
+        )
+        try:
+            await asyncio.to_thread(
+                self._native.check_capability_requirements,
+                context_id,
+                subject_did,
+                requirements_json,
+                agent_capabilities_json,
+                challenge_verifications_json,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def evaluate_trust(
         self,

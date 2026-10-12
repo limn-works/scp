@@ -2105,6 +2105,43 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rotateKeys: Bool) async throws 
     
     /**
+     * Verifies that an agent meets a context's capability requirements for
+     * admission, bound to the agent and context being admitted (spec 07
+     * §7.3.4.4).
+     *
+     * Inputs:
+     * - `context_id`: the context the agent is being admitted to. A challenge
+     * verification only satisfies a requirement when its signed
+     * `context_id` equals this value.
+     * - `subject_did`: the DID of the agent being admitted. Only challenge
+     * verifications whose signed `subject` equals this value can satisfy a
+     * requirement (cross-subject attribution is rejected).
+     * - `requirements_json`: JSON array of `CapabilityRequirement` objects.
+     * - `agent_capabilities_json`: JSON array of capability-URI strings.
+     * - `challenge_verifications_json`: JSON array of `ChallengeVerification`
+     * records; each counts only if its signature verifies against the
+     * verifier's `#active` key, resolved through this instance's DID
+     * resolver, and it is in-context, in-subject, passed and unexpired.
+     *
+     * Authenticity is not authorization: a passing `ChallengeVerified` check
+     * proves the verifier's signature, NOT that the verifier is trusted.
+     * Establish verifier legitimacy separately (spec §7.3.4.4 / §7.4).
+     *
+     * The resolver lookup blocks; call this off the main thread.
+     *
+     * # Errors
+     *
+     * - `SCP-VALID-7000` for an invalid `subject_did`.
+     * - `SCP-VALID-7073` / `7074` / `7075` for malformed requirements,
+     * agent-capabilities or challenge-verifications JSON.
+     * - `SCP-VALID-7076` when a requirement is unmet, `SCP-VALID-7077` for an
+     * empty subject.
+     * - `SCP-IDENT-1033` when a record must be verified and this instance has
+     * no DID resolver, or its backend is unreachable.
+     */
+    func checkCapabilityRequirements(contextId: String, subjectDid: String, requirementsJson: String, agentCapabilitiesJson: String, challengeVerificationsJson: String) throws 
+    
+    /**
      * Per-instance equivalent of the free-function `configure_local_transport`.
      *
      * Routes through `&*self.inner`. Installs a real `NodeMlsFactory` and
@@ -4297,6 +4334,52 @@ open func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rot
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+    
+    /**
+     * Verifies that an agent meets a context's capability requirements for
+     * admission, bound to the agent and context being admitted (spec 07
+     * §7.3.4.4).
+     *
+     * Inputs:
+     * - `context_id`: the context the agent is being admitted to. A challenge
+     * verification only satisfies a requirement when its signed
+     * `context_id` equals this value.
+     * - `subject_did`: the DID of the agent being admitted. Only challenge
+     * verifications whose signed `subject` equals this value can satisfy a
+     * requirement (cross-subject attribution is rejected).
+     * - `requirements_json`: JSON array of `CapabilityRequirement` objects.
+     * - `agent_capabilities_json`: JSON array of capability-URI strings.
+     * - `challenge_verifications_json`: JSON array of `ChallengeVerification`
+     * records; each counts only if its signature verifies against the
+     * verifier's `#active` key, resolved through this instance's DID
+     * resolver, and it is in-context, in-subject, passed and unexpired.
+     *
+     * Authenticity is not authorization: a passing `ChallengeVerified` check
+     * proves the verifier's signature, NOT that the verifier is trusted.
+     * Establish verifier legitimacy separately (spec §7.3.4.4 / §7.4).
+     *
+     * The resolver lookup blocks; call this off the main thread.
+     *
+     * # Errors
+     *
+     * - `SCP-VALID-7000` for an invalid `subject_did`.
+     * - `SCP-VALID-7073` / `7074` / `7075` for malformed requirements,
+     * agent-capabilities or challenge-verifications JSON.
+     * - `SCP-VALID-7076` when a requirement is unmet, `SCP-VALID-7077` for an
+     * empty subject.
+     * - `SCP-IDENT-1033` when a record must be verified and this instance has
+     * no DID resolver, or its backend is unreachable.
+     */
+open func checkCapabilityRequirements(contextId: String, subjectDid: String, requirementsJson: String, agentCapabilitiesJson: String, challengeVerificationsJson: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_check_capability_requirements(self.uniffiClonePointer(),
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(subjectDid),
+        FfiConverterString.lower(requirementsJson),
+        FfiConverterString.lower(agentCapabilitiesJson),
+        FfiConverterString.lower(challengeVerificationsJson),$0
+    )
+}
 }
     
     /**
@@ -16692,45 +16775,6 @@ public func broadcastOpenKey(sealedJson: String, wrappingSecret: Data)throws  ->
 })
 }
 /**
- * Verifies that an agent meets a context's capability requirements for
- * admission, bound to the agent and context being admitted.
- *
- * Inputs:
- * - `context_id`: the context the agent is being admitted to. A challenge
- * verification only satisfies a requirement when its signed `context_id`
- * equals this value.
- * - `subject_did`: the DID of the agent being admitted. Only challenge
- * verifications whose signed `subject_did` equals this value can satisfy a
- * requirement (cross-subject attribution is rejected).
- * - `requirements_json`: JSON array of `CapabilityRequirement` objects.
- * - `agent_capabilities_json`: JSON array of capability-URI strings.
- * - `challenge_verifications_json`: JSON array of `ChallengeVerification`
- * records; each is signature-verified and only counts if authentic,
- * in-context, in-subject, passed, and unexpired.
- *
- * Uses the production `IdentityDidPublicKeyResolver` for verifier-DID key
- * resolution and the fail-closed system clock for expiry. Returns without error
- * (unit) if all requirements are satisfied, throws `ScpError` with a diagnostic
- * message if any requirement is unmet or if the JSON is malformed.
- *
- * Security caveat — authenticity is not authorization: a passing
- * `ChallengeVerified` check proves the verifier's signature is authentic and
- * bound to this subject/context, NOT that the verifier is trusted. Establish
- * verifier legitimacy separately (spec §7.3.4.4 / §7.4).
- *
- * See §7.3.4.4.
- */
-public func checkCapabilityRequirements(contextId: String, subjectDid: String, requirementsJson: String, agentCapabilitiesJson: String, challengeVerificationsJson: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_check_capability_requirements(
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(subjectDid),
-        FfiConverterString.lower(requirementsJson),
-        FfiConverterString.lower(agentCapabilitiesJson),
-        FfiConverterString.lower(challengeVerificationsJson),$0
-    )
-}
-}
-/**
  * Discovers contexts from a DID string or `scp://` URI.
  *
  * Detects whether the query is a DID or an `scp://` URI and delegates to
@@ -17467,9 +17511,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_open_key() != 2915) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_check_capability_requirements() != 55898) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_discover() != 49364) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -17741,6 +17782,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_unsubscribe() != 16701) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_check_capability_requirements() != 37209) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_local_transport() != 46239) {

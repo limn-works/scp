@@ -2419,18 +2419,24 @@ class SCP internal constructor(
      * Verifies that an agent meets a context's capability requirements for
      * admission (spec §7.3.4.4, SCP-ACR-008). Serializes the typed
      * [CapabilityRequirement] / [ChallengeVerification] values (and the agent
-     * capability URIs) to the serde wire shape (ADR-058) and routes through
-     * the UniFFI-generated free function
-     * [uniffi.scp.checkCapabilityRequirements] unchanged. ADR-048 §1 + §7
+     * capability URIs) to the serde wire shape (ADR-058) and forwards to
+     * [NativeScp.checkCapabilityRequirements] on [inner]. ADR-048 §1 + §7
      * Kotlin bullet.
      *
      * [subjectDid]/[contextId] bind challenge verifications to the agent and
      * context being admitted: a [ChallengeVerification] only satisfies a
-     * requirement when its signed `subject_did`/`context_id` equal these
-     * values, closing cross-subject and cross-context attribution.
+     * requirement when its signed `subject`/`context_id` equal these values,
+     * closing cross-subject and cross-context attribution. Each record's
+     * signature is checked against the verifier's `#active` key, resolved
+     * through this instance's DID resolver. The lookup blocks, so call this
+     * off the main thread.
      *
-     * Returns normally when all requirements are satisfied; the bridge throws
-     * on any unmet requirement or malformed input.
+     * Returns normally when all requirements are satisfied.
+     *
+     * @throws uniffi.scp.ScpException.Validation with code `SCP-VALID-7076`
+     *   for an unmet requirement, `SCP-VALID-7077` for an empty subject.
+     * @throws uniffi.scp.ScpException.Identity with code `SCP-IDENT-1033` when
+     *   a record must be verified and this instance has no DID resolver.
      *
      * Security caveat — authenticity is not authorization: a passing
      * `ChallengeVerified` check proves the verifier's signature is authentic
@@ -2446,7 +2452,7 @@ class SCP internal constructor(
         agentCapabilities: List<String>,
         challengeVerifications: List<ChallengeVerification>,
     ) {
-        uniffi.scp.checkCapabilityRequirements(
+        inner.checkCapabilityRequirements(
             contextId = contextId,
             subjectDid = subjectDid,
             requirementsJson = encodeCapabilityRequirementsJson(requirements),

@@ -1355,17 +1355,33 @@ public extension SCP {
         try await inner.ucanValidate(handle: handle, token: token, capability: capability, presentingAgentDid: presentingAgentDid, proofTokens: proofTokens)
     }
 
-    // `verifyParticipationRequirements` and `checkCapabilityRequirements` are
-    // UniFFI-generated free top-level functions (ADR-048 §1 + §7 Swift bullet,
-    // §7.3.2.1 / §7.3.4.4, SCP-ACR-008). The SDK also exposes typed free-function
-    // overloads in `Trust.swift` (ADR-058) that take typed `RequireParticipation`
-    // / `ParticipationProfile` / `CapabilityRequirement` / `ChallengeVerification`
-    // values and serialize them to the serde wire shape internally — prefer those
-    // over hand-rolled JSON:
+    /// Forwards to ``Scp/checkCapabilityRequirements`` on ``inner``. Prefer the
+    /// typed overload in `Trust.swift` (ADR-058), which serializes typed
+    /// ``CapabilityRequirement`` / ``ChallengeVerification`` values.
+    func checkCapabilityRequirements(
+        contextId: String,
+        subjectDid: String,
+        requirementsJson: String,
+        agentCapabilitiesJson: String,
+        challengeVerificationsJson: String
+    ) throws {
+        try inner.checkCapabilityRequirements(
+            contextId: contextId,
+            subjectDid: subjectDid,
+            requirementsJson: requirementsJson,
+            agentCapabilitiesJson: agentCapabilitiesJson,
+            challengeVerificationsJson: challengeVerificationsJson
+        )
+    }
+
+    // `verifyParticipationRequirements` is a UniFFI-generated free top-level
+    // function (ADR-048 §1 + §7 Swift bullet, §7.3.2.1). The SDK also exposes a
+    // typed free-function overload in `Trust.swift` (ADR-058) that takes typed
+    // `RequireParticipation` / `ParticipationProfile` values and serializes them
+    // to the serde wire shape internally — prefer it over hand-rolled JSON:
     //   `try verifyParticipationRequirements(expectedSubject:requirements:profiles:)`
-    //   `try checkCapabilityRequirements(contextId:subjectDid:requirements:agentCapabilities:challengeVerifications:)`
-    // (`expectedSubject` — and `subjectDid`/`contextId` — bind the accounting to
-    // the agent/context being admitted; a genuine profile/result minted for
-    // another subject/context cannot admit this agent). See those wrappers'
-    // doc-comments for the full authenticity-is-not-authorization caveat.
+    // (`expectedSubject` binds the accounting to the agent being admitted; a
+    // genuine profile minted for another subject cannot admit this agent). See
+    // that wrapper's doc-comment for the full authenticity-is-not-authorization
+    // caveat.
 }

@@ -363,15 +363,31 @@ final class TrustAdmissionEncoderTests: XCTestCase {
 }
 
 /// Call-through against the real Rust deserializers (SCP-103): these invoke the
-/// generated UniFFI free functions through the typed wrappers, proving the
+/// generated UniFFI bindings through the typed wrappers, proving the
 /// serialized JSON parses and evaluates on the Rust side.
 final class TrustAdmissionCallThroughTests: XCTestCase {
+    // Implicitly unwrapped because XCTest `setUp` initializes it before any
+    // test method runs — the XCTest lifecycle guarantees non-nil.
+    // swiftlint:disable:next implicitly_unwrapped_optional
+    var scp: SCP!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        scp = try SCP(storage: .inMemory)
+    }
+
+    override func tearDown() async throws {
+        try await scp.shutdown(timeoutMillis: 1000)
+        scp = nil
+        try await super.tearDown()
+    }
+
     /// A satisfied `SelfAttested` requirement admits the agent: the capability is
     /// present in `agentCapabilities`, so the typed wrapper's serialized JSON
     /// parses and evaluates to success on the Rust side (no throw).
     func testCheckCapabilityRequirementsSelfAttestedPasses() throws {
         XCTAssertNoThrow(
-            try checkCapabilityRequirements(
+            try scp.checkCapabilityRequirements(
                 contextId: "ctx-1",
                 subjectDid: "did:key:zSubject",
                 requirements: [
@@ -391,7 +407,7 @@ final class TrustAdmissionCallThroughTests: XCTestCase {
     /// serialized JSON parsed and was evaluated, not silently dropped.
     func testCheckCapabilityRequirementsMissingCapabilityThrows() {
         XCTAssertThrowsError(
-            try checkCapabilityRequirements(
+            try scp.checkCapabilityRequirements(
                 contextId: "ctx-1",
                 subjectDid: "did:key:zSubject",
                 requirements: [
