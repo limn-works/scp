@@ -19,7 +19,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use scp_crypto::{CustodyFailure, CustodyFailureKind};
+use scp_crypto::CustodyFailure;
 use scp_did::DID;
 use scp_platform::PlatformError;
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType, PublicKey};
@@ -28,6 +28,7 @@ use scp_protocol::crypto::hpke::p256::ValidatedEnc;
 use zeroize::Zeroizing;
 
 use crate::context::actor::SIGN_TIMEOUT;
+use crate::context::actor::signer::custody_timed_out;
 
 /// A boxed custody future, the shape an object-safe async method returns.
 pub type WrappingCustodyFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -119,10 +120,15 @@ pub fn single_custody_source<C: KeyCustody + 'static>(custody: Arc<C>) -> Wrappi
 /// Awaits one custody call for at most [`SIGN_TIMEOUT`], the custody budget of
 /// ADR-049 Decision 7a.
 ///
+/// A timeout drops `call`; the host may still finish it. For `generate` that
+/// leaves a key in custody that no record names and no caller holds a handle
+/// to, so nothing can destroy it: the orphan is the cost of bounding a custody
+/// that does not answer. Every other call creates nothing.
+///
 /// # Errors
 ///
 /// [`ContextError::Custody`] with the custody's own kind when custody refuses,
-/// and with kind [`CustodyFailureKind::TimedOut`] (`SCP-CRYPTO-4062`) when it
+/// and with kind [`scp_crypto::CustodyFailureKind::TimedOut`] (`SCP-CRYPTO-4062`) when it
 /// does not answer in time.
 pub(crate) async fn custody_bounded<T>(
     call: WrappingCustodyFuture<'_, Result<T, PlatformError>>,
@@ -131,10 +137,32 @@ pub(crate) async fn custody_bounded<T>(
     match tokio::time::timeout(SIGN_TIMEOUT, call).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => Err(ContextError::Custody(CustodyFailure::from(&e))),
-        Err(_) => Err(ContextError::Custody(CustodyFailure {
-            kind: CustodyFailureKind::TimedOut,
-            detail: format!("custody did not answer {operation} within {SIGN_TIMEOUT:?}"),
-        })),
+        Err(_) => Err(custody_timed_out(operation)),
+    }
+}
+
+/// Reads `handle`'s public point from `custody`, under the custody budget.
+///
+/// # Errors
+///
+/// [`ContextError::Custody`] if custody refuses or times out, and
+/// [`ContextError::CryptoFailed`] if the key is not a valid 65-byte
+/// uncompressed P-256 point (§9.5).
+async fn read_public_point(
+    custody: &dyn WrappingCustody,
+    handle: &KeyHandle,
+) -> Result<[u8; 65], ContextError> {
+    let public = custody_bounded(custody.public_key(handle), "public_key").await?;
+    let point = scp_protocol::crypto::hpke::p256::validate_enc(public.as_bytes())
+        .map_err(|e| ContextError::CryptoFailed(format!("custody wrapping public key: {e}")))?;
+    Ok(*point.as_bytes())
+}
+
+/// Destroys `handle`'s key in `custody`, best effort: the caller is already
+/// failing, so a failure here is logged and not returned.
+async fn destroy_handle(custody: &dyn WrappingCustody, handle: &KeyHandle) {
+    if let Err(e) = custody_bounded(custody.destroy_key(handle), "destroy_key").await {
+        tracing::warn!(error = %e, "destroying an unrecorded wrapping key failed");
     }
 }
 
@@ -174,11 +202,10 @@ impl IdentityWrappingKey {
     /// destroyed (best effort) before the error returns.
     pub(crate) async fn generate(custody: Arc<dyn WrappingCustody>) -> Result<Self, ContextError> {
         let handle = custody_bounded(custody.generate_hpke_p256(), "generate").await?;
-        let key = Self::new(custody, handle, [0; 65]);
-        match key.read_public().await {
-            Ok(public) => Ok(Self { public, ..key }),
+        match read_public_point(custody.as_ref(), &handle).await {
+            Ok(public) => Ok(Self::new(custody, handle, public)),
             Err(e) => {
-                key.destroy().await;
+                destroy_handle(custody.as_ref(), &handle).await;
                 Err(e)
             }
         }
@@ -202,10 +229,7 @@ impl IdentityWrappingKey {
     /// [`ContextError::CryptoFailed`] if the key is not a valid 65-byte
     /// uncompressed P-256 point (§9.5).
     pub(crate) async fn read_public(&self) -> Result<[u8; 65], ContextError> {
-        let public = custody_bounded(self.custody.public_key(&self.handle), "public_key").await?;
-        let point = scp_protocol::crypto::hpke::p256::validate_enc(public.as_bytes())
-            .map_err(|e| ContextError::CryptoFailed(format!("custody wrapping public key: {e}")))?;
-        Ok(*point.as_bytes())
+        read_public_point(self.custody.as_ref(), &self.handle).await
     }
 
     /// The ECDH x-coordinate of the private key and `enc`, computed inside
@@ -225,10 +249,7 @@ impl IdentityWrappingKey {
     /// Destroys the key in custody, best effort: the caller is already
     /// failing, so a failure here is logged and not returned.
     pub(crate) async fn destroy(&self) {
-        if let Err(e) = custody_bounded(self.custody.destroy_key(&self.handle), "destroy_key").await
-        {
-            tracing::warn!(error = %e, "destroying an unrecorded wrapping key failed");
-        }
+        destroy_handle(self.custody.as_ref(), &self.handle).await;
     }
 }
 

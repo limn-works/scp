@@ -2,7 +2,10 @@
 //! round-trip test can prove the access-key open path performs exactly one key
 //! agreement, and a restart test can prove a wrapping key is generated once.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use tokio::sync::Notify;
 
 use scp_platform::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
@@ -17,6 +20,15 @@ pub struct DhCountingCustody {
     pub inner: InMemoryKeyCustody,
     dh_calls: AtomicUsize,
     generate_calls: AtomicUsize,
+    generate_gate: Option<GenerateGate>,
+}
+
+/// Holds `generate_keypair` open: the call signals `entered`, then waits for
+/// `release` before generating.
+#[derive(Clone, Default)]
+pub struct GenerateGate {
+    pub entered: Arc<Notify>,
+    pub release: Arc<Notify>,
 }
 
 impl DhCountingCustody {
@@ -25,7 +37,18 @@ impl DhCountingCustody {
             inner: InMemoryKeyCustody::new(),
             dh_calls: AtomicUsize::new(0),
             generate_calls: AtomicUsize::new(0),
+            generate_gate: None,
         }
+    }
+
+    /// A custody whose every `generate_keypair` waits on the returned gate.
+    pub fn with_generate_gate() -> (Self, GenerateGate) {
+        let gate = GenerateGate::default();
+        let custody = Self {
+            generate_gate: Some(gate.clone()),
+            ..Self::new()
+        };
+        (custody, gate)
     }
 
     /// The number of `dh_agree` calls so far, whatever their outcome.
@@ -42,6 +65,10 @@ impl DhCountingCustody {
 impl KeyCustody for DhCountingCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         self.generate_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = &self.generate_gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         self.inner.generate_keypair(key_type).await
     }
 

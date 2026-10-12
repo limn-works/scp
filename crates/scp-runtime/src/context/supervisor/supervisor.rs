@@ -3257,28 +3257,45 @@ impl Supervisor {
         // Clone the lock out of the entry so the entry (and its shard write
         // lock) drops at the end of this statement, before any await.
         let load_lock = Arc::clone(&*self.wrapping_key_loads.entry(owner.clone()).or_default());
-        let _load_guard = load_lock.lock_owned().await;
-        if let Some(key) = self.wrapping_keys.get(owner) {
-            return Ok(Arc::clone(key.value()));
-        }
-        let key = Arc::new(self.read_or_create_wrapping_key(owner).await?);
+        // The guard comes back with the key and is held until the key is in
+        // the map, so a load waiting on the lock finds it there.
+        let (key, load_guard) = {
+            let held = load_lock.lock_owned().await;
+            if let Some(key) = self.wrapping_keys.get(owner) {
+                return Ok(Arc::clone(key.value()));
+            }
+            self.read_or_create_wrapping_key(owner, held).await?
+        };
+        let key = Arc::new(key);
         let guard = self.write_lock.lock().await;
         self.insert_wrapping_key(&guard, owner, &key)?;
         drop(guard);
+        drop(load_guard);
         Ok(key)
     }
 
     /// Reads `owner`'s stored wrapping key record and checks it against
     /// `owner`'s custody or, when none is stored, generates a key in that
-    /// custody and stores its record. Runs under `owner`'s load lock only.
+    /// custody and stores its record. Runs under `owner`'s load lock only,
+    /// whose guard `load_guard` is, and returns that guard with the key.
+    ///
+    /// Generate, store, and destroy-on-store-failure run in a spawned task
+    /// that holds `load_guard`, so a caller dropped mid-sequence (a UniFFI
+    /// async cancellation drops the Rust future) cannot cut it: the task
+    /// either stores the key's record or destroys the key, and no other load
+    /// of `owner` reads the record before it finishes. A generate that times
+    /// out can still orphan a key (see
+    /// [`custody_bounded`](crate::crypto::wrapping::custody_bounded)).
     ///
     /// # Errors
     ///
-    /// As [`Self::load_wrapping_key`].
+    /// As [`Self::load_wrapping_key`], and [`ContextError::InvalidState`] if
+    /// the creating task panics or is cancelled.
     async fn read_or_create_wrapping_key(
         &self,
         owner: &DID,
-    ) -> Result<IdentityWrappingKey, ContextError> {
+        load_guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(IdentityWrappingKey, tokio::sync::OwnedMutexGuard<()>), ContextError> {
         let custody =
             (self.wrapping_custody)(owner).ok_or(ContextError::WrappingKeyCustodyUnavailable)?;
         let storage = self.mls_storage_ref().ok_or_else(|| {
@@ -3286,12 +3303,12 @@ impl Supervisor {
                 crate::context::manager_methods::PROVIDER_NOT_INITIALIZED.to_owned(),
             )
         })?;
-        if let Some(record) =
-            crate::store::wrapping_key::load_wrapping_key_handle(storage.as_ref(), owner).await?
-        {
+        let record =
+            crate::store::wrapping_key::load_wrapping_key_handle(storage.as_ref(), owner).await?;
+        if let Some(record) = record {
             let key = IdentityWrappingKey::new(custody, record.handle, record.public);
             return match key.read_public().await {
-                Ok(public) if public == record.public => Ok(key),
+                Ok(public) if public == record.public => Ok((key, load_guard)),
                 // Custody answered, and the handle is not this key: lost,
                 // destroyed, or replaced. A custody that did not answer says
                 // nothing about the handle, so its failure passes through.
@@ -3304,19 +3321,30 @@ impl Supervisor {
                 Err(e) => Err(e),
             };
         }
-        let key = IdentityWrappingKey::generate(custody).await?;
-        if let Err(e) = crate::store::wrapping_key::store_wrapping_key_handle(
-            storage.as_ref(),
-            owner,
-            key.handle(),
-            key.public(),
-        )
+        let storage = Arc::clone(storage);
+        let owner = owner.clone();
+        tokio::spawn(async move {
+            let key = IdentityWrappingKey::generate(custody).await?;
+            if let Err(e) = crate::store::wrapping_key::store_wrapping_key_handle(
+                storage.as_ref(),
+                &owner,
+                key.handle(),
+                key.public(),
+            )
+            .await
+            {
+                key.destroy().await;
+                return Err(e);
+            }
+            Ok((key, load_guard))
+        })
         .await
-        {
-            key.destroy().await;
-            return Err(e);
-        }
-        Ok(key)
+        .map_err(|e| {
+            ContextError::InvalidState(format!(
+                "wrapping key creation: {}",
+                JoinFailure::from_join_error(&e)
+            ))
+        })?
     }
 
     /// `owner`'s loaded wrapping key: a map read with no custody or storage
@@ -3326,19 +3354,22 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// [`ContextError::SupervisorShutDown`] once shutdown has begun, and
-    /// [`ContextError::InvalidState`] if no key is loaded for `owner`.
+    /// [`ContextError::SupervisorShutDown`] if no key is loaded for `owner`
+    /// and shutdown has begun (shutdown clears the map), and
+    /// [`ContextError::InvalidState`] if no key is loaded otherwise. The map is
+    /// read before the gate, so a shutdown that clears the map between a gate
+    /// check and the read still reports `SupervisorShutDown`.
     pub(crate) fn wrapping_key(
         &self,
         owner: &DID,
     ) -> Result<Arc<IdentityWrappingKey>, ContextError> {
+        if let Some(key) = self.wrapping_keys.get(owner) {
+            return Ok(Arc::clone(key.value()));
+        }
         self.refuse_if_shut_down("wrapping key lookup")?;
-        self.wrapping_keys
-            .get(owner)
-            .map(|key| Arc::clone(key.value()))
-            .ok_or_else(|| {
-                ContextError::InvalidState("wrapping key not loaded for the actor owner".to_owned())
-            })
+        Err(ContextError::InvalidState(
+            "wrapping key not loaded for the actor owner".to_owned(),
+        ))
     }
 
     /// Returns `identity`'s 65-byte wrapping public key, the value it
@@ -3916,8 +3947,17 @@ impl Supervisor {
                 let context_id = p.context_id.clone();
                 // Load the creator's wrapping key before any lock: a custody
                 // call never runs under `bootstrap_spawn_lock` (spec 09
-                // §9.16.1). A failure is reported as the deps failure below.
-                let wrapping_load = self.load_wrapping_key(&p.creator_did).await;
+                // §9.16.1). A failure returns here, before any lock, as the
+                // `ContextError` it is: a `Custody` failure keeps its custody
+                // code at the bridges, and the two wrapping-key variants keep
+                // their names.
+                if let Err(e) = self.load_wrapping_key(&p.creator_did).await {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    let _ = reply.send(Err(
+                        scp_protocol::context::builder::ContextCreationError::StateTransition(e),
+                    ));
+                    return Outcome::err_mutated(sketch);
+                }
                 // Serialize this bootstrap-spawn (crypto-init → spawn) against
                 // every other same-id bootstrap so a concurrent import/restore
                 // for the same id cannot interleave its crypto write between
@@ -3940,16 +3980,7 @@ impl Supervisor {
                 // to `lifecycle_helpers::create_context`, which spawns the
                 // per-context actor that OWNS the fresh state (no legacy
                 // `contexts` DashMap write).
-                // A wrapping-key load failure reaches the caller as the
-                // `ContextError` it is (spec 09 §9.16.1), never as a message
-                // string: a `Custody` failure keeps its custody code at the
-                // bridges, and the two wrapping-key variants keep their names.
-                let wrapping_load_failed = wrapping_load.is_err();
-                let deps_result = match wrapping_load {
-                    Ok(_) => self.build_actor_deps(&p.creator_did).await,
-                    Err(e) => Err(e),
-                };
-                let deps = match deps_result {
+                let deps = match self.build_actor_deps(&p.creator_did).await {
                     Ok(deps) => deps,
                     Err(e) => {
                         let sketch = standing_outcome_error_sketch(&e);
@@ -3957,9 +3988,6 @@ impl Supervisor {
                         // (ADR-049 Decision 16 item 2), as the import and
                         // restore arms pass `e` through unchanged.
                         let err = match e {
-                            e if wrapping_load_failed => {
-                                scp_protocol::context::builder::ContextCreationError::StateTransition(e)
-                            }
                             ContextError::SupervisorShutDown(_) => {
                                 scp_protocol::context::builder::ContextCreationError::StateTransition(e)
                             }
@@ -4231,11 +4259,19 @@ impl Supervisor {
                 // The restore payload carries no identity (it rehydrates a
                 // persisted snapshot rather than joining), so the context
                 // acts as this node's identity. Its wrapping key loads before
-                // any lock, so no custody call runs under one; a failure is
-                // reported as the deps failure below.
+                // any lock, so no custody call runs under one; a failure
+                // returns here.
                 let owner = match self.node_identity() {
                     Ok(owner) => self.load_wrapping_key(&owner).await.map(|_| owner),
                     Err(e) => Err(e),
+                };
+                let owner = match owner {
+                    Ok(owner) => owner,
+                    Err(e) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        let _ = reply.send(Err(e));
+                        return Outcome::err_mutated(sketch);
+                    }
                 };
                 // Serialize this bootstrap-spawn against every other same-id
                 // bootstrap (see `bootstrap_spawn_lock`).
@@ -4248,7 +4284,7 @@ impl Supervisor {
                     let _ = reply.send(Err(e));
                     return Outcome::err(sketch);
                 }
-                let deps = match async { self.build_actor_deps(&owner?).await }.await {
+                let deps = match self.build_actor_deps(&owner).await {
                     Ok(deps) => deps,
                     Err(e) => {
                         let sketch = standing_outcome_error_sketch(&e);
@@ -19532,6 +19568,68 @@ mod tests {
         );
     }
 
+    /// A load whose caller is dropped while custody generates still stores
+    /// the generated key's record, because generate and store run in their
+    /// own task: the next load waits for that task, returns the stored key,
+    /// and generates nothing.
+    #[tokio::test]
+    async fn load_wrapping_key_stores_the_generated_key_when_its_caller_is_dropped() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let (custody, gate) =
+            crate::crypto::dh_counting_custody::DhCountingCustody::with_generate_gate();
+        let custody = Arc::new(custody);
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let did = DID("did:example:wrap-dropped".to_owned());
+        let loading = tokio::spawn({
+            let sup = Arc::clone(&sup);
+            let did = did.clone();
+            async move { sup.load_wrapping_key(&did).await.map(|_| ()) }
+        });
+        gate.entered.notified().await;
+        loading.abort();
+        assert!(loading.await.unwrap_err().is_cancelled());
+        gate.release.notify_one();
+
+        let key = sup.load_wrapping_key(&did).await.unwrap();
+        assert_eq!(
+            custody.generate_calls(),
+            1,
+            "the dropped load's key is the one loaded"
+        );
+        let record = crate::store::wrapping_key::load_wrapping_key_handle(
+            sup.mls_storage_ref().unwrap().as_ref(),
+            &did,
+        )
+        .await
+        .unwrap()
+        .expect("the dropped load stored its record");
+        assert_eq!(record.handle, *key.handle());
+        assert_eq!(record.public, *key.public());
+    }
+
+    /// `wrapping_key` reads the map before the shutdown gate: a loaded key is
+    /// returned even once the gate is closed, so a shutdown that clears the
+    /// map between a gate check and the read cannot turn a miss into
+    /// `InvalidState`. A miss is `InvalidState` while the gate is open and
+    /// `SupervisorShutDown` once it is closed.
+    #[tokio::test]
+    async fn wrapping_key_reads_the_map_before_the_shutdown_gate() {
+        let sup = supervisor_with_providers();
+        let loaded = DID("did:example:wrap-gate-loaded".to_owned());
+        let missing = DID("did:example:wrap-gate-missing".to_owned());
+        let key = sup.load_wrapping_key(&loaded).await.unwrap();
+        let err = sup.wrapping_key(&missing).unwrap_err();
+        assert!(matches!(err, ContextError::InvalidState(_)), "{err:?}");
+
+        sup.close_spawn_gate();
+        assert!(Arc::ptr_eq(&sup.wrapping_key(&loaded).unwrap(), &key));
+        let err = sup.wrapping_key(&missing).unwrap_err();
+        assert!(
+            matches!(err, ContextError::SupervisorShutDown(_)),
+            "{err:?}"
+        );
+    }
+
     /// After shutdown, `wrapping_public_key` refuses with `SupervisorShutDown`
     /// and loads no secret back into the map, though the identity's pair is
     /// still in storage.
@@ -27423,6 +27521,54 @@ mod tests {
         assert!(sup.wrapping_keys.is_empty(), "no key is loaded");
     }
 
+    /// A wrapping-key load failure ends CreateContext and RestoreContext
+    /// before either takes `bootstrap_spawn_lock`: with that lock held
+    /// elsewhere, both return the load error without waiting on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_and_restore_return_a_wrapping_key_load_failure_before_any_lock() {
+        let none: WrappingCustodySource = Arc::new(|_: &DID| None);
+        let sup = supervisor_with_persistence_and_custody_source(
+            Box::new(MapPersistence::default()),
+            none,
+        );
+        let identity = sup.node_identity().unwrap();
+        let ctx = hex::encode([0xC6u8; 32]);
+        let params = scp_protocol::context::ContextParams {
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..Default::default()
+        };
+        let budget = std::time::Duration::from_secs(5);
+        let _held = sup.bootstrap_spawn_lock.lock().await;
+
+        let err = tokio::time::timeout(
+            budget,
+            sup.create_context(ctx.clone(), params.clone(), identity, None, Vec::new()),
+        )
+        .await
+        .expect("create returns without taking bootstrap_spawn_lock")
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                scp_protocol::context::builder::ContextCreationError::StateTransition(
+                    ContextError::WrappingKeyCustodyUnavailable
+                )
+            ),
+            "{err:?}"
+        );
+
+        let handle = crate::context::ContextHandle::new(ctx.clone(), params);
+        let err = tokio::time::timeout(budget, sup.restore_context(&ctx, &handle))
+            .await
+            .expect("restore returns without taking bootstrap_spawn_lock")
+            .unwrap_err();
+        assert!(
+            matches!(err, ContextError::WrappingKeyCustodyUnavailable),
+            "{err:?}"
+        );
+        assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+    }
+
     /// In-memory custody that, on every wrapping-key call, tries the
     /// supervisor's `write_lock` and `bootstrap_spawn_lock` and records each
     /// one it finds held: a host custody call may wait on a prompt, so no
@@ -34094,8 +34240,8 @@ mod tests {
     /// plus the signing turn's budget, so the sign budget always fires first.
     #[tokio::test(start_paused = true)]
     async fn xctx_saga_stalled_target_custody_fails_commit_with_custody_timeout() {
-        use crate::context::actor::signer::SIGN_TIMEOUT;
-        use scp_crypto::{CustodyFailure, CustodyFailureKind, DynScpSigner, SigAlg, SignFuture};
+        use crate::context::actor::signer::{SIGN_TIMEOUT, custody_timed_out};
+        use scp_crypto::{DynScpSigner, SigAlg, SignFuture};
 
         /// A signer whose sign never completes, standing in for an
         /// unanswered biometric prompt.
@@ -34162,10 +34308,7 @@ mod tests {
         // The public NeedsRepair carries the last Commit attempt's error as
         // text; it is the typed `CommandSigner::sign_bounded_ed25519` timeout (`SCP-CRYPTO-4062` at
         // the bridges), not the phase's `TransportTimeout`.
-        let expected = ContextError::Custody(CustodyFailure {
-            kind: CustodyFailureKind::TimedOut,
-            detail: format!("custody did not sign within {SIGN_TIMEOUT:?}"),
-        });
+        let expected = custody_timed_out("sign");
         assert_eq!(message, expected.to_string());
         assert!(started.elapsed() >= SIGN_TIMEOUT);
     }
