@@ -77,9 +77,14 @@ pub enum PlatformError {
     #[error("attestation error: {0}")]
     AttestationError(String),
 
-    /// A push notification operation failed.
-    #[error("push error: {0}")]
-    PushError(String),
+    /// A push notification operation failed; `kind` names which failure.
+    #[error("push error ({kind}): {detail}")]
+    PushError {
+        /// Which push failure occurred.
+        kind: PushFailureKind,
+        /// The backend's description of the failure.
+        detail: String,
+    },
 
     /// A key custody operation failed for reasons other than key-not-found or
     /// wrong-key-type.
@@ -104,31 +109,65 @@ pub enum PlatformError {
     Unsupported(&'static str),
 }
 
+/// Which push failure occurred (spec `10-infrastructure-and-self-hosting.md`
+/// §10.7.1). The kind alone decides the error code a bridge reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushFailureKind {
+    /// A received push payload is not the platform's wake signal.
+    WakePayloadInvalid,
+    /// The relay rejected a push registration: its signature, key state or
+    /// encoding is invalid.
+    RegistrationRejected,
+    /// The relay cannot verify a push registration's signature yet.
+    VerifierUnavailable,
+    /// The relay has no push sender for the registration's platform.
+    PlatformUnavailable,
+    /// The device's push provider (APNs, FCM) failed, such as a failed token
+    /// registration.
+    ProviderFailed,
+}
+
+impl std::fmt::Display for PushFailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::WakePayloadInvalid => "wake payload invalid",
+            Self::RegistrationRejected => "registration rejected",
+            Self::VerifierUnavailable => "verifier unavailable",
+            Self::PlatformUnavailable => "platform unavailable",
+            Self::ProviderFailed => "provider failed",
+        })
+    }
+}
+
 impl From<&PlatformError> for scp_crypto::CustodyFailure {
-    /// Classifies a custody error for the error types that cannot hold a
+    /// Classifies a platform error for the error types that cannot hold a
     /// [`PlatformError`]: [`PlatformError::KeyNotFound`] is key-not-found,
     /// [`PlatformError::PseudonymRejected`] is a rejected pseudonym,
-    /// [`PlatformError::StorageClosed`] and [`PlatformError::StorageLockHeld`]
-    /// keep their own kinds so a bridge reports the same storage code whether
-    /// the error arrives bare or wrapped, and every other variant is a custody
-    /// failure.
+    /// [`PlatformError::StorageClosed`], [`PlatformError::StorageLockHeld`],
+    /// [`PlatformError::AttestationError`], [`PlatformError::Unsupported`] and
+    /// each [`PushFailureKind`] of [`PlatformError::PushError`] keep their own
+    /// kinds so a bridge reports the same code whether the error arrives bare
+    /// or wrapped, and every other variant is a custody failure.
     fn from(e: &PlatformError) -> Self {
+        use scp_crypto::CustodyFailureKind as Kind;
         let kind = match e {
-            PlatformError::KeyNotFound => scp_crypto::CustodyFailureKind::KeyNotFound,
-            PlatformError::PseudonymRejected(_) => {
-                scp_crypto::CustodyFailureKind::PseudonymRejected
-            }
-            PlatformError::StorageClosed => scp_crypto::CustodyFailureKind::StorageClosed,
-            PlatformError::StorageLockHeld { .. } => {
-                scp_crypto::CustodyFailureKind::StorageLockHeld
-            }
+            PlatformError::KeyNotFound => Kind::KeyNotFound,
+            PlatformError::PseudonymRejected(_) => Kind::PseudonymRejected,
+            PlatformError::StorageClosed => Kind::StorageClosed,
+            PlatformError::StorageLockHeld { .. } => Kind::StorageLockHeld,
+            PlatformError::AttestationError(_) => Kind::AttestationFailed,
+            PlatformError::Unsupported(_) => Kind::Unsupported,
+            PlatformError::PushError { kind, .. } => match kind {
+                PushFailureKind::WakePayloadInvalid => Kind::PushWakePayloadInvalid,
+                PushFailureKind::RegistrationRejected => Kind::PushRegistrationRejected,
+                PushFailureKind::VerifierUnavailable => Kind::PushVerifierUnavailable,
+                PushFailureKind::PlatformUnavailable => Kind::PushPlatformUnavailable,
+                PushFailureKind::ProviderFailed => Kind::PushProviderFailed,
+            },
             PlatformError::WrongKeyType { .. }
             | PlatformError::NotIdentityKey
             | PlatformError::StorageError(_)
-            | PlatformError::AttestationError(_)
-            | PlatformError::PushError(_)
-            | PlatformError::CustodyError(_)
-            | PlatformError::Unsupported(_) => scp_crypto::CustodyFailureKind::Failed,
+            | PlatformError::CustodyError(_) => Kind::Failed,
         };
         Self {
             kind,

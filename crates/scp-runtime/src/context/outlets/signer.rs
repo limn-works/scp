@@ -133,7 +133,7 @@ impl From<&PlatformError> for StreamSignerCustodyCategory {
             | PlatformError::NotIdentityKey
             | PlatformError::StorageError(_)
             | PlatformError::AttestationError(_)
-            | PlatformError::PushError(_) => Self::BackendFault,
+            | PlatformError::PushError { .. } => Self::BackendFault,
         }
     }
 }
@@ -188,11 +188,14 @@ impl std::error::Error for StreamSignerError {}
 
 impl From<StreamSignerCustodyCategory> for scp_crypto::CustodyFailure {
     /// Carries a bounded category to the bridges: [`KeyNotFound`] is
-    /// key-not-found, the two storage categories keep their storage kinds, and
-    /// every other category is a custody failure. The detail is the
-    /// category's fixed string, so no backend text crosses (ADR-061).
+    /// key-not-found, the two storage categories keep their storage kinds,
+    /// [`Unsupported`] keeps the unsupported kind, so the bridges report the
+    /// same code as for the bare `PlatformError`, and every other category is
+    /// a custody failure. The detail is the category's fixed string, so no
+    /// backend text crosses (ADR-061).
     ///
     /// [`KeyNotFound`]: StreamSignerCustodyCategory::KeyNotFound
+    /// [`Unsupported`]: StreamSignerCustodyCategory::Unsupported
     fn from(category: StreamSignerCustodyCategory) -> Self {
         let kind = match category {
             StreamSignerCustodyCategory::KeyNotFound => scp_crypto::CustodyFailureKind::KeyNotFound,
@@ -202,8 +205,8 @@ impl From<StreamSignerCustodyCategory> for scp_crypto::CustodyFailure {
             StreamSignerCustodyCategory::StorageLockHeld => {
                 scp_crypto::CustodyFailureKind::StorageLockHeld
             }
+            StreamSignerCustodyCategory::Unsupported => scp_crypto::CustodyFailureKind::Unsupported,
             StreamSignerCustodyCategory::WrongKeyType
-            | StreamSignerCustodyCategory::Unsupported
             | StreamSignerCustodyCategory::BackendFault => scp_crypto::CustodyFailureKind::Failed,
         };
         Self {
@@ -485,14 +488,20 @@ mod tests {
         );
     }
 
-    /// The two §17.6 storage conditions keep their own category through the
-    /// signer and reach the bridges as the storage kinds, so a closed or
-    /// still-locked custody store reports the same code as the bare
-    /// `PlatformError`; the lock paths `StorageLockHeld` carries are dropped.
+    /// The two §17.6 storage conditions and an unsupported operation keep
+    /// their own category through the signer and reach the bridges as their
+    /// own kinds, so a closed or still-locked custody store or an HSM that
+    /// cannot sign reports the same code as the bare `PlatformError`; the
+    /// lock paths `StorageLockHeld` carries are dropped.
     #[test]
-    fn storage_conditions_keep_their_custody_kind_through_the_signer() {
+    fn storage_and_unsupported_keep_their_kind_through_the_signer() {
         let lock_path = "/secret/dir/scp.db.lock";
         for (error, category, kind) in [
+            (
+                PlatformError::Unsupported("no hsm sign"),
+                StreamSignerCustodyCategory::Unsupported,
+                scp_crypto::CustodyFailureKind::Unsupported,
+            ),
             (
                 PlatformError::StorageClosed,
                 StreamSignerCustodyCategory::StorageClosed,

@@ -1111,7 +1111,9 @@ pub trait Push: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`PlatformError::PushError`] if registration fails.
+    /// Returns [`PlatformError::PushError`] with
+    /// [`PushFailureKind::ProviderFailed`](crate::error::PushFailureKind::ProviderFailed)
+    /// if registration fails.
     fn register(&self) -> impl Future<Output = Result<PushToken, PlatformError>> + Send;
 
     /// Handle an incoming push notification payload and produce a wake signal.
@@ -1126,7 +1128,9 @@ pub trait Push: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`PlatformError::PushError`] if the payload cannot be processed.
+    /// Returns [`PlatformError::PushError`] with
+    /// [`PushFailureKind::WakePayloadInvalid`](crate::error::PushFailureKind::WakePayloadInvalid)
+    /// if the payload is not the platform's wake signal.
     fn handle_notification(
         &self,
         payload: &[u8],

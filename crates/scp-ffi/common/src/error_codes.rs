@@ -748,6 +748,12 @@ pub const CRYPTO_4059: &str = "SCP-CRYPTO-4059";
 ///
 /// [`custody_failure_code`] decides which custody failures carry this code.
 pub const CRYPTO_4060: &str = "SCP-CRYPTO-4060";
+/// Unsupported platform operation.
+///
+/// The backend does not support an optional operation
+/// (`PlatformError::Unsupported`), such as an HSM-backed custody
+/// asked for an extractable Ed25519 seed or a signature it cannot make.
+pub const CRYPTO_4061: &str = "SCP-CRYPTO-4061";
 
 // -------------------------------------------------------------------------
 // Transport (SCP-TRANS- 5000--5999)
@@ -825,6 +831,25 @@ pub const TRANS_5062: &str = "SCP-TRANS-5062";
 pub const TRANS_5063: &str = "SCP-TRANS-5063";
 /// `UniFFI` transport broadcast error.
 pub const TRANS_5070: &str = "SCP-TRANS-5070";
+
+// Push (spec `10-infrastructure-and-self-hosting.md` §10.7.1): one code per
+// `PlatformError::PushError` kind, assigned by [`custody_failure_code`].
+
+/// Push wake payload invalid: a received push payload is not the platform's
+/// wake signal (`PushFailureKind::WakePayloadInvalid`).
+pub const TRANS_5080: &str = "SCP-TRANS-5080";
+/// Push registration rejected: the relay found the registration's signature,
+/// key state or encoding invalid (`PushFailureKind::RegistrationRejected`).
+pub const TRANS_5081: &str = "SCP-TRANS-5081";
+/// Push verifier unavailable: the relay cannot verify a registration's
+/// signature yet (`PushFailureKind::VerifierUnavailable`).
+pub const TRANS_5082: &str = "SCP-TRANS-5082";
+/// Push platform unavailable: the relay has no push sender for the
+/// registration's platform (`PushFailureKind::PlatformUnavailable`).
+pub const TRANS_5083: &str = "SCP-TRANS-5083";
+/// Push provider failure: the device's push provider (APNs, FCM) failed, such
+/// as a failed token registration (`PushFailureKind::ProviderFailed`).
+pub const TRANS_5084: &str = "SCP-TRANS-5084";
 
 // -------------------------------------------------------------------------
 // Outlet (SCP-OUTLET- 6000--6999)
@@ -1250,7 +1275,8 @@ pub const STORAGE_8006: &str = "SCP-STORAGE-8006";
 /// and the Apple adapter throws it when Apple's App Attest service answers
 /// with an error that no narrower `SCP-ATTEST-` code names, or when the
 /// caller's task is cancelled while its App Attest call is queued or waiting
-/// for Apple's answer.
+/// for Apple's answer. Every native bridge reports
+/// `PlatformError::AttestationError` with it ([`custody_failure_code`]).
 pub const ATTEST_9001: &str = "SCP-ATTEST-9001";
 
 /// Attestation signature verification requires raw JSON, which is absent.
@@ -1429,15 +1455,79 @@ pub const SAGA_13066: &str = "SCP-SAGA-13066";
 /// One mapping for the `PyO3`, napi-rs and `UniFFI` bridges: key-not-found is
 /// [`CRYPTO_4006`], a rejected host pseudonym is [`IDENT_1055`], a closed
 /// custody store is [`STORAGE_8006`], a custody store whose directory lock is
-/// still held is [`STORAGE_8005`], and any other custody failure is
-/// [`CRYPTO_4060`].
+/// still held is [`STORAGE_8005`], a device attestation failure is
+/// [`ATTEST_9001`], an unsupported operation is [`CRYPTO_4061`], each push
+/// failure kind has its own code from [`TRANS_5080`] to [`TRANS_5084`], and
+/// any other custody failure is [`CRYPTO_4060`].
 #[must_use]
 pub const fn custody_failure_code(e: &scp_crypto::CustodyFailure) -> &'static str {
+    use scp_crypto::CustodyFailureKind as Kind;
     match e.kind {
-        scp_crypto::CustodyFailureKind::KeyNotFound => CRYPTO_4006,
-        scp_crypto::CustodyFailureKind::PseudonymRejected => IDENT_1055,
-        scp_crypto::CustodyFailureKind::StorageClosed => STORAGE_8006,
-        scp_crypto::CustodyFailureKind::StorageLockHeld => STORAGE_8005,
-        scp_crypto::CustodyFailureKind::Failed => CRYPTO_4060,
+        Kind::KeyNotFound => CRYPTO_4006,
+        Kind::PseudonymRejected => IDENT_1055,
+        Kind::StorageClosed => STORAGE_8006,
+        Kind::StorageLockHeld => STORAGE_8005,
+        Kind::AttestationFailed => ATTEST_9001,
+        Kind::Unsupported => CRYPTO_4061,
+        Kind::PushWakePayloadInvalid => TRANS_5080,
+        Kind::PushRegistrationRejected => TRANS_5081,
+        Kind::PushVerifierUnavailable => TRANS_5082,
+        Kind::PushPlatformUnavailable => TRANS_5083,
+        Kind::PushProviderFailed => TRANS_5084,
+        Kind::Failed => CRYPTO_4060,
+    }
+}
+
+/// The bridge error class a [`CustodyFailure`](scp_crypto::CustodyFailure)
+/// reaches the caller as; each bridge maps it to its own error variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyFailureClass {
+    /// An identity error: a rejected host pseudonym or a device attestation
+    /// failure.
+    Identity,
+    /// A validation error: a closed or still-locked store (spec §17.6).
+    Validation,
+    /// A crypto error: key-not-found, an unsupported operation, or any other
+    /// key custody failure.
+    Crypto,
+    /// A transport error: a push failure (spec §10.7.1).
+    Transport,
+}
+
+/// The error class for a custody failure kind, one mapping for the `PyO3`,
+/// napi-rs and `UniFFI` bridges.
+#[must_use]
+pub const fn custody_failure_class(kind: scp_crypto::CustodyFailureKind) -> CustodyFailureClass {
+    use scp_crypto::CustodyFailureKind as Kind;
+    match kind {
+        Kind::PseudonymRejected | Kind::AttestationFailed => CustodyFailureClass::Identity,
+        Kind::StorageClosed | Kind::StorageLockHeld => CustodyFailureClass::Validation,
+        Kind::KeyNotFound | Kind::Unsupported | Kind::Failed => CustodyFailureClass::Crypto,
+        Kind::PushWakePayloadInvalid
+        | Kind::PushRegistrationRejected
+        | Kind::PushVerifierUnavailable
+        | Kind::PushPlatformUnavailable
+        | Kind::PushProviderFailed => CustodyFailureClass::Transport,
+    }
+}
+
+/// Whether a bare `PlatformError` of this kind is a key custody failure.
+///
+/// Only then does the bridge's message point the caller at the key custody
+/// configuration. A storage, attestation or push failure is not, and its
+/// message is the error's own text.
+#[must_use]
+pub const fn is_key_custody_failure(kind: scp_crypto::CustodyFailureKind) -> bool {
+    use scp_crypto::CustodyFailureKind as Kind;
+    match kind {
+        Kind::KeyNotFound | Kind::PseudonymRejected | Kind::Unsupported | Kind::Failed => true,
+        Kind::StorageClosed
+        | Kind::StorageLockHeld
+        | Kind::AttestationFailed
+        | Kind::PushWakePayloadInvalid
+        | Kind::PushRegistrationRejected
+        | Kind::PushVerifierUnavailable
+        | Kind::PushPlatformUnavailable
+        | Kind::PushProviderFailed => false,
     }
 }
