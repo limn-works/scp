@@ -441,10 +441,10 @@ Not all capabilities are testable. "Good judgment" is not challengeable. But man
 
 ```
 ChallengeVerification {
-  verification_id:  [u8; 32],          // SHA-256(verifier_did || subject_did || capability_uri || timestamp)
-  verifier_did:     Identifier,        // who administered the challenge
-  subject_did:      Identifier,        // who was tested
-  capability_uri:   String,            // scp:capability:*/v1 or did:*:capability:*/v1
+  verification_id:  [u8; 32],          // SHA-256(verifier ‖ subject ‖ capability_uri ‖ timestamp), encoded as stated below
+  verifier:         Identifier,        // who administered the challenge
+  subject:          Identifier,        // who was tested
+  capability_uri:   String,            // scp:capability:{name}/v{N} or {identifier}:capability:{name}/v{N}, the identifier in the 03-identity.md §3.1 text form
   suite_version:    String,            // version of the challenge suite used (e.g., "2026.1")
   passed:           bool,              // true = passed, false = failed
   score:            Option<u32>,       // optional numeric score (0-10000 basis points, 10000 = perfect)
@@ -461,17 +461,38 @@ ChallengeVerification {
 
 **Expiry.** Challenge verifications expire after the `expires_at` timestamp. The maximum validity period is 90 days — capabilities can degrade over time (model updates, configuration changes), so re-verification is necessary. Contexts MAY require shorter validity periods in their admission requirements.
 
+**Verification identifier.** `verification_id = SHA-256(F(verifier) ‖ F(subject) ‖ F(capability_uri) ‖ timestamp)`, where `F(x)` is the 4-byte BE length followed by the UTF-8 bytes of `x` (the identifiers in their text form), and `timestamp` is 8-byte BE.
+
+**Verification signature.** The verifier signs the record with its `#active` key over the 32-byte digest `D_v = SHA-256(R_v)`. `R_v` is the §9.5.1 canonical preimage of `09-security-model.md` under the domain `"SCP-CHALLENGE-VERIFY-V1:"`, with these fields in order:
+
+1. `verification_id`: 32 bytes, fixed, no prefix;
+2. `verifier`: 4-byte BE length + UTF-8 of the text form;
+3. `subject`: 4-byte BE length + UTF-8 of the text form;
+4. `capability_uri`: 4-byte BE length + UTF-8;
+5. `suite_version`: 4-byte BE length + UTF-8;
+6. `passed`: 1 byte, `0x01` or `0x00`;
+7. `score`: present, `00 00 00 04` followed by the 4-byte BE u32 in basis points; absent, `00 00 00 20` followed by `SHA-256(0x00)`;
+8. `test_count`: 4-byte BE u32;
+9. `pass_count`: 4-byte BE u32;
+10. `timestamp`: 8-byte BE u64;
+11. `expires_at`: 8-byte BE u64;
+12. `context_id`: present, 4-byte BE length + UTF-8; absent, `00 00 00 20` followed by `SHA-256(0x00)`.
+
+This encoding replaces the earlier `SCP-CHALLENGE-VERIFY-V1:` encoding under the same separator; no signature made under the earlier encoding verifies. A verifier of the record rejects it when `verification_id` does not equal the derivation above, or when `expires_at` exceeds `timestamp` by more than 90 days.
+
 **Challenge suite protocol.** The protocol for administering a challenge:
 
 1. **Challenge initiation.** A verifier (context admin, peer agent, or dedicated verification service) sends a `ChallengeRequest` as an outlet call within a shared context:
    ```
    ChallengeRequest {
-     challenge_id:    [u8; 32],        // random, unique per challenge session
-     capability_uri:  String,          // which capability to test
-     suite_version:   String,          // which version of the test suite
-     test_cases:      Vec<TestCase>,   // the actual test cases
-     timeout_secs:    u32,             // maximum time to complete all tests (default: 300)
-     verifier_did:    Identifier,      // who is administering
+     challenge_id:       [u8; 32],        // random, unique per challenge session
+     capability_uri:     String,          // which capability to test
+     suite_version:      String,          // which version of the test suite
+     test_cases:         Vec<TestCase>,   // the actual test cases
+     timeout_secs:       u32,             // maximum time to complete all tests (default: 300)
+     verifier:           Identifier,      // who is administering
+     subject:            Identifier,      // who is tested
+     verifier_signature: P256Signature    // verifier signs all fields above
    }
 
    TestCase {
@@ -489,6 +510,23 @@ ChallengeVerification {
      | ContainsNone  { forbidden: Vec<String> }          // output must contain none of these
      | CustomEval    { evaluator_outlet_id: OutletId }       // a registered outlet evaluates the output
    ```
+
+   **Request signature.** The verifier signs the request with the signature algorithm of `09-security-model.md` §9.5 over the 32-byte digest `D = SHA-256(R)`. `R` is the §9.5.1 canonical preimage under the domain `"SCP-CHALLENGE-REQ-V1:"`, with these fields in order:
+
+   1. `challenge_id`: 32 bytes, fixed, no prefix.
+   2. `capability_uri`: 4-byte BE length + UTF-8.
+   3. `suite_version`: 4-byte BE length + UTF-8.
+   4. `test_cases`: a repeated field, a 4-byte BE count followed by each element in list order. Each element is:
+      - `test_id`: 4-byte BE length + UTF-8;
+      - `input`: 4-byte BE length + RFC 8785 canonical JSON;
+      - `expected`: 4-byte BE length + RFC 8785 canonical JSON of its wire form, the externally tagged object `{"<Variant>": {<fields>}}` whose variant and field names are those of `ExpectedOutput` above (`JsonSchema` is any JSON value, and `OutletId` is a JSON string);
+      - `category`: 4-byte BE length + UTF-8;
+      - `weight`: 4-byte BE u32.
+   5. `timeout_secs`: 4-byte BE u32.
+   6. `verifier`: 4-byte BE length + UTF-8 of the identifier's text form.
+   7. `subject`: 4-byte BE length + UTF-8 of the identifier's text form.
+
+   This encoding replaces the earlier `SCP-CHALLENGE-REQ-V1:` encoding under the same separator; no signature made under the earlier encoding verifies. The JSON fields carry the I-JSON numeric constraint stated for `Attestation.claim` in `09-security-model.md` §9.5.2. The verifier signs with its `#active` key, and the challenged party verifies against the `#active` key of `verifier`, before the freshness check. A request whose `test_cases` weights do not sum to 10000, or whose `test_id` values repeat, is rejected before signing.
 
 2. **Challenge execution.** The challenged agent processes each `TestCase` and returns results:
    ```

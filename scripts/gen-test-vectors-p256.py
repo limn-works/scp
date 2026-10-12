@@ -474,6 +474,7 @@ ID_HPKE_SENDER = fixture_identifier("hpke sender")
 ID_HPKE_MEMBER = fixture_identifier("hpke member")
 ID_ISSUER = fixture_identifier("issuer")
 ID_SUBJECT = fixture_identifier("subject")
+ID_VERIFIER = fixture_identifier("verifier")
 ID_PSEUDONYMIZED_MEMBER = fixture_identifier("pseudonymized member")
 ID_ANNOUNCING_MEMBER = fixture_identifier("announcing member")
 ID_OTHER_MEMBER = fixture_identifier("other member")
@@ -2567,6 +2568,130 @@ def emit_reveal_ranking_and_text_form() -> None:
     emit("vector_57.rejected_padded", text + "====")
 
 
+def challenge_verification_id(
+    verifier: str, subject: str, capability_uri: str, timestamp: int
+) -> tuple[bytes, bytes]:
+    """`07-trust-validation-and-capabilities.md` §7.3.4: the preimage and the
+    value of `verification_id`."""
+    pre = (
+        var_field(verifier)
+        + var_field(subject)
+        + var_field(capability_uri)
+        + u64(timestamp)
+    )
+    return pre, sha256(pre)
+
+
+def challenge_verification_preimage(
+    verification_id: bytes,
+    verifier: str,
+    subject: str,
+    capability_uri: str,
+    suite_version: str,
+    passed: bool,
+    score: int | None,
+    test_count: int,
+    pass_count: int,
+    timestamp: int,
+    expires_at: int,
+    context_id: str | None,
+) -> bytes:
+    """§7.3.4's `R_v`. `score` is length-prefixed in both forms."""
+    return canonical_preimage(
+        "SCP-CHALLENGE-VERIFY-V1:",
+        fixed_field(verification_id),
+        var_field(verifier),
+        var_field(subject),
+        var_field(capability_uri),
+        var_field(suite_version),
+        u8(1 if passed else 0),
+        (u32(4) + u32(score)) if score is not None else absent_var(),
+        u32(test_count),
+        u32(pass_count),
+        u64(timestamp),
+        u64(expires_at),
+        var_field(context_id) if context_id is not None else absent_var(),
+    )
+
+
+def emit_challenge_vectors() -> None:
+    section("§25.30 Trust challenge request and verification record (§7.3.4)")
+    capability_uri = "scp:capability:schema-validation/v1"
+    suite_version = "2026.1"
+
+    # --- Vector 58: the challenge request. ---
+    challenge_id = bytes(range(1, 33))
+    test_input = {"name": "widget", "count": 3}
+    expected = {
+        "SchemaMatch": {"schema": {"type": "object", "required": ["name", "count"]}}
+    }
+    input_jcs = jcs(test_input)
+    expected_jcs = jcs(expected)
+    test_case = (
+        var_field("schema-validation-001")
+        + var_field(input_jcs)
+        + var_field(expected_jcs)
+        + var_field("schema")
+        + u32(10000)
+    )
+    pre58 = canonical_preimage(
+        "SCP-CHALLENGE-REQ-V1:",
+        fixed_field(challenge_id),
+        var_field(capability_uri),
+        var_field(suite_version),
+        u32(1),
+        test_case,
+        u32(300),
+        var_field(ID_VERIFIER),
+        var_field(ID_SUBJECT),
+    )
+    emit_hex("vector_58.challenge_id", challenge_id)
+    emit("vector_58.verifier", ID_VERIFIER)
+    emit("vector_58.subject", ID_SUBJECT)
+    emit("vector_58.input_jcs", input_jcs.decode())
+    emit("vector_58.expected_jcs", expected_jcs.decode())
+    emit_hex("vector_58.test_case_field", u32(1) + test_case)
+    emit("vector_58.preimage_len", len(pre58))
+    emit_hex("vector_58.preimage", pre58)
+    emit_hex("vector_58.digest", sha256(pre58))
+
+    # --- Vectors 59 and 60: the verification record. ---
+    for label, ts, passed, score, pass_count, context_id in (
+        ("vector_59", 1700000000, True, 10000, 1, "test-context-01"),
+        ("vector_60", 1700000060, False, None, 0, None),
+    ):
+        expires_at = ts + 7776000
+        vid_pre, vid = challenge_verification_id(
+            ID_VERIFIER, ID_SUBJECT, capability_uri, ts
+        )
+        pre = challenge_verification_preimage(
+            vid,
+            ID_VERIFIER,
+            ID_SUBJECT,
+            capability_uri,
+            suite_version,
+            passed,
+            score,
+            1,
+            pass_count,
+            ts,
+            expires_at,
+            context_id,
+        )
+        score_field = (u32(4) + u32(score)) if score is not None else absent_var()
+        emit("%s.timestamp" % label, ts)
+        emit("%s.expires_at" % label, expires_at)
+        emit_hex("%s.score_field" % label, score_field)
+        emit("%s.verification_id_preimage_len" % label, len(vid_pre))
+        emit_hex("%s.verification_id_preimage" % label, vid_pre)
+        emit_hex("%s.verification_id" % label, vid)
+        emit("%s.preimage_len" % label, len(pre))
+        emit_hex("%s.preimage" % label, pre)
+        emit_hex("%s.digest" % label, sha256(pre))
+        if score is None:
+            assert pre.count(absent_var()) == 2, label
+
+
 def main() -> int:
     self_test()
     _LINES.append("SCP §25 test vectors — ECDSA on NIST P-256, RFC 6979, SHA-256")
@@ -2597,6 +2722,7 @@ def main() -> int:
     emit_witness_and_relay_objects()
     emit_commitment_and_service_record()
     emit_reveal_ranking_and_text_form()
+    emit_challenge_vectors()
     print("\n".join(_LINES))
     return 0
 

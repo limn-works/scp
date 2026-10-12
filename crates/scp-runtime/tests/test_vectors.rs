@@ -82,6 +82,7 @@ const ID_NEW_MEMBER: &str = "scp:ykcz3x3dycntc6lkxzbe3nixvd7w5c37riaowlh26lczdnc
 const ID_HPKE_SENDER: &str = "scp:jx35aojrkpxu2pjy7k6v6blpsotz5iakm7yui2t3rc6lmthfcbpa";
 const ID_ISSUER: &str = "scp:mhe6nmpij74wrgb46ngrakeetnlycmnfmcgppkfqqufyl7kkl3ia";
 const ID_SUBJECT: &str = "scp:ktarg6aqtsju6mh2ws3hk7t5kmsvmckq7d5eqwsmaw5di3e3p4ta";
+const ID_VERIFIER: &str = "scp:vsrmsobf2uzejsbdaag3txwauasjrpnt5wlkulhahbbfwtdfaapa";
 const ID_LEAF_ATTESTER: &str = "scp:gomjxlxjt4kesb5fghb6tpykrvhsxdduwwlo3uwgmvh2jhoqvjyq";
 
 /// The P-256 group order `n`.
@@ -945,6 +946,207 @@ fn vector37_keypackage_attestation() {
         hex::encode(body),
         "000000387363703a676f6d6a786c786a74346b6573623566676862367470796b727668737864647577776c6f337577676d7668326a686f71766a79710423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da604bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac30000000723616374697665000000006553f1000000000065554280e84f59744b0fba5ebc162f26a59d027694c1fae7c73dcdeb8d776e357bbf12632abea2a97205d75ca50e3914eec8af68f7315e27dd6f9296136e75ecb044ff24"
     );
+}
+
+// ---------------------------------------------------------------------------
+// §25.30 Trust challenge request and verification record (§7.3.4)
+// ---------------------------------------------------------------------------
+
+const CHALLENGE_CAPABILITY_URI: &str = "scp:capability:schema-validation/v1";
+const CHALLENGE_SUITE_VERSION: &str = "2026.1";
+
+/// §7.3.4 `verification_id`: SHA-256 over the length-prefixed verifier,
+/// subject and capability URI, then the 8-byte timestamp. Returns the preimage.
+fn challenge_verification_id_preimage(timestamp: u64) -> Vec<u8> {
+    canonical_hash_bytes(
+        b"",
+        &[
+            CanonicalField::VarBytes(ID_VERIFIER.as_bytes()),
+            CanonicalField::VarBytes(ID_SUBJECT.as_bytes()),
+            CanonicalField::VarBytes(CHALLENGE_CAPABILITY_URI.as_bytes()),
+            CanonicalField::U64(timestamp),
+        ],
+    )
+    .unwrap()
+}
+
+/// The inputs of §7.3.4's `R_v` that Vectors 59 and 60 vary.
+struct VerificationVectorInput<'a> {
+    timestamp: u64,
+    passed: bool,
+    score: Option<u32>,
+    pass_count: u32,
+    context_id: Option<&'a str>,
+}
+
+/// Rebuilds §7.3.4's `R_v`. Both optional fields are length-prefixed in both
+/// forms: a present `score` is `U32(4) ‖ U32(score)`, and an absent optional is
+/// `VarBytes(SHA-256(0x00))`, which writes `00 00 00 20 ‖ sentinel`.
+fn challenge_verification_preimage(
+    input: &VerificationVectorInput<'_>,
+    verification_id: &[u8; 32],
+) -> Vec<u8> {
+    let absent = unhex32(ABSENT_SENTINEL_HEX);
+    let mut fields = vec![
+        CanonicalField::Fixed32(verification_id),
+        CanonicalField::VarBytes(ID_VERIFIER.as_bytes()),
+        CanonicalField::VarBytes(ID_SUBJECT.as_bytes()),
+        CanonicalField::VarBytes(CHALLENGE_CAPABILITY_URI.as_bytes()),
+        CanonicalField::VarBytes(CHALLENGE_SUITE_VERSION.as_bytes()),
+        CanonicalField::U8(u8::from(input.passed)),
+    ];
+    match input.score {
+        Some(score) => {
+            fields.push(CanonicalField::U32(4));
+            fields.push(CanonicalField::U32(score));
+        }
+        None => fields.push(CanonicalField::VarBytes(&absent)),
+    }
+    fields.extend([
+        CanonicalField::U32(1),
+        CanonicalField::U32(input.pass_count),
+        CanonicalField::U64(input.timestamp),
+        CanonicalField::U64(input.timestamp + 7_776_000),
+    ]);
+    fields.push(CanonicalField::VarBytes(
+        input.context_id.map_or(&absent[..], str::as_bytes),
+    ));
+    canonical_hash_bytes(b"SCP-CHALLENGE-VERIFY-V1:", &fields).unwrap()
+}
+
+/// Asserts the `verification_id` preimage and value, `R_v` and `D_v` of one
+/// verification vector, and returns `R_v`.
+fn assert_challenge_verification_vector(
+    label: &str,
+    input: &VerificationVectorInput<'_>,
+    id_preimage_hex: &str,
+    id_hex: &str,
+    preimage_hex: &str,
+    digest_hex: &str,
+) -> Vec<u8> {
+    let id_preimage = challenge_verification_id_preimage(input.timestamp);
+    assert_eq!(
+        hex::encode(&id_preimage),
+        id_preimage_hex,
+        "{label}: verification_id preimage"
+    );
+    let verification_id = sha256(&id_preimage);
+    assert_eq!(
+        hex::encode(verification_id),
+        id_hex,
+        "{label}: verification_id"
+    );
+
+    let preimage = challenge_verification_preimage(input, &verification_id);
+    assert_eq!(hex::encode(&preimage), preimage_hex, "{label}: R_v");
+    assert_eq!(hex::encode(sha256(&preimage)), digest_hex, "{label}: D_v");
+    preimage
+}
+
+#[test]
+fn vector_58_challenge_request() {
+    let challenge_id: [u8; 32] = core::array::from_fn(|i| (i + 1) as u8);
+    // Keys inserted out of order on purpose: RFC 8785 sorts members, and keeps
+    // the `required` array in its given order.
+    let input =
+        scp_protocol::jcs::to_vec(&serde_json::json!({"name": "widget", "count": 3})).unwrap();
+    let expected = scp_protocol::jcs::to_vec(&serde_json::json!({
+        "SchemaMatch": {"schema": {"type": "object", "required": ["name", "count"]}}
+    }))
+    .unwrap();
+    assert_eq!(input, br#"{"count":3,"name":"widget"}"#);
+    assert_eq!(
+        expected,
+        br#"{"SchemaMatch":{"schema":{"required":["name","count"],"type":"object"}}}"#
+    );
+
+    let preimage = canonical_hash_bytes(
+        b"SCP-CHALLENGE-REQ-V1:",
+        &[
+            CanonicalField::Fixed32(&challenge_id),
+            CanonicalField::VarBytes(CHALLENGE_CAPABILITY_URI.as_bytes()),
+            CanonicalField::VarBytes(CHALLENGE_SUITE_VERSION.as_bytes()),
+            CanonicalField::U32(1),
+            CanonicalField::VarBytes(b"schema-validation-001"),
+            CanonicalField::VarBytes(&input),
+            CanonicalField::VarBytes(&expected),
+            CanonicalField::VarBytes(b"schema"),
+            CanonicalField::U32(10_000),
+            CanonicalField::U32(300),
+            CanonicalField::VarBytes(ID_VERIFIER.as_bytes()),
+            CanonicalField::VarBytes(ID_SUBJECT.as_bytes()),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        hex::encode(challenge_id),
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+    );
+    assert_eq!(preimage.len(), 376);
+    assert_eq!(
+        hex::encode(&preimage),
+        "5343502d4348414c4c454e47452d5245512d56313a0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20000000237363703a6361706162696c6974793a736368656d612d76616c69646174696f6e2f763100000006323032362e310000000100000015736368656d612d76616c69646174696f6e2d3030310000001b7b22636f756e74223a332c226e616d65223a22776964676574227d000000487b22536368656d614d61746368223a7b22736368656d61223a7b227265717569726564223a5b226e616d65222c22636f756e74225d2c2274797065223a226f626a656374227d7d7d00000006736368656d61000027100000012c000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461"
+    );
+    assert_eq!(
+        hex::encode(sha256(&preimage)),
+        "b08ddd6a074630d5c0f1846ca43842d2bacb2c28554389ea816eb1bd2520d96e"
+    );
+}
+
+#[test]
+fn vector_59_challenge_verification() {
+    let preimage = assert_challenge_verification_vector(
+        "vector 59",
+        &VerificationVectorInput {
+            timestamp: 1_700_000_000,
+            passed: true,
+            score: Some(10_000),
+            pass_count: 1,
+            context_id: Some("test-context-01"),
+        },
+        "000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000237363703a6361706162696c6974793a736368656d612d76616c69646174696f6e2f7631000000006553f100",
+        "c439f835731e3c11566708082fff41d9069babe86526d0cd88b297e07941c0d1",
+        "5343502d4348414c4c454e47452d5645524946592d56313ac439f835731e3c11566708082fff41d9069babe86526d0cd88b297e07941c0d1000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000237363703a6361706162696c6974793a736368656d612d76616c69646174696f6e2f763100000006323032362e310100000004000027100000000100000001000000006553f1000000000065ca98000000000f746573742d636f6e746578742d3031",
+        "88a395688b5ddc964f6a609c7923e6f1b7e7f3923ce0f8001a09b582f72fed0a",
+    );
+    assert_eq!(preimage.len(), 277);
+    // 10000 basis points, length-prefixed: `00 00 00 04 00 00 27 10`.
+    assert!(hex::encode(&preimage).contains("0000000400002710"));
+}
+
+#[test]
+fn vector_60_challenge_verification_absent_optionals() {
+    let preimage = assert_challenge_verification_vector(
+        "vector 60",
+        &VerificationVectorInput {
+            timestamp: 1_700_000_060,
+            passed: false,
+            score: None,
+            pass_count: 0,
+            context_id: None,
+        },
+        "000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000237363703a6361706162696c6974793a736368656d612d76616c69646174696f6e2f7631000000006553f13c",
+        "f4317e9ec8576534aab47b2297921be67a1ae523f74283626c66f8b54997bb14",
+        "5343502d4348414c4c454e47452d5645524946592d56313af4317e9ec8576534aab47b2297921be67a1ae523f74283626c66f8b54997bb14000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000237363703a6361706162696c6974793a736368656d612d76616c69646174696f6e2f763100000006323032362e3100000000206e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d0000000100000000000000006553f13c0000000065ca983c000000206e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "0b12ecf86ae6048a154cf4867f67b5f85ed7fe20643f2ff288a574a90cc0c2ba",
+    );
+    assert_eq!(preimage.len(), 322);
+    // Both absent optionals are length-prefixed: the sentinel appears twice,
+    // and every copy is preceded by the length word `00000020`.
+    let preimage_hex = hex::encode(&preimage);
+    let copies: Vec<usize> = preimage_hex
+        .match_indices(ABSENT_SENTINEL_HEX)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(copies.len(), 2, "vector 60: sentinel copies");
+    for at in copies {
+        assert_eq!(
+            &preimage_hex[at - 8..at],
+            "00000020",
+            "vector 60: sentinel at {at} lacks its length word"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

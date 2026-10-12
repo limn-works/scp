@@ -25,9 +25,11 @@ Build order: ADR-017 + ADR-019 (parallel, both depend on Phase 1-3) --> ADR-018 
 
 ## ADR-017: Trust Engine (Four-Layer Evaluation)
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-10-12 (challenge request and record converge on spec 07 §7.3.4).
 
 **Amendment (2026-09-10 — trust-layer signature verification is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The three signed structures this ADR defines carry `P256Signature` fields, its signature-verification step verifies an ECDSA signature on P-256 against the issuer's resolved public key, and its dependency list names the `p256` crate. The four evaluation layers, their ordering, and the fail-closed direction are untouched.
+
+**Amendment (2026-10-12 — challenge request and record converge on spec 07 §7.3.4).** The challenge request takes the field set of `07-trust-validation-and-capabilities.md` §7.3.4 plus `subject`, and carries a `verifier_signature`. The request and the `ChallengeVerification` record are each signed over the SHA-256 digest of their §9.5.1 canonical preimages, through the custody of the verifier's `#active` key, and the record is returned signed. `challenge_id` is 32 bytes, carried as 64-character lowercase hex at the bridges. All three challenge separators keep their `-V1` suffix while their encodings change before release (Alec, 2026-10-12). Aligning the challenge response with spec 07 and having the verifier score each test result follow in a named follow-up PR.
 
 ### Context
 
@@ -105,13 +107,14 @@ pub enum AttestationType {
 }
 
 pub struct ChallengeRequest {
-    pub challenge_id: String,
-    pub challenge_type: ChallengeType,
-    pub challenger_did: [u8; 32],
-    pub subject_did: [u8; 32],
-    pub parameters: serde_json::Value,
-    pub timeout: Duration,
-    pub signature: P256Signature,
+    pub challenge_id: [u8; 32],
+    pub capability_uri: String,
+    pub suite_version: String,
+    pub test_cases: Vec<TestCase>,
+    pub timeout_secs: u32,
+    pub verifier: Identifier,
+    pub subject: Identifier,
+    pub verifier_signature: P256Signature,
 }
 
 pub struct ChallengeResponse {
@@ -171,14 +174,15 @@ pub struct TrustInput {
    - Checks revocation: queries revocation status.
    - Returns specific error variant on failure.
 
-4. **`issue_challenge(challenger_did, subject_did, challenge_type, params) -> ChallengeRequest`**
-   - Constructs and signs a challenge request.
+4. **`create_challenge(verifier, subject, capability_uri, suite_version, test_cases, timeout_secs) -> ChallengeRequest` (signed through the verifier's `#active` custody)**
+   - Constructs a challenge request over the given suite and signs its canonical digest through the custody of the verifier's `#active` key.
    - Standard challenge suites: prompt injection resistance, schema validation, rate limit compliance.
 
 5. **`verify_challenge_response(request, response) -> Result<ChallengeVerification, TrustError>`**
    - Verifies the response signature against the responder's operational key.
    - Validates response matches the challenge parameters.
    - Distinguishes self-attested vs challenge-verified in metadata.
+   - Verifies the request signature against the verifier's `#active` key and the response against the subject's `#active` key; returns a `ChallengeVerification` signed through the verifier's `#active` custody; `context_id` is a required input (spec 07 §7.3.4.4 step 4(a)).
 
 6. **`evaluate_consequence_rules(rules, event_log, subject_did) -> Vec<TriggeredConsequence>`**
    - Checks each rule's trigger condition against event log data within the rule's time window.
