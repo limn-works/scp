@@ -586,8 +586,8 @@ jobs:
               - '.github/actions/cargo-fetch/**'
             # Every path a job compiles, executes, or feeds a gate as input, written as
             # the complement of prose rather than as `'**'` minus exclusions. A pull
-            # request that changes only prose (`.docs/**`, `.claude/**`, a root-level
-            # `*.md`, or `docs/guides/**/*.md`) leaves the `code` output false, and
+            # request that changes only prose (`.docs/**` outside `.docs/migration/`,
+            # `.claude/**`, a root-level `*.md`, or `docs/guides/**/*.md`) leaves the `code` output false, and
             # every job it guards skips; CODE_JOBS in
             # `scripts/tests/ci-gate/ci_gate_selftest.py` names those jobs. That
             # self-test also lists every tracked
@@ -605,6 +605,10 @@ jobs:
               - 'templates/**'
               - 'ratchet/**'
               - 'docs/examples/**'
+              # The examples-typecheck job type-checks the code blocks of the live
+              # guides under this directory, so an edit to a guide there feeds a gate
+              # and is not prose.
+              - '.docs/migration/**'
               - '.github/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -771,8 +775,11 @@ jobs:
   # under docs/examples/, scaffolds/ and templates/ passes mypy --strict or
   # tsc --noEmit against the SDK source in this tree, so a site cannot call SDK
   # API that no longer exists. scaffolds/typescript-web/ is excluded, because
-  # scaffold-typescript-web-check type-checks it against the wasm package. It
-  # compiles no Rust and loads no native module, so it needs no build artifact.
+  # scaffold-typescript-web-check type-checks it against the wasm package. The
+  # same gate type-checks every Python and TypeScript block of each live guide
+  # under .docs/migration/ that carries no skip marker, and prints each block it
+  # skipped. It compiles no Rust and loads no native module, so it needs no build
+  # artifact.
   examples-typecheck:
     needs: changes
     if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
@@ -784,15 +791,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # mypy at the version the python-test job pins, and the cryptography
-      # package templates/broadcast-feed/subscriber.py imports, so mypy
-      # resolves its types.
-      - run: pip install mypy==1.20.2 cryptography==50.0.0
+      # The packages the gate's requirements file pins: mypy, and the packages
+      # whose types mypy resolves for the sites and guide blocks.
+      - run: pip install -r scripts/examples-typecheck/requirements.txt
       - uses: oven-sh/setup-bun@v2
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
         run: bun install
-      - name: Python and TypeScript sites type-check against the SDK
+      # The cases run first: each feeds the gate a guide that must pass or must
+      # fail, among them a block that calls removed SDK API with no skip marker.
+      - name: Self-test gate
+        run: bash scripts/tests/examples-typecheck/run-tests.sh
+      - name: Python and TypeScript sites and guide blocks type-check against the SDK
         run: bash scripts/check-examples-typecheck.sh
 
   # ── Wiping allocator (09-security-model.md §9.15, freed heap memory) ──
@@ -1165,11 +1175,11 @@ jobs:
       # PyYAML for check-workflow-compile-steps.py, which parses every workflow
       # file and which the toolchain-wiring-cases job installs the same pin for.
       - run: pip install 'tree-sitter-rust>=0.21,<0.25' tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift ruff==0.15.4 'pyyaml>=6,<7'
-      # check-examples-typecheck.sh runs mypy, at the pin the python-test and
-      # examples-typecheck jobs carry, and the TypeScript compiler that
-      # `bun install` puts under bindings/typescript/node_modules, plus the
-      # cryptography package templates/broadcast-feed/subscriber.py imports.
-      - run: pip install mypy==1.20.2 cryptography==50.0.0
+      # check-examples-typecheck.sh runs mypy over the packages its requirements
+      # file pins, which the examples-typecheck job installs too, and the
+      # TypeScript compiler that `bun install` puts under
+      # bindings/typescript/node_modules.
+      - run: pip install -r scripts/examples-typecheck/requirements.txt
       - uses: oven-sh/setup-bun@v2
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
