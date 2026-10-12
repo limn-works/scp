@@ -91,6 +91,8 @@ class StoreKeychain implements KeyCustodyProvider {
   /** Key id -> the role `generateKeypair` minted it in. */
   roles = new Map<string, CustodyKeyRole>();
   next = 1;
+  /** How many times the bridge called `dhAgree`. */
+  dhAgreeCalls = 0;
 
   constructor(readonly fault?: Fault) {}
 
@@ -151,6 +153,7 @@ class StoreKeychain implements KeyCustodyProvider {
   }
 
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array {
+    this.dhAgreeCalls++;
     if (this.hpke.has(keyId)) return this.hpke.agree(keyId, peerPublic);
     // An Ed25519 seed cannot agree; an unknown id is the contract's key-not-found.
     this.#seed(keyId);
@@ -194,6 +197,8 @@ class P256Keychain implements KeyCustodyProvider {
   /** Hex SHA-256 digest -> the message it hashes. */
   preimages = new Map<string, Buffer>();
   next = 1;
+  /** How many times the bridge called `dhAgree`. */
+  dhAgreeCalls = 0;
 
   generateKeypair(keyType: CustodyKeyType, role: CustodyKeyRole): string {
     if (keyType !== "p256" && keyType !== "hpke-p256") {
@@ -259,6 +264,7 @@ class P256Keychain implements KeyCustodyProvider {
   }
 
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array {
+    this.dhAgreeCalls++;
     if (this.hpke.has(keyId)) return this.hpke.agree(keyId, peerPublic);
     this.#key(keyId);
     throw new Error(`key ${keyId} is a p256 signing key; it cannot agree`);
@@ -366,6 +372,7 @@ describe.skipIf(skipReason !== "")("napi callback custody", () => {
       expect(own.length).toBe(65);
       const peer = Buffer.from(ECDH_VECTOR_PUBLIC_I, "hex");
       const shared = await custody.dhAgree(key, peer);
+      expect(host.dhAgreeCalls).toBe(1);
       const vector = crypto.createECDH("prime256v1");
       vector.setPrivateKey(Buffer.from(ECDH_VECTOR_SCALAR_I, "hex"));
       expect(shared.toString("hex")).toBe(vector.computeSecret(Buffer.from(own)).toString("hex"));
@@ -375,6 +382,7 @@ describe.skipIf(skipReason !== "")("napi callback custody", () => {
         const refused = await rejectionOf(() => custody.dhAgree(key, bad));
         expect(refused).toBeInstanceOf(CryptoError);
       }
+      expect(host.dhAgreeCalls).toBe(1);
     }
   });
 

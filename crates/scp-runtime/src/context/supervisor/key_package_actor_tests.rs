@@ -7,7 +7,7 @@
 //! and publish idempotency against a real MLS backend + in-memory storage.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// Test-only `std::sync::Mutex` in the recording transport + faulty storage:
+// Test-only `std::sync::Mutex` in the recording transport:
 // these are sync helpers (no await held across the lock), so the async
 // deadlock hazard the disallow guards against does not apply. Per
 // `crates/scp-runtime/clippy.toml`, test-only `std::sync::Mutex` uses carry
@@ -29,6 +29,7 @@ use super::{
 use crate::context::builder::{
     ContextCreationError, ContextTransportProvider, NotConfiguredTransportProvider,
 };
+use crate::context::supervisor::faulty_storage::FaultyStorage;
 use crate::crypto::mls::backend::{
     AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
     ValidatedKeyPackage,
@@ -40,7 +41,6 @@ use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::DecryptedContent;
 use scp_mls::error::MlsError;
 use scp_mls::group::ScpMlsGroup;
-use scp_platform::PlatformError;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::traits::Storage;
 
@@ -3435,115 +3435,6 @@ impl ContextTransportProvider for RecordingTransport {
         *self.last_owner_did.lock().unwrap() = Some(owner_did.to_owned());
         self.published.fetch_add(1, Ordering::AcqRel);
         Ok(())
-    }
-}
-
-/// A `Storage` wrapper that fails writes/deletes whose key starts with a
-/// configured prefix, delegating everything else to an inner `InMemoryStorage`.
-/// Drives the H1 fail-closed branches deterministically.
-struct FaultyStorage {
-    inner: Arc<InMemoryStorage>,
-    /// Fails BOTH `store` and `delete` for keys under this prefix.
-    fail_prefix: std::sync::Mutex<Option<String>>,
-    /// Fails ONLY `delete` for keys under this prefix (`store`/`retrieve` pass).
-    /// Lets a test target the cleanup-tail / GC delete of a record while still
-    /// allowing it to have been written — the symmetric sibling of the
-    /// store-fault path, which would otherwise block the record's creation.
-    fail_delete_prefix: std::sync::Mutex<Option<String>>,
-}
-
-impl FaultyStorage {
-    fn new(inner: Arc<InMemoryStorage>) -> Self {
-        Self {
-            inner,
-            fail_prefix: std::sync::Mutex::new(None),
-            fail_delete_prefix: std::sync::Mutex::new(None),
-        }
-    }
-    fn fail_prefix(&self, prefix: &str) {
-        *self.fail_prefix.lock().unwrap() = Some(prefix.to_owned());
-    }
-    /// Arm the delete-only fault: subsequent `delete` calls for keys under
-    /// `prefix` return an injected error, while `store`/`retrieve` succeed.
-    fn fail_delete_prefix(&self, prefix: &str) {
-        *self.fail_delete_prefix.lock().unwrap() = Some(prefix.to_owned());
-    }
-    fn clear_fail(&self) {
-        *self.fail_prefix.lock().unwrap() = None;
-        *self.fail_delete_prefix.lock().unwrap() = None;
-    }
-    fn should_fail(&self, key: &str) -> bool {
-        self.fail_prefix
-            .lock()
-            .unwrap()
-            .as_deref()
-            .is_some_and(|p| key.starts_with(p))
-    }
-    /// True when a delete of `key` should be injected-failed: either the
-    /// store+delete `fail_prefix` matches, or the delete-only prefix matches.
-    fn should_fail_delete(&self, key: &str) -> bool {
-        self.should_fail(key)
-            || self
-                .fail_delete_prefix
-                .lock()
-                .unwrap()
-                .as_deref()
-                .is_some_and(|p| key.starts_with(p))
-    }
-}
-
-#[allow(clippy::manual_async_fn)]
-impl Storage for FaultyStorage {
-    fn store(
-        &self,
-        key: &str,
-        data: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), PlatformError>> + Send {
-        async move {
-            if self.should_fail(key) {
-                return Err(PlatformError::StorageError(
-                    "injected store fault".to_owned(),
-                ));
-            }
-            self.inner.store(key, data).await
-        }
-    }
-    fn retrieve(
-        &self,
-        key: &str,
-    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, PlatformError>> + Send {
-        async move { self.inner.retrieve(key).await }
-    }
-    fn delete(
-        &self,
-        key: &str,
-    ) -> impl std::future::Future<Output = Result<(), PlatformError>> + Send {
-        async move {
-            if self.should_fail_delete(key) {
-                return Err(PlatformError::StorageError(
-                    "injected delete fault".to_owned(),
-                ));
-            }
-            self.inner.delete(key).await
-        }
-    }
-    fn list_keys(
-        &self,
-        prefix: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<String>, PlatformError>> + Send {
-        async move { self.inner.list_keys(prefix).await }
-    }
-    fn delete_prefix(
-        &self,
-        prefix: &str,
-    ) -> impl std::future::Future<Output = Result<u64, PlatformError>> + Send {
-        async move { self.inner.delete_prefix(prefix).await }
-    }
-    fn exists(
-        &self,
-        key: &str,
-    ) -> impl std::future::Future<Output = Result<bool, PlatformError>> + Send {
-        async move { self.inner.exists(key).await }
     }
 }
 
