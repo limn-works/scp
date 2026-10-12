@@ -264,6 +264,30 @@ env:
 # cargo call outside the directory the override covers, into a failed job, and install.sh
 # refuses to run without it.
 
+# ── The crates each job compiles, fetched once and then offline ───────────────
+# Every job that runs cargo, maturin or wasm-pack runs `./.github/actions/cargo-fetch`
+# after its toolchain and rust-cache steps and before every other cargo command. Cargo
+# otherwise downloads the sparse index and the crate sources inside whichever build, test
+# or lint command first needs them, retrying a failed request three times; in run
+# 38171293381 job `Rust / test (macos-latest, transport-local)` could not resolve
+# `index.crates.io` and failed before it compiled anything, on a change that touched no
+# Rust. The step runs `cargo fetch --locked` with `CARGO_NET_RETRY=10` and retries a failed
+# attempt with backoff, four attempts in all; `cargo fetch` without `--target` downloads
+# every platform's crates, so the wasm32, Apple and Android builds resolve from the same
+# copy. It then proves an offline `cargo metadata --all-features` resolves and writes
+# `CARGO_NET_OFFLINE=true` to `$GITHUB_ENV`, so every later step and every cargo command a
+# script in that step starts runs offline and cannot fail on the network.
+# `.github/actions/cargo-fetch/fetch.sh` states the mechanism and every failure it reports.
+#
+# THE ORDER. After rust-cache, because rust-cache hashes every `CARGO*` variable its step
+# sees into its cache key, and a fetch before it would also download what the restore then
+# overwrites; after the toolchain step, because `RUSTUP_AUTO_INSTALL: "0"` leaves cargo no
+# compiler until that step installs one; after a `cargo install`, which downloads a tool
+# from crates.io. No step sets `CARGO_NET_OFFLINE` by hand. Check `offline-cargo` in
+# `scripts/tests/ci-gate/ci_gate_selftest.py` holds every job in `.github/workflows/` to
+# this. cargo-deny fetches its advisory database from github.com outside cargo, so job
+# rust-deny downloads it in a step of its own and runs its check with `--offline`.
+
 jobs:
   check-draft:
     if: >-
@@ -383,6 +407,11 @@ jobs:
               # targets and makes it the checkout's override, so a change to it decides
               # which compiler every Rust lane runs on.
               - '.github/actions/rust-toolchain/**'
+              # The step every Rust job runs after that one and before its first other
+              # cargo command: it downloads every crate Cargo.lock names and takes cargo
+              # offline for the rest of the job, so a change to it decides whether every
+              # Rust lane resolves its dependencies at all.
+              - '.github/actions/cargo-fetch/**'
             rust:
               - 'crates/**'
               - 'Cargo.toml'
@@ -395,10 +424,12 @@ jobs:
               # The rust-test job runs scripts/check-test-shard-features.py over
               # its own shard commands, so a change to that script must trigger it.
               - 'scripts/check-test-shard-features.py'
-              # The `docker-image` job builds from these two and is guarded by this
-              # filter, so a change to either has to reach it.
+              # The `docker-image` job builds from these three and is guarded by this
+              # filter, so a change to any of them has to reach it. The Dockerfile copies
+              # the fetch step's script in and runs it before compiling offline.
               - 'Dockerfile'
               - '.dockerignore'
+              - '.github/actions/cargo-fetch/fetch.sh'
               # `rust-clippy` reads `.clippy.toml` and `rust-fmt` reads `rustfmt.toml`,
               # and this filter guards both. A pull request that lowers a threshold in
               # either file and changes nothing else would otherwise skip the job that
@@ -548,9 +579,11 @@ jobs:
               # that rewrites that command and changes nothing else would otherwise
               # skip the one job that runs it.
               - '.github/workflows/ci.yml'
-              # fuzz-build installs its nightly through this action, and the `fuzz`
-              # output reads this filter alone.
+              # fuzz-build installs its nightly through this action and downloads
+              # fuzz/Cargo.lock's crates through the next one, and the `fuzz` output
+              # reads this filter alone.
               - '.github/actions/rust-toolchain/**'
+              - '.github/actions/cargo-fetch/**'
             # Every path a job compiles, executes, or feeds a gate as input, written as
             # the complement of prose rather than as `'**'` minus exclusions. A pull
             # request that changes only prose (`.docs/**`, `.claude/**`, a root-level
@@ -621,6 +654,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: scp-node self-host create paths fail closed
         # nextest, not `cargo test`, because `cargo test <filter>` exits 0 when
         # its filter selects no test. Every test this filter selects (each
@@ -691,6 +725,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       # `maturin_artifact_entry` parses each maturin project file and its Cargo.toml
       # with `tomllib` under python3.12, and fails when that interpreter is absent
       # or cannot import it.
@@ -721,6 +756,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       # The wheel entry comes from scripts/check-shipped-feature-graph.sh
       # --print-wheel-entries, which reads `[tool.maturin]` with `tomllib` under
       # python3.12 and fails when that interpreter is absent or cannot import it.
@@ -778,6 +814,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/rust-toolchain
+      - uses: ./.github/actions/cargo-fetch
       - name: Every shipped artifact links the wiping global allocator
         run: bash scripts/check-wiping-allocator.sh
 
@@ -924,6 +961,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/rust-toolchain
+      - uses: ./.github/actions/cargo-fetch
       - run: bash scripts/check-protocol-deps.sh
       - run: bash scripts/check-no-shim-reexports.sh
 
@@ -1030,6 +1068,12 @@ jobs:
       # minimal profile with only the named extras, and each refusal.
       - name: Run rust-toolchain action cases
         run: bash scripts/tests/rust-toolchain-action/run-tests.sh
+      # The fetch step every Rust job runs (`.github/actions/cargo-fetch`) against a stub
+      # cargo: one fetch with CARGO_NET_RETRY=10, retries with backoff on the DNS failure
+      # cargo printed, cargo's error after the last attempt, the offline metadata proof,
+      # the CARGO_NET_OFFLINE write, and each refusal.
+      - name: Run cargo-fetch action cases
+        run: bash scripts/tests/cargo-fetch-action/run-tests.sh
       # scripts/hooks/pre-commit runs `scripts/check-resolved-rustc.sh` on every commit,
       # and runs each language's format and lint steps only for files that differ from what the
       # commit's parent — or, on a merge, each merged-in head — already carries. These
@@ -1146,6 +1190,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: Run the fix-round-check cases
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
@@ -1418,6 +1463,7 @@ jobs:
         with:
           shared-key: wasm32
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - run: cargo check -p scp-alloc -p scp-clock -p scp-crypto -p scp-did -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
 
   wasm-test:
@@ -1442,6 +1488,7 @@ jobs:
         with:
           shared-key: wasm32
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       # Pin wasm-pack to a specific version for reproducibility (via the same
       # taiki-e/install-action the nextest job uses), instead of the unpinned
       # `curl … | sh` installer that always pulls latest.
@@ -1467,6 +1514,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           components: rustfmt
+      - uses: ./.github/actions/cargo-fetch
       - run: cargo fmt --all -- --check
 
   # ── Why this job is a matrix ────────────────────────────────────────────────
@@ -1568,6 +1616,7 @@ jobs:
         with:
           shared-key: clippy-packages
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.leg == 'packages' }}
+      - uses: ./.github/actions/cargo-fetch
       - name: Run clippy over the workspace
         if: matrix.leg == 'workspace'
         run: |
@@ -1748,6 +1797,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.leg == 'all' }}
+      - uses: ./.github/actions/cargo-fetch
       - uses: taiki-e/install-action@nextest
       # One leg runs the check: it reads ci.yml and the lockfile, which every leg
       # shares, so a second run would only repeat its five `cargo tree` calls.
@@ -1869,6 +1919,7 @@ jobs:
         with:
           shared-key: transport-optional-${{ matrix.group }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/cargo-fetch
       - uses: taiki-e/install-action@nextest
       - name: Run transport tests
         if: matrix.group == 'transport'
@@ -2078,6 +2129,7 @@ jobs:
         with:
           shared-key: apple-transport-platform
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.leg == 'all' }}
+      - uses: ./.github/actions/cargo-fetch
       - uses: taiki-e/install-action@nextest
       # The comments on the scp-transport commands in job
       # rust-test-optional-features say what each one selects and why each
@@ -2152,6 +2204,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: Run napi tests in production config (no custody/testing features)
         run: |
           PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
@@ -2262,6 +2315,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: Build pyo3 bridge in production config (no in-memory custody)
         run: |
           # pyo3 links libpython, so LD_LIBRARY_PATH must point at LIBDIR.
@@ -2382,6 +2436,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: Build uniffi bridge in production config (no in-memory custody)
         run: |
           # Default features = production: `server` on, no `testing`.
@@ -2516,6 +2571,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: Run doc tests
         run: |
           PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
@@ -2554,6 +2610,7 @@ jobs:
         with:
           shared-key: workspace-check
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: Build docs
         # `--document-private-items` is what lets this job reject a broken intra-doc
         # link written in a private module. Rustdoc resolves an intra-doc link only
@@ -2613,7 +2670,16 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
       - uses: ./.github/actions/rust-toolchain
-      - run: cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features check
+      - uses: ./.github/actions/cargo-fetch
+      # `cargo deny check` fetches the RustSec advisory database from github.com itself,
+      # and CARGO_NET_OFFLINE does not reach that fetch, so this step downloads it and the
+      # check below passes `--offline`, which makes cargo-deny open the downloaded copy
+      # and fail when it is missing or older than `maximum-db-staleness`. The check step
+      # then makes no network request. Yanked-crate detection reads the index entries the
+      # fetch step above wrote, online or offline.
+      - name: Fetch the advisory database
+        run: cargo deny --manifest-path ./Cargo.toml fetch db
+      - run: cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features --offline check
 
   # ── Container image ─────────────────────────────────────────────────
   # Builds the `Dockerfile` that ships `scp-relay` and `scp-node`, and that
@@ -2950,6 +3016,8 @@ jobs:
         with:
           shared-key: workspace-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/cargo-fetch
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - name: Build PyO3 native module
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
@@ -3053,6 +3121,8 @@ jobs:
         with:
           shared-key: workspace-ci-bridge
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - name: Build NAPI native addon
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
@@ -3151,6 +3221,8 @@ jobs:
         with:
           shared-key: apple-uniffi-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/cargo-fetch
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - name: Build XCFramework (dev mode — macOS arm64 only)
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
@@ -3286,6 +3358,8 @@ jobs:
         with:
           shared-key: apple-parity-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/cargo-fetch
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - name: Build PyO3 native module
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
@@ -3473,6 +3547,7 @@ jobs:
             3.10
             3.12
       - uses: ./.github/actions/rust-toolchain
+      - uses: ./.github/actions/cargo-fetch
       - name: Install maturin
         run: python3.12 -m pip install 'maturin>=1.0,<2.0'
       # No --features, no --manifest-path and no --release: maturin reads the
@@ -3681,6 +3756,7 @@ jobs:
         with:
           shared-key: wasm32
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/cargo-fetch
       # Pin wasm-pack for reproducibility (same version as the wasm-test job) —
       # the --release-only build guard depends on the shipped wasm being a
       # release build (ADR-057 Prereq-4).
@@ -3754,6 +3830,7 @@ jobs:
         with:
           shared-key: wasm32
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: Install wasm-pack
         uses: taiki-e/install-action@v2
         with:
@@ -4100,6 +4177,8 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - name: Build UniFFI native library
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
@@ -4261,6 +4340,7 @@ jobs:
       # `Run tests`, and RUSTUP_AUTO_INSTALL is "0", so the pinned toolchain must be
       # installed before it.
       - uses: ./.github/actions/rust-toolchain
+      - uses: ./.github/actions/cargo-fetch
       - uses: gradle/actions/setup-gradle@v4
       - name: Run tests
         working-directory: bindings/kotlin
@@ -4419,6 +4499,9 @@ jobs:
           workspaces: "fuzz -> target"
           shared-key: fuzz
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/cargo-fetch
+        with:
+          working-directory: fuzz
       # This step names no channel. Run from `fuzz/`, `cargo check` resolves the nightly
       # `fuzz/rust-toolchain.toml` names, which the toolchain step above installed — the
       # same invocation `fuzz/README.md` documents. That file records why the channel is

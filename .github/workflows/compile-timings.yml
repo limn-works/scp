@@ -96,6 +96,10 @@ jobs:
           rustc --version
           cargo --version
           nproc
+      # Every crate Cargo.lock names, downloaded once with retries; every later cargo
+      # command in this job runs with CARGO_NET_OFFLINE=true, so no measured build waits
+      # on the registry. fetch.sh states why.
+      - uses: ./.github/actions/cargo-fetch
       # Each leg's packages and features are read out of ci.yml rather than copied here. A
       # copy would name the same arguments in two files, and the authoritative ones live in
       # a file this workflow does not own, so a change there would leave this job
@@ -216,6 +220,10 @@ jobs:
           sysctl -n machdep.cpu.brand_string
       - name: Install cargo-llvm-lines
         run: cargo install cargo-llvm-lines --version 0.4.48 --locked
+      # After the install, which downloads cargo-llvm-lines from crates.io: every crate
+      # Cargo.lock names, downloaded once with retries; every later cargo command in this
+      # job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
+      - uses: ./.github/actions/cargo-fetch
       - name: Time the recompile under cargo check and cargo build
         run: |
           set -euo pipefail
