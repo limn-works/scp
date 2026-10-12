@@ -549,7 +549,7 @@ Changing any field's encoding, adding a field, or removing a field requires incr
 
 ### 9.5.2 Signed Structure Definitions
 
-**A preimage that takes an identifier as UTF-8 bytes takes the identifier's text form**, which `03-identity.md` §3.1 fixes. Every derivation the protocol performs consumes the identifier's 32 raw digest bytes instead: the routing derivations, both continuity-fingerprint forms of §9.11, and the `derived_context_id` of `05-contexts.md` §5.15.8. The preimages that take it sit below in this section: `InnerEnvelope`, `BroadcastEnvelope`, `SenderKeyRequest`, `SenderKeyEpochAdvance`, `AccessKeyRequest`, `Attestation`, `KeyPackageAttestation`, `KeyDestructionAttestation`, `BlockNotification`, the governance-proposal id, `SignedVote`, `ParticipationProfile`, `ScpCustodyViolationAttestation` and `CounterAttestation`. Two further preimages sit outside this section: the `"SCP-DID-AUTH-V1:"` challenge of `03-identity.md` §3.11.3, and the payment receipt's signed payload of `19-economic-governance.md` §19.15.5, whose payer signs `payer_did` and `payee` as UTF-8 bytes.
+**A preimage that takes an identifier as UTF-8 bytes takes the identifier's text form**, which `03-identity.md` §3.1 fixes. Every derivation the protocol performs consumes the identifier's 32 raw digest bytes instead: the routing derivations, both continuity-fingerprint forms of §9.11, and the `derived_context_id` of `05-contexts.md` §5.15.8. The preimages that take it sit below in this section: `InnerEnvelope`, `BroadcastEnvelope`, `SenderKeyRequest`, `SenderKeyEpochAdvance`, `AccessKeyRequest`, `Attestation`, `KeyPackageAttestation`, `KeyDestructionAttestation`, `BlockNotification`, the governance-proposal id, `SignedVote`, `ParticipationProfile`, `ScpCustodyViolationAttestation`, `CounterAttestation`, `PushRegistration` and `PushDeregistration`. The two push preimages take their `registrant` field as the 56-byte `scp:` text form under §9.5.1's length-prefixed rule, so the field is `BE32(56)` followed by those 56 bytes. Two further preimages sit outside this section: the `"SCP-DID-AUTH-V1:"` challenge of `03-identity.md` §3.11.3, and the payment receipt's signed payload of `19-economic-governance.md` §19.15.5, whose payer signs `payer_did` and `payee` as UTF-8 bytes.
 
 **InnerEnvelope** — domain: `"SCP-INNER-ENVELOPE-V1:"`
 
@@ -774,6 +774,26 @@ This derivation omits a violation record's `verifier_signature`, and that omissi
 An author computes `violation_reference` from a violation record it holds. An author that holds no violation record has nothing to contest and MUST NOT publish a counter-attestation.
 
 Note: ADR-039 assigns a counter-attestation signature to `#active` rather than to the shared agent key it defined, so that publishing a counter-attestation demonstrates human involvement. A human identity carries no such agent key, because an agent is a separate delegated identity holding its own `#active` (§9.7.4.2), so a verifier reads that assignment as naming the subject identity's own `#active`. This preimage carries no `signing_key_id` field, because a party that names its own fragment inside a record it also signs can name one key while signing with another. A verifier instead resolves `#active` from the key state the subject's latest state-carrying key event carries (§9.7.4.2 R8) and checks `signature` against that key alone. A signature that a delegated agent identity produced then fails, which enforces ADR-039's assignment. A verifier that resolves a delegated agent identity's `#active` establishes agent authorization and establishes nothing about human involvement. **No test vector pins this preimage either**, for the reason §25.25 records.
+
+**PushRegistration** — domain: `"SCP-PUSH-REGISTER-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `registrant` | 4-byte BE length + UTF-8 bytes (the 56-byte `scp:` text form of the identifier, `03-identity.md` §3.1) |
+| 2 | `platform` | 1-byte U8 tag (`0x01` = `Apns`, `0x02` = `Fcm`, `0x03` = `WebPush`) |
+| 3 | `token` | 4-byte BE length + raw bytes |
+| 4 | `contexts` | 4-byte BE element count, then each context ID as 4-byte BE length + UTF-8 bytes, in list order |
+| 5 | `timestamp` | 8-byte BE u64 (Unix seconds) |
+
+**PushDeregistration** — domain: `"SCP-PUSH-DEREGISTER-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `registrant` | 4-byte BE length + UTF-8 bytes (the 56-byte `scp:` text form of the identifier, `03-identity.md` §3.1) |
+| 2 | `platform` | 1-byte U8 tag (`0x01` = `Apns`, `0x02` = `Fcm`, `0x03` = `WebPush`) |
+| 3 | `timestamp` | 8-byte BE u64 (Unix seconds) |
+
+Note: `22-human-readable-addressing.md` §22.11.4 defines both messages' fields, and `10-infrastructure-and-self-hosting.md` §10.7.1 states how a relay verifies and stores them. The registrant signs both preimages with the key its key state lists `Current` in the `#active` role, under the attestation class of §9.7.1. **Both separators stay `-V1:` although this table changed the encoding they name**, which §9.5.1's version rule would otherwise forbid: the `contexts` element count is new, and no code had produced a signature under either separator before it was added, so no signature exists for the change to invalidate. **Both separators also stay `-V1:` when SCP-308, the key-event data model story of architecture slice S1, changes the bytes inside the `registrant` length prefix** from a DID string to the `scp:` text form: this table already specifies the `scp:` form, so S1 brings the code to this table and changes no field's encoding.
 
 **UCAN signing:** ES256 — ECDSA on P-256 with SHA-256, the JOSE algorithm identifier the UCAN specification takes for this curve. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction. **UCAN revocation** is per-context via `RevocationList` — an append-only map of token CIDs to revocation states (Active, RevocationPending, Revoked). Revocations are distributed as MLS application messages to all context members. Revocation check is step 10 of the 11-step validation pipeline (ADR-016) and is performed on every capability exercise. The system is **fail-closed**: tokens in `RevocationPending` state (revocation initiated but not yet confirmed via MLS) are denied. See ADR-016 criterion 7 and `scp-core/crypto/ucan/revoke.rs` for the full specification.
 
@@ -1986,6 +2006,8 @@ Net: this scheme provides **pseudonym-address unlinkability against a passive me
 
 These are residuals of the **as-built** browser transport, disclosed for threat-model honesty. They are real relay correlators the pseudonym scheme does not claim to close — not defects, and not softened by the address-layer unlinkability the scheme does provide.
 
+**Push-registration residual.** A relay that holds a push registration (`10-infrastructure-and-self-hosting.md` §10.7.1) learns the registering identity's identifier, the device's platform token, and every routing ID the registration lists, and it can bind each of those routing IDs to that identity. The registrant signs the registration with its `#active` key, so the binding is authenticated. SUBSCRIBE never reveals that binding, because the relay authenticates no subscriber (ADR-004, the SCP native relay protocol). A registration that lists a device's pseudonym routing ID therefore tells the relay which identity stands behind that pseudonym, which is the correlation the "Unlinkable across contexts" property and the passive-reader unlinkability above deny the relay. The linkage reaches only the relays the identity registers with, and only the routing IDs it lists there. An identity that registers no push token on a relay discloses nothing to that relay through push.
+
 #### 9.10.4.A Pseudonym Derivation Privacy Model
 
 **Threat: publicly derivable pseudonyms enable membership enumeration.** If `identity_key_material` in the HMAC were the raw P-256 public key bytes (which are public by definition), any party knowing a `context_id` and an identity's public key could compute `HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")` and test whether the resulting pseudonym appears as an active subscription on a relay. This constitutes a membership enumeration oracle.
@@ -2795,8 +2817,9 @@ All domain separators are UTF-8 strings used as prefixes (or, where a row says s
 | `"SCP-CHALLENGE-VERIFY-V1:"` | Trust challenge verification signing | §7.4 |
 | `"SCP-BRIDGE-REGISTER-V1:"` | Bridge relay registration signing | §10.12.4 |
 | `"SCP-PRIVATE-LOG-V1:"` | Private state event hash chain | §3.7 |
-| `"SCP-PUSH-REGISTER-V1:"` | Push notification registration signing | §22.11.4 |
-| `"SCP-PUSH-DEREGISTER-V1:"` | Push notification deregistration signing | §22.11.4 |
+| `"SCP-PUSH-REGISTER-V1:"` | Push notification registration signing | §9.5.2, §22.11.4 |
+| `"SCP-PUSH-DEREGISTER-V1:"` | Push notification deregistration signing | §9.5.2, §22.11.4 |
+| `"scp-push-registration"` | Reserved push routing ID of one relay — `SHA-256("scp-push-registration" \|\| relay_url)`, where `relay_url` is the UTF-8 bytes of the relay's canonical URL, carrying no length prefix and no separator byte. The canonical URL is the WebSocket URL the client dialed, with the scheme and the host lowercased, the port removed when it is the scheme's default (443 for `wss`, 80 for `ws`), the path kept byte for byte except that a trailing `/` is removed, and no query or fragment; so `WSS://Relay.Example:443/` and `wss://relay.example` yield one routing ID, while `wss://relay.example/scp/v1` yields another. A client publishes its `PushRegistration` and `PushDeregistration` to this routing ID, and a relay intercepts a PUBLISH to the routing ID derived from each URL it serves under; a routing-derivation prefix, NOT a §9.5.1 signature-preimage separator | `10-infrastructure-and-self-hosting.md` §10.7.1 |
 | `"SCP-CHUNK-MSG-ID-V1:"` | Chunked message ID derivation | §9.10.3 |
 | `"SCP-COMMIT-RANGE-REQ-V1:"` | Commit range request signing | §23.16.2 |
 | `"SCP-COMMIT-RANGE-RESP-V1:"` | Commit range response signing | §23.16.3 |
@@ -2999,6 +3022,7 @@ Both seeds go through the `"SCP-PSEUDONYM-P256-V1"` seed-to-scalar step above. T
 | Push platform tag: APNS | `0x01` | Platform tag byte for Apple Push Notification Service | §10.7.1 |
 | Push platform tag: FCM | `0x02` | Platform tag byte for Firebase Cloud Messaging | §10.7.1 |
 | Push platform tag: WebPush | `0x03` | Platform tag byte for Web Push API | §10.7.1 |
+| Push timestamp skew window | 300s | A relay rejects a push registration or deregistration whose `timestamp` differs from the relay's clock by more than this many seconds, in either direction | §10.7.1 |
 
 #### 9.18.14 Version Constants
 
