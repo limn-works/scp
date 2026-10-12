@@ -144,11 +144,19 @@ pub async fn sign_bounded(
         Ok(Ok(signature)) => Ok(signature),
         Ok(Err(SignError::Custody(failure))) => Err(ContextError::Custody(failure)),
         Ok(Err(e)) => Err(ContextError::CryptoFailed(e.to_string())),
-        Err(_) => Err(ContextError::Custody(CustodyFailure {
-            kind: CustodyFailureKind::TimedOut,
-            detail: format!("custody did not sign within {SIGN_TIMEOUT:?}"),
-        })),
+        Err(_) => Err(custody_timed_out("sign")),
     }
+}
+
+/// The failure of a custody call that did not answer within [`SIGN_TIMEOUT`]:
+/// [`ContextError::Custody`] of kind [`CustodyFailureKind::TimedOut`]
+/// (`SCP-CRYPTO-4061`). `operation` names the call in the detail. Every
+/// custody budget in the runtime builds its timeout through this function.
+pub(crate) fn custody_timed_out(operation: &'static str) -> ContextError {
+    ContextError::Custody(CustodyFailure {
+        kind: CustodyFailureKind::TimedOut,
+        detail: format!("custody did not answer {operation} within {SIGN_TIMEOUT:?}"),
+    })
 }
 
 #[cfg(test)]
@@ -236,7 +244,7 @@ mod tests {
             matches!(
                 &result,
                 Err(ContextError::Custody(CustodyFailure { kind: CustodyFailureKind::TimedOut, detail }))
-                    if detail == "custody did not sign within 30s"
+                    if detail == "custody did not answer sign within 30s"
             ),
             "{result:?}"
         );

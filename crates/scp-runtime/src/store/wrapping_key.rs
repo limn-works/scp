@@ -42,7 +42,9 @@ fn wrapping_key_path(did: &DID) -> Result<String, ContextError> {
 
 /// The stored wrapping key: the custody handle of the private key and its
 /// 65-byte uncompressed public point. It carries no key material and no
-/// identity; the storage key names the identity.
+/// identity; the storage key names the identity. A stored point of any other
+/// length fails to decode. `Debug` prints only the public point; the handle
+/// stays out of logs.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StoredWrappingKeyHandle {
     /// The record version, [`RECORD_VERSION`].
@@ -51,22 +53,13 @@ pub(crate) struct StoredWrappingKeyHandle {
     pub handle: KeyHandle,
     /// The 65-byte uncompressed public point.
     #[serde(with = "serde_bytes")]
-    pub public: Vec<u8>,
-}
-
-/// A loaded wrapping key record whose shape has been checked. `Debug` prints
-/// only the public point; the handle stays out of logs.
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct WrappingKeyRecord {
-    /// The custody handle of the private key.
-    pub handle: KeyHandle,
-    /// The 65-byte uncompressed public point.
     pub public: [u8; 65],
 }
 
-impl std::fmt::Debug for WrappingKeyRecord {
+impl std::fmt::Debug for StoredWrappingKeyHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WrappingKeyRecord")
+        f.debug_struct("StoredWrappingKeyHandle")
+            .field("v", &self.v)
             .field("public", &hex::encode(self.public))
             .finish_non_exhaustive()
     }
@@ -89,7 +82,7 @@ pub(crate) async fn store_wrapping_key_handle(
     let value = StoredWrappingKeyHandle {
         v: RECORD_VERSION,
         handle: *handle,
-        public: public.to_vec(),
+        public: *public,
     };
     let bytes = scp_platform::store_value::to_stored_value_bytes(&value)
         .map_err(|e| ContextError::PersistenceFailed(format!("wrapping key encode: {e}")))?;
@@ -111,7 +104,7 @@ pub(crate) async fn store_wrapping_key_handle(
 pub(crate) async fn load_wrapping_key_handle(
     storage: &dyn OpenMlsStorageAdapter,
     did: &DID,
-) -> Result<Option<WrappingKeyRecord>, ContextError> {
+) -> Result<Option<StoredWrappingKeyHandle>, ContextError> {
     let path = wrapping_key_path(did)?;
     let Some(bytes) = storage
         .retrieve(&path)
@@ -130,16 +123,7 @@ pub(crate) async fn load_wrapping_key_handle(
             stored.v
         )));
     }
-    let public: [u8; 65] = stored.public.as_slice().try_into().map_err(|_| {
-        ContextError::CryptoFailed(format!(
-            "stored wrapping public key must be 65 bytes, got {}",
-            stored.public.len()
-        ))
-    })?;
-    Ok(Some(WrappingKeyRecord {
-        handle: stored.handle,
-        public,
-    }))
+    Ok(Some(stored))
 }
 
 #[cfg(test)]
@@ -199,7 +183,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             loaded,
-            WrappingKeyRecord {
+            StoredWrappingKeyHandle {
+                v: RECORD_VERSION,
                 handle,
                 public: public(0x11)
             }
@@ -210,13 +195,13 @@ mod tests {
         let raw = storage.retrieve(&path).await.unwrap().unwrap();
         let stored: StoredWrappingKeyHandle =
             scp_platform::store_value::from_stored_value_bytes(&raw).unwrap();
-        assert!(
-            stored
-                == StoredWrappingKeyHandle {
-                    v: RECORD_VERSION,
-                    handle,
-                    public: public(0x11).to_vec(),
-                }
+        assert_eq!(
+            stored,
+            StoredWrappingKeyHandle {
+                v: RECORD_VERSION,
+                handle,
+                public: public(0x11),
+            }
         );
         let entries = storage.inner().list_keys("").await.unwrap();
         assert_eq!(entries, vec![path], "exactly one entry is written");
@@ -231,6 +216,14 @@ mod tests {
         struct OldScalarRecord {
             #[serde(with = "serde_bytes")]
             key: Vec<u8>,
+        }
+        /// The record shape with a public point of any length.
+        #[derive(Serialize)]
+        struct AnyLengthRecord {
+            v: u8,
+            handle: KeyHandle,
+            #[serde(with = "serde_bytes")]
+            public: Vec<u8>,
         }
         let storage = adapter();
         let alice = did("did:dht:alice");
@@ -247,7 +240,7 @@ mod tests {
         for (case, record) in [
             (
                 "version 2",
-                StoredWrappingKeyHandle {
+                AnyLengthRecord {
                     v: 2,
                     handle: KeyHandle::new(1),
                     public: public(0x22).to_vec(),
@@ -255,10 +248,18 @@ mod tests {
             ),
             (
                 "64-byte public",
-                StoredWrappingKeyHandle {
+                AnyLengthRecord {
                     v: RECORD_VERSION,
                     handle: KeyHandle::new(1),
                     public: vec![4; 64],
+                },
+            ),
+            (
+                "66-byte public",
+                AnyLengthRecord {
+                    v: RECORD_VERSION,
+                    handle: KeyHandle::new(1),
+                    public: vec![4; 66],
                 },
             ),
         ] {
@@ -347,7 +348,8 @@ mod tests {
     /// `Debug` prints the public point and not the handle.
     #[test]
     fn record_debug_hides_the_handle() {
-        let record = WrappingKeyRecord {
+        let record = StoredWrappingKeyHandle {
+            v: RECORD_VERSION,
             handle: KeyHandle::new(0xDEAD_BEEF),
             public: public(0x33),
         };
