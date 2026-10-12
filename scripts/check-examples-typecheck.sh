@@ -35,9 +35,9 @@
 # closes, or a skip marker with no reason or with no Python or TypeScript fence directly
 # below it.
 #
-# Setup: `pip install mypy==1.20.2 pytest==9.0.2` (mypy at the version the
-# `python-test` job pins, and pytest because the guides' pytest recipe imports it) and
-# `bun install` in `bindings/typescript`.
+# Setup: `pip install -r scripts/examples-typecheck/requirements.txt` (mypy, and the
+# packages the sites and guide blocks import, each pinned) and `bun install` in
+# `bindings/typescript`.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -76,9 +76,15 @@ if [[ ${#ts_files[@]} -eq 0 ]]; then
     fail=1
 fi
 if ! "$PY" -m mypy --version >/dev/null 2>&1; then
-    echo "check-examples-typecheck: FAIL: $PY cannot run mypy. Install it with: $PY -m pip install mypy==1.20.2" >&2
+    echo "check-examples-typecheck: FAIL: $PY cannot run mypy. Install it with: $PY -m pip install -r scripts/examples-typecheck/requirements.txt" >&2
     fail=1
 fi
+for module in cryptography pytest; do
+    if ! "$PY" -c "import $module" >/dev/null 2>&1; then
+        echo "check-examples-typecheck: FAIL: $PY cannot import $module, so mypy cannot resolve its types. Install it with: $PY -m pip install -r scripts/examples-typecheck/requirements.txt" >&2
+        fail=1
+    fi
+done
 if [[ ! -f $TSC ]]; then
     echo "check-examples-typecheck: FAIL: $TSC is missing. Run: (cd bindings/typescript && bun install)" >&2
     fail=1

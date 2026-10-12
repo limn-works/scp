@@ -791,11 +791,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # mypy at the version the python-test job pins, the cryptography
-      # package templates/broadcast-feed/subscriber.py imports, and the pytest
-      # the pytest recipe of .docs/migration/phase-4.md imports, so mypy
-      # resolves their types.
-      - run: pip install mypy==1.20.2 cryptography==50.0.0 pytest==9.0.2
+      # The packages the gate's requirements file pins: mypy, and the packages
+      # whose types mypy resolves for the sites and guide blocks.
+      - run: pip install -r scripts/examples-typecheck/requirements.txt
       - uses: oven-sh/setup-bun@v2
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
@@ -1177,11 +1175,11 @@ jobs:
       # PyYAML for check-workflow-compile-steps.py, which parses every workflow
       # file and which the toolchain-wiring-cases job installs the same pin for.
       - run: pip install 'tree-sitter-rust>=0.21,<0.25' tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift ruff==0.15.4 'pyyaml>=6,<7'
-      # check-examples-typecheck.sh runs mypy, at the pin the python-test and
-      # examples-typecheck jobs carry, and the TypeScript compiler that
-      # `bun install` puts under bindings/typescript/node_modules, plus the
-      # cryptography package templates/broadcast-feed/subscriber.py imports.
-      - run: pip install mypy==1.20.2 cryptography==50.0.0
+      # check-examples-typecheck.sh runs mypy over the packages its requirements
+      # file pins, which the examples-typecheck job installs too, and the
+      # TypeScript compiler that `bun install` puts under
+      # bindings/typescript/node_modules.
+      - run: pip install -r scripts/examples-typecheck/requirements.txt
       - uses: oven-sh/setup-bun@v2
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
