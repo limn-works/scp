@@ -1245,10 +1245,9 @@ macro_rules! push_conformance {
                 // Calls check_fixed_wake_signal, a public function of
                 // this module, which asserts the contract below.
                 // The adapter accepts at least one permitted wake payload:
-                // the APNs payload {"aps":{"content-available":1}}
-                // (ADR-025 criterion 4), the FCM payload
-                // {"data": {"scp": "1"}} (ADR-027), or the relay payload
-                // { "scp": 1 } (§10.7.1 step 5). It returns a non-empty
+                // the body of a row of the wake-signal table of
+                // §10.7.1 step 5, as the device receives it under that
+                // row's receipt rule. It returns a non-empty
                 // WakeSignal for it. Every other payload the adapter
                 // accepts (another permitted payload, a permitted payload
                 // with trailing whitespace, or a payload carrying a context

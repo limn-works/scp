@@ -1,0 +1,1478 @@
+{
+  "project": "Push notifications (\u00a710.7)",
+  "description": "Builds the \u00a710.7 push path: relays store signed push registrations and send a wake signal through APNs, FCM and WebPush when a message arrives for a registered routing ID, and devices accept the wake, connect, and pull pending envelopes. The keri workstream owns the one function that checks a registration's signature against the identity's key state (\u00a710.7.1 step 3); this PRD owns that function's interface, the relay code that calls it, and the error mapping (PUSH-005). Until keri replaces the stub body, every relay with push enabled answers 5003 and accepts no registration. PUSH-001 to PUSH-003 amend the specs and ADRs first, so each code story cites a section that already states its requirement. Alec ruled on 2026-10-12 that a registration lists routing IDs in place of plaintext context IDs (D5), that the registration key includes the device token so that each device registers separately (D6), and that WebPush is specified fully in a later gate (D3), which gate-push-webpush holds (PUSH-021 to PUSH-024).",
+  "gates": [
+    {
+      "id": "gate-push-spec",
+      "name": "Push spec and ADR amendments",
+      "stories": [
+        "PUSH-001",
+        "PUSH-002",
+        "PUSH-003"
+      ]
+    },
+    {
+      "id": "gate-push-relay",
+      "name": "Relay push path: wire types, verifier boundary, store, interception, senders, startup",
+      "stories": [
+        "PUSH-004",
+        "PUSH-005",
+        "PUSH-006",
+        "PUSH-007",
+        "PUSH-008",
+        "PUSH-009",
+        "PUSH-010",
+        "PUSH-011",
+        "PUSH-012"
+      ]
+    },
+    {
+      "id": "gate-push-client",
+      "name": "Client push path: routing-ID query, registrar, FFI exports, wake handling, error codes",
+      "stories": [
+        "PUSH-013",
+        "PUSH-014",
+        "PUSH-015",
+        "PUSH-016",
+        "PUSH-019"
+      ]
+    },
+    {
+      "id": "gate-push-device",
+      "name": "Device SDKs: Swift, Kotlin, Python and TypeScript push wrappers",
+      "stories": [
+        "PUSH-017",
+        "PUSH-018",
+        "PUSH-020"
+      ]
+    },
+    {
+      "id": "gate-push-webpush",
+      "name": "WebPush: spec, RFC 8291 and RFC 8292 sender, VAPID startup, browser client",
+      "stories": [
+        "PUSH-021",
+        "PUSH-022",
+        "PUSH-023",
+        "PUSH-024"
+      ]
+    }
+  ],
+  "stories": [
+    {
+      "id": "PUSH-001",
+      "title": "Amend the push payload and the device receipt rule per platform",
+      "gate": "gate-push-spec",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        ".docs/specs/10-infrastructure-and-self-hosting.md",
+        ".docs/adrs/phase-5.md",
+        ".docs/adrs/phase-6.md",
+        ".docs/adrs/phase-1.md",
+        ".docs/prds/main.json",
+        "crates/scp-protocol/src/discovery/push.rs",
+        "crates/scp-platform/src/android/push_provider.rs",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidPushProvider.kt",
+        "bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/platform/AndroidPushProviderTest.kt",
+        ".docs/specs/16-test-infrastructure.md"
+      ],
+      "description": "Step 5 of \u00a710.7.1, the push registration protocol, fixed the relay's push payload as one byte string, `{ \"scp\": 1 }`, while ADR-025, the Apple platform adapter, fixed the APNs payload as `{\"aps\": {\"content-available\": 1}}`. Both texts claimed to define the exact bytes the relay sends to APNs, and iOS wakes a background app only for a payload that carries `aps.content-available`, so the \u00a710.7.1 text was wrong for APNs. ADR-027, the Android platform adapter, gave the FCM sender a body that addressed the device through the legacy FCM API's top-level `to` field, which the FCM HTTP v1 API rejects. ADR-025 acceptance criterion 4 also made `handleNotification` compare raw bytes, which no code on the iOS delivery path can run, because iOS hands the app a parsed `userInfo` dictionary.\n\nThis story replaces \u00a710.7.1 step 5 with a wake-signal table holding one request per platform (APNs and FCM; PUSH-021 adds the WebPush row) and adds a device receipt rule per platform. The plan's decisions D1, D2 and D10 govern: D1b, the device accepts an APNs wake only when the parsed dictionary has exactly the key `aps`, and `aps` has exactly `content-available` = 1; D2b, every FCM wake carries `android.priority: HIGH`; D10, the app calls the Rust core and the Rust core calls the UniFFI `PushProvider` callback. ADR-006, the in-memory platform adapter, and ADR-025 cite the \u00a710.7.1 table rather than restating the bytes. The SCP-096 action item that asked for an encrypted context identifier in the APNs payload contradicted \u00a710.7, which forbids any context in a push payload, so this story removes it. Doc comments in `scp-protocol`, `scp-platform` and the Kotlin Android adapter that restated `{ \"scp\": 1 }` or the legacy FCM body now cite the table. Swift and Kotlin code changes belong to PUSH-017 and PUSH-018.",
+      "acceptanceCriteria": [
+        "\u00a710.7.1 step 5 contains one table with the rows APNs and FCM, each giving the request body and the headers.",
+        "The string `{ \"scp\": 1 }` no longer appears in \u00a710.7.1.",
+        "`git grep -n '\"scp\": 1' -- .docs/specs` returns nothing; \u00a716.12.5 cites the \u00a710.7.1 step 5 table instead of restating payload bytes.",
+        "ADR-025 acceptance criterion 4 checks a parsed dictionary and contains no \"whitespace outside string literals\" clause.",
+        "ADR-027 contains no `\"to\":` key.",
+        "ADR-006 and ADR-025 cite \u00a710.7.1 rather than restating the bytes.",
+        "The SCP-096 action item in `.docs/prds/main.json` no longer mentions context_id.",
+        "ADR-025 and ADR-027 state the D10 call order: `push_enable(provider)` calls `registerPush()` and publishes a signed registration; `push_handle_wake(payload)` calls `handleNotification(payload)`, then runs relay catch-up under a deadline and returns `WakeOutcome`.",
+        "\u00a710.7.1 step 5 states the APNs receipt rule (exactly the key `aps`, and `aps` exactly `content-available` = 1) and the FCM receipt rule (`scp` equals the string `\"1\"`).",
+        "The FCM row of the \u00a710.7.1 table sets `android.priority` to `HIGH` and carries no `notification` key.",
+        "`python3.12 scripts/check-doc-citations.py` passes."
+      ],
+      "actionItems": [
+        "Replace \u00a710.7.1 step 5's payload sentence with the wake-signal table and the device receipt rule.",
+        "Amend ADR-025: the Decision's push paragraph, criterion 4 (parsed-dictionary rule, relay item, call order) and criterion 7's test item.",
+        "Amend ADR-027: the Decision's FCM items, the `AndroidPushProvider.kt` code block (FCM HTTP v1 body) and criterion 10 (call order).",
+        "Amend ADR-006's `InMemoryPush` bullet to cite the \u00a710.7.1 table.",
+        "Rewrite the SCP-096 action item so that it names no context identifier.",
+        "Point the stale doc comments in `push.rs`, `push_provider.rs`, `AndroidPushProvider.kt` and its test at the \u00a710.7.1 table."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.7 Notifications and Push"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-025: Apple Platform Adapter"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-027: Android Platform Adapter"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-006: Platform Abstraction (In-Memory Testing Adapter)"
+        }
+      ],
+      "details": {
+        "planDecisions": [
+          "D1",
+          "D1b",
+          "D2",
+          "D2b",
+          "D10"
+        ],
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-002",
+      "title": "Amend the push encoding, freshness, relay exception and privacy statement",
+      "gate": "gate-push-spec",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        ".docs/specs/22-human-readable-addressing.md",
+        ".docs/specs/09-security-model.md",
+        ".docs/specs/10-infrastructure-and-self-hosting.md",
+        ".docs/adrs/phase-1.md",
+        ".docs/specs/17-persistence-and-storage.md",
+        ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md"
+      ],
+      "description": "Fixes the stale copies and gaps the plan's decisions D4, D6a, D7, D8 and D9 found in the push wire format. \u00a722.11.4, the push wire table, encodes `contexts` as length-prefixed strings with no element count, while \u00a79.5.1, which \u00a722.11.4 cites, requires a 4-byte big-endian element count before every repeated field; \u00a79.5.1 governs. \u00a710.7.1 restates the registration struct with types that drifted from the \u00a722.11.4 wire table, so \u00a710.7.1 cites \u00a722.11.4 instead. \u00a79.5.2 gets one signed-structure table per push separator (`SCP-PUSH-REGISTER-V1:` and `SCP-PUSH-DEREGISTER-V1:`); the V1 encoding is fixed in place without a V2 bump, because no code has ever signed with V1 (D4b). \u00a79.18.2 registers the reserved routing derivation `SHA-256(\"scp-push-registration\" || relay_url)` and the canonical form of `relay_url`. \u00a79.5.1 lists both push messages among the preimages that take an identity identifier: the `registrant` field is encoded as the 56-byte `scp:` text form of the SCP-308 S1 `Identifier` under \u00a79.5.1's length-prefixed rule, and the separators stay V1 when S1 changes the bytes inside the length prefix. ADR-004, the native relay protocol, lists push interception as a second narrow exception to relay opacity, registers the push wire codes, the timestamp skew window, and the rule that the relay never stores or delivers a push message as a blob. The \u00a710.7.1 storage paragraph states that a relay holding a push registration learns the identity, its platform token and the routing IDs listed for it (D7), and \u00a79.10.4 lists that linkage as a residual. \u00a717.17, capability selection, and the ADR-062 classification table add rows for the push registration store (shipped arm SQLite only; the in-memory arm compiles only under `testing`), the push senders, and the push signature verifier.",
+      "acceptanceCriteria": [
+        "\u00a722.11.4 states the BE32 element count for the repeated field.",
+        "\u00a79.5.2 has one table per push separator.",
+        "\u00a79.5.1's list of preimages that take an identifier names `PushRegistration` and `PushDeregistration`, with `registrant` encoded as the 56-byte `scp:` text form under the length-prefixed rule.",
+        "\u00a79.5.2 states that the push separators stay V1 when SCP-308 S1 changes the bytes inside the `registrant` length prefix.",
+        "\u00a79.18.2 registers the reserved routing derivation and the canonical form of `relay_url` (indicator: the WebSocket URL the client dialed, scheme and host lowercased, default port elided, no trailing slash).",
+        "\u00a710.7.1 cites \u00a722.11.4 rather than restating the struct.",
+        "ADR-004 lists two narrow exceptions, the codes 4050-4054 and 5003-5004, the skew window, and the rule that push messages are never stored or delivered as blobs.",
+        "ADR-004 states that a relay whose push role is `Disabled` rejects any PUBLISH to the reserved routing ID with code 4053.",
+        "The \u00a710.7.1 storage paragraph states the D7 linkage, and \u00a79.10.4 lists it as a residual.",
+        "\u00a717.17 and the ADR-062 table each have rows for the push store, the push senders and the push verifier, each with its classification; the push store row states that the shipped arm is SQLite and the in-memory arm compiles only under `testing`.",
+        "`python3.12 scripts/check-doc-citations.py` passes."
+      ],
+      "actionItems": [
+        "Add the element count to \u00a722.11.4 and replace \u00a710.7.1's struct with a citation of \u00a722.11.4.",
+        "Add the two \u00a79.5.2 tables and the \u00a79.18.2 registration.",
+        "Amend ADR-004 with the second exception, the wire codes, the skew window and the no-blob rule.",
+        "Amend the \u00a710.7.1 storage paragraph and the \u00a79.10.4 residuals.",
+        "Add the push rows to \u00a717.17 and to the ADR-062 classification table."
+      ],
+      "blockedBy": [
+        "PUSH-001"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/22-human-readable-addressing.md",
+          "section": "### 22.11.4 Push Notifications"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.1 Canonical Hash Construction"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.2 Signed Structure Definitions"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.2 Domain Separators"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.4 Per-Context Pseudonyms"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.17 Capability Selection Is Mandatory, Fails Closed, and Never Defaults"
+        },
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "## Capability classification (\u00a717.17.2 SCP-CAPSEL-8010 \u2014 mandatory before ship)"
+        }
+      ],
+      "details": {
+        "planDecisions": [
+          "D4",
+          "D4b",
+          "D6a",
+          "D7",
+          "D8",
+          "D9",
+          "D9b"
+        ],
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-003",
+      "title": "Routing IDs, a per-device registration key, and the registrant field",
+      "gate": "gate-push-spec",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        ".docs/specs/10-infrastructure-and-self-hosting.md",
+        ".docs/specs/22-human-readable-addressing.md"
+      ],
+      "description": "Applies Alec's 2026-10-12 rulings on D5 and D6, and keri's ruling on the identity field. D5: \u00a710.7.1 carries plaintext `contexts: Vec<ContextId>`, which hands the relay the context ID that \u00a79.10.4 forbids it to learn; the registration carries `routing_ids: Vec<[u8; 32]>` instead, and an empty list is invalid. D6: \u00a710.7.1 keys a registration by identity and platform, so a second device on the same platform replaces the first, while \u00a710.8.1 gives each device its own MLS leaf; a registration is keyed by (identity identifier, platform, token), `PushDeregistration` carries `token`, and the relay caps the registrations per identity identifier. Identity field: both messages name the signer `registrant`, typed `Identifier` as SCP-308 S1 defines it, and every text this story writes calls it the identity identifier. Alec ruled on D3 (WebPush) to specify it fully in a later gate; PUSH-021 writes that spec text, so this story leaves the WebPush enum entry and tag `0x03` as they are.",
+      "acceptanceCriteria": [
+        "\u00a722.11.4 lists `routing_ids` with a fixed 32-byte element type, and states that an empty list is invalid.",
+        "The \u00a722.11.4 tables of both messages name the signer field `registrant: Identifier`, citing SCP-308 S1, and `registrant` is the only identity field in either table.",
+        "`PushDeregistration` contains `token` in its table and its preimage.",
+        "\u00a710.7.1 states the (identity identifier, platform, token) registration key and the per-identity cap (indicator: 16).",
+        "\u00a710.7.1 no longer contains `contexts: Vec<ContextId>`.",
+        "`python3.12 scripts/check-doc-citations.py` passes."
+      ],
+      "actionItems": [
+        "Replace `contexts` with `routing_ids` in \u00a722.11.4 and \u00a710.7.1.",
+        "Rename the signer field to `registrant: Identifier` and add `token` to `PushDeregistration`.",
+        "State the registration key and the per-identity cap in \u00a710.7.1."
+      ],
+      "blockedBy": [
+        "PUSH-002"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/22-human-readable-addressing.md",
+          "section": "### 22.11.4 Push Notifications"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.4 Per-Context Pseudonyms"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.8.1 Multi-Device MLS Participation Model"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.4 Relay Architecture"
+        }
+      ],
+      "details": {
+        "planDecisions": [
+          "D5",
+          "D6"
+        ],
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-004",
+      "title": "Push wire types, canonical signing bytes and test vectors",
+      "gate": "gate-push-relay",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/discovery/push.rs",
+        "crates/scp-runtime/tests/test_vectors.rs",
+        "crates/scp-core/src/lib.rs"
+      ],
+      "description": "Fixes the `PushRegistration` and `PushDeregistration` field types to match the \u00a722.11.4 wire table, and adds the one canonical-bytes function per message, the MessagePack encoding, and the reserved routing ID derivation. The keri workstream's verifier computes each preimage through these canonical-bytes functions, so no other code builds a push preimage. Both messages carry the signer in `registrant`. Until SCP-308 S1 lands the `Identifier` type, `registrant` holds today's did:dht string; the code lags the spec here, and the field's doc comment and this story's PR body record that gap. When S1 lands, the bytes inside the `registrant` length prefix change and the separators stay V1. The `crates/scp-core/src/lib.rs` re-export already exists; this story checks it. Protocol types only, so every integration-checklist row is n/a.",
+      "acceptanceCriteria": [
+        "`push_registration_signing_bytes` and `push_deregistration_signing_bytes` produce bytes equal to golden vectors checked into `test_vectors.rs`.",
+        "These two functions are the only code that builds a push preimage: the PUSH-005 verifier interface and the PUSH-014 registrar both call them.",
+        "A test proves that two registrations whose routing-ID lists differ only in how elements split across the list produce different preimages.",
+        "`push_registration_routing_id(\"WSS://Relay.Example:443/\")` equals the derivation for `wss://relay.example`.",
+        "Decoding a registration with zero routing IDs returns a typed error.",
+        "`PushRegistration` carries `routing_ids: Vec<[u8; 32]>` and `registrant`, `PushDeregistration` carries `registrant` and `token`, and `registrant` is the only identity field in either struct.",
+        "The `registrant` doc comment states that the field holds today's did:dht string until SCP-308 S1, and that S1 changes the bytes inside its length prefix without a separator bump.",
+        "The `Ed25519Signature` alias is gone."
+      ],
+      "actionItems": [
+        "Retype the push message fields per \u00a722.11.4.",
+        "Add the canonical-bytes functions, the MessagePack encoding and the reserved routing ID derivation.",
+        "Check in golden vectors."
+      ],
+      "blockedBy": [
+        "PUSH-003"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/22-human-readable-addressing.md",
+          "section": "### 22.11.4 Push Notifications"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.1 Canonical Hash Construction"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.2 Signed Structure Definitions"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.2 Domain Separators"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-005",
+      "title": "Push signature verifier trait and refusing stub (shared with keri)",
+      "gate": "gate-push-relay",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/push_verify.rs",
+        "crates/scp-identity/src/lib.rs",
+        "crates/scp-identity/Cargo.toml"
+      ],
+      "description": "Lands the push verifier interface that the keri workstream implements. keri's five constraints bind: (1) the verifier is an async trait object the relay receives by injection (`Arc<dyn PushSignatureVerifier>`, ADR-062); (2) `verify` takes the typed `PushRegistration` or `PushDeregistration`, never raw signed bytes, and computes the preimage through the PUSH-004 canonical-bytes function; (3) `verify` returns `Ok` carrying the verified identifier, typed `Identifier` (SCP-308 S1; today's did:dht string until S1 lands), or one of five rejections: identifier unresolvable, key state unavailable (retryable), signature invalid, key not `Current` in `#active`, and malformed; (4) no allow-all verifier exists, even behind `testing`; (5) keri builds its verifier body after its identifier story and the \u00a79.7.4.2 R2, R3 and R8 key-state resolution land.\n\nBefore keri lands, the production struct `KelPushVerifier` refuses every message with a sixth error, verifier unavailable, which keri's body never returns; startup wires this struct whenever push is enabled, so every relay answers 5003 and accepts nothing unverified. keri has no story ID yet, so the stub carries `// Stub \u2014 see PUSH-005`, the form `.docs/standards/sdk-common.md` \u00a7Stub and Placeholder Policy requires; when keri files the story that replaces the stub body, the comment names that story instead. Tests use a verifier that checks a real P-256 signature against a key the test supplies. The relay maps each rejection to one wire code of ADR-004's push table (PUSH-002): identifier unresolvable, signature invalid, key not Current in #active, and malformed map to 4050; key state unavailable, and a verifier call that exceeds its timeout (indicator: 10 s), map to 5004; verifier unavailable maps to 5003. Location `crates/scp-identity/src/push_verify.rs` is an indicator. keri reviews this PR and agrees to the signature before it merges.",
+      "acceptanceCriteria": [
+        "`PushSignatureVerifier::verify` takes a typed `PushRegistration` or `PushDeregistration` and no byte-slice preimage parameter.",
+        "`verify` returns `Ok` carrying the verified identifier, or a `PushVerifyError` with exactly these rejections: identifier unresolvable, key state unavailable, signature invalid, key not `Current` in `#active`, malformed, and the stub-only verifier unavailable.",
+        "`KelPushVerifier::verify` returns `Err(VerifierUnavailable)` for every input, and the stub carries a `// Stub \u2014 see PUSH-005` comment.",
+        "The tests use a verifier that checks a real P-256 signature against a key the test supplies, and that verifier lives behind `testing`.",
+        "That test verifier returns `SignatureInvalid` for a message signed by a key other than the one the test supplied.",
+        "No verifier that returns `Ok` without checking a signature exists in any build, `testing` included.",
+        "A function maps each `PushVerifyError` to its wire code (4050, 5003 or 5004), and a test covers every variant.",
+        "`scripts/check-shipped-feature-graph.sh` passes unchanged."
+      ],
+      "actionItems": [
+        "Write the trait, the error enum and the stub struct.",
+        "Write the signature-checking test verifier under `testing`.",
+        "Write the error-to-wire-code mapping.",
+        "Get keri's agreement on the signature before merge."
+      ],
+      "blockedBy": [
+        "PUSH-004"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        },
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "## Capability classification (\u00a717.17.2 SCP-CAPSEL-8010 \u2014 mandatory before ship)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### 17.17.2 Security Classification of Development Arms"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        }
+      ],
+      "details": {
+        "sharedWith": "keri workstream",
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-006",
+      "title": "Relay push registration store capability",
+      "gate": "gate-push-relay",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/relay/push_store.rs",
+        "crates/scp-transport/src/relay/mod.rs"
+      ],
+      "description": "An enum-dispatched relay store for push registrations. The shipped arm is `Sqlite` (indicator: through `scp-sqlite-pools`). The `InMemory` arm compiles only under the `testing` feature, so no shipped relay can select it. Selection has no `Default` (ADR-062, capability injection; \u00a717.17.1). The store indexes registrations by registration key (identity identifier, platform, token) and by routing ID, and keeps a consecutive invalid-token counter per key. File location `push_store.rs` is an indicator. Relay-internal, so every integration-checklist row is n/a.",
+      "acceptanceCriteria": [
+        "`upsert` with a newer timestamp replaces the stored registration and its routing-ID index entries.",
+        "`upsert` with an identical token and routing-ID set leaves the index unchanged.",
+        "`upsert` with an equal or older timestamp returns `Stale`.",
+        "`upsert` past the per-identity cap returns `LimitReached`.",
+        "`remove(key)` deletes the registration and its index entries.",
+        "`tokens_for_routing_id` returns each matching registration once.",
+        "A test runs every behaviour above against both arms.",
+        "The SQLite arm keeps registrations across a reopen.",
+        "A build of `scp-transport` without `testing` contains no `InMemory` arm: the arm and its constructor sit behind `#[cfg(feature = \"testing\")]`.",
+        "The store selection type implements no `Default`."
+      ],
+      "actionItems": [
+        "Write the store enum with the `Sqlite` arm and the `testing`-only `InMemory` arm.",
+        "Write the shared behaviour tests over both arms."
+      ],
+      "blockedBy": [
+        "PUSH-004"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.17 Capability Selection Is Mandatory, Fails Closed, and Never Defaults"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### 17.17.2 Security Classification of Development Arms"
+        },
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "## Capability classification (\u00a717.17.2 SCP-CAPSEL-8010 \u2014 mandatory before ship)"
+        }
+      ],
+      "details": {
+        "planDecisions": [
+          "D9b"
+        ],
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-007",
+      "title": "Relay interception of push registration and deregistration",
+      "gate": "gate-push-relay",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/relay/push_gate.rs",
+        "crates/scp-relay-client/src/error.rs"
+      ],
+      "description": "Adds `RelayConfig.push: PushRole` with the variants `Disabled` and `Enabled(PushServiceConfig)`. `Disabled` is the default, because it fails safe in the same way as `BridgeRole::Disabled` (ADR-052, the unified construction pattern, M2 and M4). `PushServiceConfig` holds the store, the `Arc<dyn PushSignatureVerifier>` and the configured senders; all three are required, with no defaults. The push gate runs in `handle_publish` beside `did_slots.gate_publish`, after the rate-limit, size and TTL checks and before `storage.store`. On any verifier rejection the relay stores nothing and changes nothing. File location `push_gate.rs` is an indicator. The operation is relay-internal and has no client dispatch, so the `pw` row is n/a.",
+      "acceptanceCriteria": [
+        "A PUBLISH to the reserved routing ID never reaches `storage.store` or `deliver_to_subscribers`, whatever the result; tests prove this by querying and subscribing to the reserved routing ID afterwards.",
+        "A relay with `Disabled` returns 4053.",
+        "A relay wired with the stub `KelPushVerifier` returns 5003 for a valid registration and stores nothing.",
+        "A relay wired with the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing` stores a registration signed by the supplied key and returns success.",
+        "A relay wired with that test verifier returns 4050 for a registration signed by another key and stores nothing.",
+        "A relay returns 4052 for a timestamp outside the skew window (indicator: \u00b1300 s) or not newer than the stored one.",
+        "A relay returns 4051 for a platform with no configured sender.",
+        "A valid deregistration removes exactly its own key.",
+        "The new codes are constants in `crates/scp-relay-client/src/error.rs`."
+      ],
+      "actionItems": [
+        "Add `PushRole` and `PushServiceConfig` to `RelayConfig`.",
+        "Write the push gate and call it from `handle_publish`.",
+        "Add the wire code constants."
+      ],
+      "blockedBy": [
+        "PUSH-005",
+        "PUSH-006"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "## Capability classification (\u00a717.17.2 SCP-CAPSEL-8010 \u2014 mandatory before ship)"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-008",
+      "title": "Push sender seam, dispatcher, and deregistration after invalid-token failures",
+      "gate": "gate-push-relay",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/relay/push_dispatch.rs",
+        "crates/scp-transport/src/native/server.rs"
+      ],
+      "description": "The `PushSender` enum has the arms `Apns`, `Fcm` and, under `testing` only, `Recording`; a recording sender reports deliveries that never happened, so it is a nullifier and must stay out of the shipped feature graph. Each `send` returns `Delivered`, `InvalidToken`, `Transient` or `ConfigError`. After `storage.store` succeeds in `handle_publish`, the relay looks up the registrations for the publish's routing ID and queues one job per token on a bounded queue (indicator: 10,000); the publish never waits on a send. A background task drains the queue. Only `InvalidToken` counts toward the 3 consecutive failures of \u00a710.7.1; `Delivered` resets the counter, and at 3 the relay removes the registration. Tests register through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`. File location `push_dispatch.rs` is an indicator.",
+      "acceptanceCriteria": [
+        "A publish to a registered routing ID enqueues exactly one job per matching token.",
+        "A full queue drops the job, increments a counter, and the publish still succeeds.",
+        "Three `InvalidToken` outcomes in a row remove the registration.",
+        "`InvalidToken`, `InvalidToken`, `Delivered`, `InvalidToken` leaves the registration in place.",
+        "`Transient` and `ConfigError` never change the counter.",
+        "No push job carries the routing ID, the blob or the `registrant` identifier; a test inspects the job struct's fields.",
+        "Every test registration goes through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`.",
+        "The `Recording` arm compiles only under `testing`, and `scripts/check-shipped-feature-graph.sh` passes."
+      ],
+      "actionItems": [
+        "Write the sender enum, the bounded queue and the drain task.",
+        "Wire the enqueue after `storage.store` in `handle_publish`.",
+        "Write the invalid-token counter rules."
+      ],
+      "blockedBy": [
+        "PUSH-007"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "## Capability classification (\u00a717.17.2 SCP-CAPSEL-8010 \u2014 mandatory before ship)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### 17.17.2 Security Classification of Development Arms"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-009",
+      "title": "Rate limit of one push per 30 s per token",
+      "gate": "gate-push-relay",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/relay/rate_limit.rs",
+        "crates/scp-transport/src/relay/push_dispatch.rs"
+      ],
+      "description": "\u00a710.7.1 step 6 requires at most one push per 30 seconds per device token. The limiter keys entries by SHA-256 of the token, so no second map holds plaintext tokens. A push suppressed inside the window is dropped, not deferred, because the device pulls every pending envelope on its next wake (\u00a710.7). The relay prunes expired entries.",
+      "acceptanceCriteria": [
+        "Two publishes 1 s apart to one token's routing ID produce exactly one sender call.",
+        "A publish 30 s after the first produces a second call.",
+        "Two different tokens are limited independently.",
+        "The limiter's memory is bounded by the number of active tokens; a test checks the entry count after pruning."
+      ],
+      "actionItems": [
+        "Write the per-token limiter and call it from the dispatcher."
+      ],
+      "blockedBy": [
+        "PUSH-008"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.7 Notifications and Push"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-010",
+      "title": "APNs sender",
+      "gate": "gate-push-relay",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/relay/push_apns.rs",
+        "crates/scp-transport/Cargo.toml"
+      ],
+      "description": "Sends the APNs row of the \u00a710.7.1 step 5 wake-signal table over HTTP/2 to `api.push.apple.com`, or to `api.sandbox.push.apple.com` when the configured environment is `sandbox`. Authenticates with an ES256 provider JWT signed by the .p8 key through the `p256` crate the workspace already uses, carrying the key ID and team ID, refreshed every 50 minutes (indicator). Response mapping: 200 to `Delivered`; 410, or 400 with reason `BadDeviceToken`, to `InvalidToken`; 403 `InvalidProviderToken` or `ExpiredProviderToken` refreshes the JWT once, then `ConfigError`; 429 or 5xx to `Transient`; `DeviceTokenNotForTopic` to `InvalidToken`; `TopicDisallowed` to `ConfigError`. End-to-end tests register through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`. Runs in parallel with PUSH-011. File location `push_apns.rs` is an indicator.",
+      "acceptanceCriteria": [
+        "Against a local HTTP/2 test server under `testing`, the request carries exactly the body and headers of the APNs row of the \u00a710.7.1 step 5 table.",
+        "Each response row in the description maps to its outcome.",
+        "The JWT's header has `alg: ES256` and `kid`, and its claims have `iss` and `iat`.",
+        "No log line contains the key, the JWT or the device token; a test captures the tracing output.",
+        "Every end-to-end test registration goes through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`.",
+        "`cargo deny` passes with any new HTTP/2 dependency."
+      ],
+      "actionItems": [
+        "Write the APNs client, the JWT signer and the response mapping."
+      ],
+      "blockedBy": [
+        "PUSH-008"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-025: Apple Platform Adapter"
+        }
+      ],
+      "details": {
+        "parallelWith": "PUSH-011",
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-011",
+      "title": "FCM sender over the HTTP v1 API",
+      "gate": "gate-push-relay",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/relay/push_fcm.rs",
+        "crates/scp-transport/Cargo.toml"
+      ],
+      "description": "Reads the service-account JSON, mints an RS256 JWT for `https://oauth2.googleapis.com/token` with scope `https://www.googleapis.com/auth/firebase.messaging`, and caches the access token until 60 s before it expires (indicator). Sends the FCM row of the \u00a710.7.1 step 5 wake-signal table to `POST https://fcm.googleapis.com/v1/projects/{project_id}/messages:send`. Response mapping: 200 to `Delivered`; 404 `UNREGISTERED`, or 400 `INVALID_ARGUMENT` naming the token, to `InvalidToken`; 401 refreshes the token once, then `ConfigError`; 403 `SENDER_ID_MISMATCH` to `InvalidToken`; 429 `QUOTA_EXCEEDED`, 503 or 500 to `Transient`. End-to-end tests register through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`. Runs in parallel with PUSH-010. File location `push_fcm.rs` is an indicator.",
+      "acceptanceCriteria": [
+        "Against a local test server, the body equals the FCM body of the \u00a710.7.1 step 5 table byte for byte after JSON normalization, and it contains no `notification` key.",
+        "The body sets `message.android.priority` to `HIGH`.",
+        "Each response row in the description maps to its outcome.",
+        "A test proves the access token is reused within its lifetime and refreshed after it.",
+        "Every end-to-end test registration goes through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`.",
+        "The RSA dependency passes `cargo deny` and `scripts/check-vendored-openssl-scope.sh`."
+      ],
+      "actionItems": [
+        "Write the FCM client, the OAuth token cache and the response mapping."
+      ],
+      "blockedBy": [
+        "PUSH-008"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-027: Android Platform Adapter"
+        }
+      ],
+      "details": {
+        "parallelWith": "PUSH-010",
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-012",
+      "title": "Relay push startup selection and credentials",
+      "gate": "gate-push-relay",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/startup.rs",
+        "crates/scp-relay/src/main.rs",
+        "crates/scp-relay/README.md",
+        ".docs/adrs/phase-1.md",
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "Implements Part 5 of the plan: push selection is mandatory, has no default, and every failure is typed and fails closed (\u00a717.17). The variable names are indicators; the rules are the contract. `SCP_RELAY_PUSH_PLATFORMS` takes `none`, `apns`, `fcm` or `apns,fcm`; `none` sets `PushRole::Disabled`. `SCP_RELAY_PUSH_STORE` has no default and is required whenever the platform list is not `none`; a shipped build accepts only `sqlite`, because the in-memory store arm compiles only under `testing` (PUSH-006). APNs needs `SCP_RELAY_APNS_KEY_PATH`, `SCP_RELAY_APNS_KEY_ID`, `SCP_RELAY_APNS_TEAM_ID`, `SCP_RELAY_APNS_TOPIC` and `SCP_RELAY_APNS_ENVIRONMENT` (`production` or `sandbox`, no default). FCM needs `SCP_RELAY_FCM_SERVICE_ACCOUNT_PATH`, and `SCP_RELAY_FCM_PROJECT_ID` or the JSON's `project_id`. Credentials load only from file paths; key bytes, JWTs and access tokens live in zeroizing buffers; no `Debug` implementation prints them. The ADR-004 operator table records that APNs credentials bind a relay to one Apple team and topic, and FCM credentials to one Firebase project. The `scp-node` embedded relay takes the same selection through its builder, defaulting to `Disabled` and never reading credentials implicitly; the `scp-node` file path is an indicator.",
+      "acceptanceCriteria": [
+        "When `SCP_RELAY_PUSH_PLATFORMS` is unset, `start_relay_from_env` returns a typed `StartupError` with an SCP-CAPSEL code.",
+        "The value `none` yields `PushRole::Disabled`.",
+        "With `apns` listed, each missing APNs variable yields its own `StartupError` variant naming that variable.",
+        "An unreadable key file, or one with group or world permissions, yields a typed error.",
+        "The same rules hold for FCM.",
+        "`SCP_RELAY_PUSH_STORE` has no default; a shipped build accepts `sqlite` and returns a typed `StartupError` for any other value, `memory` included.",
+        "When push is enabled, the relay wires `KelPushVerifier`.",
+        "A test checks that the `Debug` output of the push config struct contains no key byte, JWT or access token.",
+        "The `scp-node` builder exposes push as an explicit selection whose default is `Disabled`."
+      ],
+      "actionItems": [
+        "Parse the push variables in `startup.rs` with one typed error per failure.",
+        "Load credentials from files into zeroizing buffers.",
+        "Add the ADR-004 operator table rows and the README section.",
+        "Expose the selection in the `scp-node` builder."
+      ],
+      "blockedBy": [
+        "PUSH-010",
+        "PUSH-011"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.17 Capability Selection Is Mandatory, Fails Closed, and Never Defaults"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        },
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "## Capability classification (\u00a717.17.2 SCP-CAPSEL-8010 \u2014 mandatory before ship)"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-013",
+      "title": "Supervisor query for push routing IDs",
+      "gate": "gate-push-client",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-runtime/src/context/actor/handlers/push.rs",
+        "crates/scp-runtime/src/context/actor/handlers/push_helpers.rs",
+        "crates/scp-runtime/src/context/actor/handlers/mod.rs",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs"
+      ],
+      "description": "`Supervisor::push_routing_ids()` fans a query out to each standing context actor. Each actor returns its `context_routing_id` and this device's current `pseudonym_routing_id` (\u00a79.10.4). The Supervisor groups the results by relay URL. FFI, SDK and matrix rows are covered by PUSH-015.",
+      "acceptanceCriteria": [
+        "With two contexts on two relays, the result maps each relay to exactly the routing IDs of the contexts on it.",
+        "After a pseudonym rotation, the result holds the new pseudonym routing ID and not the old one.",
+        "The query runs `dispatch_query` \u2192 actor mailbox \u2192 `handlers/push.rs` \u2192 `push_helpers.rs`.",
+        "`pipeline_wiring.rs` asserts that step."
+      ],
+      "actionItems": [
+        "Add the handler and helper, and the Supervisor fan-out.",
+        "Add the `pipeline_wiring.rs` assertion."
+      ],
+      "blockedBy": [
+        "PUSH-004"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.4 Per-Context Pseudonyms"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.10.4.1 Pseudonym Rotation (BLACK-001 Mitigation)"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "yes",
+          "pw": "yes",
+          "ffi": "PUSH-015",
+          "sdk": "PUSH-015",
+          "matrix": "PUSH-015"
+        }
+      }
+    },
+    {
+      "id": "PUSH-014",
+      "title": "Runtime push registrar (build, sign, publish, deregister)",
+      "gate": "gate-push-client",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/push/mod.rs",
+        "crates/scp-runtime/src/lib.rs",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs"
+      ],
+      "description": "`register(platform, token)` gets the routing IDs from PUSH-013, then for each relay builds a registration, computes its preimage through the PUSH-004 canonical-bytes function, and signs it with the `#active` key handle through `KeyCustody::sign`. It publishes to that relay's reserved routing ID and returns per-relay results. `deregister(platform, token)` mirrors it. The registrar re-registers when the routing-ID set changes: on context join, context leave and pseudonym rotation. It maps wire codes to typed `PushError` values; 5003 and 5004 are retryable, 4050-4054 are not. Tests run against relays wired with the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`. Module location `push/mod.rs` is an indicator.",
+      "acceptanceCriteria": [
+        "Against a relay wired with the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing` and the device's `#active` public key, `register` stores one registration per relay.",
+        "Against a relay wired with `KelPushVerifier`, `register` returns `PushError::VerifierUnavailable` for each relay.",
+        "Joining a context triggers exactly one re-registration on the affected relay.",
+        "The signed bytes contain no context ID (D7); a test checks the preimage against the context ID bytes.",
+        "`pipeline_wiring.rs` has a step assertion for `push.register`, from the registrar down to the relay PUBLISH."
+      ],
+      "actionItems": [
+        "Write the registrar and its re-registration triggers.",
+        "Map the wire codes to `PushError`.",
+        "Add the `pipeline_wiring.rs` assertion."
+      ],
+      "blockedBy": [
+        "PUSH-013",
+        "PUSH-007"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/22-human-readable-addressing.md",
+          "section": "### 22.11.4 Push Notifications"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.4 Per-Context Pseudonyms"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.10.4.1 Pseudonym Rotation (BLACK-001 Mitigation)"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "PUSH-013",
+          "pw": "yes",
+          "ffi": "PUSH-015",
+          "sdk": "PUSH-015",
+          "matrix": "PUSH-015"
+        }
+      }
+    },
+    {
+      "id": "PUSH-015",
+      "title": "FFI exports push_enable, push_disable and push_handle_wake",
+      "gate": "gate-push-client",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/common/src/push.rs",
+        "crates/scp-ffi/uniffi/src/lib.rs",
+        "crates/scp-ffi/napi/src/push.rs",
+        "crates/scp-ffi/src/push.rs",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs",
+        "crates/scp-testing/tests/integration/ffi_conformance.rs",
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "Implements the call order ADR-025 criterion 4 and ADR-027 criterion 10 state. UniFFI: `push_enable(provider: PushProvider, platform)` calls `register_push()` and then the PUSH-014 registrar; `push_disable` deregisters; `push_handle_wake(payload)` calls `handle_notification`, checks the wake bytes, runs PUSH-016, and returns `WakeOutcome`. napi and Python hosts have no callback provider, so they export `push_register(platform, token)`, `push_deregister` and `push_handle_wake`, taking the token directly. Adding pipeline assertions and matrix rows only adds enforcement, which AGENTS.md allows. SDK wrappers are PUSH-017, PUSH-018 and PUSH-020.",
+      "acceptanceCriteria": [
+        "Each of the three bridges exports the operations.",
+        "`pipeline_wiring.rs` asserts that each export reaches the registrar.",
+        "The matrix has a `Push` domain with `register`, `deregister` and `handle_wake` rows.",
+        "A UniFFI test with a Rust-side fake provider under `testing` proves that `push_enable` calls `register_push` exactly once."
+      ],
+      "actionItems": [
+        "Write the shared push module in `scp-ffi/common` and the three bridge exports.",
+        "Add the pipeline assertions, the conformance entries and the matrix rows."
+      ],
+      "blockedBy": [
+        "PUSH-014",
+        "PUSH-016",
+        "PUSH-019"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-021: UniFFI Bridge Definitions"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-025: Apple Platform Adapter"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-027: Android Platform Adapter"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "PUSH-013",
+          "ffi": "yes",
+          "pw": "yes",
+          "matrix": "yes",
+          "sdk": "PUSH-017, PUSH-018, PUSH-020"
+        }
+      }
+    },
+    {
+      "id": "PUSH-016",
+      "title": "Device wake handling (connect and pull)",
+      "gate": "gate-push-client",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/common/src/push.rs",
+        "crates/scp-ffi/common/src/reconnect.rs",
+        "crates/scp-ffi/common/src/bridge_instance.rs",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs"
+      ],
+      "description": "On a valid wake, calls `reconnect_transport_if_pending`, then `reconnect_contexts` (or `reconnect_contexts_no_drain`) for every standing context, feeding in the last relay contacts the bridge already stores, under a 25-second deadline (ADR-025 criterion 4). The outcome is `NewData` when catch-up delivered at least one envelope, `NoData` when it delivered none, and `Failed` on a deadline expiry or error. The wake path sends no cover traffic (\u00a79.10.6). Reuses the reconnect path the Supervisor already wires (ADR-029, offline and sync).",
+      "acceptanceCriteria": [
+        "With one envelope buffered on a test relay, `push_handle_wake` returns `NewData`, and the envelope appears in the context's receive buffer.",
+        "With none buffered, it returns `NoData`.",
+        "With the relay unreachable, it returns `Failed` within the deadline plus 1 s.",
+        "An invalid payload returns a typed error and makes no relay connection.",
+        "`pipeline_wiring.rs` has a step assertion for `push.handle_wake` \u2192 `reconnect_contexts`."
+      ],
+      "actionItems": [
+        "Write the wake handler over the reconnect path, with the deadline and the outcome mapping."
+      ],
+      "blockedBy": [
+        "PUSH-013"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-025: Apple Platform Adapter"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-027: Android Platform Adapter"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-029: Offline/Sync Strategy"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.6 Cover Traffic"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "reuses the Supervisor reconnect path",
+          "pw": "yes",
+          "ffi": "PUSH-015",
+          "sdk": "PUSH-015",
+          "matrix": "PUSH-015"
+        }
+      }
+    },
+    {
+      "id": "PUSH-017",
+      "title": "Swift push provider conformance and platform adapter",
+      "gate": "gate-push-device",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/swift/Sources/SCP/Platform/ApplePushProvider.swift",
+        "bindings/swift/Sources/SCP/Platform/PlatformAdapter.swift",
+        "bindings/swift/Sources/SCP/Push.swift",
+        "bindings/swift/Tests/SCPTests/Platform/ApplePushProviderTests.swift",
+        ".docs/adrs/phase-5.md"
+      ],
+      "description": "`ApplePushProvider` conforms to the UniFFI `PushProvider` protocol and throws only `ScpError`. `handleNotification` applies the parsed-dictionary rule of ADR-025 criterion 4 (amended by PUSH-001) in place of its byte comparison. The SDK gives the app `Scp.handleRemoteNotification(userInfo) async -> UIBackgroundFetchResult`, which serializes `userInfo` to JSON and calls `push_handle_wake`. Adds `ApplePlatformAdapter.make()` per ADR-025 criterion 6, and corrects ADR-025's citation of `scp.udl`. The SDK wrapper file path is an indicator. Push does not depend on `AppleStorage`, so `AppleStorage`'s conformance gap stays outside this story.",
+      "acceptanceCriteria": [
+        "`ApplePushProvider` declares the UniFFI protocol conformance.",
+        "A test passing a `userInfo` with an extra `alert` key gets a thrown `ScpError`.",
+        "A test passing exactly the APNs wake dictionary gets the wake bytes.",
+        "`ApplePlatformAdapter.make()` exists and passes a provider to `push_enable`.",
+        "SwiftLint passes."
+      ],
+      "actionItems": [
+        "Conform `ApplePushProvider` to `PushProvider` and replace the byte check with the parsed-dictionary rule.",
+        "Add `Scp.handleRemoteNotification` and `ApplePlatformAdapter.make()`."
+      ],
+      "blockedBy": [
+        "PUSH-015"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-025: Apple Platform Adapter"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-026: Swift SDK"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "sdk": "yes",
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      },
+      "tools": [
+        "mobile"
+      ]
+    },
+    {
+      "id": "PUSH-018",
+      "title": "Kotlin push provider conformance and platform adapter wiring",
+      "gate": "gate-push-device",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidPushProvider.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/PlatformAdapter.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/Types.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/Push.kt"
+      ],
+      "description": "`AndroidPushProvider` implements the UniFFI `PushProvider` interface, following the pattern in `UniffiKeyCustody.kt`. `AndroidPlatformAdapter.make(context)` passes the provider to `push_enable`. The SDK gives the app `Scp.onMessageReceived(data: Map<String,String>)`, which serializes the data map to JSON and runs `push_handle_wake` in an expedited WorkManager job (indicator). PUSH-001 already replaced the legacy FCM body comment in `AndroidPushProvider.kt`. The SDK wrapper file path is an indicator. Push does not depend on the other Android adapters, so their conformance gaps stay outside this story.",
+      "acceptanceCriteria": [
+        "`AndroidPushProvider` implements the UniFFI interface.",
+        "A data map without `scp` and a data map whose `scp` value is not `\"1\"` both raise SCP-TRANS-5080 (the invalid wake payload code PUSH-019 registers), and the message names which of the two cases occurred.",
+        "`make(context)` calls `push_enable` exactly once.",
+        "The Kotlin mutable-globals check passes."
+      ],
+      "actionItems": [
+        "Implement the UniFFI `PushProvider` in `AndroidPushProvider`.",
+        "Wire `make(context)` and `Scp.onMessageReceived`."
+      ],
+      "blockedBy": [
+        "PUSH-015"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-027: Android Platform Adapter"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-028: Kotlin SDK"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "sdk": "yes",
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      },
+      "tools": [
+        "mobile"
+      ]
+    },
+    {
+      "id": "PUSH-019",
+      "title": "Push error codes",
+      "gate": "gate-push-client",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/common/src/error_codes.rs",
+        "crates/scp-ffi/common/src/custody_parse.rs",
+        ".docs/standards/sdk-common.md"
+      ],
+      "description": "`platform_error_code` maps every push failure to `SCP-CRYPTO-4060`, a code that names no push condition. This story registers push codes in `sdk-common.md` and maps each push failure to its own code. Attestation and unsupported failures, which the same function also maps to that code, get their own codes in the same PR.",
+      "acceptanceCriteria": [
+        "`platform_error_code` returns registered push codes for push failures, and never `SCP-CRYPTO-4060`.",
+        "Each push code has a row in `sdk-common.md`.",
+        "Codes exist for: wake payload invalid, registration rejected, verifier unavailable, platform unavailable, and provider failure.",
+        "Attestation and unsupported failures get their own codes in the same PR."
+      ],
+      "actionItems": [
+        "Register the codes and rewrite the mapping."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/standards/sdk-common.md",
+          "section": "## Error Hierarchy"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-020",
+      "title": "Python and TypeScript push SDK wrappers",
+      "gate": "gate-push-device",
+      "priority": "P1",
+      "severity": "moderate",
+      "status": "pending",
+      "files": [
+        "bindings/python/scp/push.py",
+        "bindings/typescript/src/push.ts",
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "Wraps the napi and Python exports of PUSH-015 in each SDK, with typed errors, and sets the Python and TypeScript cells of the `Push` matrix rows to true. Module paths are indicators.",
+      "acceptanceCriteria": [
+        "Both SDKs expose `register`, `deregister` and `handleWake` with typed errors.",
+        "`scripts/check-sdk-coverage.py` passes with the matrix rows set to true."
+      ],
+      "actionItems": [
+        "Write the two wrappers and flip the matrix cells."
+      ],
+      "blockedBy": [
+        "PUSH-015"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "sdk": "yes",
+          "matrix": "yes",
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "pw": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-021",
+      "title": "Specify the WebPush wake signal, token encoding and VAPID key publication",
+      "gate": "gate-push-webpush",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        ".docs/specs/10-infrastructure-and-self-hosting.md",
+        ".docs/specs/22-human-readable-addressing.md",
+        ".docs/adrs/phase-1.md"
+      ],
+      "description": "Alec ruled on 2026-10-12 (D3) that WebPush is specified fully, in its own gate after APNs and FCM. \u00a710.7.1 lists `WebPush` in the platform enum and \u00a722.11.4 gives it tag `0x03`, but no artifact defines its token, its request, or its receipt rule. A push service delivers a WebPush message only under RFC 8291 message encryption and RFC 8292 VAPID, so the token must carry the subscription's endpoint URL, its `p256dh` public key and its `auth` secret, and the relay must hold a VAPID key pair whose public key the browser passes to `PushManager.subscribe` as `applicationServerKey`.\n\nThis story writes the spec text. (1) \u00a722.11.4 gives the WebPush token one canonical encoding: the endpoint as a length-prefixed UTF-8 `https` URL under \u00a79.5.1, then `p256dh` as the 65-byte uncompressed P-256 point, then `auth` as 16 bytes; the endpoint length cap is an indicator (2048 bytes). (2) The \u00a710.7.1 step 5 table gains a WebPush row: `POST <endpoint>` with headers `Content-Encoding: aes128gcm`, `Urgency: high`, `TTL` (indicator: 3600) and `Authorization: vapid t=<JWT>, k=<VAPID public key, base64url>`; the body is the RFC 8291 encryption of the plaintext `{\"scp\":\"1\"}` as one aes128gcm record with a fresh ephemeral key and salt per message. The VAPID JWT is ES256 with `aud` set to the endpoint's origin, `exp` at most 24 hours ahead, and `sub` set to the operator contact. (3) The device receipt rule: the decrypted data parses as a JSON object with exactly the key `scp`, whose value is the string `\"1\"`. (4) Browsers require `userVisibleOnly: true`, so the service worker shows a notification for every push; \u00a710.7.1 fixes that notification's text as a constant that carries no sender, context, count or preview, which keeps \u00a710.7's opacity. (5) A browser `PushSubscription` is bound to one `applicationServerKey`, and each relay has its own VAPID key, so \u00a710.7.1 states how a browser with contexts on several relays holds one subscription per relay (indicator: one service-worker registration per relay, each with its own scope). (6) ADR-004 states where a relay publishes its VAPID public key (indicator: a field of the relay's handshake response) and that a relay without a VAPID key rejects a WebPush registration with 4051. (7) The endpoint is chosen by the registrant, so ADR-004 requires the relay to refuse any endpoint whose scheme is not `https` or whose host resolves to an address that is not global unicast (loopback, private, link-local, unique-local, or the relay's own addresses), with code 4050 at registration and no request sent.",
+      "acceptanceCriteria": [
+        "\u00a722.11.4 states the WebPush token encoding: length-prefixed `https` endpoint, 65-byte uncompressed `p256dh`, 16-byte `auth`, and the endpoint length cap.",
+        "The \u00a710.7.1 step 5 table has a WebPush row giving the request line, the four headers, the VAPID JWT claims, and the encrypted body's plaintext `{\"scp\":\"1\"}` under RFC 8291 aes128gcm.",
+        "\u00a710.7.1 step 5 states the WebPush receipt rule (a JSON object with exactly the key `scp`, whose value is the string `\"1\"`) and the constant notification text that carries no sender, context, count or preview.",
+        "\u00a710.7.1 states how a browser with contexts on more than one relay holds one subscription per relay.",
+        "ADR-004 states where a relay publishes its VAPID public key, the 4051 rejection when it has none, and the endpoint refusal rule with code 4050.",
+        "The sentence \"This table defines no WebPush request.\" is gone from \u00a710.7.1.",
+        "`python3.12 scripts/check-doc-citations.py` passes."
+      ],
+      "actionItems": [
+        "Add the WebPush token encoding to \u00a722.11.4.",
+        "Add the WebPush row, receipt rule, notification text and per-relay subscription rule to \u00a710.7.1.",
+        "Add the VAPID key publication and the endpoint refusal rule to ADR-004."
+      ],
+      "blockedBy": [
+        "PUSH-003"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/22-human-readable-addressing.md",
+          "section": "### 22.11.4 Push Notifications"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.1 Canonical Hash Construction"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.7 Notifications and Push"
+        }
+      ],
+      "details": {
+        "planDecisions": [
+          "D3"
+        ],
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-022",
+      "title": "WebPush sender (RFC 8291 encryption and RFC 8292 VAPID)",
+      "gate": "gate-push-webpush",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/relay/push_webpush.rs",
+        "crates/scp-transport/src/relay/push_dispatch.rs",
+        "crates/scp-transport/Cargo.toml"
+      ],
+      "description": "Adds the `WebPush` arm of the PUSH-008 `PushSender` enum, sending the WebPush row of the \u00a710.7.1 step 5 table (PUSH-021). Encryption follows RFC 8291: an ephemeral P-256 key pair per message, ECDH with the token's `p256dh`, the HKDF steps keyed by the token's `auth` secret, and the RFC 8188 aes128gcm content coding with a fresh 16-byte salt and one record. The VAPID JWT is ES256, signed with the relay's VAPID key through the `p256` crate the workspace already uses, and cached per endpoint origin until shortly before `exp` (indicator: 5 minutes). Before each send, the sender applies the PUSH-021 endpoint rule to the resolved address and connects to that address, so a DNS answer cannot change between the check and the request. Response mapping: 201 to `Delivered`; 404 or 410 to `InvalidToken`; 403 to `InvalidToken`, because it means the subscription was made with another `applicationServerKey`; 400, 401 or 413 to `ConfigError`; 429 or 5xx to `Transient`. Ephemeral secrets live in zeroizing buffers. End-to-end tests register through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`. File location `push_webpush.rs` is an indicator.",
+      "acceptanceCriteria": [
+        "The encryption reproduces the RFC 8291 Appendix A example: given its keys, salt and plaintext, the output equals the RFC's ciphertext byte for byte.",
+        "Against a local test server under `testing`, the request carries the four headers of the WebPush row, and the body decrypts with the test subscription's private key and `auth` secret to exactly `{\"scp\":\"1\"}`.",
+        "Two sends to one token use different ephemeral keys and salts.",
+        "The VAPID JWT's header has `alg: ES256`, and its claims have `aud` equal to the endpoint origin, `exp` at most 24 hours ahead, and `sub`.",
+        "An endpoint whose host resolves to a loopback, private, link-local or unique-local address gets no request, and a test proves it for each class.",
+        "Each response row in the description maps to its outcome.",
+        "No log line contains the endpoint, `p256dh`, `auth`, the VAPID key or the JWT; a test captures the tracing output.",
+        "Every end-to-end test registration goes through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`.",
+        "`cargo deny` passes with any new dependency."
+      ],
+      "actionItems": [
+        "Write the RFC 8291 encryption and the VAPID JWT signer.",
+        "Write the endpoint address check and connect to the checked address.",
+        "Add the `WebPush` arm to `PushSender` with the response mapping."
+      ],
+      "blockedBy": [
+        "PUSH-021",
+        "PUSH-008"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/22-human-readable-addressing.md",
+          "section": "### 22.11.4 Push Notifications"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-023",
+      "title": "Relay WebPush startup selection and VAPID key",
+      "gate": "gate-push-webpush",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/startup.rs",
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-relay/README.md",
+        ".docs/adrs/phase-1.md",
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "Extends the PUSH-012 startup rules to WebPush. The variable names are indicators; the rules are the contract. `SCP_RELAY_PUSH_PLATFORMS` accepts `webpush` in its list. With `webpush` listed, `SCP_RELAY_WEBPUSH_VAPID_KEY_PATH` (a P-256 private key file) and `SCP_RELAY_WEBPUSH_VAPID_SUBJECT` (a `mailto:` or `https:` URI) are required, with no defaults. The key loads only from a file with no group or world permissions, into a zeroizing buffer, and no `Debug` implementation prints it. The relay publishes the VAPID public key where PUSH-021 states. The ADR-004 operator table records the two variables. The `scp-node` embedded relay takes WebPush through the same explicit selection as PUSH-012, defaulting to `Disabled`; the `scp-node` file path is an indicator.",
+      "acceptanceCriteria": [
+        "With `webpush` listed, each missing WebPush variable yields its own typed `StartupError` variant naming that variable.",
+        "A key file that is unreadable, has group or world permissions, or holds no P-256 private key yields a typed error.",
+        "A subject that is neither `mailto:` nor `https:` yields a typed error.",
+        "A relay started with `webpush` publishes its VAPID public key where PUSH-021 states, and a test reads it back and checks it matches the key file.",
+        "A relay started without `webpush` rejects a WebPush registration with 4051.",
+        "A test checks that the `Debug` output of the push config contains no VAPID key byte."
+      ],
+      "actionItems": [
+        "Parse the WebPush variables with one typed error per failure.",
+        "Load the VAPID key and publish its public half.",
+        "Add the operator table rows, the README section and the `scp-node` selection."
+      ],
+      "blockedBy": [
+        "PUSH-022",
+        "PUSH-012"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.17 Capability Selection Is Mandatory, Fails Closed, and Never Defaults"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        },
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "## Capability classification (\u00a717.17.2 SCP-CAPSEL-8010 \u2014 mandatory before ship)"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-024",
+      "title": "Browser client WebPush subscription, registration and wake",
+      "gate": "gate-push-webpush",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-client-wasm/src/push.rs",
+        "crates/scp-client-wasm/src/lib.rs",
+        "bindings/typescript/src/push.ts",
+        "bindings/typescript/src/push-service-worker.ts",
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "Gives the ADR-057 in-browser client WebPush. For each relay that holds one of its contexts, the client reads the relay's VAPID public key, subscribes with `userVisibleOnly: true` and that key under the per-relay rule of PUSH-021, encodes the subscription as the PUSH-021 token, and publishes a signed registration through the PUSH-004 canonical-bytes function, signing with the browser's own identity key (ADR-057, keys on-device). It deregisters on `pushsubscriptionchange` and re-registers with the new subscription. The service worker applies the PUSH-021 receipt rule, shows the constant notification for every accepted push, and posts the wake to each open page of the app. ADR-057 gives the browser cold presence: it participates only while a page is open. So an open page runs relay catch-up on the wake, and with no page open, catch-up runs when the user opens one. A rejected payload shows the constant notification, because the browser requires one, and causes no relay connection. Module paths are indicators.",
+      "acceptanceCriteria": [
+        "With contexts on two relays, the client holds one subscription per relay, each made with that relay's VAPID public key, and one registration per relay.",
+        "The published registration's token decodes to the subscription's endpoint, `p256dh` and `auth`, and its signature verifies under the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`.",
+        "A `pushsubscriptionchange` event deregisters the old token and registers the new one.",
+        "The service worker accepts exactly `{\"scp\":\"1\"}`, and rejects a payload with an extra key, a missing `scp`, or a non-string value.",
+        "Every push, accepted or rejected, shows the same constant notification text, and a test checks that the text contains no data from the payload.",
+        "An accepted push with an open page makes that page run catch-up, and a test with one envelope buffered on a test relay sees it delivered.",
+        "The matrix `Push` rows record the TypeScript browser cells."
+      ],
+      "actionItems": [
+        "Write the subscription and registration flow in the browser client.",
+        "Write the service worker push handler with the receipt rule and the constant notification.",
+        "Wire the page-side wake to catch-up and update the matrix."
+      ],
+      "blockedBy": [
+        "PUSH-021",
+        "PUSH-004",
+        "PUSH-007",
+        "PUSH-015"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/22-human-readable-addressing.md",
+          "section": "### 22.11.4 Push Notifications"
+        },
+        {
+          "file": ".docs/adrs/ADR-057-in-browser-client-over-shared-mls.md",
+          "section": "## Decision"
+        },
+        {
+          "file": ".docs/adrs/ADR-057-in-browser-client-over-shared-mls.md",
+          "section": "### Liveness / presence"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.7 Notifications and Push"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "sdk": "yes",
+          "matrix": "yes",
+          "dispatch": "n/a (ADR-057 browser driver)",
+          "ffi": "n/a (scp-client-wasm)",
+          "pw": "n/a"
+        }
+      },
+      "tools": [
+        "browser"
+      ]
+    }
+  ]
+}

@@ -400,7 +400,21 @@ The signature covers `did || platform (1-byte tag: 0x01=APNS, 0x02=FCM, 0x03=Web
 2. The client sends the `PushRegistration` to the relay via a PUBLISH operation (ADR-004) with a reserved `routing_id` of `SHA-256("scp-push-registration" || relay_url)`.
 3. The relay verifies the signature against the key the identity's key state lists `Current` in the `#active` role, resolved by replaying that identity's key-event log (`09-security-model.md` §9.7.4.2 R2, R3, R8). Invalid signatures are rejected.
 4. The relay stores the registration, associating the push token with the identifier and the listed context routing IDs.
-5. On new message arrival for a registered context (matching the routing IDs the identity subscribes to), the relay sends an opaque push notification to the registered token. The push payload is exactly `{ "scp": 1 }` — a wake signal with no content, no context, no sender, no metadata.
+5. On new message arrival for a registered context (matching the routing IDs the identity subscribes to), the relay sends a wake signal to the registered token through that token's push service. A wake signal carries no content, no context, no sender and no metadata. The relay sends exactly the request this wake-signal table gives for the registration's platform:
+
+   | Platform | Request | Headers | Body |
+   |----------|---------|---------|------|
+   | APNs | `POST /3/device/<APNs device token>` over HTTP/2 to `api.push.apple.com`, or to `api.sandbox.push.apple.com` for a token that a development build of the app registered | `authorization: bearer <provider JWT>`, `apns-push-type: background`, `apns-priority: 5`, `apns-topic: <the app's bundle ID>` | `{"aps":{"content-available":1}}` |
+   | FCM | `POST https://fcm.googleapis.com/v1/projects/{project_id}/messages:send` (the FCM HTTP v1 API) | `Authorization: Bearer <OAuth 2.0 access token>`, `Content-Type: application/json` | `{"message":{"token":"<FCM registration token>","data":{"scp":"1"},"android":{"priority":"HIGH"}}}` |
+
+   - The APNs body carries no `alert`, `badge` or `sound` key, and the FCM body carries no `notification` key, because each of those keys makes the operating system show a notification.
+   - The FCM wake value is the string `"1"`, because FCM requires every value in `data` to be a string. The FCM registration token appears only in `message.token`.
+   - The relay sets `android.priority` to `HIGH` on every FCM wake, because FCM holds a normal-priority message for a device in Android's Doze mode until Doze's next maintenance window. The relay sets no `android.ttl`, so FCM applies its default time-to-live.
+   - This table defines no WebPush request.
+
+   **Device receipt rule.** The device acts on a wake only when the payload its platform hands the app passes that platform's rule. On an accepted wake, the device connects to its relay set and pulls every pending envelope. On a rejected payload, the device makes no relay connection.
+   - **APNs.** iOS hands the app the payload as a parsed dictionary, never as bytes. The device accepts the wake only when that dictionary has exactly one top-level key, `aps`, and `aps` has exactly one key, `content-available`, whose value is the integer 1. The device rejects every other dictionary.
+   - **FCM.** The device accepts the wake when the message's data map holds the key `scp` with the string value `"1"`. The device rejects a data map that lacks `scp` or holds another value in it, and it reads no other key of the map.
 6. The relay MUST rate-limit push notifications to at most one push per 30 seconds per device token to prevent push notification flooding.
 
 **Token refresh:** When the platform issues a new push token (e.g., APNs token rotation), the client sends a new `PushRegistration` with the updated token. The relay replaces the previous registration for that identity and platform. Registrations are idempotent — re-registering with the same token is a no-op.
