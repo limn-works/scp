@@ -43,7 +43,9 @@ use scp_mls::group::{add_member, create_group, generate_key_package, join_group}
 use scp_protocol::context::params::Capability as ParamCapability;
 
 use scp_platform::in_memory::InMemoryStorage;
-use scp_platform::testing::{InMemoryDeviceAttestation, InMemoryKeyCustody, InMemoryPush};
+use scp_platform::testing::{
+    APNS_WAKE_BODY, FCM_WAKE_DATA, InMemoryDeviceAttestation, InMemoryKeyCustody, InMemoryPush,
+};
 use scp_platform::traits::{DeviceAttestation, KeyCustody, KeyType, Push, Storage};
 
 // ---------------------------------------------------------------------------
@@ -382,15 +384,30 @@ async fn platform_push_notifications() {
     assert!(!token.as_bytes().is_empty());
 
     // -- Handle notification --
-    // §10.7: "Push payloads MUST contain a wake signal and nothing else. No
-    // context ID, no sender identifier, no message preview, no metadata of any
-    // kind." The wake signal must not carry the context ID this payload holds.
-    let payload = b"new-message-ctx-123";
+    // The FCM wake body of the §10.7.1 step 5 table yields the fixed signal.
     let wake = push
-        .handle_notification(payload)
+        .handle_notification(FCM_WAKE_DATA)
         .await
         .expect("notification handling");
-    assert_eq!(wake.payload(), br#"{"aps":{"content-available":1}}"#);
+    assert_eq!(wake.payload(), APNS_WAKE_BODY);
+
+    // §10.7: "Push payloads MUST contain a wake signal and nothing else. No
+    // context ID, no sender identifier, no message preview, no metadata of any
+    // kind." A payload carrying a context ID is no wake body, so it is rejected.
+    let err = push
+        .handle_notification(b"new-message-ctx-123")
+        .await
+        .expect_err("a payload carrying a context ID is rejected");
+    assert!(
+        matches!(
+            err,
+            scp_platform::PlatformError::PushError {
+                kind: scp_platform::error::PushFailureKind::WakePayloadInvalid,
+                ..
+            }
+        ),
+        "unexpected error {err:?}"
+    );
 }
 
 #[tokio::test]

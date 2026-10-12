@@ -55,7 +55,7 @@ use scp_core::sync::{
 };
 use scp_did::DID;
 use scp_platform::testing::InMemoryKeyCustody;
-use scp_platform::testing::InMemoryPush;
+use scp_platform::testing::{APNS_WAKE_BODY, FCM_WAKE_DATA, InMemoryPush};
 use scp_platform::{KeyCustody, KeyType, Push};
 
 // ---------------------------------------------------------------------------
@@ -1456,16 +1456,20 @@ async fn conf_032_push_notification() {
     println!("    Token: {token:?}");
 
     print_step(2, "Handle notification: fixed wake signal (§10.7)");
-    let payload = br#"{"aps":{"content-available":1},"contextId":"ctx-42"}"#;
     let wake = push
-        .handle_notification(payload)
+        .handle_notification(FCM_WAKE_DATA)
         .await
         .expect("handle notification");
     println!("    Wake signal: {wake:?}");
     assert_eq!(
         wake.payload(),
-        br#"{"aps":{"content-available":1}}"#,
+        APNS_WAKE_BODY,
         "InMemoryPush must return the fixed ADR-006 wake signal"
+    );
+    let metadata = br#"{"aps":{"content-available":1},"contextId":"ctx-42"}"#;
+    assert!(
+        push.handle_notification(metadata).await.is_err(),
+        "InMemoryPush must reject a payload carrying a context ID"
     );
     scp_testing::conformance::push::check_fixed_wake_signal(&push).await;
 
