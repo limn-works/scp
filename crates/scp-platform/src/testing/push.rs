@@ -1,14 +1,21 @@
-//! Durability-only in-memory [`Push`] implementation (ADR-062 §0).
+//! Test-double in-memory [`Push`] implementation, behind the `testing` feature.
 //!
 //! Returns synthetic push tokens (UUIDs) and a fixed wake signal for every
-//! notification payload. See ADR-006 in `.docs/adrs/phase-1.md`.
+//! notification payload. No push service issued the token, so no wake reaches
+//! a device that registers with it. See ADR-006 in `.docs/adrs/phase-1.md` and
+//! ADR-062 §0 (amended 2026-10-12).
+
+// `lib.rs` already gates `testing` behind this feature. The file repeats the
+// gate because scp-testing's `test_double_gating` test parses each file alone
+// and fails on a declaration of `InMemoryPush` that carries no gate of its own.
+#![cfg(feature = "testing")]
 
 use uuid::Uuid;
 
 use crate::error::PlatformError;
 use crate::traits::{Push, PushToken, WakeSignal};
 
-/// Durability-only in-memory implementation of [`Push`].
+/// Test-double in-memory implementation of [`Push`].
 ///
 /// Produces synthetic push tokens using UUID v4. `handle_notification`
 /// returns `WAKE_SIGNAL` for every payload and never the received bytes.
