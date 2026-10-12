@@ -73,6 +73,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "fuzz_push_message"
+path = "fuzz_targets/fuzz_push_message.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "fuzz_sender_key_dist"
 path = "fuzz_targets/fuzz_sender_key_dist.rs"
 test = false
