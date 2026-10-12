@@ -16,7 +16,9 @@
 //! shared [`scp_platform::store_value`] envelope, so the bytes match what
 //! `ProtocolRepository` writes for any other key.
 //!
-//! The record is written in one store. A record whose version is not
+//! The record is written in one store. The supervisor deletes it only when
+//! that store reports an error, because a failed write may still have
+//! committed and the key it names is about to be destroyed. A record whose version is not
 //! [`RECORD_VERSION`], whose public point is not 65 bytes, or that is not a
 //! record at all (an old 32-byte scalar) fails the load with
 //! [`ContextError::CryptoFailed`]; nothing is regenerated over it.
@@ -90,6 +92,24 @@ pub(crate) async fn store_wrapping_key_handle(
         .store(&path, &bytes)
         .await
         .map_err(|e| ContextError::PersistenceFailed(format!("wrapping key write: {e}")))
+}
+
+/// Removes the wrapping key record of `did`; removing an absent record
+/// succeeds.
+///
+/// # Errors
+///
+/// [`ContextError::PersistenceFailed`] if `did` is not a valid key component
+/// or the storage delete fails.
+pub(crate) async fn delete_wrapping_key_handle(
+    storage: &dyn OpenMlsStorageAdapter,
+    did: &DID,
+) -> Result<(), ContextError> {
+    let path = wrapping_key_path(did)?;
+    storage
+        .delete(&path)
+        .await
+        .map_err(|e| ContextError::PersistenceFailed(format!("wrapping key delete: {e}")))
 }
 
 /// Loads the wrapping key record of `did`. Returns `None` if none is stored.
@@ -281,6 +301,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ContextError::CryptoFailed(_)), "{err:?}");
+    }
+
+    /// A deleted record loads as absent, and deleting an absent record
+    /// succeeds.
+    #[tokio::test]
+    async fn delete_removes_the_record_and_tolerates_an_absent_one() {
+        let storage = adapter();
+        let alice = did("did:dht:alice");
+        store_wrapping_key_handle(&storage, &alice, &KeyHandle::new(3), &public(0x33))
+            .await
+            .unwrap();
+        delete_wrapping_key_handle(&storage, &alice).await.unwrap();
+        assert!(
+            load_wrapping_key_handle(&storage, &alice)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        delete_wrapping_key_handle(&storage, &alice).await.unwrap();
     }
 
     #[tokio::test]

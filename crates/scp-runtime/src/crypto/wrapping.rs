@@ -120,10 +120,27 @@ pub fn single_custody_source<C: KeyCustody + 'static>(custody: Arc<C>) -> Wrappi
 /// Awaits one custody call for at most [`SIGN_TIMEOUT`], the custody budget of
 /// ADR-049 Decision 7a.
 ///
-/// A timeout drops `call`; the host may still finish it. For `generate` that
-/// leaves a key in custody that no record names and no caller holds a handle
-/// to, so nothing can destroy it: the orphan is the cost of bounding a custody
-/// that does not answer. Every other call creates nothing.
+/// A timeout drops `call`; the host may still finish it. Only `generate`
+/// creates anything, so only the wrapping-key create sequence (generate, read
+/// the public point, store the record, and on a failed store remove the
+/// record and destroy the key) can orphan a key: leave one in custody that no
+/// record names and no live code holds a handle to, so nothing destroys it.
+/// Each orphan is the cost of bounding a custody that does not answer or of a
+/// store that fails, and none leaves a record naming a missing key. The
+/// sequence orphans a key in exactly these cases:
+///
+/// - `generate` times out here and the host finishes it later.
+/// - Runtime shutdown cancels the spawned create task after `generate`
+///   returned a handle and before the record is stored, or before a failed
+///   store's cleanup destroys the key: the task is dropped at an `.await`
+///   and runs no cleanup.
+/// - The destroy of an unrecorded key fails or times out (after a public
+///   point that cannot be read, or after a failed store whose record was
+///   removed); the destroy is best effort and only logs.
+/// - The record write reports an error, its removal reports an error too,
+///   and no record ends up stored (the write did not commit, or the removal
+///   did): the key is kept, because the write may have committed and a
+///   committed record must name a live key.
 ///
 /// # Errors
 ///

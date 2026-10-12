@@ -119,6 +119,16 @@ impl Supervisor {
             .await
     }
 
+    /// How many commands wait in `context_id`'s actor mailbox behind the one
+    /// it is processing, or `None` if no actor is registered for it. A test
+    /// reads it to know that a caller's command has reached the mailbox and
+    /// waits on the actor's current turn.
+    #[must_use]
+    pub fn test_queued_commands(&self, context_id: &str) -> Option<usize> {
+        self.lookup(context_id)
+            .map(|handle| handle.queued_commands())
+    }
+
     /// Hands `envelope_bytes` to `context_id`'s actor through the production
     /// `MessagingCommand::DeliverIncoming`, the path a relay subscription
     /// takes, and awaits the actor's reply.

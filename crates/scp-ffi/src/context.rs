@@ -9307,7 +9307,7 @@ mod tests {
 
     #[cfg(feature = "testing")]
     const SLOW_AGREE_PY: &std::ffi::CStr = c"
-import threading, time
+import threading
 from fake_custody import P256Custody, ed_expand
 
 def x25519(k, u):
@@ -9330,20 +9330,25 @@ def x25519(k, u):
     return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, 'little')
 
 class SlowAgreeCustody(P256Custody):
-    # Signals when an HPKE dh_agree starts, holds it for 1 s, signals that
-    # the hold is over, then answers with the P-256 ECDH of its key. The
+    # Signals when an HPKE dh_agree starts, holds it until the test sets
+    # release_agree, signals that the hold is over, then answers with the
+    # P-256 ECDH of its key. release_agree starts set, so setup agrees
+    # without holding; the test clears it before the agree it watches. The
     # #active Ed25519 key agrees by real X25519, so this identity can open a
     # Welcome.
 
     def __init__(self):
         super().__init__()
         self.agree_started = threading.Event()
+        self.release_agree = threading.Event()
+        self.release_agree.set()
         self.agree_done = threading.Event()
 
     def dh_agree(self, key_id, peer_public):
         if self._types.get(key_id) == 'hpke-p256':
             self.agree_started.set()
-            time.sleep(1.0)
+            if not self.release_agree.wait(120.0):
+                raise RuntimeError('the test never released the agree')
             self.agree_done.set()
         elif self._key_types.get(key_id) == 'ed25519':
             return x25519(ed_expand(self._seed(key_id))[0], peer_public)
@@ -9517,20 +9522,23 @@ class SlowAgreeCustody(P256Custody):
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         match rx.recv_timeout(left) {
             Ok(v) => v,
-            Err(RecvTimeoutError::Timeout) => panic!("{who} did not finish within 10 s"),
+            Err(RecvTimeoutError::Timeout) => panic!("{who} did not finish by the deadline"),
             Err(RecvTimeoutError::Disconnected) => panic!("{who} panicked"),
         }
     }
 
     /// Spec 09 §9.16.1 with a host custody: Alice's wrapping key lives in a
     /// Python callback custody, so the actor turn that opens Bob's sender-key
-    /// `KeyResponse` waits on the Python `dh_agree`. While that callback runs,
-    /// a second host thread holding the GIL asks the same actor for its member
-    /// count. The count waits with the GIL released, so the callback takes the
-    /// GIL, answers, and the `KeyResponse` installs Bob's key: both threads
-    /// finish within 10 s and Bob's message opens for Alice. Were the count to
-    /// wait holding the GIL, the callback could not run and the `KeyResponse`
-    /// would fail after the 30 s custody timeout.
+    /// `KeyResponse` waits on the Python `dh_agree`. While that callback is
+    /// held, a second host thread holding the GIL asks the same actor for its
+    /// member count. The test releases the callback only once that request
+    /// sits in the actor's mailbox behind the agree turn, so the two waits
+    /// overlap by construction, with no timed sleep. The count waits with the
+    /// GIL released, so the released callback takes the GIL, answers, and the
+    /// `KeyResponse` installs Bob's key: Bob's message opens for Alice and the
+    /// count answers after the turn. Were the count to wait holding the GIL,
+    /// neither the test's release nor the callback could take it, and the
+    /// `KeyResponse` would fail after the 30 s custody timeout.
     #[test]
     #[cfg(feature = "testing")]
     fn python_callback_custody_answers_a_key_response_while_another_thread_waits_on_the_actor() {
@@ -9548,21 +9556,25 @@ class SlowAgreeCustody(P256Custody):
                 )
             });
         make_alice_a_receiving_member(rt, &alice, &bob, &ctx_id);
-        // The join may already have called the host; thread B must wait on
-        // the agree inside the delivery turn.
-        let [agree_started, agree_done] = ["agree_started", "agree_done"].map(|name| {
-            Python::with_gil(|py| {
-                let event = alice.host.bind(py).getattr(name).expect(name);
-                event.call_method0("clear").expect("reset the event");
-                event.unbind()
-            })
-        });
+        // The join may already have called the host; from here every HPKE
+        // agree is held until the test releases it.
+        let [agree_started, release_agree, agree_done] =
+            ["agree_started", "release_agree", "agree_done"].map(|name| {
+                Python::with_gil(|py| {
+                    let event = alice.host.bind(py).getattr(name).expect(name);
+                    event.call_method0("clear").expect("reset the event");
+                    event.unbind()
+                })
+            });
 
-        // Thread A delivers Bob's three payloads to Alice's actor.
+        // Thread A delivers Bob's three payloads to Alice's actor. It sends
+        // each only after the previous one is answered, so while the agree
+        // turn runs, A queues nothing behind it.
         let alice_sup =
             Arc::clone(crate::runtime::supervisor(&alice.scp.inner).expect("supervisor"));
         let deliveries = vec![commit, key_response, message];
-        let (thread_a, a_rx) = deliver_from_a_runtime_task(rt, alice_sup, ctx_id, deliveries);
+        let (thread_a, a_rx) =
+            deliver_from_a_runtime_task(rt, Arc::clone(&alice_sup), ctx_id.clone(), deliveries);
 
         // Thread B: once the callback has started, ask the same actor for its
         // member count while holding the GIL.
@@ -9570,11 +9582,12 @@ class SlowAgreeCustody(P256Custody):
         let b_scp = crate::scp::PyScp {
             inner: Arc::clone(&alice.scp.inner),
         };
+        let b_agree_started = Python::with_gil(|py| agree_started.clone_ref(py));
         let thread_b = std::thread::spawn(move || {
             let count = Python::with_gil(|py| {
-                let started = agree_started
+                let started = b_agree_started
                     .bind(py)
-                    .call_method1("wait", (10.0,))
+                    .call_method1("wait", (60.0,))
                     .and_then(|set| set.extract::<bool>())
                     .expect("wait on agree_started");
                 assert!(started, "alice's actor calls the Python dh_agree");
@@ -9585,9 +9598,10 @@ class SlowAgreeCustody(P256Custody):
                         .and_then(|set| set.extract::<bool>())
                         .expect("agree_done.is_set")
                 };
-                // The callback is still inside the agree when B asks, so B's
-                // wait overlaps it; the actor answers B after the turn.
-                assert!(!is_set(&agree_done), "thread B asks while the agree runs");
+                assert!(
+                    !is_set(&agree_done),
+                    "thread B asks while the agree is held"
+                );
                 let count = b_scp.context_member_count(py, &alice_handle);
                 assert!(is_set(&agree_done), "the count waited for the agree turn");
                 count
@@ -9595,7 +9609,34 @@ class SlowAgreeCustody(P256Custody):
             let _ = b_tx.send(count.map_err(|e| e.to_string()));
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Release the agree only once B's request waits in the mailbox. The
+        // count is read only after the agree has started: before that, A's
+        // own deliveries can sit in the mailbox. From then on the agree turn
+        // runs and A queues nothing, so a waiting command is B's, and B waits
+        // on the held turn.
+        let started = Python::with_gil(|py| {
+            agree_started
+                .bind(py)
+                .call_method1("wait", (60.0,))
+                .and_then(|set| set.extract::<bool>())
+                .expect("wait on agree_started")
+        });
+        assert!(started, "alice's actor calls the Python dh_agree");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while alice_sup.test_queued_commands(&ctx_id).unwrap_or(0) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "thread B's member count never reached alice's mailbox"
+            );
+            std::thread::yield_now();
+        }
+        Python::with_gil(|py| {
+            release_agree
+                .bind(py)
+                .call_method0("set")
+                .expect("release the agree");
+        });
+
         let count = recv_by(&b_rx, deadline, "thread B");
         let outcomes = recv_by(&a_rx, deadline, "thread A");
         thread_a.join().expect("thread A");
