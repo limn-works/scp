@@ -1752,6 +1752,27 @@ impl CoreFields {
             .unwrap_or_default()
     }
 
+    /// Returns the relays this bridge is connected to, sorted, as the relay
+    /// set of a context the bridge creates: the creator's relays host the
+    /// context (§5.12.3.1 `relay_urls`, PUSH-025).
+    ///
+    /// # Errors
+    ///
+    /// [`TransportLockError::Poisoned`] when the relay-set mutex is poisoned,
+    /// so a create fails instead of recording an empty relay set it cannot
+    /// vouch for.
+    pub fn context_relay_urls(&self) -> Result<Vec<String>, TransportLockError> {
+        let mut urls: Vec<String> = self
+            .relay_urls
+            .lock()
+            .map_err(|_| TransportLockError::Poisoned)?
+            .iter()
+            .cloned()
+            .collect();
+        urls.sort_unstable();
+        Ok(urls)
+    }
+
     /// Returns `true` if any relay URL is currently registered.
     #[must_use]
     pub fn has_pending_relay_urls(&self) -> bool {
@@ -4677,6 +4698,23 @@ mod tests {
     }
 
     #[test]
+    fn context_relay_urls_is_the_sorted_connected_set() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        assert_eq!(instance.context_relay_urls(), Ok(Vec::new()));
+        instance.add_relay_url("wss://relay2.example.com".to_owned());
+        instance.add_relay_url("wss://relay1.example.com".to_owned());
+        instance.add_relay_url("wss://relay3.example.com".to_owned());
+        instance.remove_relay_url("wss://relay3.example.com");
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(vec![
+                "wss://relay1.example.com".to_owned(),
+                "wss://relay2.example.com".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
     fn add_relay_url_deduplicates() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         instance.add_relay_url("wss://relay.example.com".to_owned());
@@ -5707,6 +5745,7 @@ mod tests {
                 },
                 scp_did::DID::from("did:dht:zbridgedraincreator"),
                 None,
+                Vec::new(),
             )
             .await
             .expect("create context");

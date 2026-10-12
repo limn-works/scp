@@ -966,7 +966,7 @@ async fn executed_proposals_survive_restart_and_accumulate() {
             ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
-        sup1.create_context(ctx_id.to_owned(), params, creator.clone(), None)
+        sup1.create_context(ctx_id.to_owned(), params, creator.clone(), None, Vec::new())
             .await
             .expect("create_context");
 
@@ -1185,7 +1185,7 @@ async fn expired_context_is_not_resurrected_and_refuses_operations() {
             ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
-        sup1.create_context(ctx_id.to_owned(), params, creator.clone(), None)
+        sup1.create_context(ctx_id.to_owned(), params, creator.clone(), None, Vec::new())
             .await
             .expect("create_context");
         sup1.flush_all_contexts().await.expect("flush_all_contexts");

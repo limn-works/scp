@@ -211,7 +211,7 @@ async fn block_subscriber_emits_key_epoch_advance_leaf() {
     // Create a broadcast context.  Alice (the creator DID we pass here) is
     // auto-registered as the first (and only) author.
     manager
-        .create_context(ctx_id.into(), broadcast_params(), alice(), None)
+        .create_context(ctx_id.into(), broadcast_params(), alice(), None, Vec::new())
         .await
         .expect("create broadcast context");
 
@@ -306,7 +306,7 @@ async fn unsubscribe_with_key_rotation_emits_key_epoch_advance_leaf() {
     let ctx_id = "kea-unsubscribe-rotate-leaf";
 
     manager
-        .create_context(ctx_id.into(), broadcast_params(), alice(), None)
+        .create_context(ctx_id.into(), broadcast_params(), alice(), None, Vec::new())
         .await
         .expect("create broadcast context");
 
@@ -407,7 +407,13 @@ async fn governance_ban_emits_key_epoch_advance_per_author() {
     // (required by execute_revoke's ceiling-check gate) and uses SingleAdmin
     // governance so the proposal auto-executes.
     manager
-        .create_context(ctx_id.into(), broadcast_params_with_ban(), alice(), None)
+        .create_context(
+            ctx_id.into(),
+            broadcast_params_with_ban(),
+            alice(),
+            None,
+            Vec::new(),
+        )
         .await
         .expect("create broadcast context with MemberBan");
 
@@ -513,7 +519,7 @@ async fn rotate_content_keys_broadcast_emits_key_epoch_advance_per_author() {
     // Create a broadcast context.  Alice is auto-registered as an author at
     // creation.  The ceiling must include MessagesRead and MessagesWrite.
     manager
-        .create_context(ctx_id.into(), broadcast_params(), alice(), None)
+        .create_context(ctx_id.into(), broadcast_params(), alice(), None, Vec::new())
         .await
         .expect("create broadcast context");
 

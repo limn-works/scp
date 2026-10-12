@@ -5956,6 +5956,7 @@ mod tests {
                 params,
                 scp_did::DID(creator.to_owned()),
                 None,
+                Vec::new(),
             ))
             .unwrap();
     }

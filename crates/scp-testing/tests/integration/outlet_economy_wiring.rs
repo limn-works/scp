@@ -372,9 +372,15 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
     let context_id = "ctx-c4-outlet-economy";
     let mut params = governance_params_with_outlets();
     params.economic_policy = Some(priced_policy(7));
-    sup.create_context(context_id.to_owned(), params, invoker.clone(), None)
-        .await
-        .expect("create_context");
+    sup.create_context(
+        context_id.to_owned(),
+        params,
+        invoker.clone(),
+        None,
+        Vec::new(),
+    )
+    .await
+    .expect("create_context");
 
     // Grant the invoker a 1000 USD budget via governance ApproveSpend.
     let admin_key = signing_key_for_did(&invoker);
@@ -495,9 +501,15 @@ async fn invoke_outlet_with_economy_rejects_insufficient_budget() {
     let mut params = governance_params_with_outlets();
     // Price the outlet above any granted budget.
     params.economic_policy = Some(priced_policy(100));
-    sup.create_context(context_id.to_owned(), params, invoker.clone(), None)
-        .await
-        .expect("create_context");
+    sup.create_context(
+        context_id.to_owned(),
+        params,
+        invoker.clone(),
+        None,
+        Vec::new(),
+    )
+    .await
+    .expect("create_context");
 
     // Grant ZERO budget — the per-DID budget tracker has no entry for the
     // invoker, so `has_budget` returns false and the pre-check must reject.

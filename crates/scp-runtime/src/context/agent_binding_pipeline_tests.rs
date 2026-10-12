@@ -760,6 +760,7 @@ mod live_supervisor_send {
                 encrypted_params(),
                 DID::from(ALICE_DID),
                 None,
+                Vec::new(),
             )
             .await
             .expect("create encrypted context");

@@ -140,7 +140,13 @@ async fn create_with_template_config_returns_active_handle() {
     };
 
     let handle = manager
-        .create("ctx-config-template".into(), config, alice(), None)
+        .create(
+            "ctx-config-template".into(),
+            config,
+            alice(),
+            None,
+            Vec::new(),
+        )
         .await
         .unwrap();
 
@@ -169,12 +175,18 @@ async fn create_matches_create_context_for_equivalent_inputs() {
     let (lowered_params, _peer) = config.clone().into_params();
 
     let via_create = manager
-        .create("ctx-via-create".into(), config, alice(), None)
+        .create("ctx-via-create".into(), config, alice(), None, Vec::new())
         .await
         .unwrap();
 
     let via_engine = manager
-        .create_context("ctx-via-engine".into(), lowered_params, alice(), None)
+        .create_context(
+            "ctx-via-engine".into(),
+            lowered_params,
+            alice(),
+            None,
+            Vec::new(),
+        )
         .await
         .unwrap();
 
@@ -199,7 +211,7 @@ async fn create_with_template_peer_fails_loud_not_silent() {
     });
 
     let result = manager
-        .create("ctx-with-peer".into(), config, alice(), None)
+        .create("ctx-with-peer".into(), config, alice(), None, Vec::new())
         .await;
 
     assert!(
@@ -234,7 +246,7 @@ async fn create_without_peer_succeeds() {
     });
 
     let handle = manager
-        .create("ctx-no-peer".into(), config, alice(), None)
+        .create("ctx-no-peer".into(), config, alice(), None, Vec::new())
         .await
         .unwrap();
     assert_eq!(handle.state(), ContextState::Active);
@@ -263,6 +275,7 @@ async fn create_with_empty_explicit_ceiling_is_rejected() {
             explicit_config(Vec::new()),
             alice(),
             None,
+            Vec::new(),
         )
         .await;
 
@@ -300,6 +313,7 @@ async fn create_with_non_empty_explicit_ceiling_succeeds() {
             explicit_config(ceiling.clone()),
             alice(),
             None,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -346,6 +360,7 @@ async fn create_context_with_empty_ceiling_is_rejected() {
             params_with_ceiling(Vec::new()),
             alice(),
             None,
+            Vec::new(),
         )
         .await;
 
@@ -382,6 +397,7 @@ async fn create_context_with_non_empty_ceiling_succeeds() {
             params_with_ceiling(ceiling.clone()),
             alice(),
             None,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -422,6 +438,7 @@ async fn create_context_rejects_empty_ceiling_before_version_check() {
             },
             alice(),
             None,
+            Vec::new(),
         )
         .await;
 
@@ -453,6 +470,7 @@ async fn create_context_rejects_unsatisfiable_version_with_non_empty_ceiling() {
             },
             alice(),
             None,
+            Vec::new(),
         )
         .await;
 

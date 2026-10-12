@@ -838,6 +838,12 @@ pub(crate) async fn context_create_on(
     // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
     // rather than calling a `ContextManager` method directly. The actor
     // mailbox wraps the delegated call in the 30s transport-timeout budget.
+    // The relays this bridge is connected to host the new context
+    // (§5.12.3.1 `relay_urls`, PUSH-025).
+    let relay_urls = bi
+        .core
+        .context_relay_urls()
+        .map_err(|e| NapiError::from(crate::transport::map_transport_lock_error(e)))?;
     let sup = crate::runtime::supervisor(bi)?;
     let core_handle = {
         use scp_core::context::actor::commands::{CreateContextPayload, LifecycleCommand};
@@ -848,6 +854,7 @@ pub(crate) async fn context_create_on(
                 params: context_params,
                 creator_did: DID(creator_did.clone()),
                 local_pseudonym,
+                relay_urls,
             }),
             reply: tx,
         };
@@ -5740,6 +5747,7 @@ mod tests {
                 params,
                 creator_did: creator,
                 local_pseudonym: None,
+                relay_urls: Vec::new(),
             }),
             reply: tx,
         };

@@ -152,6 +152,15 @@ async fn bob_imported_custody() -> (InMemoryKeyCustody, KeyHandle) {
 /// for a valid bundle, or an ATTACKER key to drive a signature-verify rejection.
 /// Callers may hand-tamper the returned bundle (e.g. flip a `signature` byte or
 /// diverge a `metadata_snapshot.structural` field) before sealing it.
+/// The relays every test bundle names as hosting its context (§5.12.3.1
+/// `relay_urls`). The first relay repeats, so a joiner that stored the list
+/// verbatim, duplicate included, fails the relay-set test.
+const BUNDLE_RELAY_URLS: [&str; 3] = [
+    "wss://relay-b.example/scp/v1",
+    "wss://relay-a.example/scp/v1",
+    "wss://relay-b.example/scp/v1",
+];
+
 fn signed_bundle(
     signer: &SigningKey,
     creator_did: &DID,
@@ -167,7 +176,7 @@ fn signed_bundle(
     let mut bundle = InvitationBundle {
         context_id: context_id.to_owned(),
         creator_did: creator_did.clone(),
-        relay_urls: vec![],
+        relay_urls: BUNDLE_RELAY_URLS.map(str::to_owned).to_vec(),
         welcome_message: welcome_bytes,
         key_material: InvitationKeyMaterial {
             context_metadata_key: [7u8; 32],
@@ -882,6 +891,38 @@ async fn welcome_joiner_does_not_install_the_genesis_outlet_declaration() {
     );
 }
 
+/// A Welcome joiner's context is hosted on the relays its invitation bundle
+/// names (§5.12.3.1 `relay_urls`, PUSH-025). The persisted Class-S snapshot,
+/// which the spawn writes from the joiner's live state, carries the bundle's
+/// set with each relay once, in first-seen order.
+#[tokio::test]
+async fn welcome_joiner_holds_the_bundle_relay_set() {
+    let rec = RecordingPersistence::default();
+    let (result, j) = run_join_with(
+        0x2d,
+        Some(Box::new(rec.clone())),
+        Some(joiner_params()),
+        joiner_params(),
+        None,
+    )
+    .await;
+    result.expect("welcome join succeeds");
+
+    let snapshot = rec
+        .store
+        .get(&j.ctx_id)
+        .map(|e| e.value().clone())
+        .expect("the joiner persisted a Class-S snapshot before spawning");
+    assert_eq!(
+        snapshot.relay_urls,
+        vec![
+            "wss://relay-b.example/scp/v1".to_owned(),
+            "wss://relay-a.example/scp/v1".to_owned(),
+        ],
+        "the joiner stores the bundle's relay set, deduplicated"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test A1c — an over-cap genesis outlet declaration is rejected BEFORE the KP
 // consume (GitHub #2250).
@@ -1385,6 +1426,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
         broadcast_params,
         bob.clone(),
         some_pseudonym(),
+        Vec::new(),
     )
     .await
     .expect("bob creates the colliding broadcast context");
@@ -1902,6 +1944,7 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
         joiner_params(),
         bob.clone(),
         some_pseudonym(),
+        Vec::new(),
     )
     .await
     .expect("a later bootstrap for a different id proceeds — the global lock was released");
@@ -2594,6 +2637,7 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
             joiner_params(),
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the encrypted context");
@@ -2778,6 +2822,7 @@ async fn invite_member_broadcasts_the_add_commit_to_existing_members() {
             joiner_params(),
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the encrypted context");
@@ -2841,6 +2886,7 @@ async fn invite_member_into_voting_context_is_rejected() {
             voting_params,
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the voting context");
@@ -2908,6 +2954,7 @@ async fn invite_member_by_non_admin_is_rejected() {
             joiner_params(),
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the encrypted SingleAdmin context");
@@ -3016,6 +3063,7 @@ async fn invite_member_rolls_back_the_add_on_delivery_failure() {
             joiner_params(),
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the encrypted context");

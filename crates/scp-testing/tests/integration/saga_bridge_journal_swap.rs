@@ -255,9 +255,15 @@ async fn journal_swap_runs_restore_and_replay_legs_over_real_journal() {
             ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
-        sup1.create_context(ctx_id.to_owned(), params, DID::from(creator_did), None)
-            .await
-            .expect("create_context");
+        sup1.create_context(
+            ctx_id.to_owned(),
+            params,
+            DID::from(creator_did),
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("create_context");
         sup1.flush_all_contexts().await.expect("flush_all_contexts");
         assert_eq!(
             persistence
@@ -389,9 +395,15 @@ async fn journal_swap_restores_context_before_replaying_sagas() {
             ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
-        sup1.create_context(ctx_id.to_owned(), params, DID::from(creator_did), None)
-            .await
-            .expect("create_context");
+        sup1.create_context(
+            ctx_id.to_owned(),
+            params,
+            DID::from(creator_did),
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("create_context");
         sup1.flush_all_contexts().await.expect("flush_all_contexts");
     }
 

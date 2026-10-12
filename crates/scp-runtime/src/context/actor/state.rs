@@ -1411,6 +1411,15 @@ pub struct PerContextState {
     /// [`Self::mode`](ContextModeState).
     pub routing: ContextRouting,
 
+    /// The relay endpoints that host this context (§5.12.3.1
+    /// `InvitationBundle.relay_urls`, "Relay endpoints where the context is
+    /// hosted"). Set once per instance: the creator's relays at create, the
+    /// invitation bundle's `relay_urls` at Welcome join, and the persisted set
+    /// at import and restore (PUSH-025). Deduplicated in first-seen order. An
+    /// empty set states that no relay hosts the context, as for a context
+    /// created with no relay connected.
+    pub relay_urls: Vec<String>,
+
     // -----------------------------------------------------------------
     // Anti-replay + reorder buffers (§9.8.2, §9.8.5)
     // -----------------------------------------------------------------
@@ -1658,6 +1667,7 @@ impl PerContextState {
             access: AccessControlState::new_empty_for_actor(),
             ttl: TtlState::new_fresh_for_actor(),
             routing,
+            relay_urls: Vec::new(),
             sequence_tracker: SequenceTracker::new(),
             reorder_buffer: ReorderBuffer::default(),
             pending_commits: VecDeque::new(),
@@ -3530,6 +3540,7 @@ mod tests {
             access,
             ttl,
             routing,
+            relay_urls,
             sequence_tracker,
             reorder_buffer,
             pending_commits,
@@ -3597,6 +3608,8 @@ mod tests {
         assert!(!routing.is_broadcast());
         assert!(routing.local_pseudonym().is_some());
         assert!(routing.peer_registry().is_some_and(HashMap::is_empty));
+        // A test constructor's context has no relay host (PUSH-025).
+        assert!(relay_urls.is_empty());
 
         // Anti-replay + reorder buffers.
         let _ = &sequence_tracker;
@@ -3668,6 +3681,7 @@ mod tests {
             access: _,
             ttl: _,
             routing,
+            relay_urls,
             sequence_tracker: _,
             reorder_buffer: _,
             pending_commits: _,
@@ -3701,6 +3715,8 @@ mod tests {
         assert!(routing.is_broadcast());
         assert!(routing.local_pseudonym().is_none());
         assert!(routing.peer_registry().is_none());
+        // A test constructor's context has no relay host (PUSH-025).
+        assert!(relay_urls.is_empty());
 
         match mode {
             ContextModeState::Broadcast(b) => {

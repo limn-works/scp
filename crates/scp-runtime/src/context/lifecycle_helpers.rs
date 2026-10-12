@@ -128,6 +128,17 @@ use crate::context::ttl::{self, CloseResult, TtlTimer};
 /// shared routing ID into app-data fan-out — so a zero local pseudonym cannot
 /// reopen the relay-correlation hole. It simply means "this member has not
 /// derived/announced its pseudonym yet."
+/// Deduplicates a context's relay set (§5.12.3.1 `relay_urls`), keeping each
+/// URL's first position, so the stored set lists each relay once whichever
+/// source supplied it (the creator, an invitation bundle, or a snapshot).
+pub fn normalize_relay_urls(relay_urls: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::with_capacity(relay_urls.len());
+    relay_urls
+        .into_iter()
+        .filter(|url| seen.insert(url.clone()))
+        .collect()
+}
+
 fn build_routing(is_broadcast: bool, local_pseudonym: Option<[u8; 32]>) -> ContextRouting {
     ContextRouting::for_mode(is_broadcast, local_pseudonym.unwrap_or([0u8; 32]))
 }
@@ -1603,6 +1614,7 @@ pub async fn create_context(
     params: ContextParams,
     creator_did: DID,
     local_pseudonym: Option<[u8; 32]>,
+    relay_urls: Vec<String>,
 ) -> Result<ContextHandle, ContextCreationError> {
     // The ceiling must be non-empty (construction.md M2, Alec's ruling of
     // 2026-09-30): an empty ceiling describes a context no member can use.
@@ -1777,6 +1789,8 @@ pub async fn create_context(
         // member's pseudonym + an empty peer registry; broadcast contexts
         // carry no pseudonym state.
         routing: create_routing,
+        // §5.12.3.1: the creator's relays host the context (PUSH-025).
+        relay_urls: normalize_relay_urls(relay_urls),
         // ADR-049 commit 8: fresh actor-shape tracker at creation.
         send_tracker: SendSequenceTracker::new(),
         // ADR-049 Phase 2A finalization keystone (ADR-049 §15 phase 2A
@@ -2753,6 +2767,9 @@ pub async fn import_context(
         // via incoming announcements. The import path is encrypted-only
         // (`mode = Encrypted` below), so a real pseudonym is required.
         routing: import_routing,
+        // §5.12.3.1: the creator-signed export names the relays that host the
+        // context; the importer installs that set (PUSH-025).
+        relay_urls: normalize_relay_urls(export.snapshot.relay_urls.clone()),
         // ADR-049 commit 8: fresh actor-shape tracker on import.
         send_tracker: SendSequenceTracker::new(),
         // ADR-049 Phase 2A finalization keystone: import path is
@@ -3403,6 +3420,8 @@ pub async fn restore_context(
         checkpoints: Vec::new(),
         last_seen_remote_checkpoint: std::collections::HashMap::new(),
         routing: restored_routing,
+        // Same-node restore carries the persisted relay set forward (PUSH-025).
+        relay_urls: normalize_relay_urls(ctx_snapshot.relay_urls),
         send_tracker: SendSequenceTracker::new(),
         // ADR-049 §9 Class S (line 144): same-node restore REHYDRATES the
         // staged saga slot from the snapshot. This is the crash-recovery path
@@ -4416,6 +4435,7 @@ mod restore_reconcile_tests {
                 params,
                 DID("did:dht:z6MkHarvestCreator".to_owned()),
                 pseudonym,
+                Vec::new(),
             )
             .await
             .expect("create_context should succeed");
@@ -4490,6 +4510,7 @@ mod restore_reconcile_tests {
                 params(),
                 creator(),
                 Some([7u8; 32]),
+                Vec::new(),
             )
             .await
         };
@@ -4604,6 +4625,7 @@ mod restore_reconcile_tests {
             params(),
             creator(),
             Some([7u8; 32]),
+            Vec::new(),
         )
         .await
         .expect("first create succeeds");
@@ -4613,6 +4635,7 @@ mod restore_reconcile_tests {
             params(),
             creator(),
             Some([8u8; 32]),
+            Vec::new(),
         )
         .await;
         assert!(

@@ -1336,6 +1336,10 @@ mod tests {
             checkpoint_last_time_secs: 0,
             generation: 0,
             routing: crate::context::actor::state::ContextRouting::Broadcast,
+            relay_urls: vec![
+                "wss://relay-b.example/scp/v1".to_owned(),
+                "wss://relay-a.example/scp/v1".to_owned(),
+            ],
             saga_pending: std::collections::HashMap::new(),
             xctx_committed_outputs: std::collections::HashMap::new(),
             xctx_committed_stream_outputs: std::collections::HashMap::new(),
@@ -1365,6 +1369,8 @@ mod tests {
         assert_eq!(loaded.state, scp_protocol::context::ContextState::Active);
         assert_eq!(loaded.ttl_deadline_secs, Some(300));
         assert!(loaded.membership.contains("did:dht:z6MkCreator"));
+        // The relay set survives the stored encoding in order (PUSH-025).
+        assert_eq!(loaded.relay_urls, snapshot.relay_urls);
     }
 
     #[tokio::test]

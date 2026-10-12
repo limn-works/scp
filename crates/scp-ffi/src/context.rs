@@ -2623,6 +2623,13 @@ impl crate::scp::PyScp {
             Some(derive_member_pseudonym(bi, identity_did, &context_id)?)
         };
 
+        // The relays this bridge is connected to host the new context
+        // (§5.12.3.1 `relay_urls`, PUSH-025).
+        let relay_urls = bi
+            .core
+            .context_relay_urls()
+            .map_err(|e| crate::error::ScpPyError::transport(e.to_string()))?;
+
         // Create the context via the shared ContextManager.
         {
             let creator_did_owned = scp_did::DID(identity_did.to_owned());
@@ -2633,9 +2640,15 @@ impl crate::scp::PyScp {
             let ctx_id = context_id.clone();
             let creator_did_for_register = scp_did::DID(identity_did.to_owned());
             rt.block_on(async move {
-                sup.create_context(ctx_id, core_params, creator_did_owned, local_pseudonym)
-                    .await
-                    .map_err(create_context_failure)?;
+                sup.create_context(
+                    ctx_id,
+                    core_params,
+                    creator_did_owned,
+                    local_pseudonym,
+                    relay_urls,
+                )
+                .await
+                .map_err(create_context_failure)?;
                 // Register the creator's DID as a local DID for defense-in-depth,
                 // matching NAPI's behavior. Routes through the supervisor's direct
                 // method (no per-context command — the local-DID set is
@@ -6385,6 +6398,7 @@ mod tests {
                 },
                 scp_did::DID(creator.clone()),
                 None,
+                Vec::new(),
             ))
             .unwrap();
             let (custody, key) = crate::runtime::with_identity(&bi, &creator, |entry| {
@@ -7273,6 +7287,7 @@ mod tests {
             params,
             scp_did::DID(creator.to_owned()),
             None,
+            Vec::new(),
         ))
         .unwrap();
         (bi, ctx_id)
@@ -8003,6 +8018,7 @@ mod tests {
             },
             scp_did::DID(creator.to_owned()),
             None,
+            Vec::new(),
         ))
         .unwrap();
 
@@ -8921,6 +8937,7 @@ mod tests {
                 },
                 scp_did::DID(creator.clone()),
                 None,
+                Vec::new(),
             ))
             .expect("create_context");
             let exported = scp.context_export(py, &ctx_id).expect("context_export");
@@ -9907,6 +9924,7 @@ mod tests {
                 params,
                 scp_did::DID(creator.clone()),
                 None,
+                Vec::new(),
             ))
             .unwrap();
 
@@ -10201,6 +10219,7 @@ class SignOnlyCustody:
                 },
                 scp_did::DID(creator.clone()),
                 None,
+                Vec::new(),
             ))
             .unwrap();
 

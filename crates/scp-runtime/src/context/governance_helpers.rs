@@ -3959,6 +3959,9 @@ pub fn execute_propose_context_migration<'a>(
             dest_params,
             creator,
             None,
+            // The destination is hosted on the source context's relays
+            // (§5.12.3.1, PUSH-025).
+            cell.relay_urls.clone(),
         ));
         if let Err(e) = create_fut.await {
             // Roll back: revert the source handle to Active. No Class-C field

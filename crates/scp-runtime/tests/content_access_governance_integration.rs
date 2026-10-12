@@ -195,7 +195,7 @@ async fn setup_threshold_context_with_dave(ctx_id: &str) -> std::sync::Arc<Super
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -658,7 +658,7 @@ async fn revoked_member_can_still_participate_in_governance() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -822,7 +822,7 @@ async fn single_admin_auto_executes_revoke_read_access() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -891,7 +891,7 @@ async fn single_admin_auto_executes_revoke_write_access() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -949,7 +949,7 @@ async fn single_admin_auto_executes_restore_read_access() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1019,7 +1019,7 @@ async fn single_admin_auto_executes_rotate_content_keys() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1062,7 +1062,7 @@ async fn unanimity_rotate_content_keys_requires_all_votes() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1132,7 +1132,7 @@ async fn unanimity_rotate_content_keys_rejected_by_single_vote() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1294,7 +1294,7 @@ async fn majority_revoke_write_access() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 

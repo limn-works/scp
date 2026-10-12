@@ -10341,6 +10341,15 @@ impl Scp {
                 // rather than calling a `ContextManager` method directly. The
                 // actor mailbox wraps the delegated call in the 30s
                 // transport-timeout budget.
+                // The relays this bridge is connected to host the new
+                // context (§5.12.3.1 `relay_urls`, PUSH-025).
+                let relay_urls = bi
+                    .core
+                    .context_relay_urls()
+                    .map_err(|e| ScpError::Transport {
+                        msg: e.to_string(),
+                        code: codes::TRANS_5002.to_owned(),
+                    })?;
                 let sup = bi.context_manager_or_error()?;
                 {
                     use scp_core::context::actor::commands::{
@@ -10353,6 +10362,7 @@ impl Scp {
                             params: core_params,
                             creator_did: identity.did.clone().into(),
                             local_pseudonym,
+                            relay_urls,
                         }),
                         reply: tx,
                     };
@@ -25668,6 +25678,7 @@ mod tests {
                 },
                 scp_did::DID(creator.to_owned()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("context creation must succeed");
@@ -27091,6 +27102,7 @@ mod tests {
                 },
                 scp_did::DID("did:dht:z6MkDenialCreator".to_owned()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("context creation must succeed");
@@ -27182,6 +27194,7 @@ mod tests {
                 },
                 scp_did::DID(issuer.clone()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("context creation must succeed");
@@ -27332,6 +27345,7 @@ mod tests {
                 },
                 scp_did::DID(issuer.clone()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("context creation must succeed");
@@ -27935,6 +27949,7 @@ mod tests {
                 },
                 scp_did::DID("did:dht:z6MkSubscriber".to_owned()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("context creation must succeed");
@@ -28077,6 +28092,7 @@ mod tests {
                 },
                 scp_did::DID("did:dht:z6MkSubscriber".to_owned()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("context creation must succeed");
@@ -30244,6 +30260,7 @@ mod tests {
                 params,
                 scp_did::DID(creator_did.to_owned()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("test supervisor context creation must succeed");
@@ -31210,6 +31227,7 @@ mod tests {
             },
             scp_did::DID(owner.did()),
             None,
+            Vec::new(),
         ))
         .expect("the narrowed actor must spawn");
         assert!(
@@ -31351,6 +31369,7 @@ mod tests {
             },
             scp_did::DID(owner.did()),
             None,
+            Vec::new(),
         ))
         .expect("the narrowed actor must spawn");
         assert!(

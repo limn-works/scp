@@ -3682,6 +3682,7 @@ impl Supervisor {
                     p.params,
                     p.creator_did,
                     p.local_pseudonym,
+                    p.relay_urls,
                 );
                 // `Box::pin` the create future: owned-state spawn keeps the
                 // freshly built `PerContextState` live across the spawn
@@ -6358,9 +6359,10 @@ impl Supervisor {
             StandingCommand::StandingContext {
                 local_did,
                 peer_did,
+                relay_urls,
                 reply,
             } => {
-                let fut = self.standing_context(&local_did, &peer_did);
+                let fut = self.standing_context(&local_did, &peer_did, relay_urls);
                 let (outcome, reply_result) =
                     match tokio::time::timeout(STANDING_TIMEOUT, fut).await {
                         Ok(Ok(ctx_id)) => (Outcome::ok_mutated(()), Ok(ctx_id)),
@@ -12083,6 +12085,7 @@ impl Supervisor {
         self: &Arc<Self>,
         local_did: &DID,
         peer_did: &DID,
+        relay_urls: Vec<String>,
     ) -> Result<String, ContextError> {
         use scp_protocol::context::ContextState;
 
@@ -12185,6 +12188,9 @@ impl Supervisor {
                 params,
                 local_did.clone(),
                 None,
+                // §5.12.3.1: the local identity's relays host the recreated
+                // standing context (PUSH-025).
+                relay_urls,
             ))
             .await
             .map(|_handle| ())
@@ -14563,12 +14569,17 @@ impl Supervisor {
     /// when `params.ceiling` is empty (construction.md M2); the context is
     /// not created. A dropped reply channel maps to
     /// [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed).
+    ///
+    /// `relay_urls` names the relays that host the context (§5.12.3.1): the
+    /// creator's relays. The actor stores the set (PUSH-025); an empty set
+    /// states that no relay hosts the context.
     pub async fn create_context(
         self: &Arc<Self>,
         context_id: String,
         params: scp_protocol::context::ContextParams,
         creator_did: DID,
         local_pseudonym: Option<[u8; 32]>,
+        relay_urls: Vec<String>,
     ) -> Result<crate::context::ContextHandle, scp_protocol::context::builder::ContextCreationError>
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -14577,6 +14588,7 @@ impl Supervisor {
             params,
             creator_did,
             local_pseudonym,
+            relay_urls,
         });
         let cmd = LifecycleCommand::CreateContext { payload, reply: tx };
         if let Err(e) = self.dispatch_lifecycle_command(cmd).await {
@@ -15318,6 +15330,9 @@ impl Supervisor {
         let context_id = bundle.context_id.clone();
         let creator_did = bundle.creator_did.clone();
         let params = bundle.context_params.clone();
+        // §5.12.3.1: the creator-signed bundle names the relays that host the
+        // context; the joiner stores that set (PUSH-025).
+        let relay_urls = bundle.relay_urls.clone();
         let welcome_bytes = bundle.welcome_message.clone();
 
         // ---- REVERSIBLE PRECHECKS (before the irreversible ConfirmConsume) ----
@@ -15563,9 +15578,12 @@ impl Supervisor {
                     //    tear down.
                     let mut state = match Self::build_welcome_joiner_state(
                         &deps,
-                        &context_id,
-                        &params,
-                        &creator_did,
+                        WelcomeBundleFacts {
+                            context_id: &context_id,
+                            params: &params,
+                            creator_did: &creator_did,
+                            relay_urls: &relay_urls,
+                        },
                         &owning_did,
                         local_pseudonym,
                         joined_epoch,
@@ -15813,15 +15831,20 @@ impl Supervisor {
     #[allow(clippy::too_many_lines)]
     fn build_welcome_joiner_state(
         deps: &crate::context::actor::deps::ActorDeps,
-        context_id: &str,
-        params: &scp_protocol::context::ContextParams,
-        creator_did: &DID,
+        bundle: WelcomeBundleFacts<'_>,
         joiner_did: &DID,
         local_pseudonym: [u8; 32],
         joined_epoch: u64,
     ) -> Result<crate::context::actor::state::PerContextState, ContextError> {
         use scp_protocol::context::roles::{CapabilityCeiling, ContextRoleState};
         use std::collections::{HashMap, HashSet, VecDeque};
+
+        let WelcomeBundleFacts {
+            context_id,
+            params,
+            creator_did,
+            relay_urls,
+        } = bundle;
 
         // NOTE: the reversible legible-param validations
         // (`check_version_compatibility` / `validate_governance_model`) are run by
@@ -15940,6 +15963,10 @@ impl Supervisor {
             checkpoints: Vec::new(),
             last_seen_remote_checkpoint: std::collections::HashMap::new(),
             routing,
+            // §5.12.3.1: the bundle's relays host the context (PUSH-025).
+            relay_urls: crate::context::lifecycle_helpers::normalize_relay_urls(
+                relay_urls.to_vec(),
+            ),
             send_tracker: crate::context::actor::sequence::SendSequenceTracker::new(),
             recv_tracker: crate::context::actor::state::RecvSequenceTracker::new(),
             xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
@@ -16008,6 +16035,7 @@ impl Supervisor {
         config: crate::context::config::ContextConfig,
         creator_did: DID,
         local_pseudonym: Option<[u8; 32]>,
+        relay_urls: Vec<String>,
     ) -> Result<crate::context::ContextHandle, scp_protocol::context::builder::ContextCreationError>
     {
         // Fail loud, never silent (AGENTS.md "no silent" tenet): a supplied
@@ -16021,7 +16049,7 @@ impl Supervisor {
                 scp_protocol::context::builder::ContextCreationError::BilateralPeerNotSupported,
             );
         }
-        self.create_context(context_id, params, creator_did, local_pseudonym)
+        self.create_context(context_id, params, creator_did, local_pseudonym, relay_urls)
             .await
     }
 
@@ -17658,6 +17686,18 @@ fn reply_with_error(cmd: QueriesCommand, err: ContextError) {
     }
 }
 
+/// What a verified §5.12.3.1 `InvitationBundle` tells a Welcome joiner about
+/// the context it joins: the id, the genesis parameters, the creator, and the
+/// relays that host it. `Supervisor::build_welcome_joiner_state` builds the
+/// joiner's actor state from these facts.
+#[derive(Clone, Copy)]
+struct WelcomeBundleFacts<'a> {
+    context_id: &'a str,
+    params: &'a scp_protocol::context::ContextParams,
+    creator_did: &'a DID,
+    relay_urls: &'a [String],
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -18191,6 +18231,7 @@ mod tests {
                     },
                     identity.clone(),
                     None,
+                    Vec::new(),
                 )
                 .await
                 .unwrap();
@@ -18221,6 +18262,65 @@ mod tests {
             "no key is loaded for another DID"
         );
         assert_eq!(persisted_own_wrapping_key(&contexts, &ctx_a), Some(owner));
+    }
+
+    /// A context's relay set (§5.12.3.1 `relay_urls`, PUSH-025) is the
+    /// creator's set at create, deduplicated in first-seen order, and its
+    /// snapshot persists it. Restore installs the stored set: the test rewrites
+    /// the stored set while the actor is down, deletes the snapshot after the
+    /// restore, and the flush writes the rewritten set back from the live actor.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_relay_set_is_set_at_create_and_installed_on_restore() {
+        const RELAY_A: &str = "wss://relay-a.example/scp/v1";
+        const RELAY_B: &str = "wss://relay-b.example/scp/v1";
+        const RELAY_C: &str = "wss://relay-c.example/scp/v1";
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_and_persistence(
+            Arc::new(TestClock::new(1_700_000_000)),
+            Box::new(persistence),
+        );
+        let identity = sup.node_identity().unwrap();
+        let ctx = hex::encode([0xC3u8; 32]);
+        let stored = |contexts: &DashMap<String, crate::context::state::ContextSnapshot>| {
+            contexts
+                .get(&ctx)
+                .map(|snapshot| snapshot.relay_urls.clone())
+        };
+
+        let handle = sup
+            .create_context(
+                ctx.clone(),
+                scp_protocol::context::ContextParams {
+                    ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                    ..Default::default()
+                },
+                identity,
+                None,
+                vec![RELAY_B.to_owned(), RELAY_A.to_owned(), RELAY_B.to_owned()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stored(&contexts),
+            Some(vec![RELAY_B.to_owned(), RELAY_A.to_owned()]),
+            "create persists the creator's relay set, each relay once"
+        );
+
+        assert!(sup.despawn_actor(&ctx).await);
+        contexts
+            .get_mut(&ctx)
+            .expect("context persisted")
+            .relay_urls = vec![RELAY_C.to_owned()];
+        sup.restore_context(&ctx, &handle).await.unwrap();
+        contexts.remove(&ctx);
+        sup.flush_all_contexts().await.unwrap();
+        assert_eq!(
+            stored(&contexts),
+            Some(vec![RELAY_C.to_owned()]),
+            "restore installs the stored relay set on the live actor"
+        );
     }
 
     /// The `0xFF01` wrapping key a KeyPackage's leaf publishes.
@@ -21758,6 +21858,7 @@ mod tests {
             checkpoint_last_time_secs: 0,
             generation: 0,
             routing: crate::context::actor::state::ContextRouting::Broadcast,
+            relay_urls: Vec::new(),
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_stream_outputs: HashMap::new(),
@@ -21910,13 +22011,28 @@ mod tests {
         creator: &str,
         ctx_id_bytes: &[u8; 32],
     ) -> Result<crate::context::ContextHandle, ContextError> {
+        Box::pin(import_snapshot_into(
+            MapPersistence::default(),
+            snapshot,
+            creator,
+            ctx_id_bytes,
+        ))
+        .await
+    }
+
+    /// [`import_snapshot_signed_by_creator`] into a supervisor that persists
+    /// to `persistence`, so a test can read what the import persisted.
+    async fn import_snapshot_into(
+        persistence: MapPersistence,
+        snapshot: crate::context::state::ContextSnapshot,
+        creator: &str,
+        ctx_id_bytes: &[u8; 32],
+    ) -> Result<crate::context::ContextHandle, ContextError> {
         use ed25519_dalek::{Signer, SigningKey};
 
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
-        let sup = supervisor_with_clock_persistence_and_merkle_log(
-            clock_dyn,
-            Box::new(MapPersistence::default()),
-        );
+        let sup =
+            supervisor_with_clock_persistence_and_merkle_log(clock_dyn, Box::new(persistence));
         let event_log_data =
             create_event_log_data(ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]).await;
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
@@ -21934,6 +22050,42 @@ mod tests {
         .expect("build a valid signed full export");
 
         sup.import_context(export, &verifying_key, None).await
+    }
+
+    /// Import installs the relay set the creator-signed snapshot names
+    /// (§5.12.3.1 `relay_urls`, PUSH-025), each relay once, and persists it.
+    #[tokio::test]
+    async fn import_installs_the_exported_relay_set() {
+        let creator = "did:key:import-relay-set-creator";
+        let context_id = "import-relay-set-ctx";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.relay_urls = vec![
+            "wss://relay-b.example/scp/v1".to_owned(),
+            "wss://relay-a.example/scp/v1".to_owned(),
+            "wss://relay-b.example/scp/v1".to_owned(),
+        ];
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+
+        Box::pin(import_snapshot_into(
+            persistence,
+            snapshot,
+            creator,
+            &ctx_id_bytes,
+        ))
+        .await
+        .expect("a creator-signed export imports");
+        assert_eq!(
+            contexts
+                .get(context_id)
+                .map(|stored| stored.relay_urls.clone()),
+            Some(vec![
+                "wss://relay-b.example/scp/v1".to_owned(),
+                "wss://relay-a.example/scp/v1".to_owned(),
+            ]),
+            "import installs and persists the exported relay set, each relay once"
+        );
     }
 
     /// The import path installs `export.snapshot.registered_outlets` into the
@@ -23753,6 +23905,7 @@ mod tests {
                     },
                     DID(creator.to_owned()),
                     None,
+                    Vec::new(),
                 )
                 .await;
 
@@ -23789,6 +23942,7 @@ mod tests {
                 },
                 DID(creator.to_owned()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("create over an ABSENT snapshot must succeed (precheck allows it)");
@@ -23813,6 +23967,7 @@ mod tests {
             params(),
             DID(creator.to_owned()),
             None,
+            Vec::new(),
         )
         .await
         .expect("a create before shutdown succeeds");
@@ -23826,6 +23981,7 @@ mod tests {
                 params(),
                 DID("did:dht:z6MkCreateAfterShutdownSecondCreator".to_owned()),
                 None,
+                Vec::new(),
             )
             .await;
         assert!(
@@ -24268,6 +24424,7 @@ mod tests {
             params,
             creator_did: DID("did:dht:z6MkReplyOrderCreator".to_owned()),
             local_pseudonym: None,
+            relay_urls: Vec::new(),
         });
         (LifecycleCommand::CreateContext { payload, reply: tx }, rx)
     }
@@ -26374,6 +26531,7 @@ mod tests {
                 },
                 creator,
                 None,
+                Vec::new(),
             )
             .await
             .expect("create the real 64-hex context under the digest");
@@ -26879,7 +27037,7 @@ mod tests {
         );
         assert!(!sup.is_context_poisoned(&ctx_key));
 
-        let revived = sup.standing_context(&local, &peer).await;
+        let revived = sup.standing_context(&local, &peer, Vec::new()).await;
         assert_eq!(
             revived.as_deref().ok(),
             Some(ctx_key.as_str()),
@@ -26944,7 +27102,7 @@ mod tests {
         let ctx_key = crate::context::standing_helpers::generate_standing_context_id(&local, &peer);
         let respawn = sup.respawn_from_snapshot(&ctx_key, &local).await;
         assert!(matches!(respawn, Err(ContextError::ActorCrashed(_))));
-        let failed = sup.standing_context(&local, &peer).await;
+        let failed = sup.standing_context(&local, &peer, Vec::new()).await;
         assert!(
             matches!(failed, Err(ContextError::TransportFailed(_))),
             "a recreate that registers no actor must surface the create error, got {failed:?}"
@@ -26976,7 +27134,7 @@ mod tests {
             }
         }
         assert!(sup.is_context_poisoned(&ctx_key));
-        let failed = sup.standing_context(&local, &peer).await;
+        let failed = sup.standing_context(&local, &peer, Vec::new()).await;
         assert!(
             matches!(failed, Err(ContextError::TransportFailed(_))),
             "a recreate that registers no actor must surface the create error, got {failed:?}"
@@ -27020,7 +27178,7 @@ mod tests {
             .expect("a key-package actor spawns before shutdown");
         sup.close_spawn_gate();
         let peer = DID("did:example:peer-standing-after-shutdown-spawn".to_owned());
-        let spawn_refused = sup.standing_context(&local, &peer).await;
+        let spawn_refused = sup.standing_context(&local, &peer, Vec::new()).await;
         assert!(
             matches!(spawn_refused, Err(ContextError::SupervisorShutDown(_))),
             "a refused actor spawn must keep SupervisorShutDown; got {spawn_refused:?}"
@@ -27029,7 +27187,7 @@ mod tests {
         // No key-package actor, so the refusal comes from `build_actor_deps`.
         sup.stop_key_package_actors().await;
         let peer = DID("did:example:peer-standing-after-shutdown-deps".to_owned());
-        let deps_refused = sup.standing_context(&local, &peer).await;
+        let deps_refused = sup.standing_context(&local, &peer, Vec::new()).await;
         assert!(
             matches!(deps_refused, Err(ContextError::SupervisorShutDown(_))),
             "a refused key-package spawn must keep SupervisorShutDown; got {deps_refused:?}"
@@ -27059,7 +27217,7 @@ mod tests {
         drop(rx);
         sup.actors
             .insert(ctx_key.clone(), ContextActorHandle::from_sender(tx));
-        let busy = sup.standing_context(&local, &peer).await;
+        let busy = sup.standing_context(&local, &peer, Vec::new()).await;
         assert!(
             matches!(busy, Err(ContextError::ActorBusy(_))),
             "a standing context whose actor does not answer must surface ActorBusy, got {busy:?}"

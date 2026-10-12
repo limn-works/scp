@@ -2338,6 +2338,7 @@ pub(crate) fn create_supervisor_context_with_params_for_test(
         params,
         scp_did::DID(creator_did.to_owned()),
         None,
+        Vec::new(),
     ))
     .expect("test supervisor context creation must succeed");
 }

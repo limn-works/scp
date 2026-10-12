@@ -228,9 +228,15 @@ async fn bridge_restore_entry_runs_restore_and_replay_legs() {
             ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
-        sup1.create_context(ctx_id.to_owned(), params, DID::from(creator_did), None)
-            .await
-            .expect("create_context");
+        sup1.create_context(
+            ctx_id.to_owned(),
+            params,
+            DID::from(creator_did),
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("create_context");
 
         // Flush the live context to persistence — this is the durable `Active`
         // snapshot the restart's restore leg must rehydrate.

@@ -36,7 +36,7 @@ use crate::{decrement_handle_count, increment_handle_count};
 // ---------------------------------------------------------------------------
 
 /// Maps a [`TransportLockError`] to the appropriate [`ScpNapiError`].
-fn map_transport_lock_error(e: TransportLockError) -> ScpNapiError {
+pub(crate) fn map_transport_lock_error(e: TransportLockError) -> ScpNapiError {
     match e {
         TransportLockError::Poisoned => ScpNapiError::Transport {
             message: "transport manager lock is poisoned".to_owned(),
