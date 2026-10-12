@@ -852,7 +852,10 @@ async fn handle_deliver_incoming(
             .await
         };
 
-        match tokio::time::timeout(HANDLER_TIMEOUT, deliver_fut).await {
+        // A KeyResponse opens through the identity wrapping key's custody
+        // `dh_agree`, bounded by `SIGN_TIMEOUT`; the signing budget lets a
+        // stalled custody fail first as `SCP-CRYPTO-4062`.
+        match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, deliver_fut).await {
             Ok(Ok(opt)) => (Outcome::ok_mutated(()), Ok(opt)),
             Ok(Err(e)) => {
                 let sketch = outcome_error_sketch(&e);
@@ -860,7 +863,7 @@ async fn handle_deliver_incoming(
             }
             Err(_elapsed) => {
                 let err = ContextError::TransportTimeout(format!(
-                    "deliver_incoming exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                    "deliver_incoming exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
                 ));
                 let sketch = outcome_error_sketch(&err);
                 (Outcome::err_mutated(sketch), Err(err))

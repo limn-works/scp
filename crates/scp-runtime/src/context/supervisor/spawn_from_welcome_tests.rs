@@ -59,7 +59,6 @@ use crate::context::providers::event_log::MerkleEventLogProvider;
 use crate::context::state::context_id_to_bytes;
 use crate::crypto::mls::provider::NodeMlsFactory;
 use crate::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
-use crate::crypto::wrapping::WrappingKeyPair;
 
 const ALICE_DID: &str = "did:dht:z6MkAliceSpawnFromWelcomeCreator";
 const BOB_DID: &str = "did:dht:z6MkBobSpawnFromWelcomeJoiner";
@@ -439,7 +438,7 @@ async fn reserve_bob_kp(
     bob: &DID,
 ) -> (super::key_package_actor::ReservationId, Vec<u8>) {
     let store = sup
-        .key_package_store_for(bob)
+        .key_package_store_for_loaded(bob)
         .await
         .expect("bob's key-package store spawns");
     store
@@ -562,14 +561,20 @@ async fn run_join_with_active_key(
     let alice_owned = committed.as_ref().map_or_else(
         || {
             alice_crypto
-                .create_bare_group_owned(WrappingKeyPair::generate().public())
+                .create_bare_group_owned(
+                    scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                        .0
+                        .as_bytes(),
+                )
                 .expect("alice creates a wrapping-only group (no 0xFF02)")
         },
         |committed_params| {
             alice_crypto
                 .create_mls_group_with_context(
                     &honest_ext(&group_ctx_id, committed_params),
-                    WrappingKeyPair::generate().public(),
+                    scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                        .0
+                        .as_bytes(),
                 )
                 .expect("alice creates the SCP context group (0xFF02)")
         },
@@ -1305,7 +1310,9 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
     let alice_owned = alice_crypto
         .create_mls_group_with_context(
             &honest_ext(&ctx_id, &joiner_params()),
-            WrappingKeyPair::generate().public(),
+            scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                .0
+                .as_bytes(),
         )
         .unwrap();
     let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, &kp_public_bytes);
@@ -1392,7 +1399,9 @@ fn alice_welcome_for(context_id: &str, kp_public_bytes: &[u8]) -> (Arc<NodeMlsFa
     let alice_owned = alice_crypto
         .create_mls_group_with_context(
             &honest_ext(context_id, &joiner_params()),
-            WrappingKeyPair::generate().public(),
+            scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                .0
+                .as_bytes(),
         )
         .expect("alice creates the SCP context group (0xFF02)");
     let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, kp_public_bytes);
@@ -3292,7 +3301,9 @@ async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() 
     let alice_owned = alice_crypto
         .create_mls_group_with_context(
             &honest_ext(&ctx_id, &params),
-            WrappingKeyPair::generate().public(),
+            scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                .0
+                .as_bytes(),
         )
         .expect("alice creates the honest SCP context group committing creator=Alice");
     let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, &kp_public_bytes);
@@ -4096,7 +4107,9 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
     let alice_owned = alice_crypto
         .create_mls_group_with_context(
             &honest_ext(&group_ctx_id, &joiner_params()),
-            WrappingKeyPair::generate().public(),
+            scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                .0
+                .as_bytes(),
         )
         .expect("alice creates the SCP context group (0xFF02)");
     let add_output = alice_welcome_for_bob(&group_ctx_bytes, alice_owned, &kp_public_bytes);

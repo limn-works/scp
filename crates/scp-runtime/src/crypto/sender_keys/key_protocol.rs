@@ -370,14 +370,39 @@ pub async fn open_sender_key_response(
             ))
         })?;
 
+    open_sender_key_response_with_dh(&dh_bytes, &pk_rm_bytes, context_id, response)
+}
+
+/// Opens a [`SenderKeyResponse`] with a KEM Diffie-Hellman output computed in custody.
+///
+/// `dh` is computed inside custody for the response's `enc`, and `pk_rm` is
+/// the recipient's wrapping public key (RFC 9180 HPKE Base mode, §9.16.2).
+/// The software half of [`open_sender_key_response`]: DHKEM Decap
+/// (`ExtractAndExpand(dh, enc || pkRm)`), `KeySchedule_base`, and the AEAD
+/// open. The caller computes `dh` with the custody handle whose public key is
+/// `pk_rm`, for exactly `ValidatedEnc::from(response.ephemeral_pubkey)`.
+///
+/// # Errors
+///
+/// [`SenderKeyError::HpkeDecryptionFailed`] if the HPKE open fails (wrong
+/// key, `info` or `aad`, tampered `enc` or `ct`) or the recovered plaintext
+/// is not exactly 32 bytes.
+pub(crate) fn open_sender_key_response_with_dh(
+    dh: &Zeroizing<[u8; 32]>,
+    pk_rm: &[u8; hpke_p256::PUBLIC_KEY_LEN],
+    context_id: &str,
+    response: &SenderKeyResponse,
+) -> Result<SenderKey, SenderKeyError> {
+    let enc = hpke_p256::ValidatedEnc::from(response.ephemeral_pubkey);
+
     // Build context-bound info and AAD (§9.16.2) using response fields.
     let info = build_hpke_info(context_id, &response.sender_did, response.epoch);
     let aad = build_hpke_aad(context_id, &response.sender_did, response.epoch);
 
     let plaintext = Zeroizing::new(
         hpke_p256::custody::open_with_external_dh(
-            &dh_bytes,
-            &pk_rm_bytes,
+            dh,
+            pk_rm,
             &enc,
             &info,
             &aad,

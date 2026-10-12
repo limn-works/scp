@@ -5521,7 +5521,7 @@ impl ClassSCell
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
-            .build_actor_deps(&DID("did:example:class-s-cell-test".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:class-s-cell-test".to_owned()))
             .await
             .expect("build_actor_deps")
     }

@@ -146,6 +146,12 @@ impl supervisor::Supervisor {
     }
 }
 
+/// The custody seam of the identity wrapping key (spec 09 §9.16.1): a bridge
+/// passes a [`WrappingCustodySource`] to the supervisor constructor.
+pub use crate::crypto::wrapping::{
+    ErasedCustody, WrappingCustody, WrappingCustodyFuture, WrappingCustodySource,
+    single_custody_source,
+};
 pub use challenger_ledger_actor::{
     BeginOutcome, ChallengeLedgerError, ChallengerLedgerCommand, ChallengerLedgerHandle,
     ChallengerLedgerShared, GradedAttempt, GradingLease, MAX_CONCURRENT_GRADINGS_PER_CHALLENGER,

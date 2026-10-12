@@ -3257,7 +3257,7 @@ pub async fn execute_rotate_content_keys(
                 // touch the `mls_epoch` mirror).
                 let wrapping_public_key = *deps
                     .supervisor
-                    .my_wrapping_keypair(&deps.owned_identity)?
+                    .my_wrapping_key(&deps.owned_identity)?
                     .public();
                 let epoch_out = state.advance_epoch(wrapping_public_key, deps.clock.as_ref())?;
 
@@ -7000,7 +7000,7 @@ mod commit_broadcast_retry_tests {
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
-            .build_actor_deps(&DID(ADMIN.to_owned()))
+            .build_actor_deps_loaded(&DID(ADMIN.to_owned()))
             .await
             .expect("build_actor_deps")
     }

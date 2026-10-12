@@ -667,7 +667,7 @@ mod live_supervisor_send {
         // round-trip). The owned constructor mints Bob's own sender key locally.
         let bob_pseudonym = [0x42u8; 32];
         let bob_deps = bob_sup
-            .build_actor_deps(&DID::from(BOB_DID))
+            .build_actor_deps_loaded(&DID::from(BOB_DID))
             .await
             .expect("build bob's actor deps");
         let joined_group = bob_deps
@@ -680,15 +680,13 @@ mod live_supervisor_send {
             .await
             .expect("bob confirms the join and receives the joined MLS group");
         let bob_owned = bob.install_joined_group(joined_group);
-        // Bob's identity wrapping secret (the actor HPKE-open key), for opening
-        // Alice's sender-key distributions; then seed his owned actor state
-        // directly from the join constructor.
-        let bob_wsec: [u8; 32] = **bob_sup
-            .ensure_wrapping_key(&DID::from(BOB_DID))
+        // Bob's identity wrapping key (the actor HPKE-open key, in custody),
+        // for opening Alice's sender-key distributions; then seed his owned
+        // actor state directly from the join constructor.
+        let bob_wrapping = bob_sup
+            .load_wrapping_key(&DID::from(BOB_DID))
             .await
-            .expect("bob's wrapping keypair is loaded")
-            .load()
-            .secret();
+            .expect("bob's wrapping key is loaded");
         drop(bob_sup);
         let mut bob_actor =
             PerContextState::new_for_test_encrypted(ctx_bytes, 0, DID::from(BOB_DID));
@@ -710,7 +708,8 @@ mod live_supervisor_send {
                     // ADR-049 PR-6: process returns (key, epoch) without
                     // installing; install unchecked (trusted bootstrap path).
                     let (key, _epoch) = bob_actor
-                        .process_incoming_sender_key(&bob_wsec, &sender_did, &payload)
+                        .process_incoming_sender_key(&bob_wrapping, &sender_did, &payload)
+                        .await
                         .expect("bob processes Alice's sender key");
                     bob_actor.set_sender_key_unchecked(&sender_did, key);
                 }

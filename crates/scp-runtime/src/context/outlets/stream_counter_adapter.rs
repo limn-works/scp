@@ -277,7 +277,7 @@ mod tests {
         );
 
         let deps = supervisor
-            .build_actor_deps(&DID(INVOKER.to_owned()))
+            .build_actor_deps_loaded(&DID(INVOKER.to_owned()))
             .await
             .expect("build_actor_deps");
         // The counter handlers gate only on the owned record, not context state,

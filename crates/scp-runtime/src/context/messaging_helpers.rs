@@ -1545,7 +1545,8 @@ pub async fn deliver_incoming(
         context_id,
         &context_id_bytes,
         encrypted_blob,
-    )?
+    )
+    .await?
     else {
         // MLS Commit / Proposal — processed internally by the crypto layer,
         // no inner envelope to classify.
@@ -3151,7 +3152,7 @@ pub(in crate::context) fn stream_reservations_snapshot(
 ///
 /// It does not advance the anti-replay floor. The only caller,
 /// [`deliver_incoming`], advances it after the inner envelope verifies.
-pub(super) fn decrypt_and_dispatch(
+pub(super) async fn decrypt_and_dispatch(
     deps: &ActorDeps,
     crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
     context_id: &str,
@@ -3162,9 +3163,9 @@ pub(super) fn decrypt_and_dispatch(
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's OWNED
     // field-granular Class-C `&mut ContextCryptoState` (driven from
     // `deliver_incoming`'s `ClassCMut` view) — byte-identical to the deleted
-    // provider `open` twin (the 16 golden tests hold). `process_incoming_sender_key`
-    // below stays on the provider (it HPKE-opens with the owning identity's
-    // wrapping secret — receive-side, NOT in the delete set); the sender-key INSTALL,
+    // provider `open` twin (the 16 golden tests hold). A KeyResponse opens
+    // through the owning identity's wrapping key in custody (`dh_agree`) and
+    // `NodeMlsFactory::finish_incoming_sender_key`; the sender-key INSTALL,
     // however, now writes to the ACTOR-owned `cs.sender_key_store.set_unchecked`
     // (the provider store is empty on a taken context — see the KeyResponse arm
     // below), and `local_did` is likewise retained. A `None` crypto
@@ -3277,25 +3278,36 @@ pub(super) fn decrypt_and_dispatch(
                     }
                     Ok(None)
                 }
-                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(_) => {
+                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(
+                    response,
+                ) => {
                     // ADR-049 PR-6 GATE-BEFORE-INSTALL + PR-7 install-onto-ACTOR
-                    // fix. `process_incoming_sender_key` HPKE-opens with the
-                    // owning identity's wrapping secret (spec 09 §9.16.1; with
-                    // none loaded it fails closed) and returns the authenticated
-                    // `(key, epoch)`; the
+                    // fix. The owning identity's wrapping key computes the KEM
+                    // Diffie-Hellman in custody (spec 09 §9.16.1; with no key
+                    // loaded it fails closed, and a custody failure or timeout
+                    // surfaces as `ContextError::Custody`), then
+                    // `finish_incoming_sender_key` HPKE-opens and returns the
+                    // authenticated `(key, epoch)`; the
                     // authoritative Class-M registry gates epoch monotonicity + the
                     // poisoning ceiling FAIL-CLOSED BEFORE install; the install then
                     // writes to the ACTOR's OWNED `cs.sender_key_store`. The provider
                     // store is EMPTY on a taken (actor-owned) context, so the former
                     // `deps.crypto.set_sender_key_unchecked` was a silent no-op — the
                     // latent bug this fixes (D1 close, fail-safe ordering preserved).
-                    let wrapping = deps.supervisor.my_wrapping_keypair(&deps.owned_identity)?;
-                    let (sender_key, epoch) = deps.crypto.process_incoming_sender_key(
-                        context_id_bytes,
-                        &sender_did,
-                        &payload,
-                        wrapping.secret(),
-                    )?;
+                    let wrapping = deps.supervisor.my_wrapping_key(&deps.owned_identity)?;
+                    let enc = scp_protocol::crypto::hpke::p256::ValidatedEnc::from(
+                        response.ephemeral_pubkey,
+                    );
+                    let dh = wrapping.agree(&enc).await?;
+                    let (sender_key, epoch) =
+                        crate::crypto::mls::provider::NodeMlsFactory::finish_incoming_sender_key(
+                            context_id_bytes,
+                            &sender_did,
+                            &response,
+                            &dh,
+                            wrapping.public(),
+                        )?;
+                    drop(dh);
                     drop(wrapping);
                     deps.supervisor.check_and_advance_sender_epoch(
                         context_id_bytes,
@@ -4986,7 +4998,7 @@ mod pseudonym_routing_tests {
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
-            .build_actor_deps(&DID(ALICE.to_owned()))
+            .build_actor_deps_loaded(&DID(ALICE.to_owned()))
             .await
             .expect("build_actor_deps")
     }
@@ -5506,7 +5518,7 @@ pub mod dropped_supervisor_tests {
                 mls_storage,
             );
             let deps = supervisor
-                .build_actor_deps(&DID(OWNER.to_owned()))
+                .build_actor_deps_loaded(&DID(OWNER.to_owned()))
                 .await
                 .expect("build_actor_deps");
             Self {

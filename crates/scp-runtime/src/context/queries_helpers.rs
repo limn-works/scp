@@ -1350,7 +1350,7 @@ mod equivocation_dedup_tests {
             mls_storage,
         );
         let deps = supervisor
-            .build_actor_deps(&DID("did:example:equiv-dedup".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:equiv-dedup".to_owned()))
             .await
             .expect("build_actor_deps");
 

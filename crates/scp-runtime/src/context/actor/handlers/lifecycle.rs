@@ -796,8 +796,8 @@ async fn handle_issue_mls_update_actor(
     // now lives in the Class-S closure. The Update keeps publishing the
     // identity's wrapping key (spec 09 §9.16.1); with none loaded it fails
     // closed before anything ratchets.
-    let wrapping_public_key = match deps.supervisor.my_wrapping_keypair(&deps.owned_identity) {
-        Ok(pair) => *pair.public(),
+    let wrapping_public_key = match deps.supervisor.my_wrapping_key(&deps.owned_identity) {
+        Ok(key) => *key.public(),
         Err(e) => {
             let _ = reply.send(Err(e));
             return Outcome::ok(());
