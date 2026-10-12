@@ -55,7 +55,7 @@ use super::capability_uri::CapabilityUri;
 /// | `PromptInjectionResistance`    | `scp:capability:prompt-injection-resistance/v1`  |
 /// | `SchemaValidation`             | `scp:capability:schema-validation/v1`            |
 /// | `RateLimitCompliance`          | `scp:capability:rate-limit-compliance/v1`        |
-/// | `Custom("name")`              | DID-scoped or protocol URI                       |
+/// | `Custom("name")`              | identifier-scoped or protocol URI                |
 ///
 /// # Serialization
 ///
@@ -210,8 +210,9 @@ pub struct ChallengeRequest {
     ///
     /// Identifies which specific capability this challenge verifies, using the
     /// structured URI format: `scp:capability:{name}/v{N}` for protocol
-    /// capabilities, or `did:{method}:{id}:capability:{name}/v{N}` for
-    /// DID-scoped custom capabilities.
+    /// capabilities, or `{identifier}:capability:{name}/v{N}` for
+    /// identifier-scoped custom capabilities, where `{identifier}` is the
+    /// `03-identity.md` §3.1 text form.
     pub capability_uri: String,
 
     /// Challenge-specific parameters (schema, test vectors, limits, etc.).
@@ -572,8 +573,8 @@ fn challenge_type_tag(ct: &ChallengeType) -> String {
 /// - **Protocol capabilities** (`scp:capability:*`): must be registered in the
 ///   protocol registry. Unknown protocol URIs are rejected with
 ///   [`TrustError::UnknownChallengeCapability`].
-/// - **DID-scoped capabilities** (`did:*`): always accepted without registry
-///   lookup (authority is the definer's DID).
+/// - **Identifier-scoped capabilities** (`scp:<52 base32>`): always accepted
+///   without registry lookup (authority is the definer's identifier).
 /// - **Parameter validation**: if the capability has a registered parameter
 ///   schema and parameters are non-null, validates the parameters against
 ///   the schema. Invalid parameters are rejected with
@@ -946,6 +947,8 @@ mod tests {
 
     /// Default capability URI for tests.
     const TEST_CAPABILITY_URI: &str = "scp:capability:schema-validation/v1";
+    /// Spec 25 Vector 57's identifier in the `03-identity.md` §3.1 text form.
+    const TEST_DEFINER: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za";
 
     /// A test resolver that maps DIDs to public key bytes.
     struct TestResolver {
@@ -1129,16 +1132,20 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_did_scoped_uri() {
-        let ct: ChallengeType =
-            serde_json::from_str("\"did:dht:z6Mk123:capability:custom-check/v1\"").unwrap();
-        assert_eq!(
-            ct,
-            ChallengeType::Uri(
-                "did:dht:z6Mk123:capability:custom-check/v1"
-                    .parse()
-                    .unwrap()
-            )
+    fn deserialize_identifier_scoped_uri() {
+        let uri = format!("{TEST_DEFINER}:capability:custom-check/v1");
+        let ct: ChallengeType = serde_json::from_value(serde_json::json!(uri)).unwrap();
+        assert_eq!(ct, ChallengeType::Uri(uri.parse().unwrap()));
+    }
+
+    #[test]
+    fn challenge_type_rejects_did_scoped_uri() {
+        let result: Result<ChallengeType, _> =
+            serde_json::from_str("\"did:dht:z6Mk123:capability:custom-check/v1\"");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not a canonical identifier"),
+            "expected the NonCanonicalIdentifier text, got {err}"
         );
     }
 
@@ -1165,7 +1172,11 @@ mod tests {
             ChallengeType::prompt_injection_resistance(),
             ChallengeType::schema_validation(),
             ChallengeType::rate_limit_compliance(),
-            ChallengeType::Uri("did:dht:z6Mk123:capability:custom/v1".parse().unwrap()),
+            ChallengeType::Uri(
+                format!("{TEST_DEFINER}:capability:custom/v1")
+                    .parse()
+                    .unwrap(),
+            ),
         ];
         for ct in &types {
             let json = serde_json::to_string(ct).unwrap();
@@ -1195,12 +1206,10 @@ mod tests {
     }
 
     #[test]
-    fn challenge_type_tag_did_scoped() {
-        let ct = ChallengeType::Uri("did:dht:z6Mk123:capability:custom/v1".parse().unwrap());
-        assert_eq!(
-            challenge_type_tag(&ct),
-            "did:dht:z6Mk123:capability:custom/v1"
-        );
+    fn challenge_type_tag_identifier_scoped() {
+        let uri = format!("{TEST_DEFINER}:capability:custom/v1");
+        let ct = ChallengeType::Uri(uri.parse().unwrap());
+        assert_eq!(challenge_type_tag(&ct), uri);
     }
 
     // -----------------------------------------------------------------------
@@ -1273,7 +1282,11 @@ mod tests {
             ChallengeType::prompt_injection_resistance(),
             ChallengeType::schema_validation(),
             ChallengeType::rate_limit_compliance(),
-            ChallengeType::Uri("did:dht:z6Mk123:capability:custom/v1".parse().unwrap()),
+            ChallengeType::Uri(
+                format!("{TEST_DEFINER}:capability:custom/v1")
+                    .parse()
+                    .unwrap(),
+            ),
         ] {
             let result = issue_challenge(
                 "did:key:c".into(),
@@ -1813,10 +1826,11 @@ mod tests {
     }
 
     #[test]
-    fn challenge_type_did_scoped_preserves_uri() {
-        let ct = ChallengeType::Uri("did:dht:z6Mk123:capability:custom-test/v1".parse().unwrap());
+    fn challenge_type_identifier_scoped_preserves_uri() {
+        let uri = format!("{TEST_DEFINER}:capability:custom-test/v1");
+        let ct = ChallengeType::Uri(uri.parse().unwrap());
         let tag = challenge_type_tag(&ct);
-        assert_eq!(tag, "did:dht:z6Mk123:capability:custom-test/v1");
+        assert_eq!(tag, uri);
     }
 
     #[test]
@@ -1854,14 +1868,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn deserialize_legacy_custom_with_did_scoped_uri() {
-        // Legacy "Custom:did:dht:z6Mk:capability:x/v1" should deserialize.
+    fn deserialize_legacy_custom_with_identifier_scoped_uri() {
+        // Legacy "Custom:scp:<identifier>:capability:x/v1" should deserialize.
+        let uri = format!("{TEST_DEFINER}:capability:x/v1");
         let ct: ChallengeType =
-            serde_json::from_str("\"Custom:did:dht:z6Mk:capability:x/v1\"").unwrap();
-        assert_eq!(
-            ct,
-            ChallengeType::Uri("did:dht:z6Mk:capability:x/v1".parse().unwrap())
-        );
+            serde_json::from_value(serde_json::json!(format!("Custom:{uri}"))).unwrap();
+        assert_eq!(ct, ChallengeType::Uri(uri.parse().unwrap()));
     }
 
     #[test]
@@ -2027,8 +2039,8 @@ mod tests {
     }
 
     #[test]
-    fn issue_challenge_accepts_did_scoped_custom_capability() {
-        let result = issue_with_uri("did:dht:z6Mk123:capability:custom-skill/v1");
+    fn issue_challenge_accepts_identifier_scoped_custom_capability() {
+        let result = issue_with_uri(&format!("{TEST_DEFINER}:capability:custom-skill/v1"));
         assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 

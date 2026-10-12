@@ -10,8 +10,8 @@
 //! # SDK Enforcement (§7.3.4.2)
 //!
 //! [`validate_capability_uri`] is the SDK enforcement point: it accepts known
-//! protocol capabilities, known system capabilities, and all valid DID-scoped
-//! URIs (no registry lookup). It rejects unknown `scp:capability:*` and unknown
+//! protocol capabilities, known system capabilities, and all valid
+//! identifier-scoped (`scp:<52 base32>`) URIs (no registry lookup). It rejects unknown `scp:capability:*` and unknown
 //! `scp:system:*` URIs with [`CapabilityRegistryError::UnknownProtocolCapability`].
 //!
 //! # Examples
@@ -35,9 +35,15 @@
 //! let uri = validate_capability_uri("scp:capability:prompt-injection-resistance/v1").unwrap();
 //! assert!(matches!(uri, CapabilityUri::Protocol { .. }));
 //!
-//! // DID-scoped URIs are always accepted
-//! let uri = validate_capability_uri("did:dht:z6Mk123:capability:custom/v1").unwrap();
-//! assert!(matches!(uri, CapabilityUri::DidScoped { .. }));
+//! // Identifier-scoped URIs are always accepted
+//! let uri = validate_capability_uri(
+//!     "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:custom/v1",
+//! )
+//! .unwrap();
+//! assert!(matches!(uri, CapabilityUri::IdentifierScoped { .. }));
+//!
+//! // A did: authority is rejected
+//! assert!(validate_capability_uri("did:dht:z6Mk123:capability:custom/v1").is_err());
 //!
 //! // Unknown protocol URIs are rejected
 //! let err = validate_capability_uri("scp:capability:nonexistent/v1");
@@ -499,8 +505,9 @@ pub fn is_known_system_capability(uri: &str) -> bool {
 /// - **System capabilities** (`scp:system:*`): accepted only if present in
 ///   the system registry. Unknown `scp:system:*` URIs are rejected with
 ///   [`CapabilityRegistryError::UnknownProtocolCapability`].
-/// - **DID-scoped capabilities** (`did:*`): always accepted without registry
-///   lookup (authority is the definer's DID).
+/// - **Identifier-scoped capabilities** (`scp:<52 base32>`): always accepted
+///   without registry lookup (authority is the definer's identifier, in the
+///   `03-identity.md` §3.1 text form).
 ///
 /// # Errors
 ///
@@ -521,8 +528,11 @@ pub fn is_known_system_capability(uri: &str) -> bool {
 /// // Unknown protocol capability — rejected
 /// assert!(validate_capability_uri("scp:capability:nonexistent/v1").is_err());
 ///
-/// // DID-scoped — always accepted
-/// assert!(validate_capability_uri("did:dht:z6Mk123:capability:anything/v1").is_ok());
+/// // Identifier-scoped — always accepted
+/// assert!(validate_capability_uri(
+///     "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:anything/v1"
+/// )
+/// .is_ok());
 ///
 /// // Known system capability — accepted
 /// assert!(validate_capability_uri("scp:system:relay-operation").is_ok());
@@ -548,8 +558,8 @@ pub fn validate_capability_uri(uri: &str) -> Result<CapabilityUri, CapabilityReg
                 ));
             }
         }
-        CapabilityUri::DidScoped { .. } => {
-            // DID-scoped URIs are always accepted — authority is the
+        CapabilityUri::IdentifierScoped { .. } => {
+            // Identifier-scoped URIs are always accepted — authority is the
             // definer's identity, not the protocol registry.
         }
     }
@@ -778,25 +788,45 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // validate_capability_uri — DID-scoped capabilities
+    // validate_capability_uri — identifier-scoped capabilities
     // -----------------------------------------------------------------------
 
+    /// Spec 25 Vector 57's identifier in the `03-identity.md` §3.1 text form.
+    const DEFINER: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za";
+
     #[test]
-    fn validate_accepts_arbitrary_did_scoped_capabilities() {
-        // DID-scoped URIs are always accepted without registry lookup
+    fn validate_accepts_any_identifier_scoped_capability() {
+        // Identifier-scoped URIs are always accepted without registry lookup
         let uris = [
-            "did:dht:z6Mk123:capability:anything/v1",
-            "did:web:example.com:capability:custom-skill/v42",
-            "did:key:z6Mktest:capability:domain-expertise/v3",
+            format!("{DEFINER}:capability:anything/v1"),
+            format!("{DEFINER}:capability:custom-skill/v42"),
+            format!("{DEFINER}:capability:domain-expertise/v3"),
         ];
-        for uri in uris {
+        for uri in &uris {
             let result = validate_capability_uri(uri);
             assert!(
                 result.is_ok(),
-                "validate_capability_uri should accept DID-scoped URI {uri}, got {result:?}"
+                "validate_capability_uri should accept identifier-scoped URI {uri}, got {result:?}"
             );
-            assert!(matches!(result.unwrap(), CapabilityUri::DidScoped { .. }));
+            assert!(matches!(
+                result.unwrap(),
+                CapabilityUri::IdentifierScoped { .. }
+            ));
         }
+    }
+
+    #[test]
+    fn validate_rejects_did_authority() {
+        let result = validate_capability_uri("did:dht:z6Mk123:capability:anything/v1");
+        assert!(
+            matches!(
+                result,
+                Err(CapabilityRegistryError::InvalidUri(
+                    CapabilityUriError::NonCanonicalIdentifier(_)
+                ))
+            ),
+            "got {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

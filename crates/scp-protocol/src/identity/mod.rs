@@ -8,3 +8,4 @@ pub mod block_list;
 pub mod private_state;
 pub mod private_state_events;
 pub mod scpid;
+pub mod text_form;

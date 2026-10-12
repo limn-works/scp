@@ -267,7 +267,7 @@ pub enum TrustError {
     },
 
     /// The challenge type URI is not a known protocol capability and is not
-    /// DID-scoped.
+    /// identifier-scoped.
     #[error("unknown challenge capability URI: {uri}")]
     UnknownChallengeCapability {
         /// The unrecognized URI string.

@@ -1162,17 +1162,24 @@ async fn capability_uri_construction() {
     let protocol_str = "scp:capability:prompt-injection-resistance/v1";
     let protocol: CapabilityUri = protocol_str.parse().unwrap();
     assert!(protocol.is_protocol());
-    assert!(!protocol.is_did_scoped());
+    assert!(!protocol.is_identifier_scoped());
     assert!(!protocol.is_system());
     assert_eq!(protocol.name(), "prompt-injection-resistance");
     assert_eq!(protocol.to_string(), protocol_str);
 
-    // DID-scoped capability
-    let did_scoped_str = "did:dht:z6Mk123:capability:domain-expertise/v2";
-    let did_scoped: CapabilityUri = did_scoped_str.parse().unwrap();
-    assert!(did_scoped.is_did_scoped());
-    assert_eq!(did_scoped.name(), "domain-expertise");
-    assert_eq!(did_scoped.to_string(), did_scoped_str);
+    // Identifier-scoped capability (spec 25 Vector 57's identifier)
+    let scoped_str =
+        "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:domain-expertise/v2";
+    let scoped: CapabilityUri = scoped_str.parse().unwrap();
+    assert!(scoped.is_identifier_scoped());
+    assert_eq!(scoped.name(), "domain-expertise");
+    assert_eq!(scoped.to_string(), scoped_str);
+    // A did: authority is not an identifier in the §3.1 text form.
+    assert!(
+        "did:dht:z6Mk123:capability:domain-expertise/v2"
+            .parse::<CapabilityUri>()
+            .is_err()
+    );
 
     // System capability
     let system_str = "scp:system:relay-operation";
@@ -1205,14 +1212,17 @@ async fn capability_matching() {
     let v1: CapabilityUri = "scp:capability:test/v1".parse().unwrap();
     let v2: CapabilityUri = "scp:capability:test/v2".parse().unwrap();
     let system: CapabilityUri = "scp:system:test".parse().unwrap();
-    let did_scoped: CapabilityUri = "did:dht:z6Mk123:capability:test/v1".parse().unwrap();
+    let scoped: CapabilityUri =
+        "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:test/v1"
+            .parse()
+            .unwrap();
 
     // Same name, different versions are not equal.
     assert_ne!(v1, v2);
 
     // Different variant types are not equal even with same name.
     assert_ne!(v1, system);
-    assert_ne!(v1, did_scoped);
+    assert_ne!(v1, scoped);
 
     // Clone equality.
     assert_eq!(v1, v1.clone());
