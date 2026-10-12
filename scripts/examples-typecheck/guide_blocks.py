@@ -21,10 +21,13 @@ checked.
 
 A fence opens on a line whose first non-blank characters are three or more
 backticks or three or more tildes, at any indentation, and closes on a line holding
-only a run of the same character at least as long as the opener's run.
+only a run of the same character at least as long as the opener's run. A fence run
+that follows a blockquote `>` or a list marker (`-`, `*`, `+`, `1.`, `1)`) on its
+own line is a fence inside a container, which this parser does not read.
 
 Exit 1 when a guide has no `**Status:**` line, a fence never closes, a line opens
-with three or more backticks but carries a backtick in its info string, a marker has
+with three or more backticks but carries a backtick in its info string, a fence run
+follows a blockquote or list marker, a marker has
 no reason, or a marker does not sit directly above the opening fence of a Python
 or TypeScript block. The gate then stops before it type-checks anything.
 """
@@ -37,6 +40,7 @@ from pathlib import Path
 
 CHECKED = {"python": "py", "py": "py", "typescript": "ts", "ts": "ts"}
 FENCE = re.compile(r"^(?P<indent>[ \t]*)(?P<run>`{3,}|~{3,})(?P<info>.*)$")
+CONTAINED = re.compile(r"^[ \t]*(?:(?:>|[-*+]|\d{1,9}[.)])[ \t]*)+(?:`{3,}|~{3,})")
 MARKER_PREFIX = "<!-- examples-typecheck:"
 MARKER = re.compile(r"^<!-- examples-typecheck: skip: (?P<reason>.*?) -->$")
 STATUS = re.compile(r"^\*\*Status:\*\*\s*(?P<status>.*)$")
@@ -46,9 +50,14 @@ def opener(line: str) -> tuple[str, str, str] | None:
     """Return (indent, fence run, info string) when LINE opens a fence, else None.
 
     Raise ValueError for a line that starts with a backtick run of three or more but
-    is not a fence, because its info string holds a backtick; such a line is
-    neither prose nor a block the gate can classify.
+    is not a fence, because its info string holds a backtick, and for a fence run
+    after a blockquote or list marker; the gate can classify neither line.
     """
+    if CONTAINED.match(line):
+        raise ValueError(
+            "a fence after a blockquote or list marker is not read by this gate; "
+            "move the block out of the blockquote or onto its own indented line"
+        )
     match = FENCE.match(line)
     if match is None:
         return None

@@ -4,7 +4,7 @@
 # THE CRITERION: the gate exits 1 when a Python or TypeScript block of a live guide under
 # `.docs/migration/` fails to type-check against the SDK source in this tree, when a guide
 # has no `**Status:**` line, when a fence never closes, when a backtick fence's info string
-# holds a backtick, when a skip marker has no reason or
+# holds a backtick, when a fence run follows a blockquote or list marker, when a skip marker has no reason or
 # does not sit directly above a Python or TypeScript fence, or when no guide exists; and it
 # exits 0 when every block it checks type-checks, printing one line for every block it
 # skipped, every block in a language it does not check, and every guide that is not live.
@@ -22,7 +22,9 @@
 # `unclosed`. Dropping the empty-guide-list rule does so on `noguide`. Matching only a bare
 # ```lang opener, or closing on any bare ``` line, makes the gate exit 0 on a `fence_*` case
 # or fail `fenceforms`; reading a backtick line with a backtick in its info string as prose
-# makes it exit 0 on `backtickinfo`. Type-checking a guide
+# makes it exit 0 on `backtickinfo`; reading a fence after `>` or a list marker as prose
+# makes it exit 0 on a `contained_*` case, and rejecting a plain `>` or list line fails
+# `fenceforms`. Type-checking a guide
 # that is not live, or a skipped block, makes the gate exit 1 on `pass`, whose not-live guide
 # and skipped blocks call removed API; and silencing the SKIP, NOT CHECKED or GUIDE NOT LIVE
 # lines fails `pass` on its output assertions.
@@ -259,6 +261,10 @@ c: str = """
        ```ts
        export const d: number = 4;
        ```
+
+> A quoted note with `code`.
+
+- A list item with ``inline`` code.
 EOF
 commit "$repo"
 run_case fenceforms "$repo" 0 \
@@ -294,6 +300,22 @@ printf '%s\n```py`x\nx: int = 1\n```\n' "$LIVE" > "$repo/.docs/migration/guide.m
 commit "$repo"
 run_case backtickinfo "$repo" 1 \
     "FAIL: .docs/migration/guide.md:5: a backtick fence's info string may not hold a backtick"
+
+# contained_FORM: a Python fence after a blockquote or list marker, around a block that
+# assigns a str to an int, is rejected in place of being read as prose.
+contained_case() {
+    local name=$1 prefix=$2 repo
+    repo=$(new_repo "$name")
+    printf '%s\n%s```python\n%sx: int = "s"\n%s```\n' "$LIVE" "$prefix" "$prefix" "$prefix" \
+        > "$repo/.docs/migration/guide.md"
+    commit "$repo"
+    run_case "$name" "$repo" 1 \
+        "FAIL: .docs/migration/guide.md:5: a fence after a blockquote or list marker is not read by this gate"
+}
+contained_case contained_blockquote '> '
+contained_case contained_nestedquote '> > '
+contained_case contained_bullet '- '
+contained_case contained_ordered '1. '
 
 # noguide: no guide under .docs/migration/.
 repo=$(new_repo noguide)
