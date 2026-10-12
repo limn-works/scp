@@ -403,6 +403,7 @@ fn stand_up_two_party_blocking(ctx_str: &str, alice_did: &str, bob_did: &str) ->
                 &bob_custody,
                 &request.wrapping_key_handle,
                 &ctx_id_hex,
+                alice_did,
                 &response,
             )
             .await

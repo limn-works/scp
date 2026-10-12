@@ -179,6 +179,20 @@ impl SupervisorHandle {
             .map_err(ContextError::from)
     }
 
+    /// Read a per-sender epoch floor from the authoritative registry without
+    /// advancing it (absent reads as `0`). See [`Supervisor::sender_epoch_floor`].
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub(in crate::context) fn sender_epoch_floor(
+        &self,
+        ctx: &[u8; 32],
+        did: &str,
+    ) -> Result<u64, ContextError> {
+        Ok(self.upgrade()?.sender_epoch_floor(ctx, did))
+    }
+
     /// Advance a per-sender receive-sequence floor in the authoritative registry,
     /// FAIL-CLOSED. See [`Supervisor::check_and_advance_recv_sequence`].
     ///

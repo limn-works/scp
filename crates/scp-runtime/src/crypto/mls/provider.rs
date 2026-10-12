@@ -786,47 +786,92 @@ impl NodeMlsFactory {
     // was DELETED with the `contexts` map. The steady-state PUSH lives on the
     // actor (`PerContextState::distribute_sender_key`); tests drive it there.
 
-    /// Opens a sender's [`SenderKeyResponse`] given the KEM Diffie-Hellman
-    /// output `dh`, computed in custody by the owning identity's wrapping key
-    /// for the response's `enc`, and that key's public point `pk_rm`. Returns
-    /// the AUTHENTICATED `(sender_key, epoch)`.
+    /// Opens an incoming [`SenderKeyResponse`] through the owning identity's
+    /// wrapping key, returning the AUTHENTICATED `(sender_key, epoch)`. The one
+    /// receive-side open in the runtime: the `decrypt_and_dispatch` `KeyResponse`
+    /// arm calls it, and so does every test that opens a response.
     ///
-    /// ADR-049 PR-6: it does NOT install the key or enforce any epoch floor —
-    /// the caller (the `decrypt_and_dispatch` messaging seam) gates the
-    /// returned `epoch` against the authoritative Class-M floor registry and
-    /// then installs the key (gate-before-install = fail-safe).
+    /// Order, each step before the next:
+    /// 1. the response names `mls_sender`, the sender the MLS layer
+    ///    authenticated ([`check_response_sender`]);
+    /// 2. its public `epoch` lies in the window above `sender_epoch_floor`
+    ///    ([`admit_sender_epoch`] with
+    ///    [`MAX_EPOCH_ADVANCE`](scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE));
+    /// 3. `enc` is the point validated at decode (spec 09 §9.16.2 Open step 1);
+    /// 4. the wrapping key agrees in custody (Open step 2);
+    /// 5. HPKE opens (Open step 3).
+    ///
+    /// Steps 1 and 2 read public fields only, so a response that cannot be
+    /// accepted never reaches custody. The function installs nothing and
+    /// advances no floor: the caller advances the Class-M floor with
+    /// `check_and_advance_sender_epoch` after the open and before the install
+    /// (gate-before-install), which re-checks the window under the entry guard.
+    ///
+    /// [`check_response_sender`]: crate::crypto::sender_keys::key_protocol::check_response_sender
+    /// [`admit_sender_epoch`]: crate::context::supervisor::admit_sender_epoch
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::CryptoFailed`] if the HPKE open fails or the
-    /// response's sender DID is not `sender_did`.
-    pub fn finish_incoming_sender_key(
+    /// [`ContextError::CryptoFailed`] if the response names another sender,
+    /// its epoch is at or below the floor or beyond the ceiling, or the HPKE
+    /// open fails; [`ContextError::Custody`] if the custody agreement fails or
+    /// times out.
+    pub(crate) async fn open_incoming_sender_key(
+        wrapping: &crate::crypto::wrapping::IdentityWrappingKey,
         context_id: &[u8; 32],
-        sender_did: &str,
+        mls_sender: &str,
         response: &SenderKeyResponse,
-        dh: &Zeroizing<[u8; 32]>,
-        pk_rm: &[u8; 65],
+        sender_epoch_floor: u64,
     ) -> Result<(SenderKey, u64), ContextError> {
+        crate::crypto::sender_keys::key_protocol::check_response_sender(mls_sender, response)
+            .map_err(|e| ContextError::CryptoFailed(format!("sender key distribution: {e}")))?;
+        crate::context::supervisor::admit_sender_epoch(
+            mls_sender,
+            sender_epoch_floor,
+            response.epoch,
+            scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+        )?;
+        let enc = scp_protocol::crypto::hpke::p256::ValidatedEnc::from(response.ephemeral_pubkey);
+        let dh = wrapping.agree(&enc).await?;
         let sender_key =
             crate::crypto::sender_keys::key_protocol::open_sender_key_response_with_dh(
-                dh,
-                pk_rm,
+                &dh,
+                wrapping.public(),
                 &hex::encode(context_id),
                 response,
             )
             .map_err(|e| ContextError::CryptoFailed(format!("HPKE open failed: {e}")))?;
-
-        // Verify the sender DID matches the claimed sender. This is
-        // AUTHENTICATION (the HPKE tag + DID binding), NOT floor gating, so it
-        // stays here. Epoch monotonicity and the epoch-poisoning ceiling belong
-        // to the Class-M floor registry, gated at the messaging seam before the
-        // caller installs this key.
-        if response.sender_did != sender_did {
-            return Err(ContextError::CryptoFailed(
-                "sender DID mismatch in sender key distribution".into(),
-            ));
-        }
         Ok((sender_key, response.epoch))
+    }
+
+    /// Decodes a `SenderKeyDistributionMessage::KeyResponse` and opens it
+    /// through [`Self::open_incoming_sender_key`] against an empty floor, the
+    /// way a receiver with no recorded epoch for `mls_sender` does. Test
+    /// fixtures that drive an actor's queued distributions by hand use it.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] if the bytes are not a `KeyResponse`, and
+    /// every error of [`Self::open_incoming_sender_key`].
+    #[cfg(test)]
+    pub(crate) async fn open_incoming_sender_key_bytes(
+        wrapping: &crate::crypto::wrapping::IdentityWrappingKey,
+        context_id: &[u8; 32],
+        mls_sender: &str,
+        message_bytes: &[u8],
+    ) -> Result<(SenderKey, u64), ContextError> {
+        let msg = scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::from_bytes(
+            message_bytes,
+        )
+        .map_err(|e| ContextError::CryptoFailed(format!("deserialization failed: {e}")))?;
+        let scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(response) =
+            msg
+        else {
+            return Err(ContextError::CryptoFailed(
+                "expected SenderKeyDistributionMessage::KeyResponse".to_string(),
+            ));
+        };
+        Self::open_incoming_sender_key(wrapping, context_id, mls_sender, &response, 0).await
     }
 
     // #2148 (ADR-049 birth-into-actor): the provider-fixture pull/answer copies
@@ -1096,7 +1141,7 @@ mod tests {
     // `add_member`, `take_crypto_state`, `build_restored_owned`, `with_context`,
     // `destroy_*`, `validate_key_package`) plus the
     // receive-side primitives (`distribute_sender_key`,
-    // `finish_incoming_sender_key`, `set_sender_key_unchecked`,
+    // `open_incoming_sender_key`, `set_sender_key_unchecked`,
     // `store_member_sender_key`). The helpers below drive the relocated actor
     // seam so this module's coverage of the snapshot format, the one-way take,
     // and the retained per-context restore reader survives the move. Byte-parity
@@ -1590,67 +1635,103 @@ mod tests {
         assert!(actor.drain_pending_sender_key_messages().is_err());
     }
 
-    #[tokio::test]
-    async fn finish_incoming_sender_key_rejects_wrong_sender() {
-        // `finish_incoming_sender_key` is a node-level HPKE-open +
-        // authentication check over a Diffie-Hellman output computed in
-        // custody — it needs no per-context group resident.
-        let ctx_id = make_context_id();
-
-        let ctx_hex = hex::encode(ctx_id);
-        let bob_wrapping = crate::crypto::wrapping::test_wrapping_key(&Arc::new(
-            scp_platform::testing::InMemoryKeyCustody::new(),
-        ))
-        .await
-        .unwrap();
-        let bob_wrapping_pk =
-            scp_protocol::crypto::hpke::p256::P256Point::try_from(*bob_wrapping.public()).unwrap();
+    /// A response from `TEST_DID` at `epoch`, sealed to `wrapping`'s public key.
+    fn sealed_response(
+        wrapping: &crate::crypto::wrapping::IdentityWrappingKey,
+        ctx_id: &[u8; 32],
+        epoch: u64,
+    ) -> SenderKeyResponse {
+        let wrapping_pk =
+            scp_protocol::crypto::hpke::p256::P256Point::try_from(*wrapping.public()).unwrap();
         let (sealed_vec, ephemeral_pub) =
             crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
                 &[42u8; 32],
-                &bob_wrapping_pk,
-                &ctx_hex,
+                &wrapping_pk,
+                &hex::encode(ctx_id),
                 TEST_DID,
-                0,
+                epoch,
             )
             .unwrap();
-        let sealed: [u8; 48] = sealed_vec.try_into().unwrap();
-
-        let response = SenderKeyResponse {
+        SenderKeyResponse {
             sender_did: TEST_DID.to_string(),
-            epoch: 0,
-            hpke_sealed_key: sealed,
+            epoch,
+            hpke_sealed_key: sealed_vec.try_into().unwrap(),
             ephemeral_pubkey: ephemeral_pub,
             request_nonce: [0u8; 16],
-        };
-        let dh = bob_wrapping
-            .agree(&scp_protocol::crypto::hpke::p256::ValidatedEnc::from(
-                response.ephemeral_pubkey,
-            ))
+        }
+    }
+
+    /// The chokepoint refuses a response from its public fields alone, with no
+    /// custody `dh_agree`, when it names another sender, carries an epoch at
+    /// or below the floor, or one beyond the ceiling. The same response opens
+    /// for its real sender above the floor with exactly one `dh_agree`
+    /// (positive control), so each refusal is the public check and not a
+    /// failed open.
+    #[tokio::test]
+    async fn open_incoming_sender_key_checks_public_fields_before_custody() {
+        use scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE;
+
+        let ctx_id = make_context_id();
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let wrapping = crate::crypto::wrapping::test_wrapping_key(&custody)
             .await
             .unwrap();
+        let response = sealed_response(&wrapping, &ctx_id, 3);
 
-        // Positive control: the same response opens for its real sender, so
-        // the rejection below is the DID check and not a failed open.
-        NodeMlsFactory::finish_incoming_sender_key(
-            &ctx_id,
-            TEST_DID,
-            &response,
-            &dh,
-            bob_wrapping.public(),
-        )
-        .expect("the response opens for its real sender");
-
-        let result = NodeMlsFactory::finish_incoming_sender_key(
+        let wrong_sender = NodeMlsFactory::open_incoming_sender_key(
+            &wrapping,
             &ctx_id,
             "did:dht:z6MkCharlie",
             &response,
-            &dh,
-            bob_wrapping.public(),
-        );
+            0,
+        )
+        .await;
         assert!(
-            matches!(result, Err(ContextError::CryptoFailed(ref m)) if m.contains("sender DID mismatch")),
-            "should reject when sender_did doesn't match transport sender: {result:?}"
+            matches!(&wrong_sender, Err(ContextError::CryptoFailed(m)) if m.contains("sender DID mismatch")),
+            "a response naming another sender is refused: {wrong_sender:?}"
+        );
+        assert_eq!(custody.dh_calls(), 0, "no dh_agree for a wrong sender");
+
+        for floor in [3, 4] {
+            let stale = NodeMlsFactory::open_incoming_sender_key(
+                &wrapping, &ctx_id, TEST_DID, &response, floor,
+            )
+            .await;
+            assert!(
+                matches!(&stale, Err(ContextError::CryptoFailed(_))),
+                "epoch 3 at floor {floor} is refused: {stale:?}"
+            );
+        }
+        assert_eq!(
+            custody.dh_calls(),
+            0,
+            "no dh_agree for an epoch at or below the floor"
+        );
+
+        let overshoot = sealed_response(&wrapping, &ctx_id, MAX_EPOCH_ADVANCE + 1);
+        let refused =
+            NodeMlsFactory::open_incoming_sender_key(&wrapping, &ctx_id, TEST_DID, &overshoot, 0)
+                .await;
+        assert!(
+            matches!(&refused, Err(ContextError::CryptoFailed(_))),
+            "an epoch beyond the ceiling is refused: {refused:?}"
+        );
+        assert_eq!(
+            custody.dh_calls(),
+            0,
+            "no dh_agree for an epoch beyond the ceiling"
+        );
+
+        let (key, epoch) =
+            NodeMlsFactory::open_incoming_sender_key(&wrapping, &ctx_id, TEST_DID, &response, 2)
+                .await
+                .expect("the response opens for its real sender above the floor");
+        assert_eq!(epoch, 3);
+        assert_eq!(key.as_bytes(), &[42u8; 32]);
+        assert_eq!(
+            custody.dh_calls(),
+            1,
+            "exactly one dh_agree for an admissible response"
         );
     }
 

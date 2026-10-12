@@ -119,6 +119,9 @@
 // accessors, keeping the registry internal (nothing outside the supervisor
 // module names it directly).
 mod floors;
+// The sender-key epoch window rule, shared with the KeyResponse receive
+// path's read-only pre-check (`NodeMlsFactory::open_incoming_sender_key`).
+pub(crate) use floors::admit_sender_epoch;
 pub mod handle;
 pub(in crate::context) mod identity_capability;
 pub mod key_package_actor;

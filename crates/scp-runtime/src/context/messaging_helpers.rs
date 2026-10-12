@@ -3122,8 +3122,9 @@ pub(super) async fn decrypt_and_dispatch(
     // field-granular Class-C `&mut ContextCryptoState` (driven from
     // `deliver_incoming`'s `ClassCMut` view) — byte-identical to the deleted
     // provider `open` twin (the 16 golden tests hold). A KeyResponse opens
-    // through the owning identity's wrapping key in custody (`dh_agree`) and
-    // `NodeMlsFactory::finish_incoming_sender_key`; the sender-key INSTALL,
+    // through `NodeMlsFactory::open_incoming_sender_key` (public sender and
+    // epoch checks, then the owning identity's wrapping key in custody); the
+    // sender-key INSTALL,
     // however, now writes to the ACTOR-owned `cs.sender_key_store.set_unchecked`
     // (the provider store is empty on a taken context — see the KeyResponse arm
     // below), and `local_did` is likewise retained. A `None` crypto
@@ -3240,32 +3241,34 @@ pub(super) async fn decrypt_and_dispatch(
                     response,
                 ) => {
                     // ADR-049 PR-6 GATE-BEFORE-INSTALL + PR-7 install-onto-ACTOR
-                    // fix. The owning identity's wrapping key computes the KEM
-                    // Diffie-Hellman in custody (spec 09 §9.16.1; with no key
-                    // loaded it fails closed, and a custody failure or timeout
-                    // surfaces as `ContextError::Custody`), then
-                    // `finish_incoming_sender_key` HPKE-opens and returns the
-                    // authenticated `(key, epoch)`; the
-                    // authoritative Class-M registry gates epoch monotonicity + the
-                    // poisoning ceiling FAIL-CLOSED BEFORE install; the install then
-                    // writes to the ACTOR's OWNED `cs.sender_key_store`. The provider
-                    // store is EMPTY on a taken (actor-owned) context, so the former
-                    // `deps.crypto.set_sender_key_unchecked` was a silent no-op — the
-                    // latent bug this fixes (D1 close, fail-safe ordering preserved).
+                    // fix. `open_incoming_sender_key` checks the response's
+                    // public sender and epoch (against the floor read here)
+                    // before any custody call, then the owning identity's
+                    // wrapping key agrees in custody (spec 09 §9.16.1; with no
+                    // key loaded it fails closed, and a custody failure or
+                    // timeout surfaces as `ContextError::Custody`) and HPKE opens
+                    // the authenticated `(key, epoch)`. The authoritative Class-M
+                    // registry then advances the floor FAIL-CLOSED (re-checking
+                    // monotonicity + the poisoning ceiling under its entry
+                    // guard) BEFORE install; the install writes to the ACTOR's
+                    // OWNED `cs.sender_key_store`. The provider store is EMPTY on
+                    // a taken (actor-owned) context, so the former
+                    // `deps.crypto.set_sender_key_unchecked` was a silent no-op —
+                    // the latent bug this fixes (D1 close, fail-safe ordering
+                    // preserved).
+                    let floor = deps
+                        .supervisor
+                        .sender_epoch_floor(context_id_bytes, &sender_did)?;
                     let wrapping = deps.supervisor.my_wrapping_key(&deps.owned_identity)?;
-                    let enc = scp_protocol::crypto::hpke::p256::ValidatedEnc::from(
-                        response.ephemeral_pubkey,
-                    );
-                    let dh = wrapping.agree(&enc).await?;
                     let (sender_key, epoch) =
-                        crate::crypto::mls::provider::NodeMlsFactory::finish_incoming_sender_key(
+                        crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key(
+                            &wrapping,
                             context_id_bytes,
                             &sender_did,
                             &response,
-                            &dh,
-                            wrapping.public(),
-                        )?;
-                    drop(dh);
+                            floor,
+                        )
+                        .await?;
                     drop(wrapping);
                     deps.supervisor.check_and_advance_sender_epoch(
                         context_id_bytes,
