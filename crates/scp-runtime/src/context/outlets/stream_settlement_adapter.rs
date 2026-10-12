@@ -509,7 +509,7 @@ mod tests {
 
     async fn deps_for(supervisor: &Arc<Supervisor>) -> ActorDeps {
         supervisor
-            .build_actor_deps(&invoker())
+            .build_actor_deps_loaded(&invoker())
             .await
             .expect("build_actor_deps")
     }

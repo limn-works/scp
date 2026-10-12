@@ -822,7 +822,7 @@ mod tests {
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         let deps = supervisor
-            .build_actor_deps(&DID("did:example:broadcast-actor".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:broadcast-actor".to_owned()))
             .await
             .expect("build_actor_deps");
         (deps, appended, recorded)

@@ -1702,7 +1702,7 @@ pub async fn create_context(
     // §9.16.1); with none loaded the creation fails closed before any group exists.
     let wrapping_public_key = *deps
         .supervisor
-        .my_wrapping_keypair(&deps.owned_identity)?
+        .my_wrapping_key(&deps.owned_identity)?
         .public();
     let (handle, created_owned_crypto) = crate::context::builder::create_context(
         context_id.clone(),
@@ -4500,7 +4500,7 @@ mod restore_reconcile_tests {
         let serving = ServingPersistence { snapshot };
         let supervisor = build_supervisor(Box::new(serving));
         let deps = supervisor
-            .build_actor_deps(&DID("did:dht:z6MkRestoreReconcile".to_owned()))
+            .build_actor_deps_loaded(&DID("did:dht:z6MkRestoreReconcile".to_owned()))
             .await
             .expect("build_actor_deps");
         let handle = ContextHandle::new(restore_ctx_id.to_owned(), ContextParams::default());
@@ -4527,7 +4527,7 @@ mod restore_reconcile_tests {
                 CapturingPersistence::default(),
             ))));
             let deps = supervisor
-                .build_actor_deps(&creator())
+                .build_actor_deps_loaded(&creator())
                 .await
                 .expect("build_actor_deps");
             if closed {
@@ -4562,7 +4562,7 @@ mod restore_reconcile_tests {
             snapshot: snapshot.clone(),
         }));
         let deps = serving
-            .build_actor_deps(&DID("did:dht:z6MkRestoreShutdown".to_owned()))
+            .build_actor_deps_loaded(&DID("did:dht:z6MkRestoreShutdown".to_owned()))
             .await
             .expect("build_actor_deps");
         let handle = ContextHandle::new(ctx_id.to_owned(), ContextParams::default());
@@ -4606,7 +4606,7 @@ mod restore_reconcile_tests {
             // The deps are built before shutdown, as an import already past
             // `build_actor_deps` holds them when shutdown begins.
             let deps = supervisor
-                .build_actor_deps(&creator)
+                .build_actor_deps_loaded(&creator)
                 .await
                 .expect("build_actor_deps");
             if closed {
@@ -4644,7 +4644,7 @@ mod restore_reconcile_tests {
         };
         let creator = || DID("did:dht:z6MkDuplicateCreate".to_owned());
         let deps = supervisor
-            .build_actor_deps(&creator())
+            .build_actor_deps_loaded(&creator())
             .await
             .expect("build_actor_deps");
         lifecycle_helpers::create_context(
@@ -5044,7 +5044,7 @@ mod restore_reconcile_tests {
 
         let admin = DID("did:dht:z6MkJoinMoneyAdmin".to_owned());
         let mut deps = sup
-            .build_actor_deps(&admin)
+            .build_actor_deps_loaded(&admin)
             .await
             .expect("build_actor_deps");
 
@@ -5246,7 +5246,7 @@ mod restore_reconcile_tests {
 
         let admin = DID("did:dht:z6MkFinalizeSendAdmin".to_owned());
         let deps = sup
-            .build_actor_deps(&admin)
+            .build_actor_deps_loaded(&admin)
             .await
             .expect("build_actor_deps");
 
@@ -5419,7 +5419,7 @@ mod restore_reconcile_tests {
             mls_storage(),
         );
         let deps = sup
-            .build_actor_deps(&admin)
+            .build_actor_deps_loaded(&admin)
             .await
             .expect("build_actor_deps");
 
@@ -5628,7 +5628,7 @@ mod restore_reconcile_tests {
         let sup = build_supervisor(Box::new(FailingJoinPersistence));
         let admin = DID("did:dht:z6MkLeaveFailClosed".to_owned());
         let deps = sup
-            .build_actor_deps(&admin)
+            .build_actor_deps_loaded(&admin)
             .await
             .expect("build_actor_deps");
 
@@ -5694,7 +5694,7 @@ mod restore_reconcile_tests {
         let sup = build_supervisor(Box::new(FailingJoinPersistence));
         let admin = DID("did:dht:z6MkCloseFailClosed".to_owned());
         let deps = sup
-            .build_actor_deps(&admin)
+            .build_actor_deps_loaded(&admin)
             .await
             .expect("build_actor_deps");
 

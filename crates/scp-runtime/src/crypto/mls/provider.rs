@@ -51,7 +51,7 @@ use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::builder::ReceiveFloor;
 use scp_protocol::crypto::sender_keys::{
-    NonceDedup, SenderKey, SenderKeyDistributionMessage, SenderKeyStore, generate_sender_key,
+    NonceDedup, SenderKey, SenderKeyResponse, SenderKeyStore, generate_sender_key,
 };
 
 // ---------------------------------------------------------------------------
@@ -786,69 +786,47 @@ impl NodeMlsFactory {
     // was DELETED with the `contexts` map. The steady-state PUSH lives on the
     // actor (`PerContextState::distribute_sender_key`); tests drive it there.
 
-    /// Processes an incoming sender key distribution message from a remote
-    /// member, returning the AUTHENTICATED `(sender_key, epoch)`.
+    /// Opens a sender's [`SenderKeyResponse`] given the KEM Diffie-Hellman
+    /// output `dh`, computed in custody by the owning identity's wrapping key
+    /// for the response's `enc`, and that key's public point `pk_rm`. Returns
+    /// the AUTHENTICATED `(sender_key, epoch)`.
     ///
-    /// Deserializes the message and HPKE-opens + DID-verifies the recovered
-    /// sender key. ADR-049 PR-6: it does NOT install the key or enforce any
-    /// epoch floor — the caller (the `decrypt_and_dispatch` messaging seam)
-    /// gates the returned `epoch` against the authoritative Class-M floor
-    /// registry and then installs the key via
-    /// `set_sender_key_unchecked` (gate-before-install = fail-safe).
+    /// ADR-049 PR-6: it does NOT install the key or enforce any epoch floor —
+    /// the caller (the `decrypt_and_dispatch` messaging seam) gates the
+    /// returned `epoch` against the authoritative Class-M floor registry and
+    /// then installs the key (gate-before-install = fail-safe).
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::CryptoFailed`] if deserialization, HPKE
-    /// decryption, or the sender-DID authentication check fails.
-    pub fn process_incoming_sender_key(
-        &self,
+    /// Returns [`ContextError::CryptoFailed`] if the HPKE open fails or the
+    /// response's sender DID is not `sender_did`.
+    pub fn finish_incoming_sender_key(
         context_id: &[u8; 32],
         sender_did: &str,
-        message_bytes: &[u8],
-        wrapping_secret_key: &[u8; 32],
+        response: &SenderKeyResponse,
+        dh: &Zeroizing<[u8; 32]>,
+        pk_rm: &[u8; 65],
     ) -> Result<(SenderKey, u64), ContextError> {
-        let ctx_id_hex = hex::encode(context_id);
+        let sender_key =
+            crate::crypto::sender_keys::key_protocol::open_sender_key_response_with_dh(
+                dh,
+                pk_rm,
+                &hex::encode(context_id),
+                response,
+            )
+            .map_err(|e| ContextError::CryptoFailed(format!("HPKE open failed: {e}")))?;
 
-        // Deserialize the distribution message.
-        let msg = SenderKeyDistributionMessage::from_bytes(message_bytes)
-            .map_err(|e| ContextError::CryptoFailed(format!("deserialization failed: {e}")))?;
-
-        match msg {
-            SenderKeyDistributionMessage::KeyResponse(response) => {
-                let sender_key = crate::crypto::sender_keys::key_protocol::hpke_open_sender_key(
-                    &response.hpke_sealed_key,
-                    &response.ephemeral_pubkey,
-                    wrapping_secret_key,
-                    &ctx_id_hex,
-                    &response.sender_did,
-                    response.epoch,
-                )
-                .map_err(|e| ContextError::CryptoFailed(format!("HPKE open failed: {e}")))?;
-
-                // Verify the sender DID matches the claimed sender. This is
-                // AUTHENTICATION (the HPKE tag + DID binding), NOT floor gating,
-                // so it stays here.
-                if response.sender_did != sender_did {
-                    return Err(ContextError::CryptoFailed(
-                        "sender DID mismatch in sender key distribution".into(),
-                    ));
-                }
-
-                // ADR-049 PR-6 (read-authority switch): epoch monotonicity
-                // (#1608) + the epoch-poisoning ceiling are NO LONGER enforced
-                // here. They are now the sole responsibility of the authoritative
-                // Class-M floor registry, gated fail-closed at the messaging seam
-                // (`decrypt_and_dispatch`) BEFORE the caller installs this key via
-                // [`Self::set_sender_key_unchecked`] (gate-before-install =
-                // fail-safe). Return the AUTHENTICATED key and its claimed epoch
-                // for the caller to gate + install; this method no longer touches
-                // the sender-key store.
-                Ok((sender_key, response.epoch))
-            }
-            _ => Err(ContextError::CryptoFailed(
-                "expected SenderKeyDistributionMessage::KeyResponse".to_string(),
-            )),
+        // Verify the sender DID matches the claimed sender. This is
+        // AUTHENTICATION (the HPKE tag + DID binding), NOT floor gating, so it
+        // stays here. Epoch monotonicity and the epoch-poisoning ceiling belong
+        // to the Class-M floor registry, gated at the messaging seam before the
+        // caller installs this key.
+        if response.sender_did != sender_did {
+            return Err(ContextError::CryptoFailed(
+                "sender DID mismatch in sender key distribution".into(),
+            ));
         }
+        Ok((sender_key, response.epoch))
     }
 
     // #2148 (ADR-049 birth-into-actor): the provider-fixture pull/answer copies
@@ -1082,7 +1060,6 @@ impl NodeMlsFactory {
 )]
 mod tests {
     use super::*;
-    use crate::crypto::wrapping::WrappingKeyPair;
     use scp_clock::{SystemClock, TestClock};
     use scp_mls::group::generate_key_package;
     use tls_codec::Serialize as TlsSerializeTrait;
@@ -1094,6 +1071,14 @@ mod tests {
     /// the crypto layer directly without the full envelope pipeline.
     fn make_provider() -> NodeMlsFactory {
         NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock))
+    }
+
+    /// Some valid wrapping public point, for tests that publish a wrapping key
+    /// but never open with it.
+    fn wrapping_public() -> [u8; 65] {
+        *scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+            .0
+            .as_bytes()
     }
 
     fn make_context_id() -> [u8; 32] {
@@ -1111,7 +1096,7 @@ mod tests {
     // `add_member`, `take_crypto_state`, `build_restored_owned`, `with_context`,
     // `destroy_*`, `validate_key_package`) plus the
     // receive-side primitives (`distribute_sender_key`,
-    // `process_incoming_sender_key`, `set_sender_key_unchecked`,
+    // `finish_incoming_sender_key`, `set_sender_key_unchecked`,
     // `store_member_sender_key`). The helpers below drive the relocated actor
     // seam so this module's coverage of the snapshot format, the one-way take,
     // and the retained per-context restore reader survives the move. Byte-parity
@@ -1134,7 +1119,7 @@ mod tests {
     /// binds its OWN `ctx_str` in the AEAD AAD, independent of the group's
     /// committed extension, so a bare group exercises those seams identically.
     fn take_into_actor(provider: &NodeMlsFactory, ctx: &[u8; 32]) -> PerContextState {
-        take_into_actor_with(provider, ctx, WrappingKeyPair::generate().public())
+        take_into_actor_with(provider, ctx, &wrapping_public())
     }
 
     /// [`take_into_actor`] with the wrapping public key the own leaf publishes
@@ -1491,9 +1476,8 @@ mod tests {
 
         // Epoch advance moved onto `PerContextState::advance_epoch`, which sources
         // the node-resident wrapping public key as a parameter.
-        let wrapping = WrappingKeyPair::generate();
         let mut actor = take_into_actor(&provider, &ctx_id);
-        let output = actor.advance_epoch(*wrapping.public(), &SystemClock);
+        let output = actor.advance_epoch(wrapping_public(), &SystemClock);
         assert!(output.is_ok(), "advance_epoch failed: {output:?}");
         let output = output.unwrap();
         assert!(
@@ -1569,8 +1553,8 @@ mod tests {
         // node-resident wrapping public key in its own leaf node.
         let provider = make_provider();
         let ctx_id = make_context_id();
-        let wrapping = WrappingKeyPair::generate();
-        let actor = take_into_actor_with(&provider, &ctx_id, wrapping.public());
+        let wrapping = wrapping_public();
+        let actor = take_into_actor_with(&provider, &ctx_id, &wrapping);
 
         let group = actor_crypto(&actor)
             .mls_group
@@ -1579,7 +1563,7 @@ mod tests {
         let extracted = scp_mls::wrapping_extension::extract_own_wrapping_key(group).unwrap();
         assert_eq!(
             extracted.map(|key| *key.as_bytes()),
-            Some(*wrapping.public()),
+            Some(wrapping),
             "own leaf node must contain the wrapping public key it was born with"
         );
     }
@@ -1606,21 +1590,19 @@ mod tests {
         assert!(actor.drain_pending_sender_key_messages().is_err());
     }
 
-    #[test]
-    fn process_incoming_sender_key_rejects_wrong_sender() {
-        use scp_protocol::crypto::sender_keys::SenderKeyResponse;
-
-        // #2148: `process_incoming_sender_key` is a node-level HPKE-open +
-        // authentication check that reads only the provider's node-resident
-        // wrapping keypair — it needs no per-context group resident.
-        let bob_provider = NodeMlsFactory::new(
-            "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string(),
-            Arc::new(SystemClock),
-        );
+    #[tokio::test]
+    async fn finish_incoming_sender_key_rejects_wrong_sender() {
+        // `finish_incoming_sender_key` is a node-level HPKE-open +
+        // authentication check over a Diffie-Hellman output computed in
+        // custody — it needs no per-context group resident.
         let ctx_id = make_context_id();
 
         let ctx_hex = hex::encode(ctx_id);
-        let bob_wrapping = WrappingKeyPair::generate();
+        let bob_wrapping = crate::crypto::wrapping::test_wrapping_key(&Arc::new(
+            scp_platform::testing::InMemoryKeyCustody::new(),
+        ))
+        .await
+        .unwrap();
         let bob_wrapping_pk =
             scp_protocol::crypto::hpke::p256::P256Point::try_from(*bob_wrapping.public()).unwrap();
         let (sealed_vec, ephemeral_pub) =
@@ -1641,18 +1623,34 @@ mod tests {
             ephemeral_pubkey: ephemeral_pub,
             request_nonce: [0u8; 16],
         };
-        let msg = SenderKeyDistributionMessage::KeyResponse(response);
-        let serialized = msg.to_bytes().unwrap();
+        let dh = bob_wrapping
+            .agree(&scp_protocol::crypto::hpke::p256::ValidatedEnc::from(
+                response.ephemeral_pubkey,
+            ))
+            .await
+            .unwrap();
 
-        let result = bob_provider.process_incoming_sender_key(
+        // Positive control: the same response opens for its real sender, so
+        // the rejection below is the DID check and not a failed open.
+        NodeMlsFactory::finish_incoming_sender_key(
+            &ctx_id,
+            TEST_DID,
+            &response,
+            &dh,
+            bob_wrapping.public(),
+        )
+        .expect("the response opens for its real sender");
+
+        let result = NodeMlsFactory::finish_incoming_sender_key(
             &ctx_id,
             "did:dht:z6MkCharlie",
-            &serialized,
-            bob_wrapping.secret(),
+            &response,
+            &dh,
+            bob_wrapping.public(),
         );
         assert!(
-            result.is_err(),
-            "should reject when sender_did doesn't match transport sender"
+            matches!(result, Err(ContextError::CryptoFailed(ref m)) if m.contains("sender DID mismatch")),
+            "should reject when sender_did doesn't match transport sender: {result:?}"
         );
     }
 
@@ -3034,7 +3032,7 @@ mod tests {
         let ctx_ext = provider_context_extension("ctx:provider-write");
 
         let owned = provider
-            .create_mls_group_with_context(&ctx_ext, WrappingKeyPair::generate().public())
+            .create_mls_group_with_context(&ctx_ext, &wrapping_public())
             .expect("birth owned context group");
 
         let read_back = owned

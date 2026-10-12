@@ -1422,7 +1422,9 @@ mod tests {
             &TestEventLog,
             ContextCreator {
                 did: TEST_DID,
-                wrapping_public_key: crate::crypto::wrapping::WrappingKeyPair::generate().public(),
+                wrapping_public_key: scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                    .0
+                    .as_bytes(),
             },
             1_700_000_000,
         )
@@ -1478,7 +1480,9 @@ mod tests {
             &provider,
             ContextCreator {
                 did: TEST_DID,
-                wrapping_public_key: crate::crypto::wrapping::WrappingKeyPair::generate().public(),
+                wrapping_public_key: scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                    .0
+                    .as_bytes(),
             },
             CREATION_TS,
         )
@@ -1609,7 +1613,9 @@ mod tests {
             &provider,
             ContextCreator {
                 did: TEST_DID,
-                wrapping_public_key: crate::crypto::wrapping::WrappingKeyPair::generate().public(),
+                wrapping_public_key: scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                    .0
+                    .as_bytes(),
             },
             CREATION_TS,
         )
