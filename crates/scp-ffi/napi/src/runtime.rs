@@ -263,6 +263,15 @@ pub struct NapiBridgeInstance {
     /// `testing`. Cleared on shutdown — dropping the entries
     /// zeroizes any retained key material via the custody provider's `Drop`.
     pub(crate) identity_registry: Arc<DashMap<String, NapiIdentityEntry>>,
+    /// Test seam: once set, the supervisor's wrapping custody source answers
+    /// an identity with no custody registered on this instance from this one
+    /// in-memory custody instead of failing closed. Set only by
+    /// `serve_unregistered_wrapping_keys_from_test_custody`, for fixtures that
+    /// create contexts for DIDs they never registered; a shipped build does
+    /// not compile it.
+    #[cfg(feature = "testing")]
+    pub(crate) unregistered_identity_wrapping_custody:
+        Arc<std::sync::OnceLock<Arc<scp_platform::testing::InMemoryKeyCustody>>>,
 
     /// Protocol repository used for trust aggregation + event log persistence.
     ///
@@ -441,6 +450,8 @@ impl NapiBridgeInstance {
             next_release_generation: std::sync::atomic::AtomicU64::new(0),
             context_handles: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "testing")]
+            unregistered_identity_wrapping_custody: Arc::default(),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             durable_providers: Some(durable_providers),
             mcp_server_registry: Arc::new(DashMap::new()),
@@ -570,6 +581,8 @@ impl NapiBridgeInstance {
             next_release_generation: std::sync::atomic::AtomicU64::new(0),
             context_handles: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "testing")]
+            unregistered_identity_wrapping_custody: Arc::default(),
             protocol_repository,
             durable_providers: Some(durable_providers),
             mcp_server_registry: Arc::new(DashMap::new()),
@@ -1042,6 +1055,7 @@ pub fn init_supervisor(bi: &NapiBridgeInstance, local_did: &str) {
         persistence,
         durable,
         key_resolver_for(bi),
+        wrapping_custody_source(bi),
     );
 
     bi.core.set_supervisor(supervisor_arc);
@@ -1109,6 +1123,7 @@ fn build_supervisor_arc(
     persistence: Box<dyn ContextPersistence>,
     durable: scp_core::context::supervisor::DurableProviders,
     key_resolver: scp_core::context::governance::KeyResolver,
+    wrapping_custody: scp_core::context::supervisor::WrappingCustodySource,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
     // Enable the event broadcast channel so `subscribe_events()` yields a
     // receiver for the MCP server's resource notifications. The unused receiver
@@ -1131,7 +1146,52 @@ fn build_supervisor_arc(
         Some(event_tx),
         Some(clock),
         durable,
+        wrapping_custody,
     )
+}
+
+/// The supervisor's wrapping custody source for this bridge instance: an
+/// identity's wrapping key (spec 09 §9.16.1) lives in the custody registered
+/// for that identity. It reads the identity registry through a `Weak`, so the
+/// supervisor does not keep the registry alive, and answers `None` for an
+/// identity that is not registered, which fails the actor build closed with
+/// `WrappingKeyCustodyUnavailable`. Under `testing`, an instance on which
+/// `serve_unregistered_wrapping_keys_from_test_custody` ran answers an
+/// unregistered identity from its test custody instead.
+fn wrapping_custody_source(
+    bi: &NapiBridgeInstance,
+) -> scp_core::context::supervisor::WrappingCustodySource {
+    let registry = Arc::downgrade(&bi.identity_registry);
+    #[cfg(feature = "testing")]
+    let unregistered = Arc::downgrade(&bi.unregistered_identity_wrapping_custody);
+    Arc::new(move |owner: &scp_did::DID| {
+        let registry = registry.upgrade()?;
+        if let Some(entry) = registry.get(owner.0.as_str()) {
+            let custody: Arc<dyn scp_core::context::supervisor::WrappingCustody> = Arc::new(
+                scp_core::context::supervisor::ErasedCustody(Arc::clone(&entry.custody)),
+            );
+            return Some(custody);
+        }
+        #[cfg(feature = "testing")]
+        if let Some(test_custody) = unregistered.upgrade().and_then(|slot| slot.get().cloned()) {
+            let custody: Arc<dyn scp_core::context::supervisor::WrappingCustody> =
+                Arc::new(scp_core::context::supervisor::ErasedCustody(test_custody));
+            return Some(custody);
+        }
+        None
+    })
+}
+
+/// Test seam: serves unregistered identities' wrapping keys from one custody.
+///
+/// Every identity with no custody registered on `bi` gets its wrapping key
+/// from one in-memory custody, so a fixture can create a context for a DID it
+/// never registered. Idempotent; a registered identity still resolves to its
+/// own custody.
+#[cfg(feature = "testing")]
+pub fn serve_unregistered_wrapping_keys_from_test_custody(bi: &NapiBridgeInstance) {
+    bi.unregistered_identity_wrapping_custody
+        .get_or_init(|| Arc::new(scp_platform::testing::InMemoryKeyCustody::new()));
 }
 
 /// Selects the governance key resolver for this bridge instance.
@@ -1219,6 +1279,7 @@ pub fn init_supervisor_with_local_transport(bi: &NapiBridgeInstance, local_did: 
         persistence,
         durable,
         key_resolver_for(bi),
+        wrapping_custody_source(bi),
     );
 
     bi.core.set_supervisor(supervisor_arc);
@@ -1291,6 +1352,7 @@ pub fn init_supervisor_with_relay_transport(
         persistence,
         durable,
         key_resolver_for(bi),
+        wrapping_custody_source(bi),
     );
 
     bi.core.set_supervisor(supervisor_arc);
@@ -1398,6 +1460,9 @@ pub(crate) fn init_production_supervisor_for_test_on(bi: &NapiBridgeInstance) {
 /// fails closed.
 #[cfg(test)]
 fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str) {
+    // Test fixtures create contexts for DIDs they never register.
+    #[cfg(feature = "testing")]
+    serve_unregistered_wrapping_keys_from_test_custody(bi);
     if bi.core.has_supervisor() {
         return;
     }
@@ -1428,6 +1493,7 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
         persistence,
         durable,
         key_resolver_for(bi),
+        wrapping_custody_source(bi),
     );
 
     bi.core.set_supervisor(supervisor_arc);

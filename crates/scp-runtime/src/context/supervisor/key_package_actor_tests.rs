@@ -3756,3 +3756,52 @@ fn kp_record_encodes_like_plain_fields() {
         rmp_serde::to_vec_named(&plain).unwrap()
     );
 }
+
+/// Spec 09 §9.16.1: every KeyPackage the store actor mints on replenish
+/// publishes, in its leaf's `0xFF01` extension, the public point of the owner's
+/// wrapping key as custody holds it.
+#[tokio::test]
+async fn replenished_key_packages_carry_the_custody_wrapping_public_key() {
+    use openmls::prelude::{OpenMlsProvider as _, ProtocolVersion};
+    use scp_platform::traits::KeyCustody as _;
+    let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
+    let wrapping_key = crate::crypto::wrapping::test_wrapping_key(&custody)
+        .await
+        .expect("the wrapping key is created in custody");
+    let custody_public = custody
+        .public_key(wrapping_key.handle())
+        .await
+        .expect("custody holds the wrapping key");
+    let storage = in_memory_storage();
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        KeyPackageStoreDeps {
+            wrapping_key,
+            ..deps_with(real_backend(), Arc::clone(&storage), no_transport()).await
+        },
+    );
+    handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect("replenish succeeds");
+
+    let pooled = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("list pooled succeeds");
+    assert!(pooled.len() >= MIN_BUFFER, "the pool is filled");
+    let provider = scp_mls::InMemoryMlsProvider::default();
+    for (_ref, public_bytes) in &pooled {
+        let verified = scp_mls::wire::parse_key_package_in(public_bytes)
+            .unwrap()
+            .validate(provider.crypto(), ProtocolVersion::Mls10)
+            .unwrap();
+        let published =
+            scp_mls::wrapping_extension::extract_wrapping_key(verified.leaf_node().extensions())
+                .unwrap()
+                .expect("every minted KeyPackage publishes 0xFF01");
+        assert_eq!(published.as_bytes().as_slice(), custody_public.as_bytes());
+    }
+
+    handle.send_shutdown().await.unwrap();
+}

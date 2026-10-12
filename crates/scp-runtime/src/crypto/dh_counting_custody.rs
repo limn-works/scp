@@ -1,5 +1,6 @@
-//! Test custody that counts `dh_agree` calls, so a round-trip test can prove
-//! the access-key open path performs exactly one key agreement.
+//! Test custody that counts `dh_agree` and `generate_keypair` calls, so a
+//! round-trip test can prove the access-key open path performs exactly one key
+//! agreement, and a restart test can prove a wrapping key is generated once.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -9,11 +10,13 @@ use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
 
-/// [`InMemoryKeyCustody`] that counts [`KeyCustody::dh_agree`] calls and
-/// otherwise delegates every call unchanged.
+/// [`InMemoryKeyCustody`] that counts [`KeyCustody::dh_agree`] and
+/// [`KeyCustody::generate_keypair`] calls and otherwise delegates every call
+/// unchanged.
 pub struct DhCountingCustody {
     pub inner: InMemoryKeyCustody,
     dh_calls: AtomicUsize,
+    generate_calls: AtomicUsize,
 }
 
 impl DhCountingCustody {
@@ -21,6 +24,7 @@ impl DhCountingCustody {
         Self {
             inner: InMemoryKeyCustody::new(),
             dh_calls: AtomicUsize::new(0),
+            generate_calls: AtomicUsize::new(0),
         }
     }
 
@@ -28,10 +32,16 @@ impl DhCountingCustody {
     pub fn dh_calls(&self) -> usize {
         self.dh_calls.load(Ordering::SeqCst)
     }
+
+    /// The number of `generate_keypair` calls so far, whatever their outcome.
+    pub fn generate_calls(&self) -> usize {
+        self.generate_calls.load(Ordering::SeqCst)
+    }
 }
 
 impl KeyCustody for DhCountingCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
+        self.generate_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.generate_keypair(key_type).await
     }
 

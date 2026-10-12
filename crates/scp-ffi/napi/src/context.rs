@@ -10394,6 +10394,12 @@ mod tests {
         let ctx_id = handle.context_id.clone();
         drop(handle);
         drop(identity);
+        // The identity's custody outlives the instance, as a platform
+        // custody would: restore reopens the creator's wrapping key from it.
+        let (_, entry) = bi
+            .identity_registry
+            .remove(&did)
+            .expect("the creator is registered");
         bi.shutdown(std::time::Duration::from_secs(10))
             .await
             .expect("shutdown must release the store");
@@ -10401,6 +10407,7 @@ mod tests {
         drop(scp);
 
         let reopened = open();
+        crate::runtime::register_identity(&reopened, &did, entry);
         crate::runtime::init_supervisor(&reopened, &did);
         let restored_json = super::context_restore_all_on(&reopened)
             .await
@@ -10502,6 +10509,12 @@ mod tests {
 
         drop(handle);
         drop(identity);
+        // The identity's custody outlives the instance, as a platform
+        // custody would: restore reopens the creator's wrapping key from it.
+        let (_, entry) = bi
+            .identity_registry
+            .remove(&did)
+            .expect("the creator is registered");
         bi.shutdown(std::time::Duration::from_secs(10))
             .await
             .expect("shutdown must release the store");
@@ -10509,6 +10522,7 @@ mod tests {
         drop(scp);
 
         let reopened = Arc::new(open());
+        crate::runtime::register_identity(&reopened, &did, entry);
         crate::runtime::init_supervisor(&reopened, &did);
         // A restarted process resolves the issuer's DID document through the
         // resolver an identity call attaches; B makes no identity call.

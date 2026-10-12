@@ -273,6 +273,11 @@ pub struct DeploySiteParams<'a, C: KeyCustody> {
     /// on that handle, so snapshots, the saga journal, and the `OpenMLS` view
     /// share one backend (spec §17.6).
     pub persistence: Box<dyn scp_core::context::persistence::ContextPersistence>,
+    /// The custody that holds the node identity's wrapping key (spec 09
+    /// §9.16.1), normally `single_custody_source` over `custody`. The loopback
+    /// supervisor fails closed with `WrappingKeyCustodyUnavailable` when it
+    /// answers `None` for the node identity.
+    pub wrapping_custody: scp_core::context::supervisor::WrappingCustodySource,
     /// The static assets to publish, in deploy order.
     pub assets: &'a [Asset],
 }
@@ -415,6 +420,7 @@ where
         custody,
         durable,
         persistence,
+        wrapping_custody,
         assets,
     } = params;
 
@@ -427,6 +433,7 @@ where
         key_resolver,
         durable,
         persistence,
+        wrapping_custody,
     )
     .await?;
 
@@ -496,6 +503,7 @@ impl SelfHostDeployer {
         key_resolver: scp_core::context::governance::KeyResolver,
         durable: scp_core::context::supervisor::DurableProviders,
         persistence: Box<dyn scp_core::context::persistence::ContextPersistence>,
+        wrapping_custody: scp_core::context::supervisor::WrappingCustodySource,
     ) -> Result<Self, SelfHostError>
     where
         S: Storage + 'static,
@@ -515,6 +523,7 @@ impl SelfHostDeployer {
             key_resolver,
             durable,
             persistence,
+            wrapping_custody,
         )
         .await?;
         // Every setup failure past this point drains the Supervisor before
@@ -802,6 +811,7 @@ async fn connect_loopback_supervisor<S>(
     key_resolver: scp_core::context::governance::KeyResolver,
     durable: scp_core::context::supervisor::DurableProviders,
     persistence: Box<dyn scp_core::context::persistence::ContextPersistence>,
+    wrapping_custody: scp_core::context::supervisor::WrappingCustodySource,
 ) -> Result<Arc<scp_core::context::supervisor::Supervisor>, SelfHostError>
 where
     S: Storage + 'static,
@@ -852,6 +862,7 @@ where
         Some(event_tx),
         Some(clock),
         durable,
+        wrapping_custody,
     );
 
     supervisor.register_local_did(author_did.clone()).await;
@@ -1822,6 +1833,7 @@ where
     //    the REAL document-derived governance resolver (ADR-053 / spec §10.17). --
     let deployer = match build_host_site_deployer(
         node.as_ref(),
+        &custody,
         &storage_dir,
         &storage_key,
         &node_did,
@@ -2753,6 +2765,7 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
 /// caller can close it after [`SelfHostDeployer::shutdown`].
 async fn build_host_site_deployer<S>(
     node: &ApplicationNode<S>,
+    custody: &Arc<SqliteKeyCustody>,
     storage_dir: &Path,
     storage_key: &Zeroizing<[u8; 32]>,
     node_did: &str,
@@ -2793,6 +2806,9 @@ where
         key_resolver,
         durable,
         persistence,
+        // The node identity's wrapping key lives in the node's own custody,
+        // beside its signing keys (spec 09 §9.16.1).
+        scp_core::context::supervisor::single_custody_source(Arc::clone(custody)),
     )
     .await;
     match started {

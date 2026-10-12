@@ -1093,15 +1093,20 @@ class WrongLengthCustody(P256Custody):
         Python::with_gil(|py| PyKeyCustodyProvider::new(py, host).expect("valid provider"))
     }
 
+    /// Loads [`FAKE_PROVIDER_PY`] as the module `fake_custody`, so Python
+    /// code can subclass its hosts with `from fake_custody import ...`.
+    pub fn fake_custody_module(py: Python<'_>) -> Bound<'_, PyModule> {
+        PyModule::from_code(py, FAKE_PROVIDER_PY, c"fake_custody.py", c"fake_custody")
+            .expect("fake provider module compiles")
+    }
+
     /// [`fake_py_custody_of`], also returning the host object.
     fn fake_py_host_of(
         class: &std::ffi::CStr,
         fault: Option<&str>,
     ) -> (PyCallbackKeyCustody, Py<PyAny>) {
         Python::with_gil(|py| {
-            let module =
-                PyModule::from_code(py, FAKE_PROVIDER_PY, c"fake_custody.py", c"fake_custody")
-                    .expect("fake provider module compiles");
+            let module = fake_custody_module(py);
             let cls = module
                 .getattr(class.to_str().expect("utf-8 class name"))
                 .expect("fake provider class");
