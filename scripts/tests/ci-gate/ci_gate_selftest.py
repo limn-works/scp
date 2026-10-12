@@ -252,8 +252,9 @@ nothing:
                nothing), and every later cargo command runs under
                `ENV CARGO_NET_OFFLINE=true` or with `--offline` or `--frozen`.
                The check also reads fetch.sh for its `$GITHUB_ENV` write, and
-               runs controls that each break the rule once (fetch removed, a
-               cargo step moved before it, fetch before rust-cache, two fetches,
+               runs controls that each break the rule once (fetch removed from
+               rust-clippy, python-wheels, fuzz-nightly and the CodeQL analyze
+               job, whose Rust extractor runs cargo, a cargo step moved before it, fetch before rust-cache, two fetches,
                CARGO_NET_OFFLINE at workflow, job and step level, a step turning
                cargo back online, a `cargo install` after the fetch, a guarded
                fetch, a raw cargo job, a stale exemption, and in the Dockerfile
@@ -4640,8 +4641,13 @@ TOOLCHAIN_OR_CACHE_ACTIONS = (
     "dtolnay/rust-toolchain@",
     "Swatinem/rust-cache@",
 )
-# An action that runs cargo inside its own step.
-CARGO_RUNNING_ACTIONS = ("PyO3/maturin-action@",)
+# An action that runs cargo inside its own step. CodeQL's Rust extractor runs
+# `cargo metadata` and the build scripts while it loads the workspace.
+CARGO_RUNNING_ACTIONS = (
+    "PyO3/maturin-action@",
+    "github/codeql-action/init@",
+    "github/codeql-action/analyze@",
+)
 # The command words that resolve this workspace's dependencies through cargo.
 CARGO_FAMILY = {"cargo", "maturin", "wasm-pack"}
 # A command word in a line shlex cannot split, read anywhere on it, which errs toward
@@ -5133,7 +5139,11 @@ def check_offline_cargo(documents: list[tuple[Path, dict]]) -> None:
     reported("a job running cargo with no toolchain step and no fetch", mutated, "ci.yml",
              "ci.yml:fixture-raw-cargo: runs cargo with 0 cargo-fetch steps")
 
-    for name, job_id in (("build-matrix.yml", "python-wheels"), ("fuzz.yml", "fuzz-nightly")):
+    for name, job_id in (
+        ("build-matrix.yml", "python-wheels"),
+        ("fuzz.yml", "fuzz-nightly"),
+        ("codeql.yml", "analyze"),
+    ):
         mutated = copy.deepcopy(by_name[name])
         steps, fetch = offline_cargo_job(mutated, job_id)
         del steps[fetch]
