@@ -3,7 +3,8 @@
 Run by scripts/check-examples-typecheck.sh as
 `python3.12 guide_blocks.py OUT_DIR GUIDE...`. For each guide it reads the
 `**Status:**` line. A guide whose status begins with the word `live` has every
-fenced block whose info string is `python`, `py`, `typescript` or `ts` written to
+fenced block whose info string's first word is `python`, `py`, `typescript` or
+`ts`, in any letter case, written to
 `OUT_DIR/py/` or `OUT_DIR/ts/` as one standalone module, so the gate type-checks
 each block against the SDK source in this tree. Each written file opens with one
 blank line per guide line above the block, so a line number in a type error is
@@ -18,7 +19,12 @@ no type checker for, is printed with its guide, line and reason, so a reviewer
 reads every block the gate did not check. A missing marker means the block is
 checked.
 
-Exit 1 when a guide has no `**Status:**` line, a fence never closes, a marker has
+A fence opens on a line whose first non-blank characters are three or more
+backticks or three or more tildes, at any indentation, and closes on a line holding
+only a run of the same character at least as long as the opener's run.
+
+Exit 1 when a guide has no `**Status:**` line, a fence never closes, a line opens
+with three or more backticks but carries a backtick in its info string, a marker has
 no reason, or a marker does not sit directly above the opening fence of a Python
 or TypeScript block. The gate then stops before it type-checks anything.
 """
@@ -30,10 +36,32 @@ import sys
 from pathlib import Path
 
 CHECKED = {"python": "py", "py": "py", "typescript": "ts", "ts": "ts"}
-FENCE = re.compile(r"^ {0,3}```\s*(\S*)\s*$")
+FENCE = re.compile(r"^(?P<indent>[ \t]*)(?P<run>`{3,}|~{3,})(?P<info>.*)$")
 MARKER_PREFIX = "<!-- examples-typecheck:"
 MARKER = re.compile(r"^<!-- examples-typecheck: skip: (?P<reason>.*?) -->$")
 STATUS = re.compile(r"^\*\*Status:\*\*\s*(?P<status>.*)$")
+
+
+def opener(line: str) -> tuple[str, str, str] | None:
+    """Return (indent, fence run, info string) when LINE opens a fence, else None.
+
+    Raise ValueError for a line that starts with a backtick run of three or more but
+    is not a fence, because its info string holds a backtick; such a line is
+    neither prose nor a block the gate can classify.
+    """
+    match = FENCE.match(line)
+    if match is None:
+        return None
+    run, info = match.group("run"), match.group("info").strip()
+    if run[0] == "`" and "`" in info:
+        raise ValueError("a backtick fence's info string may not hold a backtick")
+    return match.group("indent"), run, info
+
+
+def closes(line: str, run: str) -> bool:
+    """Return True when LINE closes a fence opened by RUN."""
+    stripped = line.strip()
+    return len(stripped) >= len(run) and stripped == run[0] * len(stripped)
 
 
 def module_name(guide: str, line: int) -> str:
@@ -61,6 +89,11 @@ def extract(guide: str, text: str, out: Path, errors: list[str]) -> None:
     while i < len(lines):
         raw = lines[i]
         number = i + 1
+        try:
+            fence = opener(raw)
+        except ValueError as error:
+            errors.append(f"{guide}:{number}: {error}")
+            return
         if raw.strip().startswith(MARKER_PREFIX):
             match = MARKER.match(raw.strip())
             if match is None or not match.group("reason").strip():
@@ -71,23 +104,26 @@ def extract(guide: str, text: str, out: Path, errors: list[str]) -> None:
             else:
                 pending = (number, match.group("reason").strip())
             i += 1
-            if pending is not None and (i >= len(lines) or not FENCE.match(lines[i])):
+            if pending is not None and (
+                i >= len(lines) or FENCE.match(lines[i]) is None
+            ):
                 errors.append(
                     f"{guide}:{pending[0]}: the skip marker is not directly above an opening fence"
                 )
                 pending = None
             continue
-        fence = FENCE.match(raw)
         if fence is None:
             i += 1
             continue
-        lang = fence.group(1).lower()
-        indent = len(raw) - len(raw.lstrip(" "))
+        indent, run, info = fence
+        lang = info.split(maxsplit=1)[0].lower() if info else ""
         body: list[str] = []
         i += 1
-        while i < len(lines) and not re.match(r"^ {0,3}```\s*$", lines[i]):
+        while i < len(lines) and not closes(lines[i], run):
             body.append(
-                lines[i][indent:] if lines[i][:indent].strip() == "" else lines[i]
+                lines[i][len(indent) :]
+                if lines[i][: len(indent)].strip() == ""
+                else lines[i]
             )
             i += 1
         if i >= len(lines):

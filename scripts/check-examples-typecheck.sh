@@ -32,8 +32,8 @@
 # TypeScript compiler, it exits 1 and says what to install. The guide list comes from
 # `git ls-files` too, and the gate fails when it lists no guide, or when
 # guide_blocks.py rejects a guide: a guide with no `**Status:**` line, a fence that never
-# closes, or a skip marker with no reason or with no Python or TypeScript fence directly
-# below it.
+# closes, a line opening with three backticks that holds another backtick after them, or a
+# skip marker with no reason or with no Python or TypeScript fence directly below it.
 #
 # Setup: `pip install -r scripts/examples-typecheck/requirements.txt` (mypy, and the
 # packages the sites and guide blocks import, each pinned) and `bun install` in

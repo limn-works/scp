@@ -3,7 +3,8 @@
 #
 # THE CRITERION: the gate exits 1 when a Python or TypeScript block of a live guide under
 # `.docs/migration/` fails to type-check against the SDK source in this tree, when a guide
-# has no `**Status:**` line, when a fence never closes, when a skip marker has no reason or
+# has no `**Status:**` line, when a fence never closes, when a backtick fence's info string
+# holds a backtick, when a skip marker has no reason or
 # does not sit directly above a Python or TypeScript fence, or when no guide exists; and it
 # exits 0 when every block it checks type-checks, printing one line for every block it
 # skipped, every block in a language it does not check, and every guide that is not live.
@@ -18,7 +19,10 @@
 # on `detachedmarker`; accepting an empty reason does so on `emptyreason`; accepting a marker
 # above a Swift block does so on `markerswift`. Treating a guide with no status line as live
 # or as not live does so on `nostatus`. Dropping the unclosed-fence rule does so on
-# `unclosed`. Dropping the empty-guide-list rule does so on `noguide`. Type-checking a guide
+# `unclosed`. Dropping the empty-guide-list rule does so on `noguide`. Matching only a bare
+# ```lang opener, or closing on any bare ``` line, makes the gate exit 0 on a `fence_*` case
+# or fail `fenceforms`; reading a backtick line with a backtick in its info string as prose
+# makes it exit 0 on `backtickinfo`. Type-checking a guide
 # that is not live, or a skipped block, makes the gate exit 1 on `pass`, whose not-live guide
 # and skipped blocks call removed API; and silencing the SKIP, NOT CHECKED or GUIDE NOT LIVE
 # lines fails `pass` on its output assertions.
@@ -226,6 +230,70 @@ printf '%s\n```python\nx = 1\n' "$LIVE" > "$repo/.docs/migration/guide.md"
 commit "$repo"
 run_case unclosed "$repo" 1 \
     "FAIL: .docs/migration/guide.md:5: the fence opened here never closes"
+
+# fenceforms: CommonMark fence forms other than a bare ```lang line are parsed and checked:
+# an info string with an attribute, a tilde fence, a longer backtick run holding a shorter
+# one, a block indented under a list item, and a language written in capitals.
+repo=$(new_repo fenceforms)
+cat > "$repo/.docs/migration/guide.md" <<'EOF'
+# Fixture guide
+
+**Status:** live — fixture.
+
+```python title="a.py"
+a: int = 1
+```
+
+~~~py
+b: int = 2
+~~~
+
+````Python
+c: str = """
+```
+"""
+````
+
+1. Step:
+
+       ```ts
+       export const d: number = 4;
+       ```
+EOF
+commit "$repo"
+run_case fenceforms "$repo" 0 \
+    "CHECK .docs/migration/guide.md:5 (python) as guide_guide_L5.py" \
+    "CHECK .docs/migration/guide.md:9 (py) as guide_guide_L9.py" \
+    "CHECK .docs/migration/guide.md:13 (python) as guide_guide_L13.py" \
+    "CHECK .docs/migration/guide.md:21 (ts) as guide_guide_L21.ts" \
+    "3 Python and 1 TypeScript guide block(s), type-check against the SDK"
+
+# fence_FORM: each fence form above, around a block that assigns a str to an int, must fail
+# on that block's type error, so the parser cannot skip the form unreported.
+fence_case() {
+    local name=$1 open=$2 close=$3 line=$4 indent=${5:-}
+    local repo
+    repo=$(new_repo "$name")
+    printf '%s\n%s%s\n%sx: int = "s"\n%s%s\n' "$LIVE" "$indent" "$open" "$indent" "$indent" "$close" \
+        > "$repo/.docs/migration/guide.md"
+    commit "$repo"
+    run_case "$name" "$repo" 1 \
+        "guide_guide_L5.py:$line: error: Incompatible types in assignment" \
+        "FAIL: a site or guide block above calls SDK API that does not type-check"
+}
+fence_case fence_attributed '```python title="a.py"' '```' 6
+fence_case fence_tilde '~~~python' '~~~' 6
+fence_case fence_longrun '````python' '````' 6
+fence_case fence_listindent '```python' '```' 6 '       '
+fence_case fence_capitals '```Python' '```' 6
+
+# backtickinfo: a line that opens with a backtick run but holds a backtick in its info string
+# is not a fence; the gate rejects it in place of reading the block below it as prose.
+repo=$(new_repo backtickinfo)
+printf '%s\n```py`x\nx: int = 1\n```\n' "$LIVE" > "$repo/.docs/migration/guide.md"
+commit "$repo"
+run_case backtickinfo "$repo" 1 \
+    "FAIL: .docs/migration/guide.md:5: a backtick fence's info string may not hold a backtick"
 
 # noguide: no guide under .docs/migration/.
 repo=$(new_repo noguide)
