@@ -9,7 +9,7 @@
 
 use scp_ffi_common::error_codes as codes;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
@@ -636,4 +636,242 @@ impl TestingCallbackCustody {
         let key = testing_handle(&key_id)?;
         self.inner.destroy_key(&key).await.map_err(custody_err)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Two-instance receive seams
+// ---------------------------------------------------------------------------
+//
+// A test that needs one SCP instance to receive exactly what another sent
+// captures the sender's context payloads and delivers them to the receiver's
+// actor itself, the way a relay subscription would, without a relay.
+
+/// Records every payload a supervisor sends to a context.
+struct CapturingTransport(Arc<Mutex<Vec<Vec<u8>>>>);
+
+#[async_trait::async_trait]
+impl scp_core::context::builder::ContextTransportProvider for CapturingTransport {
+    fn is_connected(&self) -> bool {
+        true
+    }
+    async fn publish_context(
+        &self,
+        _context_id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
+        Ok(())
+    }
+    async fn delete_published(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
+        Ok(())
+    }
+    async fn send_message(
+        &self,
+        _context_id: &[u8; 32],
+        encrypted_payload: &[u8],
+    ) -> Result<(), scp_core::context::ContextError> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(encrypted_payload.to_vec());
+        Ok(())
+    }
+}
+
+/// The payloads an instance's supervisor has sent to its contexts, oldest
+/// first, from [`Scp::testing_capture_context_sends`](crate::scp::Scp::testing_capture_context_sends).
+#[napi]
+pub struct NapiContextSendCapture {
+    sent: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+#[napi]
+impl NapiContextSendCapture {
+    /// Returns every payload captured since the last call and clears them.
+    #[napi]
+    pub fn take(&self) -> Vec<Buffer> {
+        std::mem::take(
+            &mut *self
+                .sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_iter()
+        .map(Buffer::from)
+        .collect()
+    }
+}
+
+/// Per-bridge-instance implementation of [`Scp::testing_capture_context_sends`](crate::scp::Scp::testing_capture_context_sends).
+///
+/// # Errors
+///
+/// `SCP-CTX-2000` when `bi` already has a supervisor, whose transport this
+/// cannot replace.
+pub(crate) fn capture_context_sends_on(
+    bi: &NapiBridgeInstance,
+    local_did: &str,
+) -> napi::Result<NapiContextSendCapture> {
+    if bi.core.has_supervisor() {
+        return Err(napi::Error::from(ScpNapiError::Context {
+            message: "a supervisor is already attached; capture its sends before the first \
+                      context operation"
+                .to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        }));
+    }
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    crate::runtime::init_supervisor_with_transport_for_test(
+        bi,
+        local_did,
+        Box::new(CapturingTransport(Arc::clone(&sent))),
+    );
+    // A missing storage backend attaches nothing; report it here rather than
+    // at the first context call.
+    crate::runtime::supervisor(bi)?;
+    Ok(NapiContextSendCapture { sent })
+}
+
+/// Test seam: makes `memberDid`, which joined `contextId` on `joiner` from a
+/// Welcome, a receiving member there, with the access key `inviter` minted.
+///
+/// A free function rather than an `Scp` method because it takes two
+/// instances.
+///
+/// # Errors
+///
+/// A context error when either supervisor is missing, `inviter` holds no key
+/// for `memberDid`, or an actor refuses.
+#[napi(js_name = "testingAdmitJoinedMember")]
+pub async fn testing_admit_joined_member(
+    joiner: &crate::scp::Scp,
+    inviter: &crate::scp::Scp,
+    context_id: String,
+    member_did: String,
+) -> napi::Result<()> {
+    admit_joined_member_on(&joiner.inner, &inviter.inner, context_id, member_did).await
+}
+
+/// Implementation of [`testing_admit_joined_member`].
+///
+/// Makes `member_did`, which joined `context_id` from a Welcome on `bi`, a
+/// receiving member there: `bi`'s supervisor treats the DID as local, and it
+/// holds the access key `inviter`'s supervisor minted for the member. The
+/// server wiring registers a joiner as local, and access keys arrive out of
+/// band (spec 09 §9.17.2); this stands in for both, as the full-stack harness
+/// does.
+///
+/// # Errors
+///
+/// A context error when either supervisor is missing, the inviter holds no
+/// access key for `member_did`, or an actor refuses.
+pub(crate) async fn admit_joined_member_on(
+    bi: &NapiBridgeInstance,
+    inviter: &NapiBridgeInstance,
+    context_id: String,
+    member_did: String,
+) -> napi::Result<()> {
+    use scp_core::context::actor::QueriesCommand;
+    let ctx_err = |e: scp_core::context::ContextError| {
+        napi::Error::from(ScpNapiError::Context {
+            message: e.to_string(),
+            code: codes::CTX_2000.to_owned(),
+        })
+    };
+    let member_sup = Arc::clone(crate::runtime::supervisor(bi)?);
+    let inviter_sup = Arc::clone(crate::runtime::supervisor(inviter)?);
+    member_sup
+        .register_local_did(scp_did::DID(member_did.clone()))
+        .await;
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let query = QueriesCommand::GetAllAccessKeys {
+        context_id: context_id.clone(),
+        reply,
+    };
+    inviter_sup.dispatch_query(query).await.map_err(ctx_err)?;
+    let keys = rx
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("inviter's actor dropped its reply: {e}")))?
+        .map_err(ctx_err)?;
+    let key = keys.get(&member_did).cloned().ok_or_else(|| {
+        napi::Error::from(ScpNapiError::Context {
+            message: "the inviter holds no access key for this member".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })
+    })?;
+    member_sup
+        .test_install_access_key(&context_id, &member_did, key)
+        .await
+        .map_err(ctx_err)
+}
+
+/// What one [`Scp::testing_deliver_incoming`](crate::scp::Scp::testing_deliver_incoming)
+/// payload did: exactly one of `outcome` and `error` is set.
+#[napi(object)]
+pub struct NapiDeliveryResult {
+    /// `"application"`, `"heartbeat"` or `"handled"`.
+    pub outcome: Option<String>,
+    /// The decrypted plaintext when `outcome` is `"application"`.
+    pub plaintext: Option<Buffer>,
+    /// The actor's refusal, rendered.
+    pub error: Option<String>,
+}
+
+/// Per-bridge-instance implementation of [`Scp::testing_deliver_incoming`](crate::scp::Scp::testing_deliver_incoming).
+///
+/// Hands each payload, in order, to `context_id`'s actor through the
+/// production `MessagingCommand::DeliverIncoming`, the path a relay
+/// subscription takes, and awaits each reply on the runtime.
+///
+/// # Errors
+///
+/// A context error when the supervisor is missing, the actor is gone, or it
+/// drops a reply. A payload the actor refuses is a result, not an error.
+pub(crate) async fn deliver_incoming_on(
+    bi: &NapiBridgeInstance,
+    context_id: String,
+    payloads: Vec<Buffer>,
+) -> napi::Result<Vec<NapiDeliveryResult>> {
+    use scp_core::context::actor::commands::{DeliverOutcome, MessagingCommand};
+    let sup = Arc::clone(crate::runtime::supervisor(bi)?);
+    let mut results = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let deliver = MessagingCommand::DeliverIncoming {
+            context_id: context_id.clone(),
+            envelope_bytes: payload.to_vec(),
+            reply,
+        };
+        sup.dispatch_command(&context_id, deliver)
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let reply = rx
+            .await
+            .map_err(|e| napi::Error::from_reason(format!("actor dropped its reply: {e}")))?;
+        results.push(match reply {
+            Ok(DeliverOutcome::Application((plaintext, _sender))) => NapiDeliveryResult {
+                outcome: Some("application".to_owned()),
+                plaintext: Some(Buffer::from(plaintext)),
+                error: None,
+            },
+            Ok(DeliverOutcome::Heartbeat) => NapiDeliveryResult {
+                outcome: Some("heartbeat".to_owned()),
+                plaintext: None,
+                error: None,
+            },
+            Ok(DeliverOutcome::Handled) => NapiDeliveryResult {
+                outcome: Some("handled".to_owned()),
+                plaintext: None,
+                error: None,
+            },
+            Err(e) => NapiDeliveryResult {
+                outcome: None,
+                plaintext: None,
+                error: Some(e.to_string()),
+            },
+        });
+    }
+    Ok(results)
 }
