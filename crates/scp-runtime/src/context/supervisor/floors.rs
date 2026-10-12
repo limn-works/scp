@@ -270,26 +270,27 @@ impl Supervisor {
 
         // Read-current UNDER the guard (absent read as 0, matching set_checked).
         let current = floors.sender_epochs.get(did).copied().unwrap_or(0);
-        // reject-if-<= (monotonicity, #1608).
-        if epoch <= current {
-            return Err(FloorAdvanceError::SenderEpochNotMonotonic {
-                did: did.to_owned(),
-                current,
-                proposed: epoch,
-            });
-        }
-        // reject-if-overshoot (epoch-poisoning ceiling).
-        let ceiling = current.saturating_add(max_advance);
-        if epoch > ceiling {
-            return Err(FloorAdvanceError::SenderEpochOvershoot {
-                did: did.to_owned(),
-                ceiling,
-                proposed: epoch,
-            });
-        }
+        super::admit_sender_epoch(did, current, epoch, max_advance)?;
         // write UNDER the same guard.
         floors.sender_epochs.insert(did.to_owned(), epoch);
         Ok(())
+    }
+
+    /// Reads the per-sender **sender-key epoch** floor for `ctx` without
+    /// creating an entry; an absent floor reads as `0`, the value
+    /// [`Self::check_and_advance_sender_epoch`] reads.
+    ///
+    /// The `KeyResponse` receive path checks the response's public epoch
+    /// against this floor with [`admit_sender_epoch`] before any custody call,
+    /// then advances the floor with [`Self::check_and_advance_sender_epoch`]
+    /// after the open. The read and the advance are separate, so a floor that
+    /// moves between them is caught by the advance, which re-checks under the
+    /// entry guard.
+    pub(in crate::context) fn sender_epoch_floor(&self, ctx: &[u8; 32], did: &str) -> u64 {
+        self.floors
+            .get(ctx)
+            .and_then(|entry| entry.sender_epochs.get(did).copied())
+            .unwrap_or(0)
     }
 
     /// Atomically check-and-advance the per-sender **receive-sequence** floor for

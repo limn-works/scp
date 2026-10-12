@@ -694,7 +694,7 @@ mod live_supervisor_send {
 
         // Process the captured sender-key distribution: each blob is a sealed
         // management OuterEnvelope — open it, then feed the inner MLS payload to
-        // `process_incoming_sender_key` (exactly the `Management` arm of
+        // `NodeMlsFactory::open_incoming_sender_key_bytes` (exactly the `Management` arm of
         // `FullStackNode::decrypt_message`).
         for (_routing_id, blob) in bootstrap_blobs {
             match bob_actor
@@ -707,8 +707,8 @@ mod live_supervisor_send {
                 } => {
                     // ADR-049 PR-6: process returns (key, epoch) without
                     // installing; install unchecked (trusted bootstrap path).
-                    let (key, _epoch) = bob_actor
-                        .process_incoming_sender_key(&bob_wrapping, &sender_did, &payload)
+                    let (key, _epoch) = crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
+&bob_wrapping, &bob_actor.context_id, &sender_did, &payload)
                         .await
                         .expect("bob processes Alice's sender key");
                     bob_actor.set_sender_key_unchecked(&sender_did, key);

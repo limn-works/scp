@@ -2895,56 +2895,6 @@ impl PerContextState {
         Ok(std::mem::take(&mut crypto.pending_distributions))
     }
 
-    /// Processes an incoming sender-key distribution message, returning the
-    /// AUTHENTICATED `(sender_key, epoch)`, the way the `decrypt_and_dispatch`
-    /// KeyResponse arm does: `wrapping_key` (the identity's, spec 09 §9.16.1)
-    /// computes the KEM Diffie-Hellman in custody, then
-    /// [`NodeMlsFactory::finish_incoming_sender_key`] opens and authenticates.
-    /// This method installs nothing and reads no crypto state (the caller
-    /// gates + installs via [`Self::set_sender_key_unchecked`]).
-    ///
-    /// # Errors
-    ///
-    /// [`ContextError::CryptoFailed`] on deserialization, HPKE-open, or the
-    /// sender-DID authentication check; [`ContextError::Custody`] when the
-    /// custody Diffie-Hellman fails.
-    ///
-    /// [`NodeMlsFactory::finish_incoming_sender_key`]: crate::crypto::mls::provider::NodeMlsFactory::finish_incoming_sender_key
-    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures;
-    // targeted (not block-wide) so a genuinely-unwired future method still trips.
-    #[allow(dead_code)]
-    // The future copies `context_id` and holds no `&self` (the state is not
-    // `Sync`), so it is `Send`.
-    pub(crate) fn process_incoming_sender_key<'a>(
-        &self,
-        wrapping_key: &'a crate::crypto::wrapping::IdentityWrappingKey,
-        sender_did: &'a str,
-        message_bytes: &'a [u8],
-    ) -> impl std::future::Future<Output = Result<(SenderKey, u64), ContextError>> + Send + 'a {
-        let context_id = self.context_id;
-        async move {
-            let msg = SenderKeyDistributionMessage::from_bytes(message_bytes)
-                .map_err(|e| ContextError::CryptoFailed(format!("deserialization failed: {e}")))?;
-            let SenderKeyDistributionMessage::KeyResponse(response) = msg else {
-                return Err(ContextError::CryptoFailed(
-                    "expected SenderKeyDistributionMessage::KeyResponse".to_string(),
-                ));
-            };
-            let dh = wrapping_key
-                .agree(&scp_protocol::crypto::hpke::p256::ValidatedEnc::from(
-                    response.ephemeral_pubkey,
-                ))
-                .await?;
-            crate::crypto::mls::provider::NodeMlsFactory::finish_incoming_sender_key(
-                &context_id,
-                sender_did,
-                &response,
-                &dh,
-                wrapping_key.public(),
-            )
-        }
-    }
-
     /// Installs an AUTHENTICATED sender key WITHOUT epoch gating, verbatim from
     /// the former provider `set_sender_key_unchecked`. A no-op when this actor
     /// is not encrypted-mode.
@@ -4121,7 +4071,7 @@ mod tests {
 //     round-trip decrypts to the ORIGINAL `InnerEnvelope` byte-for-byte at the
 //     AAD-bound (`sender_did`, `ReceiveFloor`), at both the zero and a rotated
 //     non-zero sender-key epoch (the epoch is bound in the sender-layer AAD).
-//   * `distribute_sender_key` / `process_incoming_sender_key` — the RECOVERED
+//   * `distribute_sender_key` / `NodeMlsFactory::open_incoming_sender_key` — the RECOVERED
 //     sender key (deterministic — the existing key material) is byte-identical
 //     to Alice's actual local sender key, and installs so her seal opens.
 //   * `group_context_extension` / `local_sender_key_epoch` — DIRECT
@@ -4602,8 +4552,13 @@ mod crypto_ops_golden {
         // Deliver the rotated key to Bob (the rotate queued a distribution).
         let msgs_a = alice_a.drain_pending_sender_key_messages().unwrap();
         assert_eq!(msgs_a.len(), 1);
-        let (key_a, recv_epoch_a) = bob_recv_a
-            .process_incoming_sender_key(&bob_p, ALICE, &msgs_a[0].1)
+        let (key_a, recv_epoch_a) =
+            crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
+                &bob_p,
+                &bob_recv_a.context_id,
+                ALICE,
+                &msgs_a[0].1,
+            )
             .await
             .unwrap();
         assert_eq!(recv_epoch_a, epoch_a);
@@ -4656,8 +4611,13 @@ mod crypto_ops_golden {
         // Deliver the rotated key to Bob (the rotate queued a distribution).
         let msgs = alice_a.drain_pending_sender_key_messages().unwrap();
         assert_eq!(msgs.len(), 1);
-        let (rotated_key, recv_epoch) = bob_a
-            .process_incoming_sender_key(&bob_p, ALICE, &msgs[0].1)
+        let (rotated_key, recv_epoch) =
+            crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
+                &bob_p,
+                &bob_a.context_id,
+                ALICE,
+                &msgs[0].1,
+            )
             .await
             .unwrap();
         assert_eq!(recv_epoch, epoch);
@@ -4813,8 +4773,13 @@ mod crypto_ops_golden {
         // Recover the key via the actor receive half. The recovered key material
         // is deterministic (Alice's existing key), so it equals Alice's actual
         // local sender key byte-for-byte.
-        let (recovered_key, epoch) = bob_a
-            .process_incoming_sender_key(&bob_p, ALICE, &actor_msgs[0].1)
+        let (recovered_key, epoch) =
+            crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
+                &bob_p,
+                &bob_a.context_id,
+                ALICE,
+                &actor_msgs[0].1,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -4863,8 +4828,13 @@ mod crypto_ops_golden {
         // carries the new epoch.
         let msgs = alice_a.drain_pending_sender_key_messages().unwrap();
         assert_eq!(msgs.len(), 1, "one member (Bob) receives the rotated key");
-        let (_key, epoch) = bob_a
-            .process_incoming_sender_key(&bob_p, ALICE, &msgs[0].1)
+        let (_key, epoch) =
+            crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
+                &bob_p,
+                &bob_a.context_id,
+                ALICE,
+                &msgs[0].1,
+            )
             .await
             .unwrap();
         assert_eq!(epoch, epoch_before + 1);

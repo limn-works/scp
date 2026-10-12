@@ -26832,9 +26832,14 @@ mod tests {
         alice_actor.rotate_sender_key(ALICE).unwrap();
         alice_actor.distribute_sender_key(ALICE, ALICE).ok();
         for (_t, msg) in alice_actor.drain_pending_sender_key_messages().unwrap() {
-            if let Ok((key, _epoch)) =
-                rt.block_on(bob_actor.process_incoming_sender_key(&bob_wrapping, ALICE, &msg))
-            {
+            if let Ok((key, _epoch)) = rt.block_on(
+                crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
+                    &bob_wrapping,
+                    &bob_actor.context_id,
+                    ALICE,
+                    &msg,
+                ),
+            ) {
                 bob_actor.set_sender_key_unchecked(ALICE, key);
             }
         }
@@ -26992,6 +26997,116 @@ mod tests {
             custody.dh_calls(),
             1,
             "an application open runs no dh_agree"
+        );
+    }
+
+    /// The KeyResponse arm refuses a response from its public fields before
+    /// any custody call: one that names a sender other than its MLS sender,
+    /// and one whose epoch is at or below Bob's recorded floor for Alice. Each
+    /// delivery fails closed and Bob's custody records zero `dh_agree` calls.
+    /// `key_response_opens_through_custody_dh_agree` is the positive control:
+    /// the same delivery, unmodified and above the floor, runs one `dh_agree`.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn key_response_public_checks_run_before_custody() {
+        use scp_protocol::crypto::sender_keys::{MAX_EPOCH_ADVANCE, SenderKeyDistributionMessage};
+
+        const ALICE: &str = "did:dht:z6MkAlicePublicChkAlicePublicChkAlicePu1";
+        const BOB: &str = "did:dht:z6MkBobPublicChkBobPublicChkBobPublicChk1";
+        const MALLORY: &str = "did:dht:z6MkMalloryPublicChkMalloryPublicChkMa1";
+        let ctx_str = "e2e-key-response-public-checks";
+
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_state: mut alice_actor,
+            bob_provider: bob_crypto,
+            bob_state: mut bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let bob_key = crate::crypto::wrapping::test_wrapping_key(&custody)
+            .await
+            .expect("bob's wrapping key is created in custody");
+        let bob_sup = supervisor_with_crypto(Arc::clone(&bob_crypto));
+        bob_sup
+            .wrapping_keys
+            .insert(DID::from(BOB), Arc::clone(&bob_key));
+        let bob_deps = bob_sup
+            .build_actor_deps(&DID::from(BOB))
+            .await
+            .expect("build bob's actor deps over his loaded key");
+
+        let alice_cs = alice_actor.mode.crypto_mut().expect("encrypted context");
+        alice_cs.member_wrapping_keys.insert(
+            BOB.to_owned(),
+            scp_protocol::crypto::hpke::p256::P256Point::try_from(*bob_key.public()).unwrap(),
+        );
+        alice_actor.rotate_sender_key(ALICE).unwrap();
+        let rotated_epoch = alice_actor.local_sender_key_epoch();
+        let msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
+        assert_eq!(msgs.len(), 1, "one KeyResponse for Bob");
+        let SenderKeyDistributionMessage::KeyResponse(response) =
+            SenderKeyDistributionMessage::from_bytes(&msgs[0].1).unwrap()
+        else {
+            panic!("alice queued a KeyResponse");
+        };
+        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
+        let mut wrap = |payload: &[u8]| {
+            alice_actor
+                .mode
+                .crypto_mut()
+                .expect("encrypted context")
+                .mls_encrypt_management(payload, &routing_id, 3600)
+                .expect("alice MLS-wraps the KeyResponse")
+        };
+
+        // Alice is the MLS sender; the response names Mallory.
+        let mut forged = response.clone();
+        forged.sender_did = MALLORY.to_owned();
+        let forged_sealed = wrap(
+            &SenderKeyDistributionMessage::KeyResponse(forged)
+                .to_bytes()
+                .unwrap(),
+        );
+        // The genuine response, delivered after Bob's floor for Alice already
+        // reached its epoch.
+        let genuine_sealed = wrap(&msgs[0].1);
+
+        let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
+        let wrong_sender = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &forged_sealed,
+        )
+        .await;
+        assert!(
+            matches!(&wrong_sender, Err(ContextError::CryptoFailed(m)) if m.contains("sender DID mismatch")),
+            "a response naming another sender fails closed: {wrong_sender:?}"
+        );
+        assert_eq!(custody.dh_calls(), 0, "no dh_agree for a wrong sender");
+
+        bob_sup
+            .check_and_advance_sender_epoch(&ctx_bytes, ALICE, rotated_epoch, MAX_EPOCH_ADVANCE)
+            .expect("bob's floor for alice reaches the rotated epoch");
+        let stale = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &genuine_sealed,
+        )
+        .await;
+        assert!(
+            matches!(&stale, Err(ContextError::CryptoFailed(_))),
+            "a response at the recorded floor fails closed: {stale:?}"
+        );
+        assert_eq!(
+            custody.dh_calls(),
+            0,
+            "no dh_agree for an epoch at the floor"
         );
     }
 

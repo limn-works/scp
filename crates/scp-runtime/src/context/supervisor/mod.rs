@@ -182,3 +182,45 @@ pub use supervisor::{
     Supervisor, SupervisorConfig, WelcomeJoinRequest,
 };
 pub use transport_slot::TransportSlot;
+
+/// The sender-key epoch window: `epoch` is admitted against the recorded
+/// floor `current` when `current < epoch <= current + max_advance`.
+///
+/// The one rule both [`Supervisor::check_and_advance_sender_epoch`] (under the
+/// entry guard) and the `KeyResponse` receive path's read-only pre-check
+/// (`NodeMlsFactory::open_incoming_sender_key`, before any custody call)
+/// apply. It lives here rather than in the private `floors` module so that
+/// `pub(crate)` states its reach: in `floors` it would have to be `pub`, which
+/// `clippy::redundant_pub_crate` requires there.
+///
+/// # Errors
+///
+/// [`FloorAdvanceError::SenderEpochNotMonotonic`](floors::FloorAdvanceError::SenderEpochNotMonotonic)
+/// if `epoch <= current`;
+/// [`FloorAdvanceError::SenderEpochOvershoot`](floors::FloorAdvanceError::SenderEpochOvershoot)
+/// if `epoch` exceeds `current + max_advance`.
+pub(crate) fn admit_sender_epoch(
+    did: &str,
+    current: u64,
+    epoch: u64,
+    max_advance: u64,
+) -> Result<(), floors::FloorAdvanceError> {
+    // reject-if-<= (monotonicity, #1608).
+    if epoch <= current {
+        return Err(floors::FloorAdvanceError::SenderEpochNotMonotonic {
+            did: did.to_owned(),
+            current,
+            proposed: epoch,
+        });
+    }
+    // reject-if-overshoot (epoch-poisoning ceiling).
+    let ceiling = current.saturating_add(max_advance);
+    if epoch > ceiling {
+        return Err(floors::FloorAdvanceError::SenderEpochOvershoot {
+            did: did.to_owned(),
+            ceiling,
+            proposed: epoch,
+        });
+    }
+    Ok(())
+}
