@@ -134,6 +134,12 @@ pub mod supervisor;
 #[path = "spawn_from_welcome_tests.rs"]
 mod spawn_from_welcome_tests;
 
+#[cfg(any(test, feature = "testing"))]
+mod two_instance_seams;
+/// The capture behind the two-instance receive seams (`testing` only).
+#[cfg(any(test, feature = "testing"))]
+pub use two_instance_seams::ContextSendCapture;
+
 #[cfg(test)]
 impl supervisor::Supervisor {
     /// Registers `handle` under `context_id` with no actor task behind it, so a

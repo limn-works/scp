@@ -9044,42 +9044,6 @@ mod tests {
         });
     }
 
-    /// Records every payload a supervisor sends to a context.
-    #[cfg(feature = "testing")]
-    struct CapturingTransport(Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
-
-    #[cfg(feature = "testing")]
-    #[async_trait::async_trait]
-    impl scp_core::context::builder::ContextTransportProvider for CapturingTransport {
-        fn is_connected(&self) -> bool {
-            true
-        }
-        async fn publish_context(
-            &self,
-            _context_id: &[u8; 32],
-            _params: &scp_core::context::ContextParams,
-        ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-            Ok(())
-        }
-        async fn delete_published(
-            &self,
-            _context_id: &[u8; 32],
-        ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-            Ok(())
-        }
-        async fn send_message(
-            &self,
-            _context_id: &[u8; 32],
-            encrypted_payload: &[u8],
-        ) -> Result<(), scp_core::context::ContextError> {
-            self.0
-                .lock()
-                .expect("capture mutex")
-                .push(encrypted_payload.to_vec());
-            Ok(())
-        }
-    }
-
     #[cfg(feature = "testing")]
     const SLOW_AGREE_PY: &std::ffi::CStr = c"
 import threading, time
@@ -9174,11 +9138,11 @@ class SlowAgreeCustody(P256Custody):
         });
         // Built after Bob's identity, so his supervisor resolves DIDs; it
         // sends into a capture, so the test holds the exact bytes.
-        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sent = scp_core::context::supervisor::ContextSendCapture::default();
         crate::runtime::init_context_manager_for_test_with_transport(
             &bob.inner,
             &bob_did,
-            Box::new(CapturingTransport(Arc::clone(&sent))),
+            sent.transport(),
         );
         let (ctx_id, alice_handle) = Python::with_gil(|py| {
             let params = PyDict::new(py);
@@ -9196,7 +9160,7 @@ class SlowAgreeCustody(P256Custody):
                 .context_create(py, &bob_did, &params)
                 .expect("bob creates X");
             // What Bob published before Alice's epoch never reaches her.
-            sent.lock().expect("capture mutex").clear();
+            drop(sent.take());
             let ctx_id = bob_handle.context_id.clone();
             let (reservation, key_package) = alice
                 .scp
@@ -9224,16 +9188,13 @@ class SlowAgreeCustody(P256Custody):
                 .expect("bob sends");
             (ctx_id, alice_handle)
         });
-        let published = std::mem::take(&mut *sent.lock().expect("capture mutex"));
+        let published = sent.take();
         (ctx_id, alice_handle, published, bob)
     }
 
-    /// Alice receives in X as a local member holding her access key. No join
-    /// path registers the joiner as a local DID yet, and the access key
-    /// reaches a new member by the pull-based HPKE distribution of spec 09
-    /// §9.17.2 item 1 (§9.16.2), which no bridge runs yet; so the test
-    /// registers Alice and copies the key Bob holds for her, as the
-    /// full-stack harness does.
+    /// Alice receives in X as a local member holding her access key, through
+    /// `Supervisor::test_admit_joined_member`, which says why no production
+    /// path does this yet.
     #[cfg(feature = "testing")]
     fn make_alice_a_receiving_member(
         rt: &tokio::runtime::Runtime,
@@ -9244,29 +9205,13 @@ class SlowAgreeCustody(P256Custody):
         let alice_sup =
             Arc::clone(crate::runtime::supervisor(&alice.scp.inner).expect("supervisor"));
         let bob_sup = Arc::clone(crate::runtime::supervisor(&bob.inner).expect("supervisor"));
-        let (ctx_id, did) = (ctx_id.to_owned(), alice.did.clone());
-        rt.block_on(async move {
-            alice_sup
-                .register_local_did(scp_did::DID(did.clone()))
-                .await?;
-            let (reply, rx) = tokio::sync::oneshot::channel();
-            let query = scp_core::context::actor::QueriesCommand::GetAllAccessKeys {
-                context_id: ctx_id.clone(),
-                reply,
-            };
-            bob_sup.dispatch_query(query).await?;
-            let keys = rx.await.expect("bob's actor replies")?;
-            let key = keys
-                .get(&did)
-                .cloned()
-                .expect("bob holds alice's access key");
-            alice_sup.test_install_access_key(&ctx_id, &did, key).await
-        })
-        .expect("alice receives as a member of X");
+        rt.block_on(alice_sup.test_admit_joined_member(&bob_sup, ctx_id, &alice.did))
+            .expect("alice receives as a member of X");
     }
 
-    /// Delivers each payload to the actor for `ctx_id` from a runtime task, as
-    /// a relay subscription would, so no host thread carries the delivery.
+    /// Delivers each payload to the actor for `ctx_id` from a runtime task
+    /// through `Supervisor::test_deliver_incoming`, as a relay subscription
+    /// would, so no host thread carries the delivery.
     #[cfg(feature = "testing")]
     fn deliver_from_a_runtime_task(
         rt: &'static tokio::runtime::Runtime,
@@ -9284,23 +9229,16 @@ class SlowAgreeCustody(P256Custody):
             >,
         >,
     ) {
-        use scp_core::context::actor::commands::MessagingCommand;
         let (tx, rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             let outcomes = rt.block_on(rt.spawn(async move {
                 let mut outcomes = Vec::new();
                 for envelope_bytes in deliveries {
-                    let (reply, rx) = tokio::sync::oneshot::channel();
-                    let context_id = ctx_id.clone();
-                    let deliver = MessagingCommand::DeliverIncoming {
-                        context_id,
-                        envelope_bytes,
-                        reply,
-                    };
-                    sup.dispatch_command(&ctx_id, deliver)
+                    let outcome = sup
+                        .test_deliver_incoming(&ctx_id, envelope_bytes)
                         .await
-                        .expect("dispatch to alice's actor");
-                    outcomes.push(rx.await.expect("actor replies"));
+                        .expect("alice's actor takes the delivery and replies");
+                    outcomes.push(outcome);
                 }
                 outcomes
             }));
