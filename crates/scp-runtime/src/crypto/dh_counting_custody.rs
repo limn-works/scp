@@ -1,9 +1,11 @@
 //! Test custody that counts `dh_agree` and `generate_keypair` calls, so a
 //! round-trip test can prove the access-key open path performs exactly one key
 //! agreement, and a restart test can prove a wrapping key is generated once.
+//! It records every handle it generates and can be told to refuse
+//! `public_key` or to report a substitute public key.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use tokio::sync::Notify;
 
@@ -21,6 +23,17 @@ pub struct DhCountingCustody {
     dh_calls: AtomicUsize,
     generate_calls: AtomicUsize,
     generate_gate: Option<GenerateGate>,
+    generated: RwLock<Vec<KeyHandle>>,
+    public_key_fault: RwLock<Option<PublicKeyFault>>,
+}
+
+/// What `public_key` answers instead of the key's public key.
+#[derive(Clone)]
+pub enum PublicKeyFault {
+    /// Refuses with `PlatformError::CustodyError` carrying this text.
+    Refuse(String),
+    /// Reports these bytes as the public key.
+    Bytes(Vec<u8>),
 }
 
 /// Holds `generate_keypair` open: the call signals `entered`, then waits for
@@ -38,6 +51,8 @@ impl DhCountingCustody {
             dh_calls: AtomicUsize::new(0),
             generate_calls: AtomicUsize::new(0),
             generate_gate: None,
+            generated: RwLock::new(Vec::new()),
+            public_key_fault: RwLock::new(None),
         }
     }
 
@@ -60,6 +75,23 @@ impl DhCountingCustody {
     pub fn generate_calls(&self) -> usize {
         self.generate_calls.load(Ordering::SeqCst)
     }
+
+    /// Every handle `generate_keypair` returned, oldest first.
+    pub fn generated_handles(&self) -> Vec<KeyHandle> {
+        self.generated
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Makes every later `public_key` call answer `fault`; `None` restores
+    /// the real answer.
+    pub fn set_public_key_fault(&self, fault: Option<PublicKeyFault>) {
+        *self
+            .public_key_fault
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = fault;
+    }
 }
 
 impl KeyCustody for DhCountingCustody {
@@ -69,7 +101,12 @@ impl KeyCustody for DhCountingCustody {
             gate.entered.notify_one();
             gate.release.notified().await;
         }
-        self.inner.generate_keypair(key_type).await
+        let handle = self.inner.generate_keypair(key_type).await?;
+        self.generated
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(handle);
+        Ok(handle)
     }
 
     async fn generate_identity_keypair(&self) -> Result<KeyHandle, PlatformError> {
@@ -81,7 +118,16 @@ impl KeyCustody for DhCountingCustody {
     }
 
     async fn public_key(&self, key: &KeyHandle) -> Result<PublicKey, PlatformError> {
-        self.inner.public_key(key).await
+        let fault = self
+            .public_key_fault
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        match fault {
+            None => self.inner.public_key(key).await,
+            Some(PublicKeyFault::Refuse(detail)) => Err(PlatformError::CustodyError(detail)),
+            Some(PublicKeyFault::Bytes(bytes)) => Ok(PublicKey::new(bytes)),
+        }
     }
 
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {

@@ -134,6 +134,9 @@ pub mod supervisor;
 #[path = "spawn_from_welcome_tests.rs"]
 mod spawn_from_welcome_tests;
 
+#[cfg(test)]
+mod faulty_storage;
+
 #[cfg(any(test, feature = "testing"))]
 mod two_instance_seams;
 /// The capture behind the two-instance receive seams (`testing` only).

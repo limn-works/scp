@@ -9069,18 +9069,21 @@ def x25519(k, u):
     return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, 'little')
 
 class SlowAgreeCustody(P256Custody):
-    # Signals when an HPKE dh_agree starts, holds it for 0.2 s, then answers
-    # with the P-256 ECDH of its d = 1 key. The #active Ed25519 key agrees by
-    # real X25519, so this identity can open a Welcome.
+    # Signals when an HPKE dh_agree starts, holds it for 1 s, signals that
+    # the hold is over, then answers with the P-256 ECDH of its key. The
+    # #active Ed25519 key agrees by real X25519, so this identity can open a
+    # Welcome.
 
     def __init__(self):
         super().__init__()
         self.agree_started = threading.Event()
+        self.agree_done = threading.Event()
 
     def dh_agree(self, key_id, peer_public):
         if self._types.get(key_id) == 'hpke-p256':
             self.agree_started.set()
-            time.sleep(0.2)
+            time.sleep(1.0)
+            self.agree_done.set()
         elif self._key_types.get(key_id) == 'ed25519':
             return x25519(ed_expand(self._seed(key_id))[0], peer_public)
         return super().dh_agree(key_id, peer_public)
@@ -9287,14 +9290,12 @@ class SlowAgreeCustody(P256Custody):
         make_alice_a_receiving_member(rt, &alice, &bob, &ctx_id);
         // The join may already have called the host; thread B must wait on
         // the agree inside the delivery turn.
-        let agree_started = Python::with_gil(|py| {
-            let event = alice
-                .host
-                .bind(py)
-                .getattr("agree_started")
-                .expect("agree_started");
-            event.call_method0("clear").expect("reset agree_started");
-            event.unbind()
+        let [agree_started, agree_done] = ["agree_started", "agree_done"].map(|name| {
+            Python::with_gil(|py| {
+                let event = alice.host.bind(py).getattr(name).expect(name);
+                event.call_method0("clear").expect("reset the event");
+                event.unbind()
+            })
         });
 
         // Thread A delivers Bob's three payloads to Alice's actor.
@@ -9317,7 +9318,19 @@ class SlowAgreeCustody(P256Custody):
                     .and_then(|set| set.extract::<bool>())
                     .expect("wait on agree_started");
                 assert!(started, "alice's actor calls the Python dh_agree");
-                b_scp.context_member_count(py, &alice_handle)
+                let is_set = |event: &Py<PyAny>| {
+                    event
+                        .bind(py)
+                        .call_method0("is_set")
+                        .and_then(|set| set.extract::<bool>())
+                        .expect("agree_done.is_set")
+                };
+                // The callback is still inside the agree when B asks, so B's
+                // wait overlaps it; the actor answers B after the turn.
+                assert!(!is_set(&agree_done), "thread B asks while the agree runs");
+                let count = b_scp.context_member_count(py, &alice_handle);
+                assert!(is_set(&agree_done), "the count waited for the agree turn");
+                count
             });
             let _ = b_tx.send(count.map_err(|e| e.to_string()));
         });
@@ -9339,15 +9352,18 @@ class SlowAgreeCustody(P256Custody):
         );
         // Bob's message opens only under his sender key, so it opening shows
         // the KeyResponse installed that key. Alice never saw the message Bob
-        // sent when he created X (sequence 1), so this one (sequence 2) is
-        // held in her reorder buffer rather than surfaced.
-        assert!(
-            matches!(
-                message,
-                Ok(DeliverOutcome::Handled | DeliverOutcome::Application(_))
-            ),
-            "bob's message opens under his installed sender key: {message:?}"
-        );
+        // sent when he created X (sequence 1), so this one (sequence 2) may be
+        // held in her reorder buffer rather than surfaced; a surfaced message
+        // is Bob's. Expect `Application` alone once the issue "A joiner holds
+        // the first post-join message from each existing sender as a false
+        // sequence gap" is fixed.
+        match &message {
+            Ok(DeliverOutcome::Handled) => {}
+            Ok(DeliverOutcome::Application((plaintext, _sender))) => {
+                assert_eq!(plaintext.as_slice(), b"hello alice");
+            }
+            other => panic!("bob's message opens under his installed sender key: {other:?}"),
+        }
     }
 
     /// Spec 09 §9.16.1, fail-closed restore order: after a restart, a context

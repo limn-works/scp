@@ -1164,18 +1164,23 @@ def der_int(v):
     return bytes([2, len(b)]) + b
 
 class P256Custody(FakeCustody):
-    '''Every P-256 key is d = 1 (public key G) and signs with nonce k = 1, so
-    r = Gx and s = z + r mod n. `sign` returns DER with the HIGH s, the form
-    a platform keystore may emit; the bridge must return raw low-s.'''
+    '''Every P-256 signing key is d = 1 (public key G) and signs with nonce
+    k = 1, so r = Gx and s = z + r mod n. `sign` returns DER with the HIGH s,
+    the form a platform keystore may emit; the bridge must return raw low-s.
+    The n-th hpke-p256 key is d = n, so two keys have different points and
+    `dh_agree` computes a real ECDH.'''
 
     def __init__(self, fault=None):
         super().__init__(fault)
         self._types = {}
+        self._hpke_d = {}
         self.dh_peers = []
 
     def generate_keypair(self, key_type, role):
         kid = super().generate_keypair(key_type, role)
         self._types[kid] = key_type
+        if key_type == 'hpke-p256':
+            self._hpke_d[kid] = len(self._hpke_d) + 1
         return kid
 
     def _public(self, key_id):
@@ -1183,7 +1188,8 @@ class P256Custody(FakeCustody):
         if t == 'p256':
             return ('p256', G_COMPRESSED)
         if t == 'hpke-p256':
-            return ('hpke-p256', bytes([4]) + GX.to_bytes(32, 'big') + GY.to_bytes(32, 'big'))
+            x, y = mul(self._hpke_d[key_id], G)
+            return ('hpke-p256', bytes([4]) + x.to_bytes(32, 'big') + y.to_bytes(32, 'big'))
         return super()._public(key_id)
 
     def sign(self, key_id, message):
@@ -1201,8 +1207,9 @@ class P256Custody(FakeCustody):
         self._count('dh_agree')
         peer = bytes(peer_public)
         self.dh_peers.append(peer)
-        # d = 1: the shared secret is the peer's x-coordinate.
-        return peer[1:33]
+        point = (int.from_bytes(peer[1:33], 'big'), int.from_bytes(peer[33:65], 'big'))
+        x, _ = mul(self._hpke_d[key_id], point)
+        return x.to_bytes(32, 'big')
 
 class BadP256Custody(P256Custody):
     '''Returns a 32-byte public key and an unverifiable signature for P-256.'''
@@ -1507,10 +1514,11 @@ class SleepyAgreeCustody(P256Custody):
         ));
     }
 
-    /// Two HPKE P-256 keys on the embedded fake host agree symmetrically,
-    /// and an agreement with the pinned RFC 5903 initiator point equals both
-    /// `ecdh_p256` from the pinned scalar and the pinned point's
-    /// x-coordinate (the fake's private scalar is 1).
+    /// Two HPKE P-256 keys on the embedded fake host have different points
+    /// and agree symmetrically, and an agreement with the pinned RFC 5903
+    /// initiator point equals both `ecdh_p256` from the pinned scalar and,
+    /// for the first key (private scalar 1), the pinned point's
+    /// x-coordinate.
     #[tokio::test]
     async fn ffi_custody_callback_hpke_p256_dh_agree_is_symmetric_and_matches_the_vector() {
         use scp_crypto::p256::{P256PublicKey, P256SecretKey, ecdh_p256, testing};
@@ -1525,6 +1533,11 @@ class SleepyAgreeCustody(P256Custody):
             .expect("generate B");
         let a_pub = custody.public_key(&a).await.expect("A public");
         let b_pub = custody.public_key(&b).await.expect("B public");
+        assert_ne!(
+            a_pub.as_bytes(),
+            b_pub.as_bytes(),
+            "each key has its own point"
+        );
         let ab = custody.dh_agree(&a, b_pub.as_bytes()).await.expect("A·B");
         let ba = custody.dh_agree(&b, a_pub.as_bytes()).await.expect("B·A");
         assert_eq!(ab.as_bytes(), ba.as_bytes());
