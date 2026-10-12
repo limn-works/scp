@@ -1048,6 +1048,68 @@ where `member = "scp:z5glr2inbuzd33xrfkdgpjejz4x7z4r2jxcsfvdxbwtgoi73xx2q"` (the
 
 This vector is mechanically enforced on BOTH native and `wasm32` by `pseudonym_wire_and_classifier_match_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_cross_target_kat.rs` (native `#[test]` + `#[wasm_bindgen_test]`, run under `wasm-pack test --node`): `native == golden` and `wasm == golden` together prove `native == wasm` (ADR-057 T-1 / Prerequisite 5). The pure predicate + classifier unit tests also live in `crates/scp-protocol/src/context/pseudonym.rs`.
 
+### Vector 58: `PseudonymAnnouncementV2` rotation announcement wire format + classifier decisions (§9.10.4.1)
+
+These vectors pin the v2 **rotation announcement** that a member of a context with a rotation policy publishes on the shared bootstrap channel after each rotation, and the decisions of the §9.10.4.1 receipt-ordering rule that runs after the four §9.10.4 checks of Vector 36. The number 37 belongs to the KeyPackage attestation vector in §25.23, and the numbers 39 and 40 belong to the vectors §25.25 deleted, so this vector takes the next unused number.
+
+**Wire format.** A sender serializes `PseudonymAnnouncementV2` the way Vector 36 serializes v1, with `rmp_serde::to_vec_named`: a name-keyed MessagePack map with four fields in declaration order, `tag` (string), `member_did` (string), `pseudonym_epoch` (u64), and `routing_id` (32-byte `serde_bytes` binary). The encoder writes `pseudonym_epoch` in MessagePack's shortest unsigned-integer form, so epoch 1 is the single byte `0x01` and epoch 2^32 is `0xcf` followed by eight big-endian bytes. The `0x43 × 32` value is an opaque fixture routing ID, distinct from Vector 36's `0x42 × 32` and not derived from Vectors 30 or 31. The fixture identifier announcing member is the `member_did` of Vector 36.
+
+```
+Input (golden, epoch 1):
+  tag:             "\0scp:pseudonym-announce:v2"   (26 bytes, NUL-prefixed)
+  member_did:      "scp:z5glr2inbuzd33xrfkdgpjejz4x7z4r2jxcsfvdxbwtgoi73xx2q"
+                   (the fixture identifier announcing member, §25.1; 56 bytes)
+  pseudonym_epoch: 1
+  routing_id:      0x43 × 32
+
+MessagePack layout:
+  0x84                                        fixmap, 4 entries
+  0xa3 "tag"                                  key
+  0xba <26 bytes> "\0scp:pseudonym-announce:v2"   fixstr value
+  0xaa "member_did"                           key
+  0xd9 0x38 <56 bytes> "scp:z5gl…xx2q"         str8 value
+  0xaf "pseudonym_epoch"                      key
+  0x01                                        positive fixint value
+  0xaa "routing_id"                           key
+  0xc4 0x20 <32 bytes> 0x43×32                 bin8 value (serde_bytes)
+
+Expected bytes (hex, 163 bytes, single continuous string):
+  84a3746167ba007363703a70736575646f6e796d2d616e6e6f756e63653a7632aa6d656d6265725f646964d9387363703a7a35676c7232696e62757a6433337872666b6467706a656a7a3478377a3472326a78637366766478627774676f69373378783271af70736575646f6e796d5f65706f636801aa726f7574696e675f6964c4204343434343434343434343434343434343434343434343434343434343434343
+
+Input (epoch 2^32 = 4294967296; every other field as above):
+  pseudonym_epoch value bytes: 0xcf 0x0000000100000000   uint64
+
+Expected bytes (hex, 171 bytes, single continuous string):
+  84a3746167ba007363703a70736575646f6e796d2d616e6e6f756e63653a7632aa6d656d6265725f646964d9387363703a7a35676c7232696e62757a6433337872666b6467706a656a7a3478377a3472326a78637366766478627774676f69373378783271af70736575646f6e796d5f65706f6368cf0000000100000000aa726f7574696e675f6964c4204343434343434343434343434343434343434343434343434343434343434343
+```
+
+`scripts/` holds no generator for these bytes. The Python `msgpack` package produced both strings from the inputs above, and the same encoding run reproduces the Vector 36 bytes, which checks that it matches `rmp_serde::to_vec_named` on this field layout.
+
+**Classifier decisions.** The classifier takes the plaintext, the authenticated MLS sender, the context ID, the receiver's registry (`None` for a broadcast context), and the receiver's own routing IDs (its current routing ID, plus its previous routing ID while that routing ID is in its grace period). A registry record is written `(epoch, routing_id)`, with epoch `—` for a record a v1 announcement wrote. The decision is one of four: `NotAnnouncement`, `Accept` (carrying the member, the epoch or none, and the routing ID, which replace the member's record), `Unchanged` (an idempotent re-announcement; the registry stays as it is), or `Rejected` with a stable `reason`. The four §9.10.4 reasons of Vector 36 keep their strings, and the two ordering reasons below are new. Like Vector 36's strings, each `reason` string is part of this vector, so a change to one is wire-observable:
+
+| Case | `sender_did` | payload / registry / receiver's own routing IDs | Decision | `reason` |
+|------|--------------|--------------------------------------------------|----------|----------|
+| first v2, no record | member | golden v2 (epoch 1, `0x43×32`) / `Some({})` / `{}` | `Accept { member, 1, 0x43×32 }` | — |
+| v2 over a v1 record | member | golden v2 / `Some({member → (—, 0x42×32)})` / `{}` | `Accept { member, 1, 0x43×32 }` | — |
+| higher epoch | member | golden v2 / `Some({member → (0, 0x44×32)})` / `{}` | `Accept { member, 1, 0x43×32 }` | — |
+| same epoch, same value | member | golden v2 / `Some({member → (1, 0x43×32)})` / `{}` | `Unchanged` | — |
+| same epoch, other value | member | golden v2 / `Some({member → (1, 0x44×32)})` / `{}` | `Rejected` | `pseudonym announcement epoch does not advance the recorded epoch` |
+| lower epoch | member | golden v2 / `Some({member → (2, 0x44×32)})` / `{}` | `Rejected` | `pseudonym announcement epoch does not advance the recorded epoch` |
+| v1 after v2 | member | Vector 36 golden v1 (`0x42×32`) / `Some({member → (1, 0x43×32)})` / `{}` | `Rejected` | `pseudonym v1 announcement follows a recorded v2 announcement` |
+| v1 over v1 | member | Vector 36 golden v1 / `Some({member → (—, 0x44×32)})` / `{}` | `Accept { member, —, 0x42×32 }` | — |
+| sender mismatch | member | golden v2 except `member_did = other` / `Some({})` / `{}` | `Rejected` (carries `claimed_did = other`) | `pseudonym announcement member_did does not match sender` |
+| reserved value | member | golden v2 except `routing_id` = `[0;32]` **or** `context_routing_id(ctx)` **or** `broadcast_routing_id(ctx)` / `Some({})` / `{}` | `Rejected` | `pseudonym announcement uses a reserved routing ID` |
+| broadcast context | member | golden v2 / `None` / `{}` | `Rejected` | `pseudonym announcement received on broadcast context` |
+| cross-DID collision | member | golden v2 / `Some({other → (—, 0x43×32)})` / `{}` | `Rejected` | `pseudonym announcement collides with another member's routing ID` |
+| receiver's current routing ID | member | golden v2 / `Some({})` / `{current: 0x43×32}` | `Rejected` | `pseudonym announcement collides with another member's routing ID` |
+| receiver's in-grace previous routing ID | member | golden v2 / `Some({})` / `{current: 0x45×32, previous: 0x43×32}` | `Rejected` | `pseudonym announcement collides with another member's routing ID` |
+| extra key | member | golden v2 map plus a fifth key / `Some({})` / `{}` | `NotAnnouncement` | — |
+| short `routing_id` | member | golden v2 with a 31-byte `routing_id` / `Some({})` / `{}` | `NotAnnouncement` | — |
+
+where `member`, `other` and `ctx` are the values Vector 36 defines. Every `Rejected` and `Unchanged` row leaves the registry exactly as the row's input states it.
+
+No test asserts this vector yet. A conforming implementation reproduces both byte strings and every decision in the table on native and on `wasm32`, as Vector 36 requires of v1.
+
 ## 25.20 Trust Attestation Signing Vectors (§7.4.1, §9.5.2)
 
 Domain: `"SCP-ATTESTATION-V1:"`

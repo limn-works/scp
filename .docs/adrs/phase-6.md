@@ -2447,11 +2447,13 @@ Checkpoint {
 
 ## ADR-031: Multi-Admin Governance Models
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-10-12 (the pseudonym rotation policy action).
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, left an identity one operational key, so the one-identity-one-vote rule has no second key to deduplicate across (`09-security-model.md` §9.1 invariant 1).
 
 **Amendment (2026-09-10 — the governance-proposal signature is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `signature` field on this ADR's governance-proposal structure carries the type `P256Signature`. The threshold models, the approval flow, and the admin-set rules are untouched.
+
+**Amendment (2026-10-12 — the pseudonym rotation policy is a governance action).** Section 3's `GovernanceAction` enum gains `ModifyPseudonymRotationPolicy { new_policy: Option<PseudonymRotationPolicy> }`. The action sets, changes or removes `ContextParams.pseudonym_rotation`, the per-context rotation policy that `09-security-model.md` §9.10.4.1 (pseudonym rotation) defines. That section states which policies are valid, and states that removing the policy freezes each member's current routing ID. The proposal flow, the quorum rules and the admin-set rules are untouched.
 
 ### Context
 
@@ -2786,6 +2788,11 @@ pub enum GovernanceAction {
     /// Lock the context's economic policy, making it immutable (§19.3).
     /// Once locked, the economic policy cannot be changed through governance.
     LockEconomicPolicy,
+    /// Set, change or remove the context's pseudonym rotation policy
+    /// (`ContextParams.pseudonym_rotation`, 09-security-model.md §9.10.4.1).
+    /// `None` stops every later rotation, and each member keeps the routing ID
+    /// it holds. The action changes no MLS state.
+    ModifyPseudonymRotationPolicy { new_policy: Option<PseudonymRotationPolicy> },
 }
 
 /// Scope of content access revocation.
