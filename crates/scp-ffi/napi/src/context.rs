@@ -1614,6 +1614,9 @@ pub(crate) async fn context_join_from_welcome_on(
 /// via the identity registry. The raw signing key is wiped the moment the invite
 /// is produced (`SigningKey` is `ZeroizeOnDrop`, so the explicit early `drop`
 /// triggers the wipe).
+///
+/// `relay_urls` must name the context's stored relay set (§5.12.3.1), which
+/// the bundle carries; a list naming a different set is rejected.
 pub(crate) async fn invite_member_on(
     bi: &NapiBridgeInstance,
     context_id: String,

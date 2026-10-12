@@ -2828,6 +2828,14 @@ pub enum QueriesCommand {
             Result<Option<scp_protocol::context::params::ContextParams>, ContextError>,
         >,
     },
+    /// The context's stored relay set (§5.12.3.1 `relay_urls`,
+    /// `PerContextState::relay_urls`).
+    RelayUrls {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel. `Ok(None)` iff the context is unknown.
+        reply: oneshot::Sender<Result<Option<Vec<String>>, ContextError>>,
+    },
     /// Role state snapshot (cloned).
     GetRoleState {
         /// Context identifier string.

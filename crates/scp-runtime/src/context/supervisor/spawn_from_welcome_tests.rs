@@ -2719,6 +2719,88 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
     );
 }
 
+/// `invite_member` seals the context's stored relay set (§5.12.3.1
+/// `relay_urls`, PUSH-025), so the joiner stores the set the creator holds. A
+/// caller list naming a different set is refused before any member is added;
+/// the stored set in another order is accepted and sealed in stored order.
+#[tokio::test]
+async fn invite_member_seals_the_creators_stored_relay_set() {
+    let ctx_id = ctx_hex(0xd6);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+    let stored = vec![
+        "wss://relay-a.example/scp/v1".to_owned(),
+        "wss://relay-b.example/scp/v1".to_owned(),
+    ];
+
+    let (alice_sup, _alice_crypto) = alice_supervisor();
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            joiner_params(),
+            alice.clone(),
+            some_pseudonym(),
+            stored.clone(),
+        )
+        .await
+        .expect("alice creates the encrypted context");
+    assert_eq!(alice_sup.context_relay_urls(&ctx_id).await, Some(stored.clone()));
+
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    let err = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes.clone(),
+            vec![],
+            &alice_signing_key(),
+        )
+        .await
+        .expect_err("an empty relay list differs from the stored set");
+    assert!(matches!(err, crate::context::ContextError::InvalidState(_)), "got {err:?}");
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(1),
+        "a refused relay list adds no member"
+    );
+
+    let InviteMemberOutcome::Sealed { bundle, .. } = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            vec![stored[1].clone(), stored[0].clone()],
+            &alice_signing_key(),
+        )
+        .await
+        .expect("the stored set in another order is accepted");
+    let enc =
+        <[u8; 32]>::try_from(bundle.enc.as_slice()).expect("sealed bundle enc is exactly 32 bytes");
+
+    let (bob_custody, bob_handle) = bob_imported_custody().await;
+    let req = WelcomeJoinRequest {
+        context_id: ctx_id.clone(),
+        creator_did: alice.clone(),
+        sealed_bundle_enc: enc,
+        sealed_bundle_ct: bundle.ciphertext,
+        reservation_id,
+        local_pseudonym: some_pseudonym(),
+    };
+    bob_sup
+        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, req)
+        .await
+        .expect("bob joins from alice's invitation");
+    assert_eq!(
+        bob_sup.context_relay_urls(&ctx_id).await,
+        Some(stored),
+        "the joiner stores the creator's relay set in stored order"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test M2 — root fix: the governance AddMember broadcasts its epoch Commit.
 // ---------------------------------------------------------------------------

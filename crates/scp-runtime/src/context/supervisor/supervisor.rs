@@ -4798,6 +4798,7 @@ impl Supervisor {
             | QueriesCommand::MemberDids { .. }
             | QueriesCommand::MemberRole { .. }
             | QueriesCommand::ContextParams { .. }
+            | QueriesCommand::RelayUrls { .. }
             | QueriesCommand::GetRoleState { .. }
             | QueriesCommand::HasEstablishedOutletInterface { .. }
             | QueriesCommand::PendingCommits { .. }
@@ -12836,6 +12837,25 @@ impl Supervisor {
         }
     }
 
+    /// Returns the context's stored relay set (§5.12.3.1 `relay_urls`), or
+    /// `None` when the context is unknown or its actor could not be reached.
+    /// Routes through the actor mailbox via [`Self::dispatch_query`].
+    #[must_use]
+    pub async fn context_relay_urls(&self, context_id: &str) -> Option<Vec<String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::RelayUrls {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return None;
+        }
+        match bounded_reply_await(rx).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
     /// Returns a clone of the context's role state, or `None` when no
     /// reachable actor answered. Routes through the actor mailbox via
     /// [`Self::dispatch_query`].
@@ -14696,7 +14716,8 @@ impl Supervisor {
     ///    added member is left without the sealed Welcome.
     /// 4. Assembles the bundle: genesis `context_params`, the visibility-filtered
     ///    [`MetadataSnapshot`](scp_protocol::context::metadata::MetadataSnapshot),
-    ///    `relay_urls`, and the §9.10.4.B `context_metadata_key`.
+    ///    the context's stored `relay_urls`, and the §9.10.4.B
+    ///    `context_metadata_key`.
     /// 5. Signs it over
     ///    [`invitation_bundle_signing_hash`](scp_protocol::context::InvitationBundle::invitation_bundle_signing_hash)
     ///    with the creator's `#active` key — the SAME `proposer_signing_key`
@@ -14739,7 +14760,9 @@ impl Supervisor {
     ///
     /// - [`ContextError::ContextNotRegistered`] if `context_id` has no live
     ///   context; [`ContextError::InvalidState`] for a voting-governed context
-    ///   (governed-context invitations are not yet implemented);
+    ///   (governed-context invitations are not yet implemented) or for a
+    ///   `relay_urls` that names a different set than the context's stored
+    ///   relay set;
     ///   [`ContextError::CryptoFailed`] for a Broadcast context, an
     ///   unresolvable invitee `#active` key, an invalid key mapping, a signing or
     ///   HPKE-seal failure, or a serialization fault;
@@ -14799,6 +14822,18 @@ impl Supervisor {
                     .to_owned(),
             ));
         }
+
+        // The bundle carries the context's stored relay set (§5.12.3.1
+        // `relay_urls`), so every member stores the set the creator holds. A
+        // caller list that names a different set is refused before any add.
+        let relay_urls = crate::context::lifecycle_helpers::sealed_relay_urls(
+            relay_urls,
+            self.context_relay_urls(&context_id).await.ok_or_else(|| {
+                ContextError::ContextNotRegistered(format!(
+                    "invite_member: no live context '{context_id}'"
+                ))
+            })?,
+        )?;
 
         // 2. Resolve the invitee's #active key -> X25519 recipient.
         let resolver = self.key_resolver_ref().ok_or_else(|| {
@@ -17233,6 +17268,7 @@ impl Supervisor {
             | QueriesCommand::MemberDids { context_id, .. }
             | QueriesCommand::MemberRole { context_id, .. }
             | QueriesCommand::ContextParams { context_id, .. }
+            | QueriesCommand::RelayUrls { context_id, .. }
             | QueriesCommand::GetRoleState { context_id, .. }
             | QueriesCommand::HasEstablishedOutletInterface { context_id, .. }
             | QueriesCommand::PendingCommits { context_id, .. }
@@ -17597,6 +17633,10 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
         }
         // Legacy `context_params` returns `None`.
         QueriesCommand::ContextParams { reply, .. } => {
+            let _ = reply.send(Ok(None));
+        }
+        // An unknown context has no stored relay set.
+        QueriesCommand::RelayUrls { reply, .. } => {
             let _ = reply.send(Ok(None));
         }
         // Legacy `get_role_state` returns `None`.

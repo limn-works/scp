@@ -119,6 +119,62 @@ pub fn normalize_relay_urls(relay_urls: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Returns the relay set an invitation bundle carries (§5.12.3.1
+/// `relay_urls`): the context's stored set `stored`.
+///
+/// # Errors
+///
+/// [`ContextError::InvalidState`] when `requested` names a different set of
+/// relays than `stored` (order and duplicates aside), so no member can be
+/// handed a relay set the context does not hold.
+pub fn sealed_relay_urls(
+    requested: Vec<String>,
+    stored: Vec<String>,
+) -> Result<Vec<String>, ContextError> {
+    let requested_set: HashSet<&String> = requested.iter().collect();
+    let stored_set: HashSet<&String> = stored.iter().collect();
+    if requested_set != stored_set {
+        return Err(ContextError::InvalidState(format!(
+            "invite_member: relay_urls {requested:?} differ from the context's stored relay set \
+             {stored:?}"
+        )));
+    }
+    Ok(stored)
+}
+
+#[cfg(test)]
+mod relay_set_tests {
+    use super::sealed_relay_urls;
+
+    fn urls(list: &[&str]) -> Vec<String> {
+        list.iter().map(|url| (*url).to_owned()).collect()
+    }
+
+    #[test]
+    fn sealed_relay_urls_accepts_the_stored_set_in_any_order() {
+        let stored = urls(&["wss://a", "wss://b"]);
+        let sealed = sealed_relay_urls(urls(&["wss://b", "wss://a", "wss://b"]), stored.clone())
+            .expect("the stored set, reordered and repeated, is accepted");
+        assert_eq!(sealed, stored);
+        assert_eq!(
+            sealed_relay_urls(Vec::new(), Vec::new()).expect("empty matches empty"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn sealed_relay_urls_rejects_a_different_set() {
+        let stored = urls(&["wss://a"]);
+        for requested in [urls(&[]), urls(&["wss://b"]), urls(&["wss://a", "wss://b"])] {
+            assert!(
+                sealed_relay_urls(requested.clone(), stored.clone()).is_err(),
+                "{requested:?} must not be sealed for a context storing {stored:?}"
+            );
+        }
+        assert!(sealed_relay_urls(urls(&["wss://a"]), Vec::new()).is_err());
+    }
+}
+
 /// Builds the [`ContextRouting`] axis for a context from its broadcast flag
 /// and the FFI-derived local pseudonym (§9.10.4, §5.14).
 ///

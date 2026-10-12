@@ -3232,7 +3232,8 @@ impl crate::scp::PyScp {
     ///   the invite is signed under its `#active` key).
     /// * `invitee_did` -- The DID being invited.
     /// * `invitee_key_package` -- The invitee's TLS-serialized MLS `KeyPackage`.
-    /// * `relay_urls` -- Relay URLs to include for the invitee's first contact.
+    /// * `relay_urls` -- The context's stored relay set (§5.12.3.1), which the
+    ///   bundle carries; a list naming a different set is rejected.
     ///
     /// # Errors
     ///
