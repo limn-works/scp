@@ -68,7 +68,7 @@ fn assert_cloud_backend_fails_closed(backend: &str, required_var: &str) {
         let tmp = tempfile::tempdir().expect("failed to create tempdir");
         let db_path = tmp.path().join("must-not-exist.db");
         let output = output_within_deadline(
-            Command::new(relay_bin())
+            relay_command()
                 .env("SCP_RELAY_STORAGE_BACKEND", &value)
                 .env("SCP_RELAY_STORAGE_PATH", &db_path)
                 .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
@@ -105,6 +105,99 @@ fn relay_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_scp-relay"))
 }
 
+/// A command that runs `scp-relay` with `SCP_RELAY_PUSH_PLATFORMS=none`, the
+/// push selection every storage test makes so the relay reaches its blob
+/// store. The push tests below override or remove it.
+fn relay_command() -> Command {
+    let mut command = Command::new(relay_bin());
+    command.env("SCP_RELAY_PUSH_PLATFORMS", "none");
+    command
+}
+
+/// PUSH-012: an unset or blank `SCP_RELAY_PUSH_PLATFORMS` makes the relay exit
+/// 1 naming the variable and SCP-CAPSEL-8000 (push selection has no default),
+/// before it opens its blob store.
+#[test]
+fn unset_push_platforms_exits_with_capsel_8000() {
+    for value in [None, Some(""), Some(" ")] {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tmp.path().join("must-not-exist.db");
+        let mut command = relay_command();
+        command
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env_remove("RUST_LOG");
+        match value {
+            Some(v) => command.env("SCP_RELAY_PUSH_PLATFORMS", v),
+            None => command.env_remove("SCP_RELAY_PUSH_PLATFORMS"),
+        };
+        let output = output_within_deadline(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{value:?}: {stderr}");
+        assert!(
+            stderr.contains("SCP_RELAY_PUSH_PLATFORMS is unset or empty"),
+            "{value:?}: {stderr}"
+        );
+        assert!(stderr.contains("SCP-CAPSEL-8000"), "{value:?}: {stderr}");
+        assert!(!db_path.exists(), "{value:?} opened {}", db_path.display());
+    }
+}
+
+/// PUSH-012: a push platform with a partial configuration makes the relay
+/// exit 1 naming the first missing variable, and opens neither the push store
+/// nor the blob store.
+#[test]
+fn partial_push_configuration_exits_naming_the_variable() {
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let db_path = tmp.path().join("must-not-exist.db");
+    let push_path = tmp.path().join("push-must-not-exist.db");
+    let cases: [(&[(&str, &str)], &str); 3] = [
+        (
+            &[("SCP_RELAY_PUSH_PLATFORMS", "apns")],
+            "SCP_RELAY_PUSH_STORE",
+        ),
+        (
+            &[
+                ("SCP_RELAY_PUSH_PLATFORMS", "apns"),
+                ("SCP_RELAY_PUSH_STORE", "memory"),
+            ],
+            "SCP_RELAY_PUSH_STORE",
+        ),
+        (
+            &[
+                ("SCP_RELAY_PUSH_PLATFORMS", "fcm"),
+                ("SCP_RELAY_PUSH_STORE", "sqlite"),
+            ],
+            "SCP_RELAY_FCM_SERVICE_ACCOUNT_PATH",
+        ),
+    ];
+    for (vars, named) in cases {
+        let mut command = relay_command();
+        command
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env("SCP_RELAY_PUSH_STORE_PATH", &push_path)
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env_remove("SCP_RELAY_PUSH_STORE")
+            .env_remove("SCP_RELAY_FCM_SERVICE_ACCOUNT_PATH")
+            .env_remove("RUST_LOG");
+        for (var, value) in vars {
+            command.env(var, value);
+        }
+        let output = output_within_deadline(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{vars:?}: {stderr}");
+        assert!(stderr.contains(named), "{vars:?}: {stderr}");
+        assert!(!db_path.exists(), "{vars:?} opened {}", db_path.display());
+        assert!(
+            !push_path.exists(),
+            "{vars:?} opened {}",
+            push_path.display()
+        );
+    }
+}
+
 /// An unset `SCP_RELAY_STORAGE_BACKEND`, and an empty or whitespace one, each
 /// make the relay exit 1 with an error naming the variable, SCP-CAPSEL-8000
 /// (persistence spec §17.17.1, selection is mandatory), and the valid values,
@@ -118,7 +211,7 @@ fn unset_or_empty_backend_exits_with_capsel_8000() {
     for value in [None, Some(""), Some("  ")] {
         let tmp = tempfile::tempdir().expect("failed to create tempdir");
         let db_path = tmp.path().join("must-not-exist.db");
-        let mut command = Command::new(relay_bin());
+        let mut command = relay_command();
         command
             .current_dir(tmp.path())
             .env("SCP_RELAY_STORAGE_PATH", &db_path)
@@ -160,7 +253,7 @@ fn sqlite_without_an_absolute_path_exits_with_error() {
         (Some("scp-relay.db"), "is a relative path"),
     ] {
         let tmp = tempfile::tempdir().expect("failed to create tempdir");
-        let mut command = Command::new(relay_bin());
+        let mut command = relay_command();
         command
             .current_dir(tmp.path())
             .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
@@ -192,7 +285,7 @@ fn sqlite_without_an_absolute_path_exits_with_error() {
 /// message naming the valid options.
 #[test]
 fn invalid_backend_exits_with_error() {
-    let output = Command::new(relay_bin())
+    let output = relay_command()
         .env("SCP_RELAY_STORAGE_BACKEND", "banana")
         .env_remove("RUST_LOG")
         .output()
@@ -325,7 +418,7 @@ fn explicit_sqlite_backend_starts() {
     let tmp = tempfile::tempdir().expect("failed to create tempdir");
     let db_path = tmp.path().join("explicit-backend.db");
 
-    let mut child = Command::new(relay_bin())
+    let mut child = relay_command()
         .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
         .env("SCP_RELAY_STORAGE_PATH", db_path.to_str().unwrap())
         .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
@@ -411,7 +504,7 @@ fn sqlite_store_that_cannot_open_exits_without_logging_the_backend() {
     let db_path = blocker.join("relay.db");
 
     let output = output_within_deadline(
-        Command::new(relay_bin())
+        relay_command()
             .current_dir(tmp.path())
             .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
             .env("SCP_RELAY_STORAGE_PATH", &db_path)

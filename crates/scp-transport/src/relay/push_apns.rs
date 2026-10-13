@@ -105,6 +105,133 @@ impl fmt::Debug for ApnsConfig {
     }
 }
 
+/// An APNs authentication key file (.p8) that could not be read as a P-256
+/// private key. No variant carries any byte of the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ApnsKeyError {
+    /// The file is not UTF-8 text holding one `-----BEGIN PRIVATE KEY-----`
+    /// block with a base64 body.
+    #[error("the file holds no PEM `PRIVATE KEY` block")]
+    NotPem,
+    /// The block is not a version-0 PKCS#8 `PrivateKeyInfo` for an
+    /// `id-ecPublicKey` key on `prime256v1` whose `ECPrivateKey` holds a
+    /// 32-byte scalar.
+    #[error("the PEM block is not a PKCS#8 P-256 private key")]
+    NotP256Pkcs8,
+    /// The scalar is zero or not below the curve order.
+    #[error("the P-256 private scalar is out of range")]
+    ScalarOutOfRange,
+    /// The key embeds a public key that is not the one its scalar derives.
+    #[error("the embedded public key does not match the private scalar")]
+    PublicKeyMismatch,
+}
+
+/// `id-ecPublicKey` (1.2.840.10045.2.1) then `prime256v1`
+/// (1.2.840.10045.3.1.7), the body of a P-256 `AlgorithmIdentifier`.
+const P256_ALGORITHM_ID: &[u8] = &[
+    0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d,
+    0x03, 0x01, 0x07,
+];
+
+/// The DER of the `prime256v1` OID, the optional `ECPrivateKey` parameters.
+const PRIME256V1_OID: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+
+/// Reads an APNs authentication key file's bytes (the .p8 file Apple issues:
+/// PEM around a PKCS#8 `PrivateKeyInfo`, RFC 5208, holding an RFC 5915
+/// `ECPrivateKey`) as a P-256 private key.
+///
+/// The DER and the scalar are held in zeroizing buffers. When the key embeds
+/// its public key, the public key must be the one the scalar derives.
+///
+/// # Errors
+///
+/// An [`ApnsKeyError`] naming what is wrong with the file.
+pub fn apns_key_from_p8(file: &[u8]) -> Result<P256SecretKey, ApnsKeyError> {
+    let pem = std::str::from_utf8(file).map_err(|_| ApnsKeyError::NotPem)?;
+    let der = super::push::pem_pkcs8_der(pem).ok_or(ApnsKeyError::NotPem)?;
+    let (scalar, embedded_public) =
+        p256_scalar_from_pkcs8(&der).ok_or(ApnsKeyError::NotP256Pkcs8)?;
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    bytes.copy_from_slice(scalar);
+    let key =
+        P256SecretKey::from_scalar_bytes(&bytes).map_err(|_| ApnsKeyError::ScalarOutOfRange)?;
+    if let Some(public) = embedded_public
+        && public != key.public_key().to_uncompressed().as_slice()
+    {
+        return Err(ApnsKeyError::PublicKeyMismatch);
+    }
+    Ok(key)
+}
+
+/// Splits one DER element with tag `tag` off the front of `input`, returning
+/// its contents and the bytes after it. Accepts definite lengths in short form
+/// and in one- or two-byte long form, each minimally encoded.
+fn der_element(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
+    let (&first, rest) = input.split_first()?;
+    if first != tag {
+        return None;
+    }
+    let (&len_byte, rest) = rest.split_first()?;
+    let (len, rest) = match len_byte {
+        0x00..=0x7f => (usize::from(len_byte), rest),
+        0x81 => {
+            let (&len, rest) = rest.split_first()?;
+            (len >= 0x80).then_some((usize::from(len), rest))?
+        }
+        0x82 => {
+            let (high, rest) = rest.split_first_chunk::<2>()?;
+            let len = usize::from(u16::from_be_bytes(*high));
+            (len >= 0x100).then_some((len, rest))?
+        }
+        _ => return None,
+    };
+    (rest.len() >= len).then(|| rest.split_at(len))
+}
+
+/// Reads the 32-byte private scalar, and the 65-byte uncompressed public key
+/// when present, from a version-0 PKCS#8 `PrivateKeyInfo` for a P-256 key.
+/// Anything outside that shape, trailing bytes included, is `None`.
+fn p256_scalar_from_pkcs8(der: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
+    let (info, rest) = der_element(der, 0x30)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    let (version, info) = der_element(info, 0x02)?;
+    let (algorithm, info) = der_element(info, 0x30)?;
+    let (private_key, info) = der_element(info, 0x04)?;
+    if version != [0x00] || algorithm != P256_ALGORITHM_ID || !info.is_empty() {
+        return None;
+    }
+    let (ec_key, rest) = der_element(private_key, 0x30)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    let (ec_version, ec_key) = der_element(ec_key, 0x02)?;
+    let (scalar, mut ec_key) = der_element(ec_key, 0x04)?;
+    if ec_version != [0x01] || scalar.len() != 32 {
+        return None;
+    }
+    if let Some((parameters, after)) = der_element(ec_key, 0xa0) {
+        if parameters != PRIME256V1_OID {
+            return None;
+        }
+        ec_key = after;
+    }
+    let mut public = None;
+    if let Some((wrapped, after)) = der_element(ec_key, 0xa1) {
+        let (bits, trailing) = der_element(wrapped, 0x03)?;
+        // A BIT STRING whose first byte (unused bits) is 0, then the point.
+        let (&unused, point) = bits.split_first()?;
+        if !trailing.is_empty() || unused != 0 || point.len() != 65 {
+            return None;
+        }
+        public = Some(point);
+        ec_key = after;
+    }
+    ec_key.is_empty().then_some((scalar, public))
+}
+
 /// A provider JWT and the clock second it was minted at.
 struct ProviderToken {
     jwt: Zeroizing<String>,
@@ -768,5 +895,107 @@ mod tests {
             assert!(!printed.contains(&jwt), "{printed}");
             assert!(printed.contains("TEAM456XYZ"), "{printed}");
         }
+    }
+
+    /// A fresh P-256 PKCS#8 key from `ring` (version 0, `ECPrivateKey` with
+    /// its public key), wrapped as a .p8 PEM file, with ring's public key.
+    fn generated_p8() -> (String, Vec<u8>) {
+        use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        (pem_of(pkcs8.as_ref()), pair.public_key().as_ref().to_vec())
+    }
+
+    fn pem_of(der: &[u8]) -> String {
+        use base64::Engine as _;
+        let body = base64::engine::general_purpose::STANDARD.encode(der);
+        let lines: Vec<&str> = body
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            lines.join("\n")
+        )
+    }
+
+    /// A minimal version-0 PKCS#8 P-256 key: `ECPrivateKey` with only the
+    /// scalar, no parameters and no public key.
+    fn minimal_pkcs8(scalar: &[u8; 32]) -> Vec<u8> {
+        let mut ec = vec![0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20];
+        ec.extend_from_slice(scalar);
+        let mut body = vec![0x02, 0x01, 0x00, 0x30, 0x13];
+        body.extend_from_slice(P256_ALGORITHM_ID);
+        body.push(0x04);
+        body.push(u8::try_from(ec.len()).unwrap());
+        body.extend_from_slice(&ec);
+        let mut der = vec![0x30, u8::try_from(body.len()).unwrap()];
+        der.extend_from_slice(&body);
+        der
+    }
+
+    #[test]
+    fn p8_key_parses_to_the_key_ring_generated() {
+        let (pem, ring_public) = generated_p8();
+        let key = apns_key_from_p8(pem.as_bytes()).unwrap();
+        assert_eq!(key.public_key().to_uncompressed().as_slice(), ring_public);
+    }
+
+    #[test]
+    fn p8_key_without_embedded_public_key_parses() {
+        let pem = pem_of(&minimal_pkcs8(&[7u8; 32]));
+        let key = apns_key_from_p8(pem.as_bytes()).unwrap();
+        assert_eq!(key.public_key(), test_key().public_key());
+    }
+
+    #[test]
+    fn p8_key_errors_are_typed() {
+        assert_eq!(
+            apns_key_from_p8(b"not a key").unwrap_err(),
+            ApnsKeyError::NotPem
+        );
+        assert_eq!(
+            apns_key_from_p8(&[0xff, 0xfe]).unwrap_err(),
+            ApnsKeyError::NotPem
+        );
+        // A PEM block whose body is not a P-256 PKCS#8 key.
+        assert_eq!(
+            apns_key_from_p8(pem_of(&[0x30, 0x00]).as_bytes()).unwrap_err(),
+            ApnsKeyError::NotP256Pkcs8
+        );
+        // Trailing bytes after the PrivateKeyInfo.
+        let mut trailing = minimal_pkcs8(&[7u8; 32]);
+        trailing.push(0x00);
+        assert_eq!(
+            apns_key_from_p8(pem_of(&trailing).as_bytes()).unwrap_err(),
+            ApnsKeyError::NotP256Pkcs8
+        );
+        // Another curve's OID in the AlgorithmIdentifier: the last byte of
+        // prime256v1 changed.
+        let mut other_curve = minimal_pkcs8(&[7u8; 32]);
+        let at = 7 + P256_ALGORITHM_ID.len() - 1;
+        other_curve[at] = 0x0a;
+        assert_eq!(
+            apns_key_from_p8(pem_of(&other_curve).as_bytes()).unwrap_err(),
+            ApnsKeyError::NotP256Pkcs8
+        );
+        assert_eq!(
+            apns_key_from_p8(pem_of(&minimal_pkcs8(&[0u8; 32])).as_bytes()).unwrap_err(),
+            ApnsKeyError::ScalarOutOfRange
+        );
+        // ring's key with its embedded public key swapped for another key's.
+        let (pem, _) = generated_p8();
+        let (_, other_public) = generated_p8();
+        let der = super::super::push::pem_pkcs8_der(&pem).unwrap();
+        let mut swapped = der.to_vec();
+        let at = swapped.len() - 65;
+        swapped[at..].copy_from_slice(&other_public);
+        assert_eq!(
+            apns_key_from_p8(pem_of(&swapped).as_bytes()).unwrap_err(),
+            ApnsKeyError::PublicKeyMismatch
+        );
     }
 }

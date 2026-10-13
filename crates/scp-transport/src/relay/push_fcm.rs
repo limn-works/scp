@@ -39,8 +39,6 @@
 use std::fmt;
 use std::sync::Arc;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use ring::rand::SystemRandom;
 use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
@@ -50,7 +48,7 @@ use zeroize::Zeroizing;
 
 use super::push::{
     PushDeviceToken, PushSendOutcome, PushSenderError, compact_jws, http2_client, loggable_reason,
-    read_bounded, transport_error_kind,
+    pem_pkcs8_der, read_bounded, transport_error_kind,
 };
 
 /// The FCM HTTP v1 origin.
@@ -187,26 +185,7 @@ impl FcmServiceAccount {
 
 /// Decodes the one `-----BEGIN PRIVATE KEY-----` block of `pem` to DER.
 fn pem_private_key_der(pem: &str) -> Result<Zeroizing<Vec<u8>>, FcmCredentialError> {
-    const BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
-    const END: &str = "-----END PRIVATE KEY-----";
-    let start = pem
-        .find(BEGIN)
-        .ok_or(FcmCredentialError::PrivateKeyNotPem)?
-        + BEGIN.len();
-    let end = pem[start..]
-        .find(END)
-        .ok_or(FcmCredentialError::PrivateKeyNotPem)?
-        + start;
-    let body: Zeroizing<String> = Zeroizing::new(
-        pem[start..end]
-            .chars()
-            .filter(|c| !c.is_ascii_whitespace())
-            .collect(),
-    );
-    STANDARD
-        .decode(body.as_bytes())
-        .map(Zeroizing::new)
-        .map_err(|_| FcmCredentialError::PrivateKeyNotPem)
+    pem_pkcs8_der(pem).ok_or(FcmCredentialError::PrivateKeyNotPem)
 }
 
 /// Everything the FCM sender needs. PUSH-012 loads it from the operator's
@@ -608,6 +587,7 @@ fn map_response(status: u16, error: &FcmError) -> Mapped {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ring::signature::{KeyPair as _, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
     use scp_clock::TestClock;
