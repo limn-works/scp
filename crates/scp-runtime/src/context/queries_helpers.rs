@@ -745,6 +745,8 @@ pub async fn create_checkpoint_if_due_view(
 ///
 /// # Errors
 ///
+/// - The event log's error when its count and root cannot be read; no
+///   checkpoint is signed over a log the node could not read.
 /// - [`ContextError::Custody`] when custody refuses the sign or does not
 ///   answer within the budget (`TimedOut`, `SCP-CRYPTO-4062`).
 /// - [`ContextError::CryptoFailed`] when the canonical hash is not 32 bytes.
@@ -757,15 +759,11 @@ pub async fn build_checkpoint(
     now: u64,
     event_log: &dyn ContextEventLogProvider,
 ) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError> {
-    let context_id_bytes = state::context_id_to_bytes(context_id);
-    let merkle_root = event_log
-        .event_log_merkle_root(&context_id_bytes)
-        .unwrap_or([0u8; 32]);
-    let event_count = event_log
-        .event_log_entries(&context_id_bytes)
-        .ok()
-        .flatten()
-        .map_or(0, |entries| entries.len() as u64);
+    // One read of the log state for both values, propagated: a failed read
+    // never becomes a signed claim of an empty log.
+    let (count, merkle_root) =
+        event_log.event_log_summary(&state::context_id_to_bytes(context_id))?;
+    let event_count = count as u64;
 
     // Encrypted contexts (no broadcast_context) use MLS epochs; broadcast
     // contexts do not use MLS and have no meaningful epoch.
@@ -857,6 +855,8 @@ fn verify_remote_checkpoint_authenticity(
 /// - [`ContextError::MemberNotFound`] if the checkpoint sender is not a member.
 /// - [`ContextError::CryptoFailed`] if the public key cannot be resolved or the
 ///   Ed25519 signature verification fails.
+/// - The event log's error when the local count and root cannot be read; a
+///   failed read is never compared as an empty log.
 fn classify_remote_checkpoint(
     sender_is_member: bool,
     deps: &ActorDeps,
@@ -872,17 +872,10 @@ fn classify_remote_checkpoint(
     // Membership + Ed25519 signature gate (fail-closed before any compare).
     verify_remote_checkpoint_authenticity(sender_is_member, deps, context_id, remote)?;
 
-    let context_id_bytes = state::context_id_to_bytes(context_id);
-    let local_root = deps
+    let (count, local_root) = deps
         .event_log
-        .event_log_merkle_root(&context_id_bytes)
-        .unwrap_or([0u8; 32]);
-    let local_count = deps
-        .event_log
-        .event_log_entries(&context_id_bytes)
-        .ok()
-        .flatten()
-        .map_or(0, |e| e.len() as u64);
+        .event_log_summary(&state::context_id_to_bytes(context_id))?;
+    let local_count = count as u64;
 
     // Note: `prove_consistency` is NOT used here because consistency
     // proofs prove that a smaller version of the SAME log is a prefix
@@ -1568,6 +1561,124 @@ mod checkpoint_signer_tests {
         ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
             Ok([7u8; 32])
         }
+
+        fn event_log_summary(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(usize, [u8; 32]), scp_protocol::context::ContextError> {
+            Ok((0, [7u8; 32]))
+        }
+    }
+
+    /// An event log whose every read fails, as a failed `SQLCipher` read does.
+    struct FailingEventLog;
+
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for FailingEventLog {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        fn event_log_entries(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Err(scp_protocol::context::ContextError::EventLogFailed(
+                "read failed".to_owned(),
+            ))
+        }
+
+        fn event_log_merkle_root(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
+            Err(scp_protocol::context::ContextError::EventLogFailed(
+                "read failed".to_owned(),
+            ))
+        }
+
+        fn event_log_summary(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(usize, [u8; 32]), scp_protocol::context::ContextError> {
+            Err(scp_protocol::context::ContextError::EventLogFailed(
+                "read failed".to_owned(),
+            ))
+        }
+    }
+
+    /// A signer that counts the signs it is asked for.
+    struct CountingSigner {
+        key: scp_crypto::LocalEd25519Signer,
+        signs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl scp_crypto::DynScpSigner for CountingSigner {
+        fn algorithm(&self) -> scp_crypto::SigAlg {
+            scp_crypto::DynScpSigner::algorithm(&self.key)
+        }
+
+        fn public_key(&self) -> Vec<u8> {
+            scp_crypto::DynScpSigner::public_key(&self.key)
+        }
+
+        fn sign_boxed<'a>(&'a self, digest: &'a [u8; 32]) -> scp_crypto::SignFuture<'a> {
+            self.signs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            scp_crypto::DynScpSigner::sign_boxed(&self.key, digest)
+        }
+    }
+
+    /// A failed event-log read fails the checkpoint turn with the log's error,
+    /// and custody is never asked to sign a fabricated empty log.
+    #[tokio::test]
+    async fn checkpoint_fails_when_the_event_log_read_fails() {
+        let signs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let signer = CommandSigner::new(std::sync::Arc::new(CountingSigner {
+            key: scp_crypto::LocalEd25519Signer::from_seed(&[0x24; 32]),
+            signs: std::sync::Arc::clone(&signs),
+        }));
+        let err = build_checkpoint(
+            "ctx-checkpoint",
+            true,
+            4,
+            &DID("did:dht:alice".to_owned()),
+            &signer,
+            1_700_000_123,
+            &FailingEventLog,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, scp_protocol::context::ContextError::EventLogFailed(_)),
+            "{err:?}"
+        );
+        assert_eq!(
+            signs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no custody call"
+        );
     }
 
     /// A checkpoint signed through `CommandSigner` (ADR-049 Decision 7a)

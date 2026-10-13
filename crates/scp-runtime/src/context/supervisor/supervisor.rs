@@ -861,8 +861,9 @@ fn build_outlet_stream_pump_semaphore(requested: u32) -> Arc<tokio::sync::Semaph
 
 /// Supervisor configuration (per-node tunables). Saga phase timeouts and
 /// respawn-budget windows are still derived from code constants
-/// (`Supervisor::LIFECYCLE_TIMEOUT`, the function-local `PHASE_TIMEOUT`, and
-/// the module-level `CRASH_WINDOW_MS`) rather than this struct.
+/// (`Supervisor::LIFECYCLE_TIMEOUT`, the Prepare phase's function-local
+/// `PHASE_TIMEOUT`, and the module-level `COMMIT_PHASE_TIMEOUT` and
+/// `CRASH_WINDOW_MS`) rather than this struct.
 #[derive(Clone, Debug)]
 pub struct SupervisorConfig {
     /// Node-level ceiling on the number of outlet stream pumps that may run
@@ -889,6 +890,36 @@ impl Default for SupervisorConfig {
 /// Crashes older than this (relative to the newest crash) are evicted
 /// before the budget is evaluated.
 const CRASH_WINDOW_MS: u64 = 60_000;
+
+/// The budget of the supervisor-side outlet executor within one saga Commit
+/// attempt (§6.2.4). The executor runs off the actor mailbox (ADR-049 §3), so
+/// no actor turn bounds it.
+const COMMIT_EXECUTOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The budget of one saga Commit attempt, built from its parts: the executor
+/// ([`COMMIT_EXECUTOR_TIMEOUT`]), the Commit-B settle turn, which signs the
+/// receipt through `sign_bounded` and so takes
+/// [`SIGNING_HANDLER_TIMEOUT`](crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT),
+/// and 30 seconds for the Commit-B reserve and Commit-A turns.
+///
+/// A phase budget equal to the sign budget would expire with it, so a stalled
+/// custody would surface as the phase's `TransportTimeout`. With this budget
+/// the stalled sign fails first, as `SCP-CRYPTO-4062` (ADR-049 Decision 7a).
+const COMMIT_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+    COMMIT_EXECUTOR_TIMEOUT.as_secs()
+        + crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT.as_secs()
+        + 30,
+);
+
+const _: () = assert!(
+    COMMIT_PHASE_TIMEOUT.as_secs()
+        > COMMIT_EXECUTOR_TIMEOUT.as_secs() + crate::context::actor::signer::SIGN_TIMEOUT.as_secs()
+);
+const _: () = assert!(
+    COMMIT_PHASE_TIMEOUT.as_secs()
+        > COMMIT_EXECUTOR_TIMEOUT.as_secs()
+            + crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT.as_secs()
+);
 
 /// Number of crashes within [`CRASH_WINDOW_MS`] that poisons a context
 /// (ADR-049 §10): "3 crashes in 60s poisons the context."
@@ -9557,7 +9588,8 @@ impl Supervisor {
         }))
     }
 
-    /// Dispatch the Commit phase under the 30s per-attempt timeout.
+    /// Dispatch the Commit phase under the per-attempt
+    /// [`COMMIT_PHASE_TIMEOUT`].
     ///
     /// For a wired `CrossContextOutletInvocation` this drives the §6.2.4 Commit:
     /// Commit-B reserve → run the executor supervisor-side → Commit-B settle →
@@ -9568,8 +9600,6 @@ impl Supervisor {
         input: &SagaInput,
         xctx: Option<&mut CrossContextSagaCtx<'_>>,
     ) -> Result<(), ContextError> {
-        const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
         let dispatch_fut = async {
             match input {
                 SagaInput::CrossContextOutletInvocation { .. } => {
@@ -9602,11 +9632,11 @@ impl Supervisor {
             }
         };
 
-        match tokio::time::timeout(PHASE_TIMEOUT, dispatch_fut).await {
+        match tokio::time::timeout(COMMIT_PHASE_TIMEOUT, dispatch_fut).await {
             Ok(r) => r,
-            Err(_elapsed) => Err(ContextError::TransportTimeout(
-                "saga Commit exceeded 30s phase budget".to_owned(),
-            )),
+            Err(_elapsed) => Err(ContextError::TransportTimeout(format!(
+                "saga Commit exceeded {COMMIT_PHASE_TIMEOUT:?} phase budget"
+            ))),
         }
     }
 
@@ -9782,12 +9812,23 @@ impl Supervisor {
                         .to_owned(),
                 )
             })?;
-            let output_value = executor(ctx.input.clone()).await.map_err(|e| {
-                ContextError::CryptoFailed(format!(
-                    "SCP-SAGA-13057: cross-context outlet executor failed for saga '{}': {e}",
-                    saga_id.0
-                ))
-            })?;
+            let output_value =
+                tokio::time::timeout(COMMIT_EXECUTOR_TIMEOUT, executor(ctx.input.clone()))
+                    .await
+                    .map_err(|_elapsed| {
+                        ContextError::TransportTimeout(format!(
+                            "saga Commit outlet executor exceeded {COMMIT_EXECUTOR_TIMEOUT:?} \
+                             budget for saga '{}'",
+                            saga_id.0
+                        ))
+                    })?
+                    .map_err(|e| {
+                        ContextError::CryptoFailed(format!(
+                            "SCP-SAGA-13057: cross-context outlet executor failed for saga '{}': \
+                             {e}",
+                            saga_id.0
+                        ))
+                    })?;
             let bytes = serde_json::to_vec(&output_value).map_err(|e| {
                 ContextError::CryptoFailed(format!(
                     "SCP-SAGA-13058: cross-context outlet output is not serializable for saga \
@@ -31506,6 +31547,88 @@ mod tests {
             message: "confused-deputy".to_owned(),
         };
         assert!(aborted.to_string().contains("SCP-SAGA-13013"));
+    }
+
+    /// A target custody that never answers fails each Commit attempt with
+    /// `SCP-CRYPTO-4062` from `sign_bounded`, never with the phase's
+    /// `TransportTimeout`: the Commit budget is built from the executor budget
+    /// plus the signing turn's budget, so the sign budget always fires first.
+    #[tokio::test(start_paused = true)]
+    async fn xctx_saga_stalled_target_custody_fails_commit_with_custody_timeout() {
+        use crate::context::actor::signer::SIGN_TIMEOUT;
+        use scp_crypto::{CustodyFailure, CustodyFailureKind, DynScpSigner, SigAlg, SignFuture};
+
+        /// A signer whose sign never completes, standing in for an
+        /// unanswered biometric prompt.
+        struct StalledSigner(Vec<u8>);
+
+        impl DynScpSigner for StalledSigner {
+            fn algorithm(&self) -> SigAlg {
+                SigAlg::Ed25519
+            }
+
+            fn public_key(&self) -> Vec<u8> {
+                self.0.clone()
+            }
+
+            fn sign_boxed<'a>(&'a self, _digest: &'a [u8; 32]) -> SignFuture<'a> {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkXctxStallCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxStallCaller";
+
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_public = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let executor =
+            |_input: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) };
+
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let started = tokio::time::Instant::now();
+        let err = supervisor
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    outlet_registration_id: XCTX_OUTLET.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 1,
+                    asserted_nonce: [0x47u8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
+                SagaSigners {
+                    target: CommandSigner::new(Arc::new(StalledSigner(target_public))),
+                    caller: CommandSigner::local_ed25519(caller_signing),
+                },
+                executor,
+            )
+            .await
+            .expect_err("a stalled target custody fails the saga");
+
+        let SagaError::NeedsRepair { message, .. } = err else {
+            panic!("a failed Commit lifts to NeedsRepair, got {err:?}");
+        };
+        // The public NeedsRepair carries the last Commit attempt's error as
+        // text; it is the typed `sign_bounded` timeout (`SCP-CRYPTO-4062` at
+        // the bridges), not the phase's `TransportTimeout`.
+        let expected = ContextError::Custody(CustodyFailure {
+            kind: CustodyFailureKind::TimedOut,
+            detail: format!("custody did not sign within {SIGN_TIMEOUT:?}"),
+        });
+        assert_eq!(message, expected.to_string());
+        assert!(started.elapsed() >= SIGN_TIMEOUT);
     }
 
     /// Replay: after a saga commits, re-driving Commit-B for the SAME `SagaId`

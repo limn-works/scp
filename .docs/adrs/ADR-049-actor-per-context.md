@@ -72,7 +72,7 @@ Saga crash-recovery is nonetheless **inert in production today** — but for a d
 
 Concurrent sagas against the same actor are **serialized** — at most one `saga_pending` entry per actor. A second Prepare while one is pending returns the typed `SagaBusy` error (the §3a FFI-facing taxonomy name — the internal saga-FSM rejection reason maps onto it at the bridge). This preserves the "Commit must eventually succeed" property without Commit-time revalidation branches.
 
-**Commit retry policy:** per-phase timeout 30s; Commit retries 3× with 500ms/1s/2s delays, then journals `NeedsRepair` and returns the typed `SagaNeedsRepair` error (the §3a FFI-facing taxonomy name) to the caller. Operator uses `repair_saga(saga_id)` admin command or process restart to re-drive. No indefinite retry loop, no "log and hope."
+**Commit retry policy:** the Prepare phase times out at 30s. One Commit attempt times out at 120s, the sum of its parts: 30 s for the supervisor-side outlet executor, which has its own 30 s budget; the Commit-B settle turn, which signs the receipt and so takes the signing turn's budget of 30 s of work plus the 30 s custody budget of §7a; and 30 s for the Commit-B reserve and Commit-A turns. A Commit budget equal to the custody budget would expire with it, so a stalled custody would surface as a phase timeout; with the summed budget the sign fails first, with SCP-CRYPTO-4062. Commit retries 3× with 500ms/1s/2s delays, then journals `NeedsRepair` and returns the typed `SagaNeedsRepair` error (the §3a FFI-facing taxonomy name) to the caller. Operator uses `repair_saga(saga_id)` admin command or process restart to re-drive. No indefinite retry loop, no "log and hope."
 
 ### 3a. FFI Saga Surface
 
