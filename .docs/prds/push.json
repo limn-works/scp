@@ -40,7 +40,8 @@
         "PUSH-026",
         "PUSH-028",
         "PUSH-029",
-        "PUSH-030"
+        "PUSH-030",
+        "PUSH-031"
       ]
     },
     {
@@ -1602,7 +1603,8 @@
       "blockedBy": [
         "PUSH-027",
         "PUSH-013",
-        "PUSH-030"
+        "PUSH-030",
+        "PUSH-031"
       ],
       "sources": [
         {
@@ -1866,6 +1868,61 @@
         {
           "file": ".docs/specs/26-conformance-suite.md",
           "section": "### CONF-005: Multi-Device (One Identity, Different Device Leaf Keys)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "PUSH-031",
+      "title": "The 0xFF02 extension commits T0; members install T0 and the TTL base from it",
+      "gate": "gate-push-client",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/group_context_extension.rs",
+        "crates/scp-mls/src/context_extension.rs",
+        "crates/scp-runtime/src/context/lifecycle_helpers.rs",
+        "crates/scp-runtime/src/context/export_import.rs",
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-runtime/src/context/supervisor/spawn_from_welcome_tests.rs",
+        "crates/scp-runtime/src/context/ttl_close_helpers.rs"
+      ],
+      "description": "Implements the `creation_timestamp_secs` field of the `0xFF02` SCP Context Parameters MLS group-context extension and validation rule 9, which `05-contexts.md` \u00a75.13.3 (context creation) specifies. Alec chose this design on 2026-10-13. The creator's `ContextCreated` leaf timestamp (`T0`) is a genesis fact, so the creator commits it in the extension, and every member installs it from the committed extension as `T0` for the pseudonym rotation schedule (`09-security-model.md` \u00a79.10.4.1) and as the TTL-deadline base (`05-contexts.md` \u00a75.10). No member takes it from an invitation bundle signature, a snapshot field, or its own clock. The extension commits the value because a bundle signature proves only who signed the bundle (\u00a75.12.3.1 step 4, \u00a75.13.3 rule 8). A false `T0` would make a joiner rotate alone, so a relay could link its subscriptions across rotations, and it would move the joiner's TTL deadline. The field is required: SCP has no users, so no transition path accepts an extension without it. TTL extensions still reach a member as `TTLExtended` leaves in the event log, and ADR-049's single-source TTL-deadline invariant keeps the persisted `ContextSnapshot.creation_timestamp_secs` as the prune-immune base, now filled from the committed extension. PUSH-026, the pseudonym rotation runtime story, needs `T0` on a Welcome joiner, so this story blocks PUSH-026. The rotation runtime itself is PUSH-026, not this story. File locations are indicators.",
+      "acceptanceCriteria": [
+        "Creator writes the field (\u00a75.13.3 'Creation timestamp'): a context created at test-clock time T0 carries a `0xFF02` extension whose JCS bytes include `creation_timestamp_secs` equal to the `timestamp` of the creator's `ContextCreated` leaf, and that value is unchanged in the extension after a later AddMember Commit. Creation rejects a creation timestamp above 2^53 \u2212 1.",
+        "Install on join, import and restore (\u00a75.13.3 rule 9): a Welcome joiner, an import and a restore each set the context's `T0` and its TTL-deadline base to the committed `creation_timestamp_secs`. A test whose invitation bundle, snapshot or local clock carries a different value shows the installed value still equals the committed one. The SDK rejects an import or restore whose snapshot creation timestamp differs from the committed value, before it installs any authority.",
+        "Reject a missing or invalid field (\u00a75.13.3 rule 1 and rule 9): a Welcome join, an import and a restore each reject an MLS group whose `0xFF02` extension omits `creation_timestamp_secs`, carries a value above 2^53 \u2212 1, or carries a value later than the member's clock plus 300 s, and each rejection installs no governance engine and no admin set.",
+        "Two-node test (\u00a79.10.4.1 'Epoch schedule' and 'First v2 derivation'; \u00a75.10 'Deadline base'): node A creates a context at T0 with `interval_secs` 3600 and a 5 h TTL, and node B joins through a Welcome at T0 + 3.5 h. B's first v2 epoch is 3, A and B each signal 'rotation due' at the same boundary T0 + 4 h, and B's TTL deadline is T0 + 5 h, not T0 + 8.5 h.",
+        "The two-node test above replaces the PUSH-026 test `a_welcome_joiner_admits_no_interval_rotation_without_the_creators_t0` in `spawn_from_welcome_tests.rs`, which the story deletes; a repository search for that test name returns no hit."
+      ],
+      "actionItems": [
+        "Add the required `creation_timestamp_secs: u64` to the `0xFF02` extension type, its JCS serialization, and its validation, with the 2^53 \u2212 1 bound.",
+        "Write the field at context creation from the `ContextCreated` leaf timestamp.",
+        "On Welcome join, import and restore, read `T0` and the TTL base from the committed extension, check the snapshot value against it, and apply the future bound of \u00a79.8.2.",
+        "Replace the PUSH-026 Welcome-joiner test with the two-node test."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.13.3 Creation"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.10 Context TTL (Time-to-Live)"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "#### 5.12.3.1 InvitationBundle Wire Format"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.10.4.1 Pseudonym Rotation (BLACK-001 Mitigation)"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-actor-per-context.md",
+          "section": "### 9. Persistence: coalesced by default, sync for safety-critical"
         }
       ],
       "details": {}
