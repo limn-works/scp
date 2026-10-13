@@ -664,9 +664,28 @@ impl FfiBridgeProvider {
             }))
         })
         .map_err(|e| AccessRefusal::Unreadable(format!("{e}")))?;
+        // A rejected token keeps its own refusal: the caller is already
+        // denied, so a durability failure on that path grants nothing.
+        let persisted = persist_invoke_nonces(bi, context_id, check);
         decision.map_err(AccessRefusal::Denied)?;
-        Ok(())
+        persisted
     }
+}
+
+/// Writes the context's UCAN nonce entries to durable storage after an
+/// `Invoke` check, the only check whose pipeline run records a nonce (step 9),
+/// so the outlet does not run on a nonce the next process start would forget.
+/// A probe records nothing and writes nothing.
+fn persist_invoke_nonces(
+    bi: &crate::runtime::PyBridgeInstance,
+    context_id: &str,
+    check: scp_mcp::server::CapabilityCheck,
+) -> Result<(), scp_mcp::server::AccessRefusal> {
+    if check != scp_mcp::server::CapabilityCheck::Invoke {
+        return Ok(());
+    }
+    crate::runtime::persist_ucan_nonces_blocking(bi, context_id)
+        .map_err(|e| scp_mcp::server::AccessRefusal::Unreadable(format!("{e}")))
 }
 
 impl ContextProvider for FfiBridgeProvider {
@@ -2824,6 +2843,7 @@ mod tests {
     ) -> String {
         // Use a unique context ID to avoid collisions across parallel tests.
         let ctx_id = crate::types::generate_random_id("test-mcp");
+        crate::runtime::select_in_memory_storage_for_test(bi);
         crate::runtime::register_ffi_state(bi, &ctx_id, &[]).unwrap();
 
         if with_outlet {

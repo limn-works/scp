@@ -235,7 +235,7 @@ impl std::fmt::Debug for SqliteKeyMaterial {
 ///
 /// Two variants are supported:
 /// - [`StorageConfig::InMemory`] — encrypted in-memory storage (ephemeral).
-/// - [`StorageConfig::Sqlite`] — persistent SQLCipher-encrypted storage on
+/// - [`StorageConfig::Sqlite`] — persistent `SQLCipher`-encrypted storage on
 ///   disk. The key material is a [`SqliteKeyMaterial`]: EITHER raw key bytes
 ///   (`key`) OR a passphrase (`passphrase`), each held in [`Zeroizing`] so it
 ///   is wiped from memory as soon as the config is consumed.
@@ -246,7 +246,7 @@ impl std::fmt::Debug for SqliteKeyMaterial {
 pub enum StorageConfig {
     /// In-memory encrypted storage (default; lost on process exit).
     InMemory,
-    /// SQLCipher-encrypted storage at `{path}/scp.db`.
+    /// `SQLCipher`-encrypted storage at `{path}/scp.db`.
     ///
     /// Wraps [`scp_platform::sqlite::SqliteStorage`]. Persists across
     /// process restarts. The `key` selects raw-key vs. passphrase derivation
@@ -350,7 +350,7 @@ impl std::error::Error for StorageInitError {}
 pub enum StorageProvider {
     /// Encrypted in-memory storage.
     InMemoryEncrypted(Arc<EncryptingAdapter<InMemoryStorage>>),
-    /// SQLCipher-encrypted on-disk storage.
+    /// `SQLCipher`-encrypted on-disk storage.
     Sqlite(Arc<SqliteStorage>),
 }
 
@@ -1011,6 +1011,20 @@ pub fn init_context_manager_with_local_transport(bi: &PyBridgeInstance, local_di
     bi.core.set_supervisor(supervisor_arc);
 }
 
+/// Selects in-memory encrypted storage on a test instance that has none, with
+/// no supervisor. Registering FFI state loads the context's durable UCAN
+/// records, so it refuses on an instance without storage; tests that run with
+/// no supervisor select storage here instead of through
+/// [`init_context_manager_for_test`].
+#[cfg(test)]
+pub(crate) fn select_in_memory_storage_for_test(bi: &PyBridgeInstance) {
+    if bi.storage_provider().is_none() {
+        let _ = bi
+            .storage_provider
+            .set(StorageProvider::new_in_memory_encrypted());
+    }
+}
+
 /// Test variant of [`init_context_manager`] that uses `LocalTransportProvider`
 /// instead of `NotConfiguredTransportProvider`.
 ///
@@ -1631,6 +1645,20 @@ fn insert_ffi_state(
             .map_err(|e| ScpPyError::context(e.to_string()))?;
     }
 
+    if ffi_state_registry(bi).contains_key(context_id) {
+        return Err(ffi_state_already_registered(context_id));
+    }
+    // Build the revocation list and nonce tracker from the durable record
+    // BEFORE taking the shard's `Entry` write guard, so the storage read never
+    // stalls every other key in that shard. The `Occupied`/`Vacant` decision
+    // and the release mark check below stay atomic; a collision discards this
+    // state.
+    let scp_ffi_common::bridge_runtime::UcanContextStateCore {
+        revocation_list,
+        nonce_tracker,
+        event_log,
+    } = load_ucan_state_blocking(bi, context_id)?;
+
     match ffi_state_registry(bi).entry(context_id.to_owned()) {
         Entry::Occupied(_) => Err(ffi_state_already_registered(context_id)),
         Entry::Vacant(vacant) => {
@@ -1651,9 +1679,9 @@ fn insert_ffi_state(
             }
             vacant.insert(FfiBridgeState {
                 outlet_registry: OutletRegistry::new(),
-                event_log: EventLog::new(context_id.to_owned()),
-                revocation_list: RevocationList::new(context_id.to_owned()),
-                nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
+                event_log,
+                revocation_list,
+                nonce_tracker,
                 outlet_handlers: HashMap::new(),
                 message_tx: None,
                 message_rx: None,
@@ -1662,6 +1690,139 @@ fn insert_ffi_state(
             Ok(())
         }
     }
+}
+
+/// Builds a context's UCAN validation state from this instance's durable
+/// records, through [`scp_ffi_common::ucan_durable_state::load_core`].
+///
+/// [`insert_ffi_state`] calls this while it builds the per-context state,
+/// which is the point at which this instance first becomes able to answer a
+/// UCAN validation for the context.
+///
+/// `insert_ffi_state` is synchronous and `Storage` is async, so this bridges
+/// the two through
+/// [`scp_ffi_common::ucan_durable_state::block_on_storage`].
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the instance has no storage backend
+/// selected, if the durable record cannot be read or decoded, or if the call
+/// arrives from inside a current-thread tokio runtime where the sync-to-async
+/// bridge cannot run. The bridge fails closed: an unreadable revocation record
+/// must not present as "nothing was revoked".
+fn load_ucan_state_blocking(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<scp_ffi_common::bridge_runtime::UcanContextStateCore, ScpPyError> {
+    let storage = durable_storage(bi, "rebuild durable UCAN state", context_id)?;
+    let to_error = durable_state_error("rebuild durable UCAN state", context_id);
+    run_storage_io(scp_ffi_common::ucan_durable_state::load_core(
+        storage, context_id,
+    ))
+    .map_err(to_error)?
+    .map_err(to_error)
+}
+
+/// Returns this instance's selected storage backend, or the `ContextError` a
+/// durable UCAN state read or write reports when none is selected.
+fn durable_storage<'a>(
+    bi: &'a PyBridgeInstance,
+    action: &str,
+    context_id: &str,
+) -> Result<&'a StorageProvider, ScpPyError> {
+    bi.storage_provider().ok_or_else(|| {
+        ScpPyError::context(format!(
+            "cannot {action} for '{context_id}': no storage backend selected — call \
+             SCP.with_storage(...) first"
+        ))
+    })
+}
+
+/// Builds the `ContextError` a failed durable UCAN state read or write reports.
+fn durable_state_error<'a>(
+    action: &'static str,
+    context_id: &'a str,
+) -> impl Fn(scp_ffi_common::ucan_durable_state::UcanDurableStateError) -> ScpPyError + Copy + 'a {
+    move |e| ScpPyError::context(format!("failed to {action} for '{context_id}': {e}"))
+}
+
+/// Runs a durable UCAN state future to completion from a synchronous `PyO3`
+/// entry point through
+/// [`scp_ffi_common::ucan_durable_state::block_on_storage`].
+///
+/// The bridge runtime is resolved only when the caller sits outside any tokio
+/// runtime (the ordinary Python-thread entry); inside a runtime the helper uses
+/// the ambient one, so a missing bridge runtime cannot fail that path.
+fn run_storage_io<F: std::future::Future>(
+    fut: F,
+) -> Result<F::Output, scp_ffi_common::ucan_durable_state::UcanDurableStateError> {
+    let fallback = if tokio::runtime::Handle::try_current().is_ok() {
+        None
+    } else {
+        super::runtime().ok().map(tokio::runtime::Runtime::handle)
+    };
+    scp_ffi_common::ucan_durable_state::block_on_storage(fallback, fut)
+}
+
+/// Writes a context's UCAN revocation list to this instance's durable store.
+///
+/// `PyScp::ucan_revoke` calls this once the core revocation pipeline has
+/// succeeded, so the durable record agrees with the in-memory list before
+/// `ucan_revoke` returns to Python. The write runs while this call holds the
+/// context's registry entry, so two concurrent writers land in the order they
+/// read the list and the last write carries every revocation made before it.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the context holds no FFI state, no
+/// storage backend is selected, or the write fails. The caller propagates the
+/// failure instead of reporting a revocation that the next process start would
+/// forget.
+pub(crate) fn persist_ucan_revocation_blocking(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<(), ScpPyError> {
+    let storage = durable_storage(bi, "persist the UCAN revocation", context_id)?;
+    let to_error = durable_state_error("persist UCAN revocation", context_id);
+    with_ffi_state(bi, context_id, |rt| {
+        run_storage_io(scp_ffi_common::ucan_durable_state::persist_revocation_list(
+            storage,
+            context_id,
+            &rt.revocation_list,
+        ))
+        .map_err(to_error)?
+        .map_err(to_error)
+    })
+}
+
+/// Writes a context's UCAN nonce entries to this instance's durable store.
+///
+/// Every `PyO3` entry point that runs the ADR-016 validation pipeline and can
+/// record a nonce calls this afterwards, because step 9 of that pipeline is the
+/// only writer of nonce state. A nonce accepted now is therefore still refused
+/// after the bridge instance is rebuilt. The write runs while this call holds
+/// the context's registry entry, so two concurrent writers land in the order
+/// they read the tracker.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the context holds no FFI state, no
+/// storage backend is selected, or the write fails.
+pub(crate) fn persist_ucan_nonces_blocking(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<(), ScpPyError> {
+    let storage = durable_storage(bi, "persist UCAN nonce state", context_id)?;
+    let to_error = durable_state_error("persist UCAN nonce state", context_id);
+    with_ffi_state(bi, context_id, |rt| {
+        run_storage_io(scp_ffi_common::ucan_durable_state::persist_nonce_entries(
+            storage,
+            context_id,
+            &rt.nonce_tracker.snapshot_entries(),
+        ))
+        .map_err(to_error)?
+        .map_err(to_error)
+    })
 }
 
 /// Executes a closure with mutable access to a context's FFI bridge state.
@@ -4750,6 +4911,7 @@ mod tests {
         let bi = Arc::new(PyBridgeInstance::new_py());
         let ctx_id = unique_ctx_id("ids-no-supervisor");
         let creator = "did:dht:z6MkIdsNoSupervisor";
+        select_in_memory_storage_for_test(&bi);
         register_ffi_state(&bi, &ctx_id, &[]).unwrap();
 
         member_context_role_states(&bi, creator)

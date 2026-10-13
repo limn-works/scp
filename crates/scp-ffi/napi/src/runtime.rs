@@ -33,15 +33,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
+#[cfg(test)]
 use scp_clock::SystemClock;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::outlets::{OutletRegistry, SessionStore};
 use scp_core::context::persistence::ContextPersistence;
 use scp_core::context::roles::ContextRoleState;
 use scp_core::context::state::ContextSnapshot;
+#[cfg(test)]
 use scp_core::crypto::ucan::nonce::NonceTracker;
+#[cfg(test)]
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
+#[cfg(test)]
 use scp_event_log::EventLog;
 
 use crate::context::NapiContextHandle;
@@ -55,7 +59,7 @@ use crate::error::ScpNapiError;
 ///
 /// Two variants are supported:
 /// - [`StorageConfig::InMemory`] — encrypted in-memory storage (ephemeral).
-/// - [`StorageConfig::Sqlite`] — SQLCipher-encrypted storage on disk at
+/// - [`StorageConfig::Sqlite`] — `SQLCipher`-encrypted storage on disk at
 ///   `{path}/scp.db`, wired through [`scp_platform::sqlite::SqliteStorage`].
 ///
 /// Kept here (not in `scp-ffi-common`) because each bridge owns its own
@@ -65,7 +69,7 @@ pub enum StorageConfig {
     /// Encrypted in-memory storage.
     #[default]
     InMemory,
-    /// SQLCipher-encrypted on-disk storage at `{path}/scp.db`.
+    /// `SQLCipher`-encrypted on-disk storage at `{path}/scp.db`.
     ///
     /// Persists context snapshots, identity state, and the event log
     /// across process restarts. The encryption key material is selected via
@@ -1296,7 +1300,7 @@ pub fn init_supervisor_with_relay_transport(
 ///
 /// Used by the trust aggregation bridge to construct a
 /// `ProtocolRepositoryTrustBridge` backed by the configured storage (either
-/// encrypted in-memory or SQLCipher-on-disk).
+/// encrypted in-memory or `SQLCipher`-on-disk).
 #[must_use]
 pub const fn protocol_repository(bi: &NapiBridgeInstance) -> &ProtocolRepoVariant {
     &bi.protocol_repository
@@ -1675,11 +1679,21 @@ pub(crate) fn ucan_registry(bi: &NapiBridgeInstance) -> &DashMap<String, UcanCon
 /// `user_ceiling` reaches this function for that grammar check alone. The state
 /// this function builds stores no role state, no ceiling, and no creator DID.
 ///
+/// The revocation list and nonce tracker are rebuilt from this instance's
+/// durable store before the state is returned (see
+/// [`load_ucan_state_blocking`]), so a token revoked before the process
+/// restarted is already revoked in the state this function hands back. Both
+/// registration paths run through here, which is why hydration lives here
+/// rather than at each caller.
+///
 /// # Errors
 ///
 /// Returns `ScpNapiError::Validation` if a ceiling entry violates the §5.3.1.1
-/// grammar.
+/// grammar, and `ScpNapiError::Context` if the durable UCAN state cannot be
+/// read — the bridge fails closed rather than answering validations from an
+/// empty revocation list.
 fn build_ucan_context_state(
+    bi: &NapiBridgeInstance,
     context_id: &str,
     user_ceiling: &[String],
 ) -> Result<UcanContextState, ScpNapiError> {
@@ -1715,14 +1729,109 @@ fn build_ucan_context_state(
     }
 
     Ok(UcanContextState {
-        core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
-            revocation_list: RevocationList::new(context_id.to_owned()),
-            nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-            event_log: EventLog::new(context_id.to_owned()),
-        },
+        core: load_ucan_state_blocking(bi, context_id)?,
         outlet_registry: OutletRegistry::new(),
         outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),
+    })
+}
+
+/// Builds a context's [`UcanContextStateCore`] from this instance's durable
+/// revocation and nonce records.
+///
+/// `build_ucan_context_state` is synchronous and both of its callers are
+/// synchronous, while `Storage` is async, so this bridges the two through
+/// [`scp_ffi_common::ucan_durable_state::block_on_storage`].
+///
+/// [`UcanContextStateCore`]: scp_ffi_common::bridge_runtime::UcanContextStateCore
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Context` if the durable record cannot be read or
+/// decoded, or if the call arrives from inside a current-thread tokio runtime
+/// where the sync-to-async bridge cannot run. Either way the bridge fails
+/// closed: an unreadable revocation record must not present as "nothing was
+/// revoked".
+fn load_ucan_state_blocking(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<scp_ffi_common::bridge_runtime::UcanContextStateCore, ScpNapiError> {
+    let to_error = durable_state_error("rebuild durable UCAN state", context_id);
+    scp_ffi_common::ucan_durable_state::block_on_storage(
+        Some(crate::runtime().handle()),
+        protocol_repository(bi).load_ucan_state(context_id),
+    )
+    .map_err(to_error)?
+    .map_err(to_error)
+}
+
+/// Builds the `SCP-CTX-2023` error a durable UCAN state read or write reports.
+fn durable_state_error<'a>(
+    action: &'static str,
+    context_id: &'a str,
+) -> impl Fn(scp_ffi_common::ucan_durable_state::UcanDurableStateError) -> ScpNapiError + Copy + 'a
+{
+    move |e| ScpNapiError::Context {
+        message: format!("failed to {action} for '{context_id}': {e}"),
+        code: codes::CTX_2023.to_owned(),
+    }
+}
+
+/// Writes the context's UCAN revocation list to this instance's durable store.
+///
+/// Called by `ucan_revoke` once the core revocation pipeline has succeeded, so
+/// the durable record agrees with the in-memory list before `ucan_revoke`
+/// returns. The write runs while this call holds the context's registry entry,
+/// so two concurrent writers land in the order they read the list and the last
+/// write carries every revocation made before it.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Context` if the context holds no UCAN state on this
+/// instance or the write fails. The caller propagates the failure instead of
+/// reporting a revocation that the next process start would forget.
+pub(crate) fn persist_ucan_revocation_blocking(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<(), ScpNapiError> {
+    let to_error = durable_state_error("persist UCAN revocation", context_id);
+    with_context(bi, context_id, |rt| {
+        scp_ffi_common::ucan_durable_state::block_on_storage(
+            Some(crate::runtime().handle()),
+            protocol_repository(bi)
+                .persist_ucan_revocation_list(context_id, &rt.core.revocation_list),
+        )
+        .map_err(to_error)?
+        .map_err(to_error)
+    })
+}
+
+/// Writes the context's UCAN nonce tracker to this instance's durable store.
+///
+/// Called after every UCAN-validation pipeline run that records a nonce,
+/// because that pipeline is the only writer of nonce state. A nonce accepted
+/// now is therefore still refused after the bridge instance is rebuilt. The
+/// write runs while this call holds the context's registry entry, so two
+/// concurrent writers land in the order they read the tracker.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Context` if the context holds no UCAN state on this
+/// instance or the write fails. The caller propagates the failure rather than
+/// reporting a validation whose replay record did not become durable.
+pub(crate) fn persist_ucan_nonces_blocking(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<(), ScpNapiError> {
+    let to_error = durable_state_error("persist UCAN nonce state", context_id);
+    with_context(bi, context_id, |rt| {
+        scp_ffi_common::ucan_durable_state::block_on_storage(
+            Some(crate::runtime().handle()),
+            protocol_repository(bi)
+                .persist_ucan_nonce_entries(context_id, &rt.core.nonce_tracker.snapshot_entries()),
+        )
+        .map_err(to_error)?
+        .map_err(to_error)
     })
 }
 
@@ -1757,14 +1866,22 @@ pub fn register_ffi_state(
 ) -> Result<(), ScpNapiError> {
     use dashmap::mapref::entry::Entry;
 
+    let already_registered = || ScpNapiError::Context {
+        message: format!("context '{context_id}' FFI state is already registered"),
+        code: codes::CTX_2023.to_owned(),
+    };
+    if ucan_registry(bi).contains_key(context_id) {
+        return Err(already_registered());
+    }
+    // Build (and hydrate from durable storage) BEFORE taking the shard's
+    // `Entry` write guard, so the storage read never stalls every other key in
+    // that shard. The `Occupied`/`Vacant` decision below stays atomic; a
+    // collision discards this state.
+    let state = build_ucan_context_state(bi, context_id, user_ceiling)?;
     match ucan_registry(bi).entry(context_id.to_owned()) {
-        Entry::Occupied(_) => Err(ScpNapiError::Context {
-            message: format!("context '{context_id}' FFI state is already registered"),
-            code: codes::CTX_2023.to_owned(),
-        }),
+        Entry::Occupied(_) => Err(already_registered()),
         Entry::Vacant(vacant) => {
             // This insert leaves the release mark in place.
-            let state = build_ucan_context_state(context_id, user_ceiling)?;
             vacant.insert(state);
             Ok(())
         }
@@ -1795,19 +1912,31 @@ pub fn ensure_registered(
     use dashmap::mapref::entry::Entry;
 
     let context_id = handle.context_id();
+    let released = || ScpNapiError::Context {
+        // The refusal withholds the lifecycle state: this call authorizes no
+        // one, so its answer must not say whether the context closed.
+        message: format!(
+            "cannot use context: {}",
+            scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+        ),
+        code: codes::CTX_2023.to_owned(),
+    };
+    if ucan_registry(bi).contains_key(&context_id) {
+        return Ok(());
+    }
+    if lock_release_marks(bi).contains_key(&context_id) {
+        return Err(released());
+    }
+    // Build (and hydrate from durable storage) BEFORE taking the shard's
+    // `Entry` write guard, so the storage read never stalls every other key in
+    // that shard. The released-id check and the insert below still run under
+    // that guard; a concurrent registration that wins the race keeps its own
+    // state and this one is discarded.
+    let state = build_ucan_context_state(bi, &context_id, &handle.ceiling())?;
     if let Entry::Vacant(vacant) = ucan_registry(bi).entry(context_id) {
         if lock_release_marks(bi).contains_key(vacant.key()) {
-            // The refusal withholds the lifecycle state: this call authorizes
-            // no one, so its answer must not say whether the context closed.
-            return Err(ScpNapiError::Context {
-                message: format!(
-                    "cannot use context: {}",
-                    scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
-                ),
-                code: codes::CTX_2023.to_owned(),
-            });
+            return Err(released());
         }
-        let state = build_ucan_context_state(vacant.key(), &handle.ceiling())?;
         vacant.insert(state);
     }
     Ok(())

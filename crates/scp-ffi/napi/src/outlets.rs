@@ -34,7 +34,44 @@ fn outlet_refusal(code: &'static str) -> impl Fn(String) -> ScpNapiError + Copy 
 /// ADR-016 step 8 compares the token's grants against the context's capability
 /// ceiling, and step 4 anchors the chain on the context creator. Both come from
 /// `role_state`.
+///
+/// Step 9 of that pipeline records the token's nonce, so this writes the
+/// context's nonce entries to durable storage before returning — a nonce
+/// accepted here is still refused after the bridge instance is rebuilt.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Permission` when the pipeline rejects the token, and
+/// `ScpNapiError::Context` when the pipeline accepted the token but the nonce
+/// record did not reach durable storage. A rejected token keeps its own error:
+/// the caller is already denied, so a durability failure on that path grants
+/// nothing.
 pub(crate) fn validate_ucan_for_outlet(
+    bi: &crate::runtime::NapiBridgeInstance,
+    context_id: &str,
+    outlet_id: &str,
+    identity_did: &str,
+    ucan_token: &str,
+    proof_resolver: &scp_ffi_common::BridgeProofResolver,
+    role_state: &scp_core::context::roles::ContextRoleState,
+) -> Result<(), ScpNapiError> {
+    let validated = validate_ucan_for_outlet_in_memory(
+        bi,
+        context_id,
+        outlet_id,
+        identity_did,
+        ucan_token,
+        proof_resolver,
+        role_state,
+    );
+    let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, context_id);
+    validated?;
+    persisted
+}
+
+/// Runs the outlet-invocation UCAN pipeline against the in-memory per-context
+/// state, leaving durability to [`validate_ucan_for_outlet`].
+fn validate_ucan_for_outlet_in_memory(
     bi: &crate::runtime::NapiBridgeInstance,
     context_id: &str,
     outlet_id: &str,

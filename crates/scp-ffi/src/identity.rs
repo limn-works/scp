@@ -128,7 +128,7 @@ pub(crate) fn no_pre_rotation_backend() -> ScpPyError {
 /// [`ScpPyError`] rather than substituting a nullifier.
 ///
 /// See #311 for the DID resolver unification design and ADR-062 §Decision 1.
-fn ensure_did_resolver_initialized_on(
+pub(crate) fn ensure_did_resolver_initialized_on(
     bi: &PyBridgeInstance,
     handle: tokio::runtime::Handle,
 ) -> Result<(), ScpPyError> {

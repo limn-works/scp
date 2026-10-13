@@ -10496,4 +10496,160 @@ mod tests {
             "the reopened SQLCipher instance must restore the context the first instance created"
         );
     }
+
+    /// A UCAN revoked through `ucan_revoke` before a restart is still refused
+    /// by `ucan_validate` after one, and a nonce `ucan_validate` accepted
+    /// before the restart is still refused as a replay after it (#2298).
+    ///
+    /// Instance A creates a context over a `SQLCipher` store, mints three
+    /// tokens, revokes the first through the real `ucan_revoke_on`, and
+    /// validates the second through the real `ucan_validate_on`. Instance B
+    /// reopens the same store, restores the context, and drives
+    /// `ucan_validate_on` again: the first token must fail at the revocation
+    /// step, the second at the nonce step, and the third, which A never
+    /// touched, must pass. Removing either durable write or the hydration at
+    /// registration makes B accept a refused token.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_revocation_and_nonce_survive_a_bridge_instance_restart() {
+        use crate::runtime::{NapiBridgeInstance, SqliteKeyMaterial, StorageConfig};
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let open = || {
+            NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+                path: tmp.path().to_path_buf(),
+                key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x5Au8; 32])),
+            })
+            .expect("SQLCipher open must succeed")
+        };
+
+        let scp = crate::scp::Scp {
+            inner: Arc::new(open()),
+        };
+        let bi = Arc::clone(&scp.inner);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let did = identity.inner.did.clone();
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read", "messages:write"],
+            "memoryScope": "full",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &identity, params_json)
+            .await
+            .expect("context_create should succeed");
+        let ctx_id = handle.context_id.clone();
+        let member = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed")
+            .inner
+            .did
+            .clone();
+        let capability = format!("scp:ctx:{ctx_id}/messages:read");
+
+        let mut tokens = Vec::new();
+        for _ in 0..3 {
+            let token = crate::ucan::ucan_mint_on(
+                &bi,
+                &handle,
+                member.clone(),
+                vec!["messages:read".to_owned()],
+                None,
+            )
+            .await
+            .expect("the creator may mint a token in its own context");
+            tokens.push(token.encoded());
+        }
+        let (revoked, used, untouched) = (tokens[0].clone(), tokens[1].clone(), tokens[2].clone());
+
+        // A never presents the revoked token: step 9 records a nonce before
+        // step 10 checks revocation, so a presentation here would make B refuse
+        // it as a replay and hide whether the revocation survived.
+        crate::ucan::ucan_revoke_on(&bi, &handle, revoked.clone(), did.clone())
+            .await
+            .expect("the context creator may revoke a token in its context");
+        crate::ucan::ucan_validate_on(
+            &bi,
+            &handle,
+            used.clone(),
+            capability.clone(),
+            member.clone(),
+            None,
+        )
+        .await
+        .expect("an unrevoked token validates on A");
+
+        drop(handle);
+        drop(identity);
+        bi.shutdown(std::time::Duration::from_secs(10))
+            .await
+            .expect("shutdown must release the store");
+        drop(bi);
+        drop(scp);
+
+        let reopened = Arc::new(open());
+        crate::runtime::init_supervisor(&reopened, &did);
+        // A restarted process resolves the issuer's DID document through the
+        // resolver an identity call attaches; B makes no identity call.
+        crate::identity::ensure_did_resolver_initialized_on(&reopened)
+            .expect("resolver initialization must succeed on B");
+        let restored_json = super::context_restore_all_on(&reopened)
+            .await
+            .expect("restore_all must succeed on the reopened store");
+        assert!(
+            restored_json.contains(&ctx_id),
+            "the reopened instance must restore the context: {restored_json}"
+        );
+        assert!(
+            !crate::runtime::ucan_registry(&reopened).contains_key(&ctx_id),
+            "instance B starts with no per-context UCAN state"
+        );
+        let handle_b = active_handle_for(&reopened, &ctx_id, &did);
+
+        let err = crate::ucan::ucan_validate_on(
+            &reopened,
+            &handle_b,
+            revoked,
+            capability.clone(),
+            member.clone(),
+            None,
+        )
+        .await
+        .expect_err("a token revoked before the restart must stay revoked after it");
+        assert!(
+            err.to_string().contains("token revoked"),
+            "B reported: {err}"
+        );
+
+        let err = crate::ucan::ucan_validate_on(
+            &reopened,
+            &handle_b,
+            used,
+            capability.clone(),
+            member.clone(),
+            None,
+        )
+        .await
+        .expect_err("a nonce accepted before the restart must stay used after it");
+        assert!(
+            err.to_string().contains("nonce reused"),
+            "B reported: {err}"
+        );
+
+        crate::ucan::ucan_validate_on(&reopened, &handle_b, untouched, capability, member, None)
+            .await
+            .expect("a token nobody revoked or presented still validates after the restart");
+
+        // The restored actor writes through the SQLCipher connection, so B
+        // drains it and closes the store before the test returns.
+        drop(handle_b);
+        reopened
+            .shutdown(std::time::Duration::from_secs(10))
+            .await
+            .expect("B's shutdown must release the store");
+    }
 }

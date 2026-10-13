@@ -44,12 +44,16 @@ use scp_ffi_common::error_codes as codes;
 use std::sync::Arc;
 
 use dashmap::DashMap;
+#[cfg(test)]
 use scp_clock::SystemClock;
 use scp_core::context::builder::ContextEventLogProvider;
 use scp_core::crypto::mls::provider::NodeMlsFactory;
+#[cfg(test)]
 use scp_core::crypto::ucan::nonce::NonceTracker;
+#[cfg(test)]
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
+#[cfg(test)]
 use scp_event_log::EventLog;
 
 // ---------------------------------------------------------------------------
@@ -1191,7 +1195,9 @@ impl UniffiBridgeInstance {
     ///
     /// # Errors
     ///
-    /// Returns whatever [`Self::require_active_context_before_authz`] returns.
+    /// Returns whatever [`Self::require_active_context_before_authz`] returns,
+    /// and the error [`Self::ensure_ucan_registered`] returns when the durable
+    /// UCAN state cannot be rebuilt.
     pub(crate) async fn require_active_context_with_ucan_before_authz<F>(
         &self,
         context_id: &str,
@@ -1204,7 +1210,7 @@ impl UniffiBridgeInstance {
         let role_state = self
             .require_active_context_before_authz(context_id, verb, mk_err)
             .await?;
-        self.ensure_ucan_registered(context_id);
+        self.ensure_ucan_registered(context_id)?;
         Ok(role_state)
     }
 
@@ -1255,18 +1261,34 @@ impl UniffiBridgeInstance {
     /// registry. No-op if the context is already registered, and no-op if
     /// `context_id` carries a release mark.
     ///
-    /// The release-mark check and the insert run while this call holds the
-    /// registry entry for `context_id` and then the release-mark lock.
+    /// The state is built, and its revocation list and nonce tracker rebuilt
+    /// from the durable record, before this call takes the registry entry, so
+    /// the storage read never stalls the other keys in that shard. The
+    /// release-mark check and the insert then run while this call holds the
+    /// registry entry for `context_id` and then the release-mark lock; a
+    /// concurrent registration that wins keeps its own state.
     ///
     /// This function is private to this module.
-    fn ensure_ucan_registered(&self, context_id: &str) {
+    ///
+    /// # Errors
+    ///
+    /// Returns the error [`Self::build_ucan_context_state`] returns when the
+    /// durable UCAN record cannot be read, and registers nothing.
+    fn ensure_ucan_registered(&self, context_id: &str) -> Result<(), crate::ScpError> {
+        if self.ucan_registry.contains_key(context_id)
+            || self.lock_release_marks().contains_key(context_id)
+        {
+            return Ok(());
+        }
+        let state = self.build_ucan_context_state(context_id)?;
         let entry = self.ucan_registry.entry(context_id.to_owned());
         let marks = self.lock_release_marks();
         if marks.contains_key(context_id) {
-            return;
+            return Ok(());
         }
-        entry.or_insert_with(|| Self::build_ucan_context_state(context_id));
+        entry.or_insert(state);
         drop(marks);
+        Ok(())
     }
 
     /// Builds UCAN validation state for `context_id` only when this instance
@@ -1314,6 +1336,8 @@ impl UniffiBridgeInstance {
     ///
     /// Returns the error `supervisor`'s lifecycle state read returns, as
     /// [`Self::read_live_context_state`] maps it, and registers nothing.
+    /// Returns the error [`Self::ensure_ucan_registered`] returns when the
+    /// durable UCAN state cannot be rebuilt.
     pub(crate) async fn ensure_ucan_registered_while_active_on(
         &self,
         supervisor: &scp_core::context::supervisor::Supervisor,
@@ -1328,7 +1352,7 @@ impl UniffiBridgeInstance {
             .map_err(crate::ScpError::from)?
         {
             Some(scp_core::context::ContextState::Active) => {
-                self.ensure_ucan_registered(context_id);
+                self.ensure_ucan_registered(context_id)?;
             }
             state => tracing::debug!(
                 context = %context_id,
@@ -1342,9 +1366,16 @@ impl UniffiBridgeInstance {
     /// Builds UCAN validation state for `context_id` without reading the
     /// supervisor, for a test that needs state for an id no `Active` actor
     /// serves.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the durable UCAN state cannot be rebuilt, which fails the
+    /// calling test.
     #[cfg(test)]
+    #[allow(clippy::expect_used)]
     pub(crate) fn ensure_ucan_registered_for_test(&self, context_id: &str) {
-        self.ensure_ucan_registered(context_id);
+        self.ensure_ucan_registered(context_id)
+            .expect("rebuilding the durable UCAN state must succeed in a test");
     }
 
     /// Locks this instance's release marks.
@@ -1578,21 +1609,30 @@ impl UniffiBridgeInstance {
     /// # Errors
     ///
     /// Returns `ScpError::Context` (`SCP-CTX-2014`) if the context's UCAN
-    /// state is already registered on this instance.
+    /// state is already registered on this instance, and the error
+    /// [`Self::build_ucan_context_state`] returns when the durable UCAN record
+    /// cannot be read.
     fn register_ucan_occupied(&self, context_id: &str) -> Result<(), crate::ScpError> {
         use dashmap::mapref::entry::Entry;
 
+        let already_registered = || crate::ScpError::Context {
+            msg: format!("context {context_id} is already registered on this instance"),
+            code: codes::CTX_2014.to_owned(),
+        };
+        if self.ucan_registry.contains_key(context_id) {
+            return Err(already_registered());
+        }
+        // Build the state, and rebuild its durable revocation and nonce
+        // records, BEFORE taking the shard's `Entry` write guard, so the
+        // storage read never stalls every other key in that shard. The
+        // `Occupied`/`Vacant` decision that makes the gate atomic is unchanged;
+        // a collision discards this state.
+        let state = self.build_ucan_context_state(context_id)?;
         match self.ucan_registry.entry(context_id.to_owned()) {
-            Entry::Occupied(_) => Err(crate::ScpError::Context {
-                msg: format!("context {context_id} is already registered on this instance"),
-                code: codes::CTX_2014.to_owned(),
-            }),
+            Entry::Occupied(_) => Err(already_registered()),
             Entry::Vacant(vacant) => {
-                // `build_ucan_context_state` never touches `ucan_registry`, so
-                // building it while holding this shard's `Entry` write guard
-                // cannot deadlock (mirrors the napi reference's Vacant arm).
                 // This arm leaves any release mark on the id in place.
-                vacant.insert(Self::build_ucan_context_state(context_id));
+                vacant.insert(state);
                 Ok(())
             }
         }
@@ -1607,12 +1647,144 @@ impl UniffiBridgeInstance {
     /// the caller decides the insert semantics.
     ///
     /// The state carries no capability ceiling and no context creator DID.
-    fn build_ucan_context_state(context_id: &str) -> UcanContextState {
-        UcanContextState {
-            revocation_list: RevocationList::new(context_id.to_owned()),
-            nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-            event_log: EventLog::new(context_id.to_owned()),
-        }
+    ///
+    /// The revocation list and nonce tracker are rebuilt from this instance's
+    /// durable store before the state is returned, so a token revoked before
+    /// the process restarted is already revoked in the state this returns. Both
+    /// registration paths run through here, which is why hydration lives here
+    /// rather than at each caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` (`SCP-CTX-2023`) if the durable UCAN record
+    /// cannot be read or decoded. The instance fails closed rather than
+    /// answering validations from an empty revocation list.
+    fn build_ucan_context_state(
+        &self,
+        context_id: &str,
+    ) -> Result<UcanContextState, crate::ScpError> {
+        self.load_ucan_state_blocking(context_id)
+    }
+
+    /// Builds a context's [`UcanContextState`] from this instance's durable
+    /// revocation and nonce records.
+    ///
+    /// [`Self::build_ucan_context_state`] is synchronous and so are both of its
+    /// callers, while `Storage` is async, so this bridges the two through
+    /// [`scp_ffi_common::ucan_durable_state::block_on_storage`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` if the durable record cannot be read or
+    /// decoded, or if the call arrives from inside a current-thread tokio
+    /// runtime where the sync-to-async bridge cannot run. Either way the
+    /// instance fails closed: an unreadable revocation record must not present
+    /// as "nothing was revoked".
+    fn load_ucan_state_blocking(
+        &self,
+        context_id: &str,
+    ) -> Result<UcanContextState, crate::ScpError> {
+        let to_error = |e: scp_ffi_common::ucan_durable_state::UcanDurableStateError| {
+            crate::ScpError::Context {
+                msg: format!("failed to rebuild durable UCAN state for '{context_id}': {e}"),
+                code: codes::CTX_2023.to_owned(),
+            }
+        };
+        scp_ffi_common::ucan_durable_state::block_on_storage(
+            Some(crate::runtime().handle()),
+            self.protocol_repository.load_ucan_state(context_id),
+        )
+        .map_err(to_error)?
+        .map_err(to_error)
+    }
+
+    /// Writes this context's UCAN revocation list to this instance's durable
+    /// store.
+    ///
+    /// Called by `ucan_revoke` once the core revocation pipeline has succeeded,
+    /// so the durable record agrees with the in-memory list before
+    /// `ucan_revoke` returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` if the write fails. The caller propagates
+    /// the failure instead of reporting a revocation that the next process
+    /// start would forget.
+    pub(crate) fn persist_ucan_revocation_blocking(
+        &self,
+        context_id: &str,
+    ) -> Result<(), crate::ScpError> {
+        let to_error = |msg: String| crate::ScpError::Context {
+            msg,
+            code: codes::CTX_2023.to_owned(),
+        };
+        // The write runs while this call holds the context's registry entry, so
+        // two concurrent writers land in the order they read the list and the
+        // last write carries every revocation made before it.
+        self.with_ucan_state(context_id, |state| {
+            scp_ffi_common::ucan_durable_state::block_on_storage(
+                Some(crate::runtime().handle()),
+                self.protocol_repository
+                    .persist_ucan_revocation_list(context_id, &state.revocation_list),
+            )
+        })
+        .ok_or_else(|| to_error(format!("context '{context_id}' not found in UCAN registry")))?
+        .map_err(|e| {
+            to_error(format!(
+                "failed to persist UCAN revocation for '{context_id}': {e}"
+            ))
+        })?
+        .map_err(|e| {
+            to_error(format!(
+                "failed to persist UCAN revocation for '{context_id}': {e}"
+            ))
+        })
+    }
+
+    /// Writes this context's UCAN nonce entries to this instance's durable
+    /// store.
+    ///
+    /// Called after every UCAN-validation pipeline run that records a nonce,
+    /// because that pipeline is the only writer of nonce state. A nonce
+    /// accepted now is therefore still refused after the bridge instance is
+    /// rebuilt.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` if the write fails. The caller propagates
+    /// the failure rather than reporting a validation whose replay record did
+    /// not become durable.
+    pub(crate) fn persist_ucan_nonces_blocking(
+        &self,
+        context_id: &str,
+    ) -> Result<(), crate::ScpError> {
+        let to_error = |msg: String| crate::ScpError::Context {
+            msg,
+            code: codes::CTX_2023.to_owned(),
+        };
+        // The write runs while this call holds the context's registry entry, so
+        // two concurrent writers land in the order they read the tracker and
+        // the last write carries every nonce recorded before it.
+        self.with_ucan_state(context_id, |state| {
+            scp_ffi_common::ucan_durable_state::block_on_storage(
+                Some(crate::runtime().handle()),
+                self.protocol_repository.persist_ucan_nonce_entries(
+                    context_id,
+                    &state.nonce_tracker.snapshot_entries(),
+                ),
+            )
+        })
+        .ok_or_else(|| to_error(format!("context '{context_id}' not found in UCAN registry")))?
+        .map_err(|e| {
+            to_error(format!(
+                "failed to persist UCAN nonce state for '{context_id}': {e}"
+            ))
+        })?
+        .map_err(|e| {
+            to_error(format!(
+                "failed to persist UCAN nonce state for '{context_id}': {e}"
+            ))
+        })
     }
 
     /// Per-instance equivalent of the module-level `with_ucan_state` free
@@ -2216,7 +2388,8 @@ mod tests {
             .build()
             .expect("test runtime");
         let bi = UniffiBridgeInstance::new_uniffi();
-        bi.ensure_ucan_registered("ctx-held");
+        bi.ensure_ucan_registered("ctx-held")
+            .expect("register ctx-held");
         let polled = std::sync::atomic::AtomicBool::new(false);
         let result = rt.block_on(bi.join_from_welcome_occupied("ctx-held", async {
             polled.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2253,7 +2426,8 @@ mod tests {
     #[test]
     fn live_revocation_checker_reads_revocations_recorded_after_it_was_built() {
         let bi = UniffiBridgeInstance::new_uniffi();
-        bi.ensure_ucan_registered("ctx-live");
+        bi.ensure_ucan_registered("ctx-live")
+            .expect("register ctx-live");
         let checker = bi.live_revocation_checker("ctx-live".to_owned());
         let absent = bi.live_revocation_checker("ctx-absent".to_owned());
         assert!(!checker.is_revoked("cid-1"));
