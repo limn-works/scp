@@ -18489,6 +18489,128 @@ mod tests {
         );
     }
 
+    /// Creates a context on `relay_urls`, then returns the relay set its
+    /// snapshot persists and the relay set its live actor holds.
+    #[cfg(feature = "testing")]
+    async fn created_relay_set(
+        ctx_byte: u8,
+        relay_urls: &[&str],
+    ) -> (Option<Vec<String>>, Option<Vec<String>>) {
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_and_persistence(
+            Arc::new(TestClock::new(1_700_000_000)),
+            Box::new(persistence),
+        );
+        let identity = sup.node_identity().unwrap();
+        let ctx = hex::encode([ctx_byte; 32]);
+        sup.create_context(
+            ctx.clone(),
+            scp_protocol::context::ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                ..Default::default()
+            },
+            identity,
+            None,
+            relay_urls.iter().map(|u| (*u).to_owned()).collect(),
+        )
+        .await
+        .expect("create succeeds whatever the relay URLs");
+        let persisted = contexts.get(&ctx).map(|s| s.relay_urls.clone());
+        (persisted, sup.context_relay_urls(&ctx).await)
+    }
+
+    /// Create stores two spellings of one relay as one entry, the §9.18.2
+    /// canonical relay URL (§5.12.3.1 `relay_urls`).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_stores_two_spellings_of_a_relay_as_one_canonical_entry() {
+        const SPELLING_1: &str = "WSS://Relay-A.Example:443/scp/v1/";
+        const SPELLING_2: &str = "wss://relay-a.example/scp/v1";
+        let want = Some(vec![SPELLING_2.to_owned()]);
+        assert_eq!(
+            created_relay_set(0xC4, &[SPELLING_1, SPELLING_2]).await,
+            (want.clone(), want)
+        );
+    }
+
+    /// Create stores a relay URL with no §9.18.2 canonical form exactly as
+    /// written, and succeeds.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_stores_a_relay_url_without_canonical_form_as_written() {
+        const HTTPS: &str = "https://Relay-A.Example/scp/v1/";
+        let want = Some(vec![HTTPS.to_owned()]);
+        assert_eq!(
+            created_relay_set(0xC5, &[HTTPS]).await,
+            (want.clone(), want)
+        );
+    }
+
+    /// Creates a context, rewrites its persisted relay set to `stored` while
+    /// its actor is down, restores it, and returns the relay set the flush
+    /// writes back from the live actor.
+    #[cfg(feature = "testing")]
+    async fn restored_relay_set(ctx_byte: u8, stored: &[&str]) -> Option<Vec<String>> {
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_and_persistence(
+            Arc::new(TestClock::new(1_700_000_000)),
+            Box::new(persistence),
+        );
+        let identity = sup.node_identity().unwrap();
+        let ctx = hex::encode([ctx_byte; 32]);
+        let handle = sup
+            .create_context(
+                ctx.clone(),
+                scp_protocol::context::ContextParams {
+                    ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                    ..Default::default()
+                },
+                identity,
+                None,
+                vec!["wss://relay-z.example".to_owned()],
+            )
+            .await
+            .unwrap();
+        assert!(sup.despawn_actor(&ctx).await);
+        contexts
+            .get_mut(&ctx)
+            .expect("context persisted")
+            .relay_urls = stored.iter().map(|u| (*u).to_owned()).collect();
+        sup.restore_context(&ctx, &handle)
+            .await
+            .expect("restore succeeds whatever the relay URLs");
+        contexts.remove(&ctx);
+        sup.flush_all_contexts().await.unwrap();
+        contexts.get(&ctx).map(|s| s.relay_urls.clone())
+    }
+
+    /// Restore stores two spellings of one relay as one entry, the §9.18.2
+    /// canonical relay URL.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_stores_two_spellings_of_a_relay_as_one_canonical_entry() {
+        const SPELLING_1: &str = "WSS://Relay-A.Example:443/scp/v1/";
+        const SPELLING_2: &str = "wss://relay-a.example/scp/v1";
+        assert_eq!(
+            restored_relay_set(0xC6, &[SPELLING_1, SPELLING_2]).await,
+            Some(vec![SPELLING_2.to_owned()])
+        );
+    }
+
+    /// Restore stores a relay URL with no §9.18.2 canonical form exactly as
+    /// written, and succeeds.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_stores_a_relay_url_without_canonical_form_as_written() {
+        const HTTPS: &str = "https://Relay-A.Example/scp/v1/";
+        assert_eq!(
+            restored_relay_set(0xC7, &[HTTPS]).await,
+            Some(vec![HTTPS.to_owned()])
+        );
+    }
+
     /// PUSH-013: with two contexts on two relays, one of them on both,
     /// `push_routing_ids` maps each relay to exactly the routing IDs of the
     /// contexts on it, and holds this
@@ -22460,6 +22582,51 @@ mod tests {
                 "wss://relay-a.example/scp/v1".to_owned(),
             ]),
             "import installs and persists the exported relay set, each relay once"
+        );
+    }
+
+    /// Imports a creator-signed export whose snapshot names `relay_urls`, then
+    /// returns the relay set the importer persists.
+    async fn imported_relay_set(context_id: &str, relay_urls: &[&str]) -> Option<Vec<String>> {
+        let creator = "did:key:import-relay-set-creator";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.relay_urls = relay_urls.iter().map(|u| (*u).to_owned()).collect();
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        Box::pin(import_snapshot_into(
+            persistence,
+            snapshot,
+            creator,
+            &ctx_id_bytes,
+        ))
+        .await
+        .expect("a creator-signed export imports whatever the relay URLs");
+        contexts
+            .get(context_id)
+            .map(|stored| stored.relay_urls.clone())
+    }
+
+    /// Import stores two spellings of one relay as one entry, the §9.18.2
+    /// canonical relay URL.
+    #[tokio::test]
+    async fn import_stores_two_spellings_of_a_relay_as_one_canonical_entry() {
+        const SPELLING_1: &str = "WSS://Relay-A.Example:443/scp/v1/";
+        const SPELLING_2: &str = "wss://relay-a.example/scp/v1";
+        assert_eq!(
+            imported_relay_set("import-relay-spellings-ctx", &[SPELLING_1, SPELLING_2]).await,
+            Some(vec![SPELLING_2.to_owned()])
+        );
+    }
+
+    /// Import stores a relay URL with no §9.18.2 canonical form exactly as
+    /// written, and succeeds.
+    #[tokio::test]
+    async fn import_stores_a_relay_url_without_canonical_form_as_written() {
+        const HTTPS: &str = "https://Relay-A.Example/scp/v1/";
+        assert_eq!(
+            imported_relay_set("import-relay-https-ctx", &[HTTPS]).await,
+            Some(vec![HTTPS.to_owned()])
         );
     }
 

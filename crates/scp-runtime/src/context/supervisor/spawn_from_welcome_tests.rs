@@ -153,12 +153,15 @@ async fn bob_imported_custody() -> (InMemoryKeyCustody, KeyHandle) {
 /// Callers may hand-tamper the returned bundle (e.g. flip a `signature` byte or
 /// diverge a `metadata_snapshot.structural` field) before sealing it.
 /// The relays every test bundle names as hosting its context (§5.12.3.1
-/// `relay_urls`). The first relay repeats, so a joiner that stored the list
-/// verbatim, duplicate included, fails the relay-set test.
-const BUNDLE_RELAY_URLS: [&str; 3] = [
+/// `relay_urls`). The creator signs these spellings as written. Entries 0 and 2
+/// spell one relay two ways, entry 1 is a non-canonical spelling, and entry 3
+/// has no §9.18.2 canonical form, so every Welcome join test also proves that
+/// such a URL fails no join.
+const BUNDLE_RELAY_URLS: [&str; 4] = [
     "wss://relay-b.example/scp/v1",
-    "wss://relay-a.example/scp/v1",
-    "wss://relay-b.example/scp/v1",
+    "WSS://Relay-A.Example:443/scp/v1/",
+    "wss://relay-b.example:443/scp/v1/",
+    "https://Relay-C.Example/scp/",
 ];
 
 fn signed_bundle(
@@ -891,35 +894,57 @@ async fn welcome_joiner_does_not_install_the_genesis_outlet_declaration() {
     );
 }
 
-/// A Welcome joiner's context is hosted on the relays its invitation bundle
-/// names (§5.12.3.1 `relay_urls`, PUSH-025). The persisted Class-S snapshot,
-/// which the spawn writes from the joiner's live state, carries the bundle's
-/// set with each relay once, in first-seen order.
-#[tokio::test]
-async fn welcome_joiner_holds_the_bundle_relay_set() {
+/// Runs a Welcome join of a bundle naming [`BUNDLE_RELAY_URLS`] and returns
+/// the relay set of the persisted Class-S snapshot, which the spawn writes
+/// from the joiner's live state (§5.12.3.1 `relay_urls`, PUSH-025). The join
+/// succeeds only when the joiner verifies the signature over the URLs as the
+/// creator signed them.
+async fn welcome_joiner_relay_set(seed: u8) -> Vec<String> {
     let rec = RecordingPersistence::default();
     let (result, j) = run_join_with(
-        0x2d,
+        seed,
         Some(Box::new(rec.clone())),
         Some(joiner_params()),
         joiner_params(),
         None,
     )
     .await;
-    result.expect("welcome join succeeds");
-
-    let snapshot = rec
-        .store
+    result.expect("welcome join succeeds whatever the relay URLs");
+    rec.store
         .get(&j.ctx_id)
-        .map(|e| e.value().clone())
-        .expect("the joiner persisted a Class-S snapshot before spawning");
+        .map(|e| e.value().relay_urls.clone())
+        .expect("the joiner persisted a Class-S snapshot before spawning")
+}
+
+/// A Welcome joiner stores two spellings of one relay as one entry, the
+/// §9.18.2 canonical relay URL, at the first spelling's position.
+#[tokio::test]
+async fn welcome_joiner_stores_two_spellings_of_a_relay_as_one_canonical_entry() {
+    let stored = welcome_joiner_relay_set(0x2d).await;
     assert_eq!(
-        snapshot.relay_urls,
-        vec![
+        stored[..2],
+        [
             "wss://relay-b.example/scp/v1".to_owned(),
             "wss://relay-a.example/scp/v1".to_owned(),
         ],
-        "the joiner stores the bundle's relay set, deduplicated"
+        "the joiner stores each relay once, in canonical form, in first-seen order"
+    );
+    assert_eq!(
+        stored.len(),
+        3,
+        "the two relay-b spellings collapse: {stored:?}"
+    );
+}
+
+/// A Welcome joiner stores a relay URL with no §9.18.2 canonical form exactly
+/// as the bundle wrote it, and the join succeeds.
+#[tokio::test]
+async fn welcome_joiner_stores_a_relay_url_without_canonical_form_as_written() {
+    let stored = welcome_joiner_relay_set(0x2e).await;
+    assert_eq!(
+        stored.last().map(String::as_str),
+        Some("https://Relay-C.Example/scp/"),
+        "the joiner stores the https URL as written: {stored:?}"
     );
 }
 

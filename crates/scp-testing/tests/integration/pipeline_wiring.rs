@@ -1015,6 +1015,41 @@ fn gated_broadcast_subscribe_builds_real_validation_context() {
     );
 }
 
+// PUSH-025 (§5.12.3.1 `relay_urls`, §9.18.2): every path that writes a
+// context's relay set stores it through `normalize_relay_urls`, which maps each
+// URL to its canonical relay URL when it has one. Create, import and restore
+// call it in `lifecycle_helpers`; a Welcome joiner calls it in
+// `Supervisor::build_welcome_joiner_state`, after bundle verification.
+const LIFECYCLE_HELPERS_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs");
+
+#[test]
+fn relay_set_writes_store_canonical_relay_urls() {
+    assert!(
+        fn_body_contains(
+            LIFECYCLE_HELPERS_SRC,
+            "normalize_relay_urls",
+            "canonical_relay_url("
+        ),
+        "normalize_relay_urls must map each relay URL through canonical_relay_url"
+    );
+    for entry in ["create_context", "import_context", "restore_context"] {
+        assert!(
+            fn_body_contains(LIFECYCLE_HELPERS_SRC, entry, "normalize_relay_urls("),
+            "lifecycle_helpers::{entry} must store its relay set through normalize_relay_urls"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "build_welcome_joiner_state",
+            "normalize_relay_urls("
+        ),
+        "Supervisor::build_welcome_joiner_state must store the bundle's relay set through \
+         normalize_relay_urls"
+    );
+}
+
 // PUSH-013 (§10.7.1): the push routing-ID query runs
 // `Supervisor::push_routing_ids` → `dispatch_push_command` → actor mailbox →
 // `handlers::push::dispatch` → `push_helpers::push_routes`.
