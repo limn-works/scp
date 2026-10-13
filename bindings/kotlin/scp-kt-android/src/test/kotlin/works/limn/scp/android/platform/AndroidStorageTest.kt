@@ -4,8 +4,8 @@
 // IMPORTANT: These are IN-MEMORY-ONLY tests. All StorageProvider contract tests run
 // against InMemoryStorageProvider, NOT the real AndroidStorage implementation. The
 // following production behaviors are NOT exercised by these tests:
-//   - Android Keystore key derivation with setRandomizedEncryptionRequired(false), which
-//     the caller-supplied fixed GCM IV needs
+//   - Android Keystore HMAC-SHA-256 key generation and the Keystore MAC that feeds HKDF
+//     (StorageKeyDerivationTest covers the HKDF half, which needs no Keystore)
 //   - SQL LIKE escaping of % and _ wildcards on real SQLCipher
 //   - Transactional deletePrefix (DELETE plus changes() in one transaction) on real
 //     SQLCipher under concurrent access
@@ -44,7 +44,7 @@
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // SCP-113 (Android Storage trait with TEE-backed SQLCipher; the adapter derives the SQLCipher
-// passphrase from a Keystore-held AES-256 key and does not check that Keystore put the AES key
+// key from a Keystore-held HMAC-SHA-256 key and does not check that Keystore put the HMAC key
 // in the TEE).
 
 package works.limn.scp.android.platform
