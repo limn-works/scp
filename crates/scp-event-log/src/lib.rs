@@ -734,7 +734,7 @@ mod tests {
     fn event_type_serialization_roundtrip_all_variants() {
         // Round-trips every variant of the closed taxonomy through serde JSON.
         // The 78-variant count and wire-distinctness are pinned separately in
-        // `event_type_taxonomy_is_closed_at_77_distinct_variants`.
+        // `event_type_taxonomy_is_closed_at_78_distinct_variants`.
         for event_type in all_event_types() {
             let json = serde_json::to_string(&event_type).expect("serialize");
             let deserialized: EventType = serde_json::from_str(&json).expect("deserialize");
@@ -745,88 +745,176 @@ mod tests {
         }
     }
     /// Returns the complete closed `EventType` taxonomy in ADR declaration
-    /// order. Used by the round-trip and distinctness coverage tests.
+    /// order. The macro also emits a `match` over the same names with no
+    /// wildcard arm, so a variant missing from this list fails to compile.
     fn all_event_types() -> Vec<EventType> {
-        vec![
-            EventType::ContextCreated,
-            EventType::ContextClosing,
-            EventType::ContextClosed,
-            EventType::ContextExpired,
-            EventType::MemberJoined,
-            EventType::MemberLeft,
-            EventType::RoleAssigned,
-            EventType::TokenRevoked,
-            EventType::MessageSent,
-            EventType::OutletRegistered,
-            EventType::OutletUpdated,
-            EventType::OutletInvoked,
-            EventType::OutletVerified,
-            EventType::OutletInterfaceEstablished,
-            EventType::GovernanceAction,
-            EventType::ConsistencyCheckpoint,
-            EventType::AbsenceProofRequested,
-            EventType::MemberBlocked,
-            EventType::KeyEpochAdvance,
-            EventType::MediaSessionStarted,
-            EventType::MediaSessionEnded,
-            EventType::PaymentReceived,
-            EventType::EconomicPolicyChanged,
-            EventType::EconomicPolicyApplied,
-            EventType::SpendingUcanGranted,
-            EventType::SpendingUcanRevoked,
-            EventType::GovernanceProposalCreated,
-            EventType::GovernanceVoteCast,
-            EventType::GovernanceVoteWithdrawn,
-            EventType::GovernanceProposalResolved,
-            EventType::GovernanceConflictDetected,
-            EventType::GovernanceConflictResolved,
-            EventType::GovernanceDeadlockRecovery,
-            EventType::GovernanceActionExecuted,
-            EventType::ProvenanceAttached,
-            EventType::ProvenanceReceived,
-            EventType::AdminTransferred,
-            EventType::CeilingModified,
-            EventType::CeilingModificationPending,
-            EventType::ThresholdModified,
-            EventType::SignerAdded,
-            EventType::SignerRemoved,
-            EventType::ChildContextCreated,
-            EventType::ContextPromoted,
-            EventType::ContentKeysRotated,
-            EventType::MemberReset,
-            EventType::MemberSuspended,
-            EventType::MemberSuspendedAll,
-            EventType::MemberUnblocked,
-            EventType::AccessRestored,
-            EventType::GovernanceReconfigured,
-            EventType::GovernanceFreezeExpired,
-            EventType::HardRateLimitModified,
-            EventType::EconomicPolicyLocked,
-            EventType::ContextMigrationStarted,
-            EventType::OutletRemoved,
-            EventType::PruningPolicyModified,
-            EventType::CommitBroadcasted,
-            EventType::CommitBroadcastPending,
-            EventType::ContextTombstoned,
-            EventType::ContextMigrationCancelled,
-            EventType::TtlExtended,
-            EventType::TtlExtensionRejected,
-            EventType::AccessRevoked,
-            EventType::SpendApproved,
-            EventType::PaymentCaptureFailed,
-            EventType::ConsequenceTriggered,
-            EventType::ConsequenceEnforced,
-            EventType::ConsequenceEnforcementFailed,
-            EventType::ConsequenceEscalatedToSuspendAll,
-            EventType::CommitBroadcastSucceeded,
-            EventType::CommitBroadcastFailed,
-            EventType::RecoveryEpochAdvanced,
-            EventType::AppBound,
-            EventType::AppUnbound,
-            EventType::CrossContextOutletInvoked,
-            EventType::CrossContextDivergenceMarker,
-            EventType::PseudonymRotationPolicyModified,
+        macro_rules! exhaustive_list {
+            ($($variant:ident),+ $(,)?) => {{
+                let _exhaustive = |event_type: EventType| match event_type {
+                    $(EventType::$variant => ()),+
+                };
+                vec![$(EventType::$variant),+]
+            }};
+        }
+        exhaustive_list![
+            ContextCreated,
+            ContextClosing,
+            ContextClosed,
+            ContextExpired,
+            MemberJoined,
+            MemberLeft,
+            RoleAssigned,
+            TokenRevoked,
+            MessageSent,
+            OutletRegistered,
+            OutletUpdated,
+            OutletInvoked,
+            OutletVerified,
+            OutletInterfaceEstablished,
+            GovernanceAction,
+            ConsistencyCheckpoint,
+            AbsenceProofRequested,
+            MemberBlocked,
+            KeyEpochAdvance,
+            MediaSessionStarted,
+            MediaSessionEnded,
+            PaymentReceived,
+            EconomicPolicyChanged,
+            EconomicPolicyApplied,
+            SpendingUcanGranted,
+            SpendingUcanRevoked,
+            GovernanceProposalCreated,
+            GovernanceVoteCast,
+            GovernanceVoteWithdrawn,
+            GovernanceProposalResolved,
+            GovernanceConflictDetected,
+            GovernanceConflictResolved,
+            GovernanceDeadlockRecovery,
+            GovernanceActionExecuted,
+            ProvenanceAttached,
+            ProvenanceReceived,
+            AdminTransferred,
+            CeilingModified,
+            CeilingModificationPending,
+            ThresholdModified,
+            SignerAdded,
+            SignerRemoved,
+            ChildContextCreated,
+            ContextPromoted,
+            ContentKeysRotated,
+            MemberReset,
+            MemberSuspended,
+            MemberSuspendedAll,
+            MemberUnblocked,
+            AccessRestored,
+            GovernanceReconfigured,
+            GovernanceFreezeExpired,
+            HardRateLimitModified,
+            EconomicPolicyLocked,
+            ContextMigrationStarted,
+            OutletRemoved,
+            PruningPolicyModified,
+            CommitBroadcasted,
+            CommitBroadcastPending,
+            ContextTombstoned,
+            ContextMigrationCancelled,
+            TtlExtended,
+            TtlExtensionRejected,
+            AccessRevoked,
+            SpendApproved,
+            PaymentCaptureFailed,
+            ConsequenceTriggered,
+            ConsequenceEnforced,
+            ConsequenceEnforcementFailed,
+            ConsequenceEscalatedToSuspendAll,
+            CommitBroadcastSucceeded,
+            CommitBroadcastFailed,
+            RecoveryEpochAdvanced,
+            AppBound,
+            AppUnbound,
+            CrossContextOutletInvoked,
+            CrossContextDivergenceMarker,
+            PseudonymRotationPolicyModified,
         ]
+    }
+
+    /// Spec 25 Vector 32, which carries the normative `EventType` tag table.
+    const SPEC_25: &str = include_str!("../../../.docs/specs/25-test-vectors.md");
+
+    /// Parses the rows of Vector 32's `EventType` tag table into
+    /// `(tag, variant name)` pairs; a retired tag maps to `None`.
+    fn spec_tag_table(spec: &str) -> Vec<(u16, Option<String>)> {
+        let start = spec
+            .find("| Tag | `EventType` variant |")
+            .expect("spec 25 Vector 32 carries the EventType tag table");
+        spec[start..]
+            .lines()
+            .skip(2)
+            .take_while(|line| line.starts_with('|'))
+            .map(|line| {
+                let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+                let tag = cells[0].parse::<u16>().expect("tag cell is a u16");
+                let name = (cells[1] != "retired").then(|| cells[1].trim_matches('`').to_owned());
+                (tag, name)
+            })
+            .collect()
+    }
+
+    /// Checks `table` against `event_type_tag` in both directions: the rows
+    /// run 0..=max in order, every variant's tag row names that variant, and
+    /// every named row is a variant carrying that tag.
+    fn check_tag_table(table: &[(u16, Option<String>)]) -> Result<(), String> {
+        for (index, (tag, _)) in table.iter().enumerate() {
+            if usize::from(*tag) != index {
+                return Err(format!("row {index} carries tag {tag}"));
+            }
+        }
+        for event_type in all_event_types() {
+            let tag = crate::tree::event_type_tag(&event_type);
+            let name = serde_json::to_value(event_type).expect("serialize");
+            let row = table.get(usize::from(tag)).and_then(|(_, n)| n.as_deref());
+            if row != name.as_str() {
+                return Err(format!(
+                    "{event_type:?} has tag {tag} but the table row is {row:?}"
+                ));
+            }
+        }
+        for (tag, name) in table {
+            if let Some(name) = name {
+                let event_type: EventType =
+                    serde_json::from_value(serde_json::Value::String(name.clone()))
+                        .map_err(|_| format!("table row {tag} names unknown variant {name}"))?;
+                if crate::tree::event_type_tag(&event_type) != *tag {
+                    return Err(format!(
+                        "table row {tag} names {name}, which has another tag"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn spec_25_tag_table_matches_event_type_tag() {
+        let table = spec_tag_table(SPEC_25);
+        assert_eq!(check_tag_table(&table), Ok(()));
+    }
+
+    #[test]
+    fn spec_25_tag_table_check_rejects_a_missing_or_wrong_row() {
+        let table = spec_tag_table(SPEC_25);
+        let mut missing_last = table.clone();
+        missing_last.pop();
+        assert!(check_tag_table(&missing_last).is_err());
+        let mut wrong_name = table.clone();
+        wrong_name[78].1 = Some("CrossContextDivergenceMarker".to_owned());
+        assert!(check_tag_table(&wrong_name).is_err());
+        let mut retired_live = table.clone();
+        retired_live[78].1 = None;
+        assert!(check_tag_table(&retired_live).is_err());
+        let mut unknown = table;
+        unknown[59].1 = Some("PseudonymAnnounced".to_owned());
+        assert!(check_tag_table(&unknown).is_err());
     }
 
     #[test]

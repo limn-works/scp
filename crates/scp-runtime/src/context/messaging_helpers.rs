@@ -4647,7 +4647,7 @@ mod pseudonym_routing_tests {
     struct DrainRecordingEventLog {
         consequence_triggered: std::sync::Arc<std::sync::atomic::AtomicBool>,
         message_sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        /// `EventType` enumerates 77 variants; `PseudonymAnnounced` was REMOVED
+        /// `PseudonymAnnounced` was REMOVED from `EventType`
         /// (it is a `ContextEvent`-only routing signal, not a durable event). A
         /// recorder cannot match a non-existent variant, so a received
         /// announcement is proven buffer-only by the ABSENCE of any append at
