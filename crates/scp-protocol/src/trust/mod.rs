@@ -53,10 +53,12 @@ pub use custody_violation::{
     CustodyViolationError, CustodyViolationResult, CustodyViolationType,
     ScpCustodyViolationAttestation, classify_action, enforce_category_a,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use participation::produce_participation_profile;
 pub use participation::{
     ParticipationFact, ParticipationFacts, ParticipationInput, ParticipationProfile,
     ParticipationRecord, ParticipationThreshold, RequireParticipation,
-    compute_participation_record, produce_participation_profile,
+    UnsignedParticipationProfile, compute_participation_record, participation_profile_unsigned,
 };
 pub use sybil::{
     EarnedCapacityLevel, FreshnessWeight, IdentityDepthAssessment, TrustSignal,
