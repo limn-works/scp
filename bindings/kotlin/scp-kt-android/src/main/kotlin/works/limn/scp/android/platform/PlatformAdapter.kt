@@ -38,8 +38,8 @@ import android.content.Context
  *   payload and returns the same [WakeSignal.PULL] whatever other fields it carries. §10.7
  *   opacity binds the sender (§10.7.1 step 5), and no code in this repository sends a push, so
  *   SCP-112's opacity criterion is unmet.
- * @property storage SQLCipher encrypted storage whose 32-byte passphrase is derived from a
- *   Keystore-held AES-256 key; SQLCipher derives the database key from that passphrase.
+ * @property storage SQLCipher encrypted storage keyed as persistence spec §17.6 requires;
+ *   [AndroidStorage] states the derivation.
  */
 data class AndroidPlatformAdapterImpl(
     val keyCustody: KeyCustodyProvider,
