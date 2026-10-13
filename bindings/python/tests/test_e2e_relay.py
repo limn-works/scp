@@ -33,6 +33,7 @@ import json
 import pytest
 
 from tests.conftest import skip_reason_if_extension_absent
+from tests.harness_custody import create_in_memory_native_identity
 
 # ---------------------------------------------------------------------------
 # Skip entire module if the native extension is not available
@@ -92,7 +93,7 @@ def relay(session_scp: SCP):
     handle = native.relay_start_in_memory()
 
     # Create a bootstrap identity for the MLS credential DID.
-    bootstrap = native.identity_create("in_memory")
+    bootstrap = create_in_memory_native_identity(native)
 
     # Wire the ContextManager to use a real relay transport provider.
     # Must be called BEFORE any context_create (OnceLock — first call wins).
@@ -138,7 +139,7 @@ class TestRelayLifecycle:
 
 def _create_identity(scp: SCP) -> str:
     """Create an in-memory identity and return the DID string."""
-    handle = scp._native.identity_create("in_memory")
+    handle = create_in_memory_native_identity(scp._native)
     return handle.did
 
 

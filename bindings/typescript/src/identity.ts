@@ -67,21 +67,42 @@ export interface IdentityLinkAttestation {
 // ---------------------------------------------------------------------------
 
 /**
- * The custody string an identity-creating {@link SCP} method sends to the
- * NAPI bridge (spec §3.2, key custody).
+ * The custody request an identity-creating {@link SCP} method sends to the
+ * NAPI bridge: the backend that holds the identity's private keys (spec
+ * `03-identity.md` §3.2.2, custody request vocabulary).
  *
- * The union is exactly the custody strings the NAPI bridge builds a key store
- * from: `"in_memory"`, which an addon built with the bridge's `testing`
- * feature builds and a shipped addon answers with `SCP-IDENT-1008`. No custody
- * string reaches Apple Keychain or Android Keystore; pass a
- * `KeyCustodyProvider` to {@link SCP.identityCreateWithCustody} for any other
- * key store.
+ * - `"encrypted_file"` keeps the keys in the encrypted key file
+ *   `$HOME/.scp/keys.bin`, sealed under the passphrase in the
+ *   `SCP_KEY_PASSPHRASE` environment variable (Argon2id plus AES-256-GCM). An
+ *   unset, empty or relative `HOME`, or an unset or empty passphrase, rejects
+ *   with a `ValidationError` carrying `SCP-VALID-7001`; a key file that does not
+ *   open (a wrong passphrase, a failed integrity check) rejects with an
+ *   `IdentityError` carrying `SCP-IDENT-1008`.
+ * - `"os_keystore"` keeps the keys in the host's own key store, reached only
+ *   through the `KeyCustodyProvider` you pass to
+ *   {@link SCP.identityCreateWithCustody}, and an identity created that way
+ *   reports `"os_keystore"`. {@link SCP.identityCreate} has no provider to
+ *   reach, so it answers `"os_keystore"` with an `IdentityError` carrying
+ *   `SCP-IDENT-1003`. The value promises that every use of a key goes through
+ *   the provider; it promises no hardware backing.
+ *
+ * The union carries these two values and no other (§3.2.2). An addon built
+ * with the bridge's `testing` feature also accepts the string `"in_memory"`,
+ * which reaches a plaintext in-memory key store; that string is a test-harness
+ * affordance, not a value of this type, and a shipped addon answers it with an
+ * `IdentityError` carrying `SCP-IDENT-1008`.
+ *
+ * The bridge answers any other string, `"platform"`, `"software"`, `"file"`
+ * and `"callback"` included, with a `ValidationError` carrying
+ * `SCP-VALID-7005`. A shipped addon has no pre-rotation custody backend, so it
+ * answers `"encrypted_file"` with an `IdentityError` carrying `SCP-IDENT-1059`
+ * once the inputs resolve and before the key file opens.
  *
  * No SDK method defaults custody: the caller names the key store, and a call
  * that passes none rejects with an `IdentityError` carrying `SCP-IDENT-1116`
  * before any bridge call (SCP-294).
  */
-export type CustodyType = "in_memory";
+export type CustodyType = "encrypted_file" | "os_keystore";
 
 // ---------------------------------------------------------------------------
 // Identity
@@ -98,7 +119,7 @@ export type CustodyType = "in_memory";
  * wherever the underlying bridge call needs access to key material.
  *
  * ```typescript
- * const identity = await scp.identityCreate("in_memory");
+ * const identity = await scp.identityCreate("encrypted_file");
  * console.log(identity.did); // "did:dht:z6Mk..."
  * await scp.identityRotateKey(identity);
  * ```
@@ -107,7 +128,12 @@ export class Identity {
   /** The DID string for this identity (e.g., `"did:dht:z6Mk..."`). */
   readonly did: string;
 
-  /** The custody type used at identity creation. */
+  /**
+   * The custody request the identity was created with (`"encrypted_file"` or
+   * `"os_keystore"`; see {@link CustodyType}), or `"external"` for an identity
+   * loaded with no retained key material. A test harness on a `testing` addon
+   * also sees `"in_memory"`.
+   */
   readonly custodyType: string;
 
   /** The opaque bridge handle; private, so it also brands real instances. */

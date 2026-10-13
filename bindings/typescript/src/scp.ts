@@ -12,7 +12,7 @@
  *
  * // Storage selection is required — there is no default (spec §17.6).
  * const scp = new SCP({ storage: { type: "in_memory" } }); // dev/test storage
- * const identity = await scp.identityCreate("in_memory");
+ * const identity = await scp.identityCreate("encrypted_file");
  * await scp.resume();                    // async — reconnects transport
  * await scp.shutdown(5);                 // graceful shutdown
  * ```
@@ -21,7 +21,7 @@
  * bridge operation has a corresponding instance method on `SCP`. The
  * process-wide default-instance façade and free-function shorthands were
  * deleted — callers construct an explicit `new SCP()` and invoke methods
- * directly (e.g. `scp.identityCreate("in_memory")`).
+ * directly (e.g. `scp.identityCreate("encrypted_file")`).
  *
  * NOTE: `SCP` requires a Node.js or Bun runtime with the native addon.
  * Browser clients run the full protocol in-tab (keys on-device) via the
@@ -135,8 +135,9 @@ export const CUSTODY_REQUIRED_CODE = "SCP-IDENT-1116";
 
 /** Remedy for a method whose custody argument is a {@link CustodyType}. */
 const CUSTODY_VALUE_REMEDY =
-  'pass "in_memory" (an addon built with the bridge\'s testing feature only), or call ' +
-  "identityCreateWithCustody() with a KeyCustodyProvider for any other key store";
+  'pass "encrypted_file" (an encrypted key file at $HOME/.scp/keys.bin, sealed under ' +
+  "SCP_KEY_PASSPHRASE), or call identityCreateWithCustody() with a KeyCustodyProvider for " +
+  '"os_keystore" (the host key store)';
 
 /** Remedy for a method whose custody argument is a {@link KeyCustodyProvider}. */
 const CUSTODY_PROVIDER_REMEDY =
@@ -1059,7 +1060,16 @@ export class SCP {
    *
    * @throws IdentityError `SCP-IDENT-1116` when `custody` is `undefined` or
    *   `null`, before any bridge call.
-   * @throws ValidationError `SCP-VALID-7005` when `custody` is not a string.
+   * @throws ValidationError `SCP-VALID-7005` when `custody` is not a string,
+   *   or names no custody request.
+   * @throws IdentityError `SCP-IDENT-1003` for `"os_keystore"`, which needs
+   *   the provider {@link SCP.identityCreateWithCustody} takes.
+   * @throws ValidationError `SCP-VALID-7001` for `"encrypted_file"` when `HOME`
+   *   or `SCP_KEY_PASSPHRASE` is unset, empty, or (for `HOME`) relative.
+   * @throws IdentityError `SCP-IDENT-1008` for `"encrypted_file"` when the key
+   *   file does not open.
+   * @throws IdentityError `SCP-IDENT-1059` on a shipped addon, which has no
+   *   pre-rotation custody backend.
    */
   async identityCreate(custody: CustodyType): Promise<Identity> {
     requireCustody("identityCreate", custody);
@@ -1076,7 +1086,10 @@ export class SCP {
    *
    * @throws IdentityError `SCP-IDENT-1116` when `custody` is `undefined` or
    *   `null`, before any bridge call.
-   * @throws ValidationError `SCP-VALID-7005` when `custody` is not a string.
+   * @throws ValidationError `SCP-VALID-7005` when `custody` is not a string,
+   *   or names no custody request.
+   * @throws The other errors {@link SCP.identityCreate} throws, for the same
+   *   custody values.
    */
   async identityCreateWithAgentKey(custody: CustodyType): Promise<Identity> {
     requireCustody("identityCreateWithAgentKey", custody);
@@ -1091,7 +1104,9 @@ export class SCP {
   }
 
   /**
-   * Create a DID whose key material lives in a caller-provided custody backend.
+   * Create a DID whose key material lives in a caller-provided custody backend:
+   * custody `"os_keystore"` (spec `03-identity.md` §3.2.2), which the returned
+   * identity's `custodyType` reports.
    *
    * `provider` is any object implementing {@link KeyCustodyProvider} — the
    * private key material never crosses into the native core (ADR-006). Use this
@@ -1369,10 +1384,11 @@ export class SCP {
    * `referenceProof` reports what this caller did about a class 2
    * (`signed_post` / `dns_record`) proof resource, per §3.5.4 Class 2 step 2.
    * `"confirmed"` reports that this caller fetched the resource
-   * `evidence.proof` names and found this issuer's DID in it, which yields a
-   * `true` or a `false`. `"not_fetched"` reports that this caller fetched
-   * nothing, which raises `SCP-IDENT-1062` for a class 2 attestation. A class 1
-   * (`did_control`) attestation ignores this argument. Any other string raises
+   * `evidence.proof` names and found in it what step 2 requires (this issuer's
+   * DID, plus the nonce for `signed_post`), which yields a `true` or a `false`.
+   * `"not_fetched"` reports that this caller fetched nothing, which raises
+   * `SCP-IDENT-1062` for a class 2 attestation. A class 1 (`did_control`)
+   * attestation ignores this argument. Any other string raises
    * `SCP-IDENT-1044`.
    *
    * @throws `SCP-IDENT-1044` for a malformed argument, `SCP-IDENT-1060` when an
@@ -3852,16 +3868,19 @@ export class SCP {
   }
 
   /**
-   * Verify an attestation's Ed25519 signature, evidence, expiry, and
-   * revocation status (ADR-017, §7.4).
+   * Verify an attestation's Ed25519 signature, evidence, expiry, its own
+   * revocation status, and this instance's revocation list for `contextId`
+   * (ADR-017, §7.4.4).
    *
    * Takes the typed attestation envelope ({@link CachedAttestationEnvelope})
    * and serializes it to the serde wire shape internally (ADR-058) before
-   * crossing FFI.
+   * crossing FFI. A revocation list that cannot be read throws; it never
+   * reads as `valid: false`.
    */
-  trustVerifyAttestation(attestation: CachedAttestationEnvelope): unknown {
+  trustVerifyAttestation(contextId: string, attestation: CachedAttestationEnvelope): unknown {
     try {
-      return (this.#native.trustVerifyAttestation as (j: string) => unknown)(
+      return (this.#native.trustVerifyAttestation as (c: string, j: string) => unknown)(
+        contextId,
         encodeAttestation(attestation),
       );
     } catch (err) {

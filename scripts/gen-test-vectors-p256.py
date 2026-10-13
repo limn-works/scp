@@ -2622,7 +2622,7 @@ def emit_challenge_vectors() -> None:
     # 20 cases (§7.3.4.3).
     capability_uri = ID_DEFINER + ":capability:schema-validation/v1"
 
-    # --- Vector 58: the challenge request. ---
+    # --- Vector 59: the challenge request. ---
     challenge_id = bytes(range(1, 33))
     test_input = {"name": "widget", "count": 3}
     expected = {
@@ -2637,7 +2637,7 @@ def emit_challenge_vectors() -> None:
         + var_field("schema")
         + u32(10000)
     )
-    pre58 = canonical_preimage(
+    pre59 = canonical_preimage(
         "SCP-CHALLENGE-REQ-V1:",
         fixed_field(challenge_id),
         var_field(capability_uri),
@@ -2647,25 +2647,25 @@ def emit_challenge_vectors() -> None:
         var_field(ID_VERIFIER),
         var_field(ID_SUBJECT),
     )
-    emit_hex("vector_58.challenge_id", challenge_id)
-    emit("vector_58.verifier", ID_VERIFIER)
-    emit("vector_58.definer", ID_DEFINER)
-    emit("vector_58.capability_uri", capability_uri)
-    emit("vector_58.subject", ID_SUBJECT)
-    emit("vector_58.input_jcs", input_jcs.decode())
-    emit("vector_58.expected_jcs", expected_jcs.decode())
+    emit_hex("vector_59.challenge_id", challenge_id)
+    emit("vector_59.verifier", ID_VERIFIER)
+    emit("vector_59.definer", ID_DEFINER)
+    emit("vector_59.capability_uri", capability_uri)
+    emit("vector_59.subject", ID_SUBJECT)
+    emit("vector_59.input_jcs", input_jcs.decode())
+    emit("vector_59.expected_jcs", expected_jcs.decode())
     test_cases_field = u32(1) + test_case
     suite_digest = sha256(test_cases_field)
-    emit_hex("vector_58.test_case_field", test_cases_field)
-    emit_hex("vector_58.suite_digest", suite_digest)
-    emit("vector_58.preimage_len", len(pre58))
-    emit_hex("vector_58.preimage", pre58)
-    emit_hex("vector_58.digest", sha256(pre58))
+    emit_hex("vector_59.test_case_field", test_cases_field)
+    emit_hex("vector_59.suite_digest", suite_digest)
+    emit("vector_59.preimage_len", len(pre59))
+    emit_hex("vector_59.preimage", pre59)
+    emit_hex("vector_59.digest", sha256(pre59))
 
-    # --- Vectors 59 and 60: the verification record. ---
+    # --- Vectors 60 and 61: the verification record. ---
     for label, ts, passed, score, pass_count, context_id in (
-        ("vector_59", 1700000000, True, 10000, 1, "test-context-01"),
-        ("vector_60", 1700000060, False, None, 0, None),
+        ("vector_60", 1700000000, True, 10000, 1, "test-context-01"),
+        ("vector_61", 1700000060, False, None, 0, None),
     ):
         expires_at = ts + 7776000
         vid_pre, vid = challenge_verification_id(

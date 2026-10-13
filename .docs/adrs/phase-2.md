@@ -841,6 +841,7 @@ pub enum EventType {
     ContextMigrationStarted,      // ProposeContextMigration §5.11A grace start
     OutletRemoved,                  // RemoveOutlet; pairs with OutletRegistered
     PruningPolicyModified,        // ModifyPruningPolicy ADR-030 §6
+    PseudonymRotationPolicyModified, // ModifyPseudonymRotationPolicy ADR-031 §3; spec 09 §9.10.4.1
     CommitBroadcasted,            // MLS commit broadcast record §9.9 reconciliation
     CommitBroadcastPending,       // deferred-commit queue record
     // (PseudonymAnnounced is NOT a durable EventType — see the exclusion list below.)

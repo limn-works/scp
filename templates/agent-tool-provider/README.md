@@ -1,6 +1,6 @@
 # SCP Agent Tool Provider
 
-A Python agent that registers tools in an SCP context, handles invocations with UCAN authorization, and optionally bridges tools to external models via MCP (Model Context Protocol).
+A Python agent that registers outlets in an SCP context, handles invocations with UCAN authorization, and optionally serves the outlets to external models via MCP (Model Context Protocol).
 
 ## Prerequisites
 
@@ -13,44 +13,46 @@ A Python agent that registers tools in an SCP context, handles invocations with 
 ```bash
 cd templates/agent-tool-provider
 pip install -e ../../bindings/python  # install SDK from source
-python agent.py                       # run with tool invocations only
-python agent.py --mcp                 # also start MCP server (stdio)
-python agent.py --mcp --sse           # MCP server over SSE
+export SCP_KEY_PASSPHRASE=...         # seals $HOME/.scp/keys.bin
+export SCP_STORAGE_PASSPHRASE=...     # encrypts the SQLCipher database
+python agent.py                       # run with outlet invocations only
+python agent.py --mcp                 # also start an MCP server (stdio)
 ```
 
 ## What This Does
 
-### Tool Lifecycle
+### Outlet Lifecycle
 
-The agent demonstrates the complete tool lifecycle within SCP:
+Every call is a method on one `SCP` instance, which the `async with` block shuts down on exit.
 
-1. **Identity creation** -- creates a `did:dht` identity with in-memory key custody.
-2. **Context creation** -- opens an encrypted context with `OutletRegister` and `OutletCallAll` capabilities in the ceiling.
-3. **Tool registration** -- registers two tools (`calculator`, `search`) with JSON Schema input/output definitions and test vectors.
-4. **Handler attachment** -- attaches Python callables to each tool via `register_tool_handler()`. When a tool is invoked, the handler receives validated JSON input and returns JSON output.
-5. **UCAN minting** -- mints a UCAN token with `outlet_call:*` capability scoped to the context. Every outlet invocation requires a valid UCAN.
-6. **Invocation** -- calls `ctx.invoke(tool_name, input, ucan_token)` which validates the UCAN, checks the input against the tool's JSON Schema, executes the handler, and returns the result.
-7. **MCP bridging** (optional) -- starts an MCP server that exposes all context tools to MCP-compatible models (Claude, GPT, etc.) over stdio or SSE transport.
+1. **Identity creation** -- `identity_create(CustodyType.ENCRYPTED_FILE)` creates a `did:dht` identity whose keys live in `$HOME/.scp/keys.bin`, sealed under `SCP_KEY_PASSPHRASE`. A build without the bridge's `testing` feature has no pre-rotation custody backend and raises `SCP-IDENT-1059` for `CustodyType.ENCRYPTED_FILE`.
+2. **Context creation** -- `context_create` opens an encrypted context with `outlet:register` and `outlet:query:*` in the ceiling.
+3. **Outlet registration** -- `outlet_register` registers two outlets (`calculator`, `search`) with JSON Schema input and output definitions and test vectors, and returns each outlet's id.
+4. **Handler attachment** -- `mcp_register_outlet_handler(context_id, outlet_id, handler)` attaches a Python callable to each outlet. When the outlet is invoked, the handler receives the validated JSON input as a dict and returns a dict.
+5. **UCAN minting** -- `ucan_mint` mints a UCAN token carrying `outlet:query:<outlet id>` for both outlets, which are Query outlets. Every outlet invocation requires a valid UCAN.
+6. **Invocation** -- `outlet_invoke(context_id, outlet_id, input, identity_did, ucan_token)` validates the UCAN, checks the input against the outlet's JSON Schema, runs the handler, and returns the result.
+7. **MCP serving** (optional) -- `mcp_serve(identity_did, [context_id], "stdio", ucan_token)` exposes the context's outlets to an MCP client over stdin and stdout, and `mcp_server_wait` returns when the client closes stdin.
 
-### Included Tools
+### Included Outlets
 
-| Tool | Description | Input | Output |
+| Outlet | Description | Input | Output |
 |------|-------------|-------|--------|
 | `calculator` | Arithmetic on two operands | `{a, b, op}` where op is add/sub/mul/div/pow | `{result}` |
 | `search` | Keyword search over a knowledge base | `{query, max_results?}` | `{results[], total}` |
 
-## How Tools Work
+## How Outlets Work
 
 ### Registration
 
-Tools are defined as `ToolDefinition` dataclasses with JSON Schema for input and output validation:
+An outlet is an `OutletDefinition` with JSON Schema for input and output validation:
 
 ```python
-from scp_sdk import ToolDefinition, TestVector
+from scp_sdk import OutletDefinition, OutletKind, TestVector
 
-tool = ToolDefinition(
+definition = OutletDefinition(
     name="my_tool",
     description="What it does",
+    kind=OutletKind.Query,
     input_schema={
         "type": "object",
         "properties": {
@@ -74,151 +76,109 @@ tool = ToolDefinition(
         ),
     ],
 )
+outlet_id = await scp.outlet_register(ctx.context_id, definition)
 ```
 
 ### Handler Attachment
 
-After registering a tool definition, attach a Python callable that processes invocations:
+After registering the outlet, attach a Python callable that processes invocations:
 
 ```python
-from scp_sdk.mcp import register_tool_handler
-
 def my_handler(input_data: dict) -> dict:
     return {"result": input_data["param"].upper()}
 
-register_tool_handler(ctx, "my_tool", my_handler)
+
+await scp.mcp_register_outlet_handler(ctx.context_id, outlet_id, my_handler)
 ```
 
 The handler receives the validated input dict and must return a dict matching the output schema.
 
 ### Invocation
 
-Tools are invoked through the context with UCAN authorization:
+Outlets are invoked through the instance with UCAN authorization:
 
 ```python
-from scp_sdk.ucan import mint as ucan_mint
+token = await scp.ucan_mint(ctx.context_id, identity.did, [Capability.outlet_query(outlet_id)])
 
-# Mint a token authorizing tool invocation.
-token = await ucan_mint(
-    audience=identity.did,
-    capabilities=["outlet_call:my_tool"],  # or "outlet_call:*" for all
-    context=ctx.context_id,
+result = await scp.outlet_invoke(
+    ctx.context_id, outlet_id, {"param": "hello"}, identity.did, token.encoded
 )
-
-# Invoke the tool.
-result = await ctx.invoke("my_tool", {"param": "hello"}, token.token_id)
 # result == {"result": "HELLO"}
-```
-
-### Cross-Context Invocation
-
-Tools can be invoked across context boundaries when both contexts approve the interface:
-
-```python
-from scp_sdk.tools import invoke_cross_context
-
-result = await invoke_cross_context(
-    source_context_id="ctx-caller",
-    target_context_id="ctx-provider",
-    tool_id="my_tool",
-    input={"param": "hello"},
-    invoker_did=identity.did,
-    ucan_token=token.token_id,
-)
 ```
 
 ### Stateful Sessions
 
-For multi-turn tool workflows, use stateful sessions:
+For multi-turn outlet workflows, use stateful sessions:
 
 ```python
-from scp_sdk.tools import session_create, session_invoke, session_close
-
-session_id = await session_create(
-    context_id=ctx.context_id,
-    tool_id="my_tool",
-    source_context_id=ctx.context_id,
+session_id = await scp.outlet_session_create(
+    ctx.context_id,
+    outlet_id,
+    ctx.context_id,  # source context
     ttl_seconds=300,  # 5-minute session
 )
 
-result = await session_invoke(
-    context_id=ctx.context_id,
-    session_id=session_id,
-    input={"param": "hello"},
-    invoker_did=identity.did,
-    ucan_token=token.token_id,
+result = await scp.outlet_session_invoke(
+    ctx.context_id, session_id, {"param": "hello"}, identity.did, token.encoded
 )
 
-await session_close(ctx.context_id, session_id)
+await scp.outlet_session_close(ctx.context_id, session_id)
 ```
 
-## How MCP Bridge Works
+## How the MCP Server Works
 
-The MCP bridge exposes SCP context tools to external models that speak the Model Context Protocol.
+The MCP server exposes SCP context outlets to external models that speak the Model Context Protocol.
 
 ### Starting the Server
 
 ```python
-from scp_sdk.mcp import serve_mcp
-
-async with await serve_mcp(
-    identity=identity,
-    contexts=[ctx],
-    transport="stdio",   # or "sse"
-) as server:
-    # Server is running; tools are exposed as MCP tools
-    # namespaced by context ID (e.g., "ctx-abc/calculator")
-    ...
+server = await scp.mcp_serve(identity.did, [ctx.context_id], "stdio", token.encoded)
+try:
+    await scp.mcp_server_wait(server)  # returns when the client closes stdin
+finally:
+    await scp.mcp_server_stop(server)
 ```
 
-### Transport Modes
-
-- **stdio** -- line-delimited JSON over stdin/stdout. Used when an MCP host (e.g., Claude Desktop) spawns the agent as a subprocess.
-- **sse** -- HTTP with Server-Sent Events. Used for network-accessible MCP servers.
+The stdio transport reads line-delimited JSON on stdin and writes it on stdout, for an MCP host (for example Claude Desktop) that spawns the agent as a subprocess. The agent logs to stderr, so its log lines stay out of the protocol stream.
 
 ### Capability Filtering
 
-The MCP server only exposes tools that the agent's role permits. If the agent lacks `OutletCallAll`, only tools matching specific `OutletCall(outlet_id)` capabilities are listed.
+The MCP server only exposes outlets that the agent's role permits.
 
 ### Provenance
 
-Every tool result served through MCP carries SCP provenance metadata recording the tool source, invoking agent DID, context ID, and timestamp. External models receive verifiable provenance with their tool results.
+Every outlet result served through MCP carries SCP provenance metadata recording the outlet source, invoking agent DID, context ID, and timestamp. External models receive verifiable provenance with their tool results.
 
 ### Consuming External MCP Servers
 
-The SDK also supports consuming tools from external MCP servers with provenance wrapping:
+The SDK also consumes tools from external MCP servers and wraps each result with provenance:
 
 ```python
-from scp_sdk.mcp import McpClient
-
-async with await McpClient.connect(
-    "stdio",
-    command=["uvx", "some-mcp-server"],
-) as client:
-    tools = await client.list_tools()
-    result = await client.invoke(
-        tool="external_tool",
-        input={"key": "value"},
-        context=ctx,
-        identity=identity,
+client = await scp.mcp_client_connect_stdio(["uvx", "some-mcp-server"])
+try:
+    tools = await scp.mcp_client_list_tools(client)
+    result = await scp.mcp_client_invoke(
+        client, "external_tool", {"key": "value"}, ctx.context_id, identity.did
     )
     # result.provenance records the external source
+finally:
+    await scp.mcp_client_disconnect(client)
 ```
 
-## Adding Custom Tools
+A command outside the instance's stdio allowlist is rejected; `mcp_configure_stdio_allowlist` permits more binaries.
 
-1. Define a `ToolDefinition` with JSON Schema for input and output.
-2. Write a handler function `(dict) -> dict`.
-3. Register the handler with `register_tool_handler(ctx, tool_name, handler)`.
-4. Mint a UCAN token with `outlet_call:<tool_name>` capability.
-5. Invoke via `ctx.invoke()` or expose via MCP with `serve_mcp()`.
+## Adding Custom Outlets
 
-Test vectors are optional but recommended -- they document expected behavior and can be used for verification during registration.
+1. Define an `OutletDefinition` with JSON Schema for input and output.
+2. Register it with `outlet_register` and keep the returned outlet id.
+3. Write a handler function `(dict) -> dict` and attach it with `mcp_register_outlet_handler(context_id, outlet_id, handler)`.
+4. Mint a UCAN token with `Capability.outlet_query(outlet_id)` for a Query outlet, or `Capability.outlet_call(outlet_id)` for an Action outlet.
+5. Invoke it with `outlet_invoke` or expose it via MCP with `mcp_serve`.
+
+Test vectors are optional but recommended -- they document expected behavior, and `outlet_verify` checks the outlet against them.
 
 ## Next Steps
 
-- Replace `"in_memory"` custody with `"platform"` for production key storage
-- Connect to a relay with `connect_relay()` for networked transport
-- Use `session_create()`/`session_invoke()` for multi-turn tool workflows
-- Add a second participant and use `delegate()` to issue scoped UCAN tokens
-- Consume external MCP servers with `McpClient` and wrap results with provenance
+- Use `outlet_session_create` and `outlet_session_invoke` for multi-turn outlet workflows
+- Invite a second identity with `reserve_key_package`, `invite_member` and `context_join_from_welcome`, then mint it a scoped UCAN with `ucan_mint`
+- Consume external MCP servers with `mcp_client_connect_stdio` and wrap results with provenance

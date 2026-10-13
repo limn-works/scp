@@ -78,36 +78,66 @@ object Capability {
 /**
  * The custody choice a caller passes to [SCP.identityCreate],
  * [SCP.identityCreateWithAgentKey], [works.limn.scp.bridge.IdentityBridge.create],
- * and [IdentityAdvancedBridge.createWithAgentKey] (spec section 3.2).
+ * and [IdentityAdvancedBridge.createWithAgentKey]: the custody request
+ * vocabulary of spec section 3.2.2.
  *
- * Its entries are exactly the custody strings the UniFFI bridge accepts
- * (`parse_custody_method` in `crates/scp-ffi/uniffi/src/bridge.rs`), so the
- * compiler rejects a custody value the bridge would refuse. None of those
- * methods gives the parameter a default: which key store holds a private key
- * decides who can reach that key, so the caller states it.
+ * None of those methods gives the parameter a default: which key store holds a
+ * private key decides who can reach that key, so the caller states it. The
+ * UniFFI bridge answers every value through one parser
+ * (`scp_ffi_common::custody_request`), so each entry gets the same answer on
+ * every bridge:
  *
- * No entry reaches Android Keystore or any other host key store. A caller
- * reaches one by injecting a `KeyCustodyProvider` through
- * [SCP.identityCreateWithCustody].
+ * - [ENCRYPTED_FILE] creates the identity over the encrypted key file.
+ * - [OS_KEYSTORE] names the host key store, which only a `KeyCustodyProvider`
+ *   reaches, so those methods answer it with `SCP-IDENT-1003`. Pass the
+ *   provider to [SCP.identityCreateWithCustody]; the identity it returns
+ *   reports `"os_keystore"` from `custodyType()`.
+ *
+ * The type has no third entry. Spec section 3.2.2 makes `in_memory` a
+ * testing-build affordance and never a peer of these two values: a bridge
+ * built with the `testing` feature accepts the raw string, a bridge built
+ * without it answers `SCP-IDENT-1008`, and a test harness reaches it outside
+ * this type. [fromRawValue] therefore returns null for `"in_memory"`.
+ *
+ * A shipped build also refuses every identity creation with `SCP-IDENT-1059`
+ * until a production pre-rotation custody backend exists (ADR-062
+ * §Decision 6).
  *
  * The Swift SDK's `CustodyType` carries the same cases.
  * `works.limn.scp.android.platform.CustodyType` in `scp-kt-android` is a
  * different enum: it reports where an Android key already lives.
  *
- * Provenance: spec section 3.2 (Key Custody); `.docs/standards/construction.md`
- * (consequential choices are enums, required choices are required); SCP-294 in
- * `.docs/prds/http-features.json`.
+ * Provenance: spec section 3.2.2 (Custody request vocabulary);
+ * `.docs/standards/sdk-common.md` §Custody request;
+ * `.docs/standards/construction.md` (consequential choices are enums, required
+ * choices are required); SCP-294 in `.docs/prds/http-features.json`.
  *
  * @property rawValue Wire-format string passed to the FFI bridge.
  */
 enum class CustodyType(val rawValue: String) {
     /**
-     * An in-memory key store that loses every key when the process exits.
+     * The encrypted key file at `$HOME/.scp/keys.bin`, sealed with Argon2id and
+     * AES-256-GCM under the passphrase in the `SCP_KEY_PASSPHRASE` environment
+     * variable (spec section 17.8).
      *
-     * The UniFFI bridge builds it only under its `testing` feature; a shipped
-     * build answers it with `SCP-IDENT-1008` and builds no other key store.
+     * An unset, empty or relative `HOME`, or an unset or empty
+     * `SCP_KEY_PASSPHRASE`, is `SCP-VALID-7001`. A key directory or key file the
+     * process cannot open, including one sealed under another passphrase, is
+     * `SCP-IDENT-1008`.
      */
-    IN_MEMORY("in_memory"),
+    ENCRYPTED_FILE("encrypted_file"),
+
+    /**
+     * The host operating system's key store, reached only through a
+     * `KeyCustodyProvider`.
+     *
+     * [SCP.identityCreate] and [SCP.identityCreateWithAgentKey] take no
+     * provider, so they answer this entry with `SCP-IDENT-1003`; pass the
+     * provider to [SCP.identityCreateWithCustody]. The value promises that the
+     * keys sit in the host's store and that every use of them goes through the
+     * provider. It promises no hardware backing.
+     */
+    OS_KEYSTORE("os_keystore"),
     ;
 
     companion object {

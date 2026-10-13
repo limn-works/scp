@@ -53,6 +53,7 @@ from scp_sdk.trust import (
     verify_participation_requirements,
 )
 from tests.conftest import skip_reason_if_extension_absent
+from tests.harness_custody import create_in_memory_identity
 
 
 def _require_native_extension() -> None:
@@ -1417,26 +1418,25 @@ class TestTrustVerifyTyped:
     def test_verify_attestation_serializes_the_typed_envelope(self) -> None:
         from scp_sdk.trust import trust_verify_attestation
 
-        bridge = MagicMock()
-        bridge.trust_verify_attestation.return_value = {
+        scp = MagicMock()
+        scp._native.trust_verify_attestation.return_value = {
             "valid": False,
             "chain_depth": 0,
             "error": "unresolvable issuer",
         }
-        with patch("scp_sdk.trust._bridge", return_value=bridge):
-            result = trust_verify_attestation(self._envelope())
+        result = trust_verify_attestation(scp, "ctx-1", self._envelope())
         assert result["valid"] is False
-        (wire_json,) = bridge.trust_verify_attestation.call_args[0]
+        context_id, wire_json = scp._native.trust_verify_attestation.call_args[0]
+        assert context_id == "ctx-1"
         assert json.loads(wire_json) == self._envelope()
 
-    def test_verify_attestation_real_bridge_call_through(self) -> None:
+    def test_verify_attestation_real_bridge_call_through(self, scp: Any) -> None:
         """The typed envelope's serialized JSON parses on the REAL Rust
         `Attestation` deserializer: a dummy signature yields a structured
         `valid: False` (verification ran), never a parse error."""
-        _require_native_extension()
         from scp_sdk.trust import trust_verify_attestation
 
-        result = trust_verify_attestation(self._envelope())
+        result = trust_verify_attestation(scp, "ctx-1", self._envelope())
         assert result["valid"] is False
         assert result["error"]
 
@@ -1621,10 +1621,9 @@ class TestTrustChallengeRealBridge:
     @pytest.mark.asyncio
     async def test_below_minimum_is_valid_7039(self, scp) -> None:  # type: ignore[no-untyped-def]
         _require_native_extension()
-        from scp_sdk.types import CustodyType
 
-        verifier = await scp.identity_create(CustodyType.IN_MEMORY)
-        subject = await scp.identity_create(CustodyType.IN_MEMORY)
+        verifier = await create_in_memory_identity(scp)
+        subject = await create_in_memory_identity(scp)
         with pytest.raises(ValidationError) as info:
             await scp.trust_create_challenge(
                 verifier.did, subject.did, _SCHEMA_URI, _schema_cases(19)
@@ -1636,10 +1635,9 @@ class TestTrustChallengeRealBridge:
         """The signed request carries the hex id, both DIDs and the cases as
         written; a response with a forged signature is refused with a code."""
         _require_native_extension()
-        from scp_sdk.types import CustodyType
 
-        verifier = await scp.identity_create(CustodyType.IN_MEMORY)
-        subject = await scp.identity_create(CustodyType.IN_MEMORY)
+        verifier = await create_in_memory_identity(scp)
+        subject = await create_in_memory_identity(scp)
         cases = _schema_cases(20)
         result = await scp.trust_create_challenge(verifier.did, subject.did, _SCHEMA_URI, cases)
         challenge: ChallengeRequest = json.loads(result["challenge_json"])

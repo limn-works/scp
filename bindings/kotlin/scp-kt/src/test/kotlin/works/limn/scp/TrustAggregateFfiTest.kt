@@ -137,6 +137,7 @@ class TrustAggregateFfiTest {
     fun `trustVerifyAttestation - typed envelope reaches the real verifier`() {
         val result =
             scp.trustVerifyAttestation(
+                "ctx-ffi-1",
                 CachedAttestationEnvelope(
                     id = "att-ffi-1",
                     attestationType = "AgentCapability",
@@ -175,8 +176,8 @@ class TrustAggregateFfiTest {
     @Test
     fun `trustCreateChallenge - suite below minimum is SCP-VALID-7039`() {
         runBlocking {
-            val verifier = scp.identityCreate(custody = CustodyType.IN_MEMORY)
-            val subject = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+            val verifier = scp.identityCreateInMemory()
+            val subject = scp.identityCreateInMemory()
             val error =
                 assertFailsWith<ScpException.Validation> {
                     scp.trustCreateChallenge(verifier, subject.did(), schemaUri, testCases(19))
@@ -192,8 +193,8 @@ class TrustAggregateFfiTest {
     @Test
     fun `trustCreateChallenge then trustVerifyResponse - forged response is refused`() {
         runBlocking {
-            val verifier = scp.identityCreate(custody = CustodyType.IN_MEMORY)
-            val subject = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+            val verifier = scp.identityCreateInMemory()
+            val subject = scp.identityCreateInMemory()
             val cases = testCases(20)
             val created = scp.trustCreateChallenge(verifier, subject.did(), schemaUri, cases)
             val challenge = decodeChallengeRequestJson(created.challengeJson)

@@ -22,7 +22,7 @@
 //! [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout).
 //! The propose, vote, approve, and reject turns sign through custody
 //! (ADR-049 Decision 7a) and run under [`SIGNING_HANDLER_TIMEOUT`] instead, so
-//! a stalled custody fails the sign with `SCP-CRYPTO-4061` before the turn
+//! a stalled custody fails the sign with `SCP-CRYPTO-4062` before the turn
 //! budget expires.
 //!
 //! # Read vs. mutate classification

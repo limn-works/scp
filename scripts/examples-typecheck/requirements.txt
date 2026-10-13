@@ -1,0 +1,8 @@
+# The Python packages scripts/check-examples-typecheck.sh needs. Every CI job that runs
+# the gate installs this file, so one edit here reaches each job.
+# mypy: the pin the python-test job carries.
+mypy==1.20.2
+# cryptography: templates/broadcast-feed/subscriber.py imports it.
+cryptography==50.0.0
+# pytest: the pytest recipe of .docs/migration/phase-4.md imports it.
+pytest==9.0.2

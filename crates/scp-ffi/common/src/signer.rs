@@ -95,9 +95,9 @@ mod tests {
         Ok(())
     }
 
-    /// A sign past the budget reaches the bridges as `SCP-CRYPTO-4061`.
+    /// A sign past the budget reaches the bridges as `SCP-CRYPTO-4062`.
     #[tokio::test(start_paused = true)]
-    async fn sign_bounded_timeout_is_crypto_4061() {
+    async fn sign_bounded_timeout_is_crypto_4062() {
         let signer = CommandSigner::new(Arc::new(NeverReadySigner));
         let started = tokio::time::Instant::now();
         let result = sign_bounded(&signer, &[5; 32]).await;
@@ -107,7 +107,7 @@ mod tests {
                 &result,
                 Err(ContextError::Custody(failure))
                     if failure.kind == CustodyFailureKind::TimedOut
-                        && custody_failure_code(failure) == "SCP-CRYPTO-4061"
+                        && custody_failure_code(failure) == "SCP-CRYPTO-4062"
             ),
             "{result:?}"
         );

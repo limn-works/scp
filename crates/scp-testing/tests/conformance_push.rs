@@ -11,6 +11,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use scp_platform::in_memory::InMemoryPush;
+use scp_platform::testing::InMemoryPush;
 
 scp_testing::push_conformance!(InMemoryPush::new());

@@ -901,41 +901,6 @@ pub fn expect_fixed_bytes_zeroized<const N: usize>(
     expect_fixed_bytes::<N>(bytes, field).map(zeroize::Zeroizing::new)
 }
 
-/// Rejects a `testing_seed` that `identity_create` cannot honor, as
-/// `(code, message)`, one rule for the `PyO3`, napi-rs and `UniFFI` bridges.
-///
-/// Every bridge calls this after it narrows the seed to 32 bytes and before
-/// it interprets the custody string, so one input yields one code on every
-/// bridge. A seed with any custody other than `"in_memory"` is
-/// `SCP-VALID-7009`; a seed with `"in_memory"` in a build without the
-/// `testing` feature (`testing_build == false`) is `SCP-VALID-7008`
-/// (ADR-048).
-///
-/// # Errors
-///
-/// Returns the code and message of the first rule `seed_present` breaks.
-pub fn check_testing_seed(
-    custody: &str,
-    seed_present: bool,
-    testing_build: bool,
-) -> Result<(), (&'static str, &'static str)> {
-    if !seed_present {
-        Ok(())
-    } else if custody != "in_memory" {
-        Err((
-            crate::error_codes::VALID_7009,
-            "`testing_seed` parameter is only valid for custody=\"in_memory\"",
-        ))
-    } else if !testing_build {
-        Err((
-            crate::error_codes::VALID_7008,
-            "`testing_seed` parameter requires the testing feature",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1851,31 +1816,5 @@ mod tests {
         fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
         assert_zeroize_on_drop::<zeroize::Zeroizing<[u8; 32]>>();
         assert_zeroize_on_drop::<zeroize::Zeroizing<[u8; 64]>>();
-    }
-
-    /// One table fixes the code for every (custody, seed, build) input, so
-    /// no bridge can answer one input with a different code.
-    #[test]
-    fn check_testing_seed_codes_every_input() {
-        use crate::error_codes::{VALID_7008, VALID_7009};
-        let cases: [(&str, bool, bool, Option<&str>); 11] = [
-            ("in_memory", false, true, None),
-            ("in_memory", false, false, None),
-            ("platform", false, false, None),
-            ("in_memory", true, true, None),
-            ("in_memory", true, false, Some(VALID_7008)),
-            ("platform", true, true, Some(VALID_7009)),
-            ("platform", true, false, Some(VALID_7009)),
-            ("software", true, true, Some(VALID_7009)),
-            ("encrypted_file", true, false, Some(VALID_7009)),
-            ("os_keystore", true, true, Some(VALID_7009)),
-            ("keychain", true, true, Some(VALID_7009)),
-        ];
-        for (custody, seed, testing, want) in cases {
-            let got = check_testing_seed(custody, seed, testing)
-                .err()
-                .map(|(c, _)| c);
-            assert_eq!(got, want, "{custody} seed={seed} testing={testing}");
-        }
     }
 }

@@ -11,7 +11,7 @@
  * `Relay.startInMemory()` factory were removed — use
  * `scp.relayStartInMemory()` and `scp.ucanMint(...)`.
  *
- * Run: bun run examples/outlet-invocation.ts
+ * Run it as the "Running the examples" section of ../README.md describes.
  */
 
 import { SCP, type OutletDefinition, type UcanToken, defineOutletDefinition } from "../src/index";
@@ -25,7 +25,7 @@ async function main(): Promise<void> {
     console.log(`Relay listening at ${relay.relayUrl}`);
 
     // 2. Create an identity.
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await scp.identityCreate("encrypted_file");
     console.log(`Identity DID: ${identity.did}`);
 
     // 3. Wire the bridge's transport to the relay.

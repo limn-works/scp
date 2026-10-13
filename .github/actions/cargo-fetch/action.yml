@@ -1,0 +1,37 @@
+name: Fetch every crate Cargo.lock names, then take cargo offline
+description: >-
+  Runs `cargo fetch --locked` in one workspace, retrying a failed fetch with backoff past
+  cargo's own three retries, proves `cargo metadata` resolves that workspace offline, and
+  writes `CARGO_NET_OFFLINE=true` to `$GITHUB_ENV` so every later step of the job, and every
+  cargo command a script in that step starts, runs offline. fetch.sh beside this file states
+  why and every failure it reports.
+inputs:
+  working-directory:
+    description: >-
+      The directory holding the workspace's Cargo.lock, relative to the workspace root (for
+      example `fuzz`). rustup resolves the toolchain from this directory, so the fetch runs
+      on the compiler the job's later cargo commands in it run on.
+    required: false
+    default: "."
+  toolchain:
+    description: >-
+      A toolchain to pass to cargo as `+<toolchain>`, for a job whose cargo commands name
+      one that way (fuzz.yml). Empty passes none.
+    required: false
+    default: ""
+outputs:
+  cargo-home:
+    description: >-
+      The cargo home the packages were downloaded into (`$CARGO_HOME`, else `$HOME/.cargo`).
+      A step that builds in a container mounts `<cargo-home>/registry` into it.
+    value: ${{ steps.fetch.outputs.cargo-home }}
+runs:
+  using: composite
+  steps:
+    - name: Fetch every crate Cargo.lock names, then take cargo offline
+      id: fetch
+      shell: bash
+      env:
+        FETCH_DIRECTORY: ${{ inputs.working-directory }}
+        FETCH_TOOLCHAIN: ${{ inputs.toolchain }}
+      run: bash "$GITHUB_ACTION_PATH/fetch.sh" "$FETCH_DIRECTORY" "$FETCH_TOOLCHAIN"

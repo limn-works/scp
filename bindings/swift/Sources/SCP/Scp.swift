@@ -764,15 +764,17 @@ public extension SCP {
     /// `custody.rawValue`.
     ///
     /// `custody` is required and typed (``CustodyType``): the caller names the
-    /// key store, and the compiler rejects a custody value the UniFFI bridge
-    /// refuses.
+    /// key store, and the compiler rejects a string outside the custody request
+    /// vocabulary (spec section 3.2.2). ``CustodyType/osKeystore`` throws
+    /// `SCP-IDENT-1003`, because only a `KeyCustodyProvider` reaches the host
+    /// key store; pass one to ``identityCreateWithCustody(provider:)``.
     ///
-    /// `testingSeed` is a testing-only parameter for the ADR-046
-    /// cross-bridge parity harness; pass `nil` from production callers
-    /// (the `testing` in-memory path uses OS RNG when
-    /// `testingSeed` is `nil`).
-    func identityCreate(custody: CustodyType, testingSeed: Data? = nil) async throws -> Identity {
-        try await inner.identityCreate(custody: custody.rawValue, testingSeed: testingSeed)
+    /// The method sends the bridge no testing seed. Spec section 3.2.2 gives
+    /// a seed with either ``CustodyType`` case `SCP-VALID-7009`, because only
+    /// the testing-build in-memory key store takes a seed, and a test reaches
+    /// that store outside ``CustodyType`` (ADR-048, amended 2026-10-11).
+    func identityCreate(custody: CustodyType) async throws -> Identity {
+        try await inner.identityCreate(custody: custody.rawValue, testingSeed: nil)
     }
 
     /// Forwards to ``Scp/identityCreateLinkAttestation`` on ``inner``.
@@ -784,13 +786,17 @@ public extension SCP {
     /// `custody.rawValue`.
     ///
     /// `custody` is required and typed (``CustodyType``): the caller names the
-    /// key store, and the compiler rejects a custody value the UniFFI bridge
-    /// refuses.
+    /// key store, and the compiler rejects a string outside the custody request
+    /// vocabulary (spec section 3.2.2). ``CustodyType/osKeystore`` throws
+    /// `SCP-IDENT-1003`, because only a `KeyCustodyProvider` reaches the host
+    /// key store.
     func identityCreateWithAgentKey(custody: CustodyType) async throws -> Identity {
         try await inner.identityCreateWithAgentKey(custody: custody.rawValue)
     }
 
-    /// Forwards to ``Scp/identityCreateWithCustody`` on ``inner``.
+    /// Forwards to ``Scp/identityCreateWithCustody`` on ``inner``: the
+    /// `os_keystore` custody request (spec section 3.2.2). The identity it
+    /// returns reports `"os_keystore"` from `custodyType()`.
     func identityCreateWithCustody(provider: KeyCustodyProvider) async throws -> Identity {
         try await inner.identityCreateWithCustody(provider: provider)
     }
@@ -876,13 +882,14 @@ public extension SCP {
     /// document rather than trusting it.
     ///
     /// `referenceProof` reports what this caller did about a class 2
-    /// (`signed_post` / `dns_record`) proof resource, per §3.5.4 Class 2
-    /// step 2. `"confirmed"` reports that this caller fetched the resource
-    /// `evidence.proof` names and found this issuer's DID in it, which yields
-    /// a `true` or a `false`. `"not_fetched"` reports that this caller fetched
-    /// nothing, which raises `SCP-IDENT-1062` for a class 2 attestation. A
-    /// class 1 (`did_control`) attestation ignores this argument. Any other
-    /// string raises `SCP-IDENT-1044`.
+    /// (`signed_post` / `dns_record`) proof resource, per §3.5.4 Class 2 step
+    /// 2. `"confirmed"` reports that this caller fetched the resource
+    /// `evidence.proof` names and found in it what step 2 requires (this
+    /// issuer's DID, plus the nonce for `signed_post`), which yields a `true`
+    /// or a `false`. `"not_fetched"` reports that this caller fetched nothing,
+    /// which raises `SCP-IDENT-1062` for a class 2 attestation. A class 1
+    /// (`did_control`) attestation ignores this argument. Any other string
+    /// raises `SCP-IDENT-1044`.
     func identityVerifyLinkAttestation(
         attestationJson: String,
         issuerPublicKeyHex: String,
@@ -1310,11 +1317,10 @@ public extension SCP {
         )
     }
 
-    // `trustQueryScore` and `trustVerifyAttestation` moved to UniFFI-generated
-    // free top-level functions under ADR-048 §1 + §7 Swift bullet. Call
-    // them directly:
+    // `trustQueryScore` moved to a UniFFI-generated free top-level function
+    // under ADR-048 §1 + §7 Swift bullet. Call it directly:
     //   `try trustQueryScore(did:contextId:)`
-    //   `try trustVerifyAttestation(attestationJson:)`
+    // `trustVerifyAttestation(contextId:attestation:)` lives in Trust.swift.
 
     /// Forwards to ``Scp/trustVerifyResponse`` on ``inner``.
     func trustVerifyResponse(

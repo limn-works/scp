@@ -10,7 +10,7 @@
  * static factories were removed — construct a relay via
  * `scp.relayStartInMemory()`.
  *
- * Run: bun run examples/broadcast.ts
+ * Run it as the "Running the examples" section of ../README.md describes.
  */
 
 import { SCP } from "../src/index";
@@ -24,8 +24,8 @@ async function main(): Promise<void> {
     console.log(`Relay listening at ${relay.relayUrl}`);
 
     // 2. Create publisher and subscriber identities.
-    const publisher = await scp.identityCreate("in_memory");
-    const subscriber = await scp.identityCreate("in_memory");
+    const publisher = await scp.identityCreate("encrypted_file");
+    const subscriber = await scp.identityCreate("encrypted_file");
     console.log(`Publisher DID:  ${publisher.did}`);
     console.log(`Subscriber DID: ${subscriber.did}`);
 

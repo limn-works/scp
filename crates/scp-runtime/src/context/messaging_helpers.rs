@@ -409,7 +409,7 @@ pub fn commit_send_nonce_token_on_abort<'d, 'c>(
 /// # Errors
 ///
 /// - [`ContextError::Custody`] when custody refuses the sign or does not
-///   answer within the budget (`TimedOut`, `SCP-CRYPTO-4061`).
+///   answer within the budget (`TimedOut`, `SCP-CRYPTO-4062`).
 /// - [`ContextError::CryptoFailed`] when the signing payload cannot be built.
 /// - Any error `publish_metadata` or `publish` returns.
 pub async fn build_broadcast_envelope(

@@ -5,8 +5,8 @@
 // Keystore path (API 33+, CustodyType.HARDWARE) against a fake KeystoreKeys; no on-device
 // test of the real Keystore exists yet. Two checks on a hardware handle throw before they
 // read Keystore, so a JVM test reaches them: dhAgree's SCP-CRYPTO-4003 for a peer key that
-// is not 32 bytes, and dhAgree's SCP-CRYPTO-4006 for a 32-byte peer key, because a Keystore
-// handle never enters softwareKeys.
+// is not 32 bytes, and dhAgree's SCP-CRYPTO-4005 for a 32-byte peer key, because Keystore
+// never releases the seed whose X25519 scalar the agreement needs.
 //
 // Uses InMemorySharedPreferences to inject a test double for EncryptedSharedPreferences,
 // allowing verification of Ed25519 key persistence without the Android framework.
@@ -105,8 +105,9 @@ internal class InMemorySharedPreferences : SharedPreferences {
  * Android Keystore is not available in JVM unit tests. These tests verify:
  * - Software Ed25519 key generation, signing, and public key extraction
  * - Software X25519 key generation and DH agreement, and `SCP-CRYPTO-4003` for a peer key that
- *   is not 32 bytes and `SCP-CRYPTO-4006` for a 32-byte one from dhAgree for a
+ *   is not 32 bytes and `SCP-CRYPTO-4005` for a 32-byte one from dhAgree for a
  *   [CustodyType.HARDWARE] handle, each thrown before it reads Keystore
+ * - dhAgree on a software Ed25519 key through its `SHA-512(seed)[0..32]` X25519 scalar
  * - Pseudonym derivation determinism
  * - Key destruction, and the error codes a destroyed handle yields
  * - Error handling (key not found, wrong key type)
@@ -466,14 +467,14 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `dhAgree throws SCP-CRYPTO-4006 for a hardware handle and never reads Keystore`() {
-            // A Keystore handle has no softwareKeyTypes entry, so dhAgree skips the key-type
-            // check and fails the software-key lookup before any Keystore call.
+        fun `dhAgree throws SCP-CRYPTO-4005 for a hardware handle and never reads Keystore`() {
+            // Keystore never releases an Ed25519 seed, so dhAgree refuses a Keystore handle
+            // before any Keystore call; this custody has no Keystore, so a call would fail.
             val hardwareHandle = KeyHandle(id = "keystore-key", custodyType = CustodyType.HARDWARE)
             val exception = assertThrows<ScpException> {
                 custody.dhAgree(hardwareHandle, ByteArray(32))
             }
-            assertEquals("SCP-CRYPTO-4006", exception.code)
+            assertEquals("SCP-CRYPTO-4005", exception.code)
             // The peer length check still runs first for a hardware handle.
             val lengthException = assertThrows<ScpException> {
                 custody.dhAgree(hardwareHandle, ByteArray(31))

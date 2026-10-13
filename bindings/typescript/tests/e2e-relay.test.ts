@@ -38,6 +38,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Context } from "../src/context";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
+import { HARNESS_IN_MEMORY_CUSTODY } from "./harness-custody";
 import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
@@ -98,7 +99,7 @@ if (bridge === null || scp === null) {
     // This must happen BEFORE configureRelayTransport because the
     // ContextManager is initialized lazily by whichever per-instance call
     // wins the race.
-    const bootstrap = await napi.identityCreate("in_memory");
+    const bootstrap = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
     // Configure the ContextManager with a relay-backed transport provider.
     // configureRelayTransport creates a relay connection and wraps it in
@@ -174,8 +175,8 @@ if (bridge === null || scp === null) {
 
   describe("Two-party encrypted messaging", () => {
     test("Alice sends to Bob through relay -- full send pipeline", async () => {
-      const alice = await napi.identityCreate("in_memory");
-      const bob = await napi.identityCreate("in_memory");
+      const alice = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const bob = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       expect(alice.did).toMatch(/^did:dht:/);
       expect(bob.did).toMatch(/^did:dht:/);
@@ -221,8 +222,8 @@ if (bridge === null || scp === null) {
     });
 
     test("Bob sends a reply through relay", async () => {
-      const alice = await napi.identityCreate("in_memory");
-      const bob = await napi.identityCreate("in_memory");
+      const alice = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const bob = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       const ctx = await napi.contextCreate(
         alice,
@@ -253,9 +254,9 @@ if (bridge === null || scp === null) {
 
   describe("Three-party encrypted messaging", () => {
     test("three members can all send through relay", async () => {
-      const alice = await napi.identityCreate("in_memory");
-      const bob = await napi.identityCreate("in_memory");
-      const carol = await napi.identityCreate("in_memory");
+      const alice = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const bob = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const carol = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       const ctx = await napi.contextCreate(
         alice,
@@ -292,8 +293,8 @@ if (bridge === null || scp === null) {
 
   describe("Multiple sequential messages", () => {
     test("five messages sent sequentially through relay", async () => {
-      const alice = await napi.identityCreate("in_memory");
-      const bob = await napi.identityCreate("in_memory");
+      const alice = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const bob = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       const ctx = await napi.contextCreate(
         alice,
@@ -318,7 +319,7 @@ if (bridge === null || scp === null) {
     });
 
     test("binary payload through send pipeline", async () => {
-      const alice = await napi.identityCreate("in_memory");
+      const alice = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       const ctx = await napi.contextCreate(
         alice,
@@ -341,7 +342,7 @@ if (bridge === null || scp === null) {
 
   describe("contextSubscribe relay wiring", () => {
     test("contextSubscribe establishes relay subscription without throwing", async () => {
-      const alice = await napi.identityCreate("in_memory");
+      const alice = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       const ctx = await napi.contextCreate(
         alice,
@@ -373,7 +374,7 @@ if (bridge === null || scp === null) {
     });
 
     test("duplicate subscription is rejected (SCP-CTX-2022)", async () => {
-      const alice = await napi.identityCreate("in_memory");
+      const alice = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       const ctx = await napi.contextCreate(
         alice,
@@ -405,7 +406,7 @@ if (bridge === null || scp === null) {
     });
 
     test("subscription rejected on non-active context", async () => {
-      const alice = await napi.identityCreate("in_memory");
+      const alice = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       const ctx = await napi.contextCreate(
         alice,
@@ -449,8 +450,8 @@ if (bridge === null || scp === null) {
   // in `governance_integration.rs` / the scp-testing cross-bridge fullstack KATs.
   describe("Governance operations with real relay", () => {
     test("Alice cannot change Bob's role via a forged proposal id", async () => {
-      const alice = await napi.identityCreate("in_memory");
-      const bob = await napi.identityCreate("in_memory");
+      const alice = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const bob = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       const ctx = await napi.contextCreate(
         alice,
@@ -483,8 +484,8 @@ if (bridge === null || scp === null) {
     });
 
     test("Alice cannot remove Bob via a forged proposal id", async () => {
-      const alice = await napi.identityCreate("in_memory");
-      const bob = await napi.identityCreate("in_memory");
+      const alice = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const bob = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       const ctx = await napi.contextCreate(
         alice,
@@ -521,8 +522,8 @@ if (bridge === null || scp === null) {
 
   describe("Context lifecycle with relay", () => {
     test("create -> join -> send -> leave -> close", async () => {
-      const alice = await napi.identityCreate("in_memory");
-      const bob = await napi.identityCreate("in_memory");
+      const alice = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const bob = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       const ctx = await napi.contextCreate(
         alice,
@@ -560,7 +561,7 @@ if (bridge === null || scp === null) {
     });
 
     test("send fails on closed context", async () => {
-      const alice = await napi.identityCreate("in_memory");
+      const alice = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       const ctx = await napi.contextCreate(
         alice,
@@ -586,7 +587,7 @@ if (bridge === null || scp === null) {
 
   describe("Event log on relay-connected context", () => {
     test("event log records context creation", async () => {
-      const alice = await napi.identityCreate("in_memory");
+      const alice = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       const ctx = await napi.contextCreate(
         alice,

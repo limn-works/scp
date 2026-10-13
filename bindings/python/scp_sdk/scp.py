@@ -81,6 +81,7 @@ if TYPE_CHECKING:
         AttestorInfo,
         BehavioralRecord,
         CachedAttestation,
+        CachedAttestationEnvelope,
         CapabilityRequirement,
         CapabilityValidation,
         ChallengeRequest,
@@ -573,9 +574,9 @@ def _to_invite_outcome(raw: Any) -> InviteMemberOutcome:
 
 
 #: The custody argument an identity-creating method takes: a
-#: :class:`~scp_sdk.types.CustodyType` member or the string it carries, which
-#: are exactly the custody strings the PyO3 bridge builds a key store from.
-CustodyArg: TypeAlias = "CustodyType | Literal['file', 'in_memory']"
+#: :class:`~scp_sdk.types.CustodyType` member or the request value it carries
+#: (spec 03 section 3.2.2).
+CustodyArg: TypeAlias = "CustodyType | Literal['encrypted_file', 'os_keystore']"
 
 #: Code raised when an identity-creating method receives no custody argument.
 CUSTODY_REQUIRED_CODE = "SCP-IDENT-1116"
@@ -583,9 +584,9 @@ CUSTODY_REQUIRED_CODE = "SCP-IDENT-1116"
 
 #: Remedy for a method whose custody argument is a :data:`CustodyArg`.
 _CUSTODY_VALUE_REMEDY = (
-    "pass CustodyType.FILE (an encrypted key file) or CustodyType.IN_MEMORY "
-    "(a build carrying the bridge's testing feature only), or call "
-    "identity_create_with_custody() with a KeyCustodyProvider for any other key store"
+    "pass CustodyType.ENCRYPTED_FILE (an encrypted key file at $HOME/.scp/keys.bin, "
+    "sealed under SCP_KEY_PASSPHRASE), or call identity_create_with_custody() with a "
+    "KeyCustodyProvider for CustodyType.OS_KEYSTORE (the host key store)"
 )
 
 #: Remedy for a method whose custody argument is a :class:`KeyCustodyProvider`.
@@ -614,8 +615,8 @@ def _custody_string(method: str, custody: object) -> str:
     if isinstance(custody, str):
         return custody
     raise ValidationError(
-        f"{method}() custody must be a CustodyType or one of 'file', 'in_memory'; "
-        f"got {type(custody).__name__}",
+        f"{method}() custody must be a CustodyType or one of 'encrypted_file', "
+        f"'os_keystore'; got {type(custody).__name__}",
         "SCP-VALID-7005",
     )
 
@@ -1013,6 +1014,9 @@ class SCP:
             or ``None``, before any bridge call.
         :raises ValidationError: ``SCP-VALID-7005`` when ``custody`` is not a
             :class:`~scp_sdk.types.CustodyType` or string.
+
+        The bridge's own exceptions reach the caller unchanged;
+        :class:`~scp_sdk.types.CustodyType` lists them for each build.
         """
 
         custody_str = _custody_string("identity_create", custody)
@@ -1030,6 +1034,9 @@ class SCP:
             or ``None``, before any bridge call.
         :raises ValidationError: ``SCP-VALID-7005`` when ``custody`` is not a
             :class:`~scp_sdk.types.CustodyType` or string.
+
+        The bridge's own exceptions reach the caller unchanged;
+        :class:`~scp_sdk.types.CustodyType` lists them for each build.
         """
 
         custody_str = _custody_string("identity_create_with_agent_key", custody)
@@ -1043,8 +1050,12 @@ class SCP:
         Delegate to ``_scp_core.SCP.identity_create_with_custody``. The
         ``provider`` is any object implementing the
         :class:`KeyCustodyProvider` protocol — the private key material never
-        crosses into the Rust core (ADR-006). Use this to back a DID with a
-        platform keychain, hardware token, or HSM wrapper.
+        crosses into the Rust core (ADR-006). This is the
+        :attr:`~scp_sdk.types.CustodyType.OS_KEYSTORE` request of spec 03
+        section 3.2.2, and the identity's
+        :attr:`~scp_sdk.Identity.custody_type` reports it. A build without the
+        bridge's ``testing`` feature raises ``IdentityError`` with
+        ``SCP-IDENT-1059`` (:class:`~scp_sdk.types.CustodyType`).
 
         The blocking bridge call runs in :func:`asyncio.to_thread` so the
         provider's (potentially blocking) keystore operations do not stall the
@@ -1339,11 +1350,12 @@ class SCP:
         ``reference_proof`` reports what this caller did about a Class 2
         (``signed_post`` / ``dns_record``) proof resource, per spec §3.5.4
         Class 2 step 2. Pass ``"confirmed"`` after fetching the resource
-        ``evidence.proof`` names and finding this issuer's DID in it, which
-        yields ``True`` or ``False``. Pass ``"not_fetched"`` after fetching
-        nothing, which raises ``SCP-IDENT-1062`` for a Class 2 attestation. A
-        Class 1 (``did_control``) attestation ignores this argument. Any other
-        string raises ``SCP-IDENT-1044``.
+        ``evidence.proof`` names and finding in it what step 2 requires (this
+        issuer's DID, plus the nonce for ``signed_post``), which yields ``True``
+        or ``False``. Pass ``"not_fetched"`` after fetching nothing, which
+        raises ``SCP-IDENT-1062`` for a Class 2 attestation. A Class 1
+        (``did_control``) attestation ignores this argument. Any other string
+        raises ``SCP-IDENT-1044``.
 
         Two conditions raise instead of returning a verdict:
 
@@ -2812,6 +2824,20 @@ class SCP:
             subject_did,
             *wire,
         )
+
+    async def trust_verify_attestation(
+        self,
+        context_id: str,
+        attestation: CachedAttestationEnvelope | dict[str, Any],
+    ) -> dict[str, Any]:
+        """Verify an attestation against this instance's revocation list for
+        ``context_id`` (ADR-017, §7.4.4).
+
+        Delegates to :func:`scp_sdk.trust.trust_verify_attestation`.
+        """
+        from scp_sdk.trust import trust_verify_attestation as _verify
+
+        return await asyncio.to_thread(_verify, self, context_id, attestation)
 
     async def trust_query_score(self, did: str, context_id: str) -> Any:
         """Delegate to ``_scp_core.SCP.trust_query_score``."""

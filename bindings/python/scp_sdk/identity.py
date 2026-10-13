@@ -12,7 +12,7 @@ Call sites shape::
     from scp_sdk.types import CustodyType
 
     with SCP(storage={"type": "in_memory"}) as scp:
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
         # identity is an Identity wrapper — use identity.did / identity.custody_type
         rotated = await scp.identity_rotate_key(identity)
 
@@ -154,10 +154,14 @@ class Identity:
 
     @property
     def custody_type(self) -> CustodyType | str:
-        """The custody type used for this identity.
+        """The custody request value this identity was created with.
 
-        Returns a :class:`~scp_sdk.types.CustodyType` enum member when
-        the value matches a known variant, otherwise the raw string.
+        Returns the matching :class:`~scp_sdk.types.CustodyType` member for
+        ``"encrypted_file"`` and ``"os_keystore"``, and the raw string the
+        bridge reports otherwise.  The one other string a bridge reports is the
+        testing-build affordance ``"in_memory"``, which no
+        :class:`~scp_sdk.types.CustodyType` member names (spec 03 section
+        3.2.2).
         """
         raw = self._raw_handle.custody
         try:

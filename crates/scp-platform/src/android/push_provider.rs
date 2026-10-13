@@ -15,10 +15,10 @@
 //! # FCM Payload Opacity (ADR-027, section 10.7)
 //!
 //! Section 10.7 requires a push payload to carry only a wake signal: no
-//! sender, no context, no count, no preview. Its §10.7.1 step 5 gives that
-//! payload as `{ "scp": 1 }`. ADR-027 carries the wake signal to Android as
-//! the FCM data-only message `{"data": {"scp": "1"}}`, with no notification
-//! fields and no other SCP-specific content. No relay or other code in this
+//! sender, no context, no count, no preview. The FCM row of the §10.7.1
+//! step 5 wake-signal table carries that wake signal to Android as an FCM
+//! HTTP v1 data-only message whose `data` map is `{"scp": "1"}`, with no
+//! notification fields and no other SCP-specific content (ADR-027). No relay or other code in this
 //! repository sends an FCM message. When one arrives, FCM starts the app if it
 //! is not running (Android delivers nothing to an app the user force-stopped)
 //! and delivers the message to `FirebaseMessagingService.onMessageReceived`,
@@ -27,7 +27,7 @@
 //! when the Kotlin adapter returns `WakeSignal.PULL`.
 //!
 //! Opacity is an obligation on the sender: §10.7.1 step 5 has the relay send
-//! exactly `{ "scp": 1 }`. FCM has carried every field of a payload before
+//! exactly the FCM request of its wake-signal table. FCM has carried every field of a payload before
 //! the Kotlin adapter sees it, so no receive-side check can keep a field from
 //! FCM, and no code in this repository sends a push. SCP-112's criterion "FCM
 //! payload format is opaque" is unmet because no sender exists; rejecting

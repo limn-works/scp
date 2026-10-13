@@ -10,8 +10,8 @@ func runQuickStart() async throws {
     // Every call goes through an SCP instance, which takes a required storage backend.
     let scp = try SCP(storage: .inMemory)
 
-    // Create a cryptographic identity (DID) whose keys live in process memory.
-    let identity = try await scp.identityCreate(custody: .inMemory)
+    // Create a cryptographic identity (DID) whose keys live in the encrypted key file.
+    let identity = try await scp.identityCreate(custody: .encryptedFile)
     print("DID: \(identity.did())")
 
     // Create an encrypted context that this identity administers.

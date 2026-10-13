@@ -1,90 +1,116 @@
-/// Context creation and lifecycle management.
+/// Context creation and the invite-and-join handshake.
 ///
 /// Demonstrates creating an SCP context with governance parameters,
-/// inspecting its state, sending messages, and managing membership.
+/// inviting a second identity, joining from the sealed invitation, and
+/// reading the membership.
+///
+/// The creator and the joiner each run their own `SCP` instance with its own
+/// database, as two devices would, and each passes its own
+/// ``KeyCustodyProvider``, the `os_keystore` custody request of spec section
+/// 3.2.2.
 ///
 /// Prerequisites:
 ///   - Add the SCP Swift package to your project
 ///   - import SCP
 ///
 /// Usage:
-///   swift run Context
+///   try await ContextExample.run(
+///       aliceProvider: aliceProvider, bobProvider: bobProvider, storagePassphrase: passphrase)
 
 import Foundation
 import SCP
 
-@main
-struct ContextExample {
-    static func main() async throws {
-        // 1. Create the identity that will own the context.
-        let alice = try await createIdentity(custody: "in_memory")
-        print("Alice DID: \(alice.did())")
+enum ContextExample {
+    static func run(
+        aliceProvider: KeyCustodyProvider,
+        bobProvider: KeyCustodyProvider,
+        storagePassphrase: String
+    ) async throws {
+        let support = try FileManager.default
+            .url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        let aliceNode = try SCP.withStorage(
+            sqliteDir: support.appendingPathComponent("scp-context-alice"), passphrase: storagePassphrase)
+        let bobNode = try SCP.withStorage(
+            sqliteDir: support.appendingPathComponent("scp-context-bob"), passphrase: storagePassphrase)
 
-        // 2. Define context parameters.
-        //    ContextParams is a UniFFI-generated struct with governance,
-        //    memory scope, TTL, and capability ceiling.
+        // 1. Each side creates its identity in its own node.
+        let alice = try await aliceNode.identityCreateWithCustody(provider: aliceProvider)
+        let bob = try await bobNode.identityCreateWithCustody(provider: bobProvider)
+        print("Alice DID: \(alice.did())")
+        print("Bob DID:   \(bob.did())")
+
+        // 2. Define context parameters. The ceiling caps what any member can
+        //    hold. Inviting runs through the governance gate, so the ceiling
+        //    must carry governance:propose.
         let params = ContextParams(
+            mode: .encrypted,
             ceiling: [
                 "messages:read",
                 "messages:write",
                 "member:invite",
                 "member:remove",
-                "tool:register",
-                "tool:invoke_all",
+                "governance:propose",
             ],
+            ceilingPolicy: .immutable,
             governance: .singleAdmin,
-            memoryScope: .full,
+            memoryScope: .ephemeral,
             ttlSeconds: 0,
             promotable: false,
-            minProtocolVersion: 0
+            minProtocolVersion: 0,
+            maxChainDepth: nil,
+            maxNestingDepth: nil,
+            sessionCap: nil,
+            economicPolicy: nil,
+            consequenceRulesJson: nil,
+            consequenceConfigJson: nil
         )
 
-        // 3. Create the context via the UniFFI bridge.
-        //    Returns a ContextHandle -- the opaque reference to Rust state.
-        let handle = try await contextCreate(identity: alice, params: params)
-
+        // 3. Alice creates the context. The returned ContextHandle is the
+        //    reference every later context call takes.
+        let handle = try await aliceNode.contextCreate(identity: alice, params: params)
         print()
         print("Context created: \(handle.contextId())")
         print("  Creator: \(handle.creatorDid())")
+        print("  State: \(try handle.state())")
 
-        let state = try handle.state()
-        print("  State: \(state)")
+        // 4. Bob reserves a single-use KeyPackage and hands Alice its public
+        //    bytes out of band.
+        let reservation = try await bobNode.reserveKeyPackage(identity: bob)
 
-        // 4. Send a message to the context.
-        let payload = "Hello, context!".data(using: .utf8)!
-        try await contextSend(handle: handle, identity: alice, payload: payload)
-        print("  Message sent successfully.")
+        // 5. Alice seals an invitation to that KeyPackage. An empty relay list
+        //    means Alice delivers the sealed bundle to Bob herself.
+        let outcome = try await aliceNode.inviteMember(
+            identity: alice,
+            contextId: handle.contextId(),
+            inviteeDid: bob.did(),
+            inviteeKeyPackage: reservation.keyPackagePublic,
+            relayUrls: []
+        )
+        let bundle: SealedInvitation
+        switch outcome {
+        case let .sealed(sealed, _):
+            bundle = sealed
+        }
 
-        // 5. Subscribe to incoming messages via the MessageListener callback.
-        //    In a real application, implement the MessageListener protocol and
-        //    consume messages asynchronously:
-        //
-        //    class MyListener: MessageListener {
-        //        func onMessage(message: Message) {
-        //            let text = String(data: message.payload, encoding: .utf8) ?? "<binary>"
-        //            print("[\(message.senderDid)] \(text)")
-        //        }
-        //        func onError(error: ScpError) { print("Error: \(error)") }
-        //        func onComplete() { print("Stream complete.") }
-        //    }
-        //    try await contextSubscribe(handle: handle, listener: MyListener())
-        //
-        print("  (Message stream ready for consumption)")
-
-        // 6. Bob joins the context.
-        let bob = try await createIdentity(custody: "in_memory")
-        try await contextJoin(handle: handle, identity: bob)
+        // 6. Bob opens the sealed bundle and joins.
+        let bobHandle = try await bobNode.contextJoinFromWelcome(
+            identity: bob,
+            sealed: bundle,
+            reservationId: reservation.reservationId
+        )
         print()
-        print("Bob joined the context.")
+        print("Bob joined context: \(bobHandle.contextId())")
 
-        // 7. Leave the context gracefully.
-        //    This sends a MemberLeft event and releases local resources.
-        try await contextLeave(handle: handle, identity: alice)
-        print("Left the context.")
+        // 7. Read the membership from Alice's node.
+        let members = await aliceNode.contextMemberDids(handle: handle)
+        print("Members: \(members)")
 
-        // Alternatively, close the context for all members:
-        // try await contextClose(handle: handle, identity: alice)
+        // 8. Close the context for every member.
+        try await aliceNode.contextClose(handle: handle, identity: alice)
+        print("Context closed.")
 
+        try await bobNode.shutdown()
+        try await aliceNode.shutdown()
         print()
         print("Context lifecycle complete.")
     }

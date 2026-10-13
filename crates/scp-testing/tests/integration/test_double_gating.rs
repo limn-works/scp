@@ -32,7 +32,8 @@ use std::path::{Path, PathBuf};
 /// `InMemorySequenceStore` forgets every DID sequence number on restart, so a
 /// node can republish at a sequence a resolver already saw.
 /// `InMemoryRelayQuerier` answers DID queries from a local map in place of a
-/// relay.
+/// relay. `InMemoryPush` registers with a UUID that no push service issued, so
+/// it delivers no wake (ADR-062 §0, amended 2026-10-12).
 const GATED_DOUBLES: &[&str] = &[
     "InMemoryFfiTrustStore",
     "InMemoryViolationStore",
@@ -44,6 +45,7 @@ const GATED_DOUBLES: &[&str] = &[
     "NoOpSagaJournal",
     "InMemorySequenceStore",
     "InMemoryRelayQuerier",
+    "InMemoryPush",
 ];
 
 /// True when a cfg predicate holds only if `test` or `feature = "testing"` holds.

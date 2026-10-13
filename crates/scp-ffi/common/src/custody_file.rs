@@ -1,8 +1,9 @@
-//! Resolves and opens the encrypted key file that backs `"file"` custody.
+//! Resolves and opens the encrypted key file that backs custody
+//! `"encrypted_file"` (spec `03-identity.md` §3.2.2).
 //!
 //! `FileKeyCustody` (Argon2id + AES-256-GCM, spec §17.8) holds a process's keys
 //! in one encrypted file at `$HOME/.scp/keys.bin`, sealed under the passphrase
-//! `SCP_KEY_PASSPHRASE` carries. A bridge that offers `"file"` custody resolves
+//! `SCP_KEY_PASSPHRASE` carries. A bridge that offers `"encrypted_file"` custody resolves
 //! those two inputs here, so every bridge reads one path and rejects one set of
 //! bad inputs.
 //!
@@ -68,19 +69,19 @@ impl std::fmt::Display for FileCustodyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::HomeUnset => f.write_str(
-                "file custody requires the HOME environment variable to name an absolute \
+                "custody \"encrypted_file\" requires the HOME environment variable to name an absolute \
                  directory; it is unset or empty, and the encrypted key file lives at \
                  $HOME/.scp/keys.bin",
             ),
             Self::HomeNotAbsolute { home } => write!(
                 f,
-                "file custody requires HOME to name an absolute directory, but HOME is {:?}; \
+                "custody \"encrypted_file\" requires HOME to name an absolute directory, but HOME is {:?}; \
                  a relative HOME places the encrypted key file $HOME/.scp/keys.bin under \
                  whichever directory the process started in",
                 home.display().to_string()
             ),
             Self::PassphraseUnset => f.write_str(
-                "file custody requires the SCP_KEY_PASSPHRASE environment variable to be \
+                "custody \"encrypted_file\" requires the SCP_KEY_PASSPHRASE environment variable to be \
                  set to a non-empty value; this passphrase protects the encrypted key file",
             ),
             Self::DirectoryCreate { path, message } => write!(
@@ -99,7 +100,7 @@ impl std::fmt::Display for FileCustodyError {
 
 impl std::error::Error for FileCustodyError {}
 
-/// The key directory and passphrase `"file"` custody opens, resolved from the
+/// The key directory and passphrase `"encrypted_file"` custody opens, resolved from the
 /// environment without touching any file.
 pub struct FileCustodyInputs {
     key_dir: PathBuf,
@@ -125,7 +126,7 @@ impl std::fmt::Debug for FileCustodyInputs {
 /// `$HOME` is unset or empty; and [`FileCustodyError::HomeNotAbsolute`] when it
 /// names a relative path.
 pub fn resolve_file_custody_inputs() -> Result<FileCustodyInputs, FileCustodyError> {
-    resolve_from(
+    resolve_file_custody_inputs_from(
         std::env::var("SCP_KEY_PASSPHRASE").ok().map(Zeroizing::new),
         std::env::var_os("HOME").as_deref(),
     )
@@ -133,7 +134,12 @@ pub fn resolve_file_custody_inputs() -> Result<FileCustodyInputs, FileCustodyErr
 
 /// [`resolve_file_custody_inputs`] over explicit values, so a test covers every
 /// case without mutating the process environment.
-fn resolve_from(
+///
+/// # Errors
+///
+/// Returns the errors [`resolve_file_custody_inputs`] returns, for the same
+/// inputs.
+pub fn resolve_file_custody_inputs_from(
     passphrase: Option<Zeroizing<String>>,
     home: Option<&OsStr>,
 ) -> Result<FileCustodyInputs, FileCustodyError> {
@@ -205,7 +211,7 @@ mod tests {
     #[test]
     fn unset_or_empty_home_is_rejected() {
         for home in [None, Some(OsStr::new(""))] {
-            match resolve_from(Some(passphrase()), home) {
+            match resolve_file_custody_inputs_from(Some(passphrase()), home) {
                 Err(FileCustodyError::HomeUnset) => {}
                 other => panic!("HOME={home:?} must be rejected as unset, got {other:?}"),
             }
@@ -217,7 +223,7 @@ mod tests {
     #[test]
     fn relative_home_is_rejected() {
         for home in ["data", ".", "./home/op"] {
-            match resolve_from(Some(passphrase()), Some(OsStr::new(home))) {
+            match resolve_file_custody_inputs_from(Some(passphrase()), Some(OsStr::new(home))) {
                 Err(FileCustodyError::HomeNotAbsolute { home: carried }) => {
                     assert_eq!(carried, PathBuf::from(home));
                 }
@@ -232,7 +238,7 @@ mod tests {
         let home = Some(OsStr::new("/home/op"));
         for pass in [None, Some(Zeroizing::new(String::new()))] {
             assert!(matches!(
-                resolve_from(pass, home),
+                resolve_file_custody_inputs_from(pass, home),
                 Err(FileCustodyError::PassphraseUnset)
             ));
         }
@@ -243,7 +249,8 @@ mod tests {
     #[test]
     fn absolute_home_yields_dot_scp_keys_bin() {
         let inputs =
-            resolve_from(Some(passphrase()), Some(OsStr::new("/home/op"))).expect("valid inputs");
+            resolve_file_custody_inputs_from(Some(passphrase()), Some(OsStr::new("/home/op")))
+                .expect("valid inputs");
         assert_eq!(inputs.key_path(), PathBuf::from("/home/op/.scp/keys.bin"));
     }
 
@@ -254,8 +261,8 @@ mod tests {
         let base =
             std::env::temp_dir().join(format!("scp-test-custody-file-open-{}", std::process::id()));
         let home = base.join("home");
-        let inputs =
-            resolve_from(Some(passphrase()), Some(home.as_os_str())).expect("valid inputs");
+        let inputs = resolve_file_custody_inputs_from(Some(passphrase()), Some(home.as_os_str()))
+            .expect("valid inputs");
         assert!(
             !home.exists(),
             "resolution must not create {}",
@@ -290,7 +297,8 @@ mod tests {
     #[test]
     fn debug_redacts_the_passphrase() {
         let inputs =
-            resolve_from(Some(passphrase()), Some(OsStr::new("/home/op"))).expect("valid inputs");
+            resolve_file_custody_inputs_from(Some(passphrase()), Some(OsStr::new("/home/op")))
+                .expect("valid inputs");
         let debug = format!("{inputs:?}");
         assert!(!debug.contains(PASSPHRASE), "{debug}");
     }

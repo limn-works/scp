@@ -25,29 +25,56 @@ from scp_sdk.errors import UnknownGovernanceOutcomeError
 
 
 class CustodyType(enum.Enum):
-    """The custody string an identity-creating :class:`scp_sdk.SCP` method sends
-    to the PyO3 bridge (spec section 3.2, key custody).
+    """The custody request value of spec 03 section 3.2.2: the backend that holds
+    a new identity's private keys.
 
-    The members are exactly the custody strings the PyO3 bridge builds a key
-    store from, and the bridge answers every other string with a typed error
-    (``SCP-IDENT-1003`` or ``SCP-VALID-7005``).  No custody string reaches Apple
-    Keychain or Android Keystore; pass a :class:`scp_sdk.scp.KeyCustodyProvider`
-    to :meth:`scp_sdk.SCP.identity_create_with_custody` for any other key store.
+    :meth:`scp_sdk.SCP.identity_create` and
+    :meth:`scp_sdk.SCP.identity_create_with_agent_key` send the value to the
+    PyO3 bridge, and :attr:`scp_sdk.Identity.custody_type` reports the value an
+    identity was created with.  The bridge answers ``SCP-VALID-7005`` to every
+    string outside the vocabulary except ``"in_memory"``, so ``"platform"``,
+    ``"software"``, ``"file"`` and ``"callback"`` each get that answer, and it
+    falls back to no other backend.
+
+    The type has two members, ``ENCRYPTED_FILE`` and ``OS_KEYSTORE``, and no
+    other (spec 03 section 3.2.2).
 
     No SDK method defaults custody: the caller names the key store, and a call
     that passes none raises ``IdentityError`` carrying ``SCP-IDENT-1116``
     before any bridge call (SCP-294).
+
+    The bridge raises its own exceptions as native ``_scp_core`` classes whose
+    message opens with the code:
+
+    - ``ValidationError`` with ``SCP-VALID-7005`` for a string outside the
+      vocabulary other than ``"in_memory"``.
+    - ``IdentityError`` with ``SCP-IDENT-1008`` for the string ``"in_memory"``
+      on a build without the bridge's ``testing`` feature.
+    - ``IdentityError`` with ``SCP-IDENT-1003`` for ``OS_KEYSTORE`` without a
+      provider.
+    - ``ValidationError`` with ``SCP-VALID-7001`` for ``ENCRYPTED_FILE`` when
+      ``HOME`` is unset, empty or relative, or ``SCP_KEY_PASSPHRASE`` is unset
+      or empty.
+
+    A build without the ``testing`` feature has no pre-rotation custody
+    backend, so an identity-creating call that passes these checks raises
+    ``IdentityError`` with ``SCP-IDENT-1059`` (ADR-062 Decision 6), a call to
+    :meth:`scp_sdk.SCP.identity_create_with_custody` included.  Only a
+    ``testing`` build opens the key file, and it raises ``SCP-IDENT-1008`` when
+    it cannot create ``$HOME/.scp`` or open the key file.
     """
 
-    #: An encrypted key file at ``$HOME/.scp/keys.bin`` (``FileKeyCustody``:
-    #: Argon2id key derivation, AES-256-GCM).  The bridge reads the passphrase
-    #: from ``SCP_KEY_PASSPHRASE`` and raises ``SCP-VALID-7001`` when it is unset
-    #: or empty.
-    FILE = "file"
-    #: An in-memory key store that loses every key when the process exits.  The
-    #: bridge builds it only in a build carrying its ``testing`` feature; a
-    #: shipped build raises ``SCP-IDENT-1008``.
-    IN_MEMORY = "in_memory"
+    #: ``FileKeyCustody``: an encrypted key file at ``$HOME/.scp/keys.bin``
+    #: (Argon2id key derivation, AES-256-GCM), sealed under the passphrase in
+    #: ``SCP_KEY_PASSPHRASE``.  The class docstring lists the errors the bridge
+    #: raises for it on each build.
+    ENCRYPTED_FILE = "encrypted_file"
+    #: The host operating system's key store, reached only through a
+    #: :class:`scp_sdk.scp.KeyCustodyProvider` passed to
+    #: :meth:`scp_sdk.SCP.identity_create_with_custody`.  It promises no
+    #: hardware backing.  The class docstring lists the errors the bridge raises
+    #: for it on each build.
+    OS_KEYSTORE = "os_keystore"
 
 
 class ContextMode(enum.Enum):

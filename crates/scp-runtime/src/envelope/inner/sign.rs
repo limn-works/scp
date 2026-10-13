@@ -121,7 +121,7 @@ pub async fn create_inner_envelope(
 /// # Errors
 ///
 /// - [`ContextError::Custody`] when custody refuses the sign or does not
-///   answer within the budget (`TimedOut`, `SCP-CRYPTO-4061`).
+///   answer within the budget (`TimedOut`, `SCP-CRYPTO-4062`).
 /// - [`ContextError::CryptoFailed`] when provenance serialization fails, the
 ///   payload exceeds the largest bucket, or the signer fails otherwise.
 pub(crate) async fn create_inner_envelope_signed(

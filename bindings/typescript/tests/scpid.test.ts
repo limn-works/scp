@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { ScpIdChallenge, ScpIdResponse } from "../src/auth";
 import { IdentityError } from "../src/errors";
 import type { SCP } from "../src/scp";
+import { createInMemoryIdentity } from "./harness-custody";
 import { createMockNativeScp, type MockNativeScp, mountMockScp } from "./mock-bridge";
 
 // ---------------------------------------------------------------------------
@@ -152,7 +153,7 @@ describe("scp.scpidChallenge", () => {
 
 describe("scpid roundtrip", () => {
   it("challenge -> sign -> verify succeeds", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const challengeJson = scp.scpidChallenge("https://example.com", 120);
     const challenge = JSON.parse(challengeJson) as ScpIdChallenge;
 
@@ -176,13 +177,13 @@ describe("scpid roundtrip", () => {
   });
 
   it("sign rejects invalid signing_key_id", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const challengeJson = scp.scpidChallenge("https://example.com", 60);
     expect(() => scp.scpidSign(identity.did, "#owner", challengeJson)).toThrow(/SCP-IDENT-1034/);
   });
 
   it("works with #agent signing key", async () => {
-    const identity = await scp.identityCreate("in_memory");
+    const identity = await createInMemoryIdentity(scp);
     const challengeJson = scp.scpidChallenge("https://agent-service.example.com", 60);
     const responseJson = scp.scpidSign(identity.did, "#agent", challengeJson);
     const response = JSON.parse(responseJson) as ScpIdResponse;
@@ -212,7 +213,7 @@ describe("scp.scpidVerify error propagation", () => {
     const { scp } = mountMockScp(mockNative);
 
     try {
-      const identity = await scp.identityCreate("in_memory");
+      const identity = await createInMemoryIdentity(scp);
       const challengeJson = scp.scpidChallenge("https://example.com", 60);
       const responseJson = scp.scpidSign(identity.did, "#active", challengeJson);
 

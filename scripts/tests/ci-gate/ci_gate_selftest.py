@@ -225,6 +225,44 @@ nothing:
                compile-timings.yml times cargo builds, so the same rule holds
                there: without the key it would time builds that carry line
                tables.
+  offline-cargo
+               Every job in `.github/workflows/` that runs cargo, maturin or
+               wasm-pack runs `./.github/actions/cargo-fetch` exactly once,
+               after every toolchain and rust-cache step and before every other
+               cargo command, and no step sets CARGO_NET_OFFLINE by hand.
+               Cargo otherwise downloads the index and the crate sources inside
+               whichever build, test or lint command first needs them and gives
+               up after three retries; in run 38171293381 a macOS rust-test leg
+               could not resolve `index.crates.io` and failed before compiling
+               anything. The fetch step retries for minutes and then writes
+               CARGO_NET_OFFLINE=true to `$GITHUB_ENV`, so every later cargo
+               command, including those scripts start, reads only the fetched
+               copy. A fetch placed before rust-cache would put that variable
+               into rust-cache's key; a cargo command before the fetch, or a
+               `cargo install` after it, reaches the network; a fetch guarded by
+               an `if:` that a later cargo step lacks leaves that step without
+               the crates. Job publish-crates in release.yml is the one
+               exemption, because `cargo publish` uploads to crates.io. A job
+               that builds an image with docker/build-push-action runs cargo
+               inside the Dockerfile it names, where no fetch step reaches, so
+               that Dockerfile holds itself to the same rule: it copies fetch.sh
+               in and runs it once per stage chain, before every cargo command
+               except `--version`, `cargo chef prepare` and
+               `cargo chef cook --no-build` (which write manifests and compile
+               nothing), and every later cargo command runs under
+               `ENV CARGO_NET_OFFLINE=true` or with `--offline` or `--frozen`.
+               The check also reads fetch.sh for its `$GITHUB_ENV` write, and
+               runs controls that each break the rule once (fetch removed from
+               rust-clippy, python-wheels, fuzz-nightly and the CodeQL analyze
+               job, whose Rust extractor runs cargo, a cargo step moved before it, fetch before rust-cache, two fetches,
+               CARGO_NET_OFFLINE at workflow, job and step level, a step turning
+               cargo back online, a `cargo install` after the fetch, a guarded
+               fetch, a raw cargo job, a stale exemption, and in the Dockerfile
+               the fetch removed, its COPY removed, the offline ENV and flags
+               removed, the ENV moved before the fetch, and a missing file).
+               LIMIT: a job that runs cargo only inside a script, with no
+               toolchain step, is not detected; in ci.yml
+               `RUSTUP_AUTO_INSTALL: "0"` fails such a job before cargo starts.
   matrix-axis
                Job rust-test-optional-features runs its commands on three
                legs, one per value of a matrix `group` axis, and jobs
@@ -686,6 +724,7 @@ DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
 # NOT_ON_PUSH_FILTER_JOBS.
 CODE_JOBS = (
     "ci-workflow-selftest",
+    "examples-typecheck",
     "fail-closed-pre-rotation",
     "fix-round-check-selftest",
     "protocol-deps",
@@ -756,6 +795,7 @@ NOT_ON_PUSH_FILTER_JOBS = (
     "bridge-parity-swift",
     "ci-workflow-selftest",
     "docker-image",
+    "examples-typecheck",
     "fail-closed-pre-rotation",
     "protocol-deps",
     "python-lint",
@@ -4585,6 +4625,592 @@ def check_profile_env_is_workflow_level(doc: dict, name: str) -> None:
     )
 
 
+# The step that fetches every crate a job compiles and takes cargo offline, and the
+# rule check_offline_cargo holds every workflow job to. See the `offline-cargo` entry
+# in this file's docstring.
+CARGO_FETCH_ACTION = "./.github/actions/cargo-fetch"
+CARGO_FETCH_SCRIPT = REPO / ".github/actions/cargo-fetch/fetch.sh"
+CARGO_FETCH_ENV_WRITE = re.compile(
+    r"""^printf 'CARGO_NET_OFFLINE=true\\n' >> "\$GITHUB_ENV"$""", re.MULTILINE
+)
+# INDICATORS of a step that installs a compiler or restores cargo's cache: the fetch
+# runs after each of them. rust-cache hashes every `CARGO*` variable its step sees into
+# its key, so a fetch before it would put CARGO_NET_OFFLINE into that key.
+TOOLCHAIN_OR_CACHE_ACTIONS = (
+    "./.github/actions/rust-toolchain",
+    "dtolnay/rust-toolchain@",
+    "Swatinem/rust-cache@",
+)
+# An action that runs cargo inside its own step. CodeQL's Rust extractor runs
+# `cargo metadata` and the build scripts while it loads the workspace.
+CARGO_RUNNING_ACTIONS = (
+    "PyO3/maturin-action@",
+    "github/codeql-action/init@",
+    "github/codeql-action/analyze@",
+)
+# The command words that resolve this workspace's dependencies through cargo.
+CARGO_FAMILY = {"cargo", "maturin", "wasm-pack"}
+# A command word in a line shlex cannot split, read anywhere on it, which errs toward
+# reporting a step rather than toward passing one.
+CARGO_COMMAND = re.compile(r"(?<![\w./$-])(cargo|maturin|wasm-pack)(?![\w-])")
+# Tokens after which the shell reads a command word, and words that run the command
+# after them (`time cargo build`, `do cargo build`, `env A=1 cargo build`).
+SHELL_SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "{", "}", "!", "$", "`", ";;"}
+SHELL_PREFIXES = {
+    "do", "then", "else", "elif", "if", "while", "until", "exec", "nohup", "sudo",
+    "xargs", "env", "nice",
+}
+TIME_COMMANDS = {"time", "/usr/bin/time"}
+TIME_VALUE_FLAGS = {"-f", "-o", "--format", "--output"}
+# INDICATORS, not the criterion: the subcommands that may run before the fetch,
+# because they read no lockfile (`--version`, `-V`) or need crates.io for a tool this
+# workspace's Cargo.lock does not name (`cargo install`).
+CARGO_BEFORE_FETCH = {"install", "--version", "-V"}
+VERSION_FLAGS = {"--version", "-V"}
+# INDICATORS, not the criterion: the cargo subcommands that need the network after
+# the fetch took cargo offline, so none may run after it.
+CARGO_NEEDS_NETWORK = {"install", "publish", "update", "search", "login", "owner", "yank"}
+# The jobs that run cargo with no fetch step, each with the reason. `cargo publish`
+# uploads each crate and resolves the next one against the versions it just uploaded,
+# which no fetch before the first upload can have downloaded.
+OFFLINE_CARGO_EXEMPT = {
+    ("release.yml", "publish-crates"): "cargo publish uploads to crates.io",
+}
+
+
+def command_substitutions(line: str) -> list[str]:
+    """Return the text inside each `$( … )` on a line, outermost first."""
+    found, start = [], line.find("$(")
+    while start != -1:
+        depth, end = 0, start + 1
+        while end < len(line):
+            depth += {"(": 1, ")": -1}.get(line[end], 0)
+            if depth == 0:
+                break
+            end += 1
+        found.append(line[start + 2 : end])
+        start = line.find("$(", start + 2)
+    return found
+
+
+def command_words(line: str) -> list[tuple[str, list[str]]] | None:
+    """Return (command word, the tokens after it) for each simple command on a line.
+
+    Reads a command word where the shell does: at the start of the line, after a
+    separator, after a keyword or prefix command in SHELL_PREFIXES, after `time` and
+    its flags, and after `VAR=value` assignments, and again inside each `$( … )`,
+    where `TREE="$(cargo tree …)"` runs cargo. `command -v cargo` looks cargo up and
+    runs nothing. Returns None for a line, or a substitution in it, that shlex cannot
+    split.
+    """
+    nested = []
+    for inner in command_substitutions(line):
+        words = command_words(inner)
+        if words is None:
+            return None
+        nested += words
+    line = line.replace("$(", "$ (")
+    lexer = shlex.shlex(
+        EXPRESSION.sub("EXPRESSION", line), posix=True, punctuation_chars=True
+    )
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    found = []
+    at_start, index = True, 0
+    while index < len(tokens):
+        token = tokens[index]
+        following = tokens[index + 1] if index + 1 < len(tokens) else ""
+        if not at_start:
+            at_start = token in SHELL_SEPARATORS
+        elif (
+            token in SHELL_SEPARATORS
+            or token in SHELL_PREFIXES
+            or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token)
+        ):
+            pass
+        elif token in TIME_COMMANDS:
+            while index + 1 < len(tokens) and tokens[index + 1].startswith("-"):
+                index += 2 if tokens[index + 1] in TIME_VALUE_FLAGS else 1
+        elif token == "command" and following.startswith("-"):
+            at_start = False
+        elif token == "command":
+            pass
+        else:
+            found.append((token, tokens[index + 1 :]))
+            at_start = False
+        index += 1
+    return found + nested
+
+
+def cargo_invocations(script: str) -> list[tuple[str, str, str]]:
+    """Return (line, command word, its subcommand) for each cargo-family command.
+
+    A `+toolchain` after `cargo` is skipped, so `cargo +nightly install` reads as
+    `install`. A line shlex cannot split is read with CARGO_COMMAND anywhere on it.
+    """
+    found = []
+    for line in logical_lines(script):
+        commands = command_words(line)
+        if commands is None:
+            commands = [
+                (match.group(1), line[match.end() :].split())
+                for match in CARGO_COMMAND.finditer(line)
+            ]
+        for word, rest in commands:
+            word = posixpath.basename(word)
+            if word not in CARGO_FAMILY:
+                continue
+            if rest and rest[0].startswith("+"):
+                rest = rest[1:]
+            found.append((line, word, rest[0] if rest else ""))
+    return found
+
+
+def step_uses(step: dict) -> str:
+    return str(step.get("uses") or "")
+
+
+def is_fetch_step(step: dict) -> bool:
+    return step_uses(step) == CARGO_FETCH_ACTION
+
+
+def is_toolchain_or_cache_step(step: dict) -> bool:
+    return step_uses(step).startswith(TOOLCHAIN_OR_CACHE_ACTIONS)
+
+
+def step_runs_cargo(step: dict) -> bool:
+    if step_uses(step).startswith(CARGO_RUNNING_ACTIONS):
+        return True
+    return bool(cargo_invocations(str(step.get("run") or "")))
+
+
+def job_runs_cargo(job: dict) -> bool:
+    return any(
+        is_fetch_step(step) or is_toolchain_or_cache_step(step) or step_runs_cargo(step)
+        for step in job.get("steps") or []
+    )
+
+
+def normalised_condition(step: dict) -> str:
+    return " ".join(str(step.get("if") or "").split())
+
+
+def offline_env_gaps(where: str, env: object) -> list[str]:
+    if isinstance(env, dict) and "CARGO_NET_OFFLINE" in env:
+        return [f"{where}: env sets CARGO_NET_OFFLINE"]
+    return []
+
+
+# A step that builds a container image, so its cargo commands run inside the Dockerfile
+# it names, where no fetch step of the job reaches.
+DOCKER_BUILD_ACTIONS = ("docker/build-push-action@",)
+CARGO_FETCH_SOURCE = ".github/actions/cargo-fetch/fetch.sh"
+OFFLINE_FLAGS = {"--offline", "--frozen"}
+DOCKER_OFFLINE_ENV = re.compile(r"""(?:^|\s)CARGO_NET_OFFLINE(?:=|\s+)(["']?)true\1(?:\s|$)""")
+
+
+def dockerfile_instructions(text: str) -> list[tuple[str, str]]:
+    """Return (KEYWORD, arguments) for each instruction, continuations joined.
+
+    Docker drops a comment line even inside a continuation, so this reader does too.
+    """
+    found, pending = [], ""
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.endswith("\\"):
+            pending += stripped[:-1] + " "
+            continue
+        keyword, _, rest = (pending + stripped).partition(" ")
+        found.append((keyword.upper(), rest.strip()))
+        pending = ""
+    if pending:
+        keyword, _, rest = pending.partition(" ")
+        found.append((keyword.upper(), rest.strip()))
+    return found
+
+
+def dockerfile_offline_gaps(label: str, text: str) -> list[str]:
+    """Return each way one Dockerfile breaks the fetch-then-offline rule.
+
+    CRITERION: in every stage, no cargo-family command runs before the stage, or a
+    stage it is built `FROM`, has run the copied-in CARGO_FETCH_SOURCE, except
+    `--version`, `cargo chef prepare` and `cargo chef cook --no-build`; the fetch runs
+    once per stage chain; and every cargo-family command after it runs under
+    `ENV CARGO_NET_OFFLINE=true` or with a flag in OFFLINE_FLAGS. No ENV sets
+    CARGO_NET_OFFLINE before the fetch or to anything but `true`. A RUN line shlex
+    cannot split is read with CARGO_COMMAND anywhere on it, as cargo_invocations reads
+    a workflow line.
+    """
+    gaps: list[str] = []
+    stages: dict[str, tuple[bool, bool]] = {}
+    scripts: set[str] = set()
+    fetched = offline = False
+    current = None
+    for keyword, rest in dockerfile_instructions(text):
+        flagless = [word for word in rest.split() if not word.startswith("--")]
+        if keyword == "FROM":
+            base = flagless[0].lower() if flagless else ""
+            fetched, offline = stages.get(base, (False, False))
+            has_name = len(flagless) >= 3 and flagless[1].lower() == "as"
+            current = flagless[2].lower() if has_name else None
+        elif keyword == "COPY" and CARGO_FETCH_SOURCE in flagless[:-1]:
+            scripts.add(flagless[-1])
+        elif keyword == "ENV" and "CARGO_NET_OFFLINE" in rest:
+            if not DOCKER_OFFLINE_ENV.search(rest):
+                gaps.append(f"{label}: `ENV {rest}` sets CARGO_NET_OFFLINE to other than true")
+            elif not fetched:
+                gaps.append(f"{label}: `ENV {rest}` comes before the fetch")
+            offline = True
+        elif keyword == "RUN":
+            while rest.startswith("--"):
+                rest = rest.partition(" ")[2].lstrip()
+            if rest.startswith("["):
+                try:
+                    rest = shlex.join(json.loads(rest))
+                except (ValueError, TypeError):
+                    gaps.append(f"{label}: cannot read `RUN {rest}`")
+                    continue
+            commands = command_words(rest)
+            if commands is None:
+                # As cargo_invocations does: a cargo word anywhere on a line shlex
+                # cannot split is read as a command.
+                commands = [
+                    (match.group(1), rest[match.end() :].split())
+                    for match in CARGO_COMMAND.finditer(rest)
+                ]
+            for word, tokens in commands:
+                runs_script = word in scripts or (
+                    posixpath.basename(word) in {"bash", "sh"} and tokens[:1]
+                    and tokens[0] in scripts
+                )
+                if runs_script:
+                    if fetched:
+                        gaps.append(f"{label}: `RUN {rest}` fetches a second time")
+                    fetched = True
+                    continue
+                word = posixpath.basename(word)
+                if word not in CARGO_FAMILY:
+                    continue
+                if tokens and tokens[0].startswith("+"):
+                    tokens = tokens[1:]
+                if tokens[:1] and tokens[0] in VERSION_FLAGS:
+                    continue
+                if not fetched:
+                    writes_manifests = word == "cargo" and (
+                        tokens[:2] == ["chef", "prepare"]
+                        or (tokens[:2] == ["chef", "cook"] and "--no-build" in tokens)
+                    )
+                    if not writes_manifests:
+                        gaps.append(f"{label}: `RUN {rest}` runs before the fetch")
+                elif not offline and not OFFLINE_FLAGS & set(tokens):
+                    gaps.append(f"{label}: `RUN {rest}` runs online after the fetch")
+                if word == "cargo" and tokens[:1] and tokens[0] in CARGO_NEEDS_NETWORK:
+                    gaps.append(f"{label}: `RUN {rest}` needs the network")
+        if current:
+            stages[current] = (fetched, offline)
+    return gaps
+
+
+def docker_build_gaps(label: str, step: dict, dockerfiles: dict[str, str]) -> list[str]:
+    """Return the gaps of the Dockerfile one docker/build-push-action step builds."""
+    inputs = step.get("with") or {}
+    context = str(inputs.get("context") or ".")
+    if "://" in context or "${{" in context:
+        return [f"{label}: builds context `{context}`, which this check cannot read"]
+    path = posixpath.normpath(str(inputs.get("file") or posixpath.join(context, "Dockerfile")))
+    if path not in dockerfiles:
+        source = REPO / path
+        if not source.is_file():
+            return [f"{label}: builds `{path}`, which does not exist"]
+        dockerfiles[path] = source.read_text()
+    return dockerfile_offline_gaps(f"{label}, {path}", dockerfiles[path])
+
+
+def offline_cargo_gaps(
+    name: str, doc: dict, dockerfiles: dict[str, str] | None = None
+) -> list[str]:
+    """Return each way one workflow's jobs break the fetch-then-offline rule.
+
+    CRITERION: every job that runs cargo, and is not in OFFLINE_CARGO_EXEMPT, has
+    exactly one CARGO_FETCH_ACTION step; that step comes after every toolchain and
+    rust-cache step; no step before it runs a cargo-family command other than one in
+    CARGO_BEFORE_FETCH; no step after it runs one in CARGO_NEEDS_NETWORK; and when the
+    fetch carries an `if:`, every later step that runs cargo carries that condition
+    too, so no cargo step runs where the fetch skipped. In every job, no `env:` sets
+    CARGO_NET_OFFLINE and no `run:` text names it or `net.offline`, so the fetch step's
+    `$GITHUB_ENV` write is the one place cargo goes offline. A job runs cargo when it
+    has a toolchain, rust-cache or fetch step, or a step that runs a cargo-family
+    command or a cargo-running action. Each step that uses a DOCKER_BUILD_ACTIONS
+    action adds the gaps dockerfile_offline_gaps finds in the Dockerfile it builds;
+    `dockerfiles` maps a repository path to the text to read in place of that file.
+    """
+    dockerfiles = {} if dockerfiles is None else dockerfiles
+    gaps = offline_env_gaps(f"{name}: workflow", doc.get("env"))
+    for job_id, job in sorted((doc.get("jobs") or {}).items()):
+        label = f"{name}:{job_id}"
+        gaps += offline_env_gaps(label, job.get("env"))
+        steps = job.get("steps") or []
+        for index, step in enumerate(steps):
+            step_label = f"{label}, {step.get('name') or f'step {index}'}"
+            gaps += offline_env_gaps(step_label, step.get("env"))
+            script = str(step.get("run") or "")
+            if "CARGO_NET_OFFLINE" in script or "net.offline" in script:
+                gaps.append(f"{step_label}: run text sets cargo's offline mode by hand")
+            if step_uses(step).startswith(DOCKER_BUILD_ACTIONS):
+                gaps += docker_build_gaps(step_label, step, dockerfiles)
+        exempt = (name, job_id) in OFFLINE_CARGO_EXEMPT
+        if exempt or "uses" in job or not job_runs_cargo(job):
+            continue
+        fetches = [index for index, step in enumerate(steps) if is_fetch_step(step)]
+        if len(fetches) != 1:
+            gaps.append(f"{label}: runs cargo with {len(fetches)} cargo-fetch steps, not 1")
+            if not fetches:
+                continue
+        fetch = fetches[0]
+        for index, step in enumerate(steps):
+            step_label = f"{label}, {step.get('name') or f'step {index}'}"
+            if is_toolchain_or_cache_step(step) and index > fetch:
+                gaps.append(
+                    f"{step_label}: {step_uses(step)} runs after the cargo-fetch step"
+                )
+            if index < fetch and step_uses(step).startswith(CARGO_RUNNING_ACTIONS):
+                gaps.append(f"{step_label}: {step_uses(step)} runs before the fetch")
+            for line, word, subcommand in cargo_invocations(str(step.get("run") or "")):
+                if index < fetch and not (
+                    (word == "cargo" and subcommand in CARGO_BEFORE_FETCH)
+                    or subcommand in VERSION_FLAGS
+                ):
+                    gaps.append(f"{step_label}: `{line}` runs before the fetch")
+                if index > fetch and word == "cargo" and subcommand in CARGO_NEEDS_NETWORK:
+                    gaps.append(
+                        f"{step_label}: `{line}` needs the network after the fetch "
+                        f"took cargo offline"
+                    )
+        condition = normalised_condition(steps[fetch])
+        if condition:
+            for index, step in enumerate(steps[fetch + 1 :], start=fetch + 1):
+                if step_runs_cargo(step) and condition not in normalised_condition(step):
+                    gaps.append(
+                        f"{label}, {step.get('name') or f'step {index}'}: runs cargo "
+                        f"without the fetch's condition `{condition}`"
+                    )
+    for (workflow, job_id), reason in OFFLINE_CARGO_EXEMPT.items():
+        if workflow != name:
+            continue
+        job = (doc.get("jobs") or {}).get(job_id)
+        if job is None or not any(
+            word == "cargo" and subcommand == "publish"
+            for step in job.get("steps") or []
+            for _, word, subcommand in cargo_invocations(str(step.get("run") or ""))
+        ):
+            gaps.append(
+                f"{name}:{job_id}: exempt because {reason}, but runs no `cargo publish`"
+            )
+    return gaps
+
+
+def offline_cargo_job(doc: dict, job_id: str) -> tuple[list[dict], int]:
+    steps = doc["jobs"][job_id]["steps"]
+    return steps, next(index for index, step in enumerate(steps) if is_fetch_step(step))
+
+
+def check_offline_cargo(documents: list[tuple[Path, dict]]) -> None:
+    by_name = {path.name: doc for path, doc in documents}
+    for name, doc in sorted(by_name.items()):
+        gaps = offline_cargo_gaps(name, doc)
+        check(
+            f"{name}: every job that runs cargo fetches once, first, then runs offline",
+            not gaps,
+            f"{gaps}: a cargo command that reaches the registry fails its job when "
+            f"index.crates.io does not resolve",
+        )
+    script = CARGO_FETCH_SCRIPT.read_text()
+    check(
+        "fetch.sh writes CARGO_NET_OFFLINE=true to $GITHUB_ENV",
+        bool(CARGO_FETCH_ENV_WRITE.search(script)),
+        f"{CARGO_FETCH_SCRIPT.relative_to(REPO)} no longer takes cargo offline for "
+        f"the steps after it, so every job's later cargo commands reach the network",
+    )
+    check(
+        "the fetch-script reader rejects a fetch.sh without the $GITHUB_ENV write",
+        not CARGO_FETCH_ENV_WRITE.search(CARGO_FETCH_ENV_WRITE.sub("", script)),
+        "the reader matched a fetch.sh with the write removed",
+    )
+
+    # Reader controls: the command lines the reader must and must not read as cargo.
+    for line, expected in (
+        ("cargo clippy --workspace", [("cargo", "clippy")]),
+        ('TREE="$(cargo tree -p scp-ffi -i libsqlite3-sys)"', [("cargo", "tree")]),
+        ("for pkg in a b; do cargo build -p \"$pkg\"; done", [("cargo", "build")]),
+        ('/usr/bin/time -f "${label} wall %e s" cargo build --timings', [("cargo", "build")]),
+        ("CARGO_TARGET_DIR=t env A=1 cargo +1.98.0 test", [("cargo", "test")]),
+        ("cd bindings/python && maturin develop", [("maturin", "develop")]),
+        ("rustc --version; cargo --version", [("cargo", "--version")]),
+        ("if PATH=/usr/bin command -v cargo >/dev/null; then", []),
+        ('echo "::error::cargo is on PATH"', []),
+        ("pip install maturin", []),
+    ):
+        got = [(word, sub) for _, word, sub in cargo_invocations(line)]
+        check(
+            f"the offline-cargo reader reads `{line}` as {expected or 'no cargo command'}",
+            got == expected,
+            f"read {got}",
+        )
+
+    # Controls: each fixture below breaks the rule one way and must be reported.
+    ci = by_name["ci.yml"]
+
+    def reported(label: str, doc: dict, name: str, needle: str) -> None:
+        gaps = offline_cargo_gaps(name, doc)
+        check(
+            f"offline-cargo control: {label} is reported",
+            any(needle in gap for gap in gaps),
+            f"no gap containing {needle!r} among {gaps}",
+        )
+
+    mutated = copy.deepcopy(ci)
+    steps, fetch = offline_cargo_job(mutated, "rust-clippy")
+    del steps[fetch]
+    reported("rust-clippy with its fetch step removed", mutated, "ci.yml",
+             "ci.yml:rust-clippy: runs cargo with 0 cargo-fetch steps")
+
+    mutated = copy.deepcopy(ci)
+    steps, fetch = offline_cargo_job(mutated, "rust-clippy")
+    later = next(
+        index for index in range(fetch + 1, len(steps)) if step_runs_cargo(steps[index])
+    )
+    steps.insert(fetch, steps.pop(later))
+    reported("a rust-clippy cargo step moved before the fetch", mutated, "ci.yml",
+             "runs before the fetch")
+
+    mutated = copy.deepcopy(ci)
+    steps, fetch = offline_cargo_job(mutated, "rust-clippy")
+    cache = max(
+        index for index, step in enumerate(steps) if is_toolchain_or_cache_step(step)
+    )
+    steps.insert(cache, steps.pop(fetch))
+    reported("rust-clippy fetching before its rust-cache step", mutated, "ci.yml",
+             "runs after the cargo-fetch step")
+
+    mutated = copy.deepcopy(ci)
+    steps, fetch = offline_cargo_job(mutated, "rust-clippy")
+    steps.insert(fetch, copy.deepcopy(steps[fetch]))
+    reported("rust-clippy fetching twice", mutated, "ci.yml",
+             "ci.yml:rust-clippy: runs cargo with 2 cargo-fetch steps")
+
+    for where, apply in (
+        ("workflow", lambda doc: doc.setdefault("env", {})),
+        ("job", lambda doc: doc["jobs"]["rust-clippy"].setdefault("env", {})),
+        ("step", lambda doc: offline_cargo_job(doc, "rust-clippy")[0][-1].setdefault("env", {})),
+    ):
+        mutated = copy.deepcopy(ci)
+        apply(mutated)["CARGO_NET_OFFLINE"] = "true"
+        reported(f"a {where}-level CARGO_NET_OFFLINE", mutated, "ci.yml",
+                 "env sets CARGO_NET_OFFLINE")
+
+    mutated = copy.deepcopy(ci)
+    steps, fetch = offline_cargo_job(mutated, "rust-clippy")
+    steps.insert(fetch + 1, {"run": 'echo "CARGO_NET_OFFLINE=false" >> "$GITHUB_ENV"'})
+    reported("a step turning cargo back online", mutated, "ci.yml",
+             "run text sets cargo's offline mode by hand")
+
+    mutated = copy.deepcopy(ci)
+    steps, fetch = offline_cargo_job(mutated, "rust-clippy")
+    steps.insert(fetch + 1, {"run": "cargo +1.98.0 install cargo-nextest --locked"})
+    reported("a cargo install after the fetch", mutated, "ci.yml",
+             "needs the network after the fetch")
+
+    mutated = copy.deepcopy(ci)
+    steps, fetch = offline_cargo_job(mutated, "rust-clippy")
+    steps[fetch]["if"] = "steps.artifact-cache.outputs.cache-hit != 'true'"
+    reported("a guarded fetch with an unguarded later cargo step", mutated, "ci.yml",
+             "without the fetch's condition")
+
+    mutated = copy.deepcopy(ci)
+    mutated["jobs"]["fixture-raw-cargo"] = {
+        "runs-on": "ubuntu-latest",
+        "steps": [{"uses": "actions/checkout@v5"}, {"run": "cargo build --workspace"}],
+    }
+    reported("a job running cargo with no toolchain step and no fetch", mutated, "ci.yml",
+             "ci.yml:fixture-raw-cargo: runs cargo with 0 cargo-fetch steps")
+
+    for name, job_id in (
+        ("build-matrix.yml", "python-wheels"),
+        ("fuzz.yml", "fuzz-nightly"),
+        ("codeql.yml", "analyze"),
+    ):
+        mutated = copy.deepcopy(by_name[name])
+        steps, fetch = offline_cargo_job(mutated, job_id)
+        del steps[fetch]
+        reported(f"{name}:{job_id} with its fetch step removed", mutated, name,
+                 f"{name}:{job_id}: runs cargo with 0 cargo-fetch steps")
+
+    mutated = copy.deepcopy(by_name["release.yml"])
+    mutated["jobs"]["publish-crates"]["steps"] = [
+        step for step in mutated["jobs"]["publish-crates"]["steps"]
+        if "cargo publish" not in str(step.get("run") or "")
+    ]
+    reported("an exemption naming a job that no longer publishes", mutated, "release.yml",
+             "runs no `cargo publish`")
+
+    # Dockerfile controls: the reader, then the image the docker-image job builds,
+    # broken one way at a time.
+    read = dockerfile_instructions("RUN a \\\n# note\n    && b\nENV X=1\n")
+    check(
+        "the Dockerfile reader joins a continuation and drops a comment line inside it",
+        read == [("RUN", "a  && b"), ("ENV", "X=1")],
+        f"read {read}",
+    )
+    dockerfile = (REPO / "Dockerfile").read_text()
+    fetch_run = next(
+        line for line in dockerfile.splitlines()
+        if line.startswith("RUN ") and "cargo-fetch.sh" in line
+    )
+    offline_env = "ENV CARGO_NET_OFFLINE=true\n"
+    for label, text, needle in (
+        ("a Dockerfile with its fetch removed",
+         dockerfile.replace(fetch_run + "\n", ""), "runs before the fetch"),
+        ("a Dockerfile that runs the fetch script without copying it in",
+         "\n".join(line for line in dockerfile.splitlines()
+                   if not (line.startswith("COPY ") and CARGO_FETCH_SOURCE in line)),
+         "runs before the fetch"),
+        ("a Dockerfile building online after the fetch",
+         dockerfile.replace(offline_env, "").replace(" --offline", ""),
+         "runs online after the fetch"),
+        ("a Dockerfile setting CARGO_NET_OFFLINE before the fetch",
+         dockerfile.replace(offline_env, "").replace(fetch_run, offline_env + fetch_run),
+         "comes before the fetch"),
+        ("a Dockerfile running cargo before the fetch on a line shlex cannot split",
+         dockerfile.replace(fetch_run, "RUN a=\"$(printf '\"')\"; cargo build --release\n"
+                            + fetch_run),
+         "runs before the fetch"),
+        ("a Dockerfile fetching twice",
+         dockerfile.replace(fetch_run, fetch_run + "\n" + fetch_run),
+         "fetches a second time"),
+    ):
+        check(f"offline-cargo control: {label} differs from the Dockerfile",
+              text != dockerfile, "the mutation changed nothing")
+        gaps = offline_cargo_gaps("ci.yml", ci, {"Dockerfile": text})
+        check(
+            f"offline-cargo control: {label} is reported",
+            any(needle in gap and "docker-image" in gap for gap in gaps),
+            f"no docker-image gap containing {needle!r} among {gaps}",
+        )
+    mutated = copy.deepcopy(ci)
+    build = next(
+        step for step in mutated["jobs"]["docker-image"]["steps"]
+        if step_uses(step).startswith(DOCKER_BUILD_ACTIONS)
+    )
+    build.setdefault("with", {})["file"] = "fixture/Missing.Dockerfile"
+    reported("a docker-image job building a Dockerfile that does not exist", mutated,
+             "ci.yml", "fixture/Missing.Dockerfile`, which does not exist")
+
+
 def package_write_holders(doc: dict) -> list[str]:
     """Return `workflow` and every job id whose own `permissions:` grants package write.
 
@@ -7448,12 +8074,16 @@ def check_macos_bridge_mutants(doc: dict) -> None:
 
 # CRITERION for unrouted_paths: a tracked path is routed when the `code` output
 # of job `changes` selects it or when it is prose. Prose is every path under
-# `.docs/` or `.claude/`, every `*.md` file at the repository root, and every
-# `*.md` file under `docs/guides/`. A pull request that changes only prose skips
-# every job the `code` output guards, so a path that is neither reaches no such
-# job when it alone changes, whatever that job reads.
+# `.docs/` or `.claude/` except `.docs/migration/`, every `*.md` file at the
+# repository root, and every `*.md` file under `docs/guides/`. A pull request that
+# changes only prose skips every job the `code` output guards, so a path that is
+# neither reaches no such job when it alone changes, whatever that job reads. The
+# guides under `.docs/migration/` are not prose, because job examples-typecheck
+# type-checks their code blocks.
 def is_prose(path: str) -> bool:
     """Report whether a tracked path is prose, which no `code`-guarded job reads."""
+    if path.startswith(".docs/migration/"):
+        return False
     if path.startswith((".docs/", ".claude/")):
         return True
     if path.endswith(".md"):
@@ -7579,6 +8209,12 @@ def check_every_path_routed(doc: dict) -> None:
     check(
         "a `code` filter that drops scripts/** reports scripts/ci-aggregate-result.py",
         "scripts/ci-aggregate-result.py" in unrouted_paths(mutant, paths),
+    )
+    filters["code"] = [entry for entry in filters["code"] if entry != ".docs/migration/**"]
+    step["with"]["filters"] = yaml.safe_dump(filters)
+    check(
+        "a `code` filter that drops .docs/migration/** reports .docs/migration/phase-4.md",
+        ".docs/migration/phase-4.md" in unrouted_paths(mutant, paths),
     )
     sources = crate_sources(paths)
     reads = rust_test_reads(sources)
@@ -8212,6 +8848,14 @@ def run_profile_env(inputs: Inputs) -> None:
     check_profile_env_is_workflow_level(
         yaml.safe_load(COMPILE_TIMINGS.read_text()), "compile-timings.yml"
     )
+
+
+def run_offline_cargo(inputs: Inputs) -> None:
+    print(
+        "offline-cargo — every job that runs cargo fetches once, after its toolchain "
+        "and cache, then runs offline"
+    )
+    check_offline_cargo(inputs.documents)
 
 
 def run_artifact_key(inputs: Inputs) -> None:
@@ -8920,6 +9564,7 @@ CHECKS: dict[str, Callable[[Inputs], None]] = {
     "downloaded-addon": run_downloaded_addon,
     "retention": run_retention,
     "profile-env": run_profile_env,
+    "offline-cargo": run_offline_cargo,
     "artifact-key": run_artifact_key,
     "artifact-digest": run_artifact_digest,
     "producer-outputs": run_producer_outputs,
@@ -8974,6 +9619,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "downloaded-addon",
         "retention",
         "profile-env",
+        "offline-cargo",
         "artifact-key",
         "artifact-digest",
         "producer-outputs",

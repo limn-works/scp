@@ -4,85 +4,67 @@
  * Demonstrates creating a new SCP identity using did:dht,
  * inspecting the resulting DID document, and resolving it.
  *
+ * [works.limn.scp.CustodyType] names the custody request of spec section
+ * 3.2.2. `identityCreate(custody)` answers `OS_KEYSTORE` with `SCP-IDENT-1003`,
+ * because only a [uniffi.scp.KeyCustodyProvider] reaches the host key store.
+ * The KDoc of [works.limn.scp.CustodyType] states which identity creations a
+ * build without the `testing` feature refuses; `identityCreateWithCustody` is
+ * one of them.
+ * This example passes the caller's provider to `identityCreateWithCustody`;
+ * on Android, `UniffiKeyCustody(AndroidKeyCustody(context))` from
+ * `works.limn:scp-kt-android` is that provider over Android Keystore.
+ *
  * Prerequisites:
  *   implementation("works.limn:scp-kt:0.1.0")
  *
  * Usage:
- *   ./gradlew run --args="identity"
+ *   identityExample(myProvider, File(context.filesDir, "scp-identity"), passphrase)
  */
 
 package works.limn.scp.examples
 
 import kotlinx.coroutines.runBlocking
-import works.limn.scp.CustodyType
-import works.limn.scp.bridge.CoroutineBridge
+import uniffi.scp.KeyCustodyProvider
+import works.limn.scp.SCP
+import java.io.File
 
-fun identityExample(bridge: CoroutineBridge) = runBlocking {
-    // 1. Create a new identity with in-memory key custody.
-    //    In production on Android, use CustodyType.PLATFORM for Keystore.
-    //    All FFI calls are dispatched on Dispatchers.IO via the bridge.
-    val identityHandle = bridge.identity.create(CustodyType.IN_MEMORY)
-    println("Identity handle: $identityHandle")
-    println("Custody type: ${CustodyType.IN_MEMORY.rawValue}")
+fun identityExample(
+    provider: KeyCustodyProvider,
+    storageDir: File,
+    storagePassphrase: String,
+) = runBlocking {
+    val scp = SCP.withSqlite(storageDir, storagePassphrase)
+
+    // 1. Create a new identity whose keys the caller's provider holds.
+    val identity = scp.identityCreateWithCustody(provider)
+    println("DID: ${identity.did()}")
+    println("Custody type: ${identity.custodyType()}")
     println()
 
-    // 2. Resolve the DID to its document.
-    //    Returns a JSON string representing the DID document.
-    //    The bridge dispatches the blocking JNA call on Dispatchers.IO.
-    val didString = "did:dht:z6MkExample"
-    val docJson = bridge.identity.resolve(didString)
-
-    println("DID Document (JSON):")
-    println("  $docJson")
+    val doc = scp.identityResolve(identity.did())
+    println(doc.id)
     println()
 
-    // 3. Load an existing identity by DID string.
-    //    Returns an opaque handle (Long) for the loaded identity.
-    val loadedHandle = bridge.identity.load(didString)
-    println("Loaded identity handle: $loadedHandle")
+    // 2. Load an existing identity by DID string.
+    val loaded = scp.identityLoad(identity.did())
+    println("Loaded identity: ${loaded.did()}")
     println()
 
-    // 4. Agent key management (ADR-039).
-    //    Requires CoroutineBridge constructed with ExtendedBindings
-    //    that include IdentityAdvancedBindings.
-    //    bridge.identityAdvanced is nullable; here we assert non-null
-    //    because we know extended bindings were provided.
-    val advanced = bridge.identityAdvanced
-        ?: error("identityAdvanced requires ExtendedBindings")
+    // 3. Add an agent key to the identity.
+    val withAgent = scp.identityAddAgentKey(identity)
+    println("Added agent key to: ${withAgent.did()}")
 
-    //    Create an identity with an agent signing key for
-    //    human+agent shared DID patterns.
-    val agentHandle = advanced.createWithAgentKey(CustodyType.IN_MEMORY)
-    println("Agent identity handle: $agentHandle")
+    // 4. Rotate the agent key.
+    val rotated = scp.identityRotateAgentKey(withAgent)
+    println("Rotated agent key for: ${rotated.did()}")
 
-    // 5. Add an agent key to an existing identity.
-    val withAgent = advanced.addAgentKey(identityHandle)
-    println("Added agent key, new handle: $withAgent")
+    // 5. Remove the agent key.
+    val cleaned = scp.identityRemoveAgentKey(rotated)
+    println("Removed agent key from: ${cleaned.did()}")
 
-    // 6. Rotate the agent key.
-    val rotated = advanced.rotateAgentKey(withAgent)
-    println("Rotated agent key, new handle: $rotated")
-
-    // 7. Remove the agent key.
-    val cleaned = advanced.removeAgentKey(rotated)
-    println("Removed agent key, new handle: $cleaned")
-
-    // 8. Migrate identity to a new DID (Layer 2 rotation).
-    //    The DidRotationEvent JSON must be distributed to every active
-    //    context where the OLD DID is a member (spec §9.12, ADR-003 §4b)
-    //    so peers accept the new DID's #active key. Pre-context callers
-    //    can ignore the event (it has nowhere to go yet).
-    val migrated = advanced.migrateWithRotationEvent(identityHandle)
-    println("Migrated identity, new handle: ${migrated.handle}")
-    // In a real app, forward migrated.rotationEventJson to each active context here.
-
-    // 9. Device attestation (section 9.3).
-    val token = advanced.attestDevice(identityHandle)
-    println("\nDevice attestation token: ${token.take(40)}...")
-
-    val valid = advanced.verifyDeviceAttestation(didString, token)
-    println("Attestation valid: $valid")
-
+    // SCP.shutdown takes a CoroutineBridge, and the SDK ships no NativeBindings
+    // implementation to build one with, so this example cannot shut the
+    // instance down. The finalizer logs a warning when the JVM collects it.
     println()
     println("Identity operations complete.")
 }

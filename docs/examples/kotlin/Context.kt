@@ -1,86 +1,122 @@
 /**
- * Context creation and lifecycle management.
+ * Context creation and the invite-and-join handshake.
  *
  * Demonstrates creating an SCP context with governance parameters,
- * inspecting its state, joining/leaving, and managing membership.
+ * inviting a second identity, joining from the sealed invitation, and
+ * reading the membership.
+ *
+ * The creator and the joiner each run their own [SCP] instance with its own
+ * database, as two devices would, and each passes its own
+ * [KeyCustodyProvider], because only a provider reaches the host key store
+ * (spec section 3.2.2). [works.limn.scp.CustodyType] states which identity
+ * creations a build without the `testing` feature refuses.
  *
  * Prerequisites:
  *   implementation("works.limn:scp-kt:0.1.0")
  *
  * Usage:
- *   ./gradlew run --args="context"
+ *   contextExample(aliceProvider, bobProvider, context.filesDir, passphrase)
  */
 
 package works.limn.scp.examples
 
 import kotlinx.coroutines.runBlocking
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonArray
-import works.limn.scp.CustodyType
-import works.limn.scp.bridge.CoroutineBridge
+import uniffi.scp.CeilingPolicy
+import uniffi.scp.ContextMode
+import uniffi.scp.ContextParams
+import uniffi.scp.GovernanceModel
+import uniffi.scp.InviteMemberOutcome
+import uniffi.scp.KeyCustodyProvider
+import uniffi.scp.MemoryScope
+import works.limn.scp.SCP
+import java.io.File
 
-fun contextExample(bridge: CoroutineBridge) = runBlocking {
-    // 1. Create the identity that will own the context.
-    val aliceHandle = bridge.identity.create(CustodyType.IN_MEMORY)
-    println("Alice identity handle: $aliceHandle")
+fun contextExample(
+    aliceProvider: KeyCustodyProvider,
+    bobProvider: KeyCustodyProvider,
+    storageRoot: File,
+    storagePassphrase: String,
+) = runBlocking {
+    val aliceNode = SCP.withSqlite(File(storageRoot, "scp-context-alice"), storagePassphrase)
+    val bobNode = SCP.withSqlite(File(storageRoot, "scp-context-bob"), storagePassphrase)
 
-    // 2. Define context parameters as JSON.
-    //    The Kotlin SDK uses JSON strings for structured parameters
-    //    passed through the FFI bridge.
-    val paramsJson = buildJsonObject {
-        putJsonArray("ceiling") {
-            add(JsonPrimitive("messages:read"))
-            add(JsonPrimitive("messages:write"))
-            add(JsonPrimitive("member:invite"))
-            add(JsonPrimitive("member:remove"))
-            add(JsonPrimitive("tool:register"))
-            add(JsonPrimitive("tool:invoke_all"))
+    // 1. Each side creates its identity in its own node.
+    val alice = aliceNode.identityCreateWithCustody(aliceProvider)
+    val bob = bobNode.identityCreateWithCustody(bobProvider)
+    println("Alice DID: ${alice.did()}")
+    println("Bob DID:   ${bob.did()}")
+
+    // 2. Define context parameters. The ceiling caps what any member can
+    //    hold. Inviting runs through the governance gate, so the ceiling
+    //    must carry governance:propose.
+    val params =
+        ContextParams(
+            mode = ContextMode.ENCRYPTED,
+            ceiling =
+                listOf(
+                    "messages:read",
+                    "messages:write",
+                    "member:invite",
+                    "member:remove",
+                    "governance:propose",
+                ),
+            ceilingPolicy = CeilingPolicy.IMMUTABLE,
+            governance = GovernanceModel.SINGLE_ADMIN,
+            memoryScope = MemoryScope.EPHEMERAL,
+            ttlSeconds = 0uL,
+            promotable = false,
+            minProtocolVersion = 0.toUShort(),
+            maxChainDepth = null,
+            maxNestingDepth = null,
+            sessionCap = null,
+            economicPolicy = null,
+            consequenceRulesJson = null,
+            consequenceConfigJson = null,
+        )
+
+    // 3. Alice creates the context. The returned ContextHandle is the
+    //    reference every later context call takes.
+    val handle = aliceNode.contextCreate(alice, params)
+    println()
+    println("Context created: ${handle.contextId()}")
+    println("  Creator: ${handle.creatorDid()}")
+    println("  State: ${handle.state()}")
+
+    // 4. Bob reserves a single-use KeyPackage and hands Alice its public
+    //    bytes out of band.
+    val reservation = bobNode.reserveKeyPackage(bob)
+
+    // 5. Alice seals an invitation to that KeyPackage. An empty relay list
+    //    means Alice delivers the sealed bundle to Bob herself.
+    val outcome =
+        aliceNode.inviteMember(
+            identity = alice,
+            contextId = handle.contextId(),
+            inviteeDid = bob.did(),
+            inviteeKeyPackage = reservation.keyPackagePublic,
+            relayUrls = emptyList(),
+        )
+    val bundle =
+        when (outcome) {
+            is InviteMemberOutcome.Sealed -> outcome.bundle
         }
-        put("mode", "Encrypted")
-        put("memory_scope", "full")
-        put("governance", "single_admin")
-    }.toString()
 
-    // 3. Create the context.
-    //    Returns an opaque context handle (Long) for subsequent operations.
-    val contextHandle = bridge.context.create(aliceHandle, paramsJson)
+    // 6. Bob opens the sealed bundle and joins.
+    val bobHandle = bobNode.contextJoinFromWelcome(bob, bundle, reservation.reservationId)
     println()
-    println("Context created, handle: $contextHandle")
+    println("Bob joined context: ${bobHandle.contextId()}")
 
-    // 4. Send a message to the context.
-    val payload = "Hello, context!".toByteArray()
-    bridge.context.send(contextHandle, payload)
-    println("  Message sent successfully.")
+    // 7. Read the membership from Alice's node.
+    val members = aliceNode.contextMemberDids(handle)
+    println("Members: $members")
 
-    // 5. Query membership.
-    val memberCount = bridge.membership.memberCount(contextHandle)
-    println("  Member count: $memberCount")
-
-    val members = bridge.membership.memberDids(contextHandle)
-    println("  Members: $members")
-
-    // 6. Bob joins the context.
-    val bobHandle = bridge.identity.create(CustodyType.IN_MEMORY)
-    val bobContextHandle = bridge.context.join(bobHandle, "context-id")
-    println()
-    println("Bob joined the context, handle: $bobContextHandle")
-
-    val isBobMember = bridge.membership.isMember(contextHandle, "did:dht:z6MkBob")
-    println("  Bob is member: $isBobMember")
-
-    val bobRole = bridge.membership.memberRole(contextHandle, "did:dht:z6MkBob")
-    println("  Bob role: $bobRole")
-
-    // 7. Bob leaves the context.
-    bridge.context.leave(bobContextHandle)
-    println("Bob left the context.")
-
-    // 8. Close the context for all members.
-    bridge.context.close(contextHandle)
+    // 8. Close the context for every member.
+    aliceNode.contextClose(handle, alice)
     println("Context closed.")
 
+    // SCP.shutdown takes a CoroutineBridge, and the SDK ships no NativeBindings
+    // implementation to build one with, so this example cannot shut either
+    // instance down. The finalizer logs a warning when the JVM collects it.
     println()
     println("Context lifecycle complete.")
 }

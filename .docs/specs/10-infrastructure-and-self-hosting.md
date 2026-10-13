@@ -379,46 +379,48 @@ Mobile devices need push notifications. On iOS the only mechanism is APNs (Apple
 
 Clients register for push notifications with relays via the following wire protocol:
 
-**PushRegistration message:**
-
-```
-PushRegistration {
-  did:          Identifier                // the registering identity
-  platform:     enum { APNS, FCM, WebPush }  // push service platform
-  token:        String                    // platform-specific push token (APNs device token, FCM registration token, WebPush endpoint URL)
-  contexts:     Vec<ContextId>            // contexts for which to receive push notifications (empty = all contexts on this relay)
-  timestamp:    DateTime                  // registration time
-  signature:    P256Signature          // signed by the identity's Active Signing Key (#active)
-}
-```
-
-The signature covers `did || platform (1-byte tag: 0x01=APNS, 0x02=FCM, 0x03=WebPush) || token || contexts (length-prefixed concatenation) || timestamp` using the canonical signed structure format (§9.5.2).
+**PushRegistration message.** `22-human-readable-addressing.md` §22.11.4 defines the `PushRegistration` fields and their wire types, and the `PushRegistration` table of `09-security-model.md` §9.5.2 lists the fields of its signature preimage in order. The registrant signs the preimage with the key its key state lists `Current` in the `#active` role.
 
 **Registration flow:**
 
 1. The client generates a `PushRegistration` message and signs it with the identity's Active Signing Key.
-2. The client sends the `PushRegistration` to the relay via a PUBLISH operation (ADR-004) with a reserved `routing_id` of `SHA-256("scp-push-registration" || relay_url)`.
-3. The relay verifies the signature against the key the identity's key state lists `Current` in the `#active` role, resolved by replaying that identity's key-event log (`09-security-model.md` §9.7.4.2 R2, R3, R8). Invalid signatures are rejected.
-4. The relay stores the registration, associating the push token with the identifier and the listed context routing IDs.
-5. On new message arrival for a registered context (matching the routing IDs the identity subscribes to), the relay sends an opaque push notification to the registered token. The push payload is exactly `{ "scp": 1 }` — a wake signal with no content, no context, no sender, no metadata.
+2. The client sends the `PushRegistration` to the relay in a PUBLISH operation (ADR-004, the SCP native relay protocol) whose `routing_id` is the relay's reserved push routing ID, `SHA-256("scp-push-registration" || relay_url)`, where `relay_url` is the relay's canonical URL that `09-security-model.md` §9.18.2 defines.
+3. The relay verifies the signature against the key the identity's key state lists `Current` in the `#active` role, resolved by replaying that identity's key-event log (`09-security-model.md` §9.7.4.2 R2, R3, R8). The relay rebuilds the preimage with its own canonical URL, the one from which it derived the reserved push routing ID the PUBLISH arrived at (`09-security-model.md` §9.5.2, §9.18.2), never with a URL the client supplies. A message signed for a different relay URL therefore fails verification. The relay rejects an invalid signature with `4060` PUSH_REGISTRATION_REJECTED (ADR-004). A client that registers with several relays signs a separate message for each relay, with that relay's canonical URL.
+4. The relay stores the registration, associating the push token with the identity identifier and the listed `routing_ids`. The registration key is the triple (identity identifier, platform, token), so each device of one identity, including two devices on one platform, holds its own registration, and the relay stores at most one registration per registration key. The relay holds at most 16 registrations per identity identifier (`09-security-model.md` §9.18.13). It rejects a registration whose registration key is not stored when the identity identifier already holds 16, with `4064` PUSH_REGISTRATION_LIMIT (ADR-004), and the cap never rejects a registration whose registration key is already stored. A `PushRegistration` whose `routing_ids` list is empty is invalid, and the relay rejects it with `4060` PUSH_REGISTRATION_REJECTED.
+5. When a blob arrives at a routing ID that a stored registration lists in its `routing_ids`, the relay sends a wake signal to the registered token through that token's push service. A wake signal carries no content, no context, no sender and no metadata. The relay sends exactly the request this wake-signal table gives for the registration's platform:
+
+   | Platform | Request | Headers | Body |
+   |----------|---------|---------|------|
+   | APNs | `POST /3/device/<APNs device token>` over HTTP/2 to `api.push.apple.com`, or to `api.sandbox.push.apple.com` for a token that a development build of the app registered | `authorization: bearer <provider JWT>`, `apns-push-type: background`, `apns-priority: 5`, `apns-topic: <the app's bundle ID>` | `{"aps":{"content-available":1}}` |
+   | FCM | `POST https://fcm.googleapis.com/v1/projects/{project_id}/messages:send` (the FCM HTTP v1 API) | `Authorization: Bearer <OAuth 2.0 access token>`, `Content-Type: application/json` | `{"message":{"token":"<FCM registration token>","data":{"scp":"1"},"android":{"priority":"HIGH"}}}` |
+
+   - The APNs body carries no `alert`, `badge` or `sound` key, and the FCM body carries no `notification` key, because each of those keys makes the operating system show a notification.
+   - The FCM wake value is the string `"1"`, because FCM requires every value in `data` to be a string. The FCM registration token appears only in `message.token`.
+   - The relay sets `android.priority` to `HIGH` on every FCM wake, because FCM holds a normal-priority message for a device in Android's Doze mode until Doze's next maintenance window. The relay sets no `android.ttl`, so FCM applies its default time-to-live.
+   - This table defines no WebPush request.
+
+   **Device receipt rule.** The device acts on a wake only when the payload its platform hands the app passes that platform's rule. On an accepted wake, the device connects to its relay set and pulls every pending envelope. On a rejected payload, the device makes no relay connection.
+   - **APNs.** iOS hands the app the payload as a parsed dictionary, never as bytes. The device accepts the wake only when that dictionary has exactly one top-level key, `aps`, and `aps` has exactly one key, `content-available`, whose value is the integer 1. The device rejects every other dictionary.
+   - **FCM.** The device accepts the wake when the message's data map holds the key `scp` with the string value `"1"`. The device rejects a data map that lacks `scp` or holds another value in it, and it reads no other key of the map.
 6. The relay MUST rate-limit push notifications to at most one push per 30 seconds per device token to prevent push notification flooding.
 
-**Token refresh:** When the platform issues a new push token (e.g., APNs token rotation), the client sends a new `PushRegistration` with the updated token. The relay replaces the previous registration for that identity and platform. Registrations are idempotent — re-registering with the same token is a no-op.
+**Freshness.** Before it verifies a signature under step 3, the relay rejects a `PushRegistration` or a `PushDeregistration` in either of two cases:
+- the message's `timestamp` differs from the relay's clock by more than the push timestamp skew window, 300 seconds (`09-security-model.md` §9.18.13), in either direction;
+- the message's `timestamp` is at or below the `timestamp` of the last message the relay accepted for the same registration key.
 
-**PushDeregistration message:**
+After a deregistration removes a registration, the relay keeps the accepted timestamp for that registration key for at least the skew window, so a registration replayed inside the window after its deregistration fails the second check. A relay that rejects a message changes no stored registration and no stored timestamp.
 
-```
-PushDeregistration {
-  did:          Identifier
-  platform:     enum { APNS, FCM, WebPush }
-  timestamp:    DateTime
-  signature:    P256Signature          // signed by the identity's Active Signing Key (#active)
-}
-```
+**No blob storage.** The relay never stores a message published to its reserved push routing ID as a blob, and never delivers one to a subscriber or in a QUERY response, whether it accepts or rejects the message. A client that subscribes to or queries the reserved push routing ID therefore receives no identity's token. A relay that offers no push service rejects every PUBLISH to its reserved push routing ID and stores nothing. ADR-004 registers the error code for each rejection this section states.
 
-The client sends a `PushDeregistration` to explicitly remove its push registration. The relay deletes the stored registration for that identity and platform. Implicit deregistration occurs when the relay observes push delivery failures (invalid token responses from APNs/FCM) — the relay MUST remove registrations after 3 consecutive delivery failures for the same token.
+**Re-registration.** A registration whose registration key matches a stored registration passed the freshness checks above, so its `timestamp` is newer, and it replaces the stored registration. The client re-registers whenever its `routing_ids` set changes: when it joins or leaves a context and when a pseudonym rotates (`09-security-model.md` §9.10.4.1). When the new registration's `routing_ids` also equal the stored registration's, the relay changes only the stored `timestamp`, and the relay sends the same response it sends for a replacement.
 
-**Relay-side storage:** Push registrations are stored in the relay's local state (not in the protocol's encrypted state). The relay operator can see which identities have registered for push and their platform tokens — this is an accepted tradeoff, equivalent to any push notification service. The push token itself does not reveal which contexts the identity participates in beyond the routing IDs it subscribes to (which the relay already knows from SUBSCRIBE operations).
+**Token refresh:** When the platform issues a new push token (e.g., APNs token rotation), the new token makes a new registration key (step 4). The client sends a `PushDeregistration` for the old token and then a `PushRegistration` for the new token. The 3-failure rule below also removes an old token the client never deregistered.
+
+**PushDeregistration message.** `22-human-readable-addressing.md` §22.11.4 defines the `PushDeregistration` fields and their wire types, and the `PushDeregistration` table of `09-security-model.md` §9.5.2 lists the fields of its signature preimage in order. The registrant signs the preimage with the key its key state lists `Current` in the `#active` role, and the relay verifies it as step 3 verifies a registration.
+
+The client sends a `PushDeregistration` to explicitly remove its push registration. The relay deletes the stored registration whose registration key is the message's (identity identifier, platform, token), and leaves the identity's other registrations in place. Implicit deregistration occurs when the relay observes push delivery failures (invalid token responses from APNs/FCM) — the relay MUST remove registrations after 3 consecutive delivery failures for the same token.
+
+**Relay-side storage:** Push registrations are stored in the relay's local state (not in the protocol's encrypted state). The relay operator can see which identities have registered for push and their platform tokens — this is an accepted tradeoff, equivalent to any push notification service. A relay that holds a push registration learns the registering identity's identifier, the device's platform token, and every routing ID the registration lists, and it can bind each of those routing IDs to that identity. SUBSCRIBE never gave the relay that binding, because the relay authenticates no subscriber. A registration that lists a device's pseudonym routing ID therefore tells the relay which identity stands behind that pseudonym on that relay. `09-security-model.md` §9.10.4 lists this linkage among the residuals of per-context pseudonyms.
 
 ## 10.8 Multi-Device
 

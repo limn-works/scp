@@ -6,3 +6,6 @@ bindings/
 node_modules/
 .github/
 scripts/
+# The CI fetch step's script, which the Dockerfile's builder stage runs to download every
+# crate once before it compiles offline.
+!.github/actions/cargo-fetch/fetch.sh

@@ -4,62 +4,64 @@
  * Demonstrates creating a new SCP identity using did:dht,
  * inspecting the resulting DID document, and resolving it.
  *
+ * The TypeScript SDK's `CustodyType` carries the two custody requests of spec
+ * `03-identity.md` §3.2.2, `"encrypted_file"` and `"os_keystore"`. For
+ * `"os_keystore"` a caller passes its own `KeyCustodyProvider`, such as one
+ * backed by an HSM or the operating system's key store, to
+ * `identityCreateWithCustody`.
+ *
  * Prerequisites:
  *   bun add @limn-works/scp-ts
  *
  * Usage:
- *   bun run identity.ts
+ *   import { identityExample } from "./identity";
+ *   await identityExample(myCustodyProvider, process.env.SCP_STORAGE_PASSPHRASE);
  */
 
-import { Identity } from "@limn-works/scp-ts";
+import { type KeyCustodyProvider, SCP } from "@limn-works/scp-ts";
 
-async function main(): Promise<void> {
-  // 1. Create a new identity with in-memory key custody.
-  const alice = await Identity.create({ custody: "in_memory" });
-
-  console.log(`DID: ${alice.did}`);
-  console.log(`Custody type: ${alice.custodyType}`);
-  console.log();
-
-  // 2. Resolve the DID to its document.
-  //    This queries the DHT and returns a DIDDocument.
-  const doc = await Identity.resolve(alice.did);
-
-  console.log("DID Document:");
-  console.log(`  ID: ${doc.id}`);
-  console.log(`  Verification methods: ${doc.verificationMethods.length}`);
-  for (const vm of doc.verificationMethods) {
-    console.log(`    - ${vm.id} (type: ${vm.type})`);
-  }
-  console.log(`  Service endpoints: ${doc.serviceEndpoints.length}`);
-  console.log();
-
-  // 3. Create an identity with an agent signing key (ADR-039).
-  //    Agent keys enable human+agent shared DID patterns.
-  const agentIdentity = await Identity.createWithAgentKey({
-    custody: "in_memory",
+export async function identityExample(
+  provider: KeyCustodyProvider,
+  storagePassphrase: string,
+): Promise<void> {
+  const scp = new SCP({
+    storage: { type: "sqlite", path: "./scp-identity-example", passphrase: storagePassphrase },
   });
-  console.log(`Agent identity DID: ${agentIdentity.did}`);
-  console.log();
+  try {
+    // 1. Create a new identity whose keys the caller's provider holds.
+    const alice = await scp.identityCreateWithCustody(provider);
 
-  // 4. Add an agent key to an existing identity.
-  const withAgent = await alice.addAgentKey();
-  console.log(`Added agent key to: ${withAgent.did}`);
+    console.log(`DID: ${alice.did}`);
+    console.log(`Custody type: ${alice.custodyType}`);
+    console.log();
 
-  // 5. Rotate the agent key.
-  const rotated = await withAgent.rotateAgentKey();
-  console.log(`Rotated agent key for: ${rotated.did}`);
+    // 2. Resolve the DID to its document.
+    //    This queries the DHT and returns a DIDDocument.
+    const doc = await scp.identityResolve(alice.did);
 
-  // 6. Remove the agent key.
-  const cleaned = await rotated.removeAgentKey();
-  console.log(`Removed agent key from: ${cleaned.did}`);
+    console.log("DID Document:");
+    console.log(JSON.stringify(doc, null, 2));
+    console.log();
 
-  // 7. Rotate the active signing key (Layer 1 rotation).
-  const rotatedKey = await alice.rotateKey();
-  console.log(`Rotated signing key: ${rotatedKey.did}`);
+    // 3. Add an agent key to the identity.
+    const withAgent = await scp.identityAddAgentKey(alice);
+    console.log(`Added agent key to: ${withAgent.did}`);
 
-  console.log();
-  console.log("Identity operations complete.");
+    // 4. Rotate the agent key.
+    const rotated = await scp.identityRotateAgentKey(withAgent);
+    console.log(`Rotated agent key for: ${rotated.did}`);
+
+    // 5. Remove the agent key.
+    const cleaned = await scp.identityRemoveAgentKey(rotated);
+    console.log(`Removed agent key from: ${cleaned.did}`);
+
+    // 7. Rotate the active signing key (Layer 1 rotation).
+    const rotatedKey = await scp.identityRotateKey(cleaned);
+    console.log(`Rotated signing key: ${rotatedKey.did}`);
+
+    console.log();
+    console.log("Identity operations complete.");
+  } finally {
+    await scp.shutdown();
+  }
 }
-
-main().catch(console.error);

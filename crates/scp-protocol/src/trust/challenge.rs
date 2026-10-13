@@ -1706,10 +1706,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // suite_digest and the request preimage (spec 07 §7.3.4, Vector 58)
+    // suite_digest and the request preimage (spec 07 §7.3.4, Vector 59)
     // -----------------------------------------------------------------------
 
-    fn vector_58_case() -> TestCase {
+    fn vector_59_case() -> TestCase {
         TestCase {
             test_id: "schema-validation-001".to_owned(),
             input: json!({"name": "widget", "count": 3}),
@@ -1722,16 +1722,16 @@ mod tests {
     }
 
     #[test]
-    fn suite_digest_matches_vector_58() {
+    fn suite_digest_matches_vector_59() {
         assert_eq!(
-            hex::encode(challenge_suite_digest(&[vector_58_case()]).unwrap()),
+            hex::encode(challenge_suite_digest(&[vector_59_case()]).unwrap()),
             "728fca93ec869b96f4f784cb46ad1b2aa68a4a39d7c4b60b66707586914fdcfc"
         );
     }
 
     #[test]
     fn suite_digest_changes_with_each_test_case_field() {
-        let base = vec![vector_58_case(), case("second", "other", 0)];
+        let base = vec![vector_59_case(), case("second", "other", 0)];
         let digest = challenge_suite_digest(&base).unwrap();
         let mutations: [CaseMutation; 6] = [
             ("test_id", |c| c[0].test_id.push('x')),
@@ -1759,8 +1759,8 @@ mod tests {
 
     #[test]
     fn suite_digest_equal_for_equal_cases_with_reordered_json_keys() {
-        let a = vector_58_case();
-        let mut b = vector_58_case();
+        let a = vector_59_case();
+        let mut b = vector_59_case();
         b.input = serde_json::from_str(r#"{"count": 3, "name": "widget"}"#).unwrap();
         b.expected = ExpectedOutput::SchemaMatch {
             schema: serde_json::from_str(r#"{"required": ["name", "count"], "type": "object"}"#)

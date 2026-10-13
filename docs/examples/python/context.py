@@ -1,87 +1,98 @@
-"""Context creation and lifecycle management.
+"""Context creation and the invite-and-join handshake.
 
 Demonstrates creating an SCP context with governance parameters,
-inspecting its state, joining/leaving, and managing membership.
+inviting a second identity, and joining from the sealed invitation.
+
+The creator and the joiner each run their own ``SCP`` instance with its
+own database, as two devices would. Both instances read the same key file,
+because this script runs both in one process.
 
 Prerequisites:
     pip install scp-sdk
     # or: maturin develop --release (from bindings/python/)
+    export SCP_KEY_PASSPHRASE=...      # seals $HOME/.scp/keys.bin
+    export SCP_STORAGE_PASSPHRASE=...  # encrypts each SQLCipher database
 
 Usage:
     python context.py
 """
 
 import asyncio
+import os
+from pathlib import Path
 
-from scp_sdk import (
-    Capability,
-    Context,
-    ContextMode,
-    CustodyType,
-    Identity,
-    MemoryScope,
-)
+from scp_sdk import SCP, Capability, CustodyType, MemoryScope, StorageConfig
+
+
+def node_storage(name: str) -> StorageConfig:
+    """Return SQLCipher storage at ``$HOME/.scp/<name>``.
+
+    ``SCP_STORAGE_PASSPHRASE`` derives the database key. An unset variable
+    raises ``KeyError`` here, before any database opens.
+    """
+    path = Path.home() / ".scp" / name
+    path.mkdir(parents=True, exist_ok=True)
+    return {
+        "type": "sqlite",
+        "path": str(path),
+        "passphrase": os.environ["SCP_STORAGE_PASSPHRASE"],
+    }
 
 
 async def main() -> None:
-    # 1. Create the identity that will own the context.
-    alice = await Identity.create(custody=CustodyType.IN_MEMORY)
-    print(f"Alice DID: {alice.did}")
+    async with (
+        SCP(storage=node_storage("context-example-alice")) as alice_node,
+        SCP(storage=node_storage("context-example-bob")) as bob_node,
+    ):
+        # 1. Each side creates its identity in its own node.
+        alice = await alice_node.identity_create(CustodyType.ENCRYPTED_FILE)
+        bob = await bob_node.identity_create(CustodyType.ENCRYPTED_FILE)
+        print(f"Alice DID: {alice.did}")
+        print(f"Bob DID:   {bob.did}")
 
-    # 2. Create a context with messaging capabilities.
-    #    The context uses async-with for automatic cleanup on exit.
-    async with await Context.create(
-        creator=alice,
-        ceiling=[
-            Capability.MESSAGES_READ,
-            Capability.MESSAGES_WRITE,
-            Capability.MEMBER_INVITE,
-            Capability.MEMBER_REMOVE,
-            Capability.TOOL_REGISTER,
-            Capability.TOOL_INVOKE_ALL,
-        ],
-        mode=ContextMode.ENCRYPTED,
-        memory_scope=MemoryScope.FULL,
-        governance="single_admin",
-    ) as ctx:
+        # 2. Alice creates a single-admin context. The ceiling caps what any
+        #    member can hold. Inviting runs through the governance gate, so
+        #    the ceiling must carry governance:propose.
+        ctx = await alice_node.context_create(
+            alice.did,
+            {
+                "ceiling": [
+                    Capability.MESSAGES_READ.value,
+                    Capability.MESSAGES_WRITE.value,
+                    Capability.MEMBER_INVITE.value,
+                    Capability.MEMBER_REMOVE.value,
+                    Capability.GOVERNANCE_PROPOSE.value,
+                ],
+                "memory_scope": MemoryScope.EPHEMERAL.value,
+                "governance": "single_admin",
+            },
+        )
         print()
         print(f"Context created: {ctx.context_id}")
         print(f"  State: {ctx.state}")
 
-        # 3. Check membership -- the creator is automatically a member.
-        members = await ctx.member_dids()
-        print(f"  Members: {members}")
+        # 3. Bob reserves a single-use KeyPackage and hands Alice its public
+        #    bytes out of band.
+        reservation_id, key_package = await bob_node.reserve_key_package(bob.did)
 
-        count = await ctx.member_count()
-        print(f"  Member count: {count}")
+        # 4. Alice seals an invitation to that KeyPackage. An empty relay list
+        #    means Alice delivers the sealed bundle to Bob herself.
+        outcome = await alice_node.invite_member(
+            ctx.context_id,
+            alice.did,
+            bob.did,
+            key_package,
+            [],
+        )
+        print(f"  Invitation sealed for {bob.did}")
 
-        is_alice = await ctx.is_member(alice.did)
-        print(f"  Alice is member: {is_alice}")
-
-        role = await ctx.member_role(alice.did)
-        print(f"  Alice role: {role}")
-
-        # 4. Send a message to the context.
-        await ctx.send("Hello, context!", identity=alice)
-        print("  Message sent successfully.")
-
-        # 5. Bob joins the context.
-        bob = await Identity.create(custody=CustodyType.IN_MEMORY)
-        membership = await ctx.join(bob)
+        # 5. Bob opens the sealed bundle and joins.
+        joined = await bob_node.context_join_from_welcome(
+            bob.did, outcome.bundle, reservation_id
+        )
         print()
-        print(f"Bob joined: {membership.did} as {membership.role}")
+        print(f"Bob joined context: {joined.context_id}")
 
-        members = await ctx.member_dids()
-        print(f"  Members after join: {members}")
-
-        # 6. Bob leaves the context.
-        await ctx.leave(bob)
-        print("Bob left the context.")
-
-        members = await ctx.member_dids()
-        print(f"  Remaining members: {members}")
-
-    # Context is automatically cleaned up after exiting async-with.
     print()
     print("Context lifecycle complete.")
 

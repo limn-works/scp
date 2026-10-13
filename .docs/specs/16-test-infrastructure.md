@@ -1244,18 +1244,21 @@ macro_rules! push_conformance {
             async fn handle_notification_returns_fixed_wake() {
                 // Calls check_fixed_wake_signal, a public function of
                 // this module, which asserts the contract below.
-                // The adapter accepts at least one permitted wake payload:
-                // the APNs payload {"aps":{"content-available":1}}
-                // (ADR-025 criterion 4), the FCM payload
-                // {"data": {"scp": "1"}} (ADR-027), or the relay payload
-                // { "scp": 1 } (§10.7.1 step 5). It returns a non-empty
-                // WakeSignal for it. Every other payload the adapter
-                // accepts (another permitted payload, a permitted payload
-                // with trailing whitespace, or a payload carrying a context
-                // ID or sender) yields a byte-identical WakeSignal; the
-                // adapter may reject any of them instead. A signal that
-                // varied with the payload would hand the caller whatever
-                // a relay put in it, which §10.7 forbids.
+                // The permitted wake payloads are the payloads the device
+                // receives from the bodies of the wake-signal table of
+                // §10.7.1 step 5: the APNs body, and the FCM row's data
+                // map as a JSON object. The adapter accepts at least one
+                // of them and returns a non-empty WakeSignal for it. The
+                // check also sends the permitted payloads with trailing
+                // whitespace, and payloads carrying a context ID, a
+                // sender, an extra APNs key, or a non-string scp value.
+                // Every payload the adapter accepts passes the device
+                // receipt rule of §10.7.1 step 5 for APNs or for FCM,
+                // applied to the payload parsed as JSON, and yields a
+                // WakeSignal byte-identical to the first one; the adapter
+                // may reject any payload but its own permitted one. A
+                // signal that varied with the payload would hand the
+                // caller whatever a relay put in it, which §10.7 forbids.
             }
         }
     };

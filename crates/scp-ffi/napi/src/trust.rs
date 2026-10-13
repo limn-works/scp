@@ -175,12 +175,20 @@ pub(crate) fn trust_query_score_on(
 
 /// Per-bridge-instance implementation of `trust_verify_attestation`.
 ///
-/// Pure verification — the bridge instance is unused but accepted for API
-/// symmetry with the other `_on` helpers in this module.
+/// Verifies one attestation's signature, evidence, expiry, and its own
+/// revocation status, and checks this instance's revocation list for
+/// `context_id`. A rejection returns `valid: false` with the reason; a
+/// revocation list that cannot be read is an error (`VALID_7052`), never a
+/// verdict.
 pub(crate) fn trust_verify_attestation_on(
-    _bi: &NapiBridgeInstance,
+    bi: &NapiBridgeInstance,
+    context_id: String,
     attestation_json: String,
 ) -> napi::Result<NapiAttestationVerificationResult> {
+    use scp_ffi_common::trust_store::AttestationVerdict;
+
+    scp_ffi_common::validate::validate_context_id(&context_id)
+        .map_err(|e| coded_validation_error(&e.message, codes::VALID_7011))?;
     // VALID_7012 matches the UniFFI bridge's code for malformed attestation
     // JSON so the same logical failure carries the same code on every bridge.
     let attestation: scp_core::trust::Attestation = serde_json::from_str(&attestation_json)
@@ -191,21 +199,47 @@ pub(crate) fn trust_verify_attestation_on(
             )
         })?;
 
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_clock::SystemClock;
+    let verdict = match crate::runtime::protocol_repository(bi) {
+        crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+            run_verify_attestation(repo, &context_id, &attestation)
+        }
+        crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+            run_verify_attestation(repo, &context_id, &attestation)
+        }
+    }
+    .map_err(|e| coded_validation_error(&e.to_string(), codes::VALID_7052))?;
 
-    match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
-        Ok(()) => Ok(NapiAttestationVerificationResult {
+    Ok(match verdict {
+        AttestationVerdict::Valid => NapiAttestationVerificationResult {
             valid: true,
             chain_depth: 1,
             error_message: String::new(),
-        }),
-        Err(e) => Ok(NapiAttestationVerificationResult {
+        },
+        AttestationVerdict::Rejected(reason) => NapiAttestationVerificationResult {
             valid: false,
             chain_depth: 0,
-            error_message: format!("{e}"),
-        }),
-    }
+            error_message: reason.to_string(),
+        },
+    })
+}
+
+/// Verifies one attestation against the revocation list in the concrete
+/// backend behind a `ProtocolRepoVariant` arm, with the production DID-key
+/// resolver and clock.
+fn run_verify_attestation<S: scp_platform::traits::Storage + 'static>(
+    repo: &Arc<scp_core::store::ProtocolRepository<S>>,
+    context_id: &str,
+    attestation: &scp_core::trust::Attestation,
+) -> Result<scp_ffi_common::trust_store::AttestationVerdict, scp_core::trust::TrustError> {
+    let handle = crate::runtime().handle().clone();
+    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
+    scp_ffi_common::trust_store::verify_attestation_in_context(
+        &bridge,
+        context_id,
+        attestation,
+        &scp_core::trust::IdentityDidPublicKeyResolver,
+        &scp_clock::SystemClock,
+    )
 }
 
 /// Maps a shared challenge-operation failure to its bridge error:
@@ -955,7 +989,7 @@ mod tests {
             let inner = &who.inner;
             let identity = inner.scp_identity.as_ref().unwrap();
             let doc_json = inner.document.as_ref().unwrap().to_json().unwrap();
-            let custody = inner.in_memory_custody.as_ref().unwrap();
+            let custody = inner.custody.as_ref().unwrap();
             let public_key = scp_identity::extract_public_key(&identity.did).unwrap();
             let signable = scp_dht::bep44_signable(doc_json.as_bytes(), 1);
             let signature: [u8; 64] = custody
@@ -1015,7 +1049,7 @@ mod tests {
             let v = identity(&scp).await;
             let identity = v.inner.scp_identity.as_ref().unwrap();
             v.inner
-                .in_memory_custody
+                .custody
                 .as_ref()
                 .unwrap()
                 .destroy_key(&identity.active_signing_key)
@@ -1073,7 +1107,7 @@ mod tests {
             let bytes = scp_core::trust::canonical_challenge_response_bytes(&response).unwrap();
             response.signature = s
                 .inner
-                .in_memory_custody
+                .custody
                 .as_ref()
                 .unwrap()
                 .sign(&s_id.active_signing_key, &bytes)
@@ -1210,7 +1244,7 @@ mod tests {
                 completed_at: timestamp,
             };
             let digest = scp_core::trust::challenge_verification_signing_digest(&record).unwrap();
-            let custody = verifier.inner.in_memory_custody.as_ref().unwrap();
+            let custody = verifier.inner.custody.as_ref().unwrap();
             record.verifier_signature = match signer {
                 CvSigner::Active => custody
                     .sign(&v_id.active_signing_key, &digest)
@@ -1314,7 +1348,7 @@ mod tests {
     #[test]
     fn trust_verify_attestation_rejects_invalid_json() {
         let bi = test_bi();
-        let result = trust_verify_attestation_on(&bi, "not json".to_owned());
+        let result = trust_verify_attestation_on(&bi, "ctx-1".to_owned(), "not json".to_owned());
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(

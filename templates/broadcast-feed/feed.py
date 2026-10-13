@@ -2,137 +2,142 @@
 
 Creates a broadcast context (spec section 5.14) with single-admin governance
 and demonstrates the publisher side of the broadcast pattern: creating the
-feed, publishing content, handling subscriber registrations, and managing
-subscribers (approve, block, unblock, remove).
+feed, publishing content, registering a subscriber, sealing the author's
+broadcast key to that subscriber, and managing the subscriber (block,
+unblock).
 
 Broadcast contexts use per-author AES-256-GCM broadcast keys instead of MLS
 group encryption, enabling unlimited subscriber scale. Authors publish
-encrypted content; subscribers pull author keys and decrypt locally.
+encrypted content; subscribers obtain author keys and decrypt locally.
+
+Key requests have no network path yet, so the subscriber hands its DID and
+wrapping key to the publisher out of band, and the publisher prints the
+sealed key for the subscriber to paste back.
 
 Usage:
     pip install -e ../../bindings/python
-    python feed.py
+    export SCP_KEY_PASSPHRASE=...      # seals $HOME/.scp/keys.bin
+    export SCP_STORAGE_PASSPHRASE=...  # encrypts the SQLCipher database
+    export SCP_RELAY_URL=wss://...     # the relay the feed publishes to
 
-    # In another terminal, pass the printed context ID to the subscriber:
-    python subscriber.py <context_id>
+    # Start the subscriber first; it prints its DID and wrapping key:
+    python subscriber.py
+
+    # Then pass both to the publisher:
+    python feed.py --subscriber <did> --wrapping-key <hex>
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-import json
-import sys
+import os
+from pathlib import Path
 
 from scp_sdk import (
+    SCP,
     Capability,
     Context,
+    CustodyType,
     Identity,
-    connect_relay,
-    execute_governance_action,
-    propose_governance_action,
+    MemoryScope,
+    StorageConfig,
 )
-from scp_sdk.types import ContextMode, MemberRole
 
 
-RELAY_URL = "wss://relay.example.com"
+def node_storage(name: str) -> StorageConfig:
+    """Return SQLCipher storage at ``$HOME/.scp/<name>``.
+
+    ``SCP_STORAGE_PASSPHRASE`` derives the database key. An unset variable
+    raises ``KeyError`` here, before any database opens.
+    """
+    path = Path.home() / ".scp" / name
+    path.mkdir(parents=True, exist_ok=True)
+    return {
+        "type": "sqlite",
+        "path": str(path),
+        "passphrase": os.environ["SCP_STORAGE_PASSPHRASE"],
+    }
 
 
-async def create_publisher() -> Identity:
-    """Create a publisher identity with in-memory custody."""
-    identity = await Identity.create(custody="in_memory")
-    print(f"Publisher DID: {identity.did}")
-    return identity
-
-
-async def create_broadcast_feed(publisher: Identity) -> Context:
+async def create_broadcast_feed(node: SCP, publisher: Identity) -> Context:
     """Create an open broadcast context with single-admin governance.
 
     The publisher is the context creator and sole author. The ceiling
-    includes messagesRead (subscribers), messagesWrite (authors),
-    roleAssign (for promoting subscribers to authors), and memberInvite
+    includes messages:read (subscribers), messages:write (authors),
+    role:assign (for promoting subscribers to authors), and member:invite
     (for gated admission workflows).
 
-    Uses the public-broadcast template semantics: subscribers auto-register
-    via DID-authenticated requests.
+    Uses the public-broadcast template semantics: subscribers register
+    by DID, with no admin-issued UCAN.
     """
-    ctx = await Context.create(
-        creator=publisher,
-        ceiling=[
-            Capability.MESSAGES_READ,
-            Capability.MESSAGES_WRITE,
-            Capability.ROLE_ASSIGN,
-            Capability.MEMBER_INVITE,
-            Capability.MEMBER_REMOVE,
-            Capability.CONTEXT_CLOSE,
-        ],
-        governance="single_admin",
-        mode=ContextMode.BROADCAST,
-        memory_scope="full",
-        template_id="scp:template/public-broadcast",
+    ctx = await node.context_create(
+        publisher.did,
+        {
+            "ceiling": [
+                Capability.MESSAGES_READ.value,
+                Capability.MESSAGES_WRITE.value,
+                Capability.ROLE_ASSIGN.value,
+                Capability.MEMBER_INVITE.value,
+                Capability.MEMBER_REMOVE.value,
+                Capability.CONTEXT_CLOSE.value,
+            ],
+            "governance": "single_admin",
+            "mode": "broadcast",
+            "memory_scope": MemoryScope.FULL.value,
+            "template_id": "PublicBroadcast",
+        },
     )
     print(f"Broadcast feed created: {ctx.context_id}")
-    print(f"  Mode: broadcast (per-author AES-256-GCM keys)")
-    print(f"  Governance: single_admin")
+    print("  Mode: broadcast (per-author AES-256-GCM keys)")
+    print("  Governance: single_admin")
     print(f"  State: {ctx.state}")
     return ctx
 
 
-async def publish_content(ctx: Context, publisher: Identity, content: str) -> None:
+async def publish_content(
+    node: SCP, ctx: Context, publisher: Identity, content: str
+) -> None:
     """Publish a broadcast message to the feed.
 
     The payload is encrypted with the publisher's broadcast key. Subscribers
     who hold the key can decrypt it locally.
     """
-    payload = content.encode("utf-8")
-    await ctx.broadcast_publish(payload, identity=publisher)
+    await node.broadcast_publish(ctx, publisher.did, content.encode("utf-8"))
     print(f"  Published: {content!r}")
 
 
-async def handle_subscriber_registration(
+async def seal_key_for(
+    node: SCP,
     ctx: Context,
     publisher: Identity,
     subscriber_did: str,
-) -> None:
-    """Register a subscriber and handle their broadcast key request.
+    wrapping_key: bytes,
+) -> str | None:
+    """Seal the publisher's current broadcast key to a subscriber.
+
+    Returns the sealed key JSON on grant, or ``None`` when the publisher
+    denies the request: a denied requester receives no key material
+    (spec section 5.14.8).
+    """
+    return await node.broadcast_handle_key_request(
+        ctx, publisher.did, subscriber_did, wrapping_key
+    )
+
+
+async def register_subscriber(node: SCP, ctx: Context, subscriber_did: str) -> None:
+    """Register a subscriber on the feed.
 
     In open broadcast contexts, subscriber registration is DID-authenticated
-    (no admin-issued UCAN needed). The publisher processes the registration
-    and responds with the current broadcast key via the pull-based key
-    distribution protocol (spec section 5.14.3).
+    (no admin-issued UCAN needed).
     """
-    await ctx.broadcast_subscribe(subscriber_did)
-    print(f"  Subscriber registered: {subscriber_did}")
-
-    # Handle the key request -- the subscriber needs the author's current
-    # broadcast key to decrypt published content.
-    result = await ctx.broadcast_handle_key_request(
-        author_did=publisher.did,
-        requester_did=subscriber_did,
-    )
-    print(f"  Key request handled: {result}")
-
-
-async def manage_subscribers(ctx: Context, publisher: Identity) -> None:
-    """Demonstrate subscriber management operations.
-
-    Shows how to check subscriber status, block/unblock subscribers,
-    and remove subscribers from the feed.
-    """
-    # Query subscriber count.
-    count = await ctx.broadcast_subscriber_count()
-    print(f"\n  Subscriber count: {count}")
-
-    # Query admission policy.
-    admission = await ctx.broadcast_admission()
-    print(f"  Admission policy: {admission}")
-
-    # Check if a specific DID is subscribed.
-    test_did = "did:dht:z6MkTestSubscriber"
-    is_sub = await ctx.broadcast_is_subscriber(test_did)
-    print(f"  Is {test_did} subscribed? {is_sub}")
+    await node.broadcast_subscribe(ctx, subscriber_did)
+    is_sub = await node.broadcast_is_subscriber(ctx, subscriber_did)
+    print(f"  Subscriber registered: {subscriber_did} (active: {is_sub})")
 
 
 async def block_subscriber(
+    node: SCP,
     ctx: Context,
     publisher: Identity,
     subscriber_did: str,
@@ -147,14 +152,12 @@ async def block_subscriber(
     access key layer (ADR-038). Authors rotate their broadcast key on block
     events, and the blocked subscriber is excluded from future key requests.
     """
-    await ctx.broadcast_block_subscriber(
-        subscriber_did=subscriber_did,
-        blocker_did=publisher.did,
-    )
+    await node.broadcast_block_subscriber(ctx, subscriber_did, publisher.did)
     print(f"  Blocked subscriber: {subscriber_did}")
 
 
 async def unblock_subscriber(
+    node: SCP,
     ctx: Context,
     publisher: Identity,
     subscriber_did: str,
@@ -165,97 +168,86 @@ async def unblock_subscriber(
     can request the current key on next pull but cannot decrypt content from
     the block period.
     """
-    await ctx.broadcast_unblock_subscriber(
-        subscriber_did=subscriber_did,
-        unblocker_did=publisher.did,
-    )
+    await node.broadcast_unblock_subscriber(ctx, subscriber_did, publisher.did)
     print(f"  Unblocked subscriber: {subscriber_did}")
 
 
-async def remove_subscriber(ctx: Context, subscriber_did: str) -> None:
-    """Remove a subscriber from the feed entirely.
-
-    Unsubscribes the DID and rotates all author broadcast keys to prevent
-    the removed subscriber from decrypting future content.
-    """
-    await ctx.broadcast_unsubscribe(subscriber_did, rotate_keys=True)
-    print(f"  Removed subscriber (keys rotated): {subscriber_did}")
-
-
-async def add_author(
-    ctx: Context,
-    publisher: Identity,
-    new_author_did: str,
-) -> None:
-    """Promote a subscriber to author role via governance.
-
-    Authors hold messagesWrite and can publish their own broadcast-key-
-    encrypted content. Each author maintains an independent broadcast key
-    with its own epoch counter (spec section 5.14.2).
-    """
-    action = json.dumps(
-        {
-            "action": {
-                "RoleChange": {
-                    "target_did": new_author_did,
-                    "new_role": "author",
-                }
-            }
-        }
-    )
-    result = await propose_governance_action(ctx, action, identity_did=publisher.did)
-    print(f"  Promoted to author: {new_author_did} -> {result}")
-
-
-async def run_publisher() -> None:
+async def run_publisher(subscriber_did: str | None, wrapping_key: bytes | None) -> None:
     """Run the full publisher lifecycle."""
-    # 1. Create publisher identity.
-    publisher = await create_publisher()
+    relay_url = os.environ["SCP_RELAY_URL"]
 
-    # 2. Connect to relay.
-    transport = await connect_relay(RELAY_URL)
-    print(f"Connected to relay: {RELAY_URL}")
+    async with SCP(storage=node_storage("broadcast-feed-publisher")) as node:
+        # 1. Create the publisher identity.
+        publisher = await node.identity_create(CustodyType.ENCRYPTED_FILE)
+        print(f"Publisher DID: {publisher.did}")
 
-    # 3. Create broadcast feed.
-    feed = await create_broadcast_feed(publisher)
-    context_id = feed.context_id
+        # 2. Attach the relay transport before creating the feed: the context
+        #    supervisor starts on the first context and binds the transport it
+        #    finds then.
+        await node.configure_relay_transport(relay_url, publisher.did)
+        print(f"Relay transport: {relay_url}")
 
-    # Print context ID for subscribers to use.
-    print(f"\n--- Share this context ID with subscribers ---")
-    print(f"  {context_id}")
-    print(f"--- ---\n")
+        # 3. Create the broadcast feed.
+        feed = await create_broadcast_feed(node, publisher)
 
-    async with feed:
         # 4. Publish initial content.
-        print("Publishing content:")
-        await publish_content(feed, publisher, "Welcome to the broadcast feed!")
-        await publish_content(feed, publisher, "This is post #2.")
+        print("\nPublishing content:")
+        await publish_content(node, feed, publisher, "Welcome to the broadcast feed!")
+        await publish_content(node, feed, publisher, "This is post #2.")
+
+        # 5. Report the feed's admission policy and subscriber count.
+        print(f"\n  Admission policy: {await node.broadcast_admission(feed)}")
+        print(f"  Subscriber count: {await node.broadcast_subscriber_count(feed)}")
+
+        if subscriber_did is not None and wrapping_key is not None:
+            # 6. Register the subscriber, then show that a blocked subscriber
+            #    is denied a key and an unblocked one is granted the current
+            #    key again.
+            print(f"\nSubscriber lifecycle ({subscriber_did}):")
+            await register_subscriber(node, feed, subscriber_did)
+            await block_subscriber(node, feed, publisher, subscriber_did)
+            denied = await seal_key_for(
+                node, feed, publisher, subscriber_did, wrapping_key
+            )
+            print(f"  Key request while blocked granted: {denied is not None}")
+            await unblock_subscriber(node, feed, publisher, subscriber_did)
+
+            # 7. Seal the current key for the subscriber to paste back.
+            sealed = await seal_key_for(
+                node, feed, publisher, subscriber_did, wrapping_key
+            )
+            if sealed is None:
+                raise RuntimeError(
+                    f"publisher denied the key request from {subscriber_did}"
+                )
+            print("\n--- Paste this sealed key into the subscriber ---")
+            print(sealed)
+            print("--- ---")
+
+        # 8. Keep publishing (in production, this runs indefinitely).
+        print()
         await publish_content(
-            feed, publisher, "Breaking: SCP broadcast contexts are live."
+            node, feed, publisher, "Breaking: SCP broadcast contexts are live."
         )
 
-        # 5. Demonstrate subscriber management.
-        print("\nSubscriber management:")
-        await manage_subscribers(feed, publisher)
-
-        # 6. Simulate subscriber lifecycle (block/unblock/remove).
-        # In production, subscriber_did comes from actual registration events.
-        demo_subscriber = "did:dht:z6MkDemoSubscriber"
-        print(f"\nSubscriber lifecycle demo ({demo_subscriber}):")
-        await handle_subscriber_registration(feed, publisher, demo_subscriber)
-        await block_subscriber(feed, publisher, demo_subscriber)
-        await unblock_subscriber(feed, publisher, demo_subscriber)
-        await remove_subscriber(feed, demo_subscriber)
-
-        # 7. Keep publishing (in production, this runs indefinitely).
-        await publish_content(feed, publisher, "Final broadcast before shutdown.")
-
-    print("\nFeed closed.")
+    print("\nPublisher stopped.")
 
 
 def main() -> None:
     """Entry point for the broadcast feed publisher."""
-    asyncio.run(run_publisher())
+    parser = argparse.ArgumentParser(description="SCP broadcast feed publisher")
+    parser.add_argument("--subscriber", help="DID the subscriber printed")
+    parser.add_argument(
+        "--wrapping-key",
+        help="hex wrapping key the subscriber printed (65-byte uncompressed P-256 point)",
+    )
+    args = parser.parse_args()
+    if (args.subscriber is None) != (args.wrapping_key is None):
+        parser.error("--subscriber and --wrapping-key go together")
+    wrapping_key = (
+        None if args.wrapping_key is None else bytes.fromhex(args.wrapping_key)
+    )
+    asyncio.run(run_publisher(args.subscriber, wrapping_key))
 
 
 if __name__ == "__main__":

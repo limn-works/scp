@@ -50,23 +50,23 @@ class IdentityConformanceTest {
     @Nested
     inner class IdentityCreate {
         @Test
-        fun `identity_create with in_memory custody returns handle`() =
+        fun `identity_create with encrypted_file custody returns handle`() =
             runTest(testDispatcher) {
                 stubBindings.identityCreateResult = 42L
                 val result =
                     dispatcher.dispatch(
                         "identity_create",
-                        mapOf("custody" to "in_memory"),
+                        mapOf("custody" to "encrypted_file"),
                     )
                 assertEquals("42", result["handle"])
-                assertEquals("in_memory", result["custody_type"])
-                assertEquals("in_memory", stubBindings.identityCreateCustody)
+                assertEquals("encrypted_file", result["custody_type"])
+                assertEquals("encrypted_file", stubBindings.identityCreateCustody)
             }
 
         @Test
         fun `identity_create with a custody string CustodyType lacks never reaches the bindings`() =
             runTest(testDispatcher) {
-                for (custody in listOf("platform", "software")) {
+                for (custody in listOf("platform", "software", "in_memory")) {
                     val result =
                         dispatcher.dispatch(
                             "identity_create",
@@ -94,7 +94,7 @@ class IdentityConformanceTest {
                 val result =
                     dispatcher.dispatch(
                         "identity_create",
-                        mapOf("custody" to "in_memory"),
+                        mapOf("custody" to "encrypted_file"),
                     )
                 assertEquals("SCP-IDENT-1008", result["error"])
             }
@@ -175,10 +175,10 @@ class IdentityConformanceTest {
                     ConformanceFixture(
                         testId = "identity-create-001",
                         category = "identity",
-                        description = "Create identity with in-memory custody",
+                        description = "Create identity with encrypted-file custody",
                         operation = "identity_create",
-                        input = mapOf("custody" to "in_memory"),
-                        expected = mapOf("custody_type" to "in_memory"),
+                        input = mapOf("custody" to "encrypted_file"),
+                        expected = mapOf("custody_type" to "encrypted_file"),
                     )
                 val result = dispatcher.dispatch(fixture.operation, fixture.input)
                 val mismatches = compareResults(result, fixture.expected)

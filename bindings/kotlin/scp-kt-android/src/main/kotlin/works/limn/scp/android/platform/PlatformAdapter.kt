@@ -18,11 +18,11 @@ import android.content.Context
  *
  * Created by [AndroidPlatformAdapter.make]. Each provider implements a Kotlin interface in
  * `Types.kt`, and each interface's KDoc states how it differs from the Rust trait and from the
- * UniFFI callback interface in `crates/scp-ffi/uniffi/src/lib.rs`. No code passes this
- * adapter to the Rust engine yet. The UniFFI bridge has no function that accepts a storage,
- * push or device attestation provider, and `SCP.identityCreateWithCustody` in `scp-kt`
- * accepts only the UniFFI-generated `uniffi.scp.KeyCustodyProvider`, which [keyCustody]
- * does not implement.
+ * UniFFI callback interface in `crates/scp-ffi/uniffi/src/lib.rs`. The UniFFI bridge has no
+ * function that accepts a storage, push or device attestation provider, so no code passes those
+ * three to the Rust engine. `SCP.identityCreateWithCustody` in `scp-kt` accepts the
+ * UniFFI-generated `uniffi.scp.KeyCustodyProvider`, which [keyCustody] does not implement;
+ * `UniffiKeyCustody(AndroidKeyCustody(context))` does.
  *
  * @property keyCustody Android Keystore and Bouncy Castle key management (Keystore-held Ed25519
  *   on API 33+ today, reported as [CustodyType.HARDWARE] without a `KeyInfo.securityLevel`
@@ -56,7 +56,8 @@ data class AndroidPlatformAdapterImpl(
  * [AndroidPlatformAdapterImpl] to the Rust engine: the UniFFI bridge has no function that
  * accepts a storage, push or device attestation provider, and `SCP.identityCreateWithCustody`
  * in `scp-kt` takes the UniFFI-generated `uniffi.scp.KeyCustodyProvider`, which the Kotlin
- * [KeyCustodyProvider] in `Types.kt` is not.
+ * [KeyCustodyProvider] in `Types.kt` is not; [UniffiKeyCustody] wraps an [AndroidKeyCustody]
+ * as one.
  *
  * ## Provider construction
  *

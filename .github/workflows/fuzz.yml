@@ -201,6 +201,15 @@ jobs:
           shared-key: fuzz-run
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.target == 'fuzz_outer_envelope' }}
 
+      # Every crate fuzz/Cargo.lock names, downloaded once with retries on the channel the
+      # `cargo fuzz` commands below name; every later cargo command in this job runs with
+      # CARGO_NET_OFFLINE=true. It runs after rust-cache, which hashes every CARGO_*
+      # variable into its key. fetch.sh states why.
+      - uses: ./.github/actions/cargo-fetch
+        with:
+          working-directory: fuzz
+          toolchain: ${{ needs.toolchain.outputs.channel }}
+
       - name: Restore corpus cache
         uses: actions/cache/restore@v4
         with:
@@ -323,6 +332,15 @@ jobs:
           workspaces: "fuzz -> target"
           shared-key: fuzz-run
           save-if: false
+
+      # Every crate fuzz/Cargo.lock names, downloaded once with retries on the channel the
+      # `cargo fuzz` commands below name; every later cargo command in this job runs with
+      # CARGO_NET_OFFLINE=true. It runs after rust-cache, which hashes every CARGO_*
+      # variable into its key. fetch.sh states why.
+      - uses: ./.github/actions/cargo-fetch
+        with:
+          working-directory: fuzz
+          toolchain: ${{ needs.toolchain.outputs.channel }}
 
       - name: Restore corpus cache
         uses: actions/cache/restore@v4

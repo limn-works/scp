@@ -12126,7 +12126,7 @@ impl Supervisor {
     ///
     /// Propagates [`ContextError`] from the handler, including
     /// [`ContextError::Custody`] when the checkpoint sign is refused or times
-    /// out (`SCP-CRYPTO-4061`); [`ContextError::TransportFailed`] if the reply
+    /// out (`SCP-CRYPTO-4062`); [`ContextError::TransportFailed`] if the reply
     /// channel is dropped.
     pub async fn build_local_checkpoint(
         &self,
@@ -25792,7 +25792,7 @@ mod tests {
 
     /// ADR-049 Decision 7a: a custody that never answers fails a signing
     /// handler's turn with a custody failure of kind `TimedOut`
-    /// (`SCP-CRYPTO-4061`), not the handler's `TransportTimeout`. The handler
+    /// (`SCP-CRYPTO-4062`), not the handler's `TransportTimeout`. The handler
     /// budget (`SIGNING_HANDLER_TIMEOUT`) outlasts the sign budget
     /// (`SIGN_TIMEOUT`), so the sign budget always fires first.
     #[cfg(feature = "testing")]
@@ -25888,7 +25888,7 @@ mod tests {
                         ..
                     }))
                 ),
-                "a stalled custody must surface as TimedOut (SCP-CRYPTO-4061), got {result:?}"
+                "a stalled custody must surface as TimedOut (SCP-CRYPTO-4062), got {result:?}"
             );
         });
     }

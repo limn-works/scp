@@ -494,7 +494,7 @@ struct PublishRequest<'a> {
 /// Publishes in one actor turn through
 /// [`publish_broadcast_in_turn`](crate::context::broadcast_helpers::publish_broadcast_in_turn),
 /// under [`SIGNING_HANDLER_TIMEOUT`] so a stalled custody fails with
-/// `SCP-CRYPTO-4061` before the turn budget expires. Reports `mutated` on
+/// `SCP-CRYPTO-4062` before the turn budget expires. Reports `mutated` on
 /// every publish attempt, because a sealed publish consumes the sequence and
 /// a failed one has reserved and rolled it back.
 async fn handle_publish_broadcast(
@@ -3402,7 +3402,7 @@ mod tests {
                         ..
                     })
                 ),
-                "a stalled custody fails with SCP-CRYPTO-4061, got {err:?}"
+                "a stalled custody fails with SCP-CRYPTO-4062, got {err:?}"
             );
             assert!(started.elapsed() >= SIGN_TIMEOUT);
             assert!(started.elapsed() < SIGNING_HANDLER_TIMEOUT);

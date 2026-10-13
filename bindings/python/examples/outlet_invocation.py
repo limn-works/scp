@@ -29,7 +29,7 @@ async def main() -> None:
         await scp.transport_connect(relay.relay_url)
 
         # 2. Create an identity.
-        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
         print(f"Identity DID: {identity.did}")
 
         # 3. Create a context with outlet capabilities.

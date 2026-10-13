@@ -3,8 +3,8 @@ import XCTest
 
 /// The quoted custody strings a bridge custody rejection names after
 /// "this bridge accepts " and before the next ";" (`ACCEPTED_CUSTODY` in
-/// crates/scp-ffi/uniffi/src/bridge.rs), or nil when the message carries no
-/// such clause.
+/// crates/scp-ffi/common/src/custody_request.rs), or nil when the message
+/// carries no such clause.
 private func acceptedCustodyStrings(inRejection message: String) -> [String]? {
     guard let start = message.range(of: "this bridge accepts ") else { return nil }
     let clause = message[start.upperBound...].prefix { $0 != ";" }
@@ -14,10 +14,29 @@ private func acceptedCustodyStrings(inRejection message: String) -> [String]? {
     return quoted.isEmpty ? nil : quoted
 }
 
-/// `CustodyType` carries exactly the custody strings the UniFFI bridge accepts,
-/// and each case reaches a key store through both identity-create methods
-/// (SCP-294; `.docs/standards/construction.md`, consequential choices are
-/// enums).
+/// The error code a bridge call threw, or a description of what it did instead.
+private func errorCode(_ body: () async throws -> Identity) async -> String {
+    do {
+        _ = try await body()
+        return "created an identity"
+    } catch let ScpError.Validation(_, code) {
+        return code
+    } catch let ScpError.Identity(_, code) {
+        return code
+    } catch {
+        return "\(error)"
+    }
+}
+
+/// `CustodyType` carries the custody request vocabulary of spec section 3.2.2,
+/// and each case gets the code that section gives it through both
+/// identity-create methods (`.docs/standards/sdk-common.md` §Custody request;
+/// `.docs/standards/construction.md`, consequential choices are enums).
+///
+/// The tests run against the `testing` XCFramework (`build-xcframework.sh
+/// --dev`), which admits `in_memory` and opens the encrypted key file. Tests
+/// reach `in_memory` through `TestHarnessCustody.swift`, because
+/// `CustodyType` has no case for it.
 final class CustodyTypeTests: XCTestCase {
     // Implicitly unwrapped because XCTest `setUp` initializes it before any
     // test method runs.
@@ -35,24 +54,29 @@ final class CustodyTypeTests: XCTestCase {
         try await super.tearDown()
     }
 
-    /// Reads the accepted set from the bridge's own `SCP-IDENT-1003` rejection
-    /// of "platform". A case the bridge does not accept fails this test, and
-    /// so does a bridge string with no case.
-    func testCasesAreExactlyTheBridgeAcceptedStrings() async throws {
+    /// Reads the accepted set from the bridge's own `SCP-VALID-7005`
+    /// rejection of "platform". `CustodyType`'s cases must be exactly that
+    /// set, in the same order, with no third case (spec section 3.2.2).
+    func testRequestCasesAreExactlyTheBridgeAcceptedStrings() async throws {
         do {
             _ = try await scp.inner.identityCreate(custody: "platform", testingSeed: nil)
             XCTFail("the bridge accepted the custody string \"platform\"")
-        } catch let ScpError.Identity(msg, code) {
-            XCTAssertEqual(code, "SCP-IDENT-1003")
+        } catch let ScpError.Validation(msg, code) {
+            XCTAssertEqual(code, "SCP-VALID-7005")
             let accepted = try XCTUnwrap(acceptedCustodyStrings(inRejection: msg), msg)
             XCTAssertEqual(CustodyType.allCases.map(\.rawValue), accepted)
         }
+        XCTAssertEqual(CustodyType.allCases, [.encryptedFile, .osKeystore])
+        XCTAssertNil(CustodyType(rawValue: harnessInMemoryCustody))
     }
 
     func testAcceptedCustodyStringsParsesEveryQuotedString() {
-        let message = "custody type \"x\" names no key store — this bridge accepts "
-            + "\"in_memory\" or \"file\" only here; inject \"callback\""
-        XCTAssertEqual(acceptedCustodyStrings(inRejection: message), ["in_memory", "file"])
+        let message = "unknown custody type \"x\" — this bridge accepts custody "
+            + "\"encrypted_file\" (a file) or \"os_keystore\" (a store); inject \"callback\""
+        XCTAssertEqual(
+            acceptedCustodyStrings(inRejection: message),
+            ["encrypted_file", "os_keystore"]
+        )
     }
 
     func testAcceptedCustodyStringsIsNilWithoutTheClause() {
@@ -60,21 +84,124 @@ final class CustodyTypeTests: XCTestCase {
         XCTAssertNil(acceptedCustodyStrings(inRejection: "this bridge accepts nothing; done"))
     }
 
-    /// Every case creates an identity through `identityCreate(custody:)`. A
-    /// case the bridge refuses throws here (`SCP-IDENT-1003` for `platform`).
-    func testEveryCaseCreatesAnIdentity() async throws {
-        for custody in CustodyType.allCases {
-            let identity = try await scp.identityCreate(custody: custody)
-            XCTAssertFalse(identity.verifyingKey()?.isEmpty ?? true, "\(custody) holds no key")
+    /// Strings outside the vocabulary, including the retired `platform`,
+    /// `software`, `file` and `callback`, are `SCP-VALID-7005` on both
+    /// entry points.
+    func testStringsOutsideTheVocabularyAreValid7005() async {
+        for custody in ["platform", "software", "file", "callback", "EncryptedFile"] {
+            let create = await errorCode {
+                try await self.scp.inner.identityCreate(custody: custody, testingSeed: nil)
+            }
+            XCTAssertEqual(create, "SCP-VALID-7005", "identityCreate(\(custody))")
+            let agent = await errorCode {
+                try await self.scp.inner.identityCreateWithAgentKey(custody: custody)
+            }
+            XCTAssertEqual(agent, "SCP-VALID-7005", "identityCreateWithAgentKey(\(custody))")
         }
     }
 
-    /// Every case creates an identity through
-    /// `identityCreateWithAgentKey(custody:)`.
-    func testEveryCaseCreatesAnIdentityWithAgentKey() async throws {
-        for custody in CustodyType.allCases {
-            let identity = try await scp.identityCreateWithAgentKey(custody: custody)
-            XCTAssertFalse(identity.verifyingKey()?.isEmpty ?? true, "\(custody) holds no key")
+    /// `osKeystore` needs a `KeyCustodyProvider`, which neither method takes,
+    /// so both answer it with `SCP-IDENT-1003` naming the method that does.
+    func testOsKeystoreWithoutAProviderIsIdent1003() async throws {
+        do {
+            _ = try await scp.identityCreate(custody: .osKeystore)
+            XCTFail("identityCreate(.osKeystore) created an identity with no provider")
+        } catch let ScpError.Identity(msg, code) {
+            XCTAssertEqual(code, "SCP-IDENT-1003")
+            XCTAssertTrue(msg.contains("identity_create_with_custody"), msg)
         }
+        let agent = await errorCode {
+            try await self.scp.identityCreateWithAgentKey(custody: .osKeystore)
+        }
+        XCTAssertEqual(agent, "SCP-IDENT-1003")
+    }
+
+    /// The bridge answers a testing seed with either `CustodyType` case with
+    /// `SCP-VALID-7009`, checked before the custody value is read, which is
+    /// why `SCP.identityCreate(custody:)` sends no seed.
+    func testBridgeSeedWithACustodyTypeCaseIsValid7009() async {
+        let seed = Data(repeating: 7, count: 32)
+        for custody in CustodyType.allCases {
+            let code = await errorCode {
+                try await self.scp.inner.identityCreate(custody: custody.rawValue, testingSeed: seed)
+            }
+            XCTAssertEqual(code, "SCP-VALID-7009", "\(custody)")
+        }
+    }
+
+    /// The harness's raw `in_memory` string creates an identity through both
+    /// bridge methods on the testing build, and the handle reports the
+    /// request value. The same seed yields the same verifying key on two
+    /// instances and a different seed yields another key, so the helper
+    /// passes its seed through to the bridge.
+    func testHarnessInMemoryCreatesAnIdentity() async throws {
+        let identity = try await createInMemoryIdentity(scp)
+        XCTAssertEqual(identity.custodyType(), "in_memory")
+        XCTAssertFalse(identity.verifyingKey()?.isEmpty ?? true)
+        let agent = try await createInMemoryIdentityWithAgentKey(scp)
+        XCTAssertEqual(agent.custodyType(), "in_memory")
+
+        let seed = Data(repeating: 9, count: 32)
+        let first = try await createInMemoryIdentity(scp, seed: seed)
+        let other = try SCP(storage: .inMemory)
+        let second = try await createInMemoryIdentity(other, seed: seed)
+        let otherSeed = try await createInMemoryIdentity(other, seed: Data(repeating: 10, count: 32))
+        try await other.shutdown(timeoutMillis: 1000)
+        XCTAssertNotNil(first.verifyingKey())
+        XCTAssertEqual(first.verifyingKey(), second.verifyingKey())
+        XCTAssertNotEqual(first.verifyingKey(), otherSeed.verifyingKey())
+    }
+
+    /// `encryptedFile` opens `$HOME/.scp/keys.bin` under `SCP_KEY_PASSPHRASE`
+    /// through both methods, and the handle reports the request value. A
+    /// missing passphrase is `SCP-VALID-7001`, and a key file sealed under
+    /// another passphrase is `SCP-IDENT-1008`. XCTest runs these methods
+    /// serially, and the variables are restored before the method returns.
+    func testEncryptedFileCreatesAnIdentityAndRejectsBadInputs() async throws {
+        let fileManager = FileManager.default
+        let base = fileManager.temporaryDirectory
+            .appendingPathComponent("scp-custody-\(UUID().uuidString)")
+        let createHome = base.appendingPathComponent("create")
+        let agentHome = base.appendingPathComponent("agent")
+        let savedHome = getenv("HOME").map { String(cString: $0) }
+        let savedPassphrase = getenv("SCP_KEY_PASSPHRASE").map { String(cString: $0) }
+        defer {
+            if let savedHome {
+                setenv("HOME", savedHome, 1)
+            } else {
+                unsetenv("HOME")
+            }
+            if let savedPassphrase {
+                setenv("SCP_KEY_PASSPHRASE", savedPassphrase, 1)
+            } else {
+                unsetenv("SCP_KEY_PASSPHRASE")
+            }
+            try? fileManager.removeItem(at: base)
+        }
+
+        setenv("SCP_KEY_PASSPHRASE", "swift-encrypted-file-passphrase", 1)
+        setenv("HOME", createHome.path, 1)
+        let identity = try await scp.identityCreate(custody: .encryptedFile)
+        XCTAssertEqual(identity.custodyType(), "encrypted_file")
+        XCTAssertTrue(identity.did().hasPrefix("did:dht:"))
+        let keyFile = createHome.appendingPathComponent(".scp/keys.bin")
+        XCTAssertTrue(fileManager.fileExists(atPath: keyFile.path), keyFile.path)
+
+        setenv("HOME", agentHome.path, 1)
+        let agent = try await scp.identityCreateWithAgentKey(custody: .encryptedFile)
+        XCTAssertEqual(agent.custodyType(), "encrypted_file")
+
+        setenv("HOME", createHome.path, 1)
+        setenv("SCP_KEY_PASSPHRASE", "another-passphrase", 1)
+        let wrongPassphrase = await errorCode {
+            try await self.scp.identityCreate(custody: .encryptedFile)
+        }
+        XCTAssertEqual(wrongPassphrase, "SCP-IDENT-1008")
+
+        unsetenv("SCP_KEY_PASSPHRASE")
+        let noPassphrase = await errorCode {
+            try await self.scp.identityCreateWithAgentKey(custody: .encryptedFile)
+        }
+        XCTAssertEqual(noPassphrase, "SCP-VALID-7001")
     }
 }

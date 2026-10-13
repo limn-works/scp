@@ -14,7 +14,7 @@ The script uses nothing outside the Python standard library, and it self-gates b
 
 **Identifier strings in the fixtures.** Where a signed or hashed structure takes a fixture party's identifier as UTF-8 bytes, the vectors print it in the `scp:` text form that Vector 57 of §25.29 pins: `"scp:"` followed by the lowercase, unpadded RFC 4648 base32 of the 32-byte identifier, 56 characters in all, so each such field carries the length prefix `BE32(56)` or the MessagePack header `0xd9 0x38`. Each fixture party's 32-byte identifier is `SHA-256("SCP test vector identifier <role>")` over the ASCII label, with one role per party, following the precedent of §25.9. The 25 roles, each `<role>` exactly as the label spells it, are `a`, `agent`, `alice`, `announcing member`, `app`, `b`, `bob`, `carol`, `dave`, `definer`, `event-log actor`, `hpke member`, `hpke sender`, `issuer`, `leaf attester`, `m`, `new member`, `other member`, `proposer`, `pseudonymized member`, `sender`, `subject`, `sync member`, `verifier`, `voter`. A fixture identifier is bound to no key: the vectors that carry one pin a preimage, not a binding between an identifier and the key that signs it. The rule covers the fixture parties only: Vector 52's signed export preimage carries the literal snapshot string `"creator_did":"<scp-identifier:creator>"`, which is not an identifier in the `scp:` form, and Vectors 41 through 57 are unchanged by it.
 
-**What a signature covers.** Every SCP signature here is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 reaches it. The vectors run RFC 6979 with `h1` set to that same digest, because §9.5 fixes RFC 6979 with SHA-256 for a software signer and states no value for `h1` under a prehashed digest. An implementation that hashes the digest a second time reproduces none of the signature bytes below.
+**What a signature covers.** Every SCP signature here is an ECDSA signature over a 32-byte canonical hash, so the ECDSA message digest **is** that canonical hash and no second SHA-256 reaches it. The vectors run RFC 6979 with `h1` set to that same digest, because §9.5 fixes RFC 6979 with SHA-256 for a software signer other than a platform signer and states no value for `h1` under a prehashed digest. An implementation that hashes the digest a second time reproduces none of the signature bytes below.
 
 ## 25.2 Reference Key Material
 
@@ -177,7 +177,7 @@ Verification vector:
 
 Implementations MUST produce identical canonical hash bytes. The SHA-256 of those bytes is the value the P-256 key signs.
 
-**What an implementation matches.** A software signer that derives its nonce under RFC 6979 with SHA-256 (§9.5) reproduces the signature bytes above exactly, because RFC 6979 removes the nonce as a source of variation. A hardware signer — a Secure Enclave, a passkey authenticator, an HSM, a smartcard — draws a random nonce and therefore produces different `r` and `s` for this same preimage on every call. §9.5 states that such a signer conforms. A conformance check for a hardware signer therefore verifies its signature against the signer's public key and MUST NOT compare bytes against the value printed here. The verification vector above is the check that binds both signer classes.
+**What an implementation matches.** A software signer that derives its nonce under RFC 6979 with SHA-256 (§9.5) reproduces the signature bytes above exactly, because RFC 6979 removes the nonce as a source of variation. A hardware signer — a Secure Enclave, a passkey authenticator, an HSM, a smartcard — draws a random nonce and therefore produces different `r` and `s` for this same preimage on every call. A platform signer — Android Keystore, or CryptoKit on an Apple platform without a Secure Enclave — draws its nonce from the operating system's random source and produces different bytes in the same way. §9.5 states that both signers conform. A conformance check for a hardware signer or a platform signer therefore verifies its signature against the signer's public key and MUST NOT compare bytes against the value printed here. The verification vector above is the check that binds every signer class.
 
 ### Vector 6: InnerEnvelope with Provenance
 
@@ -512,7 +512,7 @@ RFC 6962 tree::root over the 9 leaves:
   0xd161de08f68888a0b13e7fb03e8bbc25758701ab247beb7b6bc2232c87971500
 ```
 
-**Only a software signer reproduces these leaves.** Each leaf hashes the event's signature bytes, so the leaf hash inherits the RFC 6979 determinism of the signature. A hardware signer produces a different signature for the same canonical hash and therefore a different leaf and a different root, which is correct behavior and not a conformance failure. A conformance check for such a signer verifies each event's signature against the signer's public key and compares the root only against a tree it built from its own events.
+**Only an RFC 6979 signer reproduces these leaves.** Each leaf hashes the event's signature bytes, so the leaf hash inherits the RFC 6979 determinism of the signature. A hardware signer or a platform signer (§9.5) produces a different signature for the same canonical hash and therefore a different leaf and a different root, which is correct behavior and not a conformance failure. A conformance check for such a signer verifies each event's signature against the signer's public key and compares the root only against a tree it built from its own events.
 
 ### Vector 33: Checkpoint Root KAT (§23.16.1)
 
@@ -785,7 +785,7 @@ Verification vector:
   verdict:    accept
 ```
 
-A software signer under RFC 6979 reproduces those signature bytes; a hardware signer produces different bytes over the same canonical hash and is checked against the verification vector instead (§25.4 states that rule). Before 2026-09-10 this vector printed no hash at all and told the reader to compute one from the Rust reference implementation, so it pinned nothing an independent implementer could check.
+A software signer under RFC 6979 reproduces those signature bytes; a hardware signer or a platform signer (§9.5) produces different bytes over the same canonical hash and is checked against the verification vector instead (§25.4 states that rule). Before 2026-09-10 this vector printed no hash at all and told the reader to compute one from the Rust reference implementation, so it pinned nothing an independent implementer could check.
 
 ## 25.14 Pseudonymization Vectors (§24.3.5)
 
@@ -887,7 +887,7 @@ To verify an implementation against these test vectors:
 
 4. **Hash verification.** Compute SHA-256 of each canonical byte sequence. Compare against the expected hash the vector prints.
 
-5. **Signature verification.** For signed structures, verify the printed 64-byte signature against the reference public key and the canonical hash, and confirm the verifier rejects the same signature with `s` replaced by `n − s` (§9.5's low-`s` rule). Then sign the canonical hash with your own signer and **verify the signature your signer produced against the same public key and the same hash**; a hardware signer's conformance check is that verification and never a comparison against the printed bytes. **Confirm as part of it that your signer emitted the low form** (§9.5), because a substrate that returns the high form leaves that conversion to the code around it. A **software** signer MUST additionally reproduce the printed bytes exactly, because §9.5 requires it to derive the nonce under RFC 6979 with SHA-256 over that same digest.
+5. **Signature verification.** For signed structures, verify the printed 64-byte signature against the reference public key and the canonical hash, and confirm the verifier rejects the same signature with `s` replaced by `n − s` (§9.5's low-`s` rule). Then sign the canonical hash with your own signer and **verify the signature your signer produced against the same public key and the same hash**; a hardware signer's or a platform signer's conformance check is that verification and never a comparison against the printed bytes. **Confirm as part of it that your signer emitted the low form** (§9.5), because a substrate that returns the high form leaves that conversion to the code around it. A **software** signer other than a platform signer MUST additionally reproduce the printed bytes exactly, because §9.5 requires it to derive the nonce under RFC 6979 with SHA-256 over that same digest.
 
 5a. **Point validation.** Confirm your parser applies §9.5's point-validation criterion to every wire-read point before that point reaches any signature verification and any key agreement. §25.2's three reference public keys are the positive cases; negate the y-coordinate of the tertiary key's uncompressed form and flip its final byte to obtain an off-curve negative case.
 
@@ -1047,6 +1047,68 @@ Expected bytes (hex, single continuous string):
 where `member = "scp:z5glr2inbuzd33xrfkdgpjejz4x7z4r2jxcsfvdxbwtgoi73xx2q"` (the fixture identifier announcing member), `other = "scp:ur5v4nca7x4lfagd2fojmjydguxwjwvfz2tur63s3x3k5vvqmppa"` (the fixture identifier other member), and `ctx = "ctx-adr057-pseudonym-kat"`.
 
 This vector is mechanically enforced on BOTH native and `wasm32` by `pseudonym_wire_and_classifier_match_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_cross_target_kat.rs` (native `#[test]` + `#[wasm_bindgen_test]`, run under `wasm-pack test --node`): `native == golden` and `wasm == golden` together prove `native == wasm` (ADR-057 T-1 / Prerequisite 5). The pure predicate + classifier unit tests also live in `crates/scp-protocol/src/context/pseudonym.rs`.
+
+### Vector 58: `PseudonymAnnouncementV2` rotation announcement wire format + classifier decisions (§9.10.4.1)
+
+These vectors pin the v2 **rotation announcement** that a member of a context with a rotation policy publishes on the shared bootstrap channel after each rotation, and the decisions of the §9.10.4.1 receipt-ordering rule that runs after the four §9.10.4 checks of Vector 36. The number 37 belongs to the KeyPackage attestation vector in §25.23, and the numbers 39 and 40 belong to the vectors §25.25 deleted, so this vector takes the next unused number.
+
+**Wire format.** A sender serializes `PseudonymAnnouncementV2` the way Vector 36 serializes v1, with `rmp_serde::to_vec_named`: a name-keyed MessagePack map with four fields in declaration order, `tag` (string), `member_did` (string), `pseudonym_epoch` (u64), and `routing_id` (32-byte `serde_bytes` binary). The encoder writes `pseudonym_epoch` in MessagePack's shortest unsigned-integer form, so epoch 1 is the single byte `0x01` and epoch 2^32 is `0xcf` followed by eight big-endian bytes. The `0x43 × 32` value is an opaque fixture routing ID, distinct from Vector 36's `0x42 × 32` and not derived from Vectors 30 or 31. The fixture identifier announcing member is the `member_did` of Vector 36.
+
+```
+Input (golden, epoch 1):
+  tag:             "\0scp:pseudonym-announce:v2"   (26 bytes, NUL-prefixed)
+  member_did:      "scp:z5glr2inbuzd33xrfkdgpjejz4x7z4r2jxcsfvdxbwtgoi73xx2q"
+                   (the fixture identifier announcing member, §25.1; 56 bytes)
+  pseudonym_epoch: 1
+  routing_id:      0x43 × 32
+
+MessagePack layout:
+  0x84                                        fixmap, 4 entries
+  0xa3 "tag"                                  key
+  0xba <26 bytes> "\0scp:pseudonym-announce:v2"   fixstr value
+  0xaa "member_did"                           key
+  0xd9 0x38 <56 bytes> "scp:z5gl…xx2q"         str8 value
+  0xaf "pseudonym_epoch"                      key
+  0x01                                        positive fixint value
+  0xaa "routing_id"                           key
+  0xc4 0x20 <32 bytes> 0x43×32                 bin8 value (serde_bytes)
+
+Expected bytes (hex, 163 bytes, single continuous string):
+  84a3746167ba007363703a70736575646f6e796d2d616e6e6f756e63653a7632aa6d656d6265725f646964d9387363703a7a35676c7232696e62757a6433337872666b6467706a656a7a3478377a3472326a78637366766478627774676f69373378783271af70736575646f6e796d5f65706f636801aa726f7574696e675f6964c4204343434343434343434343434343434343434343434343434343434343434343
+
+Input (epoch 2^32 = 4294967296; every other field as above):
+  pseudonym_epoch value bytes: 0xcf 0x0000000100000000   uint64
+
+Expected bytes (hex, 171 bytes, single continuous string):
+  84a3746167ba007363703a70736575646f6e796d2d616e6e6f756e63653a7632aa6d656d6265725f646964d9387363703a7a35676c7232696e62757a6433337872666b6467706a656a7a3478377a3472326a78637366766478627774676f69373378783271af70736575646f6e796d5f65706f6368cf0000000100000000aa726f7574696e675f6964c4204343434343434343434343434343434343434343434343434343434343434343
+```
+
+`scripts/` holds no generator for these bytes. The Python `msgpack` package produced both strings from the inputs above, and the same encoding run reproduces the Vector 36 bytes, which checks that it matches `rmp_serde::to_vec_named` on this field layout.
+
+**Classifier decisions.** The classifier takes the plaintext, the authenticated MLS sender, the context ID, the receiver's registry (`None` for a broadcast context), and the receiver's own routing IDs (its current routing ID, plus its previous routing ID while that routing ID is in its grace period). A registry record is written `(epoch, routing_id)`, with epoch `—` for a record a v1 announcement wrote. The decision is one of four: `NotAnnouncement`, `Accept` (carrying the member, the epoch or none, and the routing ID, which replace the member's record), `Unchanged` (an idempotent re-announcement; the registry stays as it is), or `Rejected` with a stable `reason`. The four §9.10.4 reasons of Vector 36 keep their strings, and the two ordering reasons below are new. Like Vector 36's strings, each `reason` string is part of this vector, so a change to one is wire-observable:
+
+| Case | `sender_did` | payload / registry / receiver's own routing IDs | Decision | `reason` |
+|------|--------------|--------------------------------------------------|----------|----------|
+| first v2, no record | member | golden v2 (epoch 1, `0x43×32`) / `Some({})` / `{}` | `Accept { member, 1, 0x43×32 }` | — |
+| v2 over a v1 record | member | golden v2 / `Some({member → (—, 0x42×32)})` / `{}` | `Accept { member, 1, 0x43×32 }` | — |
+| higher epoch | member | golden v2 / `Some({member → (0, 0x44×32)})` / `{}` | `Accept { member, 1, 0x43×32 }` | — |
+| same epoch, same value | member | golden v2 / `Some({member → (1, 0x43×32)})` / `{}` | `Unchanged` | — |
+| same epoch, other value | member | golden v2 / `Some({member → (1, 0x44×32)})` / `{}` | `Rejected` | `pseudonym announcement epoch does not advance the recorded epoch` |
+| lower epoch | member | golden v2 / `Some({member → (2, 0x44×32)})` / `{}` | `Rejected` | `pseudonym announcement epoch does not advance the recorded epoch` |
+| v1 after v2 | member | Vector 36 golden v1 (`0x42×32`) / `Some({member → (1, 0x43×32)})` / `{}` | `Rejected` | `pseudonym v1 announcement follows a recorded v2 announcement` |
+| v1 over v1 | member | Vector 36 golden v1 / `Some({member → (—, 0x44×32)})` / `{}` | `Accept { member, —, 0x42×32 }` | — |
+| sender mismatch | member | golden v2 except `member_did = other` / `Some({})` / `{}` | `Rejected` (carries `claimed_did = other`) | `pseudonym announcement member_did does not match sender` |
+| reserved value | member | golden v2 except `routing_id` = `[0;32]` **or** `context_routing_id(ctx)` **or** `broadcast_routing_id(ctx)` / `Some({})` / `{}` | `Rejected` | `pseudonym announcement uses a reserved routing ID` |
+| broadcast context | member | golden v2 / `None` / `{}` | `Rejected` | `pseudonym announcement received on broadcast context` |
+| cross-DID collision | member | golden v2 / `Some({other → (—, 0x43×32)})` / `{}` | `Rejected` | `pseudonym announcement collides with another member's routing ID` |
+| receiver's current routing ID | member | golden v2 / `Some({})` / `{current: 0x43×32}` | `Rejected` | `pseudonym announcement collides with another member's routing ID` |
+| receiver's in-grace previous routing ID | member | golden v2 / `Some({})` / `{current: 0x45×32, previous: 0x43×32}` | `Rejected` | `pseudonym announcement collides with another member's routing ID` |
+| extra key | member | golden v2 map plus a fifth key / `Some({})` / `{}` | `NotAnnouncement` | — |
+| short `routing_id` | member | golden v2 with a 31-byte `routing_id` / `Some({})` / `{}` | `NotAnnouncement` | — |
+
+where `member`, `other` and `ctx` are the values Vector 36 defines. Every `Rejected` and `Unchanged` row leaves the registry exactly as the row's input states it.
+
+No test asserts this vector yet. A conforming implementation reproduces both byte strings and every decision in the table on native and on `wasm32`, as Vector 36 requires of v1.
 
 ## 25.20 Trust Attestation Signing Vectors (§7.4.1, §9.5.2)
 
@@ -1239,7 +1301,7 @@ Verification vector:
   verdict:    accept
 ```
 
-A software signer under RFC 6979 reproduces these exact signature bytes on every run; a hardware signer produces different bytes and is checked against the verification vector instead (§25.4). Note the extension body omits the domain separator (present only in the signed preimage) and shares the eight fields byte-for-byte with the preimage's post-domain portion.
+A software signer under RFC 6979 reproduces these exact signature bytes on every run; a hardware signer or a platform signer (§9.5) produces different bytes and is checked against the verification vector instead (§25.4). Note the extension body omits the domain separator (present only in the signed preimage) and shares the eight fields byte-for-byte with the preimage's post-domain portion.
 
 ## 25.24 Outlet Registration V2 Vectors (§5.4.1)
 
@@ -2039,7 +2101,7 @@ rejected, padded:
 
 The request and verification preimages below are the encodings now in force under `SCP-CHALLENGE-REQ-V1:` and `SCP-CHALLENGE-VERIFY-V1:`; each encoding changed under the same separator, and no earlier encoding has a vector. `07-trust-validation-and-capabilities.md` §7.3.4 fixes both field orders, the `verification_id` derivation and the `suite_digest` derivation. None of these vectors carries a key or a signature: each pins a preimage and its SHA-256 digest, which the verifier's `#active` key signs, so none depends on the curve. `verifier` and `subject` are the §25.1 fixture identifiers of those roles, in the `scp:` text form, so each carries the length prefix `00000038`. `capability_uri` is an identifier-scoped URI whose definer is the fixture identifier `definer`. A protocol capability URI would need at least the minimum number of test cases §7.3.4.3 sets for it, 20 for `schema-validation/v1`, and a conforming SDK refuses a one-case request for one.
 
-### Vector 58: the challenge request
+### Vector 59: the challenge request
 
 Inputs:
 
@@ -2069,7 +2131,7 @@ JCS(expected):  {"SchemaMatch":{"schema":{"required":["name","count"],"type":"ob
   6a656374227d7d7d00000006736368656d6100002710
 ```
 
-`suite_digest` is `SHA-256(T)` with no domain prefix, and Vectors 59 and 60 carry it:
+`suite_digest` is `SHA-256(T)` with no domain prefix, and Vectors 60 and 61 carry it:
 
 ```
 suite_digest = SHA-256(T):  728fca93ec869b96f4f784cb46ad1b2aa68a4a39d7c4b60b66707586914fdcfc
@@ -2098,9 +2160,9 @@ suite_digest = SHA-256(T):  728fca93ec869b96f4f784cb46ad1b2aa68a4a39d7c4b60b6670
 D = SHA-256(R):  9425a8bca59a96ea6f400233a247fb9aa4b0d4bbb98b7e8b1e756297e7e2a91f
 ```
 
-### Vector 59: the verification record, with every optional field present
+### Vector 60: the verification record, with every optional field present
 
-Inputs: `verifier`, `subject` and `capability_uri` as in Vector 58; `suite_digest` the Vector 58 value, 32 fixed bytes; `timestamp` 1700000000 (`0x6553f100`); `verification_id` derived as §7.3.4 states from those inputs; `passed` true; `score` 10000 basis points (100.00%), present, so its field is `00 00 00 04` followed by `00 00 27 10`; `test_count` 1 and `pass_count` 1; `expires_at` 1707776000, `timestamp` plus 7776000 seconds (90 days); `context_id` `test-context-01`.
+Inputs: `verifier`, `subject` and `capability_uri` as in Vector 59; `suite_digest` the Vector 59 value, 32 fixed bytes; `timestamp` 1700000000 (`0x6553f100`); `verification_id` derived as §7.3.4 states from those inputs; `passed` true; `score` 10000 basis points (100.00%), present, so its field is `00 00 00 04` followed by `00 00 27 10`; `test_count` 1 and `pass_count` 1; `expires_at` 1707776000, `timestamp` plus 7776000 seconds (90 days); `context_id` `test-context-01`.
 
 ```
 timestamp:                     1700000000
@@ -2144,9 +2206,9 @@ verification_id:               2334382d57e941658fc2c2a2457010918c9eec0ec822a85f7
 D_v = SHA-256(R_v):            ac0cd969cbbeb08ca4021ad9f852fdef1bf80db83039fe0c9c5347d73e8027a9
 ```
 
-### Vector 60: the verification record, with `score` and `context_id` both absent
+### Vector 61: the verification record, with `score` and `context_id` both absent
 
-Inputs as in Vector 59 except: `timestamp` 1700000060, so `verification_id` differs; `expires_at` 1707776060; `passed` false and `pass_count` 0; `score` absent; `context_id` absent.
+Inputs as in Vector 60 except: `timestamp` 1700000060, so `verification_id` differs; `expires_at` 1707776060; `passed` false and `pass_count` 0; `score` absent; `context_id` absent.
 
 Both absent forms are length-prefixed: each is `00 00 00 20` followed by `SHA-256(0x00)`, so `R_v` carries the sentinel twice, each copy preceded by `00000020`. A present `score` begins with the length word `00000004` and an absent one with `00000020`, so a record carrying a present score cannot re-parse as this one, whatever its length.
 

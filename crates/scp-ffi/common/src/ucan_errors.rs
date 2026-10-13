@@ -201,7 +201,7 @@ mod tests {
         );
         assert_eq!(
             ucan_error_code(&failure(scp_crypto::CustodyFailureKind::TimedOut)),
-            codes::CRYPTO_4061
+            codes::CRYPTO_4062
         );
         assert_eq!(
             ucan_error_code(&failure(scp_crypto::CustodyFailureKind::Failed)),

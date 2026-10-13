@@ -845,8 +845,17 @@ fn trust_attestation_verify_round_trip_rule_b_ed25519() {
     use scp_clock::TestClock;
     use scp_protocol::trust::TrustError;
     use scp_protocol::trust::attestation::{
-        DidPublicKeyResolver, canonical_attestation_bytes, verify_attestation,
+        AttestationRevocationChecker, DidPublicKeyResolver, canonical_attestation_bytes,
+        verify_attestation,
     };
+
+    /// This vector carries no revocation list, so the list names nothing.
+    struct EmptyRevocationList;
+    impl AttestationRevocationChecker for EmptyRevocationList {
+        fn check_revocation(&self, _id: &str, _issuer: &scp_did::DID) -> Option<u64> {
+            None
+        }
+    }
 
     struct Resolver(Vec<u8>);
     impl DidPublicKeyResolver for Resolver {
@@ -864,12 +873,13 @@ fn trust_attestation_verify_round_trip_rule_b_ed25519() {
     let hash = canonical_attestation_bytes(&signed).unwrap();
     signed.signature = rule_b_ed25519_key.sign(&hash).to_bytes().to_vec();
     let clock = TestClock::new(1_700_000_001);
-    verify_attestation(&signed, &resolver, &clock).expect("signature must verify");
+    verify_attestation(&signed, &resolver, &clock, &EmptyRevocationList)
+        .expect("signature must verify");
 
     let mut tampered = signed;
     tampered.subject = ID_ISSUER.into();
     assert!(
-        verify_attestation(&tampered, &resolver, &clock).is_err(),
+        verify_attestation(&tampered, &resolver, &clock, &EmptyRevocationList).is_err(),
         "a changed subject must invalidate the signature"
     );
 }
@@ -962,7 +972,7 @@ fn vector37_keypackage_attestation() {
 /// `:capability:schema-validation/v1`.
 const CHALLENGE_CAPABILITY_URI: &str =
     "scp:tfgiiao36zlseo2tzfoi32knfx6topped3qloxcsube5gdvfrqgq:capability:schema-validation/v1";
-/// §7.3.4 `suite_digest`: SHA-256 of Vector 58's `test_cases` field, no prefix.
+/// §7.3.4 `suite_digest`: SHA-256 of Vector 59's `test_cases` field, no prefix.
 const CHALLENGE_SUITE_DIGEST_HEX: &str =
     "728fca93ec869b96f4f784cb46ad1b2aa68a4a39d7c4b60b66707586914fdcfc";
 
@@ -981,7 +991,7 @@ fn challenge_verification_id_preimage(timestamp: u64) -> Vec<u8> {
     .unwrap()
 }
 
-/// The inputs of §7.3.4's `R_v` that Vectors 59 and 60 vary.
+/// The inputs of §7.3.4's `R_v` that Vectors 60 and 61 vary.
 struct VerificationVectorInput<'a> {
     timestamp: u64,
     passed: bool,
@@ -1101,7 +1111,7 @@ fn assert_challenge_verification_vector(
 }
 
 #[test]
-fn vector_58_challenge_request() {
+fn vector_59_challenge_request() {
     let challenge_id: [u8; 32] = core::array::from_fn(|i| (i + 1) as u8);
     // Keys inserted out of order on purpose: RFC 8785 sorts members, and keeps
     // the `required` array in its given order.
@@ -1202,7 +1212,7 @@ fn vector_58_challenge_request() {
 }
 
 #[test]
-fn vector_59_challenge_verification() {
+fn vector_60_challenge_verification() {
     let preimage = assert_challenge_verification_vector(
         "vector 59",
         &VerificationVectorInput {
@@ -1223,7 +1233,7 @@ fn vector_59_challenge_verification() {
 }
 
 #[test]
-fn vector_60_challenge_verification_absent_optionals() {
+fn vector_61_challenge_verification_absent_optionals() {
     let preimage = assert_challenge_verification_vector(
         "vector 60",
         &VerificationVectorInput {

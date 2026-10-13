@@ -776,7 +776,7 @@ class SCP internal constructor(
      * ```kotlin
      * // Step 1 (joiner): reserve a single-use KeyPackage under the joiner's
      * // own locally-custodied identity.
-     * val joiner = scp.identityCreate(custody = CustodyType.IN_MEMORY)
+     * val joiner = scp.identityCreate(custody = CustodyType.ENCRYPTED_FILE)
      * val reservation = scp.reserveKeyPackage(joiner)
      *
      * // Hand reservation.keyPackagePublic to the creator out of band. The
@@ -1253,16 +1253,18 @@ class SCP internal constructor(
      * [CustodyType.rawValue].
      *
      * [custody] is required and typed: the caller names the key store, and
-     * the compiler rejects a custody value the UniFFI bridge refuses.
+     * the compiler rejects a string outside the custody request vocabulary
+     * (spec section 3.2.2). [CustodyType.OS_KEYSTORE] throws `SCP-IDENT-1003`,
+     * because only a `KeyCustodyProvider` reaches the host key store; pass one
+     * to [identityCreateWithCustody].
      *
-     * [testingSeed] is a testing-only parameter for the ADR-046
-     * cross-bridge parity harness; pass `null` from production callers
-     * (in-memory custody uses OS RNG when [testingSeed] is `null`).
+     * The method sends no ADR-046 testing seed: spec section 3.2.2 answers a
+     * seed with `SCP-VALID-7009` for every [CustodyType] entry, because only the
+     * test-harness `in_memory` string, which this type does not carry, takes one.
      */
-    suspend fun identityCreate(
-        custody: CustodyType,
-        testingSeed: ByteArray? = null,
-    ): Identity = inner.identityCreate(custody = custody.rawValue, testingSeed = testingSeed)
+    suspend fun identityCreate(custody: CustodyType): Identity {
+        return inner.identityCreate(custody = custody.rawValue, testingSeed = null)
+    }
 
     /** Forwards to [NativeScp.identityCreateLinkAttestation] on [inner]. */
     @Suppress("LongParameterList")
@@ -1288,14 +1290,20 @@ class SCP internal constructor(
      * [CustodyType.rawValue].
      *
      * [custody] is required and typed: the caller names the key store, and
-     * the compiler rejects a custody value the UniFFI bridge refuses.
+     * the compiler rejects a string outside the custody request vocabulary
+     * (spec section 3.2.2). [CustodyType.OS_KEYSTORE] throws `SCP-IDENT-1003`,
+     * because only a `KeyCustodyProvider` reaches the host key store.
      */
     suspend fun identityCreateWithAgentKey(custody: CustodyType): Identity =
         inner.identityCreateWithAgentKey(
             custody = custody.rawValue,
         )
 
-    /** Forwards to [NativeScp.identityCreateWithCustody] on [inner]. */
+    /**
+     * Forwards to [NativeScp.identityCreateWithCustody] on [inner]: the
+     * `os_keystore` custody request (spec section 3.2.2). The identity it
+     * returns reports `"os_keystore"` from `custodyType()`.
+     */
     suspend fun identityCreateWithCustody(provider: KeyCustodyProvider): Identity =
         inner.identityCreateWithCustody(
             provider = provider,
@@ -1429,11 +1437,12 @@ class SCP internal constructor(
      * [referenceProof] reports what this caller did about a class 2
      * (`signed_post` / `dns_record`) proof resource, per §3.5.4 Class 2 step 2.
      * `"confirmed"` reports that this caller fetched the resource
-     * `evidence.proof` names and found this issuer's DID in it, which yields a
-     * `true` or a `false`. `"not_fetched"` reports that this caller fetched
-     * nothing, which raises `SCP-IDENT-1062` for a class 2 attestation. A
-     * class 1 (`did_control`) attestation ignores this argument. Any other
-     * string raises `SCP-IDENT-1044`.
+     * `evidence.proof` names and found in it what step 2 requires (this
+     * issuer's DID, plus the nonce for `signed_post`), which yields a `true` or
+     * a `false`. `"not_fetched"` reports that this caller fetched nothing,
+     * which raises `SCP-IDENT-1062` for a class 2 attestation. A class 1
+     * (`did_control`) attestation ignores this argument. Any other string
+     * raises `SCP-IDENT-1044`.
      */
     suspend fun identityVerifyLinkAttestation(
         attestationJson: String,
@@ -2101,15 +2110,20 @@ class SCP internal constructor(
         )
 
     /**
-     * Verifies an attestation's Ed25519 signature, evidence, expiry, and
-     * revocation status (ADR-017, §7.4). Takes the typed attestation envelope
+     * Verifies an attestation's Ed25519 signature, evidence, expiry, its own
+     * revocation status, and this instance's revocation list for [contextId]
+     * (ADR-017, §7.4.4). Takes the typed attestation envelope
      * ([CachedAttestationEnvelope]) and serializes it to the serde wire shape
-     * internally (ADR-058), then routes through the UniFFI-generated free
-     * function [uniffi.scp.trustVerifyAttestation] unchanged. ADR-048 §1 + §7
-     * Kotlin bullet.
+     * internally (ADR-058), then forwards to [NativeScp.trustVerifyAttestation]
+     * on [inner]. A revocation list that cannot be read throws; it never reads
+     * as `valid = false`.
      */
-    fun trustVerifyAttestation(attestation: CachedAttestationEnvelope): AttestationVerificationResult =
-        uniffi.scp.trustVerifyAttestation(
+    fun trustVerifyAttestation(
+        contextId: String,
+        attestation: CachedAttestationEnvelope,
+    ): AttestationVerificationResult =
+        inner.trustVerifyAttestation(
+            contextId = contextId,
             attestationJson = encodeAttestationJson(attestation),
         )
 

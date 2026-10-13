@@ -24,6 +24,7 @@ import { __getNativeScp, SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 import type { BehavioralRecord, CapabilityRequirement, ParticipationProfile } from "../src/types";
 import { allValid } from "../src/types";
+import { HARNESS_IN_MEMORY_CUSTODY } from "./harness-custody";
 import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 /**
@@ -147,7 +148,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // This must happen BEFORE configureRelayTransport because the
     // ContextManager is initialized lazily by whichever per-instance call
     // wins the race.
-    const bootstrap = await napi.identityCreate("in_memory");
+    const bootstrap = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
     // Configure the ContextManager with a relay-backed transport provider.
     // configureRelayTransport creates a relay connection and wraps it in
@@ -198,27 +199,27 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("Identity (real NAPI)", () => {
     test("creates an in-memory identity with a valid did:dht DID", async () => {
-      const handle = await napi.identityCreate("in_memory");
+      const handle = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       expect(handle.did).toMatch(/^did:dht:/);
       expect(handle.custodyType).toBe("in_memory");
     });
 
     test("creates two identities with distinct DIDs", async () => {
-      const a = await napi.identityCreate("in_memory");
-      const b = await napi.identityCreate("in_memory");
+      const a = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const b = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       expect(a.did).not.toBe(b.did);
     });
 
     // identityLoad and identityResolve now use the local identity registry
     // as a fallback when DHT is unavailable. See #1144 (C6).
     test("loads an identity by DID (local registry fallback)", async () => {
-      const created = await napi.identityCreate("in_memory");
+      const created = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const loaded = await napi.identityLoad(created.did);
       expect(loaded.did).toBe(created.did);
     });
 
     test("resolves a DID to a DID document (no agent key)", async () => {
-      const handle = await napi.identityCreate("in_memory");
+      const handle = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const doc = await napi.identityResolve(handle.did);
       expect(doc.id).toBe(handle.did);
       // The document should have at least one authentication method.
@@ -233,7 +234,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("resolves a DID to a DID document (with agent key, ADR-039)", async () => {
-      const handle = await napi.identityCreateWithAgentKey("in_memory");
+      const handle = await napi.identityCreateWithAgentKey(HARNESS_IN_MEMORY_CUSTODY);
       const doc = await napi.identityResolve(handle.did);
       expect(doc.id).toBe(handle.did);
       // Identity created with agent key: hasAgentKey must be true.
@@ -245,36 +246,36 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("rotates an identity key and preserves the DID", async () => {
-      const handle = await napi.identityCreate("in_memory");
+      const handle = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const rotated = await napi.identityRotateKey(handle);
       expect(rotated.did).toBe(handle.did);
     });
 
     test("creates an identity with an agent key (ADR-039)", async () => {
-      const handle = await napi.identityCreateWithAgentKey("in_memory");
+      const handle = await napi.identityCreateWithAgentKey(HARNESS_IN_MEMORY_CUSTODY);
       expect(handle.did).toMatch(/^did:dht:/);
     });
 
     test("adds an agent key to an existing identity", async () => {
-      const handle = await napi.identityCreate("in_memory");
+      const handle = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const withAgent = await napi.identityAddAgentKey(handle);
       expect(withAgent.did).toBe(handle.did);
     });
 
     test("rotates an agent key", async () => {
-      const handle = await napi.identityCreateWithAgentKey("in_memory");
+      const handle = await napi.identityCreateWithAgentKey(HARNESS_IN_MEMORY_CUSTODY);
       const rotated = await napi.identityRotateAgentKey(handle);
       expect(rotated.did).toBe(handle.did);
     });
 
     test("removes an agent key", async () => {
-      const handle = await napi.identityCreateWithAgentKey("in_memory");
+      const handle = await napi.identityCreateWithAgentKey(HARNESS_IN_MEMORY_CUSTODY);
       const removed = await napi.identityRemoveAgentKey(handle);
       expect(removed.did).toBe(handle.did);
     });
 
     test("migrates an identity to a new DID", async () => {
-      const handle = await napi.identityCreate("in_memory");
+      const handle = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const migrated = await napi.identityMigrate(handle);
       // Migration creates a new DID.
       expect(migrated.did).toMatch(/^did:dht:/);
@@ -282,7 +283,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("removes an existing identity from the registry", async () => {
-      const handle = await napi.identityCreate("in_memory");
+      const handle = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       // `identityRemove` is void and idempotent; after it runs the DID is
       // no longer present, so `identityRemoveIfPresent` reports false.
       napi.identityRemove(handle.did);
@@ -290,7 +291,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("identityRemoveIfPresent reports true then false", async () => {
-      const handle = await napi.identityCreate("in_memory");
+      const handle = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       // First call finds the identity and removes it.
       expect(napi.identityRemoveIfPresent(handle.did)).toBe(true);
       // Second call finds nothing.
@@ -314,7 +315,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("generates and verifies a device attestation", async () => {
-      const handle = await napi.identityCreate("in_memory");
+      const handle = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const token = await napi.identityAttestDevice(handle.did);
       expect(typeof token).toBe("string");
       expect(token.length).toBeGreaterThan(0);
@@ -330,7 +331,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("Context lifecycle (real NAPI)", () => {
     test("creates a context and returns a context ID", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -343,8 +344,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("a second identity can join the context", async () => {
-      const creator = await napi.identityCreate("in_memory");
-      const joiner = await napi.identityCreate("in_memory");
+      const creator = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const joiner = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         creator,
         JSON.stringify({ ceiling: ["messages:read", "role:assign"] }),
@@ -354,7 +355,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("sends a message without error (relay transport)", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
@@ -365,7 +366,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("leaves a context without error", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -374,7 +375,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("closes a context without error", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read", "context:close"] }),
@@ -383,7 +384,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("creates a context with broadcast mode", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -396,7 +397,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("rejects unsupported governance model", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       await expect(
         napi.contextCreate(
           identity,
@@ -412,7 +413,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("creates a context with single_admin governance and TTL", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -432,7 +433,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("Membership (real NAPI)", () => {
     test("member count after creation is 1", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -442,7 +443,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("creator is a member", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -452,8 +453,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("non-member is not a member", async () => {
-      const identity = await napi.identityCreate("in_memory");
-      const other = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const other = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -463,7 +464,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("member DIDs includes the creator", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -473,8 +474,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("member count increases after join", async () => {
-      const creator = await napi.identityCreate("in_memory");
-      const joiner = await napi.identityCreate("in_memory");
+      const creator = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const joiner = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         creator,
         JSON.stringify({ ceiling: ["messages:read", "role:assign"] }),
@@ -485,7 +486,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("creator role is Admin", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -502,7 +503,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("Outlets (real NAPI)", () => {
     test("registers an outlet and returns an outlet ID", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["outlet:register"] }),
@@ -528,8 +529,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("invokes a registered outlet", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["outlet:register", "outlet:call:*"] }),
@@ -562,7 +563,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("registers an outlet whose cost.amount exceeds 2^53 (bigint boundary, ADR-060)", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["outlet:register"] }),
@@ -598,7 +599,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("rejects a negative cost.amount (fail-closed, unsigned money)", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["outlet:register"] }),
@@ -625,7 +626,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("verifies an outlet and returns a verification result", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["outlet:register"] }),
@@ -658,8 +659,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("UCAN (real NAPI)", () => {
     test("mints a UCAN token with capabilities", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
@@ -677,8 +678,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // identity_create now publishes to the shared InMemoryDhtClient so that
     // the DualLayerResolver can find the issuer's DID document (#1144).
     test("validates a minted token for a granted capability", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
@@ -696,7 +697,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // handle carries a non-empty declared ceiling as written. The accepted
     // case proves the check does not reject every create.
     test("an omitted or null ceiling rejects with SCP-VALID-7004, an empty one with SCP-VALID-7005", async () => {
-      const admin = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const cases: [object, RegExp][] = [
         [{ memoryScope: "ephemeral" }, /SCP-VALID-7004/],
         [{ ceiling: null }, /SCP-VALID-7004/],
@@ -717,8 +718,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("rejects validation for an ungranted capability", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
@@ -728,8 +729,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("ucanValidate fails closed when no presenting agent is supplied", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
@@ -748,8 +749,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("revokes a token", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
@@ -759,8 +760,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
     // C3c (ADR-059, §7.2.4): structured read-only diagnostic.
     test("ucanEvaluate returns all-true for a valid token on a granted capability", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
@@ -777,8 +778,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("ucanEvaluate reports signaturesValid:false for a forged-signature token (no throw)", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
@@ -805,8 +806,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("ucanEvaluate is read-only: re-evaluating the same token keeps nonceValid:true", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
@@ -830,8 +831,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // to one bridge cannot silently diverge. A bare "*" is NOT this (it is a
     // malformed URI the bridge rejects); absence is emptiness/omission only.
     test("ucanEvaluate empty/whitespace capability coerces to no-challenge (NAPI parity)", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
@@ -858,8 +859,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // FAILED under the old `"*"` behavior (grant-match against `*` never
     // matches), so it is the regression guard for the actual bug.
     test("evaluateTrust reports a single valid token as intrinsically valid (real SCP method)", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const good = await napi.ucanMint(ctx, member.did, ["messages:read"]);
@@ -888,8 +889,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("evaluateTrust AND-combines per-token validations (real SCP method)", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const good = await napi.ucanMint(ctx, member.did, ["messages:read"]);
@@ -936,8 +937,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // activity. This test deliberately does not assert them, since no governance
     // action has occurred at this point.
     test("participationRecord returns a typed record with a real Merkle root (real SCP method)", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
@@ -978,8 +979,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // is the affirmative counterpart to the create+join-only test above — it
     // proves the facts are real, not perpetually zero.
     test("participationRecord reflects real governance activity (real SCP method)", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       // The ceiling MUST carry the governance + child-creation capabilities, or
       // the proposer (creator) lacks `governance:propose` / the child-creation
       // capability and the proposal is permission-denied.
@@ -1081,8 +1082,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // Merkle root vary per run and are excluded from the parity tuple; the
     // leaf-derived/credential counts are deterministic for the scenario.)
     test("participation facts match the canonical cross-SDK counts (real SCP method)", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       // Event timestamps are whole Unix seconds from the core's system clock,
       // and a still-open membership interval runs to the latest event timestamp
       // (§7.3.2). Events milliseconds apart that straddle a second boundary
@@ -1189,7 +1190,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // empty and the graceful fold is exercised end-to-end against the real
     // bridge. `participationRecord` on the same empty context propagates instead.
     test("evaluateTrust folds an empty event log into a zeroed behavioral record (real SCP method)", async () => {
-      const member = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       // A handle whose resolved contextId is a never-created label → empty log.
       const emptyHandle = { contextId: "ctx-never-created-empty-log" };
 
@@ -1238,9 +1239,9 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // addressed to someone else). This guards a future edit that drops
     // `subjectDid` from `evaluateTrust` (ADR-059 / §7.2.4).
     test("evaluateTrust reports signaturesValid:false for an audience-mismatched token", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const bob = await napi.identityCreate("in_memory");
-      const carol = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const bob = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const carol = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       // Token audience is Bob.
@@ -1274,8 +1275,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // INVALID case so coercion cannot be mistaken for a validity shortcut. PyO3
     // sibling: test_ucan_evaluate_empty_capability_invalid_token_still_fails.
     test("ucanEvaluate empty capability on a forged token still reports signaturesValid:false", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
@@ -1301,7 +1302,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("Event log (real NAPI)", () => {
     test("queries events after context creation (ContextManager Merkle entries)", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -1314,8 +1315,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("a send surfaces MessageSent on the ContextEvent buffer, not the durable log", async () => {
-      const identity = await napi.identityCreate("in_memory");
-      const bob = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const bob = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1351,7 +1352,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // event_log_verify now syncs ContextManager Merkle entries into the
     // UCAN-state EventLog via push_leaf_raw before calling prove_inclusion.
     test("verifies an inclusion proof against ContextManager event log", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -1363,7 +1364,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("creates a checkpoint (via DID registry lookup)", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -1664,8 +1665,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("E2E context lifecycle (real NAPI)", () => {
     test("create -> join -> send -> membership check -> leave -> close (relay transport)", async () => {
-      const alice = await napi.identityCreate("in_memory");
-      const bob = await napi.identityCreate("in_memory");
+      const alice = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const bob = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       const ctx = await napi.contextCreate(
         alice,
@@ -1713,8 +1714,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   describe("E2E UCAN lifecycle (real NAPI)", () => {
     // identity_create now publishes to the shared InMemoryDhtClient (#1144).
     test("mint -> validate -> revoke lifecycle", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
@@ -1762,8 +1763,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("E2E outlet lifecycle (real NAPI)", () => {
     test("register -> invoke -> verify", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({
@@ -1850,7 +1851,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("Broadcast operations (real NAPI)", () => {
     test("subscriber count is 0 on a fresh broadcast context", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1865,8 +1866,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("subscribe adds a subscriber", async () => {
-      const identity = await napi.identityCreate("in_memory");
-      const subscriber = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const subscriber = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1889,8 +1890,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("non-subscriber is not a subscriber", async () => {
-      const identity = await napi.identityCreate("in_memory");
-      const other = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const other = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1904,8 +1905,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("unsubscribe removes a subscriber", async () => {
-      const identity = await napi.identityCreate("in_memory");
-      const subscriber = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const subscriber = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1923,7 +1924,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("broadcast admission returns a policy", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1938,7 +1939,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("publish sends a broadcast message (relay transport)", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1957,8 +1958,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // content only, not to other authors'. Only governance_ban_subscriber
     // removes from the roster.
     test("block subscriber adds to block list without removing from roster", async () => {
-      const identity = await napi.identityCreate("in_memory");
-      const subscriber = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const subscriber = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1980,8 +1981,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("unblock after block does not throw and subscriber remains in roster", async () => {
-      const identity = await napi.identityCreate("in_memory");
-      const subscriber = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const subscriber = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2005,8 +2006,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("unblock non-blocked subscriber throws", async () => {
-      const identity = await napi.identityCreate("in_memory");
-      const subscriber = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const subscriber = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2024,8 +2025,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("handle key request grants and the subscriber opens the key", async () => {
-      const identity = await napi.identityCreate("in_memory");
-      const subscriber = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const subscriber = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2057,8 +2058,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("handle key request denies a non-subscriber with no key material", async () => {
-      const identity = await napi.identityCreate("in_memory");
-      const stranger = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const stranger = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2080,8 +2081,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("handle key request rejects a wrapping key that is not a 65-byte P-256 point", async () => {
-      const identity = await napi.identityCreate("in_memory");
-      const subscriber = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const subscriber = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2113,8 +2114,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("Governance (real NAPI)", () => {
     test("rejects an untracked proposal id (direct-execute trust boundary)", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({
@@ -2135,7 +2136,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("rejects a malformed proposal id", async () => {
-      const admin = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({
@@ -2154,7 +2155,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("TTL operations (real NAPI)", () => {
     test("handle TTL expiry on a context with TTL", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2167,7 +2168,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("propose TTL extension returns a boolean", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2181,7 +2182,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("reset TTL timer does not throw", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2200,7 +2201,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("Context export/import (real NAPI)", () => {
     test("exports a context to bytes", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2218,7 +2219,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // terminal state (Closed/Expired/Tombstoned). Test the create → export →
     // close → import round-trip.
     test("exports and imports a context round-trip (close before reimport)", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2240,7 +2241,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("import rejects invalid data", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const invalidData = new Uint8Array([0, 1, 2, 3]);
       await expect(napi.contextImport(invalidData, identity.did)).rejects.toThrow();
     });
@@ -2253,7 +2254,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // the prior bug where import went straight to the DID resolver and failed
     // for unpublished self-exports.
     test("self-export round-trips via local-custody key resolution (§23.16.8)", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2280,7 +2281,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // must cause import to be rejected with SCP-CTX-2093 (the dedicated
     // signed-export verification code), not a generic context error.
     test("import rejects a tampered export with SCP-CTX-2093 (§23.16.8)", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2336,7 +2337,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("Drain events (real NAPI)", () => {
     test("drain events returns an array after context creation", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2349,7 +2350,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("drain events is idempotent (second drain returns empty)", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2366,8 +2367,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("drain events captures events from join", async () => {
-      const creator = await napi.identityCreate("in_memory");
-      const joiner = await napi.identityCreate("in_memory");
+      const creator = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const joiner = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         creator,
         JSON.stringify({ ceiling: ["messages:read", "role:assign"] }),
@@ -2389,9 +2390,9 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("UCAN delegation (real NAPI)", () => {
     test("delegates a minted token to a third party", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
-      const delegate = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const delegate = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
@@ -2414,8 +2415,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("delegation rejects invalid delegator DID", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
@@ -2427,9 +2428,9 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("delegation rejects mismatched delegator (not token audience)", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
-      const other = await napi.identityCreate("in_memory");
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const other = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       // Mint token for member (audience = member.did).
@@ -2448,8 +2449,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("E2E broadcast lifecycle (real NAPI)", () => {
     test("create -> subscribe -> publish -> check subscriber -> unsubscribe (relay transport)", async () => {
-      const author = await napi.identityCreate("in_memory");
-      const subscriber = await napi.identityCreate("in_memory");
+      const author = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const subscriber = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
 
       const ctx = await napi.contextCreate(
         author,
@@ -2481,7 +2482,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("Broadcast content delivery (real NAPI)", () => {
     test("broadcastPublishAsset returns blobId and etag", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2508,7 +2509,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     });
 
     test("broadcastPublishAssets batch returns correct count", async () => {
-      const identity = await napi.identityCreate("in_memory");
+      const identity = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -2728,7 +2729,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // addon and the saga actually ran.
     // -----------------------------------------------------------------------
     test("is callable: BigInt timestamp + hex nonce marshal and the saga runs", async () => {
-      const owner = await napi.identityCreate("in_memory");
+      const owner = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctxA = await createCallerContext(owner);
       const ctxB = await createTargetContext(owner);
 
@@ -2772,7 +2773,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // boundary with both the code AND the parseable structured suffix intact.
     // -----------------------------------------------------------------------
     test("surfaces SCP-SAGA-13050 with a parseable structured suffix on a caller mismatch", async () => {
-      const owner = await napi.identityCreate("in_memory");
+      const owner = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctxA = await createCallerContext(owner);
       const ctxB = await createTargetContext(owner);
 
@@ -2824,7 +2825,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // decodes to the echoed JSON.
     // -----------------------------------------------------------------------
     test("commits via governance-established interface and marshals the result object", async () => {
-      const owner = await napi.identityCreate("in_memory");
+      const owner = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       const ctxA = await createCallerContext(owner);
       const ctxB = await createTargetContext(owner);
 

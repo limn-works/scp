@@ -1,143 +1,114 @@
-/// Tool registration and invocation within a context.
+/// Outlet registration, verification, and UCAN minting within a context.
 ///
-/// Demonstrates defining a tool with a JSON schema, registering it
-/// in a context, and invoking it with the UniFFI bridge functions.
+/// Demonstrates defining an outlet with JSON schemas and test vectors,
+/// registering it in a context, verifying it against those vectors, and
+/// minting the UCAN token a caller presents to invoke it.
+///
+/// The operator's identity comes from a caller-supplied
+/// ``KeyCustodyProvider``, the `os_keystore` custody request of spec section
+/// 3.2.2.
 ///
 /// Prerequisites:
 ///   - Add the SCP Swift package to your project
 ///   - import SCP
 ///
 /// Usage:
-///   swift run Tools
+///   try await ToolsExample.run(provider: myProvider, storagePassphrase: passphrase)
 
 import Foundation
 import SCP
 
-@main
-struct ToolsExample {
-    static func main() async throws {
-        // 1. Create an identity for the tool operator.
-        let operator_ = try await createIdentity(custody: "in_memory")
-        print("Operator DID: \(operator_.did())")
+enum ToolsExample {
+    static func run(provider: KeyCustodyProvider, storagePassphrase: String) async throws {
+        let storageDir = try FileManager.default
+            .url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("scp-tools-example")
+        let scp = try SCP.withStorage(sqliteDir: storageDir, passphrase: storagePassphrase)
 
-        // 2. Create a context with tool capabilities.
+        // 1. Create an identity for the outlet operator.
+        let operatorIdentity = try await scp.identityCreateWithCustody(provider: provider)
+        print("Operator DID: \(operatorIdentity.did())")
+
+        // 2. Create a context whose ceiling allows registering and invoking Query outlets.
         let params = ContextParams(
+            mode: .encrypted,
             ceiling: [
-                "messages:read",
-                "messages:write",
-                "tool:register",
-                "tool:invoke:*",
+                Capability.Name.messagesRead,
+                Capability.Name.outletRegister,
+                Capability.Name.outletQueryAll,
             ],
+            ceilingPolicy: .immutable,
             governance: .singleAdmin,
-            memoryScope: .full,
+            memoryScope: .ephemeral,
             ttlSeconds: 0,
             promotable: false,
-            minProtocolVersion: 0
+            minProtocolVersion: 0,
+            maxChainDepth: nil,
+            maxNestingDepth: nil,
+            sessionCap: nil,
+            economicPolicy: nil,
+            consequenceRulesJson: nil,
+            consequenceConfigJson: nil
         )
-
-        let handle = try await contextCreate(identity: operator_, params: params)
+        let handle = try await scp.contextCreate(identity: operatorIdentity, params: params)
         print("Context: \(handle.contextId())")
 
-        // 3. Define a calculator tool.
-        //    ToolDefinition is a UniFFI-generated type with JSON schema fields.
-        let inputSchema = """
-        {
-            "type": "object",
-            "properties": {
-                "a": {"type": "number"},
-                "b": {"type": "number"},
-                "op": {"type": "string", "enum": ["add", "sub", "mul"]}
-            },
-            "required": ["a", "b", "op"]
-        }
-        """
-
-        let outputSchema = """
-        {
-            "type": "object",
-            "properties": {
-                "result": {"type": "number"}
-            },
-            "required": ["result"]
-        }
-        """
-
-        let definition = ToolDefinition(
+        // 3. Define a calculator outlet with JSON schemas and test vectors.
+        let calculator = OutletDefinition(
             name: "calculator",
             description: "A simple arithmetic calculator",
-            inputSchemaJson: inputSchema,
-            outputSchemaJson: outputSchema,
-            operatorDid: operator_.did(),
+            kind: .query,
+            inputSchemaJson: """
+            {
+                "type": "object",
+                "properties": {
+                    "a": {"type": "number"},
+                    "b": {"type": "number"},
+                    "op": {"type": "string", "enum": ["add", "sub", "mul"]}
+                },
+                "required": ["a", "b", "op"]
+            }
+            """,
+            outputSchemaJson: """
+            {
+                "type": "object",
+                "properties": {"result": {"type": "number"}},
+                "required": ["result"]
+            }
+            """,
+            operatorDid: operatorIdentity.did(),
             testVectorsJson: """
             [
-                {"input": {"a": 2, "b": 3, "op": "add"}, "expected_output": {"result": 5}},
-                {"input": {"a": 7, "b": 3, "op": "mul"}, "expected_output": {"result": 21}}
+                {"input": {"a": 2, "b": 3, "op": "add"}, "expected_output": {"result": 5}, "description": "2 + 3 = 5"},
+                {"input": {"a": 7, "b": 3, "op": "mul"}, "expected_output": {"result": 21}, "description": "7 * 3 = 21"}
             ]
             """,
             implementationHash: nil,
             cost: nil
         )
 
-        print("\nTool defined: \(definition.name)")
-        print("  Description: \(definition.description)")
+        // 4. Register the outlet. The returned id names it in every later call.
+        let outletId = try await scp.outletRegister(handle: handle, definition: calculator)
+        print("\nOutlet registered: \(outletId)")
 
-        // 4. Register the tool in the context.
-        let toolId = try await toolRegister(handle: handle, definition: definition)
-        print("  Registered with ID: \(toolId)")
-
-        // 5. Verify the tool against its test vectors.
-        let verification = try await toolVerify(handle: handle, toolId: toolId)
+        // 5. Verify the outlet against its test vectors.
+        let verification = try await scp.outletVerify(handle: handle, outletId: outletId)
         print("  Verification passed: \(verification.passed)")
-        if !verification.failures.isEmpty {
-            for failure in verification.failures {
-                print("    Failure: \(failure)")
-            }
+        for failure in verification.failures {
+            print("    - \(failure)")
         }
 
-        // 6. Invoke the tool.
-        //    Tool input and output are JSON strings at the bridge level.
-        let inputJson = #"{"a": 7, "b": 3, "op": "mul"}"#
-
-        let outputJson = try await toolInvoke(
+        // 6. Mint a UCAN token that authorizes invoking this one Query outlet.
+        let token = try await scp.ucanMint(
             handle: handle,
-            toolId: "calculator",
-            inputJson: inputJson,
-            identity: operator_,
-            ucanToken: nil,
-            proofTokens: nil
+            memberDid: operatorIdentity.did(),
+            capabilities: [Capability.outletQuery(outletId)],
+            proofs: nil
         )
+        print("\nUCAN minted: \(token.tokenId())")
+        print("  Capabilities: \(token.capabilities())")
 
-        print("\nInvoked calculator: 7 * 3")
-        print("  Result: \(outputJson)")
-
-        // 7. Stateful tool sessions (spec section 6.2.1).
-        //    Sessions enable multi-turn workflows with state preservation.
-        let sessionId = try await toolSessionCreate(
-            handle: handle,
-            toolId: toolId,
-            sourceContextId: handle.contextId(),
-            ttlSeconds: 300  // 5-minute session
-        )
-        print("\nSession created: \(sessionId)")
-
-        // Invoke within the session.
-        let sessionInputJson = #"{"a": 10, "b": 5, "op": "sub"}"#
-        let sessionOutputJson = try await toolSessionInvoke(
-            handle: handle,
-            sessionId: sessionId,
-            inputJson: sessionInputJson,
-            identity: operator_,
-            ucanToken: "placeholder-token",
-            proofTokens: nil
-        )
-        print("  Session invoke: 10 - 5 = \(sessionOutputJson)")
-
-        // Close the session.
-        try await toolSessionClose(handle: handle, sessionId: sessionId)
-        print("  Session closed.")
-
-        // 8. Clean up.
-        try await contextClose(handle: handle, identity: operator_)
-        print("\nTool operations complete.")
+        try await scp.shutdown()
+        print("\nOutlet operations complete.")
     }
 }

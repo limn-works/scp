@@ -66,6 +66,11 @@ jobs:
           key: rust-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: rust-${{ matrix.target }}-
 
+      # Every crate Cargo.lock names, downloaded once with retries; every later cargo
+      # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
+      - name: Fetch crates, then take cargo offline
+        uses: ./.github/actions/cargo-fetch
+
       - name: Install cross-compilation tools (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
@@ -203,6 +208,17 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
 
+      # The Linux legs build inside a manylinux container. maturin-action passes every
+      # `CARGO_*` variable into it, CARGO_NET_OFFLINE=true among them, but no file of the
+      # runner's, and the container's cargo home is `/root/.cargo` (both images run as
+      # root and install Rust with rustup's default paths). `docker-options` below mounts
+      # the registry this step filled at that path, so the offline build inside the
+      # container reads the crates fetched here. The macOS and Windows legs build on the
+      # runner and ignore `docker-options`.
+      - name: Fetch crates, then take cargo offline
+        id: cargo-fetch
+        uses: ./.github/actions/cargo-fetch
+
       # MACOSX_DEPLOYMENT_TARGET sets the macOS floor the universal2 wheel's tag
       # names, `macosx_11_0_universal2` in `.docs/standards/python.md`; 11.0 is the
       # first release that runs on arm64. rustc and the cc crate read it only when
@@ -215,6 +231,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           before-script-linux: ${{ matrix.before-script }}
+          docker-options: -v ${{ steps.cargo-fetch.outputs.cargo-home }}/registry:/root/.cargo/registry
           args: >-
             --release
             --out dist
@@ -235,6 +252,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      # Every crate Cargo.lock names, downloaded once with retries; every later cargo
+      # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
+      - name: Fetch crates, then take cargo offline
+        uses: ./.github/actions/cargo-fetch
 
       # No --manifest-path: pyproject.toml carries [tool.maturin] manifest-path.
       - name: Build sdist
@@ -294,6 +316,11 @@ jobs:
           key: napi-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: napi-${{ matrix.target }}-
 
+      # Every crate Cargo.lock names, downloaded once with retries; every later cargo
+      # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
+      - name: Fetch crates, then take cargo offline
+        uses: ./.github/actions/cargo-fetch
+
       - name: Install cross-compilation tools (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
@@ -340,6 +367,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      # Every crate Cargo.lock names, downloaded once with retries; every later cargo
+      # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
+      - name: Fetch crates, then take cargo offline
+        uses: ./.github/actions/cargo-fetch
 
       - name: Build for macOS (x86_64)
         run: cargo build --release --target x86_64-apple-darwin -p scp-ffi-uniffi
@@ -466,6 +498,11 @@ jobs:
           echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android21-clang" >> $GITHUB_ENV
           echo "CARGO_TARGET_I686_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android21-clang" >> $GITHUB_ENV
 
+      # Every crate Cargo.lock names, downloaded once with retries; every later cargo
+      # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
+      - name: Fetch crates, then take cargo offline
+        uses: ./.github/actions/cargo-fetch
+
       - name: Build for Android targets
         run: |
           for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android; do
@@ -542,6 +579,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      # Every crate Cargo.lock names, downloaded once with retries; every later cargo
+      # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
+      - name: Fetch crates, then take cargo offline
+        uses: ./.github/actions/cargo-fetch
 
       - name: Install cross-compilation tools (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'

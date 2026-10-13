@@ -1471,7 +1471,11 @@ fn trust_query_score_validates_empty_did() {
 fn trust_verify_attestation_rejects_invalid_json() {
     setup();
     Python::with_gil(|py| {
-        assert!(_scp_core::trust::py_trust_verify_attestation(py, "not valid json").is_err());
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        assert!(
+            scp.trust_verify_attestation(py, "ctx-valid", "not valid json")
+                .is_err()
+        );
     });
 }
 

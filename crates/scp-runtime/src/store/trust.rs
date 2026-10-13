@@ -8,7 +8,7 @@
 //! # Key convention
 //!
 //! ```text
-//! trust/{context_id}/attestation/{subject_did}/{attestation_id}
+//! trust/{context_id}/attestation/{subject_did}/{sha256_hex(revocation_list_key(issuer, attestation_id))}
 //! trust/{context_id}/revocation/{sha256_hex(revocation_list_key)}
 //! trust/{context_id}/challenge/{subject_did}/{verification_id}
 //! ```
@@ -22,7 +22,10 @@ use scp_platform::traits::Storage;
 
 use super::{ProtocolRepository, StoreError, sanitize_key_component};
 use scp_protocol::trust::TrustError;
-use scp_protocol::trust::aggregate::{CachedAttestation, TrustProtocolRepository};
+use scp_protocol::trust::aggregate::{
+    CachedAttestation, RevocationEntry, TrustProtocolRepository, plan_revocation_write,
+    revocation_list_key,
+};
 use scp_protocol::trust::challenge::ChallengeVerification;
 
 // ---------------------------------------------------------------------------
@@ -31,16 +34,29 @@ use scp_protocol::trust::challenge::ChallengeVerification;
 
 /// Builds the storage key for a cached attestation.
 ///
-/// Format: `trust/{context_id}/attestation/{subject_did}/{attestation_id}`
+/// Format: `trust/{context_id}/attestation/{subject_did}/{sha256_hex(list_key)}`,
+/// where `list_key` is `revocation_list_key(issuer, attestation_id)`.
+///
+/// The key names the issuer as well as the id, because §7.4.1 of
+/// `.docs/specs/07-trust-validation-and-capabilities.md` binds
+/// `Attestation.id` to no issuer: a key built from the id alone would let any
+/// DID overwrite another issuer's cached attestation by signing one that
+/// carries its id. Both fields are caller-chosen bytes, so they reach the path
+/// only as a fixed-width hash that `sanitize_key_component` always accepts.
 fn attestation_key(
     context_id: &str,
     subject_did: &str,
-    attestation_id: &str,
+    attestation: &scp_protocol::trust::Attestation,
 ) -> Result<String, StoreError> {
+    use sha2::{Digest, Sha256};
     let ctx = sanitize_key_component(context_id)?;
     let subject = sanitize_key_component(subject_did)?;
-    let att = sanitize_key_component(attestation_id)?;
-    Ok(format!("trust/{ctx}/attestation/{subject}/{att}"))
+    let list_key = revocation_list_key(&attestation.issuer, &attestation.id);
+    let digest = Sha256::digest(list_key.as_bytes());
+    Ok(format!(
+        "trust/{ctx}/attestation/{subject}/{}",
+        hex::encode(digest)
+    ))
 }
 
 /// Builds the prefix for listing all cached attestations for a subject DID
@@ -87,12 +103,14 @@ fn revocation_prefix(context_id: &str) -> Result<String, StoreError> {
 /// DID plus an attestation id. A storage key holds a hash of that value, so the
 /// value itself rides in the record and
 /// [`ProtocolRepository::load_trust_revocation_state`] rebuilds the map from it.
+/// A record exists only for a revocation; its presence is the revocation.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RevocationRecord {
     /// The revocation-list key this record stands for.
     list_key: String,
-    /// Whether the issuer named in `list_key` revoked that attestation.
-    revoked: bool,
+    /// The revoked attestation's own `expires_at`, which decides when the
+    /// record is pruned (see `RevocationEntry::expires_at`).
+    expires_at: Option<u64>,
 }
 
 /// Builds the storage key for a challenge verification result.
@@ -126,9 +144,9 @@ fn challenge_prefix(context_id: &str, subject_did: &str) -> Result<String, Store
 impl<S: Storage> ProtocolRepository<S> {
     /// Stores a cached attestation entry.
     ///
-    /// The key includes the attestation's subject DID and unique ID, so
-    /// storing the same attestation ID again replaces the previous entry
-    /// (replace-by-ID semantics).
+    /// The key includes the attestation's subject DID, issuer DID, and ID, so
+    /// storing an attestation replaces only an entry that carries the same
+    /// issuer and the same ID.
     ///
     /// # Errors
     ///
@@ -142,7 +160,7 @@ impl<S: Storage> ProtocolRepository<S> {
         let key = attestation_key(
             context_id,
             entry.attestation.subject.as_ref(),
-            &entry.attestation.id,
+            &entry.attestation,
         )?;
         self.store_value(&key, entry).await
     }
@@ -174,72 +192,73 @@ impl<S: Storage> ProtocolRepository<S> {
         Ok(entries)
     }
 
-    /// Stores revocation state for a context.
+    /// Records each entry in `entries` as a revocation for a context, after
+    /// pruning the records that are moot at `now`, by the plan
+    /// `scp_protocol::trust::aggregate::plan_revocation_write` returns.
     ///
-    /// REPLACES any existing revocation state: every entry this context holds
-    /// and `state` does not name is deleted. A caller that learned about
-    /// individual revocations calls [`Self::add_trust_revocations`] instead. Map
-    /// keys come from `scp_protocol::trust::aggregate::revocation_list_key`, and
-    /// each value reports whether the issuer inside its key revoked that
-    /// attestation (`true` = revoked).
+    /// SECURITY (lost update). Each record is written under its own storage
+    /// key, so no write carries a stale copy of another key, and two concurrent
+    /// callers that record different revocations both keep their record. A
+    /// prune deletes only a record whose
+    /// attestation has expired, which a concurrent caller can at most rewrite
+    /// with the same content, and which no verification can need.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] if key sanitization, serialization, or storage
-    /// fails.
-    pub async fn store_trust_revocation_state(
+    /// Returns [`TrustError::StoreError`] if key sanitization, serialization,
+    /// or storage fails.
+    async fn add_trust_revocations(
         &self,
         context_id: &str,
-        state: &HashMap<String, bool>,
-    ) -> Result<(), StoreError> {
-        let prefix = revocation_prefix(context_id)?;
-        self.storage().delete_prefix(&prefix).await?;
-        for (list_key, revoked) in state {
-            let key = revocation_entry_key(context_id, list_key)?;
+        entries: &[RevocationEntry],
+        now: u64,
+    ) -> Result<(), TrustError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let existing = self
+            .load_trust_revocation_records(context_id)
+            .await
+            .map_err(map_store_error)?;
+        let plan = plan_revocation_write(&existing, entries, now);
+        for list_key in &plan.prune {
+            let key = revocation_entry_key(context_id, list_key).map_err(map_store_error)?;
+            self.storage()
+                .delete(&key)
+                .await
+                .map_err(|e| map_store_error(StoreError::from(e)))?;
+        }
+        for entry in plan.write {
+            let key = revocation_entry_key(context_id, &entry.list_key).map_err(map_store_error)?;
             let record = RevocationRecord {
-                list_key: list_key.clone(),
-                revoked: *revoked,
+                list_key: entry.list_key,
+                expires_at: entry.expires_at,
             };
-            self.store_value(&key, &record).await?;
+            self.store_value(&key, &record)
+                .await
+                .map_err(map_store_error)?;
         }
         Ok(())
     }
 
-    /// Marks each key in `list_keys` revoked for a context, leaving every entry
-    /// this call does not name as it was.
-    ///
-    /// Each key comes from `scp_protocol::trust::aggregate::revocation_list_key`.
-    ///
-    /// SECURITY (lost update). Each key is written under its own storage key, so
-    /// this method reads nothing and no write carries a stale copy of another
-    /// key. Two concurrent callers on one context that record different
-    /// revocations therefore both keep their record, and two that record the
-    /// same revocation write the same value. Reading a whole map and writing a
-    /// mutated copy back would instead drop whichever addition landed first, and
-    /// a dropped revocation lets a revoked attestation count again. Nothing here
-    /// makes a read-then-write pair atomic — this repository exposes no
-    /// transaction and no compare-and-set — so a caller that must replace a whole
-    /// map still races, which is why [`Self::store_trust_revocation_state`] stays
-    /// separate and why the ingest path never calls it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError`] if key sanitization, serialization, or storage
-    /// fails.
-    pub async fn add_trust_revocations(
+    /// Loads every revocation record a context holds, with each record's
+    /// expiry.
+    async fn load_trust_revocation_records(
         &self,
         context_id: &str,
-        list_keys: &[String],
-    ) -> Result<(), StoreError> {
-        for list_key in list_keys {
-            let key = revocation_entry_key(context_id, list_key)?;
-            let record = RevocationRecord {
-                list_key: list_key.clone(),
-                revoked: true,
-            };
-            self.store_value(&key, &record).await?;
+    ) -> Result<Vec<RevocationEntry>, StoreError> {
+        let prefix = revocation_prefix(context_id)?;
+        let keys = self.storage().list_keys(&prefix).await?;
+        let mut records = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(record) = self.load_value::<RevocationRecord>(&key).await? {
+                records.push(RevocationEntry {
+                    list_key: record.list_key,
+                    expires_at: record.expires_at,
+                });
+            }
         }
-        Ok(())
+        Ok(records)
     }
 
     /// Loads revocation state for a context.
@@ -254,15 +273,12 @@ impl<S: Storage> ProtocolRepository<S> {
         &self,
         context_id: &str,
     ) -> Result<HashMap<String, bool>, StoreError> {
-        let prefix = revocation_prefix(context_id)?;
-        let keys = self.storage().list_keys(&prefix).await?;
-        let mut state = HashMap::with_capacity(keys.len());
-        for key in keys {
-            if let Some(record) = self.load_value::<RevocationRecord>(&key).await? {
-                state.insert(record.list_key, record.revoked);
-            }
-        }
-        Ok(state)
+        Ok(self
+            .load_trust_revocation_records(context_id)
+            .await?
+            .into_iter()
+            .map(|record| (record.list_key, true))
+            .collect())
     }
 
     /// Stores a challenge verification result.
@@ -394,33 +410,23 @@ impl<S: Storage + 'static> TrustProtocolRepository for ProtocolRepositoryTrustBr
             .map_err(map_store_error)
     }
 
-    fn store_revocation_state(
+    fn add_revocations(
         &self,
         context_id: &str,
-        state: &HashMap<String, bool>,
+        entries: &[RevocationEntry],
+        now: u64,
     ) -> Result<(), TrustError> {
         let store = self.store.clone();
         let ctx_id = context_id.to_owned();
-        let state = state.clone();
-        self.handle
-            .block_on(async { store.store_trust_revocation_state(&ctx_id, &state).await })
-            .map_err(map_store_error)
-    }
-
-    fn add_revocations(&self, context_id: &str, keys: &[String]) -> Result<(), TrustError> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let keys = keys.to_vec();
+        let entries = entries.to_vec();
         // `TrustProtocolRepository` is a sync trait over an async repository, and every
         // sibling method in this impl bridges that gap exactly this way. A caller reaches
         // this method from an FFI bridge thread, never from a tokio worker. Deleting this
-        // call would delete a merge operation `verify_and_cache_attestations` needs to add
-        // revocations under one transaction; a read-then-whole-map-write alternative loses
-        // a concurrent caller's additions, which is a defect this method exists to close.
-        let merged = self
-            .handle
-            .block_on(async { store.add_trust_revocations(&ctx_id, &keys).await }); // ci-allow: block-on: sync TrustProtocolRepository over an async repository, mirroring six sibling methods
-        merged.map_err(map_store_error)
+        // call would delete the per-key merge `verify_and_cache_attestations` needs to add
+        // revocations; a read-then-whole-map-write alternative loses a concurrent caller's
+        // additions, which is a defect this method exists to close.
+        self.handle
+            .block_on(async { store.add_trust_revocations(&ctx_id, &entries, now).await }) // ci-allow: block-on: sync TrustProtocolRepository over an async repository, mirroring five sibling methods
     }
 
     fn get_challenge_results(
@@ -513,6 +519,14 @@ mod tests {
             },
             result: serde_json::json!({"passed": true}),
             completed_at: 1800,
+        }
+    }
+
+    /// A revocation entry that never expires.
+    fn rev(list_key: &str) -> RevocationEntry {
+        RevocationEntry {
+            list_key: list_key.to_owned(),
+            expires_at: None,
         }
     }
 
@@ -661,17 +675,91 @@ mod tests {
     #[tokio::test]
     async fn revocation_state_roundtrip() {
         let store = new_store();
-        let mut state = HashMap::new();
-        state.insert("att-1".to_owned(), true);
-        state.insert("att-2".to_owned(), false);
-
         store
-            .store_trust_revocation_state("ctx-1", &state)
+            .add_trust_revocations("ctx-1", &[rev("att-1"), rev("att-2")], 1000)
             .await
             .unwrap();
 
         let loaded = store.load_trust_revocation_state("ctx-1").await.unwrap();
-        assert_eq!(loaded, state);
+        let expected: HashMap<String, bool> =
+            [("att-1".to_owned(), true), ("att-2".to_owned(), true)]
+                .into_iter()
+                .collect();
+        assert_eq!(loaded, expected);
+    }
+
+    /// Two issuers' attestations that carry one id and one subject are two
+    /// cache entries, and storing the second leaves the first in place.
+    #[tokio::test]
+    async fn attestations_from_two_issuers_with_one_id_both_survive() {
+        let store = new_store();
+        let honest = make_cached("att-shared", "did:key:alice", 1000, 300);
+        let mut forged = make_cached("att-shared", "did:key:alice", 1001, 300);
+        forged.attestation.issuer = "did:key:mallory".into();
+
+        store
+            .store_trust_cached_attestation("ctx-1", &honest)
+            .await
+            .unwrap();
+        store
+            .store_trust_cached_attestation("ctx-1", &forged)
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_trust_cached_attestations("ctx-1", "did:key:alice")
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 2, "one id from two issuers is two entries");
+        assert!(
+            loaded
+                .iter()
+                .any(|e| e.attestation.issuer.as_ref() == "did:key:bob" && e.verified_at == 1000),
+            "the honest issuer's entry must survive, cache reads {loaded:?}"
+        );
+    }
+
+    /// A record whose attestation has expired is pruned by the next write, and
+    /// a record that never expires is kept.
+    #[tokio::test]
+    async fn add_trust_revocations_prunes_records_whose_attestation_expired() {
+        let store = new_store();
+        let expiring = RevocationEntry {
+            list_key: "9:did:key:a:att-old".to_owned(),
+            expires_at: Some(1500),
+        };
+        store
+            .add_trust_revocations(
+                "ctx-prune",
+                &[expiring, rev("9:did:key:a:att-forever")],
+                1000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_trust_revocation_state("ctx-prune")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        store
+            .add_trust_revocations("ctx-prune", &[rev("9:did:key:a:att-new")], 2000)
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_trust_revocation_state("ctx-prune")
+            .await
+            .unwrap();
+        assert!(
+            !loaded.contains_key("9:did:key:a:att-old"),
+            "a record past its attestation's expiry must be pruned, list reads {loaded:?}"
+        );
+        assert!(loaded.contains_key("9:did:key:a:att-forever"));
+        assert!(loaded.contains_key("9:did:key:a:att-new"));
     }
 
     /// SECURITY (lost update, issue #2335 bug-catcher item 8). Two callers on
@@ -691,11 +779,11 @@ mod tests {
         assert!(second_read.is_empty());
 
         store
-            .add_trust_revocations("ctx-race", &["9:did:key:a:att-a".to_owned()])
+            .add_trust_revocations("ctx-race", &[rev("9:did:key:a:att-a")], 1000)
             .await
             .unwrap();
         store
-            .add_trust_revocations("ctx-race", &["9:did:key:b:att-b".to_owned()])
+            .add_trust_revocations("ctx-race", &[rev("9:did:key:b:att-b")], 1000)
             .await
             .unwrap();
 
@@ -722,7 +810,7 @@ mod tests {
         let hostile = "13:did:key:../..:att/../../escape".to_owned();
 
         store
-            .add_trust_revocations("ctx-hostile", std::slice::from_ref(&hostile))
+            .add_trust_revocations("ctx-hostile", &[rev(&hostile)], 1000)
             .await
             .unwrap();
 
@@ -738,30 +826,6 @@ mod tests {
                 "a revocation entry must stay inside its context namespace: {key}"
             );
         }
-    }
-
-    /// `store_trust_revocation_state` REPLACES a whole list, so an entry the new
-    /// map omits is gone afterwards.
-    #[tokio::test]
-    async fn store_revocation_state_replaces_every_earlier_entry() {
-        let store = new_store();
-        store
-            .add_trust_revocations("ctx-replace", &["9:did:key:a:att-a".to_owned()])
-            .await
-            .unwrap();
-
-        let mut replacement = HashMap::new();
-        replacement.insert("9:did:key:b:att-b".to_owned(), true);
-        store
-            .store_trust_revocation_state("ctx-replace", &replacement)
-            .await
-            .unwrap();
-
-        let loaded = store
-            .load_trust_revocation_state("ctx-replace")
-            .await
-            .unwrap();
-        assert_eq!(loaded, replacement, "a replace drops every earlier entry");
     }
 
     #[tokio::test]
@@ -930,13 +994,28 @@ mod tests {
         assert!(loaded.is_err());
     }
 
+    /// An attestation id and issuer reach the storage path only as a hash, so
+    /// path-hostile bytes in either stay inside the subject's namespace.
     #[tokio::test]
-    async fn rejects_null_byte_in_attestation_id() {
+    async fn hostile_attestation_id_stays_inside_its_namespace() {
         let store = new_store();
-        let mut entry = make_cached("att\0evil", "did:key:alice", 1000, 300);
-        entry.attestation.id = "att\0evil".to_owned();
-        let result = store.store_trust_cached_attestation("ctx-1", &entry).await;
-        assert!(result.is_err());
+        let mut entry = make_cached("att\0evil/../../escape", "did:key:alice", 1000, 300);
+        entry.attestation.issuer = "did:key:../..".into();
+        store
+            .store_trust_cached_attestation("ctx-1", &entry)
+            .await
+            .unwrap();
+        for key in store.storage().list_keys("").await.unwrap() {
+            assert!(
+                key.starts_with("trust/ctx-1/attestation/did:key:alice/"),
+                "a cached attestation must stay inside its subject namespace: {key}"
+            );
+        }
+        let loaded = store
+            .load_trust_cached_attestations("ctx-1", "did:key:alice")
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
     }
 
     // -------------------------------------------------------------------
@@ -987,7 +1066,9 @@ mod tests {
 
         // Call from blocking thread (simulates FFI caller context).
         tokio::task::spawn_blocking(move || {
-            bridge.store_revocation_state("ctx-1", &state).unwrap();
+            bridge
+                .add_revocations("ctx-1", &[rev("att-1")], 1000)
+                .unwrap();
             let loaded = bridge.get_revocation_state("ctx-1").unwrap();
             assert_eq!(loaded, state);
         })
@@ -1081,10 +1162,8 @@ mod tests {
             .await
             .unwrap();
 
-        let mut revocation = HashMap::new();
-        revocation.insert("att-ns".to_owned(), false);
         store
-            .store_trust_revocation_state("ctx-ns", &revocation)
+            .add_trust_revocations("ctx-ns", &[rev("att-ns")], 1000)
             .await
             .unwrap();
 
@@ -1125,10 +1204,8 @@ mod tests {
             .await
             .unwrap();
 
-        let mut revocation = HashMap::new();
-        revocation.insert("att-del".to_owned(), true);
         store
-            .store_trust_revocation_state("ctx-del", &revocation)
+            .add_trust_revocations("ctx-del", &[rev("att-del")], 1000)
             .await
             .unwrap();
 

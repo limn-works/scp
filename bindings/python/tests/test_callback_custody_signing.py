@@ -6,7 +6,7 @@ the wait releases the GIL: a Python ``sign`` completes, and a second thread's
 non-signing call proceeds while the first thread's ``sign`` sleeps. If the
 bridge held the GIL while waiting, the second thread's call would block the
 first thread's callback, and the proposal would fail at the 30-second signing
-budget with ``SCP-CRYPTO-4061``.
+budget with ``SCP-CRYPTO-4062``.
 
 Requires the native extension built with ``testing``::
 

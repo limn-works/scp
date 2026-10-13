@@ -171,7 +171,6 @@ pub mod trust {
         DidPublicKeyResolver, FreshnessStatus, IdentityDidPublicKeyResolver, RevocationStatus,
         ThresholdCheckInput, ThresholdRequirement, ThresholdResult, canonical_attestation_bytes,
         check_attestation_freshness, check_threshold_attestation, verify_attestation,
-        verify_attestation_with_revocation,
     };
     // `NoOpRevocationChecker` reports every attestation as not revoked, so its
     // re-export carries the same `testing` gate as its definition.

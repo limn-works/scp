@@ -55,12 +55,14 @@ pub const IDENT_1000: &str = "SCP-IDENT-1000";
 pub const IDENT_1001: &str = "SCP-IDENT-1001";
 /// Identity not found.
 pub const IDENT_1002: &str = "SCP-IDENT-1002";
-/// Custody string reaches no key store on this bridge (SCP-294).
+/// `"os_keystore"` custody requested with no `KeyCustodyProvider` (spec 03
+/// §3.2.2).
 ///
-/// Every bridge returns this code when a caller names such a string:
-/// `"platform"` on all three bridges, `"software"` on the NAPI and `UniFFI`
-/// bridges, and `"callback"` on the `UniFFI` bridge. A `testing_seed` passed
-/// with such a string is reported first, as [`VALID_7009`].
+/// The `PyO3`, NAPI and `UniFFI` bridges return this code only for
+/// `"os_keystore"` with no provider, through
+/// [`crate::custody_request::parse_custody_request`]; the caller passes the
+/// provider through `identity_create_with_custody`. A `testing_seed` passed
+/// with the request is reported first, as [`VALID_7009`].
 pub const IDENT_1003: &str = "SCP-IDENT-1003";
 /// Identity key generation failed.
 pub const IDENT_1004: &str = "SCP-IDENT-1004";
@@ -746,12 +748,18 @@ pub const CRYPTO_4059: &str = "SCP-CRYPTO-4059";
 ///
 /// [`custody_failure_code`] decides which custody failures carry this code.
 pub const CRYPTO_4060: &str = "SCP-CRYPTO-4060";
+/// Unsupported platform operation.
+///
+/// The backend does not support an optional operation
+/// (`PlatformError::Unsupported`), such as an HSM-backed custody
+/// asked for an extractable Ed25519 seed or a signature it cannot make.
+pub const CRYPTO_4061: &str = "SCP-CRYPTO-4061";
 /// Key custody timeout: a custody sign did not answer within the ADR-049
 /// Decision 7a signing budget ([`CustodyFailureKind::TimedOut`](scp_crypto::CustodyFailureKind::TimedOut)).
 ///
 /// Not a transport timeout: an unanswered biometric prompt or host callback is
 /// not a retryable network fault.
-pub const CRYPTO_4061: &str = "SCP-CRYPTO-4061";
+pub const CRYPTO_4062: &str = "SCP-CRYPTO-4062";
 
 // -------------------------------------------------------------------------
 // Transport (SCP-TRANS- 5000--5999)
@@ -829,6 +837,25 @@ pub const TRANS_5062: &str = "SCP-TRANS-5062";
 pub const TRANS_5063: &str = "SCP-TRANS-5063";
 /// `UniFFI` transport broadcast error.
 pub const TRANS_5070: &str = "SCP-TRANS-5070";
+
+// Push (ADR-006 2026-10-12 amendment): one code per
+// `PlatformError::PushError` kind, assigned by [`custody_failure_code`].
+
+/// Push wake payload invalid: a received push payload is not the platform's
+/// wake signal (`PushFailureKind::WakePayloadInvalid`).
+pub const TRANS_5080: &str = "SCP-TRANS-5080";
+/// Push registration rejected: the relay found the registration's signature,
+/// key state or encoding invalid (`PushFailureKind::RegistrationRejected`).
+pub const TRANS_5081: &str = "SCP-TRANS-5081";
+/// Push verifier unavailable: the relay cannot verify a registration's
+/// signature yet (`PushFailureKind::VerifierUnavailable`).
+pub const TRANS_5082: &str = "SCP-TRANS-5082";
+/// Push platform unavailable: the relay has no push sender for the
+/// registration's platform (`PushFailureKind::PlatformUnavailable`).
+pub const TRANS_5083: &str = "SCP-TRANS-5083";
+/// Push provider failure: the device's push provider (APNs, FCM) failed, such
+/// as a failed token registration (`PushFailureKind::ProviderFailed`).
+pub const TRANS_5084: &str = "SCP-TRANS-5084";
 
 // -------------------------------------------------------------------------
 // Outlet (SCP-OUTLET- 6000--6999)
@@ -914,19 +941,20 @@ pub const VALID_7006: &str = "SCP-VALID-7006";
 pub const VALID_7007: &str = "SCP-VALID-7007";
 /// Testing-only feature requires the `testing` feature flag.
 ///
-/// Returned by FFI entry points when a caller supplies a parity-harness
-/// affordance (`testing_seed` on `identity_create`, `signed_at_override`
-/// on `scpid_sign`) in a build that was NOT compiled with the `testing`
-/// feature enabled. These are ADR-046 cross-bridge parity-harness
-/// inputs, not production APIs — production bundles reject them with
-/// this code.
+/// Returned by `scpid_sign` when a caller supplies `signed_at_override`, an
+/// ADR-046 cross-bridge parity-harness input rather than a production API,
+/// in a build that was NOT compiled with the `testing` feature enabled.
+///
+/// A `testing_seed` on `identity_create` does not use this code: spec 03
+/// §3.2.2 answers a seed with `"in_memory"` on such a build with
+/// [`IDENT_1008`], through [`crate::custody_request::parse_custody_request`].
 pub const VALID_7008: &str = "SCP-VALID-7008";
 /// Seed requires `InMemoryKeyCustody`.
 ///
 /// Returned when a caller passes a deterministic parity-harness `seed`
 /// together with a custody type other than `"in_memory"`. Seeded
 /// determinism is only meaningful for the in-process `InMemoryKeyCustody`
-/// backend — platform/software/file custody all produce keys outside the
+/// backend — `encrypted_file` and `os_keystore` custody produce keys outside the
 /// seeded RNG, so accepting a seed with them would silently lie about
 /// reproducibility.
 pub const VALID_7009: &str = "SCP-VALID-7009";
@@ -1256,7 +1284,8 @@ pub const STORAGE_8006: &str = "SCP-STORAGE-8006";
 /// and the Apple adapter throws it when Apple's App Attest service answers
 /// with an error that no narrower `SCP-ATTEST-` code names, or when the
 /// caller's task is cancelled while its App Attest call is queued or waiting
-/// for Apple's answer.
+/// for Apple's answer. Every native bridge reports
+/// `PlatformError::AttestationError` with it ([`custody_failure_code`]).
 pub const ATTEST_9001: &str = "SCP-ATTEST-9001";
 
 /// Attestation signature verification requires raw JSON, which is absent.
@@ -1436,16 +1465,86 @@ pub const SAGA_13066: &str = "SCP-SAGA-13066";
 /// [`CRYPTO_4006`], a rejected host pseudonym is [`IDENT_1055`], a closed
 /// custody store is [`STORAGE_8006`], a custody store whose directory lock is
 /// still held is [`STORAGE_8005`], a custody sign past the ADR-049 Decision 7a
-/// budget is [`CRYPTO_4061`], and any other custody failure is
-/// [`CRYPTO_4060`].
+/// budget is [`CRYPTO_4062`], a device attestation failure is
+/// [`ATTEST_9001`], an unsupported operation is [`CRYPTO_4061`], each push
+/// failure kind has its own code from [`TRANS_5080`] to [`TRANS_5084`], and
+/// any other custody failure is [`CRYPTO_4060`].
 #[must_use]
 pub const fn custody_failure_code(e: &scp_crypto::CustodyFailure) -> &'static str {
+    use scp_crypto::CustodyFailureKind as Kind;
     match e.kind {
-        scp_crypto::CustodyFailureKind::KeyNotFound => CRYPTO_4006,
-        scp_crypto::CustodyFailureKind::PseudonymRejected => IDENT_1055,
-        scp_crypto::CustodyFailureKind::StorageClosed => STORAGE_8006,
-        scp_crypto::CustodyFailureKind::StorageLockHeld => STORAGE_8005,
-        scp_crypto::CustodyFailureKind::TimedOut => CRYPTO_4061,
-        scp_crypto::CustodyFailureKind::Failed => CRYPTO_4060,
+        Kind::KeyNotFound => CRYPTO_4006,
+        Kind::PseudonymRejected => IDENT_1055,
+        Kind::StorageClosed => STORAGE_8006,
+        Kind::StorageLockHeld => STORAGE_8005,
+        Kind::TimedOut => CRYPTO_4062,
+        Kind::AttestationFailed => ATTEST_9001,
+        Kind::Unsupported => CRYPTO_4061,
+        Kind::PushWakePayloadInvalid => TRANS_5080,
+        Kind::PushRegistrationRejected => TRANS_5081,
+        Kind::PushVerifierUnavailable => TRANS_5082,
+        Kind::PushPlatformUnavailable => TRANS_5083,
+        Kind::PushProviderFailed => TRANS_5084,
+        Kind::Failed => CRYPTO_4060,
+    }
+}
+
+/// The bridge error class a [`CustodyFailure`](scp_crypto::CustodyFailure)
+/// reaches the caller as; each bridge maps it to its own error variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyFailureClass {
+    /// An identity error: a rejected host pseudonym or a device attestation
+    /// failure.
+    Identity,
+    /// A validation error: a closed or still-locked store (spec §17.6).
+    Validation,
+    /// A crypto error: key-not-found, a custody sign past its budget, an
+    /// unsupported operation, or any other key custody failure.
+    Crypto,
+    /// A transport error: a push failure (ADR-006 2026-10-12 amendment).
+    Transport,
+}
+
+/// The error class for a custody failure kind, one mapping for the `PyO3`,
+/// napi-rs and `UniFFI` bridges.
+#[must_use]
+pub const fn custody_failure_class(kind: scp_crypto::CustodyFailureKind) -> CustodyFailureClass {
+    use scp_crypto::CustodyFailureKind as Kind;
+    match kind {
+        Kind::PseudonymRejected | Kind::AttestationFailed => CustodyFailureClass::Identity,
+        Kind::StorageClosed | Kind::StorageLockHeld => CustodyFailureClass::Validation,
+        Kind::KeyNotFound | Kind::TimedOut | Kind::Unsupported | Kind::Failed => {
+            CustodyFailureClass::Crypto
+        }
+        Kind::PushWakePayloadInvalid
+        | Kind::PushRegistrationRejected
+        | Kind::PushVerifierUnavailable
+        | Kind::PushPlatformUnavailable
+        | Kind::PushProviderFailed => CustodyFailureClass::Transport,
+    }
+}
+
+/// Whether a bare `PlatformError` of this kind is a key custody failure.
+///
+/// Only then does the bridge's message point the caller at the key custody
+/// configuration. A storage, attestation or push failure is not, and its
+/// message is the error's own text.
+#[must_use]
+pub const fn is_key_custody_failure(kind: scp_crypto::CustodyFailureKind) -> bool {
+    use scp_crypto::CustodyFailureKind as Kind;
+    match kind {
+        Kind::KeyNotFound
+        | Kind::PseudonymRejected
+        | Kind::TimedOut
+        | Kind::Unsupported
+        | Kind::Failed => true,
+        Kind::StorageClosed
+        | Kind::StorageLockHeld
+        | Kind::AttestationFailed
+        | Kind::PushWakePayloadInvalid
+        | Kind::PushRegistrationRejected
+        | Kind::PushVerifierUnavailable
+        | Kind::PushPlatformUnavailable
+        | Kind::PushProviderFailed => false,
     }
 }

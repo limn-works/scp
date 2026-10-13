@@ -303,7 +303,12 @@ async fn attestation_verify_roundtrip() {
     resolver.add(&issuer_did, vk.to_bytes().to_vec());
 
     let clock = FixedClock(2000);
-    let result = verify_attestation(&att, &resolver, &clock);
+    let result = verify_attestation(
+        &att,
+        &resolver,
+        &clock,
+        &scp_core::trust::NoOpRevocationChecker,
+    );
     assert!(result.is_ok(), "verify_attestation failed: {result:?}");
 }
 
@@ -401,7 +406,7 @@ async fn attestation_threshold() {
         requirement: &requirement,
         resolver: &resolver,
         clock: &clock,
-        revocation_checker: None,
+        revocation_checker: &scp_core::trust::NoOpRevocationChecker,
     });
     assert!(result.met, "2-of-3 threshold should be met");
     assert_eq!(result.valid_count, 3);
@@ -415,7 +420,7 @@ async fn attestation_threshold() {
         requirement: &strict_requirement,
         resolver: &resolver,
         clock: &clock,
-        revocation_checker: None,
+        revocation_checker: &scp_core::trust::NoOpRevocationChecker,
     });
     assert!(
         !result_strict.met,
@@ -1395,7 +1400,7 @@ struct ScopingTestStore {
     attestations: std::sync::Mutex<
         HashMap<(String, String, String, String), scp_core::trust::aggregate::CachedAttestation>,
     >,
-    revocations: std::sync::Mutex<HashMap<String, HashMap<String, bool>>>,
+    revocations: std::sync::Mutex<HashMap<String, HashSet<String>>>,
     challenges:
         std::sync::Mutex<HashMap<(String, String), Vec<scp_core::trust::ChallengeVerification>>>,
 }
@@ -1434,26 +1439,25 @@ impl scp_core::trust::aggregate::TrustProtocolRepository for ScopingTestStore {
 
     fn get_revocation_state(&self, context_id: &str) -> Result<HashMap<String, bool>, TrustError> {
         let store = self.revocations.lock().unwrap();
-        Ok(store.get(context_id).cloned().unwrap_or_default())
+        Ok(store
+            .get(context_id)
+            .map(|keys| keys.iter().map(|k| (k.clone(), true)).collect())
+            .unwrap_or_default())
     }
 
-    fn store_revocation_state(
+    fn add_revocations(
         &self,
         context_id: &str,
-        state: &HashMap<String, bool>,
+        entries: &[scp_core::trust::aggregate::RevocationEntry],
+        _now: u64,
     ) -> Result<(), TrustError> {
-        let mut store = self.revocations.lock().unwrap();
-        store.insert(context_id.to_owned(), state.clone());
-        Ok(())
-    }
-
-    fn add_revocations(&self, context_id: &str, keys: &[String]) -> Result<(), TrustError> {
         // One guard spans the lookup and the inserts, so a concurrent caller on
-        // this context cannot drop what this call adds.
+        // this context cannot drop what this call adds. These tests write a
+        // handful of never-expiring records, so the cap and prune never engage.
         let mut store = self.revocations.lock().unwrap();
-        let entry = store.entry(context_id.to_owned()).or_default();
-        for key in keys {
-            entry.insert(key.clone(), true);
+        let keys = store.entry(context_id.to_owned()).or_default();
+        for entry in entries {
+            keys.insert(entry.list_key.clone());
         }
         Ok(())
     }
@@ -1503,7 +1507,7 @@ fn scoping_entry(attestation: Attestation) -> scp_core::trust::aggregate::Cached
 #[test]
 fn attestation_revocation_binds_to_the_issuer_that_signed_it() {
     use scp_core::trust::aggregate::{
-        AttestationCache, TrustProtocolRepository, revocation_list_key,
+        AttestationCache, RevocationEntry, TrustProtocolRepository, revocation_list_key,
     };
 
     let context_id = "ctx-issuer-scoped-revocation";
@@ -1555,9 +1559,13 @@ fn attestation_revocation_binds_to_the_issuer_that_signed_it() {
         .unwrap();
 
     // The attacker records a revocation of the shared id under its own DID.
-    let mut revoked = HashMap::new();
-    revoked.insert(revocation_list_key(&attacker.issuer, shared_id), true);
-    store.store_revocation_state(context_id, &revoked).unwrap();
+    let attacker_revocation = RevocationEntry {
+        list_key: revocation_list_key(&attacker.issuer, shared_id),
+        expires_at: None,
+    };
+    store
+        .add_revocations(context_id, &[attacker_revocation], 2000)
+        .unwrap();
 
     let cache = AttestationCache::new(store);
     let survived = cache
@@ -1574,11 +1582,13 @@ fn attestation_revocation_binds_to_the_issuer_that_signed_it() {
     );
 
     // The honest issuer revokes its own attestation, and that revocation lands.
-    let mut both_revoked = revoked.clone();
-    both_revoked.insert(revocation_list_key(&honest.issuer, shared_id), true);
+    let honest_revocation = RevocationEntry {
+        list_key: revocation_list_key(&honest.issuer, shared_id),
+        expires_at: None,
+    };
     cache
         .store()
-        .store_revocation_state(context_id, &both_revoked)
+        .add_revocations(context_id, &[honest_revocation], 2000)
         .unwrap();
 
     let excluded = cache

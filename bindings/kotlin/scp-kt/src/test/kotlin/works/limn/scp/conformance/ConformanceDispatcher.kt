@@ -62,7 +62,8 @@ class ConformanceDispatcher(
 
     // A fixture's custody string reaches the bridge only through `CustodyType`,
     // as an SDK caller's does, so an absent custody or one with no entry
-    // ("platform", "software") never reaches the bindings.
+    // ("platform", "software", the test-harness "in_memory") never reaches the
+    // bindings.
     private suspend fun dispatchIdentityCreate(input: Map<String, String>): Map<String, String> {
         val custody =
             input["custody"]?.let { CustodyType.fromRawValue(it) }

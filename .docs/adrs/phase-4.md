@@ -191,8 +191,8 @@ pub struct TrustInput {
    - Returns list of triggered consequences with the triggering evidence.
 
 7. **`check_threshold_attestation(&ThresholdCheckInput) -> ThresholdResult`**
-   - `ThresholdCheckInput` carries an attestation type, an attestor set, a threshold requirement, a subject identifier, a `KeyResolver`, a `Clock`, and an optional external revocation checker.
-   - Admits an attestor only when that attestor's carried attestation answers a required type, names a given subject, names that attestor as its own issuer, and passes `verify_attestation_with_revocation`.
+   - `ThresholdCheckInput` carries an attestation type, an attestor set, a threshold requirement, a subject identifier, a `KeyResolver`, a `Clock`, and an external revocation checker.
+   - Admits an attestor only when that attestor's carried attestation answers a required type, names a given subject, names that attestor as its own issuer, and passes `verify_attestation`.
    - Deduplicates admitted attestors by identifier, per spec §7.3.5 rule 1, which requires attestors to carry distinct identifiers and counts several attestations from one attestor as one. Deduplication runs after verification, so a rejected duplicate never consumes a slot.
    - Verifies independence: shared context memberships and mutual endorsements reduce independence score.
    - Returns whether the N-of-M threshold is met with sufficient independence.

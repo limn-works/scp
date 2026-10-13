@@ -14,9 +14,10 @@ from scp_sdk.types import Capability, CustodyType, MemoryScope
 
 async def main() -> None:
     with SCP(storage={"type": "in_memory"}) as scp:
-        # Create two identities (in_memory custody for examples).
-        alice = await scp.identity_create(CustodyType.IN_MEMORY)
-        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        # Create two identities whose keys live in $HOME/.scp/keys.bin, sealed
+        # under SCP_KEY_PASSPHRASE.
+        alice = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
+        bob = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
         print(f"Alice DID: {alice.did}")
         print(f"Bob DID: {bob.did}")
 

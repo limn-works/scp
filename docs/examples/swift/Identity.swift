@@ -3,22 +3,32 @@
 /// Demonstrates creating a new SCP identity using did:dht,
 /// inspecting the resulting DID document, and resolving it.
 ///
+/// The Swift SDK ships no production key store that `identityCreate(custody:)`
+/// reaches; the doc comment on ``CustodyType`` states how a shipped build
+/// answers each case. A production caller passes ``AppleKeyCustody``, the
+/// SDK's ``KeyCustodyProvider`` over the Keychain, to
+/// `identityCreateWithCustody`. A shipped build refuses that call with
+/// `SCP-IDENT-1059`, as it refuses every identity creation.
+///
 /// Prerequisites:
 ///   - Add the SCP Swift package to your project
 ///   - import SCP
 ///
 /// Usage:
-///   swift run Identity
+///   try await IdentityExample.run(provider: myProvider, storagePassphrase: passphrase)
 
 import Foundation
 import SCP
 
-@main
-struct IdentityExample {
-    static func main() async throws {
-        // 1. Create a new identity with in-memory key custody.
-        //    In production on iOS/macOS, use "platform" for Keychain storage.
-        let identity = try await createIdentity(custody: "in_memory")
+enum IdentityExample {
+    static func run(provider: KeyCustodyProvider, storagePassphrase: String) async throws {
+        let storageDir = try FileManager.default
+            .url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("scp-identity-example")
+        let scp = try SCP.withStorage(sqliteDir: storageDir, passphrase: storagePassphrase)
+
+        // 1. Create a new identity whose keys the caller's provider holds.
+        let identity = try await scp.identityCreateWithCustody(provider: provider)
 
         print("DID: \(identity.did())")
         print("Custody: \(identity.custodyType())")
@@ -26,7 +36,7 @@ struct IdentityExample {
 
         // 2. Resolve the DID to its document.
         //    This queries the DHT and returns a DidDocument.
-        let doc = try await resolveIdentity(did: identity.did())
+        let doc = try await identityResolve(did: identity.did())
 
         print("DID Document:")
         print("  ID: \(doc.id)")
@@ -38,38 +48,27 @@ struct IdentityExample {
         print("  Service endpoints: \(doc.serviceEndpoints.count)")
         print()
 
-        // 3. Create an identity with an agent signing key (ADR-039).
-        //    Agent keys enable human+agent shared DID patterns.
-        let agentIdentity = try await createIdentityWithAgentKey(
-            custody: "in_memory"
-        )
-        print("Agent identity DID: \(agentIdentity.did())")
-
-        // 4. Check for agent key and get its public key.
-        let hasAgent = identityHasAgentKey(agentIdentity)
-        print("  Has agent key: \(hasAgent)")
-
-        if let pubKey = identityGetAgentPublicKey(agentIdentity) {
+        // 3. Add an agent key to the identity.
+        let withAgent = try await identity.addAgentKey()
+        print("Added agent key to: \(withAgent.did())")
+        print("  Has agent key: \(withAgent.hasAgentKey())")
+        if let pubKey = withAgent.getAgentPublicKey() {
             print("  Agent public key: \(pubKey)")
         }
-        print()
 
-        // 5. Add an agent key to an existing identity.
-        let withAgent = try await addAgentKeyToIdentity(identity)
-        print("Added agent key to: \(withAgent.did())")
-
-        // 6. Rotate the agent key.
-        let rotated = try await rotateAgentKeyForIdentity(withAgent)
+        // 4. Rotate the agent key.
+        let rotated = try await withAgent.rotateAgentKey()
         print("Rotated agent key for: \(rotated.did())")
 
-        // 7. Remove the agent key.
-        let cleaned = try await removeAgentKeyFromIdentity(rotated)
+        // 5. Remove the agent key.
+        let cleaned = try await rotated.removeAgentKey()
         print("Removed agent key from: \(cleaned.did())")
 
-        // 8. Load an existing identity by DID.
-        let loaded = try await loadIdentity(did: identity.did())
+        // 6. Load an existing identity by DID.
+        let loaded = try await scp.identityLoad(did: identity.did())
         print("\nLoaded identity: \(loaded.did())")
 
+        try await scp.shutdown()
         print()
         print("Identity operations complete.")
     }

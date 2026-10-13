@@ -6,7 +6,7 @@
 //! prechecks, awaits [`sign_bounded`] once, and applies the signed result in
 //! the same actor turn. A sign that does not answer within [`SIGN_TIMEOUT`] is
 //! a custody failure of kind [`CustodyFailureKind::TimedOut`]
-//! (`SCP-CRYPTO-4061`), never a transport timeout.
+//! (`SCP-CRYPTO-4062`), never a transport timeout.
 
 use std::fmt;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ pub const SIGN_TIMEOUT: Duration = Duration::from_secs(30);
 /// A plain 30-second handler budget would expire with the signing budget, so a
 /// stalled custody would surface as the handler's `TransportTimeout` instead of
 /// [`CustodyFailureKind::TimedOut`]. With this budget a single stalled sign
-/// always fails first, as `SCP-CRYPTO-4061`. A turn whose several signs each
+/// always fails first, as `SCP-CRYPTO-4062`. A turn whose several signs each
 /// answer within [`SIGN_TIMEOUT`] but together outlast this budget still
 /// reports the handler timeout. The budget stays below the caller's
 /// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT), so the handler's

@@ -746,7 +746,7 @@ pub async fn create_checkpoint_if_due_view(
 /// # Errors
 ///
 /// - [`ContextError::Custody`] when custody refuses the sign or does not
-///   answer within the budget (`TimedOut`, `SCP-CRYPTO-4061`).
+///   answer within the budget (`TimedOut`, `SCP-CRYPTO-4062`).
 /// - [`ContextError::CryptoFailed`] when the canonical hash is not 32 bytes.
 pub async fn build_checkpoint(
     context_id: &str,

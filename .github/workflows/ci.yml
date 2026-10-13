@@ -264,6 +264,30 @@ env:
 # cargo call outside the directory the override covers, into a failed job, and install.sh
 # refuses to run without it.
 
+# ── The crates each job compiles, fetched once and then offline ───────────────
+# Every job that runs cargo, maturin or wasm-pack runs `./.github/actions/cargo-fetch`
+# after its toolchain and rust-cache steps and before every other cargo command. Cargo
+# otherwise downloads the sparse index and the crate sources inside whichever build, test
+# or lint command first needs them, retrying a failed request three times; in run
+# 38171293381 job `Rust / test (macos-latest, transport-local)` could not resolve
+# `index.crates.io` and failed before it compiled anything, on a change that touched no
+# Rust. The step runs `cargo fetch --locked` with `CARGO_NET_RETRY=10` and retries a failed
+# attempt with backoff, four attempts in all; `cargo fetch` without `--target` downloads
+# every platform's crates, so the wasm32, Apple and Android builds resolve from the same
+# copy. It then proves an offline `cargo metadata --all-features` resolves and writes
+# `CARGO_NET_OFFLINE=true` to `$GITHUB_ENV`, so every later step and every cargo command a
+# script in that step starts runs offline and cannot fail on the network.
+# `.github/actions/cargo-fetch/fetch.sh` states the mechanism and every failure it reports.
+#
+# THE ORDER. After rust-cache, because rust-cache hashes every `CARGO*` variable its step
+# sees into its cache key, and a fetch before it would also download what the restore then
+# overwrites; after the toolchain step, because `RUSTUP_AUTO_INSTALL: "0"` leaves cargo no
+# compiler until that step installs one; after a `cargo install`, which downloads a tool
+# from crates.io. No step sets `CARGO_NET_OFFLINE` by hand. Check `offline-cargo` in
+# `scripts/tests/ci-gate/ci_gate_selftest.py` holds every job in `.github/workflows/` to
+# this. cargo-deny fetches its advisory database from github.com outside cargo, so job
+# rust-deny downloads it in a step of its own and runs its check with `--offline`.
+
 jobs:
   check-draft:
     if: >-
@@ -383,6 +407,11 @@ jobs:
               # targets and makes it the checkout's override, so a change to it decides
               # which compiler every Rust lane runs on.
               - '.github/actions/rust-toolchain/**'
+              # The step every Rust job runs after that one and before its first other
+              # cargo command: it downloads every crate Cargo.lock names and takes cargo
+              # offline for the rest of the job, so a change to it decides whether every
+              # Rust lane resolves its dependencies at all.
+              - '.github/actions/cargo-fetch/**'
             rust:
               - 'crates/**'
               - 'Cargo.toml'
@@ -395,10 +424,12 @@ jobs:
               # The rust-test job runs scripts/check-test-shard-features.py over
               # its own shard commands, so a change to that script must trigger it.
               - 'scripts/check-test-shard-features.py'
-              # The `docker-image` job builds from these two and is guarded by this
-              # filter, so a change to either has to reach it.
+              # The `docker-image` job builds from these three and is guarded by this
+              # filter, so a change to any of them has to reach it. The Dockerfile copies
+              # the fetch step's script in and runs it before compiling offline.
               - 'Dockerfile'
               - '.dockerignore'
+              - '.github/actions/cargo-fetch/fetch.sh'
               # `rust-clippy` reads `.clippy.toml` and `rust-fmt` reads `rustfmt.toml`,
               # and this filter guards both. A pull request that lowers a threshold in
               # either file and changes nothing else would otherwise skip the job that
@@ -548,13 +579,15 @@ jobs:
               # that rewrites that command and changes nothing else would otherwise
               # skip the one job that runs it.
               - '.github/workflows/ci.yml'
-              # fuzz-build installs its nightly through this action, and the `fuzz`
-              # output reads this filter alone.
+              # fuzz-build installs its nightly through this action and downloads
+              # fuzz/Cargo.lock's crates through the next one, and the `fuzz` output
+              # reads this filter alone.
               - '.github/actions/rust-toolchain/**'
+              - '.github/actions/cargo-fetch/**'
             # Every path a job compiles, executes, or feeds a gate as input, written as
             # the complement of prose rather than as `'**'` minus exclusions. A pull
-            # request that changes only prose (`.docs/**`, `.claude/**`, a root-level
-            # `*.md`, or `docs/guides/**/*.md`) leaves the `code` output false, and
+            # request that changes only prose (`.docs/**` outside `.docs/migration/`,
+            # `.claude/**`, a root-level `*.md`, or `docs/guides/**/*.md`) leaves the `code` output false, and
             # every job it guards skips; CODE_JOBS in
             # `scripts/tests/ci-gate/ci_gate_selftest.py` names those jobs. That
             # self-test also lists every tracked
@@ -572,6 +605,10 @@ jobs:
               - 'templates/**'
               - 'ratchet/**'
               - 'docs/examples/**'
+              # The examples-typecheck job type-checks the code blocks of the live
+              # guides under this directory, so an edit to a guide there feeds a gate
+              # and is not prose.
+              - '.docs/migration/**'
               - '.github/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -621,6 +658,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: scp-node self-host create paths fail closed
         # nextest, not `cargo test`, because `cargo test <filter>` exits 0 when
         # its filter selects no test. Every test this filter selects (each
@@ -691,6 +729,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       # `maturin_artifact_entry` parses each maturin project file and its Cargo.toml
       # with `tomllib` under python3.12, and fails when that interpreter is absent
       # or cannot import it.
@@ -721,6 +760,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       # The wheel entry comes from scripts/check-shipped-feature-graph.sh
       # --print-wheel-entries, which reads `[tool.maturin]` with `tomllib` under
       # python3.12 and fails when that interpreter is absent or cannot import it.
@@ -729,6 +769,41 @@ jobs:
           python-version: "3.12"
       - name: openssl-src reaches the PyPI wheel's configuration and no other shipped configuration
         run: bash scripts/check-vendored-openssl-scope.sh
+
+  # ── Examples type-check ──
+  # scripts/check-examples-typecheck.sh: every tracked Python and TypeScript file
+  # under docs/examples/, scaffolds/ and templates/ passes mypy --strict or
+  # tsc --noEmit against the SDK source in this tree, so a site cannot call SDK
+  # API that no longer exists. scaffolds/typescript-web/ is excluded, because
+  # scaffold-typescript-web-check type-checks it against the wasm package. The
+  # same gate type-checks every Python and TypeScript block of each live guide
+  # under .docs/migration/ that carries no skip marker, and prints each block it
+  # skipped. It compiles no Rust and loads no native module, so it needs no build
+  # artifact.
+  examples-typecheck:
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
+    name: Examples type-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The packages the gate's requirements file pins: mypy, and the packages
+      # whose types mypy resolves for the sites and guide blocks.
+      - run: pip install -r scripts/examples-typecheck/requirements.txt
+      - uses: oven-sh/setup-bun@v2
+      - name: Install TypeScript dependencies
+        working-directory: bindings/typescript
+        run: bun install
+      # The cases run first: each feeds the gate a guide that must pass or must
+      # fail, among them a block that calls removed SDK API with no skip marker.
+      - name: Self-test gate
+        run: bash scripts/tests/examples-typecheck/run-tests.sh
+      - name: Python and TypeScript sites and guide blocks type-check against the SDK
+        run: bash scripts/check-examples-typecheck.sh
 
   # ── Wiping allocator (09-security-model.md §9.15, freed heap memory) ──
   # Every shipped binary and cdylib links scp-alloc's one `#[global_allocator]`
@@ -749,6 +824,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/rust-toolchain
+      - uses: ./.github/actions/cargo-fetch
       - name: Every shipped artifact links the wiping global allocator
         run: bash scripts/check-wiping-allocator.sh
 
@@ -895,6 +971,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/rust-toolchain
+      - uses: ./.github/actions/cargo-fetch
       - run: bash scripts/check-protocol-deps.sh
       - run: bash scripts/check-no-shim-reexports.sh
 
@@ -1001,6 +1078,12 @@ jobs:
       # minimal profile with only the named extras, and each refusal.
       - name: Run rust-toolchain action cases
         run: bash scripts/tests/rust-toolchain-action/run-tests.sh
+      # The fetch step every Rust job runs (`.github/actions/cargo-fetch`) against a stub
+      # cargo: one fetch with CARGO_NET_RETRY=10, retries with backoff on the DNS failure
+      # cargo printed, cargo's error after the last attempt, the offline metadata proof,
+      # the CARGO_NET_OFFLINE write, and each refusal.
+      - name: Run cargo-fetch action cases
+        run: bash scripts/tests/cargo-fetch-action/run-tests.sh
       # scripts/hooks/pre-commit runs `scripts/check-resolved-rustc.sh` on every commit,
       # and runs each language's format and lint steps only for files that differ from what the
       # commit's parent — or, on a merge, each merged-in head — already carries. These
@@ -1036,7 +1119,7 @@ jobs:
   # names no crate derives its crate set from the files the branch changed or
   # fails saying why.
   #
-  # This job installs what case 3 of that suite needs, which is what the 29
+  # This job installs what case 3 of that suite needs, which is what the 35
   # gates in the runner's list read: the tree-sitter grammars nine Python gates
   # parse with, the PyYAML check-workflow-compile-steps.py reads every workflow
   # file with, the Python 3.12 whose tomllib check-shipped-feature-graph.sh
@@ -1044,15 +1127,16 @@ jobs:
   # check-pyi-generated.sh runs, the jq
   # check-bridge-symmetry.sh requires, a Rust toolchain for the `cargo tree`
   # resolutions check-shipped-feature-graph.sh, check-protocol-deps.sh and
-  # check-vendored-openssl-scope.sh run, and the base ref check-cross-layer.sh
-  # diffs against. No step here
+  # check-vendored-openssl-scope.sh run, the mypy and the TypeScript compiler
+  # under bindings/typescript/node_modules that check-examples-typecheck.sh runs,
+  # and the base ref check-cross-layer.sh diffs against. No step here
   # compiles a crate: the suite replaces `cargo check` and `cargo fmt` with
   # stubs, because what it tests is what the runner does with their exit codes.
   #
   # The `if:` matches the one the cross-layer job above carries, and for the
   # reason that job carries it: check-cross-layer.sh reads a declared exemption
   # out of the pull request's body, a merge_group event publishes no body, and
-  # the 29 gates this suite runs include that one. Without the condition, a pull
+  # the 35 gates this suite runs include that one. Without the condition, a pull
   # request whose exemption the cross-layer job accepted would fail this job in
   # the merge queue over an exemption the queue cannot read. Every fix round
   # pushes to a pull request, so the suite runs on the head each round produces.
@@ -1064,7 +1148,7 @@ jobs:
   # gate whose own job runs on every pull request (doc-citations, doc-includes,
   # agent-verdict-criterion, error-codes, sdk-coverage and toolchain-wiring among
   # them). The gates in that list whose jobs the `code` output guards
-  # (protocol-deps, no-shim-reexports, shipped-feature-graph,
+  # (examples-typecheck, protocol-deps, no-shim-reexports, shipped-feature-graph,
   # vendored-openssl-scope, wiping-allocator, workflow-compile-steps) open no
   # prose file, so a prose change still reaches
   # every gate that reads it.
@@ -1091,6 +1175,15 @@ jobs:
       # PyYAML for check-workflow-compile-steps.py, which parses every workflow
       # file and which the toolchain-wiring-cases job installs the same pin for.
       - run: pip install 'tree-sitter-rust>=0.21,<0.25' tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift ruff==0.15.4 'pyyaml>=6,<7'
+      # check-examples-typecheck.sh runs mypy over the packages its requirements
+      # file pins, which the examples-typecheck job installs too, and the
+      # TypeScript compiler that `bun install` puts under
+      # bindings/typescript/node_modules.
+      - run: pip install -r scripts/examples-typecheck/requirements.txt
+      - uses: oven-sh/setup-bun@v2
+      - name: Install TypeScript dependencies
+        working-directory: bindings/typescript
+        run: bun install
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
       - uses: ./.github/actions/rust-toolchain
@@ -1107,11 +1200,27 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: Run the fix-round-check cases
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          FIX_ROUND_CHECK_EVIDENCE_DIR: ${{runner.temp}}/fix-round-check-evidence
         run: bash scripts/tests/fix-round-check/run-tests.sh
+      # The suite deletes its working directory on exit, so the runner output a
+      # failed case read survives only in the copy the step above writes to
+      # FIX_ROUND_CHECK_EVIDENCE_DIR. That directory sits outside the checkout,
+      # because case 3 runs the gates over the checkout and a gate rejects an
+      # unrouted file at its root. The expression carries no spaces because the
+      # ci-gate selftest splits an upload `path` on whitespace. No job downloads
+      # this artifact.
+      - name: Upload the runner output the cases read
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fix-round-check-evidence
+          path: ${{runner.temp}}/fix-round-check-evidence
+          retention-days: 7
 
   # ── Mutable shared process-global enforcement (ADR-048, #1549 Phase 4) ──
   # Forward-prevention gates that forbid the DEFAULT_BRIDGE_INSTANCE pattern
@@ -1370,6 +1479,7 @@ jobs:
         with:
           shared-key: wasm32
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - run: cargo check -p scp-alloc -p scp-clock -p scp-crypto -p scp-did -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
 
   wasm-test:
@@ -1394,6 +1504,7 @@ jobs:
         with:
           shared-key: wasm32
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       # Pin wasm-pack to a specific version for reproducibility (via the same
       # taiki-e/install-action the nextest job uses), instead of the unpinned
       # `curl … | sh` installer that always pulls latest.
@@ -1419,6 +1530,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           components: rustfmt
+      - uses: ./.github/actions/cargo-fetch
       - run: cargo fmt --all -- --check
 
   # ── Why this job is a matrix ────────────────────────────────────────────────
@@ -1520,6 +1632,7 @@ jobs:
         with:
           shared-key: clippy-packages
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.leg == 'packages' }}
+      - uses: ./.github/actions/cargo-fetch
       - name: Run clippy over the workspace
         if: matrix.leg == 'workspace'
         run: |
@@ -1700,6 +1813,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.leg == 'all' }}
+      - uses: ./.github/actions/cargo-fetch
       - uses: taiki-e/install-action@nextest
       # One leg runs the check: it reads ci.yml and the lockfile, which every leg
       # shares, so a second run would only repeat its five `cargo tree` calls.
@@ -1821,6 +1935,7 @@ jobs:
         with:
           shared-key: transport-optional-${{ matrix.group }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/cargo-fetch
       - uses: taiki-e/install-action@nextest
       - name: Run transport tests
         if: matrix.group == 'transport'
@@ -2030,6 +2145,7 @@ jobs:
         with:
           shared-key: apple-transport-platform
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.leg == 'all' }}
+      - uses: ./.github/actions/cargo-fetch
       - uses: taiki-e/install-action@nextest
       # The comments on the scp-transport commands in job
       # rust-test-optional-features say what each one selects and why each
@@ -2104,6 +2220,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: Run napi tests in production config (no custody/testing features)
         run: |
           PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
@@ -2146,15 +2263,15 @@ jobs:
           cargo nextest run --no-tests=fail -p scp-ffi-common \
             -E 'test(ffi_dht_client_is_pkarr_only_in_shipped_build) + test(disabled_node_resolution_returns_ok_none_for_unknown_did)'
           # The same tripwire for scp-ffi-napi. `cargo test -p scp-ffi-napi`
-          # above carries no name filter, so it exits 0 when the bridge's one
-          # `#[cfg(not(feature = "testing"))]` test,
-          # `in_memory_on_a_shipped_build_names_the_accepted_set` (a shipped
-          # build refuses custody "in_memory" with SCP-IDENT-1008, SCP-294),
-          # compiled out. This filter names only that test, so a build that
-          # turned `scp-ffi-napi/testing` on selects zero tests and
-          # `--no-tests=fail` exits 4.
+          # above carries no name filter, so it exits 0 when the bridge's
+          # `#[cfg(not(feature = "testing"))]` tests compiled out. This filter
+          # names only those tests: a shipped build refuses custody
+          # "in_memory" with SCP-IDENT-1008, and refuses "encrypted_file" with
+          # SCP-IDENT-1059 before the key file opens (spec 03 §3.2.2,
+          # ADR-062 §Decision 6). A build that turned `scp-ffi-napi/testing`
+          # on selects zero tests and `--no-tests=fail` exits 4.
           cargo nextest run --no-tests=fail -p scp-ffi-napi --features server --lib \
-            -E 'test(in_memory_on_a_shipped_build_names_the_accepted_set)'
+            -E 'test(in_memory_on_a_shipped_build_rejects_with_ident_1008) + test(encrypted_file_on_a_shipped_build_refuses_with_ident_1059_before_opening)'
 
   # Builds the pyo3 bridge (`scp-ffi`) in its PRODUCTION configuration: default
   # features (`server` on) but WITHOUT `testing`. `build-matrix.yml` builds the
@@ -2214,6 +2331,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: Build pyo3 bridge in production config (no in-memory custody)
         run: |
           # pyo3 links libpython, so LD_LIBRARY_PATH must point at LIBDIR.
@@ -2241,7 +2359,7 @@ jobs:
           # `std::env::set_var` calls on, and `--no-tests=fail` exits 4 rather
           # than 0 if a feature flip selects zero tests.
           cargo nextest run --no-tests=fail -p scp-ffi --features server --lib \
-            -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed) + test(parse_custody_rejects_in_memory_on_a_shipped_build_naming_the_accepted_set)'
+            -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed) + test(resolve_custody_rejects_in_memory_on_a_shipped_build_with_ident_1008)'
       - name: Check the PyPI wheel's features vendor OpenSSL on non-Apple targets only
         run: |
           # `crates/scp-platform/Cargo.toml` declares the libsqlite3-sys edge that
@@ -2334,6 +2452,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: Build uniffi bridge in production config (no in-memory custody)
         run: |
           # Default features = production: `server` on, no `testing`.
@@ -2358,9 +2477,10 @@ jobs:
           #   identity_create_in_memory_rejected_without_feature
           #     (crates/scp-ffi/uniffi/src/lib.rs) — `identity_create` rejects
           #     `in_memory` custody with SCP-IDENT-1008.
-          #   parse_custody_method_rejects_in_memory_on_a_shipped_build
-          #     (same file) — the boundary parser rejects the same string with
-          #     the same code, one layer earlier.
+          #   identity_create_entry_points_reject_in_memory_on_a_shipped_build
+          #     (same file) — `identity_create` and
+          #     `identity_create_with_agent_key` each reject `in_memory` with
+          #     SCP-IDENT-1008 in a message naming the accepted custody values.
           #   identity_create_with_custody_fails_closed_without_pre_rotation_backend
           #     (crates/scp-ffi/uniffi/src/bridge.rs) — a create over CALLBACK
           #     custody declines with SCP-IDENT-1059, because the tree's only
@@ -2412,7 +2532,7 @@ jobs:
           # runs the un-gated `ucan_*` tests under a `--no-tests=fail` of their
           # own, which fires if one of them is renamed out of the filter.
           cargo nextest run --no-tests=fail -p scp-ffi-uniffi --features server --lib \
-            -E 'test(identity_create_in_memory_rejected_without_feature) + test(parse_custody_method_rejects_in_memory_on_a_shipped_build) + test(identity_create_with_custody_fails_closed_without_pre_rotation_backend) + test(shipped_build_reaches_every_callback_custody_identity_op)'
+            -E 'test(identity_create_in_memory_rejected_without_feature) + test(identity_create_entry_points_reject_in_memory_on_a_shipped_build) + test(identity_create_with_custody_fails_closed_without_pre_rotation_backend) + test(shipped_build_reaches_every_callback_custody_identity_op)'
           cargo nextest run --no-tests=fail -p scp-ffi-uniffi --features server --lib \
             -E 'test(ucan_mint_works_over_callback_custody) + test(ucan_delegate_works_over_callback_custody) + test(ucan_delegate_signs_with_delegator_key_not_context_creator_key) + test(ucan_mint_without_retained_custody_returns_ident_1017)'
 
@@ -2467,6 +2587,7 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: Run doc tests
         run: |
           PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
@@ -2505,6 +2626,7 @@ jobs:
         with:
           shared-key: workspace-check
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: Build docs
         # `--document-private-items` is what lets this job reject a broken intra-doc
         # link written in a private module. Rustdoc resolves an intra-doc link only
@@ -2564,7 +2686,16 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
       - uses: ./.github/actions/rust-toolchain
-      - run: cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features check
+      - uses: ./.github/actions/cargo-fetch
+      # `cargo deny check` fetches the RustSec advisory database from github.com itself,
+      # and CARGO_NET_OFFLINE does not reach that fetch, so this step downloads it and the
+      # check below passes `--offline`, which makes cargo-deny open the downloaded copy
+      # and fail when it is missing or older than `maximum-db-staleness`. The check step
+      # then makes no network request. Yanked-crate detection reads the index entries the
+      # fetch step above wrote, online or offline.
+      - name: Fetch the advisory database
+        run: cargo deny --manifest-path ./Cargo.toml fetch db
+      - run: cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features --offline check
 
   # ── Container image ─────────────────────────────────────────────────
   # Builds the `Dockerfile` that ships `scp-relay` and `scp-node`, and that
@@ -2901,6 +3032,8 @@ jobs:
         with:
           shared-key: workspace-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/cargo-fetch
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - name: Build PyO3 native module
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
@@ -3004,6 +3137,8 @@ jobs:
         with:
           shared-key: workspace-ci-bridge
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - name: Build NAPI native addon
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
@@ -3102,6 +3237,8 @@ jobs:
         with:
           shared-key: apple-uniffi-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/cargo-fetch
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - name: Build XCFramework (dev mode — macOS arm64 only)
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
@@ -3237,6 +3374,8 @@ jobs:
         with:
           shared-key: apple-parity-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/cargo-fetch
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - name: Build PyO3 native module
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
@@ -3382,33 +3521,11 @@ jobs:
           mypy --follow-imports=silent examples
       # `cd bindings/python` above resolves `tests/` to `bindings/python/tests/`,
       # so this step runs no pytest suite that lives elsewhere in this
-      # repository. Five such suites exist. Three of them, under `scripts/`, run
+      # repository. Four such suites exist. Three of them, under `scripts/`, run
       # in their own steps (`scripts/test_check_sdk_coverage.py`,
       # `scripts/tests/call-invariants/` and
-      # `scripts/tests/summarize-cargo-timings/`). The other two run in no CI job, and
-      # each comment below says why its suite gets no step.
-      #
-      # `examples/reference-agent/test_agent.py` gets no step. Two of its 23
-      # tests, `TestEndToEnd::test_full_lifecycle` and
-      # `TestDemoScript::test_demo_exits_zero`, fail whenever `scp_sdk` imports,
-      # which the download step above makes true. Every one of the eleven
-      # SDK call sites in `examples/reference-agent/agent.py` names a symbol
-      # `scp_sdk` no longer defines: `Identity.create_sync`, `Identity.load_sync`,
-      # `Context.create_sync`, `Context.join_sync`, `context.send_sync`,
-      # `context.leave_sync`, and a `Context(context_id=..., identity=...)`
-      # constructor whose real signature reads `Context(handle, identity_did,
-      # scp)`. `scp_sdk` defines no `*_sync` method at all today, because
-      # identity and context operations moved onto an async `SCP` facade whose
-      # constructor requires a storage config, as
-      # `await scp.identity_create(custody)` and
-      # `await scp.context_create(identity_did, params)`. Each call site sits
-      # under `except ImportError`, which does not catch the `AttributeError`
-      # that a deleted attribute raises, so that example returns a
-      # `uuid`-fabricated DID when `scp_sdk` is absent and raises when it is
-      # present. Rewriting that example against the async facade replaces its
-      # agent module, its demo module, and its end-to-end tests, and makes the
-      # suite require the compiled PyO3 module that its README calls optional,
-      # which is a scoped work item rather than a CI wiring change.
+      # `scripts/tests/summarize-cargo-timings/`). The fourth runs in no CI job,
+      # and the comment below says why it gets no step.
       #
       # `tests/integration/phase3_integration_test.py` gets no step. Its 17 tests
       # import `ToolDefinition` and call `Identity.create`, `Context.create`,
@@ -3446,6 +3563,7 @@ jobs:
             3.10
             3.12
       - uses: ./.github/actions/rust-toolchain
+      - uses: ./.github/actions/cargo-fetch
       - name: Install maturin
         run: python3.12 -m pip install 'maturin>=1.0,<2.0'
       # No --features, no --manifest-path and no --release: maturin reads the
@@ -3654,6 +3772,7 @@ jobs:
         with:
           shared-key: wasm32
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/cargo-fetch
       # Pin wasm-pack for reproducibility (same version as the wasm-test job) —
       # the --release-only build guard depends on the shipped wasm being a
       # release build (ADR-057 Prereq-4).
@@ -3727,6 +3846,7 @@ jobs:
         with:
           shared-key: wasm32
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
       - name: Install wasm-pack
         uses: taiki-e/install-action@v2
         with:
@@ -4073,6 +4193,8 @@ jobs:
         with:
           shared-key: workspace-debug
           save-if: false
+      - uses: ./.github/actions/cargo-fetch
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - name: Build UniFFI native library
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
@@ -4234,6 +4356,7 @@ jobs:
       # `Run tests`, and RUSTUP_AUTO_INSTALL is "0", so the pinned toolchain must be
       # installed before it.
       - uses: ./.github/actions/rust-toolchain
+      - uses: ./.github/actions/cargo-fetch
       - uses: gradle/actions/setup-gradle@v4
       - name: Run tests
         working-directory: bindings/kotlin
@@ -4392,6 +4515,9 @@ jobs:
           workspaces: "fuzz -> target"
           shared-key: fuzz
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/cargo-fetch
+        with:
+          working-directory: fuzz
       # This step names no channel. Run from `fuzz/`, `cargo check` resolves the nightly
       # `fuzz/rust-toolchain.toml` names, which the toolchain step above installed — the
       # same invocation `fuzz/README.md` documents. That file records why the channel is
@@ -4883,6 +5009,7 @@ jobs:
       - error-codes
       - shipped-feature-graph
       - vendored-openssl-scope
+      - examples-typecheck
       - wiping-allocator
       - fail-closed-pre-rotation
       - cross-layer

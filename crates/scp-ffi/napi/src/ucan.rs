@@ -1901,7 +1901,7 @@ mod tests {
             .await
             .expect("context_create should succeed");
         let custody = handle
-            .in_memory_custody
+            .custody
             .as_ref()
             .expect("an in-memory identity retains its custody on the handle");
         let key = handle

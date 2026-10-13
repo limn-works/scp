@@ -39,6 +39,7 @@ function testCases(n: number): TestCase[] {
   }));
 }
 
+import { createInMemoryIdentity } from "./harness-custody";
 import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
@@ -123,7 +124,7 @@ if (scp === null) {
       // The dummy signature cannot verify — but a structured `valid: false`
       // result (not a parse error) proves the serialized envelope reached the
       // real verifier.
-      const result = live.trustVerifyAttestation(attestation) as {
+      const result = live.trustVerifyAttestation("ctx-ffi-1", attestation) as {
         valid: boolean;
         errorMessage: string;
       };
@@ -132,8 +133,8 @@ if (scp === null) {
     });
 
     test("trustCreateChallenge refuses a protocol suite below its minimum with SCP-VALID-7039", async () => {
-      const verifier = await live.identityCreate("in_memory");
-      const subject = await live.identityCreate("in_memory");
+      const verifier = await createInMemoryIdentity(live);
+      const subject = await createInMemoryIdentity(live);
       let caught: unknown;
       try {
         await live.trustCreateChallenge(verifier.did, subject.did, SCHEMA_URI, testCases(19));
@@ -145,8 +146,8 @@ if (scp === null) {
     });
 
     test("a created request decodes into the SDK types; a forged response is refused", async () => {
-      const verifier = await live.identityCreate("in_memory");
-      const subject = await live.identityCreate("in_memory");
+      const verifier = await createInMemoryIdentity(live);
+      const subject = await createInMemoryIdentity(live);
       const cases = testCases(20);
       const created = await live.trustCreateChallenge(verifier.did, subject.did, SCHEMA_URI, cases);
       const challenge: ChallengeRequest = decodeChallengeRequest(created.challengeJson);

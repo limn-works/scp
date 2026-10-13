@@ -359,7 +359,7 @@ struct PendingBroadcastPublish {
 /// - [`ContextError::PermissionDenied`] if the sender is not an author or
 ///   write access is suspended.
 /// - [`ContextError::Custody`] with the custody's own kind when custody
-///   refuses the sign, or with kind `TimedOut` (`SCP-CRYPTO-4061`) when it
+///   refuses the sign, or with kind `TimedOut` (`SCP-CRYPTO-4062`) when it
 ///   does not answer within `SIGN_TIMEOUT`.
 /// - [`ContextError::CryptoFailed`] when the signer is not Ed25519, or the
 ///   signing payload or the seal fails.

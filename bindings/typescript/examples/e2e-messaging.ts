@@ -10,7 +10,7 @@
  * `SCP` instance. The static `Relay.startInMemory()` factory was
  * removed — construct via `scp.relayStartInMemory()`.
  *
- * Run: bun run examples/e2e-messaging.ts
+ * Run it as the "Running the examples" section of ../README.md describes.
  */
 
 import { SCP } from "../src/index";
@@ -24,8 +24,8 @@ async function main(): Promise<void> {
     console.log(`Relay listening at ${relay.relayUrl}`);
 
     // 2. Create two identities.
-    const alice = await scp.identityCreate("in_memory");
-    const bob = await scp.identityCreate("in_memory");
+    const alice = await scp.identityCreate("encrypted_file");
+    const bob = await scp.identityCreate("encrypted_file");
     console.log(`Alice DID: ${alice.did}`);
     console.log(`Bob DID:   ${bob.did}`);
 

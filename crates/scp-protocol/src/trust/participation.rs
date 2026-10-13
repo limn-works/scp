@@ -266,7 +266,7 @@ impl From<&ParticipationRecord> for ParticipationFacts {
 /// `events` as the authoritative convergent log and trusts
 /// `accessible_attestations` as ALREADY-VERIFIED credentials (signature, expiry,
 /// revocation). The verification boundary is the FFI ingest path
-/// (`verify_and_cache` / `verify_attestation_with_revocation`), which is what
+/// (`verify_and_cache` / `verify_attestation`), which is what
 /// sources `accessible_attestations`; passing unverified attestations here would
 /// inflate `attestation_count` with forged credentials. Callers MUST supply only
 /// verified inputs.

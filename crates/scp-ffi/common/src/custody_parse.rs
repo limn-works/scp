@@ -133,10 +133,18 @@ mod tests {
 
     /// Every [`PlatformError`] variant reaches a bridge with the one code
     /// [`custody_failure_code`](crate::error_codes::custody_failure_code)
-    /// assigns (ADR-021 2026-09-29 amendment, spec §17.6).
+    /// assigns (ADR-021 2026-09-29 amendment, spec §17.6). Attestation, push
+    /// and unsupported failures carry their own codes, never the key custody
+    /// code `SCP-CRYPTO-4060`, and each push kind has a distinct code (ADR-006
+    /// 2026-10-12 amendment).
     #[test]
     fn custody_failure_code_covers_every_platform_error() {
         use crate::error_codes as codes;
+        use scp_platform::PushFailureKind;
+        let push = |kind| PlatformError::PushError {
+            kind,
+            detail: "x".to_owned(),
+        };
         let table = [
             (PlatformError::KeyNotFound, codes::CRYPTO_4006),
             (
@@ -165,14 +173,27 @@ mod tests {
             ),
             (
                 PlatformError::AttestationError("x".to_owned()),
-                codes::CRYPTO_4060,
+                codes::ATTEST_9001,
             ),
-            (PlatformError::PushError("x".to_owned()), codes::CRYPTO_4060),
+            (push(PushFailureKind::WakePayloadInvalid), codes::TRANS_5080),
+            (
+                push(PushFailureKind::RegistrationRejected),
+                codes::TRANS_5081,
+            ),
+            (
+                push(PushFailureKind::VerifierUnavailable),
+                codes::TRANS_5082,
+            ),
+            (
+                push(PushFailureKind::PlatformUnavailable),
+                codes::TRANS_5083,
+            ),
+            (push(PushFailureKind::ProviderFailed), codes::TRANS_5084),
             (
                 PlatformError::CustodyError("x".to_owned()),
                 codes::CRYPTO_4060,
             ),
-            (PlatformError::Unsupported("x"), codes::CRYPTO_4060),
+            (PlatformError::Unsupported("x"), codes::CRYPTO_4061),
         ];
         for (error, expected) in table {
             assert_eq!(

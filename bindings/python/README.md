@@ -12,7 +12,7 @@ pip install scp-python
 
 ## Quick Start
 
-This quick start runs only in a build compiled with the `testing` feature (`maturin develop --features testing` in `bindings/python`), because a published wheel rejects `CustodyType.IN_MEMORY`.
+This quick start runs only in a build compiled with the `testing` feature (`maturin develop --features testing` in `bindings/python`). A published wheel has no pre-rotation custody backend, so it raises `SCP-IDENT-1059` for `CustodyType.ENCRYPTED_FILE`. Set `SCP_KEY_PASSPHRASE` before you run it: the identity's keys go to `$HOME/.scp/keys.bin`, sealed under that passphrase.
 
 ```python
 import asyncio
@@ -24,8 +24,8 @@ async def main():
     # Every call goes through an SCP instance, which takes a required storage backend.
     scp = SCP({"type": "in_memory"})
 
-    # Create a cryptographic identity (DID) whose keys live in process memory.
-    identity = await scp.identity_create(CustodyType.IN_MEMORY)
+    # Create a cryptographic identity (DID) whose keys live in the encrypted key file.
+    identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
     print(f"DID: {identity.did}")
 
     # Create an encrypted context that this identity administers.

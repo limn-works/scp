@@ -1,46 +1,53 @@
 """Minimal SCP agent in Python.
 
-Creates a DID identity, opens an encrypted context, and sends a message.
+Creates a DID identity and opens an encrypted context.
 
 Usage:
     pip install -e ../../bindings/python
+    export SCP_KEY_PASSPHRASE=...      # seals $HOME/.scp/keys.bin
+    export SCP_STORAGE_PASSPHRASE=...  # encrypts the SQLCipher database
     python main.py
-
-Replace in_memory custody with platform custody for production use.
 """
 
 import asyncio
+import os
+from pathlib import Path
 
-from scp_sdk import Capability, Context, Identity
+from scp_sdk import SCP, Capability, CustodyType, MemoryScope
 
 
 async def main() -> None:
-    # 1. Create a DID identity with in-memory key custody.
-    identity = await Identity.create(custody="in_memory")
-    print(f"Created identity: {identity.did}")
+    storage_dir = Path.home() / ".scp" / "python-agent"
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    async with SCP(
+        storage={
+            "type": "sqlite",
+            "path": str(storage_dir),
+            "passphrase": os.environ["SCP_STORAGE_PASSPHRASE"],
+        }
+    ) as scp:
+        # 1. Create a DID identity whose keys live in the passphrase-sealed key file.
+        identity = await scp.identity_create(CustodyType.ENCRYPTED_FILE)
+        print(f"Created identity: {identity.did}")
 
-    # 2. Create an encrypted context with messaging capabilities.
-    async with await Context.create(
-        creator=identity,
-        ceiling=[
-            Capability.MESSAGES_READ,
-            Capability.MESSAGES_WRITE,
-            Capability.ROLE_ASSIGN,
-            Capability.MEMBER_INVITE,
-            Capability.MEMBER_REMOVE,
-        ],
-        memory_scope="ephemeral",
-    ) as ctx:
+        # 2. Create an encrypted context with messaging capabilities.
+        ctx = await scp.context_create(
+            identity.did,
+            {
+                "ceiling": [
+                    Capability.MESSAGES_READ.value,
+                    Capability.MESSAGES_WRITE.value,
+                    Capability.ROLE_ASSIGN.value,
+                    Capability.MEMBER_INVITE.value,
+                    Capability.MEMBER_REMOVE.value,
+                    Capability.GOVERNANCE_PROPOSE.value,
+                ],
+                "memory_scope": MemoryScope.EPHEMERAL.value,
+                "governance": "single_admin",
+            },
+        )
         print(f"Created context: {ctx.context_id}")
         print(f"  State: {ctx.state}")
-
-        # 3. Send a message.
-        await ctx.send("Hello, SCP!", identity=identity)
-        print("  Message sent.")
-
-        # 4. Check membership.
-        members = await ctx.member_dids()
-        print(f"  Members: {members}")
 
     print("\nAgent complete.")
 

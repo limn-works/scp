@@ -9,9 +9,9 @@
  * ## FCM Payload Opacity (§10.7)
  *
  * §10.7 requires a push payload to carry only a wake signal: no sender, no context, no
- * count, no preview. Its §10.7.1 step 5 gives that payload as `{ "scp": 1 }`. ADR-027
- * carries the wake signal to Android as the FCM data-only message `{"data": {"scp": "1"}}`,
- * with no notification fields and no other SCP-specific content, so FCM learns only that
+ * count, no preview. The FCM row of the §10.7.1 step 5 wake-signal table carries that
+ * wake signal to Android as an FCM HTTP v1 data-only message whose `data` map is
+ * `{"scp": "1"}` (ADR-027), with no notification fields and no other SCP-specific content, so FCM learns only that
  * the device received a data message at a specific time. No relay or other code in this
  * repository sends an FCM message. When one arrives, FCM starts the app if it is not
  * running (Android delivers nothing to an app the user force-stopped) and delivers the
@@ -20,13 +20,13 @@
  * push: the caller does both when [handleNotification] returns [WakeSignal.PULL].
  *
  * [handleNotification] checks only the `scp` field. It rejects a payload that lacks the
- * field with [ScpException] code `SCP-TRANS-5001`, and a payload whose field is not
- * `"1"` with code `SCP-TRANS-5002`. It accepts a payload that carries other fields
- * beside `"scp": "1"` and returns the same [WakeSignal.PULL] for it, reading nothing
- * else from the payload.
+ * field, and a payload whose field is not `"1"`, with [ScpException] code
+ * `SCP-TRANS-5080` (wake payload invalid); the message says which of the two it was.
+ * It accepts a payload that carries other fields beside `"scp": "1"` and returns the
+ * same [WakeSignal.PULL] for it, reading nothing else from the payload.
  *
- * Opacity is an obligation on the sender: §10.7.1 step 5 has the relay send exactly
- * `{ "scp": 1 }`. FCM has already carried every field of a payload before
+ * Opacity is an obligation on the sender: §10.7.1 step 5 has the relay send exactly the
+ * FCM request of its wake-signal table. FCM has already carried every field of a payload before
  * [handleNotification] sees it, so no check in this class can keep a field from FCM. No
  * code in this repository sends a push, so no code meets the sender obligation. SCP-112's
  * criterion "FCM payload format is opaque" is unmet because no sender exists; rejecting
@@ -128,9 +128,8 @@ class AndroidPushProvider(
      *   `RemoteMessage.getData()`). Expected: `{"scp": "1"}`.
      * @return [WakeSignal.PULL] — tells the caller to connect to the relay
      *   and pull all pending encrypted envelopes.
-     * @throws ScpException with code `SCP-TRANS-5001` if the `scp` field is missing.
-     * @throws ScpException with code `SCP-TRANS-5002` if the `scp` field has an
-     *   unexpected value.
+     * @throws ScpException with code `SCP-TRANS-5080` (wake payload invalid) if the
+     *   `scp` field is missing or has a value other than `"1"`.
      */
     override fun handleNotification(payload: Map<String, String>): WakeSignal {
         // ADR-027's FCM data payload is {"scp": "1"}; the value "1" is the wake signal.
@@ -138,24 +137,26 @@ class AndroidPushProvider(
         val scpField = payload["scp"]
             ?: throw ScpException(
                 "FCM payload missing 'scp' field",
-                "SCP-TRANS-5001"
+                "SCP-TRANS-5080"
             )
         if (scpField != "1") {
             throw ScpException(
                 "FCM payload 'scp' field has unexpected value: $scpField",
-                "SCP-TRANS-5002"
+                "SCP-TRANS-5080"
             )
         }
         return WakeSignal.PULL // connect to relay and pull pending envelopes
     }
 }
 
-// ADR-027 gives a push sender this FCM message structure — opaque, data-only.
-// No code in this repository sends it:
+// The FCM row of the §10.7.1 step 5 wake-signal table (ADR-027) gives a push sender this
+// FCM HTTP v1 request — opaque, data-only. No code in this repository sends it:
+// POST https://fcm.googleapis.com/v1/projects/{project_id}/messages:send
 // {
-//   "to": "<fcm_token>",
-//   "data": {
-//     "scp": "1"
+//   "message": {
+//     "token": "<fcm_token>",
+//     "data": { "scp": "1" },
+//     "android": { "priority": "HIGH" }
 //   }
 // }
 // No "notification" key. No content visible to Android notification shade.

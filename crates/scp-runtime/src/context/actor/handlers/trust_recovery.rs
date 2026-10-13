@@ -260,7 +260,7 @@ async fn handle_recovery_send_notification(
     };
 
     // The notification signs in this turn (ADR-049 Decision 7a), so the turn
-    // runs under the signing budget and a stalled custody fails as 4061.
+    // runs under the signing budget and a stalled custody fails as 4062.
     let (outcome, reply_result) = match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, send_fut)
         .await
     {

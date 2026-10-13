@@ -8,19 +8,25 @@ Broadcast contexts provide a one-to-many communication pattern at unlimited subs
 
 Key properties:
 
-- **Authors** hold `messagesWrite` and publish broadcast-key-encrypted content. Each author maintains an independent broadcast key with a monotonic epoch counter.
-- **Subscribers** hold `messagesRead` and receive author broadcast keys on request. Subscribers are unbounded.
+- **Authors** hold `messages:write` and publish broadcast-key-encrypted content. Each author maintains an independent broadcast key with a monotonic epoch counter.
+- **Subscribers** hold `messages:read` and receive author broadcast keys on request. Subscribers are unbounded.
 - **No MLS group** -- broadcast contexts substitute per-author broadcast keys for MLS group encryption, enabling unlimited scale.
-- **Open vs. gated admission** -- open contexts (`public-broadcast` template) auto-grant `messagesRead` on DID-authenticated registration. Gated contexts (`gated-broadcast` template) require admin-issued UCANs.
+- **Open vs. gated admission** -- open contexts (`PublicBroadcast` template) admit a subscriber on DID-authenticated registration. Gated contexts (`GatedBroadcast` template) require an admin-issued `messages:read` UCAN.
 - **Blocking** uses the content access key layer (ADR-038). When a subscriber is blocked, authors rotate their broadcast key, and the blocked subscriber is excluded from future key requests. Unblocking is forward-only -- the subscriber gets the current key but cannot decrypt content from the block period.
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `feed.py` | Publisher: creates a broadcast feed, publishes content, manages subscribers |
-| `subscriber.py` | Subscriber: joins a feed, receives broadcasts |
+| `feed.py` | Publisher: creates a broadcast feed, publishes content, registers a subscriber, seals its broadcast key to the subscriber, blocks and unblocks |
+| `subscriber.py` | Subscriber: creates an identity and a wrapping key, opens the sealed broadcast key |
 | `pyproject.toml` | Python project metadata and dependencies |
+
+## What runs today
+
+A broadcast key request has no network path yet: no runtime or relay code carries a subscriber's request to the author or carries the sealed key back (#2727). The two scripts therefore exchange the request and the sealed key through you, by copy and paste. The publisher's `broadcast_handle_key_request` and the subscriber's `broadcast_open_key` are the same calls the network path will make.
+
+The subscriber does not yet receive published posts: the Python SDK has no call that pulls broadcast content from a relay (#2856).
 
 ## Running
 
@@ -31,97 +37,104 @@ Install the SCP Python SDK from source. The build needs a Rust toolchain, a C co
 ```bash
 cd templates/broadcast-feed
 pip install -e ../../bindings/python
+pip install cryptography
+```
+
+Both scripts keep keys in `$HOME/.scp/keys.bin` (`CustodyType.ENCRYPTED_FILE`) and each opens its own SQLCipher database under `$HOME/.scp/`. Set these in each terminal:
+
+```bash
+export SCP_KEY_PASSPHRASE=...      # seals $HOME/.scp/keys.bin
+export SCP_STORAGE_PASSPHRASE=...  # encrypts the SQLCipher database
+```
+
+The publisher also needs a relay:
+
+```bash
+export SCP_RELAY_URL=wss://relay.example.com
 ```
 
 Run the commands below from `templates/broadcast-feed`.
 
-### Start the publisher
+### Start the subscriber
 
 ```bash
-python feed.py
-```
-
-The publisher will:
-1. Create an identity and connect to a relay
-2. Create a broadcast context with `single_admin` governance
-3. Print the context ID for subscribers to use
-4. Publish sample content
-5. Demonstrate subscriber management (register, block, unblock, remove)
-
-### Start a subscriber
-
-In a separate terminal, pass the context ID printed by the publisher:
-
-```bash
-python subscriber.py <context_id>
+python subscriber.py
 ```
 
 The subscriber will:
-1. Create its own identity and connect to the relay
-2. Join the broadcast context and register as a subscriber
-3. Request the author's broadcast key
-4. Listen for incoming broadcasts on the async receive stream
+1. Create its identity
+2. Generate a DHKEM(P-256) wrapping key pair, keeping the secret half in memory
+3. Print its DID and the public half of its wrapping key
+4. Wait for you to paste the sealed key from the publisher
 
-Press `Ctrl+C` to stop the subscriber.
+### Start the publisher
+
+In a separate terminal, pass the two values the subscriber printed:
+
+```bash
+python feed.py --subscriber <did> --wrapping-key <hex>
+```
+
+The publisher will:
+1. Create an identity and attach the relay transport
+2. Create a broadcast context with `single_admin` governance
+3. Publish sample content
+4. Print the admission policy and subscriber count
+5. Register the subscriber, block it, show that its key request is denied, and unblock it
+6. Print the sealed broadcast key for the subscriber
+
+Paste the sealed key into the subscriber's terminal. The subscriber opens it and reports the 32-byte broadcast key. Run `python feed.py` with no arguments to create the feed and publish without a subscriber.
 
 ## Customizing
 
 ### Relay URL
 
-Both scripts default to `wss://relay.example.com`. Change the `RELAY_URL` constant in each file to point to your relay, or run a local relay with the `personal-relay` template.
+Set `SCP_RELAY_URL` to your relay, or run a local relay with the `personal-relay` template.
 
 ### Gated broadcast
 
-To require admin approval for subscribers, remove the `template_id` and configure the context for gated admission:
+To require admin approval for subscribers, create the context from the gated template:
 
 ```python
-ctx = await Context.create(
-    creator=publisher,
-    ceiling=[
-        Capability.MESSAGES_READ,
-        Capability.MESSAGES_WRITE,
-        Capability.ROLE_ASSIGN,
-        Capability.MEMBER_INVITE,
-        Capability.MEMBER_REMOVE,
-        Capability.CONTEXT_CLOSE,
-    ],
-    governance="single_admin",
-    mode=ContextMode.BROADCAST,
-    template_id="scp:template/gated-broadcast",
+ctx = await node.context_create(
+    publisher.did,
+    {
+        "ceiling": [
+            Capability.MESSAGES_READ.value,
+            Capability.MESSAGES_WRITE.value,
+            Capability.ROLE_ASSIGN.value,
+            Capability.MEMBER_INVITE.value,
+            Capability.MEMBER_REMOVE.value,
+            Capability.CONTEXT_CLOSE.value,
+        ],
+        "governance": "single_admin",
+        "mode": "broadcast",
+        "template_id": "GatedBroadcast",
+    },
 )
 ```
 
-In gated mode, subscribers need an admin-issued `messagesRead` UCAN before they can access content.
+In gated mode, `broadcast_subscribe` takes the subscriber's admin-issued `messages:read` UCAN as `messages_read_ucan_jwt`.
+
+### Removing a subscriber
+
+Unsubscribe the DID and rotate every author's broadcast key, so the removed subscriber cannot decrypt future content:
+
+```python
+await node.broadcast_unsubscribe(ctx, subscriber_did, rotate_keys=True)
+```
 
 ### Multiple authors
 
 Promote a subscriber to author role via governance:
 
 ```python
-action = json.dumps({
-    "action": {
-        "RoleChange": {
-            "target_did": subscriber_did,
-            "new_role": "author",
-        }
-    }
-})
-await propose_governance_action(ctx, action, identity_did=publisher.did)
+action = json.dumps({"ChangeRole": {"did": subscriber_did, "new_role": "author"}})
+result = await node.governance_propose(ctx, publisher.did, action)
 ```
 
 Each author gets their own broadcast key and can publish independently.
 
 ### Economic policy
 
-For paid subscriptions, use the `paid-broadcast` template with an economic policy:
-
-```python
-ctx = await Context.create(
-    creator=publisher,
-    ceiling=[Capability.MESSAGES_READ, Capability.MESSAGES_WRITE],
-    governance="single_admin",
-    mode=ContextMode.BROADCAST,
-    template_id="scp:template/paid-broadcast",
-    economic_policy='{"per_period": {"amount": "1.00", "currency": "USD", "period_seconds": 2592000}}',
-)
-```
+For paid subscriptions, create the context from the `scp:template/paid-broadcast` template and pass `economic_policy`, the JSON of an economic policy: its cost schedule, accepted payment adapters, and payee (spec section 19.3).

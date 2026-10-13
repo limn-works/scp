@@ -29,6 +29,7 @@ from scp_sdk import (
     CustodyKeyRole,
     CustodyKeyType,
     CustodyPublicKey,
+    CustodyType,
     p256_software_pseudonym_point,
 )
 from scp_sdk.errors import KeyNotFoundError
@@ -227,8 +228,8 @@ async def test_identity_create_with_custody_produces_did(scp) -> None:
     identity = await scp.identity_create_with_custody(provider)
 
     assert identity.did.startswith("did:dht:"), f"unexpected DID: {identity.did}"
-    # Custody is reported as the callback path.
-    assert identity.custody_type == "callback"
+    # Custody is reported as the os_keystore request (spec 03 section 3.2.2).
+    assert identity.custody_type is CustodyType.OS_KEYSTORE
     # The #0 verifying key is snapshotted from the provider's public key.
     # Exposed on the raw bridge handle as `verifying_key` (32 raw bytes =
     # 64 hex chars).

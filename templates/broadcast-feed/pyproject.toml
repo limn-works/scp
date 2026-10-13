@@ -5,6 +5,7 @@ description = "Broadcast feed with subscriber management over SCP"
 requires-python = ">=3.12"
 dependencies = [
     "scp-python",
+    "cryptography>=46",
 ]
 
 [project.scripts]

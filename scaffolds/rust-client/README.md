@@ -16,7 +16,7 @@ cargo run
 
 ## What This Does
 
-1. Creates a `did:dht` identity with in-memory key custody
+1. Creates a `did:dht` identity with in-memory key custody (`scp_platform::testing::InMemoryKeyCustody`, which exists only with the `testing` feature)
 2. Publishes the DID document to an in-memory DHT
 3. Builds a `ContextManager` with mock providers
 4. Creates an encrypted context with messaging capabilities

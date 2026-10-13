@@ -34,7 +34,7 @@
 //! plan's "every transport and storage call inside a handler wraps
 //! `tokio::time::timeout(30s, ...)`" contract. A handler that signs in its
 //! turn uses [`SIGNING_HANDLER_TIMEOUT`] instead, so a stalled custody fails
-//! as `SCP-CRYPTO-4061` before the handler budget expires (ADR-049
+//! as `SCP-CRYPTO-4062` before the handler budget expires (ADR-049
 //! Decision 7a).
 
 use std::time::Duration;

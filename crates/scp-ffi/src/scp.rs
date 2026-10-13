@@ -596,9 +596,9 @@ mod tests {
 
     /// AC5: on a shipped build the production `identity_create` path fails closed
     /// with [`IDENT_1059`](scp_ffi_common::error_codes::IDENT_1059) rather than
-    /// minting the `InMemoryPreRotationCustody` nullifier. File custody is used
+    /// minting the `InMemoryPreRotationCustody` nullifier. `encrypted_file` custody is used
     /// because `in_memory` custody is itself severed on shipped builds; a temp
-    /// `HOME` + `SCP_KEY_PASSPHRASE` resolve the File backend's inputs. The
+    /// `HOME` + `SCP_KEY_PASSPHRASE` resolve its inputs. The
     /// refusal runs after those inputs resolve and before the key directory or
     /// key file is created, so a failed call leaves no `$HOME/.scp`.
     #[cfg(not(feature = "testing"))]
@@ -618,7 +618,7 @@ mod tests {
         }
         Python::with_gil(|py| {
             let scp = PyScp::new_in_memory_for_test();
-            let msg = match scp.identity_create(py, "file", None) {
+            let msg = match scp.identity_create(py, "encrypted_file", None) {
                 Ok(_) => panic!(
                     "shipped identity_create must FAIL CLOSED — the in-memory \
                      pre-rotation nullifier must not be minted on a production path"

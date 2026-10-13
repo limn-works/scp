@@ -129,12 +129,12 @@ pub struct NapiContextHandle {
     /// `Arc<NapiKeyCustody>` so context-level signing uses the same key
     /// material (and works for callback-backed identities too).
     ///
-    /// Available in production (not feature-gated): in the production
-    /// callback-custody path this carries the creator identity's retained
-    /// `Arc<NapiKeyCustody::Callback>`. The field name is historical — it
-    /// backs any retained custody, not just in-memory. `None` when the context
-    /// creator was an externally loaded (DID-string-only) identity.
-    pub(crate) in_memory_custody: Option<Arc<crate::custody::NapiKeyCustody>>,
+    /// Available in production (not feature-gated): it carries whichever
+    /// custody the creator identity retains — `Callback` for `os_keystore`,
+    /// `File` for `encrypted_file` (spec `03-identity.md` §3.2.2). `None` when
+    /// the context creator was an externally loaded (DID-string-only)
+    /// identity.
+    pub(crate) custody: Option<Arc<crate::custody::NapiKeyCustody>>,
     /// Handle to the creator's active signing key for UCAN minting and
     /// context-export signing.
     pub(crate) signing_key: Option<scp_platform::traits::KeyHandle>,
@@ -324,7 +324,7 @@ impl NapiContextHandle {
             promotion_policy: None,
             governance: "single_admin".to_owned(),
             economic_policy: None,
-            in_memory_custody: None,
+            custody: None,
             signing_key: None,
             core_handle: None,
             subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
@@ -380,7 +380,7 @@ async fn derive_context_pseudonym_required(
 ) -> napi::Result<[u8; 32]> {
     let (Some(scp_id), Some(custody)) = (
         identity.inner.scp_identity.as_ref(),
-        identity.inner.in_memory_custody.as_ref(),
+        identity.inner.custody.as_ref(),
     ) else {
         return Err(NapiError::from(ScpNapiError::Identity {
             message: "cannot derive pseudonym without retained key material — \
@@ -766,7 +766,7 @@ pub(crate) async fn context_create_on(
     let context_params = parsed.core;
 
     // Extract key custody and signing key from the identity handle.
-    let in_memory_custody = identity.inner.in_memory_custody.clone();
+    let custody = identity.inner.custody.clone();
     let signing_key = identity
         .inner
         .scp_identity
@@ -909,7 +909,7 @@ pub(crate) async fn context_create_on(
         promotion_policy: parsed.promotion_policy,
         governance: parsed.governance,
         economic_policy: parsed.economic_policy,
-        in_memory_custody,
+        custody,
         signing_key,
         core_handle: Some(core_handle),
         subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
@@ -1543,7 +1543,7 @@ pub(crate) async fn context_join_from_welcome_on(
         promotion_policy: fields.promotion_policy,
         governance: fields.governance,
         economic_policy: fields.economic_policy,
-        in_memory_custody: Some(custody),
+        custody: Some(custody),
         signing_key: Some(active_handle),
         core_handle: Some(core_handle),
         subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
@@ -2953,7 +2953,7 @@ pub(crate) async fn broadcast_publish_on(
     let author_did = DID(author_did);
 
     use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastPayload};
-    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+    let custody = handle.custody.as_ref().ok_or_else(|| {
         NapiError::from(ScpNapiError::Identity {
             message: "broadcast publish requires retained signing custody — this identity has no \
                       retained custody (it was externally loaded)"
@@ -3099,7 +3099,7 @@ pub(crate) async fn broadcast_publish_asset_on(
     };
 
     use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastContentPayload};
-    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+    let custody = handle.custody.as_ref().ok_or_else(|| {
         NapiError::from(ScpNapiError::Identity {
             message: "broadcast publish asset requires retained signing custody — this identity \
                       has no retained custody (it was externally loaded)"
@@ -3204,7 +3204,7 @@ pub(crate) async fn broadcast_publish_assets_on(
     })?;
 
     use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastContentPayload};
-    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+    let custody = handle.custody.as_ref().ok_or_else(|| {
         NapiError::from(ScpNapiError::Identity {
             message: "broadcast publish assets requires retained signing custody — this identity \
                       has no retained custody (it was externally loaded)"
@@ -3687,7 +3687,7 @@ pub(crate) async fn context_reconnect_on(
 /// Builds the `#active` [`CommandSigner`](scp_core::context::actor::CommandSigner)
 /// over the context handle's retained custody (ADR-049 Decision 7a).
 ///
-/// The NAPI handle retains `in_memory_custody` and `signing_key` (`KeyHandle`)
+/// The NAPI handle retains `custody` and `signing_key` (`KeyHandle`)
 /// from the creating identity. The private key stays in custody.
 ///
 /// # Errors
@@ -3698,7 +3698,7 @@ pub(crate) async fn context_reconnect_on(
 async fn resolve_napi_signer(
     handle: &NapiContextHandle,
 ) -> napi::Result<scp_core::context::actor::CommandSigner> {
-    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+    let custody = handle.custody.as_ref().ok_or_else(|| {
         NapiError::from(ScpNapiError::Context {
             message: "no custody provider on context handle — signing \
                       requires an identity created with custody"
@@ -3811,7 +3811,7 @@ fn resolve_napi_export_signer(
     Arc<crate::custody::NapiKeyCustody>,
     scp_platform::traits::KeyHandle,
 )> {
-    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+    let custody = handle.custody.as_ref().ok_or_else(|| {
         NapiError::from(ScpNapiError::Context {
             message: "no custody provider on context handle — context export \
                       requires an identity created with custody"
@@ -5813,7 +5813,7 @@ mod tests {
             promotion_policy: None,
             governance: "single_admin".to_owned(),
             economic_policy: None,
-            in_memory_custody: Some(Arc::clone(&custody)),
+            custody: Some(Arc::clone(&custody)),
             signing_key: Some(active_handle),
             core_handle: None,
             subscription_cancel: std::sync::Mutex::new(super::CancellationToken::new()),
@@ -5967,7 +5967,7 @@ mod tests {
             promotion_policy: None,
             governance: "single_admin".to_owned(),
             economic_policy: None,
-            in_memory_custody: Some(Arc::clone(&custody_b)),
+            custody: Some(Arc::clone(&custody_b)),
             signing_key: Some(active_handle),
             core_handle: None,
             subscription_cancel: std::sync::Mutex::new(super::CancellationToken::new()),
@@ -6836,7 +6836,7 @@ mod tests {
             promotion_policy: None,
             governance: "single_admin".to_owned(),
             economic_policy: None,
-            in_memory_custody: None,
+            custody: None,
             signing_key: None,
             core_handle: None,
             subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
@@ -7591,16 +7591,14 @@ mod tests {
         .expect("test supervisor context creation must succeed");
         crate::runtime::register_test_context(&bi, &ctx_id);
         let mut handle = active_handle_for(&bi, &ctx_id, &owner_did);
-        handle
-            .in_memory_custody
-            .clone_from(&stranger.inner.in_memory_custody);
+        handle.custody.clone_from(&stranger.inner.custody);
         handle.signing_key = stranger
             .inner
             .scp_identity
             .as_ref()
             .map(|identity| identity.active_signing_key);
         assert!(
-            handle.in_memory_custody.is_some() && handle.signing_key.is_some(),
+            handle.custody.is_some() && handle.signing_key.is_some(),
             "the fixture's handle must carry the stranger's custody"
         );
 
@@ -7914,7 +7912,7 @@ mod tests {
                     scp_crypto::CustodyFailureKind::KeyNotFound,
                     codes::CRYPTO_4006,
                 ),
-                (scp_crypto::CustodyFailureKind::TimedOut, codes::CRYPTO_4061),
+                (scp_crypto::CustodyFailureKind::TimedOut, codes::CRYPTO_4062),
                 (scp_crypto::CustodyFailureKind::Failed, codes::CRYPTO_4060),
             ] {
                 let failure = scp_crypto::CustodyFailure {
@@ -9142,7 +9140,7 @@ mod tests {
             .await
             .expect("context_create should succeed");
         let custody = handle
-            .in_memory_custody
+            .custody
             .as_ref()
             .expect("an in-memory identity retains its custody on the handle");
         let key = handle
@@ -9184,7 +9182,7 @@ mod tests {
             .await
             .expect("context_create should succeed");
         let custody = handle
-            .in_memory_custody
+            .custody
             .as_ref()
             .expect("an in-memory identity retains its custody on the handle");
         let key = handle
@@ -9390,7 +9388,7 @@ mod tests {
 
     /// Proves the fail-closed boundary is the ABSENCE of retained custody, not a
     /// build feature: `context_export_on` on a `NapiContextHandle` whose
-    /// `in_memory_custody` is `None` (e.g. an externally loaded, DID-string-only
+    /// `custody` is `None` (e.g. an externally loaded, DID-string-only
     /// creator) is rejected with `CTX_2040` by `resolve_napi_export_signer` —
     /// never with the old build-gate PERM-3001, and never an unsigned export.
     /// Runs WITHOUT `testing`.
@@ -9425,7 +9423,7 @@ mod tests {
             promotion_policy: None,
             governance: "single_admin".to_owned(),
             economic_policy: None,
-            in_memory_custody: None,
+            custody: None,
             signing_key: None,
             core_handle: Some(core_handle),
             subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
@@ -9584,7 +9582,7 @@ mod tests {
             .await
             .expect("broadcast context_create should succeed");
         let custody = handle
-            .in_memory_custody
+            .custody
             .as_ref()
             .expect("an in-memory identity retains its custody on the handle");
         let key = handle
@@ -9610,7 +9608,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn broadcast_publish_without_retained_custody_returns_ident_1017() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        // `test_active_on` leaves `in_memory_custody`/`signing_key` as `None`
+        // `test_active_on` leaves `custody`/`signing_key` as `None`
         // (an externally-loaded identity), so broadcast publish trips the
         // missing signing-custody gate before reaching the relay.
         let handle = super::NapiContextHandle::test_active_on(

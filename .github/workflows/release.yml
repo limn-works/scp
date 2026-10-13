@@ -91,6 +91,11 @@ jobs:
           key: conformance-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: conformance-
 
+      # Every crate Cargo.lock names, downloaded once with retries; every later cargo
+      # command in this job runs with CARGO_NET_OFFLINE=true. fetch.sh states why.
+      - name: Fetch crates, then take cargo offline
+        uses: ./.github/actions/cargo-fetch
+
       - name: Run all workspace tests
         run: cargo test --workspace --release --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/saga-witness-test-mint
 
@@ -463,6 +468,12 @@ jobs:
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # The one job in `.github/workflows/` that runs cargo with no
+    # `./.github/actions/cargo-fetch` step and online throughout. `cargo publish` uploads
+    # each crate to crates.io and then resolves the next crate against the versions it
+    # just uploaded, which no fetch made before the first upload can have downloaded.
+    # Check `offline-cargo` in scripts/tests/ci-gate/ci_gate_selftest.py names this job
+    # as its one exemption.
     steps:
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
