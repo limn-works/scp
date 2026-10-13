@@ -729,9 +729,9 @@ Published out-of-band (relay metadata page, a service-record entry). Relay MAY i
 | `rate_limit_publish` | 6000/min | The rate per publishing address. Per-IP shared across connections; operator-adjustable. Priced relays have economic DDoS resistance (§19.7). |
 | `rate_limit_subscribe` | 100 | Max concurrent subscriptions per connection. SUBSCRIBE operation rate is separately enforced at 20/min per connection but not exposed in `.well-known/scp`. |
 | `idle_timeout` | 90s | Seconds before idle connection close |
-| `push_platforms` | none: the operator selects it (§17.17.1, SCP-CAPSEL-8000) | The push platforms the relay wakes devices on (§10.7.1): `none`, `apns`, `fcm`, or both. `none` disables push, and a registration then receives `SCP-4063` |
-| APNs credentials | none: required when `push_platforms` lists `apns` | One authentication key, key ID, Apple team ID, topic (bundle ID) and APNs environment. They bind the relay to one Apple team, one app and one environment: a client whose app was issued under another team or topic receives `SCP-4061` and registers with another relay |
-| FCM credentials | none: required when `push_platforms` lists `fcm` | One service-account key and its Firebase project ID. They bind the relay to one Firebase project: a client whose app belongs to another project receives `SCP-4061` and registers with another relay |
+| `push_platforms` | none: the operator selects it (§17.17.1, SCP-CAPSEL-8000) | The push platforms the relay wakes devices on (§10.7.1): `none`, `apns`, `fcm`, or both. `none` disables push, and a registration then receives `4063` PUSH_NOT_SUPPORTED |
+| APNs credentials | none: required when `push_platforms` lists `apns` | One authentication key, key ID, Apple team ID, topic (bundle ID) and APNs environment. They bind the relay to one Apple team, one app and one environment |
+| FCM credentials | none: required when `push_platforms` lists `fcm` | One service-account key and its Firebase project ID. They bind the relay to one Firebase project |
 | `webpush_vapid_key` | none | The relay's VAPID public key, published as `relay_config.webpush_vapid_key` in `.well-known/scp` (`18-addressability-and-deployment.md` §18.3.3). Absent on a relay that sends no WebPush wakes. |
 
 #### Reference Rust Types

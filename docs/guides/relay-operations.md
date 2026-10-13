@@ -155,7 +155,7 @@ A relay wakes a registered mobile device through APNs or FCM when a message arri
 
 Credentials load only from files, never from an environment value. Each credential file must be a regular file of at most 64 KiB whose mode grants nothing to its group or to others (`chmod 600` or `chmod 400`); a looser mode exits 1 naming the variable and the mode. The relay reads key bytes into buffers it zeroes on release, and no log line or error message carries them: startup logs only that each platform's credentials loaded, and the APNs environment.
 
-One relay serves one Apple team, topic and APNs environment, and one Firebase project. A client whose app was issued under other credentials gets `SCP-4061` (push platform unavailable) and registers with another relay.
+One relay serves one Apple team, topic and APNs environment, and one Firebase project.
 
 This build validates the whole push configuration and then exits 1 with `this relay build cannot serve push yet` for any value other than `none`: the relay's push role, which serves registrations and sends wakes, is not built yet (story PUSH-007). Set `SCP_RELAY_PUSH_PLATFORMS=none` until it is.
 
