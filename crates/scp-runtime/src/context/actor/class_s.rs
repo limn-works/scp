@@ -7810,6 +7810,80 @@ impl ClassSCell
         }
     }
 
+    // ------------------------------------------------------------------
+    // execute_modify_capability_requirements — the direction a failed
+    // persist leaves the live list in is chosen by the delta (spec 07
+    // §7.3.4.4): a tightening stays in force, anything else is restored.
+    // ------------------------------------------------------------------
+
+    fn self_attested_requirements(uris: &[&str]) -> scp_protocol::trust::CapabilityRequirements {
+        let list: Vec<scp_protocol::trust::CapabilityRequirement> = uris
+            .iter()
+            .map(|uri| {
+                scp_protocol::trust::RawCapabilityRequirement {
+                    capability: uri.parse().expect("capability URI"),
+                    verification_level: scp_protocol::trust::VerificationLevel::SelfAttested,
+                    trusted_verifiers: Vec::new(),
+                    retry_cap: None,
+                }
+                .try_into()
+                .expect("valid requirement")
+            })
+            .collect();
+        list.try_into().expect("valid requirement list")
+    }
+
+    /// A failed persist keeps a tightening in force and restores the old list
+    /// for a loosening and for a mixed change.
+    #[tokio::test]
+    async fn governance_modify_capability_requirements_failure_direction() {
+        let deps = build_deps(Box::new(FailPersistence)).await;
+        let schema = "scp:capability:schema-validation/v1";
+        let safety = "scp:capability:content-safety/v1";
+        // (old list, new list, whether the new list is a tightening)
+        let cases: [(&[&str], &[&str], bool); 3] = [
+            (&[schema], &[schema, safety], true),
+            (&[schema, safety], &[schema], false),
+            (&[schema], &[safety], false),
+        ];
+        for (byte, (old, new, tightening)) in (0xD0u8..).zip(cases) {
+            let old = self_attested_requirements(old);
+            let new = self_attested_requirements(new);
+            assert_eq!(new.is_tightening_of(&old), tightening);
+            let mut state = fresh_state(byte);
+            state.handle = crate::context::ContextHandle::new(
+                ctx_hex(byte),
+                scp_protocol::context::params::ContextParams::default(),
+            );
+            state
+                .handle
+                .transition_to(&crate::context::ContextState::Active)
+                .expect("transition to Active");
+            state.governance.class_s.capability_requirements = old.clone();
+            let mut cell = ClassSCell::new(state);
+
+            let result =
+                crate::context::governance_helpers::execute_modify_capability_requirements(
+                    &mut cell,
+                    &deps,
+                    &ctx_hex(byte),
+                    &new,
+                    ceiling_commit_meta(),
+                )
+                .await;
+
+            assert!(
+                matches!(result, Err(ContextError::PersistenceFailed(_))),
+                "a failed persist surfaces; got {result:?}"
+            );
+            let expected = if tightening { &new } else { &old };
+            assert_eq!(
+                &cell.governance.class_s.capability_requirements, expected,
+                "tightening {tightening}: the live list after a failed persist"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn execute_modify_ceiling_rejects_malformed_proposal_at_propose_time() {
         use scp_protocol::context::roles::Capability;
