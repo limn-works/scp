@@ -269,12 +269,18 @@ pub async fn load_revocation_list<S: Storage>(
 /// when the tracker pruned, which the tracker does at most every 1000 records
 /// or 10 minutes, so its listing cost is amortized over those records.
 ///
+/// The result depends only on the store of the recorded nonce's own key. A
+/// sweep failure is logged with `tracing::warn!` and not returned: the nonce is
+/// already held in the tracker and stored, so reporting the failure would make
+/// the bridge refuse a valid first-use token whose nonce it had spent. The keys
+/// the sweep could not remove are retried at the next prune or at restore.
+///
 /// # Errors
 ///
 /// Returns [`UcanDurableStateError::NonceNotTracked`] if the tracker holds no
 /// entry for the recorded nonce, and another [`UcanDurableStateError`] if the
-/// key is invalid, a value cannot be encoded or decoded, or a storage call
-/// fails.
+/// key is invalid, the value cannot be encoded, or the store of the nonce's
+/// key fails.
 pub async fn persist_recorded_nonce<S: Storage, C: Clock>(
     storage: &S,
     context_id: &str,
@@ -291,34 +297,78 @@ pub async fn persist_recorded_nonce<S: Storage, C: Clock>(
         .store(&key, &bytes)
         .await
         .map_err(|e| UcanDurableStateError::Storage(e.to_string()))?;
-    if recorded.pruned {
-        prune_nonce_keys(storage, context_id, tracker).await?;
+    if recorded.pruned
+        && let Err(failure) = prune_nonce_keys(storage, context_id, tracker).await
+    {
+        tracing::warn!(
+            context_id,
+            failed_keys = failure.failed,
+            error = %failure.first,
+            "UCAN nonce prune sweep failed; the expired keys it could not remove \
+             are retried at the next prune or at restore"
+        );
     }
     Ok(())
 }
 
+/// The keys a prune sweep could not process: how many, and the first failure.
+/// The error carries no key bytes, so it can be logged as is.
+#[derive(Debug)]
+struct PruneFailure {
+    failed: usize,
+    first: UcanDurableStateError,
+}
+
 /// Deletes the durable key of every nonce the tracker does not hold whose
 /// stored entry is expired by the tracker's retention rule.
+///
+/// A key that cannot be decoded, read, or deleted is counted and skipped, so
+/// one bad key cannot keep the sweep from reaching the keys after it.
 async fn prune_nonce_keys<S: Storage, C: Clock>(
     storage: &S,
     context_id: &str,
     tracker: &NonceTracker<C>,
-) -> Result<(), UcanDurableStateError> {
-    let prefix = nonce_key_prefix(context_id)?;
-    let keys = storage
-        .list_keys(&prefix)
-        .await
-        .map_err(|e| UcanDurableStateError::Storage(e.to_string()))?;
+) -> Result<(), PruneFailure> {
+    let prefix = nonce_key_prefix(context_id).map_err(|first| PruneFailure { failed: 0, first })?;
+    let keys = storage.list_keys(&prefix).await.map_err(|e| PruneFailure {
+        failed: 0,
+        first: UcanDurableStateError::Storage(e.to_string()),
+    })?;
+    let mut failure: Option<PruneFailure> = None;
     for key in keys {
-        let nonce = nonce_from_key(&prefix, &key)?;
-        if tracker.entry(&nonce).is_some() {
-            continue;
+        if let Err(err) = prune_nonce_key(storage, tracker, &prefix, &key).await {
+            match &mut failure {
+                Some(f) => f.failed += 1,
+                None => {
+                    failure = Some(PruneFailure {
+                        failed: 1,
+                        first: err,
+                    });
+                }
+            }
         }
-        if let Some((first_seen, token_expiry)) = read_nonce_entry(storage, &key).await?
-            && tracker.is_expired_entry(first_seen, token_expiry)
-        {
-            delete_key(storage, &key).await?;
-        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+/// Deletes one key under the nonce prefix when the tracker does not hold its
+/// nonce and its stored entry is expired. The returned error names no key.
+async fn prune_nonce_key<S: Storage, C: Clock>(
+    storage: &S,
+    tracker: &NonceTracker<C>,
+    prefix: &str,
+    key: &str,
+) -> Result<(), UcanDurableStateError> {
+    let nonce = nonce_from_key(prefix, key).map_err(|_| {
+        UcanDurableStateError::Codec("a key under the nonce prefix is not a hex nonce".to_owned())
+    })?;
+    if tracker.entry(&nonce).is_some() {
+        return Ok(());
+    }
+    if let Some((first_seen, token_expiry)) = read_nonce_entry(storage, key).await?
+        && tracker.is_expired_entry(first_seen, token_expiry)
+    {
+        delete_key(storage, key).await?;
     }
     Ok(())
 }
@@ -811,6 +861,75 @@ mod tests {
                 .exists(&nonce_key("ctx-shared", &old).unwrap())
                 .await
                 .unwrap()
+        );
+    }
+
+    /// A [`Storage`] over an [`InMemoryStorage`] whose `delete` always fails.
+    #[derive(Default)]
+    struct FailingDeleteStorage {
+        inner: InMemoryStorage,
+    }
+
+    impl Storage for FailingDeleteStorage {
+        async fn store(&self, key: &str, data: &[u8]) -> Result<(), PlatformError> {
+            self.inner.store(key, data).await
+        }
+        async fn retrieve(&self, key: &str) -> Result<Option<Vec<u8>>, PlatformError> {
+            self.inner.retrieve(key).await
+        }
+        async fn delete(&self, _key: &str) -> Result<(), PlatformError> {
+            Err(PlatformError::StorageError("delete refused".to_owned()))
+        }
+        async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PlatformError> {
+            self.inner.list_keys(prefix).await
+        }
+        async fn delete_prefix(&self, prefix: &str) -> Result<u64, PlatformError> {
+            self.inner.delete_prefix(prefix).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool, PlatformError> {
+            self.inner.exists(key).await
+        }
+    }
+
+    /// A prune sweep that fails (here, every `delete` fails) does not fail the
+    /// persist: the recorded nonce's own key is stored and the call returns
+    /// `Ok`, so the bridge accepts the first-use token instead of refusing it
+    /// after spending its nonce.
+    #[tokio::test]
+    async fn prune_failure_does_not_fail_the_nonce_persist() {
+        let storage = FailingDeleteStorage::default();
+        let start = 1_800_000_000;
+        let clock = Arc::new(TestClock::new(start));
+        let mut live = NonceTracker::new("ctx-prune-fail".to_owned(), Arc::clone(&clock));
+        let old = fresh_nonce(start, 'a');
+        let recorded = record(&mut live, &old, start + 60);
+        persist_recorded_nonce(&storage, "ctx-prune-fail", &live, recorded)
+            .await
+            .unwrap();
+
+        let later = start + 86_400 + 1_000;
+        clock.set(later);
+        let new = fresh_nonce(later, 'b');
+        let recorded = record(&mut live, &new, later + 60);
+        assert!(recorded.pruned, "the record must trigger a prune sweep");
+        let result = persist_recorded_nonce(&storage, "ctx-prune-fail", &live, recorded).await;
+        assert!(
+            result.is_ok(),
+            "a failed prune sweep must not fail the persist, got {result:?}"
+        );
+        assert!(
+            storage
+                .exists(&nonce_key("ctx-prune-fail", &new).unwrap())
+                .await
+                .unwrap(),
+            "the recorded nonce's key must be stored"
+        );
+        assert!(
+            storage
+                .exists(&nonce_key("ctx-prune-fail", &old).unwrap())
+                .await
+                .unwrap(),
+            "the expired key the sweep could not delete stays for the next sweep"
         );
     }
 
