@@ -3898,6 +3898,8 @@ impl TransportManager {
                 msg: e.to_string(),
                 code: codes::TRANS_5003.to_owned(),
             })?;
+        // The added relay joins the bridge's relay set.
+        self.bi.core.add_relay_url(relay_url.clone());
 
         // Spawn suppression → scoring bridge task against this handle's
         // owning `UniffiBridgeInstance`.
@@ -10341,8 +10343,8 @@ impl Scp {
                 // rather than calling a `ContextManager` method directly. The
                 // actor mailbox wraps the delegated call in the 30s
                 // transport-timeout budget.
-                // The relays this bridge is connected to host the new
-                // context (§5.12.3.1 `relay_urls`, PUSH-025).
+                // The bridge's relay set hosts the new context (§5.12.3.1
+                // `relay_urls`, PUSH-025).
                 let relay_urls = bi
                     .core
                     .context_relay_urls()
@@ -10350,6 +10352,9 @@ impl Scp {
                         msg: e.to_string(),
                         code: codes::TRANS_5002.to_owned(),
                     })?;
+                // The known-context cache names a relay from the same set, so
+                // the two cannot disagree.
+                let known_relay_url = relay_urls.first().cloned();
                 let sup = bi.context_manager_or_error()?;
                 {
                     use scp_core::context::actor::commands::{
@@ -10445,9 +10450,7 @@ impl Scp {
                 // pseudonym) fall back to the mode-appropriate deterministic
                 // routing id — `broadcast_routing_id` for broadcast,
                 // `context_routing_id` otherwise — matching the PyO3 reference.
-                // `relay_url` is `None`: the connected relay lives on the
-                // caller-held `TransportManager` handle, not on the bridge
-                // instance. Infallible + idempotent, so it is safe after the
+                // Infallible + idempotent, so it is safe after the
                 // irreversible runtime commit and needs no rollback.
                 let routing_id = local_pseudonym.unwrap_or_else(|| {
                     if create_is_broadcast {
@@ -10458,7 +10461,7 @@ impl Scp {
                 });
                 let known = scp_ffi_common::bridge_instance::KnownContext {
                     routing_id,
-                    relay_url: None,
+                    relay_url: known_relay_url,
                     member_did: identity.did.clone(),
                     last_seen: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
                 };
@@ -16024,18 +16027,17 @@ impl Scp {
                 let manager = scp_transport::TransportManager::new(adapter);
 
                 // Install the manager on THIS instance's CoreFields — not on
-                // the process-wide DEFAULT_BRIDGE_INSTANCE.
+                // the process-wide DEFAULT_BRIDGE_INSTANCE — with `relay_url`
+                // as the bridge's whole relay set, so
+                // `BridgeInstanceCore::resume` rebuilds the transport after
+                // suspend/resume cycles (#1678) and a context created next is
+                // hosted on the relay actually connected.
                 bi.core
-                    .set_transport(std::sync::Arc::new(manager))
+                    .install_transport(std::sync::Arc::new(manager), relay_url.clone())
                     .map_err(|e| ScpError::Transport {
                         msg: e.to_string(),
                         code: codes::TRANS_5002.to_owned(),
                     })?;
-
-                // Register the URL on this bridge's pending-reconnect set
-                // so `BridgeInstanceCore::resume` can rebuild the transport
-                // after suspend/resume cycles (#1678).
-                bi.core.add_relay_url(relay_url.clone());
 
                 let handle = Arc::new(TransportManager {
                     status: std::sync::Mutex::new(TransportStatus {

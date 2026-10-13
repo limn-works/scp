@@ -111,6 +111,7 @@ async fn auto_wire_context_manager(
                     let _ = crate::transport::set_transport_manager_arc_on(
                         bi,
                         std::sync::Arc::new(manager),
+                        relay_url.to_owned(),
                     );
                 }
                 Err(e) => {

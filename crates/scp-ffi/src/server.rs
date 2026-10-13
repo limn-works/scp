@@ -130,7 +130,9 @@ fn auto_wire_context_manager(
             }) {
                 Ok(relay_adapter) => {
                     let manager = scp_transport::TransportManager::new(relay_adapter);
-                    let _ = crate::runtime::set_transport_manager(bi, manager);
+                    let _ = bi
+                        .core
+                        .install_transport(std::sync::Arc::new(manager), relay_url.to_owned());
                 }
                 Err(e) => {
                     tracing::warn!(

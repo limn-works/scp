@@ -2623,12 +2623,15 @@ impl crate::scp::PyScp {
             Some(derive_member_pseudonym(bi, identity_did, &context_id)?)
         };
 
-        // The relays this bridge is connected to host the new context
-        // (§5.12.3.1 `relay_urls`, PUSH-025).
+        // The bridge's relay set hosts the new context (§5.12.3.1
+        // `relay_urls`, PUSH-025).
         let relay_urls = bi
             .core
             .context_relay_urls()
             .map_err(|e| crate::error::ScpPyError::transport(e.to_string()))?;
+        // The known-context cache names a relay from the same set, so the two
+        // cannot disagree.
+        let known_relay_url = relay_urls.first().cloned();
 
         // Create the context via the shared ContextManager.
         {
@@ -2722,22 +2725,11 @@ impl crate::scp::PyScp {
                 }
             });
 
-            // Get the relay URL from transport status if a relay is connected.
-            let relay_url = match self.transport_status() {
-                Ok(status) => status.relay_url,
-                Err(e) => {
-                    tracing::warn!(
-                        "failed to query transport status during context registration: {e}"
-                    );
-                    None
-                }
-            };
-
             let last_seen = scp_clock::SystemClock.now_secs();
 
             let known = crate::runtime::KnownContext {
                 routing_id,
-                relay_url,
+                relay_url: known_relay_url,
                 member_did: identity_did.to_owned(),
                 last_seen,
             };

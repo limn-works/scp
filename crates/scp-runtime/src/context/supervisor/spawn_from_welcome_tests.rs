@@ -2744,7 +2744,10 @@ async fn invite_member_seals_the_creators_stored_relay_set() {
         )
         .await
         .expect("alice creates the encrypted context");
-    assert_eq!(alice_sup.context_relay_urls(&ctx_id).await, Some(stored.clone()));
+    assert_eq!(
+        alice_sup.context_relay_urls(&ctx_id).await,
+        Some(stored.clone())
+    );
 
     let (bob_sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
@@ -2760,7 +2763,10 @@ async fn invite_member_seals_the_creators_stored_relay_set() {
         )
         .await
         .expect_err("an empty relay list differs from the stored set");
-    assert!(matches!(err, crate::context::ContextError::InvalidState(_)), "got {err:?}");
+    assert!(
+        matches!(err, crate::context::ContextError::InvalidState(_)),
+        "got {err:?}"
+    );
     assert_eq!(
         alice_sup.member_count(&ctx_id).await,
         Some(1),

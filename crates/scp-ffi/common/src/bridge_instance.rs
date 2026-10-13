@@ -1598,10 +1598,36 @@ impl CoreFields {
     ///
     /// Returns `Err` if the `RwLock` is poisoned, or if the instance is
     /// suspended (lifecycle violation — call `resume()` first).
-    #[allow(clippy::significant_drop_tightening)]
     pub fn set_transport(
         &self,
         manager: Arc<scp_transport::TransportManager>,
+    ) -> Result<(), TransportLockError> {
+        self.install_transport_inner(manager, None)
+    }
+
+    /// Installs `manager`, connected to the one relay `relay_url`, replacing
+    /// any previous transport manager, and makes `relay_url` the bridge's
+    /// whole relay set (the set [`Self::context_relay_urls`] and resume read).
+    /// The replaced manager's relays are no longer connected, so they leave
+    /// the set in the same write-locked step that installs `manager`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_transport`], plus [`TransportLockError::Poisoned`]
+    /// when the relay-set mutex is poisoned.
+    pub fn install_transport(
+        &self,
+        manager: Arc<scp_transport::TransportManager>,
+        relay_url: String,
+    ) -> Result<(), TransportLockError> {
+        self.install_transport_inner(manager, Some(relay_url))
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn install_transport_inner(
+        &self,
+        manager: Arc<scp_transport::TransportManager>,
+        relay_url: Option<String>,
     ) -> Result<(), TransportLockError> {
         // Shutdown: warn only — matches bridge_instance()/context_manager()
         // behavior where shutdown is a terminal state and operations fail
@@ -1620,6 +1646,17 @@ impl CoreFields {
             .transport
             .write()
             .map_err(|_| TransportLockError::Poisoned)?;
+        if let Some(url) = relay_url {
+            let mut relays = self
+                .relay_urls
+                .lock()
+                .map_err(|_| TransportLockError::Poisoned)?;
+            relays.clear();
+            // After shutdown the set stays empty, as `add_relay_url` keeps it.
+            if !self.is_shutdown() {
+                relays.insert(url);
+            }
+        }
         *guard = Some(manager);
         Ok(())
     }
@@ -1752,23 +1789,32 @@ impl CoreFields {
             .unwrap_or_default()
     }
 
-    /// Returns the relays this bridge is connected to, sorted, as the relay
-    /// set of a context the bridge creates: the creator's relays host the
-    /// context (§5.12.3.1 `relay_urls`, PUSH-025).
+    /// Returns the bridge's relay set, sorted, as the relay set of a context
+    /// the bridge creates: the creator's relays host the context (§5.12.3.1
+    /// `relay_urls`, PUSH-025). The set is empty when no transport manager is
+    /// installed; otherwise it holds the relay of the last
+    /// [`Self::install_transport`] plus each relay added to that manager since.
     ///
     /// # Errors
     ///
-    /// [`TransportLockError::Poisoned`] when the relay-set mutex is poisoned,
-    /// so a create fails instead of recording an empty relay set it cannot
-    /// vouch for.
+    /// [`TransportLockError::Poisoned`] when the transport lock or the
+    /// relay-set mutex is poisoned, so a create fails instead of recording a
+    /// relay set it cannot vouch for.
     pub fn context_relay_urls(&self) -> Result<Vec<String>, TransportLockError> {
-        let mut urls: Vec<String> = self
-            .relay_urls
-            .lock()
-            .map_err(|_| TransportLockError::Poisoned)?
-            .iter()
-            .cloned()
-            .collect();
+        let mut urls: Vec<String> = {
+            let transport = self
+                .transport
+                .read()
+                .map_err(|_| TransportLockError::Poisoned)?;
+            if transport.is_none() {
+                return Ok(Vec::new());
+            }
+            let relays = self
+                .relay_urls
+                .lock()
+                .map_err(|_| TransportLockError::Poisoned)?;
+            relays.iter().cloned().collect()
+        };
         urls.sort_unstable();
         Ok(urls)
     }
@@ -4698,10 +4744,15 @@ mod tests {
     }
 
     #[test]
-    fn context_relay_urls_is_the_sorted_connected_set() {
+    fn context_relay_urls_is_the_sorted_set_of_the_installed_transport() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         assert_eq!(instance.context_relay_urls(), Ok(Vec::new()));
-        instance.add_relay_url("wss://relay2.example.com".to_owned());
+        instance
+            .install_transport(
+                Arc::new(test_transport_manager()),
+                "wss://relay2.example.com".to_owned(),
+            )
+            .unwrap();
         instance.add_relay_url("wss://relay1.example.com".to_owned());
         instance.add_relay_url("wss://relay3.example.com".to_owned());
         instance.remove_relay_url("wss://relay3.example.com");
@@ -4711,6 +4762,52 @@ mod tests {
                 "wss://relay1.example.com".to_owned(),
                 "wss://relay2.example.com".to_owned(),
             ])
+        );
+    }
+
+    #[test]
+    fn install_transport_replaces_the_relay_set_of_the_replaced_manager() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        instance
+            .install_transport(
+                Arc::new(test_transport_manager()),
+                "wss://a.example".to_owned(),
+            )
+            .unwrap();
+        instance
+            .install_transport(
+                Arc::new(test_transport_manager()),
+                "wss://b.example".to_owned(),
+            )
+            .unwrap();
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(vec!["wss://b.example".to_owned()]),
+            "the replaced manager's relay is no longer connected"
+        );
+        assert_eq!(instance.pending_relay_urls().len(), 1);
+    }
+
+    #[test]
+    fn context_relay_urls_is_empty_without_an_installed_transport() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        instance.add_relay_url("wss://pending.example".to_owned());
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(Vec::new()),
+            "a pending relay with no transport hosts nothing"
+        );
+        instance
+            .install_transport(
+                Arc::new(test_transport_manager()),
+                "wss://a.example".to_owned(),
+            )
+            .unwrap();
+        instance.clear_transport().unwrap();
+        assert_eq!(instance.context_relay_urls(), Ok(Vec::new()));
+        assert!(
+            instance.pending_relay_urls().contains("wss://a.example"),
+            "clear_transport keeps the relay for reconnect"
         );
     }
 

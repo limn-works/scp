@@ -838,12 +838,15 @@ pub(crate) async fn context_create_on(
     // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
     // rather than calling a `ContextManager` method directly. The actor
     // mailbox wraps the delegated call in the 30s transport-timeout budget.
-    // The relays this bridge is connected to host the new context
-    // (§5.12.3.1 `relay_urls`, PUSH-025).
+    // The bridge's relay set hosts the new context (§5.12.3.1 `relay_urls`,
+    // PUSH-025).
     let relay_urls = bi
         .core
         .context_relay_urls()
         .map_err(|e| NapiError::from(crate::transport::map_transport_lock_error(e)))?;
+    // The known-context cache names a relay from the same set, so the two
+    // cannot disagree.
+    let known_relay_url = relay_urls.first().cloned();
     let sup = crate::runtime::supervisor(bi)?;
     let core_handle = {
         use scp_core::context::actor::commands::{CreateContextPayload, LifecycleCommand};
@@ -892,10 +895,6 @@ pub(crate) async fn context_create_on(
     // send path) for broadcast contexts, which carry no per-member pseudonym.
     // Infallible and idempotent (overwrites), so it is safe after the committed
     // create and needs no rollback.
-    //
-    // The relay URL comes from the handleless transport probe. On the NAPI bridge
-    // the relay URL lives on a `NapiTransportManager` handle, so the honest value
-    // here is whatever `transport_status_on` surfaces (never a fabricated URL).
     let routing_id = local_pseudonym.unwrap_or_else(|| {
         if create_is_broadcast {
             scp_core::context::broadcast_routing_id(&context_id)
@@ -903,20 +902,11 @@ pub(crate) async fn context_create_on(
             scp_core::context::context_routing_id(&context_id)
         }
     });
-    let relay_url = match crate::transport::transport_status_on(bi, None).await {
-        Ok(status) => status.relay_url,
-        Err(e) => {
-            tracing::warn!(
-                "failed to query transport status during context create registration: {e}"
-            );
-            None
-        }
-    };
     bi.core.register_known_context(
         &context_id,
         scp_ffi_common::bridge_instance::KnownContext {
             routing_id,
-            relay_url,
+            relay_url: known_relay_url,
             member_did: creator_did.clone(),
             last_seen: scp_clock::SystemClock.now_secs(),
         },
