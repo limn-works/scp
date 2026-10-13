@@ -2714,23 +2714,6 @@ pub fn with_transport_manager<T>(
         .map_err(|e| ScpPyError::transport(e.to_string()))?
 }
 
-/// Executes a closure with a mutable reference to the `TransportManager`.
-///
-/// Delegates to [`CoreFields::with_transport_mut`].
-///
-/// # Errors
-///
-/// Returns `ScpPyError::TransportError` if the lock is poisoned, no
-/// transport manager has been initialized, or the bridge is not initialized.
-pub fn with_transport_manager_mut<T>(
-    bi: &PyBridgeInstance,
-    f: impl FnOnce(&mut scp_transport::TransportManager) -> Result<T, ScpPyError>,
-) -> Result<T, ScpPyError> {
-    bi.core
-        .with_transport_mut(f)
-        .map_err(|e| ScpPyError::transport(e.to_string()))?
-}
-
 /// Returns `true` if a transport manager has been initialized.
 #[must_use]
 pub fn has_transport_manager(bi: &PyBridgeInstance) -> bool {

@@ -94,8 +94,7 @@ enum MessagingExample {
             identity: alice,
             contextId: aliceHandle.contextId(),
             inviteeDid: bob.did(),
-            inviteeKeyPackage: reservation.keyPackagePublic,
-            relayUrls: [relayURL]
+            inviteeKeyPackage: reservation.keyPackagePublic
         )
         let bundle: SealedInvitation
         switch outcome {

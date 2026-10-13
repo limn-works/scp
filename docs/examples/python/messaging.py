@@ -117,7 +117,7 @@ async def main() -> None:
         #    and Bob joins from the sealed bundle.
         reservation_id, key_package = await bob_node.reserve_key_package(bob.did)
         outcome = await alice_node.invite_member(
-            ctx.context_id, alice.did, bob.did, key_package, [relay_url]
+            ctx.context_id, alice.did, bob.did, key_package
         )
         bob_ctx = await bob_node.context_join_from_welcome(
             bob.did, outcome.bundle, reservation_id

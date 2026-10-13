@@ -459,7 +459,7 @@ use scp_transport::TransportManager;
 let adapter = MqttTransportAdapter::connect("broker.example.com", "scp-client-1")
     .await?;
 
-let manager = TransportManager::new(Box::new(adapter));
+let manager = TransportManager::new("mqtt://broker.example.com".to_owned(), Box::new(adapter));
 ```
 
 ### Multiple adapters (Phase 2)
@@ -479,15 +479,15 @@ let sourced = SourcedRelayUrl {
     source: RelayUrlSource::Explicit,
 };
 let native = NativeRelayAdapter::connect_sourced(&sourced).await?;
-manager.add_adapter(Box::new(native));
+manager.add_adapter(sourced.url.clone(), Box::new(native));
 
 // Register an MQTT adapter for IoT devices
 let mqtt = MqttTransportAdapter::connect("broker.example.com", "scp-client-1").await?;
-manager.add_adapter(Box::new(mqtt));
+manager.add_adapter("mqtt://broker.example.com".to_owned(), Box::new(mqtt));
 
 // Register a Nostr adapter for decentralized relay infrastructure
 let nostr = NostrTransportAdapter::connect("wss://nostr-relay.example.com").await?;
-manager.add_adapter(Box::new(nostr));
+manager.add_adapter("wss://nostr-relay.example.com".to_owned(), Box::new(nostr));
 ```
 
 When multiple adapters are registered, `TransportManager` distributes contexts across them:
@@ -497,7 +497,7 @@ When multiple adapters are registered, `TransportManager` distributes contexts a
 - `subscribe_context` merges streams from all adapters in the relay set, deduplicating by `BlobId` via an LRU cache.
 - Per-adapter reliability scoring tracks delivery success rates. Adapters with poor reliability are deprioritized in relay set assignment.
 
-The `TransportManager::builder()` constructor creates a manager with no adapters -- use `add_adapter` to register them before performing any operations.
+The `TransportManager::builder()` constructor creates a manager with no adapters -- use `add_adapter` to register them before performing any operations. Every adapter is registered with the URL of the relay it connects to, and `relay_urls()` returns the URLs of the adapters the manager holds; an adapter evicted for the connection budget or shed as idle takes its URL with it.
 
 ---
 

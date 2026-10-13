@@ -1594,7 +1594,6 @@ class SCP:
         creator_did: str,
         invitee_did: str,
         invitee_key_package: bytes,
-        relay_urls: list[str],
     ) -> InviteMemberOutcome:
         """Invite a member into a context (ADR-049 Phase 2J; FFI-02 Option A).
 
@@ -1617,13 +1616,16 @@ class SCP:
         capability in the context's declared ceiling, so the creator can invite
         only when that ceiling includes ``governance:propose``.
 
+        The bundle carries the context's stored relay set (§5.12.3.1
+        ``relay_urls``), which the runtime reads; the caller supplies none.
+
         Example::
 
             reservation_id, invitee_kp = await joiner_scp.reserve_key_package(
                 invitee.did
             )
             outcome = await scp.invite_member(
-                context_id, creator.did, invitee.did, invitee_kp, []
+                context_id, creator.did, invitee.did, invitee_kp
             )
             # `outcome.bundle` is directly usable — no manual re-assembly:
             ctx = await joiner_scp.context_join_from_welcome(
@@ -1637,7 +1639,6 @@ class SCP:
             invitee_did: The DID being invited.
             invitee_key_package: The invitee's TLS-serialized MLS ``KeyPackage``
                 (the public bytes from the invitee's :meth:`reserve_key_package`).
-            relay_urls: Relay URLs to include for the invitee's first contact.
 
         Returns:
             A :class:`Sealed` outcome carrying the sealed
@@ -1658,7 +1659,6 @@ class SCP:
             creator_did,
             invitee_did,
             invitee_key_package,
-            relay_urls,
         )
         return _to_invite_outcome(raw)
 

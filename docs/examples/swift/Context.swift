@@ -77,14 +77,13 @@ enum ContextExample {
         //    bytes out of band.
         let reservation = try await bobNode.reserveKeyPackage(identity: bob)
 
-        // 5. Alice seals an invitation to that KeyPackage. An empty relay list
-        //    means Alice delivers the sealed bundle to Bob herself.
+        // 5. Alice seals an invitation to that KeyPackage. The bundle carries
+        //    the relay set the context stored when Alice created it.
         let outcome = try await aliceNode.inviteMember(
             identity: alice,
             contextId: handle.contextId(),
             inviteeDid: bob.did(),
-            inviteeKeyPackage: reservation.keyPackagePublic,
-            relayUrls: []
+            inviteeKeyPackage: reservation.keyPackagePublic
         )
         let bundle: SealedInvitation
         switch outcome {

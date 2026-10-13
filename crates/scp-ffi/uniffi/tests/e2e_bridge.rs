@@ -574,7 +574,6 @@ async fn invite_member_seals_for_a_locally_minted_invitee() {
             context_id.clone(),
             invitee.did(),
             reservation.key_package_public,
-            Vec::new(),
         )
         .await
         .expect("invite_member should seal for an invitee this instance minted");

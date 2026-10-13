@@ -59,8 +59,7 @@ pub(crate) fn map_transport_lock_error(e: TransportLockError) -> ScpNapiError {
     }
 }
 
-/// Installs a pre-built `Arc<TransportManager>`, connected to `relay_url`, on
-/// the given bridge instance (called by [`crate::server`] auto-wire where the
+/// Installs a pre-built `Arc<TransportManager>` on the given bridge instance (called by [`crate::server`] auto-wire where the
 /// caller needs to construct the manager externally).
 ///
 /// Delegates to [`CoreFields::install_transport`](scp_ffi_common::bridge_instance::CoreFields::install_transport).
@@ -76,10 +75,9 @@ pub(crate) fn map_transport_lock_error(e: TransportLockError) -> ScpNapiError {
 pub(crate) fn set_transport_manager_arc_on(
     bi: &NapiBridgeInstance,
     manager: Arc<scp_transport::TransportManager>,
-    relay_url: String,
 ) -> Result<(), ScpNapiError> {
     bi.core
-        .install_transport(manager, relay_url)
+        .install_transport(manager)
         .map_err(map_transport_lock_error)
 }
 
@@ -90,16 +88,6 @@ pub(crate) fn with_transport_manager_on<T>(
 ) -> napi::Result<T> {
     bi.core
         .with_transport(f)
-        .map_err(|e| napi::Error::from(map_transport_lock_error(e)))?
-}
-
-/// Per-bridge-instance implementation of `with_transport_manager_mut`.
-pub(crate) fn with_transport_manager_mut_on<T>(
-    bi: &NapiBridgeInstance,
-    f: impl FnOnce(&mut scp_transport::TransportManager) -> napi::Result<T>,
-) -> napi::Result<T> {
-    bi.core
-        .with_transport_mut(f)
         .map_err(|e| napi::Error::from(map_transport_lock_error(e)))?
 }
 
@@ -271,13 +259,14 @@ pub(crate) async fn transport_connect_on(
             // `Box<dyn TransportAdapter>`; the blanket
             // `impl TransportAdapter for Box<dyn TransportAdapter>` lets it be
             // used anywhere a concrete adapter is expected.
-            // Installing it makes `relay_url` the bridge's whole relay set, so
+            // The manager records `relay_url` with the adapter, and installing
+            // it makes its relays the bridge's whole reconnect set, so
             // `BridgeInstanceCore::resume` rebuilds the transport after
-            // suspend/resume cycles (#1678) and a context created next is
+            // suspend/resume cycles (#1678), and a context created next is
             // hosted on the relay actually connected.
-            let manager = scp_transport::TransportManager::new(adapter);
+            let manager = scp_transport::TransportManager::new(relay_url.clone(), adapter);
             bi.core
-                .install_transport(Arc::new(manager), relay_url.clone())
+                .install_transport(Arc::new(manager))
                 .map_err(|e| napi::Error::from(map_transport_lock_error(e)))?;
 
             // Spawn suppression → scoring bridge task. Holds a `Weak` to the
@@ -540,13 +529,14 @@ pub(crate) async fn transport_add_relay_on(
             code: codes::TRANS_5001.to_owned(),
         })?;
 
-    let count = with_transport_manager_mut_on(bi, |manager| {
-        let _eviction = manager.add_adapter(adapter);
-        #[allow(clippy::cast_possible_truncation)]
-        Ok(manager.adapter_count() as u32)
-    })?;
-    // The added relay joins the bridge's relay set.
-    bi.core.add_relay_url(relay_url.clone());
+    // The manager records the relay with its adapter; a budget eviction
+    // removes the evicted relay from the bridge's relay set in the same step.
+    let count = bi
+        .core
+        .add_relay_adapter(relay_url.clone(), adapter)
+        .map_err(|e| napi::Error::from(map_transport_lock_error(e)))?;
+    #[allow(clippy::cast_possible_truncation)] // Bounded by the connection budget.
+    let count = count as u32;
 
     // Spawn suppression → scoring bridge task.
     if let Some(rx) = suppression_rx {

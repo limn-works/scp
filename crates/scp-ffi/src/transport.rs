@@ -180,14 +180,15 @@ impl crate::scp::PyScp {
                 // `connect_sourced` with a profile auto-starts it via
                 // `finalize_connection` (#1532 AC6).
 
-                // Wrap the adapter in a TransportManager for multi-relay support
-                // and install it with `url` as the bridge's whole relay set, so
+                // Wrap the adapter in a TransportManager for multi-relay support,
+                // which records `url` with it, and install it; its relays become
+                // the bridge's whole reconnect set, so
                 // `BridgeInstanceCore::resume` rebuilds the transport after
-                // suspend/resume cycles (#1678) and a context created next is
+                // suspend/resume cycles (#1678), and a context created next is
                 // hosted on the relay actually connected.
-                let manager = scp_transport::TransportManager::new(adapter);
+                let manager = scp_transport::TransportManager::new(url.clone(), adapter);
                 bi.core
-                    .install_transport(Arc::new(manager), url.clone())
+                    .install_transport(Arc::new(manager))
                     .map_err(|e| ScpPyError::transport(e.to_string()))?;
 
                 // Spawn suppression → scoring bridge task.
@@ -455,12 +456,13 @@ impl crate::scp::PyScp {
             .map_err(ScpPyError::from)?;
         let scoring_url = relay_url.to_owned();
 
-        let count = crate::runtime::with_transport_manager_mut(bi, |manager| {
-            let _eviction = manager.add_adapter(adapter);
-            Ok(manager.adapter_count())
-        })?;
-        // The added relay joins the bridge's relay set.
-        bi.core.add_relay_url(relay_url.to_owned());
+        // The manager records the relay with its adapter; a budget eviction
+        // removes the evicted relay from the bridge's relay set in the same
+        // step.
+        let count = bi
+            .core
+            .add_relay_adapter(relay_url.to_owned(), adapter)
+            .map_err(|e| ScpPyError::transport(e.to_string()))?;
 
         // Spawn suppression → scoring bridge task.
         //

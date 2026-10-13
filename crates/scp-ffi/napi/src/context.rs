@@ -1573,15 +1573,14 @@ pub(crate) async fn context_join_from_welcome_on(
 /// is produced (`SigningKey` is `ZeroizeOnDrop`, so the explicit early `drop`
 /// triggers the wipe).
 ///
-/// `relay_urls` must name the context's stored relay set (§5.12.3.1), which
-/// the bundle carries; a list naming a different set is rejected.
+/// The bundle carries the context's stored relay set (§5.12.3.1
+/// `relay_urls`), which the runtime reads; the caller supplies none.
 pub(crate) async fn invite_member_on(
     bi: &NapiBridgeInstance,
     context_id: String,
     creator_did: String,
     invitee_did: String,
     invitee_key_package: Vec<u8>,
-    relay_urls: Vec<String>,
 ) -> napi::Result<NapiInviteMemberOutcome> {
     scp_ffi_common::validate::validate_context_id(&context_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -1616,7 +1615,6 @@ pub(crate) async fn invite_member_on(
             DID(creator_did),
             DID(invitee_did),
             invitee_key_package,
-            relay_urls,
             &signing_key,
         )
         .await;
@@ -6606,7 +6604,6 @@ mod tests {
                 inviter_did.clone(),
                 "did:dht:z6MkNapiInviteeUnknownCtx".to_owned(),
                 b"bogus-key-package".to_vec(),
-                vec![],
             )
             .await
             else {
@@ -6627,7 +6624,6 @@ mod tests {
             "did:dht:z6MkNoSuchNapiInviterIdentity".to_owned(),
             "did:dht:z6MkNapiInviteeUncustodied".to_owned(),
             b"bogus-key-package".to_vec(),
-            vec![],
         )
         .await
         else {

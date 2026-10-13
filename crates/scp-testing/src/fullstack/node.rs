@@ -399,7 +399,6 @@ impl FullStackNode {
                 self.did.clone(),
                 DID::from(member_did),
                 kp_bytes,
-                vec![],
                 &self.signing_key,
             )
             .await?;

@@ -14760,9 +14760,7 @@ impl Supervisor {
     ///
     /// - [`ContextError::ContextNotRegistered`] if `context_id` has no live
     ///   context; [`ContextError::InvalidState`] for a voting-governed context
-    ///   (governed-context invitations are not yet implemented) or for a
-    ///   `relay_urls` that names a different set than the context's stored
-    ///   relay set;
+    ///   (governed-context invitations are not yet implemented);
     ///   [`ContextError::CryptoFailed`] for a Broadcast context, an
     ///   unresolvable invitee `#active` key, an invalid key mapping, a signing or
     ///   HPKE-seal failure, or a serialization fault;
@@ -14779,7 +14777,6 @@ impl Supervisor {
         creator_did: DID,
         invitee_did: DID,
         invitee_key_package: Vec<u8>,
-        relay_urls: Vec<String>,
         proposer_signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<InviteMemberOutcome, ContextError> {
         use rand::RngCore as _;
@@ -14824,16 +14821,13 @@ impl Supervisor {
         }
 
         // The bundle carries the context's stored relay set (§5.12.3.1
-        // `relay_urls`), so every member stores the set the creator holds. A
-        // caller list that names a different set is refused before any add.
-        let relay_urls = crate::context::lifecycle_helpers::sealed_relay_urls(
-            relay_urls,
-            self.context_relay_urls(&context_id).await.ok_or_else(|| {
-                ContextError::ContextNotRegistered(format!(
-                    "invite_member: no live context '{context_id}'"
-                ))
-            })?,
-        )?;
+        // `relay_urls`) and no caller-supplied list, so every member stores
+        // the set the inviter holds.
+        let relay_urls = self.context_relay_urls(&context_id).await.ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "invite_member: no live context '{context_id}'"
+            ))
+        })?;
 
         // 2. Resolve the invitee's #active key -> X25519 recipient.
         let resolver = self.key_resolver_ref().ok_or_else(|| {

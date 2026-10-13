@@ -1847,12 +1847,14 @@ export class SCP {
    * `creatorDid` MUST be a locally-custodied identity; the invite is signed
    * under its `#active` key.
    *
+   * The bundle carries the context's stored relay set (§5.12.3.1
+   * `relay_urls`), which the runtime reads; the caller supplies none.
+   *
    * @param contextId The context to invite the member into.
    * @param creatorDid The inviting creator/admin DID (locally custodied).
    * @param inviteeDid The DID of the member being invited.
    * @param inviteeKeyPackage The invitee's PUBLIC MLS `KeyPackage` bytes (from
    *   the invitee's {@link reserveKeyPackage}).
-   * @param relayUrls Relay URLs the runtime may publish the sealed bundle to.
    * @returns The {@link InviteMemberOutcome} — the sealed `bundle` plus the
    *   `delivered` flag.
    *
@@ -1862,7 +1864,6 @@ export class SCP {
    *   creator.did,
    *   invitee.did,
    *   reservation.keyPackagePublic,
-   *   [],
    * );
    * // `outcome.bundle` is directly usable — no manual re-assembly:
    * const joined = await joinerScp.contextJoinFromWelcome(
@@ -1876,7 +1877,6 @@ export class SCP {
     creatorDid: string,
     inviteeDid: string,
     inviteeKeyPackage: Uint8Array | readonly number[],
-    relayUrls: readonly string[],
   ): Promise<InviteMemberOutcome> {
     const keyPackageArray = ArrayBuffer.isView(inviteeKeyPackage)
       ? Array.from(inviteeKeyPackage as Uint8Array)
@@ -1887,7 +1887,6 @@ export class SCP {
         c: string,
         i: string,
         kp: readonly number[],
-        r: readonly string[],
       ) => Promise<{
         bundle: {
           contextId: string;
@@ -1897,7 +1896,7 @@ export class SCP {
         };
         delivered: boolean;
       }>
-    )(contextId, creatorDid, inviteeDid, keyPackageArray, relayUrls);
+    )(contextId, creatorDid, inviteeDid, keyPackageArray);
 
     // Project the flat napi object into the SDK outcome. The `bundle` is a
     // SealedInvitation directly usable as the join input. A voting-governed

@@ -3885,21 +3885,19 @@ impl TransportManager {
             })
             .map_err(ScpError::from)?;
 
+        // The manager records the relay with its adapter; a budget eviction
+        // removes the evicted relay from the bridge's relay set in the same
+        // step.
         let count = self
             .bi
             .core
-            .with_transport_mut(|mgr| {
-                let _eviction = mgr.add_adapter(adapter);
-                #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
-                let count = mgr.adapter_count() as u32;
-                count
-            })
+            .add_relay_adapter(relay_url.clone(), adapter)
             .map_err(|e| ScpError::Transport {
                 msg: e.to_string(),
                 code: codes::TRANS_5003.to_owned(),
             })?;
-        // The added relay joins the bridge's relay set.
-        self.bi.core.add_relay_url(relay_url.clone());
+        #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
+        let count = count as u32;
 
         // Spawn suppression → scoring bridge task against this handle's
         // owning `UniffiBridgeInstance`.
@@ -10828,8 +10826,9 @@ impl Scp {
     /// * `context_id` -- The context to invite into.
     /// * `invitee_did` -- The DID being invited.
     /// * `invitee_key_package` -- The invitee's TLS-serialized MLS `KeyPackage`.
-    /// * `relay_urls` -- The context's stored relay set (§5.12.3.1), which the
-    ///   bundle carries; a list naming a different set is rejected.
+    ///
+    /// The bundle carries the context's stored relay set (§5.12.3.1
+    /// `relay_urls`), which the runtime reads; the caller supplies none.
     ///
     /// # Errors
     ///
@@ -10843,7 +10842,6 @@ impl Scp {
         context_id: String,
         invitee_did: String,
         invitee_key_package: Vec<u8>,
-        relay_urls: Vec<String>,
     ) -> Result<InviteMemberOutcome, ScpError> {
         self.inner
             .core
@@ -10878,7 +10876,6 @@ impl Scp {
                         scp_did::DID(creator_did),
                         scp_did::DID(invitee_did),
                         invitee_key_package,
-                        relay_urls,
                         &signing_key,
                     )
                     .await;
@@ -16019,16 +16016,16 @@ impl Scp {
                 // The selector returns a `Box<dyn TransportAdapter>`; the
                 // blanket `impl TransportAdapter for Box<dyn TransportAdapter>`
                 // lets it be used where a concrete adapter is expected.
-                let manager = scp_transport::TransportManager::new(adapter);
+                let manager = scp_transport::TransportManager::new(relay_url.clone(), adapter);
 
                 // Install the manager on THIS instance's CoreFields — not on
-                // the process-wide DEFAULT_BRIDGE_INSTANCE — with `relay_url`
-                // as the bridge's whole relay set, so
+                // the process-wide DEFAULT_BRIDGE_INSTANCE. Its relays become
+                // the bridge's whole reconnect set, so
                 // `BridgeInstanceCore::resume` rebuilds the transport after
-                // suspend/resume cycles (#1678) and a context created next is
+                // suspend/resume cycles (#1678), and a context created next is
                 // hosted on the relay actually connected.
                 bi.core
-                    .install_transport(std::sync::Arc::new(manager), relay_url.clone())
+                    .install_transport(std::sync::Arc::new(manager))
                     .map_err(|e| ScpError::Transport {
                         msg: e.to_string(),
                         code: codes::TRANS_5002.to_owned(),
@@ -21979,7 +21976,6 @@ mod tests {
                 context_id.clone(),
                 invitee.did(),
                 reservation.key_package_public,
-                Vec::new(),
             ))
             .expect("invite_member should seal a bundle");
 
@@ -22195,7 +22191,6 @@ mod tests {
                 unknown_ctx,
                 "did:dht:z6MkInviteeUnknownCtx".to_owned(),
                 b"bogus-key-package".to_vec(),
-                vec![],
             ))
             .expect_err("inviting into an unknown context must be rejected");
         assert!(
@@ -22217,7 +22212,6 @@ mod tests {
                 scp_ffi_common::generate_context_id(),
                 "did:dht:z6MkInviteeUncustodied".to_owned(),
                 b"bogus-key-package".to_vec(),
-                vec![],
             ))
             .expect_err("a non-locally-custodied inviter must be rejected");
         assert!(
@@ -28897,6 +28891,113 @@ mod tests {
         );
 
         relay.shutdown();
+    }
+
+    /// Under the Mobile connection budget of 10, the eleventh relay a bridge
+    /// adds through `add_relay` evicts the least recently used relay, r0. The
+    /// bridge's relay set drops r0 in the same step, so a context created next
+    /// records r1..r10 as its stored relay set (§5.12.3.1 `relay_urls`), and
+    /// the invitation bundle `invite_member` seals carries no relay the bridge
+    /// no longer holds a connection to.
+    #[cfg(all(feature = "server", feature = "testing"))]
+    #[test]
+    fn add_relay_mobile_budget_eviction_drops_the_evicted_relay_from_a_created_context() {
+        use scp_transport::profile::TransportProfile;
+        use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+
+        let rt = runtime();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let relays: Vec<_> = (0..11)
+            .map(|_| {
+                rt.block_on(scp.relay_start_in_memory())
+                    .expect("in-memory relay must start")
+            })
+            .collect();
+        let urls: Vec<String> = relays.iter().map(|r| r.relay_url()).collect();
+        let mobile = TransportProfile::Mobile;
+        assert_eq!(mobile.max_connections(), 10);
+
+        // Connect r0, then replace the platform-default manager with one under
+        // the Mobile profile holding r0, as a Mobile build installs it.
+        let handle = rt
+            .block_on(scp.transport_connect(urls[0].clone()))
+            .expect("connect to r0");
+        let (r0_adapter, _suppression_rx) = rt
+            .block_on(
+                scp.inner
+                    .core
+                    .transport_selector()
+                    .select_and_connect_discovering_with_suppression(
+                        &SourcedRelayUrl {
+                            url: urls[0].clone(),
+                            source: RelayUrlSource::Explicit,
+                        },
+                        Some(&mobile),
+                    ),
+            )
+            .expect("connect r0 under the Mobile profile");
+        let mut manager =
+            scp_transport::TransportManager::with_config(&scp_transport::TransportConfig {
+                profile: mobile,
+                ..scp_transport::TransportConfig::default()
+            });
+        assert!(manager.add_adapter(urls[0].clone(), r0_adapter).is_none());
+        scp.inner
+            .core
+            .install_transport(Arc::new(manager))
+            .expect("install the Mobile-profile manager");
+
+        // `add_relay` is a sync export, so it runs on a plain thread with no
+        // ambient runtime, as UniFFI calls it.
+        for (i, url) in urls.iter().enumerate().skip(1) {
+            let add_handle = Arc::clone(&handle);
+            let url = url.clone();
+            let count = std::thread::spawn(move || add_handle.add_relay(url))
+                .join()
+                .expect("add_relay thread must not panic")
+                .expect("add_relay to a live relay succeeds");
+            assert_eq!(
+                count,
+                u32::try_from(i + 1).unwrap().min(10),
+                "the manager holds at most the Mobile budget"
+            );
+        }
+
+        let mut expected: Vec<String> = urls[1..].to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            scp.inner.core.context_relay_urls(),
+            Ok(expected.clone()),
+            "the evicted relay r0 leaves the bridge's relay set"
+        );
+        assert!(
+            !scp.inner.core.pending_relay_urls().contains(&urls[0]),
+            "a resume does not redial the evicted relay"
+        );
+
+        let creator = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create");
+        let context_id = rt
+            .block_on(scp.context_create(Arc::clone(&creator), encrypted_join_test_params()))
+            .expect("context_create")
+            .context_id();
+        let sup = Arc::clone(
+            scp.inner
+                .context_manager_or_error()
+                .expect("context_create attaches the supervisor"),
+        );
+        let stored = rt
+            .block_on(sup.context_relay_urls(&context_id))
+            .expect("the created context is live");
+        assert_eq!(
+            stored, expected,
+            "the created context records r1..r10 and never the evicted r0"
+        );
+
+        for relay in relays {
+            relay.shutdown();
+        }
     }
 
     /// `Scp::configure_relay_transport` must route through the instance selector

@@ -3199,8 +3199,9 @@ impl crate::scp::PyScp {
     ///   the invite is signed under its `#active` key).
     /// * `invitee_did` -- The DID being invited.
     /// * `invitee_key_package` -- The invitee's TLS-serialized MLS `KeyPackage`.
-    /// * `relay_urls` -- The context's stored relay set (§5.12.3.1), which the
-    ///   bundle carries; a list naming a different set is rejected.
+    ///
+    /// The bundle carries the context's stored relay set (§5.12.3.1
+    /// `relay_urls`), which the runtime reads; the caller supplies none.
     ///
     /// # Errors
     ///
@@ -3208,14 +3209,13 @@ impl crate::scp::PyScp {
     /// key cannot be resolved, the context is voting-governed (governed-context
     /// invitations are not yet implemented), or the runtime invite fails (e.g.
     /// unauthorized inviter, invalid `KeyPackage`).
-    #[pyo3(signature = (context_id, creator_did, invitee_did, invitee_key_package, relay_urls))]
+    #[pyo3(signature = (context_id, creator_did, invitee_did, invitee_key_package))]
     pub fn invite_member(
         &self,
         context_id: String,
         creator_did: String,
         invitee_did: String,
         invitee_key_package: Vec<u8>,
-        relay_urls: Vec<String>,
     ) -> PyResult<PyInviteMemberOutcome> {
         let bi = &*self.inner;
         validate::validate_context_id(&context_id)?;
@@ -3237,7 +3237,6 @@ impl crate::scp::PyScp {
             scp_did::DID(creator_did),
             scp_did::DID(invitee_did),
             invitee_key_package,
-            relay_urls,
             &signing_key,
         ));
         // Defense-in-depth: wipe the raw signing key the moment the invite is
@@ -7076,7 +7075,6 @@ mod tests {
                     creator_did,
                     "did:dht:z6MkInviteeUnknownCtx".to_owned(),
                     b"bogus-key-package".to_vec(),
-                    vec![],
                 )
                 .expect_err("inviting into an unknown context must be rejected")
                 .to_string();
@@ -7093,7 +7091,6 @@ mod tests {
                     "did:dht:z6MkNoSuchInviterIdentity".to_owned(),
                     "did:dht:z6MkInviteeUncustodied".to_owned(),
                     b"bogus-key-package".to_vec(),
-                    vec![],
                 )
                 .expect_err("a non-locally-custodied inviter must be rejected")
                 .to_string();

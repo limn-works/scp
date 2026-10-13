@@ -2658,7 +2658,6 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &alice_signing_key(),
         )
         .await
@@ -2720,9 +2719,8 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
 }
 
 /// `invite_member` seals the context's stored relay set (§5.12.3.1
-/// `relay_urls`, PUSH-025), so the joiner stores the set the creator holds. A
-/// caller list naming a different set is refused before any member is added;
-/// the stored set in another order is accepted and sealed in stored order.
+/// `relay_urls`, PUSH-025) and takes no relay list from its caller, so the
+/// joiner stores exactly the set the creator holds, in stored order.
 #[tokio::test]
 async fn invite_member_seals_the_creators_stored_relay_set() {
     let ctx_id = ctx_hex(0xd6);
@@ -2752,38 +2750,16 @@ async fn invite_member_seals_the_creators_stored_relay_set() {
     let (bob_sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
 
-    let err = alice_sup
-        .invite_member(
-            ctx_id.clone(),
-            alice.clone(),
-            bob.clone(),
-            kp_public_bytes.clone(),
-            vec![],
-            &alice_signing_key(),
-        )
-        .await
-        .expect_err("an empty relay list differs from the stored set");
-    assert!(
-        matches!(err, crate::context::ContextError::InvalidState(_)),
-        "got {err:?}"
-    );
-    assert_eq!(
-        alice_sup.member_count(&ctx_id).await,
-        Some(1),
-        "a refused relay list adds no member"
-    );
-
     let InviteMemberOutcome::Sealed { bundle, .. } = alice_sup
         .invite_member(
             ctx_id.clone(),
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![stored[1].clone(), stored[0].clone()],
             &alice_signing_key(),
         )
         .await
-        .expect("the stored set in another order is accepted");
+        .expect("alice seals an invitation for bob");
     let enc =
         <[u8; 32]>::try_from(bundle.enc.as_slice()).expect("sealed bundle enc is exactly 32 bytes");
 
@@ -2924,7 +2900,6 @@ async fn invite_member_broadcasts_the_add_commit_to_existing_members() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &alice_signing_key(),
         )
         .await
@@ -2988,7 +2963,6 @@ async fn invite_member_into_voting_context_is_rejected() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &alice_signing_key(),
         )
         .await
@@ -3058,7 +3032,6 @@ async fn invite_member_by_non_admin_is_rejected() {
             bob.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &bob_signing_key(),
         )
         .await;
@@ -3165,7 +3138,6 @@ async fn invite_member_rolls_back_the_add_on_delivery_failure() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &alice_signing_key(),
         )
         .await;

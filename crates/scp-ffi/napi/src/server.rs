@@ -107,12 +107,21 @@ async fn auto_wire_context_manager(
             .await
             {
                 Ok(relay_adapter) => {
-                    let manager = scp_transport::TransportManager::new(Box::new(relay_adapter));
-                    let _ = crate::transport::set_transport_manager_arc_on(
+                    let manager = scp_transport::TransportManager::new(
+                        relay_url.to_owned(),
+                        Box::new(relay_adapter),
+                    );
+                    if let Err(e) = crate::transport::set_transport_manager_arc_on(
                         bi,
                         std::sync::Arc::new(manager),
-                        relay_url.to_owned(),
-                    );
+                    ) {
+                        tracing::warn!(
+                            error = %e,
+                            relay_url = %relay_url,
+                            "auto_wire_supervisor: transport install failed — the bridge holds \
+                             no transport manager and records no relay for a context it creates"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(

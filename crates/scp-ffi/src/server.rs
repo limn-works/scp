@@ -129,10 +129,16 @@ fn auto_wire_context_manager(
                 ))
             }) {
                 Ok(relay_adapter) => {
-                    let manager = scp_transport::TransportManager::new(relay_adapter);
-                    let _ = bi
-                        .core
-                        .install_transport(std::sync::Arc::new(manager), relay_url.to_owned());
+                    let manager =
+                        scp_transport::TransportManager::new(relay_url.to_owned(), relay_adapter);
+                    if let Err(e) = bi.core.install_transport(std::sync::Arc::new(manager)) {
+                        tracing::warn!(
+                            error = %e,
+                            relay_url = %relay_url,
+                            "auto_wire: transport install failed — the bridge holds no transport \
+                             manager and records no relay for a context it creates"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1061,7 +1067,7 @@ mod tests {
         let adapter = rt()
             .block_on(selector.select_and_connect(&sourced, None, None))
             .expect("should connect to the relay");
-        let manager = scp_transport::TransportManager::new(adapter);
+        let manager = scp_transport::TransportManager::new(sourced.url.clone(), adapter);
         let bi = bi_setup;
         crate::runtime::set_transport_manager(&bi, manager)
             .expect("should store transport manager in global");
