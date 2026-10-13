@@ -113,9 +113,10 @@ wildcards = "allow"
 # 0.18.2 fails the check unless mainline is what depends on it, so a workspace crate
 # or any other dependency pulling in an unpatched lru is reported.
 #
-# The rsa ignore above holds RUSTSEC-2023-0071 for every rsa version. This ban keeps
-# it scoped to scp-transport's dev-only test-key generation: any other crate that
-# depends on rsa, normal or dev, fails the check.
+# The rsa ignore above holds RUSTSEC-2023-0071 for every rsa version. This ban fails
+# the check when any crate other than scp-transport depends on rsa directly, normal or
+# dev. It does not check the edge kind: the rust-deny job in .github/workflows/ci.yml
+# fails when rsa is reachable over a normal or build edge.
 deny = [
     { crate = "p256", wrappers = [
         "scp-crypto",
@@ -135,7 +136,7 @@ deny = [
         "p384",
     ], reason = "P-256 arithmetic stays in scp-crypto" },
     { crate = "lru:<0.18.2", wrappers = ["mainline"], reason = "RUSTSEC-2026-0253 is ignored only for mainline's copy" },
-    { crate = "rsa", wrappers = ["scp-transport"], reason = "RUSTSEC-2023-0071 is ignored only for scp-transport's dev-only test-key generation" },
+    { crate = "rsa", wrappers = ["scp-transport"], reason = "RUSTSEC-2023-0071 is ignored for every rsa version; only scp-transport may depend on rsa" },
 ]
 
 # ── Sources ─────────────────────────────────────────────────────────────────
