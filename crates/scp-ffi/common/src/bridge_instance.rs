@@ -1951,10 +1951,11 @@ impl CoreFields {
         let cancel = self.reconnect_cancel_token();
         let profile = scp_transport::profile::TransportProfile::platform_default();
         // Build ONE TransportManager and register every successful adapter
-        // in it. `TransportManager::new(adapter)` creates a manager with a
-        // single adapter, so calling it in a loop and set_transport'ing each
-        // time would keep only the last URL's adapter. Using `builder()` +
-        // `add_adapter` preserves multi-relay semantics.
+        // in it. `TransportManager::new(relay_url, adapter)` creates a
+        // manager holding a single relay URL and its adapter, so calling it
+        // in a loop and set_transport'ing each time would keep only the last
+        // URL's adapter. Using `builder()` + `add_adapter(relay_url, adapter)`
+        // preserves multi-relay semantics.
         //
         // Dial every URL in parallel with a per-URL timeout. A serial loop
         // would let a single slow (or attacker-controlled) relay stall
