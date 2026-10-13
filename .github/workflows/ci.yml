@@ -1708,13 +1708,14 @@ jobs:
           cargo clippy -p scp-transport --features push-store --all-targets -- -D warnings
           cargo clippy -p scp-transport --features push-store,testing --all-targets -- -D warnings
           # The `local-cache` blob cache, the `combined` SQLCipher store, the
-          # `relay-persistence` store, the `upnp` port mappers and the native
-          # build of `webtransport-wasm` compile only under their own features,
-          # which no other clippy command enables; this command lints them
-          # together with the push store. ci_gate_selftest.py's
-          # linted-features check fails when a scp-transport or scp-node
-          # feature is in no clippy command.
-          cargo clippy -p scp-transport --features combined,local-cache,push-store,relay-persistence,testing,upnp,webtransport-wasm --all-targets -- -D warnings
+          # `relay-persistence` store and the `upnp` port mappers compile only
+          # under their own features, which no other clippy command enables;
+          # this command lints them together with the push store.
+          # ci_gate_selftest.py's linted-features check fails when a
+          # scp-transport or scp-node feature is in no clippy command. The
+          # wasm32-only `webtransport-wasm` client is linted by no command,
+          # because scp-transport does not compile for wasm32-unknown-unknown.
+          cargo clippy -p scp-transport --features combined,local-cache,push-store,relay-persistence,testing,upnp --all-targets -- -D warnings
           cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
           cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
       # Runs scripts/check-examples-compile.sh against throwaway one- and two-crate
