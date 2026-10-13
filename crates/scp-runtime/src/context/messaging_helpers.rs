@@ -3962,9 +3962,10 @@ pub fn encode_local_announcement(
 /// - [`ContextError::NotPseudonymousContext`] for a broadcast context.
 /// - [`ContextError::PermissionDenied`] when `sender_did` is not the local
 ///   member's DID.
-/// - [`ContextError::InvalidState`] when no rotation is admissible (a v1
-///   member of a context without a rotation policy, or an exhausted epoch),
-///   when `new_epoch` is not the admissible epoch, when `new_routing_id` is a
+/// - [`ContextError::InvalidState`] when no rotation is due (no rotation
+///   policy, no boundary, membership change or join derivation pending since
+///   the last rotation, or an exhausted epoch), when `new_epoch` is not the
+///   due epoch, when `new_routing_id` is a
 ///   reserved value, the current or previous routing ID, or a peer's routing
 ///   ID, or when the grace end overflows. Nothing changes on any of these.
 /// - The persist error of the rotation; the epoch, routing ID and grace state
@@ -3997,16 +3998,16 @@ pub async fn rotate_pseudonym(
     let t0_secs = cell.creation_timestamp_secs;
     let policy = handle.params().pseudonym_rotation;
     let mut rotation = cell.class_s.pseudonym_rotation;
-    let Some(expected_epoch) = rotation.next_epoch(policy.as_ref(), t0_secs, now_secs) else {
+    let Some(expected_epoch) = rotation.due_epoch(policy.as_ref(), t0_secs, now_secs) else {
         return Err(ContextError::InvalidState(
-            "no pseudonym rotation is admissible: rotation is opt-in and the context has no \
-             rotation policy, or the epoch has no successor (spec 09 §9.10.4.1)"
+            "no pseudonym rotation is due: the context has no rotation policy, no trigger has \
+             fired since the last rotation, or the epoch has no successor (spec 09 §9.10.4.1)"
                 .into(),
         ));
     };
     if new_epoch != expected_epoch {
         return Err(ContextError::InvalidState(format!(
-            "pseudonym rotation epoch {new_epoch} is not the admissible epoch {expected_epoch} \
+            "pseudonym rotation epoch {new_epoch} is not the due epoch {expected_epoch} \
              (spec 09 §9.10.4.1 epoch schedule)"
         )));
     }

@@ -101,6 +101,22 @@ struct Store {
 }
 
 impl Store {
+    /// The write count once the actor's coalesced persist, which lands about
+    /// 50 ms after a Class-C mutation, has drained: the count unchanged
+    /// across 300 ms. A "nothing persisted" check that snapshots the count
+    /// earlier counts that late write against the operation under test.
+    async fn settled_writes(&self) -> usize {
+        let mut last = self.writes.load(Ordering::SeqCst);
+        loop {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let now = self.writes.load(Ordering::SeqCst);
+            if now == last {
+                return now;
+            }
+            last = now;
+        }
+    }
+
     fn snapshot(&self, ctx_id: &str) -> ContextSnapshot {
         self.contexts
             .get(ctx_id)
@@ -504,7 +520,7 @@ async fn rejected_rotations_change_nothing_and_send_nothing() {
     n.clock.set(T0 + INTERVAL);
     n.drain();
     let before = n.ids(ctx).await;
-    let writes = n.store.writes.load(Ordering::SeqCst);
+    let writes = n.store.settled_writes().await;
     let sent = n.sent.count();
 
     let invalid = |r: Result<(), ContextError>, what: &str| {
@@ -557,11 +573,75 @@ async fn rejected_rotations_change_nothing_and_send_nothing() {
     let events = n.collect_for(Duration::from_millis(200)).await;
     assert!(rotated(&events).is_empty(), "no rotation event: {events:?}");
 
-    // The previous routing ID is also rejected while it is held.
+    // The previous routing ID is also rejected while it is held, at the next
+    // boundary, where epoch 2 is due.
     n.rotate(ctx, 1, RID_1)
         .await
         .expect("an admissible rotation");
+    n.clock.set(T0 + 2 * INTERVAL);
     invalid(n.rotate(ctx, 2, V1_RID).await, "the previous routing ID");
+}
+
+/// §9.10.4.1 "no caller action starts a rotation": `rotate_pseudonym` commits
+/// only the rotation the schedule makes due. Before the first boundary and
+/// between boundaries it refuses the epoch `next_pseudonym_epoch` reports,
+/// and changes, persists and sends nothing; at the boundary the same call
+/// commits.
+#[tokio::test]
+async fn a_rotation_off_the_schedule_is_refused() {
+    let n = node();
+    let ctx = &cid("rotation-off-schedule");
+    n.create(ctx, params(Some(interval_policy()))).await;
+
+    let refused = |r: Result<(), ContextError>, what: &str| {
+        assert!(
+            matches!(r, Err(ContextError::InvalidState(_))),
+            "{what} must be InvalidState: {r:?}"
+        );
+    };
+    let writes = n.store.settled_writes().await;
+    let sent = n.sent.count();
+    let before = n.ids(ctx).await;
+    assert_eq!(before.next_pseudonym_epoch, Some(0));
+    refused(
+        n.rotate(ctx, 0, RID_1).await,
+        "a rotation before the first boundary",
+    );
+    assert_eq!(n.ids(ctx).await, before, "nothing changed");
+    assert_eq!(
+        n.store.writes.load(Ordering::SeqCst),
+        writes,
+        "nothing persisted"
+    );
+    assert_eq!(n.sent.count(), sent, "nothing sent");
+
+    n.clock.set(T0 + INTERVAL);
+    n.rotate(ctx, 1, RID_1)
+        .await
+        .expect("the rotation due at the first boundary commits");
+
+    n.clock.set(T0 + INTERVAL + 60);
+    let mid = n.ids(ctx).await;
+    assert_eq!(mid.next_pseudonym_epoch, Some(2));
+    let writes = n.store.settled_writes().await;
+    let sent = n.sent.count();
+    refused(
+        n.rotate(ctx, 2, RID_2).await,
+        "a rotation between boundaries",
+    );
+    assert_eq!(n.ids(ctx).await, mid, "nothing changed");
+    assert_eq!(
+        n.store.writes.load(Ordering::SeqCst),
+        writes,
+        "nothing persisted"
+    );
+    assert_eq!(n.sent.count(), sent, "nothing sent");
+
+    n.clock.set(T0 + 2 * INTERVAL);
+    n.rotate(ctx, 2, RID_2)
+        .await
+        .expect("the rotation due at the second boundary commits");
+    assert_eq!(n.ids(ctx).await.current, RID_2);
 }
 
 /// Rotation is opt-in: a v1 member of a context without a policy has no

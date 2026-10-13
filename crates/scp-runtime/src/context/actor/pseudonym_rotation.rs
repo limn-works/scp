@@ -195,6 +195,25 @@ impl PseudonymRotationState {
             || self.join_derivation_pending
     }
 
+    /// The epoch of the rotation due at `now_secs`: [`Self::next_epoch`] while
+    /// [`Self::rotation_due`] holds, else `None`. The rotation arm signals this
+    /// epoch and `rotate_pseudonym` commits only this epoch, so a rotation off
+    /// the schedule cannot commit (spec 09 §9.10.4.1: "no caller action starts
+    /// a rotation").
+    #[must_use]
+    pub fn due_epoch(
+        &self,
+        policy: Option<&PseudonymRotationPolicy>,
+        t0_secs: u64,
+        now_secs: u64,
+    ) -> Option<u64> {
+        if self.rotation_due(policy, t0_secs, now_secs) {
+            self.next_epoch(policy, t0_secs, now_secs)
+        } else {
+            None
+        }
+    }
+
     /// The wall-clock second of the next interval boundary the member has not
     /// handled, `T0 + (boundary_index + 1) × interval_secs`, or `None` when the
     /// policy sets no interval or the value overflows `u64`.
@@ -287,9 +306,7 @@ impl PseudonymRotationState {
         if let (true, Some(pseudonym_epoch)) = (self.announce_pending, self.epoch) {
             return RotationWake::AnnouncementPending { pseudonym_epoch };
         }
-        if self.rotation_due(policy, t0_secs, now_secs)
-            && let Some(pseudonym_epoch) = self.next_epoch(policy, t0_secs, now_secs)
-        {
+        if let Some(pseudonym_epoch) = self.due_epoch(policy, t0_secs, now_secs) {
             return RotationWake::RotationDue { pseudonym_epoch };
         }
         self.next_boundary_secs(policy, t0_secs)

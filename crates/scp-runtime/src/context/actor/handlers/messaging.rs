@@ -1033,9 +1033,11 @@ struct RotateRequest<'a> {
 ///
 /// Delegates to
 /// [`rotate_pseudonym`](crate::context::messaging_helpers::rotate_pseudonym)
-/// under [`HANDLER_TIMEOUT`] and replies with its result. The rotation may
-/// have committed before an announcement error or a timeout, so every error
-/// arm reports `mutated`.
+/// under [`HANDLER_TIMEOUT`] and replies with its result. An error reports
+/// `mutated` when the rotation state or the local routing ID changed (the
+/// rotation committed before an announcement error) and on a timeout, which
+/// can stop the helper part-way; a rejection or a restored persist failure
+/// changed nothing and reports no mutation.
 async fn handle_rotate_pseudonym(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -1044,6 +1046,10 @@ async fn handle_rotate_pseudonym(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let sk = request.signing_key.to_signing_key();
+    let before = (
+        cell.class_s.pseudonym_rotation,
+        cell.routing.local_pseudonym(),
+    );
     let rotate_fut = crate::context::messaging_helpers::rotate_pseudonym(
         cell,
         deps,
@@ -1056,7 +1062,15 @@ async fn handle_rotate_pseudonym(
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
         Ok(Err(err)) => {
             let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
+            let after = (
+                cell.class_s.pseudonym_rotation,
+                cell.routing.local_pseudonym(),
+            );
+            if after == before {
+                (Outcome::err(sketch), Err(err))
+            } else {
+                (Outcome::err_mutated(sketch), Err(err))
+            }
         }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(

@@ -2052,6 +2052,7 @@ fn local_pseudonym_rotation_reaches_its_helpers() {
     let helper = extract_fn_body(MANAGER_SRC, "rotate_pseudonym")
         .expect("messaging_helpers::rotate_pseudonym exists");
     for step in [
+        "due_epoch(",
         "commit_class_s_compensating(",
         "record_rotation(",
         "ContextEvent::LocalPseudonymRotated",
