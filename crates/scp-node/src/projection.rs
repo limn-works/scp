@@ -2813,7 +2813,7 @@ mod tests {
             blob_storage: Arc::new(BlobStorageBackend::from(storage)),
             relay_config: scp_transport::native::server::RelayConfig::default(),
             start_time: Instant::now(),
-            http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),
+            http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             cors_origins: None,
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(

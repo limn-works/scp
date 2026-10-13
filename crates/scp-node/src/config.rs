@@ -33,10 +33,10 @@ use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
 
 use crate::{
-    ApplicationNode, DEFAULT_HTTP_BIND_ADDR, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy,
-    NoOpCustody, NoOpDidMethod, NoOpStorage, NodeError, TlsProvider, build_domain_inner,
-    build_no_domain_inner, generate_bridge_secret, generate_dev_token,
-    provision_with_challenge_listener, resolve_identity_persistent, resolve_nat, resolve_tls,
+    ApplicationNode, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy, NoOpCustody, NoOpDidMethod,
+    NoOpStorage, NodeError, TlsProvider, build_domain_inner, build_no_domain_inner,
+    generate_bridge_secret, generate_dev_token, provision_with_challenge_listener,
+    resolve_identity_persistent, resolve_nat, resolve_tls,
 };
 
 // ---------------------------------------------------------------------------
@@ -371,7 +371,12 @@ pub struct NodeConfig<
     pub bind_addr: Option<SocketAddr>,
     /// Bind address for the local dev API (`None` = dev API disabled).
     pub local_api: Option<SocketAddr>,
-    /// Bind address for the public HTTP server (`None` = default `0.0.0.0:8443`).
+    /// Bind address for the public HTTP server.
+    ///
+    /// `None` leaves the address unconfigured: the node advertises, and NAT
+    /// tier selection uses, the default port 8443; `serve`/`bind` listen on
+    /// `0.0.0.0:8443`; and `serve_background*(None)` listens on loopback
+    /// `127.0.0.1:8443`, never `0.0.0.0`.
     pub http_bind_addr: Option<SocketAddr>,
     /// CORS allowed origins for public endpoints (`None` = permissive `*`).
     pub cors_origins: Option<Vec<String>>,
@@ -898,7 +903,10 @@ async fn build_node_domain<D, S>(
     dht: DhtMode,
     bind_addr: Option<SocketAddr>,
     local_api: Option<SocketAddr>,
-    http_bind_addr_opt: Option<SocketAddr>,
+    // Threaded as an `Option` to `NodeState`, which records whether the caller
+    // configured an address, so `serve_background*` falls back to loopback and
+    // not to the all-interfaces `DEFAULT_HTTP_BIND_ADDR` (SCP-320).
+    http_bind_addr: Option<SocketAddr>,
     cors_origins: Option<Vec<String>>,
     projection_rate_limit_opt: Option<u32>,
     dns_provider: Option<crate::dns_provider::DnsProviderConfig>,
@@ -972,7 +980,6 @@ where
     let did_slot_registry = relay_server.did_slot_registry();
     let (shutdown_handle, bound_addr) = relay_server.start().await?;
     let dev_token = local_api.map(generate_dev_token);
-    let http_bind_addr = http_bind_addr_opt.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
 
     let tls_provider = resolve_tls(
         tls_provider_override,
@@ -1045,7 +1052,7 @@ where
                 local_api,
                 blob_storage,
                 relay_config,
-                Some(http_bind_addr),
+                http_bind_addr,
                 cors_origins,
                 rate_limit,
                 network_detector,
