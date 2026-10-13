@@ -40,6 +40,7 @@ use super::dtls::AsyncDtlsSession;
 use crate::native::did_slot::{DidDeleteGate, DidPublishGate, DidSlotRegistry};
 use crate::native::server::RelayConfig;
 use crate::native::storage::BlobStorage;
+use crate::relay::push_gate;
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter};
 use scp_relay_client::{ClientMessage, DEFAULT_QUERY_LIMIT, MIN_BLOB_TTL, RelayMessage};
 
@@ -216,8 +217,9 @@ impl<S: BlobStorage + 'static> UdpDtlsListener<S> {
     ///
     /// # Errors
     ///
-    /// Returns an error string if the OpenSSL DTLS server context cannot
-    /// be initialized.
+    /// Returns an error string if `relay_config` enables push without a relay
+    /// URL (§10.7.1 step 2), or if the OpenSSL DTLS server context cannot be
+    /// initialized.
     pub fn new(
         config: UdpDtlsListenerConfig,
         relay_config: RelayConfig,
@@ -226,6 +228,7 @@ impl<S: BlobStorage + 'static> UdpDtlsListener<S> {
         connection_tracker: ConnectionTracker,
         did_slots: DidSlotRegistry,
     ) -> Result<Self, String> {
+        relay_config.check_push().map_err(|e| e.to_string())?;
         let ssl_ctx = build_dtls_server_context()
             .map_err(|e| format!("failed to build DTLS server context: {e}"))?;
 
@@ -943,6 +946,23 @@ async fn handle_udp_publish<S: BlobStorage>(
             ),
         };
         send_dtls_response(sessions, remote_addr, &err).await;
+        return;
+    }
+
+    // Push interception (§10.7.1, ADR-004 "Push registration interception"),
+    // the same gate every relay transport runs: a PUBLISH to the reserved push
+    // routing ID is answered here and never reaches storage or a subscriber.
+    if let Some(reply) = push_gate::gate_publish(
+        config.relay_url.as_ref(),
+        &config.push,
+        &routing_id,
+        blob,
+        scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+    )
+    .await
+    .reply(ref_id.as_deref())
+    {
+        send_dtls_response(sessions, remote_addr, &reply).await;
         return;
     }
 
@@ -2119,5 +2139,63 @@ mod tests {
         }
 
         handle.shutdown();
+    }
+
+    /// The UDP/DTLS listener runs the same push gate as the WebSocket relay
+    /// (§10.7.1): with push disabled it answers a PUBLISH to the reserved push
+    /// routing ID with 4063 and stores nothing there.
+    #[tokio::test]
+    async fn udp_rejects_the_reserved_push_routing_id_with_4063_and_stores_nothing() {
+        let url = crate::relay::push_gate::RelayUrl::new("wss://relay.push.test").unwrap();
+        let (handle, addr, storage) = start_test_listener_with_relay_config(RelayConfig {
+            relay_url: Some(url.clone()),
+            ..RelayConfig::default()
+        })
+        .await;
+        let client = create_dtls_client(addr).await;
+
+        let rid = url.push_routing_id();
+        let response = send_and_recv(
+            &client,
+            &ClientMessage::Publish {
+                ref_id: Some("push".to_string()),
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: vec![0x42; 64],
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                &response,
+                RelayMessage::Err { code: 4063, ref_id: Some(r), .. } if r == "push"
+            ),
+            "{response:?}"
+        );
+        assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+
+        handle.shutdown();
+    }
+
+    #[cfg(feature = "push-store")]
+    #[test]
+    fn udp_new_refuses_push_enabled_without_a_relay_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let relay_config = RelayConfig {
+            push: crate::relay::push_gate::PushRole::Enabled(
+                crate::relay::push_gate::kel_service_for_tests(dir.path()),
+            ),
+            ..RelayConfig::default()
+        };
+        let result = UdpDtlsListener::new(
+            UdpDtlsListenerConfig::default(),
+            relay_config,
+            Arc::new(InMemoryBlobStorage::new()),
+            PublishRateLimiter::new(100),
+            rate_limit::new_connection_tracker(),
+            DidSlotRegistry::new(),
+        );
+        assert!(matches!(result, Err(e) if e.contains("relay URL")));
     }
 }

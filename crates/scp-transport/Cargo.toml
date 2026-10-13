@@ -183,6 +183,10 @@ scp-testing = { path = "../scp-testing" }
 # The BEP44 signable payload / verify helpers (scp-dht) are now a NORMAL
 # dependency (validating-relay path, SCP-RELAYRES-003). Dev-only: scp-did.
 scp-did = { path = "../scp-did" }
+# The push gate tests (PUSH-007) wire `TestPushVerifier`, which checks a real
+# P-256 signature against a key the test supplies and compiles only under
+# `scp-identity/testing`. Dev-only, so no shipped build contains it.
+scp-identity = { path = "../scp-identity", features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 futures = "0.3"

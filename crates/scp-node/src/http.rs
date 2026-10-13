@@ -1980,6 +1980,10 @@ fn spawn_quic_listener(
         // store (§3.10.2). The listener also shares the relay's slot registry
         // below — the two together honor one set of claimed slots.
         did_record_validation: rc.did_record_validation,
+        // The same reserved push routing ID and push role as the WebSocket
+        // relay, so a push message is intercepted on QUIC too (§10.7.1).
+        relay_url: rc.relay_url.clone(),
+        push: rc.push.clone(),
     };
 
     let listener = QuicListener::new(

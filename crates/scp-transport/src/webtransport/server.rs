@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::native::did_slot::DidSlotRegistry;
 use crate::native::storage::BlobStorage;
+use crate::relay::push_gate;
 use crate::relay::rate_limit::{ConnectionTracker, PublishRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 
@@ -81,6 +82,11 @@ pub enum WebTransportListenerError {
     /// The listener could not accept a connection.
     #[error("accept failed: {0}")]
     AcceptFailed(String),
+
+    /// The session configuration enables push but names no relay URL
+    /// (§10.7.1 step 2).
+    #[error(transparent)]
+    PushWithoutRelayUrl(#[from] push_gate::PushWithoutRelayUrl),
 }
 
 // ---------------------------------------------------------------------------
@@ -144,23 +150,33 @@ impl<S: BlobStorage + 'static> WebTransportListener<S> {
     /// store (ADR-037 AC3, §3.10.2). Obtain the shared registry via
     /// [`RelayServer::did_slot_registry`](crate::native::server::RelayServer::did_slot_registry)
     /// and set `config.session_config.did_record_validation` to the relay's mode.
-    #[must_use]
-    pub const fn new(
+    /// Set `config.session_config.relay_url` and `config.session_config.push`
+    /// to the relay's values too, so push messages are intercepted (§10.7.1).
+    ///
+    /// # Errors
+    ///
+    /// [`WebTransportListenerError::PushWithoutRelayUrl`] when the session
+    /// configuration enables push without a relay URL.
+    pub fn new(
         config: WebTransportListenerConfig,
         storage: Arc<S>,
         subscriptions: SubscriptionRegistry,
         publish_rate_limiter: PublishRateLimiter,
         connection_tracker: ConnectionTracker,
         did_slots: DidSlotRegistry,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, WebTransportListenerError> {
+        push_gate::check_config(
+            config.session_config.relay_url.as_ref(),
+            &config.session_config.push,
+        )?;
+        Ok(Self {
             config,
             storage,
             subscriptions,
             connection_tracker,
             publish_rate_limiter,
             did_slots,
-        }
+        })
     }
 
     /// Returns the next globally unique session ID.
@@ -257,6 +273,7 @@ mod tests {
             conn_tracker,
             DidSlotRegistry::new(),
         )
+        .unwrap()
     }
 
     #[test]
@@ -292,5 +309,27 @@ mod tests {
         assert!(!handle.is_shutdown());
         handle.shutdown();
         assert!(handle.is_shutdown());
+    }
+
+    #[cfg(feature = "push-store")]
+    #[test]
+    fn listener_new_refuses_push_enabled_without_a_relay_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = WebTransportListenerConfig::default();
+        config.session_config.push = crate::relay::push_gate::PushRole::Enabled(
+            crate::relay::push_gate::kel_service_for_tests(dir.path()),
+        );
+        let result = WebTransportListener::new(
+            config,
+            Arc::new(InMemoryBlobStorage::new()),
+            crate::relay::subscription::new_registry(),
+            PublishRateLimiter::new(100),
+            crate::relay::rate_limit::new_connection_tracker(),
+            DidSlotRegistry::new(),
+        );
+        assert!(matches!(
+            result,
+            Err(WebTransportListenerError::PushWithoutRelayUrl(_))
+        ));
     }
 }

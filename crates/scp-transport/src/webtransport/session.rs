@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::native::did_slot::{DidDeleteGate, DidPublishGate, DidSlotRegistry};
 use crate::native::server::DidRecordValidation;
 use crate::native::storage::BlobStorage;
+use crate::relay::push_gate::{self, PushRole, RelayUrl};
 use crate::relay::rate_limit::{PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 use scp_relay_client::code;
@@ -123,6 +124,17 @@ pub struct WebTransportSessionConfig {
     /// [`DidRecordValidation::Enabled`](crate::native::server::DidRecordValidation::Enabled),
     /// the canonical SCP-native behavior. Never a trust dependency (RELAYRES-002).
     pub did_record_validation: DidRecordValidation,
+    /// The relay's canonical URL, from which the reserved push routing ID
+    /// derives (§10.7.1 step 2). When this listener shares a relay's blob
+    /// store, it MUST equal that relay's
+    /// [`RelayConfig::relay_url`](crate::native::server::RelayConfig::relay_url)
+    /// so a push message is intercepted whichever transport carries it.
+    /// `None` reserves no routing ID.
+    pub relay_url: Option<RelayUrl>,
+    /// Whether this listener offers push (§10.7.1). It MUST equal the shared
+    /// relay's [`RelayConfig::push`](crate::native::server::RelayConfig::push);
+    /// the default is [`PushRole::Disabled`].
+    pub push: PushRole,
 }
 
 impl Default for WebTransportSessionConfig {
@@ -136,6 +148,8 @@ impl Default for WebTransportSessionConfig {
             delivery_jitter_ms: 50,
             subscribe_rate_limit: 20,
             did_record_validation: DidRecordValidation::Enabled,
+            relay_url: None,
+            push: PushRole::Disabled,
         }
     }
 }
@@ -436,6 +450,23 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
                     MIN_BLOB_TTL, self.config.max_blob_ttl, blob_ttl
                 ),
             });
+        }
+
+        // Push interception (§10.7.1, ADR-004 "Push registration interception"),
+        // the same gate every relay transport runs: a PUBLISH to the reserved
+        // push routing ID is answered here and never reaches storage or a
+        // subscriber.
+        if let Some(reply) = push_gate::gate_publish(
+            self.config.relay_url.as_ref(),
+            &self.config.push,
+            &routing_id,
+            blob,
+            scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+        )
+        .await
+        .reply(ref_id.as_deref())
+        {
+            return Ok(reply);
         }
 
         // Compute blob_id = SHA-256(blob) using the canonical BlobId helper.
@@ -1735,5 +1766,46 @@ mod tests {
 
         handler.state = SessionState::Closed;
         assert_eq!(handler.state(), SessionState::Closed);
+    }
+
+    /// A WebTransport session runs the same push gate as the WebSocket relay
+    /// (§10.7.1): with push disabled it answers a PUBLISH to the reserved push
+    /// routing ID with 4063 and stores nothing there.
+    #[tokio::test]
+    async fn webtransport_rejects_the_reserved_push_routing_id_with_4063_and_stores_nothing() {
+        let url = RelayUrl::new("wss://relay.push.test").unwrap();
+        let storage = Arc::new(InMemoryBlobStorage::new());
+        let mut handler = WebTransportSessionHandler::new(
+            SessionId(1),
+            WebTransportSessionConfig {
+                delivery_jitter_ms: 0,
+                relay_url: Some(url.clone()),
+                ..WebTransportSessionConfig::default()
+            },
+            Arc::clone(&storage),
+            crate::relay::subscription::new_registry(),
+            CancellationToken::new(),
+            PublishRateLimiter::new(100),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            DidSlotRegistry::new(),
+        );
+        handler.mark_active();
+
+        let rid = url.push_routing_id();
+        let result = handler
+            .dispatch_message_multi(&ClientMessage::Publish {
+                ref_id: Some("push".to_owned()),
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 60,
+                blob: vec![0x42; 64],
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            unwrap_single(result),
+            RelayMessage::Err { code: 4063, ref_id: Some(ref r), .. } if r == "push"
+        ));
+        assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
     }
 }

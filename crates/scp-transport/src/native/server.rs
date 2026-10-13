@@ -51,6 +51,7 @@ use super::relay_persistence::RelayPersistence;
 use super::storage::{BlobStorage, BlobStorageBackend};
 use crate::error::TransportError;
 use crate::relay::bridge::{BRIDGE_AUTH_FAILED_MSG, BridgeRegistration, BridgeRegistry};
+use crate::relay::push_gate::{self, PushRole, RelayUrl};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 use scp_relay_client::code;
@@ -181,6 +182,17 @@ pub struct RelayConfig {
     /// always re-verifies); set [`DidRecordValidation::Disabled`] to store DID
     /// frames opaquely like a foreign transport.
     pub did_record_validation: DidRecordValidation,
+    /// The relay's own URL in its §9.18.2 canonical form, from which it
+    /// derives its reserved push routing ID (§10.7.1 step 2). With `None` the
+    /// relay knows no reserved push routing ID and intercepts no PUBLISH, so
+    /// [`RelayServer::start`] and [`RelayServer::run`] refuse to start a relay
+    /// whose `push` is enabled without it. Defaults to `None`.
+    pub relay_url: Option<RelayUrl>,
+    /// Whether the relay offers push (§10.7.1, ADR-004 "Push registration
+    /// interception"). Defaults to [`PushRole::Disabled`] (the fail-safe —
+    /// stores no push token and answers `4063` at the reserved push routing
+    /// ID).
+    pub push: PushRole,
 }
 
 impl Default for RelayConfig {
@@ -209,7 +221,29 @@ impl Default for RelayConfig {
             // dependency (client always re-verifies), and inert for encrypted
             // context blobs (they never decode as DID-record frames).
             did_record_validation: DidRecordValidation::Enabled,
+            relay_url: None,
+            // Fail-safe push default, like `bridge`: a relay stores no push
+            // token until push is explicitly enabled (construction.md M2).
+            push: PushRole::Disabled,
         }
+    }
+}
+
+impl RelayConfig {
+    /// Refuses a configuration that enables push without the relay URL its
+    /// reserved push routing ID derives from (§10.7.1 step 2), because such a
+    /// relay would intercept nothing and store push tokens as blobs.
+    ///
+    /// [`RelayServer::run`] and [`RelayServer::start`] call it first. A
+    /// deployment that also starts the QUIC, UDP or WebTransport listener from
+    /// this configuration calls it before starting them.
+    ///
+    /// # Errors
+    ///
+    /// [`RelayError::PushWithoutRelayUrl`] when `push` is `Enabled` and
+    /// `relay_url` is `None`.
+    pub fn check_push(&self) -> Result<(), RelayError> {
+        push_gate::check_config(self.relay_url.as_ref(), &self.push).map_err(RelayError::from)
     }
 }
 
@@ -440,6 +474,7 @@ impl RelayServer {
     /// Returns [`RelayError::BindFailed`] if the server cannot bind to
     /// the configured address.
     pub async fn run(&self) -> Result<(), RelayError> {
+        self.config.check_push()?;
         // Restore persisted subscriptions on startup (SCP-PERSIST-066).
         self.restore_persisted_subscriptions().await;
 
@@ -553,6 +588,7 @@ impl RelayServer {
     /// Returns [`RelayError::BindFailed`] if the server cannot bind to
     /// the configured address.
     pub async fn start(&self) -> Result<(ShutdownHandle, SocketAddr), RelayError> {
+        self.config.check_push()?;
         // Restore persisted subscriptions on startup (SCP-PERSIST-066).
         self.restore_persisted_subscriptions().await;
 
@@ -688,6 +724,11 @@ pub enum RelayError {
     /// The server could not accept a connection.
     #[error("accept failed: {0}")]
     AcceptFailed(String),
+
+    /// The configuration enables push but names no relay URL, so the relay
+    /// could not derive its reserved push routing ID (§10.7.1 step 2).
+    #[error(transparent)]
+    PushWithoutRelayUrl(#[from] push_gate::PushWithoutRelayUrl),
 }
 
 /// Background task that periodically purges expired blobs and reclaims stale
@@ -1256,6 +1297,23 @@ async fn handle_publish(
             ),
         };
         let _ = tx.send(err).await;
+        return;
+    }
+
+    // Push interception (§10.7.1, ADR-004 "Push registration interception"),
+    // the same gate every relay transport runs: a PUBLISH to the reserved push
+    // routing ID is answered here and never reaches storage or a subscriber.
+    if let Some(reply) = push_gate::gate_publish(
+        config.relay_url.as_ref(),
+        &config.push,
+        &routing_id,
+        blob,
+        scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+    )
+    .await
+    .reply(ref_id.as_deref())
+    {
+        let _ = tx.send(reply).await;
         return;
     }
 
@@ -4068,6 +4126,486 @@ mod tests {
             assert_eq!(got.len(), 3, "non-validating relay keeps all blobs");
             assert!(got.contains(&f));
             assert!(got.contains(&wrong));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Push registration interception (§10.7.1, ADR-004, PUSH-007)
+    // -----------------------------------------------------------------------
+
+    /// The relay URL the push tests sign for. Any canonical URL works: the
+    /// relay derives its reserved routing ID and every preimage from it.
+    const PUSH_RELAY_URL: &str = "wss://relay.push.test";
+
+    /// The reserved push routing ID of [`PUSH_RELAY_URL`].
+    fn push_rid() -> [u8; 32] {
+        RelayUrl::new(PUSH_RELAY_URL).unwrap().push_routing_id()
+    }
+
+    /// Starts a relay with `push` and the relay URL [`PUSH_RELAY_URL`].
+    async fn start_push_server(push: PushRole) -> SocketAddr {
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
+            relay_url: Some(RelayUrl::new(PUSH_RELAY_URL).unwrap()),
+            push,
+            ..RelayConfig::default()
+        };
+        let server = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()));
+        let (_handle, addr) = server.start().await.unwrap();
+        addr
+    }
+
+    /// Publishes `blob` to the reserved push routing ID and returns the reply.
+    async fn publish_push(addr: SocketAddr, blob: Vec<u8>) -> RelayMessage {
+        let (mut sink, mut stream) = connect_client(addr).await;
+        send_msg(
+            &mut sink,
+            &ClientMessage::Publish {
+                ref_id: Some("push".to_string()),
+                routing_id: push_rid(),
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob,
+            },
+        )
+        .await;
+        recv_msg(&mut stream).await
+    }
+
+    fn err_code(reply: &RelayMessage) -> u16 {
+        match reply {
+            RelayMessage::Err { code, .. } => *code,
+            other => panic!("expected ERR, got {other:?}"),
+        }
+    }
+
+    /// Asserts that nothing was stored at the reserved push routing ID: a
+    /// QUERY returns no BLOB, and a SUBSCRIBE with backfill returns no BLOB.
+    async fn assert_reserved_id_holds_no_blob(addr: SocketAddr) {
+        let (mut sink, mut stream) = connect_client(addr).await;
+        send_msg(
+            &mut sink,
+            &ClientMessage::Query {
+                ref_id: Some("q".to_string()),
+                routing_id: push_rid(),
+                since: None,
+                limit: None,
+            },
+        )
+        .await;
+        match recv_msg(&mut stream).await {
+            RelayMessage::Event { event_type, .. } => assert_eq!(event_type, "query_complete"),
+            other => panic!("QUERY of the reserved push routing ID returned {other:?}"),
+        }
+        send_msg(
+            &mut sink,
+            &ClientMessage::Subscribe {
+                ref_id: Some("s".to_string()),
+                routing_id: push_rid(),
+                since: Some(0),
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_msg(&mut stream).await,
+            RelayMessage::Ok { .. }
+        ));
+        match recv_msg(&mut stream).await {
+            RelayMessage::Event { event_type, .. } => {
+                assert_eq!(event_type, "backfill_complete");
+            }
+            other => {
+                panic!("SUBSCRIBE backfill of the reserved push routing ID returned {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn push_disabled_relay_rejects_the_reserved_routing_id_with_4063() {
+        let addr = start_push_server(PushRole::Disabled).await;
+        let reply = publish_push(addr, vec![1, 2, 3]).await;
+        assert_eq!(err_code(&reply), code::PUSH_NOT_SUPPORTED);
+        assert_reserved_id_holds_no_blob(addr).await;
+        // Control: an ordinary routing ID on the same relay still stores.
+        let (mut sink, mut stream) = connect_client(addr).await;
+        send_msg(
+            &mut sink,
+            &ClientMessage::Publish {
+                ref_id: None,
+                routing_id: [0xAB; 32],
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: vec![1],
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_msg(&mut stream).await,
+            RelayMessage::Ok {
+                blob_id: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn push_role_defaults_to_disabled() {
+        assert!(matches!(RelayConfig::default().push, PushRole::Disabled));
+        assert!(RelayConfig::default().relay_url.is_none());
+    }
+
+    #[cfg(feature = "push-store")]
+    mod enabled {
+        use std::sync::Arc;
+
+        use scp_crypto::p256::{P256SecretKey, sign_prehash_rfc6979};
+        use scp_did::DID;
+        use scp_identity::push_verify::{KelPushVerifier, PushSignatureVerifier, TestPushVerifier};
+        use scp_protocol::discovery::push::{
+            PushDeregistration, PushPlatform, PushRegistration, push_deregistration_signing_bytes,
+            push_registration_signing_bytes,
+        };
+        use sha2::{Digest, Sha256};
+
+        use super::*;
+        use crate::relay::push::{ApnsConfig, ApnsEnvironment, ApnsSender, PushSender};
+        use crate::relay::push_gate::{PUSH_TIMESTAMP_SKEW_SECS, PushServiceConfig};
+        use crate::relay::push_store::{PushRegistrationKey, PushRegistrationStore};
+
+        const REGISTRANT: &str = "did:dht:push-registrant";
+
+        fn key(seed: u8) -> P256SecretKey {
+            P256SecretKey::from_scalar_bytes(&[seed; 32]).unwrap()
+        }
+
+        fn now() -> u64 {
+            scp_clock::Clock::now_secs(&scp_clock::SystemClock)
+        }
+
+        fn sign(key: &P256SecretKey, preimage: &[u8]) -> [u8; 64] {
+            let digest: [u8; 32] = Sha256::digest(preimage).into();
+            sign_prehash_rfc6979(key, &digest).unwrap()
+        }
+
+        fn registration(
+            signer: &P256SecretKey,
+            platform: PushPlatform,
+            token: &[u8],
+            timestamp: u64,
+            relay_url: &str,
+        ) -> PushRegistration {
+            let mut msg = PushRegistration {
+                registrant: DID::from(REGISTRANT),
+                platform,
+                token: token.to_vec(),
+                routing_ids: vec![[0x11; 32], [0x22; 32]],
+                timestamp,
+                signature: [0; 64],
+            };
+            msg.signature = sign(
+                signer,
+                &push_registration_signing_bytes(&msg, relay_url).unwrap(),
+            );
+            msg
+        }
+
+        fn deregistration(
+            signer: &P256SecretKey,
+            token: &[u8],
+            timestamp: u64,
+        ) -> PushDeregistration {
+            let mut msg = PushDeregistration {
+                registrant: DID::from(REGISTRANT),
+                platform: PushPlatform::Apns,
+                token: token.to_vec(),
+                timestamp,
+                signature: [0; 64],
+            };
+            msg.signature = sign(
+                signer,
+                &push_deregistration_signing_bytes(&msg, PUSH_RELAY_URL).unwrap(),
+            );
+            msg
+        }
+
+        fn reg_blob(msg: &PushRegistration) -> Vec<u8> {
+            rmp_serde::to_vec_named(msg).unwrap()
+        }
+
+        fn apns_key(token: &[u8]) -> PushRegistrationKey {
+            PushRegistrationKey {
+                registrant: REGISTRANT.to_owned(),
+                platform: PushPlatform::Apns,
+                token: token.to_vec(),
+            }
+        }
+
+        fn apns_sender() -> PushSender {
+            PushSender::Apns(
+                ApnsSender::new(ApnsConfig {
+                    signing_key: key(3),
+                    key_id: "ABC123DEFG".to_owned(),
+                    team_id: "TEAM456XYZ".to_owned(),
+                    topic: "works.limn.app".to_owned(),
+                    environment: ApnsEnvironment::Sandbox,
+                })
+                .unwrap(),
+            )
+        }
+
+        /// A push-enabled relay with an APNs sender only, `verifier`, and a
+        /// SQLite registration store the test keeps a handle to.
+        async fn start_enabled(
+            verifier: Arc<dyn PushSignatureVerifier>,
+        ) -> (SocketAddr, PushRegistrationStore, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            let store = PushRegistrationStore::open_sqlite(&dir.path().join("push.db")).unwrap();
+            let push = PushRole::Enabled(PushServiceConfig {
+                store: store.clone(),
+                verifier,
+                senders: Arc::from(vec![apns_sender()]),
+            });
+            (start_push_server(push).await, store, dir)
+        }
+
+        /// A test verifier holding `key(7)` as the registrant's key.
+        fn test_verifier() -> Arc<dyn PushSignatureVerifier> {
+            Arc::new(TestPushVerifier::new([(
+                DID::from(REGISTRANT),
+                key(7).public_key(),
+            )]))
+        }
+
+        #[tokio::test]
+        async fn kel_verifier_relay_answers_5003_and_stores_nothing() {
+            let (addr, store, _dir) = start_enabled(Arc::new(KelPushVerifier)).await;
+            let msg = registration(&key(7), PushPlatform::Apns, b"tok", now(), PUSH_RELAY_URL);
+            let reply = publish_push(addr, reg_blob(&msg)).await;
+            assert_eq!(err_code(&reply), code::PUSH_VERIFIER_UNAVAILABLE);
+            assert_eq!(store.get(&apns_key(b"tok")).await.unwrap(), None);
+            assert_eq!(
+                store.accepted_timestamp(&apns_key(b"tok")).await.unwrap(),
+                None
+            );
+            assert_reserved_id_holds_no_blob(addr).await;
+        }
+
+        #[tokio::test]
+        async fn test_verifier_relay_stores_a_registration_signed_by_the_supplied_key() {
+            let (addr, store, _dir) = start_enabled(test_verifier()).await;
+            let ts = now();
+            let msg = registration(&key(7), PushPlatform::Apns, b"tok", ts, PUSH_RELAY_URL);
+            let reply = publish_push(addr, reg_blob(&msg)).await;
+            assert_eq!(
+                reply,
+                RelayMessage::Ok {
+                    ref_id: Some("push".to_string()),
+                    blob_id: None,
+                }
+            );
+            let stored = store.get(&apns_key(b"tok")).await.unwrap().unwrap();
+            assert_eq!(stored.routing_ids, vec![[0x11; 32], [0x22; 32]]);
+            assert_eq!(stored.timestamp, ts);
+            assert_eq!(stored.registrant, REGISTRANT);
+            assert_reserved_id_holds_no_blob(addr).await;
+        }
+
+        #[tokio::test]
+        async fn test_verifier_relay_rejects_a_registration_signed_by_another_key_with_4060() {
+            let (addr, store, _dir) = start_enabled(test_verifier()).await;
+            let msg = registration(&key(9), PushPlatform::Apns, b"tok", now(), PUSH_RELAY_URL);
+            let reply = publish_push(addr, reg_blob(&msg)).await;
+            assert_eq!(err_code(&reply), code::PUSH_REGISTRATION_REJECTED);
+            assert_eq!(store.get(&apns_key(b"tok")).await.unwrap(), None);
+            assert_eq!(
+                store.accepted_timestamp(&apns_key(b"tok")).await.unwrap(),
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn a_registration_signed_for_another_relay_url_is_rejected_with_4060() {
+            let (addr, store, _dir) = start_enabled(test_verifier()).await;
+            let msg = registration(
+                &key(7),
+                PushPlatform::Apns,
+                b"tok",
+                now(),
+                "wss://other.push.test",
+            );
+            let reply = publish_push(addr, reg_blob(&msg)).await;
+            assert_eq!(err_code(&reply), code::PUSH_REGISTRATION_REJECTED);
+            assert_eq!(store.get(&apns_key(b"tok")).await.unwrap(), None);
+        }
+
+        #[tokio::test]
+        async fn undecodable_blobs_and_empty_routing_ids_are_rejected_with_4060() {
+            let (addr, store, _dir) = start_enabled(test_verifier()).await;
+            let reply = publish_push(addr, vec![0xC1, 0x00, 0x01]).await;
+            assert_eq!(err_code(&reply), code::PUSH_REGISTRATION_REJECTED);
+
+            // A registration with an empty list decodes as a registration and
+            // is refused, never re-read as a deregistration.
+            let mut msg = registration(&key(7), PushPlatform::Apns, b"tok", now(), PUSH_RELAY_URL);
+            msg.routing_ids.clear();
+            let reply = publish_push(addr, rmp_serde::to_vec_named(&msg).unwrap()).await;
+            assert_eq!(err_code(&reply), code::PUSH_REGISTRATION_REJECTED);
+            assert_eq!(store.get(&apns_key(b"tok")).await.unwrap(), None);
+            assert_reserved_id_holds_no_blob(addr).await;
+        }
+
+        #[tokio::test]
+        async fn a_timestamp_outside_the_skew_window_or_not_newer_is_rejected_with_4062() {
+            let (addr, store, _dir) = start_enabled(test_verifier()).await;
+            let ts = now();
+            for skewed in [
+                ts - PUSH_TIMESTAMP_SKEW_SECS - 60,
+                ts + PUSH_TIMESTAMP_SKEW_SECS + 60,
+            ] {
+                let msg = registration(&key(7), PushPlatform::Apns, b"tok", skewed, PUSH_RELAY_URL);
+                let reply = publish_push(addr, reg_blob(&msg)).await;
+                assert_eq!(err_code(&reply), code::PUSH_REGISTRATION_STALE);
+                assert_eq!(store.get(&apns_key(b"tok")).await.unwrap(), None);
+            }
+
+            let first = registration(&key(7), PushPlatform::Apns, b"tok", ts, PUSH_RELAY_URL);
+            assert!(matches!(
+                publish_push(addr, reg_blob(&first)).await,
+                RelayMessage::Ok { blob_id: None, .. }
+            ));
+            // Same timestamp, then an older one inside the window: both stale,
+            // and the stored registration keeps its timestamp.
+            for older in [ts, ts - 1] {
+                let mut msg =
+                    registration(&key(7), PushPlatform::Apns, b"tok", older, PUSH_RELAY_URL);
+                msg.routing_ids = vec![[0x33; 32]];
+                msg.signature = sign(
+                    &key(7),
+                    &push_registration_signing_bytes(&msg, PUSH_RELAY_URL).unwrap(),
+                );
+                let reply = publish_push(addr, reg_blob(&msg)).await;
+                assert_eq!(err_code(&reply), code::PUSH_REGISTRATION_STALE);
+            }
+            let stored = store.get(&apns_key(b"tok")).await.unwrap().unwrap();
+            assert_eq!(stored.timestamp, ts);
+            assert_eq!(stored.routing_ids, vec![[0x11; 32], [0x22; 32]]);
+        }
+
+        #[tokio::test]
+        async fn a_platform_with_no_configured_sender_is_rejected_with_4061() {
+            let (addr, store, _dir) = start_enabled(test_verifier()).await;
+            for platform in [PushPlatform::Fcm, PushPlatform::WebPush] {
+                let msg = registration(&key(7), platform, b"tok", now(), PUSH_RELAY_URL);
+                let reply = publish_push(addr, reg_blob(&msg)).await;
+                assert_eq!(err_code(&reply), code::PUSH_PLATFORM_UNAVAILABLE);
+                let key = PushRegistrationKey {
+                    registrant: REGISTRANT.to_owned(),
+                    platform,
+                    token: b"tok".to_vec(),
+                };
+                assert_eq!(store.get(&key).await.unwrap(), None);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_valid_deregistration_removes_exactly_its_own_key() {
+            let (addr, store, _dir) = start_enabled(test_verifier()).await;
+            let ts = now() - 10;
+            for token in [b"phone".as_slice(), b"tablet".as_slice()] {
+                let msg = registration(&key(7), PushPlatform::Apns, token, ts, PUSH_RELAY_URL);
+                assert!(matches!(
+                    publish_push(addr, reg_blob(&msg)).await,
+                    RelayMessage::Ok { blob_id: None, .. }
+                ));
+            }
+
+            // A deregistration signed by another key changes nothing.
+            let forged = deregistration(&key(9), b"phone", ts + 1);
+            let reply = publish_push(addr, rmp_serde::to_vec_named(&forged).unwrap()).await;
+            assert_eq!(err_code(&reply), code::PUSH_REGISTRATION_REJECTED);
+            assert!(store.get(&apns_key(b"phone")).await.unwrap().is_some());
+
+            let dereg = deregistration(&key(7), b"phone", ts + 1);
+            let reply = publish_push(addr, rmp_serde::to_vec_named(&dereg).unwrap()).await;
+            assert_eq!(
+                reply,
+                RelayMessage::Ok {
+                    ref_id: Some("push".to_string()),
+                    blob_id: None,
+                }
+            );
+            assert_eq!(store.get(&apns_key(b"phone")).await.unwrap(), None);
+            assert!(store.get(&apns_key(b"tablet")).await.unwrap().is_some());
+            let woken = store.tokens_for_routing_id(&[0x11; 32]).await.unwrap();
+            assert_eq!(woken.len(), 1);
+            assert_eq!(woken[0].token, b"tablet");
+
+            // The registration replayed after its deregistration is stale.
+            let replayed = registration(&key(7), PushPlatform::Apns, b"phone", ts, PUSH_RELAY_URL);
+            let reply = publish_push(addr, reg_blob(&replayed)).await;
+            assert_eq!(err_code(&reply), code::PUSH_REGISTRATION_STALE);
+            assert_reserved_id_holds_no_blob(addr).await;
+        }
+
+        #[tokio::test]
+        async fn a_live_subscriber_to_the_reserved_routing_id_receives_nothing() {
+            let (addr, _store, _dir) = start_enabled(test_verifier()).await;
+            let (mut sub_sink, mut sub_stream) = connect_client(addr).await;
+            send_msg(
+                &mut sub_sink,
+                &ClientMessage::Subscribe {
+                    ref_id: None,
+                    routing_id: push_rid(),
+                    since: None,
+                },
+            )
+            .await;
+            assert!(matches!(
+                recv_msg(&mut sub_stream).await,
+                RelayMessage::Ok { .. }
+            ));
+
+            let accepted = registration(&key(7), PushPlatform::Apns, b"tok", now(), PUSH_RELAY_URL);
+            let rejected =
+                registration(&key(9), PushPlatform::Apns, b"tok2", now(), PUSH_RELAY_URL);
+            assert!(matches!(
+                publish_push(addr, reg_blob(&accepted)).await,
+                RelayMessage::Ok { blob_id: None, .. }
+            ));
+            assert_eq!(
+                err_code(&publish_push(addr, reg_blob(&rejected)).await),
+                code::PUSH_REGISTRATION_REJECTED
+            );
+            assert!(
+                recv_msg_timeout(&mut sub_stream, Duration::from_millis(300))
+                    .await
+                    .is_none(),
+                "a subscriber to the reserved push routing ID received a message"
+            );
+        }
+
+        #[tokio::test]
+        async fn start_refuses_push_enabled_without_a_relay_url() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = RelayConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                push: PushRole::Enabled(PushServiceConfig {
+                    store: PushRegistrationStore::open_sqlite(&dir.path().join("p.db")).unwrap(),
+                    verifier: Arc::new(KelPushVerifier),
+                    senders: Arc::from(vec![apns_sender()]),
+                }),
+                ..RelayConfig::default()
+            };
+            let server = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()));
+            assert!(matches!(
+                server.start().await,
+                Err(RelayError::PushWithoutRelayUrl(_))
+            ));
+            assert!(matches!(
+                server.run().await,
+                Err(RelayError::PushWithoutRelayUrl(_))
+            ));
         }
     }
 }

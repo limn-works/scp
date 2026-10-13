@@ -498,13 +498,20 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/server.rs",
         "crates/scp-transport/src/relay/push_gate.rs",
+        "crates/scp-transport/src/relay/mod.rs",
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/quic/listener.rs",
+        "crates/scp-transport/src/udp/listener.rs",
+        "crates/scp-transport/src/webtransport/session.rs",
+        "crates/scp-transport/src/webtransport/server.rs",
+        "crates/scp-node/src/http.rs",
         "crates/scp-relay-client/src/error.rs"
       ],
-      "description": "Adds `RelayConfig.push: PushRole` with the variants `Disabled` and `Enabled(PushServiceConfig)`. `Disabled` is the default, because it fails safe in the same way as `BridgeRole::Disabled` (ADR-052, the unified construction pattern, M2 and M4). `PushServiceConfig` holds the store, the `Arc<dyn PushSignatureVerifier>` and the configured senders; all three are required, with no defaults. The push gate runs in `handle_publish` beside `did_slots.gate_publish`, after the rate-limit, size and TTL checks and before `storage.store`. On any verifier rejection the relay stores nothing and changes nothing. File location `push_gate.rs` is an indicator. The operation is relay-internal and has no client dispatch, so the `pw` row is n/a.",
+      "description": "Adds `RelayConfig.push: PushRole` with the variants `Disabled` and `Enabled(PushServiceConfig)`. `Disabled` is the default, because it fails safe in the same way as `BridgeRole::Disabled` (ADR-052, the unified construction pattern, M2 and M4). `PushServiceConfig` holds the store, the `Arc<dyn PushSignatureVerifier>` and the configured senders; all three are required, with no defaults. `RelayConfig.relay_url` holds the relay's \u00a79.18.2 canonical URL, from which the relay derives its reserved push routing ID and rebuilds every preimage (\u00a710.7.1 steps 2 and 3); a relay without it intercepts nothing, so startup refuses `Enabled` without it. The push gate runs in the PUBLISH handler of every relay transport that stores blobs (WebSocket, QUIC, UDP/DTLS and WebTransport) beside `did_slots.gate_publish`, after the rate-limit, size and TTL checks and before `storage.store`; the QUIC and WebTransport configurations carry the same `relay_url` and `push` fields, and every listener refuses to start with `Enabled` and no URL. On any verifier rejection the relay stores nothing and changes nothing. File location `push_gate.rs` is an indicator. The operation is relay-internal and has no client dispatch, so the `pw` row is n/a.",
       "acceptanceCriteria": [
         "A PUBLISH to the reserved routing ID never reaches `storage.store` or `deliver_to_subscribers`, whatever the result; tests prove this by querying and subscribing to the reserved routing ID afterwards.",
         "A relay with `Disabled` returns 4063.",
