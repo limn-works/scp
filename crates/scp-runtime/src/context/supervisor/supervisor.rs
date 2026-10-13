@@ -11074,67 +11074,42 @@ impl Supervisor {
     /// [`ContextExport`](crate::context::export_import::ContextExport)
     /// (§23.16.8, ADR-050).
     ///
-    /// The per-context actor captures the UNSIGNED export building blocks
-    /// (snapshot + Merkle event-log data) via the
-    /// [`LifecycleCommand::ExportContext`] mailbox turn; the snapshot is then
-    /// signed HERE, at the dispatch boundary, because the runtime holds no
-    /// custody key. The caller supplies a `sign` closure that produces an
-    /// Ed25519 signature over the canonical snapshot digest
+    /// The per-context actor captures the snapshot and Merkle event-log data
+    /// and signs the canonical snapshot digest
     /// (`SHA-256("SCP-CONTEXT-EXPORT-V1:" || scope-tag-byte || JCS(snapshot))`)
-    /// using the exporter's custody key.
+    /// through `signer` in the same turn (ADR-049 Decision 7a), so a custody
+    /// that never answers fails the export after `SIGN_TIMEOUT`.
     ///
     /// The exporter MUST be the snapshot `creator_did` (the importer enforces
-    /// `exporter_did == creator_did`). The FFI bridge resolves the signing
-    /// key via `resolve_signing_key`, mirroring the governance signing path.
-    /// The closure receives the canonical digest computed over the final
-    /// (post–public-stripping) snapshot.
+    /// `exporter_did == creator_did`), and `signer` holds that DID's key.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError`] if the context does not exist, the actor reply
     /// channel closes, event-log export or Merkle verification fails, canonical
-    /// hashing fails, or `sign` returns an error ([`ContextError::Custody`],
-    /// which keeps the custody failure's kind for the bridges).
-    pub async fn export_context<F, E>(
+    /// hashing fails, or the sign fails: [`ContextError::Custody`] keeps the
+    /// custody failure's kind (`TimedOut`, SCP-CRYPTO-4062, past
+    /// `SIGN_TIMEOUT`), and [`ContextError::CryptoFailed`] names a signer that
+    /// is not Ed25519.
+    pub async fn export_context(
         self: &Arc<Self>,
         context_id: &str,
         exporter_did: DID,
-        sign: F,
-    ) -> Result<crate::context::export_import::ContextExport, ContextError>
-    where
-        F: FnOnce(&[u8; 32]) -> Result<[u8; 64], E>,
-        E: Into<scp_crypto::CustodyFailure>,
-    {
+        signer: &crate::context::actor::CommandSigner,
+    ) -> Result<crate::context::export_import::ContextExport, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = LifecycleCommand::ExportContext {
             context_id: context_id.to_owned(),
-            exporter_did: exporter_did.clone(),
+            exporter_did,
+            signer: signer.clone(),
             reply: tx,
         };
         self.dispatch_lifecycle_command(cmd).await?;
-        let (snapshot, event_log_data) = bounded_reply_await(rx).await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::export_context — actor reply channel closed".to_owned(),
             )
-        })??;
-
-        // Sign at the dispatch boundary: the actor holds no custody key, so
-        // the FFI-supplied `sign` closure produces the Ed25519 signature over
-        // the canonical snapshot digest computed inside `create_export`
-        // (§23.16.8, ADR-050).
-        let clock = self.clock_ref().ok_or_else(|| {
-            ContextError::PersistenceFailed(
-                "Supervisor::export_context — clock provider not initialized".to_owned(),
-            )
-        })?;
-        crate::context::export_import::create_export(
-            snapshot,
-            event_log_data,
-            exporter_did,
-            crate::context::export_import::ExportScope::Full,
-            clock.as_ref(),
-            sign,
-        )
+        })?
     }
 
     /// Imports a previously exported context (§23.16.8, ADR-050).
@@ -28294,7 +28269,7 @@ mod tests {
             &sender,
             0,
             b"paid",
-            &signing_key,
+            crate::context::supervisor::MessageSigner::Active(&signing_key),
             // Paid send: a deferred spending-nonce token whose fail-closed
             // commit drives the persist (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
@@ -28317,7 +28292,7 @@ mod tests {
             &sender,
             1,
             b"free",
-            &signing_key,
+            crate::context::supervisor::MessageSigner::Active(&signing_key),
             // Free send: no token (previously the `false` bool) — keeps the
             // best-effort persist, un-regressed.
             None,
@@ -28329,6 +28304,87 @@ mod tests {
             "a free (non-spending) send must keep best-effort persist and \
              not be regressed to fail-closed: got {free:?}"
         );
+    }
+
+    /// §9.9.3 + ADR-039: a checkpoint is stamped `#active`, so an agent-persona
+    /// send that makes one due builds none (no agent-key signature under the
+    /// `#active` stamp), and the next `#active` send builds one that verifies
+    /// against the `#active` key, as a peer checks it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_send_leaves_the_due_checkpoint_to_the_next_active_send() {
+        let sup = supervisor_with_providers();
+        let mut deps = test_actor_deps(&sup).await;
+        let ctx_id_bytes = [0xC7u8; 32];
+        // A real Merkle log: the checkpoint signs the log's count and root.
+        let event_log =
+            Arc::new(crate::context::providers::event_log::MerkleEventLogProvider::new());
+        event_log.init_event_log(&ctx_id_bytes).await.unwrap();
+        deps.event_log = event_log;
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let sender = DID("did:example:checkpoint-persona".to_owned());
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            sender.clone(),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let active_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        let active = CommandSigner::local_ed25519(active_key.clone());
+        let agent =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]));
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        // One more send reaches the 50-event threshold.
+        *cell.class_c_view().checkpoint_events_since_mut() = 49;
+
+        crate::context::messaging_helpers::finalize_send(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            &ctx_id_bytes,
+            &sender,
+            0,
+            b"agent",
+            MessageSigner::Agent(&agent),
+            None,
+            /* is_broadcast = */ false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cell.class_c_view().checkpoints_mut().is_empty(),
+            "an agent-persona send must not build a checkpoint"
+        );
+        assert_eq!(*cell.class_c_view().checkpoint_events_since_mut(), 50);
+
+        crate::context::messaging_helpers::finalize_send(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            &ctx_id_bytes,
+            &sender,
+            1,
+            b"active",
+            MessageSigner::Active(&active),
+            None,
+            /* is_broadcast = */ false,
+        )
+        .await
+        .unwrap();
+        let checkpoints = cell.class_c_view().checkpoints_mut().clone();
+        assert_eq!(
+            checkpoints.len(),
+            1,
+            "the #active send builds the due checkpoint"
+        );
+        scp_event_log::checkpoint::verify_checkpoint_signature(
+            &checkpoints[0],
+            &active_key.verifying_key(),
+        )
+        .unwrap();
+        assert_eq!(*cell.class_c_view().checkpoint_events_since_mut(), 0);
     }
 
     /// Build an Active broadcast `PerContextState` with `author` registered as
@@ -28990,7 +29046,7 @@ mod tests {
             &sender,
             0,
             b"paid-send",
-            &signing_key,
+            crate::context::supervisor::MessageSigner::Active(&signing_key),
             // Paid send: deferred token whose fail-closed commit persists the
             // consumed nonce (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
@@ -29464,7 +29520,7 @@ mod tests {
             &sender,
             reserved,
             b"paid",
-            &signing_key,
+            crate::context::supervisor::MessageSigner::Active(&signing_key),
             // Paid send: deferred token whose fail-closed commit fails here,
             // driving the sequence-rollback path (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),

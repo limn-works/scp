@@ -1390,10 +1390,9 @@ pub async fn send_message(
         sender_did,
         sequence,
         payload,
-        // Periodic checkpoints broadcast from `finalize_send` are always
-        // human/device-originated `#active` signals; they need only the
-        // signer, which we hand over from the one `MessageSigner`.
-        signer.signer(),
+        // The persona travels with the key: `finalize_send` builds a due
+        // periodic checkpoint only under `MessageSigner::Active`.
+        signer,
         spending_nonce_token.take(),
         is_broadcast,
     )
@@ -2260,7 +2259,7 @@ pub async fn finalize_send(
     sender_did: &DID,
     sequence: u64,
     payload: &[u8],
-    signer: &crate::context::actor::signer::CommandSigner,
+    signer: MessageSigner<'_>,
     token: Option<crate::context::actor::class_s::ClassSCommitToken>,
     is_broadcast: bool,
 ) -> Result<(), ContextError> {
@@ -2428,7 +2427,9 @@ pub async fn finalize_send(
 /// transport failure is logged but never rolls back the just-completed
 /// application send, because the checkpoint is an independent
 /// consistency-monitoring artifact, not part of the message's delivery
-/// guarantee. A refused or timed-out checkpoint sign is logged the same way
+/// guarantee. An agent-persona send builds no checkpoint, because a
+/// checkpoint is stamped `#active` and only the `#active` key may sign it.
+/// A refused or timed-out checkpoint sign is logged the same way
 /// and leaves the §9.9.3 thresholds armed, so the next send retries it; the
 /// checkpoint fields change only after the signature exists.
 async fn create_and_broadcast_checkpoint_if_due(
@@ -2436,9 +2437,16 @@ async fn create_and_broadcast_checkpoint_if_due(
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &DID,
-    signer: &crate::context::actor::signer::CommandSigner,
+    signer: MessageSigner<'_>,
     now: u64,
 ) {
+    // A checkpoint is stamped `#active` (ADR-039), so only the `#active` key may
+    // sign it: the key comes out of the same variant as the stamp. After an
+    // agent-persona send the §9.9.3 thresholds stay armed, and the next
+    // `#active` operation builds the due checkpoint.
+    let MessageSigner::Active(signer) = signer else {
+        return;
+    };
     // Build + retain the checkpoint through the non-persisting Class-C view
     // (coalesced — the run loop persists on `mutated`). The `&mut view` borrow
     // ends before the shared-`&` `send_checkpoint` read below (NLL).

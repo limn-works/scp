@@ -72,8 +72,8 @@ pub type Ed25519Signature = Vec<u8>;
 /// `scp-platform`, allowing `scp-event-log` to remain independent of
 /// platform-specific key custody implementations.
 ///
-/// `scp-core` provides a `KeyCustodySigner` adapter that bridges
-/// `KeyCustody`/`KeyHandle` to this trait.
+/// The runtime's `CommandSigner` implements it with the bounded,
+/// key-type-checked custody sign of ADR-049 Decision 7a.
 #[async_trait::async_trait]
 pub trait EventLogSigner: Send + Sync {
     /// Signs the given message bytes and returns the Ed25519 signature.

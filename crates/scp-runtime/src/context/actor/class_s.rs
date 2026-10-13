@@ -6139,8 +6139,10 @@ impl ClassSCell
             &sender,
             0,
             b"paid-with-suspension",
-            &crate::context::actor::signer::CommandSigner::local_ed25519(
-                ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
+            crate::context::supervisor::MessageSigner::Active(
+                &crate::context::actor::signer::CommandSigner::local_ed25519(
+                    ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
+                ),
             ),
             Some(ClassSCommitToken::new_for_test(&ctx)),
             /* is_broadcast = */ false,

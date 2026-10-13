@@ -3683,77 +3683,14 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-        // Resolve the creator's custody provider and `#active` signing-key
-        // handle (NOT a raw exported private key). Signing the §23.16.8
-        // snapshot digest is delegated to `KeyCustody::sign`, which dispatches
-        // to whichever backend backs this identity — in-memory, file, OR a
-        // Python callback custody (`identity_create_with_custody`). This lets
-        // sign-only keychain/HSM-shaped providers — which implement `sign` but
-        // intentionally refuse raw key export — produce a signed export.
-        // Private key material never crosses the FFI boundary (ADR-006),
-        // matching the NAPI/UniFFI bridges.
-        let (custody, signing_handle) =
-            crate::runtime::with_identity(bi, &exporter_did.0, |entry| {
-                Ok((
-                    Arc::clone(&entry.custody),
-                    entry.identity.active_signing_key,
-                ))
-            })
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        // `export_context`'s `sign` closure is synchronous, but custody `sign`
-        // is async (a Python callback custody re-acquires the GIL). The whole
-        // export runs inside `block_on_released`, so a nested
-        // `block_on`/`block_in_place` on the SAME runtime would panic ("Cannot
-        // start a runtime from within a runtime"), and `block_in_place` is
-        // unavailable on the current-thread fallback runtime (see `init_runtime`
-        // in `lib.rs`). The sign closure therefore drives the async custody sign
-        // on a dedicated OS thread with its own tiny current-thread runtime and
-        // hands the result back through `join()` — the regime-(c) pattern
-        // documented in `mcp.rs`. This is runtime-flavor-agnostic and never
-        // nests `block_on`.
-        //
-        // Crucially, the entire export (including that signing thread `join`) is
-        // run under `block_on_released`, which releases the GIL: the calling
-        // Python thread holds the GIL, and a `Callback` custody's `sign` re-acquires the GIL on the
-        // signing thread. Releasing the GIL here lets the signing thread acquire
-        // it; otherwise the main thread would block on `join` while holding the
-        // GIL, deadlocking against the signing thread (in-memory/file custody
-        // never touch the GIL, but releasing it for them is harmless).
+        // The creator's `#active` signer signs the §23.16.8 snapshot digest
+        // through custody inside the exporting actor's turn, bounded by
+        // `SIGN_TIMEOUT` (ADR-049 Decision 7a). No key leaves custody, so a
+        // sign-only keychain or HSM custody exports too (ADR-006).
+        let signer = resolve_signer(py, bi, &exporter_did.0)?;
         let export = crate::actor_wait::block_on_released(
             py,
-            sup.export_context(&ctx_id, exporter_did, |hash: &[u8; 32]| {
-                let hash = *hash;
-                let custody = Arc::clone(&custody);
-                let signature = std::thread::scope(|scope| {
-                    scope
-                        .spawn(move || {
-                            let sign_rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .map_err(|e| {
-                                    scp_platform::error::PlatformError::CustodyError(format!(
-                                        "context export: failed to build signing runtime: {e}"
-                                    ))
-                                })?;
-                            // ci-allow: bridge-block-on: runs on a scoped signing thread with its own runtime while the enclosing block_on_released holds the GIL released
-                            sign_rt.block_on(custody.sign(&signing_handle, &hash))
-                        })
-                        .join()
-                        .map_err(|_| {
-                            scp_platform::error::PlatformError::CustodyError(
-                                "context export: signing thread panicked".to_owned(),
-                            )
-                        })?
-                })?;
-                let bytes: [u8; 64] = signature.as_bytes().try_into().map_err(|_| {
-                    scp_platform::error::PlatformError::CustodyError(format!(
-                        "custody sign returned {} bytes, expected 64 (Ed25519)",
-                        signature.as_bytes().len()
-                    ))
-                })?;
-                Ok::<[u8; 64], scp_platform::error::PlatformError>(bytes)
-            }),
+            sup.export_context(&ctx_id, exporter_did, &signer),
         )?
         .map_err(|e| typed_supervisor_failure("context export", &e))?;
 
@@ -6595,9 +6532,8 @@ mod tests {
     }
 
     /// An identity whose `#active` key custody no longer holds fails
-    /// `event_log_checkpoint` with `SCP-CRYPTO-4006`: `KeyCustodySigner`
-    /// carries the signing failure as `EventLogError::Custody`, and the bridge
-    /// maps its kind.
+    /// `event_log_checkpoint` with `SCP-CRYPTO-4006`: building the `#active`
+    /// signer finds the key gone, and the bridge maps the custody's kind.
     #[test]
     #[cfg(feature = "testing")]
     fn event_log_checkpoint_with_a_destroyed_signing_key_is_crypto_4006() {

@@ -3786,50 +3786,6 @@ async fn resolve_napi_message_signer(
     ))
 }
 
-/// Resolves the exporter identity's custody provider and `#active` signing-key
-/// handle for signing a context export snapshot (§23.16.8).
-///
-/// Like [`resolve_napi_signer`], this does NOT export raw private key
-/// bytes. It returns the [`NapiKeyCustody`](crate::custody::NapiKeyCustody)
-/// provider and the [`KeyHandle`](scp_platform::traits::KeyHandle) so the caller
-/// can delegate signing to [`KeyCustody::sign`], which dispatches to whichever
-/// backend backs this identity (in-memory OR JS callback custody). This is the
-/// path that lets keychain/HSM-shaped callback providers — which sign but cannot
-/// export key bytes — produce a signed export. Private key material never crosses
-/// the FFI boundary (ADR-006).
-///
-/// The `Arc<NapiKeyCustody>` is cloned out so the returned pair is `'static` and
-/// can be moved into the synchronous `export_context` sign closure.
-///
-/// # Errors
-///
-/// Returns `ScpNapiError::Context` (SCP-CTX-2040) if the context handle carries
-/// no retained custody or no active signing-key handle.
-fn resolve_napi_export_signer(
-    handle: &NapiContextHandle,
-) -> napi::Result<(
-    Arc<crate::custody::NapiKeyCustody>,
-    scp_platform::traits::KeyHandle,
-)> {
-    let custody = handle.custody.as_ref().ok_or_else(|| {
-        NapiError::from(ScpNapiError::Context {
-            message: "no custody provider on context handle — context export \
-                      requires an identity created with custody"
-                .to_owned(),
-            code: codes::CTX_2040.to_owned(),
-        })
-    })?;
-    let key_handle = handle.signing_key.ok_or_else(|| {
-        NapiError::from(ScpNapiError::Context {
-            message: "no signing key on context handle — context export \
-                      requires an identity with an active signing key"
-                .to_owned(),
-            code: codes::CTX_2040.to_owned(),
-        })
-    })?;
-    Ok((Arc::clone(custody), key_handle))
-}
-
 /// Resolves the snapshot creator's Ed25519 verification key for
 /// snapshot-signature verification on context import (spec §23.16.8, ADR-050,
 /// ADR-039).
@@ -4858,21 +4814,18 @@ pub(crate) async fn context_reset_ttl_timer_on(
 /// Returns serialized `StoredValue<ContextExport>` bytes (§17.5) suitable for
 /// backup, migration, or transfer to another node.
 ///
-/// Signs the exported snapshot's §23.16.8 canonical digest by delegating to the
-/// exporter identity's [`KeyCustody::sign`], which dispatches to whichever
-/// backend backs that identity — in-memory OR a JS callback custody
-/// (`identityCreateWithCustody`). The raw private key never leaves custody, so
-/// a keychain/HSM-shaped callback provider, which only signs, produces a
-/// signed export. The signature is
-/// applied at this dispatch boundary because the runtime holds no custody key;
-/// `Supervisor::export_context` captures the unsigned snapshot from the actor
-/// and signs it here via the supplied closure (§23.16.8, ADR-050).
+/// The exporter identity's `#active` signer signs the snapshot's §23.16.8
+/// canonical digest through custody inside the exporting actor's turn,
+/// bounded by `SIGN_TIMEOUT` (ADR-049 Decision 7a). The raw private key never
+/// leaves custody, so a keychain/HSM-shaped callback custody exports too.
 ///
-/// The retained custody and signing-key handle live on the context handle. If
-/// the handle has no retained custody (e.g. the context creator was an
-/// externally loaded, DID-string-only identity), the export is rejected
-/// fail-closed by `resolve_napi_export_signer` (`CTX_2040`) rather than emitting
-/// an unsigned (and thus unverifiable) export.
+/// # Errors
+///
+/// - `SCP-CTX-2040` when the handle retains no custody or no signing key
+///   (an externally loaded, DID-string-only creator), so no unsigned export
+///   is ever emitted.
+/// - `SCP-CRYPTO-4062` when custody does not sign within `SIGN_TIMEOUT`, and
+///   the custody's own code for any other refusal.
 pub(crate) async fn context_export_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -4881,41 +4834,9 @@ pub(crate) async fn context_export_on(
     let exporter_did = scp_did::DID::from(handle.creator_did.clone());
     let sup = crate::runtime::supervisor(bi)?;
 
-    // Resolve the exporter identity's custody provider and `#active` signing
-    // key handle (NOT a raw exported key). Signing the §23.16.8 snapshot
-    // digest is delegated to `KeyCustody::sign`, which dispatches to whichever
-    // backend backs this identity — in-memory OR a JS callback custody
-    // (`identityCreateWithCustody`). This lets a keychain/HSM-shaped callback
-    // provider, which only signs, produce a signed export. Private key
-    // material never crosses the FFI boundary (ADR-006).
-    let (custody, key_handle) = resolve_napi_export_signer(handle)?;
-
-    // `export_context`'s `sign` closure is synchronous, but custody `sign` is
-    // async (a callback custody awaits a JS `ThreadsafeFunction`). Bridge the
-    // two with `block_in_place` + `block_on` on the current multi-thread
-    // runtime — the same pattern used by `identity_create_link_attestation`
-    // (see `scp.rs`). `context_export_on` already runs on a tokio worker, so a
-    // runtime handle is always present here.
-    let rt = tokio::runtime::Handle::try_current().map_err(|e| {
-        NapiError::from(ScpNapiError::Context {
-            message: format!("context export requires a tokio runtime: {e}"),
-            code: codes::CTX_2030.to_owned(),
-        })
-    })?;
-
+    let signer = resolve_napi_signer(handle).await?;
     let export = sup
-        .export_context(&handle.context_id, exporter_did, |hash: &[u8; 32]| {
-            let signature =
-                // ci-allow: bridge-block-on: runs in the async export on a tokio worker; the JS thread stays free to serve a JS custody callback
-                tokio::task::block_in_place(|| rt.block_on(custody.sign(&key_handle, hash)))?;
-            let bytes: [u8; 64] = signature.as_bytes().try_into().map_err(|_| {
-                scp_platform::PlatformError::CustodyError(format!(
-                    "custody sign returned {} bytes, expected 64 (Ed25519)",
-                    signature.as_bytes().len()
-                ))
-            })?;
-            Ok::<[u8; 64], scp_platform::PlatformError>(bytes)
-        })
+        .export_context(&handle.context_id, exporter_did, &signer)
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     scp_core::context::export_import::serialize_export(&export).map_err(|e| {
@@ -9259,7 +9180,7 @@ mod tests {
     // un-gated §23.16.8 export sign/verify chain works for a non-in-memory,
     // callback-shaped signer (the `identityCreateWithCustody` keychain/HSM
     // case) and that the fail-closed boundary is the ABSENCE of retained
-    // custody (CTX_2040 from `resolve_napi_export_signer`), not a build flag.
+    // custody (CTX_2040 from `resolve_napi_signer`), not a build flag.
     // -----------------------------------------------------------------------
 
     /// A minimal Rust signer that stands in for a production callback custody
@@ -9268,8 +9189,7 @@ mod tests {
     /// `KeyCustody` backend and intentionally cannot export raw key bytes — the
     /// keychain/HSM shape. It is a plain Rust struct, not a `NapiKeyCustody`, so
     /// it needs no live JS `Env`/`ThreadsafeFunction` and exercises the exact
-    /// fallible sign-closure shape `context_export_on` hands to
-    /// `Supervisor::export_context`.
+    /// signer shape `context_export_on` hands to `Supervisor::export_context`.
     struct FakeExportCustody {
         signing_key: ed25519_dalek::SigningKey,
     }
@@ -9283,22 +9203,30 @@ mod tests {
             }
         }
 
-        /// Mirrors `KeyCustody::sign` over the §23.16.8 digest. A real callback
-        /// custody can fail (the JS callback may throw), so the `Result` is part
-        /// of the contract even though this in-test signer is infallible.
-        #[allow(clippy::unnecessary_wraps)]
-        fn sign(&self, digest: &[u8; 32]) -> Result<[u8; 64], scp_crypto::CustodyFailure> {
-            use ed25519_dalek::Signer;
-            Ok(self.signing_key.sign(digest).to_bytes())
-        }
-
         fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
             self.signing_key.verifying_key()
         }
     }
 
+    /// Signs the §23.16.8 digest the way a callback custody's signer does.
+    impl scp_crypto::DynScpSigner for FakeExportCustody {
+        fn algorithm(&self) -> scp_crypto::SigAlg {
+            scp_crypto::SigAlg::Ed25519
+        }
+
+        fn public_key(&self) -> Vec<u8> {
+            self.signing_key.verifying_key().to_bytes().to_vec()
+        }
+
+        fn sign_boxed<'a>(&'a self, digest: &'a [u8; 32]) -> scp_crypto::SignFuture<'a> {
+            use ed25519_dalek::Signer;
+            let signature = self.signing_key.sign(digest).to_bytes();
+            Box::pin(async move { Ok(signature) })
+        }
+    }
+
     /// Drives the production export sign/verify chain with a non-in-memory
-    /// `FakeExportCustody` — the same `Supervisor::export_context` sign-closure +
+    /// `FakeExportCustody` — the same `Supervisor::export_context` signer +
     /// `serialize_export` / `deserialize_export` + `Supervisor::import_context`
     /// path that `context_export_on` / `context_import_on` delegate to. Proves a
     /// callback-shaped (non-exportable) signer produces a spec-valid §23.16.8
@@ -9316,7 +9244,8 @@ mod tests {
         let sup = crate::runtime::supervisor(&bi).expect("supervisor initialized above");
         let sup = Arc::clone(sup);
 
-        let custody = FakeExportCustody::new();
+        let custody = Arc::new(FakeExportCustody::new());
+        let signer = scp_core::context::actor::CommandSigner::new(Arc::clone(&custody) as _);
         let creator = DID("did:dht:z6MkCallbackExporter".to_owned());
         let ctx_id = format!("callback-export-{}", uuid::Uuid::new_v4());
 
@@ -9328,14 +9257,12 @@ mod tests {
         };
         let handle = test_dispatch_create_context(&bi, &ctx_id, params, creator.clone()).await;
 
-        // Export: sign the §23.16.8 digest via the callback-shaped custody — the
-        // exact closure shape `context_export_on` passes to `export_context`.
+        // Export: the callback-shaped signer signs the §23.16.8 digest in the
+        // actor turn, as the `#active` signer `context_export_on` resolves.
         let export = sup
-            .export_context(&ctx_id, creator.clone(), |digest: &[u8; 32]| {
-                custody.sign(digest)
-            })
+            .export_context(&ctx_id, creator.clone(), &signer)
             .await
-            .expect("export_context should succeed via callback-shaped sign closure");
+            .expect("export_context should succeed via the callback-shaped signer");
         let data = serialize_export(&export).expect("serialize_export should succeed");
         assert!(!data.is_empty(), "serialized export must not be empty");
 
@@ -9389,7 +9316,7 @@ mod tests {
     /// Proves the fail-closed boundary is the ABSENCE of retained custody, not a
     /// build feature: `context_export_on` on a `NapiContextHandle` whose
     /// `custody` is `None` (e.g. an externally loaded, DID-string-only
-    /// creator) is rejected with `CTX_2040` by `resolve_napi_export_signer` —
+    /// creator) is rejected with `CTX_2040` by `resolve_napi_signer` —
     /// never with the old build-gate PERM-3001, and never an unsigned export.
     /// Runs WITHOUT `testing`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

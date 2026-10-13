@@ -1499,8 +1499,10 @@ mod consequence_fail_closed_tests {
             &DID(SUBJECT.to_owned()),
             0,
             b"payload",
-            &crate::context::actor::signer::CommandSigner::local_ed25519(
-                ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
+            crate::context::supervisor::MessageSigner::Active(
+                &crate::context::actor::signer::CommandSigner::local_ed25519(
+                    ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
+                ),
             ),
             None,
             false,

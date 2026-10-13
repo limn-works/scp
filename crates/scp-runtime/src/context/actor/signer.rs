@@ -143,6 +143,31 @@ impl CommandSigner {
     }
 }
 
+/// A checkpoint signed outside an actor turn (the bridges'
+/// `event_log_checkpoint`) signs through the same bounded, key-type-checked
+/// call as every actor-path sign, so a custody that never answers fails with
+/// `SCP-CRYPTO-4062` after [`SIGN_TIMEOUT`].
+#[async_trait::async_trait]
+impl scp_event_log::EventLogSigner for CommandSigner {
+    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, CustodyFailure> {
+        let digest: &[u8; 32] = message.try_into().map_err(|_| CustodyFailure {
+            kind: CustodyFailureKind::Failed,
+            detail: format!(
+                "checkpoint signing input is {} bytes, not a 32-byte digest",
+                message.len()
+            ),
+        })?;
+        match self.sign_bounded_ed25519(digest).await {
+            Ok(signature) => Ok(signature.to_vec()),
+            Err(ContextError::Custody(failure)) => Err(failure),
+            Err(other) => Err(CustodyFailure {
+                kind: CustodyFailureKind::Failed,
+                detail: other.to_string(),
+            }),
+        }
+    }
+}
+
 impl fmt::Debug for CommandSigner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CommandSigner")
@@ -321,6 +346,78 @@ mod tests {
         assert!(rendered.contains(&hex::encode(key.verifying_key().to_bytes())));
         assert!(!rendered.contains(&hex::encode(key.to_bytes())));
         assert!(!rendered.contains(&format!("{:?}", key.to_bytes())));
+    }
+
+    /// A checkpoint signed through a destroyed key fails with a typed
+    /// key-not-found custody failure, which every bridge reports as
+    /// `SCP-CRYPTO-4006`.
+    #[tokio::test]
+    async fn checkpoint_with_a_destroyed_key_is_custody_key_not_found() -> TestResult {
+        use scp_platform::testing::InMemoryKeyCustody;
+        use scp_platform::traits::KeyType;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let key = custody.generate_keypair(KeyType::Ed25519).await?;
+        let signer = CommandSigner::from_custody(
+            CustodySigner::new(Arc::clone(&custody), key, SigAlg::Ed25519).await?,
+        );
+        custody.destroy_key(&key).await?;
+        let log = scp_event_log::EventLog::new("ctx-checkpoint-custody".to_owned());
+        let result = scp_event_log::checkpoint::generate_checkpoint(
+            &log,
+            &scp_did::DID::from("did:dht:alice"),
+            1,
+            &signer,
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(scp_event_log::EventLogError::Custody(failure)) if failure.is_key_not_found()),
+            "expected EventLogError::Custody key-not-found, got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// A checkpoint whose custody never answers fails with kind `TimedOut`
+    /// (`SCP-CRYPTO-4062`) at [`SIGN_TIMEOUT`], not after an unbounded wait.
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_with_a_stalled_custody_times_out() {
+        let signer = CommandSigner::new(Arc::new(NeverReadySigner));
+        let log = scp_event_log::EventLog::new("ctx-checkpoint-stall".to_owned());
+        let started = tokio::time::Instant::now();
+        let result = scp_event_log::checkpoint::generate_checkpoint(
+            &log,
+            &scp_did::DID::from("did:dht:alice"),
+            1,
+            &signer,
+        )
+        .await;
+        assert!(
+            matches!(
+                &result,
+                Err(scp_event_log::EventLogError::Custody(CustodyFailure {
+                    kind: CustodyFailureKind::TimedOut,
+                    ..
+                }))
+            ),
+            "{result:?}"
+        );
+        assert!(started.elapsed() >= SIGN_TIMEOUT);
+        assert!(started.elapsed() < SIGN_TIMEOUT + Duration::from_secs(1));
+    }
+
+    /// A checkpoint signing input that is not a 32-byte digest is refused
+    /// before custody is asked.
+    #[tokio::test]
+    async fn event_log_sign_refuses_a_non_digest_input() {
+        let signer = CommandSigner::new(Arc::new(RefusingSigner(None)));
+        let result = scp_event_log::EventLogSigner::sign(&signer, &[0; 31]).await;
+        assert!(
+            matches!(
+                &result,
+                Err(CustodyFailure { kind: CustodyFailureKind::Failed, detail }) if detail.contains("31 bytes")
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]

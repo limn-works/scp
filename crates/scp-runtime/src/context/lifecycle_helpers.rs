@@ -22,8 +22,9 @@
 //!
 //! Per-context (actor-shape `(&mut PerContextState, &ActorDeps, ...)`):
 //!
-//! 1. [`export_context_blocks`] — read-only state borrow + persistence-side
-//!    snapshot construction; produces a signed [`ContextExport`](crate::context::export_import::ContextExport).
+//! 1. [`export_context_blocks`] — read-only state borrow; captures the
+//!    snapshot and event-log blocks the actor signs into a
+//!    [`ContextExport`](crate::context::export_import::ContextExport).
 //! 2. [`leave_context`] — capability check + MLS remove + sender-key
 //!    cleanup + membership removal + close-on-empty.
 //! 3. [`drain_and_deliver_sender_keys`] — drain pending sender-key
@@ -140,24 +141,23 @@ fn build_routing(is_broadcast: bool, local_pseudonym: Option<[u8; 32]>) -> Conte
 /// actor-owned state (§23.16.8, ADR-050).
 ///
 /// Returns the `ContextSnapshot` and the serialized Merkle event-log data.
-/// The actor holds no custody/signing key, so the signature is NOT applied
-/// here — the caller ([`crate::context::supervisor::Supervisor::export_context`])
-/// invokes [`crate::context::export_import::create_export`] with the
-/// FFI-supplied `sign` closure once the actor mailbox returns these blocks.
-/// Splitting the read-only capture (inside the actor) from the signing
-/// (at the bridge boundary) preserves the actor-per-context model while
-/// keeping the signature over the exact canonical bytes a verifier recomputes.
+/// The capture is synchronous so no `PerContextState` borrow (which is
+/// `!Sync`) spans the sign's await.
 ///
 /// The snapshot's `mls_crypto_state` is empty on this portable export path;
 /// live MLS crypto state is carried only on the persistence/restore path.
 /// Whether portable export should include MLS crypto state is an open design
 /// decision (security tradeoff).
 ///
-/// The event-log export is best-effort (`unwrap_or_default`), matching the
-/// pre-actor `export_context` body, so this capture is infallible. Any signing
-/// or Merkle-verification failure surfaces later in
-/// [`create_export`](crate::context::export_import::create_export) at the
-/// dispatch boundary.
+/// The actor lifecycle handler signs the returned blocks in the same turn
+/// through
+/// [`create_signed_export`](crate::context::export_import::create_signed_export).
+///
+/// # Errors
+///
+/// The event-log provider's error when the context's log cannot be exported:
+/// an export without its log would sign the empty-log Merkle root and
+/// silently drop the context's history.
 ///
 /// Crate-internal: this lives in the `pub(crate) mod lifecycle_helpers`
 /// module, so it is unreachable outside `scp-runtime` regardless of this
@@ -169,7 +169,7 @@ fn build_routing(is_broadcast: bool, local_pseudonym: Option<[u8; 32]>) -> Conte
 pub fn export_context_blocks(
     state: &PerContextState,
     deps: &ActorDeps,
-) -> (crate::context::state::ContextSnapshot, Vec<u8>) {
+) -> Result<(crate::context::state::ContextSnapshot, Vec<u8>), ContextError> {
     let context_id = state.handle.context_id();
     // ADR-056: resolve to the canonical digest (matches `state.context_id` and
     // the crypto keys the snapshot exports), not a re-hash of the hex id.
@@ -177,12 +177,9 @@ pub fn export_context_blocks(
 
     let snapshot = crate::context::messaging_helpers::build_snapshot_from_state(state);
 
-    let event_log_data = deps
-        .event_log
-        .export_event_log_data(&ctx_id_bytes)
-        .unwrap_or_default();
+    let event_log_data = deps.event_log.export_event_log_data(&ctx_id_bytes)?;
 
-    (snapshot, event_log_data)
+    Ok((snapshot, event_log_data))
 }
 
 // ---------------------------------------------------------------------------
@@ -5289,8 +5286,10 @@ mod restore_reconcile_tests {
             &sender,
             reserved,
             b"payload",
-            &crate::context::actor::signer::CommandSigner::local_ed25519(
-                ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
+            crate::context::supervisor::MessageSigner::Active(
+                &crate::context::actor::signer::CommandSigner::local_ed25519(
+                    ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
+                ),
             ),
             None,  // no spending-nonce token (free send) — keeps best-effort persist
             false, // is_broadcast

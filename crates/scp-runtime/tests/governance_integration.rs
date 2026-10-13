@@ -1442,7 +1442,16 @@ async fn ac10_remove_member_action() {
 /// Helper: create a `SingleAdmin` context with alice as admin and add bob as a
 /// member. Returns the supervisor and context id.
 async fn ctx_with_alice_admin_bob_member(ctx_id: &str) -> std::sync::Arc<Supervisor> {
-    let manager = new_manager();
+    // A real Merkle log: export signs the log's root, and a provider without
+    // export support fails the export.
+    ctx_with_alice_admin_bob_member_on(new_manager_with_real_event_log(), ctx_id).await
+}
+
+/// [`ctx_with_alice_admin_bob_member`] on a caller-chosen supervisor.
+async fn ctx_with_alice_admin_bob_member_on(
+    manager: std::sync::Arc<Supervisor>,
+    ctx_id: &str,
+) -> std::sync::Arc<Supervisor> {
     let params = ContextParams {
         ceiling: governance_ceiling(),
         governance: GovernanceModel::SingleAdmin,
@@ -1547,10 +1556,11 @@ async fn execute_remove_member_clears_read_exclusion() {
 
     // Precondition: bob is in the read_exclusion_list (observed via export).
     let export = manager
-        .export_context(ctx_id, alice(), |digest| {
-            use ed25519_dalek::Signer;
-            Ok::<_, scp_crypto::CustodyFailure>(sk_alice.sign(digest).to_bytes())
-        })
+        .export_context(
+            ctx_id,
+            alice(),
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     assert!(
@@ -1575,10 +1585,11 @@ async fn execute_remove_member_clears_read_exclusion() {
 
     // Postcondition: bob's read-exclusion entry is gone (spec §5.6.1).
     let export = manager
-        .export_context(ctx_id, alice(), |digest| {
-            use ed25519_dalek::Signer;
-            Ok::<_, scp_crypto::CustodyFailure>(sk_alice.sign(digest).to_bytes())
-        })
+        .export_context(
+            ctx_id,
+            alice(),
+            &scp_runtime::context::actor::CommandSigner::local_ed25519(sk_alice.clone()),
+        )
         .await
         .unwrap();
     assert!(
@@ -4349,4 +4360,71 @@ async fn rotate_content_keys_dropped_kea_leaf_is_never_reappended_by_a_later_rot
         );
 
     assert_dropped_kea_leaf_is_never_reappended(&manager, ctx_id, &ctx_bytes).await;
+}
+
+/// A custody that never answers fails the export with kind `TimedOut`
+/// (`SCP-CRYPTO-4062`) once `SIGN_TIMEOUT` elapses, because the export signs
+/// inside the actor turn through the bounded sign (ADR-049 Decision 7a).
+#[tokio::test(start_paused = true)]
+async fn export_with_stalled_custody_fails_with_custody_timeout() {
+    use scp_crypto::{CustodyFailure, CustodyFailureKind, DynScpSigner, SigAlg, SignFuture};
+    use scp_runtime::context::actor::{CommandSigner, SIGN_TIMEOUT};
+
+    /// A signer whose sign never completes, standing in for an unanswered
+    /// biometric prompt.
+    struct StalledSigner(Vec<u8>);
+
+    impl DynScpSigner for StalledSigner {
+        fn algorithm(&self) -> SigAlg {
+            SigAlg::Ed25519
+        }
+
+        fn public_key(&self) -> Vec<u8> {
+            self.0.clone()
+        }
+
+        fn sign_boxed<'a>(&'a self, _digest: &'a [u8; 32]) -> SignFuture<'a> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    let ctx_id = "ctx-export-stalled-custody";
+    let manager = ctx_with_alice_admin_bob_member(ctx_id).await;
+    let public_key = signing_key_for_did(&alice())
+        .verifying_key()
+        .to_bytes()
+        .to_vec();
+    let signer = CommandSigner::new(Arc::new(StalledSigner(public_key)));
+
+    let started = tokio::time::Instant::now();
+    let result = manager.export_context(ctx_id, alice(), &signer).await;
+    assert!(
+        matches!(
+            result,
+            Err(ContextError::Custody(CustodyFailure {
+                kind: CustodyFailureKind::TimedOut,
+                ..
+            }))
+        ),
+        "a stalled custody must surface as TimedOut (SCP-CRYPTO-4062), got {result:?}"
+    );
+    assert!(started.elapsed() >= SIGN_TIMEOUT);
+    assert!(started.elapsed() < SIGN_TIMEOUT + std::time::Duration::from_secs(1));
+}
+
+/// An event-log provider that cannot export its log fails the export with its
+/// error, instead of signing an export that carries an empty log.
+#[tokio::test]
+async fn export_fails_when_the_event_log_cannot_export() {
+    let ctx_id = "ctx-export-event-log-unsupported";
+    // `MockEventLog` keeps the provider's default `export_event_log_data`,
+    // which refuses.
+    let manager = ctx_with_alice_admin_bob_member_on(new_manager(), ctx_id).await;
+    let signer =
+        scp_runtime::context::actor::CommandSigner::local_ed25519(signing_key_for_did(&alice()));
+    let result = manager.export_context(ctx_id, alice(), &signer).await;
+    assert!(
+        matches!(result, Err(ContextError::EventLogFailed(_))),
+        "an unreadable event log must fail the export, got {result:?}"
+    );
 }
