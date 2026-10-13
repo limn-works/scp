@@ -109,6 +109,9 @@ pub enum ContextCommand {
     /// initiator — the cross-context outlet-invocation saga runs
     /// supervisor-side, not over this mailbox.
     Outlets(OutletsCommand),
+    /// Push: the routing IDs this device registers for push wakes (§10.7.1).
+    /// Read-only, like `Queries`.
+    Push(PushCommand),
     /// Read-only queries. Handlers MUST NOT mutate state; the actor
     /// takes `&self.state` when dispatching this variant.
     Queries(QueriesCommand),
@@ -2310,6 +2313,18 @@ pub enum TtlCloseCommand {
         payload: Box<TtlContextPayload>,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+}
+
+/// See [`ContextCommand::Push`]. Read-only: the actor answers from its owned
+/// state through `crate::context::push_helpers`.
+pub enum PushCommand {
+    /// This context's push routes (§10.7.1): its relay set and the routing IDs
+    /// on those relays at which a blob for this device arrives. `None` for a
+    /// `Closed`, `Expired` or `Tombstoned` context.
+    Routes {
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Option<crate::context::push_helpers::ContextPushRoutes>>,
     },
 }
 

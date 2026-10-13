@@ -43,8 +43,9 @@ use scp_protocol::context::membership::ContextEvent;
 
 use crate::context::actor::commands::{
     BroadcastCommand, ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand,
-    MessagingCommand, OutletsCommand, PrepareAOutcome, PrepareBOutcome, QueriesCommand, SagaReject,
-    StandingCommand, TrustRecoveryCommand, TtlCloseCommand, saga_reject,
+    MessagingCommand, OutletsCommand, PrepareAOutcome, PrepareBOutcome, PushCommand,
+    QueriesCommand, SagaReject, StandingCommand, TrustRecoveryCommand, TtlCloseCommand,
+    saga_reject,
 };
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
@@ -903,6 +904,10 @@ const CRASH_POISON_THRESHOLD: usize = 3;
 /// keeps the structure O(1) in space regardless of clock behaviour.
 const CRASH_DEQUE_CAP: usize = CRASH_POISON_THRESHOLD;
 
+/// The `crash_windows` key prefix of a per-identity KeyPackage actor's window
+/// ([`Supervisor::kp_crash_key`]); no context ID starts with it.
+const KP_CRASH_KEY_PREFIX: &str = "kp::";
+
 /// Per-context crash-count window (ADR-049 §10 — actor respawn budget).
 ///
 /// Tracks the wall-clock-millisecond timestamps of recent actor crashes
@@ -1041,6 +1046,14 @@ impl CrashWindow {
     /// budget — but it is no longer "silently dead".
     const fn mark_respawn_succeeded(&mut self) {
         self.last_respawn_failed = false;
+    }
+
+    /// Whether the window records a context whose actor is down: poisoned,
+    /// its last respawn failed, or mid-respawn. [`Supervisor::lookup_miss_error`]
+    /// returns `ContextPoisoned` or `ActorCrashed` for exactly these windows,
+    /// and [`Supervisor::known_context_ids`] lists their context IDs.
+    const fn actor_down(&self) -> bool {
+        self.poisoned || self.last_respawn_failed || self.respawning
     }
 
     /// Whether the context is mid-respawn (despawned, not yet re-registered).
@@ -3113,7 +3126,7 @@ impl Supervisor {
     /// (context keys are hex context-ids / original id strings, neither of
     /// which start with `kp::`).
     fn kp_crash_key(identity: &DID) -> String {
-        format!("kp::{}", identity.0)
+        format!("{KP_CRASH_KEY_PREFIX}{}", identity.0)
     }
 
     /// The sticky typed error a poisoned KeyPackage actor surfaces on the next
@@ -4872,6 +4885,24 @@ impl Supervisor {
         self.actors.iter().map(|e| e.key().clone()).collect()
     }
 
+    /// Returns every context ID the supervisor knows: each registered actor's,
+    /// plus each context whose actor is down ([`CrashWindow::actor_down`]),
+    /// for which [`Self::lookup_miss_error`] returns `ContextPoisoned` or
+    /// `ActorCrashed`. KeyPackage-actor windows (`kp::` keys) are not contexts
+    /// and are left out. Sorted, without duplicates.
+    #[must_use]
+    pub(in crate::context) fn known_context_ids(&self) -> Vec<String> {
+        let mut ids: std::collections::BTreeSet<String> =
+            self.actors.iter().map(|e| e.key().clone()).collect();
+        ids.extend(
+            self.crash_windows
+                .iter()
+                .filter(|e| !e.key().starts_with(KP_CRASH_KEY_PREFIX) && e.value().actor_down())
+                .map(|e| e.key().clone()),
+        );
+        ids.into_iter().collect()
+    }
+
     /// Spawn a new `ContextActor` task that owns drained
     /// [`PerContextState`](crate::context::actor::PerContextState) +
     /// [`ActorDeps`](crate::context::actor::ActorDeps) directly
@@ -5843,13 +5874,14 @@ impl Supervisor {
     ///    [`ContextError::ContextNotRegistered`] with the caller's
     ///    diagnostic message.
     fn lookup_miss_error(&self, ctx_id: &str, not_registered_msg: String) -> ContextError {
-        if let Some(window) = self.crash_windows.get(ctx_id) {
-            if window.is_poisoned() {
-                return ContextError::ContextPoisoned(ctx_id.to_owned());
-            }
-            if window.last_respawn_failed() || window.is_respawning() {
-                return ContextError::ActorCrashed(ctx_id.to_owned());
-            }
+        if let Some(window) = self.crash_windows.get(ctx_id)
+            && window.actor_down()
+        {
+            return if window.is_poisoned() {
+                ContextError::ContextPoisoned(ctx_id.to_owned())
+            } else {
+                ContextError::ActorCrashed(ctx_id.to_owned())
+            };
         }
         ContextError::ContextNotRegistered(not_registered_msg)
     }
@@ -16926,6 +16958,98 @@ impl Supervisor {
         })?
     }
 
+    /// Dispatch a read-only [`PushCommand`] to `ctx_id`'s actor mailbox, where
+    /// `handlers::push::dispatch` answers it from `push_helpers`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`], [`ContextError::ContextPoisoned`]
+    ///   or [`ContextError::ActorCrashed`] when no actor serves `ctx_id`.
+    /// - [`ContextError::ActorBusy`] from the mailbox send.
+    pub async fn dispatch_push_command(
+        &self,
+        ctx_id: &str,
+        cmd: PushCommand,
+    ) -> Result<Outcome<()>, ContextError> {
+        let actor = self.lookup(ctx_id).ok_or_else(|| {
+            self.lookup_miss_error(
+                ctx_id,
+                format!("dispatch_push_command — no actor registered for context_id `{ctx_id}`"),
+            )
+        })?;
+        Self::dispatch_via_mailbox(&actor, ContextCommand::Push(cmd)).await
+    }
+
+    /// Returns the routing IDs this device registers for push wakes, grouped by
+    /// canonical relay URL (`10-infrastructure-and-self-hosting.md` §10.7.1,
+    /// `09-security-model.md` §9.18.2).
+    ///
+    /// Asks every context in [`Self::known_context_ids`] for its push routes
+    /// through [`Self::dispatch_push_command`], concurrently. Each context adds
+    /// its shared routing ID and, in an encrypted context, this device's
+    /// current pseudonym routing ID (§9.10.4) under the canonical form of every
+    /// relay in its relay set, so two spellings of one relay share one key.
+    /// The result holds no context ID. A context that is `Closed`, `Expired`
+    /// or `Tombstoned`, or whose actor was removed with no crash record after
+    /// the IDs were read, adds nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails rather than return a partial set, because a registration built
+    /// from a partial set would silently drop the wakes for the missing
+    /// contexts:
+    /// - [`ContextError::ContextPoisoned`] or [`ContextError::ActorCrashed`]
+    ///   when a context's actor is down;
+    /// - [`ContextError::ActorBusy`] from a mailbox send;
+    /// - [`ContextError::TransportFailed`] when an actor drops its reply or
+    ///   does not answer within the reply bound;
+    /// - [`ContextError::InvalidState`] when a context's relay set holds a URL
+    ///   with no §9.18.2 canonical form.
+    pub async fn push_routing_ids(
+        &self,
+    ) -> Result<
+        std::collections::BTreeMap<String, std::collections::BTreeSet<[u8; 32]>>,
+        ContextError,
+    > {
+        let replies = futures::future::join_all(self.known_context_ids().into_iter().map(
+            |ctx_id| async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                match self
+                    .dispatch_push_command(&ctx_id, PushCommand::Routes { reply: tx })
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(ContextError::ContextNotRegistered(_)) => return Ok(None),
+                    Err(err) => return Err(err),
+                }
+                bounded_reply_await(rx).await.map_err(|_| {
+                    ContextError::TransportFailed(format!(
+                        "Supervisor::push_routing_ids — no reply from the actor of `{ctx_id}`"
+                    ))
+                })
+            },
+        ))
+        .await;
+        let mut by_relay =
+            std::collections::BTreeMap::<String, std::collections::BTreeSet<[u8; 32]>>::new();
+        for routes in replies {
+            let Some(routes) = routes? else { continue };
+            for relay_url in routes.relay_urls {
+                let canonical = scp_protocol::discovery::push::canonical_relay_url(&relay_url)
+                    .map_err(|err| {
+                        ContextError::InvalidState(format!(
+                            "Supervisor::push_routing_ids — relay URL `{relay_url}` has no canonical form: {err}"
+                        ))
+                    })?;
+                by_relay
+                    .entry(canonical)
+                    .or_default()
+                    .extend(routes.routing_ids.iter().copied());
+            }
+        }
+        Ok(by_relay)
+    }
+
     /// Returns every commit currently in the per-context retry queue.
     /// Soft-default contract: empty `Vec` on unknown context or
     /// mailbox failure. Routes through the actor mailbox via
@@ -18362,6 +18486,215 @@ mod tests {
             stored(&contexts),
             Some(vec![RELAY_C.to_owned()]),
             "restore installs the stored relay set on the live actor"
+        );
+    }
+
+    /// PUSH-013: with two contexts on two relays, one of them on both,
+    /// `push_routing_ids` maps each relay to exactly the routing IDs of the
+    /// contexts on it, and holds this
+    /// device's current local pseudonym routing ID for each context. After the
+    /// local pseudonym changes through the join path, the next query returns
+    /// the new one and not the old one.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_routing_ids_group_by_relay_and_follow_the_local_pseudonym() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        const RELAY_A: &str = "wss://relay-a.example/scp/v1";
+        const RELAY_B: &str = "wss://relay-b.example/scp/v1";
+        const PSEUDONYM_A: [u8; 32] = [0xA1; 32];
+        const PSEUDONYM_B: [u8; 32] = [0xB1; 32];
+        const PSEUDONYM_A_NEW: [u8; 32] = [0xA2; 32];
+        let sup = supervisor_with_providers();
+        let identity = sup.node_identity().unwrap();
+        let params = || scp_protocol::context::ContextParams {
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..Default::default()
+        };
+        let ctx_a = hex::encode([0xA0u8; 32]);
+        let ctx_b = hex::encode([0xB0u8; 32]);
+        let handle_a = sup
+            .create_context(
+                ctx_a.clone(),
+                params(),
+                identity.clone(),
+                Some(PSEUDONYM_A),
+                vec![RELAY_A.to_owned()],
+            )
+            .await
+            .unwrap();
+        sup.create_context(
+            ctx_b.clone(),
+            params(),
+            identity,
+            Some(PSEUDONYM_B),
+            vec![RELAY_B.to_owned(), RELAY_A.to_owned()],
+        )
+        .await
+        .unwrap();
+        let shared_a = scp_protocol::context::context_routing_id(&ctx_a);
+        let shared_b = scp_protocol::context::context_routing_id(&ctx_b);
+
+        assert_eq!(
+            sup.push_routing_ids().await.unwrap(),
+            BTreeMap::from([
+                (
+                    RELAY_A.to_owned(),
+                    BTreeSet::from([shared_a, PSEUDONYM_A, shared_b, PSEUDONYM_B]),
+                ),
+                (RELAY_B.to_owned(), BTreeSet::from([shared_b, PSEUDONYM_B])),
+            ]),
+            "each relay maps to exactly the routing IDs of the contexts on it"
+        );
+
+        sup.join_context(
+            &handle_a,
+            scp_protocol::context::membership::KeyPackage::mock(DID(
+                "did:dht:z6MkPushRoutingJoiner".to_owned(),
+            )),
+            None,
+            Some(PSEUDONYM_A_NEW),
+        )
+        .await
+        .unwrap();
+
+        let after = sup.push_routing_ids().await.unwrap();
+        assert_eq!(
+            after.get(RELAY_A),
+            Some(&BTreeSet::from([
+                shared_a,
+                PSEUDONYM_A_NEW,
+                shared_b,
+                PSEUDONYM_B
+            ])),
+            "the next query returns the new local pseudonym and not the old one"
+        );
+        assert_eq!(
+            after.get(RELAY_B),
+            Some(&BTreeSet::from([shared_b, PSEUDONYM_B])),
+            "the other context's routing IDs are unchanged"
+        );
+    }
+
+    /// A supervisor with no context actors returns an empty map.
+    #[tokio::test]
+    async fn push_routing_ids_is_empty_without_contexts() {
+        let sup = supervisor_with_providers();
+        assert!(sup.push_routing_ids().await.unwrap().is_empty());
+    }
+
+    /// Creates an encrypted context `ctx_id` on `relay_urls` for the
+    /// `push_routing_ids` tests.
+    #[cfg(feature = "testing")]
+    async fn create_push_context(sup: &Arc<Supervisor>, ctx_id: &str, relay_urls: &[&str]) {
+        let identity = sup.node_identity().unwrap();
+        sup.create_context(
+            ctx_id.to_owned(),
+            scp_protocol::context::ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                ..Default::default()
+            },
+            identity,
+            Some([0x5A; 32]),
+            relay_urls.iter().map(|u| (*u).to_owned()).collect(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Two spellings of one relay share one key, the §9.18.2 canonical URL.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_routing_ids_group_equivalent_relay_spellings_under_one_key() {
+        let sup = supervisor_with_providers();
+        let ctx_a = hex::encode([0xC0u8; 32]);
+        let ctx_b = hex::encode([0xC1u8; 32]);
+        create_push_context(&sup, &ctx_a, &["wss://relay.example"]).await;
+        create_push_context(&sup, &ctx_b, &["WSS://Relay.Example:443/"]).await;
+        let by_relay = sup.push_routing_ids().await.unwrap();
+        assert_eq!(
+            by_relay.keys().collect::<Vec<_>>(),
+            vec!["wss://relay.example"],
+            "both spellings map to the one canonical relay URL"
+        );
+        let ids = &by_relay["wss://relay.example"];
+        assert!(ids.contains(&scp_protocol::context::context_routing_id(&ctx_a)));
+        assert!(ids.contains(&scp_protocol::context::context_routing_id(&ctx_b)));
+    }
+
+    /// A relay URL with no §9.18.2 canonical form fails the whole query.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_routing_ids_reject_a_relay_url_with_no_canonical_form() {
+        let sup = supervisor_with_providers();
+        create_push_context(&sup, &hex::encode([0xC2u8; 32]), &["https://relay.example"]).await;
+        assert!(matches!(
+            sup.push_routing_ids().await,
+            Err(ContextError::InvalidState(_))
+        ));
+    }
+
+    /// A context whose actor is down — poisoned, its last respawn failed, or
+    /// mid-respawn — fails the query with the typed error `lookup_miss_error`
+    /// gives it, instead of being left out of an `Ok` result.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_routing_ids_fail_when_a_context_actor_is_down() {
+        for down in 0..3u8 {
+            let sup = supervisor_with_providers();
+            let healthy = hex::encode([0xD0u8; 32]);
+            let broken = hex::encode([0xD1u8; 32]);
+            create_push_context(&sup, &healthy, &["wss://relay.example"]).await;
+            create_push_context(&sup, &broken, &["wss://relay.example"]).await;
+            assert!(sup.push_routing_ids().await.is_ok(), "both actors are up");
+            match down {
+                0 => sup.test_poison_context(&broken).await,
+                1 => sup.test_fail_context_respawn(&broken).await,
+                _ => sup.test_hold_context_mid_respawn(&broken).await,
+            }
+            let result = sup.push_routing_ids().await;
+            if down == 0 {
+                assert!(
+                    matches!(result, Err(ContextError::ContextPoisoned(ref id)) if *id == broken),
+                    "a poisoned context fails the query: {result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(ContextError::ActorCrashed(ref id)) if *id == broken),
+                    "a crashed context fails the query: {result:?}"
+                );
+            }
+        }
+    }
+
+    /// `known_context_ids` lists registered actors and contexts whose actor is
+    /// down, and leaves out KeyPackage-actor windows and crash windows that do
+    /// not mark an actor down.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn known_context_ids_list_live_and_down_contexts_only() {
+        let sup = supervisor_with_providers();
+        let live = hex::encode([0xE0u8; 32]);
+        create_push_context(&sup, &live, &["wss://relay.example"]).await;
+        let crash = |id: String, crashes: usize| {
+            let mut window = sup.crash_windows.entry(id).or_default();
+            for _ in 0..crashes {
+                window.record(0);
+            }
+        };
+        crash("poisoned-ctx".to_owned(), CRASH_POISON_THRESHOLD);
+        crash("crashed-once-ctx".to_owned(), 1);
+        crash(
+            format!("{KP_CRASH_KEY_PREFIX}did:dht:z6MkKnownIds"),
+            CRASH_POISON_THRESHOLD,
+        );
+        sup.crash_windows
+            .entry("respawning-ctx".to_owned())
+            .or_default()
+            .mark_respawning();
+        assert_eq!(
+            sup.known_context_ids(),
+            vec![live, "poisoned-ctx".to_owned(), "respawning-ctx".to_owned()]
         );
     }
 

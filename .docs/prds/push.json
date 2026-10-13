@@ -816,19 +816,22 @@
       "gate": "gate-push-client",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-runtime/src/context/actor/commands.rs",
+        "crates/scp-runtime/src/context/actor/mod.rs",
         "crates/scp-runtime/src/context/actor/handlers/push.rs",
-        "crates/scp-runtime/src/context/actor/handlers/push_helpers.rs",
         "crates/scp-runtime/src/context/actor/handlers/mod.rs",
+        "crates/scp-runtime/src/context/push_helpers.rs",
+        "crates/scp-runtime/src/context/mod.rs",
         "crates/scp-testing/tests/integration/pipeline_wiring.rs"
       ],
-      "description": "`Supervisor::push_routing_ids()` fans a query out to each standing context actor. Each actor returns its `context_routing_id` and this device's current `pseudonym_routing_id` (\u00a79.10.4). The Supervisor groups the results by relay URL. FFI, SDK and matrix rows are covered by PUSH-015.",
+      "description": "`Supervisor::push_routing_ids()` fans a query out to each standing context actor. Each actor returns its `context_routing_id` and this device's current `pseudonym_routing_id` (\u00a79.10.4). The Supervisor groups the results by canonical relay URL (\u00a79.18.2). FFI, SDK and matrix rows are covered by PUSH-015.",
       "acceptanceCriteria": [
         "With two contexts on two relays, the result maps each relay to exactly the routing IDs of the contexts on it.",
-        "After a pseudonym rotation, the result holds the new pseudonym routing ID and not the old one.",
-        "The query runs `dispatch_query` \u2192 actor mailbox \u2192 `handlers/push.rs` \u2192 `push_helpers.rs`.",
+        "the result contains this device's current local pseudonym routing ID for each context; after the local pseudonym changes, the next query returns the new one and not the old one",
+        "The query runs `dispatch_push_command` \u2192 actor mailbox \u2192 `handlers/push.rs` \u2192 `push_helpers.rs`.",
         "`pipeline_wiring.rs` asserts that step."
       ],
       "actionItems": [
@@ -836,7 +839,7 @@
         "Add the `pipeline_wiring.rs` assertion."
       ],
       "blockedBy": [
-        "PUSH-004"
+        "PUSH-025"
       ],
       "sources": [
         {
@@ -1489,7 +1492,7 @@
       "gate": "gate-push-client",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/context/actor/state.rs",
         "crates/scp-runtime/src/context/state.rs",

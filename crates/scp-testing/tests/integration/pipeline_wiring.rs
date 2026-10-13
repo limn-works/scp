@@ -183,6 +183,11 @@ const HANDLERS_BROADCAST_SRC: &str =
 // `actor_owned_timer_arms_reconcile_from_state`.
 const ACTOR_MOD_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context/actor/mod.rs");
 
+// Push handler source — owns `handlers::push::dispatch`, the mailbox step of
+// the PUSH-013 push routing-ID query (§10.7.1).
+const HANDLERS_PUSH_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/push.rs");
+
 // UCAN validation pipeline source — owns `validate_ucan`, the 11-step
 // capability authorization gate. The `ucan_step8_enforces_ceiling_over_all_att`
 // assertion below pins step 8 to checking the FULL parsed attestation set
@@ -1007,6 +1012,49 @@ fn gated_broadcast_subscribe_builds_real_validation_context() {
         fn_body_contains(MANAGER_SRC, "handle_broadcast_key_request", "is_banned("),
         "broadcast_helpers::handle_broadcast_key_request must consult the durable ban \
          record via bc.is_banned(...) before granting a broadcast key (BLACK-303)"
+    );
+}
+
+// PUSH-013 (§10.7.1): the push routing-ID query runs
+// `Supervisor::push_routing_ids` → `dispatch_push_command` → actor mailbox →
+// `handlers::push::dispatch` → `push_helpers::push_routes`.
+#[test]
+fn push_routing_ids_reach_push_helpers_through_the_actor_mailbox() {
+    assert!(
+        fn_body_contains(SUPERVISOR_SRC, "push_routing_ids", "dispatch_push_command("),
+        "Supervisor::push_routing_ids must ask each actor through dispatch_push_command"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "push_routing_ids",
+            "self.known_context_ids()"
+        ),
+        "Supervisor::push_routing_ids must enumerate known_context_ids, so a context whose actor is down fails the query"
+    );
+    assert!(
+        fn_body_contains(SUPERVISOR_SRC, "push_routing_ids", "canonical_relay_url("),
+        "Supervisor::push_routing_ids must group by the canonical relay URL"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "dispatch_push_command",
+            "dispatch_via_mailbox(&actor, ContextCommand::Push(cmd))"
+        ),
+        "dispatch_push_command must send ContextCommand::Push through the actor mailbox"
+    );
+    assert!(
+        fn_body_contains(ACTOR_MOD_SRC, "dispatch_state", "handlers::push::dispatch("),
+        "the actor's dispatch_state must route ContextCommand::Push to handlers::push::dispatch"
+    );
+    assert!(
+        fn_body_contains(
+            HANDLERS_PUSH_SRC,
+            "dispatch",
+            "push_helpers::push_routes(state)"
+        ),
+        "handlers::push::dispatch must answer PushCommand::Routes from push_helpers::push_routes"
     );
 }
 
