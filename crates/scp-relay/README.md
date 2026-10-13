@@ -17,7 +17,7 @@ A listed platform needs `SCP_RELAY_PUSH_STORE=sqlite` and an absolute `SCP_RELAY
 
 A missing or invalid variable exits 1 with an error naming it. Credentials load only from files that grant nothing to their group or to others (`chmod 600`), and no log line carries key bytes. One relay serves one Apple team, topic and environment, and one Firebase project.
 
-This build validates a push configuration and then exits 1 on any value but `none`, because the relay's push role is not built yet. The relay operations guide (`docs/guides/relay-operations.md`, section 3) has the full table.
+With a platform listed, the relay opens its SQLite push store at `SCP_RELAY_PUSH_STORE_PATH` before it opens its blob store, and exits 1 when the store cannot open. It verifies each registration's signature through the key-event-log verifier, which refuses every registration with `5003` until that verifier's key-state resolution is built. The relay operations guide (`docs/guides/relay-operations.md`, section 3) has the full table.
 
 ## License
 

@@ -30,8 +30,8 @@ fn node_command() -> Command {
 
 /// PUSH-012: a `--relay-only` node selects push as `scp-relay` does, so an
 /// unset `SCP_RELAY_PUSH_PLATFORMS` makes it exit 1 naming the variable and
-/// SCP-CAPSEL-8000 before it opens its blob store, and a push platform it
-/// cannot serve makes it exit 1 too.
+/// SCP-CAPSEL-8000 before it opens its blob store, and a push platform with no
+/// push store makes it exit 1 too.
 #[test]
 fn relay_only_requires_a_push_selection() {
     let tmp = tempfile::tempdir().expect("tempdir");

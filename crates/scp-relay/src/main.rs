@@ -39,8 +39,9 @@
 //! no default either: unset or empty exits 1 under SCP-CAPSEL-8000. A listed
 //! platform needs its push store and credential files, read by
 //! [`startup::push_selection_from_env`]; any missing or invalid one exits 1
-//! naming its variable. This build serves only `none` and exits 1 on any
-//! platform, because the relay's push role is not built yet.
+//! naming its variable. A listed platform opens the SQLite push store at
+//! `SCP_RELAY_PUSH_STORE_PATH` and wires the production `KelPushVerifier`; a
+//! store that cannot open exits 1 (SCP-CAPSEL-8001).
 //!
 //! See §10.5 and §10.7.1 of the SCP infrastructure spec.
 

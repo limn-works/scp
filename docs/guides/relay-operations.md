@@ -158,7 +158,7 @@ Credentials load only from files, never from an environment value. Each credenti
 
 One relay serves one Apple team, topic and APNs environment, and one Firebase project.
 
-This build validates the whole push configuration and then exits 1 with `this relay build cannot serve push yet` for any value other than `none`: the relay's push role, which serves registrations and sends wakes, is not built yet (story PUSH-007). Set `SCP_RELAY_PUSH_PLATFORMS=none` until it is.
+With a platform listed, the relay opens the SQLite push store at `SCP_RELAY_PUSH_STORE_PATH` before it opens its blob store and serves its reserved push routing ID through the push gate. A store that cannot open exits 1 with `SCP_RELAY_PUSH_STORE=sqlite cannot open the push store at SCP_RELAY_PUSH_STORE_PATH='<path>' ... (SCP-CAPSEL-8001)`, and nothing falls back to another store. The relay verifies each registration's signature against the registrant's key-event log; until that verifier's key-state resolution is built, it refuses every registration with `5003` `PUSH_VERIFIER_UNAVAILABLE` and stores none.
 
 ### Node-specific configuration
 

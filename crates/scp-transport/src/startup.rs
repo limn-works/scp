@@ -24,7 +24,9 @@ use tracing_subscriber::EnvFilter;
 
 use crate::native::server::{RelayConfig, RelayError};
 use crate::native::storage::{BlobStorageBackend, StorageError};
-use crate::relay::push_gate::RelayUrl;
+use crate::relay::push::PushSender;
+use crate::relay::push_gate::{PushRole, PushServiceConfig, RelayUrl};
+use crate::relay::push_store::{PushRegistrationStore, PushStoreError};
 
 /// The variable that names the relay's blob storage backend.
 const BACKEND_VAR: &str = "SCP_RELAY_STORAGE_BACKEND";
@@ -961,16 +963,20 @@ pub enum PushStartupError {
         /// The sender's refusal.
         error: crate::relay::push::PushSenderError,
     },
-    /// The relay cannot yet serve the push platforms the operator named. The
-    /// configuration is valid, but the relay has no push role to hand it to,
-    /// so it fails closed instead of starting a relay that ignores push.
-    // Stub — see PUSH-012: the relay's push role (`RelayConfig.push`, built by
-    // PUSH-007) and the `KelPushVerifier` it wires replace this refusal.
+    /// The push store the operator selected cannot be opened at the path
+    /// `SCP_RELAY_PUSH_STORE_PATH` names. Nothing falls back to another store
+    /// (SCP-CAPSEL-8001: a selection that cannot be satisfied is terminal).
     #[error(
-        "{PUSH_PLATFORMS_VAR} names a push platform, and this relay build cannot serve push yet; \
-         set {PUSH_PLATFORMS_VAR}=none (SCP-CAPSEL-8001)"
+        "{PUSH_STORE_VAR}=sqlite cannot open the push store at {PUSH_STORE_PATH_VAR}='{}': {error} \
+         (SCP-CAPSEL-8001)",
+        path.display()
     )]
-    NotServed,
+    StoreOpen {
+        /// The path the store failed to open.
+        path: PathBuf,
+        /// The store's refusal.
+        error: PushStoreError,
+    },
 }
 
 impl PushStartupError {
@@ -999,7 +1005,7 @@ impl PushStartupError {
             | Self::CredentialPermissions { .. }
             | Self::CredentialFile { .. }
             | Self::Sender { .. }
-            | Self::NotServed => "SCP-CAPSEL-8001",
+            | Self::StoreOpen { .. } => "SCP-CAPSEL-8001",
         }
     }
 }
@@ -1370,19 +1376,55 @@ fn check_owner_only(
     })
 }
 
-/// Refuses an enabled push selection, because this relay has no push role to
-/// serve it with yet.
+/// Builds the relay's push role from `selection`.
+///
+/// [`PushSelection::Disabled`] yields [`PushRole::Disabled`]. An enabled
+/// selection opens the SQLite push registration store at its path, wires the
+/// production `KelPushVerifier` (spec §10.7.1 step 3, PUSH-005) and the
+/// senders the selection built, and yields [`PushRole::Enabled`]. No other
+/// store arm is reachable: the in-memory arm compiles only under the
+/// `testing` feature (persistence spec §17.17.2).
 ///
 /// # Errors
 ///
-/// [`PushStartupError::NotServed`] for [`PushSelection::Enabled`].
-// Stub — see PUSH-012: once PUSH-007 adds `RelayConfig.push`, an enabled
-// selection becomes `PushRole::Enabled` with the opened store, these senders
-// and `KelPushVerifier`, and this refusal goes away.
-pub fn require_push_servable(selection: &PushSelection) -> Result<(), StartupError> {
-    match selection {
-        PushSelection::Disabled => Ok(()),
-        PushSelection::Enabled(_) => Err(PushStartupError::NotServed.into()),
+/// [`PushStartupError::StoreOpen`] when the store cannot be opened or its
+/// schema cannot be applied. Nothing falls back to another store
+/// (SCP-CAPSEL-8001).
+pub fn push_role_from(selection: PushSelection) -> Result<PushRole, StartupError> {
+    let PushBackends { store, apns, fcm } = match selection {
+        PushSelection::Disabled => return Ok(PushRole::Disabled),
+        PushSelection::Enabled(backends) => *backends,
+    };
+    let store = match store {
+        PushStoreChoice::Sqlite { path } => match PushRegistrationStore::open_sqlite(&path) {
+            Ok(store) => store,
+            Err(error) => return Err(PushStartupError::StoreOpen { path, error }.into()),
+        },
+    };
+    let senders: Vec<PushSender> = apns
+        .map(PushSender::Apns)
+        .into_iter()
+        .chain(fcm.map(PushSender::Fcm))
+        .collect();
+    Ok(PushRole::Enabled(PushServiceConfig {
+        store,
+        verifier: Arc::new(scp_identity::push_verify::KelPushVerifier),
+        senders: Arc::from(senders),
+    }))
+}
+
+/// Logs the push role a relay starts with. No field carries a credential.
+pub fn log_push_role(role: &PushRole) {
+    match role {
+        PushRole::Disabled => tracing::info!("push: none (SCP_RELAY_PUSH_PLATFORMS=none)"),
+        PushRole::Enabled(service) => {
+            let platforms: Vec<String> = service
+                .senders
+                .iter()
+                .map(|sender| sender.platform().to_string())
+                .collect();
+            tracing::info!(platforms = ?platforms, "push: enabled with the sqlite push store");
+        }
     }
 }
 
@@ -1400,10 +1442,10 @@ pub fn require_push_servable(selection: &PushSelection) -> Result<(), StartupErr
 /// # Errors
 ///
 /// Every error [`relay_config_from_env`], [`push_selection_from_env`],
-/// [`require_push_servable`] and [`storage_from_env`] return, and
+/// [`push_role_from`] and [`storage_from_env`] return, and
 /// [`StartupError::Relay`] when the relay cannot bind its address. The push
-/// selection is read before the blob store opens, so a push refusal leaves no
-/// store behind.
+/// selection is read before any store opens, so a push configuration refusal
+/// leaves no store behind; the push store opens before the blob store.
 pub async fn start_relay_from_env(
     backend: BackendChoice,
 ) -> Result<
@@ -1414,7 +1456,7 @@ pub async fn start_relay_from_env(
     ),
     StartupError,
 > {
-    let config = relay_config_from_env()?;
+    let mut config = relay_config_from_env()?;
     tracing::info!(
         bind_addr = %config.bind_addr,
         max_blob_size = config.max_blob_size,
@@ -1422,9 +1464,8 @@ pub async fn start_relay_from_env(
         "starting relay"
     );
 
-    let push = push_selection_from_env()?;
-    require_push_servable(&push)?;
-    tracing::info!("push: none (SCP_RELAY_PUSH_PLATFORMS=none)");
+    config.push = push_role_from(push_selection_from_env()?)?;
+    log_push_role(&config.push);
 
     let storage = Arc::new(storage_from_env(backend).await?);
     let server = crate::native::server::RelayServer::new(config, Arc::clone(&storage));
@@ -1815,10 +1856,11 @@ mod push_tests {
         APNS_ENVIRONMENT_VAR, APNS_KEY_ID_VAR, APNS_KEY_PATH_VAR, APNS_TEAM_ID_VAR, APNS_TOPIC_VAR,
         FCM_PROJECT_ID_VAR, FCM_SERVICE_ACCOUNT_PATH_VAR, MAX_CREDENTIAL_FILE_BYTES,
         PUSH_PLATFORMS_VAR, PUSH_STORE_PATH_VAR, PUSH_STORE_VAR, PushPlatforms, PushSelection,
-        PushStartupError, PushStoreChoice, StartupError, parse_push_platforms, push_selection_from,
-        require_push_servable,
+        PushStartupError, PushStoreChoice, StartupError, parse_push_platforms, push_role_from,
+        push_selection_from,
     };
     use crate::relay::log_capture::LogCapture;
+    use crate::relay::push_gate::PushRole;
 
     /// The P-256 `AlgorithmIdentifier` (id-ecPublicKey, prime256v1).
     const P256_ALGORITHM_ID: [u8; 19] = [
@@ -1998,7 +2040,10 @@ mod push_tests {
             .unwrap();
             assert!(matches!(selection, PushSelection::Disabled));
             assert_eq!(*read.borrow(), vec![PUSH_PLATFORMS_VAR]);
-            require_push_servable(&selection).unwrap();
+            assert!(matches!(
+                push_role_from(selection).unwrap(),
+                PushRole::Disabled
+            ));
         }
     }
 
@@ -2324,8 +2369,8 @@ mod push_tests {
     }
 
     /// Criteria 4 and 5 together: a complete `apns,fcm` environment yields
-    /// both production senders and the SQLite store choice, and the relay
-    /// refuses to start with it until it can serve push.
+    /// both production senders and the SQLite store choice, and parsing it
+    /// opens no store.
     #[test]
     fn a_complete_environment_builds_both_senders() {
         let dir = tempfile::tempdir().unwrap();
@@ -2344,13 +2389,141 @@ mod push_tests {
         assert!(backends.fcm.is_some());
         // The parse opens no store.
         assert!(!dir.path().join("push.sqlite").exists());
+    }
 
-        let Err(StartupError::Push(error)) = require_push_servable(&selection) else {
-            panic!("an enabled selection must be refused until the relay serves push");
+    /// Criterion 6 and PUSH-012's store wiring: `SCP_RELAY_PUSH_STORE=sqlite`
+    /// opens the SQLite store at `SCP_RELAY_PUSH_STORE_PATH`, wires
+    /// `KelPushVerifier` and both senders, and a relay started with that role
+    /// serves its reserved push routing ID through the push gate (a disabled
+    /// relay answers `4063` there). A registration written through the
+    /// relay's store is read back after the relay stops and the file reopens.
+    #[tokio::test]
+    async fn sqlite_push_store_opens_at_its_path_and_serves_the_relay() {
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        use futures::{SinkExt as _, StreamExt as _};
+        use scp_protocol::discovery::push::PushPlatform;
+        use scp_relay_client::{ClientMessage, RelayMessage, code};
+        use tokio_tungstenite::tungstenite::Message;
+
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::relay::push_gate::RelayUrl;
+        use crate::relay::push_store::{
+            PushRegistrationKey, PushRegistrationRecord, PushRegistrationStore,
         };
-        assert!(matches!(error, PushStartupError::NotServed));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("push.sqlite");
+        let env = Env::full(dir.path());
+        let role = push_role_from(env.parse().unwrap()).unwrap();
+        assert!(
+            path.exists(),
+            "the push store was not opened at {}",
+            path.display()
+        );
+        let PushRole::Enabled(service) = &role else {
+            panic!("expected push enabled: {role:?}");
+        };
+        assert!(
+            format!("{:?}", service.verifier).contains("KelPushVerifier"),
+            "{:?}",
+            service.verifier
+        );
+        let platforms: Vec<PushPlatform> = service
+            .senders
+            .iter()
+            .map(super::PushSender::platform)
+            .collect();
+        assert_eq!(platforms, vec![PushPlatform::Apns, PushPlatform::Fcm]);
+        let relays_store = service.store.clone();
+
+        let relay_url = RelayUrl::new("wss://relay.example/scp/v1").unwrap();
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            relay_url: Some(relay_url.clone()),
+            push: role,
+            ..RelayConfig::default()
+        };
+        let server = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()));
+        let (handle, addr) = server.start().await.unwrap();
+
+        // A malformed push message reaches the push gate, which refuses it
+        // with a push code; a relay whose role was dropped would answer 4063.
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/scp/v1"))
+            .await
+            .unwrap();
+        let (mut sink, mut stream) = ws.split();
+        let publish = ClientMessage::Publish {
+            ref_id: Some("push".to_owned()),
+            routing_id: relay_url.push_routing_id(),
+            recipient_hint: None,
+            blob_ttl: 3600,
+            blob: vec![0xC1],
+        };
+        sink.send(Message::Binary(publish.to_bytes().unwrap()))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Message::Binary(bytes) = frame else {
+            panic!("expected a binary frame, got {frame:?}");
+        };
+        match RelayMessage::from_bytes(&bytes).unwrap() {
+            RelayMessage::Err { code: reply, .. } => assert_ne!(
+                reply,
+                code::PUSH_NOT_SUPPORTED,
+                "the relay did not receive its push role"
+            ),
+            other => panic!("expected the push gate to refuse a malformed message: {other:?}"),
+        }
+
+        let record = PushRegistrationRecord {
+            registrant: "did:dht:alice".to_owned(),
+            platform: PushPlatform::Apns,
+            token: b"device-token".to_vec(),
+            routing_ids: vec![[7; 32]],
+            timestamp: 1_700_000_000,
+        };
+        let key: PushRegistrationKey = record.key();
+        relays_store.upsert(record.clone()).await.unwrap();
+
+        handle.shutdown();
+        drop(relays_store);
+        drop(sink);
+        drop(stream);
+
+        let reopened = PushRegistrationStore::open_sqlite(&path).unwrap();
+        assert_eq!(reopened.get(&key).await.unwrap(), Some(record));
+    }
+
+    /// A push store path that cannot be opened (its parent is a regular file)
+    /// is the typed `StoreOpen` refusal under SCP-CAPSEL-8001, naming the
+    /// store variables, and nothing else is opened in its place.
+    #[test]
+    fn an_unopenable_push_store_path_is_a_typed_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = write_file(dir.path(), "not-a-directory", b"x", 0o600);
+        let path = blocker.join("push.sqlite");
+        let mut env = Env::full(dir.path());
+        env.set(PUSH_STORE_PATH_VAR, &path);
+        let result = push_role_from(env.parse().unwrap());
+        let Err(StartupError::Push(error)) = result else {
+            panic!("expected a push refusal, got {result:?}");
+        };
+        let PushStartupError::StoreOpen { path: refused, .. } = &error else {
+            panic!("expected StoreOpen, got {error:?}");
+        };
+        assert_eq!(refused, &path);
         assert_eq!(error.rule(), "SCP-CAPSEL-8001");
-        assert!(error.to_string().contains(PUSH_PLATFORMS_VAR));
+        let message = error.to_string();
+        assert!(message.contains(PUSH_STORE_VAR), "{message}");
+        assert!(message.contains(PUSH_STORE_PATH_VAR), "{message}");
+        assert!(!path.exists());
     }
 
     /// The fragments of a credential that must never appear in a log line or
@@ -2415,15 +2588,16 @@ mod push_tests {
         );
         env.set(FCM_SERVICE_ACCOUNT_PATH_VAR, p8_as_sa);
         refusals.push(env.parse().unwrap_err());
-        let require = require_push_servable(&selection).unwrap_err();
-        drop(selection);
+        let role = push_role_from(selection).unwrap();
+        let role_printed = format!("{role:?} {role:#?}");
+        drop(role);
 
         let logs = capture.contents();
         assert!(logs.contains("apns push credentials loaded"), "{logs}");
         assert!(logs.contains("fcm push credentials loaded"), "{logs}");
         assert_no_secret(&logs, &fragments);
         assert_no_secret(&printed, &fragments);
-        assert_no_secret(&format!("{require} {require:?}"), &fragments);
+        assert_no_secret(&role_printed, &fragments);
         for refusal in &refusals {
             assert_no_secret(&format!("{refusal} {refusal:?}"), &fragments);
         }

@@ -18,7 +18,10 @@
 # features that compile those two backends (ADR-062, capability injection,
 # §Enforcement G1); and optional transport features that no shipped build enables,
 # such as `scp-node/quic`, `scp-node/upnp`, `scp-transport/quic` and
-# `scp-transport/upnp`. Any resolved SCP-crate
+# `scp-transport/upnp`. The list admits `scp-transport/push-store`, a
+# real-backend feature: it compiles the relay's SQLite push registration store
+# (spec §10.7.1, §17.17.2), and that store's in-memory arm compiles only under
+# `scp-transport/testing`, which this list does not admit. Any resolved SCP-crate
 # feature that is NOT on this allowlist — named or novel, present or future —
 # FAILS this gate. This gate's soundness invariant — shipped-graph
 # feature-absence ≡ nullifier-type absence — holds for every `testing`-gated
@@ -274,6 +277,7 @@ scp-relay-client/default
 scp-runtime/default
 scp-sqlite-pools/default
 scp-transport/default
+scp-transport/push-store
 scp-transport/redb-blob
 scp-transport/sqlite-blob
 scp-transport/startup
