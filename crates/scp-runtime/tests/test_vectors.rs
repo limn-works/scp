@@ -1214,7 +1214,7 @@ fn vector_59_challenge_request() {
 #[test]
 fn vector_60_challenge_verification() {
     let preimage = assert_challenge_verification_vector(
-        "vector 59",
+        "vector 60",
         &VerificationVectorInput {
             timestamp: 1_700_000_000,
             passed: true,
@@ -1235,7 +1235,7 @@ fn vector_60_challenge_verification() {
 #[test]
 fn vector_61_challenge_verification_absent_optionals() {
     let preimage = assert_challenge_verification_vector(
-        "vector 60",
+        "vector 61",
         &VerificationVectorInput {
             timestamp: 1_700_000_060,
             passed: false,
@@ -1256,12 +1256,12 @@ fn vector_61_challenge_verification_absent_optionals() {
         .match_indices(ABSENT_SENTINEL_HEX)
         .map(|(i, _)| i)
         .collect();
-    assert_eq!(copies.len(), 2, "vector 60: sentinel copies");
+    assert_eq!(copies.len(), 2, "vector 61: sentinel copies");
     for at in copies {
         assert_eq!(
             &preimage_hex[at - 8..at],
             "00000020",
-            "vector 60: sentinel at {at} lacks its length word"
+            "vector 61: sentinel at {at} lacks its length word"
         );
     }
 }

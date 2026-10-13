@@ -352,6 +352,24 @@ pub enum TrustError {
         max_secs: u64,
     },
 
+    /// The record's `timestamp` is later than the verifier's clock plus the
+    /// clock-skew tolerance of `09-security-model.md` §9.14 (spec 07 §7.3.4).
+    /// Without this bound a record stamped years ahead would pass the 90-day
+    /// validity cap and stay unexpired for years.
+    #[error(
+        "challenge verification {verification_id}: timestamp {timestamp} is later than now {now} plus the {skew_secs}s clock-skew tolerance"
+    )]
+    ChallengeVerificationFromFuture {
+        /// The record's `verification_id` (lowercase hex).
+        verification_id: String,
+        /// The record's `timestamp`, in Unix seconds.
+        timestamp: u64,
+        /// The verifier's clock, in Unix seconds.
+        now: u64,
+        /// The clock-skew tolerance, in seconds (5 minutes).
+        skew_secs: u64,
+    },
+
     /// A public key could not be resolved because every resolution layer was
     /// unreachable. This is an infrastructure fault, not a judgement on the
     /// credential being verified: a caller retries, and a verify-on-ingest
@@ -474,7 +492,8 @@ impl TrustError {
     ///
     /// `true` means the caller-supplied record is itself invalid (a bad
     /// signature, expired, revoked, a malformed revocation or evidence, the
-    /// wrong context or subject, an underived id, an over-long validity, or
+    /// wrong context or subject, an underived id, an over-long validity, a
+    /// timestamp beyond the clock-skew tolerance, or
     /// bytes that cannot be canonicalized): a verify-on-ingest or read-path
     /// loop drops that record and continues. `false` means an infrastructure
     /// fault (store failure, unreachable key resolution) or an error no record
@@ -497,6 +516,7 @@ impl TrustError {
             | Self::ChallengeSubjectMismatch { .. }
             | Self::ChallengeVerificationIdMismatch { .. }
             | Self::ChallengeVerificationValidityTooLong { .. }
+            | Self::ChallengeVerificationFromFuture { .. }
             | Self::CanonicalizationFailed { .. } => true,
             // `InvalidEventData` and `ChallengeSigningFailed` are excluded on
             // purpose: no record-verification path raises them, so treating

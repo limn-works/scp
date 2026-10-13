@@ -466,6 +466,16 @@ pub fn lookup_protocol_capability(uri: &str) -> Option<&'static RegistryEntry> {
     PROTOCOL_REGISTRY.get(uri)
 }
 
+/// Every protocol capability URI with its entry, for tests that cover the
+/// whole registry.
+#[cfg(test)]
+pub(crate) fn protocol_capabilities() -> impl Iterator<Item = (&'static str, &'static RegistryEntry)>
+{
+    PROTOCOL_REGISTRY
+        .iter()
+        .map(|(uri, entry)| (uri.as_str(), entry))
+}
+
 /// Looks up a system capability by its full URI string.
 ///
 /// Returns `Some(&RegistryEntry)` if the URI matches a known system

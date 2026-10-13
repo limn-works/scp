@@ -1200,12 +1200,16 @@ pub fn verify_challenge_response(
 ///    fields, else [`TrustError::ChallengeVerificationIdMismatch`];
 /// 3. `expires_at - timestamp` is at most 90 days, else
 ///    [`TrustError::ChallengeVerificationValidityTooLong`];
-/// 4. the signed `subject` is `expected_subject`, else
+/// 4. `timestamp` is at most `now` plus the 5-minute clock-skew tolerance of
+///    `09-security-model.md` §9.14, else
+///    [`TrustError::ChallengeVerificationFromFuture`], so the 90-day cap
+///    bounds validity in real time;
+/// 5. the signed `subject` is `expected_subject`, else
 ///    [`TrustError::ChallengeSubjectMismatch`];
-/// 5. the signed `context_id` is `Some(target_context_id)`, else
+/// 6. the signed `context_id` is `Some(target_context_id)`, else
 ///    [`TrustError::ChallengeContextMismatch`]; a genuine record minted for
 ///    another context, or for none, is not replayable here;
-/// 6. `expires_at > now`, else [`TrustError::ChallengeVerificationExpired`].
+/// 7. `expires_at > now`, else [`TrustError::ChallengeVerificationExpired`].
 ///
 /// # Errors
 ///
@@ -1251,6 +1255,16 @@ pub fn verify_challenge_verification(
         });
     }
 
+    let now = clock.now_secs();
+    if verification.timestamp > now.saturating_add(MAX_COMPLETION_FUTURE_SKEW_SECS) {
+        return Err(TrustError::ChallengeVerificationFromFuture {
+            verification_id: id_hex,
+            timestamp: verification.timestamp,
+            now,
+            skew_secs: MAX_COMPLETION_FUTURE_SKEW_SECS,
+        });
+    }
+
     if verification.subject != expected_subject {
         return Err(TrustError::ChallengeSubjectMismatch {
             verification_id: id_hex,
@@ -1267,7 +1281,6 @@ pub fn verify_challenge_verification(
         });
     }
 
-    let now = clock.now_secs();
     if verification.expires_at <= now {
         return Err(TrustError::ChallengeVerificationExpired {
             verification_id: id_hex,
@@ -1605,6 +1618,58 @@ mod tests {
     fn unsigned_identifier_scoped_uri_has_no_protocol_minimum() {
         let uri = format!("{TEST_DEFINER}:capability:schema-validation/v1");
         unsigned(&uri, cases(1)).unwrap();
+    }
+
+    /// Each of the 28 protocol capability URIs, spanning all 10 categories,
+    /// refuses a suite one case below its §7.3.4.3 minimum, issues at the
+    /// minimum, and its response checks into a record for that URI.
+    #[test]
+    fn every_protocol_capability_challenges_at_its_minimum() {
+        let f = fixture();
+        let mut categories = HashSet::new();
+        let mut seen = 0;
+        for (uri, entry) in super::super::capability_registry::protocol_capabilities() {
+            seen += 1;
+            categories.insert(entry.category.as_str());
+            let standard = entry
+                .challenge
+                .expect("a protocol capability has a standard");
+            let (at_minimum, below) = match standard.min_cases {
+                MinCases::Total(n) => {
+                    let n = usize::try_from(n).unwrap();
+                    assert!(n >= 2, "{uri}: a one-case minimum has no suite below it");
+                    (cases(n), cases(n - 1))
+                }
+                MinCases::PerCategory(n) => {
+                    let n = usize::try_from(n).unwrap();
+                    (
+                        cases_in(&[("en", n), ("fr", n)]),
+                        cases_in(&[("en", n), ("fr", n - 1)]),
+                    )
+                }
+            };
+            let err = unsigned(uri, below).unwrap_err();
+            assert!(
+                matches!(&err, TrustError::ChallengeSuiteBelowMinimum { uri: u, .. } if u == uri),
+                "{uri}: {err:?}"
+            );
+            let count = u32::try_from(at_minimum.len()).unwrap();
+            let request = unsigned(uri, at_minimum).unwrap();
+            let signature = f.verifier.sign(&request.signing_digest()).unwrap();
+            let request = request.with_verifier_signature(signature);
+            let response = respond(
+                &f,
+                &request,
+                json!({"test_count": count, "pass_count": count, "passed": true, "score": 10_000}),
+            );
+            let record = check(&f, &request, &response)
+                .unwrap_or_else(|e| panic!("{uri}: {e:?}"))
+                .with_verifier_signature(Vec::new());
+            assert_eq!(record.capability_uri, uri);
+            assert_eq!(record.test_count, count, "{uri}");
+        }
+        assert_eq!(seen, 28);
+        assert_eq!(categories.len(), 10);
     }
 
     #[test]
@@ -2260,6 +2325,46 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// A record stamped ten years ahead with a 90-day validity passes the
+    /// validity cap, so only the future-timestamp bound rejects it.
+    #[test]
+    fn verify_rejects_timestamp_beyond_clock_skew() {
+        const TEN_YEARS: u64 = 10 * 365 * 24 * 60 * 60;
+        let f = fixture();
+        let now = f.clock.now_secs();
+        for (timestamp, rejected) in [
+            (now + TEN_YEARS, true),
+            (now + MAX_COMPLETION_FUTURE_SKEW_SECS + 1, true),
+            (now + MAX_COMPLETION_FUTURE_SKEW_SECS, false),
+        ] {
+            let mut record = signed_record(&f);
+            record.timestamp = timestamp;
+            record.expires_at = timestamp + DEFAULT_VERIFICATION_TTL_SECS;
+            record.verification_id = challenge_verification_id(
+                &record.verifier,
+                &record.subject,
+                &record.capability_uri,
+                timestamp,
+            )
+            .unwrap();
+            let result = verify(&f, &resign(&f, record));
+            if rejected {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(
+                        &err,
+                        TrustError::ChallengeVerificationFromFuture { timestamp: t, now: n, skew_secs, .. }
+                        if *t == timestamp && *n == now && *skew_secs == MAX_COMPLETION_FUTURE_SKEW_SECS
+                    ),
+                    "{err:?}"
+                );
+                assert!(err.is_record_rejection());
+            } else {
+                result.unwrap();
+            }
+        }
     }
 
     #[test]

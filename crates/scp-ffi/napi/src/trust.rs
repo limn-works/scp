@@ -243,16 +243,15 @@ fn run_verify_attestation<S: scp_platform::traits::Storage + 'static>(
 }
 
 /// Maps a shared challenge-operation failure to its bridge error:
-/// `test_cases_json` that does not parse is `VALID_7002`, a protocol refusal
+/// a JSON argument that does not parse is `VALID_7002`, a protocol refusal
 /// takes the `TrustError` mapping, and a signer failure the `ContextError`
 /// mapping.
 fn challenge_op_error(e: scp_ffi_common::challenge::ChallengeOpError) -> napi::Error {
     use scp_ffi_common::challenge::ChallengeOpError;
     match e {
-        ChallengeOpError::MalformedTestCases(reason) => coded_validation_error(
-            &format!("failed to parse test_cases_json: {reason}"),
-            codes::VALID_7002,
-        ),
+        e @ ChallengeOpError::MalformedJson { .. } => {
+            coded_validation_error(&e.to_string(), codes::VALID_7002)
+        }
         ChallengeOpError::Trust(e) => napi::Error::from(ScpNapiError::from(e)),
         ChallengeOpError::Sign(e) => napi::Error::from(ScpNapiError::from(e)),
     }
@@ -342,23 +341,8 @@ pub(crate) async fn trust_verify_response_on(
             codes::VALID_7011,
         ));
     }
-    // VALID_7016 (challenge position) / VALID_7017 (response position) match
-    // the UniFFI bridge's per-case codes for malformed JSON.
-    let request: scp_core::trust::ChallengeRequest = serde_json::from_str(&challenge_json)
-        .map_err(|e| {
-            coded_validation_error(
-                &format!("failed to parse challenge JSON: {e}"),
-                codes::VALID_7016,
-            )
-        })?;
-    let response: scp_core::trust::ChallengeResponse = serde_json::from_str(&response_json)
-        .map_err(|e| {
-            coded_validation_error(
-                &format!("failed to parse response JSON: {e}"),
-                codes::VALID_7017,
-            )
-        })?;
-
+    let inputs = scp_ffi_common::challenge::VerifyInputs::decode(&challenge_json, &response_json)
+        .map_err(challenge_op_error)?;
     let resolver =
         crate::runtime::did_resolver(bi)
             .cloned()
@@ -374,8 +358,7 @@ pub(crate) async fn trust_verify_response_on(
         &signer,
         resolver,
         verifier.into(),
-        request,
-        response,
+        inputs,
         context_id,
     )
     .await
@@ -927,7 +910,7 @@ mod tests {
             "ctx".to_owned(),
         )
         .await;
-        assert_code(result, codes::VALID_7016);
+        assert_code(result, codes::VALID_7002);
     }
 
     #[tokio::test]
@@ -942,7 +925,7 @@ mod tests {
             "ctx".to_owned(),
         )
         .await;
-        assert_code(result, codes::VALID_7017);
+        assert_code(result, codes::VALID_7002);
     }
 
     #[tokio::test]

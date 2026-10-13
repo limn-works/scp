@@ -16,12 +16,39 @@ use scp_core::trust::{
 };
 use scp_did::DID;
 
+/// The caller-supplied JSON argument of a challenge operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonInput {
+    /// `test_cases_json`: a JSON array of `TestCase`.
+    TestCases,
+    /// `challenge_json`: a signed `ChallengeRequest`.
+    Challenge,
+    /// `response_json`: a `ChallengeResponse`.
+    Response,
+}
+
+impl std::fmt::Display for JsonInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TestCases => "test_cases_json",
+            Self::Challenge => "challenge_json",
+            Self::Response => "response_json",
+        })
+    }
+}
+
 /// Why a challenge operation failed.
 #[derive(Debug, thiserror::Error)]
 pub enum ChallengeOpError {
-    /// `test_cases_json` is not a JSON array of test cases.
-    #[error("malformed test_cases_json: {0}")]
-    MalformedTestCases(String),
+    /// A caller-supplied JSON argument does not decode to its type. Every
+    /// bridge reports it as `SCP-VALID-7002`, whichever argument it is.
+    #[error("failed to parse {input}: {reason}")]
+    MalformedJson {
+        /// Which argument failed to decode.
+        input: JsonInput,
+        /// The decoder's message.
+        reason: String,
+    },
     /// The protocol refused the request, the response or the record.
     #[error(transparent)]
     Trust(#[from] TrustError),
@@ -38,7 +65,7 @@ pub enum ChallengeOpError {
 /// - [`ChallengeOpError::Sign`] with [`ContextError::CryptoFailed`] when the
 ///   signer is not Ed25519, checked before anything else so no custody call
 ///   is made; otherwise the custody failure from signing.
-/// - [`ChallengeOpError::MalformedTestCases`] when `test_cases_json` does not
+/// - [`ChallengeOpError::MalformedJson`] when `test_cases_json` does not
 ///   parse.
 /// - [`ChallengeOpError::Trust`] for every refusal of
 ///   [`challenge_request_unsigned`], including
@@ -52,16 +79,51 @@ pub async fn create_challenge(
     timeout_secs: u32,
 ) -> Result<ChallengeRequest, ChallengeOpError> {
     signer.require_ed25519()?;
-    let test_cases: Vec<TestCase> = serde_json::from_str(test_cases_json)
-        .map_err(|e| ChallengeOpError::MalformedTestCases(e.to_string()))?;
+    let test_cases: Vec<TestCase> =
+        decode(JsonInput::TestCases, serde_json::from_str(test_cases_json))?;
     let unsigned =
         challenge_request_unsigned(verifier, subject, capability_uri, test_cases, timeout_secs)?;
     let signature = sign_bounded(signer, &unsigned.signing_digest()).await?;
     Ok(unsigned.with_verifier_signature(signature.to_vec()))
 }
 
-/// Checks `response` against `request` and signs the resulting record with the
-/// verifier's `#active` key through `signer`.
+/// Names the `input` argument on a failed decode of it.
+fn decode<T>(input: JsonInput, parsed: serde_json::Result<T>) -> Result<T, ChallengeOpError> {
+    parsed.map_err(|e| ChallengeOpError::MalformedJson {
+        input,
+        reason: e.to_string(),
+    })
+}
+
+/// The decoded arguments of [`verify_response_and_sign`].
+///
+/// Only [`VerifyInputs::decode`] builds one, so every bridge decodes the
+/// caller's JSON here and reports a malformed argument with one code.
+#[derive(Debug)]
+pub struct VerifyInputs {
+    request: ChallengeRequest,
+    response: ChallengeResponse,
+}
+
+impl VerifyInputs {
+    /// Decodes the signed request in `challenge_json` and the response in
+    /// `response_json`. A bridge calls this before it resolves any identity,
+    /// so a malformed argument fails as such whoever the verifier is.
+    ///
+    /// # Errors
+    ///
+    /// [`ChallengeOpError::MalformedJson`] naming the first argument that
+    /// does not decode, the challenge before the response.
+    pub fn decode(challenge_json: &str, response_json: &str) -> Result<Self, ChallengeOpError> {
+        Ok(Self {
+            request: decode(JsonInput::Challenge, serde_json::from_str(challenge_json))?,
+            response: decode(JsonInput::Response, serde_json::from_str(response_json))?,
+        })
+    }
+}
+
+/// Checks the response in `inputs` against its request and signs the
+/// resulting record with the verifier's `#active` key through `signer`.
 ///
 /// `resolver` resolves the request's verifier key and the response's
 /// responder key. The bridges pass their instance's
@@ -81,14 +143,14 @@ pub async fn verify_response_and_sign<R>(
     signer: &CommandSigner,
     resolver: Arc<R>,
     verifier: DID,
-    request: ChallengeRequest,
-    response: ChallengeResponse,
+    inputs: VerifyInputs,
     context_id: String,
 ) -> Result<ChallengeVerification, ChallengeOpError>
 where
     R: DidPublicKeyResolver + Send + Sync + 'static,
 {
     signer.require_ed25519()?;
+    let VerifyInputs { request, response } = inputs;
     let unsigned = tokio::task::spawn_blocking(move || {
         check_challenge_response(
             &request,
@@ -222,6 +284,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_inputs_name_the_malformed_argument() {
+        let request = create_challenge(
+            &CommandSigner::local_ed25519(key(1)),
+            did(1),
+            did(2),
+            URI.to_owned(),
+            &cases_json(20),
+            300,
+        )
+        .await
+        .unwrap();
+        let challenge_json = serde_json::to_string(&request).unwrap();
+        for (challenge, response, expected) in [
+            ("{\"not\": \"a challenge\"}", "[1, 2]", JsonInput::Challenge),
+            (challenge_json.as_str(), "[1, 2]", JsonInput::Response),
+        ] {
+            let err = VerifyInputs::decode(challenge, response).unwrap_err();
+            assert!(
+                matches!(err, ChallengeOpError::MalformedJson { input, .. } if input == expected),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn verify_response_and_sign_rejects_p256_signer() {
         let (signer, signs) = p256_signer();
         let request = create_challenge(
@@ -245,8 +332,11 @@ mod tests {
             &signer,
             Arc::new(SeedResolver),
             did(1),
-            request,
-            response,
+            VerifyInputs::decode(
+                &serde_json::to_string(&request).unwrap(),
+                &serde_json::to_string(&response).unwrap(),
+            )
+            .unwrap(),
             "ctx".to_owned(),
         )
         .await
@@ -291,7 +381,13 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(err, ChallengeOpError::MalformedTestCases(_)),
+            matches!(
+                err,
+                ChallengeOpError::MalformedJson {
+                    input: JsonInput::TestCases,
+                    ..
+                }
+            ),
             "{err:?}"
         );
     }
@@ -351,8 +447,11 @@ mod tests {
             &CommandSigner::local_ed25519(key(1)),
             Arc::new(SeedResolver),
             did(1),
-            request,
-            response,
+            VerifyInputs::decode(
+                &serde_json::to_string(&request).unwrap(),
+                &serde_json::to_string(&response).unwrap(),
+            )
+            .unwrap(),
             "ctx-1".to_owned(),
         )
         .await

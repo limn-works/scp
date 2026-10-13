@@ -1480,7 +1480,7 @@ fn trust_verify_attestation_rejects_invalid_json() {
 }
 
 #[test]
-fn trust_verify_response_rejects_invalid_challenge_json_with_valid_7016() {
+fn trust_verify_response_rejects_invalid_challenge_json_with_valid_7002() {
     setup();
     Python::with_gil(|py| {
         let err = _scp_core::scp::PyScp::new_in_memory_for_test()
@@ -1492,7 +1492,7 @@ fn trust_verify_response_rejects_invalid_challenge_json_with_valid_7016() {
                 "ctx",
             )
             .unwrap_err();
-        assert!(err.to_string().contains("SCP-VALID-7016"), "{err}");
+        assert!(err.to_string().contains("SCP-VALID-7002"), "{err}");
     });
 }
 

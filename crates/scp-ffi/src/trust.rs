@@ -200,11 +200,9 @@ fn run_verify_attestation<S: scp_platform::EncryptedStorage + 'static>(
 fn challenge_op_error(e: scp_ffi_common::challenge::ChallengeOpError) -> PyErr {
     use scp_ffi_common::challenge::ChallengeOpError;
     match e {
-        ChallengeOpError::MalformedTestCases(reason) => coded_validation_error(
-            format!("failed to parse test_cases_json: {reason}"),
-            codes::VALID_7002,
-        )
-        .into(),
+        e @ ChallengeOpError::MalformedJson { .. } => {
+            coded_validation_error(e.to_string(), codes::VALID_7002).into()
+        }
         ChallengeOpError::Trust(e) => crate::error::ScpPyError::from(e).into(),
         ChallengeOpError::Sign(e) => crate::error::ScpPyError::from(e).into(),
     }
@@ -280,23 +278,8 @@ fn trust_verify_response_impl(
         )
         .into());
     }
-    // VALID_7016 (challenge position) / VALID_7017 (response position) match
-    // the UniFFI and napi bridges' per-case codes for malformed JSON.
-    let request: scp_core::trust::ChallengeRequest =
-        serde_json::from_str(challenge_json).map_err(|e| {
-            coded_validation_error(
-                format!("failed to parse challenge JSON: {e}"),
-                codes::VALID_7016,
-            )
-        })?;
-    let response: scp_core::trust::ChallengeResponse = serde_json::from_str(response_json)
-        .map_err(|e| {
-            coded_validation_error(
-                format!("failed to parse response JSON: {e}"),
-                codes::VALID_7017,
-            )
-        })?;
-
+    let inputs = scp_ffi_common::challenge::VerifyInputs::decode(challenge_json, response_json)
+        .map_err(challenge_op_error)?;
     let resolver = crate::runtime::did_resolver(bi).cloned().ok_or_else(|| {
         crate::error::ScpPyError::IdentityError {
             message: "DID resolver not initialized — create an identity with \
@@ -313,8 +296,7 @@ fn trust_verify_response_impl(
             &signer,
             resolver,
             verifier.into(),
-            request,
-            response,
+            inputs,
             context_id.to_owned(),
         ),
     )?
@@ -981,7 +963,7 @@ impl crate::scp::PyScp {
     ///
     /// - `SCP-VALID-7013` for an invalid verifier DID, `SCP-VALID-7011` for an
     ///   empty `context_id`.
-    /// - `SCP-VALID-7016` / `SCP-VALID-7017` for malformed challenge / response
+    /// - `SCP-VALID-7002` for a malformed challenge or response
     ///   JSON.
     /// - `SCP-IDENT-1033` when this instance has no DID resolver.
     /// - `SCP-VALID-7003` when the response is refused.
@@ -1353,7 +1335,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let result = default_scp().trust_verify_response(py, VALID_DID, "bad", "bad", "ctx");
-            assert_code(result, codes::VALID_7016);
+            assert_code(result, codes::VALID_7002);
         });
     }
 
@@ -1369,7 +1351,7 @@ mod tests {
                 "bad",
                 "ctx",
             );
-            assert_code(result, codes::VALID_7017);
+            assert_code(result, codes::VALID_7002);
         });
     }
 

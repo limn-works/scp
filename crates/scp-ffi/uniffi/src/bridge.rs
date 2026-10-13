@@ -6597,10 +6597,6 @@ async fn event_log_checkpoint_by_did_impl(
 // Free functions — governance proposal lifecycle (#621)
 // ---------------------------------------------------------------------------
 
-/// Resolves the raw Ed25519 signing key from a `UniFFI` `ContextHandle`.
-///
-/// Exports through the handle's single retained `custody`. Returns
-/// `ScpError::Context` if the handle holds no custody or no key handle.
 /// Builds the `#active` [`CommandSigner`](scp_core::context::actor::CommandSigner)
 /// over an `Identity`'s retained custody (ADR-049 Decision 7a). The private
 /// key stays in custody.
@@ -7631,8 +7627,8 @@ fn run_verify_attestation<S: scp_platform::traits::Storage + 'static>(
 fn challenge_op_error(e: scp_ffi_common::challenge::ChallengeOpError) -> ScpError {
     use scp_ffi_common::challenge::ChallengeOpError;
     match e {
-        ChallengeOpError::MalformedTestCases(reason) => ScpError::Validation {
-            msg: format!("failed to parse test_cases_json: {reason}"),
+        e @ ChallengeOpError::MalformedJson { .. } => ScpError::Validation {
+            msg: e.to_string(),
             code: codes::VALID_7002.to_owned(),
         },
         ChallengeOpError::Trust(e) => ScpError::from(e),
@@ -7699,19 +7695,8 @@ async fn trust_verify_response_impl(
             code: codes::VALID_7011.to_owned(),
         });
     }
-    // VALID_7016 (challenge position) / VALID_7017 (response position) match
-    // the napi and PyO3 bridges' per-case codes for malformed JSON.
-    let request: scp_core::trust::ChallengeRequest = serde_json::from_str(&challenge_json)
-        .map_err(|e| ScpError::Validation {
-            msg: format!("failed to parse challenge JSON: {e}"),
-            code: codes::VALID_7016.to_owned(),
-        })?;
-    let response: scp_core::trust::ChallengeResponse = serde_json::from_str(&response_json)
-        .map_err(|e| ScpError::Validation {
-            msg: format!("failed to parse response JSON: {e}"),
-            code: codes::VALID_7017.to_owned(),
-        })?;
-
+    let inputs = scp_ffi_common::challenge::VerifyInputs::decode(&challenge_json, &response_json)
+        .map_err(challenge_op_error)?;
     let resolver = bi.did_resolver().ok_or_else(|| ScpError::Identity {
         msg: "DID resolver not initialized — create an identity with \
               identityCreate before calling trustVerifyResponse"
@@ -7724,8 +7709,7 @@ async fn trust_verify_response_impl(
         &signer,
         resolver,
         verifier.did.as_str().into(),
-        request,
-        response,
+        inputs,
         context_id,
     )
     .await
@@ -16643,7 +16627,7 @@ impl Scp {
     ///
     /// - The handle check's error when `verifier` belongs to another `Scp`.
     /// - `SCP-VALID-7011` for an empty `context_id`.
-    /// - `SCP-VALID-7016` / `SCP-VALID-7017` for malformed challenge / response
+    /// - `SCP-VALID-7002` for a malformed challenge or response
     ///   JSON.
     /// - `SCP-IDENT-1033` when this instance has no DID resolver.
     /// - `SCP-VALID-7003` when the response is refused.
@@ -22635,7 +22619,7 @@ mod tests {
                 "bad".to_owned(),
                 "ctx".to_owned(),
             )),
-            codes::VALID_7016,
+            codes::VALID_7002,
         );
         // The challenge parses, so the failure is attributed to the response.
         assert_error_code(
@@ -22645,7 +22629,7 @@ mod tests {
                 "bad".to_owned(),
                 "ctx".to_owned(),
             )),
-            codes::VALID_7017,
+            codes::VALID_7002,
         );
         assert_error_code(
             runtime().block_on(scp.trust_verify_response(

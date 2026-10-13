@@ -4289,10 +4289,12 @@ mod tests {
                 let mut e = engine(model);
                 let pid = propose(e.as_mut());
                 let before = snapshot(e.as_ref(), &pid);
-                // Voter 3 signs its own approval; voter 2's call carries it.
+                // Voter 2 signs an approval naming voter 3 and passes it on its
+                // own call. The signature verifies under voter 2's key, so only
+                // the voter clause rejects it.
                 let d3 =
                     vote_signing_digest(&pid, did(3).as_ref(), &VoteType::Approve, NOW).unwrap();
-                let vote = signed_vote(&VoteType::Approve, &did(3), NOW, sign(3, &d3));
+                let vote = signed_vote(&VoteType::Approve, &did(3), NOW, sign(2, &d3));
                 assert_invalid_signature(&e.approve_signed(&pid, &did(2), &ctx(NOW), vote));
                 assert_eq!(snapshot(e.as_ref(), &pid), before, "{model:?}");
             }

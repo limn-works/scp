@@ -714,7 +714,9 @@ mod tests {
     }
 
     /// Builds a challenge record with a derived `verification_id`, its
-    /// `timestamp` one day before `expires_at`, and an empty signature.
+    /// `timestamp` 30 days before `expires_at`, and an empty signature. A
+    /// record expiring 30 days after the verifying clock's now is therefore
+    /// stamped at that now, never in its future, which a verifier rejects.
     fn unsigned_challenge(
         verifier_key: &ed25519_dalek::SigningKey,
         subject: &str,
@@ -723,7 +725,7 @@ mod tests {
     ) -> ChallengeVerification {
         let verifier = scp_did::did_dht_from_public_key(&verifier_key.verifying_key().to_bytes());
         let subject = scp_did::DID::from(subject);
-        let timestamp = expires_at.saturating_sub(86_400);
+        let timestamp = expires_at.saturating_sub(30 * 86_400);
         ChallengeVerification {
             verification_id: scp_core::trust::challenge_verification_id(
                 &verifier,
@@ -879,7 +881,9 @@ mod tests {
 
         // A genuinely verifier-signed, in-context challenge result so it survives
         // the aggregation read-path re-validation.
-        let cr = make_genuinely_signed_challenge(subject_did, context_id);
+        // Stamped at the test clock's now, 2000, and live for 30 days.
+        let cr =
+            make_genuinely_signed_challenge_with(subject_did, Some(context_id), 2000 + 30 * 86_400);
         store.store_challenge_result(context_id, &cr).unwrap();
 
         // --- Build events ---
