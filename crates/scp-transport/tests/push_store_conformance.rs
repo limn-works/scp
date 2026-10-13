@@ -401,16 +401,31 @@ async fn registration_replayed_after_deregistration_is_stale(
     assert!(!store.deregister(&key, 25).await?);
     assert_eq!(store.accepted_timestamp(&key).await?, Some(25));
 
-    // A deregistration for a key the store never held stores nothing.
+    // A deregistration for a key the store never held still keeps its
+    // timestamp as the floor, so an older registration arriving later is stale.
     let never = record("did:dht:alice", b"tok-never", &[A], 1).key();
     assert!(!store.deregister(&never, 30).await?);
-    assert_eq!(store.accepted_timestamp(&never).await?, None);
+    assert_eq!(store.accepted_timestamp(&never).await?, Some(30));
     assert_eq!(
         store
             .upsert(record("did:dht:alice", b"tok-never", &[A], 5))
+            .await,
+        Err(PushStoreError::Stale {
+            last_accepted: 30,
+            offered: 5
+        })
+    );
+    assert_eq!(
+        store
+            .upsert(record("did:dht:alice", b"tok-never", &[A], 31))
             .await?,
         UpsertOutcome::Inserted
     );
+
+    // An invalid-token removal of a key the store never held records nothing.
+    let unheld = record("did:dht:alice", b"tok-unheld", &[A], 1).key();
+    assert!(!store.remove(&unheld).await?);
+    assert_eq!(store.accepted_timestamp(&unheld).await?, None);
 
     // A newer registration is accepted and replaces the floor.
     let fresh = record("did:dht:alice", b"tok-1", &[B], 26);

@@ -322,9 +322,9 @@ impl PushRegistrationStore {
     ///   [`Self::remove`] does and keeps `timestamp` as the key's
     ///   deregistration floor. The registrant's other registrations stay in
     ///   place.
-    /// - With no registration under `key`, the store raises an existing floor
-    ///   to `timestamp` and records no new one, so a deregistration for a key
-    ///   the relay never held stores nothing.
+    /// - With no registration under `key`, the store still keeps `timestamp`
+    ///   as the key's deregistration floor, so a registration under `key` at
+    ///   or below `timestamp` that arrives later is stale.
     ///
     /// Returns whether a registration existed.
     ///
@@ -578,6 +578,16 @@ fn floor_timestamp(
     .transpose()
 }
 
+/// The floor a removal leaves for its key: an accepted deregistration's own
+/// timestamp, whether or not the store held anything for the key, because
+/// every accepted message bounds later ones (§10.7.1 Freshness); else, for a
+/// removal after invalid-token failures, the removed registration's timestamp.
+/// `None` writes no floor and leaves any existing one in place. Both arms call
+/// this, so they cannot diverge on which removals record a floor.
+fn floor_after_removal(deregistered_at: Option<u64>, registered_at: Option<u64>) -> Option<u64> {
+    deregistered_at.or(registered_at)
+}
+
 /// The registration's timestamp, or else the deregistration floor. A key never
 /// holds both: an insert deletes the floor and a removal writes it.
 fn last_accepted(
@@ -776,9 +786,7 @@ impl SqlitePushStore {
             check_fresh(last_accepted(&tx, key)?, offered)?;
         }
         let registered_at = stored_timestamp(&tx, key)?;
-        // A key the store holds nothing for gets no floor.
-        let held = registered_at.is_some() || floor_timestamp(&tx, key)?.is_some();
-        let floor = deregistered_at.or(registered_at).filter(|_| held);
+        let floor = floor_after_removal(deregistered_at, registered_at);
         delete_index(&tx, key)?;
         tx.execute(
             "DELETE FROM push_registrations
@@ -954,7 +962,7 @@ mod in_memory {
 
     use super::{
         MAX_REGISTRATIONS_PER_REGISTRANT, PushRegistrationKey, PushRegistrationRecord,
-        PushStoreError, RoutingId, UpsertOutcome, check_fresh,
+        PushStoreError, RoutingId, UpsertOutcome, check_fresh, floor_after_removal,
     };
 
     #[derive(Debug, Default)]
@@ -1070,10 +1078,9 @@ mod in_memory {
             if let Some(offered) = deregistered_at {
                 check_fresh(state.last_accepted(key), offered)?;
             }
-            let held = state.floors.contains_key(key);
             let Some((record, _)) = state.records.remove(key) else {
-                if held && let Some(offered) = deregistered_at {
-                    state.floors.insert(key.clone(), offered);
+                if let Some(floor) = floor_after_removal(deregistered_at, None) {
+                    state.floors.insert(key.clone(), floor);
                 }
                 drop(state);
                 return Ok(false);
@@ -1085,9 +1092,9 @@ mod in_memory {
                     state.per_registrant.remove(&key.registrant);
                 }
             }
-            state
-                .floors
-                .insert(key.clone(), deregistered_at.unwrap_or(record.timestamp));
+            if let Some(floor) = floor_after_removal(deregistered_at, Some(record.timestamp)) {
+                state.floors.insert(key.clone(), floor);
+            }
             drop(state);
             Ok(true)
         }
