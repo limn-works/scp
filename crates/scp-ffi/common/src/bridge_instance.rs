@@ -1801,19 +1801,22 @@ impl CoreFields {
     /// relay-set mutex is poisoned, so a create fails instead of recording a
     /// relay set it cannot vouch for.
     pub fn context_relay_urls(&self) -> Result<Vec<String>, TransportLockError> {
-        let mut urls: Vec<String> = {
-            let transport = self
-                .transport
-                .read()
-                .map_err(|_| TransportLockError::Poisoned)?;
-            if transport.is_none() {
-                return Ok(Vec::new());
-            }
-            let relays = self
+        // The transport read guard lives through the match, so the relay set
+        // is read against the installed manager it describes.
+        let mut urls: Vec<String> = match self
+            .transport
+            .read()
+            .map_err(|_| TransportLockError::Poisoned)?
+            .as_ref()
+        {
+            None => return Ok(Vec::new()),
+            Some(_) => self
                 .relay_urls
                 .lock()
-                .map_err(|_| TransportLockError::Poisoned)?;
-            relays.iter().cloned().collect()
+                .map_err(|_| TransportLockError::Poisoned)?
+                .iter()
+                .cloned()
+                .collect(),
         };
         urls.sort_unstable();
         Ok(urls)

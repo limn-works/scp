@@ -131,12 +131,14 @@ pub fn sealed_relay_urls(
     requested: Vec<String>,
     stored: Vec<String>,
 ) -> Result<Vec<String>, ContextError> {
-    let requested_set: HashSet<&String> = requested.iter().collect();
+    let requested_set: HashSet<String> = requested.into_iter().collect();
     let stored_set: HashSet<&String> = stored.iter().collect();
-    if requested_set != stored_set {
+    if requested_set.len() != stored_set.len()
+        || !requested_set.iter().all(|url| stored_set.contains(url))
+    {
         return Err(ContextError::InvalidState(format!(
-            "invite_member: relay_urls {requested:?} differ from the context's stored relay set \
-             {stored:?}"
+            "invite_member: relay_urls {requested_set:?} differ from the context's stored relay \
+             set {stored:?}"
         )));
     }
     Ok(stored)
@@ -153,13 +155,13 @@ mod relay_set_tests {
     #[test]
     fn sealed_relay_urls_accepts_the_stored_set_in_any_order() {
         let stored = urls(&["wss://a", "wss://b"]);
-        let sealed = sealed_relay_urls(urls(&["wss://b", "wss://a", "wss://b"]), stored.clone())
-            .expect("the stored set, reordered and repeated, is accepted");
-        assert_eq!(sealed, stored);
-        assert_eq!(
-            sealed_relay_urls(Vec::new(), Vec::new()).expect("empty matches empty"),
-            Vec::<String>::new()
+        let sealed = sealed_relay_urls(urls(&["wss://b", "wss://a", "wss://b"]), stored.clone());
+        assert!(
+            matches!(&sealed, Ok(urls) if *urls == stored),
+            "the stored set, reordered and repeated, is accepted: {sealed:?}"
         );
+        let empty = sealed_relay_urls(Vec::new(), Vec::new());
+        assert!(matches!(&empty, Ok(urls) if urls.is_empty()), "{empty:?}");
     }
 
     #[test]
