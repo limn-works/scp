@@ -74,7 +74,7 @@ use crate::context::actor::commands::{
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
-use crate::context::actor::signer::{CommandSigner, sign_bounded};
+use crate::context::actor::signer::CommandSigner;
 use crate::context::actor::state::PerContextState;
 use crate::context::economy_logic::{ContextRevocationChecker, KeyResolverDidResolver};
 use crate::context::messaging_helpers::{
@@ -2091,8 +2091,7 @@ async fn build_signed_receipt(
             "SCP-SAGA-13034: Commit-B receipt signing failed: {e}"
         ))
     })?;
-    target_signer.require_ed25519()?;
-    let signature = sign_bounded(target_signer, &preimage).await?;
+    let signature = target_signer.sign_bounded_ed25519(&preimage).await?;
     Ok(unsigned.with_signature(signature))
 }
 
@@ -2923,8 +2922,7 @@ async fn build_signed_stream_receipt(
             "SCP-SAGA-13044: streaming Commit-B receipt signing failed: {e}"
         ))
     })?;
-    target_signer.require_ed25519()?;
-    let signature = sign_bounded(target_signer, &preimage).await?;
+    let signature = target_signer.sign_bounded_ed25519(&preimage).await?;
     Ok(unsigned.with_signature(signature))
 }
 
@@ -3537,8 +3535,7 @@ async fn sign_divergence_marker(
             "SCP-SAGA-13036: divergence-marker signing failed for saga '{saga_id}': {e}"
         ))
     })?;
-    signer.require_ed25519()?;
-    let signature = sign_bounded(signer, &preimage).await?;
+    let signature = signer.sign_bounded_ed25519(&preimage).await?;
     Ok(unsigned.with_signature(signature))
 }
 

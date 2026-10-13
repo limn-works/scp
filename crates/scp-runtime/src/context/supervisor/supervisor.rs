@@ -898,7 +898,7 @@ const COMMIT_EXECUTOR_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 /// The budget of one saga Commit attempt, built from its parts: the executor
 /// ([`COMMIT_EXECUTOR_TIMEOUT`]), the Commit-B settle turn, which signs the
-/// receipt through `sign_bounded` and so takes
+/// receipt through `CommandSigner::sign_bounded_ed25519` and so takes
 /// [`SIGNING_HANDLER_TIMEOUT`](crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT),
 /// and 30 seconds for the Commit-B reserve and Commit-A turns.
 ///
@@ -14629,9 +14629,7 @@ impl Supervisor {
                 ContextError::CryptoFailed(format!("invite_member: bundle hash failed: {e}"))
             })?;
             // A custody refusal or timeout keeps its typed custody error.
-            bundle.set_signature(
-                crate::context::actor::signer::sign_bounded(proposer_signer, &bundle_hash).await?,
-            );
+            bundle.set_signature(proposer_signer.sign_bounded_ed25519(&bundle_hash).await?);
 
             // 6. HPKE-seal the serialized bundle to the invitee. `wire` carries
             //    the plaintext `context_metadata_key` (§9.10.4.B) — hold it in
@@ -31550,7 +31548,7 @@ mod tests {
     }
 
     /// A target custody that never answers fails each Commit attempt with
-    /// `SCP-CRYPTO-4062` from `sign_bounded`, never with the phase's
+    /// `SCP-CRYPTO-4062` from `CommandSigner::sign_bounded_ed25519`, never with the phase's
     /// `TransportTimeout`: the Commit budget is built from the executor budget
     /// plus the signing turn's budget, so the sign budget always fires first.
     #[tokio::test(start_paused = true)]
@@ -31621,7 +31619,7 @@ mod tests {
             panic!("a failed Commit lifts to NeedsRepair, got {err:?}");
         };
         // The public NeedsRepair carries the last Commit attempt's error as
-        // text; it is the typed `sign_bounded` timeout (`SCP-CRYPTO-4062` at
+        // text; it is the typed `CommandSigner::sign_bounded_ed25519` timeout (`SCP-CRYPTO-4062` at
         // the bridges), not the phase's `TransportTimeout`.
         let expected = ContextError::Custody(CustodyFailure {
             kind: CustodyFailureKind::TimedOut,

@@ -38,7 +38,7 @@ mod tests {
     use super::*;
     use crate::error_codes::{self, custody_failure_code};
     use scp_core::context::ContextError;
-    use scp_core::context::actor::signer::{SIGN_TIMEOUT, sign_bounded};
+    use scp_core::context::actor::signer::SIGN_TIMEOUT;
     use scp_crypto::{CustodyFailure, CustodyFailureKind, DynScpSigner, SignFuture};
     use scp_platform::testing::InMemoryKeyCustody;
     use scp_platform::traits::KeyType;
@@ -71,7 +71,7 @@ mod tests {
         let signer = identity_command_signer(Arc::clone(&custody), handle).await?;
         assert_eq!(signer.public_key(), public_key.as_bytes());
         let digest = [4u8; 32];
-        let signature = sign_bounded(&signer, &digest).await?;
+        let signature = signer.sign_bounded_ed25519(&digest).await?;
         signer
             .verifying_key()?
             .verify_strict(&digest, &ed25519_dalek::Signature::from_bytes(&signature))?;
@@ -100,7 +100,7 @@ mod tests {
     async fn sign_bounded_timeout_is_crypto_4062() {
         let signer = CommandSigner::new(Arc::new(NeverReadySigner));
         let started = tokio::time::Instant::now();
-        let result = sign_bounded(&signer, &[5; 32]).await;
+        let result = signer.sign_bounded_ed25519(&[5; 32]).await;
         assert!(started.elapsed() >= SIGN_TIMEOUT);
         assert!(
             matches!(

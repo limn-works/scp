@@ -3,10 +3,11 @@
 //! The actor holds no key material. A command that needs a signature carries
 //! a [`CommandSigner`], an `Arc<dyn DynScpSigner>`; in production it wraps a
 //! [`CustodySigner`] over the identity's `KeyCustody`. A handler runs its sync
-//! prechecks, awaits [`sign_bounded`] once, and applies the signed result in
-//! the same actor turn. A sign that does not answer within [`SIGN_TIMEOUT`] is
-//! a custody failure of kind [`CustodyFailureKind::TimedOut`]
-//! (`SCP-CRYPTO-4062`), never a transport timeout.
+//! prechecks, awaits [`CommandSigner::sign_bounded_ed25519`] once, and applies
+//! the signed result in the same actor turn. A sign that does not answer
+//! within [`SIGN_TIMEOUT`] is a custody failure of kind
+//! [`CustodyFailureKind::TimedOut`] (`SCP-CRYPTO-4062`), never a transport
+//! timeout.
 
 use std::fmt;
 use std::sync::Arc;
@@ -22,7 +23,8 @@ use scp_protocol::context::ContextError;
 /// [`CustodyFailureKind::TimedOut`].
 pub const SIGN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The turn budget of an actor handler that signs through [`sign_bounded`]:
+/// The turn budget of an actor handler that signs through
+/// [`CommandSigner::sign_bounded_ed25519`]:
 /// the 30-second handler work budget plus [`SIGN_TIMEOUT`].
 ///
 /// A plain 30-second handler budget would expire with the signing budget, so a
@@ -99,9 +101,32 @@ impl CommandSigner {
 }
 
 impl CommandSigner {
-    /// Fails unless this signer makes Ed25519 signatures. Every artifact whose
-    /// format fixes Ed25519 (a saga receipt, a divergence marker, a broadcast
-    /// envelope) checks this before it asks custody to sign.
+    /// Signs the 32-byte `digest` of an Ed25519-format artifact, waiting at
+    /// most [`SIGN_TIMEOUT`].
+    ///
+    /// The key-type check and the bounded wait are one call, so no site can
+    /// ask custody for a signature that the artifact's format cannot carry:
+    /// every SCP artifact a [`CommandSigner`] signs (a vote, a checkpoint, a
+    /// broadcast or inner envelope, a saga receipt, a divergence marker, a
+    /// challenge record) fixes Ed25519.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::CryptoFailed`] naming the algorithm when the signer
+    ///   is not Ed25519; custody is not called.
+    /// - [`ContextError::Custody`] with the custody's own kind when custody
+    ///   refuses the sign.
+    /// - [`ContextError::Custody`] with kind [`CustodyFailureKind::TimedOut`]
+    ///   when custody does not answer within [`SIGN_TIMEOUT`].
+    /// - [`ContextError::CryptoFailed`] for any other signer failure.
+    pub async fn sign_bounded_ed25519(&self, digest: &[u8; 32]) -> Result<[u8; 64], ContextError> {
+        self.require_ed25519()?;
+        sign_bounded(self, digest).await
+    }
+
+    /// Fails unless this signer makes Ed25519 signatures.
+    /// [`Self::sign_bounded_ed25519`] runs it before every sign; a site calls
+    /// it directly only to reject a signer before work that precedes the sign.
     ///
     /// # Errors
     ///
@@ -127,7 +152,9 @@ impl fmt::Debug for CommandSigner {
     }
 }
 
-/// Signs `digest` through `signer`, waiting at most [`SIGN_TIMEOUT`].
+/// Signs `digest` through `signer`, waiting at most [`SIGN_TIMEOUT`]. Private:
+/// every caller goes through [`CommandSigner::sign_bounded_ed25519`], which
+/// checks the key type first.
 ///
 /// # Errors
 ///
@@ -136,10 +163,7 @@ impl fmt::Debug for CommandSigner {
 /// - [`ContextError::Custody`] with kind [`CustodyFailureKind::TimedOut`]
 ///   when custody does not answer within [`SIGN_TIMEOUT`].
 /// - [`ContextError::CryptoFailed`] for any other signer failure.
-pub async fn sign_bounded(
-    signer: &CommandSigner,
-    digest: &[u8; 32],
-) -> Result<[u8; 64], ContextError> {
+async fn sign_bounded(signer: &CommandSigner, digest: &[u8; 32]) -> Result<[u8; 64], ContextError> {
     match tokio::time::timeout(SIGN_TIMEOUT, signer.0.sign_boxed(digest)).await {
         Ok(Ok(signature)) => Ok(signature),
         Ok(Err(SignError::Custody(failure))) => Err(ContextError::Custody(failure)),
@@ -230,7 +254,7 @@ mod tests {
     async fn sign_bounded_times_out() {
         let signer = CommandSigner::new(Arc::new(NeverReadySigner));
         let started = tokio::time::Instant::now();
-        let result = sign_bounded(&signer, &[1; 32]).await;
+        let result = signer.sign_bounded_ed25519(&[1; 32]).await;
         assert!(started.elapsed() >= SIGN_TIMEOUT);
         assert!(
             matches!(
@@ -254,7 +278,7 @@ mod tests {
             CustodyFailureKind::Failed,
         ] {
             let signer = CommandSigner::new(Arc::new(RefusingSigner(Some(kind))));
-            let result = sign_bounded(&signer, &[2; 32]).await;
+            let result = signer.sign_bounded_ed25519(&[2; 32]).await;
             assert!(
                 matches!(
                     &result,
@@ -265,7 +289,7 @@ mod tests {
             );
         }
         let signer = CommandSigner::new(Arc::new(RefusingSigner(None)));
-        let result = sign_bounded(&signer, &[2; 32]).await;
+        let result = signer.sign_bounded_ed25519(&[2; 32]).await;
         assert!(
             matches!(
                 &result,
@@ -281,7 +305,7 @@ mod tests {
         let key = SigningKey::from_bytes(&[9; 32]);
         let signer = CommandSigner::local_ed25519(key.clone());
         let digest = [3u8; 32];
-        let signature = sign_bounded(&signer, &digest).await?;
+        let signature = signer.sign_bounded_ed25519(&digest).await?;
         assert_eq!(signature, key.sign(&digest).to_bytes());
         let verifying_key = signer.verifying_key()?;
         assert_eq!(verifying_key, key.verifying_key());

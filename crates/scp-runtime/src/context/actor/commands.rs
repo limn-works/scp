@@ -1560,7 +1560,7 @@ pub struct UnsubscribeBroadcastPayload {
 ///
 /// The payload carries the author's `CommandSigner` (ADR-049 Decision 7a).
 /// The handler reserves the author's broadcast sequence, signs the 32-byte
-/// broadcast signing payload through `sign_bounded`, and seals in one actor
+/// broadcast signing payload through `CommandSigner::sign_bounded_ed25519`, and seals in one actor
 /// turn. A failed sign rolls the reservation back in the same turn.
 pub struct PublishBroadcastPayload {
     /// Context identifier string.
@@ -1607,7 +1607,7 @@ pub struct BroadcastBlockPayload {
 /// `PublishBroadcast` / `PublishBroadcastContent` carry the author's
 /// `CommandSigner` (ADR-049 Decision 7a) and ride the per-context actor
 /// mailbox like every other variant. The handler reserves the sequence,
-/// signs through `sign_bounded`, and seals in one actor turn, rolling the
+/// signs through `CommandSigner::sign_bounded_ed25519`, and seals in one actor turn, rolling the
 /// reservation back when the sign or the seal fails.
 pub enum BroadcastCommand {
     /// Subscribe a DID to a broadcast context. Mirrors

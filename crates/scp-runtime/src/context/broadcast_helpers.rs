@@ -37,7 +37,7 @@ use scp_protocol::crypto::ucan::validate::{
 
 use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::signer::{CommandSigner, sign_bounded};
+use crate::context::actor::signer::CommandSigner;
 use crate::context::actor::state::PerContextState;
 use crate::context::state::{context_id_to_bytes, require_active, strip_event_payload};
 
@@ -321,7 +321,7 @@ pub async fn unsubscribe_broadcast(
 // The publish command carries the author's `CommandSigner` (ADR-049 Decision
 // 7a), so a publish completes in one actor turn: reserve the author's
 // broadcast sequence, sign the 32-byte broadcast signing payload through
-// `sign_bounded`, and seal. No other command runs inside the turn, so the
+// `CommandSigner::sign_bounded_ed25519`, and seal. No other command runs inside the turn, so the
 // reserved sequence is still the author's head when a failed sign or seal
 // rolls it back, and two publishes, serialized by the mailbox, never share a
 // sequence. After a successful seal the sequence is consumed even if
@@ -380,7 +380,7 @@ pub async fn publish_broadcast_in_turn(
 
     // `reserve_publish` has released its Class-C view borrow; only `cell`
     // itself, which the handler owns for the whole turn, spans the await.
-    let signature = match sign_bounded(signer, &signing_payload).await {
+    let signature = match signer.sign_bounded_ed25519(&signing_payload).await {
         Ok(signature) => signature,
         Err(e) => {
             release_reserved(cell, &pending);

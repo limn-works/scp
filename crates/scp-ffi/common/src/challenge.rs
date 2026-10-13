@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use scp_core::context::ContextError;
-use scp_core::context::actor::signer::{CommandSigner, sign_bounded};
+use scp_core::context::actor::signer::CommandSigner;
 use scp_core::trust::attestation::ActiveKeyResolver;
 use scp_core::trust::{
     ChallengeRequest, ChallengeResponse, ChallengeVerification, TestCase, TrustError,
@@ -83,7 +83,9 @@ pub async fn create_challenge(
         decode(JsonInput::TestCases, serde_json::from_str(test_cases_json))?;
     let unsigned =
         challenge_request_unsigned(verifier, subject, capability_uri, test_cases, timeout_secs)?;
-    let signature = sign_bounded(signer, &unsigned.signing_digest()).await?;
+    let signature = signer
+        .sign_bounded_ed25519(&unsigned.signing_digest())
+        .await?;
     Ok(unsigned.with_verifier_signature(signature.to_vec()))
 }
 
@@ -167,7 +169,9 @@ where
             "challenge response check task failed: {e}"
         )))
     })??;
-    let signature = sign_bounded(signer, &unsigned.signing_digest()).await?;
+    let signature = signer
+        .sign_bounded_ed25519(&unsigned.signing_digest())
+        .await?;
     Ok(unsigned.with_verifier_signature(signature.to_vec()))
 }
 

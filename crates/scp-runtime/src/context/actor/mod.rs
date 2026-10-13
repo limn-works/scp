@@ -59,7 +59,7 @@ pub use handle::{ContextActorHandle, REPLY_TIMEOUT, SEND_TIMEOUT};
 pub(crate) use handle::{BoundedReplyError, bounded_reply_await};
 pub use outcome::Outcome;
 pub use sequence::{SendSequenceTracker, SequenceReservation};
-pub use signer::{CommandSigner, SIGN_TIMEOUT, sign_bounded};
+pub use signer::{CommandSigner, SIGN_TIMEOUT};
 pub use state::{
     AuthorKeyEntry, BroadcastRecvTracker, BroadcastState, ContextCryptoState, ContextEventLog,
     ContextLifecycleState, ContextModeState, ContextRouting, PendingBroadcastKeyRotation,

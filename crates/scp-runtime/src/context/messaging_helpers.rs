@@ -437,9 +437,8 @@ pub async fn build_broadcast_envelope(
         },
     )
     .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-    let signature = ed25519_dalek::Signature::from_bytes(
-        &crate::context::actor::signer::sign_bounded(signer, &signing_payload).await?,
-    );
+    let signature =
+        ed25519_dalek::Signature::from_bytes(&signer.sign_bounded_ed25519(&signing_payload).await?);
     bc.publish(sender_did, payload, timestamp, signature, &nonce, None)
 }
 

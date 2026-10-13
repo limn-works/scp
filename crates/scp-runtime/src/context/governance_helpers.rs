@@ -40,7 +40,7 @@ use scp_protocol::economy::types::EconomicPolicy;
 use tracing::instrument;
 
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::signer::{CommandSigner, sign_bounded};
+use crate::context::actor::signer::CommandSigner;
 use crate::context::actor::state::PerContextState;
 use crate::context::governance_logic::ConsequenceStateSplit;
 use crate::context::governance_logic::{
@@ -4247,7 +4247,7 @@ pub async fn propose_governance_action_inner(
             timestamp, digest, ..
         } => {
             debug_assert_eq!(timestamp, gov_ctx.now);
-            let signature = sign_bounded(signer, &digest).await?;
+            let signature = signer.sign_bounded_ed25519(&digest).await?;
             Some(signed_vote(
                 &VoteType::Approve,
                 proposer_did,
@@ -4608,7 +4608,7 @@ pub async fn vote_on_proposal_inner(
     let (status, events) = match intent {
         VoteIntent::Sign { timestamp, digest } => {
             debug_assert_eq!(timestamp, gov_ctx.now);
-            let signature = sign_bounded(signer, &digest).await?;
+            let signature = signer.sign_bounded_ed25519(&digest).await?;
             let vote = signed_vote(&vote_type, voter_did, timestamp, signature);
             let mut view = cell.class_c_view();
             let engine = view.governance_class_c_mut().engine_mut();
@@ -7515,6 +7515,26 @@ mod commit_broadcast_retry_tests {
             CommandSigner::local_ed25519(key_for(voter))
         }
 
+        /// Reports P-256 and counts every sign it is asked for.
+        struct P256Probe {
+            signs: Arc<AtomicUsize>,
+        }
+
+        impl ScpSigner for P256Probe {
+            fn algorithm(&self) -> SigAlg {
+                SigAlg::EcdsaP256Sha256
+            }
+
+            fn public_key(&self) -> Vec<u8> {
+                vec![0x04; 65]
+            }
+
+            async fn sign(&self, _digest: &[u8; 32]) -> Result<[u8; 64], SignError> {
+                self.signs.fetch_add(1, Ordering::SeqCst);
+                Ok([0; 64])
+            }
+        }
+
         fn ceiling() -> Vec<Capability> {
             [
                 "messages:read",
@@ -7648,6 +7668,32 @@ mod commit_broadcast_retry_tests {
                 false,
             )
             .await
+        }
+
+        /// A vote signature is Ed25519 (spec 07), so a P-256 custody fails the
+        /// vote with the key-type error and custody is never asked to sign.
+        #[tokio::test]
+        async fn p256_signer_fails_vote_before_custody() {
+            let (deps, clock, _) = deps_and_clock().await;
+            let mut cell = majority_cell(&clock);
+            let pid = propose(&mut cell, &deps, A, &local(A)).await;
+            let signs = Arc::new(AtomicUsize::new(0));
+            let p256 = CommandSigner::new(Arc::new(P256Probe {
+                signs: Arc::clone(&signs),
+            }));
+
+            let err = vote(&mut cell, &deps, &pid, B, &p256)
+                .await
+                .expect_err("a P-256 signer cannot sign a vote");
+
+            assert!(
+                matches!(
+                    &err,
+                    scp_protocol::context::ContextError::CryptoFailed(m) if m.contains("not Ed25519")
+                ),
+                "{err:?}"
+            );
+            assert_eq!(signs.load(Ordering::SeqCst), 0, "custody is never asked");
         }
 
         /// A vote the engine precheck refuses never reaches the signer: an

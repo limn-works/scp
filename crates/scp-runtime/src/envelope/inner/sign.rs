@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use scp_platform::traits::{KeyCustody, KeyHandle};
 
 use super::{InnerEnvelope, InnerEnvelopeParams, SCP_INNER_ENVELOPE_VERSION};
-use crate::context::actor::signer::{CommandSigner, sign_bounded};
+use crate::context::actor::signer::CommandSigner;
 use scp_protocol::context::ContextError;
 use scp_protocol::envelope::EnvelopeError;
 
@@ -114,7 +114,7 @@ pub async fn create_inner_envelope(
 /// constructor.
 ///
 /// The canonical hash is computed first, then signed through
-/// [`sign_bounded`] within the custody budget, then the envelope is
+/// [`CommandSigner::sign_bounded_ed25519`] within the custody budget, then the envelope is
 /// assembled. The signer's persona must match `params.signing_key_id`;
 /// [`MessageSigner`](crate::context::supervisor::MessageSigner) pairs them.
 ///
@@ -130,7 +130,7 @@ pub(crate) async fn create_inner_envelope_signed(
 ) -> Result<InnerEnvelope, ContextError> {
     let digest =
         inner_envelope_digest(params).map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-    let signature = sign_bounded(signer, &digest.canonical).await?;
+    let signature = signer.sign_bounded_ed25519(&digest.canonical).await?;
     assemble_inner_envelope(params, &digest, signature)
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))
 }

@@ -271,7 +271,7 @@ const NAPI_SCP_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp
 // the instance's own repository.
 // Raised 59 -> 67 when the challenge operations (spec 07 §7.3.4) gained their
 // routing assertions: two pin the shared `create_challenge` and
-// `verify_response_and_sign` to their checks and to `sign_bounded`, and one per
+// `verify_response_and_sign` to their checks and to `CommandSigner::sign_bounded_ed25519`, and one per
 // native bridge pins each of `trust_create_challenge` and
 // `trust_verify_response` to the shared operation.
 const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 67;
@@ -5253,9 +5253,13 @@ fn shared_create_challenge_checks_the_suite_and_signs_through_custody() {
             FFI_CHALLENGE_SRC,
             "create_challenge",
             "challenge_request_unsigned("
-        ) && fn_body_contains(FFI_CHALLENGE_SRC, "create_challenge", "sign_bounded("),
+        ) && fn_body_contains(
+            FFI_CHALLENGE_SRC,
+            "create_challenge",
+            "sign_bounded_ed25519("
+        ),
         "create_challenge must build the request with challenge_request_unsigned \
-         and sign it through sign_bounded"
+         and sign it through sign_bounded_ed25519"
     );
 }
 
@@ -5269,10 +5273,10 @@ fn shared_verify_response_checks_the_response_and_signs_through_custody() {
         ) && fn_body_contains(
             FFI_CHALLENGE_SRC,
             "verify_response_and_sign",
-            "sign_bounded("
+            "sign_bounded_ed25519("
         ),
         "verify_response_and_sign must check the response with \
-         check_challenge_response and sign the record through sign_bounded"
+         check_challenge_response and sign the record through sign_bounded_ed25519"
     );
 }
 

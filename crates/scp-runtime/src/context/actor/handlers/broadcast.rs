@@ -17,7 +17,7 @@
 //! [`BroadcastCommand::PublishBroadcast`] and
 //! [`BroadcastCommand::PublishBroadcastContent`] carry the author's
 //! `CommandSigner`. The handler reserves the author's broadcast sequence,
-//! signs the broadcast signing payload through `sign_bounded`, and seals in
+//! signs the broadcast signing payload through `CommandSigner::sign_bounded_ed25519`, and seals in
 //! one actor turn, under [`SIGNING_HANDLER_TIMEOUT`]. A refused or timed-out
 //! sign rolls the reservation back in the same turn, and the mailbox
 //! serializes publishes, so two publishes never share a sequence. A publish

@@ -96,7 +96,7 @@ use zeroize::Zeroizing;
 
 use crate::context::actor::class_s::ClassCMut;
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::signer::{CommandSigner, sign_bounded};
+use crate::context::actor::signer::CommandSigner;
 use crate::context::actor::state::PerContextState;
 use crate::context::builder::ContextEventLogProvider;
 use crate::context::state::{self, CommitFaultMarker, EpochState, PendingCommit};
@@ -788,7 +788,7 @@ pub async fn build_checkpoint(
             canonical_hash.len()
         ))
     })?;
-    let signature = sign_bounded(signer, &digest).await?;
+    let signature = signer.sign_bounded_ed25519(&digest).await?;
 
     Ok(scp_event_log::checkpoint::ConsistencyCheckpoint {
         context_id: context_id.to_owned(),
@@ -1648,6 +1648,57 @@ mod checkpoint_signer_tests {
             self.signs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             scp_crypto::DynScpSigner::sign_boxed(&self.key, digest)
         }
+    }
+
+    /// Reports P-256 and counts every sign it is asked for.
+    struct P256CountingSigner(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl scp_crypto::DynScpSigner for P256CountingSigner {
+        fn algorithm(&self) -> scp_crypto::SigAlg {
+            scp_crypto::SigAlg::EcdsaP256Sha256
+        }
+
+        fn public_key(&self) -> Vec<u8> {
+            vec![0x04; 65]
+        }
+
+        fn sign_boxed<'a>(&'a self, _digest: &'a [u8; 32]) -> scp_crypto::SignFuture<'a> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok([0; 64]) })
+        }
+    }
+
+    /// A checkpoint signature is Ed25519, so a P-256 custody fails the
+    /// checkpoint with the key-type error and custody is never asked to sign.
+    #[tokio::test]
+    async fn p256_signer_fails_checkpoint_before_custody() {
+        let signs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let signer = CommandSigner::new(std::sync::Arc::new(P256CountingSigner(
+            std::sync::Arc::clone(&signs),
+        )));
+        let err = build_checkpoint(
+            "ctx-checkpoint",
+            true,
+            4,
+            &DID("did:dht:alice".to_owned()),
+            &signer,
+            1_700_000_123,
+            &FixedRootEventLog,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                scp_protocol::context::ContextError::CryptoFailed(m) if m.contains("not Ed25519")
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            signs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no custody call"
+        );
     }
 
     /// A failed event-log read fails the checkpoint turn with the log's error,
