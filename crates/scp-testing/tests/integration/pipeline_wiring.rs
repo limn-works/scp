@@ -1015,14 +1015,6 @@ fn gated_broadcast_subscribe_builds_real_validation_context() {
     );
 }
 
-// Supervisor level: the lifecycle bootstrap arms spawn a real per-context
-// actor by delegating to the actor-shape `lifecycle_helpers::*` bodies
-// (each of which spawns an owned-state actor via `spawn_actor_with_state`).
-// ADR-049 Phase 2A finalization. This is an additive assertion —
-// `dispatch_lifecycle_direct` still references the `_legacy` helpers for the
-// per-context Join / Leave / Close / Export / AccessKey arms, so we pin the
-// presence of the actor-shape bootstrap calls rather than the absence of all
-// legacy references.
 // PUSH-013 (§10.7.1): the push routing-ID query runs
 // `Supervisor::push_routing_ids` → `dispatch_push_command` → actor mailbox →
 // `handlers::push::dispatch` → `push_helpers::push_routes`.
@@ -1054,6 +1046,14 @@ fn push_routing_ids_reach_push_helpers_through_the_actor_mailbox() {
     );
 }
 
+// Supervisor level: the lifecycle bootstrap arms spawn a real per-context
+// actor by delegating to the actor-shape `lifecycle_helpers::*` bodies
+// (each of which spawns an owned-state actor via `spawn_actor_with_state`).
+// ADR-049 Phase 2A finalization. This is an additive assertion —
+// `dispatch_lifecycle_direct` still references the `_legacy` helpers for the
+// per-context Join / Leave / Close / Export / AccessKey arms, so we pin the
+// presence of the actor-shape bootstrap calls rather than the absence of all
+// legacy references.
 #[test]
 fn dispatch_lifecycle_direct_bootstrap_arms_call_actor_shape_helpers() {
     assert!(

@@ -815,7 +815,7 @@
       "gate": "gate-push-client",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/context/supervisor/supervisor.rs",
         "crates/scp-runtime/src/context/actor/commands.rs",
@@ -1492,7 +1492,7 @@
       "gate": "gate-push-client",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/context/actor/state.rs",
         "crates/scp-runtime/src/context/state.rs",
