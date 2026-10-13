@@ -1797,10 +1797,7 @@ pub(crate) async fn context_close_on(
     // holder of the handle can release this bridge's `UcanContextState` once
     // the supervisor reports no actor or a terminal state. The release marks
     // the id, and `crate::runtime::ensure_registered` refuses to rebuild a
-    // marked id's revocation list and nonce tracker. This bridge keeps
-    // revocations in process memory, so a revocation recorded before the
-    // close does not survive a later readmit of the id, just as it does not
-    // survive a process restart.
+    // marked id's revocation list and nonce tracker.
     //
     // `Poisoned` and `MigratingOut` refuse because a release while the
     // context can still return to `Active` would leave the `Active` context

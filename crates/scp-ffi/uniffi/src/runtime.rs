@@ -1744,10 +1744,11 @@ impl UniffiBridgeInstance {
     /// Writes this context's UCAN nonce entries to this instance's durable
     /// store.
     ///
-    /// Called after every UCAN-validation pipeline run that records a nonce,
-    /// because that pipeline is the only writer of nonce state. A nonce
+    /// Called after every UCAN-validation pipeline run that can record a
+    /// nonce, because that pipeline is the only writer of nonce state. A nonce
     /// accepted now is therefore still refused after the bridge instance is
-    /// rebuilt.
+    /// rebuilt. `recorded` is what the run's nonce adapter reported; when it
+    /// is `None` the run recorded nothing and this writes nothing.
     ///
     /// # Errors
     ///
@@ -1757,7 +1758,11 @@ impl UniffiBridgeInstance {
     pub(crate) fn persist_ucan_nonces_blocking(
         &self,
         context_id: &str,
+        recorded: Option<scp_ffi_common::NonceRecorded>,
     ) -> Result<(), crate::ScpError> {
+        if recorded.is_none() {
+            return Ok(());
+        }
         let to_error = |msg: String| crate::ScpError::Context {
             msg,
             code: codes::CTX_2023.to_owned(),

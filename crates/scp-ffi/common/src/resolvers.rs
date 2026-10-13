@@ -751,14 +751,36 @@ impl ProofResolver for BridgeProofResolver {
 // BridgeNonceTracker
 // ---------------------------------------------------------------------------
 
+/// Proof that a validation run recorded a nonce in a context's tracker.
+///
+/// Only [`BridgeNonceTracker`] and [`OutletGrantNonceTracker`] construct it,
+/// and only after the wrapped tracker accepted a `record`. Each bridge's
+/// nonce-persist function takes an `Option<NonceRecorded>` and writes nothing
+/// when it is `None`, so a run that recorded nothing (a forged or malformed
+/// token refused before Step 9, or a probe) cannot trigger a storage write.
+#[derive(Debug)]
+pub struct NonceRecorded(());
+
 /// Adapter that implements the `validate::NonceTracker` trait for
 /// `nonce::NonceTracker<C>`.
 ///
 /// The `nonce::NonceTracker` struct and `validate::NonceTracker` trait have
 /// the same `check_and_record` method signature but are separate types. This
-/// adapter bridges the two by wrapping a mutable reference to the struct.
+/// adapter bridges the two by wrapping a mutable reference to the struct, and
+/// sets `recorded` to [`NonceRecorded`] when the wrapped tracker records a nonce.
 pub struct BridgeNonceTracker<'a, C: Clock> {
-    pub inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
+    inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
+    recorded: &'a mut Option<NonceRecorded>,
+}
+
+impl<'a, C: Clock> BridgeNonceTracker<'a, C> {
+    /// An adapter over `inner` that reports a successful record in `recorded`.
+    pub const fn new(
+        inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
+        recorded: &'a mut Option<NonceRecorded>,
+    ) -> Self {
+        Self { inner, recorded }
+    }
 }
 
 impl<C: Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
@@ -767,7 +789,9 @@ impl<C: Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
     }
 
     fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
-        self.inner.record(nonce, token_expiry)
+        self.inner.record(nonce, token_expiry)?;
+        *self.recorded = Some(NonceRecorded(()));
+        Ok(())
     }
 }
 
@@ -791,18 +815,22 @@ impl<C: Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
 pub struct OutletGrantNonceTracker<'a, C: Clock> {
     inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
     record: bool,
+    recorded: &'a mut Option<NonceRecorded>,
 }
 
 impl<'a, C: Clock> OutletGrantNonceTracker<'a, C> {
     /// An adapter over `inner` that records the nonce only for an
-    /// [`scp_mcp::server::CapabilityCheck::Invoke`] check.
+    /// [`scp_mcp::server::CapabilityCheck::Invoke`] check, and reports a
+    /// successful record in `recorded`.
     pub fn new(
         inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
         check: scp_mcp::server::CapabilityCheck,
+        recorded: &'a mut Option<NonceRecorded>,
     ) -> Self {
         Self {
             inner,
             record: check == scp_mcp::server::CapabilityCheck::Invoke,
+            recorded,
         }
     }
 }
@@ -814,7 +842,9 @@ impl<C: Clock> NonceTrackerTrait for OutletGrantNonceTracker<'_, C> {
 
     fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
         if self.record {
-            self.inner.record(nonce, token_expiry)
+            self.inner.record(nonce, token_expiry)?;
+            *self.recorded = Some(NonceRecorded(()));
+            Ok(())
         } else {
             self.inner.check_replay(nonce, token_expiry)
         }
@@ -986,7 +1016,8 @@ mod tests {
 
     /// A probe runs the replay check and records nothing, so the same token
     /// passes any number of probes and then one invoke check; after that
-    /// check, a probe and an invoke check both fail it as a replay.
+    /// check, a probe and an invoke check both fail it as a replay. Only the
+    /// passing invoke check yields a [`NonceRecorded`].
     #[test]
     fn outlet_grant_nonce_probe_records_nothing() {
         use scp_mcp::server::CapabilityCheck;
@@ -997,14 +1028,50 @@ mod tests {
             scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-probe".to_owned(), clock);
         let check = |tracker: &mut scp_core::crypto::ucan::nonce::NonceTracker<_>,
                      kind: CapabilityCheck| {
-            OutletGrantNonceTracker::new(tracker, kind).check_and_record(&nonce, expiry)
+            let mut recorded = None;
+            let result = OutletGrantNonceTracker::new(tracker, kind, &mut recorded)
+                .check_and_record(&nonce, expiry);
+            (result, recorded.is_some())
         };
         for _ in 0..3 {
-            check(&mut tracker, CapabilityCheck::Probe).expect("a probe must not record the nonce");
+            let (result, recorded) = check(&mut tracker, CapabilityCheck::Probe);
+            result.expect("a probe must not record the nonce");
+            assert!(!recorded, "a probe must not report a recorded nonce");
         }
-        check(&mut tracker, CapabilityCheck::Invoke).expect("the first invoke check passes");
-        assert!(check(&mut tracker, CapabilityCheck::Probe).is_err());
-        assert!(check(&mut tracker, CapabilityCheck::Invoke).is_err());
+        let (result, recorded) = check(&mut tracker, CapabilityCheck::Invoke);
+        result.expect("the first invoke check passes");
+        assert!(recorded, "a passing invoke check must report the record");
+        let (result, recorded) = check(&mut tracker, CapabilityCheck::Probe);
+        assert!(result.is_err() && !recorded);
+        let (result, recorded) = check(&mut tracker, CapabilityCheck::Invoke);
+        assert!(result.is_err() && !recorded);
+    }
+
+    /// `BridgeNonceTracker` reports a record only when the wrapped tracker
+    /// accepted it: a first presentation yields [`NonceRecorded`], a replay
+    /// refused by the tracker yields none, so a bridge persists nothing for it.
+    #[test]
+    fn bridge_nonce_tracker_reports_only_accepted_records() {
+        let clock = scp_clock::SystemClock;
+        let nonce = scp_core::crypto::ucan::nonce::generate_nonce(&clock);
+        let expiry = clock.now_secs() + 3600;
+        let mut tracker =
+            scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-recorded".to_owned(), clock);
+
+        let mut first = None;
+        BridgeNonceTracker::new(&mut tracker, &mut first)
+            .check_and_record(&nonce, expiry)
+            .expect("a fresh nonce is accepted");
+        assert!(first.is_some(), "an accepted record must be reported");
+
+        let mut replay = None;
+        assert!(
+            BridgeNonceTracker::new(&mut tracker, &mut replay)
+                .check_and_record(&nonce, expiry)
+                .is_err(),
+            "a replayed nonce is refused"
+        );
+        assert!(replay.is_none(), "a refused record must not be reported");
     }
 
     /// Helper: create a `DualLayerResolver` with in-memory backends for testing.

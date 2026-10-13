@@ -1807,9 +1807,10 @@ pub(crate) fn persist_ucan_revocation_blocking(
 /// Every `PyO3` entry point that runs the ADR-016 validation pipeline and can
 /// record a nonce calls this afterwards, because step 9 of that pipeline is the
 /// only writer of nonce state. A nonce accepted now is therefore still refused
-/// after the bridge instance is rebuilt. The write runs while this call holds
-/// the context's registry entry, so two concurrent writers land in the order
-/// they read the tracker.
+/// after the bridge instance is rebuilt. `recorded` is what the run's nonce
+/// adapter reported; when it is `None` the run recorded nothing and this
+/// writes nothing. The write runs while this call holds the context's registry
+/// entry, so two concurrent writers land in the order they read the tracker.
 ///
 /// # Errors
 ///
@@ -1818,7 +1819,11 @@ pub(crate) fn persist_ucan_revocation_blocking(
 pub(crate) fn persist_ucan_nonces_blocking(
     bi: &PyBridgeInstance,
     context_id: &str,
+    recorded: Option<scp_ffi_common::NonceRecorded>,
 ) -> Result<(), ScpPyError> {
+    if recorded.is_none() {
+        return Ok(());
+    }
     let storage = durable_storage(bi, "persist UCAN nonce state", context_id)?;
     let to_error = durable_state_error("persist UCAN nonce state", context_id);
     with_ffi_state(bi, context_id, |rt| {
@@ -5055,5 +5060,32 @@ mod tests {
             creator
         );
         remove_context(&bi, &ctx_id);
+    }
+
+    /// A validation run that recorded no nonce writes nothing: the call
+    /// succeeds on an instance with no storage selected and no state for the
+    /// context, because it never reaches either. A run that did record a
+    /// nonce must reach storage, so the same instance refuses it.
+    #[test]
+    fn nonce_persist_writes_only_for_a_recorded_nonce() {
+        use scp_core::crypto::ucan::validate::NonceTracker as _;
+        let bi = Arc::new(PyBridgeInstance::new_py());
+        let ctx_id = unique_ctx_id("nonce-persist-recorded");
+
+        persist_ucan_nonces_blocking(&bi, &ctx_id, None)
+            .expect("a run that recorded nothing must not touch storage");
+
+        let clock = SystemClock;
+        let nonce = scp_core::crypto::ucan::nonce::generate_nonce(&clock);
+        let expiry = scp_clock::Clock::now_secs(&clock) + 3600;
+        let mut tracker = NonceTracker::new(ctx_id.clone(), clock);
+        let mut recorded = None;
+        scp_ffi_common::BridgeNonceTracker::new(&mut tracker, &mut recorded)
+            .record(&nonce, expiry)
+            .expect("a fresh nonce is recorded");
+        assert!(
+            persist_ucan_nonces_blocking(&bi, &ctx_id, recorded).is_err(),
+            "a recorded nonce must reach storage, which this instance lacks"
+        );
     }
 }

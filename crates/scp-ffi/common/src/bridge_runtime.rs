@@ -385,8 +385,9 @@ impl ProtocolRepoVariant {
     /// this repository wraps, so a nonce seen now is still refused after the
     /// bridge instance is rebuilt.
     ///
-    /// The napi-rs and `UniFFI` bridges call this after every UCAN-validation
-    /// pipeline run, because that pipeline is the only writer of nonce state.
+    /// The napi-rs and `UniFFI` bridges call this after a UCAN-validation
+    /// pipeline run that recorded a nonce, because that pipeline is the only
+    /// writer of nonce state.
     /// Callers pass `NonceTracker::snapshot_entries`.
     ///
     /// # Errors

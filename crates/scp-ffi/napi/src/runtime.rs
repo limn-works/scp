@@ -1808,11 +1808,13 @@ pub(crate) fn persist_ucan_revocation_blocking(
 
 /// Writes the context's UCAN nonce tracker to this instance's durable store.
 ///
-/// Called after every UCAN-validation pipeline run that records a nonce,
+/// Called after every UCAN-validation pipeline run that can record a nonce,
 /// because that pipeline is the only writer of nonce state. A nonce accepted
-/// now is therefore still refused after the bridge instance is rebuilt. The
-/// write runs while this call holds the context's registry entry, so two
-/// concurrent writers land in the order they read the tracker.
+/// now is therefore still refused after the bridge instance is rebuilt.
+/// `recorded` is what the run's nonce adapter reported; when it is `None` the
+/// run recorded nothing and this writes nothing. The write runs while this
+/// call holds the context's registry entry, so two concurrent writers land in
+/// the order they read the tracker.
 ///
 /// # Errors
 ///
@@ -1822,7 +1824,11 @@ pub(crate) fn persist_ucan_revocation_blocking(
 pub(crate) fn persist_ucan_nonces_blocking(
     bi: &NapiBridgeInstance,
     context_id: &str,
+    recorded: Option<scp_ffi_common::NonceRecorded>,
 ) -> Result<(), ScpNapiError> {
+    if recorded.is_none() {
+        return Ok(());
+    }
     let to_error = durable_state_error("persist UCAN nonce state", context_id);
     with_context(bi, context_id, |rt| {
         scp_ffi_common::ucan_durable_state::block_on_storage(

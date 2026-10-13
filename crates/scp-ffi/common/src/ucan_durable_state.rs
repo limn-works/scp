@@ -29,7 +29,7 @@
 //! | Key | Value | Written by | Read by |
 //! |---|---|---|---|
 //! | `context/{ctx}/ucan/revocation_list` | serialized [`RevocationList`] | every bridge's `ucan_revoke`, after `revoke_ucan` succeeds | [`hydrate_core`], at per-context UCAN-state construction |
-//! | `context/{ctx}/ucan/nonce_tracker` | serialized [`NonceTracker`] | every bridge's UCAN-validation entry points, after the validation pipeline runs | [`hydrate_core`], at per-context UCAN-state construction |
+//! | `context/{ctx}/ucan/nonce_tracker` | serialized [`NonceTracker`] | every bridge's UCAN-validation entry points, after a validation pipeline run that recorded a nonce | [`hydrate_core`], at per-context UCAN-state construction |
 //!
 //! Hydration is monotonic in both directions, so calling it twice cannot
 //! un-revoke a token or forget a nonce: the revocation list merges as a set
@@ -53,8 +53,7 @@
 //! A bridge instance configured with `{"type":"sqlite", …}` writes them to the
 //! same `SQLCipher` database that holds context snapshots and the Merkle event
 //! log, and they survive a restart. This module never substitutes one backend
-//! for another and never falls back: when the bridge has no storage selected,
-//! the caller receives [`UcanDurableStateError::NoStorage`] and fails closed.
+//! for another and never falls back.
 
 use std::collections::HashMap;
 
@@ -82,14 +81,6 @@ pub enum UcanDurableStateError {
     /// The persisted bytes could not be encoded or decoded.
     #[error("UCAN durable-state value codec failed: {0}")]
     Codec(String),
-    /// The bridge instance has no storage backend selected, so the revocation
-    /// could not be made durable. The caller fails closed rather than
-    /// performing a revocation the next process start would forget.
-    #[error(
-        "bridge instance has no storage backend selected — a UCAN revocation \
-         cannot be made durable; select storage via SCP.with_storage(...) first"
-    )]
-    NoStorage,
     /// The caller asked to run the storage future to completion from a
     /// synchronous FFI entry point with nothing to drive it on: either inside a
     /// current-thread tokio runtime, where neither `block_in_place` nor
@@ -185,9 +176,10 @@ pub async fn load_revocation_list<S: Storage>(
 
 /// Writes the context's UCAN nonce entries to durable storage.
 ///
-/// Every bridge calls this after each UCAN-validation pipeline run, because
-/// that pipeline is the only thing that records nonces (through
-/// `BridgeNonceTracker`). Callers pass
+/// Every bridge calls this after a UCAN-validation pipeline run that recorded
+/// a nonce, because that pipeline is the only thing that records nonces
+/// (through `BridgeNonceTracker`, which reports each record as a
+/// `NonceRecorded`). Callers pass
 /// [`NonceTracker::snapshot_entries`], which is also what the runtime embeds in
 /// a `ContextStateSnapshot` for its own `spending_nonce_tracker`. Writing the
 /// whole entry set rather than the single new nonce keeps a pruned tracker from

@@ -360,6 +360,7 @@ impl crate::scp::PyScp {
 
         // Execute the full 11-step validation pipeline within the context runtime.
         // Use production DID resolver when available (#311), fallback to string-only.
+        let mut recorded = None;
         let validated = crate::runtime::with_context(bi, context_id, |rt| {
             let production_resolver = crate::runtime::did_resolver(bi);
             let did_resolver =
@@ -367,9 +368,7 @@ impl crate::scp::PyScp {
             let revocation_checker = BridgeRevocationChecker {
                 revocation_list: &rt.revocation_list,
             };
-            let mut nonce_adapter = BridgeNonceTracker {
-                inner: &mut rt.nonce_tracker,
-            };
+            let mut nonce_adapter = BridgeNonceTracker::new(&mut rt.nonce_tracker, &mut recorded);
 
             let mut ctx = ValidationContext {
                 did_resolver: &did_resolver,
@@ -395,7 +394,7 @@ impl crate::scp::PyScp {
         // context's nonce entries to durable storage before returning. A
         // rejected token keeps its own error: the caller is already denied, so
         // a durability failure on that path grants nothing.
-        let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, context_id);
+        let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, context_id, recorded);
         validated?;
         persisted?;
 
@@ -521,9 +520,9 @@ impl crate::scp::PyScp {
             let revocation_checker = BridgeRevocationChecker {
                 revocation_list: &rt.revocation_list,
             };
-            let mut nonce_adapter = BridgeNonceTracker {
-                inner: &mut rt.nonce_tracker,
-            };
+            let mut never_recorded = None;
+            let mut nonce_adapter =
+                BridgeNonceTracker::new(&mut rt.nonce_tracker, &mut never_recorded);
 
             let ctx = ValidationContext {
                 did_resolver: &did_resolver,
@@ -1100,9 +1099,8 @@ mod tests {
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
         let expiry = now_secs + 3600;
 
-        let mut adapter = BridgeNonceTracker {
-            inner: &mut tracker,
-        };
+        let mut recorded = None;
+        let mut adapter = BridgeNonceTracker::new(&mut tracker, &mut recorded);
 
         // First check should succeed.
         assert!(adapter.check_and_record(&nonce, expiry).is_ok());

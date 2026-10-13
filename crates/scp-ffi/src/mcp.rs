@@ -57,6 +57,7 @@ use scp_mcp::sse_client::{SseClientTransport, SseCloser};
 use scp_mcp::stdio::read_response;
 use scp_platform::traits::Storage;
 
+use crate::bridge_adapters::OutletGrantNonceTracker;
 use crate::error::ScpPyError;
 use crate::types::{json_to_py_dict, py_dict_to_json};
 use crate::validate;
@@ -604,6 +605,7 @@ impl FfiBridgeProvider {
 
         // The closure's `Ok` carries the UCAN decision, so an `Err` from
         // `with_context` is a failed read of the bridge's context copy.
+        let mut recorded = None;
         let decision = crate::runtime::with_context(bi, context_id, |rt| {
             // SCP-OUT-014: select the split capability stem from the
             // outlet's registered kind — `outlet_query:{id}` for Query
@@ -625,7 +627,7 @@ impl FfiBridgeProvider {
             // Only the Invoke check made just before a `tools/call` runs
             // its outlet records the nonce; a probe records nothing.
             let mut nonce_adapter =
-                crate::bridge_adapters::OutletGrantNonceTracker::new(&mut rt.nonce_tracker, check);
+                OutletGrantNonceTracker::new(&mut rt.nonce_tracker, check, &mut recorded);
 
             let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
                 did_resolver: &did_resolver,
@@ -664,28 +666,13 @@ impl FfiBridgeProvider {
             }))
         })
         .map_err(|e| AccessRefusal::Unreadable(format!("{e}")))?;
-        // A rejected token keeps its own refusal: the caller is already
-        // denied, so a durability failure on that path grants nothing.
-        let persisted = persist_invoke_nonces(bi, context_id, check);
+        // Only a run that recorded the nonce (step 9) writes; a rejected token
+        // keeps its own refusal, so a durability failure there grants nothing.
+        let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, context_id, recorded)
+            .map_err(|e| AccessRefusal::Unreadable(format!("{e}")));
         decision.map_err(AccessRefusal::Denied)?;
         persisted
     }
-}
-
-/// Writes the context's UCAN nonce entries to durable storage after an
-/// `Invoke` check, the only check whose pipeline run records a nonce (step 9),
-/// so the outlet does not run on a nonce the next process start would forget.
-/// A probe records nothing and writes nothing.
-fn persist_invoke_nonces(
-    bi: &crate::runtime::PyBridgeInstance,
-    context_id: &str,
-    check: scp_mcp::server::CapabilityCheck,
-) -> Result<(), scp_mcp::server::AccessRefusal> {
-    if check != scp_mcp::server::CapabilityCheck::Invoke {
-        return Ok(());
-    }
-    crate::runtime::persist_ucan_nonces_blocking(bi, context_id)
-        .map_err(|e| scp_mcp::server::AccessRefusal::Unreadable(format!("{e}")))
 }
 
 impl ContextProvider for FfiBridgeProvider {

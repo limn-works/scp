@@ -4642,6 +4642,7 @@ pub(crate) fn validate_outlet_ucan_uniffi(
     let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
     let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
+    let mut recorded = None;
     let validated = bi
         .with_ucan_state(&handle.context_id, |ucan_state| {
             let production_resolver = bi.did_resolver();
@@ -4650,9 +4651,10 @@ pub(crate) fn validate_outlet_ucan_uniffi(
             let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                 revocation_list: &ucan_state.revocation_list,
             };
-            let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                inner: &mut ucan_state.nonce_tracker,
-            };
+            let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker::new(
+                &mut ucan_state.nonce_tracker,
+                &mut recorded,
+            );
 
             let mut ctx = ValidationContext {
                 did_resolver: &did_resolver,
@@ -4692,7 +4694,7 @@ pub(crate) fn validate_outlet_ucan_uniffi(
     // nonce entries to durable storage before returning. A rejected token keeps
     // its own error: the caller is already denied, so a durability failure on
     // that path grants nothing.
-    let persisted = bi.persist_ucan_nonces_blocking(&handle.context_id);
+    let persisted = bi.persist_ucan_nonces_blocking(&handle.context_id, recorded);
     validated??;
     persisted
 }
@@ -5588,6 +5590,7 @@ impl McpUniFfiBridgeProvider {
         // nonce tracker.
         let ceiling_strings = role_state.ceiling().to_ucan_string_set();
         let agent_did = self.agent_did.clone();
+        let mut recorded = None;
         let decision = bi
             .with_ucan_state(context_id, |ucan_state| {
                 let production_resolver = bi.did_resolver();
@@ -5601,6 +5604,7 @@ impl McpUniFfiBridgeProvider {
                 let mut nonce_adapter = scp_ffi_common::OutletGrantNonceTracker::new(
                     &mut ucan_state.nonce_tracker,
                     check,
+                    &mut recorded,
                 );
 
                 let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
@@ -5646,14 +5650,11 @@ impl McpUniFfiBridgeProvider {
             })?;
         // Step 9 of the pipeline records the token's nonce on an Invoke check,
         // so write the context's nonce entries to durable storage before the
-        // outlet runs. A probe records nothing and writes nothing. A rejected
-        // token keeps its own refusal: the caller is already denied, so a
-        // durability failure on that path grants nothing.
-        let persisted = if check == scp_mcp::server::CapabilityCheck::Invoke {
-            bi.persist_ucan_nonces_blocking(context_id)
-        } else {
-            Ok(())
-        };
+        // outlet runs. A probe, or a token refused before step 9, records
+        // nothing and writes nothing. A rejected token keeps its own refusal:
+        // the caller is already denied, so a durability failure on that path
+        // grants nothing.
+        let persisted = bi.persist_ucan_nonces_blocking(context_id, recorded);
         decision.map_err(AccessRefusal::Denied)?;
         persisted.map_err(|e| AccessRefusal::Unreadable(e.to_string()))?;
         Ok(())
@@ -15596,6 +15597,7 @@ impl Scp {
                 let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
                 // Execute the full 11-step validation pipeline via per-context state.
+                let mut recorded = None;
                 let validation_result = bi
                     .with_ucan_state(&handle.context_id, |ucan_state| {
                         let production_resolver = bi.did_resolver();
@@ -15605,9 +15607,10 @@ impl Scp {
                         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                             revocation_list: &ucan_state.revocation_list,
                         };
-                        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                            inner: &mut ucan_state.nonce_tracker,
-                        };
+                        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker::new(
+                            &mut ucan_state.nonce_tracker,
+                            &mut recorded,
+                        );
 
                         let mut ctx = ValidationContext {
                             did_resolver: &did_resolver,
@@ -15643,7 +15646,7 @@ impl Scp {
                 // context's nonce entries to durable storage before returning. A
                 // rejected token keeps its own error: the caller is already
                 // denied, so a durability failure on that path grants nothing.
-                let persisted = bi.persist_ucan_nonces_blocking(&handle.context_id);
+                let persisted = bi.persist_ucan_nonces_blocking(&handle.context_id, recorded);
                 validation_result?;
                 persisted
             })
@@ -15786,9 +15789,11 @@ impl Scp {
                         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                             revocation_list: &ucan_state.revocation_list,
                         };
-                        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                            inner: &mut ucan_state.nonce_tracker,
-                        };
+                        let mut never_recorded = None;
+                        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker::new(
+                            &mut ucan_state.nonce_tracker,
+                            &mut never_recorded,
+                        );
 
                         let ctx = ValidationContext {
                             did_resolver: &did_resolver,
