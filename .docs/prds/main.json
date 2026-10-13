@@ -11561,7 +11561,7 @@
       "acceptanceCriteria": [
         "Each bridge's `node_start` runs these steps in this order: the handle check (`check_handle` on UniFFI), config parse or conversion, operator identity resolution, taking the instance storage, `server::node_start`, `server::register_node`, `auto_wire_context_manager`, and wrapping the handle",
         "An operator identity that does not resolve returns `SCP-IDENT-1063` on every bridge: PyO3 `build_node_identity` keeps the code, the napi-rs registry miss returns it, and UniFFI `build_node_identity_from_uniffi` compiles and runs without `testing`, with the `IDENT_1013` stub deleted",
-        "Every `server_err` and `node_err` on the three bridges maps through `server_error_code` and `server_error_class`, so no bridge returns an uncoded runtime error for a `ServerError`",
+        "Every `server_err` and `node_err` on the three bridges maps through `server_error_code` and `server_error_class`, so no bridge returns an uncoded runtime error for a `ServerError`; the `TRANS_5053` constant in `crates/scp-ffi/common/src/error_codes.rs` and its UniFFI node-storage use in `crates/scp-ffi/uniffi/src/server.rs` are deleted, and `git grep -n TRANS_5053 crates` returns nothing",
         "Shipped tests in the existing bridge production filters pass: PyO3 and napi-rs `node_start_with_unregistered_operator_did_returns_ident_1063`, UniFFI `node_start_with_externally_loaded_identity_returns_ident_1063`",
         "Tests built with `testing` cover a successful `node_start` and every row of sdk-common.md §\"Node start error codes\" that a bridge can reach",
         "`scripts/bridge-aliases.json` has a `node_start` entry, and `pipeline_wiring.rs` asserts that each bridge delegates to `server::node_start(`"

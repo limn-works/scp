@@ -401,7 +401,7 @@ and are documented with their own features.
 | `Platform` (dev pair) | `SCP-CTX-2053` | A dev-pair start received a `PlatformError`, such as from a key custody file it could not open |
 | `DevStartUnavailable` | `SCP-TRANS-5055` | A dev-pair constructor (`start_node_in_memory`, `start_node_local`) was called on a bridge built without its `testing` feature |
 
-`SCP-IDENT-1063` is the next free number in the `SCP-IDENT-1000` to `SCP-IDENT-1099` bridge sub-block. The `SCP-IDENT-1100` to `SCP-IDENT-1199` sub-block stays with the key-event-log identity model of `03-identity.md` §3.10.10. `SCP-STORAGE-8007` to `SCP-STORAGE-8009` sit between the selection layer's `8004` to `8006` and the browser participant's `8010` to `8013`. `SCP-TRANS-5055` follows the node codes `SCP-TRANS-5050` to `SCP-TRANS-5054`. `DevStartUnavailable` replaces `AutoGenerateUnavailable`.
+`SCP-IDENT-1063` is the next free number in the `SCP-IDENT-1000` to `SCP-IDENT-1099` bridge sub-block. The `SCP-IDENT-1100` to `SCP-IDENT-1199` sub-block stays with the key-event-log identity model of `03-identity.md` §3.10.10. `SCP-STORAGE-8007` to `SCP-STORAGE-8009` sit between the selection layer's `8004` to `8006` and the browser participant's `8010` to `8013`. `SCP-TRANS-5055` follows the node codes `SCP-TRANS-5050` to `SCP-TRANS-5054`. `DevStartUnavailable` replaces `AutoGenerateUnavailable`. `SCP-TRANS-5053`, the former UniFFI node-storage code, is retired, and a node storage failure now returns `SCP-STORAGE-8009`.
 
 ### Custody request
 
