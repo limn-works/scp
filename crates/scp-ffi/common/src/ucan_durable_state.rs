@@ -91,12 +91,14 @@ pub enum UcanDurableStateError {
     )]
     NoStorage,
     /// The caller asked to run the storage future to completion from a
-    /// synchronous FFI entry point while already inside a current-thread tokio
-    /// runtime, where neither `block_in_place` nor `Handle::block_on` can run.
-    /// Reported rather than risking a panic or a deadlock.
+    /// synchronous FFI entry point with nothing to drive it on: either inside a
+    /// current-thread tokio runtime, where neither `block_in_place` nor
+    /// `Handle::block_on` can run, or outside any runtime with no fallback
+    /// handle. Reported rather than risking a panic or a deadlock.
     #[error(
-        "cannot run UCAN durable-state storage I/O from inside a current-thread \
-         tokio runtime"
+        "cannot run UCAN durable-state storage I/O: the caller is inside a \
+         current-thread tokio runtime, or outside any runtime with no bridge \
+         runtime to drive it"
     )]
     NoBlockingContext,
 }

@@ -1756,10 +1756,17 @@ fn durable_state_error<'a>(
 fn run_storage_io<F: std::future::Future>(
     fut: F,
 ) -> Result<F::Output, scp_ffi_common::ucan_durable_state::UcanDurableStateError> {
+    // Outside any runtime, drive the future on the bridge runtime. Module
+    // import initializes it; `init_runtime` is idempotent, so a caller that
+    // reaches this before import (a Rust test running alone in its process)
+    // gets the same runtime rather than a refusal.
     let fallback = if tokio::runtime::Handle::try_current().is_ok() {
         None
     } else {
-        super::runtime().ok().map(tokio::runtime::Runtime::handle)
+        super::init_runtime()
+            .ok()
+            .and_then(|()| super::runtime().ok())
+            .map(tokio::runtime::Runtime::handle)
     };
     scp_ffi_common::ucan_durable_state::block_on_storage(fallback, fut)
 }
