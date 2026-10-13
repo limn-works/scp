@@ -355,7 +355,7 @@ class SCP internal constructor(
      *   any bridge call).
      */
     @Suppress("LongParameterList")
-    fun aggregateTrustInput(
+    suspend fun aggregateTrustInput(
         contextId: String,
         subjectDid: String,
         events: List<EventLogEntry>,
@@ -2118,7 +2118,7 @@ class SCP internal constructor(
      * on [inner]. A revocation list that cannot be read throws; it never reads
      * as `valid = false`.
      */
-    fun trustVerifyAttestation(
+    suspend fun trustVerifyAttestation(
         contextId: String,
         attestation: CachedAttestationEnvelope,
     ): AttestationVerificationResult =
@@ -2221,7 +2221,7 @@ class SCP internal constructor(
      * [NO_PARTICIPATION_FACTS_CODE]; callers wanting the empty-log case as a
      * zeroed record (rather than an exception) should use [evaluateTrust].
      */
-    fun participationRecord(
+    suspend fun participationRecord(
         contextId: String,
         subjectDid: String,
         cachedAttestations: List<CachedAttestation> = emptyList(),
@@ -2459,7 +2459,7 @@ class SCP internal constructor(
      * genuinely-signed result from a verifier it controls. Establish verifier
      * legitimacy separately and MUST NOT treat success as authorization.
      */
-    fun checkCapabilityRequirements(
+    suspend fun checkCapabilityRequirements(
         contextId: String,
         subjectDid: String,
         requirements: List<CapabilityRequirement>,

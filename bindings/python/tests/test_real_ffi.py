@@ -1199,8 +1199,8 @@ class TestTrust:
         )
         after_secs = int(time.time())
 
-        admin_record = participation_record(scp, context_id, admin.did)
-        member_record = participation_record(scp, context_id, member.did)
+        admin_record = await participation_record(scp, context_id, admin.did)
+        member_record = await participation_record(scp, context_id, member.did)
 
         # Admin INITIATED all three governance actions and created one child.
         assert admin_record.governance_actions_by == 3

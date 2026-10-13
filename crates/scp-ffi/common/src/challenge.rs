@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use scp_core::context::ContextError;
 use scp_core::context::actor::signer::{CommandSigner, sign_bounded};
-use scp_core::trust::attestation::DidPublicKeyResolver;
+use scp_core::trust::attestation::ActiveKeyResolver;
 use scp_core::trust::{
     ChallengeRequest, ChallengeResponse, ChallengeVerification, TestCase, TrustError,
     challenge_request_unsigned, check_challenge_response,
@@ -147,7 +147,7 @@ pub async fn verify_response_and_sign<R>(
     context_id: String,
 ) -> Result<ChallengeVerification, ChallengeOpError>
 where
-    R: DidPublicKeyResolver + Send + Sync + 'static,
+    R: ActiveKeyResolver + Send + Sync + 'static,
 {
     signer.require_ed25519()?;
     let VerifyInputs { request, response } = inputs;
@@ -228,8 +228,8 @@ mod tests {
     /// identity and `#active` key.
     struct SeedResolver;
 
-    impl DidPublicKeyResolver for SeedResolver {
-        fn resolve_public_key(&self, did_str: &str) -> Result<Vec<u8>, TrustError> {
+    impl ActiveKeyResolver for SeedResolver {
+        fn resolve_active_key(&self, did_str: &str) -> Result<Vec<u8>, TrustError> {
             (1u8..=2)
                 .find(|seed| did(*seed) == did_str)
                 .map(|seed| key(seed).verifying_key().to_bytes().to_vec())

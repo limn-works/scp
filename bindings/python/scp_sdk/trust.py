@@ -1030,7 +1030,9 @@ async def evaluate_trust(
     # error (NotInitialized, a provider failure, malformed input) is genuine and
     # MUST propagate — the prior blanket `except ContextError` masked them.
     try:
-        behavioral = _participation_record_from(instance, context_id, subject_did, "[]")
+        behavioral = await asyncio.to_thread(
+            _participation_record_from, instance, context_id, subject_did, "[]"
+        )
     except ContextError as exc:
         if exc.code != NO_PARTICIPATION_FACTS_CODE:
             raise
@@ -1347,7 +1349,7 @@ def _participation_record_from(
     )
 
 
-def participation_record(
+async def participation_record(
     scp: SCP,
     context_id: str,
     subject_did: str,
@@ -1402,10 +1404,12 @@ def participation_record(
     bridge = _bridge()
     instance: Any = bridge if hasattr(bridge, "_mock_name") else scp._native
     cached_json = json.dumps(cached_attestations if cached_attestations is not None else [])
-    return _participation_record_from(instance, context_id, subject_did, cached_json)
+    return await asyncio.to_thread(
+        _participation_record_from, instance, context_id, subject_did, cached_json
+    )
 
 
-def aggregate_trust_input(
+async def aggregate_trust_input(
     scp: SCP,
     context_id: str,
     subject_did: str,
@@ -1482,7 +1486,7 @@ def aggregate_trust_input(
         challenge_results,
     )
 
-    result = instance.aggregate_trust_input(context_id, subject_did, *wire)
+    result = await asyncio.to_thread(instance.aggregate_trust_input, context_id, subject_did, *wire)
     if isinstance(result, str):
         return json.loads(result)
     return result
@@ -1758,7 +1762,7 @@ class ChallengeResponse(TypedDict):
     signature: list[int]
 
 
-def trust_verify_attestation(
+async def trust_verify_attestation(
     scp: SCP,
     context_id: str,
     attestation: CachedAttestationEnvelope | dict[str, Any],
@@ -1790,7 +1794,9 @@ def trust_verify_attestation(
             provider, or a revocation list that cannot be read. A list that
             cannot be read raises; it never reads as ``valid: False``.
     """
-    return scp._native.trust_verify_attestation(context_id, json.dumps(attestation))
+    return await asyncio.to_thread(
+        scp._native.trust_verify_attestation, context_id, json.dumps(attestation)
+    )
 
 
 __all__ = [

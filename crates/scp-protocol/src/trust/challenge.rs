@@ -36,7 +36,7 @@ use scp_did::DID;
 use scp_event_log::Ed25519Signature;
 
 use super::TrustError;
-use super::attestation::DidPublicKeyResolver;
+use super::attestation::ActiveKeyResolver;
 use super::capability_registry::{MinCases, lookup_protocol_capability, validate_capability_uri};
 use super::capability_uri::CapabilityUri;
 use super::language_tag::is_well_formed_language_tag;
@@ -1011,7 +1011,7 @@ fn reported_counts(response: &ChallengeResponse) -> Result<ReportedCounts, Trust
 pub fn check_challenge_response(
     request: &ChallengeRequest,
     response: &ChallengeResponse,
-    resolver: &(impl DidPublicKeyResolver + ?Sized),
+    resolver: &(impl ActiveKeyResolver + ?Sized),
     clock: &(impl Clock + ?Sized),
     verifier: &DID,
     context_id: String,
@@ -1038,7 +1038,7 @@ pub fn check_challenge_response(
         });
     }
 
-    let verifier_pk = resolver.resolve_public_key(&request.verifier)?;
+    let verifier_pk = resolver.resolve_active_key(&request.verifier)?;
     let request_digest = challenge_request_signing_digest(request)?;
     verify_ed25519_signature(&verifier_pk, &request_digest, &request.verifier_signature)
         .map_err(|reason| TrustError::ChallengeRequestSignatureInvalid { reason })?;
@@ -1056,7 +1056,7 @@ pub fn check_challenge_response(
         });
     }
 
-    let subject_pk = resolver.resolve_public_key(&response.responder_did)?;
+    let subject_pk = resolver.resolve_active_key(&response.responder_did)?;
     let response_bytes = canonical_challenge_response_bytes(response)?;
     verify_ed25519_signature(&subject_pk, &response_bytes, &response.signature).map_err(
         |reason| TrustError::ChallengeSignatureInvalid {
@@ -1172,7 +1172,7 @@ pub fn issue_challenge(
 pub fn verify_challenge_response(
     request: &ChallengeRequest,
     response: &ChallengeResponse,
-    resolver: &(impl DidPublicKeyResolver + ?Sized),
+    resolver: &(impl ActiveKeyResolver + ?Sized),
     clock: &(impl Clock + ?Sized),
     verifier_signer: &(impl ChallengeSigner + ?Sized),
     verifier: &DID,
@@ -1216,13 +1216,13 @@ pub fn verify_challenge_response(
 /// The errors above; a resolver error propagates unchanged.
 pub fn verify_challenge_verification(
     verification: &ChallengeVerification,
-    resolver: &(impl DidPublicKeyResolver + ?Sized),
+    resolver: &(impl ActiveKeyResolver + ?Sized),
     target_context_id: &str,
     expected_subject: &str,
     clock: &(impl Clock + ?Sized),
 ) -> Result<(), TrustError> {
     let id_hex = hex::encode(verification.verification_id);
-    let verifier_pk = resolver.resolve_public_key(&verification.verifier)?;
+    let verifier_pk = resolver.resolve_active_key(&verification.verifier)?;
     let digest = challenge_verification_signing_digest(verification)?;
     verify_ed25519_signature(&verifier_pk, &digest, &verification.verifier_signature).map_err(
         |reason| TrustError::ChallengeVerificationSignatureInvalid {
@@ -1333,8 +1333,8 @@ mod tests {
         keys: HashMap<String, Vec<u8>>,
     }
 
-    impl DidPublicKeyResolver for TestResolver {
-        fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+    impl ActiveKeyResolver for TestResolver {
+        fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
             self.keys
                 .get(did)
                 .cloned()

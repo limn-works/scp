@@ -4987,6 +4987,10 @@ fn pyo3_participation_record_routes_to_supervisor() {
         fn_body_contains(
             PYO3_TRUST_SRC,
             "participation_record_impl",
+            "participation_record_on_pool("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "participation_record_on_pool",
             ".participation_record("
         ),
         "PyO3 participation_record_impl must call Supervisor::participation_record, \
@@ -5039,7 +5043,7 @@ fn uniffi_participation_record_routes_to_supervisor() {
 // core `scp_protocol::trust::check_capability_requirements` (re-exported as
 // `scp_core::trust::check_capability_requirements`) rather than re-implementing
 // the admission decision locally, AND MUST wire the instance's DID resolver
-// (`instance_challenge_resolver` over the instance `IdentityBackedDidResolver`),
+// (`instance_active_key_resolver` over the instance `IdentityBackedDidResolver`),
 // which reads the verifier's `#active` key, so each `ChallengeVerification` is
 // signature/subject/context/expiry verified. Pinning the fully-qualified
 // `scp_core::trust::check_capability_requirements(` call (not the bare leaf,
@@ -5057,10 +5061,19 @@ fn pyo3_check_capability_requirements_routes_to_core() {
         ) && fn_body_contains(
             PYO3_TRUST_SRC,
             "check_capability_requirements",
-            "instance_challenge_resolver(crate::runtime::did_resolver(bi))"
+            "on_resolution_pool(py, move |scope|"
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "check_capability_requirements",
+            "instance_active_key_resolver("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "check_capability_requirements",
+            "crate::runtime::did_resolver(&bi)"
         ),
         "PyO3 check_capability_requirements must call core \
-         check_capability_requirements with the instance DID resolver"
+         check_capability_requirements with the instance DID resolver, \
+         on the blocking pool without the GIL"
     );
 }
 
@@ -5076,7 +5089,7 @@ fn napi_check_capability_requirements_routes_to_core() {
         ) && fn_body_contains(
             NAPI_TRUST_SRC,
             "check_capability_requirements_on",
-            "instance_challenge_resolver(crate::runtime::did_resolver(bi))"
+            "instance_active_key_resolver(scope, crate::runtime::did_resolver(bi))"
         ),
         "NAPI check_capability_requirements_on must call core \
          check_capability_requirements with the instance DID resolver"
@@ -5094,11 +5107,15 @@ fn uniffi_check_capability_requirements_routes_to_core() {
         ) && fn_body_contains(
             UNIFFI_BRIDGE_SRC,
             "check_capability_requirements",
-            "let did_resolver = self.inner.did_resolver();"
+            "on_resolution_pool(move |scope|"
         ) && fn_body_contains(
             UNIFFI_BRIDGE_SRC,
             "check_capability_requirements",
-            "instance_challenge_resolver(did_resolver.as_ref())"
+            "let did_resolver = inner.did_resolver();"
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "check_capability_requirements",
+            "instance_active_key_resolver(scope, did_resolver.as_ref())"
         ),
         "UniFFI check_capability_requirements must call core \
          check_capability_requirements with the instance DID resolver"
@@ -5195,7 +5212,15 @@ fn uniffi_trust_verify_attestation_reads_the_instance_revocation_list() {
         fn_body_contains(
             UNIFFI_BRIDGE_SRC,
             "trust_verify_attestation",
-            "self.inner.protocol_repository()"
+            "let inner = Arc::clone(&self.inner);"
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_verify_attestation",
+            "on_resolution_pool("
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_verify_attestation",
+            "inner.protocol_repository()"
         ) && fn_body_contains(
             UNIFFI_BRIDGE_SRC,
             "trust_verify_attestation",

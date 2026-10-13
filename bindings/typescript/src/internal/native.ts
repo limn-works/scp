@@ -1228,7 +1228,7 @@ export function createNativeBridge(scp: SCP): Bridge {
           attestorSetsJson: string,
           cachedAttestationsJson: string,
           challengeResultsJson: string,
-        ) => string
+        ) => Promise<string>
       )(
         contextId,
         subjectDid,
@@ -2068,21 +2068,21 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     // Trust — capability admission verification (§7.3.4.4, SCP-ACR-008)
-    checkCapabilityRequirements(
+    async checkCapabilityRequirements(
       contextId: string,
       subjectDid: string,
       requirementsJson: string,
       agentCapabilitiesJson: string,
       challengeVerificationsJson: string,
-    ): void {
-      (
+    ): Promise<void> {
+      await (
         native.checkCapabilityRequirements as (
           c: string,
           s: string,
           r: string,
           a: string,
           v: string,
-        ) => void
+        ) => Promise<void>
       )(contextId, subjectDid, requirementsJson, agentCapabilitiesJson, challengeVerificationsJson);
     },
 

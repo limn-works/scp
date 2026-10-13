@@ -21,7 +21,7 @@ use scp_core::trust::aggregate::{
     CachedAttestation, RevocationEntry, RevocationMapChecker, TrustProtocolRepository,
     revocation_list_key,
 };
-use scp_core::trust::attestation::{Attestation, DidPublicKeyResolver, RevocationStatus};
+use scp_core::trust::attestation::{ActiveKeyResolver, Attestation, RevocationStatus};
 use scp_core::trust::{
     ChallengeVerification, TrustError, verify_attestation, verify_challenge_verification,
 };
@@ -286,8 +286,8 @@ const fn is_issuer_signed_revocation(err: &TrustError, attestation: &Attestation
 /// (`revoked_by == issuer`) can revoke an attestation") while §7.4.1 binds
 /// `Attestation.id` to no issuer. Keying on an id alone would break that grant:
 /// an attacker who derives a DID from a fresh keypair — which costs nothing,
-/// because `IdentityDidPublicKeyResolver` reads a public key out of a DID string
-/// and no publication gates it — signs an attestation carrying an honest
+/// because publishing a DID document needs no one's permission — signs an
+/// attestation carrying an honest
 /// issuer's id and revoking itself, both conditions of
 /// [`is_issuer_signed_revocation`] hold, and every later read of the honest
 /// issuer's attestation then finds that id listed. [`revocation_list_key`]
@@ -296,7 +296,7 @@ const fn is_issuer_signed_revocation(err: &TrustError, attestation: &Attestation
 fn verify_and_cache_attestations<S: TrustProtocolRepository>(
     cache: &scp_core::trust::aggregate::AttestationCache<S>,
     context_id: &str,
-    resolver: &impl DidPublicKeyResolver,
+    resolver: &dyn ActiveKeyResolver,
     clock: &impl Clock,
     entries: Vec<CachedAttestation>,
 ) -> Result<(), TrustError> {
@@ -412,7 +412,7 @@ pub fn verify_attestation_in_context<S, R, C>(
 ) -> Result<AttestationVerdict, TrustError>
 where
     S: TrustProtocolRepository + ?Sized,
-    R: DidPublicKeyResolver + ?Sized,
+    R: ActiveKeyResolver + ?Sized,
     C: Clock + ?Sized,
 {
     let revoked = store.get_revocation_state(context_id)?;
@@ -442,17 +442,18 @@ where
 /// # Errors
 ///
 /// Returns [`TrustError`] if store population, aggregation, or serialization
-/// fails, or if `challenge_resolver` cannot reach its backend
+/// fails, or if `resolver` cannot reach its backend
 /// ([`TrustError::KeyResolutionUnavailable`]).
 ///
-/// `challenge_resolver` resolves each challenge verifier's `#active` key, for
-/// verify-on-ingest and for the aggregation read path. The bridges pass their
+/// `resolver` resolves the `#active` key of each attestation issuer, threshold
+/// attestor and challenge verifier (spec 09 §9.7.1), for verify-on-ingest and
+/// for the aggregation read path. The bridges pass their
 /// instance's resolver through
-/// [`instance_challenge_resolver`](crate::resolvers::instance_challenge_resolver).
+/// [`instance_active_key_resolver`](crate::resolvers::instance_active_key_resolver).
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub fn populate_and_aggregate<S: TrustProtocolRepository>(
     store: S,
-    challenge_resolver: &dyn DidPublicKeyResolver,
+    resolver: &dyn ActiveKeyResolver,
     context_id: &str,
     subject_did: &str,
     cached_attestations: Vec<CachedAttestation>,
@@ -467,12 +468,11 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
     attestor_sets: &HashMap<scp_core::trust::AttestationType, Vec<scp_core::trust::AttestorInfo>>,
 ) -> Result<String, TrustError> {
     let cache = scp_core::trust::aggregate::AttestationCache::new(store);
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
     let clock = scp_clock::SystemClock;
 
     // Verify-on-ingest for caller-supplied attestations (see helper for the
     // SECURITY rationale).
-    verify_and_cache_attestations(&cache, context_id, &resolver, &clock, cached_attestations)?;
+    verify_and_cache_attestations(&cache, context_id, resolver, &clock, cached_attestations)?;
 
     // SECURITY (verify-on-ingest). Caller-supplied challenge verifications carry
     // a caller-controlled `passed`/`score` trust signal that is only meaningful
@@ -488,8 +488,7 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
     // that fail verification, and propagate infra faults so a backend error does
     // not silently discard a legitimate verifier's signal.
     for cr in challenge_results {
-        match verify_challenge_verification(cr, challenge_resolver, context_id, subject_did, &clock)
-        {
+        match verify_challenge_verification(cr, resolver, context_id, subject_did, &clock) {
             Ok(()) => cache.store().store_challenge_result(context_id, cr)?,
             Err(reason) if reason.is_record_rejection() => {
                 tracing::debug!(
@@ -511,8 +510,7 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
         threshold_requirements,
         attestor_sets,
         cache: &cache,
-        resolver: &resolver,
-        challenge_resolver,
+        resolver,
         clock: &clock,
     };
 
@@ -529,8 +527,7 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
 /// This is the attestation-sourcing half of [`populate_and_aggregate`], factored
 /// out so the participation-record bridge path can obtain the credential-layer
 /// `attestation_count` input (§7.4) WITHOUT running the full trust aggregation.
-/// It uses the SAME `AttestationCache` /
-/// [`IdentityDidPublicKeyResolver`](scp_core::trust::IdentityDidPublicKeyResolver) /
+/// It uses the SAME `AttestationCache` / `#active` key `resolver` /
 /// [`SystemClock`](scp_clock::SystemClock) wiring as
 /// `aggregate_trust_input`, so the participation `attestation_count` and the
 /// aggregation's `verified_attestations` agree by construction.
@@ -544,24 +541,26 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
 ///
 /// # Errors
 ///
-/// Returns [`TrustError`] if store population or attestation verification fails.
+/// Returns [`TrustError`] if store population or attestation verification
+/// fails, or if `resolver` cannot reach its backend
+/// ([`TrustError::KeyResolutionUnavailable`]).
 pub fn verified_attestations<S: TrustProtocolRepository>(
     store: S,
+    resolver: &dyn ActiveKeyResolver,
     context_id: &str,
     subject_did: &str,
     cached_attestations: Vec<CachedAttestation>,
 ) -> Result<Vec<scp_core::trust::attestation::Attestation>, TrustError> {
     let cache = scp_core::trust::aggregate::AttestationCache::new(store);
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
     let clock = scp_clock::SystemClock;
 
     // Verify-on-ingest for caller-supplied attestations (see helper for the
     // SECURITY rationale). A REJECTION drops the entry so a caller can never
     // inflate `attestation_count` with an unverified, freshly-marked, or
     // context-revoked entry.
-    verify_and_cache_attestations(&cache, context_id, &resolver, &clock, cached_attestations)?;
+    verify_and_cache_attestations(&cache, context_id, resolver, &clock, cached_attestations)?;
 
-    cache.get_verified_attestations(context_id, subject_did, &resolver, &clock)
+    cache.get_verified_attestations(context_id, subject_did, resolver, &clock)
 }
 
 #[cfg(test)]
@@ -822,8 +821,8 @@ mod tests {
     /// Resolver that returns a dummy key — attestation cache holds already-verified
     /// (non-expired) entries, so the resolver is not called for fresh entries.
     struct NoOpResolver;
-    impl scp_core::trust::attestation::DidPublicKeyResolver for NoOpResolver {
-        fn resolve_public_key(&self, _did: &str) -> Result<Vec<u8>, TrustError> {
+    impl scp_core::trust::attestation::ActiveKeyResolver for NoOpResolver {
+        fn resolve_active_key(&self, _did: &str) -> Result<Vec<u8>, TrustError> {
             Ok(vec![0u8; 32])
         }
     }
@@ -834,8 +833,8 @@ mod tests {
     /// path (Fix 1). Fresh cached attestations are not re-verified, so the
     /// resolver is only consulted for the challenge result here.
     struct GenuineVerifierResolver;
-    impl scp_core::trust::attestation::DidPublicKeyResolver for GenuineVerifierResolver {
-        fn resolve_public_key(&self, _did: &str) -> Result<Vec<u8>, TrustError> {
+    impl scp_core::trust::attestation::ActiveKeyResolver for GenuineVerifierResolver {
+        fn resolve_active_key(&self, _did: &str) -> Result<Vec<u8>, TrustError> {
             Ok(ed25519_dalek::SigningKey::from_bytes(&[3u8; 32])
                 .verifying_key()
                 .to_bytes()
@@ -924,7 +923,6 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
-            challenge_resolver: &resolver,
             clock: &clock,
         };
 
@@ -1012,6 +1010,7 @@ mod tests {
         let store = InMemoryFfiTrustStore::new();
         let verified = verified_attestations(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![make_forged_fresh_cached(subject_did)],
@@ -1116,6 +1115,7 @@ mod tests {
         let store = InMemoryFfiTrustStore::new();
         let verified = verified_attestations(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![CachedAttestation {
@@ -1554,6 +1554,7 @@ mod tests {
         let inner = SharedFfiStore::new();
         let verified = verified_attestations(
             inner.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(revoked_copy)],
@@ -1669,6 +1670,7 @@ mod tests {
 
         let first = verified_attestations(
             store.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(revoked_copy)],
@@ -1682,6 +1684,7 @@ mod tests {
 
         let second = verified_attestations(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(active_copy)],
@@ -1727,6 +1730,7 @@ mod tests {
 
         let attacker_pass = verified_attestations(
             store.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(attacker_revoked)],
@@ -1740,6 +1744,7 @@ mod tests {
 
         let honest_pass = verified_attestations(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(honest_active)],
@@ -1845,6 +1850,7 @@ mod tests {
 
         let before = verified_attestations(
             store.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(active_copy)],
@@ -1858,6 +1864,7 @@ mod tests {
 
         let during = verified_attestations(
             store.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(revoked_copy)],
@@ -1870,7 +1877,14 @@ mod tests {
 
         // A later call that supplies nothing reads the cache alone, so the
         // revocation this ingest recorded is what excludes the cached copy.
-        let after = verified_attestations(store, context_id, subject_did, vec![]).unwrap();
+        let after = verified_attestations(
+            store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
+            context_id,
+            subject_did,
+            vec![],
+        )
+        .unwrap();
         assert!(
             after.is_empty(),
             "an issuer's own revocation must keep suppressing that issuer's cached copy, got {after:?}"
@@ -1893,6 +1907,7 @@ mod tests {
         let store = SharedFfiStore::new();
         verified_attestations(
             store.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(revoked_copy)],
@@ -1928,6 +1943,7 @@ mod tests {
         let store = SharedFfiStore::new();
         let verified = verified_attestations(
             store.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(forged)],
@@ -1957,6 +1973,7 @@ mod tests {
         let store = RevocationWriteFailsStore(SharedFfiStore::new());
         let err = verified_attestations(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(revoked_copy)],
@@ -1992,6 +2009,7 @@ mod tests {
         let store = RevocationWriteFailsStore(inner.clone());
         let err = verified_attestations(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(revoked_copy), fresh_entry(cacheable)],
@@ -2124,8 +2142,8 @@ mod tests {
 
     /// A challenge resolver whose backend is down.
     struct UnavailableResolver;
-    impl DidPublicKeyResolver for UnavailableResolver {
-        fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+    impl ActiveKeyResolver for UnavailableResolver {
+        fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
             Err(TrustError::KeyResolutionUnavailable {
                 did: did.to_owned(),
                 reason: "offline".to_owned(),
@@ -2164,7 +2182,10 @@ mod tests {
     ) -> Result<String, TrustError> {
         populate_and_aggregate(
             InMemoryFfiTrustStore::new(),
-            crate::resolvers::instance_challenge_resolver(None),
+            crate::resolvers::instance_active_key_resolver(
+                &crate::resolvers::BlockingResolutionScope::for_tests(),
+                None,
+            ),
             ctx,
             POPULATE_SUBJECT,
             vec![],
@@ -2287,6 +2308,7 @@ mod tests {
 
         verified_attestations(
             store.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(revoked_copy)],

@@ -17,7 +17,7 @@ use scp_core::crypto::ucan::validate::{
     DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
 };
 use scp_core::trust::TrustError;
-use scp_core::trust::attestation::DidPublicKeyResolver;
+use scp_core::trust::attestation::ActiveKeyResolver;
 use scp_did::decode_multibase_key;
 use scp_identity::IdentityError;
 use scp_identity::resolver::ResolvedDidDocument;
@@ -181,7 +181,7 @@ pub struct DidRotatedEvent {
 /// for full DID document validation.
 ///
 /// Implements both `scp_core::crypto::ucan::validate::DidResolver` and
-/// `scp_core::trust::attestation::DidPublicKeyResolver`, providing a single
+/// `scp_core::trust::attestation::ActiveKeyResolver`, providing a single
 /// unified resolution path for all DID-dependent operations in the FFI layer.
 ///
 /// # Resolution pipeline
@@ -229,7 +229,7 @@ pub struct IdentityBackedDidResolver {
     rotation_events: Arc<RwLock<Vec<DidRotatedEvent>>>,
 
     /// Long-lived, dedicated runtime that drives async DID resolution from the
-    /// sync `DidResolver`/`DidPublicKeyResolver` trait methods.
+    /// sync `DidResolver`/`ActiveKeyResolver` trait methods.
     ///
     /// This is a HOT, SHARED path: a single UCAN delegation-chain validation
     /// resolves up to `MAX_CHAIN_DEPTH` (32) DIDs, and every FFI bridge
@@ -537,7 +537,7 @@ impl IdentityBackedDidResolver {
     /// governance engine verifies votes against the voter's *document-derived*
     /// key for the exact signing key they claimed — not a caller-supplied key.
     ///
-    /// Unlike the `DidResolver`/`DidPublicKeyResolver` trait-impl siblings
+    /// Unlike the `DidResolver`/`ActiveKeyResolver` trait-impl siblings
     /// ([`resolve_public_key`](DidResolver::resolve_public_key) /
     /// [`resolve_public_key_by_kid`](DidResolver::resolve_public_key_by_kid)),
     /// which flatten failures into the foreign error types those traits require
@@ -636,14 +636,14 @@ impl DidResolver for IdentityBackedDidResolver {
     }
 }
 
-/// The challenge-record resolver of a bridge instance whose DID resolver is
-/// not initialized: every lookup fails with
-/// [`TrustError::KeyResolutionUnavailable`], so no record is admitted or
-/// dropped without a resolver.
+/// The `#active` key resolver of a bridge instance whose DID resolver is not
+/// initialized: every lookup fails with
+/// [`TrustError::KeyResolutionUnavailable`], so no attestation or challenge
+/// record is admitted or dropped without a resolver.
 struct DidResolverNotInitialized;
 
-impl DidPublicKeyResolver for DidResolverNotInitialized {
-    fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+impl ActiveKeyResolver for DidResolverNotInitialized {
+    fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
         Err(TrustError::KeyResolutionUnavailable {
             did: did.to_owned(),
             reason: "the DID resolver is not initialized; create an identity first".to_owned(),
@@ -651,26 +651,92 @@ impl DidPublicKeyResolver for DidResolverNotInitialized {
     }
 }
 
-/// The resolver a bridge verifies challenge records with.
+/// Proof that the holder runs on tokio's blocking pool.
+///
+/// There, a lookup through [`IdentityBackedDidResolver`] may block on the
+/// network without stalling a host's event loop (the JavaScript loop, Python's
+/// asyncio loop with the GIL, or a Kotlin or Swift main thread).
+///
+/// Only [`run_blocking_resolution`] constructs one, and
+/// [`instance_active_key_resolver`] requires one, so a synchronous bridge
+/// export cannot build the instance resolver.
+pub struct BlockingResolutionScope {
+    _private: (),
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl BlockingResolutionScope {
+    /// A scope for synchronous bridge unit tests, whose instances either have
+    /// no DID resolver or one over an in-memory DHT. Compiled only under
+    /// `testing`, which no shipped artifact enables.
+    #[must_use]
+    pub const fn for_tests() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// The blocking task that [`run_blocking_resolution`] spawned panicked or was
+/// cancelled before it returned.
+#[derive(Debug, thiserror::Error)]
+#[error("blocking DID-resolution task failed: {0}")]
+pub struct BlockingResolutionFailed(String);
+
+/// Runs `work` on tokio's blocking pool with a [`BlockingResolutionScope`],
+/// so the DID lookups it makes block that pool thread and never the caller.
+///
+/// A bridge export that verifies attestations or challenge records awaits
+/// this from an `async` export (napi, `UniFFI`), or from
+/// `block_on_released` with the GIL released (`PyO3`).
+///
+/// # Errors
+///
+/// Returns [`BlockingResolutionFailed`] when the task panics or is cancelled;
+/// `work`'s own errors are in `T`.
+pub async fn run_blocking_resolution<T, F>(work: F) -> Result<T, BlockingResolutionFailed>
+where
+    F: FnOnce(&BlockingResolutionScope) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || work(&BlockingResolutionScope { _private: () }))
+        .await
+        .map_err(|e| BlockingResolutionFailed(e.to_string()))
+}
+
+/// The resolver a bridge verifies attestations and challenge records with:
+/// each signer's current `#active` key (spec 09 §9.7.1).
 ///
 /// It is the instance's [`IdentityBackedDidResolver`], or, when the instance
 /// has not initialized one, a resolver whose every lookup fails with
 /// [`TrustError::KeyResolutionUnavailable`]. A call with no record to verify
-/// therefore needs no resolver, and a call with one fails closed.
+/// therefore needs no resolver, and a call with one fails closed. The
+/// `_scope` witness confines every lookup to the blocking pool.
+///
+/// A resolver that reads a key out of the DID string, such as
+/// [`BridgeDidResolver`], returns the `#0` root, which signs establishment
+/// events only (ADR-063). It does not implement
+/// [`ActiveKeyResolver`], so it cannot stand in for this one:
+///
+/// ```compile_fail,E0277
+/// use scp_core::trust::attestation::ActiveKeyResolver;
+/// fn verify_with(_: &dyn ActiveKeyResolver) {}
+/// verify_with(&scp_ffi_common::BridgeDidResolver);
+/// ```
 #[must_use]
-pub fn instance_challenge_resolver(
-    resolver: Option<&Arc<IdentityBackedDidResolver>>,
-) -> &dyn DidPublicKeyResolver {
+pub fn instance_active_key_resolver<'a>(
+    _scope: &BlockingResolutionScope,
+    resolver: Option<&'a Arc<IdentityBackedDidResolver>>,
+) -> &'a dyn ActiveKeyResolver {
     match resolver {
         Some(r) => r.as_ref(),
         None => &DidResolverNotInitialized,
     }
 }
 
-/// Implements `scp_core::trust::attestation::DidPublicKeyResolver` for
-/// production attestation verification via the identity layer.
-impl DidPublicKeyResolver for IdentityBackedDidResolver {
-    fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+/// Implements `scp_core::trust::attestation::ActiveKeyResolver` for
+/// production attestation and challenge verification via the identity layer:
+/// the resolved document's current `#active` key, after the sequence ratchet.
+impl ActiveKeyResolver for IdentityBackedDidResolver {
+    fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
         debug!(did = %did, "resolving DID public key for attestation verification via identity layer");
 
         let resolved = self
@@ -1301,23 +1367,139 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // DidPublicKeyResolver for attestation
+    // ActiveKeyResolver for attestation
     // -----------------------------------------------------------------------
 
     #[test]
-    fn identity_resolver_implements_did_public_key_resolver() {
-        // Verify that IdentityBackedDidResolver implements DidPublicKeyResolver.
+    fn identity_resolver_implements_active_key_resolver() {
+        // Verify that IdentityBackedDidResolver implements ActiveKeyResolver.
         // The trait method returns Vec<u8> (not [u8; 32]) per the attestation API.
         let resolver = make_identity_resolver();
         let pk_bytes: [u8; 32] = [0x42; 32];
         let did = format!("did:dht:z{}", zbase32::encode(&pk_bytes));
 
         // Will fail because DID is not in DHT, but proves the trait is implemented.
-        let result = DidPublicKeyResolver::resolve_public_key(&resolver, &did);
+        let result = ActiveKeyResolver::resolve_active_key(&resolver, &did);
         assert!(
             result.is_err(),
             "expected error for unknown DID via attestation resolver"
         );
+    }
+
+    /// A DID resolver that serves whichever document the test last published,
+    /// so a test can rotate `#active` under a live `IdentityBackedDidResolver`.
+    struct PublishedDocument(std::sync::Mutex<ResolvedDidDocument>);
+
+    impl scp_identity::resolver::DidResolver for PublishedDocument {
+        fn resolve(
+            &self,
+            _did: &str,
+        ) -> impl Future<Output = Result<Option<ResolvedDidDocument>, IdentityError>> + Send
+        {
+            let doc = self.0.lock().unwrap().clone();
+            async move { Ok(Some(doc)) }
+        }
+    }
+
+    /// An attestation verifies against its issuer's CURRENT `#active` key
+    /// (spec 09 §9.7.1), read from the resolved document, never against the
+    /// `#0` root the DID string embeds. After the issuer rotates `#active`
+    /// (a higher-seq document), an attestation the retired key signed is
+    /// rejected and one the new key signed is accepted.
+    #[test]
+    fn attestation_verifies_against_the_rotated_active_key() {
+        use crate::trust_store::{AttestationVerdict, InMemoryFfiTrustStore};
+        use ed25519_dalek::{Signer, SigningKey};
+        use scp_core::trust::{AttestationType, RevocationStatus};
+
+        let root = SigningKey::from_bytes(&[1u8; 32]);
+        let active_a = SigningKey::from_bytes(&[2u8; 32]);
+        let active_b = SigningKey::from_bytes(&[3u8; 32]);
+        let issuer = scp_did::did_dht_from_public_key(&root.verifying_key().to_bytes());
+        let mut document = DidDocument::new(
+            &issuer,
+            &root.verifying_key().to_bytes(),
+            &active_a.verifying_key().to_bytes(),
+            &[0u8; 32],
+        );
+        let published = Arc::new(PublishedDocument(std::sync::Mutex::new(
+            ResolvedDidDocument {
+                document: document.clone(),
+                seq: 1,
+                source: ResolutionSource::Cache,
+            },
+        )));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let resolver = Arc::new(IdentityBackedDidResolver::new(
+            Arc::clone(&published),
+            rt.handle().clone(),
+        ));
+
+        let signed_by = |key: &SigningKey| {
+            let mut att = scp_core::trust::Attestation {
+                id: "att-rotation".to_owned(),
+                attestation_type: AttestationType::Endorsement,
+                issuer: issuer.clone(),
+                subject: "did:dht:zsubject".into(),
+                claim: serde_json::json!({"skill": "rust"}),
+                evidence: None,
+                issued_at: 1000,
+                expires_at: Some(u64::MAX),
+                renewal_interval: None,
+                revocation_status: RevocationStatus::Active,
+                signature: Vec::new(),
+                renewed_at: None,
+            };
+            let canonical = scp_core::trust::canonical_attestation_bytes(&att).unwrap();
+            att.signature = key.sign(&canonical).to_bytes().to_vec();
+            att
+        };
+        let store = InMemoryFfiTrustStore::new();
+        let verify = |att: &scp_core::trust::Attestation| {
+            crate::trust_store::verify_attestation_in_context(
+                &store,
+                "ctx-rotation",
+                att,
+                instance_active_key_resolver(
+                    &BlockingResolutionScope::for_tests(),
+                    Some(&resolver),
+                ),
+                &scp_clock::SystemClock,
+            )
+            .unwrap()
+        };
+
+        assert!(
+            matches!(verify(&signed_by(&active_a)), AttestationVerdict::Valid),
+            "the current #active key verifies"
+        );
+        assert!(
+            matches!(verify(&signed_by(&root)), AttestationVerdict::Rejected(_)),
+            "the #0 root signs establishment events only; it must not verify an attestation"
+        );
+
+        document.retire_active_key(&active_b.verifying_key().to_bytes(), 1);
+        *published.0.lock().unwrap() = ResolvedDidDocument {
+            document,
+            seq: 2,
+            source: ResolutionSource::Cache,
+        };
+
+        assert!(
+            matches!(
+                verify(&signed_by(&active_a)),
+                AttestationVerdict::Rejected(_)
+            ),
+            "the retired #active key must not verify after rotation"
+        );
+        assert!(
+            matches!(verify(&signed_by(&active_b)), AttestationVerdict::Valid),
+            "the rotated #active key verifies"
+        );
+        assert_eq!(resolver.rotation_events.read().unwrap().len(), 1);
     }
 
     // -----------------------------------------------------------------------

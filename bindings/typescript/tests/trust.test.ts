@@ -537,7 +537,7 @@ describe("scp.checkCapabilityRequirements — capability admission (§7.3.4.4)",
     ];
     const capabilities: readonly string[] = ["scp:capability:schema-validation/v1"];
 
-    const result = scp.checkCapabilityRequirements(
+    const result = await scp.checkCapabilityRequirements(
       "ctx-1",
       "did:dht:subject",
       requirements,
@@ -567,9 +567,9 @@ describe("scp.checkCapabilityRequirements — capability admission (§7.3.4.4)",
       throw new Error("missing required capability");
     });
 
-    expect(() => scp.checkCapabilityRequirements("ctx-1", "did:dht:subject", [], [], [])).toThrow(
-      "missing required capability",
-    );
+    await expect(
+      scp.checkCapabilityRequirements("ctx-1", "did:dht:subject", [], [], []),
+    ).rejects.toThrow("missing required capability");
   });
 });
 
@@ -1028,7 +1028,7 @@ describe("scp.aggregateTrustInput — typed trust-aggregation inputs (§7.3)", (
       },
     ];
 
-    const result = scp.aggregateTrustInput(
+    const result = await scp.aggregateTrustInput(
       "ctx-1",
       "did:dht:subject",
       events,
@@ -1073,7 +1073,7 @@ describe("scp.aggregateTrustInput — typed trust-aggregation inputs (§7.3)", (
     cleanup = () => scp.shutdown(0);
     native.__stub("aggregateTrustInput", () => "{}");
 
-    scp.aggregateTrustInput(
+    await scp.aggregateTrustInput(
       "ctx-1",
       "did:dht:subject",
       [],
@@ -1261,7 +1261,7 @@ describe("scp.trustVerifyAttestation / scp.trustVerifyResponse — typed challen
       errorMessage: "unresolvable issuer",
     }));
 
-    scp.trustVerifyAttestation("ctx-1", attestationEnvelope);
+    await scp.trustVerifyAttestation("ctx-1", attestationEnvelope);
     const call = native.__lastCall("trustVerifyAttestation");
     expect(call?.args).toEqual(["ctx-1", encodeAttestation(attestationEnvelope)]);
   });

@@ -137,6 +137,28 @@ fn coded_validation_error(msg: &str, code: &str) -> napi::Error {
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of [`Scp::trust_query_score`](crate::scp::Scp::trust_query_score).
+/// Runs a trust operation that resolves signers' `#active` keys on tokio's
+/// blocking pool, so a DID lookup never blocks the JavaScript thread.
+///
+/// # Errors
+///
+/// `work`'s own error, or `CTX_2000` when the blocking task panics or is
+/// cancelled.
+pub(crate) async fn on_resolution_pool<T, F>(work: F) -> napi::Result<T>
+where
+    F: FnOnce(&scp_ffi_common::BlockingResolutionScope) -> napi::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    scp_ffi_common::run_blocking_resolution(work)
+        .await
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: e.to_string(),
+                code: codes::CTX_2000.to_owned(),
+            })
+        })?
+}
+
 pub(crate) fn trust_query_score_on(
     bi: &NapiBridgeInstance,
     did: String,
@@ -181,6 +203,7 @@ pub(crate) fn trust_query_score_on(
 /// revocation list that cannot be read is an error (`VALID_7052`), never a
 /// verdict.
 pub(crate) fn trust_verify_attestation_on(
+    scope: &scp_ffi_common::BlockingResolutionScope,
     bi: &NapiBridgeInstance,
     context_id: String,
     attestation_json: String,
@@ -199,12 +222,16 @@ pub(crate) fn trust_verify_attestation_on(
             )
         })?;
 
+    // The issuer's current `#active` key (spec 09 §9.7.1), resolved through
+    // this instance's DID resolver; an instance without one fails closed.
+    let resolver =
+        scp_ffi_common::instance_active_key_resolver(scope, crate::runtime::did_resolver(bi));
     let verdict = match crate::runtime::protocol_repository(bi) {
         crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
-            run_verify_attestation(repo, &context_id, &attestation)
+            run_verify_attestation(repo, resolver, &context_id, &attestation)
         }
         crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
-            run_verify_attestation(repo, &context_id, &attestation)
+            run_verify_attestation(repo, resolver, &context_id, &attestation)
         }
     }
     .map_err(|e| coded_validation_error(&e.to_string(), codes::VALID_7052))?;
@@ -224,10 +251,11 @@ pub(crate) fn trust_verify_attestation_on(
 }
 
 /// Verifies one attestation against the revocation list in the concrete
-/// backend behind a `ProtocolRepoVariant` arm, with the production DID-key
-/// resolver and clock.
+/// backend behind a `ProtocolRepoVariant` arm, with the instance's `#active`
+/// key resolver and the system clock.
 fn run_verify_attestation<S: scp_platform::traits::Storage + 'static>(
     repo: &Arc<scp_core::store::ProtocolRepository<S>>,
+    resolver: &dyn scp_core::trust::attestation::ActiveKeyResolver,
     context_id: &str,
     attestation: &scp_core::trust::Attestation,
 ) -> Result<scp_ffi_common::trust_store::AttestationVerdict, scp_core::trust::TrustError> {
@@ -237,7 +265,7 @@ fn run_verify_attestation<S: scp_platform::traits::Storage + 'static>(
         &bridge,
         context_id,
         attestation,
-        &scp_core::trust::IdentityDidPublicKeyResolver,
+        resolver,
         &scp_clock::SystemClock,
     )
 }
@@ -455,6 +483,7 @@ pub(crate) fn verify_participation_requirements_on(
 /// challenge-verification check does not establish verifier legitimacy (see spec
 /// §7.3.4.4).
 pub(crate) fn check_capability_requirements_on(
+    scope: &scp_ffi_common::BlockingResolutionScope,
     bi: &NapiBridgeInstance,
     context_id: String,
     subject_did: String,
@@ -494,7 +523,8 @@ pub(crate) fn check_capability_requirements_on(
     // Records are signed with the verifier's `#active` key, which only the
     // instance's DID resolver reads; without one, a supplied record fails
     // closed with SCP-IDENT-1033.
-    let resolver = scp_ffi_common::instance_challenge_resolver(crate::runtime::did_resolver(bi));
+    let resolver =
+        scp_ffi_common::instance_active_key_resolver(scope, crate::runtime::did_resolver(bi));
     let clock = scp_clock::SystemClock;
 
     scp_core::trust::check_capability_requirements(
@@ -533,6 +563,7 @@ pub(crate) fn check_capability_requirements_on(
 /// Per-bridge-instance implementation of [`Scp::aggregate_trust_input`](crate::scp::Scp::aggregate_trust_input).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aggregate_trust_input_on(
+    scope: &scp_ffi_common::BlockingResolutionScope,
     bi: &NapiBridgeInstance,
     context_id: String,
     subject_did: String,
@@ -641,7 +672,10 @@ pub(crate) fn aggregate_trust_input_on(
                 scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
             scp_ffi_common::trust_store::populate_and_aggregate(
                 bridge,
-                scp_ffi_common::instance_challenge_resolver(crate::runtime::did_resolver(bi)),
+                scp_ffi_common::instance_active_key_resolver(
+                    scope,
+                    crate::runtime::did_resolver(bi),
+                ),
                 &context_id,
                 &subject_did,
                 cached_attestations,
@@ -664,7 +698,10 @@ pub(crate) fn aggregate_trust_input_on(
                 scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
             scp_ffi_common::trust_store::populate_and_aggregate(
                 bridge,
-                scp_ffi_common::instance_challenge_resolver(crate::runtime::did_resolver(bi)),
+                scp_ffi_common::instance_active_key_resolver(
+                    scope,
+                    crate::runtime::did_resolver(bi),
+                ),
                 &context_id,
                 &subject_did,
                 cached_attestations,
@@ -702,6 +739,7 @@ pub(crate) fn aggregate_trust_input_on(
 /// concrete `ProtocolRepository<S>`.
 fn run_verified_attestations<S: scp_platform::traits::Storage + 'static>(
     repo: &Arc<scp_core::store::ProtocolRepository<S>>,
+    resolver: &dyn scp_core::trust::attestation::ActiveKeyResolver,
     context_id: &str,
     subject_did: &str,
     cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
@@ -710,6 +748,7 @@ fn run_verified_attestations<S: scp_platform::traits::Storage + 'static>(
     let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
     scp_ffi_common::trust_store::verified_attestations(
         bridge,
+        resolver,
         context_id,
         subject_did,
         cached_attestations,
@@ -717,6 +756,7 @@ fn run_verified_attestations<S: scp_platform::traits::Storage + 'static>(
 }
 
 pub(crate) fn participation_record_on(
+    scope: &scp_ffi_common::BlockingResolutionScope,
     bi: &NapiBridgeInstance,
     context_id: String,
     subject_did: String,
@@ -740,12 +780,14 @@ pub(crate) fn participation_record_on(
     // Source verified attestations from this instance's `ProtocolRepository`
     // (same backend as context/event-log writes). Both variants route through
     // the single generic `run_verified_attestations` helper.
+    let resolver =
+        scp_ffi_common::instance_active_key_resolver(scope, crate::runtime::did_resolver(bi));
     let verified = match crate::runtime::protocol_repository(bi) {
         crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
-            run_verified_attestations(repo, &context_id, &subject_did, cached_attestations)
+            run_verified_attestations(repo, resolver, &context_id, &subject_did, cached_attestations)
         }
         crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
-            run_verified_attestations(repo, &context_id, &subject_did, cached_attestations)
+            run_verified_attestations(repo, resolver, &context_id, &subject_did, cached_attestations)
         }
     }
     // An error from `verified_attestations` is an INFRA fault (trust-store read,
@@ -962,6 +1004,113 @@ mod tests {
             dht_client
         }
 
+        /// A DID resolver whose every lookup announces itself on `entered`
+        /// and then waits for a permit on `release`.
+        struct GatedResolver {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Semaphore>,
+        }
+
+        impl scp_identity::resolver::DidResolver for GatedResolver {
+            fn resolve(
+                &self,
+                _did: &str,
+            ) -> impl std::future::Future<
+                Output = Result<
+                    Option<scp_identity::resolver::ResolvedDidDocument>,
+                    scp_identity::IdentityError,
+                >,
+            > + Send {
+                let entered = Arc::clone(&self.entered);
+                let release = Arc::clone(&self.release);
+                async move {
+                    entered.notify_one();
+                    release.acquire().await.unwrap().forget();
+                    Ok(None)
+                }
+            }
+        }
+
+        /// `trustVerifyAttestation` resolves the issuer's key on the blocking
+        /// pool: while one call waits on a DID lookup, the single runtime
+        /// thread that awaits it still completes a second call. An export
+        /// that resolved on the calling thread would block that thread inside
+        /// the lookup and never reach the second call.
+        #[test]
+        fn a_pending_key_resolution_leaves_the_calling_thread_free() {
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let gate = Arc::clone(&release);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let caller = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let scp = crate::scp::Scp::new_in_memory_for_test();
+                    // An issuer this instance does not host, so its key comes
+                    // only from the resolver.
+                    let issuer = scp_did::did_dht_from_public_key(
+                        &ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+                            .verifying_key()
+                            .to_bytes(),
+                    );
+                    let entered = Arc::new(tokio::sync::Notify::new());
+                    crate::runtime::init_did_resolver(
+                        &scp.inner,
+                        Arc::new(GatedResolver {
+                            entered: Arc::clone(&entered),
+                            release: Arc::clone(&gate),
+                        }),
+                        tokio::runtime::Handle::current(),
+                    );
+                    let attestation = scp_core::trust::Attestation {
+                        id: "att-pool".to_owned(),
+                        attestation_type: scp_core::trust::AttestationType::Endorsement,
+                        issuer: issuer.clone(),
+                        subject: "did:dht:zsubject".into(),
+                        claim: serde_json::json!({"skill": "rust"}),
+                        evidence: None,
+                        issued_at: 1000,
+                        expires_at: Some(u64::MAX),
+                        renewal_interval: None,
+                        revocation_status: scp_core::trust::RevocationStatus::Active,
+                        signature: vec![0u8; 64],
+                        renewed_at: None,
+                    };
+                    let first = scp.trust_verify_attestation(
+                        "ctx-pool".to_owned(),
+                        serde_json::to_string(&attestation).unwrap(),
+                    );
+                    tokio::pin!(first);
+                    tokio::select! {
+                        biased;
+                        early = &mut first => unreachable!("the lookup is gated: {early:?}"),
+                        () = entered.notified() => {}
+                    }
+                    // The first call is parked in the lookup; a second call on
+                    // this same thread still runs to completion.
+                    let second = scp
+                        .trust_verify_attestation("ctx-pool".to_owned(), "not json".to_owned())
+                        .await;
+                    assert!(second.is_err(), "malformed JSON is refused");
+                    done_tx.send(()).unwrap();
+                    gate.add_permits(1);
+                    // The issuer is not found: the attestation is rejected,
+                    // not verified.
+                    let verdict = first.await.unwrap();
+                    assert!(!verdict.valid, "{verdict:?}");
+                });
+            });
+            let freed = done_rx.recv_timeout(std::time::Duration::from_secs(30));
+            release.add_permits(1);
+            assert!(
+                freed.is_ok(),
+                "the second call never ran: the first blocked the calling thread"
+            );
+            caller.join().unwrap();
+        }
+
         /// Publishes `who`'s DID document into `dht_client`, signed by its
         /// identity key.
         async fn publish(
@@ -1148,20 +1297,14 @@ mod tests {
                 capability: SCHEMA_URI.parse().unwrap(),
                 verification_level: scp_core::trust::VerificationLevel::ChallengeVerified,
             }];
-            let bi = Arc::clone(&scp.inner);
-            let subject = s.inner.did.clone();
-            tokio::task::spawn_blocking(move || {
-                check_capability_requirements_on(
-                    &bi,
-                    "ctx-e2e".to_owned(),
-                    subject,
-                    serde_json::to_string(&requirements).unwrap(),
-                    "[]".to_owned(),
-                    format!("[{record_json}]"),
-                )
-            })
+            scp.check_capability_requirements(
+                "ctx-e2e".to_owned(),
+                s.inner.did.clone(),
+                serde_json::to_string(&requirements).unwrap(),
+                "[]".to_owned(),
+                format!("[{record_json}]"),
+            )
             .await
-            .unwrap()
             .unwrap();
         }
 
@@ -1260,8 +1403,9 @@ mod tests {
         ) -> napi::Result<()> {
             let bi = Arc::clone(bi);
             let (subject, context_id) = (subject.to_owned(), context_id.to_owned());
-            tokio::task::spawn_blocking(move || {
+            scp_ffi_common::run_blocking_resolution(move |scope| {
                 check_capability_requirements_on(
+                    scope,
                     &bi,
                     context_id,
                     subject,
@@ -1331,7 +1475,12 @@ mod tests {
     #[test]
     fn trust_verify_attestation_rejects_invalid_json() {
         let bi = test_bi();
-        let result = trust_verify_attestation_on(&bi, "ctx-1".to_owned(), "not json".to_owned());
+        let result = trust_verify_attestation_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
+            &bi,
+            "ctx-1".to_owned(),
+            "not json".to_owned(),
+        );
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
@@ -1450,6 +1599,7 @@ mod tests {
     fn check_capability_requirements_rejects_invalid_requirements_json() {
         let bi = test_bi();
         let result = check_capability_requirements_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:alice".to_owned(),
@@ -1469,6 +1619,7 @@ mod tests {
     fn check_capability_requirements_rejects_invalid_capabilities_json() {
         let bi = test_bi();
         let result = check_capability_requirements_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:alice".to_owned(),
@@ -1488,6 +1639,7 @@ mod tests {
     fn check_capability_requirements_rejects_invalid_verifications_json() {
         let bi = test_bi();
         let result = check_capability_requirements_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:alice".to_owned(),
@@ -1507,6 +1659,7 @@ mod tests {
     fn check_capability_requirements_empty_inputs_succeeds() {
         let bi = test_bi();
         let result = check_capability_requirements_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:alice".to_owned(),
@@ -1521,6 +1674,7 @@ mod tests {
     fn check_capability_requirements_rejects_empty_subject() {
         let bi = test_bi();
         let result = check_capability_requirements_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             String::new(),
@@ -1535,6 +1689,7 @@ mod tests {
     fn check_capability_requirements_rejects_malformed_subject() {
         let bi = test_bi();
         let result = check_capability_requirements_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "not-a-did".to_owned(),
@@ -1553,6 +1708,7 @@ mod tests {
         let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
         let capabilities = r#"["scp:capability:schema-validation/v1"]"#;
         let result = check_capability_requirements_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:alice".to_owned(),
@@ -1568,6 +1724,7 @@ mod tests {
         let bi = test_bi();
         let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
         let result = check_capability_requirements_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:alice".to_owned(),
@@ -1620,6 +1777,7 @@ mod tests {
             completed_at: 1_700_000_000,
         };
         let result = check_capability_requirements_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx".to_owned(),
             VALID_DID.to_owned(),
@@ -1631,6 +1789,7 @@ mod tests {
         // Control: with no record to check, no resolver is needed and the
         // missing verification is the failure.
         let result = check_capability_requirements_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx".to_owned(),
             VALID_DID.to_owned(),
@@ -1645,6 +1804,7 @@ mod tests {
     fn aggregate_trust_input_rejects_empty_context() {
         let bi = test_bi();
         let result = aggregate_trust_input_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             String::new(),
             "did:key:test".to_owned(),
@@ -1669,6 +1829,7 @@ mod tests {
     fn aggregate_trust_input_rejects_invalid_events_json() {
         let bi = test_bi();
         let result = aggregate_trust_input_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:test".to_owned(),
@@ -1693,6 +1854,7 @@ mod tests {
     fn aggregate_trust_input_rejects_empty_did() {
         let bi = test_bi();
         let result = aggregate_trust_input_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             String::new(),
@@ -1717,6 +1879,7 @@ mod tests {
     fn aggregate_trust_input_rejects_invalid_merkle_root_json() {
         let bi = test_bi();
         let result = aggregate_trust_input_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:test".to_owned(),
@@ -1741,6 +1904,7 @@ mod tests {
     fn aggregate_trust_input_rejects_wrong_length_merkle_root() {
         let bi = test_bi();
         let result = aggregate_trust_input_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:test".to_owned(),
@@ -1765,6 +1929,7 @@ mod tests {
     fn aggregate_trust_input_rejects_invalid_consequence_rules_json() {
         let bi = test_bi();
         let result = aggregate_trust_input_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:test".to_owned(),
@@ -1789,6 +1954,7 @@ mod tests {
     fn aggregate_trust_input_rejects_invalid_threshold_requirements_json() {
         let bi = test_bi();
         let result = aggregate_trust_input_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:test".to_owned(),
@@ -1813,6 +1979,7 @@ mod tests {
     fn aggregate_trust_input_rejects_invalid_attestor_sets_json() {
         let bi = test_bi();
         let result = aggregate_trust_input_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:test".to_owned(),
@@ -1837,6 +2004,7 @@ mod tests {
     fn aggregate_trust_input_rejects_invalid_cached_attestations_json() {
         let bi = test_bi();
         let result = aggregate_trust_input_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:test".to_owned(),
@@ -1861,6 +2029,7 @@ mod tests {
     fn aggregate_trust_input_rejects_invalid_challenge_results_json() {
         let bi = test_bi();
         let result = aggregate_trust_input_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:test".to_owned(),
@@ -1885,6 +2054,7 @@ mod tests {
     fn participation_record_rejects_empty_context() {
         let bi = test_bi();
         let result = participation_record_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             String::new(),
             "did:key:test".to_owned(),
@@ -1896,8 +2066,13 @@ mod tests {
     #[test]
     fn participation_record_rejects_empty_did() {
         let bi = test_bi();
-        let result =
-            participation_record_on(&bi, "ctx-1".to_owned(), String::new(), "[]".to_owned());
+        let result = participation_record_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
+            &bi,
+            "ctx-1".to_owned(),
+            String::new(),
+            "[]".to_owned(),
+        );
         assert!(result.is_err());
     }
 
@@ -1905,6 +2080,7 @@ mod tests {
     fn participation_record_rejects_invalid_attestations_json() {
         let bi = test_bi();
         let result = participation_record_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "did:key:test".to_owned(),
@@ -1919,6 +2095,7 @@ mod tests {
         // bridge: a non-empty but malformed DID is rejected.
         let bi = test_bi();
         let result = participation_record_on(
+            &scp_ffi_common::BlockingResolutionScope::for_tests(),
             &bi,
             "ctx-1".to_owned(),
             "not-a-did".to_owned(),

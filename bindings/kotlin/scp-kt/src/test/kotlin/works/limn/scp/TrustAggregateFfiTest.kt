@@ -74,12 +74,12 @@ class TrustAggregateFfiTest {
     @Test
     fun `aggregateTrustInput - typed inputs cross FFI and aggregate`() {
         val resultJson =
-            scp.aggregateTrustInput(
+            runBlocking { scp.aggregateTrustInput(
                 contextId = "ctx-aggregate-ffi",
                 subjectDid = "did:dht:zSubject",
                 events = listOf(genesisMemberJoined()),
                 merkleRoot = List(32) { 0.toUByte() },
-            )
+            ) }
         val result = Json.parseToJsonElement(resultJson).jsonObject
         assertTrue("participation_record" in result, "missing participation_record: $resultJson")
         assertTrue("challenge_results" in result, "missing challenge_results: $resultJson")
@@ -94,7 +94,7 @@ class TrustAggregateFfiTest {
     @Test
     fun `aggregateTrustInput - typed threshold and attestor maps cross FFI`() {
         val resultJson =
-            scp.aggregateTrustInput(
+            runBlocking { scp.aggregateTrustInput(
                 contextId = "ctx-aggregate-ffi",
                 subjectDid = "did:dht:zSubject",
                 events = listOf(genesisMemberJoined()),
@@ -119,7 +119,7 @@ class TrustAggregateFfiTest {
                                 ),
                             ),
                     ),
-            )
+            ) }
         val result = Json.parseToJsonElement(resultJson).jsonObject
         assertTrue("threshold_counts" in result, "missing threshold_counts: $resultJson")
     }
@@ -136,7 +136,7 @@ class TrustAggregateFfiTest {
     @Test
     fun `trustVerifyAttestation - typed envelope reaches the real verifier`() {
         val result =
-            scp.trustVerifyAttestation(
+            runBlocking { scp.trustVerifyAttestation(
                 "ctx-ffi-1",
                 CachedAttestationEnvelope(
                     id = "att-ffi-1",
@@ -151,7 +151,7 @@ class TrustAggregateFfiTest {
                     revocationStatus = Json.parseToJsonElement("\"Active\""),
                     signature = List(64) { 0.toUByte() },
                 ),
-            )
+            ) }
         assertFalse(result.valid)
         assertTrue(result.errorMessage.isNotEmpty())
     }

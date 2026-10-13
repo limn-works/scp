@@ -845,7 +845,7 @@ fn trust_attestation_verify_round_trip_rule_b_ed25519() {
     use scp_clock::TestClock;
     use scp_protocol::trust::TrustError;
     use scp_protocol::trust::attestation::{
-        AttestationRevocationChecker, DidPublicKeyResolver, canonical_attestation_bytes,
+        ActiveKeyResolver, AttestationRevocationChecker, canonical_attestation_bytes,
         verify_attestation,
     };
 
@@ -858,8 +858,8 @@ fn trust_attestation_verify_round_trip_rule_b_ed25519() {
     }
 
     struct Resolver(Vec<u8>);
-    impl DidPublicKeyResolver for Resolver {
-        fn resolve_public_key(&self, _did: &str) -> Result<Vec<u8>, TrustError> {
+    impl ActiveKeyResolver for Resolver {
+        fn resolve_active_key(&self, _did: &str) -> Result<Vec<u8>, TrustError> {
             Ok(self.0.clone())
         }
     }

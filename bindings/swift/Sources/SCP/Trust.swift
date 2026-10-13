@@ -700,9 +700,9 @@ public extension SCP {
         contextId: String,
         subjectDid: String,
         cachedAttestations: [CachedAttestation] = []
-    ) throws -> BehavioralRecord {
+    ) async throws -> BehavioralRecord {
         let cachedJson = try encodeCachedAttestations(cachedAttestations)
-        let view = try inner.participationRecord(
+        let view = try await inner.participationRecord(
             contextId: contextId,
             subjectDid: subjectDid,
             cachedAttestationsJson: cachedJson
@@ -770,7 +770,7 @@ public extension SCP {
         // bridge's own trust store (verifier-relative, §7.4).
         let behavioralRecord: BehavioralRecord
         do {
-            behavioralRecord = try participationRecord(
+            behavioralRecord = try await participationRecord(
                 contextId: resolvedContextId,
                 subjectDid: subjectDid
             )
@@ -905,8 +905,8 @@ public extension SCP {
         attestorSets: [AttestationType: [AttestorInfo]] = [:],
         cachedAttestations: [CachedAttestation] = [],
         challengeResults: [ChallengeVerification] = []
-    ) throws -> AggregatedTrustInput {
-        let resultJson = try aggregateTrustInput(
+    ) async throws -> AggregatedTrustInput {
+        let resultJson = try await aggregateTrustInput(
             contextId: contextId,
             subjectDid: subjectDid,
             eventsJson: encodeEventLogEntriesJson(events),
@@ -1899,8 +1899,8 @@ public extension SCP {
         requirements: [CapabilityRequirement],
         agentCapabilities: [String],
         challengeVerifications: [ChallengeVerification]
-    ) throws {
-        try checkCapabilityRequirements(
+    ) async throws {
+        try await checkCapabilityRequirements(
             contextId: contextId,
             subjectDid: subjectDid,
             requirementsJson: encodeCapabilityRequirementsJson(requirements),
@@ -2217,8 +2217,8 @@ public extension SCP {
     func trustVerifyAttestation(
         contextId: String,
         attestation: CachedAttestationEnvelope
-    ) throws -> AttestationVerificationResult {
-        try inner.trustVerifyAttestation(
+    ) async throws -> AttestationVerificationResult {
+        try await inner.trustVerifyAttestation(
             contextId: contextId,
             attestationJson: encodeAttestationJson(attestation)
         )

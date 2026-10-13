@@ -167,15 +167,20 @@ pub mod trust {
         AdmissionError, CapabilityRequirement, VerificationLevel, check_capability_requirements,
     };
     pub use scp_protocol::trust::attestation::{
-        Attestation, AttestationEvidence, AttestationRevocationChecker, AttestorInfo,
-        DidPublicKeyResolver, FreshnessStatus, IdentityDidPublicKeyResolver, RevocationStatus,
-        ThresholdCheckInput, ThresholdRequirement, ThresholdResult, canonical_attestation_bytes,
-        check_attestation_freshness, check_threshold_attestation, verify_attestation,
+        ActiveKeyResolver, Attestation, AttestationEvidence, AttestationRevocationChecker,
+        AttestorInfo, FreshnessStatus, RevocationStatus, ThresholdCheckInput, ThresholdRequirement,
+        ThresholdResult, canonical_attestation_bytes, check_attestation_freshness,
+        check_threshold_attestation, verify_attestation,
     };
     // `NoOpRevocationChecker` reports every attestation as not revoked, so its
     // re-export carries the same `testing` gate as its definition.
     #[cfg(feature = "testing")]
     pub use scp_protocol::trust::attestation::NoOpRevocationChecker;
+    // `IdentityDidPublicKeyResolver` reads the key a DID string embeds, which is
+    // no identity's `#active` key once it rotates, so its re-export carries the
+    // same `testing` gate as its definition.
+    #[cfg(feature = "testing")]
+    pub use scp_protocol::trust::attestation::IdentityDidPublicKeyResolver;
     pub use scp_protocol::trust::capability_registry::{ChallengeStandard, MinCases};
     pub use scp_protocol::trust::challenge::{
         ChallengeRequest, ChallengeResponse, ChallengeType, ChallengeVerification, ExpectedOutput,

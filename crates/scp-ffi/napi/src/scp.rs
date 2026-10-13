@@ -3659,12 +3659,16 @@ impl Scp {
     /// Verifies an attestation, including this instance's revocation list for
     /// `context_id`.
     #[napi(js_name = "trustVerifyAttestation")]
-    pub fn trust_verify_attestation(
+    pub async fn trust_verify_attestation(
         &self,
         context_id: String,
         attestation_json: String,
     ) -> napi::Result<NapiAttestationVerificationResult> {
-        crate::trust::trust_verify_attestation_on(&self.inner, context_id, attestation_json)
+        let bi = Arc::clone(&self.inner);
+        crate::trust::on_resolution_pool(move |scope| {
+            crate::trust::trust_verify_attestation_on(scope, &bi, context_id, attestation_json)
+        })
+        .await
     }
 
     /// Creates a challenge for `subject` from the challenger-written test cases
@@ -3734,7 +3738,7 @@ impl Scp {
     /// when all requirements are satisfied; throws on any unmet requirement or
     /// malformed JSON.
     #[napi(js_name = "checkCapabilityRequirements")]
-    pub fn check_capability_requirements(
+    pub async fn check_capability_requirements(
         &self,
         context_id: String,
         subject_did: String,
@@ -3742,20 +3746,25 @@ impl Scp {
         agent_capabilities_json: String,
         challenge_verifications_json: String,
     ) -> napi::Result<()> {
-        crate::trust::check_capability_requirements_on(
-            &self.inner,
-            context_id,
-            subject_did,
-            requirements_json,
-            agent_capabilities_json,
-            challenge_verifications_json,
-        )
+        let bi = Arc::clone(&self.inner);
+        crate::trust::on_resolution_pool(move |scope| {
+            crate::trust::check_capability_requirements_on(
+                scope,
+                &bi,
+                context_id,
+                subject_did,
+                requirements_json,
+                agent_capabilities_json,
+                challenge_verifications_json,
+            )
+        })
+        .await
     }
 
     /// Per-instance equivalent of the free-function `aggregate_trust_input`.
     #[napi(js_name = "aggregateTrustInput")]
     #[allow(clippy::too_many_arguments)]
-    pub fn aggregate_trust_input(
+    pub async fn aggregate_trust_input(
         &self,
         context_id: String,
         subject_did: String,
@@ -3767,18 +3776,23 @@ impl Scp {
         cached_attestations_json: String,
         challenge_results_json: String,
     ) -> napi::Result<String> {
-        crate::trust::aggregate_trust_input_on(
-            &self.inner,
-            context_id,
-            subject_did,
-            events_json,
-            merkle_root_json,
-            consequence_rules_json,
-            threshold_requirements_json,
-            attestor_sets_json,
-            cached_attestations_json,
-            challenge_results_json,
-        )
+        let bi = Arc::clone(&self.inner);
+        crate::trust::on_resolution_pool(move |scope| {
+            crate::trust::aggregate_trust_input_on(
+                scope,
+                &bi,
+                context_id,
+                subject_did,
+                events_json,
+                merkle_root_json,
+                consequence_rules_json,
+                threshold_requirements_json,
+                attestor_sets_json,
+                cached_attestations_json,
+                challenge_results_json,
+            )
+        })
+        .await
     }
 
     /// Computes the structured participation record (§7.3.2) for `subjectDid`
@@ -3791,18 +3805,23 @@ impl Scp {
     /// a typed `NapiParticipationRecord` — the SDK receives the flattened facts
     /// and never re-aggregates event-log collections. See ADR-017, spec §7.3.2.
     #[napi(js_name = "participationRecord")]
-    pub fn participation_record(
+    pub async fn participation_record(
         &self,
         context_id: String,
         subject_did: String,
         cached_attestations_json: String,
     ) -> napi::Result<crate::trust::NapiParticipationRecord> {
-        crate::trust::participation_record_on(
-            &self.inner,
-            context_id,
-            subject_did,
-            cached_attestations_json,
-        )
+        let bi = Arc::clone(&self.inner);
+        crate::trust::on_resolution_pool(move |scope| {
+            crate::trust::participation_record_on(
+                scope,
+                &bi,
+                context_id,
+                subject_did,
+                cached_attestations_json,
+            )
+        })
+        .await
     }
 
     // ====================================================================

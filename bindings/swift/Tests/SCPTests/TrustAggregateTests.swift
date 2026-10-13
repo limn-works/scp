@@ -419,12 +419,12 @@ final class ChallengeTrustInputEncoderTests: XCTestCase {
 /// parses and evaluates on the Rust side (dummy signatures yield structured
 /// negative verdicts, never parse errors).
 final class ChallengeTrustInputCallThroughTests: XCTestCase {
-    func testTrustVerifyAttestationTypedEnvelopeReachesVerifier() throws {
+    func testTrustVerifyAttestationTypedEnvelopeReachesVerifier() async throws {
         // The dummy signature cannot verify — a structured `valid: false`
         // (not a thrown parse error) proves the envelope reached the real
         // verifier.
         let scp = try SCP(storage: .inMemory)
-        let result = try scp.trustVerifyAttestation(
+        let result = try await scp.trustVerifyAttestation(
             contextId: "ctx-ffi-1",
             attestation: makeAttestationEnvelope()
         )

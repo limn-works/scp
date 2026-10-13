@@ -74,8 +74,8 @@ if (scp === null) {
   const live = scp;
 
   describe("scp.aggregateTrustInput — real-FFI call-through", () => {
-    test("typed inputs cross FFI and aggregate", () => {
-      const resultJson = live.aggregateTrustInput(
+    test("typed inputs cross FFI and aggregate", async () => {
+      const resultJson = await live.aggregateTrustInput(
         "ctx-aggregate-ffi",
         "did:dht:zSubject",
         [genesisMemberJoined],
@@ -86,8 +86,8 @@ if (scp === null) {
       expect(result).toHaveProperty("challenge_results");
     });
 
-    test("typed threshold and attestor maps parse on the Rust HashMap deserializers", () => {
-      const resultJson = live.aggregateTrustInput(
+    test("typed threshold and attestor maps parse on the Rust HashMap deserializers", async () => {
+      const resultJson = await live.aggregateTrustInput(
         "ctx-aggregate-ffi",
         "did:dht:zSubject",
         [genesisMemberJoined],
@@ -110,7 +110,7 @@ if (scp === null) {
   });
 
   describe("scp.trustVerifyAttestation / scp.trustVerifyResponse — real-FFI call-through", () => {
-    test("a typed attestation envelope parses and verification runs (invalid signature)", () => {
+    test("a typed attestation envelope parses and verification runs (invalid signature)", async () => {
       const attestation: CachedAttestationEnvelope = {
         id: "att-ffi-1",
         attestationType: "AgentCapability",
@@ -124,7 +124,7 @@ if (scp === null) {
       // The dummy signature cannot verify — but a structured `valid: false`
       // result (not a parse error) proves the serialized envelope reached the
       // real verifier.
-      const result = live.trustVerifyAttestation("ctx-ffi-1", attestation) as {
+      const result = (await live.trustVerifyAttestation("ctx-ffi-1", attestation)) as {
         valid: boolean;
         errorMessage: string;
       };

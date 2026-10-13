@@ -625,7 +625,7 @@ class _FakeParticipationRecord:
 class TestParticipationRecordWrapper:
     """The participation_record SDK wrapper projects the typed bridge record."""
 
-    def test_projects_all_twelve_fields(self) -> None:
+    async def test_projects_all_twelve_fields(self) -> None:
         mock_scp = MagicMock()
         mock_bridge = MagicMock()
         mock_bridge.participation_record.return_value = _FakeParticipationRecord(
@@ -642,7 +642,7 @@ class TestParticipationRecordWrapper:
             event_log_root="deadbeef",
         )
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            record = participation_record(mock_scp, "ctx-1", "did:dht:zalice")
+            record = await participation_record(mock_scp, "ctx-1", "did:dht:zalice")
 
         assert isinstance(record, BehavioralRecord)
         assert record.subject_did == "did:dht:zalice"
@@ -659,19 +659,19 @@ class TestParticipationRecordWrapper:
         assert record.computed_at == 42
         assert record.event_log_root == "deadbeef"
 
-    def test_defaults_to_empty_cached_attestations(self) -> None:
+    async def test_defaults_to_empty_cached_attestations(self) -> None:
         mock_scp = MagicMock()
         mock_bridge = MagicMock()
         mock_bridge.participation_record.return_value = _FakeParticipationRecord()
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            participation_record(mock_scp, "ctx-1", "did:dht:zsubject")
+            await participation_record(mock_scp, "ctx-1", "did:dht:zsubject")
 
         # No cached attestations supplied → the bridge receives an empty JSON
         # array (honest, verifier-relative; the SDK fabricates none).
         call = mock_bridge.participation_record.call_args
         assert call.args == ("ctx-1", "did:dht:zsubject", "[]")
 
-    def test_typed_cached_attestation_serializes_to_snake_case_wire(self) -> None:
+    async def test_typed_cached_attestation_serializes_to_snake_case_wire(self) -> None:
         """A typed CachedAttestation is json.dumps'd onto the wire verbatim.
 
         The TypedDict is a dict at runtime, so its serde-canonical snake_case
@@ -697,7 +697,7 @@ class TestParticipationRecordWrapper:
             "ttl_secs": 3600,
         }
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            participation_record(mock_scp, "ctx-1", "did:dht:zsubject", [cached])
+            await participation_record(mock_scp, "ctx-1", "did:dht:zsubject", [cached])
 
         call = mock_bridge.participation_record.call_args
         assert call.args == ("ctx-1", "did:dht:zsubject", json.dumps([cached]))
@@ -787,7 +787,7 @@ class TestParticipationRecordWrapper:
                     )
                 )
 
-    def test_participation_record_translates_native_error_with_code(self) -> None:
+    async def test_participation_record_translates_native_error_with_code(self) -> None:
         """The public wrapper re-raises native bridge errors as coded SDK errors.
 
         A native exception whose string carries ``[SCP-CTX-2076]`` becomes a
@@ -806,7 +806,7 @@ class TestParticipationRecordWrapper:
         )
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
             with pytest.raises(ContextError) as excinfo:
-                participation_record(mock_scp, "ctx-1", "did:dht:zsubject")
+                await participation_record(mock_scp, "ctx-1", "did:dht:zsubject")
         assert excinfo.value.code == "SCP-CTX-2076"
 
 
@@ -1077,12 +1077,12 @@ class TestAggregateTrustInputFalsy:
         bridge.aggregate_trust_input.return_value = "{}"
         return bridge
 
-    def test_empty_consequence_rules_serializes_as_empty_array(self) -> None:
+    async def test_empty_consequence_rules_serializes_as_empty_array(self) -> None:
         from scp_sdk.trust import aggregate_trust_input
 
         bridge = self._mock_bridge()
         with patch("scp_sdk.trust._bridge", return_value=bridge):
-            aggregate_trust_input(
+            await aggregate_trust_input(
                 scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
@@ -1097,7 +1097,7 @@ class TestAggregateTrustInputFalsy:
         call_args = bridge.aggregate_trust_input.call_args[0]
         assert call_args[4] == "[]"
 
-    def test_none_consequence_rules_still_serializes_as_empty_array(self) -> None:
+    async def test_none_consequence_rules_still_serializes_as_empty_array(self) -> None:
         # `None` and absent both fall back to `[]` here -- the bridge
         # needs SOMETHING to deserialize. The point of `is not None` is
         # that an *explicit empty* list is not silently lost; this test
@@ -1106,7 +1106,7 @@ class TestAggregateTrustInputFalsy:
 
         bridge = self._mock_bridge()
         with patch("scp_sdk.trust._bridge", return_value=bridge):
-            aggregate_trust_input(
+            await aggregate_trust_input(
                 scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
@@ -1117,12 +1117,12 @@ class TestAggregateTrustInputFalsy:
         call_args = bridge.aggregate_trust_input.call_args[0]
         assert call_args[4] == "[]"
 
-    def test_empty_threshold_requirements_serializes_as_empty_object(self) -> None:
+    async def test_empty_threshold_requirements_serializes_as_empty_object(self) -> None:
         from scp_sdk.trust import aggregate_trust_input
 
         bridge = self._mock_bridge()
         with patch("scp_sdk.trust._bridge", return_value=bridge):
-            aggregate_trust_input(
+            await aggregate_trust_input(
                 scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
@@ -1133,12 +1133,12 @@ class TestAggregateTrustInputFalsy:
         call_args = bridge.aggregate_trust_input.call_args[0]
         assert call_args[5] == "{}"
 
-    def test_empty_attestor_sets_serializes_as_empty_object(self) -> None:
+    async def test_empty_attestor_sets_serializes_as_empty_object(self) -> None:
         from scp_sdk.trust import aggregate_trust_input
 
         bridge = self._mock_bridge()
         with patch("scp_sdk.trust._bridge", return_value=bridge):
-            aggregate_trust_input(
+            await aggregate_trust_input(
                 scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
@@ -1149,12 +1149,12 @@ class TestAggregateTrustInputFalsy:
         call_args = bridge.aggregate_trust_input.call_args[0]
         assert call_args[6] == "{}"
 
-    def test_empty_cached_attestations_serializes_as_empty_array(self) -> None:
+    async def test_empty_cached_attestations_serializes_as_empty_array(self) -> None:
         from scp_sdk.trust import aggregate_trust_input
 
         bridge = self._mock_bridge()
         with patch("scp_sdk.trust._bridge", return_value=bridge):
-            aggregate_trust_input(
+            await aggregate_trust_input(
                 scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
@@ -1165,12 +1165,12 @@ class TestAggregateTrustInputFalsy:
         call_args = bridge.aggregate_trust_input.call_args[0]
         assert call_args[7] == "[]"
 
-    def test_empty_challenge_results_serializes_as_empty_array(self) -> None:
+    async def test_empty_challenge_results_serializes_as_empty_array(self) -> None:
         from scp_sdk.trust import aggregate_trust_input
 
         bridge = self._mock_bridge()
         with patch("scp_sdk.trust._bridge", return_value=bridge):
-            aggregate_trust_input(
+            await aggregate_trust_input(
                 scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
@@ -1181,7 +1181,7 @@ class TestAggregateTrustInputFalsy:
         call_args = bridge.aggregate_trust_input.call_args[0]
         assert call_args[8] == "[]"
 
-    def test_populated_inputs_round_trip(self) -> None:
+    async def test_populated_inputs_round_trip(self) -> None:
         import json as _json
 
         from scp_sdk.trust import aggregate_trust_input
@@ -1196,7 +1196,7 @@ class TestAggregateTrustInputFalsy:
             }
         }
         with patch("scp_sdk.trust._bridge", return_value=bridge):
-            aggregate_trust_input(
+            await aggregate_trust_input(
                 scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
@@ -1232,13 +1232,13 @@ class TestAggregateTrustInputTyped:
             "signature": [5] * 64,
         }
 
-    def test_typed_events_serialize_verbatim(self) -> None:
+    async def test_typed_events_serialize_verbatim(self) -> None:
         from scp_sdk.trust import aggregate_trust_input
 
         bridge = self._mock_bridge()
         event = self._event()
         with patch("scp_sdk.trust._bridge", return_value=bridge):
-            aggregate_trust_input(
+            await aggregate_trust_input(
                 scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
@@ -1249,7 +1249,7 @@ class TestAggregateTrustInputTyped:
         assert json.loads(call_args[2]) == [event]
         assert json.loads(call_args[3]) == [7] * 32
 
-    def test_typed_attestor_sets_serialize_verbatim(self) -> None:
+    async def test_typed_attestor_sets_serialize_verbatim(self) -> None:
         from scp_sdk.trust import aggregate_trust_input
 
         bridge = self._mock_bridge()
@@ -1260,7 +1260,7 @@ class TestAggregateTrustInputTyped:
             "attestation": None,
         }
         with patch("scp_sdk.trust._bridge", return_value=bridge):
-            aggregate_trust_input(
+            await aggregate_trust_input(
                 scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
@@ -1271,7 +1271,7 @@ class TestAggregateTrustInputTyped:
         call_args = bridge.aggregate_trust_input.call_args[0]
         assert json.loads(call_args[6]) == {"Endorsement": [attestor]}
 
-    def test_challenge_results_accept_the_dataclass(self) -> None:
+    async def test_challenge_results_accept_the_dataclass(self) -> None:
         """``challenge_results`` accepts the merged ChallengeVerification
         dataclass and serializes it via its bridge projection."""
         from scp_sdk.trust import (
@@ -1298,7 +1298,7 @@ class TestAggregateTrustInputTyped:
             verifier_signature=[9] * 64,
         )
         with patch("scp_sdk.trust._bridge", return_value=bridge):
-            aggregate_trust_input(
+            await aggregate_trust_input(
                 scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
@@ -1309,7 +1309,7 @@ class TestAggregateTrustInputTyped:
         call_args = bridge.aggregate_trust_input.call_args[0]
         assert json.loads(call_args[8]) == [verification._to_bridge_dict()]
 
-    def test_rejects_wrong_length_merkle_root(self) -> None:
+    async def test_rejects_wrong_length_merkle_root(self) -> None:
         from scp_sdk.trust import aggregate_trust_input
 
         bridge = self._mock_bridge()
@@ -1317,7 +1317,7 @@ class TestAggregateTrustInputTyped:
             patch("scp_sdk.trust._bridge", return_value=bridge),
             pytest.raises(ValueError, match="merkle_root must be exactly 32 elements, got 3"),
         ):
-            aggregate_trust_input(
+            await aggregate_trust_input(
                 scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
@@ -1327,7 +1327,7 @@ class TestAggregateTrustInputTyped:
         bridge.aggregate_trust_input.assert_not_called()
 
     @pytest.mark.parametrize("param", ["threshold_requirements", "attestor_sets"])
-    def test_rejects_invalid_attestation_type_key(self, param: str) -> None:
+    async def test_rejects_invalid_attestation_type_key(self, param: str) -> None:
         from scp_sdk.trust import aggregate_trust_input
 
         bridge = self._mock_bridge()
@@ -1335,7 +1335,7 @@ class TestAggregateTrustInputTyped:
             patch("scp_sdk.trust._bridge", return_value=bridge),
             pytest.raises(ValueError, match="not an AttestationType"),
         ):
-            aggregate_trust_input(
+            await aggregate_trust_input(
                 scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
@@ -1415,7 +1415,7 @@ class TestTrustVerifyTyped:
             "signature": [3] * 64,
         }
 
-    def test_verify_attestation_serializes_the_typed_envelope(self) -> None:
+    async def test_verify_attestation_serializes_the_typed_envelope(self) -> None:
         from scp_sdk.trust import trust_verify_attestation
 
         scp = MagicMock()
@@ -1424,19 +1424,19 @@ class TestTrustVerifyTyped:
             "chain_depth": 0,
             "error": "unresolvable issuer",
         }
-        result = trust_verify_attestation(scp, "ctx-1", self._envelope())
+        result = await trust_verify_attestation(scp, "ctx-1", self._envelope())
         assert result["valid"] is False
         context_id, wire_json = scp._native.trust_verify_attestation.call_args[0]
         assert context_id == "ctx-1"
         assert json.loads(wire_json) == self._envelope()
 
-    def test_verify_attestation_real_bridge_call_through(self, scp: Any) -> None:
+    async def test_verify_attestation_real_bridge_call_through(self, scp: Any) -> None:
         """The typed envelope's serialized JSON parses on the REAL Rust
         `Attestation` deserializer: a dummy signature yields a structured
         `valid: False` (verification ran), never a parse error."""
         from scp_sdk.trust import trust_verify_attestation
 
-        result = trust_verify_attestation(scp, "ctx-1", self._envelope())
+        result = await trust_verify_attestation(scp, "ctx-1", self._envelope())
         assert result["valid"] is False
         assert result["error"]
 

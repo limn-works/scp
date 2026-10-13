@@ -23,9 +23,13 @@ pub use admission::{
     AdmissionError, CapabilityRequirement, VerificationLevel, check_capability_requirements,
 };
 pub use attestation::{
-    Attestation, AttestationEvidence, DidPublicKeyResolver, IdentityDidPublicKeyResolver,
-    RevocationStatus, canonical_attestation_bytes, verify_attestation,
+    ActiveKeyResolver, Attestation, AttestationEvidence, RevocationStatus,
+    canonical_attestation_bytes, verify_attestation,
 };
+// The DID-string key fixture is not an `#active` resolution, so its re-export
+// carries the same `testing` gate as its definition.
+#[cfg(any(test, feature = "testing"))]
+pub use attestation::IdentityDidPublicKeyResolver;
 pub use capability_registry::{ChallengeStandard, MinCases};
 pub use capability_uri::{CapabilityUri, CapabilityUriError};
 pub use caveats::{

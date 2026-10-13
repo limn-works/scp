@@ -2837,7 +2837,7 @@ class SCP:
         """
         from scp_sdk.trust import trust_verify_attestation as _verify
 
-        return await asyncio.to_thread(_verify, self, context_id, attestation)
+        return await _verify(self, context_id, attestation)
 
     async def trust_query_score(self, did: str, context_id: str) -> Any:
         """Delegate to ``_scp_core.SCP.trust_query_score``."""
@@ -3042,9 +3042,7 @@ class SCP:
         """
         from scp_sdk.trust import participation_record as _participation_record
 
-        return await asyncio.to_thread(
-            _participation_record, self, context_id, subject_did, cached_attestations
-        )
+        return await _participation_record(self, context_id, subject_did, cached_attestations)
 
     # endregion Trust
 

@@ -3877,12 +3877,14 @@ export class SCP {
    * crossing FFI. A revocation list that cannot be read throws; it never
    * reads as `valid: false`.
    */
-  trustVerifyAttestation(contextId: string, attestation: CachedAttestationEnvelope): unknown {
+  async trustVerifyAttestation(
+    contextId: string,
+    attestation: CachedAttestationEnvelope,
+  ): Promise<unknown> {
     try {
-      return (this.#native.trustVerifyAttestation as (c: string, j: string) => unknown)(
-        contextId,
-        encodeAttestation(attestation),
-      );
+      return await (
+        this.#native.trustVerifyAttestation as (c: string, j: string) => Promise<unknown>
+      )(contextId, encodeAttestation(attestation));
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -4033,28 +4035,32 @@ export class SCP {
    * @param challengeVerifications Typed {@link ChallengeVerification} records.
    *   Serialized internally to the serde wire shape (ADR-058).
    */
-  checkCapabilityRequirements(
+  async checkCapabilityRequirements(
     contextId: string,
     subjectDid: string,
     requirements: readonly CapabilityRequirement[],
     agentCapabilities: readonly string[],
     challengeVerifications: readonly ChallengeVerification[],
-  ): void {
-    (
-      this.#native.checkCapabilityRequirements as (
-        c: string,
-        s: string,
-        r: string,
-        a: string,
-        v: string,
-      ) => void
-    )(
-      contextId,
-      subjectDid,
-      encodeCapabilityRequirements(requirements),
-      JSON.stringify(agentCapabilities),
-      encodeChallengeVerifications(challengeVerifications),
-    );
+  ): Promise<void> {
+    try {
+      await (
+        this.#native.checkCapabilityRequirements as (
+          c: string,
+          s: string,
+          r: string,
+          a: string,
+          v: string,
+        ) => Promise<void>
+      )(
+        contextId,
+        subjectDid,
+        encodeCapabilityRequirements(requirements),
+        JSON.stringify(agentCapabilities),
+        encodeChallengeVerifications(challengeVerifications),
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -4278,12 +4284,12 @@ export class SCP {
   ): Promise<BehavioralRecord> {
     let record: BehavioralRecord;
     try {
-      record = (
+      record = await (
         this.#native.participationRecord as (
           ctx: string,
           subj: string,
           ca: string,
-        ) => BehavioralRecord
+        ) => Promise<BehavioralRecord>
       )(contextId, subjectDid, encodeCachedAttestations(cachedAttestations));
     } catch (error) {
       throw mapBridgeError(error);
@@ -4329,7 +4335,7 @@ export class SCP {
    * @param challengeResults Typed {@link ChallengeVerification} records.
    * @returns The aggregated `TrustInput` as a JSON string.
    */
-  aggregateTrustInput(
+  async aggregateTrustInput(
     contextId: string,
     subjectDid: string,
     events: readonly EventLogEntry[],
@@ -4339,9 +4345,9 @@ export class SCP {
     attestorSets: Readonly<Partial<Record<AttestationType, readonly AttestorInfo[]>>> = {},
     cachedAttestations: readonly CachedAttestation[] = [],
     challengeResults: readonly ChallengeVerification[] = [],
-  ): string {
+  ): Promise<string> {
     try {
-      return (
+      return await (
         this.#native.aggregateTrustInput as (
           ctx: string,
           subj: string,
@@ -4352,7 +4358,7 @@ export class SCP {
           as: string,
           ca: string,
           cres: string,
-        ) => string
+        ) => Promise<string>
       )(
         contextId,
         subjectDid,

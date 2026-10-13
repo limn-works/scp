@@ -667,7 +667,7 @@ export interface Bridge {
     requirementsJson: string,
     agentCapabilitiesJson: string,
     challengeVerificationsJson: string,
-  ): void;
+  ): Promise<void>;
 
   // Lifecycle
   version(): string;

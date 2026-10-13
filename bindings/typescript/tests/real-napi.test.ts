@@ -2882,14 +2882,14 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   // surface as a parse error here, not just in the mock unit tests.
   // ---------------------------------------------------------------------------
   describe("Typed trust-input admission (real NAPI, ADR-058)", () => {
-    test("checkCapabilityRequirements: SelfAttested requirement met by a declared capability", () => {
+    test("checkCapabilityRequirements: SelfAttested requirement met by a declared capability", async () => {
       const requirements: readonly CapabilityRequirement[] = [
         { capability: "scp:capability:schema-validation/v1", verificationLevel: "SelfAttested" },
       ];
       // A SelfAttested requirement is satisfied by the declared capability with
       // no challenge verification — the typed inputs round-trip through the
-      // bridge deserializers and admission succeeds (returns void, no throw).
-      expect(() =>
+      // bridge deserializers and admission succeeds (resolves, no rejection).
+      await expect(
         scpInstance.checkCapabilityRequirements(
           "ctx-admission",
           "did:dht:zSubject",
@@ -2897,14 +2897,14 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
           ["scp:capability:schema-validation/v1"],
           [],
         ),
-      ).not.toThrow();
+      ).resolves.toBeUndefined();
     });
 
-    test("checkCapabilityRequirements: missing SelfAttested capability is rejected", () => {
+    test("checkCapabilityRequirements: missing SelfAttested capability is rejected", async () => {
       const requirements: readonly CapabilityRequirement[] = [
         { capability: "scp:capability:schema-validation/v1", verificationLevel: "SelfAttested" },
       ];
-      expect(() =>
+      await expect(
         scpInstance.checkCapabilityRequirements(
           "ctx-admission",
           "did:dht:zSubject",
@@ -2912,7 +2912,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
           [],
           [],
         ),
-      ).toThrow();
+      ).rejects.toMatchObject({ code: "SCP-VALID-7076" });
     });
 
     test("verifyParticipationRequirements: valid profile + empty requirements round-trips", () => {

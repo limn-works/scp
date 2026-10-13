@@ -385,29 +385,27 @@ final class TrustAdmissionCallThroughTests: XCTestCase {
     /// A satisfied `SelfAttested` requirement admits the agent: the capability is
     /// present in `agentCapabilities`, so the typed wrapper's serialized JSON
     /// parses and evaluates to success on the Rust side (no throw).
-    func testCheckCapabilityRequirementsSelfAttestedPasses() throws {
-        XCTAssertNoThrow(
-            try scp.checkCapabilityRequirements(
-                contextId: "ctx-1",
-                subjectDid: "did:key:zSubject",
-                requirements: [
-                    CapabilityRequirement(
-                        capability: "scp:capability:messages-write/v1",
-                        verificationLevel: .selfAttested
-                    )
-                ],
-                agentCapabilities: ["scp:capability:messages-write/v1"],
-                challengeVerifications: []
-            )
+    func testCheckCapabilityRequirementsSelfAttestedPasses() async throws {
+        try await scp.checkCapabilityRequirements(
+            contextId: "ctx-1",
+            subjectDid: "did:key:zSubject",
+            requirements: [
+                CapabilityRequirement(
+                    capability: "scp:capability:messages-write/v1",
+                    verificationLevel: .selfAttested
+                )
+            ],
+            agentCapabilities: ["scp:capability:messages-write/v1"],
+            challengeVerifications: []
         )
     }
 
     /// An unmet `SelfAttested` requirement (capability not declared, no matching
     /// challenge verification) is rejected by the Rust evaluator — proving the
     /// serialized JSON parsed and was evaluated, not silently dropped.
-    func testCheckCapabilityRequirementsMissingCapabilityThrows() {
-        XCTAssertThrowsError(
-            try scp.checkCapabilityRequirements(
+    func testCheckCapabilityRequirementsMissingCapabilityThrows() async {
+        do {
+            try await scp.checkCapabilityRequirements(
                 contextId: "ctx-1",
                 subjectDid: "did:key:zSubject",
                 requirements: [
@@ -419,7 +417,12 @@ final class TrustAdmissionCallThroughTests: XCTestCase {
                 agentCapabilities: ["scp:capability:messages-write/v1"],
                 challengeVerifications: []
             )
-        )
+            XCTFail("an unmet SelfAttested requirement must be rejected")
+        } catch let ScpError.Validation(_, code) {
+            XCTAssertEqual(code, "SCP-VALID-7076")
+        } catch {
+            XCTFail("expected ScpError.Validation, got \(error)")
+        }
     }
 
     /// Empty requirements are vacuously satisfied — a clean call-through proving

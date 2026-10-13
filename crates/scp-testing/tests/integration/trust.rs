@@ -95,8 +95,8 @@ impl TestKeyResolver {
     }
 }
 
-impl scp_core::trust::attestation::DidPublicKeyResolver for TestKeyResolver {
-    fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+impl scp_core::trust::attestation::ActiveKeyResolver for TestKeyResolver {
+    fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
         self.keys
             .get(did)
             .cloned()
@@ -407,7 +407,8 @@ async fn attestation_threshold() {
         resolver: &resolver,
         clock: &clock,
         revocation_checker: &scp_core::trust::NoOpRevocationChecker,
-    });
+    })
+    .unwrap();
     assert!(result.met, "2-of-3 threshold should be met");
     assert_eq!(result.valid_count, 3);
 
@@ -421,7 +422,8 @@ async fn attestation_threshold() {
         resolver: &resolver,
         clock: &clock,
         revocation_checker: &scp_core::trust::NoOpRevocationChecker,
-    });
+    })
+    .unwrap();
     assert!(
         !result_strict.met,
         "4-of-5 threshold should not be met with only 3 attestors"

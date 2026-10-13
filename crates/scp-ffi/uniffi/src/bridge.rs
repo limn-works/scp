@@ -7602,11 +7602,33 @@ pub fn trust_query_score(did: String, context_id: String) -> Result<TrustScoreRe
     })
 }
 
+/// Runs a trust operation that resolves signers' `#active` keys (spec 09
+/// §9.7.1) on tokio's blocking pool, so a DID lookup blocks neither the
+/// caller's thread nor an async worker.
+///
+/// # Errors
+///
+/// `work`'s own error, or `CTX_2000` when the blocking task panics or is
+/// cancelled.
+async fn on_resolution_pool<T, F>(work: F) -> Result<T, ScpError>
+where
+    F: FnOnce(&scp_ffi_common::BlockingResolutionScope) -> Result<T, ScpError> + Send + 'static,
+    T: Send + 'static,
+{
+    scp_ffi_common::run_blocking_resolution(work)
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: e.to_string(),
+            code: codes::CTX_2000.to_owned(),
+        })?
+}
+
 /// Verifies one attestation against the revocation list in the concrete
-/// backend behind a `ProtocolRepoVariant` arm, with the production DID-key
-/// resolver and clock.
+/// backend behind a `ProtocolRepoVariant` arm, with the instance's `#active`
+/// key resolver and the system clock.
 fn run_verify_attestation<S: scp_platform::traits::Storage + 'static>(
     repo: &std::sync::Arc<scp_core::store::ProtocolRepository<S>>,
+    resolver: &dyn scp_core::trust::attestation::ActiveKeyResolver,
     context_id: &str,
     attestation: &scp_core::trust::Attestation,
 ) -> Result<scp_ffi_common::trust_store::AttestationVerdict, scp_core::trust::TrustError> {
@@ -7617,7 +7639,7 @@ fn run_verify_attestation<S: scp_platform::traits::Storage + 'static>(
         &bridge,
         context_id,
         attestation,
-        &scp_core::trust::IdentityDidPublicKeyResolver,
+        resolver,
         &scp_clock::SystemClock,
     )
 }
@@ -7792,6 +7814,7 @@ pub fn verify_participation_requirements(
 /// concrete `ProtocolRepository<S>`.
 fn run_verified_attestations<S: scp_platform::traits::Storage + 'static>(
     repo: &std::sync::Arc<scp_core::store::ProtocolRepository<S>>,
+    resolver: &dyn scp_core::trust::attestation::ActiveKeyResolver,
     context_id: &str,
     subject_did: &str,
     cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
@@ -7801,6 +7824,7 @@ fn run_verified_attestations<S: scp_platform::traits::Storage + 'static>(
         scp_core::trust::ProtocolRepositoryTrustBridge::new(std::sync::Arc::clone(repo), handle);
     scp_ffi_common::trust_store::verified_attestations(
         bridge,
+        resolver,
         context_id,
         subject_did,
         cached_attestations,
@@ -16534,7 +16558,7 @@ impl Scp {
     /// `context_id` (§7.4.4). A rejection returns `valid: false` with the
     /// reason; a revocation list that cannot be read is an error
     /// (`VALID_7052`), never a verdict. See ADR-017 Layer 3 (Attestation).
-    pub fn trust_verify_attestation(
+    pub async fn trust_verify_attestation(
         &self,
         context_id: String,
         attestation_json: String,
@@ -16551,18 +16575,28 @@ impl Scp {
                 code: codes::VALID_7012.to_owned(),
             })?;
 
-        let verdict = match self.inner.protocol_repository() {
-            crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
-                run_verify_attestation(repo, &context_id, &attestation)
+        // The issuer's current `#active` key (spec 09 §9.7.1), resolved
+        // through this instance's DID resolver; an instance without one fails
+        // closed.
+        let inner = Arc::clone(&self.inner);
+        let verdict = on_resolution_pool(move |scope| {
+            let did_resolver = inner.did_resolver();
+            let resolver =
+                scp_ffi_common::instance_active_key_resolver(scope, did_resolver.as_ref());
+            match inner.protocol_repository() {
+                crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+                    run_verify_attestation(repo, resolver, &context_id, &attestation)
+                }
+                crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+                    run_verify_attestation(repo, resolver, &context_id, &attestation)
+                }
             }
-            crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
-                run_verify_attestation(repo, &context_id, &attestation)
-            }
-        }
-        .map_err(|e| ScpError::Validation {
-            msg: e.to_string(),
-            code: codes::VALID_7052.to_owned(),
-        })?;
+            .map_err(|e| ScpError::Validation {
+                msg: e.to_string(),
+                code: codes::VALID_7052.to_owned(),
+            })
+        })
+        .await?;
 
         Ok(match verdict {
             AttestationVerdict::Valid => AttestationVerificationResult {
@@ -16676,7 +16710,7 @@ impl Scp {
     /// proves the verifier's signature, NOT that the verifier is trusted.
     /// Establish verifier legitimacy separately (spec §7.3.4.4 / §7.4).
     ///
-    /// The resolver lookup blocks; call this off the main thread.
+    /// The resolver lookup runs on the blocking pool.
     ///
     /// # Errors
     ///
@@ -16687,7 +16721,7 @@ impl Scp {
     ///   empty subject.
     /// - `SCP-IDENT-1033` when a record must be verified and this instance has
     ///   no DID resolver, or its backend is unreachable.
-    pub fn check_capability_requirements(
+    pub async fn check_capability_requirements(
         &self,
         context_id: String,
         subject_did: String,
@@ -16722,36 +16756,41 @@ impl Scp {
         // Records are signed with the verifier's `#active` key, which only
         // this instance's DID resolver reads; without one, a supplied record
         // fails closed with SCP-IDENT-1033.
-        let did_resolver = self.inner.did_resolver();
-        let resolver = scp_ffi_common::instance_challenge_resolver(did_resolver.as_ref());
-        let clock = scp_clock::SystemClock;
-
-        scp_core::trust::check_capability_requirements(
-            &requirements,
-            &agent_capabilities,
-            &challenge_verifications,
-            &context_id,
-            &subject_did,
-            resolver,
-            &clock,
-        )
-        .map_err(|e| match e {
-            scp_core::trust::AdmissionError::EmptySubjectDid => ScpError::Validation {
-                msg: format!("capability admission verification failed: {e}"),
-                code: codes::VALID_7077.to_owned(),
-            },
-            scp_core::trust::AdmissionError::MissingCapability { .. }
-            | scp_core::trust::AdmissionError::VerificationRequired { .. } => {
-                ScpError::Validation {
+        let inner = Arc::clone(&self.inner);
+        on_resolution_pool(move |scope| {
+            let did_resolver = inner.did_resolver();
+            let resolver =
+                scp_ffi_common::instance_active_key_resolver(scope, did_resolver.as_ref());
+            scp_core::trust::check_capability_requirements(
+                &requirements,
+                &agent_capabilities,
+                &challenge_verifications,
+                &context_id,
+                &subject_did,
+                resolver,
+                &scp_clock::SystemClock,
+            )
+            .map_err(|e| match e {
+                scp_core::trust::AdmissionError::EmptySubjectDid => ScpError::Validation {
                     msg: format!("capability admission verification failed: {e}"),
-                    code: codes::VALID_7076.to_owned(),
+                    code: codes::VALID_7077.to_owned(),
+                },
+                scp_core::trust::AdmissionError::MissingCapability { .. }
+                | scp_core::trust::AdmissionError::VerificationRequired { .. } => {
+                    ScpError::Validation {
+                        msg: format!("capability admission verification failed: {e}"),
+                        code: codes::VALID_7076.to_owned(),
+                    }
                 }
-            }
-            scp_core::trust::AdmissionError::VerificationUnavailable { .. } => ScpError::Identity {
-                msg: format!("capability admission verification failed: {e}"),
-                code: codes::IDENT_1033.to_owned(),
-            },
+                scp_core::trust::AdmissionError::VerificationUnavailable { .. } => {
+                    ScpError::Identity {
+                        msg: format!("capability admission verification failed: {e}"),
+                        code: codes::IDENT_1033.to_owned(),
+                    }
+                }
+            })
         })
+        .await
     }
 
     /// Per-instance equivalent of the free-function `aggregate_trust_input`.
@@ -16761,7 +16800,7 @@ impl Scp {
     /// falling back to an ephemeral in-memory store when no repository
     /// is attached.
     #[allow(clippy::too_many_arguments)]
-    pub fn aggregate_trust_input(
+    pub async fn aggregate_trust_input(
         &self,
         context_id: String,
         subject_did: String,
@@ -16841,63 +16880,67 @@ impl Scp {
                 code: codes::VALID_7049.to_owned(),
             })?;
 
-        // The instance resolver verifies each challenge record's `#active`
-        // signature; without one, a supplied record fails closed.
-        let challenge_resolver = self.inner.did_resolver();
+        // The instance resolver verifies each attestation's and challenge
+        // record's `#active` signature; without one, a supplied record fails
+        // closed.
+        let inner = Arc::clone(&self.inner);
+        on_resolution_pool(move |scope| {
+            let did_resolver = inner.did_resolver();
 
-        // Route trust aggregation through THIS instance's
-        // `ProtocolRepository` variant. Falls back to an ephemeral
-        // in-memory store when no repository is attached yet.
-        match self.inner.protocol_repository() {
-            crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
-                let handle = runtime().handle().clone();
-                let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
-                    std::sync::Arc::clone(repo),
-                    handle,
-                );
-                scp_ffi_common::trust_store::populate_and_aggregate(
-                    bridge,
-                    scp_ffi_common::instance_challenge_resolver(challenge_resolver.as_ref()),
-                    &context_id,
-                    &subject_did,
-                    cached_attestations,
-                    &challenge_results,
-                    &events,
-                    merkle_root,
-                    &consequence_rules,
-                    &threshold_requirements,
-                    &attestor_sets,
-                )
-                .map_err(|e| ScpError::Validation {
-                    msg: e.to_string(),
-                    code: codes::VALID_7052.to_owned(),
-                })
+            // Route trust aggregation through THIS instance's
+            // `ProtocolRepository` variant.
+            match inner.protocol_repository() {
+                crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+                    let handle = runtime().handle().clone();
+                    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
+                        std::sync::Arc::clone(repo),
+                        handle,
+                    );
+                    scp_ffi_common::trust_store::populate_and_aggregate(
+                        bridge,
+                        scp_ffi_common::instance_active_key_resolver(scope, did_resolver.as_ref()),
+                        &context_id,
+                        &subject_did,
+                        cached_attestations,
+                        &challenge_results,
+                        &events,
+                        merkle_root,
+                        &consequence_rules,
+                        &threshold_requirements,
+                        &attestor_sets,
+                    )
+                    .map_err(|e| ScpError::Validation {
+                        msg: e.to_string(),
+                        code: codes::VALID_7052.to_owned(),
+                    })
+                }
+                crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+                    let handle = runtime().handle().clone();
+                    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
+                        std::sync::Arc::clone(repo),
+                        handle,
+                    );
+                    scp_ffi_common::trust_store::populate_and_aggregate(
+                        bridge,
+                        scp_ffi_common::instance_active_key_resolver(scope, did_resolver.as_ref()),
+                        &context_id,
+                        &subject_did,
+                        cached_attestations,
+                        &challenge_results,
+                        &events,
+                        merkle_root,
+                        &consequence_rules,
+                        &threshold_requirements,
+                        &attestor_sets,
+                    )
+                    .map_err(|e| ScpError::Validation {
+                        msg: e.to_string(),
+                        code: codes::VALID_7052.to_owned(),
+                    })
+                }
             }
-            crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
-                let handle = runtime().handle().clone();
-                let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
-                    std::sync::Arc::clone(repo),
-                    handle,
-                );
-                scp_ffi_common::trust_store::populate_and_aggregate(
-                    bridge,
-                    scp_ffi_common::instance_challenge_resolver(challenge_resolver.as_ref()),
-                    &context_id,
-                    &subject_did,
-                    cached_attestations,
-                    &challenge_results,
-                    &events,
-                    merkle_root,
-                    &consequence_rules,
-                    &threshold_requirements,
-                    &attestor_sets,
-                )
-                .map_err(|e| ScpError::Validation {
-                    msg: e.to_string(),
-                    code: codes::VALID_7052.to_owned(),
-                })
-            }
-        }
+        })
+        .await
     }
 
     /// Computes the structured participation record (§7.3.2) for `subject_did`
@@ -16910,7 +16953,7 @@ impl Scp {
     /// Supervisor gathers the FULL event log + Merkle root for every other fact.
     /// Returns the flattened typed [`ParticipationRecordView`] so the
     /// Swift/Kotlin SDKs never re-aggregate. See ADR-017, spec §7.3.2.
-    pub fn participation_record(
+    pub async fn participation_record(
         &self,
         context_id: String,
         subject_did: String,
@@ -16931,50 +16974,63 @@ impl Scp {
         // Source verified attestations from this instance's `ProtocolRepository`
         // (same backend as context/event-log writes). Both variants route
         // through the single generic `run_verified_attestations` helper.
-        let verified = match self.inner.protocol_repository() {
-            crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
-                run_verified_attestations(repo, &context_id, &subject_did, cached_attestations)
+        let inner = Arc::clone(&self.inner);
+        on_resolution_pool(move |scope| {
+            let did_resolver = inner.did_resolver();
+            let resolver =
+                scp_ffi_common::instance_active_key_resolver(scope, did_resolver.as_ref());
+            let verified = match inner.protocol_repository() {
+                crate::runtime::ProtocolRepoVariant::InMemory(repo) => run_verified_attestations(
+                    repo,
+                    resolver,
+                    &context_id,
+                    &subject_did,
+                    cached_attestations,
+                ),
+                crate::runtime::ProtocolRepoVariant::Sqlite(repo) => run_verified_attestations(
+                    repo,
+                    resolver,
+                    &context_id,
+                    &subject_did,
+                    cached_attestations,
+                ),
             }
-            crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
-                run_verified_attestations(repo, &context_id, &subject_did, cached_attestations)
-            }
-        }
-        // An error from `verified_attestations` is an INFRA fault (trust-store
-        // read, signature-verification infrastructure) — NOT caller-input
-        // validation. Code it as a context-layer fault (CTX_2000), consistent
-        // with the generic-failure arm of `participation_record` below, and keep
-        // it propagating (fail-closed): it must never be folded into the empty-log
-        // CTX_2076 path.
-        .map_err(|e| ScpError::Context {
-            msg: e.to_string(),
-            code: codes::CTX_2000.to_owned(),
-        })?;
+            // An error from `verified_attestations` is an INFRA fault (trust-store
+            // read, signature-verification infrastructure) — NOT caller-input
+            // validation. Code it as a context-layer fault (CTX_2000), consistent
+            // with the generic-failure arm of `participation_record` below, and keep
+            // it propagating (fail-closed): it must never be folded into the empty-log
+            // CTX_2076 path.
+            .map_err(|e| ScpError::Context {
+                msg: e.to_string(),
+                code: codes::CTX_2000.to_owned(),
+            })?;
 
-        let supervisor = self
-            .inner
-            .core
-            .supervisor()
-            .ok_or_else(|| ScpError::Context {
+            let supervisor = inner.core.supervisor().ok_or_else(|| ScpError::Context {
                 msg: "supervisor not initialized — cannot compute participation record".to_owned(),
                 code: codes::CTX_2000.to_owned(),
             })?;
-        let record = supervisor
-            .participation_record(&context_id, &subject_did, &verified)
-            .map_err(|e| {
-                // Empty-log → dedicated CTX_2076 so SDKs branch on the code, not
-                // the message; genuine failures stay on the generic CTX_2000.
-                let code = match e {
-                    scp_core::context::ContextError::NoParticipationFacts { .. } => codes::CTX_2076,
-                    _ => codes::CTX_2000,
-                };
-                ScpError::Context {
-                    msg: e.to_string(),
-                    code: code.to_owned(),
-                }
-            })?;
+            let record = supervisor
+                .participation_record(&context_id, &subject_did, &verified)
+                .map_err(|e| {
+                    // Empty-log → dedicated CTX_2076 so SDKs branch on the code, not
+                    // the message; genuine failures stay on the generic CTX_2000.
+                    let code = match e {
+                        scp_core::context::ContextError::NoParticipationFacts { .. } => {
+                            codes::CTX_2076
+                        }
+                        _ => codes::CTX_2000,
+                    };
+                    ScpError::Context {
+                        msg: e.to_string(),
+                        code: code.to_owned(),
+                    }
+                })?;
 
-        let facts = scp_core::trust::ParticipationFacts::from(&record);
-        Ok(ParticipationRecordView::from(&facts))
+            let facts = scp_core::trust::ParticipationFacts::from(&record);
+            Ok(ParticipationRecordView::from(&facts))
+        })
+        .await
     }
 
     // ===== State-touching operations — per-instance methods on `Scp` =====
@@ -22461,14 +22517,16 @@ mod tests {
     #[test]
     fn trust_verify_attestation_rejects_invalid_json_with_code() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
-        let result = scp.trust_verify_attestation("ctx-1".to_owned(), "not json".to_owned());
+        let result = runtime()
+            .block_on(scp.trust_verify_attestation("ctx-1".to_owned(), "not json".to_owned()));
         assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7012);
     }
 
     #[test]
     fn trust_verify_attestation_rejects_malformed_context_with_code() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
-        let result = scp.trust_verify_attestation(String::new(), "{}".to_owned());
+        let result =
+            runtime().block_on(scp.trust_verify_attestation(String::new(), "{}".to_owned()));
         assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7011);
     }
 
@@ -22755,26 +22813,33 @@ mod tests {
     #[test]
     fn participation_record_rejects_empty_context() {
         let scp = scp_test();
-        let result =
-            scp.participation_record(String::new(), "did:key:test".to_owned(), "[]".to_owned());
+        let result = runtime().block_on(scp.participation_record(
+            String::new(),
+            "did:key:test".to_owned(),
+            "[]".to_owned(),
+        ));
         assert!(result.is_err());
     }
 
     #[test]
     fn participation_record_rejects_empty_did() {
         let scp = scp_test();
-        let result = scp.participation_record("ctx-1".to_owned(), String::new(), "[]".to_owned());
+        let result = runtime().block_on(scp.participation_record(
+            "ctx-1".to_owned(),
+            String::new(),
+            "[]".to_owned(),
+        ));
         assert!(result.is_err());
     }
 
     #[test]
     fn participation_record_rejects_invalid_attestations_json() {
         let scp = scp_test();
-        let result = scp.participation_record(
+        let result = runtime().block_on(scp.participation_record(
             "ctx-1".to_owned(),
             "did:key:test".to_owned(),
             "not json".to_owned(),
-        );
+        ));
         assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7059);
     }
 
@@ -22783,8 +22848,11 @@ mod tests {
         // Format validation (not just non-empty) matches the PyO3 reference
         // bridge: a non-empty but malformed DID is rejected.
         let scp = scp_test();
-        let result =
-            scp.participation_record("ctx-1".to_owned(), "not-a-did".to_owned(), "[]".to_owned());
+        let result = runtime().block_on(scp.participation_record(
+            "ctx-1".to_owned(),
+            "not-a-did".to_owned(),
+            "[]".to_owned(),
+        ));
         assert!(result.is_err());
     }
 
@@ -22856,7 +22924,7 @@ mod tests {
         cached_attestations_json: &str,
         challenge_results_json: &str,
     ) -> Result<String, ScpError> {
-        scp_test().aggregate_trust_input(
+        runtime().block_on(scp_test().aggregate_trust_input(
             context_id.to_owned(),
             subject_did.to_owned(),
             events_json.to_owned(),
@@ -22866,7 +22934,7 @@ mod tests {
             attestor_sets_json.to_owned(),
             cached_attestations_json.to_owned(),
             challenge_results_json.to_owned(),
-        )
+        ))
     }
 
     const TEST_MERKLE_ROOT_JSON: &str =
@@ -23036,73 +23104,73 @@ mod tests {
 
     #[test]
     fn check_capability_requirements_rejects_invalid_requirements_json() {
-        let result = scp_test().check_capability_requirements(
+        let result = runtime().block_on(scp_test().check_capability_requirements(
             "ctx-1".to_owned(),
             "did:key:alice".to_owned(),
             "not json".to_owned(),
             "[]".to_owned(),
             "[]".to_owned(),
-        );
+        ));
         assert_error_code(result, codes::VALID_7073);
     }
 
     #[test]
     fn check_capability_requirements_rejects_invalid_capabilities_json() {
-        let result = scp_test().check_capability_requirements(
+        let result = runtime().block_on(scp_test().check_capability_requirements(
             "ctx-1".to_owned(),
             "did:key:alice".to_owned(),
             "[]".to_owned(),
             "not json".to_owned(),
             "[]".to_owned(),
-        );
+        ));
         assert_error_code(result, codes::VALID_7074);
     }
 
     #[test]
     fn check_capability_requirements_rejects_invalid_verifications_json() {
-        let result = scp_test().check_capability_requirements(
+        let result = runtime().block_on(scp_test().check_capability_requirements(
             "ctx-1".to_owned(),
             "did:key:alice".to_owned(),
             "[]".to_owned(),
             "[]".to_owned(),
             "not json".to_owned(),
-        );
+        ));
         assert_error_code(result, codes::VALID_7075);
     }
 
     #[test]
     fn check_capability_requirements_empty_inputs_succeeds() {
-        let result = scp_test().check_capability_requirements(
+        let result = runtime().block_on(scp_test().check_capability_requirements(
             "ctx-1".to_owned(),
             "did:key:alice".to_owned(),
             "[]".to_owned(),
             "[]".to_owned(),
             "[]".to_owned(),
-        );
+        ));
         assert!(result.is_ok());
     }
 
     #[test]
     fn check_capability_requirements_rejects_empty_subject() {
-        let result = scp_test().check_capability_requirements(
+        let result = runtime().block_on(scp_test().check_capability_requirements(
             "ctx-1".to_owned(),
             String::new(),
             "[]".to_owned(),
             "[]".to_owned(),
             "[]".to_owned(),
-        );
+        ));
         assert_error_code(result, codes::VALID_7000);
     }
 
     #[test]
     fn check_capability_requirements_rejects_malformed_subject() {
-        let result = scp_test().check_capability_requirements(
+        let result = runtime().block_on(scp_test().check_capability_requirements(
             "ctx-1".to_owned(),
             "not-a-did".to_owned(),
             "[]".to_owned(),
             "[]".to_owned(),
             "[]".to_owned(),
-        );
+        ));
         assert_error_code(result, codes::VALID_7000);
     }
 
@@ -23110,26 +23178,26 @@ mod tests {
     fn check_capability_requirements_self_attested_present_succeeds() {
         let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
         let capabilities = r#"["scp:capability:schema-validation/v1"]"#;
-        let result = scp_test().check_capability_requirements(
+        let result = runtime().block_on(scp_test().check_capability_requirements(
             "ctx-1".to_owned(),
             "did:key:alice".to_owned(),
             requirements.to_owned(),
             capabilities.to_owned(),
             "[]".to_owned(),
-        );
+        ));
         assert!(result.is_ok());
     }
 
     #[test]
     fn check_capability_requirements_self_attested_missing_fails() {
         let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
-        let result = scp_test().check_capability_requirements(
+        let result = runtime().block_on(scp_test().check_capability_requirements(
             "ctx-1".to_owned(),
             "did:key:alice".to_owned(),
             requirements.to_owned(),
             "[]".to_owned(),
             "[]".to_owned(),
-        );
+        ));
         assert_error_code(result, codes::VALID_7076);
     }
 
@@ -23227,14 +23295,15 @@ mod tests {
         let subject = "did:dht:zResponder";
         let ctx = "ctx-admission";
         let cvs = signed_cv_json(&v, &CvSigner::Active, CHALLENGE_URI, subject, ctx);
-        scp.check_capability_requirements(
-            ctx.to_owned(),
-            subject.to_owned(),
-            challenge_requirement_json(),
-            "[]".to_owned(),
-            cvs,
-        )
-        .unwrap();
+        runtime()
+            .block_on(scp.check_capability_requirements(
+                ctx.to_owned(),
+                subject.to_owned(),
+                challenge_requirement_json(),
+                "[]".to_owned(),
+                cvs,
+            ))
+            .unwrap();
     }
 
     /// A record signed by a key unrelated to the verifier's DID, or by its
@@ -23248,13 +23317,13 @@ mod tests {
         let ctx = "ctx-admission";
         for signer in [CvSigner::Unrelated, CvSigner::IdentityKey] {
             let cvs = signed_cv_json(&v, &signer, CHALLENGE_URI, subject, ctx);
-            let result = scp.check_capability_requirements(
+            let result = runtime().block_on(scp.check_capability_requirements(
                 ctx.to_owned(),
                 subject.to_owned(),
                 challenge_requirement_json(),
                 "[]".to_owned(),
                 cvs,
-            );
+            ));
             assert_error_code(result, codes::VALID_7076);
         }
     }
@@ -23270,13 +23339,13 @@ mod tests {
         let subject = "did:dht:zResponder";
         let ctx = "ctx-admission";
         let cvs = signed_cv_json(&v, &CvSigner::Active, CHALLENGE_URI, subject, ctx);
-        let result = scp.check_capability_requirements(
+        let result = runtime().block_on(scp.check_capability_requirements(
             ctx.to_owned(),
             subject.to_owned(),
             challenge_requirement_json(),
             "[]".to_owned(),
             cvs,
-        );
+        ));
         assert_error_code(result, codes::IDENT_1033);
     }
 
@@ -23287,13 +23356,13 @@ mod tests {
         let v = challenge_identity(&scp);
         let ctx = "ctx-admission";
         let cvs = signed_cv_json(&v, &CvSigner::Active, CHALLENGE_URI, "did:dht:zVictim", ctx);
-        let result = scp.check_capability_requirements(
+        let result = runtime().block_on(scp.check_capability_requirements(
             ctx.to_owned(),
             "did:dht:zAttacker".to_owned(),
             challenge_requirement_json(),
             "[]".to_owned(),
             cvs,
-        );
+        ));
         assert_error_code(result, codes::VALID_7076);
     }
 
@@ -23304,13 +23373,13 @@ mod tests {
         let v = challenge_identity(&scp);
         let subject = "did:dht:zResponder";
         let cvs = signed_cv_json(&v, &CvSigner::Active, CHALLENGE_URI, subject, "ctx-other");
-        let result = scp.check_capability_requirements(
+        let result = runtime().block_on(scp.check_capability_requirements(
             "ctx-admission".to_owned(),
             subject.to_owned(),
             challenge_requirement_json(),
             "[]".to_owned(),
             cvs,
-        );
+        ));
         assert_error_code(result, codes::VALID_7076);
     }
 

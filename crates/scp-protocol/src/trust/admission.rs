@@ -13,7 +13,7 @@
 use scp_clock::Clock;
 use serde::{Deserialize, Serialize};
 
-use super::attestation::DidPublicKeyResolver;
+use super::attestation::ActiveKeyResolver;
 use super::capability_uri::CapabilityUri;
 use super::challenge::{ChallengeVerification, verify_challenge_verification};
 
@@ -157,7 +157,7 @@ pub fn check_capability_requirements(
     challenge_verifications: &[ChallengeVerification],
     context_id: &str,
     subject_did: &str,
-    resolver: &(impl DidPublicKeyResolver + ?Sized),
+    resolver: &(impl ActiveKeyResolver + ?Sized),
     clock: &(impl Clock + ?Sized),
 ) -> Result<(), AdmissionError> {
     // Reject an empty subject up front: it is invalid input, not a "no match"
@@ -263,8 +263,8 @@ mod tests {
         keys: HashMap<String, Vec<u8>>,
     }
 
-    impl DidPublicKeyResolver for TestResolver {
-        fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+    impl ActiveKeyResolver for TestResolver {
+        fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
             self.keys.get(did).cloned().ok_or_else(|| {
                 TrustError::ChallengeVerificationSignatureInvalid {
                     verification_id: String::new(),
@@ -735,8 +735,8 @@ mod tests {
     /// failure, not a judgment on the record.
     struct UnavailableResolver;
 
-    impl DidPublicKeyResolver for UnavailableResolver {
-        fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+    impl ActiveKeyResolver for UnavailableResolver {
+        fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
             Err(TrustError::KeyResolutionUnavailable {
                 did: did.to_owned(),
                 reason: "resolver offline".to_owned(),

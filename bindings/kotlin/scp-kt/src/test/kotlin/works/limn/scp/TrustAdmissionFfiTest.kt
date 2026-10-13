@@ -56,7 +56,7 @@ class TrustAdmissionFfiTest {
         // wrapper's serialized JSON parses and evaluates to success on the
         // Rust side (no throw).
         assertDoesNotThrow {
-            scp.checkCapabilityRequirements(
+            runBlocking { scp.checkCapabilityRequirements(
                 contextId = "ctx-1",
                 subjectDid = "did:key:zSubject",
                 requirements =
@@ -68,7 +68,7 @@ class TrustAdmissionFfiTest {
                     ),
                 agentCapabilities = listOf("scp:capability:messages-write/v1"),
                 challengeVerifications = emptyList(),
-            )
+            ) }
         }
     }
 
@@ -79,7 +79,7 @@ class TrustAdmissionFfiTest {
         // proving the serialized JSON parsed and was evaluated, not silently
         // dropped.
         assertThrows<ScpException> {
-            scp.checkCapabilityRequirements(
+            runBlocking { scp.checkCapabilityRequirements(
                 contextId = "ctx-1",
                 subjectDid = "did:key:zSubject",
                 requirements =
@@ -91,7 +91,7 @@ class TrustAdmissionFfiTest {
                     ),
                 agentCapabilities = listOf("scp:capability:messages-write/v1"),
                 challengeVerifications = emptyList(),
-            )
+            ) }
         }
     }
 
@@ -103,7 +103,7 @@ class TrustAdmissionFfiTest {
         // (tagged verification_method, explicit-null score, number-array
         // signature) deserialized on the Rust side and reached evaluation.
         assertThrows<ScpException> {
-            scp.checkCapabilityRequirements(
+            runBlocking { scp.checkCapabilityRequirements(
                 contextId = "ctx-admission",
                 subjectDid = "did:key:zSubject",
                 requirements =
@@ -138,7 +138,7 @@ class TrustAdmissionFfiTest {
                             verifierSignature = List(64) { 0.toUByte() },
                         ),
                     ),
-            )
+            ) }
         }
     }
 

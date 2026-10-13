@@ -278,8 +278,8 @@ public extension SCP {
 
     // swiftlint:disable function_parameter_count
     /// Forwards to ``Scp/aggregateTrustInput`` on ``inner``.
-    func aggregateTrustInput(contextId: String, subjectDid: String, eventsJson: String, merkleRootJson: String, consequenceRulesJson: String, thresholdRequirementsJson: String, attestorSetsJson: String, cachedAttestationsJson: String, challengeResultsJson: String) throws -> String {
-        try inner.aggregateTrustInput(contextId: contextId, subjectDid: subjectDid, eventsJson: eventsJson, merkleRootJson: merkleRootJson, consequenceRulesJson: consequenceRulesJson, thresholdRequirementsJson: thresholdRequirementsJson, attestorSetsJson: attestorSetsJson, cachedAttestationsJson: cachedAttestationsJson, challengeResultsJson: challengeResultsJson)
+    func aggregateTrustInput(contextId: String, subjectDid: String, eventsJson: String, merkleRootJson: String, consequenceRulesJson: String, thresholdRequirementsJson: String, attestorSetsJson: String, cachedAttestationsJson: String, challengeResultsJson: String) async throws -> String {
+        try await inner.aggregateTrustInput(contextId: contextId, subjectDid: subjectDid, eventsJson: eventsJson, merkleRootJson: merkleRootJson, consequenceRulesJson: consequenceRulesJson, thresholdRequirementsJson: thresholdRequirementsJson, attestorSetsJson: attestorSetsJson, cachedAttestationsJson: cachedAttestationsJson, challengeResultsJson: challengeResultsJson)
     }
 
     // swiftlint:enable function_parameter_count
@@ -1370,8 +1370,8 @@ public extension SCP {
         requirementsJson: String,
         agentCapabilitiesJson: String,
         challengeVerificationsJson: String
-    ) throws {
-        try inner.checkCapabilityRequirements(
+    ) async throws {
+        try await inner.checkCapabilityRequirements(
             contextId: contextId,
             subjectDid: subjectDid,
             requirementsJson: requirementsJson,

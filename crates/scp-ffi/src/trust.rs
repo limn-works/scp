@@ -58,6 +58,27 @@ fn coded_validation_error(message: String, code: &str) -> crate::error::ScpPyErr
     }
 }
 
+/// Runs `work` on tokio's blocking pool with the GIL released. The trust
+/// operations that verify attestations or challenge records resolve each
+/// signer's `#active` key (spec 09 §9.7.1), and a DID lookup blocks; it must
+/// hold neither the GIL nor the calling thread.
+///
+/// # Errors
+///
+/// `work`'s own error; `CTX_2000` when the blocking task panics or is
+/// cancelled; the runtime error when no runtime can drive the task.
+fn on_resolution_pool<T, F>(py: Python<'_>, work: F) -> PyResult<T>
+where
+    F: FnOnce(&scp_ffi_common::BlockingResolutionScope) -> PyResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    crate::actor_wait::block_on_released(py, scp_ffi_common::run_blocking_resolution(work))?
+        .map_err(|e| crate::error::ScpPyError::ContextError {
+            message: e.to_string(),
+            code: codes::CTX_2000.to_owned(),
+        })?
+}
+
 // ---------------------------------------------------------------------------
 // trust_query_score — per-bridge helper used by PyScp method
 // ---------------------------------------------------------------------------
@@ -118,7 +139,7 @@ fn trust_query_score_impl(
 /// cannot read a revocation list, so it fails closed), and `VALID_7052` when
 /// the revocation list cannot be read.
 fn trust_verify_attestation_impl(
-    bi: &PyBridgeInstance,
+    bi: &Arc<PyBridgeInstance>,
     py: Python<'_>,
     context_id: &str,
     attestation_json: &str,
@@ -135,25 +156,43 @@ fn trust_verify_attestation_impl(
                 codes::VALID_7012,
             )
         })?;
-    let provider = crate::runtime::get_storage(bi).map_err(|_| {
-        coded_validation_error(
-            "bridge storage not initialized — attestation verification cannot read \
-             this instance's revocation list (bridge init bug)"
-                .to_owned(),
-            codes::VALID_7005,
-        )
-    })?;
     let handle = crate::runtime()?.handle().clone();
-    // The store read blocks on the runtime, so it runs without the GIL.
-    let verdict = py.allow_threads(|| match provider {
-        StorageProvider::InMemoryEncrypted(storage) => {
-            run_verify_attestation(Arc::clone(storage), handle, context_id, &attestation)
+    let bi = Arc::clone(bi);
+    let context_id = context_id.to_owned();
+    // The store read and the key resolution block, so they run on the
+    // blocking pool without the GIL.
+    let verdict = on_resolution_pool(py, move |scope| {
+        let provider = crate::runtime::get_storage(&bi).map_err(|_| {
+            coded_validation_error(
+                "bridge storage not initialized — attestation verification cannot read \
+                 this instance's revocation list (bridge init bug)"
+                    .to_owned(),
+                codes::VALID_7005,
+            )
+        })?;
+        // The issuer's current `#active` key (spec 09 §9.7.1), resolved
+        // through this instance's DID resolver; an instance without one fails
+        // closed.
+        let resolver =
+            scp_ffi_common::instance_active_key_resolver(scope, crate::runtime::did_resolver(&bi));
+        match provider {
+            StorageProvider::InMemoryEncrypted(storage) => run_verify_attestation(
+                Arc::clone(storage),
+                handle,
+                resolver,
+                &context_id,
+                &attestation,
+            ),
+            StorageProvider::Sqlite(storage) => run_verify_attestation(
+                Arc::clone(storage),
+                handle,
+                resolver,
+                &context_id,
+                &attestation,
+            ),
         }
-        StorageProvider::Sqlite(storage) => {
-            run_verify_attestation(Arc::clone(storage), handle, context_id, &attestation)
-        }
-    });
-    let verdict = verdict.map_err(|e| coded_validation_error(e.to_string(), codes::VALID_7052))?;
+        .map_err(|e| coded_validation_error(e.to_string(), codes::VALID_7052).into())
+    })?;
 
     let dict = PyDict::new(py);
     match verdict {
@@ -173,10 +212,11 @@ fn trust_verify_attestation_impl(
 
 /// Builds a `ProtocolRepositoryTrustBridge` over the concrete encrypted backend
 /// and verifies one attestation against its revocation list, with the
-/// production DID-key resolver and clock.
+/// instance's `#active` key resolver and the system clock.
 fn run_verify_attestation<S: scp_platform::EncryptedStorage + 'static>(
     storage: Arc<S>,
     handle: tokio::runtime::Handle,
+    resolver: &dyn scp_core::trust::attestation::ActiveKeyResolver,
     context_id: &str,
     attestation: &scp_core::trust::Attestation,
 ) -> Result<scp_ffi_common::trust_store::AttestationVerdict, scp_core::trust::TrustError> {
@@ -186,7 +226,7 @@ fn run_verify_attestation<S: scp_platform::EncryptedStorage + 'static>(
         &bridge,
         context_id,
         attestation,
-        &scp_core::trust::IdentityDidPublicKeyResolver,
+        resolver,
         &scp_clock::SystemClock,
     )
 }
@@ -413,7 +453,8 @@ pub fn py_verify_participation_requirements(
 /// See ADR-017 acceptance criterion 9, spec §7.3.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_trust_input_impl(
-    bi: &PyBridgeInstance,
+    bi: &Arc<PyBridgeInstance>,
+    py: Python<'_>,
     context_id: &str,
     subject_did: &str,
     events_json: &str,
@@ -500,18 +541,25 @@ fn aggregate_trust_input_impl(
             )
         })?;
 
-    aggregate_with_storage(
-        bi,
-        context_id,
-        subject_did,
-        cached_attestations,
-        &challenge_results,
-        &events,
-        merkle_root,
-        &consequence_rules,
-        &threshold_requirements,
-        &attestor_sets,
-    )
+    let bi = Arc::clone(bi);
+    let (context_id, subject_did) = (context_id.to_owned(), subject_did.to_owned());
+    // Each attestation and challenge record resolves its signer's key, so the
+    // aggregation runs on the blocking pool without the GIL.
+    on_resolution_pool(py, move |scope| {
+        aggregate_with_storage(
+            scope,
+            &bi,
+            &context_id,
+            &subject_did,
+            cached_attestations,
+            &challenge_results,
+            &events,
+            merkle_root,
+            &consequence_rules,
+            &threshold_requirements,
+            &attestor_sets,
+        )
+    })
 }
 
 /// Dispatches `populate_and_aggregate` to the active storage backend.
@@ -523,6 +571,7 @@ fn aggregate_trust_input_impl(
 /// Otherwise falls back to an ephemeral in-memory store.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_with_storage(
+    scope: &scp_ffi_common::BlockingResolutionScope,
     bi: &PyBridgeInstance,
     context_id: &str,
     subject_did: &str,
@@ -563,9 +612,11 @@ fn aggregate_with_storage(
     // `scp-platform`), so the concrete `Arc<S>` must be recovered per variant.
     // Both arms route through the single generic body — no duplicated logic.
     let inputs = AggregationInputs {
-        // The instance resolver verifies each challenge record's `#active`
-        // signature; without one, a supplied record fails closed.
-        challenge_resolver: scp_ffi_common::instance_challenge_resolver(
+        // The instance resolver verifies each attestation's and challenge
+        // record's `#active` signature; without one, a supplied record fails
+        // closed.
+        resolver: scp_ffi_common::instance_active_key_resolver(
+            scope,
             crate::runtime::did_resolver(bi),
         ),
         context_id,
@@ -593,7 +644,7 @@ fn aggregate_with_storage(
 /// Owned + borrowed inputs for [`run_aggregation`], grouped to keep the generic
 /// helper's signature manageable.
 struct AggregationInputs<'a> {
-    challenge_resolver: &'a dyn scp_core::trust::attestation::DidPublicKeyResolver,
+    resolver: &'a dyn scp_core::trust::attestation::ActiveKeyResolver,
     context_id: &'a str,
     subject_did: &'a str,
     cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
@@ -623,7 +674,7 @@ fn run_aggregation<S: scp_platform::EncryptedStorage + 'static>(
     let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
     scp_ffi_common::trust_store::populate_and_aggregate(
         bridge,
-        inputs.challenge_resolver,
+        inputs.resolver,
         inputs.context_id,
         inputs.subject_did,
         inputs.cached_attestations,
@@ -753,13 +804,12 @@ impl PyParticipationRecord {
 /// Those attestations feed `attestation_count` (§7.4); the Supervisor gathers
 /// the full event log + Merkle root for every other fact.
 fn participation_record_impl(
-    bi: &crate::runtime::PyBridgeInstance,
+    bi: &Arc<PyBridgeInstance>,
+    py: Python<'_>,
     context_id: &str,
     subject_did: &str,
     cached_attestations_json: &str,
 ) -> PyResult<PyParticipationRecord> {
-    use crate::runtime::StorageProvider;
-
     // VALID_7000 matches the UniFFI/NAPI bridges, which route these same
     // checks through the shared `scp_ffi_common::validate::ValidationError`
     // conversion (generic validation code).
@@ -782,12 +832,43 @@ fn participation_record_impl(
     // `EncryptedStorage` backend); the match is pure type dispatch because the
     // sealed `EncryptedStorage` bound cannot be satisfied by the `StorageProvider`
     // enum itself. Both arms route through the single generic body.
-    let provider = crate::runtime::get_storage(bi)?;
     let handle = crate::runtime()?.handle().clone();
+    let bi = Arc::clone(bi);
+    let (context_id, subject_did) = (context_id.to_owned(), subject_did.to_owned());
+    // Each cached attestation resolves its issuer's key, so the record is
+    // computed on the blocking pool without the GIL.
+    on_resolution_pool(py, move |scope| {
+        participation_record_on_pool(
+            scope,
+            &bi,
+            handle,
+            &context_id,
+            &subject_did,
+            cached_attestations,
+        )
+    })
+}
+
+/// The part of [`participation_record_impl`] that resolves keys: sources the
+/// verified attestations, then computes the record through the Supervisor.
+fn participation_record_on_pool(
+    scope: &scp_ffi_common::BlockingResolutionScope,
+    bi: &PyBridgeInstance,
+    handle: tokio::runtime::Handle,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
+) -> PyResult<PyParticipationRecord> {
+    use crate::runtime::StorageProvider;
+
+    let provider = crate::runtime::get_storage(bi)?;
+    let resolver =
+        scp_ffi_common::instance_active_key_resolver(scope, crate::runtime::did_resolver(bi));
     let verified = match provider {
         StorageProvider::InMemoryEncrypted(storage) => run_verified_attestations(
             Arc::clone(storage),
             handle,
+            resolver,
             context_id,
             subject_did,
             cached_attestations,
@@ -795,6 +876,7 @@ fn participation_record_impl(
         StorageProvider::Sqlite(storage) => run_verified_attestations(
             Arc::clone(storage),
             handle,
+            resolver,
             context_id,
             subject_did,
             cached_attestations,
@@ -841,6 +923,7 @@ fn participation_record_impl(
 fn run_verified_attestations<S: scp_platform::EncryptedStorage + 'static>(
     storage: Arc<S>,
     handle: tokio::runtime::Handle,
+    resolver: &dyn scp_core::trust::attestation::ActiveKeyResolver,
     context_id: &str,
     subject_did: &str,
     cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
@@ -849,6 +932,7 @@ fn run_verified_attestations<S: scp_platform::EncryptedStorage + 'static>(
     let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
     scp_ffi_common::trust_store::verified_attestations(
         bridge,
+        resolver,
         context_id,
         subject_did,
         cached_attestations,
@@ -894,8 +978,7 @@ impl crate::scp::PyScp {
         context_id: &str,
         attestation_json: &str,
     ) -> PyResult<Py<PyDict>> {
-        let bi = &*self.inner;
-        trust_verify_attestation_impl(bi, py, context_id, attestation_json)
+        trust_verify_attestation_impl(&self.inner, py, context_id, attestation_json)
     }
 
     #[pyo3(name = "trust_query_score")]
@@ -1062,48 +1145,30 @@ impl crate::scp::PyScp {
                 )
             })?;
 
-        let bi = &*self.inner;
-        let clock = scp_clock::SystemClock;
+        let bi = Arc::clone(&self.inner);
+        let (context_id, subject_did) = (context_id.to_owned(), subject_did.to_owned());
 
-        // The resolver blocks on DID resolution, so the GIL is released.
-        py.allow_threads(|| {
+        // The resolver blocks on DID resolution, so the check runs on the
+        // blocking pool without the GIL.
+        on_resolution_pool(py, move |scope| {
             // Records are signed with the verifier's `#active` key, which only
             // this instance's DID resolver reads; without one, a supplied
             // record fails closed with SCP-IDENT-1033.
-            let resolver =
-                scp_ffi_common::instance_challenge_resolver(crate::runtime::did_resolver(bi));
+            let resolver = scp_ffi_common::instance_active_key_resolver(
+                scope,
+                crate::runtime::did_resolver(&bi),
+            );
             scp_core::trust::check_capability_requirements(
                 &requirements,
                 &agent_capabilities,
                 &challenge_verifications,
-                context_id,
-                subject_did,
+                &context_id,
+                &subject_did,
                 resolver,
-                &clock,
+                &scp_clock::SystemClock,
             )
+            .map_err(|e| PyErr::from(admission_error(e)))
         })
-        .map_err(|e| {
-            // Every native bridge maps each variant to the same code and
-            // error class.
-            let message = format!("capability admission verification failed: {e}");
-            match e {
-                scp_core::trust::AdmissionError::EmptySubjectDid => {
-                    coded_validation_error(message, codes::VALID_7077)
-                }
-                scp_core::trust::AdmissionError::MissingCapability { .. }
-                | scp_core::trust::AdmissionError::VerificationRequired { .. } => {
-                    coded_validation_error(message, codes::VALID_7076)
-                }
-                scp_core::trust::AdmissionError::VerificationUnavailable { .. } => {
-                    crate::error::ScpPyError::IdentityError {
-                        message,
-                        code: codes::IDENT_1033.to_owned(),
-                    }
-                }
-            }
-        })?;
-
-        Ok(())
     }
 
     /// Aggregates all trust engine layers into a single `TrustInput` for
@@ -1123,6 +1188,7 @@ impl crate::scp::PyScp {
     #[allow(clippy::too_many_arguments)]
     pub fn aggregate_trust_input(
         &self,
+        py: Python<'_>,
         context_id: &str,
         subject_did: &str,
         events_json: &str,
@@ -1133,9 +1199,9 @@ impl crate::scp::PyScp {
         cached_attestations_json: &str,
         challenge_results_json: &str,
     ) -> PyResult<String> {
-        let bi = &*self.inner;
         aggregate_trust_input_impl(
-            bi,
+            &self.inner,
+            py,
             context_id,
             subject_did,
             events_json,
@@ -1169,12 +1235,39 @@ impl crate::scp::PyScp {
     #[pyo3(name = "participation_record", signature = (context_id, subject_did, cached_attestations_json="[]"))]
     pub fn participation_record(
         &self,
+        py: Python<'_>,
         context_id: &str,
         subject_did: &str,
         cached_attestations_json: &str,
     ) -> PyResult<PyParticipationRecord> {
-        let bi = &*self.inner;
-        participation_record_impl(bi, context_id, subject_did, cached_attestations_json)
+        participation_record_impl(
+            &self.inner,
+            py,
+            context_id,
+            subject_did,
+            cached_attestations_json,
+        )
+    }
+}
+
+/// Maps a capability-admission failure to the bridge error; every native
+/// bridge maps each variant to the same code and error class.
+fn admission_error(e: scp_core::trust::AdmissionError) -> crate::error::ScpPyError {
+    let message = format!("capability admission verification failed: {e}");
+    match e {
+        scp_core::trust::AdmissionError::EmptySubjectDid => {
+            coded_validation_error(message, codes::VALID_7077)
+        }
+        scp_core::trust::AdmissionError::MissingCapability { .. }
+        | scp_core::trust::AdmissionError::VerificationRequired { .. } => {
+            coded_validation_error(message, codes::VALID_7076)
+        }
+        scp_core::trust::AdmissionError::VerificationUnavailable { .. } => {
+            crate::error::ScpPyError::IdentityError {
+                message,
+                code: codes::IDENT_1033.to_owned(),
+            }
+        }
     }
 }
 
@@ -1209,6 +1302,116 @@ mod tests {
 
     fn default_scp() -> crate::scp::PyScp {
         crate::scp::PyScp::new_in_memory_for_test()
+    }
+
+    /// A DID resolver that announces each lookup on `entered`, then waits up
+    /// to ten seconds for a permit on `release`, recording whether one came.
+    struct GatedResolver {
+        entered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+        release: Arc<tokio::sync::Semaphore>,
+        released: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl scp_identity::resolver::DidResolver for GatedResolver {
+        fn resolve(
+            &self,
+            _did: &str,
+        ) -> impl std::future::Future<
+            Output = Result<
+                Option<scp_identity::resolver::ResolvedDidDocument>,
+                scp_identity::IdentityError,
+            >,
+        > + Send {
+            if let Ok(entered) = self.entered.lock() {
+                entered.send(()).ok();
+            }
+            let release = Arc::clone(&self.release);
+            let released = Arc::clone(&self.released);
+            async move {
+                let permit =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), release.acquire())
+                        .await;
+                released.store(
+                    matches!(permit, Ok(Ok(_))),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// `trust_verify_attestation` resolves the issuer's key without the GIL:
+    /// while the lookup is pending, another Python thread takes the GIL and
+    /// then lets the lookup finish. Holding the GIL across the lookup would
+    /// keep that thread out until the lookup gave up.
+    #[test]
+    fn a_pending_key_resolution_lets_another_thread_take_the_gil() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().unwrap();
+        let scp = default_scp();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::runtime::init_did_resolver(
+            &scp.inner,
+            Arc::new(GatedResolver {
+                entered: std::sync::Mutex::new(entered_tx),
+                release: Arc::clone(&release),
+                released: Arc::clone(&released),
+            }),
+            crate::runtime().unwrap().handle().clone(),
+        );
+        let helper = std::thread::spawn(move || {
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            Python::with_gil(|_py| release.add_permits(1));
+        });
+        // An issuer this instance does not host, so its key comes only from
+        // the resolver.
+        let issuer = scp_did::did_dht_from_public_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let attestation = scp_core::trust::Attestation {
+            id: "att-gil".to_owned(),
+            attestation_type: scp_core::trust::AttestationType::Endorsement,
+            issuer,
+            subject: "did:dht:zsubject".into(),
+            claim: serde_json::json!({"skill": "rust"}),
+            evidence: None,
+            issued_at: 1000,
+            expires_at: Some(u64::MAX),
+            renewal_interval: None,
+            revocation_status: scp_core::trust::RevocationStatus::Active,
+            signature: vec![0u8; 64],
+            renewed_at: None,
+        };
+        let outcome = Python::with_gil(|py| {
+            scp.trust_verify_attestation(
+                py,
+                "ctx-gil",
+                &serde_json::to_string(&attestation).unwrap(),
+            )
+        });
+        helper.join().unwrap();
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "the helper thread could not take the GIL while the lookup was pending"
+        );
+        // The issuer is not found: the attestation is rejected, not verified.
+        let valid = Python::with_gil(|py| {
+            outcome
+                .unwrap()
+                .bind(py)
+                .get_item("valid")
+                .unwrap()
+                .unwrap()
+                .extract::<bool>()
+                .unwrap()
+        });
+        assert!(!valid);
     }
 
     #[test]
@@ -2030,17 +2233,21 @@ mod tests {
 
     #[test]
     fn aggregate_trust_input_rejects_invalid_events_json() {
-        let result = default_scp().aggregate_trust_input(
-            "ctx-1",
-            "did:key:test",
-            "not json",
-            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
-            "[]",
-            "{}",
-            "{}",
-            "[]",
-            "[]",
-        );
+        pyo3::prepare_freethreaded_python();
+        let result = Python::with_gil(|py| {
+            default_scp().aggregate_trust_input(
+                py,
+                "ctx-1",
+                "did:key:test",
+                "not json",
+                "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+                "[]",
+                "{}",
+                "{}",
+                "[]",
+                "[]",
+            )
+        });
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(
@@ -2052,17 +2259,21 @@ mod tests {
 
     #[test]
     fn aggregate_trust_input_rejects_wrong_merkle_root_length() {
-        let result = default_scp().aggregate_trust_input(
-            "ctx-1",
-            "did:key:test",
-            "[]",
-            "[0,0,0]",
-            "[]",
-            "{}",
-            "{}",
-            "[]",
-            "[]",
-        );
+        pyo3::prepare_freethreaded_python();
+        let result = Python::with_gil(|py| {
+            default_scp().aggregate_trust_input(
+                py,
+                "ctx-1",
+                "did:key:test",
+                "[]",
+                "[0,0,0]",
+                "[]",
+                "{}",
+                "{}",
+                "[]",
+                "[]",
+            )
+        });
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(
@@ -2074,17 +2285,21 @@ mod tests {
 
     #[test]
     fn aggregate_trust_input_rejects_empty_did() {
-        let result = default_scp().aggregate_trust_input(
-            "ctx-1",
-            "",
-            "[]",
-            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
-            "[]",
-            "{}",
-            "{}",
-            "[]",
-            "[]",
-        );
+        pyo3::prepare_freethreaded_python();
+        let result = Python::with_gil(|py| {
+            default_scp().aggregate_trust_input(
+                py,
+                "ctx-1",
+                "",
+                "[]",
+                "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+                "[]",
+                "{}",
+                "{}",
+                "[]",
+                "[]",
+            )
+        });
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(
@@ -2097,17 +2312,21 @@ mod tests {
     #[test]
     fn aggregate_trust_input_rejects_empty_context() {
         pyo3::prepare_freethreaded_python();
-        let result = default_scp().aggregate_trust_input(
-            "",
-            "did:key:test",
-            "[]",
-            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
-            "[]",
-            "{}",
-            "{}",
-            "[]",
-            "[]",
-        );
+        pyo3::prepare_freethreaded_python();
+        let result = Python::with_gil(|py| {
+            default_scp().aggregate_trust_input(
+                py,
+                "",
+                "did:key:test",
+                "[]",
+                "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+                "[]",
+                "{}",
+                "{}",
+                "[]",
+                "[]",
+            )
+        });
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(
@@ -2120,17 +2339,21 @@ mod tests {
     #[test]
     fn aggregate_trust_input_rejects_invalid_merkle_root_json() {
         pyo3::prepare_freethreaded_python();
-        let result = default_scp().aggregate_trust_input(
-            "ctx-1",
-            "did:key:test",
-            "[]",
-            "not json",
-            "[]",
-            "{}",
-            "{}",
-            "[]",
-            "[]",
-        );
+        pyo3::prepare_freethreaded_python();
+        let result = Python::with_gil(|py| {
+            default_scp().aggregate_trust_input(
+                py,
+                "ctx-1",
+                "did:key:test",
+                "[]",
+                "not json",
+                "[]",
+                "{}",
+                "{}",
+                "[]",
+                "[]",
+            )
+        });
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(
@@ -2143,17 +2366,21 @@ mod tests {
     #[test]
     fn aggregate_trust_input_rejects_invalid_consequence_rules_json() {
         pyo3::prepare_freethreaded_python();
-        let result = default_scp().aggregate_trust_input(
-            "ctx-1",
-            "did:key:test",
-            "[]",
-            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
-            "not json",
-            "{}",
-            "{}",
-            "[]",
-            "[]",
-        );
+        pyo3::prepare_freethreaded_python();
+        let result = Python::with_gil(|py| {
+            default_scp().aggregate_trust_input(
+                py,
+                "ctx-1",
+                "did:key:test",
+                "[]",
+                "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+                "not json",
+                "{}",
+                "{}",
+                "[]",
+                "[]",
+            )
+        });
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(
@@ -2166,17 +2393,21 @@ mod tests {
     #[test]
     fn aggregate_trust_input_rejects_invalid_threshold_requirements_json() {
         pyo3::prepare_freethreaded_python();
-        let result = default_scp().aggregate_trust_input(
-            "ctx-1",
-            "did:key:test",
-            "[]",
-            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
-            "[]",
-            "not json",
-            "{}",
-            "[]",
-            "[]",
-        );
+        pyo3::prepare_freethreaded_python();
+        let result = Python::with_gil(|py| {
+            default_scp().aggregate_trust_input(
+                py,
+                "ctx-1",
+                "did:key:test",
+                "[]",
+                "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+                "[]",
+                "not json",
+                "{}",
+                "[]",
+                "[]",
+            )
+        });
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(
@@ -2189,17 +2420,21 @@ mod tests {
     #[test]
     fn aggregate_trust_input_rejects_invalid_attestor_sets_json() {
         pyo3::prepare_freethreaded_python();
-        let result = default_scp().aggregate_trust_input(
-            "ctx-1",
-            "did:key:test",
-            "[]",
-            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
-            "[]",
-            "{}",
-            "not json",
-            "[]",
-            "[]",
-        );
+        pyo3::prepare_freethreaded_python();
+        let result = Python::with_gil(|py| {
+            default_scp().aggregate_trust_input(
+                py,
+                "ctx-1",
+                "did:key:test",
+                "[]",
+                "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+                "[]",
+                "{}",
+                "not json",
+                "[]",
+                "[]",
+            )
+        });
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(
@@ -2212,17 +2447,21 @@ mod tests {
     #[test]
     fn aggregate_trust_input_rejects_invalid_cached_attestations_json() {
         pyo3::prepare_freethreaded_python();
-        let result = default_scp().aggregate_trust_input(
-            "ctx-1",
-            "did:key:test",
-            "[]",
-            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
-            "[]",
-            "{}",
-            "{}",
-            "not json",
-            "[]",
-        );
+        pyo3::prepare_freethreaded_python();
+        let result = Python::with_gil(|py| {
+            default_scp().aggregate_trust_input(
+                py,
+                "ctx-1",
+                "did:key:test",
+                "[]",
+                "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+                "[]",
+                "{}",
+                "{}",
+                "not json",
+                "[]",
+            )
+        });
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(
@@ -2235,17 +2474,21 @@ mod tests {
     #[test]
     fn aggregate_trust_input_rejects_invalid_challenge_results_json() {
         pyo3::prepare_freethreaded_python();
-        let result = default_scp().aggregate_trust_input(
-            "ctx-1",
-            "did:key:test",
-            "[]",
-            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
-            "[]",
-            "{}",
-            "{}",
-            "[]",
-            "not json",
-        );
+        pyo3::prepare_freethreaded_python();
+        let result = Python::with_gil(|py| {
+            default_scp().aggregate_trust_input(
+                py,
+                "ctx-1",
+                "did:key:test",
+                "[]",
+                "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+                "[]",
+                "{}",
+                "{}",
+                "[]",
+                "not json",
+            )
+        });
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(
@@ -2258,7 +2501,8 @@ mod tests {
     #[test]
     fn participation_record_validates_context_id() {
         pyo3::prepare_freethreaded_python();
-        let result = default_scp().participation_record("", "did:key:test", "[]");
+        let result =
+            Python::with_gil(|py| default_scp().participation_record(py, "", "did:key:test", "[]"));
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(
@@ -2271,7 +2515,9 @@ mod tests {
     #[test]
     fn participation_record_validates_did() {
         pyo3::prepare_freethreaded_python();
-        let result = default_scp().participation_record("ctx-1", "not-a-did", "[]");
+        let result = Python::with_gil(|py| {
+            default_scp().participation_record(py, "ctx-1", "not-a-did", "[]")
+        });
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(
@@ -2284,7 +2530,9 @@ mod tests {
     #[test]
     fn participation_record_rejects_invalid_attestations_json() {
         pyo3::prepare_freethreaded_python();
-        let result = default_scp().participation_record("ctx-1", "did:key:test", "not json");
+        let result = Python::with_gil(|py| {
+            default_scp().participation_record(py, "ctx-1", "did:key:test", "not json")
+        });
         assert!(result.is_err());
         let err_str = format!("{}", result.unwrap_err());
         assert!(
