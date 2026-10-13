@@ -19,7 +19,6 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
-import type { Context } from "../src/context";
 import { UcanPermissionError } from "../src/errors";
 import type {
   AttestorInfo,
@@ -242,9 +241,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     const thrown = new UcanPermissionError("any prose at all", "SCP-PERM-3001");
     native.__stub("ucanEvaluate", () => Promise.reject(thrown));
 
-    await expect(
-      scp.evaluateTrust(context, "did:dht:subject", ["token-a"]),
-    ).rejects.toBe(thrown);
+    await expect(scp.evaluateTrust(context, "did:dht:subject", ["token-a"])).rejects.toBe(thrown);
   });
 
   // The reader-facing form of the same property: one failure, stated twice.
@@ -780,9 +777,7 @@ describe("encodeCapabilityRequirements", () => {
     // The catch block in Layer 2 must re-throw non-context errors — it must NOT
     // swallow them into behavioralRecord: null (which would hide genuine faults).
     // mapBridgeError re-wraps the raw error; check the preserved message.
-    await expect(scp.evaluateTrust(context, "did:dht:z6MkBob")).rejects.toThrow(
-      "Network timeout",
-    );
+    await expect(scp.evaluateTrust(context, "did:dht:z6MkBob")).rejects.toThrow("Network timeout");
   });
 });
 
