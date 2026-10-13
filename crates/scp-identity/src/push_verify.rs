@@ -137,11 +137,52 @@ impl PushVerifyError {
     }
 }
 
+/// Seals [`PushSignatureVerifier`]: `Sealed` is nameable only inside this
+/// module, so only the types this module implements it for can implement the
+/// verifier trait.
+mod sealed {
+    pub trait Sealed {}
+}
+
 /// Verifies the signature of a push message for one relay (§10.7.1 step 3).
 ///
 /// The relay holds an `Arc<dyn PushSignatureVerifier>` (ADR-062).
+///
+/// The trait is sealed: [`KelPushVerifier`] and the `testing`-gated
+/// `TestPushVerifier` are its only implementors, and no other crate can add
+/// one. A third implementor needs an edit to this module.
+///
+/// ```compile_fail
+/// use scp_did::DID;
+/// use scp_identity::push_verify::{PushMessage, PushSignatureVerifier, PushVerifyError};
+///
+/// #[derive(Debug)]
+/// struct AllowAll;
+///
+/// #[async_trait::async_trait]
+/// impl PushSignatureVerifier for AllowAll {
+///     async fn verify(
+///         &self,
+///         message: PushMessage<'_>,
+///         _relay_url: &str,
+///     ) -> Result<DID, PushVerifyError> {
+///         Ok(message.registrant().clone())
+///     }
+/// }
+/// ```
+///
+/// Another crate still holds the sealed trait as a trait object:
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use scp_identity::push_verify::{KelPushVerifier, PushSignatureVerifier};
+///
+/// let verifier: Arc<dyn PushSignatureVerifier> = Arc::new(KelPushVerifier);
+/// assert!(format!("{verifier:?}").contains("KelPushVerifier"));
+/// ```
 #[async_trait::async_trait]
-pub trait PushSignatureVerifier: Debug + Send + Sync {
+pub trait PushSignatureVerifier: sealed::Sealed + Debug + Send + Sync {
     /// Verifies `message`'s signature for the relay whose URL is `relay_url`.
     ///
     /// `relay_url` is the URL from which the relay derived the reserved push
@@ -172,6 +213,8 @@ pub trait PushSignatureVerifier: Debug + Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KelPushVerifier;
 
+impl sealed::Sealed for KelPushVerifier {}
+
 #[async_trait::async_trait]
 impl PushSignatureVerifier for KelPushVerifier {
     async fn verify(
@@ -197,7 +240,7 @@ mod test_verifier {
     use scp_did::DID;
     use sha2::{Digest, Sha256};
 
-    use super::{PushMessage, PushSignatureVerifier, PushVerifyError};
+    use super::{PushMessage, PushSignatureVerifier, PushVerifyError, sealed};
 
     /// A test verifier that checks a real P-256 signature against the key the
     /// test supplies for each registrant.
@@ -223,6 +266,8 @@ mod test_verifier {
             }
         }
     }
+
+    impl sealed::Sealed for TestPushVerifier {}
 
     #[async_trait::async_trait]
     impl PushSignatureVerifier for TestPushVerifier {
@@ -583,41 +628,5 @@ mod tests {
             }
             assert_eq!(err.wire_code(), expected, "{err:?}");
         }
-    }
-
-    /// Indicator for "no verifier returns `Ok` without checking a signature":
-    /// every `impl PushSignatureVerifier for` in the workspace's sources names
-    /// one of the two reviewed verifiers. A new implementation fails this test
-    /// until a reviewer adds it here, after reading that it checks a signature
-    /// before it returns `Ok`.
-    #[test]
-    fn only_the_reviewed_verifiers_implement_the_trait() {
-        const NEEDLE: &str = concat!("PushSignatureVerifier", " for ");
-        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap();
-        let mut implementors = Vec::new();
-        let mut stack = vec![crates.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    if path.file_name().is_some_and(|n| n != "target") {
-                        stack.push(path);
-                    }
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    let source = std::fs::read_to_string(&path).unwrap();
-                    implementors.extend(source.split(NEEDLE).skip(1).filter_map(|rest| {
-                        let name: String = rest
-                            .chars()
-                            .take_while(|c| c.is_alphanumeric() || *c == '_')
-                            .collect();
-                        name.starts_with(char::is_uppercase).then_some(name)
-                    }));
-                }
-            }
-        }
-        implementors.sort();
-        assert_eq!(implementors, ["KelPushVerifier", "TestPushVerifier"]);
     }
 }
