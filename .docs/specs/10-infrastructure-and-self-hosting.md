@@ -391,13 +391,15 @@ Clients register for push notifications with relays via the following wire proto
 
    | Platform | Request | Headers | Body |
    |----------|---------|---------|------|
-   | APNs | `POST /3/device/<APNs device token>` over HTTP/2 to `api.push.apple.com`, or to `api.sandbox.push.apple.com` for a token that a development build of the app registered | `authorization: bearer <provider JWT>`, `apns-push-type: background`, `apns-priority: 5`, `apns-topic: <the app's bundle ID>` | `{"aps":{"content-available":1}}` |
+   | APNs | `POST /3/device/<APNs device token>` over HTTP/2 to the gateway of the APNs environment the relay operator configured: `api.push.apple.com` for `production`, `api.sandbox.push.apple.com` for `sandbox` | `authorization: bearer <provider JWT>`, `apns-push-type: background`, `apns-priority: 5`, `apns-topic: <the app's bundle ID>` | `{"aps":{"content-available":1}}` |
    | FCM | `POST https://fcm.googleapis.com/v1/projects/{project_id}/messages:send` (the FCM HTTP v1 API) | `Authorization: Bearer <OAuth 2.0 access token>`, `Content-Type: application/json` | `{"message":{"token":"<FCM registration token>","data":{"scp":"1"},"android":{"priority":"HIGH"}}}` |
 
    - The APNs body carries no `alert`, `badge` or `sound` key, and the FCM body carries no `notification` key, because each of those keys makes the operating system show a notification.
    - The FCM wake value is the string `"1"`, because FCM requires every value in `data` to be a string. The FCM registration token appears only in `message.token`.
    - The relay sets `android.priority` to `HIGH` on every FCM wake, because FCM holds a normal-priority message for a device in Android's Doze mode until Doze's next maintenance window. The relay sets no `android.ttl`, so FCM applies its default time-to-live.
    - This table defines no WebPush request.
+   - The relay operator configures one APNs environment for the relay, `production` or `sandbox`, with no default. The relay sends every APNs wake to that environment's gateway, so one relay serves APNs tokens from one environment only. A `PushRegistration` carries no field that names the environment of its token (`22-human-readable-addressing.md` §22.11.4).
+   - APNs rejects a wake for a token from the other environment with reason `BadDeviceToken`. The relay counts that rejection as an invalid token response, and the implicit-deregistration rule under **PushDeregistration message** below removes the registration after 3 consecutive delivery failures for the token.
 
    **Device receipt rule.** The device acts on a wake only when the payload its platform hands the app passes that platform's rule. On an accepted wake, the device connects to its relay set and pulls every pending envelope. On a rejected payload, the device makes no relay connection.
    - **APNs.** iOS hands the app the payload as a parsed dictionary, never as bytes. The device accepts the wake only when that dictionary has exactly one top-level key, `aps`, and `aps` has exactly one key, `content-available`, whose value is the integer 1. The device rejects every other dictionary.
