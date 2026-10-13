@@ -40,7 +40,7 @@ pub mod config;
 pub mod connection;
 pub mod did_record_validation;
 #[cfg(test)]
-mod log_capture;
+pub(crate) mod log_capture;
 pub mod push;
 pub mod push_apns;
 pub mod push_fcm;

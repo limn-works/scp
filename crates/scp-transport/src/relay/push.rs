@@ -22,11 +22,13 @@ use std::fmt;
 use std::time::Duration;
 
 use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use scp_protocol::discovery::push::PushPlatform;
 use zeroize::Zeroizing;
 
-pub use super::push_apns::{ApnsConfig, ApnsEnvironment, ApnsSender};
+pub use super::push_apns::{
+    ApnsConfig, ApnsEnvironment, ApnsKeyError, ApnsSender, apns_key_from_p8,
+};
 pub use super::push_fcm::{FcmConfig, FcmCredentialError, FcmSender, FcmServiceAccount};
 
 /// The result of one wake-signal send.
@@ -226,6 +228,23 @@ pub(super) fn compact_jws<E>(
     jws.push('.');
     jws.push_str(&URL_SAFE_NO_PAD.encode(signature));
     Ok(jws)
+}
+
+/// Decodes the one `-----BEGIN PRIVATE KEY-----` (PKCS#8) block of `pem` to
+/// DER, or `None` when `pem` holds no such block or its body is not base64.
+/// The body copy and the DER are zeroizing.
+pub(super) fn pem_pkcs8_der(pem: &str) -> Option<Zeroizing<Vec<u8>>> {
+    const BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
+    const END: &str = "-----END PRIVATE KEY-----";
+    let start = pem.find(BEGIN)? + BEGIN.len();
+    let end = pem.get(start..)?.find(END)? + start;
+    let body: Zeroizing<String> = Zeroizing::new(
+        pem.get(start..end)?
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect(),
+    );
+    STANDARD.decode(body.as_bytes()).ok().map(Zeroizing::new)
 }
 
 #[cfg(test)]

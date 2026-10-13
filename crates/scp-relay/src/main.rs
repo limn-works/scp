@@ -32,7 +32,17 @@
 //! did not compile the selected backend exits on that value with an error
 //! naming the missing feature.
 //!
-//! See §10.5 of the SCP infrastructure spec.
+//! ## Push selection
+//!
+//! The operator names the push platforms the relay serves in
+//! `SCP_RELAY_PUSH_PLATFORMS` (`none`, `apns`, `fcm` or `apns,fcm`), which has
+//! no default either: unset or empty exits 1 under SCP-CAPSEL-8000. A listed
+//! platform needs its push store and credential files, read by
+//! [`startup::push_selection_from_env`]; any missing or invalid one exits 1
+//! naming its variable. This build serves only `none` and exits 1 on any
+//! platform, because the relay's push role is not built yet.
+//!
+//! See §10.5 and §10.7.1 of the SCP infrastructure spec.
 
 // Links the one `#[global_allocator]`, which wipes every heap block before
 // freeing it (09-security-model.md §9.15, freed heap memory).

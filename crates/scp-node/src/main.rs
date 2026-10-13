@@ -259,6 +259,10 @@ ENVIRONMENT VARIABLES:
     SCP_RELAY_DATABASE_URL      PostgreSQL connection URL (required when backend=postgres)
     SCP_RELAY_S3_BUCKET         S3 bucket name (required when backend=s3)
     SCP_RELAY_S3_PREFIX         S3 key prefix (default: blobs/)
+    SCP_RELAY_PUSH_PLATFORMS    Push platforms the relay serves: none, apns, fcm, apns,fcm.
+                                Required in --relay-only mode: no default, and an unset or
+                                empty value exits 1. This build serves only 'none'; any
+                                platform exits 1. Full node mode does not read it
     SCP_RELAY_MAX_BLOB_SIZE     Max blob size in bytes (default: 262144)
     SCP_RELAY_MAX_BLOB_TTL      Max blob TTL in seconds (default: 604800)
     SCP_RELAY_MAX_CONNECTIONS   Max total connections (default: 1000)
@@ -369,6 +373,13 @@ async fn run_relay_only() {
         max_connections = config.max_total_connections,
         "starting scp-node in relay-only mode"
     );
+
+    // A relay-only node is a standalone relay, so its operator selects push
+    // exactly as an scp-relay operator does (PUSH-012). Read before the blob
+    // store opens, so a refusal leaves no store behind.
+    let push = or_exit(startup::push_selection_from_env());
+    or_exit(startup::require_push_servable(&push));
+    tracing::info!("push: none (SCP_RELAY_PUSH_PLATFORMS=none)");
 
     let storage = Arc::new(or_exit(startup::storage_from_env(backend).await));
     let shutdown = or_exit(startup::shutdown_signal());
