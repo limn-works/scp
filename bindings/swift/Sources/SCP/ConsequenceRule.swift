@@ -461,7 +461,8 @@ public extension ContextParams {
         sessionCap: UInt32? = nil,
         economicPolicy: String? = nil,
         consequenceRules: [ConsequenceRule]?,
-        consequenceConfig: ConsequenceConfig?
+        consequenceConfig: ConsequenceConfig?,
+        pseudonymRotation: PseudonymRotationPolicy? = nil
     ) throws {
         let rulesJson = try consequenceRules.map { try encodeConsequenceRulesJson($0) }
         let configJson = try consequenceConfig.map { try encodeConsequenceConfigJson($0) }
@@ -479,7 +480,8 @@ public extension ContextParams {
             sessionCap: sessionCap,
             economicPolicy: economicPolicy,
             consequenceRulesJson: rulesJson,
-            consequenceConfigJson: configJson
+            consequenceConfigJson: configJson,
+            pseudonymRotation: pseudonymRotation
         )
     }
 }

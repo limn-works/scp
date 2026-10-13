@@ -207,7 +207,10 @@ class PyContextHandle:
 class PyContextParams:
     """Context creation parameters."""
 
-    ...
+    @property
+    def pseudonym_rotation(self) -> dict[str, Any] | None:
+        """Spec 09 §9.10.4.1 rotation policy: ``interval_secs`` and ``on_membership_change``."""
+        ...
 
 class PyMessage:
     """An incoming protocol message."""

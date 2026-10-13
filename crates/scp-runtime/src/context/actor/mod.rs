@@ -1426,7 +1426,8 @@ mod tests {
         assert!(consumed, "an announcement is reported as consumed (true)");
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert_eq!(
-            reg.get(&scp_did::DID(DIRECT_ALICE.to_owned())),
+            reg.get(&scp_did::DID(DIRECT_ALICE.to_owned()))
+                .map(|r| &r.routing_id),
             Some(&pseudonym)
         );
     }
@@ -1525,7 +1526,8 @@ mod tests {
         }
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert_eq!(
-            reg.get(&scp_did::DID(DIRECT_ALICE.to_owned())),
+            reg.get(&scp_did::DID(DIRECT_ALICE.to_owned()))
+                .map(|r| &r.routing_id),
             Some(&[0x43u8; 32]),
             "a same-DID re-announce updates the registry to the rotated routing ID"
         );
@@ -1848,7 +1850,9 @@ mod tests {
             .peer_registry()
             .expect("the encrypted test context must persist a Pseudonymous peer registry");
         assert_eq!(
-            registry.get(&scp_did::DID(member.to_owned())),
+            registry
+                .get(&scp_did::DID(member.to_owned()))
+                .map(|r| &r.routing_id),
             Some(&pseudonym),
             "the coalesced peer-pseudonym mutation must be durable after the Arm-4 tick",
         );

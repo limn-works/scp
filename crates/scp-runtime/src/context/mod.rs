@@ -163,6 +163,17 @@ impl ContextHandle {
         self.params.ttl = None;
     }
 
+    /// Replaces `ContextParams.pseudonym_rotation` with an executed
+    /// `ModifyPseudonymRotationPolicy` value (ADR-031 amendment of 2026-10-12;
+    /// spec 09 §9.10.4.1). The caller validates `policy` first; `None`
+    /// disables rotation and freezes each member's current routing ID.
+    pub const fn set_pseudonym_rotation(
+        &mut self,
+        policy: Option<params::PseudonymRotationPolicy>,
+    ) {
+        self.params.pseudonym_rotation = policy;
+    }
+
     /// Returns the context's current lifecycle state.
     ///
     /// A lock-free atomic load of the cached state (ADR-049 §10).

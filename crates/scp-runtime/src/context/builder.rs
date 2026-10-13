@@ -835,6 +835,9 @@ impl CreationReceipt {
 ///
 /// Returns [`ContextCreationError::TemplateValidationFailed`] if a template
 /// is specified and the params do not match the template definition.
+///
+/// Returns [`ContextCreationError::InvalidPseudonymRotationPolicy`] if
+/// `pseudonym_rotation` fails the §9.10.4.1 validity criterion.
 fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // Governance model validation (SCP-267, ADR-031).
     // GovernanceModel is a variant-only enum in ContextParams. Structural
@@ -872,6 +875,13 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // caller, so `Supervisor::spawn_actor_from_welcome`'s Precheck C calls the
     // SAME validator on the creator-signed parameters (GitHub #2250).
     crate::context::state::validate_genesis_outlets(&params.outlets)?;
+
+    // §9.10.4.1 validity criterion: creation rejects an invalid rotation
+    // policy. `lifecycle_helpers::create_context` checks it first; this check
+    // makes the rule hold for every in-crate caller of `create_context`.
+    if let Some(policy) = &params.pseudonym_rotation {
+        policy.validate()?;
+    }
 
     // Validate memory scope is permitted for the context mode (§5.11).
     // Broadcast contexts only support MemoryScope::Full — Ephemeral and

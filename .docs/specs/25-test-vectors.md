@@ -448,7 +448,91 @@ Note: The vectors above use abstract `data` leaves to pin the RFC 6962 tree cons
 
 ### Vector 32: Typed-Leaf KAT (closed `EventType` taxonomy)
 
-Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed 77-variant `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextOutletInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77)). The events are signed with the §25.2 reference P-256 key under RFC 6979, so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
+Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextOutletInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77); the ADR-031 amendment of 2026-10-12 (`phase-6.md`) added the `ModifyPseudonymRotationPolicy` action that `PseudonymRotationPolicyModified` (tag 78) records). The events are signed with the §25.2 reference P-256 key under RFC 6979, so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
+
+**`EventType` tags.** This table is the complete closed `EventType` taxonomy and fixes the `event_type_tag` that the signed value below carries for each variant. The tags are protocol constants and never change. Tag 59 is retired: it belonged to `PseudonymAnnounced`, which is not a durable event, and no event carries it.
+
+| Tag | `EventType` variant |
+|-----|---------------------|
+| 0 | `ContextCreated` |
+| 1 | `ContextClosing` |
+| 2 | `ContextClosed` |
+| 3 | `ContextExpired` |
+| 4 | `MemberJoined` |
+| 5 | `MemberLeft` |
+| 6 | `RoleAssigned` |
+| 7 | `TokenRevoked` |
+| 8 | `MessageSent` |
+| 9 | `OutletRegistered` |
+| 10 | `OutletUpdated` |
+| 11 | `OutletInvoked` |
+| 12 | `OutletVerified` |
+| 13 | `OutletInterfaceEstablished` |
+| 14 | `GovernanceAction` |
+| 15 | `ConsistencyCheckpoint` |
+| 16 | `AbsenceProofRequested` |
+| 17 | `MemberBlocked` |
+| 18 | `KeyEpochAdvance` |
+| 19 | `MediaSessionStarted` |
+| 20 | `MediaSessionEnded` |
+| 21 | `PaymentReceived` |
+| 22 | `EconomicPolicyChanged` |
+| 23 | `SpendingUcanGranted` |
+| 24 | `SpendingUcanRevoked` |
+| 25 | `GovernanceProposalCreated` |
+| 26 | `GovernanceVoteCast` |
+| 27 | `GovernanceVoteWithdrawn` |
+| 28 | `GovernanceProposalResolved` |
+| 29 | `GovernanceConflictDetected` |
+| 30 | `GovernanceConflictResolved` |
+| 31 | `GovernanceDeadlockRecovery` |
+| 32 | `GovernanceActionExecuted` |
+| 33 | `EconomicPolicyApplied` |
+| 34 | `ProvenanceAttached` |
+| 35 | `ProvenanceReceived` |
+| 36 | `AdminTransferred` |
+| 37 | `CeilingModified` |
+| 38 | `CeilingModificationPending` |
+| 39 | `ThresholdModified` |
+| 40 | `SignerAdded` |
+| 41 | `SignerRemoved` |
+| 42 | `ChildContextCreated` |
+| 43 | `ContextPromoted` |
+| 44 | `ContentKeysRotated` |
+| 45 | `MemberReset` |
+| 46 | `MemberSuspended` |
+| 47 | `MemberSuspendedAll` |
+| 48 | `MemberUnblocked` |
+| 49 | `AccessRestored` |
+| 50 | `GovernanceReconfigured` |
+| 51 | `GovernanceFreezeExpired` |
+| 52 | `HardRateLimitModified` |
+| 53 | `EconomicPolicyLocked` |
+| 54 | `ContextMigrationStarted` |
+| 55 | `OutletRemoved` |
+| 56 | `PruningPolicyModified` |
+| 57 | `CommitBroadcasted` |
+| 58 | `CommitBroadcastPending` |
+| 59 | retired |
+| 60 | `ContextTombstoned` |
+| 61 | `ContextMigrationCancelled` |
+| 62 | `TtlExtended` |
+| 63 | `TtlExtensionRejected` |
+| 64 | `AccessRevoked` |
+| 65 | `SpendApproved` |
+| 66 | `PaymentCaptureFailed` |
+| 67 | `ConsequenceTriggered` |
+| 68 | `ConsequenceEnforced` |
+| 69 | `ConsequenceEnforcementFailed` |
+| 70 | `ConsequenceEscalatedToSuspendAll` |
+| 71 | `CommitBroadcastSucceeded` |
+| 72 | `CommitBroadcastFailed` |
+| 73 | `RecoveryEpochAdvanced` |
+| 74 | `AppBound` |
+| 75 | `AppUnbound` |
+| 76 | `CrossContextOutletInvoked` |
+| 77 | `CrossContextDivergenceMarker` |
+| 78 | `PseudonymRotationPolicyModified` |
 
 **MessagePack layout of a signed `Event`.** The seven fields serialize positionally, so an implementer reproduces the bytes without reading Rust: a 7-element array holding the `EventType` variant **name** as a string, the actor DID as a string, the timestamp as an unsigned integer, the sequence as an unsigned integer, the one-element `EventPayload` array holding the payload as a MessagePack binary, the 32-byte `prev_hash` as a 32-element array of unsigned integers, and the 64-byte signature as a MessagePack binary. The signed value is `SHA-256("SCP-EVENT-V1:" || BE16(event_type_tag) || BE32(len(actor_did)) || actor_did || BE64(timestamp) || BE64(sequence) || BE32(len(payload)) || payload || prev_hash)`.
 
@@ -1108,7 +1192,7 @@ Expected bytes (hex, 171 bytes, single continuous string):
 
 where `member`, `other` and `ctx` are the values Vector 36 defines. Every `Rejected` and `Unchanged` row leaves the registry exactly as the row's input states it.
 
-No test asserts this vector yet. A conforming implementation reproduces both byte strings and every decision in the table on native and on `wasm32`, as Vector 36 requires of v1.
+A conforming implementation reproduces both byte strings and every decision in the table on native and on `wasm32`, as Vector 36 requires of v1. `vector_58_v2_wire_and_decision_table_match_on_every_target` in `crates/scp-client-wasm/tests/pseudonym_cross_target_kat.rs` asserts both on native and on `wasm32` (native `#[test]` plus `#[wasm_bindgen_test]`), and `vector_58_v2_wire_bytes_match_golden` and `vector_58_decision_table` in `crates/scp-protocol/src/context/pseudonym.rs` assert them beside the classifier.
 
 ## 25.20 Trust Attestation Signing Vectors (§7.4.1, §9.5.2)
 

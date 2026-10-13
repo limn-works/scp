@@ -213,7 +213,8 @@ private fun buildContextParams(
         sessionCap = null,
         economicPolicy = null,
         consequenceRulesJson = null,
-        consequenceConfigJson = null
+        consequenceConfigJson = null,
+        pseudonymRotation = null
     )
 
 private fun ceilingFromArgs(

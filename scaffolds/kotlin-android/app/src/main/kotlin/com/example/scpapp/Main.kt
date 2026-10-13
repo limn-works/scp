@@ -56,6 +56,7 @@ fun main() =
                 economicPolicy = null,
                 consequenceRulesJson = null,
                 consequenceConfigJson = null,
+                pseudonymRotation = null,
             )
         val handle = scp.contextCreate(identity, params)
         println("Created context: ${handle.contextId()}")

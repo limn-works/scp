@@ -1001,7 +1001,7 @@ pub enum EventType {
    >    even under ADR-051** (a transport-send outcome is not a causal-DAG
    >    application event; it has no cross-member referent to linearize), so they
    >    are excluded **permanently**, not interim. They remain in the closed
-   >    `EventType` set (the 77-variant set is not narrowed) but are NEVER passed to
+   >    `EventType` set but are NEVER passed to
    >    `append_context_event`; the three retry-sweep lifecycle states
    >    (`CommitBroadcastSucceeded` / `CommitBroadcastPending` /
    >    `CommitBroadcastFailed`) and the enqueue-time `CommitBroadcastPending` are

@@ -116,6 +116,7 @@ fun messagingExample(
             economicPolicy = null,
             consequenceRulesJson = null,
             consequenceConfigJson = null,
+            pseudonymRotation = null,
         )
     val aliceHandle = aliceNode.contextCreate(alice, params)
 

@@ -446,7 +446,9 @@ jobs:
               # reads `scripts/pure-helpers-allowlist.txt` at run time and compiles in the
               # bridge-symmetry fixtures, and `crates/scp-testing/tests/integration/sdk_wrapper.rs`
               # compiles in the Python, TypeScript, Swift and Kotlin SDK sources under the
-              # four `bindings/` directories listed last. A pull request that edits only one
+              # four `bindings/` directories listed last. `crates/scp-event-log/src/lib.rs`
+              # compiles in spec 25 and checks its Vector 32 `EventType` tag table against
+              # the enum. A pull request that edits only one
               # of them changes what rust-test asserts. The `prose-route` check of
               # `scripts/tests/ci-gate/ci_gate_selftest.py` scans `crates/**/*.rs` for every
               # such read and fails when this filter does not select one.
@@ -459,6 +461,7 @@ jobs:
               - 'bindings/typescript-wasm/tests/fixtures/outlet-stream-invoker-kat.json'
               - 'scripts/pure-helpers-allowlist.txt'
               - 'scripts/tests/bridge-symmetry/fixtures/**'
+              - '.docs/specs/25-test-vectors.md'
               - 'bindings/python/scp_sdk/**'
               - 'bindings/typescript/src/**'
               - 'bindings/swift/Sources/SCP/**'
