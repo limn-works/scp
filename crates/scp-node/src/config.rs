@@ -533,6 +533,15 @@ struct ConfigTail {
 /// Validates the config, returning a loud error for contradictory combinations
 /// (ADR-052 M2/M3 — fail loud, never silent).
 ///
+/// Public and re-exported as `scp_node::validate_reach_and_tls`
+/// (`.docs/prds/main.json` SCP-319).
+///
+/// # Errors
+///
+/// Returns [`NodeError::InvalidConfig`] for each `✗` cell of the matrix below:
+/// `Reach::Domain` with `TlsMode::Plaintext`, and `TlsMode::Acme` with any
+/// non-`Domain` reach.
+///
 /// # TLS × Reach validity matrix
 ///
 /// The first axis is TLS-vs-Reach; every cell below is decided (never a silent
@@ -570,7 +579,7 @@ struct ConfigTail {
 /// deliberate, explicit opt-in (`Disabled` is the default). Erroring on
 /// `Disabled` would reject the safe direction and nudge callers toward the
 /// disclosing one, so it is never rejected here.
-fn validate_config(reach: &Reach, tls: &TlsMode) -> Result<(), NodeError> {
+pub fn validate_reach_and_tls(reach: &Reach, tls: &TlsMode) -> Result<(), NodeError> {
     // TLS axis, rule 1: Domain cannot serve plaintext.
     if matches!(reach, Reach::Domain { .. }) && matches!(tls, TlsMode::Plaintext) {
         return Err(NodeError::InvalidConfig(
@@ -609,7 +618,7 @@ fn validate_config(reach: &Reach, tls: &TlsMode) -> Result<(), NodeError> {
 /// no-publish. The `dht_gateways` field is still dropped here (not yet threaded
 /// end-to-end on the `Node::start` path — see #2153).
 ///
-/// `validate_config` borrows `config.reach` / `config.tls` and so MUST run
+/// `validate_reach_and_tls` borrows `config.reach` / `config.tls` and so MUST run
 /// **before** this function moves `config` — callers keep that ordering.
 fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
     config: NodeConfig<K, D, S>,
@@ -692,7 +701,7 @@ fn resolve_nat_slot(nat: NatSlot) -> Arc<dyn NatStrategy> {
 ///   (non-domain builds skip TLS provisioning entirely — no domain to sign for).
 /// - `Acme` returns `None`: the engine's default `resolve_tls` constructs the
 ///   `AcmeProvider` for the domain (only ever reached on a `Domain` reach —
-///   `validate_config` already rejected `Acme` on every non-`Domain` reach). The
+///   `validate_reach_and_tls` already rejected `Acme` on every non-`Domain` reach). The
 ///   ACME contact email is threaded separately via the engine's `acme_email`.
 /// - `Terminated` (TLS terminated upstream by a tunnel/reverse proxy) on a
 ///   `Domain` reach installs the **no-network** [`SelfSignedTlsProvider`]: the
@@ -704,7 +713,7 @@ fn resolve_nat_slot(nat: NatSlot) -> Arc<dyn NatStrategy> {
 ///   the construction standard forbids. The upstream proxy presents the real CA
 ///   certificate to the public; the node-side self-signed cert only secures the
 ///   proxy↔node hop.
-/// - `Plaintext` is only valid on a non-`Domain` reach (`validate_config` already
+/// - `Plaintext` is only valid on a non-`Domain` reach (`validate_reach_and_tls` already
 ///   rejected `Domain` + `Plaintext`); no-domain mode skips TLS, so it returns
 ///   `None` (no-op). On a non-`Domain` reach, `Terminated` is likewise `None`
 ///   (the loopback listener is plaintext; the proxy adds TLS).
@@ -726,7 +735,7 @@ fn tls_override(tls: TlsMode, reach: &Reach) -> Option<Arc<dyn TlsProvider>> {
         // `Acme` and `Plaintext` both return no override, for distinct reasons:
         //   - `Acme`: the engine's `resolve_tls` constructs the default
         //     `AcmeProvider::new(domain)` and threads `acme_email` itself
-        //     (only ever reached on a `Domain` reach — `validate_config` rejects
+        //     (only ever reached on a `Domain` reach — `validate_reach_and_tls` rejects
         //     `Acme` on every non-`Domain` reach).
         //   - `Plaintext`: only valid on a non-`Domain` reach (Domain+Plaintext
         //     errored already); no-domain mode skips TLS, so it is a no-op.
@@ -1217,9 +1226,9 @@ impl Node {
         D: DidMethod + 'static,
         S: EncryptedStorage + 'static,
     {
-        // `validate_config` borrows `config.reach` / `config.tls`, so it MUST
+        // `validate_reach_and_tls` borrows `config.reach` / `config.tls`, so it MUST
         // run before `split_config` moves `config`.
-        validate_config(&config.reach, &config.tls)?;
+        validate_reach_and_tls(&config.reach, &config.tls)?;
         let (storage, identity, tail) = split_config(config);
 
         // Production constructor: `ProtocolRepository::new` (the only difference
@@ -1303,9 +1312,9 @@ impl Node {
         D: DidMethod + 'static,
         S: Storage + 'static,
     {
-        // `validate_config` borrows `config.reach` / `config.tls`, so it MUST
+        // `validate_reach_and_tls` borrows `config.reach` / `config.tls`, so it MUST
         // run before `split_config` moves `config`.
-        validate_config(&config.reach, &config.tls)?;
+        validate_reach_and_tls(&config.reach, &config.tls)?;
         let (storage, identity, tail) = split_config(config);
 
         // Testing constructor: `ProtocolRepository::new_for_testing` (the only
@@ -2215,14 +2224,14 @@ mod tests {
         // domain `build()` falls through to `AcmeProvider::new(domain)` with no
         // contact email). It must be a VALID config on a `Reach::Domain` reach —
         // no loud error (the DHT mode does not affect TLS×Reach validity).
-        // We assert at the `validate_config` layer rather than building, because
+        // We assert at the `validate_reach_and_tls` layer rather than building, because
         // a real ACME provision would contact Let's Encrypt over the network;
         // validation is the observable acceptance gate before any provisioning.
         let reach = Reach::Domain {
             domain: "config-acme-headless.example.com".to_owned(),
         };
         let tls = TlsMode::Acme { email: None };
-        validate_config(&reach, &tls)
+        validate_reach_and_tls(&reach, &tls)
             .expect("Domain + Acme { email: None } must be a valid config");
     }
 

@@ -11397,7 +11397,7 @@
       "gate": "gate-addr",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/config.rs",
         "crates/scp-node/src/lib.rs"
