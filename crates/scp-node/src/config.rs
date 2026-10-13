@@ -533,11 +533,8 @@ struct ConfigTail {
 /// Validates the config, returning a loud error for contradictory combinations
 /// (ADR-052 M2/M3 — fail loud, never silent).
 ///
-/// Public so a bridge constructor can run the core node's reach and TLS
-/// validation before it creates any directory or file: `node_start` in
-/// `scp-ffi-common` calls it first (`.docs/standards/construction.md`, node
-/// start target shape; `.docs/prds/main.json` SCP-319). Re-exported as
-/// `scp_node::validate_reach_and_tls`.
+/// Public and re-exported as `scp_node::validate_reach_and_tls`
+/// (`.docs/prds/main.json` SCP-319).
 ///
 /// # Errors
 ///

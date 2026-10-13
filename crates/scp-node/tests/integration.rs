@@ -904,11 +904,9 @@ async fn dev_constructor_creates_working_node() {
     node.shutdown();
 }
 
-/// `node_start` in `scp-ffi-common` runs the core node's reach and TLS
-/// validation through the crate-root path before it creates any directory or
-/// file (`.docs/standards/construction.md`, node start target shape;
-/// `.docs/prds/main.json` SCP-319). This test calls that path from outside the
-/// crate: it fails to compile without the re-export, and fails at run time if
+/// Calls the crate-root path `scp_node::validate_reach_and_tls` from outside
+/// the crate (`.docs/prds/main.json` SCP-319): it fails to compile without the
+/// re-export, and fails at run time if
 /// the re-exported function stops rejecting `Reach::Domain` with
 /// `TlsMode::Plaintext` or starts rejecting the valid `Reach::Local` with
 /// `TlsMode::Plaintext`.
