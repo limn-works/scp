@@ -110,26 +110,46 @@ if (scp === null) {
   });
 
   describe("scp.trustVerifyAttestation / scp.trustVerifyResponse — real-FFI call-through", () => {
-    test("a typed attestation envelope parses and verification runs (invalid signature)", async () => {
-      const attestation: CachedAttestationEnvelope = {
-        id: "att-ffi-1",
-        attestationType: "AgentCapability",
-        issuer: "did:dht:zIssuer",
-        subject: "did:dht:zSubject",
-        claim: { capability: "scp:capability:schema-validation/v1" },
-        issuedAt: 1_700_000_000,
-        revocationStatus: "Active",
-        signature: Array.from({ length: 64 }, () => 0),
-      };
-      // The dummy signature cannot verify — but a structured `valid: false`
-      // result (not a parse error) proves the serialized envelope reached the
-      // real verifier.
-      const result = (await live.trustVerifyAttestation("ctx-ffi-1", attestation)) as {
-        valid: boolean;
-        errorMessage: string;
-      };
+    /** A typed envelope whose 64-byte signature is all zeros. */
+    const zeroSignedAttestation = (issuer: string): CachedAttestationEnvelope => ({
+      id: "att-ffi-1",
+      attestationType: "AgentCapability",
+      issuer,
+      subject: "did:dht:zSubject",
+      claim: { capability: "scp:capability:schema-validation/v1" },
+      issuedAt: 1_700_000_000,
+      revocationStatus: "Active",
+      signature: Array.from({ length: 64 }, () => 0),
+    });
+
+    test("an instance without a DID resolver fails closed with SCP-VALID-7052", async () => {
+      // A fresh instance: no identity, so no DID resolver. The issuer's
+      // #active key cannot be resolved, which is an error, never a verdict.
+      // The issuer DID in the message proves the envelope parsed (a parse
+      // failure is SCP-VALID-7012 and names no issuer).
+      const bare = new SCP({ storage: { type: "in_memory" } });
+      let caught: unknown;
+      try {
+        await bare.trustVerifyAttestation("ctx-ffi-1", zeroSignedAttestation("did:dht:zIssuer"));
+      } catch (e: unknown) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(ScpError);
+      expect((caught as ScpError).code).toBe("SCP-VALID-7052");
+      expect((caught as ScpError).message).toContain("did:dht:zIssuer");
+    });
+
+    test("a resolvable issuer with an invalid signature is a valid: false verdict", async () => {
+      // The issuer is an identity on this instance, so its #active key
+      // resolves and verification runs to a structured rejection.
+      const own = new SCP({ storage: { type: "in_memory" } });
+      const issuer = await createInMemoryIdentity(own);
+      const result = (await own.trustVerifyAttestation(
+        "ctx-ffi-1",
+        zeroSignedAttestation(issuer.did),
+      )) as { valid: boolean; errorMessage: string };
       expect(result.valid).toBe(false);
-      expect(result.errorMessage.length).toBeGreaterThan(0);
+      expect(result.errorMessage).toContain("signature");
     });
 
     test("trustCreateChallenge refuses a protocol suite below its minimum with SCP-VALID-7039", async () => {

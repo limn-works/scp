@@ -274,6 +274,29 @@ impl Drop for RelayHandle {
 // NodeHandle -- type-erased ApplicationNode wrapper
 // ---------------------------------------------------------------------------
 
+/// The site settings of one [`NodeHandle::enable_site_projection`] call
+/// (section 18.11).
+///
+/// They travel as one record so that the export takes five buffer
+/// arguments: JNA on darwin-aarch64 corrupts a by-value `RustBuffer`
+/// argument of some calls that pass nine or more of them, and the
+/// `ffi_buffer_arg_bound` test holds every export to eight.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SiteProjectionSettings {
+    /// The virtual host (RFC 1123).
+    pub hostname: String,
+    /// The path served at `/`; `None` serves `/index.html`.
+    pub index_path: Option<String>,
+    /// The most assets one deploy may hold; `None` allows 10 000.
+    pub max_assets_per_deploy: Option<u32>,
+    /// The largest total deploy size in bytes; `None` allows 512 MiB.
+    pub max_deploy_size_bytes: Option<u64>,
+    /// How many past deploys are kept; `None` keeps 2.
+    pub deploy_retention_count: Option<u32>,
+    /// A Content-Security-Policy header replacing the default.
+    pub csp_override: Option<String>,
+}
+
 /// Opaque handle to a running SCP application node.
 ///
 /// Created by [`Scp::node_start_in_memory`](crate::scp::Scp::node_start_in_memory)
@@ -369,22 +392,24 @@ impl NodeHandle {
     ///
     /// Providing `broadcast_key_hex` without `author_did` is an error.
     ///
-    /// `admission` is `"open"` or `"gated"`. `hostname` is the virtual
-    /// host (RFC 1123).
-    #[allow(clippy::too_many_arguments)]
+    /// `admission` is `"open"` or `"gated"`. `site` carries the virtual
+    /// host (RFC 1123) and the serving limits.
     pub async fn enable_site_projection(
         &self,
         context_id: String,
         admission: String,
-        hostname: String,
         broadcast_key_hex: Option<String>,
         author_did: Option<String>,
-        index_path: Option<String>,
-        max_assets_per_deploy: Option<u32>,
-        max_deploy_size_bytes: Option<u64>,
-        deploy_retention_count: Option<u32>,
-        csp_override: Option<String>,
+        site: SiteProjectionSettings,
     ) -> Result<(), ScpError> {
+        let SiteProjectionSettings {
+            hostname,
+            index_path,
+            max_assets_per_deploy,
+            max_deploy_size_bytes,
+            deploy_retention_count,
+            csp_override,
+        } = site;
         validate_context_id(&context_id)?;
         if let Some(ref did) = author_did {
             validate_did(did)?;

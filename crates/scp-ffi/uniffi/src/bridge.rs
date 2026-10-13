@@ -2016,6 +2016,30 @@ pub enum CeilingPolicy {
 // See ADR-021 acceptance criterion 10.
 // ---------------------------------------------------------------------------
 
+/// The JSON inputs of one [`Scp::aggregate_trust_input`] call (spec §7.3).
+///
+/// They travel as one record so that the export takes three buffer
+/// arguments: JNA on darwin-aarch64 corrupts a by-value `RustBuffer`
+/// argument of some calls that pass nine or more of them, and the
+/// `ffi_buffer_arg_bound` test holds every export to eight.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TrustAggregationInputs {
+    /// The subject's event-log entries, as a JSON array of `Event`.
+    pub events_json: String,
+    /// The log's 32-byte Merkle root, as a JSON array of bytes.
+    pub merkle_root_json: String,
+    /// The context's consequence rules, as a JSON array.
+    pub consequence_rules_json: String,
+    /// Threshold requirements keyed by attestation type, as a JSON object.
+    pub threshold_requirements_json: String,
+    /// Attestor sets keyed by attestation type, as a JSON object.
+    pub attestor_sets_json: String,
+    /// Cached attestations to verify and store, as a JSON array.
+    pub cached_attestations_json: String,
+    /// Signed challenge verification records, as a JSON array.
+    pub challenge_results_json: String,
+}
+
 /// A DID document returned by identity resolution.
 ///
 /// See ADR-002 (DID) and spec §3 (Identity).
@@ -16742,22 +16766,23 @@ impl Scp {
     /// Per-instance equivalent of the free-function `aggregate_trust_input`.
     ///
     /// Routes through `&*self.inner` — trust data is populated against
-    /// THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`),
-    /// falling back to an ephemeral in-memory store when no repository
-    /// is attached.
-    #[allow(clippy::too_many_arguments)]
+    /// THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`).
+    /// The JSON inputs arrive as one [`TrustAggregationInputs`] record.
     pub async fn aggregate_trust_input(
         &self,
         context_id: String,
         subject_did: String,
-        events_json: String,
-        merkle_root_json: String,
-        consequence_rules_json: String,
-        threshold_requirements_json: String,
-        attestor_sets_json: String,
-        cached_attestations_json: String,
-        challenge_results_json: String,
+        inputs: TrustAggregationInputs,
     ) -> Result<String, ScpError> {
+        let TrustAggregationInputs {
+            events_json,
+            merkle_root_json,
+            consequence_rules_json,
+            threshold_requirements_json,
+            attestor_sets_json,
+            cached_attestations_json,
+            challenge_results_json,
+        } = inputs;
         if context_id.is_empty() {
             return Err(ScpError::Validation {
                 msg: "context_id must not be empty".to_owned(),
@@ -22849,13 +22874,15 @@ mod tests {
         runtime().block_on(scp_test().aggregate_trust_input(
             context_id.to_owned(),
             subject_did.to_owned(),
-            events_json.to_owned(),
-            merkle_root_json.to_owned(),
-            consequence_rules_json.to_owned(),
-            threshold_requirements_json.to_owned(),
-            attestor_sets_json.to_owned(),
-            cached_attestations_json.to_owned(),
-            challenge_results_json.to_owned(),
+            TrustAggregationInputs {
+                events_json: events_json.to_owned(),
+                merkle_root_json: merkle_root_json.to_owned(),
+                consequence_rules_json: consequence_rules_json.to_owned(),
+                threshold_requirements_json: threshold_requirements_json.to_owned(),
+                attestor_sets_json: attestor_sets_json.to_owned(),
+                cached_attestations_json: cached_attestations_json.to_owned(),
+                challenge_results_json: challenge_results_json.to_owned(),
+            },
         ))
     }
 

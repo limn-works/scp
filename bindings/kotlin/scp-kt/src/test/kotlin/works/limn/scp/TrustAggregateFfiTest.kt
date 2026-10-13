@@ -74,12 +74,14 @@ class TrustAggregateFfiTest {
     @Test
     fun `aggregateTrustInput - typed inputs cross FFI and aggregate`() {
         val resultJson =
-            runBlocking { scp.aggregateTrustInput(
-                contextId = "ctx-aggregate-ffi",
-                subjectDid = "did:dht:zSubject",
-                events = listOf(genesisMemberJoined()),
-                merkleRoot = List(32) { 0.toUByte() },
-            ) }
+            runBlocking {
+                scp.aggregateTrustInput(
+                    contextId = "ctx-aggregate-ffi",
+                    subjectDid = "did:dht:zSubject",
+                    events = listOf(genesisMemberJoined()),
+                    merkleRoot = List(32) { 0.toUByte() },
+                )
+            }
         val result = Json.parseToJsonElement(resultJson).jsonObject
         assertTrue("participation_record" in result, "missing participation_record: $resultJson")
         assertTrue("challenge_results" in result, "missing challenge_results: $resultJson")
@@ -94,32 +96,34 @@ class TrustAggregateFfiTest {
     @Test
     fun `aggregateTrustInput - typed threshold and attestor maps cross FFI`() {
         val resultJson =
-            runBlocking { scp.aggregateTrustInput(
-                contextId = "ctx-aggregate-ffi",
-                subjectDid = "did:dht:zSubject",
-                events = listOf(genesisMemberJoined()),
-                merkleRoot = List(32) { 0.toUByte() },
-                thresholdRequirements =
-                    mapOf(
-                        AttestationType.ENDORSEMENT to
-                            ThresholdRequirement(
-                                requiredCount = 1u,
-                                totalAttestors = 1u,
-                                independenceThreshold = 0.0,
-                            ),
-                    ),
-                attestorSets =
-                    mapOf(
-                        AttestationType.ENDORSEMENT to
-                            listOf(
-                                AttestorInfo(
-                                    did = "did:dht:zAttestor",
-                                    contextMemberships = listOf("ctx-aggregate-ffi"),
-                                    endorsements = emptyList(),
+            runBlocking {
+                scp.aggregateTrustInput(
+                    contextId = "ctx-aggregate-ffi",
+                    subjectDid = "did:dht:zSubject",
+                    events = listOf(genesisMemberJoined()),
+                    merkleRoot = List(32) { 0.toUByte() },
+                    thresholdRequirements =
+                        mapOf(
+                            AttestationType.ENDORSEMENT to
+                                ThresholdRequirement(
+                                    requiredCount = 1u,
+                                    totalAttestors = 1u,
+                                    independenceThreshold = 0.0,
                                 ),
-                            ),
-                    ),
-            ) }
+                        ),
+                    attestorSets =
+                        mapOf(
+                            AttestationType.ENDORSEMENT to
+                                listOf(
+                                    AttestorInfo(
+                                        did = "did:dht:zAttestor",
+                                        contextMemberships = listOf("ctx-aggregate-ffi"),
+                                        endorsements = emptyList(),
+                                    ),
+                                ),
+                        ),
+                )
+            }
         val result = Json.parseToJsonElement(resultJson).jsonObject
         assertTrue("threshold_counts" in result, "missing threshold_counts: $resultJson")
     }
@@ -128,32 +132,52 @@ class TrustAggregateFfiTest {
     // Challenge trust inputs (§7.3.4, ADR-058 Op D)
     // -----------------------------------------------------------------------
 
+    /** A typed envelope whose 64-byte signature is all zeros. */
+    private fun zeroSignedAttestation(issuer: String): CachedAttestationEnvelope =
+        CachedAttestationEnvelope(
+            id = "att-ffi-1",
+            attestationType = "AgentCapability",
+            issuer = issuer,
+            subject = "did:dht:zSubject",
+            claim =
+                buildJsonObject {
+                    put("capability", "scp:capability:schema-validation/v1")
+                },
+            issuedAt = 1_700_000_000uL,
+            revocationStatus = Json.parseToJsonElement("\"Active\""),
+            signature = List(64) { 0.toUByte() },
+        )
+
     /**
-     * The typed attestation envelope's serialized JSON parses on the REAL
-     * Rust `Attestation` deserializer: a dummy signature yields a structured
-     * `valid = false` result (verification ran), never a parse error.
+     * An instance with no identity has no DID resolver, so the issuer's
+     * `#active` key cannot be resolved: a coded SCP-VALID-7052 error, never a
+     * verdict. The issuer DID in the message proves the typed envelope parsed
+     * on the real Rust deserializer (a parse failure is SCP-VALID-7012).
      */
     @Test
-    fun `trustVerifyAttestation - typed envelope reaches the real verifier`() {
-        val result =
-            runBlocking { scp.trustVerifyAttestation(
-                "ctx-ffi-1",
-                CachedAttestationEnvelope(
-                    id = "att-ffi-1",
-                    attestationType = "AgentCapability",
-                    issuer = "did:dht:zIssuer",
-                    subject = "did:dht:zSubject",
-                    claim =
-                        buildJsonObject {
-                            put("capability", "scp:capability:schema-validation/v1")
-                        },
-                    issuedAt = 1_700_000_000uL,
-                    revocationStatus = Json.parseToJsonElement("\"Active\""),
-                    signature = List(64) { 0.toUByte() },
-                ),
-            ) }
-        assertFalse(result.valid)
-        assertTrue(result.errorMessage.isNotEmpty())
+    fun `trustVerifyAttestation - without a DID resolver fails closed with SCP-VALID-7052`() {
+        runBlocking {
+            val error =
+                assertFailsWith<ScpException.Validation> {
+                    scp.trustVerifyAttestation("ctx-ffi-1", zeroSignedAttestation("did:dht:zIssuer"))
+                }
+            assertEquals("SCP-VALID-7052", error.code)
+            assertTrue(error.message.orEmpty().contains("did:dht:zIssuer"))
+        }
+    }
+
+    /**
+     * An issuer that resolves on this instance reaches the real verifier: a
+     * dummy signature yields a structured `valid = false` verdict.
+     */
+    @Test
+    fun `trustVerifyAttestation - resolvable issuer with a bad signature is valid false`() {
+        runBlocking {
+            val issuer = scp.identityCreateInMemory()
+            val result = scp.trustVerifyAttestation("ctx-ffi-1", zeroSignedAttestation(issuer.did()))
+            assertFalse(result.valid)
+            assertTrue(result.errorMessage.contains("signature"))
+        }
     }
 
     private val schemaUri = "scp:capability:schema-validation/v1"

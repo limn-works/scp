@@ -56,19 +56,21 @@ class TrustAdmissionFfiTest {
         // wrapper's serialized JSON parses and evaluates to success on the
         // Rust side (no throw).
         assertDoesNotThrow {
-            runBlocking { scp.checkCapabilityRequirements(
-                contextId = "ctx-1",
-                subjectDid = "did:key:zSubject",
-                requirements =
-                    listOf(
-                        CapabilityRequirement(
-                            capability = "scp:capability:messages-write/v1",
-                            verificationLevel = VerificationLevel.SELF_ATTESTED,
+            runBlocking {
+                scp.checkCapabilityRequirements(
+                    contextId = "ctx-1",
+                    subjectDid = "did:key:zSubject",
+                    requirements =
+                        listOf(
+                            CapabilityRequirement(
+                                capability = "scp:capability:messages-write/v1",
+                                verificationLevel = VerificationLevel.SELF_ATTESTED,
+                            ),
                         ),
-                    ),
-                agentCapabilities = listOf("scp:capability:messages-write/v1"),
-                challengeVerifications = emptyList(),
-            ) }
+                    agentCapabilities = listOf("scp:capability:messages-write/v1"),
+                    challengeVerifications = emptyList(),
+                )
+            }
         }
     }
 
@@ -79,19 +81,21 @@ class TrustAdmissionFfiTest {
         // proving the serialized JSON parsed and was evaluated, not silently
         // dropped.
         assertThrows<ScpException> {
-            runBlocking { scp.checkCapabilityRequirements(
-                contextId = "ctx-1",
-                subjectDid = "did:key:zSubject",
-                requirements =
-                    listOf(
-                        CapabilityRequirement(
-                            capability = "scp:capability:member-invite/v1",
-                            verificationLevel = VerificationLevel.SELF_ATTESTED,
+            runBlocking {
+                scp.checkCapabilityRequirements(
+                    contextId = "ctx-1",
+                    subjectDid = "did:key:zSubject",
+                    requirements =
+                        listOf(
+                            CapabilityRequirement(
+                                capability = "scp:capability:member-invite/v1",
+                                verificationLevel = VerificationLevel.SELF_ATTESTED,
+                            ),
                         ),
-                    ),
-                agentCapabilities = listOf("scp:capability:messages-write/v1"),
-                challengeVerifications = emptyList(),
-            ) }
+                    agentCapabilities = listOf("scp:capability:messages-write/v1"),
+                    challengeVerifications = emptyList(),
+                )
+            }
         }
     }
 
@@ -103,42 +107,44 @@ class TrustAdmissionFfiTest {
         // (tagged verification_method, explicit-null score, number-array
         // signature) deserialized on the Rust side and reached evaluation.
         assertThrows<ScpException> {
-            runBlocking { scp.checkCapabilityRequirements(
-                contextId = "ctx-admission",
-                subjectDid = "did:key:zSubject",
-                requirements =
-                    listOf(
-                        CapabilityRequirement(
-                            capability = "scp:capability:prompt-injection-resistance/v1",
-                            verificationLevel = VerificationLevel.CHALLENGE_VERIFIED,
+            runBlocking {
+                scp.checkCapabilityRequirements(
+                    contextId = "ctx-admission",
+                    subjectDid = "did:key:zSubject",
+                    requirements =
+                        listOf(
+                            CapabilityRequirement(
+                                capability = "scp:capability:prompt-injection-resistance/v1",
+                                verificationLevel = VerificationLevel.CHALLENGE_VERIFIED,
+                            ),
                         ),
-                    ),
-                agentCapabilities = emptyList(),
-                challengeVerifications =
-                    listOf(
-                        ChallengeVerification(
-                            verificationId = "ab".repeat(32),
-                            verifier = "did:key:zVerifier",
-                            subject = "did:key:zSubject",
-                            capabilityUri = "scp:capability:prompt-injection-resistance/v1",
-                            suiteDigest = "cd".repeat(32),
-                            verificationMethod =
-                                ChallengeVerificationMethod.ChallengeVerified(
-                                    challengeType =
-                                        "scp:capability:prompt-injection-resistance/v1",
-                                ),
-                            passed = true,
-                            testCount = 20u,
-                            passCount = 20u,
-                            result = JsonNull,
-                            completedAt = 1_700_000_000uL,
-                            timestamp = 1_700_000_000uL,
-                            expiresAt = 1_700_086_400uL,
-                            contextId = "ctx-admission",
-                            verifierSignature = List(64) { 0.toUByte() },
+                    agentCapabilities = emptyList(),
+                    challengeVerifications =
+                        listOf(
+                            ChallengeVerification(
+                                verificationId = "ab".repeat(32),
+                                verifier = "did:key:zVerifier",
+                                subject = "did:key:zSubject",
+                                capabilityUri = "scp:capability:prompt-injection-resistance/v1",
+                                suiteDigest = "cd".repeat(32),
+                                verificationMethod =
+                                    ChallengeVerificationMethod.ChallengeVerified(
+                                        challengeType =
+                                            "scp:capability:prompt-injection-resistance/v1",
+                                    ),
+                                passed = true,
+                                testCount = 20u,
+                                passCount = 20u,
+                                result = JsonNull,
+                                completedAt = 1_700_000_000uL,
+                                timestamp = 1_700_000_000uL,
+                                expiresAt = 1_700_086_400uL,
+                                contextId = "ctx-admission",
+                                verifierSignature = List(64) { 0.toUByte() },
+                            ),
                         ),
-                    ),
-            ) }
+                )
+            }
         }
     }
 

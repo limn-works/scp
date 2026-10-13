@@ -1486,7 +1486,12 @@ async def aggregate_trust_input(
         challenge_results,
     )
 
-    result = await asyncio.to_thread(instance.aggregate_trust_input, context_id, subject_did, *wire)
+    try:
+        result = await asyncio.to_thread(
+            instance.aggregate_trust_input, context_id, subject_did, *wire
+        )
+    except Exception as exc:  # PyO3 raises native Scp*Error
+        raise _coded_bridge_error(exc) from exc
     if isinstance(result, str):
         return json.loads(result)
     return result
@@ -1794,9 +1799,12 @@ async def trust_verify_attestation(
             provider, or a revocation list that cannot be read. A list that
             cannot be read raises; it never reads as ``valid: False``.
     """
-    return await asyncio.to_thread(
-        scp._native.trust_verify_attestation, context_id, json.dumps(attestation)
-    )
+    try:
+        return await asyncio.to_thread(
+            scp._native.trust_verify_attestation, context_id, json.dumps(attestation)
+        )
+    except Exception as exc:  # PyO3 raises native Scp*Error
+        raise _coded_bridge_error(exc) from exc
 
 
 __all__ = [

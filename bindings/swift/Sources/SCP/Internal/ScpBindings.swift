@@ -1339,10 +1339,10 @@ public protocol NodeHandleProtocol: AnyObject, Sendable {
      *
      * Providing `broadcast_key_hex` without `author_did` is an error.
      *
-     * `admission` is `"open"` or `"gated"`. `hostname` is the virtual
-     * host (RFC 1123).
+     * `admission` is `"open"` or `"gated"`. `site` carries the virtual
+     * host (RFC 1123) and the serving limits.
      */
-    func enableSiteProjection(contextId: String, admission: String, hostname: String, broadcastKeyHex: String?, authorDid: String?, indexPath: String?, maxAssetsPerDeploy: UInt32?, maxDeploySizeBytes: UInt64?, deployRetentionCount: UInt32?, cspOverride: String?) async throws 
+    func enableSiteProjection(contextId: String, admission: String, broadcastKeyHex: String?, authorDid: String?, site: SiteProjectionSettings) async throws 
     
     /**
      * Returns the HTTP URL of the background server, or `None` if not serving.
@@ -1521,16 +1521,16 @@ open func disableSiteProjection(contextId: String)async throws   {
      *
      * Providing `broadcast_key_hex` without `author_did` is an error.
      *
-     * `admission` is `"open"` or `"gated"`. `hostname` is the virtual
-     * host (RFC 1123).
+     * `admission` is `"open"` or `"gated"`. `site` carries the virtual
+     * host (RFC 1123) and the serving limits.
      */
-open func enableSiteProjection(contextId: String, admission: String, hostname: String, broadcastKeyHex: String?, authorDid: String?, indexPath: String?, maxAssetsPerDeploy: UInt32?, maxDeploySizeBytes: UInt64?, deployRetentionCount: UInt32?, cspOverride: String?)async throws   {
+open func enableSiteProjection(contextId: String, admission: String, broadcastKeyHex: String?, authorDid: String?, site: SiteProjectionSettings)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_nodehandle_enable_site_projection(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(contextId),FfiConverterString.lower(admission),FfiConverterString.lower(hostname),FfiConverterOptionString.lower(broadcastKeyHex),FfiConverterOptionString.lower(authorDid),FfiConverterOptionString.lower(indexPath),FfiConverterOptionUInt32.lower(maxAssetsPerDeploy),FfiConverterOptionUInt64.lower(maxDeploySizeBytes),FfiConverterOptionUInt32.lower(deployRetentionCount),FfiConverterOptionString.lower(cspOverride)
+                    FfiConverterString.lower(contextId),FfiConverterString.lower(admission),FfiConverterOptionString.lower(broadcastKeyHex),FfiConverterOptionString.lower(authorDid),FfiConverterTypeSiteProjectionSettings_lower(site)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
@@ -1989,11 +1989,10 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Per-instance equivalent of the free-function `aggregate_trust_input`.
      *
      * Routes through `&*self.inner` — trust data is populated against
-     * THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`),
-     * falling back to an ephemeral in-memory store when no repository
-     * is attached.
+     * THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`).
+     * The JSON inputs arrive as one [`TrustAggregationInputs`] record.
      */
-    func aggregateTrustInput(contextId: String, subjectDid: String, eventsJson: String, merkleRootJson: String, consequenceRulesJson: String, thresholdRequirementsJson: String, attestorSetsJson: String, cachedAttestationsJson: String, challengeResultsJson: String) throws  -> String
+    func aggregateTrustInput(contextId: String, subjectDid: String, inputs: TrustAggregationInputs) async throws  -> String
     
     /**
      * Per-instance equivalent of the free-function
@@ -2129,7 +2128,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * proves the verifier's signature, NOT that the verifier is trusted.
      * Establish verifier legitimacy separately (spec §7.3.4.4 / §7.4).
      *
-     * The resolver lookup blocks; call this off the main thread.
+     * The resolver lookup runs on the blocking pool.
      *
      * # Errors
      *
@@ -2141,7 +2140,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * - `SCP-IDENT-1033` when a record must be verified and this instance has
      * no DID resolver, or its backend is unreachable.
      */
-    func checkCapabilityRequirements(contextId: String, subjectDid: String, requirementsJson: String, agentCapabilitiesJson: String, challengeVerificationsJson: String) throws 
+    func checkCapabilityRequirements(contextId: String, subjectDid: String, requirementsJson: String, agentCapabilitiesJson: String, challengeVerificationsJson: String) async throws 
     
     /**
      * Per-instance equivalent of the free-function `configure_local_transport`.
@@ -3335,7 +3334,8 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `caller_did` is bound to this bridge instance's channel-authenticated
      * principal (§6.2.4) and must be a member of `source_handle`'s context — a
      * mismatch returns `ScpError::SagaAborted` (SCP-SAGA-13050) BEFORE the saga
-     * runs, so the receiver is never handed out.
+     * runs, so the receiver is never handed out. `authority` carries the UCAN,
+     * its proof chain, and the spending proof id.
      *
      * # Errors
      *
@@ -3345,7 +3345,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Prepare/Commit-transition is rejected; `ScpError::Validation` if an
      * id/DID/outlet-id is malformed or `asserted_nonce_hex` is not 16 bytes.
      */
-    func outletStreamingSagaOpen(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanToken: String, proofTokens: [String]?, ucanProofId: String?, timeoutMs: UInt32?, estimatedChunkCount: UInt32?) async throws  -> String
+    func outletStreamingSagaOpen(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, authority: OutletStreamAuthority, timeoutMs: UInt32?, estimatedChunkCount: UInt32?) async throws  -> String
     
     /**
      * Drains one chunk from a live cross-context streaming saga, awaiting until
@@ -3402,7 +3402,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Returns the flattened typed [`ParticipationRecordView`] so the
      * Swift/Kotlin SDKs never re-aggregate. See ADR-017, spec §7.3.2.
      */
-    func participationRecord(contextId: String, subjectDid: String, cachedAttestationsJson: String) throws  -> ParticipationRecordView
+    func participationRecord(contextId: String, subjectDid: String, cachedAttestationsJson: String) async throws  -> ParticipationRecordView
     
     /**
      * Applies a serialized petname event to the owner's petname map.
@@ -3725,7 +3725,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * reason; a revocation list that cannot be read is an error
      * (`VALID_7052`), never a verdict. See ADR-017 Layer 3 (Attestation).
      */
-    func trustVerifyAttestation(contextId: String, attestationJson: String) throws  -> AttestationVerificationResult
+    func trustVerifyAttestation(contextId: String, attestationJson: String) async throws  -> AttestationVerificationResult
     
     /**
      * Verifies a challenge response and returns the signed
@@ -3739,7 +3739,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * - The handle check's error when `verifier` belongs to another `Scp`.
      * - `SCP-VALID-7011` for an empty `context_id`.
-     * - `SCP-VALID-7016` / `SCP-VALID-7017` for malformed challenge / response
+     * - `SCP-VALID-7002` for a malformed challenge or response
      * JSON.
      * - `SCP-IDENT-1033` when this instance has no DID resolver.
      * - `SCP-VALID-7003` when the response is refused.
@@ -4045,24 +4045,24 @@ open func addressResolve(ownerDid: String, address: String, knownContextsJson: S
      * Per-instance equivalent of the free-function `aggregate_trust_input`.
      *
      * Routes through `&*self.inner` — trust data is populated against
-     * THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`),
-     * falling back to an ephemeral in-memory store when no repository
-     * is attached.
+     * THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`).
+     * The JSON inputs arrive as one [`TrustAggregationInputs`] record.
      */
-open func aggregateTrustInput(contextId: String, subjectDid: String, eventsJson: String, merkleRootJson: String, consequenceRulesJson: String, thresholdRequirementsJson: String, attestorSetsJson: String, cachedAttestationsJson: String, challengeResultsJson: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_aggregate_trust_input(self.uniffiClonePointer(),
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(subjectDid),
-        FfiConverterString.lower(eventsJson),
-        FfiConverterString.lower(merkleRootJson),
-        FfiConverterString.lower(consequenceRulesJson),
-        FfiConverterString.lower(thresholdRequirementsJson),
-        FfiConverterString.lower(attestorSetsJson),
-        FfiConverterString.lower(cachedAttestationsJson),
-        FfiConverterString.lower(challengeResultsJson),$0
-    )
-})
+open func aggregateTrustInput(contextId: String, subjectDid: String, inputs: TrustAggregationInputs)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_aggregate_trust_input(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(contextId),FfiConverterString.lower(subjectDid),FfiConverterTypeTrustAggregationInputs_lower(inputs)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -4382,7 +4382,7 @@ open func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rot
      * proves the verifier's signature, NOT that the verifier is trusted.
      * Establish verifier legitimacy separately (spec §7.3.4.4 / §7.4).
      *
-     * The resolver lookup blocks; call this off the main thread.
+     * The resolver lookup runs on the blocking pool.
      *
      * # Errors
      *
@@ -4394,15 +4394,21 @@ open func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rot
      * - `SCP-IDENT-1033` when a record must be verified and this instance has
      * no DID resolver, or its backend is unreachable.
      */
-open func checkCapabilityRequirements(contextId: String, subjectDid: String, requirementsJson: String, agentCapabilitiesJson: String, challengeVerificationsJson: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_check_capability_requirements(self.uniffiClonePointer(),
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(subjectDid),
-        FfiConverterString.lower(requirementsJson),
-        FfiConverterString.lower(agentCapabilitiesJson),
-        FfiConverterString.lower(challengeVerificationsJson),$0
-    )
-}
+open func checkCapabilityRequirements(contextId: String, subjectDid: String, requirementsJson: String, agentCapabilitiesJson: String, challengeVerificationsJson: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_check_capability_requirements(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(contextId),FfiConverterString.lower(subjectDid),FfiConverterString.lower(requirementsJson),FfiConverterString.lower(agentCapabilitiesJson),FfiConverterString.lower(challengeVerificationsJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -6826,7 +6832,8 @@ open func outletStreamVerifyChunkSignature(chunkBytes: Data, operatorPk: Data, c
      * `caller_did` is bound to this bridge instance's channel-authenticated
      * principal (§6.2.4) and must be a member of `source_handle`'s context — a
      * mismatch returns `ScpError::SagaAborted` (SCP-SAGA-13050) BEFORE the saga
-     * runs, so the receiver is never handed out.
+     * runs, so the receiver is never handed out. `authority` carries the UCAN,
+     * its proof chain, and the spending proof id.
      *
      * # Errors
      *
@@ -6836,13 +6843,13 @@ open func outletStreamVerifyChunkSignature(chunkBytes: Data, operatorPk: Data, c
      * Prepare/Commit-transition is rejected; `ScpError::Validation` if an
      * id/DID/outlet-id is malformed or `asserted_nonce_hex` is not 16 bytes.
      */
-open func outletStreamingSagaOpen(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanToken: String, proofTokens: [String]?, ucanProofId: String?, timeoutMs: UInt32?, estimatedChunkCount: UInt32?)async throws  -> String  {
+open func outletStreamingSagaOpen(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, authority: OutletStreamAuthority, timeoutMs: UInt32?, estimatedChunkCount: UInt32?)async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_outlet_streaming_saga_open(
                     self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(callerDid),FfiConverterString.lower(outletRegistrationId),FfiConverterString.lower(inputJson),FfiConverterString.lower(assertedNonceHex),FfiConverterUInt64.lower(timestampMs),FfiConverterUInt8.lower(chainDepth),FfiConverterString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens),FfiConverterOptionString.lower(ucanProofId),FfiConverterOptionUInt32.lower(timeoutMs),FfiConverterOptionUInt32.lower(estimatedChunkCount)
+                    FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(callerDid),FfiConverterString.lower(outletRegistrationId),FfiConverterString.lower(inputJson),FfiConverterString.lower(assertedNonceHex),FfiConverterUInt64.lower(timestampMs),FfiConverterUInt8.lower(chainDepth),FfiConverterTypeOutletStreamAuthority_lower(authority),FfiConverterOptionUInt32.lower(timeoutMs),FfiConverterOptionUInt32.lower(estimatedChunkCount)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -6953,14 +6960,21 @@ open func outletVerify(handle: ContextHandle, outletId: String)async throws  -> 
      * Returns the flattened typed [`ParticipationRecordView`] so the
      * Swift/Kotlin SDKs never re-aggregate. See ADR-017, spec §7.3.2.
      */
-open func participationRecord(contextId: String, subjectDid: String, cachedAttestationsJson: String)throws  -> ParticipationRecordView  {
-    return try  FfiConverterTypeParticipationRecordView_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_participation_record(self.uniffiClonePointer(),
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(subjectDid),
-        FfiConverterString.lower(cachedAttestationsJson),$0
-    )
-})
+open func participationRecord(contextId: String, subjectDid: String, cachedAttestationsJson: String)async throws  -> ParticipationRecordView  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_participation_record(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(contextId),FfiConverterString.lower(subjectDid),FfiConverterString.lower(cachedAttestationsJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeParticipationRecordView_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -7631,13 +7645,21 @@ open func trustCreateChallenge(verifier: Identity, subject: String, capabilityUr
      * reason; a revocation list that cannot be read is an error
      * (`VALID_7052`), never a verdict. See ADR-017 Layer 3 (Attestation).
      */
-open func trustVerifyAttestation(contextId: String, attestationJson: String)throws  -> AttestationVerificationResult  {
-    return try  FfiConverterTypeAttestationVerificationResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_trust_verify_attestation(self.uniffiClonePointer(),
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(attestationJson),$0
-    )
-})
+open func trustVerifyAttestation(contextId: String, attestationJson: String)async throws  -> AttestationVerificationResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_trust_verify_attestation(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(contextId),FfiConverterString.lower(attestationJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeAttestationVerificationResult_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -7652,7 +7674,7 @@ open func trustVerifyAttestation(contextId: String, attestationJson: String)thro
      *
      * - The handle check's error when `verifier` belongs to another `Scp`.
      * - `SCP-VALID-7011` for an empty `context_id`.
-     * - `SCP-VALID-7016` / `SCP-VALID-7017` for malformed challenge / response
+     * - `SCP-VALID-7002` for a malformed challenge or response
      * JSON.
      * - `SCP-IDENT-1033` when this instance has no DID resolver.
      * - `SCP-VALID-7003` when the response is refused.
@@ -11082,6 +11104,113 @@ public func FfiConverterTypeOutletDefinition_lower(_ value: OutletDefinition) ->
 
 
 /**
+ * The invocation authority of one [`Scp::outlet_streaming_saga_open`] call
+ * (§6.2.4).
+ *
+ * It travels as one record so that the export takes seven buffer arguments:
+ * JNA on darwin-aarch64 corrupts a by-value `RustBuffer` argument of some
+ * calls that pass nine or more of them, and the `ffi_buffer_arg_bound` test
+ * holds every export to eight.
+ */
+public struct OutletStreamAuthority {
+    /**
+     * The invocation UCAN, validated once at open against the target context.
+     */
+    public var ucanToken: String
+    /**
+     * The delegation-chain proof tokens, if the UCAN is delegated.
+     */
+    public var proofTokens: [String]?
+    /**
+     * The id of the spending proof, resolved on the target side at
+     * Prepare-B, if the invocation spends.
+     */
+    public var ucanProofId: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The invocation UCAN, validated once at open against the target context.
+         */ucanToken: String, 
+        /**
+         * The delegation-chain proof tokens, if the UCAN is delegated.
+         */proofTokens: [String]?, 
+        /**
+         * The id of the spending proof, resolved on the target side at
+         * Prepare-B, if the invocation spends.
+         */ucanProofId: String?) {
+        self.ucanToken = ucanToken
+        self.proofTokens = proofTokens
+        self.ucanProofId = ucanProofId
+    }
+}
+
+#if compiler(>=6)
+extension OutletStreamAuthority: Sendable {}
+#endif
+
+
+extension OutletStreamAuthority: Equatable, Hashable {
+    public static func ==(lhs: OutletStreamAuthority, rhs: OutletStreamAuthority) -> Bool {
+        if lhs.ucanToken != rhs.ucanToken {
+            return false
+        }
+        if lhs.proofTokens != rhs.proofTokens {
+            return false
+        }
+        if lhs.ucanProofId != rhs.ucanProofId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(ucanToken)
+        hasher.combine(proofTokens)
+        hasher.combine(ucanProofId)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutletStreamAuthority: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutletStreamAuthority {
+        return
+            try OutletStreamAuthority(
+                ucanToken: FfiConverterString.read(from: &buf), 
+                proofTokens: FfiConverterOptionSequenceString.read(from: &buf), 
+                ucanProofId: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OutletStreamAuthority, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.ucanToken, into: &buf)
+        FfiConverterOptionSequenceString.write(value.proofTokens, into: &buf)
+        FfiConverterOptionString.write(value.ucanProofId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletStreamAuthority_lift(_ buf: RustBuffer) throws -> OutletStreamAuthority {
+    return try FfiConverterTypeOutletStreamAuthority.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletStreamAuthority_lower(_ value: OutletStreamAuthority) -> RustBuffer {
+    return FfiConverterTypeOutletStreamAuthority.lower(value)
+}
+
+
+/**
  * Result of verifying an outlet against its test vectors.
  *
  * See ADR-010 (Outlet Registry).
@@ -12252,6 +12381,153 @@ public func FfiConverterTypeSealedInvitation_lower(_ value: SealedInvitation) ->
 
 
 /**
+ * The site settings of one [`NodeHandle::enable_site_projection`] call
+ * (section 18.11).
+ *
+ * They travel as one record so that the export takes five buffer
+ * arguments: JNA on darwin-aarch64 corrupts a by-value `RustBuffer`
+ * argument of some calls that pass nine or more of them, and the
+ * `ffi_buffer_arg_bound` test holds every export to eight.
+ */
+public struct SiteProjectionSettings {
+    /**
+     * The virtual host (RFC 1123).
+     */
+    public var hostname: String
+    /**
+     * The path served at `/`; `None` serves `/index.html`.
+     */
+    public var indexPath: String?
+    /**
+     * The most assets one deploy may hold; `None` allows 10 000.
+     */
+    public var maxAssetsPerDeploy: UInt32?
+    /**
+     * The largest total deploy size in bytes; `None` allows 512 MiB.
+     */
+    public var maxDeploySizeBytes: UInt64?
+    /**
+     * How many past deploys are kept; `None` keeps 2.
+     */
+    public var deployRetentionCount: UInt32?
+    /**
+     * A Content-Security-Policy header replacing the default.
+     */
+    public var cspOverride: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The virtual host (RFC 1123).
+         */hostname: String, 
+        /**
+         * The path served at `/`; `None` serves `/index.html`.
+         */indexPath: String?, 
+        /**
+         * The most assets one deploy may hold; `None` allows 10 000.
+         */maxAssetsPerDeploy: UInt32?, 
+        /**
+         * The largest total deploy size in bytes; `None` allows 512 MiB.
+         */maxDeploySizeBytes: UInt64?, 
+        /**
+         * How many past deploys are kept; `None` keeps 2.
+         */deployRetentionCount: UInt32?, 
+        /**
+         * A Content-Security-Policy header replacing the default.
+         */cspOverride: String?) {
+        self.hostname = hostname
+        self.indexPath = indexPath
+        self.maxAssetsPerDeploy = maxAssetsPerDeploy
+        self.maxDeploySizeBytes = maxDeploySizeBytes
+        self.deployRetentionCount = deployRetentionCount
+        self.cspOverride = cspOverride
+    }
+}
+
+#if compiler(>=6)
+extension SiteProjectionSettings: Sendable {}
+#endif
+
+
+extension SiteProjectionSettings: Equatable, Hashable {
+    public static func ==(lhs: SiteProjectionSettings, rhs: SiteProjectionSettings) -> Bool {
+        if lhs.hostname != rhs.hostname {
+            return false
+        }
+        if lhs.indexPath != rhs.indexPath {
+            return false
+        }
+        if lhs.maxAssetsPerDeploy != rhs.maxAssetsPerDeploy {
+            return false
+        }
+        if lhs.maxDeploySizeBytes != rhs.maxDeploySizeBytes {
+            return false
+        }
+        if lhs.deployRetentionCount != rhs.deployRetentionCount {
+            return false
+        }
+        if lhs.cspOverride != rhs.cspOverride {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(hostname)
+        hasher.combine(indexPath)
+        hasher.combine(maxAssetsPerDeploy)
+        hasher.combine(maxDeploySizeBytes)
+        hasher.combine(deployRetentionCount)
+        hasher.combine(cspOverride)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSiteProjectionSettings: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SiteProjectionSettings {
+        return
+            try SiteProjectionSettings(
+                hostname: FfiConverterString.read(from: &buf), 
+                indexPath: FfiConverterOptionString.read(from: &buf), 
+                maxAssetsPerDeploy: FfiConverterOptionUInt32.read(from: &buf), 
+                maxDeploySizeBytes: FfiConverterOptionUInt64.read(from: &buf), 
+                deployRetentionCount: FfiConverterOptionUInt32.read(from: &buf), 
+                cspOverride: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SiteProjectionSettings, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.hostname, into: &buf)
+        FfiConverterOptionString.write(value.indexPath, into: &buf)
+        FfiConverterOptionUInt32.write(value.maxAssetsPerDeploy, into: &buf)
+        FfiConverterOptionUInt64.write(value.maxDeploySizeBytes, into: &buf)
+        FfiConverterOptionUInt32.write(value.deployRetentionCount, into: &buf)
+        FfiConverterOptionString.write(value.cspOverride, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSiteProjectionSettings_lift(_ buf: RustBuffer) throws -> SiteProjectionSettings {
+    return try FfiConverterTypeSiteProjectionSettings.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSiteProjectionSettings_lower(_ value: SiteProjectionSettings) -> RustBuffer {
+    return FfiConverterTypeSiteProjectionSettings.lower(value)
+}
+
+
+/**
  * Sync policy parameters record.
  *
  * Contains the default sync policy values. Returned by `sync_get_policy`.
@@ -12522,6 +12798,166 @@ public func FfiConverterTypeTransportStatus_lift(_ buf: RustBuffer) throws -> Tr
 #endif
 public func FfiConverterTypeTransportStatus_lower(_ value: TransportStatus) -> RustBuffer {
     return FfiConverterTypeTransportStatus.lower(value)
+}
+
+
+/**
+ * The JSON inputs of one [`Scp::aggregate_trust_input`] call (spec §7.3).
+ *
+ * They travel as one record so that the export takes three buffer
+ * arguments: JNA on darwin-aarch64 corrupts a by-value `RustBuffer`
+ * argument of some calls that pass nine or more of them, and the
+ * `ffi_buffer_arg_bound` test holds every export to eight.
+ */
+public struct TrustAggregationInputs {
+    /**
+     * The subject's event-log entries, as a JSON array of `Event`.
+     */
+    public var eventsJson: String
+    /**
+     * The log's 32-byte Merkle root, as a JSON array of bytes.
+     */
+    public var merkleRootJson: String
+    /**
+     * The context's consequence rules, as a JSON array.
+     */
+    public var consequenceRulesJson: String
+    /**
+     * Threshold requirements keyed by attestation type, as a JSON object.
+     */
+    public var thresholdRequirementsJson: String
+    /**
+     * Attestor sets keyed by attestation type, as a JSON object.
+     */
+    public var attestorSetsJson: String
+    /**
+     * Cached attestations to verify and store, as a JSON array.
+     */
+    public var cachedAttestationsJson: String
+    /**
+     * Signed challenge verification records, as a JSON array.
+     */
+    public var challengeResultsJson: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The subject's event-log entries, as a JSON array of `Event`.
+         */eventsJson: String, 
+        /**
+         * The log's 32-byte Merkle root, as a JSON array of bytes.
+         */merkleRootJson: String, 
+        /**
+         * The context's consequence rules, as a JSON array.
+         */consequenceRulesJson: String, 
+        /**
+         * Threshold requirements keyed by attestation type, as a JSON object.
+         */thresholdRequirementsJson: String, 
+        /**
+         * Attestor sets keyed by attestation type, as a JSON object.
+         */attestorSetsJson: String, 
+        /**
+         * Cached attestations to verify and store, as a JSON array.
+         */cachedAttestationsJson: String, 
+        /**
+         * Signed challenge verification records, as a JSON array.
+         */challengeResultsJson: String) {
+        self.eventsJson = eventsJson
+        self.merkleRootJson = merkleRootJson
+        self.consequenceRulesJson = consequenceRulesJson
+        self.thresholdRequirementsJson = thresholdRequirementsJson
+        self.attestorSetsJson = attestorSetsJson
+        self.cachedAttestationsJson = cachedAttestationsJson
+        self.challengeResultsJson = challengeResultsJson
+    }
+}
+
+#if compiler(>=6)
+extension TrustAggregationInputs: Sendable {}
+#endif
+
+
+extension TrustAggregationInputs: Equatable, Hashable {
+    public static func ==(lhs: TrustAggregationInputs, rhs: TrustAggregationInputs) -> Bool {
+        if lhs.eventsJson != rhs.eventsJson {
+            return false
+        }
+        if lhs.merkleRootJson != rhs.merkleRootJson {
+            return false
+        }
+        if lhs.consequenceRulesJson != rhs.consequenceRulesJson {
+            return false
+        }
+        if lhs.thresholdRequirementsJson != rhs.thresholdRequirementsJson {
+            return false
+        }
+        if lhs.attestorSetsJson != rhs.attestorSetsJson {
+            return false
+        }
+        if lhs.cachedAttestationsJson != rhs.cachedAttestationsJson {
+            return false
+        }
+        if lhs.challengeResultsJson != rhs.challengeResultsJson {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(eventsJson)
+        hasher.combine(merkleRootJson)
+        hasher.combine(consequenceRulesJson)
+        hasher.combine(thresholdRequirementsJson)
+        hasher.combine(attestorSetsJson)
+        hasher.combine(cachedAttestationsJson)
+        hasher.combine(challengeResultsJson)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTrustAggregationInputs: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TrustAggregationInputs {
+        return
+            try TrustAggregationInputs(
+                eventsJson: FfiConverterString.read(from: &buf), 
+                merkleRootJson: FfiConverterString.read(from: &buf), 
+                consequenceRulesJson: FfiConverterString.read(from: &buf), 
+                thresholdRequirementsJson: FfiConverterString.read(from: &buf), 
+                attestorSetsJson: FfiConverterString.read(from: &buf), 
+                cachedAttestationsJson: FfiConverterString.read(from: &buf), 
+                challengeResultsJson: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TrustAggregationInputs, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.eventsJson, into: &buf)
+        FfiConverterString.write(value.merkleRootJson, into: &buf)
+        FfiConverterString.write(value.consequenceRulesJson, into: &buf)
+        FfiConverterString.write(value.thresholdRequirementsJson, into: &buf)
+        FfiConverterString.write(value.attestorSetsJson, into: &buf)
+        FfiConverterString.write(value.cachedAttestationsJson, into: &buf)
+        FfiConverterString.write(value.challengeResultsJson, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrustAggregationInputs_lift(_ buf: RustBuffer) throws -> TrustAggregationInputs {
+    return try FfiConverterTypeTrustAggregationInputs.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrustAggregationInputs_lower(_ value: TrustAggregationInputs) -> RustBuffer {
+    return FfiConverterTypeTrustAggregationInputs.lower(value)
 }
 
 
@@ -17745,7 +18181,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_disable_site_projection() != 49517) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_enable_site_projection() != 59651) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_enable_site_projection() != 31205) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_http_url() != 26199) {
@@ -17796,7 +18232,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_address_resolve() != 23956) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_aggregate_trust_input() != 37504) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_aggregate_trust_input() != 58051) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_apply_pending_ceiling_modification() != 41792) {
@@ -17835,7 +18271,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_unsubscribe() != 16701) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_check_capability_requirements() != 37209) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_check_capability_requirements() != 64202) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_local_transport() != 46239) {
@@ -18123,7 +18559,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_stream_verify_chunk_signature() != 15888) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_streaming_saga_open() != 5447) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_streaming_saga_open() != 34415) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_streaming_saga_poll_next() != 45714) {
@@ -18135,7 +18571,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_verify() != 31142) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_participation_record() != 20243) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_participation_record() != 55185) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_apply_event() != 32223) {
@@ -18237,10 +18673,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_create_challenge() != 10459) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_attestation() != 39312) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_attestation() != 54259) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 4984) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 52836) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 59265) {

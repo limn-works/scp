@@ -1669,6 +1669,24 @@ fn join_err(e: tokio::task::JoinError) -> ScpError {
     }
 }
 
+/// The invocation authority of one [`Scp::outlet_streaming_saga_open`] call
+/// (§6.2.4).
+///
+/// It travels as one record so that the export takes seven buffer arguments:
+/// JNA on darwin-aarch64 corrupts a by-value `RustBuffer` argument of some
+/// calls that pass nine or more of them, and the `ffi_buffer_arg_bound` test
+/// holds every export to eight.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OutletStreamAuthority {
+    /// The invocation UCAN, validated once at open against the target context.
+    pub ucan_token: String,
+    /// The delegation-chain proof tokens, if the UCAN is delegated.
+    pub proof_tokens: Option<Vec<String>>,
+    /// The id of the spending proof, resolved on the target side at
+    /// Prepare-B, if the invocation spends.
+    pub ucan_proof_id: Option<String>,
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl Scp {
     /// Opens a §5.4.5 streaming outlet invocation, returning a `StreamHandleId`
@@ -1885,7 +1903,8 @@ impl Scp {
     /// `caller_did` is bound to this bridge instance's channel-authenticated
     /// principal (§6.2.4) and must be a member of `source_handle`'s context — a
     /// mismatch returns `ScpError::SagaAborted` (SCP-SAGA-13050) BEFORE the saga
-    /// runs, so the receiver is never handed out.
+    /// runs, so the receiver is never handed out. `authority` carries the UCAN,
+    /// its proof chain, and the spending proof id.
     ///
     /// # Errors
     ///
@@ -1905,12 +1924,15 @@ impl Scp {
         asserted_nonce_hex: String,
         timestamp_ms: u64,
         chain_depth: u8,
-        ucan_token: String,
-        proof_tokens: Option<Vec<String>>,
-        ucan_proof_id: Option<String>,
+        authority: OutletStreamAuthority,
         timeout_ms: Option<u32>,
         estimated_chunk_count: Option<u32>,
     ) -> Result<String, ScpError> {
+        let OutletStreamAuthority {
+            ucan_token,
+            proof_tokens,
+            ucan_proof_id,
+        } = authority;
         // Per-instance handle affinity: both participant handles MUST have been
         // minted by THIS bridge instance (mirrors the unary saga export).
         self.inner

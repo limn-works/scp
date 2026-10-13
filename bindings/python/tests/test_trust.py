@@ -1430,15 +1430,40 @@ class TestTrustVerifyTyped:
         assert context_id == "ctx-1"
         assert json.loads(wire_json) == self._envelope()
 
-    async def test_verify_attestation_real_bridge_call_through(self, scp: Any) -> None:
-        """The typed envelope's serialized JSON parses on the REAL Rust
-        `Attestation` deserializer: a dummy signature yields a structured
-        `valid: False` (verification ran), never a parse error."""
+    async def test_verify_attestation_without_a_resolver_fails_closed(self, scp: Any) -> None:
+        """An instance with no identity has no DID resolver, so the issuer's
+        `#active` key cannot be resolved: a coded SCP-VALID-7052 error, never a
+        verdict. The issuer DID in the message proves the typed envelope
+        parsed on the real Rust deserializer (a parse failure is 7012)."""
         from scp_sdk.trust import trust_verify_attestation
 
-        result = await trust_verify_attestation(scp, "ctx-1", self._envelope())
+        _require_native_extension()
+        with pytest.raises(ValidationError) as info:
+            await trust_verify_attestation(scp, "ctx-1", self._envelope())
+        assert info.value.code == "SCP-VALID-7052"
+        assert "did:dht:zIssuer" in str(info.value)
+
+    async def test_verify_attestation_resolvable_issuer_bad_signature(self, scp: Any) -> None:
+        """An issuer that resolves on this instance reaches the real verifier:
+        a dummy signature yields a structured `valid: False` verdict."""
+        from scp_sdk.trust import trust_verify_attestation
+
+        _require_native_extension()
+        issuer = await create_in_memory_identity(scp)
+        envelope = {**self._envelope(), "issuer": issuer.did}
+        result = await trust_verify_attestation(scp, "ctx-1", envelope)
         assert result["valid"] is False
-        assert result["error"]
+        assert "signature" in result["error"]
+
+    async def test_aggregate_trust_input_raises_the_coded_sdk_error(self, scp: Any) -> None:
+        """A bridge refusal from aggregate_trust_input reaches the caller as the
+        coded SDK exception, not the native ``_scp_core`` one."""
+        from scp_sdk.trust import aggregate_trust_input
+
+        _require_native_extension()
+        with pytest.raises(ValidationError) as info:
+            await aggregate_trust_input(scp, "bad\x00ctx", "did:dht:zSubject", [], [0] * 32)
+        assert info.value.code.startswith("SCP-VALID-")
 
 
 _SCHEMA_URI = "scp:capability:schema-validation/v1"

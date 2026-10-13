@@ -231,11 +231,11 @@ final class TrustAggregateEncoderTests: XCTestCase {
 // MARK: - Challenge trust-input encoders (§7.3.4, ADR-058)
 
 /// A structurally-valid attestation envelope for the verify path.
-private func makeAttestationEnvelope() -> CachedAttestationEnvelope {
+private func makeAttestationEnvelope(issuer: String = "did:dht:zIssuer") -> CachedAttestationEnvelope {
     CachedAttestationEnvelope(
         id: "att-1",
         attestationType: "AgentCapability",
-        issuer: "did:dht:zIssuer",
+        issuer: issuer,
         subject: "did:dht:zSubject",
         claim: ["capability": "scp:capability:schema-validation/v1"],
         issuedAt: 1_700_000_000,
@@ -419,17 +419,35 @@ final class ChallengeTrustInputEncoderTests: XCTestCase {
 /// parses and evaluates on the Rust side (dummy signatures yield structured
 /// negative verdicts, never parse errors).
 final class ChallengeTrustInputCallThroughTests: XCTestCase {
-    func testTrustVerifyAttestationTypedEnvelopeReachesVerifier() async throws {
-        // The dummy signature cannot verify — a structured `valid: false`
-        // (not a thrown parse error) proves the envelope reached the real
-        // verifier.
+    func testTrustVerifyAttestationWithoutAResolverFailsClosedWith7052() async throws {
+        // An instance with no identity has no DID resolver, so the issuer's
+        // `#active` key cannot be resolved: a coded SCP-VALID-7052 error,
+        // never a verdict. The issuer DID in the message proves the envelope
+        // parsed on the real Rust deserializer (a parse failure is 7012).
         let scp = try SCP(storage: .inMemory)
+        do {
+            _ = try await scp.trustVerifyAttestation(
+                contextId: "ctx-ffi-1",
+                attestation: makeAttestationEnvelope()
+            )
+            XCTFail("an unresolvable issuer key must be an error, not a verdict")
+        } catch let ScpError.Validation(msg, code) {
+            XCTAssertEqual(code, "SCP-VALID-7052")
+            XCTAssertTrue(msg.contains("did:dht:zIssuer"), msg)
+        }
+    }
+
+    func testTrustVerifyAttestationResolvableIssuerBadSignatureIsInvalid() async throws {
+        // An issuer that resolves on this instance reaches the real verifier:
+        // a dummy signature yields a structured `valid: false` verdict.
+        let scp = try SCP(storage: .inMemory)
+        let issuer = try await createInMemoryIdentity(scp)
         let result = try await scp.trustVerifyAttestation(
             contextId: "ctx-ffi-1",
-            attestation: makeAttestationEnvelope()
+            attestation: makeAttestationEnvelope(issuer: issuer.did())
         )
         XCTAssertFalse(result.valid)
-        XCTAssertFalse(result.errorMessage.isEmpty)
+        XCTAssertTrue(result.errorMessage.contains("signature"), result.errorMessage)
     }
 
     func testTrustCreateChallengeBelowMinimumIsValid7039() async throws {

@@ -279,7 +279,7 @@ public extension SCP {
     // swiftlint:disable function_parameter_count
     /// Forwards to ``Scp/aggregateTrustInput`` on ``inner``.
     func aggregateTrustInput(contextId: String, subjectDid: String, eventsJson: String, merkleRootJson: String, consequenceRulesJson: String, thresholdRequirementsJson: String, attestorSetsJson: String, cachedAttestationsJson: String, challengeResultsJson: String) async throws -> String {
-        try await inner.aggregateTrustInput(contextId: contextId, subjectDid: subjectDid, eventsJson: eventsJson, merkleRootJson: merkleRootJson, consequenceRulesJson: consequenceRulesJson, thresholdRequirementsJson: thresholdRequirementsJson, attestorSetsJson: attestorSetsJson, cachedAttestationsJson: cachedAttestationsJson, challengeResultsJson: challengeResultsJson)
+        try await inner.aggregateTrustInput(contextId: contextId, subjectDid: subjectDid, inputs: TrustAggregationInputs(eventsJson: eventsJson, merkleRootJson: merkleRootJson, consequenceRulesJson: consequenceRulesJson, thresholdRequirementsJson: thresholdRequirementsJson, attestorSetsJson: attestorSetsJson, cachedAttestationsJson: cachedAttestationsJson, challengeResultsJson: challengeResultsJson))
     }
 
     // swiftlint:enable function_parameter_count
@@ -1238,9 +1238,11 @@ public extension SCP {
             assertedNonceHex: assertedNonceHex,
             timestampMs: timestampMs,
             chainDepth: chainDepth,
-            ucanToken: ucanToken,
-            proofTokens: proofTokens,
-            ucanProofId: ucanProofId,
+            authority: OutletStreamAuthority(
+                ucanToken: ucanToken,
+                proofTokens: proofTokens,
+                ucanProofId: ucanProofId
+            ),
             timeoutMs: timeoutMs,
             estimatedChunkCount: estimatedChunkCount
         )

@@ -55,6 +55,7 @@ import uniffi.scp.StorageConfig
 import uniffi.scp.SyncPolicyResult
 import uniffi.scp.TransportManager
 import uniffi.scp.TransportStatus
+import uniffi.scp.TrustAggregationInputs
 import uniffi.scp.TrustScoreResult
 import uniffi.scp.UcanToken
 import works.limn.scp.bridge.CoroutineBridge
@@ -369,13 +370,16 @@ class SCP internal constructor(
         inner.aggregateTrustInput(
             contextId = contextId,
             subjectDid = subjectDid,
-            eventsJson = encodeEventLogEntriesJson(events),
-            merkleRootJson = encodeMerkleRootJson(merkleRoot),
-            consequenceRulesJson = encodeConsequenceRulesJson(consequenceRules),
-            thresholdRequirementsJson = encodeThresholdRequirementsJson(thresholdRequirements),
-            attestorSetsJson = encodeAttestorSetsJson(attestorSets),
-            cachedAttestationsJson = encodeCachedAttestationsJson(cachedAttestations),
-            challengeResultsJson = encodeChallengeVerificationsJson(challengeResults),
+            inputs =
+                TrustAggregationInputs(
+                    eventsJson = encodeEventLogEntriesJson(events),
+                    merkleRootJson = encodeMerkleRootJson(merkleRoot),
+                    consequenceRulesJson = encodeConsequenceRulesJson(consequenceRules),
+                    thresholdRequirementsJson = encodeThresholdRequirementsJson(thresholdRequirements),
+                    attestorSetsJson = encodeAttestorSetsJson(attestorSets),
+                    cachedAttestationsJson = encodeCachedAttestationsJson(cachedAttestations),
+                    challengeResultsJson = encodeChallengeVerificationsJson(challengeResults),
+                ),
         )
 
     /** Forwards to [NativeScp.applyPendingCeilingModification] on [inner]. */
