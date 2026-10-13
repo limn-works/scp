@@ -4239,6 +4239,22 @@ mod tests {
             }
         }
 
+        /// An action whose canonical bytes would also stand for another number
+        /// is refused before any proposer signs its digest.
+        #[test]
+        fn an_action_number_beyond_2_53_is_refused_before_signing() {
+            let action = GovernanceAction::ExtendTtl {
+                additional_secs: (1u64 << 53) + 1,
+            };
+            for model in ALL {
+                let r = engine(model).precheck_propose(&did(1), &action, &ctx(NOW));
+                assert!(
+                    matches!(&r, Err(GovernanceError::SerializationFailed(m)) if m.contains("2^53")),
+                    "{model:?}: {r:?}"
+                );
+            }
+        }
+
         fn sign(n: u8, digest: &[u8; 32]) -> [u8; 64] {
             sk(n).sign(digest).to_bytes()
         }

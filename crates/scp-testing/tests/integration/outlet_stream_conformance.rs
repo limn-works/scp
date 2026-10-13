@@ -42,7 +42,7 @@ use scp_protocol::trust::caveats::InvocationCaveats;
 
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::outlets::dispatch::{
-    CancelIdentity, OpenStreamParams, open_stream_session,
+    CancelIdentity, OpenStreamParams, OpenStreamRejection, StreamSessionHandle, open_stream_session,
 };
 use scp_runtime::context::outlets::signer::InProcessStreamSigner;
 use scp_runtime::context::outlets::stream::{
@@ -96,9 +96,13 @@ fn authorizing_role_state() -> ContextRoleState {
     role_state
 }
 
-/// Opens a raw stream session for `vector`, applies the vector's credit grants
-/// and (optionally) a signed cancel, and drains to the terminal chunk.
-async fn drive_vector(vec: &Vector) -> DrainOutcome {
+/// Opens a raw stream session for `vec` with `input`, counting admission in
+/// `admission`.
+async fn open_vector(
+    vec: &Vector,
+    input: serde_json::Value,
+    admission: Arc<RwLock<StreamAdmissionTracker>>,
+) -> Result<StreamSessionHandle, OpenStreamRejection> {
     let key = invoker_key();
     let invoker_pk = key.verifying_key();
     let request_id: RequestId = vec.open.request_id;
@@ -188,16 +192,15 @@ async fn drive_vector(vec: &Vector) -> DrainOutcome {
         economic_policy_snapshot: None,
     };
 
-    let admission = Arc::new(RwLock::new(StreamAdmissionTracker::new()));
     let origin_admission = Arc::new(RwLock::new(OriginAdmissionTracker::new()));
     let pump_semaphore = Arc::new(tokio::sync::Semaphore::new(4096));
 
-    let mut handle = open_stream_session(
+    open_stream_session(
         &handle_ctx,
         &registry,
         &role_state,
         &outlet_id,
-        vec.open.input.clone(),
+        input,
         &invoker_did(),
         Some(vec.open.timeout_ms),
         executor,
@@ -215,7 +218,27 @@ async fn drive_vector(vec: &Vector) -> DrainOutcome {
         tokio_util::sync::CancellationToken::new(),
     )
     .await
-    .expect("open_stream_session accepts a well-formed open");
+}
+
+/// Opens a raw stream session for `vector`, applies the vector's credit grants
+/// and (optionally) a signed cancel, and drains to the terminal chunk.
+async fn drive_vector(vec: &Vector) -> DrainOutcome {
+    let key = invoker_key();
+    let request_id: RequestId = vec.open.request_id;
+    let outlet_id: OutletId = vec.open.outlet_id.clone();
+    let caveats_binding = compute_caveats_binding(
+        b"cid-outlet-stream-conformance",
+        &request_id,
+        &invoker_did().0,
+        vec.open.estimated_chunk_count,
+        &InvocationCaveats::empty()
+            .to_canonical_json_bytes()
+            .expect("caveats jcs"),
+    );
+    let admission = Arc::new(RwLock::new(StreamAdmissionTracker::new()));
+    let mut handle = open_vector(vec, vec.open.input.clone(), admission)
+        .await
+        .expect("open_stream_session accepts a well-formed open");
 
     let mut rx = handle.receiver().expect("receiver");
     let summary_rx = handle.close_summary().expect("close summary");
@@ -306,6 +329,30 @@ async fn run_transcript_vector(name: &str) {
     let outcome = drive_vector(vec).await;
     assert_transcript_matches(vec, &outcome);
     assert_terminal_status(vec, &outcome);
+}
+
+/// An input carrying a number beyond 2^53 has no canonical form, so the
+/// `OutletInvokedEvent` cannot commit to its hash: the open is refused as an
+/// input violation before the admission gate counts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_input_beyond_2_53_is_refused_before_admission() {
+    let file = load_vectors();
+    let vec = vector(&file, "non_streaming");
+    let admission = Arc::new(RwLock::new(StreamAdmissionTracker::new()));
+    let refused = open_vector(
+        vec,
+        serde_json::json!({"id": 9_007_199_254_740_993_u64}),
+        Arc::clone(&admission),
+    )
+    .await;
+    let Err(rejection) = refused else {
+        panic!("an input beyond 2^53 must not open a stream");
+    };
+    assert_eq!(rejection, OpenStreamRejection::InputNotCanonicalizable);
+    assert_eq!(rejection.error_code(), scp_protocol::CODE_INPUT_VIOLATION);
+    let tracker = admission.read().expect("admission lock");
+    assert_eq!(tracker.count_per_invoker(&invoker_did().0), 0);
+    assert_eq!(tracker.count_per_outlet(&vec.open.outlet_id), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

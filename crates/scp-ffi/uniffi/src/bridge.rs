@@ -5763,7 +5763,10 @@ impl McpUniFfiBridgeProvider {
             )
             .map_err(|msg| format!("input validation failed for outlet '{outlet_name}': {msg}"))?;
 
-            let input_hash = scp_core::context::outlets::sha256_json(&arguments);
+            // An input with no canonical form (a number outside I-JSON) has
+            // no hash, so it fails input validation.
+            let input_hash = scp_core::context::outlets::sha256_json(&arguments)
+                .map_err(|e| format!("input validation failed for outlet '{outlet_name}': {e}"))?;
 
             let handler_dispatch = {
                 let outlet_handlers = handle
@@ -5790,7 +5793,7 @@ impl McpUniFfiBridgeProvider {
         // Phase 2: Execute handler OUTSIDE the locks so that concurrent
         // same-context operations are not blocked. Handler execution is
         // bounded by `outlet_timeout_ms` (matching PyO3 pattern, issue #123).
-        let output = {
+        let (output, output_hash) = {
             let (handler, output_schema) = dispatch;
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -5814,8 +5817,12 @@ impl McpUniFfiBridgeProvider {
                 &output_schema,
             )
             .map_err(|msg| format!("output validation failed for outlet '{outlet_name}': {msg}"))?;
+            // An output with no canonical form has no hash, so it fails
+            // output validation before any event is appended.
+            let output_hash = scp_core::context::outlets::sha256_json(&output)
+                .map_err(|e| format!("output validation failed for outlet '{outlet_name}': {e}"))?;
 
-            output
+            (output, output_hash)
         };
 
         // Phase 3: Append OutletInvokedEvent to the event log (ADR-010
@@ -5838,7 +5845,7 @@ impl McpUniFfiBridgeProvider {
             status: scp_core::context::outlets::OutletStatus::Success,
             execution_time_ms: elapsed_ms,
             input_hash,
-            output_hash: Some(scp_core::context::outlets::sha256_json(&output)),
+            output_hash: Some(output_hash),
             cost: None,
             // Non-streaming bridge invocation: degenerate/no-manifest
             // streaming-field defaults matching the lifecycle serde defaults.

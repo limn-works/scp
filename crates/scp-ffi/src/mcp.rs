@@ -1042,7 +1042,13 @@ impl FfiBridgeProvider {
 
             // Clone handler Arc and output schema so we can release the lock.
             // Compute input hash before dispatch (arguments may be consumed).
-            let input_hash = scp_core::context::outlets::sha256_json(&arguments);
+            // An input with no canonical form (a number outside I-JSON) has
+            // no hash, so it fails input validation.
+            let input_hash = scp_core::context::outlets::sha256_json(&arguments).map_err(|e| {
+                ScpPyError::validation(format!(
+                    "input validation failed for outlet '{outlet_name}': {e}"
+                ))
+            })?;
 
             let dispatch = rt
                 .outlet_handlers
@@ -1069,7 +1075,7 @@ impl FfiBridgeProvider {
         // concurrent same-context operations are not blocked during Python
         // GIL acquisition and handler execution. Handler execution is
         // bounded by `outlet_timeout_ms` (issue #123).
-        let output = {
+        let (output, output_hash) = {
             let (handler, output_schema) = dispatch;
             // Run the handler on a dedicated thread with a timeout to
             // prevent indefinite blocking. The handler is Send + Sync
@@ -1102,8 +1108,15 @@ impl FfiBridgeProvider {
                     "output validation failed for outlet '{outlet_name}': {msg}"
                 ))
             })?;
+            // An output with no canonical form has no hash, so it fails output
+            // validation, with the same refund, before any event is appended.
+            let output_hash = scp_core::context::outlets::sha256_json(&output).map_err(|e| {
+                refund(format!(
+                    "output validation failed for outlet '{outlet_name}': {e}"
+                ))
+            })?;
 
-            output
+            (output, output_hash)
         };
 
         // Phase 3: Append OutletInvokedEvent to the event log (ADR-010
@@ -1126,8 +1139,6 @@ impl FfiBridgeProvider {
                 millis as u64
             }
         };
-
-        let output_hash = scp_core::context::outlets::sha256_json(&output);
 
         let outlet_event = scp_core::context::outlets::OutletInvokedEvent {
             request_id: uuid::Uuid::new_v4().to_string(),

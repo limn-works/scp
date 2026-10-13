@@ -482,9 +482,9 @@ pub struct OutletStreamChunk {
 ///
 /// # Errors
 ///
-/// Returns the JCS error string if `payload` cannot be canonicalized
-/// (should not happen for valid `ChunkPayload` values; surfaced for
-/// completeness).
+/// Returns the JCS error string if `payload` cannot be canonicalized: it
+/// carries a JSON value with a number outside I-JSON (RFC 7493), such as an
+/// integer beyond 2^53 ([`crate::jcs::require_i_json`]).
 pub fn compute_chunk_sig_preimage(
     context_id: &str,
     outlet_id: &str,
@@ -1070,9 +1070,9 @@ pub const CHUNK_MANIFEST_INTERIOR_TAG: u8 = 0x01;
 ///
 /// # Errors
 ///
-/// Returns the JCS canonicalization error string if the chunk cannot
-/// be serialized — should not happen for valid [`OutletStreamChunk`]
-/// values; surfaced for completeness.
+/// Returns the JCS canonicalization error string if the chunk cannot be
+/// canonicalized: its payload carries a number outside I-JSON (RFC 7493),
+/// such as an integer beyond 2^53 ([`crate::jcs::require_i_json`]).
 pub fn compute_chunk_leaf_hash(chunk: &OutletStreamChunk) -> Result<[u8; 32], String> {
     let chunk_jcs = crate::jcs::to_vec(chunk)?;
     let mut hasher = Sha256::new();

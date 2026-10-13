@@ -1694,7 +1694,7 @@ mod tests {
             },
             status: ProposalStatus::Approved,
             created_at: 0,
-            voting_deadline: u64::MAX,
+            voting_deadline: 1_700_086_400,
             approvals: vec![],
             rejections: vec![],
             created_at_epoch: Some(0),
