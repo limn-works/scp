@@ -311,12 +311,28 @@ pub async fn persist_recorded_nonce<S: Storage, C: Clock>(
     Ok(())
 }
 
-/// The keys a prune sweep could not process: how many, and the first failure.
-/// The error carries no key bytes, so it can be logged as is.
+/// The expired-key cleanups that failed (in the prune sweep or at restore):
+/// how many, and the first failure. The error carries no key bytes, so it can
+/// be logged as is.
 #[derive(Debug)]
 struct PruneFailure {
     failed: usize,
     first: UcanDurableStateError,
+}
+
+impl PruneFailure {
+    /// Counts one failed cleanup into `failure`, keeping the first error.
+    fn count(failure: &mut Option<Self>, err: UcanDurableStateError) {
+        match failure {
+            Some(f) => f.failed += 1,
+            None => {
+                *failure = Some(Self {
+                    failed: 1,
+                    first: err,
+                });
+            }
+        }
+    }
 }
 
 /// Deletes the durable key of every nonce the tracker does not hold whose
@@ -337,15 +353,7 @@ async fn prune_nonce_keys<S: Storage, C: Clock>(
     let mut failure: Option<PruneFailure> = None;
     for key in keys {
         if let Err(err) = prune_nonce_key(storage, tracker, &prefix, &key).await {
-            match &mut failure {
-                Some(f) => f.failed += 1,
-                None => {
-                    failure = Some(PruneFailure {
-                        failed: 1,
-                        first: err,
-                    });
-                }
-            }
+            PruneFailure::count(&mut failure, err);
         }
     }
     failure.map_or(Ok(()), Err)
@@ -433,10 +441,20 @@ pub async fn hydrate_revocation_list<S: Storage>(
 /// restore prunes the durable set by the same rule it prunes the tracker.
 /// `clock` becomes the rebuilt tracker's time source.
 ///
+/// A failed delete of an expired key does not fail the hydration. The entry is
+/// expired, so the tracker drops it whether or not the delete succeeds, and the
+/// failure only leaves dead bytes that the next prune or restore retries. The
+/// failures are counted and logged once with `tracing::warn!`, with no key
+/// bytes.
+///
+/// A key or value that cannot be read or decoded does fail the hydration. An
+/// unreadable entry may be a live nonce, and loading the tracker without it
+/// would accept a replay of that nonce.
+///
 /// # Errors
 ///
-/// Returns [`UcanDurableStateError`] if a storage call fails or a persisted key
-/// or value cannot be decoded.
+/// Returns [`UcanDurableStateError`] if listing or reading the nonce keys fails
+/// or a persisted key or value cannot be decoded.
 pub async fn hydrate_nonce_tracker<S: Storage, C: Clock>(
     storage: &S,
     context_id: &str,
@@ -452,10 +470,27 @@ pub async fn hydrate_nonce_tracker<S: Storage, C: Clock>(
         entries.entry(nonce.clone()).or_insert(*seen);
     }
     *tracker = NonceTracker::from_snapshot(context_id.to_owned(), clock, entries);
+    let mut failure: Option<PruneFailure> = None;
     for (nonce, (first_seen, token_expiry)) in &persisted {
-        if tracker.is_expired_entry(*first_seen, *token_expiry) {
-            delete_key(storage, &nonce_key(context_id, nonce)?).await?;
+        if !tracker.is_expired_entry(*first_seen, *token_expiry) {
+            continue;
         }
+        let deleted = match nonce_key(context_id, nonce) {
+            Ok(key) => delete_key(storage, &key).await,
+            Err(e) => Err(e),
+        };
+        if let Err(err) = deleted {
+            PruneFailure::count(&mut failure, err);
+        }
+    }
+    if let Some(failure) = failure {
+        tracing::warn!(
+            context_id,
+            failed_keys = failure.failed,
+            error = %failure.first,
+            "UCAN nonce restore could not delete expired nonce keys; they are \
+             retried at the next prune or at restore"
+        );
     }
     Ok(())
 }
@@ -930,6 +965,48 @@ mod tests {
                 .await
                 .unwrap(),
             "the expired key the sweep could not delete stays for the next sweep"
+        );
+    }
+
+    /// A failed delete of an expired nonce key does not fail the restore: the
+    /// hydration returns `Ok`, the expired nonce is not loaded, and its key
+    /// stays in storage for the next sweep.
+    #[tokio::test]
+    async fn restore_delete_failure_does_not_fail_hydration() {
+        let storage = FailingDeleteStorage::default();
+        let start = 1_800_000_000;
+        let clock = Arc::new(TestClock::new(start));
+        let mut live = NonceTracker::new("ctx-restore-fail".to_owned(), Arc::clone(&clock));
+        let old = fresh_nonce(start, 'a');
+        let recorded = record(&mut live, &old, start + 60);
+        persist_recorded_nonce(&storage, "ctx-restore-fail", &live, recorded)
+            .await
+            .unwrap();
+        drop(live);
+
+        clock.set(start + 86_400 + 1_000);
+        let mut rebuilt = NonceTracker::new("ctx-restore-fail".to_owned(), Arc::clone(&clock));
+        let result = hydrate_nonce_tracker(
+            &storage,
+            "ctx-restore-fail",
+            &mut rebuilt,
+            Arc::clone(&clock),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a failed delete of an expired key must not fail hydration, got {result:?}"
+        );
+        assert!(
+            rebuilt.entry(&old).is_none(),
+            "the expired nonce must not be loaded"
+        );
+        assert!(
+            storage
+                .exists(&nonce_key("ctx-restore-fail", &old).unwrap())
+                .await
+                .unwrap(),
+            "the expired key the delete could not remove stays in storage"
         );
     }
 
