@@ -497,7 +497,7 @@ pub enum BlobStorageBackend {
     Combined(super::combined::CombinedNodeStorage),
     /// Size-limited local blob cache wrapping another backend.
     #[cfg(feature = "local-cache")]
-    Cached(Box<super::local_cache::LocalBlobCache<BlobStorageBackend>>),
+    Cached(Box<super::local_cache::LocalBlobCache<Self>>),
 }
 
 impl BlobStorageBackend {
@@ -610,8 +610,8 @@ impl From<super::combined::CombinedNodeStorage> for BlobStorageBackend {
 }
 
 #[cfg(feature = "local-cache")]
-impl From<super::local_cache::LocalBlobCache<BlobStorageBackend>> for BlobStorageBackend {
-    fn from(cache: super::local_cache::LocalBlobCache<BlobStorageBackend>) -> Self {
+impl From<super::local_cache::LocalBlobCache<Self>> for BlobStorageBackend {
+    fn from(cache: super::local_cache::LocalBlobCache<Self>) -> Self {
         Self::Cached(Box::new(cache))
     }
 }
