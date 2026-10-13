@@ -1549,7 +1549,7 @@
       "gate": "gate-push-client",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-protocol/src/context/params.rs",
         "crates/scp-protocol/src/context/governance/mod.rs",

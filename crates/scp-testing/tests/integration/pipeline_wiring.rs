@@ -187,6 +187,11 @@ const ACTOR_MOD_SRC: &str = include_str!("../../../../crates/scp-runtime/src/con
 // the PUSH-013 push routing-ID query (§10.7.1).
 const HANDLERS_PUSH_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/push.rs");
+// Actor queries-handler source — owns the `QueriesCommand::LocalRoutingIds`
+// arm that answers through `queries_helpers::local_routing_ids` (spec 09
+// §9.10.4.1). Pinned by `local_pseudonym_rotation_reaches_its_helpers`.
+const HANDLERS_QUERIES_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/queries.rs");
 
 // UCAN validation pipeline source — owns `validate_ucan`, the 11-step
 // capability authorization gate. The `ucan_step8_enforces_ceiling_over_all_att`
@@ -269,7 +274,10 @@ const FFI_TRUST_STORE_SRC: &str =
 // `verify_attestation_in_context` to the list read and its checker, and one per
 // native bridge pins each `trust_verify_attestation` export to that helper over
 // the instance's own repository.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 59;
+// Raised 59 -> 60 when the local member's pseudonym rotation (spec 09
+// §9.10.4.1) was wired: one assertion pins the rotate command, the routing-ID
+// query, and the actor's rotation and grace arms to their helpers.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 60;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -2002,6 +2010,104 @@ fn modify_pseudonym_rotation_policy_reaches_its_executor() {
             "execute_modify_pseudonym_rotation_policy must contain `{step}`"
         );
     }
+}
+
+/// Spec 09 §9.10.4.1: the local member's pseudonym rotation is reachable on
+/// its production paths. `Supervisor::rotate_pseudonym` dispatches
+/// `MessagingCommand::RotatePseudonym`, the messaging handler calls
+/// `messaging_helpers::rotate_pseudonym`, which commits through the
+/// fail-closed compensating Class-S commit and then announces through
+/// `send_pseudonym_announcement`. `Supervisor::local_routing_ids` dispatches
+/// `QueriesCommand::LocalRoutingIds`, answered by
+/// `queries_helpers::local_routing_ids`. The actor run loop drives the
+/// rotation arm (`on_rotation_tick`, which signals from
+/// `PseudonymRotationState::wake`) and the grace arm (`on_grace_tick`, which
+/// drops the previous routing ID through the restore commit), and
+/// `reconcile_timers` re-arms both from state.
+#[test]
+fn local_pseudonym_rotation_reaches_its_helpers() {
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "rotate_pseudonym",
+            "MessagingCommand::RotatePseudonym"
+        ),
+        "Supervisor::rotate_pseudonym must dispatch MessagingCommand::RotatePseudonym"
+    );
+    let dispatch = extract_fn_body(HANDLERS_MESSAGING_SRC, "dispatch")
+        .expect("the messaging handler dispatch exists");
+    assert!(
+        dispatch.contains("MessagingCommand::RotatePseudonym")
+            && dispatch.contains("handle_rotate_pseudonym("),
+        "the messaging dispatch must route RotatePseudonym to handle_rotate_pseudonym"
+    );
+    assert!(
+        fn_body_contains(
+            HANDLERS_MESSAGING_SRC,
+            "handle_rotate_pseudonym",
+            "messaging_helpers::rotate_pseudonym("
+        ),
+        "handle_rotate_pseudonym must call messaging_helpers::rotate_pseudonym"
+    );
+    let helper = extract_fn_body(MANAGER_SRC, "rotate_pseudonym")
+        .expect("messaging_helpers::rotate_pseudonym exists");
+    for step in [
+        "due_epoch(",
+        "commit_class_s_compensating(",
+        "record_rotation(",
+        "ContextEvent::LocalPseudonymRotated",
+        "send_pseudonym_announcement(",
+    ] {
+        assert!(
+            helper.contains(step),
+            "messaging_helpers::rotate_pseudonym must contain `{step}`"
+        );
+    }
+
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "local_routing_ids",
+            "QueriesCommand::LocalRoutingIds"
+        ),
+        "Supervisor::local_routing_ids must dispatch QueriesCommand::LocalRoutingIds"
+    );
+    let queries = extract_fn_body(HANDLERS_QUERIES_SRC, "dispatch")
+        .expect("the queries handler dispatch exists");
+    assert!(
+        queries.contains("QueriesCommand::LocalRoutingIds")
+            && queries.contains("queries_helpers::local_routing_ids("),
+        "the queries dispatch must answer LocalRoutingIds through \
+         queries_helpers::local_routing_ids"
+    );
+
+    let run = extract_fn_body(ACTOR_MOD_SRC, "run").expect("ContextActor::run exists");
+    assert!(
+        run.contains("self.on_rotation_tick()") && run.contains("self.on_grace_tick()"),
+        "the actor run loop must drive the rotation and grace arms"
+    );
+    assert!(
+        fn_body_contains(
+            ACTOR_MOD_SRC,
+            "reconcile_timers",
+            "reconcile_pseudonym_timers("
+        ),
+        "reconcile_timers must re-arm the pseudonym timers from state"
+    );
+    assert!(
+        fn_body_contains(ACTOR_MOD_SRC, "on_rotation_tick", ".wake("),
+        "on_rotation_tick must signal from PseudonymRotationState::wake"
+    );
+    assert!(
+        fn_body_contains(ACTOR_MOD_SRC, "on_grace_tick", "commit_class_s_restore(")
+            && fn_body_contains(
+                ACTOR_MOD_SRC,
+                "on_grace_tick",
+                "ContextEvent::PseudonymGraceEnded"
+            ),
+        "on_grace_tick must drop the previous routing ID through the restore commit \
+         and emit PseudonymGraceEnded"
+    );
 }
 
 #[test]

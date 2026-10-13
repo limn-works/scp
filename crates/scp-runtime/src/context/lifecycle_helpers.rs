@@ -366,6 +366,14 @@ pub async fn leave_context(
             if let Some(reg) = state.routing.peer_registry_mut() {
                 reg.remove(member_did);
             }
+            // §9.10.4.1: another member's leave triggers a rotation under
+            // `on_membership_change`; the local member's own leave discards its
+            // grace state. Persisted with the removal.
+            crate::context::actor::pseudonym_rotation::note_member_removed(
+                state,
+                deps.crypto.local_did(),
+                member_did.as_ref(),
+            );
 
             // Emit MemberLeft event to receive buffer.
             let left_event = ContextEvent::MemberLeft {
@@ -710,6 +718,9 @@ pub async fn close_context_with_key(
         // The context is terminal at this point, so the routing axis no longer
         // needs to agree with the (also torn-down) crypto axis.
         state.routing = ContextRouting::Broadcast;
+        // §9.10.4.1 "Leave, close and expiry during a grace": a terminal
+        // context drops its previous routing ID and pending rotation work.
+        state.class_s.pseudonym_rotation.discard_grace();
 
         // Participation decay: clear participation cache and cooldown state
         // on context close (#1530).
@@ -1046,10 +1057,21 @@ pub async fn join_context(
 
     // add_member — Class-S. On failure NO MLS rollback is needed (the add itself
     // failed, so no member was added), matching the prior provider disposition.
+    //
+    // The same commit records the §9.10.4.1 membership trigger for the local
+    // member; the rollbacks below restore `rotation_before_add` with the MLS
+    // removal, so an add that does not commit triggers no rotation.
+    let rotation_before_add = cell.class_s.pseudonym_rotation;
     let add_output = match cell
         .commit_class_s_keep(deps, &context_id, |mut v| {
-            v.rest_mut()
-                .add_member(&member_did, kp_bytes, deps.clock.as_ref())
+            let state = v.rest_mut();
+            let output = state.add_member(&member_did, kp_bytes, deps.clock.as_ref())?;
+            crate::context::actor::pseudonym_rotation::note_member_added(
+                state,
+                &local_did,
+                member_did.as_ref(),
+            );
+            Ok(output)
         })
         .await
     {
@@ -1090,6 +1112,9 @@ pub async fn join_context(
             .commit_class_s_keep(deps, &context_id, |mut v| {
                 let s = v.rest_mut();
                 let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
+                // §9.10.4.1: the add did not commit, so neither does its
+                // membership trigger.
+                s.class_s.pseudonym_rotation = rotation_before_add;
                 s.remove_member_sender_key(&member_did)
             })
             .await;
@@ -1132,6 +1157,9 @@ pub async fn join_context(
             .commit_class_s_keep(deps, &context_id, |mut v| {
                 let s = v.rest_mut();
                 let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
+                // §9.10.4.1: the add did not commit, so neither does its
+                // membership trigger.
+                s.class_s.pseudonym_rotation = rotation_before_add;
                 s.remove_member_sender_key(&member_did)
             })
             .await;
@@ -1171,6 +1199,9 @@ pub async fn join_context(
             .commit_class_s_keep(deps, &context_id, |mut v| {
                 let s = v.rest_mut();
                 let _ = s.remove_member(&local_did, &member_did, deps.clock.as_ref());
+                // §9.10.4.1: the add did not commit, so neither does its
+                // membership trigger.
+                s.class_s.pseudonym_rotation = rotation_before_add;
                 s.remove_member_sender_key(&member_did)
             })
             .await;
@@ -1828,6 +1859,13 @@ pub async fn create_context(
             caveat_counters: HashMap::new(),
             // Fix-D streaming reservation recovery records: fresh on create.
             stream_reservations: HashMap::new(),
+            // §9.10.4.1: the creator stamps T0 and follows the schedule from it.
+            pseudonym_rotation:
+                crate::context::actor::pseudonym_rotation::PseudonymRotationState::anchored(
+                    params.pseudonym_rotation.as_ref(),
+                    Some(creation_timestamp_secs),
+                    creation_timestamp_secs,
+                ),
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -2815,6 +2853,15 @@ pub async fn import_context(
             caveat_counters: HashMap::new(),
             // Fix-D streaming reservation recovery records: fresh on create.
             stream_reservations: HashMap::new(),
+            // §9.10.4.1: rotation state is local to the member that rotated; the
+            // importer starts with its own routing ID and follows the schedule
+            // from the import time.
+            pseudonym_rotation:
+                crate::context::actor::pseudonym_rotation::PseudonymRotationState::anchored(
+                    handle.params().pseudonym_rotation.as_ref(),
+                    Some(export.snapshot.creation_timestamp_secs),
+                    deps.clock.now_secs(),
+                ),
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -3491,6 +3538,13 @@ pub async fn restore_context(
             // settle lands on the respawned generation and is dropped). Cross-
             // node public export strips this map (invoker economy is local).
             stream_reservations: ctx_snapshot.stream_reservations,
+            // §9.10.4.1 Class S: same-node restore REHYDRATES the rotation state.
+            // A restore with `announce_pending` set re-publishes the announcement
+            // for the persisted epoch (the actor's rotation arm signals the
+            // driver until the publish succeeds), and a previous routing ID whose
+            // grace ended while the node was down is discarded by the grace arm
+            // on the first actor turn.
+            pseudonym_rotation: ctx_snapshot.pseudonym_rotation,
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,

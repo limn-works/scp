@@ -822,6 +822,41 @@ pub enum ContextEvent {
         /// The 32-byte pseudonym-derived routing ID.
         pseudonym: [u8; 32],
     },
+    /// The local member's pseudonym rotation is due (spec 09 §9.10.4.1
+    /// "Epoch schedule").
+    ///
+    /// The context actor holds no key custody, so it signals and the bridge
+    /// driver derives the routing ID at `pseudonym_epoch` and dispatches the
+    /// rotation. The channel that carries this signal can drop events, so the
+    /// actor repeats it until the member's epoch advances. Carries no routing
+    /// ID.
+    PseudonymRotationDue {
+        /// The epoch the next rotation derives at: the persisted epoch plus
+        /// one, or the schedule index `k` for a member with no v2 epoch yet.
+        pseudonym_epoch: u64,
+    },
+    /// The local member persisted a rotation whose announcement is not yet
+    /// published (spec 09 §9.10.4.1 "Rotation order and crash recovery"):
+    /// the publish failed, or the node stopped before it. The bridge driver
+    /// re-publishes the announcement for `pseudonym_epoch`, which peers that
+    /// already hold it treat as the idempotent same-epoch case. Repeated, like
+    /// [`Self::PseudonymRotationDue`], until the publish succeeds. Carries no
+    /// routing ID.
+    PseudonymAnnouncementPending {
+        /// The persisted epoch whose announcement is pending.
+        pseudonym_epoch: u64,
+    },
+    /// The local member persisted a pseudonym rotation (spec 09 §9.10.4.1
+    /// "Rotation order and crash recovery", step 2). Emitted once per
+    /// committed rotation. Carries no routing ID.
+    LocalPseudonymRotated {
+        /// The epoch the member rotated to.
+        pseudonym_epoch: u64,
+    },
+    /// The local member's rotation grace ended and it discarded its previous
+    /// routing ID (spec 09 §9.10.4.1 "Transition protocol and grace").
+    /// Carries no routing ID.
+    PseudonymGraceEnded,
 }
 
 impl ContextEvent {
@@ -876,6 +911,10 @@ impl ContextEvent {
             Self::EquivocationDetected { .. } => "EquivocationDetected",
             Self::CommitBroadcastFailed { .. } => "CommitBroadcastFailed",
             Self::PseudonymAnnounced { .. } => "PseudonymAnnounced",
+            Self::PseudonymRotationDue { .. } => "PseudonymRotationDue",
+            Self::PseudonymAnnouncementPending { .. } => "PseudonymAnnouncementPending",
+            Self::LocalPseudonymRotated { .. } => "LocalPseudonymRotated",
+            Self::PseudonymGraceEnded => "PseudonymGraceEnded",
         }
     }
 }

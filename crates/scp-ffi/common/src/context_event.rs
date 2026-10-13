@@ -218,6 +218,7 @@ pub fn context_event_wire_string(event: &ContextEvent) -> String {
             format!("system_close:{}", escape_value(initiator_did.as_ref(), false))
         },
         ContextEvent::Expired => context_event_name(event),
+        ContextEvent::PseudonymGraceEnded => context_event_name(event),
         ]
         MessageSent { sender_did: text, sequence_number: num, payload: hex }
         MessageReceived { sender_did: text, payload: hex }
@@ -292,6 +293,9 @@ pub fn context_event_wire_string(event: &ContextEvent) -> String {
         }
         CommitBroadcastFailed { operation: text, reason: text, attempts: num }
         PseudonymAnnounced { member_did: text, pseudonym: hex }
+        PseudonymRotationDue { pseudonym_epoch: num }
+        PseudonymAnnouncementPending { pseudonym_epoch: num }
+        LocalPseudonymRotated { pseudonym_epoch: num }
     }
 }
 
@@ -403,6 +407,19 @@ mod tests {
                  unsupported_features=a|b",
             ),
             (ContextEvent::Expired, "expired"),
+            (
+                ContextEvent::PseudonymRotationDue { pseudonym_epoch: 3 },
+                "pseudonym_rotation_due:pseudonym_epoch=3",
+            ),
+            (
+                ContextEvent::PseudonymAnnouncementPending { pseudonym_epoch: 4 },
+                "pseudonym_announcement_pending:pseudonym_epoch=4",
+            ),
+            (
+                ContextEvent::LocalPseudonymRotated { pseudonym_epoch: 5 },
+                "local_pseudonym_rotated:pseudonym_epoch=5",
+            ),
+            (ContextEvent::PseudonymGraceEnded, "pseudonym_grace_ended"),
         ];
         for (event, expected) in cases {
             assert_eq!(context_event_wire_string(&event), expected);

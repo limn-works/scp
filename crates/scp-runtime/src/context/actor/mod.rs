@@ -42,6 +42,7 @@ pub mod deps;
 pub mod handle;
 pub mod handlers;
 pub mod outcome;
+pub mod pseudonym_rotation;
 pub mod sequence;
 pub mod state;
 
@@ -127,6 +128,39 @@ fn ttl_expiry_retry_backoff(retries: u32) -> Duration {
         .min(TTL_EXPIRY_RETRY_CAP.as_secs());
     Duration::from_secs(secs)
 }
+
+/// BASE interval at which the rotation arm repeats an unanswered
+/// `PseudonymRotationDue` or `PseudonymAnnouncementPending` signal (spec 09
+/// §9.10.4.1). The signal travels on a channel that drops events when no
+/// receiver listens or a receiver lags, so the arm repeats it, doubling the
+/// interval per consecutive repeat up to [`PSEUDONYM_SIGNAL_RETRY_CAP`], until
+/// the rotation state changes. The same backoff spaces grace-end persist
+/// retries.
+const PSEUDONYM_SIGNAL_RETRY_BASE: Duration = Duration::from_secs(30);
+
+/// CAP on the rotation-signal and grace-retry backoff: one repeat every
+/// 15 min while a signal stays unanswered.
+const PSEUDONYM_SIGNAL_RETRY_CAP: Duration = Duration::from_mins(15);
+
+/// Backoff before the n-th (1-based) consecutive repeat of a rotation signal
+/// or grace-end retry: `PSEUDONYM_SIGNAL_RETRY_BASE · 2^(n−1)`, saturating at
+/// [`PSEUDONYM_SIGNAL_RETRY_CAP`].
+fn pseudonym_signal_backoff(repeats: u32) -> Duration {
+    let shift = repeats.saturating_sub(1).min(32);
+    let secs = PSEUDONYM_SIGNAL_RETRY_BASE
+        .as_secs()
+        .saturating_mul(1u64 << shift)
+        .min(PSEUDONYM_SIGNAL_RETRY_CAP.as_secs());
+    Duration::from_secs(secs)
+}
+
+/// The inputs the rotation arm was last armed from: the persisted rotation
+/// state and the context's rotation policy. A change to either re-arms the arm
+/// and resets its backoff.
+type RotationArmKey = (
+    pseudonym_rotation::PseudonymRotationState,
+    Option<scp_protocol::context::params::PseudonymRotationPolicy>,
+);
 
 /// Governance-timeout evaluation cadence (60 s). Re-exported from
 /// [`crate::context::governance::timeout::TIMEOUT_CHECK_INTERVAL_SECS`]
@@ -275,6 +309,29 @@ pub struct ContextActor {
     /// `run()`). Reset to 0 whenever a non-inbox arm fires.
     // read + written by the run-loop's fairness bound
     consecutive_inbox: u32,
+    /// One-shot pseudonym-rotation arm (spec 09 §9.10.4.1). Armed by
+    /// [`Self::reconcile_timers`] while the context is `Active`, uses
+    /// pseudonymous routing, and lists the local member: it fires at once when
+    /// an announcement is pending or a rotation is due, else at the next
+    /// interval boundary. [`Self::on_rotation_tick`] signals and re-arms with
+    /// backoff.
+    rotation_timer: Option<Pin<Box<Sleep>>>,
+    /// The inputs [`Self::rotation_timer`] was armed from; `None` while the
+    /// arm is gated off.
+    rotation_armed_key: Option<RotationArmKey>,
+    /// Consecutive signals the rotation arm sent for the current
+    /// [`Self::rotation_armed_key`]; drives [`pseudonym_signal_backoff`].
+    rotation_signals: u32,
+    /// One-shot grace-end arm (spec 09 §9.10.4.1 "Transition protocol and
+    /// grace"): fires at the previous routing ID's `grace_until_secs`.
+    /// [`Self::on_grace_tick`] clears the previous routing ID fail-closed and
+    /// emits `PseudonymGraceEnded`.
+    grace_timer: Option<Pin<Box<Sleep>>>,
+    /// The `grace_until_secs` [`Self::grace_timer`] was armed for.
+    grace_armed_deadline: Option<u64>,
+    /// Consecutive failed grace-end persists for the current
+    /// [`Self::grace_armed_deadline`]; drives [`pseudonym_signal_backoff`].
+    grace_retries: u32,
 }
 
 impl ContextActor {
@@ -333,17 +390,26 @@ impl ContextActor {
             last_persisted_at: Instant::now(),
             dirty: false,
             consecutive_inbox: 0,
+            rotation_timer: None,
+            rotation_armed_key: None,
+            rotation_signals: 0,
+            grace_timer: None,
+            grace_armed_deadline: None,
+            grace_retries: 0,
         }
     }
 
     /// Dispatch loop. See plan §"ContextActor" — the operational
-    /// four-arm `tokio::select!`:
+    /// `tokio::select!`:
     ///
     /// 1. **Inbox** — `mpsc::Receiver::recv` for [`ContextCommand`]s.
     ///    Shutdown commands dispatch and then break the loop.
     /// 2. **TTL timer** — only when `ttl_timer.is_some()`.
     /// 3. **Governance timeout** — only when `governance_timeout.is_some()`.
-    /// 4. **Persistence coalesce** — only when `dirty == true`.
+    /// 4. **Pseudonym rotation** (Arm 3b) — only when
+    ///    `rotation_timer.is_some()`.
+    /// 5. **Rotation grace end** (Arm 3c) — only when `grace_timer.is_some()`.
+    /// 6. **Persistence coalesce** (Arm 4) — only when `dirty == true`.
     ///
     /// `biased;` ordering keeps shutdown priority and gives deterministic
     /// dispatch under test reproducers.
@@ -431,15 +497,7 @@ impl ContextActor {
                 }
 
                 // --- Arm 2: TTL timer (one-shot) -------------------
-                () = async {
-                    match self.ttl_timer.as_mut() {
-                        // `Pin<Box<Sleep>>` is a one-shot future: awaiting
-                        // the pinned mutable reference resolves once the
-                        // convergent deadline elapses.
-                        Some(sleep) => sleep.as_mut().await,
-                        None => std::future::pending::<()>().await,
-                    }
-                }, if self.ttl_timer.is_some() => {
+                () = one_shot(self.ttl_timer.as_mut()), if self.ttl_timer.is_some() => {
                     self.consecutive_inbox = 0;
                     // Run the best-effort expiry pipeline; break the run loop
                     // when it lands the context in a terminal state so the
@@ -478,12 +536,7 @@ impl ContextActor {
                 // operator-visible signal (M2). Independent of the `is_active`-
                 // gated `ttl_timer` (disarmed once the FSM leaves `Active`), so
                 // `reconcile_timers` cannot clobber this arm.
-                () = async {
-                    match self.ttl_expiry_retry.as_mut() {
-                        Some(sleep) => sleep.as_mut().await,
-                        None => std::future::pending::<()>().await,
-                    }
-                }, if self.ttl_expiry_retry.is_some() => {
+                () = one_shot(self.ttl_expiry_retry.as_mut()), if self.ttl_expiry_retry.is_some() => {
                     self.consecutive_inbox = 0;
                     // Clear the fired retry arm; `on_ttl_tick` re-arms it if the
                     // expiry is still incomplete.
@@ -510,6 +563,18 @@ impl ContextActor {
                     // `on_governance_timeout` nulls it only when the sweep
                     // signals stop (context no longer `Active`).
                     self.on_governance_timeout().await;
+                }
+
+                // --- Arm 3b: pseudonym rotation (one-shot, re-armed) ---
+                () = one_shot(self.rotation_timer.as_mut()), if self.rotation_timer.is_some() => {
+                    self.consecutive_inbox = 0;
+                    self.on_rotation_tick();
+                }
+
+                // --- Arm 3c: rotation grace end (one-shot) ---------
+                () = one_shot(self.grace_timer.as_mut()), if self.grace_timer.is_some() => {
+                    self.consecutive_inbox = 0;
+                    self.on_grace_tick().await;
                 }
 
                 // --- Arm 4: persistence coalesce -------------------
@@ -779,6 +844,182 @@ impl ContextActor {
         } else {
             self.governance_timeout = None;
         }
+
+        self.reconcile_pseudonym_timers(is_active);
+    }
+
+    /// Reconciles the pseudonym rotation and grace-end arms (spec 09
+    /// §9.10.4.1) from owned state; see [`Self::reconcile_timers`].
+    ///
+    /// - **Rotation**: armed only while the context is `Active`, uses
+    ///   pseudonymous routing, and lists the local member, so a member that
+    ///   left, or a closed or expired context, signals nothing. It re-arms,
+    ///   resetting the backoff, only when the persisted rotation state or the
+    ///   policy changes; a committed rotation, a membership trigger, a policy
+    ///   change, or a cleared announcement flag each change it.
+    /// - **Grace**: armed while a previous routing ID is held, re-armed when
+    ///   its `grace_until_secs` changes. Not gated on `Active`: leave, close
+    ///   and expiry discard the previous routing ID, which disarms it.
+    fn reconcile_pseudonym_timers(&mut self, is_active: bool) {
+        let eligible = is_active
+            && self.state.routing.local_pseudonym().is_some()
+            && self.state.membership.contains(self.deps.crypto.local_did());
+        if eligible {
+            let key: RotationArmKey = (
+                self.state.class_s.pseudonym_rotation,
+                self.state.handle.params().pseudonym_rotation,
+            );
+            if self.rotation_armed_key != Some(key) {
+                self.rotation_armed_key = Some(key);
+                self.rotation_signals = 0;
+                let now_secs = self.deps.clock.now_secs();
+                self.rotation_timer = match key.0.wake(key.1.as_ref(), now_secs) {
+                    pseudonym_rotation::RotationWake::AnnouncementPending { .. }
+                    | pseudonym_rotation::RotationWake::RotationDue { .. } => {
+                        Some(Box::pin(tokio::time::sleep(Duration::ZERO)))
+                    }
+                    pseudonym_rotation::RotationWake::SleepUntil { boundary_secs } => {
+                        Some(Box::pin(tokio::time::sleep(Duration::from_secs(
+                            boundary_secs.saturating_sub(now_secs),
+                        ))))
+                    }
+                    pseudonym_rotation::RotationWake::Idle => None,
+                };
+            }
+        } else {
+            self.rotation_timer = None;
+            self.rotation_armed_key = None;
+            self.rotation_signals = 0;
+        }
+
+        let grace_deadline = self
+            .state
+            .class_s
+            .pseudonym_rotation
+            .previous()
+            .map(|p| p.grace_until_secs);
+        if grace_deadline != self.grace_armed_deadline {
+            self.grace_armed_deadline = grace_deadline;
+            self.grace_retries = 0;
+            let now_secs = self.deps.clock.now_secs();
+            self.grace_timer = grace_deadline.map(|deadline| {
+                Box::pin(tokio::time::sleep(Duration::from_secs(
+                    deadline.saturating_sub(now_secs),
+                )))
+            });
+        }
+    }
+
+    /// Drives the pseudonym rotation arm (spec 09 §9.10.4.1). Re-reads the
+    /// rotation state at the wall clock and:
+    ///
+    /// - sends `PseudonymAnnouncementPending` or `PseudonymRotationDue` on the
+    ///   event channel and re-arms after [`pseudonym_signal_backoff`], so the
+    ///   signal repeats until the bridge driver's rotation or re-announcement
+    ///   changes the state (which re-arms through
+    ///   [`Self::reconcile_pseudonym_timers`]);
+    /// - re-arms at the next boundary when nothing is due yet;
+    /// - stays disarmed when nothing is scheduled.
+    ///
+    /// The signals go on the lossy `event_tx` channel only, never into the
+    /// receive buffer, so repeats cannot crowd application events out of it.
+    /// A send with no receiver is not an error here: the repeat delivers the
+    /// signal once a receiver subscribes.
+    fn on_rotation_tick(&mut self) {
+        self.rotation_timer = None;
+        let now_secs = self.deps.clock.now_secs();
+        let policy = self.state.handle.params().pseudonym_rotation;
+        let wake = self
+            .state
+            .class_s
+            .pseudonym_rotation
+            .wake(policy.as_ref(), now_secs);
+        let event = match wake {
+            pseudonym_rotation::RotationWake::AnnouncementPending { pseudonym_epoch } => {
+                scp_protocol::context::membership::ContextEvent::PseudonymAnnouncementPending {
+                    pseudonym_epoch,
+                }
+            }
+            pseudonym_rotation::RotationWake::RotationDue { pseudonym_epoch } => {
+                scp_protocol::context::membership::ContextEvent::PseudonymRotationDue {
+                    pseudonym_epoch,
+                }
+            }
+            pseudonym_rotation::RotationWake::SleepUntil { boundary_secs } => {
+                self.rotation_timer = Some(Box::pin(tokio::time::sleep(Duration::from_secs(
+                    boundary_secs.saturating_sub(now_secs),
+                ))));
+                return;
+            }
+            pseudonym_rotation::RotationWake::Idle => return,
+        };
+        if let Some(tx) = self.deps.event_tx.as_ref()
+            && tx.send((self.context_id.clone(), event)).is_err()
+        {
+            tracing::debug!(
+                context_id = %self.context_id,
+                "pseudonym rotation signal has no receiver; it repeats after the backoff"
+            );
+        }
+        self.rotation_signals = self.rotation_signals.saturating_add(1);
+        self.rotation_timer = Some(Box::pin(tokio::time::sleep(pseudonym_signal_backoff(
+            self.rotation_signals,
+        ))));
+    }
+
+    /// Drives the grace-end arm (spec 09 §9.10.4.1 "Transition protocol and
+    /// grace"): once the wall clock reaches the previous routing ID's
+    /// `grace_until_secs`, clears it with a fail-closed persist and emits
+    /// `PseudonymGraceEnded`. A persist failure keeps the previous routing ID
+    /// and retries after [`pseudonym_signal_backoff`]; the bridge driver keeps
+    /// its subscription until the event arrives. A tick that fires before the
+    /// wall clock reaches the deadline re-arms for the remainder.
+    async fn on_grace_tick(&mut self) {
+        self.grace_timer = None;
+        let Some(previous) = self.state.class_s.pseudonym_rotation.previous() else {
+            return;
+        };
+        let now_secs = self.deps.clock.now_secs();
+        if previous.in_grace(now_secs) {
+            self.grace_timer = Some(Box::pin(tokio::time::sleep(Duration::from_secs(
+                previous.grace_until_secs.saturating_sub(now_secs),
+            ))));
+            return;
+        }
+        let committed = self
+            .state
+            .commit_class_s_restore(&self.deps, &self.context_id, |mut view| {
+                let rotation = &mut view.rest_mut().class_s.pseudonym_rotation;
+                if rotation.previous == Some(previous) {
+                    rotation.previous = None;
+                }
+                Ok(())
+            })
+            .await;
+        match committed {
+            Ok(()) => {
+                self.state.class_c_view().emit_event(
+                    scp_protocol::context::membership::ContextEvent::PseudonymGraceEnded,
+                    &self.context_id,
+                    self.deps.event_tx.as_ref(),
+                );
+                // The buffered event is Class-C state: persist it with the
+                // next coalesced write.
+                self.dirty = true;
+            }
+            Err(err) => {
+                self.grace_retries = self.grace_retries.saturating_add(1);
+                tracing::warn!(
+                    context_id = %self.context_id,
+                    error = %err,
+                    retries = self.grace_retries,
+                    "pseudonym grace end failed to persist; the previous routing ID stays until a retry persists"
+                );
+                self.grace_timer = Some(Box::pin(tokio::time::sleep(pseudonym_signal_backoff(
+                    self.grace_retries,
+                ))));
+            }
+        }
     }
 
     /// Drive the TTL expiry (SEC-1 / ADR-049 §9 amendment): run the
@@ -1018,6 +1259,17 @@ impl ContextActor {
         let deps: &deps::ActorDeps = &self.deps;
         let context_id: &str = &self.context_id;
         crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id).await;
+    }
+}
+
+/// Resolves once `timer` elapses; pending forever when no timer is armed. Each
+/// one-shot arm of the actor's `select!` awaits it, guarded by `is_some()`.
+/// `Pin<Box<Sleep>>` is a one-shot future: awaiting the pinned mutable
+/// reference resolves once the deadline elapses.
+async fn one_shot(timer: Option<&mut Pin<Box<Sleep>>>) {
+    match timer {
+        Some(sleep) => sleep.as_mut().await,
+        None => std::future::pending::<()>().await,
     }
 }
 

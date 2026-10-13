@@ -1231,6 +1231,19 @@ pub struct ContextSnapshot {
     pub stream_reservations:
         HashMap<String, crate::context::outlets::invoke::StreamReservationRecord>,
 
+    /// The local member's pseudonym rotation state (spec 09 §9.10.4.1). The
+    /// serialized projection of
+    /// [`ClassSState::pseudonym_rotation`](crate::context::actor::state::ClassSState::pseudonym_rotation).
+    ///
+    /// **Class S** — the rotation's fail-closed persist writes it before the
+    /// announcement is sent (§9.10.4.1 "Rotation order and crash recovery",
+    /// step 2). Same-node restore REHYDRATES it; a public export STRIPS it to
+    /// the default (it names the member's previous routing ID). A snapshot
+    /// written before this field existed decodes as the default: no rotation
+    /// state.
+    #[serde(default)]
+    pub pseudonym_rotation: crate::context::actor::pseudonym_rotation::PseudonymRotationState,
+
     /// Broadcast context security + roster state (§5.14, §5.14.8).
     ///
     /// **Class S** — the per-author key epochs, block lists, and the subscriber
@@ -1904,7 +1917,11 @@ pub(crate) fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
         | ContextEvent::CommitBroadcastSucceeded { .. }
         | ContextEvent::EquivocationDetected { .. }
         | ContextEvent::CommitBroadcastFailed { .. }
-        | ContextEvent::PseudonymAnnounced { .. } => event.clone(),
+        | ContextEvent::PseudonymAnnounced { .. }
+        | ContextEvent::PseudonymRotationDue { .. }
+        | ContextEvent::PseudonymAnnouncementPending { .. }
+        | ContextEvent::LocalPseudonymRotated { .. }
+        | ContextEvent::PseudonymGraceEnded => event.clone(),
     }
 }
 

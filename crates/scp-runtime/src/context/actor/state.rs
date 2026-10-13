@@ -1110,6 +1110,14 @@ pub struct ClassSState {
     /// exactly like [`Self::caveat_counters`].
     pub(crate) stream_reservations:
         HashMap<String, crate::context::outlets::invoke::StreamReservationRecord>,
+    /// The local member's pseudonym rotation state (spec 09 §9.10.4.1).
+    ///
+    /// **Class S.** A rotation persists it fail-closed before the
+    /// announcement: a coalesce-window loss would let the member announce an
+    /// epoch it then forgets, and a re-announcement at the forgotten epoch is
+    /// one every peer rejects under the receipt-ordering rule. Same-node
+    /// restore rehydrates it; a public export strips it.
+    pub(crate) pseudonym_rotation: super::pseudonym_rotation::PseudonymRotationState,
 }
 
 /// Lossless, `Clone`-able mirror of [`ClassSState`] (ADR-049 §9).
@@ -1160,6 +1168,8 @@ pub struct ClassSStateSnapshot {
     /// is `Clone` + serde, so this snapshots by direct clone (no projection).
     pub(crate) stream_reservations:
         HashMap<String, crate::context::outlets::invoke::StreamReservationRecord>,
+    /// Mirror of [`ClassSState::pseudonym_rotation`] (`Copy`).
+    pub(crate) pseudonym_rotation: super::pseudonym_rotation::PseudonymRotationState,
 }
 
 #[allow(
@@ -1191,6 +1201,7 @@ impl ClassSState {
             xctx_caller_reservations: self.xctx_caller_reservations.clone(),
             caveat_counters: self.caveat_counters.clone(),
             stream_reservations: self.stream_reservations.clone(),
+            pseudonym_rotation: self.pseudonym_rotation,
         }
     }
 
@@ -1213,6 +1224,7 @@ impl ClassSState {
         self.xctx_caller_reservations = snap.xctx_caller_reservations;
         self.caveat_counters = snap.caveat_counters;
         self.stream_reservations = snap.stream_reservations;
+        self.pseudonym_rotation = snap.pseudonym_rotation;
     }
 }
 
@@ -1701,6 +1713,12 @@ impl PerContextState {
                 xctx_caller_reservations: std::collections::HashMap::new(),
                 caveat_counters: HashMap::new(),
                 stream_reservations: HashMap::new(),
+                pseudonym_rotation:
+                    crate::context::actor::pseudonym_rotation::PseudonymRotationState::anchored(
+                        None,
+                        Some(created_at),
+                        created_at,
+                    ),
             },
             pending_broadcast_publishes: HashMap::new(),
             welcome_scratchpad: None,
@@ -3241,9 +3259,16 @@ impl PerContextState {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::context::actor::pseudonym_rotation::PseudonymRotationState;
 
     fn test_admin() -> DID {
         DID("did:example:admin".to_owned())
+    }
+
+    /// The rotation state a context created at `t0` starts with: no policy,
+    /// the schedule anchored at the creator's T0.
+    fn rotation_anchored_at(t0: u64) -> PseudonymRotationState {
+        PseudonymRotationState::anchored(None, Some(t0), t0)
     }
 
     /// §9.10.4: `ContextRouting::for_mode` makes "encrypted context with no
@@ -3609,6 +3634,7 @@ mod tests {
             xctx_caller_reservations,
             caveat_counters,
             stream_reservations,
+            pseudonym_rotation,
         } = class_s;
 
         // Identity + lifetime.
@@ -3684,6 +3710,7 @@ mod tests {
         assert!(caveat_counters.is_empty());
         // No in-flight streaming reservation recovery records on a fresh context.
         assert!(stream_reservations.is_empty());
+        assert_eq!(pseudonym_rotation, rotation_anchored_at(12));
         assert!(pending_broadcast_publishes.is_empty());
         assert!(welcome_scratchpad.is_none());
         assert_eq!(lifecycle_state, ContextLifecycleState::Open);
@@ -3742,6 +3769,7 @@ mod tests {
                     xctx_caller_reservations: _,
                     caveat_counters: _,
                     stream_reservations: _,
+                    pseudonym_rotation: _,
                 },
             pending_broadcast_publishes: _,
             welcome_scratchpad: _,
