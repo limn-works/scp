@@ -1340,6 +1340,8 @@ mod tests {
                 "wss://relay-b.example/scp/v1".to_owned(),
                 "wss://relay-a.example/scp/v1".to_owned(),
             ],
+            pseudonym_rotation:
+                crate::context::actor::pseudonym_rotation::PseudonymRotationState::default(),
             saga_pending: std::collections::HashMap::new(),
             xctx_committed_outputs: std::collections::HashMap::new(),
             xctx_committed_stream_outputs: std::collections::HashMap::new(),

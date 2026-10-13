@@ -301,19 +301,46 @@ pub enum MessagingCommand {
     /// Send the local member's pseudonym announcement (§9.10.4) to the
     /// other members of a context.
     ///
-    /// Mirrors the legacy
-    /// `messaging_helpers::send_pseudonym_announcement`
-    /// signature exactly: the handler delegates to that method which
-    /// in turn wraps the announcement payload and routes it through
-    /// `send_message`. Best-effort — the legacy method returns no
-    /// error and silently swallows transport / serialization failures
-    /// (only logs them); this dispatch surface preserves the same
-    /// contract by replying `Ok(())` regardless of inner errors.
+    /// The handler delegates to
+    /// `messaging_helpers::send_pseudonym_announcement`, which sends the v2
+    /// form for a member with a rotation epoch and the v1 form otherwise
+    /// (spec 09 §9.10.4.1), routes it through `send_message`, and clears a
+    /// pending rotation announcement on success. This is also the re-publish
+    /// path for a rotation whose announcement failed or was interrupted.
     SendPseudonymAnnouncement {
         /// Boxed owned payload — see [`SendPseudonymAnnouncementPayload`].
         payload: Box<SendPseudonymAnnouncementPayload>,
-        /// Oneshot reply channel. Always replies `Ok(())` (matches the
-        /// legacy method's no-error contract).
+        /// Oneshot reply channel: `Ok(())` once the announcement is sent and
+        /// any pending flag cleared, else the typed error of
+        /// `send_pseudonym_announcement`.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Rotate the local member's pseudonym (spec 09 §9.10.4.1 "Rotation
+    /// order and crash recovery").
+    ///
+    /// The bridge driver derives `new_routing_id` with
+    /// `KeyCustody::derive_rotatable_pseudonym` at `new_epoch` and subscribes
+    /// to it before dispatching; the handler delegates to
+    /// `messaging_helpers::rotate_pseudonym`, which persists the rotation
+    /// fail-closed, emits `ContextEvent::LocalPseudonymRotated`, and sends the
+    /// announcement. The signing key is per-call because the actor holds no
+    /// signing key.
+    RotatePseudonym {
+        /// Context identifier.
+        context_id: String,
+        /// The epoch the new routing ID was derived at; must equal the
+        /// epoch `LocalRoutingIds::next_pseudonym_epoch` names.
+        new_epoch: u64,
+        /// The routing ID derived at `new_epoch`.
+        new_routing_id: [u8; 32],
+        /// The local member's DID, which signs the announcement.
+        sender_did: scp_did::DID,
+        /// The member's Ed25519 signing key. Wrapped in [`SigningKeyBytes`]
+        /// so the private key zeroes on drop.
+        signing_key: SigningKeyBytes,
+        /// Oneshot reply channel: `Ok(())` once the rotation is persisted and
+        /// announced, else the typed error of `rotate_pseudonym`.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
@@ -2784,6 +2811,19 @@ pub enum QueriesCommand {
         context_id: String,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<[u8; 32], ContextError>>,
+    },
+    /// The local member's routing IDs and rotation state (spec 09
+    /// §9.10.4.1): the current routing ID, the previous one while its grace
+    /// runs, the epoch, the epoch the next rotation must carry, and whether
+    /// an announcement is pending. Read-only. `Err(NotPseudonymousContext)`
+    /// for a broadcast context.
+    LocalRoutingIds {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<
+            Result<crate::context::actor::pseudonym_rotation::LocalRoutingIds, ContextError>,
+        >,
     },
     /// Broadcast key + epoch for a locally-controlled author in a
     /// broadcast context. Read-only.

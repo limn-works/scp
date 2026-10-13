@@ -4791,6 +4791,7 @@ impl Supervisor {
             // through `lookup_miss_error` so a poisoned / silently-dead
             // context surfaces the dedicated poison error (ADR-049 §10).
             QueriesCommand::LocalPseudonym { ref context_id, .. }
+            | QueriesCommand::LocalRoutingIds { ref context_id, .. }
             | QueriesCommand::GetBroadcastKeyForLocalAuthor { ref context_id, .. } => {
                 let err = self
                     .lookup_miss_error(context_id, format!("context not registered: {context_id}"));
@@ -12561,6 +12562,48 @@ impl Supervisor {
         })?
     }
 
+    /// Rotates the local member's pseudonym in `context_id` to
+    /// `new_routing_id` at `new_epoch` (spec 09 §9.10.4.1). Routes through
+    /// the actor mailbox via [`Self::dispatch_command`].
+    ///
+    /// The caller (the bridge rotation driver) derives `new_routing_id` with
+    /// `KeyCustody::derive_rotatable_pseudonym` at the epoch
+    /// [`Self::local_routing_ids`] reports as `next_pseudonym_epoch`, and
+    /// subscribes to it first. The actor persists the rotation fail-closed,
+    /// emits `ContextEvent::LocalPseudonymRotated`, and announces.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the typed [`ContextError`] of
+    /// [`messaging_helpers::rotate_pseudonym`](crate::context::messaging_helpers::rotate_pseudonym);
+    /// [`ContextError::TransportFailed`] if the reply channel is dropped.
+    pub async fn rotate_pseudonym(
+        &self,
+        context_id: &str,
+        sender_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+        new_epoch: u64,
+        new_routing_id: [u8; 32],
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::RotatePseudonym {
+            context_id: context_id.to_owned(),
+            new_epoch,
+            new_routing_id,
+            sender_did: sender_did.clone(),
+            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
+                signing_key,
+            ),
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::rotate_pseudonym — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Compares a remote consistency checkpoint against local event-log
     /// state for equivocation detection (§9.9.3). Routes through the actor
     /// mailbox via [`Self::dispatch_command`].
@@ -16052,6 +16095,15 @@ impl Supervisor {
                 caveat_counters: HashMap::new(),
                 // Fix-D streaming reservation recovery: a fresh joiner carries none.
                 stream_reservations: HashMap::new(),
+                // §9.10.4.1 "First v2 derivation": a joiner follows the schedule
+                // from its join time, and under a policy its first rotation, to
+                // v2 at the schedule index, is due at once.
+                pseudonym_rotation:
+                    crate::context::actor::pseudonym_rotation::PseudonymRotationState::joined(
+                        params.pseudonym_rotation.as_ref(),
+                        creation_timestamp_secs,
+                        deps.clock.now_secs(),
+                    ),
             },
             pending_broadcast_publishes: HashMap::new(),
             // Transient join-handshake state; the fused join already consumed
@@ -17048,6 +17100,33 @@ impl Supervisor {
             }
         }
         Ok(by_relay)
+    /// Returns the local member's routing IDs and rotation state (spec 09
+    /// §9.10.4.1) for `context_id`: the current routing ID, the previous one
+    /// while its grace runs, the epoch, the epoch the next rotation must
+    /// carry, and whether an announcement is pending. Routes through the
+    /// actor mailbox via [`Self::dispatch_query`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotPseudonymousContext`] for a broadcast context.
+    /// - [`ContextError::ContextNotRegistered`] (or the poison error) for an
+    ///   unknown context.
+    /// - [`ContextError::TransportFailed`] if the reply channel is dropped.
+    pub async fn local_routing_ids(
+        &self,
+        context_id: &str,
+    ) -> Result<crate::context::actor::pseudonym_rotation::LocalRoutingIds, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::LocalRoutingIds {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_query(cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::local_routing_ids — actor reply channel closed".to_owned(),
+            )
+        })?
     }
 
     /// Returns every commit currently in the per-context retry queue.
@@ -17388,6 +17467,7 @@ impl Supervisor {
         match cmd {
             QueriesCommand::ReadContextState { context_id, .. }
             | QueriesCommand::LocalPseudonym { context_id, .. }
+            | QueriesCommand::LocalRoutingIds { context_id, .. }
             | QueriesCommand::GetBroadcastKeyForLocalAuthor { context_id, .. }
             | QueriesCommand::MemberCount { context_id, .. }
             | QueriesCommand::IsMember { context_id, .. }
@@ -17738,6 +17818,7 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
         // `reply_with_error` instead. Left unreachable so a future
         // dispatch-classification change trips a compile-time match.
         QueriesCommand::LocalPseudonym { .. }
+        | QueriesCommand::LocalRoutingIds { .. }
         | QueriesCommand::GetBroadcastKeyForLocalAuthor { .. } => {
             debug_assert!(false, "hard-error variant routed through soft-default path");
         }
@@ -17833,6 +17914,9 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
 fn reply_with_error(cmd: QueriesCommand, err: ContextError) {
     match cmd {
         QueriesCommand::LocalPseudonym { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        QueriesCommand::LocalRoutingIds { reply, .. } => {
             let _ = reply.send(Err(err));
         }
         QueriesCommand::GetBroadcastKeyForLocalAuthor { reply, .. } => {
@@ -22234,6 +22318,8 @@ mod tests {
             generation: 0,
             routing: crate::context::actor::state::ContextRouting::Broadcast,
             relay_urls: Vec::new(),
+            pseudonym_rotation:
+                crate::context::actor::pseudonym_rotation::PseudonymRotationState::default(),
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_stream_outputs: HashMap::new(),

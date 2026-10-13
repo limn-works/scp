@@ -836,6 +836,11 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // public export (like the budget tracker and the caveat counters). A
         // foreign node must never drive a local escrow refund / counter release.
         stream_reservations: HashMap::new(),
+        // §9.10.4.1: rotation state names the member's previous routing ID and
+        // is local to the member that rotated — ALWAYS stripped from the public
+        // export, like the routing axis above.
+        pseudonym_rotation:
+            crate::context::actor::pseudonym_rotation::PseudonymRotationState::default(),
         // Broadcast per-author keys and block lists are sensitive access-control
         // state; a public-scope export is for pre-join observers, so it is
         // redacted here (mirrors the empty `read_exclusion_list` / `membership`).
@@ -1088,6 +1093,8 @@ mod tests {
             generation: 0,
             routing: crate::context::actor::state::ContextRouting::Broadcast,
             relay_urls: Vec::new(),
+            pseudonym_rotation:
+                crate::context::actor::pseudonym_rotation::PseudonymRotationState::default(),
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_stream_outputs: HashMap::new(),

@@ -308,6 +308,9 @@ pub async fn tombstone_migrated_context(
             migration_proposal_id: migration_pid,
         };
         emit(state, tombstone_event, context_id, deps);
+        // §9.10.4.1 "Leave, close and expiry during a grace": a terminal
+        // context drops its previous routing ID and pending rotation work.
+        state.class_s.pseudonym_rotation.discard_grace();
 
         // TTL + governance timers are actor-owned arms (ADR-049 finding A3);
         // the tombstone leaves the context non-Active so `reconcile_timers`
@@ -1337,9 +1340,17 @@ pub async fn execute_add_member(
     // matching the prior provider disposition; the error propagates unchanged.
     let add_output = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
-            v.rest_mut()
+            let state = v.rest_mut();
+            let output = state
                 .add_member(did.as_ref(), key_package, deps.clock.as_ref())
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            // §9.10.4.1 membership trigger, persisted with the add.
+            crate::context::actor::pseudonym_rotation::note_member_added(
+                state,
+                deps.crypto.local_did(),
+                did.as_ref(),
+            );
+            Ok(output)
         })
         .await?;
 
@@ -1649,6 +1660,12 @@ pub async fn execute_remove_member(
             if let Some(reg) = state.routing.peer_registry_mut() {
                 reg.remove(did);
             }
+            // §9.10.4.1 membership trigger, persisted with the removal.
+            crate::context::actor::pseudonym_rotation::note_member_removed(
+                state,
+                deps.crypto.local_did(),
+                did.as_ref(),
+            );
 
             emit(
                 state,
@@ -2140,6 +2157,9 @@ pub async fn execute_close_context(
         state.ttl.timer.deadline_unix_secs = None;
         state.broadcast_context = None;
         state.governance.decay_participation();
+        // §9.10.4.1 "Leave, close and expiry during a grace": a terminal
+        // context drops its previous routing ID and pending rotation work.
+        state.class_s.pseudonym_rotation.discard_grace();
         Ok(())
     })
     .await?;
@@ -3867,8 +3887,20 @@ pub async fn execute_modify_pseudonym_rotation_policy(
     // like `execute_promote_context`: a best-effort persist that failed would
     // let a respawn resume the superseded policy after members were told the
     // change applied.
+    //
+    // The same commit re-anchors the local member's epoch schedule at the
+    // moment the policy applies (spec 09 §9.10.4.1 "First v2 derivation"):
+    // interval boundaries that passed before the change trigger nothing, and a
+    // pending membership trigger survives only under `on_membership_change`.
+    let now_secs = deps.clock.now_secs();
     cell.commit_class_s_keep(deps, context_id, |mut view| {
-        view.rest_mut().handle.set_pseudonym_rotation(new_policy);
+        let t0_secs = view.creation_timestamp_secs;
+        let state = view.rest_mut();
+        state.handle.set_pseudonym_rotation(new_policy);
+        state
+            .class_s
+            .pseudonym_rotation
+            .anchor_schedule(new_policy.as_ref(), t0_secs, now_secs);
         Ok(())
     })
     .await?;

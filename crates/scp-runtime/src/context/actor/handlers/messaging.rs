@@ -189,6 +189,28 @@ pub(crate) async fn dispatch(
             signing_key,
             reply,
         } => handle_send_heartbeat(cell, deps, &context_id, &sender_did, &signing_key, reply).await,
+        MessagingCommand::RotatePseudonym {
+            context_id,
+            new_epoch,
+            new_routing_id,
+            sender_did,
+            signing_key,
+            reply,
+        } => {
+            handle_rotate_pseudonym(
+                cell,
+                deps,
+                &context_id,
+                RotateRequest {
+                    new_epoch,
+                    new_routing_id,
+                    sender_did: &sender_did,
+                    signing_key: &signing_key,
+                },
+                reply,
+            )
+            .await
+        }
         #[cfg(feature = "testing")]
         MessagingCommand::HandleSenderKeyRequest {
             context_id,
@@ -977,8 +999,14 @@ async fn handle_send_pseudonym_announcement(
         cell, deps, &handle, sender_did, &sk,
     );
 
+    // The announcement seals an MLS message (send-ratchet advance) and may
+    // clear `announce_pending`, so every arm reports `mutated`.
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {
-        Ok(()) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(err)) => {
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "send_pseudonym_announcement exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
@@ -988,6 +1016,56 @@ async fn handle_send_pseudonym_announcement(
         }
     };
 
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// The rotation a [`MessagingCommand::RotatePseudonym`] carries, bundled so
+/// [`handle_rotate_pseudonym`] stays under the argument-count lint.
+struct RotateRequest<'a> {
+    new_epoch: u64,
+    new_routing_id: [u8; 32],
+    sender_did: &'a scp_did::DID,
+    signing_key: &'a crate::context::actor::commands::SigningKeyBytes,
+}
+
+/// Handle [`MessagingCommand::RotatePseudonym`] (actor-shape).
+///
+/// Delegates to
+/// [`rotate_pseudonym`](crate::context::messaging_helpers::rotate_pseudonym)
+/// under [`HANDLER_TIMEOUT`] and replies with its result. The rotation may
+/// have committed before an announcement error or a timeout, so every error
+/// arm reports `mutated`.
+async fn handle_rotate_pseudonym(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    request: RotateRequest<'_>,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let sk = request.signing_key.to_signing_key();
+    let rotate_fut = crate::context::messaging_helpers::rotate_pseudonym(
+        cell,
+        deps,
+        request.sender_did,
+        &sk,
+        request.new_epoch,
+        request.new_routing_id,
+    );
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, rotate_fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(err)) => {
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "rotate_pseudonym exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
     let _ = reply.send(reply_result);
     outcome
 }

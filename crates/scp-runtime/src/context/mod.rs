@@ -502,3 +502,7 @@ mod tests {
 // items sit together at the tail of the module.
 #[cfg(test)]
 mod agent_binding_pipeline_tests;
+
+// Runtime pseudonym-rotation tests (spec 09 §9.10.4.1), also `#![cfg(test)]`.
+#[cfg(test)]
+mod pseudonym_rotation_runtime_tests;

@@ -130,6 +130,36 @@ pub fn local_pseudonym(state: &PerContextState) -> Result<[u8; 32], ContextError
         })
 }
 
+/// Returns the local member's routing IDs and rotation state (spec 09
+/// §9.10.4.1) at wall-clock second `now_secs`.
+///
+/// `previous` is reported only while its grace runs at `now_secs`.
+/// `next_pseudonym_epoch` is the epoch a rotation must carry now, or `None`
+/// when no rotation is admissible.
+///
+/// # Errors
+///
+/// [`ContextError::NotPseudonymousContext`] for a broadcast context.
+pub fn local_routing_ids(
+    state: &PerContextState,
+    now_secs: u64,
+) -> Result<crate::context::actor::pseudonym_rotation::LocalRoutingIds, ContextError> {
+    let current = local_pseudonym(state)?;
+    let rotation = &state.class_s.pseudonym_rotation;
+    let policy = state.handle.params().pseudonym_rotation;
+    Ok(crate::context::actor::pseudonym_rotation::LocalRoutingIds {
+        current,
+        previous: rotation.previous().filter(|p| p.in_grace(now_secs)),
+        pseudonym_epoch: rotation.epoch(),
+        next_pseudonym_epoch: rotation.next_epoch(
+            policy.as_ref(),
+            state.creation_timestamp_secs,
+            now_secs,
+        ),
+        announce_pending: rotation.announce_pending(),
+    })
+}
+
 /// Returns the broadcast key and epoch for an author in a broadcast
 /// context.
 ///
