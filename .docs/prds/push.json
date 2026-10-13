@@ -68,7 +68,7 @@
       "gate": "gate-push-spec",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/specs/10-infrastructure-and-self-hosting.md",
         ".docs/adrs/phase-5.md",
@@ -149,7 +149,7 @@
       "gate": "gate-push-spec",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/specs/22-human-readable-addressing.md",
         ".docs/specs/09-security-model.md",
@@ -246,7 +246,7 @@
       "gate": "gate-push-spec",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/specs/10-infrastructure-and-self-hosting.md",
         ".docs/specs/22-human-readable-addressing.md"
@@ -310,7 +310,7 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-protocol/src/discovery/push.rs",
         "crates/scp-runtime/tests/test_vectors.rs",
@@ -370,7 +370,7 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-identity/src/push_verify.rs",
         "crates/scp-identity/src/lib.rs",
@@ -435,7 +435,7 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/relay/push_store.rs",
         "crates/scp-transport/src/relay/mod.rs"
@@ -656,7 +656,7 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-transport/src/relay/push_apns.rs",
         "crates/scp-transport/Cargo.toml"
@@ -703,7 +703,7 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-transport/src/relay/push_fcm.rs",
         "crates/scp-transport/Cargo.toml"
@@ -1153,7 +1153,7 @@
       "gate": "gate-push-client",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/common/src/error_codes.rs",
         "crates/scp-ffi/common/src/custody_parse.rs",
