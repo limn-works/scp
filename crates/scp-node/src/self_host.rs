@@ -539,8 +539,17 @@ impl SelfHostDeployer {
                 ],
                 ..Default::default()
             };
+            // The node's own relay hosts the site's context (§5.12.3.1): the
+            // public URL it publishes in its DID document, not the loopback
+            // address the in-process supervisor dials.
             supervisor
-                .create_context(context_id.clone(), context_params, author_did.clone(), None)
+                .create_context(
+                    context_id.clone(),
+                    context_params,
+                    author_did.clone(),
+                    None,
+                    vec![node.relay_url()],
+                )
                 .await
                 .map_err(|e| SelfHostError::CreateContext(e.to_string()))?;
 

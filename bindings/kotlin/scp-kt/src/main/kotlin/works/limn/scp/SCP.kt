@@ -826,7 +826,9 @@ class SCP internal constructor(
      * @param inviteeDid The DID being invited.
      * @param inviteeKeyPackage The invitee's TLS-serialized MLS `KeyPackage`
      *   (its [ReservedKeyPackage.keyPackagePublic] from [reserveKeyPackage]).
-     * @param relayUrls Relay URLs to include for the invitee's first contact.
+     *
+     * The bundle carries the context's stored relay set (§5.12.3.1
+     * `relay_urls`), which the runtime reads; the caller supplies none.
      *
      * Forwards to [NativeScp.inviteMember] on [inner].
      */
@@ -835,14 +837,12 @@ class SCP internal constructor(
         contextId: String,
         inviteeDid: String,
         inviteeKeyPackage: ByteArray,
-        relayUrls: List<String>,
     ): InviteMemberOutcome =
         inner.inviteMember(
             identity = identity,
             contextId = contextId,
             inviteeDid = inviteeDid,
             inviteeKeyPackage = inviteeKeyPackage,
-            relayUrls = relayUrls,
         )
 
     /** Forwards to [NativeScp.contextSubscribe] on [inner]. */

@@ -140,7 +140,7 @@ async fn connect_transport(relay_addr: SocketAddr) -> Arc<TransportManager> {
     let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
         .await
         .expect("relay adapter connect");
-    Arc::new(TransportManager::new(Box::new(adapter)))
+    Arc::new(TransportManager::new(sourced.url, Box::new(adapter)))
 }
 
 /// End-to-end relay-backed driver run plus all-three-tier classification.

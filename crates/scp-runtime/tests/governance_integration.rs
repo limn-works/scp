@@ -213,7 +213,7 @@ async fn ac1_create_single_admin_context() {
         ..ContextParams::default()
     };
     let handle = manager
-        .create_context("ctx-single-admin".into(), params, alice(), None)
+        .create_context("ctx-single-admin".into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
     assert_eq!(handle.state(), ContextState::Active);
@@ -231,7 +231,7 @@ async fn ac1_create_threshold_context() {
         ..ContextParams::default()
     };
     let handle = manager
-        .create_context("ctx-threshold".into(), params, alice(), None)
+        .create_context("ctx-threshold".into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
     assert_eq!(handle.state(), ContextState::Active);
@@ -248,7 +248,7 @@ async fn ac1_create_majority_context() {
         ..ContextParams::default()
     };
     let handle = manager
-        .create_context("ctx-majority".into(), params, alice(), None)
+        .create_context("ctx-majority".into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
     assert_eq!(handle.state(), ContextState::Active);
@@ -265,7 +265,7 @@ async fn ac1_create_unanimity_context() {
         ..ContextParams::default()
     };
     let handle = manager
-        .create_context("ctx-unanimity".into(), params, alice(), None)
+        .create_context("ctx-unanimity".into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
     assert_eq!(handle.state(), ContextState::Active);
@@ -285,7 +285,7 @@ async fn ac2_single_admin_auto_approve_and_execute() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -332,7 +332,7 @@ async fn ac2_single_admin_checked_returns_execution_result() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -375,7 +375,7 @@ async fn ac3_threshold_propose_approve_execute() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -439,7 +439,7 @@ async fn ac4_majority_propose_approve_execute() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -513,7 +513,7 @@ async fn governance_action_executed_leaf_stamps_executor_not_proposer() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -599,7 +599,7 @@ async fn governance_quorum_voter_without_action_capability_mints_one_leaf() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -677,7 +677,7 @@ async fn governance_out_of_ceiling_action_rejected_native() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -739,7 +739,7 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -806,7 +806,7 @@ async fn governance_out_of_ceiling_establish_outlet_interface_rejected_native() 
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -862,7 +862,7 @@ async fn ac5_unanimity_all_approve_execute() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -911,7 +911,7 @@ async fn ac6_rejected_proposal_not_executed_unanimity() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -967,7 +967,7 @@ async fn ac6_rejected_threshold_proposal() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1152,7 +1152,7 @@ async fn ac8_vote_withdrawn_event_via_manager() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1193,7 +1193,7 @@ async fn ac9_non_admin_cannot_propose_in_single_admin() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1228,7 +1228,7 @@ async fn ac9_checked_propose_requires_capability() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1264,7 +1264,7 @@ async fn ac10_remove_member_action() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1316,7 +1316,7 @@ async fn ctx_with_alice_admin_bob_member(ctx_id: &str) -> std::sync::Arc<Supervi
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1539,7 +1539,7 @@ async fn leave_context_clears_suspension() {
         ..ContextParams::default()
     };
     let handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1602,7 +1602,7 @@ async fn ac10_change_role_action() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1632,7 +1632,7 @@ async fn ac10_close_context_action() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1664,7 +1664,7 @@ async fn ac10_add_signer_action() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1727,7 +1727,7 @@ async fn ac10_extend_ttl_action() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1757,7 +1757,7 @@ async fn ac10_revoke_write_access_action() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1802,7 +1802,7 @@ async fn ac10_restore_write_access_action() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1868,7 +1868,7 @@ async fn ac11_extend_ttl_requires_unanimity_in_threshold() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -1932,7 +1932,7 @@ async fn ac12_promote_context_requires_unanimity_in_majority() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -2434,7 +2434,7 @@ async fn list_proposals_returns_all_proposals() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -2490,7 +2490,7 @@ async fn full_threshold_lifecycle_add_signer_then_change_role() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -2701,7 +2701,7 @@ async fn multi_party_threshold_propose_approve_verify() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -2823,7 +2823,7 @@ async fn direct_execute_rejects_untracked_proposal_id() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -2852,7 +2852,7 @@ async fn direct_execute_forgery_applies_no_state_change() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -2894,7 +2894,7 @@ async fn direct_execute_of_genuine_proposal_runs_once_then_replay_rejected() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -2973,7 +2973,7 @@ async fn governance_deadlock_recovery_appends_both_event_leaves() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -3089,7 +3089,7 @@ async fn reconfigure_governance_bumps_checkpoint_counter_by_exactly_two() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -3193,7 +3193,7 @@ async fn rotate_content_keys_broadcast_kea_governance_integration() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -3265,7 +3265,7 @@ async fn rotate_content_keys_counter_multi_author() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -3373,7 +3373,7 @@ async fn governance_ban_subscriber_bumps_counter_per_kea() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -3504,7 +3504,7 @@ async fn block_broadcast_subscriber_counter() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -3622,7 +3622,7 @@ async fn unsubscribe_broadcast_counter_with_kea() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -3819,7 +3819,7 @@ async fn two_author_broadcast_with_subscriber(manager: &Arc<Supervisor>, ctx_id:
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
     manager.seed_broadcast_author(ctx_id, bob()).await.unwrap();

@@ -3,7 +3,7 @@ import XCTest
 
 /// Tests for the ADR-049 Phase 2J / FFI-02 Option A membership handshake ops:
 /// `SCP.reserveKeyPackage(identity:)`,
-/// `SCP.inviteMember(identity:contextId:inviteeDid:inviteeKeyPackage:relayUrls:)`,
+/// `SCP.inviteMember(identity:contextId:inviteeDid:inviteeKeyPackage:)`,
 /// and `Context.joinFromWelcome(scp:identity:sealed:reservationId:)`.
 ///
 /// The suite links the Rust binary built with `testing`, so
@@ -191,8 +191,7 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
                 identity: creator,
                 contextId: ctx.contextId,
                 inviteeDid: invitee.did(),
-                inviteeKeyPackage: reservation.keyPackagePublic,
-                relayUrls: []
+                inviteeKeyPackage: reservation.keyPackagePublic
             )
             // If a future UniFFI identity_create begins publishing the DID doc,
             // the seal will succeed — accept the SUCCESS outcome too rather than
@@ -236,8 +235,7 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
                 identity: loaded,
                 contextId: self.makeContextId(),
                 inviteeDid: invitee.did(),
-                inviteeKeyPackage: reservation.keyPackagePublic,
-                relayUrls: []
+                inviteeKeyPackage: reservation.keyPackagePublic
             )
         }
     }

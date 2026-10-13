@@ -36,6 +36,7 @@
         "PUSH-015",
         "PUSH-016",
         "PUSH-019",
+        "PUSH-025",
         "PUSH-026",
         "PUSH-028",
         "PUSH-029"
@@ -1480,6 +1481,61 @@
       "tools": [
         "browser"
       ]
+    },
+    {
+      "id": "PUSH-025",
+      "title": "The runtime persists each context's relay set",
+      "gate": "gate-push-client",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/actor/state.rs",
+        "crates/scp-runtime/src/context/state.rs",
+        "crates/scp-runtime/src/context/lifecycle_helpers.rs",
+        "crates/scp-runtime/src/context/actor/commands.rs",
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-runtime/src/context/export_import.rs",
+        "crates/scp-runtime/src/context/manager_methods.rs",
+        "crates/scp-runtime/src/context/messaging_helpers.rs",
+        "crates/scp-runtime/src/context/governance_helpers.rs",
+        "crates/scp-ffi/src/context.rs",
+        "crates/scp-ffi/napi/src/runtime.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs"
+      ],
+      "description": "Each context's actor state holds the relay endpoints that host the context, the set the \u00a75.12.3.1 `InvitationBundle` carries as `relay_urls`. The creator sets it at create, a joiner takes the bundle's `relay_urls` at join, and import and restore install the set the snapshot stored. PUSH-013 groups routing IDs by this set.",
+      "acceptanceCriteria": [
+        "`PerContextState` holds `relay_urls`, and `ContextSnapshot` persists it with no serde default.",
+        "`Supervisor::create_context` takes the creator's relay set, and the created context holds it.",
+        "A Welcome joiner's context holds the `relay_urls` of the `InvitationBundle` it joined through.",
+        "A snapshot of a context round-trips its relay set, and import and restore install the stored set.",
+        "Every FFI bridge's create passes the bridge's connected relay set; no production caller passes an empty set when a relay set exists."
+      ],
+      "actionItems": [
+        "Add the field to `PerContextState` and `ContextSnapshot`, and set it on the create, join, import and restore paths.",
+        "Pass the relay set through every create caller in the runtime, the FFI bridges and the node.",
+        "Test create, join, the snapshot round trip and restore."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "#### 5.12.3.1 InvitationBundle Wire Format"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "existing create, join, import and restore paths",
+          "pw": "no new operation",
+          "ffi": "create passes the relay set",
+          "sdk": "no API change",
+          "matrix": "no new row"
+        }
+      }
     },
     {
       "id": "PUSH-026",

@@ -75,14 +75,13 @@ async def main() -> None:
         #    bytes out of band.
         reservation_id, key_package = await bob_node.reserve_key_package(bob.did)
 
-        # 4. Alice seals an invitation to that KeyPackage. An empty relay list
-        #    means Alice delivers the sealed bundle to Bob herself.
+        # 4. Alice seals an invitation to that KeyPackage. The bundle carries
+        #    the relay set the context stored when Alice created it.
         outcome = await alice_node.invite_member(
             ctx.context_id,
             alice.did,
             bob.did,
             key_package,
-            [],
         )
         print(f"  Invitation sealed for {bob.did}")
 

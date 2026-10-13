@@ -2586,6 +2586,7 @@ async fn create_supervisor_context_with_capabilities(
         params,
         scp_did::DID(creator_did.to_owned()),
         None,
+        Vec::new(),
     )
     .await
     .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;

@@ -172,7 +172,6 @@ async def run_create(relay_url: str) -> None:
             did,
             request["did"],
             bytes.fromhex(request["key_package"]),
-            [relay_url],
         )
         bundle = outcome.bundle
         invitation = {

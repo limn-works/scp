@@ -60,14 +60,13 @@ export async function contextExample(
     //    bytes out of band.
     const reservation = await bobNode.reserveKeyPackage(bob.did);
 
-    // 4. Alice seals an invitation to that KeyPackage. An empty relay list
-    //    means Alice delivers the sealed bundle to Bob herself.
+    // 4. Alice seals an invitation to that KeyPackage. The bundle carries
+    //    the relay set the context stored when Alice created it.
     const outcome = await aliceNode.inviteMember(
       ctx.contextId,
       alice.did,
       bob.did,
       reservation.keyPackagePublic,
-      [],
     );
     console.log(`  Invitation sealed for ${bob.did}`);
 

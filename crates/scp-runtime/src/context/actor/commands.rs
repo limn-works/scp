@@ -792,6 +792,9 @@ pub struct CreateContextPayload {
     /// Optional §9.10.4 pseudonym routing ID for the creator's
     /// local member. `None` on broadcast contexts (ignored).
     pub local_pseudonym: Option<[u8; 32]>,
+    /// The relays that host the new context (§5.12.3.1 `relay_urls`): the
+    /// creator's relays. Stored on `PerContextState::relay_urls` (PUSH-025).
+    pub relay_urls: Vec<String>,
 }
 
 /// Payload for [`LifecycleCommand::JoinContext`]. Boxed inside the
@@ -2116,6 +2119,10 @@ pub enum StandingCommand {
         local_did: scp_did::DID,
         /// Remote peer DID.
         peer_did: scp_did::DID,
+        /// The relays that host the standing context when this call creates
+        /// it (§5.12.3.1 `relay_urls`, PUSH-025): the local identity's relays.
+        /// Unused when the context already exists.
+        relay_urls: Vec<String>,
         /// Oneshot reply channel. `Ok(String)` carries the
         /// deterministic standing context ID; the underlying method
         /// returns the same ID whether the context already existed or
@@ -2820,6 +2827,14 @@ pub enum QueriesCommand {
         reply: oneshot::Sender<
             Result<Option<scp_protocol::context::params::ContextParams>, ContextError>,
         >,
+    },
+    /// The context's stored relay set (§5.12.3.1 `relay_urls`,
+    /// `PerContextState::relay_urls`).
+    RelayUrls {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel. `Ok(None)` iff the context is unknown.
+        reply: oneshot::Sender<Result<Option<Vec<String>>, ContextError>>,
     },
     /// Role state snapshot (cloned).
     GetRoleState {

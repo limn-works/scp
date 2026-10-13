@@ -2912,6 +2912,7 @@ pub fn build_snapshot_from_state(
         // single shared type between live state and the serialized snapshot,
         // so no field-by-field translation is needed.
         routing: state.routing.clone(),
+        relay_urls: state.relay_urls.clone(),
         // ADR-049 §9 Class S (line 144): persist the staged saga slot through
         // its sanctioned serialization mirror so a Prepare's staged evidence
         // survives an actor crash. See [`saga_pending_snapshot`].

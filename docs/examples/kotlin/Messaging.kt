@@ -129,7 +129,6 @@ fun messagingExample(
             contextId = aliceHandle.contextId(),
             inviteeDid = bob.did(),
             inviteeKeyPackage = reservation.keyPackagePublic,
-            relayUrls = listOf(relayUrl),
         )
     val bundle =
         when (outcome) {

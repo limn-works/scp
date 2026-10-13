@@ -2821,7 +2821,9 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * * `context_id` -- The context to invite into.
      * * `invitee_did` -- The DID being invited.
      * * `invitee_key_package` -- The invitee's TLS-serialized MLS `KeyPackage`.
-     * * `relay_urls` -- Relay URLs to include for the invitee's first contact.
+     *
+     * The bundle carries the context's stored relay set (§5.12.3.1
+     * `relay_urls`), which the runtime reads; the caller supplies none.
      *
      * # Errors
      *
@@ -2830,7 +2832,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * runtime invite fails (e.g. no live context, unauthorized inviter,
      * invalid `KeyPackage`).
      */
-    func inviteMember(identity: Identity, contextId: String, inviteeDid: String, inviteeKeyPackage: Data, relayUrls: [String]) async throws  -> InviteMemberOutcome
+    func inviteMember(identity: Identity, contextId: String, inviteeDid: String, inviteeKeyPackage: Data) async throws  -> InviteMemberOutcome
     
     /**
      * Per-instance equivalent of the free-function `is_local_did`.
@@ -5772,7 +5774,9 @@ open func instanceId() -> UInt64  {
      * * `context_id` -- The context to invite into.
      * * `invitee_did` -- The DID being invited.
      * * `invitee_key_package` -- The invitee's TLS-serialized MLS `KeyPackage`.
-     * * `relay_urls` -- Relay URLs to include for the invitee's first contact.
+     *
+     * The bundle carries the context's stored relay set (§5.12.3.1
+     * `relay_urls`), which the runtime reads; the caller supplies none.
      *
      * # Errors
      *
@@ -5781,13 +5785,13 @@ open func instanceId() -> UInt64  {
      * runtime invite fails (e.g. no live context, unauthorized inviter,
      * invalid `KeyPackage`).
      */
-open func inviteMember(identity: Identity, contextId: String, inviteeDid: String, inviteeKeyPackage: Data, relayUrls: [String])async throws  -> InviteMemberOutcome  {
+open func inviteMember(identity: Identity, contextId: String, inviteeDid: String, inviteeKeyPackage: Data)async throws  -> InviteMemberOutcome  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_invite_member(
                     self.uniffiClonePointer(),
-                    FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(contextId),FfiConverterString.lower(inviteeDid),FfiConverterData.lower(inviteeKeyPackage),FfiConverterSequenceString.lower(relayUrls)
+                    FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(contextId),FfiConverterString.lower(inviteeDid),FfiConverterData.lower(inviteeKeyPackage)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -18147,7 +18151,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_instance_id() != 43175) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_invite_member() != 46281) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_invite_member() != 33429) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_is_local_did() != 10856) {

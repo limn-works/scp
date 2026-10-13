@@ -299,7 +299,7 @@ async fn setup_context_with_member(supervisor: &Arc<Supervisor>, ctx_id: &str) {
         ..ContextParams::default()
     };
     let handle = supervisor
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .expect("create_context should succeed while persistence is healthy");
     assert_eq!(handle.state(), ContextState::Active);

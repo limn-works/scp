@@ -888,6 +888,12 @@ pub(crate) async fn context_create_on(
     // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
     // rather than calling a `ContextManager` method directly. The actor
     // mailbox wraps the delegated call in the 30s transport-timeout budget.
+    // The bridge's relay set hosts the new context (§5.12.3.1 `relay_urls`,
+    // PUSH-025).
+    let relay_urls = bi
+        .core
+        .context_relay_urls()
+        .map_err(|e| NapiError::from(crate::transport::map_transport_lock_error(e)))?;
     let sup = crate::runtime::supervisor(bi)?;
     let core_handle = {
         use scp_core::context::actor::commands::{CreateContextPayload, LifecycleCommand};
@@ -898,6 +904,7 @@ pub(crate) async fn context_create_on(
                 params: context_params,
                 creator_did: DID(creator_did.clone()),
                 local_pseudonym,
+                relay_urls,
             }),
             reply: tx,
         };
@@ -935,10 +942,6 @@ pub(crate) async fn context_create_on(
     // send path) for broadcast contexts, which carry no per-member pseudonym.
     // Infallible and idempotent (overwrites), so it is safe after the committed
     // create and needs no rollback.
-    //
-    // The relay URL comes from the handleless transport probe. On the NAPI bridge
-    // the relay URL lives on a `NapiTransportManager` handle, so the honest value
-    // here is whatever `transport_status_on` surfaces (never a fabricated URL).
     let routing_id = local_pseudonym.unwrap_or_else(|| {
         if create_is_broadcast {
             scp_core::context::broadcast_routing_id(&context_id)
@@ -946,24 +949,14 @@ pub(crate) async fn context_create_on(
             scp_core::context::context_routing_id(&context_id)
         }
     });
-    let relay_url = match crate::transport::transport_status_on(bi, None).await {
-        Ok(status) => status.relay_url,
-        Err(e) => {
-            tracing::warn!(
-                "failed to query transport status during context create registration: {e}"
-            );
-            None
-        }
-    };
-    bi.core.register_known_context(
-        &context_id,
-        scp_ffi_common::bridge_instance::KnownContext {
+    bi.core
+        .register_known_context_from_runtime(
+            &context_id,
             routing_id,
-            relay_url,
-            member_did: creator_did.clone(),
-            last_seen: scp_clock::SystemClock.now_secs(),
-        },
-    );
+            creator_did.clone(),
+            scp_clock::SystemClock.now_secs(),
+        )
+        .await;
 
     // §9.10.4: a freshly created context has exactly one member, so the
     // pseudonym routing-ID announcement has no recipients and is a guaranteed
@@ -1136,10 +1129,6 @@ pub(crate) async fn context_join_on(
     // matching the send path) for broadcast contexts, which carry no per-member
     // pseudonym. Infallible and idempotent (overwrites), so it is safe after the
     // committed join and needs no rollback.
-    //
-    // The relay URL comes from the handleless transport probe. On the NAPI bridge
-    // the relay URL lives on a `NapiTransportManager` handle, so the honest value
-    // here is whatever `transport_status_on` surfaces (never a fabricated URL).
     let routing_id = local_pseudonym.unwrap_or_else(|| {
         if join_is_broadcast {
             scp_core::context::broadcast_routing_id(&context_id)
@@ -1147,24 +1136,14 @@ pub(crate) async fn context_join_on(
             scp_core::context::context_routing_id(&context_id)
         }
     });
-    let relay_url = match crate::transport::transport_status_on(bi, None).await {
-        Ok(status) => status.relay_url,
-        Err(e) => {
-            tracing::warn!(
-                "failed to query transport status during context join registration: {e}"
-            );
-            None
-        }
-    };
-    bi.core.register_known_context(
-        &context_id,
-        scp_ffi_common::bridge_instance::KnownContext {
+    bi.core
+        .register_known_context_from_runtime(
+            &context_id,
             routing_id,
-            relay_url,
-            member_did: identity_did.clone(),
-            last_seen: scp_clock::SystemClock.now_secs(),
-        },
-    );
+            identity_did.clone(),
+            scp_clock::SystemClock.now_secs(),
+        )
+        .await;
 
     Ok(())
 }
@@ -1587,28 +1566,14 @@ pub(crate) async fn context_join_from_welcome_on(
     // pseudonym (`local_pseudonym` is `Copy`, still valid after the request
     // move); the member is the JOINER, the member `spawn_actor_from_welcome`
     // recorded in the supervisor's role state.
-    //
-    // The relay URL comes from the handleless transport probe. On the NAPI
-    // bridge the relay URL lives on a `NapiTransportManager` handle, not on the
-    // bridge instance, and the bare-DID join receives no such handle — so the
-    // honest value here is `None` (never a fabricated URL). Peers refresh
-    // `last_seen`/relay on subsequent activity.
-    let relay_url = match crate::transport::transport_status_on(bi, None).await {
-        Ok(status) => status.relay_url,
-        Err(e) => {
-            tracing::warn!("failed to query transport status during join registration: {e}");
-            None
-        }
-    };
-    bi.core.register_known_context(
-        &sealed.context_id,
-        scp_ffi_common::bridge_instance::KnownContext {
-            routing_id: local_pseudonym,
-            relay_url,
-            member_did: owning_did.clone(),
-            last_seen: scp_clock::SystemClock.now_secs(),
-        },
-    );
+    bi.core
+        .register_known_context_from_runtime(
+            &sealed.context_id,
+            local_pseudonym,
+            owning_did.clone(),
+            scp_clock::SystemClock.now_secs(),
+        )
+        .await;
 
     // Build the returned handle from the AUTHENTICATED params carried by the
     // joined MLS group's signed context binding — NOT from caller input (there is
@@ -1657,13 +1622,15 @@ pub(crate) async fn context_join_from_welcome_on(
 /// via the identity registry. The raw signing key is wiped the moment the invite
 /// is produced (`SigningKey` is `ZeroizeOnDrop`, so the explicit early `drop`
 /// triggers the wipe).
+///
+/// The bundle carries the context's stored relay set (§5.12.3.1
+/// `relay_urls`), which the runtime reads; the caller supplies none.
 pub(crate) async fn invite_member_on(
     bi: &NapiBridgeInstance,
     context_id: String,
     creator_did: String,
     invitee_did: String,
     invitee_key_package: Vec<u8>,
-    relay_urls: Vec<String>,
 ) -> napi::Result<NapiInviteMemberOutcome> {
     scp_ffi_common::validate::validate_context_id(&context_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -1698,7 +1665,6 @@ pub(crate) async fn invite_member_on(
             DID(creator_did),
             DID(invitee_did),
             invitee_key_package,
-            relay_urls,
             &signing_key,
         )
         .await;
@@ -5790,6 +5756,7 @@ mod tests {
                 params,
                 creator_did: creator,
                 local_pseudonym: None,
+                relay_urls: Vec::new(),
             }),
             reply: tx,
         };
@@ -6687,7 +6654,6 @@ mod tests {
                 inviter_did.clone(),
                 "did:dht:z6MkNapiInviteeUnknownCtx".to_owned(),
                 b"bogus-key-package".to_vec(),
-                vec![],
             )
             .await
             else {
@@ -6708,7 +6674,6 @@ mod tests {
             "did:dht:z6MkNoSuchNapiInviterIdentity".to_owned(),
             "did:dht:z6MkNapiInviteeUncustodied".to_owned(),
             b"bogus-key-package".to_vec(),
-            vec![],
         )
         .await
         else {

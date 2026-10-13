@@ -2709,6 +2709,13 @@ impl crate::scp::PyScp {
             Some(derive_member_pseudonym(bi, identity_did, &context_id)?)
         };
 
+        // The bridge's relay set hosts the new context (§5.12.3.1
+        // `relay_urls`, PUSH-025).
+        let relay_urls = bi
+            .core
+            .context_relay_urls()
+            .map_err(|e| crate::error::ScpPyError::transport(e.to_string()))?;
+
         // Create the context via the shared ContextManager.
         {
             let creator_did_owned = scp_did::DID(identity_did.to_owned());
@@ -2719,9 +2726,15 @@ impl crate::scp::PyScp {
             let ctx_id = context_id.clone();
             let creator_did_for_register = scp_did::DID(identity_did.to_owned());
             rt.block_on(async move {
-                sup.create_context(ctx_id, core_params, creator_did_owned, local_pseudonym)
-                    .await
-                    .map_err(create_context_failure)?;
+                sup.create_context(
+                    ctx_id,
+                    core_params,
+                    creator_did_owned,
+                    local_pseudonym,
+                    relay_urls,
+                )
+                .await
+                .map_err(create_context_failure)?;
                 // Register the creator's DID as a local DID for defense-in-depth,
                 // matching NAPI's behavior. Routes through the supervisor's direct
                 // method (no per-context command — the local-DID set is
@@ -2795,26 +2808,13 @@ impl crate::scp::PyScp {
                 }
             });
 
-            // Get the relay URL from transport status if a relay is connected.
-            let relay_url = match self.transport_status() {
-                Ok(status) => status.relay_url,
-                Err(e) => {
-                    tracing::warn!(
-                        "failed to query transport status during context registration: {e}"
-                    );
-                    None
-                }
-            };
-
-            let last_seen = scp_clock::SystemClock.now_secs();
-
-            let known = crate::runtime::KnownContext {
+            let rt = crate::runtime()?;
+            rt.block_on(bi.core.register_known_context_from_runtime(
+                &context_id,
                 routing_id,
-                relay_url,
-                member_did: identity_did.to_owned(),
-                last_seen,
-            };
-            crate::runtime::register_known_context_on(bi, &context_id, known);
+                identity_did.to_owned(),
+                scp_clock::SystemClock.now_secs(),
+            ));
         }
 
         // Transition to "active" -- in the full runtime this happens after MLS
@@ -2998,23 +2998,12 @@ impl crate::scp::PyScp {
                     }
                 });
 
-                let relay_url = match self.transport_status() {
-                    Ok(status) => status.relay_url,
-                    Err(e) => {
-                        tracing::warn!(
-                            "failed to query transport status during context join registration: {e}"
-                        );
-                        None
-                    }
-                };
-
-                let known = crate::runtime::KnownContext {
+                rt.block_on(bi.core.register_known_context_from_runtime(
+                    &context_id,
                     routing_id,
-                    relay_url,
                     member_did,
-                    last_seen: scp_clock::SystemClock.now_secs(),
-                };
-                crate::runtime::register_known_context_on(bi, &context_id, known);
+                    scp_clock::SystemClock.now_secs(),
+                ));
             }
         }
 
@@ -3247,21 +3236,12 @@ impl crate::scp::PyScp {
         // ENCRYPTED context, so the routing id is the joiner's derived §9.10.4
         // pseudonym (`local_pseudonym` is `Copy`, still valid after the request
         // move). The member is the JOINER (`owning_did`).
-        let relay_url = match self.transport_status() {
-            Ok(status) => status.relay_url,
-            Err(e) => {
-                tracing::warn!("failed to query transport status during join registration: {e}");
-                None
-            }
-        };
-        let known = crate::runtime::KnownContext {
-            routing_id: local_pseudonym,
-            relay_url,
-            member_did: owning_did,
-            last_seen: scp_clock::SystemClock.now_secs(),
-        };
-
-        crate::runtime::register_known_context_on(bi, &sealed.context_id, known);
+        rt.block_on(bi.core.register_known_context_from_runtime(
+            &sealed.context_id,
+            local_pseudonym,
+            owning_did,
+            scp_clock::SystemClock.now_secs(),
+        ));
 
         // Build the returned handle from the AUTHENTICATED params carried by the
         // joined MLS group's signed context binding — NOT from caller input
@@ -3305,7 +3285,9 @@ impl crate::scp::PyScp {
     ///   the invite is signed under its `#active` key).
     /// * `invitee_did` -- The DID being invited.
     /// * `invitee_key_package` -- The invitee's TLS-serialized MLS `KeyPackage`.
-    /// * `relay_urls` -- Relay URLs to include for the invitee's first contact.
+    ///
+    /// The bundle carries the context's stored relay set (§5.12.3.1
+    /// `relay_urls`), which the runtime reads; the caller supplies none.
     ///
     /// # Errors
     ///
@@ -3313,14 +3295,13 @@ impl crate::scp::PyScp {
     /// key cannot be resolved, the context is voting-governed (governed-context
     /// invitations are not yet implemented), or the runtime invite fails (e.g.
     /// unauthorized inviter, invalid `KeyPackage`).
-    #[pyo3(signature = (context_id, creator_did, invitee_did, invitee_key_package, relay_urls))]
+    #[pyo3(signature = (context_id, creator_did, invitee_did, invitee_key_package))]
     pub fn invite_member(
         &self,
         context_id: String,
         creator_did: String,
         invitee_did: String,
         invitee_key_package: Vec<u8>,
-        relay_urls: Vec<String>,
     ) -> PyResult<PyInviteMemberOutcome> {
         let bi = &*self.inner;
         validate::validate_context_id(&context_id)?;
@@ -3342,7 +3323,6 @@ impl crate::scp::PyScp {
             scp_did::DID(creator_did),
             scp_did::DID(invitee_did),
             invitee_key_package,
-            relay_urls,
             &signing_key,
         ));
         // Defense-in-depth: wipe the raw signing key the moment the invite is
@@ -6471,6 +6451,7 @@ mod tests {
                 },
                 scp_did::DID(creator.clone()),
                 None,
+                Vec::new(),
             ))
             .unwrap();
             let (custody, key) = crate::runtime::with_identity(&bi, &creator, |entry| {
@@ -7180,7 +7161,6 @@ mod tests {
                     creator_did,
                     "did:dht:z6MkInviteeUnknownCtx".to_owned(),
                     b"bogus-key-package".to_vec(),
-                    vec![],
                 )
                 .expect_err("inviting into an unknown context must be rejected")
                 .to_string();
@@ -7197,7 +7177,6 @@ mod tests {
                     "did:dht:z6MkNoSuchInviterIdentity".to_owned(),
                     "did:dht:z6MkInviteeUncustodied".to_owned(),
                     b"bogus-key-package".to_vec(),
-                    vec![],
                 )
                 .expect_err("a non-locally-custodied inviter must be rejected")
                 .to_string();
@@ -7359,6 +7338,7 @@ mod tests {
             params,
             scp_did::DID(creator.to_owned()),
             None,
+            Vec::new(),
         ))
         .unwrap();
         (bi, ctx_id)
@@ -8184,6 +8164,7 @@ mod tests {
             },
             scp_did::DID(creator.to_owned()),
             None,
+            Vec::new(),
         ))
         .unwrap();
 
@@ -9102,6 +9083,7 @@ mod tests {
                 },
                 scp_did::DID(creator.clone()),
                 None,
+                Vec::new(),
             ))
             .expect("create_context");
             let exported = scp.context_export(py, &ctx_id).expect("context_export");
@@ -10088,6 +10070,7 @@ mod tests {
                 params,
                 scp_did::DID(creator.clone()),
                 None,
+                Vec::new(),
             ))
             .unwrap();
 
@@ -10382,6 +10365,7 @@ class SignOnlyCustody:
                 },
                 scp_did::DID(creator.clone()),
                 None,
+                Vec::new(),
             ))
             .unwrap();
 

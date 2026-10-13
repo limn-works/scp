@@ -242,7 +242,6 @@ class TestInviteMemberDelegation:
             _CREATOR_DID,
             "did:dht:z6MkInvitee",
             b"invitee-key-package",
-            ["wss://relay.example"],
         )
 
         native.invite_member.assert_called_once_with(
@@ -250,7 +249,6 @@ class TestInviteMemberDelegation:
             _CREATOR_DID,
             "did:dht:z6MkInvitee",
             b"invitee-key-package",
-            ["wss://relay.example"],
         )
 
     async def test_maps_sealed_outcome(self) -> None:
@@ -265,7 +263,7 @@ class TestInviteMemberDelegation:
         scp = _make_scp(native)
 
         outcome = await SCP.invite_member(
-            scp, _HEX_CTX_ID, _CREATOR_DID, "did:dht:z6MkInvitee", b"kp", []
+            scp, _HEX_CTX_ID, _CREATOR_DID, "did:dht:z6MkInvitee", b"kp"
         )
 
         # The outcome carries a SealedInvitation `bundle` directly usable as the
@@ -286,9 +284,7 @@ class TestInviteMemberDelegation:
         scp = _make_scp(native)
 
         with pytest.raises(RuntimeError, match="no live context"):
-            await SCP.invite_member(
-                scp, _HEX_CTX_ID, _CREATOR_DID, "did:dht:z6MkInvitee", b"kp", []
-            )
+            await SCP.invite_member(scp, _HEX_CTX_ID, _CREATOR_DID, "did:dht:z6MkInvitee", b"kp")
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +366,6 @@ class TestInviteMemberRealFfi:
                 creator.did,
                 "did:dht:z6MkInviteeUnknownCtx",
                 b"bogus-key-package",
-                [],
             )
 
     async def test_invite_member_rejects_non_custodied_inviter(self, scp) -> None:
@@ -382,7 +377,6 @@ class TestInviteMemberRealFfi:
                 "did:dht:z6MkNoSuchInviterIdentity",
                 "did:dht:z6MkInviteeUncustodied",
                 b"bogus-key-package",
-                [],
             )
 
     async def test_invite_member_seals_for_single_admin_context(self, scp) -> None:
@@ -420,7 +414,7 @@ class TestInviteMemberRealFfi:
         assert reservation_id
         assert len(invitee_kp) > 0
 
-        outcome = await scp.invite_member(ctx.context_id, creator.did, invitee.did, invitee_kp, [])
+        outcome = await scp.invite_member(ctx.context_id, creator.did, invitee.did, invitee_kp)
 
         # The outcome carries a SealedInvitation `bundle` directly usable as the
         # join input (no re-assembly): its fields are exactly the

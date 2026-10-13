@@ -64,8 +64,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Governance: {:?}", params.governance);
 
     // 4. Create the context — returns a handle for all subsequent operations.
+    //    The example runs in process with no relay, so no relay hosts it.
     let handle = manager
-        .create_context("demo-context".to_owned(), params, alice.clone(), None)
+        .create_context(
+            "demo-context".to_owned(),
+            params,
+            alice.clone(),
+            None,
+            Vec::new(),
+        )
         .await?;
 
     println!();

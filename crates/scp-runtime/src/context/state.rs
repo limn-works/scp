@@ -1013,6 +1013,12 @@ pub struct ContextSnapshot {
     /// re-announce, the same state a cold restore always starts from.
     #[serde(default = "default_context_routing")]
     pub routing: crate::context::actor::state::ContextRouting,
+    /// The relay endpoints that host this context (§5.12.3.1), copied from
+    /// [`PerContextState::relay_urls`](crate::context::actor::state::PerContextState::relay_urls).
+    /// Restore and import install this set verbatim (PUSH-025). No serde
+    /// default: a snapshot without the field fails to decode rather than
+    /// restoring a context that silently lost its relays.
+    pub relay_urls: Vec<String>,
     /// Staged cross-context saga evidence awaiting Commit or Abort
     /// (ADR-049 §3 / §9; spec §5.15.8, §6.2.4). **Class S** —
     /// synchronously-persisted, fail-closed.

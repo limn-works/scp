@@ -204,7 +204,6 @@ class JoinFromWelcomeTest {
                         contextId = ctx.contextId(),
                         inviteeDid = invitee.did(),
                         inviteeKeyPackage = reservation.keyPackagePublic,
-                        relayUrls = emptyList(),
                     )
 
                 // The outcome carries a SealedInvitation `bundle` whose fields
@@ -276,7 +275,6 @@ class JoinFromWelcomeTest {
                         contextId = ctx.contextId(),
                         inviteeDid = invitee.did(),
                         inviteeKeyPackage = reservation.keyPackagePublic,
-                        relayUrls = emptyList(),
                     )
                     fail("expected inviteMember to reject a non-custodied inviter")
                 } catch (e: ScpException.Identity) {

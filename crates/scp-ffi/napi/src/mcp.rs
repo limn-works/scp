@@ -2379,6 +2379,7 @@ mod tests {
                 params,
                 scp_did::DID(creator.to_owned()),
                 None,
+                Vec::new(),
             ))
             .expect("the supervisor creates the context");
     }
@@ -2820,6 +2821,7 @@ mod tests {
                 params,
                 scp_did::DID(actor_creator.to_owned()),
                 None,
+                Vec::new(),
             ))
             .unwrap();
     }
@@ -2958,6 +2960,7 @@ mod tests {
                 params,
                 scp_did::DID(agent.to_owned()),
                 None,
+                Vec::new(),
             ))
             .unwrap();
         assert!(!crate::runtime::ucan_registry(&bi).contains_key(ctx));

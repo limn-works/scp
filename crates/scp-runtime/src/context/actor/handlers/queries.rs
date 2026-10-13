@@ -152,6 +152,14 @@ pub(crate) async fn dispatch(
             Outcome::ok(())
         }
 
+        QueriesCommand::RelayUrls {
+            context_id: _,
+            reply,
+        } => {
+            let _ = reply.send(Ok(Some(state.relay_urls.clone())));
+            Outcome::ok(())
+        }
+
         QueriesCommand::GetRoleState {
             context_id: _,
             reply,

@@ -56,8 +56,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..ContextParams::default()
     };
 
+    // The example runs in process with no relay, so no relay hosts the context.
     let handle = manager
-        .create_context("chat-demo".to_owned(), params, alice.clone(), None)
+        .create_context(
+            "chat-demo".to_owned(),
+            params,
+            alice.clone(),
+            None,
+            Vec::new(),
+        )
         .await?;
     println!("Alice created context: {}", handle.context_id());
 

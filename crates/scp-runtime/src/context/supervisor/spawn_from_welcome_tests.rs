@@ -152,6 +152,15 @@ async fn bob_imported_custody() -> (InMemoryKeyCustody, KeyHandle) {
 /// for a valid bundle, or an ATTACKER key to drive a signature-verify rejection.
 /// Callers may hand-tamper the returned bundle (e.g. flip a `signature` byte or
 /// diverge a `metadata_snapshot.structural` field) before sealing it.
+/// The relays every test bundle names as hosting its context (§5.12.3.1
+/// `relay_urls`). The first relay repeats, so a joiner that stored the list
+/// verbatim, duplicate included, fails the relay-set test.
+const BUNDLE_RELAY_URLS: [&str; 3] = [
+    "wss://relay-b.example/scp/v1",
+    "wss://relay-a.example/scp/v1",
+    "wss://relay-b.example/scp/v1",
+];
+
 fn signed_bundle(
     signer: &SigningKey,
     creator_did: &DID,
@@ -167,7 +176,7 @@ fn signed_bundle(
     let mut bundle = InvitationBundle {
         context_id: context_id.to_owned(),
         creator_did: creator_did.clone(),
-        relay_urls: vec![],
+        relay_urls: BUNDLE_RELAY_URLS.map(str::to_owned).to_vec(),
         welcome_message: welcome_bytes,
         key_material: InvitationKeyMaterial {
             context_metadata_key: [7u8; 32],
@@ -882,6 +891,38 @@ async fn welcome_joiner_does_not_install_the_genesis_outlet_declaration() {
     );
 }
 
+/// A Welcome joiner's context is hosted on the relays its invitation bundle
+/// names (§5.12.3.1 `relay_urls`, PUSH-025). The persisted Class-S snapshot,
+/// which the spawn writes from the joiner's live state, carries the bundle's
+/// set with each relay once, in first-seen order.
+#[tokio::test]
+async fn welcome_joiner_holds_the_bundle_relay_set() {
+    let rec = RecordingPersistence::default();
+    let (result, j) = run_join_with(
+        0x2d,
+        Some(Box::new(rec.clone())),
+        Some(joiner_params()),
+        joiner_params(),
+        None,
+    )
+    .await;
+    result.expect("welcome join succeeds");
+
+    let snapshot = rec
+        .store
+        .get(&j.ctx_id)
+        .map(|e| e.value().clone())
+        .expect("the joiner persisted a Class-S snapshot before spawning");
+    assert_eq!(
+        snapshot.relay_urls,
+        vec![
+            "wss://relay-b.example/scp/v1".to_owned(),
+            "wss://relay-a.example/scp/v1".to_owned(),
+        ],
+        "the joiner stores the bundle's relay set, deduplicated"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test A1c — an over-cap genesis outlet declaration is rejected BEFORE the KP
 // consume (GitHub #2250).
@@ -1385,6 +1426,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
         broadcast_params,
         bob.clone(),
         some_pseudonym(),
+        Vec::new(),
     )
     .await
     .expect("bob creates the colliding broadcast context");
@@ -1902,6 +1944,7 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
         joiner_params(),
         bob.clone(),
         some_pseudonym(),
+        Vec::new(),
     )
     .await
     .expect("a later bootstrap for a different id proceeds — the global lock was released");
@@ -2594,6 +2637,7 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
             joiner_params(),
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the encrypted context");
@@ -2614,7 +2658,6 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &alice_signing_key(),
         )
         .await
@@ -2672,6 +2715,71 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
         bob_sup.local_mls_epoch(&ctx_id).await,
         Some(1),
         "bob's joined MLS group is installed at the joined absolute epoch (1)"
+    );
+}
+
+/// `invite_member` seals the context's stored relay set (§5.12.3.1
+/// `relay_urls`, PUSH-025) and takes no relay list from its caller, so the
+/// joiner stores exactly the set the creator holds, in stored order.
+#[tokio::test]
+async fn invite_member_seals_the_creators_stored_relay_set() {
+    let ctx_id = ctx_hex(0xd6);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+    let stored = vec![
+        "wss://relay-a.example/scp/v1".to_owned(),
+        "wss://relay-b.example/scp/v1".to_owned(),
+    ];
+
+    let (alice_sup, _alice_crypto) = alice_supervisor();
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            joiner_params(),
+            alice.clone(),
+            some_pseudonym(),
+            stored.clone(),
+        )
+        .await
+        .expect("alice creates the encrypted context");
+    assert_eq!(
+        alice_sup.context_relay_urls(&ctx_id).await,
+        Some(stored.clone())
+    );
+
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    let InviteMemberOutcome::Sealed { bundle, .. } = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            &alice_signing_key(),
+        )
+        .await
+        .expect("alice seals an invitation for bob");
+    let enc =
+        <[u8; 32]>::try_from(bundle.enc.as_slice()).expect("sealed bundle enc is exactly 32 bytes");
+
+    let (bob_custody, bob_handle) = bob_imported_custody().await;
+    let req = WelcomeJoinRequest {
+        context_id: ctx_id.clone(),
+        creator_did: alice.clone(),
+        sealed_bundle_enc: enc,
+        sealed_bundle_ct: bundle.ciphertext,
+        reservation_id,
+        local_pseudonym: some_pseudonym(),
+    };
+    bob_sup
+        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, req)
+        .await
+        .expect("bob joins from alice's invitation");
+    assert_eq!(
+        bob_sup.context_relay_urls(&ctx_id).await,
+        Some(stored),
+        "the joiner stores the creator's relay set in stored order"
     );
 }
 
@@ -2778,6 +2886,7 @@ async fn invite_member_broadcasts_the_add_commit_to_existing_members() {
             joiner_params(),
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the encrypted context");
@@ -2791,7 +2900,6 @@ async fn invite_member_broadcasts_the_add_commit_to_existing_members() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &alice_signing_key(),
         )
         .await
@@ -2841,6 +2949,7 @@ async fn invite_member_into_voting_context_is_rejected() {
             voting_params,
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the voting context");
@@ -2854,7 +2963,6 @@ async fn invite_member_into_voting_context_is_rejected() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &alice_signing_key(),
         )
         .await
@@ -2908,6 +3016,7 @@ async fn invite_member_by_non_admin_is_rejected() {
             joiner_params(),
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the encrypted SingleAdmin context");
@@ -2923,7 +3032,6 @@ async fn invite_member_by_non_admin_is_rejected() {
             bob.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &bob_signing_key(),
         )
         .await;
@@ -3016,6 +3124,7 @@ async fn invite_member_rolls_back_the_add_on_delivery_failure() {
             joiner_params(),
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the encrypted context");
@@ -3029,7 +3138,6 @@ async fn invite_member_rolls_back_the_add_on_delivery_failure() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &alice_signing_key(),
         )
         .await;

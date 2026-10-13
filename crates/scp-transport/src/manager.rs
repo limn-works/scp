@@ -72,6 +72,10 @@ const MOBILE_IDLE_THRESHOLD: Duration = Duration::from_mins(5);
 pub struct EvictionOutcome {
     /// The adapter index that was evicted.
     pub evicted_index: usize,
+    /// The relay URL of the evicted adapter. It left
+    /// [`TransportManager::relay_urls`] with the adapter, unless another
+    /// adapter the manager still holds connects to the same relay.
+    pub evicted_relay_url: String,
     /// Routing IDs whose subscriptions were on the evicted connection.
     /// These subscriptions need to be migrated to a surviving connection
     /// to the same relay, or the relay must be reassigned.
@@ -80,6 +84,17 @@ pub struct EvictionOutcome {
     /// `None` means no surviving connection to the same relay was found,
     /// and relay reassignment should be triggered by the caller.
     pub migrated_to: Option<usize>,
+}
+
+/// A registered adapter and the URL of the relay it connects to.
+///
+/// The manager holds the two as one element of its adapter list, so every
+/// path that removes an adapter removes its relay URL in the same operation,
+/// and [`TransportManager::relay_urls`] cannot name a relay the manager holds
+/// no adapter for.
+struct HeldAdapter {
+    relay_url: String,
+    adapter: Box<dyn TransportAdapter>,
 }
 
 /// Multi-adapter transport manager.
@@ -115,8 +130,9 @@ pub struct TransportManager {
     /// Determines `min_relays()` for relay set assignment and
     /// `min_successful_sends()` for send fanout thresholds (§10.13.1).
     profile: TransportProfile,
-    /// Registered transport adapters, in insertion order.
-    adapters: Vec<Box<dyn TransportAdapter>>,
+    /// Registered transport adapters with their relay URLs, in insertion
+    /// order.
+    adapters: Vec<HeldAdapter>,
     /// Per-context relay set assignments: context -> adapter indices.
     /// Wrapped in `RwLock` for interior mutability so that `send_to_context`
     /// and `assign_relay_set` can take `&self`, enabling concurrent sends.
@@ -205,7 +221,8 @@ fn reindex_usize_map<V>(map: &Mutex<HashMap<usize, V>>, removed_index: usize) {
 }
 
 impl TransportManager {
-    /// Creates a new `TransportManager` with a single adapter.
+    /// Creates a new `TransportManager` with a single adapter, connected to
+    /// the relay at `relay_url`.
     ///
     /// This is the Phase 1 constructor. The provided adapter is used for
     /// all operations. Uses the default (platform-inferred) transport
@@ -213,13 +230,13 @@ impl TransportManager {
     /// configuration with explicit profile, use
     /// [`TransportManager::with_config`].
     #[must_use]
-    pub fn new(adapter: Box<dyn TransportAdapter>) -> Self {
+    pub fn new(relay_url: String, adapter: Box<dyn TransportAdapter>) -> Self {
         let profile = TransportProfile::platform_default();
         let mut last_used = HashMap::new();
         last_used.insert(0, Instant::now());
         Self {
             profile,
-            adapters: vec![adapter],
+            adapters: vec![HeldAdapter { relay_url, adapter }],
             relay_assignments: RwLock::new(HashMap::new()),
             reliability_scores: Arc::new(Mutex::new(HashMap::new())),
             dedup_cache: LruCache::new(nonzero_capacity(DEFAULT_DEDUP_CAPACITY)),
@@ -371,11 +388,12 @@ impl TransportManager {
 
     /// Returns the number of currently active connections (adapters).
     #[must_use]
-    pub fn active_connection_count(&self) -> usize {
+    pub const fn active_connection_count(&self) -> usize {
         self.adapters.len()
     }
 
-    /// Registers an additional transport adapter.
+    /// Registers an additional transport adapter, connected to the relay at
+    /// `relay_url`.
     ///
     /// The adapter is appended to the end of the adapter list. Its index
     /// is used as the identifier for relay set assignments and reliability
@@ -391,7 +409,12 @@ impl TransportManager {
     ///
     /// Returns `None` if no eviction was needed, or `Some(EvictionOutcome)`
     /// describing the evicted connection and subscription migration result.
-    pub fn add_adapter(&mut self, adapter: Box<dyn TransportAdapter>) -> Option<EvictionOutcome> {
+    /// The evicted adapter's relay URL leaves [`Self::relay_urls`] with it.
+    pub fn add_adapter(
+        &mut self,
+        relay_url: String,
+        adapter: Box<dyn TransportAdapter>,
+    ) -> Option<EvictionOutcome> {
         // Enforce connection budget per section 10.13.3.
         let eviction = if self.adapters.len() >= self.max_connections {
             self.evict_lru_connection()
@@ -406,15 +429,33 @@ impl TransportManager {
         if let Ok(mut last_used) = self.connection_last_used.lock() {
             last_used.insert(idx, Instant::now());
         }
-        self.adapters.push(adapter);
+        self.adapters.push(HeldAdapter { relay_url, adapter });
 
         eviction
     }
 
     /// Returns the number of registered adapters.
     #[must_use]
-    pub fn adapter_count(&self) -> usize {
+    pub const fn adapter_count(&self) -> usize {
         self.adapters.len()
+    }
+
+    /// Returns the URLs of the relays this manager holds an adapter for,
+    /// sorted and deduplicated.
+    ///
+    /// The set changes only with the adapter list: an adapter's URL joins it
+    /// in [`Self::new`] and [`Self::add_adapter`], and leaves it when the
+    /// adapter is evicted for the connection budget or shed as idle.
+    #[must_use]
+    pub fn relay_urls(&self) -> Vec<String> {
+        let mut urls: Vec<String> = self
+            .adapters
+            .iter()
+            .map(|held| held.relay_url.clone())
+            .collect();
+        urls.sort_unstable();
+        urls.dedup();
+        urls
     }
 
     /// Send an outer envelope through the registered adapters.
@@ -428,9 +469,9 @@ impl TransportManager {
     /// Returns [`TransportError::NotConnected`] if no adapters are registered.
     /// Propagates errors from the underlying adapter.
     pub async fn send(&self, envelope: &OuterEnvelope) -> Result<BlobId, TransportError> {
-        let adapter = self.adapters.first().ok_or(TransportError::NotConnected)?;
+        let held = self.adapters.first().ok_or(TransportError::NotConnected)?;
         self.touch_adapter(0);
-        adapter.send(envelope).await
+        held.adapter.send(envelope).await
     }
 
     /// Send an envelope to all relays assigned to a context.
@@ -512,11 +553,11 @@ impl TransportManager {
             .iter()
             .zip(jitter_delays.iter())
             .filter_map(|(&idx, &delay_ms)| {
-                self.adapters.get(idx).map(|adapter| async move {
+                self.adapters.get(idx).map(|held| async move {
                     if delay_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }
-                    (idx, adapter.send(envelope).await)
+                    (idx, held.adapter.send(envelope).await)
                 })
             })
             .collect();
@@ -590,10 +631,10 @@ impl TransportManager {
         let mut indexed_streams: Vec<(usize, SubscriptionStream)> =
             Vec::with_capacity(self.adapters.len());
 
-        for (idx, adapter) in self.adapters.iter().enumerate() {
+        for (idx, held) in self.adapters.iter().enumerate() {
             self.touch_adapter(idx);
             self.record_subscription(idx, routing_id);
-            let stream = adapter.subscribe(routing_id, since).await?;
+            let stream = held.adapter.subscribe(routing_id, since).await?;
             indexed_streams.push((idx, stream));
         }
 
@@ -658,10 +699,10 @@ impl TransportManager {
         let mut indexed_streams: Vec<(usize, SubscriptionStream)> =
             Vec::with_capacity(relay_indices.len());
         for &idx in &relay_indices {
-            if let Some(adapter) = self.adapters.get(idx) {
+            if let Some(held) = self.adapters.get(idx) {
                 self.touch_adapter(idx);
                 self.record_subscription(idx, routing_id);
-                let stream = adapter.subscribe(routing_id, since).await?;
+                let stream = held.adapter.subscribe(routing_id, since).await?;
                 indexed_streams.push((idx, stream));
             }
         }
@@ -706,9 +747,9 @@ impl TransportManager {
         }
 
         let mut first_error: Option<TransportError> = None;
-        for (idx, adapter) in self.adapters.iter().enumerate() {
+        for (idx, held) in self.adapters.iter().enumerate() {
             self.remove_subscription_record(idx, routing_id);
-            if let Err(e) = adapter.unsubscribe(routing_id).await
+            if let Err(e) = held.adapter.unsubscribe(routing_id).await
                 && first_error.is_none()
             {
                 first_error = Some(e);
@@ -733,9 +774,9 @@ impl TransportManager {
         routing_id: &RoutingId,
         since: Option<u64>,
     ) -> Result<Vec<OuterEnvelope>, TransportError> {
-        let adapter = self.adapters.first().ok_or(TransportError::NotConnected)?;
+        let held = self.adapters.first().ok_or(TransportError::NotConnected)?;
         self.touch_adapter(0);
-        adapter.query(routing_id, since).await
+        held.adapter.query(routing_id, since).await
     }
 
     /// Request deletion of a blob across all adapters.
@@ -754,8 +795,8 @@ impl TransportManager {
         }
 
         let mut first_error: Option<TransportError> = None;
-        for adapter in &self.adapters {
-            if let Err(e) = adapter.delete(blob_id).await
+        for held in &self.adapters {
+            if let Err(e) = held.adapter.delete(blob_id).await
                 && first_error.is_none()
             {
                 first_error = Some(e);
@@ -802,8 +843,8 @@ impl TransportManager {
     /// Adapters without an active monitor no-op (the trait default), so this is
     /// safe to call unconditionally. A no-op when no adapters are registered.
     pub async fn record_heartbeat_received(&self) {
-        for adapter in &self.adapters {
-            adapter.record_heartbeat_received().await;
+        for held in &self.adapters {
+            held.adapter.record_heartbeat_received().await;
         }
     }
 
@@ -1042,14 +1083,16 @@ impl TransportManager {
             subs.entry(target).or_default().extend(migrated);
         }
 
-        // Remove the evicted adapter and reindex all data structures.
-        self.adapters.remove(lru_index);
+        // Remove the evicted adapter, and its relay URL with it, and reindex
+        // all data structures.
+        let evicted = self.adapters.remove(lru_index);
         self.reindex_after_removal(lru_index);
 
         let adjusted_target = migration_target.map(|t| if t > lru_index { t - 1 } else { t });
 
         tracing::info!(
             evicted = lru_index,
+            evicted_relay_url = %evicted.relay_url,
             migrated_to = ?adjusted_target,
             affected_subscriptions = affected_subscriptions.len(),
             remaining_connections = self.adapters.len(),
@@ -1059,6 +1102,7 @@ impl TransportManager {
 
         Some(EvictionOutcome {
             evicted_index: lru_index,
+            evicted_relay_url: evicted.relay_url,
             affected_subscriptions,
             migrated_to: adjusted_target,
         })
@@ -1272,14 +1316,16 @@ impl TransportManager {
                 subs.entry(target).or_default().extend(migrated);
             }
 
-            // Remove the adapter and reindex all data structures.
-            self.adapters.remove(idx);
+            // Remove the adapter, and its relay URL with it, and reindex all
+            // data structures.
+            let shed = self.adapters.remove(idx);
             self.reindex_after_removal(idx);
 
             let adjusted_target = migration_target.map(|t| if t > idx { t - 1 } else { t });
 
             outcomes.push(EvictionOutcome {
                 evicted_index: idx,
+                evicted_relay_url: shed.relay_url,
                 affected_subscriptions,
                 migrated_to: adjusted_target,
             });
@@ -1527,6 +1573,9 @@ mod tests {
 
     use super::*;
 
+    /// The relay URL tests give an adapter whose relay they do not inspect.
+    const MOCK_RELAY: &str = "mock://relay";
+
     /// A mock transport adapter for testing.
     struct MockAdapter {
         /// Result returned by `send()`.
@@ -1634,7 +1683,8 @@ mod tests {
 
     #[tokio::test]
     async fn manager_new_has_one_adapter() {
-        let manager = TransportManager::new(Box::new(MockAdapter::succeeding()));
+        let manager =
+            TransportManager::new(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         assert_eq!(manager.adapter_count(), 1);
     }
 
@@ -1647,15 +1697,16 @@ mod tests {
     #[tokio::test]
     async fn manager_add_adapter_increments_count() {
         let mut manager = TransportManager::builder();
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         assert_eq!(manager.adapter_count(), 1);
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         assert_eq!(manager.adapter_count(), 2);
     }
 
     #[tokio::test]
     async fn manager_send_returns_blob_id() {
-        let manager = TransportManager::new(Box::new(MockAdapter::succeeding()));
+        let manager =
+            TransportManager::new(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         let envelope = test_envelope();
         let blob_id = manager.send(&envelope).await.unwrap();
         assert_eq!(blob_id, BlobId::new([0xAA; 32]));
@@ -1671,9 +1722,12 @@ mod tests {
 
     #[tokio::test]
     async fn manager_send_propagates_adapter_error() {
-        let manager = TransportManager::new(Box::new(MockAdapter::failing(
-            TransportError::SendFailed("mock failure".to_string()),
-        )));
+        let manager = TransportManager::new(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::failing(TransportError::SendFailed(
+                "mock failure".to_string(),
+            ))),
+        );
         let envelope = test_envelope();
         let result = manager.send(&envelope).await;
         assert!(matches!(result, Err(TransportError::SendFailed(_))));
@@ -1685,7 +1739,7 @@ mod tests {
         let env = test_envelope();
         adapter.query_result = Ok(vec![env]);
 
-        let manager = TransportManager::new(Box::new(adapter));
+        let manager = TransportManager::new(MOCK_RELAY.to_owned(), Box::new(adapter));
         let routing_id = RoutingId::new([0xAA; 32]);
         let envelopes = manager.query(&routing_id, None).await.unwrap();
         assert_eq!(envelopes.len(), 1);
@@ -1719,7 +1773,7 @@ mod tests {
             ]),
         };
 
-        let manager = TransportManager::new(Box::new(adapter));
+        let manager = TransportManager::new(MOCK_RELAY.to_owned(), Box::new(adapter));
         let routing_id = RoutingId::new([0xAA; 32]);
         let mut stream = manager.subscribe(&routing_id, Some(0)).await.unwrap();
 
@@ -1743,7 +1797,8 @@ mod tests {
 
     #[tokio::test]
     async fn manager_unsubscribe_single_adapter_succeeds() {
-        let manager = TransportManager::new(Box::new(MockAdapter::succeeding()));
+        let manager =
+            TransportManager::new(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         let routing_id = RoutingId::new([0xAA; 32]);
         let result = manager.unsubscribe(&routing_id).await;
         assert!(result.is_ok());
@@ -1759,7 +1814,8 @@ mod tests {
 
     #[tokio::test]
     async fn manager_delete_single_adapter_succeeds() {
-        let manager = TransportManager::new(Box::new(MockAdapter::succeeding()));
+        let manager =
+            TransportManager::new(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         let blob_id = BlobId::new([0xAA; 32]);
         let result = manager.delete(&blob_id).await;
         assert!(result.is_ok());
@@ -1783,8 +1839,8 @@ mod tests {
         };
 
         let mut manager = TransportManager::builder();
-        manager.add_adapter(Box::new(adapter1));
-        manager.add_adapter(Box::new(adapter2));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(adapter1));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(adapter2));
 
         let routing_id = RoutingId::new([0xAA; 32]);
         let mut stream = manager.subscribe(&routing_id, None).await.unwrap();
@@ -1812,8 +1868,8 @@ mod tests {
         };
 
         let mut manager = TransportManager::builder();
-        manager.add_adapter(Box::new(adapter1));
-        manager.add_adapter(Box::new(adapter2));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(adapter1));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(adapter2));
 
         let routing_id = RoutingId::new([0xAA; 32]);
         let mut stream = manager.subscribe(&routing_id, Some(0)).await.unwrap();
@@ -1935,9 +1991,18 @@ mod tests {
     #[tokio::test]
     async fn send_to_context_fanout_returns_blob_ids_per_relay() {
         let mut manager = TransportManager::builder();
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))));
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))),
+        );
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))),
+        );
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))),
+        );
 
         let ctx = "ctx-1".to_string();
         manager
@@ -1955,13 +2020,22 @@ mod tests {
     async fn send_to_context_error_when_fewer_than_two_succeed() {
         let mut manager = TransportManager::builder();
         // One succeeds, two fail => only 1 success < min_successful_sends (2 for desktop).
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
-        manager.add_adapter(Box::new(MockAdapter::failing(TransportError::SendFailed(
-            "fail1".to_string(),
-        ))));
-        manager.add_adapter(Box::new(MockAdapter::failing(TransportError::SendFailed(
-            "fail2".to_string(),
-        ))));
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))),
+        );
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::failing(TransportError::SendFailed(
+                "fail1".to_string(),
+            ))),
+        );
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::failing(TransportError::SendFailed(
+                "fail2".to_string(),
+            ))),
+        );
 
         let ctx = "ctx-fail".to_string();
         manager
@@ -1979,11 +2053,20 @@ mod tests {
     async fn send_to_context_succeeds_with_exactly_two_relays() {
         let mut manager = TransportManager::builder();
         // Two succeed, one fails => 2 successes >= min_successful_sends (2 for desktop).
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))));
-        manager.add_adapter(Box::new(MockAdapter::failing(TransportError::SendFailed(
-            "fail".to_string(),
-        ))));
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))),
+        );
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))),
+        );
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::failing(TransportError::SendFailed(
+                "fail".to_string(),
+            ))),
+        );
 
         let ctx = "ctx-partial".to_string();
         manager
@@ -2000,11 +2083,20 @@ mod tests {
     #[tokio::test]
     async fn send_to_context_records_reliability_scores() {
         let mut manager = TransportManager::builder();
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
-        manager.add_adapter(Box::new(MockAdapter::failing(TransportError::SendFailed(
-            "fail".to_string(),
-        ))));
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))),
+        );
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::failing(TransportError::SendFailed(
+                "fail".to_string(),
+            ))),
+        );
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))),
+        );
 
         let ctx = "ctx-score".to_string();
         manager
@@ -2035,7 +2127,7 @@ mod tests {
     #[tokio::test]
     async fn send_to_context_no_assignment_returns_error() {
         let mut manager = TransportManager::builder();
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
 
         let envelope = test_envelope();
         let result = manager
@@ -2065,8 +2157,8 @@ mod tests {
         };
 
         let mut manager = TransportManager::builder();
-        manager.add_adapter(Box::new(adapter1));
-        manager.add_adapter(Box::new(adapter2));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(adapter1));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(adapter2));
 
         let ctx = "ctx-dedup".to_string();
         manager
@@ -2106,8 +2198,8 @@ mod tests {
         };
 
         let mut manager = TransportManager::builder();
-        manager.add_adapter(Box::new(adapter1));
-        manager.add_adapter(Box::new(adapter2));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(adapter1));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(adapter2));
 
         let ctx = "ctx-distinct".to_string();
         manager
@@ -2136,7 +2228,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_context_no_assignment_returns_error() {
         let mut manager = TransportManager::builder();
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
 
         let routing_id = RoutingId::new([0xAA; 32]);
         let result = manager
@@ -2153,7 +2245,7 @@ mod tests {
     async fn assign_relay_set_selects_min_three_relays() {
         let mut manager = TransportManager::builder();
         for _ in 0..5 {
-            manager.add_adapter(Box::new(MockAdapter::succeeding()));
+            manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         }
 
         let ctx = "ctx-assign".to_string();
@@ -2164,8 +2256,8 @@ mod tests {
     #[tokio::test]
     async fn assign_relay_set_caps_at_adapter_count_when_fewer_than_three() {
         let mut manager = TransportManager::builder();
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
 
         let ctx = "ctx-small".to_string();
         let set = manager.assign_relay_set(&ctx).unwrap();
@@ -2177,7 +2269,7 @@ mod tests {
     async fn assign_relay_set_minimizes_overlap() {
         let mut manager = TransportManager::builder();
         for _ in 0..6 {
-            manager.add_adapter(Box::new(MockAdapter::succeeding()));
+            manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         }
 
         let set1 = manager.assign_relay_set(&"ctx-a".to_string()).unwrap();
@@ -2196,7 +2288,7 @@ mod tests {
     async fn assign_relay_set_stores_assignment() {
         let mut manager = TransportManager::builder();
         for _ in 0..3 {
-            manager.add_adapter(Box::new(MockAdapter::succeeding()));
+            manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         }
 
         let ctx = "ctx-stored".to_string();
@@ -2217,7 +2309,7 @@ mod tests {
     async fn assign_relay_set_prefers_higher_reliability() {
         let mut manager = TransportManager::builder();
         for _ in 0..5 {
-            manager.add_adapter(Box::new(MockAdapter::succeeding()));
+            manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         }
 
         // Degrade reliability for adapters 0 and 1 using the scoring API.
@@ -2356,8 +2448,8 @@ mod tests {
         };
 
         let mut manager = TransportManager::builder();
-        manager.add_adapter(Box::new(adapter1));
-        manager.add_adapter(Box::new(adapter2));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(adapter1));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(adapter2));
 
         let ctx = "ctx-suppress-both".to_string();
         manager
@@ -2428,10 +2520,10 @@ mod tests {
         };
 
         let mut manager = TransportManager::builder();
-        manager.add_adapter(Box::new(adapter1));
-        manager.add_adapter(Box::new(adapter2));
-        manager.add_adapter(Box::new(adapter3));
-        manager.add_adapter(Box::new(adapter4));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(adapter1));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(adapter2));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(adapter3));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(adapter4));
 
         let ctx = "ctx-suppress-one".to_string();
         manager
@@ -2477,9 +2569,9 @@ mod tests {
         use std::collections::HashSet;
 
         let mut manager = TransportManager::builder();
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
 
         // Manually simulate what MergedStream::check_suppressions_if_due does:
         // a warning where adapter 2 did not deliver.
@@ -2534,7 +2626,10 @@ mod tests {
         // All sends should complete without deadlock.
         let mut manager = TransportManager::builder();
         for _ in 0..5 {
-            manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0xAA; 32]))));
+            manager.add_adapter(
+                MOCK_RELAY.to_owned(),
+                Box::new(MockAdapter::with_blob_id(BlobId::new([0xAA; 32]))),
+            );
         }
 
         // Assign relay sets for 10 contexts.
@@ -2572,7 +2667,7 @@ mod tests {
     async fn assign_relay_set_prefers_cheaper_relays() {
         let mut manager = TransportManager::builder();
         for _ in 0..5 {
-            manager.add_adapter(Box::new(MockAdapter::succeeding()));
+            manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         }
 
         // Set high costs for adapters 0 and 1, leave 2, 3, 4 free.
@@ -2609,7 +2704,7 @@ mod tests {
     async fn assign_relay_set_cost_breaks_tie_between_equal_reliability() {
         let mut manager = TransportManager::builder();
         for _ in 0..4 {
-            manager.add_adapter(Box::new(MockAdapter::succeeding()));
+            manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         }
 
         // All adapters have equal reliability (default 1.0).
@@ -2681,10 +2776,10 @@ mod tests {
         let mut manager = TransportManager::builder();
         assert_eq!(manager.active_connection_count(), 0);
 
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         assert_eq!(manager.active_connection_count(), 1);
 
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         assert_eq!(manager.active_connection_count(), 2);
     }
 
@@ -2699,15 +2794,19 @@ mod tests {
         assert_eq!(manager.max_connections(), 2);
 
         // Add 2 adapters (at budget).
-        let eviction =
-            manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
+        let eviction = manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))),
+        );
         assert!(eviction.is_none(), "no eviction expected when under budget");
 
         // Sleep briefly so adapter 0 has an older timestamp than adapter 1.
         std::thread::sleep(Duration::from_millis(10));
 
-        let eviction =
-            manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))));
+        let eviction = manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))),
+        );
         assert!(eviction.is_none(), "no eviction expected when at budget");
         assert_eq!(manager.active_connection_count(), 2);
 
@@ -2715,8 +2814,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
 
         // Add a 3rd adapter — should evict the LRU (adapter 0, the oldest).
-        let eviction =
-            manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
+        let eviction = manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))),
+        );
         assert!(eviction.is_some(), "eviction expected when budget exceeded");
 
         let outcome = eviction.unwrap();
@@ -2738,9 +2839,15 @@ mod tests {
         let mut manager = TransportManager::with_config(&config);
 
         // Add 2 adapters.
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))),
+        );
         std::thread::sleep(Duration::from_millis(10));
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))));
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))),
+        );
 
         // Touch adapter 0 (make it more recently used than adapter 1).
         std::thread::sleep(Duration::from_millis(10));
@@ -2748,8 +2855,10 @@ mod tests {
 
         // Add a 3rd adapter — should evict adapter 1 (now the LRU).
         std::thread::sleep(Duration::from_millis(10));
-        let eviction =
-            manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
+        let eviction = manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))),
+        );
         assert!(eviction.is_some());
 
         let outcome = eviction.unwrap();
@@ -2771,9 +2880,9 @@ mod tests {
         let mut manager = TransportManager::with_config(&config);
 
         // Add 2 adapters.
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         std::thread::sleep(Duration::from_millis(10));
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
 
         // Assign both adapters to a context.
         let ctx = "ctx-migrate".to_string();
@@ -2800,7 +2909,8 @@ mod tests {
 
         // Add a 3rd adapter — evicts adapter 0 (LRU).
         std::thread::sleep(Duration::from_millis(10));
-        let eviction = manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        let eviction =
+            manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         assert!(eviction.is_some());
 
         let outcome = eviction.unwrap();
@@ -2825,9 +2935,9 @@ mod tests {
         let mut manager = TransportManager::with_config(&config);
 
         // Add 2 adapters, each assigned to different contexts (no overlap).
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         std::thread::sleep(Duration::from_millis(10));
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
 
         manager
             .relay_assignments
@@ -2846,7 +2956,8 @@ mod tests {
 
         // Add a 3rd adapter — evicts adapter 0 (LRU).
         std::thread::sleep(Duration::from_millis(10));
-        let eviction = manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        let eviction =
+            manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         assert!(eviction.is_some());
 
         let outcome = eviction.unwrap();
@@ -2871,7 +2982,8 @@ mod tests {
 
         // Add many adapters — none should trigger eviction.
         for _ in 0..100 {
-            let eviction = manager.add_adapter(Box::new(MockAdapter::succeeding()));
+            let eviction =
+                manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
             assert!(eviction.is_none());
         }
         assert_eq!(manager.active_connection_count(), 100);
@@ -2885,9 +2997,15 @@ mod tests {
         };
         let mut manager = TransportManager::with_config(&config);
 
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))),
+        );
         std::thread::sleep(Duration::from_millis(10));
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))));
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))),
+        );
 
         // Assign context to adapter 1 (index 1).
         let ctx = "ctx-reindex".to_string();
@@ -2900,7 +3018,10 @@ mod tests {
         // Add 3rd adapter — evicts adapter 0 (LRU). Adapter 1 becomes
         // adapter 0 after reindexing.
         std::thread::sleep(Duration::from_millis(10));
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))),
+        );
 
         let set = manager.get_relay_set(&ctx).unwrap();
         assert_eq!(
@@ -2921,13 +3042,15 @@ mod tests {
 
         // Fill to budget.
         for _ in 0..10 {
-            let eviction = manager.add_adapter(Box::new(MockAdapter::succeeding()));
+            let eviction =
+                manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
             assert!(eviction.is_none());
         }
         assert_eq!(manager.active_connection_count(), 10);
 
         // 11th adapter triggers eviction.
-        let eviction = manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        let eviction =
+            manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         assert!(
             eviction.is_some(),
             "mobile profile should evict at 11th connection"
@@ -2952,9 +3075,9 @@ mod tests {
         let mut manager = TransportManager::with_config(&config);
 
         // Add 3 adapters.
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
         assert_eq!(manager.active_connection_count(), 3);
 
         // Manually backdate adapters 0 and 1 past the idle threshold.
@@ -2984,8 +3107,8 @@ mod tests {
         };
         let mut manager = TransportManager::with_config(&config);
 
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
 
         // Backdate both adapters past the idle threshold.
         {
@@ -3020,8 +3143,8 @@ mod tests {
         let mut manager = TransportManager::with_config(&config);
 
         // Add 2 adapters.
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
 
         // Assign both adapters to a shared context so migration can occur.
         let ctx = "ctx-shed-migrate".to_string();
@@ -3089,9 +3212,9 @@ mod tests {
         };
         let mut manager = TransportManager::with_config(&config);
 
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
-        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
 
         // All adapters are recent — none should be idle.
         assert_eq!(
@@ -3143,9 +3266,18 @@ mod tests {
         let mut manager = TransportManager::with_config(&config);
         assert_eq!(manager.max_publish_jitter_ms(), 200);
 
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))));
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))),
+        );
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))),
+        );
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))),
+        );
 
         let ctx = "ctx-jitter".to_string();
         manager
@@ -3178,9 +3310,18 @@ mod tests {
         let mut manager = TransportManager::with_config(&config);
         assert_eq!(manager.max_publish_jitter_ms(), 0);
 
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))));
-        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))),
+        );
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))),
+        );
+        manager.add_adapter(
+            MOCK_RELAY.to_owned(),
+            Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))),
+        );
 
         let ctx = "ctx-no-jitter".to_string();
         manager
@@ -3242,5 +3383,151 @@ mod tests {
         };
         let manager_zero = TransportManager::with_config(&config_zero);
         assert_eq!(manager_zero.max_publish_jitter_ms(), 0);
+    }
+
+    /// Builds a manager under `profile` holding one adapter per URL in
+    /// `urls`, with adapter `i` last used `urls.len() - i` minutes ago, so
+    /// the first adapter is the least recently used.
+    fn manager_with_relays(profile: TransportProfile, urls: &[&str]) -> TransportManager {
+        let config = TransportConfig {
+            profile,
+            ..TransportConfig::default()
+        };
+        let mut manager = TransportManager::with_config(&config);
+        for url in urls {
+            assert!(
+                manager
+                    .add_adapter((*url).to_owned(), Box::new(MockAdapter::succeeding()))
+                    .is_none(),
+                "setup stays within the connection budget"
+            );
+        }
+        let now = Instant::now();
+        let mut last_used = manager.connection_last_used.lock().unwrap();
+        for idx in 0..urls.len() {
+            let age = u64::try_from(urls.len() - idx).unwrap();
+            last_used.insert(idx, now.checked_sub(Duration::from_mins(age)).unwrap());
+        }
+        drop(last_used);
+        manager
+    }
+
+    #[test]
+    fn relay_urls_names_each_held_adapter_sorted_and_deduplicated() {
+        let mut manager = TransportManager::new(
+            "wss://b.example".to_owned(),
+            Box::new(MockAdapter::succeeding()),
+        );
+        assert_eq!(manager.relay_urls(), vec!["wss://b.example".to_owned()]);
+        manager.add_adapter(
+            "wss://a.example".to_owned(),
+            Box::new(MockAdapter::succeeding()),
+        );
+        manager.add_adapter(
+            "wss://b.example".to_owned(),
+            Box::new(MockAdapter::succeeding()),
+        );
+        assert_eq!(
+            manager.relay_urls(),
+            vec!["wss://a.example".to_owned(), "wss://b.example".to_owned()]
+        );
+        assert!(TransportManager::builder().relay_urls().is_empty());
+    }
+
+    #[test]
+    fn add_adapter_budget_eviction_removes_the_evicted_relay_url() {
+        let mut manager = manager_with_relays(
+            TransportProfile::Constrained,
+            &["wss://r0.example", "wss://r1.example"],
+        );
+        let outcome = manager
+            .add_adapter(
+                "wss://r2.example".to_owned(),
+                Box::new(MockAdapter::succeeding()),
+            )
+            .expect("the third adapter exceeds the Constrained budget of 2");
+        assert_eq!(outcome.evicted_relay_url, "wss://r0.example");
+        assert_eq!(
+            manager.relay_urls(),
+            vec!["wss://r1.example".to_owned(), "wss://r2.example".to_owned()]
+        );
+    }
+
+    #[test]
+    fn add_adapter_budget_eviction_on_mobile_removes_the_first_relay_url() {
+        let urls: Vec<String> = (0..10).map(|i| format!("wss://r{i}.example")).collect();
+        let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let mut manager = manager_with_relays(TransportProfile::Mobile, &refs);
+        assert_eq!(manager.max_connections(), 10);
+        let outcome = manager
+            .add_adapter(
+                "wss://r10.example".to_owned(),
+                Box::new(MockAdapter::succeeding()),
+            )
+            .expect("the eleventh adapter exceeds the Mobile budget of 10");
+        assert_eq!(outcome.evicted_relay_url, "wss://r0.example");
+        let held = manager.relay_urls();
+        assert_eq!(held.len(), 10);
+        assert!(!held.contains(&"wss://r0.example".to_owned()));
+        assert!(held.contains(&"wss://r10.example".to_owned()));
+    }
+
+    #[test]
+    fn evict_lru_connection_removes_the_evicted_relay_url() {
+        let mut manager = manager_with_relays(
+            TransportProfile::Desktop,
+            &["wss://old.example", "wss://new.example"],
+        );
+        let outcome = manager
+            .evict_lru_connection()
+            .expect("two adapters are held");
+        assert_eq!(outcome.evicted_relay_url, "wss://old.example");
+        assert_eq!(manager.relay_urls(), vec!["wss://new.example".to_owned()]);
+        manager.evict_lru_connection().expect("one adapter is held");
+        assert!(manager.relay_urls().is_empty());
+        assert!(manager.evict_lru_connection().is_none());
+    }
+
+    #[test]
+    fn evict_lru_connection_keeps_a_url_another_adapter_still_connects_to() {
+        let mut manager = manager_with_relays(
+            TransportProfile::Desktop,
+            &["wss://same.example", "wss://same.example"],
+        );
+        let outcome = manager
+            .evict_lru_connection()
+            .expect("two adapters are held");
+        assert_eq!(outcome.evicted_relay_url, "wss://same.example");
+        assert_eq!(manager.relay_urls(), vec!["wss://same.example".to_owned()]);
+    }
+
+    #[test]
+    fn shed_idle_connections_removes_each_shed_relay_url() {
+        let mut manager = manager_with_relays(
+            TransportProfile::Mobile,
+            &[
+                "wss://idle-a.example",
+                "wss://idle-b.example",
+                "wss://live.example",
+            ],
+        );
+        {
+            let mut last_used = manager.connection_last_used.lock().unwrap();
+            let idle = Instant::now().checked_sub(Duration::from_mins(10)).unwrap();
+            last_used.insert(0, idle);
+            last_used.insert(1, idle);
+            last_used.insert(2, Instant::now());
+        }
+        let outcomes = manager.shed_idle_connections(&TransportProfile::Mobile);
+        let mut shed: Vec<String> = outcomes.into_iter().map(|o| o.evicted_relay_url).collect();
+        shed.sort_unstable();
+        assert_eq!(
+            shed,
+            vec![
+                "wss://idle-a.example".to_owned(),
+                "wss://idle-b.example".to_owned()
+            ]
+        );
+        assert_eq!(manager.relay_urls(), vec!["wss://live.example".to_owned()]);
     }
 }

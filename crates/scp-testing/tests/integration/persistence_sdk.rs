@@ -226,7 +226,13 @@ async fn context_create_persists_membership_to_sqlite() {
 
         manager.register_local_did(alice.clone()).await.unwrap();
         let handle = manager
-            .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
+            .create_context(
+                ctx_id.to_owned(),
+                encrypted_params(),
+                alice.clone(),
+                None,
+                Vec::new(),
+            )
             .await
             .expect("context_create must succeed with sqlite-backed persistence");
         assert_eq!(handle.state(), ContextState::Active);
@@ -330,7 +336,13 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
 
         manager.register_local_did(alice.clone()).await.unwrap();
         let _handle = manager
-            .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
+            .create_context(
+                ctx_id.to_owned(),
+                encrypted_params(),
+                alice.clone(),
+                None,
+                Vec::new(),
+            )
             .await
             .expect("context_create must succeed");
 
@@ -487,6 +499,7 @@ async fn close_then_reopen_same_path_is_deterministic() {
                 encrypted_params(),
                 alice.clone(),
                 None,
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -513,6 +526,7 @@ async fn close_then_reopen_same_path_is_deterministic() {
             encrypted_params(),
             alice.clone(),
             None,
+            Vec::new(),
         )
         .await
         .unwrap();

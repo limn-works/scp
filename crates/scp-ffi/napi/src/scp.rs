@@ -1936,6 +1936,8 @@ impl Scp {
     /// `contextJoinFromWelcome`. A voting-governed context throws (governed-
     /// context invitations are not yet implemented). `creatorDid` MUST be a
     /// locally-custodied identity; the invite is signed under its `#active` key.
+    /// The bundle carries the context's stored relay set (§5.12.3.1
+    /// `relay_urls`), which the runtime reads; the caller supplies none.
     #[napi(js_name = "inviteMember")]
     pub async fn invite_member(
         &self,
@@ -1943,7 +1945,6 @@ impl Scp {
         creator_did: String,
         invitee_did: String,
         invitee_key_package: Vec<u8>,
-        relay_urls: Vec<String>,
     ) -> napi::Result<NapiInviteMemberOutcome> {
         crate::context::invite_member_on(
             &self.inner,
@@ -1951,7 +1952,6 @@ impl Scp {
             creator_did,
             invitee_did,
             invitee_key_package,
-            relay_urls,
         )
         .await
     }

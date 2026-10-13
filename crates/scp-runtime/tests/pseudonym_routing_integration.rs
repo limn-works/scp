@@ -207,7 +207,7 @@ async fn encrypted_send_fans_out_to_peer_registry_not_shared_rid() {
     let ctx_id = "ctx-routing-fanout";
 
     manager
-        .create_context(ctx_id.into(), encrypted_params(), alice(), None)
+        .create_context(ctx_id.into(), encrypted_params(), alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -280,7 +280,7 @@ async fn multi_member_empty_registry_send_errors_and_rolls_back() {
     let ctx_id = "ctx-routing-empty";
 
     manager
-        .create_context(ctx_id.into(), encrypted_params(), alice(), None)
+        .create_context(ctx_id.into(), encrypted_params(), alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -362,7 +362,7 @@ async fn lone_member_encrypted_send_is_noop_no_charge_no_event() {
     // Single-member encrypted context: Alice creates it and never adds Bob, so
     // `member_count == 1` and the peer registry is empty.
     manager
-        .create_context(ctx_id.into(), encrypted_params(), alice(), None)
+        .create_context(ctx_id.into(), encrypted_params(), alice(), None, Vec::new())
         .await
         .unwrap();
 
@@ -480,7 +480,7 @@ async fn local_pseudonym_query_on_broadcast_is_not_pseudonymous() {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .unwrap();
 

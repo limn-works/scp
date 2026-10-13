@@ -526,12 +526,7 @@ class SCP:
         self, owning_did: Any, sealed: PySealedInvitation, reservation_id: Any
     ) -> Any: ...
     def invite_member(
-        self,
-        context_id: Any,
-        creator_did: Any,
-        invitee_did: Any,
-        invitee_key_package: Any,
-        relay_urls: Any,
+        self, context_id: Any, creator_did: Any, invitee_did: Any, invitee_key_package: Any
     ) -> PyInviteMemberOutcome: ...
     def context_leave(self, handle: Any, identity_did: Any) -> Any: ...
     def context_member_count(self, handle: Any) -> Any: ...
