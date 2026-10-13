@@ -511,6 +511,7 @@ RUSTDOC_LINT_LEVEL = "forbid"
 # kind; remove one only alongside the job it names.
 WORKSPACE_SCOPED_JOBS = {
     ("ci.yml", "rust-clippy"),
+    ("ci.yml", "rust-deny"),
     ("ci.yml", "rust-doc"),
     ("ci.yml", "rust-doctest"),
     ("ci.yml", "rust-test"),

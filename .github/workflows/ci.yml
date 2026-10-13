@@ -2708,6 +2708,18 @@ jobs:
       - name: Fetch the advisory database
         run: cargo deny --manifest-path ./Cargo.toml fetch db
       - run: cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features --offline check
+      # deny.toml ignores RUSTSEC-2023-0071 for every rsa version, and its rsa ban checks
+      # which crate depends on rsa, not the kind of edge. This step fails when rsa is
+      # reachable from any workspace crate over a normal or build edge on any target.
+      # `cargo tree` exits non-zero once rsa leaves the graph; remove this step with the
+      # advisory ignore then.
+      - name: Check rsa is reachable over dev edges only
+        run: |
+          out="$(cargo tree -e normal,build -i rsa --workspace --all-features --target all)"
+          if [ -n "$out" ]; then
+            printf 'rsa is reachable over a normal or build edge:\n%s\n' "$out"
+            exit 1
+          fi
 
   # ── Container image ─────────────────────────────────────────────────
   # Builds the `Dockerfile` that ships `scp-relay` and `scp-node`, and that
