@@ -477,7 +477,13 @@ fn handle_seed_peer_pseudonym(
     let result = view.routing_mut().peer_registry_mut().map_or(
         Err(ContextError::NotPseudonymousContext { context_id }),
         |reg| {
-            reg.insert(member_did, pseudonym);
+            reg.insert(
+                member_did,
+                scp_protocol::context::pseudonym::PseudonymRecord {
+                    routing_id: pseudonym,
+                    epoch: None,
+                },
+            );
             Ok(())
         },
     );

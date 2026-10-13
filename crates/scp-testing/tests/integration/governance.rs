@@ -250,6 +250,12 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
         GovernanceAction::ModifyHardRateLimit {
             new_config: scp_core::economy::antispam::HardRateLimitConfig::matrix_defaults(),
         },
+        GovernanceAction::ModifyPseudonymRotationPolicy {
+            new_policy: Some(scp_core::context::PseudonymRotationPolicy {
+                interval_secs: Some(3600),
+                on_membership_change: true,
+            }),
+        },
     ]
 }
 
@@ -264,7 +270,7 @@ async fn all_governance_action_variants_roundtrip() {
     // values to exercise both scopes of the AccessScope enum.
     assert_eq!(
         actions.len(),
-        31,
+        32,
         "fixture must cover every GovernanceAction variant; bump when adding a new variant"
     );
 

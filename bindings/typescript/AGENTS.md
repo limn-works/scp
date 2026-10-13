@@ -13,10 +13,10 @@ Use bun, never npm or npx. Follow `.docs/standards/typescript.md`. Biome handles
 
 ## Code that also runs in a browser
 
-`Buffer`, `process`, and `setImmediate` do not exist in browsers or edge runtimes, and referencing one throws `ReferenceError`. `tsc` stays silent because `@types/node` declares them, and every test under Node or Bun passes. Once, a JWT decoder in `src/trust.ts` called `Buffer.from(…, "base64url")` inside a `try`/`catch` that returned `null`, so in a browser every token decoded to `null` and `evaluateLayer1` reported all-false: a verdict that looks legitimate.
+`Buffer`, `process`, and `setImmediate` do not exist in browsers or edge runtimes, and referencing one throws `ReferenceError`. `tsc` stays silent because `@types/node` declares them, and every test under Node or Bun passes. Once, a JWT decoder in `src/trust.ts` (since deleted) called `Buffer.from(…, "base64url")` inside a `try`/`catch` that returned `null`, so in a browser every token decoded to `null` and `evaluateLayer1` reported all-false: a verdict that looks legitimate.
 
 - On any path more than one runtime runs, treat Node globals as absent. Feature-detect with `typeof X !== "undefined"` and fall back to Web APIs: `atob`/`btoa`, `TextEncoder`/`TextDecoder`, `crypto.subtle`, `queueMicrotask`.
 - Never let a `try`/`catch` turn a `ReferenceError` into a fail-closed value. A missing global is a packaging defect, not a data outcome.
-- Test each fallback by deleting the global, as `tests/browser-fallback.test.ts` does with `globalThis.Buffer`; without such a test the fallback is dead code.
+- Test each fallback by deleting the global (`delete globalThis.Buffer`, restored in a `finally`) and calling the code; without such a test the fallback is dead code.
 - Browser `atob` accepts standard base64, not base64url: map `-`→`+` and `_`→`/` and re-pad first.
-- The rules bind every file more than one runtime compiles. That includes `src/trust.ts` (its `__decodeBase64UrlToUtf8` has a `globalThis.atob` branch) and `src/errors.ts`, which the browser package `bindings/typescript-wasm/` bundles through the `@scp-core/errors` path alias, so a Node global there breaks `mapBridgeError` for every browser error.
+- The rules bind every file more than one runtime compiles. That includes `src/errors.ts`, which the browser package `bindings/typescript-wasm/` bundles through the `@scp-core/errors` path alias, so a Node global there breaks `mapBridgeError` for every browser error.

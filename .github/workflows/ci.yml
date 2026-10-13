@@ -446,7 +446,9 @@ jobs:
               # reads `scripts/pure-helpers-allowlist.txt` at run time and compiles in the
               # bridge-symmetry fixtures, and `crates/scp-testing/tests/integration/sdk_wrapper.rs`
               # compiles in the Python, TypeScript, Swift and Kotlin SDK sources under the
-              # four `bindings/` directories listed last. A pull request that edits only one
+              # four `bindings/` directories listed last. `crates/scp-event-log/src/lib.rs`
+              # compiles in spec 25 and checks its Vector 32 `EventType` tag table against
+              # the enum. A pull request that edits only one
               # of them changes what rust-test asserts. The `prose-route` check of
               # `scripts/tests/ci-gate/ci_gate_selftest.py` scans `crates/**/*.rs` for every
               # such read and fails when this filter does not select one.
@@ -459,6 +461,7 @@ jobs:
               - 'bindings/typescript-wasm/tests/fixtures/outlet-stream-invoker-kat.json'
               - 'scripts/pure-helpers-allowlist.txt'
               - 'scripts/tests/bridge-symmetry/fixtures/**'
+              - '.docs/specs/25-test-vectors.md'
               - 'bindings/python/scp_sdk/**'
               - 'bindings/typescript/src/**'
               - 'bindings/swift/Sources/SCP/**'
@@ -1697,6 +1700,10 @@ jobs:
           # would compile the backends for scp-relay even when scp-relay's own
           # `cloud-blobs` no longer enables them.
           cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
+          # The relay push registration store compiles only under `push-store`,
+          # with and without its `testing`-only in-memory arm.
+          cargo clippy -p scp-transport --features push-store --all-targets -- -D warnings
+          cargo clippy -p scp-transport --features push-store,testing --all-targets -- -D warnings
           cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
           cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
       # Runs scripts/check-examples-compile.sh against throwaway one- and two-crate
@@ -1971,6 +1978,17 @@ jobs:
           # builds them. Each `--test` names one target; a target that stops
           # existing fails this command.
           cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --test postgres_blob_fail_closed --test s3_blob_fail_closed
+          # The relay push registration store (spec §10.7.1, PUSH-006) compiles
+          # only under `push-store`, and its in-memory arm only under `testing`,
+          # which --workspace leaves off. Each feature set runs the whole lib
+          # and every integration target with no test filter, so a unit test
+          # in any module, or a target whose required features a set meets,
+          # runs with no edit here.
+          cargo nextest run --no-tests=fail -p scp-transport --features push-store,testing --lib --tests
+          cargo nextest run --no-tests=fail -p scp-transport --features push-store --lib --tests
+          # Selects only the assertion that compiles out under `testing`, so a
+          # build that turned `testing` on selects zero tests and fails.
+          cargo nextest run --no-tests=fail -p scp-transport --features push-store --lib store_without_testing_has_only_the_sqlite_arm
       - name: Run node and relay tests
         if: matrix.group == 'node-relay'
         run: |
@@ -2690,6 +2708,18 @@ jobs:
       - name: Fetch the advisory database
         run: cargo deny --manifest-path ./Cargo.toml fetch db
       - run: cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features --offline check
+      # deny.toml ignores RUSTSEC-2023-0071 for every rsa version, and its rsa ban checks
+      # which crate depends on rsa, not the kind of edge. This step fails when rsa is
+      # reachable from any workspace crate over a normal or build edge on any target.
+      # `cargo tree` exits non-zero once rsa leaves the graph; remove this step with the
+      # advisory ignore then.
+      - name: Check rsa is reachable over dev edges only
+        run: |
+          out="$(cargo tree -e normal,build -i rsa --workspace --all-features --target all)"
+          if [ -n "$out" ]; then
+            printf 'rsa is reachable over a normal or build edge:\n%s\n' "$out"
+            exit 1
+          fi
 
   # ── Container image ─────────────────────────────────────────────────
   # Builds the `Dockerfile` that ships `scp-relay` and `scp-node`, and that

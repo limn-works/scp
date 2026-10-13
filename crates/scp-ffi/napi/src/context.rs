@@ -737,6 +737,8 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
         .unwrap_or("ephemeral")
         .to_owned();
 
+    let pseudonym_rotation = parse_pseudonym_rotation(&params["pseudonymRotation"])?;
+
     // Delegate to the shared context-params builder (#1447). All parsing,
     // validation, and ContextParams construction happens in scp-ffi-common.
     let common = scp_ffi_common::context_params::CommonContextParams {
@@ -754,6 +756,7 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
         economic_policy_json: economic_policy.clone(),
         consequence_rules_json,
         consequence_config_json,
+        pseudonym_rotation,
         ..Default::default()
     };
 
@@ -774,6 +777,53 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
         governance,
         economic_policy,
     })
+}
+
+/// Parses the `pseudonymRotation` value of a context-params JSON (spec 09
+/// §9.10.4.1): `null` or absent disables rotation; otherwise it must be
+/// `{ intervalSecs?: number | null, onMembershipChange: boolean }`. A
+/// non-object, an unknown or misspelled key (so a typo cannot leave rotation
+/// off), a missing or mistyped field each fail with `SCP-VALID-7000`; the
+/// common builder then applies the §9.10.4.1 validity criterion.
+fn parse_pseudonym_rotation(
+    value: &serde_json::Value,
+) -> napi::Result<Option<scp_core::context::PseudonymRotationPolicy>> {
+    let invalid = |detail: String| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!(
+                "invalid pseudonymRotation (spec §9.10.4.1): {detail}; expected null or \
+                 {{ intervalSecs?: number | null, onMembershipChange: boolean }}"
+            ),
+            code: codes::VALID_7000.to_owned(),
+        })
+    };
+    let object = match value {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::Object(object) => object,
+        other => return Err(invalid(format!("not an object: {other}"))),
+    };
+    if let Some(key) = object
+        .keys()
+        .find(|k| *k != "intervalSecs" && *k != "onMembershipChange")
+    {
+        return Err(invalid(format!("unknown key '{key}'")));
+    }
+    let interval_secs =
+        match object.get("intervalSecs") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(v.as_u64().ok_or_else(|| {
+                invalid(format!("intervalSecs is not a non-negative integer: {v}"))
+            })?),
+        };
+    let on_membership_change = match object.get("onMembershipChange") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(v) => return Err(invalid(format!("onMembershipChange is not a boolean: {v}"))),
+        None => return Err(invalid("missing onMembershipChange".to_owned())),
+    };
+    Ok(Some(scp_core::context::PseudonymRotationPolicy {
+        interval_secs,
+        on_membership_change,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -8273,6 +8323,57 @@ mod tests {
             parsed_ceiling_names(r#"{"ceiling":["messages:write"]}"#),
             std::iter::once("messages:write".to_owned()).collect::<std::collections::HashSet<_>>()
         );
+    }
+
+    /// Spec 09 §9.10.4.1: `pseudonymRotation` reaches the core params; an
+    /// absent key or `null` disables rotation; a malformed object (wrong type,
+    /// unknown key, missing `onMembershipChange`) and a policy failing the
+    /// validity criterion both reject with `SCP-VALID-7000`.
+    #[test]
+    fn parse_context_params_carries_and_validates_pseudonym_rotation() {
+        let rotation = |json: &str| {
+            super::parse_context_params(json)
+                .map(|p| p.core.pseudonym_rotation)
+                .map_err(|e| e.reason.clone())
+        };
+        assert_eq!(rotation(r#"{"ceiling":["messages:write"]}"#), Ok(None));
+        assert_eq!(
+            rotation(r#"{"ceiling":["messages:write"],"pseudonymRotation":null}"#),
+            Ok(None)
+        );
+        assert_eq!(
+            rotation(
+                r#"{"ceiling":["messages:write"],"pseudonymRotation":{"intervalSecs":3600,"onMembershipChange":false}}"#
+            ),
+            Ok(Some(scp_core::context::PseudonymRotationPolicy {
+                interval_secs: Some(3600),
+                on_membership_change: false,
+            }))
+        );
+        assert_eq!(
+            rotation(
+                r#"{"ceiling":["messages:write"],"pseudonymRotation":{"onMembershipChange":true}}"#
+            ),
+            Ok(Some(scp_core::context::PseudonymRotationPolicy {
+                interval_secs: None,
+                on_membership_change: true,
+            }))
+        );
+        for bad in [
+            r#"{"ceiling":["messages:write"],"pseudonymRotation":true}"#,
+            r#"{"ceiling":["messages:write"],"pseudonymRotation":{"intervalSecs":3600}}"#,
+            r#"{"ceiling":["messages:write"],"pseudonymRotation":{"intervalSec":3600,"onMembershipChange":false}}"#,
+            r#"{"ceiling":["messages:write"],"pseudonymRotation":{"intervalSecs":-1,"onMembershipChange":true}}"#,
+            r#"{"ceiling":["messages:write"],"pseudonymRotation":{"onMembershipChange":false}}"#,
+            r#"{"ceiling":["messages:write"],"pseudonymRotation":{"intervalSecs":599,"onMembershipChange":true}}"#,
+        ] {
+            let reason = rotation(bad).expect_err(bad);
+            assert!(
+                reason.starts_with(&format!("[{}] ", codes::VALID_7000)),
+                "{bad} must reject with {}, got: {reason}",
+                codes::VALID_7000
+            );
+        }
     }
 
     /// A close of a context whose actor the supervisor despawned succeeds

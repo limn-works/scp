@@ -58,7 +58,8 @@ final class BroadcastKeyRequestTests: XCTestCase {
             sessionCap: nil,
             economicPolicy: nil,
             consequenceRulesJson: nil,
-            consequenceConfigJson: nil
+            consequenceConfigJson: nil,
+            pseudonymRotation: nil
         )
     }
 

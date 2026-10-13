@@ -74,6 +74,7 @@ fn full_capability_params() -> ContextParams {
         economic_policy: None,
         consequence_rules_json: None,
         consequence_config_json: None,
+        pseudonym_rotation: None,
     }
 }
 
@@ -97,6 +98,7 @@ fn default_encrypted_params() -> ContextParams {
         economic_policy: None,
         consequence_rules_json: None,
         consequence_config_json: None,
+        pseudonym_rotation: None,
     }
 }
 
@@ -1273,6 +1275,7 @@ async fn context_create_with_all_governance_models() {
             economic_policy: None,
             consequence_rules_json: None,
             consequence_config_json: None,
+            pseudonym_rotation: None,
         };
         let handle = scp.context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");
@@ -1307,6 +1310,7 @@ async fn context_create_with_all_memory_scopes() {
             economic_policy: None,
             consequence_rules_json: None,
             consequence_config_json: None,
+            pseudonym_rotation: None,
         };
         let handle = scp.context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");

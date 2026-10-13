@@ -333,6 +333,11 @@ pub enum ContextCreationError {
     #[error(transparent)]
     InvalidCeilingCategory(#[from] crate::context::roles::CeilingEntryError),
 
+    /// `ContextParams.pseudonym_rotation` fails the §9.10.4.1 validity
+    /// criterion, so the context is not created.
+    #[error(transparent)]
+    InvalidPseudonymRotationPolicy(#[from] crate::context::params::PseudonymRotationPolicyError),
+
     /// Generic creation failure with a descriptive message.
     #[error("context creation failed: {0}")]
     CreationFailed(String),

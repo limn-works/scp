@@ -48,7 +48,8 @@ enum ToolsExample {
             sessionCap: nil,
             economicPolicy: nil,
             consequenceRulesJson: nil,
-            consequenceConfigJson: nil
+            consequenceConfigJson: nil,
+            pseudonymRotation: nil
         )
         let handle = try await scp.contextCreate(identity: operatorIdentity, params: params)
         print("Context: \(handle.contextId())")

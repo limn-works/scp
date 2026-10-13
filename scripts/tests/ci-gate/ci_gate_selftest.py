@@ -511,6 +511,7 @@ RUSTDOC_LINT_LEVEL = "forbid"
 # kind; remove one only alongside the job it names.
 WORKSPACE_SCOPED_JOBS = {
     ("ci.yml", "rust-clippy"),
+    ("ci.yml", "rust-deny"),
     ("ci.yml", "rust-doc"),
     ("ci.yml", "rust-doctest"),
     ("ci.yml", "rust-test"),
@@ -642,6 +643,7 @@ SHIPPED_CONFIG_LANES = {
 NON_BRIDGE_SHIPPED_ASSERTION_LANES = {
     "scp-identity": "fail-closed-pre-rotation",
     "scp-node": "fail-closed-pre-rotation",
+    "scp-transport": "rust-test-optional-features",
 }
 
 # Attributes that mark a Rust function as a test, and the attribute that
@@ -6858,6 +6860,11 @@ LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ..
             (
                 "cargo clippy -p scp-transport --features "
                 "sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings"
+            ),
+            "cargo clippy -p scp-transport --features push-store --all-targets -- -D warnings",
+            (
+                "cargo clippy -p scp-transport --features push-store,testing --all-targets "
+                "-- -D warnings"
             ),
             "cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings",
             "cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings",

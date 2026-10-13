@@ -72,6 +72,7 @@ fun contextExample(
             economicPolicy = null,
             consequenceRulesJson = null,
             consequenceConfigJson = null,
+            pseudonymRotation = null,
         )
 
     // 3. Alice creates the context. The returned ContextHandle is the

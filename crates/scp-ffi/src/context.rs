@@ -462,6 +462,11 @@ impl PyContextHandle {
 /// - `promotion_policy` -- string: `"no_promotion"` (default), `"promotable"` (spec §5.10)
 /// - `template_id` -- optional string: template identifier (spec §5.14)
 /// - `economic_policy` -- optional JSON string: economic policy (spec §19)
+/// - `pseudonym_rotation` -- `None` (default: rotation off) or a dict
+///   `{"interval_secs": int | None, "on_membership_change": bool}` (spec 09
+///   §9.10.4.1). `on_membership_change` is required; a malformed dict, an
+///   unknown key, and a policy failing the validity criterion (no trigger, or
+///   `interval_secs` under 600) raise `ValidationError` with `SCP-VALID-7000`.
 ///
 /// Unrecognized keys are silently ignored. A missing optional key uses its
 /// protocol default.
@@ -517,6 +522,9 @@ pub struct PyContextParams {
     /// When `None`, defaults to `ConsequenceConfig::default()` (all severe
     /// enforcement tiers gated to governance only).
     consequence_config: Option<String>,
+    /// Pseudonym rotation policy (spec 09 §9.10.4.1). `None` disables
+    /// rotation.
+    pseudonym_rotation: Option<scp_core::context::PseudonymRotationPolicy>,
 }
 
 #[pymethods]
@@ -650,6 +658,21 @@ impl PyContextParams {
         self.consequence_config.as_deref()
     }
 
+    /// Returns the pseudonym rotation policy as a dict
+    /// `{"interval_secs": int | None, "on_membership_change": bool}`, or
+    /// `None` when rotation is off (spec 09 §9.10.4.1).
+    #[getter]
+    fn pseudonym_rotation<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        self.pseudonym_rotation
+            .map(|policy| {
+                let dict = PyDict::new(py);
+                dict.set_item("interval_secs", policy.interval_secs)?;
+                dict.set_item("on_membership_change", policy.on_membership_change)?;
+                Ok(dict)
+            })
+            .transpose()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "PyContextParams(ceiling={:?}, roles={:?}, outlets={:?}, ttl={:?}, \
@@ -657,7 +680,8 @@ impl PyContextParams {
              promotion_policy='{}', template_id={:?}, economic_policy={:?}, \
              min_protocol_version={:?}, max_chain_depth={:?}, \
              max_nesting_depth={:?}, session_cap={:?}, \
-             consequence_rules={:?}, consequence_config={:?})",
+             consequence_rules={:?}, consequence_config={:?}, \
+             pseudonym_rotation={:?})",
             self.ceiling,
             self.roles,
             self.outlets,
@@ -675,6 +699,7 @@ impl PyContextParams {
             self.session_cap,
             self.consequence_rules,
             self.consequence_config,
+            self.pseudonym_rotation,
         )
     }
 }
@@ -718,6 +743,58 @@ fn typed_supervisor_error(
         message: format!("{op} failed: {e}"),
         code: code.to_owned(),
     })
+}
+
+/// Extracts a `pseudonym_rotation` dict (spec 09 §9.10.4.1). The dict holds
+/// `on_membership_change` (bool, required) and optionally `interval_secs`
+/// (non-negative int or `None`). A non-dict value, an unknown or misspelled
+/// key, a missing or mistyped field, and a policy failing the §9.10.4.1
+/// validity criterion (no trigger, or `interval_secs` under 600) each raise
+/// `ValidationError` with `SCP-VALID-7000`.
+fn pseudonym_rotation_from_py(
+    val: &Bound<'_, PyAny>,
+) -> PyResult<scp_core::context::PseudonymRotationPolicy> {
+    let invalid = |detail: String| -> PyErr {
+        crate::error::ScpPyError::ValidationError {
+            message: format!(
+                "invalid pseudonym_rotation (spec §9.10.4.1): {detail}; expected None or \
+                 {{'interval_secs': int | None, 'on_membership_change': bool}}"
+            ),
+            code: codes::VALID_7000.to_owned(),
+        }
+        .into()
+    };
+    let dict = val
+        .downcast::<PyDict>()
+        .map_err(|_| invalid("not a dict".to_owned()))?;
+    for key in dict.keys() {
+        let key: String = key
+            .extract()
+            .map_err(|_| invalid("a key is not a string".to_owned()))?;
+        if key != "interval_secs" && key != "on_membership_change" {
+            return Err(invalid(format!("unknown key '{key}'")));
+        }
+    }
+    let interval_secs: Option<u64> = match dict.get_item("interval_secs")? {
+        Some(v) if v.is_none() => None,
+        Some(v) => Some(
+            v.extract()
+                .map_err(|e| invalid(format!("interval_secs: {e}")))?,
+        ),
+        None => None,
+    };
+    let on_membership_change: bool = match dict.get_item("on_membership_change")? {
+        Some(v) => v
+            .extract()
+            .map_err(|e| invalid(format!("on_membership_change: {e}")))?,
+        None => return Err(invalid("missing 'on_membership_change'".to_owned())),
+    };
+    let policy = scp_core::context::PseudonymRotationPolicy {
+        interval_secs,
+        on_membership_change,
+    };
+    policy.validate().map_err(|e| invalid(e.to_string()))?;
+    Ok(policy)
 }
 
 /// Valid template ID strings accepted from the Python bridge layer.
@@ -960,6 +1037,12 @@ impl PyContextParams {
             None => None,
         };
 
+        let pseudonym_rotation = match dict.get_item("pseudonym_rotation")? {
+            Some(val) if val.is_none() => None,
+            Some(val) => Some(pseudonym_rotation_from_py(&val)?),
+            None => None,
+        };
+
         Ok(Self {
             ceiling,
             roles,
@@ -978,6 +1061,7 @@ impl PyContextParams {
             session_cap,
             consequence_rules,
             consequence_config,
+            pseudonym_rotation,
         })
     }
 
@@ -1093,6 +1177,7 @@ impl PyContextParams {
             session_cap: params.session_cap,
             consequence_rules,
             consequence_config,
+            pseudonym_rotation: params.pseudonym_rotation,
         }
     }
 }
@@ -1687,6 +1772,7 @@ fn build_core_context_params(
         economic_policy_json: py_params.economic_policy.clone(),
         consequence_rules_json: py_params.consequence_rules.clone(),
         consequence_config_json: py_params.consequence_config.clone(),
+        pseudonym_rotation: py_params.pseudonym_rotation,
         roles: py_params
             .roles
             .iter()
@@ -7578,7 +7664,102 @@ mod tests {
             session_cap: None,
             consequence_rules: None,
             consequence_config: None,
+            pseudonym_rotation: None,
         }
+    }
+
+    /// Spec 09 §9.10.4.1: a `pseudonym_rotation` dict reaches the core
+    /// params and round-trips through `from_core_params`; `None` and an
+    /// absent key disable rotation; a malformed or invalid value raises
+    /// `ValidationError` (`SCP-VALID-7000`) before any context state exists.
+    #[test]
+    fn params_pseudonym_rotation_parsed_validated_and_projected() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let parse = |rotation: Option<Bound<'_, PyAny>>| {
+                let dict = PyDict::new(py);
+                dict.set_item("ceiling", vec!["messages:read"]).unwrap();
+                if let Some(r) = rotation {
+                    dict.set_item("pseudonym_rotation", r).unwrap();
+                }
+                PyContextParams::from_py_dict(&dict)
+            };
+            let policy = |pairs: &[(&str, Bound<'_, PyAny>)]| {
+                let d = PyDict::new(py);
+                for (k, v) in pairs {
+                    d.set_item(*k, v).unwrap();
+                }
+                Some(d.into_any())
+            };
+            let int = |n: i64| n.into_pyobject(py).unwrap().into_any();
+            let flag = |b: bool| b.into_pyobject(py).unwrap().to_owned().into_any();
+
+            assert_eq!(parse(None).unwrap().pseudonym_rotation, None);
+            assert_eq!(
+                parse(Some(py.None().into_bound(py)))
+                    .unwrap()
+                    .pseudonym_rotation,
+                None
+            );
+
+            let parsed = parse(policy(&[
+                ("interval_secs", int(3600)),
+                ("on_membership_change", flag(true)),
+            ]))
+            .unwrap();
+            let expected = scp_core::context::PseudonymRotationPolicy {
+                interval_secs: Some(3600),
+                on_membership_change: true,
+            };
+            assert_eq!(parsed.pseudonym_rotation, Some(expected));
+            let core = super::build_core_context_params(&parsed).unwrap();
+            assert_eq!(core.pseudonym_rotation, Some(expected));
+            assert_eq!(
+                PyContextParams::from_core_params(&core).pseudonym_rotation,
+                Some(expected)
+            );
+            let getter = parsed.pseudonym_rotation(py).unwrap().unwrap();
+            let interval: Option<u64> = getter
+                .get_item("interval_secs")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(interval, Some(3600));
+
+            // Malformed, and well-formed but invalid under §9.10.4.1 (no
+            // trigger; interval under 600): each raises ValidationError with
+            // SCP-VALID-7000.
+            for bad in [
+                Some(int(5)),
+                policy(&[("interval_secs", int(3600))]),
+                policy(&[
+                    ("interval_sec", int(3600)),
+                    ("on_membership_change", flag(false)),
+                ]),
+                policy(&[
+                    ("interval_secs", int(-1)),
+                    ("on_membership_change", flag(true)),
+                ]),
+                policy(&[("on_membership_change", flag(false))]),
+                policy(&[
+                    ("interval_secs", int(599)),
+                    ("on_membership_change", flag(true)),
+                ]),
+            ] {
+                let err = parse(bad).expect_err("must reject");
+                assert!(
+                    err.is_instance_of::<crate::error::ValidationError>(py),
+                    "expected ValidationError, got {err}"
+                );
+                let message = err.value(py).to_string();
+                assert!(
+                    message.starts_with(&format!("[{}]", codes::VALID_7000)),
+                    "expected {}, got {message}",
+                    codes::VALID_7000
+                );
+            }
+        });
     }
 
     #[test]

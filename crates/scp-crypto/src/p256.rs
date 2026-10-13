@@ -511,9 +511,10 @@ pub fn check_keypair(
 /// JOSE ES256 codec (RFC 7518 §3.4): ECDSA P-256 over SHA-256 of the JWS
 /// signing input, with the signature as the fixed 64-byte `r ‖ s`.
 ///
-/// This is only the signature codec and the `alg` value. It is not wired into
-/// UCAN or any JWT yet: UCAN issuers resolve through did:dht, which carries
-/// only Ed25519 until the identity key moves to P-256 (SCP-315).
+/// This is only the signature codec and the `alg` value. The relay's APNs
+/// sender signs its provider JWT with it (PUSH-010). It is not wired into UCAN
+/// yet: UCAN issuers resolve through did:dht, which carries only Ed25519 until
+/// the identity key moves to P-256 (SCP-315).
 pub mod jose {
     use sha2::{Digest, Sha256};
 

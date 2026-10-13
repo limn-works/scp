@@ -3826,6 +3826,65 @@ pub async fn execute_modify_hard_rate_limit(
 }
 
 // ---------------------------------------------------------------------------
+// execute_modify_pseudonym_rotation_policy (per-action leaf helper)
+// ---------------------------------------------------------------------------
+
+/// Executes an approved `ModifyPseudonymRotationPolicy` (ADR-031 amendment of
+/// 2026-10-12; spec 09 §9.10.4.1 "Rotation policy, and where it lives").
+///
+/// # Errors
+///
+/// - [`ContextError::GovernanceFailed`] when `new_policy` fails the §9.10.4.1
+///   validity criterion; nothing is persisted.
+/// - The [`require_active`] error when the context is not active.
+/// - The persist error of `commit_class_s_keep`, and the event-log append
+///   error.
+pub async fn execute_modify_pseudonym_rotation_policy(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    new_policy: Option<scp_protocol::context::params::PseudonymRotationPolicy>,
+    meta: CommitMeta<'_>,
+) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
+    let context_id_bytes = context_id_to_bytes(context_id);
+
+    if let Some(policy) = &new_policy {
+        policy.validate().map_err(|e| {
+            ContextError::GovernanceFailed(format!(
+                "ModifyPseudonymRotationPolicy: invalid policy (spec §9.10.4.1): {e}"
+            ))
+        })?;
+    }
+    require_active(&cell.handle)?;
+
+    // The policy lives in `ContextParams`, which only the Class-S snapshot
+    // persists. Route the change through the fail-closed `commit_class_s_keep`,
+    // like `execute_promote_context`: a best-effort persist that failed would
+    // let a respawn resume the superseded policy after members were told the
+    // change applied.
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        view.rest_mut().handle.set_pseudonym_rotation(new_policy);
+        Ok(())
+    })
+    .await?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::PseudonymRotationPolicyModified,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // execute_propose_context_migration (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
@@ -4920,7 +4979,8 @@ pub async fn dispatch_content_governance_action(
         | GovernanceAction::ModifyPruningPolicy { .. }
         | GovernanceAction::ProposeContextMigration { .. }
         | GovernanceAction::CancelContextMigration
-        | GovernanceAction::ModifyHardRateLimit { .. } => {
+        | GovernanceAction::ModifyHardRateLimit { .. }
+        | GovernanceAction::ModifyPseudonymRotationPolicy { .. } => {
             // ADR-049 §10 (round-9): these variants are routed by
             // `dispatch_governance_action` / `dispatch_context_governance_action`
             // and never reach this content-level leaf. A future routing change
@@ -5195,7 +5255,8 @@ pub async fn dispatch_context_governance_action(
         | GovernanceAction::SetEconomicPolicy { .. }
         | GovernanceAction::ApproveSpend { .. }
         | GovernanceAction::LockEconomicPolicy
-        | GovernanceAction::ModifyHardRateLimit { .. } => {
+        | GovernanceAction::ModifyHardRateLimit { .. }
+        | GovernanceAction::ModifyPseudonymRotationPolicy { .. } => {
             // ADR-049 §10 (round-9): these variants are handled by the top-level
             // `dispatch_governance_action` and never reach this context-level
             // dispatcher. A future routing change that delivers one here must
@@ -5441,6 +5502,21 @@ pub async fn dispatch_governance_action(
                 deps,
                 context_id,
                 new_config,
+                CommitMeta {
+                    pid,
+                    actor_did: actor,
+                    timestamp_secs: ts,
+                },
+            )
+            .await?;
+            Ok(GovernanceActionResult::Executed)
+        }
+        GovernanceAction::ModifyPseudonymRotationPolicy { new_policy } => {
+            execute_modify_pseudonym_rotation_policy(
+                cell,
+                deps,
+                context_id,
+                *new_policy,
                 CommitMeta {
                     pid,
                     actor_did: actor,

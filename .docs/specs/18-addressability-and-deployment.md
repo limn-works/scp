@@ -169,8 +169,9 @@ The `relay_config` object exposes operational parameters that agents need to eva
 | `economic.per_byte_stored` | integer | smallest unit | Cost per byte stored as `Amount` in smallest currency unit (§19.1.1). |
 | `economic.payment_adapters` | array | — | Accepted payment adapter IDs (e.g., `["x402", "lightning"]`). |
 | `economic.payee` | string | — | The identifier the relay operator receives payments under. |
+| `webpush_vapid_key` | string | — | The relay's VAPID public key (RFC 8292 §3.2): the base64url encoding, without padding, of the 65-byte uncompressed P-256 point, 87 characters. A relay that sends WebPush wakes publishes it (`10-infrastructure-and-self-hosting.md` §10.7.1, ADR-004). An absent field means the relay sends no WebPush wakes and rejects a WebPush registration with `4061`. A browser client passes the decoded key to `PushManager.subscribe` as `applicationServerKey`. |
 
-**Three of these ten rows — `max_blob_size`, `max_blob_ttl` and `rate_limit_publish` — are the write policy a publisher reads through `IdentityBackend::read_policy`, and the other seven are not**: `03-identity.md` §3.10.10 declares `DeclaredWritePolicy` and states its field set, so a binding author generating that type reads the field set there and reads the wire form here.
+**Three of these eleven rows — `max_blob_size`, `max_blob_ttl` and `rate_limit_publish` — are the write policy a publisher reads through `IdentityBackend::read_policy`, and the other eight are not**: `03-identity.md` §3.10.10 declares `DeclaredWritePolicy` and states its field set, so a binding author generating that type reads the field set there and reads the wire form here.
 
 **All fields are optional.** Absent fields indicate the relay uses protocol defaults or has no limit. An absent `economic` field indicates a free relay. What an absent term means:
 
@@ -179,6 +180,8 @@ The `relay_config` object exposes operational parameters that agents need to eva
 - **An absent `relay_config` object is an entry that declares no write policy**, which `read_policy` answers with `None` and no error, and a publisher addressing that entry applies the defaults this list states for each term (`03-identity.md` §3.10.10).
 
 ADR-004 specifies that relay configuration is available "out-of-band." `.well-known/scp` is the canonical location for this out-of-band configuration. Agents evaluating whether to use a relay can fetch `/.well-known/scp` and inspect `relay_config` before establishing a WebSocket connection.
+
+**Reading a relay's VAPID key.** A relay that sends WebPush wakes serves its own document at `https://<authority>/.well-known/scp`, where `<authority>` is the host of its canonical URL (`09-security-model.md` §9.18.2), followed by `:` and the port when that URL names one. It serves the document with the header `Access-Control-Allow-Origin: *`, because a browser client reads it from a page of another origin and the document holds only public data. A client takes a relay's `webpush_vapid_key` only from the document at that location, only after the verification chain of §18.3.2 passes, and only when the document's `relay` field, canonicalized under §9.18.2, equals that relay's canonical URL. The chain shows that the operator's identifier lists the relay URL, and no step of it covers the bytes of `relay_config`, so the key carries the assurance of the TLS connection to the relay's host, the same assurance as the relay connection itself. `10-infrastructure-and-self-hosting.md` §10.7.1 states what a substituted key can and cannot do.
 
 ## 18.4 Context URIs
 

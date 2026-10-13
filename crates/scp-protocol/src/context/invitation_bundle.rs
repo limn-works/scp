@@ -634,9 +634,12 @@ mod tests {
         // fields are folded into the genesis `ContextParams` JCS canonical form
         // and thus into this digest — an intended encoding change, not a
         // regression.
+        // Regenerated again when `ContextParams` gained `pseudonym_rotation`
+        // (spec 09 §9.10.4.1): the absent policy serializes as `null` under
+        // its JCS key and is folded into the genesis params hash.
         assert_eq!(
             hex::encode(hash),
-            "c103dc6aa1efd28c3c592acdc6e237c453887d0014763516b48d4df72af8cdac",
+            "e5c15039ac377c209fd280754987efd5d1370a1c0f8fdc4ec223ce208f6a3f52",
             "invitation bundle signing-hash KAT"
         );
     }

@@ -1414,7 +1414,14 @@ class SCP:
         return await asyncio.to_thread(self._native.context_close, native_handle, identity_did)
 
     async def context_create(self, identity_did: str, params: dict[str, Any]) -> Context:
-        """Delegate to ``_scp_core.SCP.context_create`` (returns :class:`Context`)."""
+        """Delegate to ``_scp_core.SCP.context_create`` (returns :class:`Context`).
+
+        ``params["pseudonym_rotation"]`` (spec 09 §9.10.4.1) is ``None`` (the
+        default: rotation off) or ``{"interval_secs": int | None,
+        "on_membership_change": bool}``. A malformed dict, an unknown key, no
+        trigger, or an ``interval_secs`` under 600 raises ``ValidationError``
+        with ``SCP-VALID-7000``.
+        """
 
         raw = await asyncio.to_thread(self._native.context_create, identity_did, params)
         return Context(raw, identity_did=identity_did, scp=self)

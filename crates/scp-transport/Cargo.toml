@@ -16,9 +16,15 @@ redb-blob = ["dep:redb"]
 local-cache = []
 combined = ["dep:rusqlite", "dep:scp-sqlite-pools", "dep:scp-platform"]
 relay-persistence = ["dep:scp-platform"]
+# The relay push registration store (spec §10.7.1, PUSH-006). Its one shipped
+# arm is SQLite through scp-sqlite-pools.
+push-store = ["dep:rusqlite", "dep:scp-sqlite-pools"]
+# Compiles test-only arms: today the push store's in-memory arm, which is
+# durability-only (spec §17.17.2) and absent from every build without it.
+testing = []
 postgres-blob = ["dep:sqlx"]
 s3-blob = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-http-client", "dep:http-body"]
-quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots", "dep:reqwest"]
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots"]
 udp = ["dep:openssl", "dep:socket2"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:http"]
 webtransport-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys", "dep:wasm-bindgen-futures", "dep:getrandom_02", "dep:getrandom_03"]
@@ -26,7 +32,7 @@ webtransport-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys", "dep:wasm-
 # (CoAP-over-DTLS, §10.16.2), so it must pull `udp` to bring in
 # `udp::dtls::AsyncDtlsSession`.
 coap = ["dep:coap-lite", "dep:openssl", "udp"]
-nostr = ["dep:base64", "dep:k256"]
+nostr = ["dep:k256"]
 webrtc = []
 upnp = ["dep:igd-next", "dep:natpmp"]
 # Shared startup utilities for relay/node binaries: env_or, config_from_env,
@@ -49,6 +55,10 @@ scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 # helpers are used.
 scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2" }
 scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
+# ES256 signing of the APNs provider JWT (PUSH-010). deny.toml confines the
+# P-256 curve crates to scp-crypto, so the APNs sender signs through
+# `scp_crypto::p256::jose::es256_sign`.
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 # The relay wire types (ClientMessage/RelayMessage + constants + code) live in
 # the wasm-safe scp-relay-client leaf, shared with the in-browser client
 # (ADR-057 Slice 3, Decision D5). The native relay/adapters import them directly.
@@ -126,20 +136,26 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 # the same trust anchors the OS/browser would use, without pulling in a second
 # crypto provider. Gated on `quic` to keep the default build lean.
 webpki-roots = { version = "1", optional = true }
-# Async HTTPS client for connect-time `.well-known/scp` transport discovery
-# (spec §10.5.1, §10.14.3 item 4). Gated on `quic`: the discovery fetch only
-# matters when QUIC selection is possible — without `quic` the WebSocket
-# baseline is the only transport, so there is nothing to discover. `rustls-tls`
-# (default-features off) keeps the single ring-backed rustls provider this
-# crate already pins (see the `quinn`/`rustls` notes above), avoiding a second
-# crypto provider, and gives a non-permissive WebPKI-roots TLS client for the
-# `https://` well-known fetch. Matches the canonical reqwest config used by
-# scp-identity's DHT gateway client.
+# Async HTTPS client for two jobs. (1) Connect-time `.well-known/scp`
+# transport discovery (spec §10.5.1, §10.14.3 item 4), which runs only under
+# `quic`. (2) The relay push senders (`relay::push_apns`, `relay::push_fcm`,
+# PUSH-010 and PUSH-011), which send the §10.7.1 step 5 wake signal: APNs
+# accepts only HTTP/2, hence `http2`. The senders compile in every build, so
+# the dependency is not optional. `rustls-tls` (default-features off) keeps the
+# single ring-backed rustls provider this crate already pins (see the
+# `quinn`/`rustls` notes above), avoiding a second crypto provider, and gives a
+# non-permissive WebPKI-roots TLS client. Matches the canonical reqwest config
+# used by scp-identity's DHT gateway client.
 # `stream` enables `Response::bytes_stream()` so the `.well-known/scp` body can
 # be read with a running size cap (a chunked response that omits Content-Length
 # is still bounded). It pulls only futures plumbing this crate already depends
 # on (futures 0.3) — no new TLS or crypto provider.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
+# RS256 signing of the FCM OAuth 2.0 service-account assertion (PUSH-011).
+# ring is already this crate's rustls provider, so the RSA signer adds no crate
+# to the graph; it is constant-time, unlike the `rsa` crate (RUSTSEC-2023-0071),
+# and links no OpenSSL.
+ring = "0.17"
 rcgen = { version = "0.13", optional = true }
 bytes = "1"
 http = { version = "1", optional = true }
@@ -150,7 +166,9 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 getrandom_02 = { package = "getrandom", version = "0.2", optional = true, features = ["js"] }
 getrandom_03 = { package = "getrandom", version = "0.3", optional = true, features = ["wasm_js"] }
 coap-lite = { version = "0.13", optional = true }
-base64 = { workspace = true, optional = true }
+# PEM decoding of the FCM service-account key and base64url JWT encoding for
+# the push senders (PUSH-010, PUSH-011), and the Nostr adapter.
+base64 = { workspace = true }
 k256 = { version = "0.13", optional = true, features = ["schnorr"] }
 igd-next = { version = "0.16", optional = true, features = ["aio_tokio"] }
 natpmp = { version = "0.5", optional = true, features = ["tokio"] }
@@ -179,6 +197,15 @@ base64 = { workspace = true }
 # single rustls provider. Dev-only — production discovery uses reqwest.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Local HTTP/2 server the push sender tests send to (PUSH-010, PUSH-011). h2 is
+# already reqwest's HTTP/2 implementation. Dev-only.
+h2 = "0.4"
+http = "1"
+# Generates the throwaway RSA-2048 service-account key the FCM sender tests
+# sign with, fresh each test run, so no private key is committed (PUSH-011).
+# Dev-only: production RS256 signing is ring's. `getrandom` enables
+# `rand_core::OsRng` for key generation.
+rsa = { version = "0.9.10", features = ["getrandom"] }
 
 [[test]]
 name = "blob_storage_fail_closed"
@@ -199,6 +226,11 @@ required-features = ["postgres-blob"]
 name = "combined_conformance"
 path = "tests/combined_conformance.rs"
 required-features = ["combined"]
+
+[[test]]
+name = "push_store_conformance"
+path = "tests/push_store_conformance.rs"
+required-features = ["push-store", "testing"]
 
 [[test]]
 name = "local_cache_conformance"

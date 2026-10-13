@@ -87,6 +87,16 @@ ignore = [
     # the newest release after `latest`, and `cargo info mainline@<latest> --verbose`
     # lists that release's lru requirement.
     "RUSTSEC-2026-0253",
+    # rsa: Marvin Attack, a non-constant-time RSA decryption and signing path that leaks
+    # private-key bits through timing an attacker observes over the network. rsa is a
+    # dev-dependency of scp-transport only: the FCM sender tests use it to generate a
+    # throwaway RSA-2048 service-account key at test time, so no private key is
+    # committed, and the key signs nothing outside those tests. Production RS256 signing
+    # uses ring. No patched version exists: the advisory lists `patched = []`, and rsa
+    # 0.9.10 and 0.10.0-rc.18 are both affected. The `[bans]` entry for rsa below fails
+    # the check if any crate other than scp-transport depends on rsa, because this ID is
+    # ignored for every rsa version. A patched rsa release clears this entry.
+    "RUSTSEC-2023-0071",
 ]
 
 # ── Bans ────────────────────────────────────────────────────────────────────
@@ -102,6 +112,11 @@ wildcards = "allow"
 # ban keeps it scoped to the transitive copy it justifies: an lru below the patched
 # 0.18.2 fails the check unless mainline is what depends on it, so a workspace crate
 # or any other dependency pulling in an unpatched lru is reported.
+#
+# The rsa ignore above holds RUSTSEC-2023-0071 for every rsa version. This ban fails
+# the check when any crate other than scp-transport depends on rsa directly, normal or
+# dev. It does not check the edge kind: the rust-deny job in .github/workflows/ci.yml
+# fails when rsa is reachable over a normal or build edge.
 deny = [
     { crate = "p256", wrappers = [
         "scp-crypto",
@@ -121,6 +136,7 @@ deny = [
         "p384",
     ], reason = "P-256 arithmetic stays in scp-crypto" },
     { crate = "lru:<0.18.2", wrappers = ["mainline"], reason = "RUSTSEC-2026-0253 is ignored only for mainline's copy" },
+    { crate = "rsa", wrappers = ["scp-transport"], reason = "RUSTSEC-2023-0071 is ignored for every rsa version; only scp-transport may depend on rsa" },
 ]
 
 # ── Sources ─────────────────────────────────────────────────────────────────

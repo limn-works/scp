@@ -1594,6 +1594,8 @@ fn rollback_join_economy_ticket(
 ///   when the running SDK does not satisfy `params.min_protocol_version`.
 /// - [`ContextCreationError::InvalidCeilingCategory`] when a ceiling entry
 ///   breaks the ceiling-entry grammar (spec §5.3.1.1).
+/// - [`ContextCreationError::InvalidPseudonymRotationPolicy`] when
+///   `params.pseudonym_rotation` fails the §9.10.4.1 validity criterion.
 /// - [`ContextCreationError::StateTransition`] wrapping
 ///   [`ContextError::SupervisorShutDown`] when the actor spawn is refused
 ///   because shutdown has begun or the Supervisor dropped (ADR-049 Decision 16).
@@ -1634,6 +1636,11 @@ pub async fn create_context(
     // Defense-in-depth: verify creator's SDK version satisfies
     // min_protocol_version.
     params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
+    // §9.10.4.1 validity criterion: creation rejects a rotation policy with no
+    // trigger or an interval shorter than the rotation grace.
+    if let Some(policy) = &params.pseudonym_rotation {
+        policy.validate()?;
+    }
     state::validate_governance_model(&params.governance)?;
     crate::context::lifecycle_logic::validate_consequence_rules(
         &params.consequence_rules,
@@ -4379,6 +4386,18 @@ mod restore_reconcile_tests {
     }
 
     fn build_supervisor(persistence: Box<dyn ContextPersistence>) -> Arc<Supervisor> {
+        build_supervisor_with_resolver(
+            persistence,
+            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
+        )
+    }
+
+    /// [`build_supervisor`] with a key resolver, for tests that drive signed
+    /// governance proposals (the proposal signature verifies against it).
+    fn build_supervisor_with_resolver(
+        persistence: Box<dyn ContextPersistence>,
+        key_resolver: scp_protocol::context::governance::KeyResolver,
+    ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkRestoreReconcile".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
@@ -4387,7 +4406,7 @@ mod restore_reconcile_tests {
             crypto,
             Box::new(OkTransport),
             Box::new(OkEventLog),
-            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
+            key_resolver,
             Some(persistence),
             None,
             None,
@@ -5718,5 +5737,290 @@ mod restore_reconcile_tests {
             cell.broadcast_context.is_none(),
             "keep-direction: the close teardown stays applied through persist failure"
         );
+    }
+
+    /// Spec 09 §9.10.4.1, ADR-031: `ModifyPseudonymRotationPolicy` through the
+    /// production propose path (`propose_governance_action_checked`).
+    ///
+    /// - A proposal from a non-member and a proposal carrying a policy that
+    ///   fails the validity criterion are both refused, and neither changes
+    ///   the live or the persisted policy.
+    /// - The admin's approved proposal changes the live policy and the
+    ///   persisted Class-S snapshot, and a restore from that snapshot carries
+    ///   the new policy.
+    #[tokio::test]
+    async fn modify_pseudonym_rotation_policy_persists_and_survives_restore() {
+        use scp_protocol::context::PseudonymRotationPolicy;
+        use scp_protocol::context::governance::{GovernanceAction, ProposalStatus};
+        use scp_protocol::context::roles::Capability;
+
+        let ctx_id = "rotation-policy-governance";
+        let admin = DID("did:dht:z6MkRotationPolicyAdmin".to_owned());
+        let admin_key = ed25519_dalek::SigningKey::from_bytes(&[0x31; 32]);
+        let outsider = DID("did:dht:z6MkRotationPolicyOutsider".to_owned());
+        let outsider_key = ed25519_dalek::SigningKey::from_bytes(&[0x32; 32]);
+        let capture = Arc::new(CapturingPersistence::default());
+        let supervisor = build_supervisor_with_resolver(
+            Box::new(SharedCapture(Arc::clone(&capture))),
+            resolver_for(&[(&admin, &admin_key), (&outsider, &outsider_key)]),
+        );
+        supervisor
+            .create_context(
+                ctx_id.to_owned(),
+                ContextParams {
+                    mode: ContextMode::Encrypted,
+                    ceiling: vec![Capability::MessagesRead, Capability::GovernancePropose],
+                    ..ContextParams::default()
+                },
+                admin.clone(),
+                Some([7u8; 32]),
+                Vec::new(),
+            )
+            .await
+            .expect("create_context");
+        let persisted = || {
+            capture
+                .contexts
+                .lock()
+                .unwrap()
+                .get(ctx_id)
+                .expect("the context is persisted")
+                .context_params
+                .pseudonym_rotation
+        };
+        let live = || async {
+            supervisor
+                .context_params(ctx_id)
+                .await
+                .expect("the context answers")
+                .pseudonym_rotation
+        };
+        assert_eq!(live().await, None);
+        assert_eq!(persisted(), None);
+
+        let policy = PseudonymRotationPolicy {
+            interval_secs: Some(3600),
+            on_membership_change: true,
+        };
+        let modify = |new_policy| GovernanceAction::ModifyPseudonymRotationPolicy { new_policy };
+
+        // Unapproved: a non-member's proposal is refused.
+        let refused = supervisor
+            .propose_governance_action_checked(
+                ctx_id,
+                &outsider,
+                modify(Some(policy)),
+                &outsider_key,
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "a non-member's proposal must be refused: {refused:?}"
+        );
+        assert_eq!(live().await, None, "a refused proposal changes nothing");
+        assert_eq!(persisted(), None, "a refused proposal persists nothing");
+
+        // Invalid policy (no trigger): refused before any write.
+        let invalid = supervisor
+            .propose_governance_action_checked(
+                ctx_id,
+                &admin,
+                modify(Some(PseudonymRotationPolicy {
+                    interval_secs: None,
+                    on_membership_change: false,
+                })),
+                &admin_key,
+            )
+            .await;
+        assert!(
+            invalid.is_err(),
+            "an invalid policy must be refused: {invalid:?}"
+        );
+        assert_eq!(live().await, None, "an invalid policy changes nothing");
+        assert_eq!(persisted(), None, "an invalid policy persists nothing");
+
+        // Approved: the single admin's proposal auto-approves and executes.
+        let outcome = supervisor
+            .propose_governance_action_checked(ctx_id, &admin, modify(Some(policy)), &admin_key)
+            .await
+            .expect("the admin's proposal executes");
+        assert_eq!(outcome.status, ProposalStatus::Approved);
+        assert!(
+            outcome.execution_result.is_some(),
+            "an approved single-admin proposal executes"
+        );
+        assert_eq!(live().await, Some(policy));
+        assert_eq!(
+            persisted(),
+            Some(policy),
+            "the Class-S snapshot holds the new policy"
+        );
+
+        // Restore from the persisted snapshot on a fresh supervisor, through
+        // the production startup path (`restore_all_contexts`).
+        let snapshot = capture
+            .contexts
+            .lock()
+            .unwrap()
+            .get(ctx_id)
+            .cloned()
+            .expect("the context is persisted");
+        let store = Arc::new(CapturingPersistence::default());
+        store
+            .contexts
+            .lock()
+            .unwrap()
+            .insert(ctx_id.to_owned(), snapshot);
+        let restored = build_supervisor(Box::new(SharedCapture(store)));
+        let ids = lifecycle_helpers::restore_all_contexts(&restored)
+            .await
+            .expect("restore_all_contexts");
+        assert_eq!(ids, vec![ctx_id.to_owned()], "the context restores");
+        assert_eq!(
+            restored
+                .context_params(ctx_id)
+                .await
+                .expect("the restored context answers")
+                .pseudonym_rotation,
+            Some(policy),
+            "the policy survives restore"
+        );
+    }
+
+    /// A key resolver that knows exactly the given `(DID, key)` pairs.
+    fn resolver_for(
+        pairs: &[(&DID, &ed25519_dalek::SigningKey)],
+    ) -> scp_protocol::context::governance::KeyResolver {
+        let keys: HashMap<String, ed25519_dalek::VerifyingKey> = pairs
+            .iter()
+            .map(|(did, key)| (did.as_ref().to_owned(), key.verifying_key()))
+            .collect();
+        Arc::new(move |did: &DID, _: scp_did::SigningKeyId| keys.get(did.as_ref()).copied())
+    }
+
+    /// Spec 09 §9.10.4.1 "Receipt ordering": when a member's removal or
+    /// departure commits, the receiver deletes that member's pseudonym record
+    /// (routing ID and epoch together), so a re-admitted member's first
+    /// announcement is compared against no record. Driven through the
+    /// production Supervisor entry points (`propose_governance_action_checked`
+    /// for `RemoveMember`, `leave_context` for a departure) and observed in the
+    /// persisted Class-S snapshot each commit writes.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn removal_and_departure_delete_the_member_pseudonym_record() {
+        use scp_protocol::context::governance::{GovernanceAction, ProposalStatus};
+        use scp_protocol::context::roles::Capability;
+
+        let admin = DID("did:dht:z6MkRecordDeleteAdmin".to_owned());
+        let admin_key = ed25519_dalek::SigningKey::from_bytes(&[0x41; 32]);
+        let bob = DID("did:dht:z6MkRecordDeleteBob".to_owned());
+        let capture = Arc::new(CapturingPersistence::default());
+        let supervisor = build_supervisor_with_resolver(
+            Box::new(SharedCapture(Arc::clone(&capture))),
+            resolver_for(&[(&admin, &admin_key)]),
+        );
+        let persisted_record = |ctx_id: &str| {
+            capture
+                .contexts
+                .lock()
+                .unwrap()
+                .get(ctx_id)
+                .expect("the context is persisted")
+                .routing
+                .peer_registry()
+                .expect("encrypted ⇒ registry")
+                .get(&bob)
+                .copied()
+        };
+
+        for (ctx_id, departs) in [
+            ("record-delete-remove", false),
+            ("record-delete-leave", true),
+        ] {
+            let handle = supervisor
+                .create_context(
+                    ctx_id.to_owned(),
+                    ContextParams {
+                        mode: ContextMode::Encrypted,
+                        ceiling: vec![
+                            Capability::MessagesRead,
+                            Capability::GovernancePropose,
+                            Capability::MemberRemove,
+                        ],
+                        ..ContextParams::default()
+                    },
+                    admin.clone(),
+                    Some([7u8; 32]),
+                    Vec::new(),
+                )
+                .await
+                .expect("create_context");
+            let added = supervisor
+                .propose_governance_action_checked(
+                    ctx_id,
+                    &admin,
+                    GovernanceAction::AddMember {
+                        did: bob.clone(),
+                        role: "member".to_owned(),
+                    },
+                    &admin_key,
+                )
+                .await
+                .expect("the admin adds bob");
+            assert_eq!(added.status, ProposalStatus::Approved);
+            supervisor
+                .seed_peer_pseudonym(ctx_id, bob.clone(), [0x42; 32])
+                .await
+                .expect("record bob's routing ID");
+
+            // Precondition: a Class-S commit (a rotation-policy change) persists
+            // the snapshot with bob's record in it.
+            let modified = supervisor
+                .propose_governance_action_checked(
+                    ctx_id,
+                    &admin,
+                    GovernanceAction::ModifyPseudonymRotationPolicy {
+                        new_policy: Some(scp_protocol::context::PseudonymRotationPolicy {
+                            interval_secs: None,
+                            on_membership_change: true,
+                        }),
+                    },
+                    &admin_key,
+                )
+                .await
+                .expect("the admin sets a rotation policy");
+            assert_eq!(modified.status, ProposalStatus::Approved);
+            assert_eq!(
+                persisted_record(ctx_id).map(|r| r.routing_id),
+                Some([0x42; 32]),
+                "{ctx_id}: bob's record is persisted before he leaves"
+            );
+
+            if departs {
+                supervisor
+                    .leave_context(&handle, &bob, &bob)
+                    .await
+                    .expect("bob departs");
+            } else {
+                let removed = supervisor
+                    .propose_governance_action_checked(
+                        ctx_id,
+                        &admin,
+                        GovernanceAction::RemoveMember {
+                            did: bob.clone(),
+                            reason: None,
+                        },
+                        &admin_key,
+                    )
+                    .await
+                    .expect("the admin removes bob");
+                assert_eq!(removed.status, ProposalStatus::Approved);
+            }
+            assert_eq!(
+                persisted_record(ctx_id),
+                None,
+                "{ctx_id}: the commit deletes bob's pseudonym record"
+            );
+        }
     }
 }
