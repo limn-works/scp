@@ -61,10 +61,13 @@ WHAT THE CHECK DOES NOT READ, AND WHY
     check carries no per-site allowlist and gets none.
 
 BARE SCP CODES
-    The same files fail on `SCP-` followed directly by digits, at a word boundary,
-    unless those digits name a story in `.docs/prds/`. Two registries own an
-    identifier that starts with `SCP-`: the PRD story ledger, whose IDs read `SCP-NNN`
-    (`SCP-046`), and the SDK error registry in `crates/scp-ffi/common/src/error_codes.rs`,
+    Every Markdown file git tracks or would track (`git ls-files --cached --others
+    --exclude-standard`), outside `.docs/archive/`, fails on `SCP-` followed directly by
+    digits, at a word boundary, unless those digits name a story in `.docs/prds/`. The
+    archive keeps the record of cut features, whose stories have left the ledger.
+
+    Two registries own an identifier that starts with `SCP-`: the PRD story ledger,
+    whose IDs read `SCP-NNN` (`SCP-046`), and the SDK error registry in `crates/scp-ffi/common/src/error_codes.rs`,
     whose codes carry a band (`SCP-CAPSEL-8001`). A relay wire code from the error table
     of ADR-004, the SCP native relay protocol, is a bare number with a name (`4061`
     PUSH_PLATFORM_UNAVAILABLE). Prose that writes `SCP-4061` puts a wire code in the
@@ -89,14 +92,16 @@ USAGE
     scanner that reports nothing on a tree with a planted defect proves nothing about
     the tree it scans next.
 
-    The self-test also plants `SCP-4061` in one file and asserts that the bare-code
-    scan reports it and passes `SCP-CAPSEL-8001` and the story reference `SCP-046`,
-    which the scratch story ledger declares.
+    The self-test also plants `SCP-4061` in a lesson and `SCP-4063` in `docs/guides/`,
+    outside the citation scope, and asserts that the bare-code scan reports both and
+    passes `SCP-CAPSEL-8001`, the story reference `SCP-046`, which the scratch story
+    ledger declares, and the archived story `SCP-084`.
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -114,6 +119,8 @@ MARKER = "[no such section]"
 BARE_SCP = re.compile(r"\bSCP-\d+\b")
 # A story ID as a PRD file declares it.
 STORY_ID = re.compile(r'"id"\s*:\s*"(SCP-\d+)"')
+# The record of cut features; its story IDs no longer appear in the ledger.
+ARCHIVE = ".docs/archive/"
 
 # Positive scope: the artifacts that govern work in this repository.
 SCOPE_DIRS = (
@@ -171,11 +178,39 @@ def story_ids(root: Path) -> set[str]:
     return out
 
 
+def markdown_files(root: Path) -> list[Path]:
+    """List every Markdown file git tracks or would track under root.
+
+    git applies .gitignore, which excludes `.claude/worktrees` and `target/`. The
+    archive of cut features is skipped. A root git cannot list raises, so the check
+    fails rather than scanning nothing.
+    """
+    listed = subprocess.run(
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "*.md",
+        ],
+        cwd=root,
+        capture_output=True,
+        check=True,
+    ).stdout.decode("utf-8")
+    paths = {
+        root / rel for rel in listed.split("\0") if rel and not rel.startswith(ARCHIVE)
+    }
+    return sorted(p for p in paths if p.is_file())
+
+
 def scan_bare_codes(root: Path) -> list[tuple[Path, int, str]]:
     """Return every `SCP-<digits>` that names no story, as (file, line, code)."""
     stories = story_ids(root)
     failures: list[tuple[Path, int, str]] = []
-    for path in scan_files(root):
+    for path in markdown_files(root):
         text = path.read_text(encoding="utf-8")
         for number, line in enumerate(text.splitlines(), start=1):
             for match in BARE_SCP.finditer(line):
@@ -228,6 +263,14 @@ The passage cites §18.11.13.2 [no such section], which this scratch spec does n
 SELF_TEST_PRD = """{"stories": [{"id": "SCP-046"}]}
 """
 
+# A relay wire code in SDK spelling in a guide, outside the citation scope.
+SELF_TEST_GUIDE_CODE = """A registration under other Apple credentials receives SCP-4063.
+"""
+
+# An archived feature's story, which left the ledger when the feature was cut.
+SELF_TEST_ARCHIVE = """The cut feature shipped as SCP-084.
+"""
+
 # A relay wire code in SDK spelling, beside a registered SDK code that must pass.
 SELF_TEST_BARE_CODE = """A relay with no APNs sender answers SCP-4061.
 A capability selection failure reports SCP-CAPSEL-8001.
@@ -267,6 +310,13 @@ def self_test() -> int:
         prds = root / ".docs" / "prds"
         prds.mkdir(parents=True)
         (prds / "main.json").write_text(SELF_TEST_PRD)
+        guides = root / "docs" / "guides"
+        guides.mkdir(parents=True)
+        (guides / "relay-operations.md").write_text(SELF_TEST_GUIDE_CODE)
+        archive = root / ".docs" / "archive" / "cut-feature"
+        archive.mkdir(parents=True)
+        (archive / "HISTORY.md").write_text(SELF_TEST_ARCHIVE)
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
 
         failures = scan(root)
         got = sorted((f.name, line, ref) for f, line, ref in failures)
@@ -280,7 +330,10 @@ def self_test() -> int:
             return 1
 
         bare = sorted((f.name, line, code) for f, line, code in scan_bare_codes(root))
-        want_bare = [("barecode.md", 1, "SCP-4061")]
+        want_bare = [
+            ("barecode.md", 1, "SCP-4061"),
+            ("relay-operations.md", 1, "SCP-4063"),
+        ]
         if bare != want_bare:
             print(f"SELF-TEST FAILED: expected bare codes {want_bare}, got {bare}")
             return 1
@@ -291,8 +344,9 @@ def self_test() -> int:
         "  and skips a resolving citation, an RFC citation, a non-spec number, and the"
     )
     print("  occurrence the marker directly follows.")
-    print("SELF-TEST PASSED: the bare-code scan reports SCP-4061 and passes")
-    print("  SCP-CAPSEL-8001 and the ledger story SCP-046.")
+    print("SELF-TEST PASSED: the bare-code scan reports SCP-4061 and SCP-4063 in")
+    print("  docs/guides/, and passes SCP-CAPSEL-8001, the ledger story SCP-046,")
+    print("  and the archived story SCP-084.")
     return 0
 
 
