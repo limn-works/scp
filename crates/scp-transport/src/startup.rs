@@ -65,6 +65,12 @@ pub enum StartupError {
         /// The variable the backend requires.
         var: &'static str,
     },
+    /// `var` is unset or empty, and it has no default.
+    #[error("{var} must be set to a non-empty value; {var} has no default")]
+    RequiredVarUnset {
+        /// The unset variable.
+        var: &'static str,
+    },
     /// `var` names a relative path. A relative path resolves against the
     /// working directory the process starts in, so two starts from two
     /// directories open two different stores.
@@ -195,18 +201,20 @@ fn is_blank(raw: &std::ffi::OsStr) -> bool {
 /// | `SCP_RELAY_MAX_CONNECTIONS` | 1,000 |
 /// | `SCP_RELAY_MAX_CONNECTIONS_PER_IP` | 10 |
 /// | `SCP_RELAY_RATE_LIMIT` | 100 |
-/// | `SCP_RELAY_URL` | unset: the relay reserves no push routing ID |
+/// | `SCP_RELAY_URL` | none: startup refuses it unset or empty |
 ///
 /// `SCP_RELAY_URL` is the relay's public URL, from which it derives its
 /// reserved push routing ID (§10.7.1 step 2).
 ///
 /// # Errors
 ///
-/// [`StartupError::InvalidValue`] when one of these variables is set to a
-/// value that does not parse.
+/// - [`StartupError::RequiredVarUnset`] when `SCP_RELAY_URL` is unset or
+///   empty.
+/// - [`StartupError::InvalidValue`] when one of these variables is set to a
+///   value that does not parse.
 pub fn relay_config_from_env() -> Result<RelayConfig, StartupError> {
     Ok(RelayConfig {
-        relay_url: parse_relay_url(RELAY_URL_VAR, env::var_os(RELAY_URL_VAR))?,
+        relay_url: Some(parse_relay_url(RELAY_URL_VAR, env::var_os(RELAY_URL_VAR))?),
         bind_addr: env_or(
             "SCP_RELAY_BIND_ADDR",
             SocketAddr::from(([0, 0, 0, 0], 9000)),
@@ -223,19 +231,22 @@ pub fn relay_config_from_env() -> Result<RelayConfig, StartupError> {
 /// The variable that holds the relay's public URL.
 const RELAY_URL_VAR: &str = "SCP_RELAY_URL";
 
-/// Parses `raw`, the value of variable `name`, as a [`RelayUrl`], or returns
-/// `None` when the variable is unset.
-fn parse_relay_url(
-    name: &'static str,
-    raw: Option<OsString>,
-) -> Result<Option<RelayUrl>, StartupError> {
-    raw.map(|raw| {
-        RelayUrl::new(&utf8(name, raw)?).map_err(|e| StartupError::InvalidValue {
-            var: name,
-            reason: e.to_string(),
-        })
+/// Parses `raw`, the value of variable `name`, as a [`RelayUrl`].
+///
+/// # Errors
+///
+/// - [`StartupError::RequiredVarUnset`] when `raw` is unset or blank.
+/// - [`StartupError::InvalidValue`] when `raw` is not UTF-8 or has no
+///   §9.18.2 canonical form.
+fn parse_relay_url(name: &'static str, raw: Option<OsString>) -> Result<RelayUrl, StartupError> {
+    let raw = match raw {
+        Some(raw) if !raw.to_string_lossy().trim().is_empty() => raw,
+        _ => return Err(StartupError::RequiredVarUnset { var: name }),
+    };
+    RelayUrl::new(&utf8(name, raw)?).map_err(|e| StartupError::InvalidValue {
+        var: name,
+        reason: e.to_string(),
     })
-    .transpose()
 }
 
 // ---------------------------------------------------------------------------
@@ -1435,15 +1446,14 @@ mod tests {
     use crate::relay::push_gate::RelayUrl;
 
     /// `SCP_RELAY_URL` set to a relay URL yields that URL's reserved push
-    /// routing ID; unset yields `None`; a value with no canonical form is
-    /// refused, never read as unset.
+    /// routing ID; unset or blank is `RequiredVarUnset`; a value with no
+    /// canonical form is `InvalidValue`.
     #[test]
     fn relay_url_parses_set_unset_and_refuses_invalid() {
         let url = "wss://relay.example/scp/v1";
         assert_eq!(
             parse_relay_url("V", Some(OsString::from(url)))
                 .ok()
-                .flatten()
                 .as_ref()
                 .map(RelayUrl::push_routing_id),
             RelayUrl::new(url)
@@ -1452,8 +1462,16 @@ mod tests {
                 .map(RelayUrl::push_routing_id),
         );
         assert!(RelayUrl::new(url).is_ok());
-        assert!(matches!(parse_relay_url("V", None), Ok(None)));
-        for bad in ["", "not a url", "https://relay.example"] {
+        for unset in [None, Some(""), Some("  ")] {
+            assert!(
+                matches!(
+                    parse_relay_url("V", unset.map(OsString::from)),
+                    Err(StartupError::RequiredVarUnset { var: "V" })
+                ),
+                "{unset:?} must be refused as unset"
+            );
+        }
+        for bad in ["not a url", "https://relay.example"] {
             assert!(
                 matches!(
                     parse_relay_url("V", Some(OsString::from(bad))),

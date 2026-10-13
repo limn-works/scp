@@ -10,6 +10,7 @@ services:
     ports:
       - "9000:9000"
     environment:
+      SCP_RELAY_URL: "ws://localhost:9000"
       SCP_RELAY_PUSH_PLATFORMS: "none"
       SCP_RELAY_STORAGE_BACKEND: "sqlite"
       SCP_RELAY_STORAGE_PATH: "/data/scp-relay.db"

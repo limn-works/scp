@@ -105,13 +105,50 @@ fn relay_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_scp-relay"))
 }
 
-/// A command that runs `scp-relay` with `SCP_RELAY_PUSH_PLATFORMS=none`, the
-/// push selection every storage test makes so the relay reaches its blob
-/// store. The push tests below override or remove it.
+/// The relay URL every test but `unset_or_empty_relay_url_exits_with_error`
+/// sets, so each reaches the configuration it tests.
+const RELAY_URL: &str = "wss://relay.example/scp/v1";
+
+/// A command that runs `scp-relay` with `SCP_RELAY_URL` set to [`RELAY_URL`]
+/// and `SCP_RELAY_PUSH_PLATFORMS=none`. The relay refuses to start without
+/// either. The URL and push tests below override or remove one of them.
 fn relay_command() -> Command {
     let mut command = Command::new(relay_bin());
-    command.env("SCP_RELAY_PUSH_PLATFORMS", "none");
     command
+        .env("SCP_RELAY_URL", RELAY_URL)
+        .env("SCP_RELAY_PUSH_PLATFORMS", "none");
+    command
+}
+
+/// An unset, empty, or whitespace `SCP_RELAY_URL` makes the relay exit 1 with
+/// an error naming the variable, before it opens a store. The relay derives
+/// its reserved push routing ID from that URL (§10.7.1), so the variable has
+/// no default.
+#[test]
+fn unset_or_empty_relay_url_exits_with_error() {
+    for value in [None, Some(""), Some("  ")] {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tmp.path().join("must-not-exist.db");
+        let mut command = relay_command();
+        command
+            .current_dir(tmp.path())
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env_remove("RUST_LOG");
+        match value {
+            Some(v) => command.env("SCP_RELAY_URL", v),
+            None => command.env_remove("SCP_RELAY_URL"),
+        };
+        let output = output_within_deadline(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{value:?}: {stderr}");
+        assert!(
+            stderr.contains("SCP_RELAY_URL must be set to a non-empty value"),
+            "{value:?}: {stderr}"
+        );
+        assert!(!db_path.exists(), "{value:?} opened a store");
+    }
 }
 
 /// PUSH-012: an unset or blank `SCP_RELAY_PUSH_PLATFORMS` makes the relay exit

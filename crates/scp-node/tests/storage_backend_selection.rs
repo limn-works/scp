@@ -134,6 +134,7 @@ fn a_cloud_backend_fails_closed() {
                     .env("SCP_STORAGE_PATH", &node_storage)
                     .env("SCP_RELAY_STORAGE_PATH", &blob_db)
                     .env("SCP_RELAY_STORAGE_BACKEND", value)
+                    .env("SCP_RELAY_URL", "wss://relay.example/scp/v1")
                     .env_remove(required_var)
                     .env_remove("SCP_NODE_DHT_MODE")
                     .env_remove("SCP_STORAGE_KEY")
@@ -223,6 +224,7 @@ fn an_unset_or_empty_backend_fails_closed() {
                 .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
                 .env("SCP_STORAGE_PATH", &node_storage)
                 .env("SCP_RELAY_STORAGE_PATH", &blob_db)
+                .env("SCP_RELAY_URL", "wss://relay.example/scp/v1")
                 .env_remove("SCP_NODE_DHT_MODE")
                 .env_remove("SCP_STORAGE_KEY")
                 .env_remove("RUST_LOG");
