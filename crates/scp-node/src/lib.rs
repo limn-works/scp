@@ -74,31 +74,64 @@ pub use config::{
 // Default HTTP bind address
 // ---------------------------------------------------------------------------
 
+/// Default port for the public HTTP server (8443).
+///
+/// Port 8443 is the standard unprivileged HTTPS alternative port, avoiding
+/// the need for root/elevated privileges required by port 443. The node
+/// advertises this port, and hands it to NAT tier selection, when
+/// [`NodeConfig::http_bind_addr`] is `None`.
+pub const DEFAULT_HTTP_PORT: u16 = 8443;
+
 /// Default bind address for the public HTTP server (`0.0.0.0:8443`).
 ///
 /// This binds to **all network interfaces** (`0.0.0.0`), which is
 /// appropriate for public-facing deployments where the node must be
-/// reachable from external clients.
-///
-/// Port 8443 is the standard unprivileged HTTPS alternative port, avoiding
-/// the need for root/elevated privileges required by port 443.
+/// reachable from external clients. Only [`ApplicationNode::serve`] and
+/// [`ApplicationNode::bind`] fall back to it; the background server falls
+/// back to [`DEFAULT_BACKGROUND_HTTP_BIND_ADDR`] instead.
 ///
 /// For development or internal-only deployments, use `127.0.0.1` (loopback
 /// only) via [`NodeConfig::http_bind_addr`] to avoid exposing
 /// the server to the network.
-pub const DEFAULT_HTTP_BIND_ADDR: SocketAddr =
-    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 8443);
+pub const DEFAULT_HTTP_BIND_ADDR: SocketAddr = SocketAddr::new(
+    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+    DEFAULT_HTTP_PORT,
+);
 
 /// Default bind address for the background HTTP server (`127.0.0.1:8443`).
 ///
 /// This binds to **loopback only** (`127.0.0.1`), which is the safe default
 /// for [`ApplicationNode::serve_background`] since SDK consumers typically
-/// run the node in-process and do not need external access.
+/// run the node in-process and do not need external access. The background
+/// server uses it only when neither the call nor
+/// [`NodeConfig::http_bind_addr`] names an address, so an unset config never
+/// makes it listen on every interface.
 ///
 /// For public-facing deployments, pass a non-loopback address explicitly —
 /// a warning is logged when a non-loopback address is used.
-pub const DEFAULT_BACKGROUND_HTTP_BIND_ADDR: SocketAddr =
-    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8443);
+pub const DEFAULT_BACKGROUND_HTTP_BIND_ADDR: SocketAddr = SocketAddr::new(
+    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    DEFAULT_HTTP_PORT,
+);
+
+/// The public HTTP port a node advertises and hands to NAT tier selection:
+/// the configured [`NodeConfig::http_bind_addr`] port, or
+/// [`DEFAULT_HTTP_PORT`] when none is configured.
+fn advertised_http_port(http_bind_addr: Option<SocketAddr>) -> u16 {
+    http_bind_addr.map_or(DEFAULT_HTTP_PORT, |addr| addr.port())
+}
+
+/// The address `serve_background*` binds: the caller's `requested` address,
+/// else the configured [`NodeConfig::http_bind_addr`], else loopback
+/// [`DEFAULT_BACKGROUND_HTTP_BIND_ADDR`] — never `0.0.0.0` by default.
+fn background_bind_addr(
+    requested: Option<SocketAddr>,
+    configured: Option<SocketAddr>,
+) -> SocketAddr {
+    requested
+        .or(configured)
+        .unwrap_or(DEFAULT_BACKGROUND_HTTP_BIND_ADDR)
+}
 
 // ---------------------------------------------------------------------------
 // Resource limits
@@ -683,9 +716,10 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// ## Bind address
     ///
-    /// Defaults to `127.0.0.1:8443` (loopback only) when `bind_addr` is
-    /// `None`. A `tracing::warn!` is emitted when a non-loopback address
-    /// is used, since exposing the HTTP server to the network may have
+    /// When `bind_addr` is `None`, binds the configured
+    /// [`NodeConfig::http_bind_addr`], or `127.0.0.1:8443` (loopback only,
+    /// never `0.0.0.0`) when none is configured. A `tracing::warn!` is
+    /// emitted when a non-loopback address is used, since exposing the HTTP server to the network may have
     /// security implications.
     ///
     /// ## TLS
@@ -780,7 +814,7 @@ impl<S: Storage> ApplicationNode<S> {
     ) -> Result<SocketAddr, NodeError> {
         self.claim_background_serve()?;
 
-        let addr = bind_addr.unwrap_or(DEFAULT_BACKGROUND_HTTP_BIND_ADDR);
+        let addr = background_bind_addr(bind_addr, self.state.http_bind_addr);
 
         // Security: warn when binding a *plaintext* listener to a non-loopback
         // address. When a TLS config is present (self-host self-signed cert),
@@ -3205,7 +3239,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     dev_bind_addr: Option<SocketAddr>,
     blob_storage: Arc<BlobStorageBackend>,
     relay_config: RelayConfig,
-    http_bind_addr: SocketAddr,
+    http_bind_addr: Option<SocketAddr>,
     cors_origins: Option<Vec<String>>,
     projection_rate_limit: u32,
     cert_data: tls::CertificateData,
@@ -3566,7 +3600,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     skip_nat_probe: bool,
 ) -> Result<ApplicationNode<S>, NodeError> {
     // NAT strategy needs the public HTTP port, not the internal relay port (#641).
-    let http_bind_addr = http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
+    let http_port = advertised_http_port(http_bind_addr);
 
     // When `skip_nat_probe` is set (operator opted out — e.g. behind a
     // tunnel/proxy that terminates on `localhost`), the STUN/NAT probe is dead
@@ -3578,10 +3612,10 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     let tier = if skip_nat_probe {
         None
     } else {
-        Some(nat_strategy.select_tier(http_bind_addr.port()).await?)
+        Some(nat_strategy.select_tier(http_port).await?)
     };
 
-    let relay_url = no_domain_relay_url(tier.as_ref(), http_bind_addr.port());
+    let relay_url = no_domain_relay_url(tier.as_ref(), http_port);
 
     push_relay_service(&mut document, &relay_url);
 
@@ -3636,7 +3670,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
             publisher,
             bg_identity,
             live_state.clone(),
-            http_bind_addr.port(),
+            http_port,
             Some(tier_event_tx),
             TIER_REEVALUATION_INTERVAL,
         ))
@@ -5154,6 +5188,169 @@ mod tests {
             node.identity().did().starts_with("did:dht:"),
             "DID should start with did:dht:"
         );
+    }
+
+    // -- HTTP bind address (SCP-320) ------------------------------------------
+
+    /// Returns a loopback address whose port the OS reports free right now.
+    fn free_loopback_addr() -> SocketAddr {
+        let probe = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        probe.local_addr().unwrap()
+    }
+
+    /// NAT strategy that records the port tier selection received.
+    struct PortRecordingNatStrategy {
+        received_port: Arc<std::sync::atomic::AtomicU16>,
+        tier: ReachabilityTier,
+    }
+
+    impl NatStrategy for PortRecordingNatStrategy {
+        fn select_tier(
+            &self,
+            relay_port: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>> + Send + '_>,
+        > {
+            self.received_port
+                .store(relay_port, std::sync::atomic::Ordering::SeqCst);
+            let tier = self.tier.clone();
+            Box::pin(async move { Ok(tier) })
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_background_none_binds_configured_http_bind_addr() {
+        let configured = free_loopback_addr();
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        };
+        let node = Node::start_for_testing(NodeConfig {
+            http_bind_addr: Some(configured),
+            ..no_domain_config(tier)
+        })
+        .await
+        .unwrap();
+
+        let bound = node.serve_background(None).await.unwrap();
+
+        assert_eq!(
+            bound, configured,
+            "serve_background(None) must bind the configured http_bind_addr"
+        );
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn serve_background_none_without_config_binds_loopback() {
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        };
+        let config = no_domain_config(tier);
+        assert!(config.http_bind_addr.is_none());
+        let node = Node::start_for_testing(config).await.unwrap();
+
+        let bound = node.serve_background(None).await.unwrap();
+
+        assert_eq!(
+            bound,
+            SocketAddr::from(([127, 0, 0, 1], 8443)),
+            "serve_background(None) with no configured address must bind loopback 127.0.0.1:8443"
+        );
+        assert!(
+            !bound.ip().is_unspecified(),
+            "serve_background(None) must never bind 0.0.0.0, got {bound}"
+        );
+        node.shutdown();
+    }
+
+    #[test]
+    fn background_bind_addr_prefers_requested_then_configured_then_loopback() {
+        let requested = SocketAddr::from(([127, 0, 0, 1], 9001));
+        let configured = SocketAddr::from(([0, 0, 0, 0], 9002));
+        assert_eq!(
+            background_bind_addr(Some(requested), Some(configured)),
+            requested
+        );
+        assert_eq!(background_bind_addr(None, Some(configured)), configured);
+        assert_eq!(
+            background_bind_addr(None, None),
+            SocketAddr::from(([127, 0, 0, 1], 8443))
+        );
+    }
+
+    #[tokio::test]
+    async fn nat_tier_selection_reads_configured_http_port() {
+        let received_port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        };
+        let node = Node::start_for_testing(NodeConfig {
+            http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 9555))),
+            nat: NatSlot::Custom(Arc::new(PortRecordingNatStrategy {
+                received_port: Arc::clone(&received_port),
+                tier: tier.clone(),
+            })),
+            ..no_domain_config(tier)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            received_port.load(std::sync::atomic::Ordering::SeqCst),
+            9555,
+            "NAT tier selection must receive the configured http_bind_addr port"
+        );
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn nat_tier_selection_reads_default_http_port_without_config() {
+        let received_port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        };
+        let node = Node::start_for_testing(NodeConfig {
+            nat: NatSlot::Custom(Arc::new(PortRecordingNatStrategy {
+                received_port: Arc::clone(&received_port),
+                tier: tier.clone(),
+            })),
+            ..no_domain_config(tier)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            received_port.load(std::sync::atomic::Ordering::SeqCst),
+            DEFAULT_HTTP_PORT
+        );
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn advertised_relay_url_reads_configured_http_port() {
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        };
+        let configured = Node::start_for_testing(NodeConfig {
+            reach: Reach::Local,
+            dht: DhtMode::Disabled,
+            http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 9556))),
+            ..no_domain_config(tier.clone())
+        })
+        .await
+        .unwrap();
+        assert_eq!(configured.relay_url(), "ws://127.0.0.1:9556/scp/v1");
+        configured.shutdown();
+
+        let unconfigured = Node::start_for_testing(NodeConfig {
+            reach: Reach::Local,
+            dht: DhtMode::Disabled,
+            ..no_domain_config(tier)
+        })
+        .await
+        .unwrap();
+        assert_eq!(unconfigured.relay_url(), "ws://127.0.0.1:8443/scp/v1");
+        unconfigured.shutdown();
     }
 
     #[tokio::test]

@@ -11443,7 +11443,7 @@
       "gate": "gate-addr",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/lib.rs",
         "crates/scp-node/src/http.rs"
