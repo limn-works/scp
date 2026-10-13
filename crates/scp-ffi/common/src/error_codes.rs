@@ -1601,8 +1601,7 @@ pub enum ServerErrorClass {
 }
 
 /// The error class for a [`ServerError`](crate::server::ServerError), one
-/// mapping for the `PyO3`, napi-rs and `UniFFI` bridges. Each class matches
-/// the prefix of the code [`server_error_code`] returns.
+/// mapping for the `PyO3`, napi-rs and `UniFFI` bridges.
 #[cfg(feature = "server")]
 #[must_use]
 pub const fn server_error_class(e: &crate::server::ServerError) -> ServerErrorClass {

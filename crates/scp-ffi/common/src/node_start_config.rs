@@ -234,35 +234,59 @@ mod tests {
 
     #[test]
     fn from_json_rejects_an_unknown_key_inside_every_enum_arm() {
-        for (from, to) in [
+        // Each case swaps one object of `VALID` for an arm (`known`) and for the
+        // same arm plus one unknown key (`unknown`): `known` must parse, so the
+        // unknown key is the only reason `unknown` can fail.
+        let reach = r#"{"kind": "domain", "domain": "node.example.org"}"#;
+        let blob = r#"{"kind": "redb", "path": "/var/lib/scp/blobs.redb"}"#;
+        for (from, known, unknown) in [
             (
-                r#"{"kind": "domain", "domain": "node.example.org"}"#,
+                reach,
+                reach,
                 r#"{"kind": "domain", "domain": "node.example.org", "port": 1}"#,
             ),
             (
+                reach,
+                r#"{"kind": "local"}"#,
+                r#"{"kind": "local", "x": 1}"#,
+            ),
+            (
+                reach,
+                r#"{"kind": "nat_traversal"}"#,
+                r#"{"kind": "nat_traversal", "x": 1}"#,
+            ),
+            (
+                blob,
+                r#"{"kind": "in_memory"}"#,
+                r#"{"kind": "in_memory", "x": 1}"#,
+            ),
+            (
+                r#"{"kind": "disabled"}"#,
                 r#"{"kind": "disabled"}"#,
                 r#"{"kind": "disabled", "gateways": []}"#,
             ),
-            (r#"{"kind": "auto"}"#, r#"{"kind": "auto", "stun": "x"}"#),
             (
+                r#"{"kind": "auto"}"#,
+                r#"{"kind": "auto"}"#,
+                r#"{"kind": "auto", "stun": "x"}"#,
+            ),
+            (
+                r#"{"kind": "acme", "email": "ops@example.org"}"#,
                 r#"{"kind": "acme", "email": "ops@example.org"}"#,
                 r#"{"kind": "acme", "emial": "ops@example.org"}"#,
             ),
         ] {
-            let json = VALID.replacen(from, to, 1);
-            assert_ne!(json, VALID, "fixture replacement must apply: {from}");
-            assert!(invalid(&json), "unknown key accepted in {to}");
-        }
-        for unit in [
-            r#""reach":{"kind":"local","x":1}"#,
-            r#""reach":{"kind":"nat_traversal","x":1}"#,
-        ] {
-            let json = format!(
-                r#"{{{unit},"identity":"did:dht:abc","blob_storage":{{"kind":"in_memory","x":1}},
-                "tls":{{"kind":"self_signed"}},"dht":{{"kind":"disabled"}},
-                "cors_origins":{{"kind":"any_origin"}}}}"#
+            let with_known = VALID.replacen(from, known, 1);
+            let with_unknown = VALID.replacen(from, unknown, 1);
+            assert_ne!(
+                with_unknown, VALID,
+                "fixture replacement must apply: {from}"
             );
-            assert!(invalid(&json), "unknown key accepted in {unit}");
+            assert!(
+                NodeStartConfig::from_json(&with_known).is_ok(),
+                "arm without the unknown key rejected: {known}"
+            );
+            assert!(invalid(&with_unknown), "unknown key accepted in {unknown}");
         }
     }
 
