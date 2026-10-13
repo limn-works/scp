@@ -2301,10 +2301,13 @@ mod push_tests {
     }
 
     fn assert_no_secret(text: &str, fragments: &[String]) {
-        for fragment in fragments {
+        // The message names the fragment's index, never the fragment, so a
+        // failure prints no key material either.
+        for (index, fragment) in fragments.iter().enumerate() {
             assert!(
                 !text.contains(fragment.as_str()),
-                "secret fragment {fragment} appears in:\n{text}"
+                "secret fragment #{index} appears in the checked output ({} bytes)",
+                text.len()
             );
         }
     }
