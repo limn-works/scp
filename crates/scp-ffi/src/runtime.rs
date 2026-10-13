@@ -1960,14 +1960,6 @@ fn remove_context_entry(
     }
 }
 
-/// Registers a known context in the discovery registry for the supplied
-/// [`PyBridgeInstance`].
-///
-/// Overwrites any existing entry for the same context ID (idempotent).
-pub fn register_known_context_on(bi: &PyBridgeInstance, context_id: &str, known: KnownContext) {
-    bi.core.register_known_context(context_id, known);
-}
-
 /// Removes `context_id`'s release mark under the registry entry's shard lock
 /// when the mark was set no later than `admitted_at`, and keeps a mark set
 /// after it.
@@ -3418,7 +3410,8 @@ mod tests {
                 .iter()
                 .any(|(id, _)| id == &ctx_id)
         };
-        register_known_context_on(&bi, &ctx_id, release_fixture_known());
+        bi.core
+            .register_known_context(&ctx_id, release_fixture_known());
 
         set_release_mark(&bi, &ctx_id);
         clear_release_mark_set_by(&bi, &ctx_id, std::time::Instant::now());

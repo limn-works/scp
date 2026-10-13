@@ -2629,9 +2629,6 @@ impl crate::scp::PyScp {
             .core
             .context_relay_urls()
             .map_err(|e| crate::error::ScpPyError::transport(e.to_string()))?;
-        // The known-context cache names a relay from the same set, so the two
-        // cannot disagree.
-        let known_relay_url = relay_urls.first().cloned();
 
         // Create the context via the shared ContextManager.
         {
@@ -2725,15 +2722,13 @@ impl crate::scp::PyScp {
                 }
             });
 
-            let last_seen = scp_clock::SystemClock.now_secs();
-
-            let known = crate::runtime::KnownContext {
+            let rt = crate::runtime()?;
+            rt.block_on(bi.core.register_known_context_from_runtime(
+                &context_id,
                 routing_id,
-                relay_url: known_relay_url,
-                member_did: identity_did.to_owned(),
-                last_seen,
-            };
-            crate::runtime::register_known_context_on(bi, &context_id, known);
+                identity_did.to_owned(),
+                scp_clock::SystemClock.now_secs(),
+            ));
         }
 
         // Transition to "active" -- in the full runtime this happens after MLS
@@ -2917,23 +2912,12 @@ impl crate::scp::PyScp {
                     }
                 });
 
-                let relay_url = match self.transport_status() {
-                    Ok(status) => status.relay_url,
-                    Err(e) => {
-                        tracing::warn!(
-                            "failed to query transport status during context join registration: {e}"
-                        );
-                        None
-                    }
-                };
-
-                let known = crate::runtime::KnownContext {
+                rt.block_on(bi.core.register_known_context_from_runtime(
+                    &context_id,
                     routing_id,
-                    relay_url,
                     member_did,
-                    last_seen: scp_clock::SystemClock.now_secs(),
-                };
-                crate::runtime::register_known_context_on(bi, &context_id, known);
+                    scp_clock::SystemClock.now_secs(),
+                ));
             }
         }
 
@@ -3166,21 +3150,12 @@ impl crate::scp::PyScp {
         // ENCRYPTED context, so the routing id is the joiner's derived §9.10.4
         // pseudonym (`local_pseudonym` is `Copy`, still valid after the request
         // move). The member is the JOINER (`owning_did`).
-        let relay_url = match self.transport_status() {
-            Ok(status) => status.relay_url,
-            Err(e) => {
-                tracing::warn!("failed to query transport status during join registration: {e}");
-                None
-            }
-        };
-        let known = crate::runtime::KnownContext {
-            routing_id: local_pseudonym,
-            relay_url,
-            member_did: owning_did,
-            last_seen: scp_clock::SystemClock.now_secs(),
-        };
-
-        crate::runtime::register_known_context_on(bi, &sealed.context_id, known);
+        rt.block_on(bi.core.register_known_context_from_runtime(
+            &sealed.context_id,
+            local_pseudonym,
+            owning_did,
+            scp_clock::SystemClock.now_secs(),
+        ));
 
         // Build the returned handle from the AUTHENTICATED params carried by the
         // joined MLS group's signed context binding — NOT from caller input

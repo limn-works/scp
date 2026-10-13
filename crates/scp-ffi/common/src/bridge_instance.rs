@@ -2317,6 +2317,38 @@ impl CoreFields {
         self.known_contexts.insert(context_id.to_owned(), known);
     }
 
+    /// Registers a known context whose `relay_url` is the first entry of the
+    /// runtime's stored relay set for `context_id` (§5.12.3.1 `relay_urls`,
+    /// PUSH-025), read through
+    /// [`Supervisor::context_relay_urls`](scp_core::context::supervisor::Supervisor::context_relay_urls).
+    ///
+    /// `relay_url` is `None` when no supervisor is bound, the context's actor
+    /// does not answer, or the stored set is empty.
+    pub async fn register_known_context_from_runtime(
+        &self,
+        context_id: &str,
+        routing_id: [u8; 32],
+        member_did: String,
+        last_seen: u64,
+    ) {
+        let relay_url = match self.supervisor() {
+            Some(sup) => sup
+                .context_relay_urls(context_id)
+                .await
+                .and_then(|urls| urls.into_iter().next()),
+            None => None,
+        };
+        self.register_known_context(
+            context_id,
+            KnownContext {
+                routing_id,
+                relay_url,
+                member_did,
+                last_seen,
+            },
+        );
+    }
+
     /// Removes a known context from the discovery registry.
     pub fn remove_known_context(&self, context_id: &str) {
         self.known_contexts.remove(context_id);
@@ -4811,6 +4843,88 @@ mod tests {
         assert!(
             instance.pending_relay_urls().contains("wss://a.example"),
             "clear_transport keeps the relay for reconnect"
+        );
+    }
+
+    /// The known-context cache names the first relay of the runtime's stored
+    /// set, not the bridge's installed transport, so a context joined onto
+    /// another relay set is cached with that set's relay.
+    #[tokio::test]
+    async fn register_known_context_from_runtime_reads_the_stored_relay_set() {
+        let sup = test_supervisor();
+        let stored = vec![
+            "wss://relay-b.example/scp/v1".to_owned(),
+            "wss://relay-a.example/scp/v1".to_owned(),
+        ];
+        sup.create_context(
+            "known-from-runtime".to_owned(),
+            scp_core::context::ContextParams {
+                ceiling: vec![scp_core::context::Capability::MessagesRead],
+                ..scp_core::context::ContextParams::default()
+            },
+            scp_did::DID::from("did:dht:zknownfromruntime"),
+            None,
+            stored,
+        )
+        .await
+        .expect("create context");
+        let instance = CoreFields::with_supervisor(sup);
+        instance
+            .install_transport(
+                Arc::new(test_transport_manager()),
+                "wss://bridge.example".to_owned(),
+            )
+            .unwrap();
+
+        instance
+            .register_known_context_from_runtime("known-from-runtime", [7; 32], "m".to_owned(), 5)
+            .await;
+        let known = instance
+            .known_contexts()
+            .get("known-from-runtime")
+            .map(|e| e.value().clone())
+            .expect("registered");
+        assert_eq!(
+            known.relay_url.as_deref(),
+            Some("wss://relay-b.example/scp/v1")
+        );
+        assert_eq!(known.routing_id, [7; 32]);
+        assert_eq!(known.member_did, "m");
+        assert_eq!(known.last_seen, 5);
+
+        // A context the runtime does not hold has no stored set.
+        instance
+            .register_known_context_from_runtime("not-in-runtime", [8; 32], "m".to_owned(), 5)
+            .await;
+        assert_eq!(
+            instance
+                .known_contexts()
+                .get("not-in-runtime")
+                .map(|e| e.value().relay_url.clone()),
+            Some(None)
+        );
+    }
+
+    /// Without a supervisor there is no stored relay set, so the cache records
+    /// no relay even when the bridge has a transport installed.
+    #[tokio::test]
+    async fn register_known_context_from_runtime_without_supervisor_records_no_relay() {
+        let instance = CoreFields::new();
+        instance
+            .install_transport(
+                Arc::new(test_transport_manager()),
+                "wss://bridge.example".to_owned(),
+            )
+            .unwrap();
+        instance
+            .register_known_context_from_runtime("ctx", [1; 32], "m".to_owned(), 1)
+            .await;
+        assert_eq!(
+            instance
+                .known_contexts()
+                .get("ctx")
+                .map(|e| e.value().relay_url.clone()),
+            Some(None)
         );
     }
 

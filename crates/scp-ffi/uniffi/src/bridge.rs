@@ -10352,9 +10352,6 @@ impl Scp {
                         msg: e.to_string(),
                         code: codes::TRANS_5002.to_owned(),
                     })?;
-                // The known-context cache names a relay from the same set, so
-                // the two cannot disagree.
-                let known_relay_url = relay_urls.first().cloned();
                 let sup = bi.context_manager_or_error()?;
                 {
                     use scp_core::context::actor::commands::{
@@ -10459,13 +10456,14 @@ impl Scp {
                         scp_core::context::context_routing_id(&handle.context_id)
                     }
                 });
-                let known = scp_ffi_common::bridge_instance::KnownContext {
-                    routing_id,
-                    relay_url: known_relay_url,
-                    member_did: identity.did.clone(),
-                    last_seen: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
-                };
-                bi.core.register_known_context(&handle.context_id, known);
+                bi.core
+                    .register_known_context_from_runtime(
+                        &handle.context_id,
+                        routing_id,
+                        identity.did.clone(),
+                        scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+                    )
+                    .await;
 
                 Ok(handle)
             })
@@ -10785,17 +10783,15 @@ impl Scp {
                 // Post-commit discovery registration. spawn-from-Welcome always
                 // stands up an ENCRYPTED context, so the routing id is the joiner's
                 // derived §9.10.4 pseudonym (`local_pseudonym` is `Copy`, still
-                // valid after the request move). The member is the JOINER; the
-                // relay_url is `None` because a UniFFI `Scp` instance does not
-                // retain the connected relay URL — it lives on the caller-held
-                // opaque `TransportManager`, so `None` is the honest value here.
-                let known = scp_ffi_common::bridge_instance::KnownContext {
-                    routing_id: local_pseudonym,
-                    relay_url: None,
-                    member_did: identity.did.clone(),
-                    last_seen: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
-                };
-                bi.core.register_known_context(&context_id, known);
+                // valid after the request move). The member is the JOINER.
+                bi.core
+                    .register_known_context_from_runtime(
+                        &context_id,
+                        local_pseudonym,
+                        identity.did.clone(),
+                        scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+                    )
+                    .await;
 
                 Ok(handle)
             })
@@ -11052,10 +11048,8 @@ impl Scp {
                 // context must be discoverable just like a created one. Routing
                 // id is the joiner's pre-derived §9.10.4 pseudonym; BROADCAST
                 // joins (which carry no per-member pseudonym) fall back to the
-                // mode-appropriate deterministic routing id. `relay_url` is
-                // `None` — the connected relay lives on the caller-held
-                // `TransportManager` handle, not the bridge instance. Infallible
-                // + idempotent, so it is safe after the irreversible runtime
+                // mode-appropriate deterministic routing id. Infallible +
+                // idempotent, so it is safe after the irreversible runtime
                 // commit and needs no rollback.
                 let routing_id = local_pseudonym.unwrap_or_else(|| {
                     if join_is_broadcast {
@@ -11064,13 +11058,14 @@ impl Scp {
                         scp_core::context::context_routing_id(&handle.context_id)
                     }
                 });
-                let known = scp_ffi_common::bridge_instance::KnownContext {
-                    routing_id,
-                    relay_url: None,
-                    member_did: identity.did.clone(),
-                    last_seen: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
-                };
-                bi.core.register_known_context(&handle.context_id, known);
+                bi.core
+                    .register_known_context_from_runtime(
+                        &handle.context_id,
+                        routing_id,
+                        identity.did.clone(),
+                        scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+                    )
+                    .await;
 
                 Ok(())
             })
@@ -18968,21 +18963,20 @@ impl Scp {
                 // registering `local_pseudonym` here would make a broadcast
                 // re-home silently unaddressable. Encrypted imports use the
                 // importer's derived §9.10.4 pseudonym as the routing id.
-                // `relay_url` is `None` (the connected relay lives on the
-                // caller-held `TransportManager` handle, not the bridge
-                // instance). Infallible + idempotent, so it needs no rollback.
+                // Infallible + idempotent, so it needs no rollback.
                 let routing_id = if imported_is_broadcast {
                     scp_core::context::broadcast_routing_id(&context_id)
                 } else {
                     local_pseudonym
                 };
-                let known = scp_ffi_common::bridge_instance::KnownContext {
-                    routing_id,
-                    relay_url: None,
-                    member_did: identity.did.clone(),
-                    last_seen: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
-                };
-                bi.core.register_known_context(&context_id, known);
+                bi.core
+                    .register_known_context_from_runtime(
+                        &context_id,
+                        routing_id,
+                        identity.did.clone(),
+                        scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+                    )
+                    .await;
 
                 Ok(context_id)
             })
