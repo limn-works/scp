@@ -1,13 +1,12 @@
 // AndroidStorage.kt — StorageProvider implementation for Android (ADR-027)
 //
-// Encrypted key-value storage using SQLCipher. The adapter opens the database with a
-// 32-byte SQLCipher passphrase derived from a Keystore-held AES-256 key, and SQLCipher
-// derives the database encryption key from that passphrase. Keystore does not hand
-// the AES key to the app; the key encrypts a fixed 22-byte label via AES-GCM with a
-// fixed IV, and the first 32 of the 38 output bytes (the 22 ciphertext bytes and the
-// first 10 bytes of the 16-byte GCM tag) are the SQLCipher passphrase. The adapter
-// does not read KeyInfo.securityLevel, so it does not know whether Keystore put the
-// AES key in the TEE or, on a device whose KeyMint runs in software, in software.
+// Encrypted key-value storage using SQLCipher. A non-exportable HMAC-SHA-256 key in
+// Android Keystore MACs a fixed label, and HKDF-SHA-256 derives the 32-byte SQLCipher
+// key from that MAC output under the salt and info of section 17.6 of
+// .docs/specs/17-persistence-and-storage.md. The adapter passes the key to SQLCipher
+// in raw-key syntax, so SQLCipher runs no second KDF over it. The adapter does not read
+// KeyInfo.securityLevel, so it does not know whether Keystore put the HMAC key in the
+// TEE or, on a device whose KeyMint runs in software, in software.
 //
 // The database file is "scp.db" in the application's noBackupFilesDir directory.
 // This directory is excluded from Android Auto Backup, ensuring that SQLCipher
@@ -17,7 +16,8 @@
 // unreadable without the derived passphrase.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
-// ADR-025 (Apple Platform Adapter — parallel reference), section 17 (Persistence Architecture).
+// ADR-025 (Apple Platform Adapter — parallel reference), section 17.6 of
+// .docs/specs/17-persistence-and-storage.md (SQLCipher key derivation), RFC 5869 (HKDF).
 
 package works.limn.scp.android.platform
 
@@ -29,10 +29,10 @@ import net.zetetic.database.sqlcipher.SQLiteOpenHelper
 import java.io.File
 import java.security.GeneralSecurityException
 import java.security.KeyStore
-import javax.crypto.Cipher
+import java.security.MessageDigest
 import javax.crypto.KeyGenerator
+import javax.crypto.Mac
 import javax.crypto.SecretKey
-import javax.crypto.spec.GCMParameterSpec
 
 /**
  * Android SQLCipher-backed storage provider for SCP.
@@ -44,26 +44,35 @@ import javax.crypto.spec.GCMParameterSpec
  *
  * ## Encryption architecture
  *
- * SQLCipher derives the database encryption key from a passphrase, and the adapter derives
- * that passphrase from a Keystore-held key:
+ * Section 17.6 of `.docs/specs/17-persistence-and-storage.md` fixes the SQLCipher key
+ * derivation, and the adapter follows it:
  *
- * 1. Android Keystore holds an AES-256-GCM key (alias: `scp.storage.key`). The key is
- *    generated on first use and persists across app restarts. The adapter does not read
- *    `KeyInfo.securityLevel`, so it does not know whether Keystore put the key in the TEE
- *    or, on a device whose KeyMint runs in software, in software.
- * 2. The Keystore key encrypts a fixed 22-byte label (`"scp-storage-passphrase"`) using
- *    AES-GCM with a fixed 12-byte zero IV. The fixed IV makes the 38-byte output (22 bytes
- *    of ciphertext followed by the 16-byte GCM tag) deterministic.
- * 3. The first 32 bytes of that output (the ciphertext and the first 10 bytes of the tag)
- *    are the SQLCipher passphrase. SQLCipher derives the database encryption key from that
- *    passphrase and encrypts the whole database with the derived key.
+ * 1. Android Keystore holds a 256-bit HMAC-SHA-256 key (alias: `scp.storage.key`,
+ *    purpose `PURPOSE_SIGN`). The key is generated on first use, persists across app
+ *    restarts, and is not exportable. The adapter does not read `KeyInfo.securityLevel`,
+ *    so it does not know whether Keystore put the key in the TEE or, on a device whose
+ *    KeyMint runs in software, in software.
+ * 2. Keystore computes `ikm = HMAC-SHA-256(keystore_key, "scp-storage-passphrase")`. HMAC
+ *    is deterministic and takes no nonce, so the same Keystore key yields the same 32
+ *    bytes on every open and nothing is stored beside the database.
+ * 3. HKDF-SHA-256 derives the 32-byte key: salt `SHA-256("SCP-SQLCIPHER-KEY-V1")`, info
+ *    `"scp-sqlcipher:" || identifier`, where the identifier is the 32-byte SHA-256 digest
+ *    of the database directory's absolute path. Two storage directories therefore get two
+ *    keys, and one directory gets the same key on every open.
+ * 4. The adapter hands SQLCipher the key as the raw-key literal `x'<64 hex>'`, so SQLCipher
+ *    uses the 32 bytes as the database key and runs no PBKDF2 over them.
  *
- * Keystore does not hand the AES key bytes to the app. The derived passphrase is not
- * persisted to disk in plaintext, but key material stays in process memory: SQLCipher keeps
- * the database key it derives from the passphrase in native memory for as long as the
- * database is open, and the adapter zeroes only the returned passphrase array after open,
- * not the 38-byte `doFinal` output or the list `take` builds from it, which stay on the
- * JVM heap until garbage collection.
+ * Section 17.6 says the identifier binds the database to one identity. This adapter opens
+ * its database before any identity loads, and it keeps one database per storage directory,
+ * so the directory digest is the identifier. A move of the app's data directory to another
+ * path changes the key, and the open then fails: SQLCipher rejects the existing file, and
+ * the adapter never creates a fresh database in its place.
+ *
+ * Keystore does not hand the HMAC key bytes to the app. The derived key is not persisted
+ * to disk, but key material stays in process memory: SQLCipher keeps the database key in
+ * native memory for as long as the database is open. The adapter zeroes the MAC output,
+ * the HKDF output and the raw-key literal once each has been used; the JCA `Mac` objects
+ * keep their internal state until garbage collection.
  *
  * ## Thread safety
  *
@@ -103,83 +112,100 @@ class AndroidStorage(private val context: Context) : StorageProvider {
      */
     internal val db: SQLiteDatabase by lazy { openEncryptedDatabase() }
 
+    /**
+     * Directory that holds [DATABASE_NAME]: the app's `noBackupFilesDir`, which Android Auto
+     * Backup excludes. A backed-up database would be unreadable on another device, because
+     * the Keystore key that derives its SQLCipher key is device-bound. The HKDF info binds
+     * this directory, so the open and the derivation both read it here.
+     */
+    private val databaseDirectory: File
+        get() = context.noBackupFilesDir
+
     private fun openEncryptedDatabase(): SQLiteDatabase {
         System.loadLibrary("sqlcipher")
         val encryptionKey = getOrCreateStorageKey()
         try {
-            // The passphrase is passed as byte[] to the SQLiteOpenHelper constructor.
-            // SQLCipher 4.6+ derives the database encryption key from the constructor-supplied
-            // passphrase.
-            // The returned ByteArray (encryptionKey) is zeroed in the finally block; the
-            // intermediate copies inside getOrCreateStorageKey are not.
-            // The real protection is Keystore-held key derivation — the passphrase
-            // cannot be recomputed without the Android Keystore key.
-            //
-            // The database path is computed from noBackupFilesDir so that the
-            // encrypted database is excluded from Android Auto Backup. Backed-up
-            // databases would be unreadable on a different device because the Keystore
-            // key that derived the passphrase is device-bound.
-            val dbPath = File(context.noBackupFilesDir, DATABASE_NAME).absolutePath
+            // The raw-key literal is passed as byte[] to the SQLiteOpenHelper constructor,
+            // which hands it to sqlite3_key; SQLCipher reads the x'..' form as the key itself.
+            // The literal is zeroed in the finally block. The protection is the Keystore
+            // key: the literal cannot be recomputed without it.
+            val dbPath = File(databaseDirectory, DATABASE_NAME).absolutePath
             val helper = ScpDatabaseHelper(context, dbPath, encryptionKey)
             return helper.writableDatabase
         } finally {
-            // Zero key material immediately after use to limit exposure window.
+            // Zero the key literal immediately after use to limit the exposure window.
             encryptionKey.fill(0)
         }
     }
 
     /**
-     * Retrieve or generate the Keystore-held AES-256 key, then derive the SQLCipher passphrase.
+     * Retrieves or generates the Keystore-held HMAC-SHA-256 key, then derives the SQLCipher
+     * key from it as section 17.6 requires.
      *
-     * The Keystore key is generated on first call and persists in Android Keystore. Subsequent calls
-     * retrieve the existing key. The derived passphrase is deterministic for a given Keystore
-     * key (fixed IV, fixed plaintext label).
+     * The Keystore key is generated on first call and persists in Android Keystore.
+     * Subsequent calls retrieve the existing key. HMAC is deterministic, so the same
+     * Keystore key, the fixed [DERIVATION_LABEL] and the same [databaseDirectory] always
+     * yield the same result.
      *
-     * @return 32-byte SQLCipher passphrase derived from the Keystore key.
+     * @return the SQLCipher raw-key literal `x'<64 hex>'` as ASCII bytes; see
+     *   [derivePassphrase].
      * @throws ScpException with code `SCP-STORAGE-8003` if a Keystore, key-generation or
-     *   cipher call throws a `GeneralSecurityException`. Every other failure propagates
-     *   unconverted, for example the `IOException` from `KeyStore.load`, a
-     *   `ProviderException` from Keystore key generation, or the `NullPointerException`
-     *   the `as SecretKey` cast throws when `KeyStore.getKey` returns `null`.
+     *   MAC call throws a `GeneralSecurityException`, including the `InvalidKeyException`
+     *   `Mac.init` throws when the alias holds a key that is not an HMAC-SHA-256 key. Every
+     *   other failure propagates unconverted, for example the `IOException` from
+     *   `KeyStore.load`, a `ProviderException` from Keystore key generation, or the
+     *   `NullPointerException` the `as SecretKey` cast throws when `KeyStore.getKey`
+     *   returns `null`.
      */
     internal fun getOrCreateStorageKey(): ByteArray {
         try {
             val keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
 
             if (!keyStore.containsAlias(KEY_ALIAS)) {
-                val keySpec = KeyGenParameterSpec.Builder(
-                    KEY_ALIAS,
-                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
-                )
-                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                val keySpec = KeyGenParameterSpec.Builder(KEY_ALIAS, KeyProperties.PURPOSE_SIGN)
+                    .setDigests(KeyProperties.DIGEST_SHA256)
                     .setKeySize(KEY_SIZE_BITS)
-                    .setRandomizedEncryptionRequired(false) // required for caller-supplied IV with GCM
                     .setUserAuthenticationRequired(false) // background access required
                     .build()
-                KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE_PROVIDER)
+                KeyGenerator.getInstance(MAC_ALGORITHM, KEYSTORE_PROVIDER)
                     .apply { init(keySpec) }
                     .generateKey()
             }
 
-            // Derive a 32-byte SQLCipher passphrase by encrypting a fixed label with the Keystore key.
-            // Keystore does not hand the key bytes to the app — this pattern uses AES-GCM with a
-            // deterministic IV to produce a stable 32-byte value for the SQLCipher passphrase.
+            // Keystore computes one HMAC over the fixed label; the key bytes never reach
+            // the app, and HMAC takes no nonce, so nothing is stored beside the database.
             val secretKey = keyStore.getKey(KEY_ALIAS, null) as SecretKey
-            val cipher = Cipher.getInstance(CIPHER_TRANSFORMATION).apply {
-                init(
-                    Cipher.ENCRYPT_MODE,
-                    secretKey,
-                    GCMParameterSpec(GCM_TAG_LENGTH_BITS, ByteArray(GCM_IV_LENGTH))
-                )
+            val ikm = Mac.getInstance(MAC_ALGORITHM)
+                .apply { init(secretKey) }
+                .doFinal(DERIVATION_LABEL.toByteArray(Charsets.UTF_8))
+            try {
+                return derivePassphrase(ikm)
+            } finally {
+                ikm.fill(0)
             }
-            val ciphertext = cipher.doFinal(DERIVATION_LABEL.toByteArray(Charsets.UTF_8))
-            // doFinal returns 38 bytes: 22 of ciphertext, then the 16-byte GCM tag. Keep the first 32.
-            return ciphertext.take(PASSPHRASE_LENGTH).toByteArray()
         } catch (e: ScpException) {
             throw e
         } catch (e: GeneralSecurityException) {
             throw ScpException("Storage encryption key derivation failed", ERROR_KEY_DERIVATION_FAILED, e)
+        }
+    }
+
+    /**
+     * Derives this instance's SQLCipher raw-key literal from the Keystore MAC output [ikm].
+     *
+     * Calls [deriveDatabaseKey] with [databaseDirectory] and encodes the result with
+     * [rawKeyLiteral]. It reads no Keystore state, so a JVM unit test can show that two
+     * instances over one directory agree and that two directories disagree.
+     *
+     * @param ikm the 32-byte HMAC that the Keystore key computes over [DERIVATION_LABEL].
+     * @return the ASCII bytes of `x'<64 hex>'`; the caller zeroes them after use.
+     */
+    internal fun derivePassphrase(ikm: ByteArray): ByteArray {
+        val key = deriveDatabaseKey(ikm, databaseDirectory)
+        try {
+            return rawKeyLiteral(key)
+        } finally {
+            key.fill(0)
         }
     }
 
@@ -326,30 +352,79 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         private fun escapeLikePrefix(prefix: String): String =
             prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
+        /**
+         * HKDF-SHA-256 from section 17.6 of `.docs/specs/17-persistence-and-storage.md`:
+         * salt `SHA-256("SCP-SQLCIPHER-KEY-V1")`, info `"scp-sqlcipher:" || identifier`,
+         * 32 bytes out. The identifier is [directoryIdentifier] of [databaseDirectory].
+         *
+         * @param ikm input keying material, the Keystore MAC output.
+         * @param databaseDirectory directory holding [DATABASE_NAME].
+         * @return the 32-byte SQLCipher key; the caller zeroes it after use.
+         */
+        internal fun deriveDatabaseKey(ikm: ByteArray, databaseDirectory: File): ByteArray = Hkdf.sha256(
+            ikm = ikm,
+            salt = sha256(SQLCIPHER_SALT_LABEL.toByteArray(Charsets.UTF_8)),
+            info = SQLCIPHER_INFO_PREFIX.toByteArray(Charsets.UTF_8) + directoryIdentifier(databaseDirectory),
+            length = DATABASE_KEY_LENGTH,
+        )
+
+        /** The 32-byte SHA-256 digest of [directory]'s absolute path in UTF-8. */
+        internal fun directoryIdentifier(directory: File): ByteArray =
+            sha256(directory.absolutePath.toByteArray(Charsets.UTF_8))
+
+        /**
+         * Encodes [key] as SQLCipher's raw-key literal `x'<lowercase hex>'` in ASCII bytes.
+         *
+         * Section 17.6 requires this form: SQLCipher uses the hex-decoded bytes as the
+         * database key, where a plain passphrase would get a second, redundant PBKDF2. The
+         * bytes are built directly, never through a `String`, so the caller can zero them.
+         */
+        internal fun rawKeyLiteral(key: ByteArray): ByteArray {
+            val out = ByteArray(key.size * 2 + RAW_KEY_FRAMING_BYTES)
+            out[0] = 'x'.code.toByte()
+            out[1] = '\''.code.toByte()
+            key.forEachIndexed { i, b ->
+                out[2 + i * 2] = HEX_DIGITS[(b.toInt() shr 4) and 0x0F]
+                out[3 + i * 2] = HEX_DIGITS[b.toInt() and 0x0F]
+            }
+            out[out.size - 1] = '\''.code.toByte()
+            return out
+        }
+
+        private fun sha256(input: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(input)
+
+        private val HEX_DIGITS = "0123456789abcdef".toByteArray(Charsets.US_ASCII)
+
+        /** `x'` before the hex digits and `'` after them. */
+        private const val RAW_KEY_FRAMING_BYTES = 3
 
         /** Android Keystore provider name. */
         private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
 
-        /** Alias for the Keystore-held AES-256 key that derives the SQLCipher passphrase. */
+        /** Alias for the Keystore-held HMAC-SHA-256 key that derives the SQLCipher key. */
         internal const val KEY_ALIAS = "scp.storage.key"
 
-        /** AES key size in bits. */
+        /** Keystore HMAC key size in bits. */
         private const val KEY_SIZE_BITS = 256
 
-        /** Cipher transformation for AES-GCM key derivation. */
-        private const val CIPHER_TRANSFORMATION = "AES/GCM/NoPadding"
+        /**
+         * Algorithm of the Keystore key and of the MAC computed under it. It equals
+         * `KeyProperties.KEY_ALGORITHM_HMAC_SHA256`; a JVM unit test reads this constant,
+         * where the Android stub would return a default.
+         */
+        internal const val MAC_ALGORITHM = "HmacSHA256"
 
-        /** GCM authentication tag length in bits. */
-        private const val GCM_TAG_LENGTH_BITS = 128
+        /** Fixed label the Keystore key MACs to produce the HKDF input keying material. */
+        internal const val DERIVATION_LABEL = "scp-storage-passphrase"
 
-        /** GCM initialization vector length in bytes (12-byte fixed zero IV for determinism). */
-        private const val GCM_IV_LENGTH = 12
+        /** Label hashed to form the HKDF salt (section 17.6). */
+        internal const val SQLCIPHER_SALT_LABEL = "SCP-SQLCIPHER-KEY-V1"
 
-        /** Fixed label encrypted by the Keystore key to derive the SQLCipher passphrase. */
-        private const val DERIVATION_LABEL = "scp-storage-passphrase"
+        /** HKDF info prefix (section 17.6); the 32-byte directory identifier follows it. */
+        internal const val SQLCIPHER_INFO_PREFIX = "scp-sqlcipher:"
 
-        /** Length of the derived SQLCipher passphrase in bytes. */
-        private const val PASSPHRASE_LENGTH = 32
+        /** Length of the derived SQLCipher key in bytes (section 17.6). */
+        internal const val DATABASE_KEY_LENGTH = 32
 
         /** SQLCipher database file name. */
         internal const val DATABASE_NAME = "scp.db"
@@ -376,7 +451,7 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         internal const val ERROR_STORAGE_OPERATION_FAILED = "SCP-STORAGE-8002"
 
         /**
-         * Error code: the Keystore key or the SQLCipher passphrase derivation threw a
+         * Error code: the Keystore key or the SQLCipher key derivation threw a
          * `GeneralSecurityException`. [AndroidStorage.getOrCreateStorageKey] lists the
          * failures it does not convert.
          */

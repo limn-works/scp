@@ -56,7 +56,7 @@ Implement the Android platform adapter in Kotlin at `bindings/kotlin/scp-kt-andr
 - **`AndroidKeyCustody.kt`** — `KeyCustodyProvider` implementation using Android Keystore. EC P-256 signing keys in Keystore at every supported API level; Keystore key agreement at API 31+, with a Bouncy Castle software P-256 agreement key below it. TEE-backed by default; StrongBox explicitly opt-out.
 - **`AndroidDeviceAttestation.kt`** — `DeviceAttestationProvider` implementation using Play Integrity Standard API. Standard (server-side, low-latency) preferred over Classic (offline, high-cost) attestation.
 - **`AndroidPushProvider.kt`** — `PushProvider` implementation using Firebase Cloud Messaging. Opaque data-only message: the FCM row of the §10.7.1 step 5 wake-signal table, whose `data` map is `{"scp": "1"}` (amended 2026-10-12; this item previously gave the payload as `{"data": {"scp": "1"}}` and cited no table). No context ID, sender identifier, or message content in any notification payload.
-- **`AndroidStorage.kt`** — `StorageProvider` implementation using SQLCipher. Database encryption key derived from a 32-byte symmetric key stored in Android Keystore (TEE-backed AES-256). Key ID: `scp.storage.key`.
+- **`AndroidStorage.kt`** — `StorageProvider` implementation using SQLCipher. The SQLCipher key is derived as `17-persistence-and-storage.md` §17.6 requires: a non-exportable HMAC-SHA-256 key in Android Keystore MACs a fixed label, and HKDF-SHA-256 expands that MAC output into the 32-byte key. Key ID: `scp.storage.key`. (Amended 2026-10-12; this item previously named a TEE-backed AES-256 Keystore key.)
 - **`PlatformAdapter.kt`** — `AndroidPlatformAdapter` factory. `AndroidPlatformAdapter.make()` constructs and injects all four providers. Called by the Kotlin SDK when the caller requests `os_keystore` custody (`03-identity.md` §3.2.2). (Amended 2026-10-10; this item previously ended "Called by the Kotlin SDK's `SCP.create()` when `custody = "platform"`.")
 
 **Minimum API level:** API 26 (Android 8.0) for the SDK. Keystore has backed EC P-256 signing keys in hardware since API 23, so every device this SDK supports reports `CustodyType.Hardware` for a signing key. API 31 (Android 12) is the first level at which Keystore performs ECDH, so a device on API 26-32 holds its key-agreement key as a software Bouncy Castle P-256 key with `CustodyType.Software`.
@@ -334,28 +334,36 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         val keyAlias = "scp.storage.key"
 
         if (!keyStore.containsAlias(keyAlias)) {
-            val keySpec = KeyGenParameterSpec.Builder(
-                keyAlias,
-                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
-            )
-                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            val keySpec = KeyGenParameterSpec.Builder(keyAlias, KeyProperties.PURPOSE_SIGN)
+                .setDigests(KeyProperties.DIGEST_SHA256)
                 .setKeySize(256)
                 .setUserAuthenticationRequired(false)  // background access required
                 .build()
-            KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+            KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_HMAC_SHA256, "AndroidKeyStore")
                 .apply { init(keySpec) }
                 .generateKey()
         }
 
-        // Derive a 32-byte SQLCipher passphrase by encrypting a fixed label with the Keystore key.
-        // The actual key bytes never leave the TEE — this pattern uses AES-GCM with a deterministic
-        // IV to produce a stable 32-byte value for the SQLCipher passphrase.
+        // §17.6 SQLCipher key derivation. Keystore MACs a fixed label (HMAC is deterministic
+        // and takes no nonce); HKDF-SHA-256 expands the MAC output under the §17.6 salt and info.
+        // The identifier is SHA-256 of the database directory's absolute path, because the
+        // database opens before any identity loads. The key reaches SQLCipher as the raw-key
+        // literal x'<64 hex>', so SQLCipher runs no second KDF.
+        // (Amended 2026-10-12; this sketch previously encrypted the label with AES-GCM under a
+        // fixed all-zero IV and truncated the output, which §17.6 does not permit.)
         val secretKey = keyStore.getKey(keyAlias, null) as SecretKey
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply {
-            init(Cipher.ENCRYPT_MODE, secretKey, GCMParameterSpec(128, ByteArray(12)))  // fixed IV for determinism
-        }
-        return cipher.doFinal("scp-storage-passphrase".toByteArray(Charsets.UTF_8)).take(32).toByteArray()
+        val ikm = Mac.getInstance("HmacSHA256").apply { init(secretKey) }
+            .doFinal("scp-storage-passphrase".toByteArray(Charsets.UTF_8))
+        val dbDir = context.noBackupFilesDir
+        val sha256 = MessageDigest.getInstance("SHA-256")
+        val okm = hkdfSha256(
+            ikm = ikm,
+            salt = sha256.digest("SCP-SQLCIPHER-KEY-V1".toByteArray(Charsets.UTF_8)),
+            info = "scp-sqlcipher:".toByteArray(Charsets.UTF_8) +
+                sha256.digest(dbDir.absolutePath.toByteArray(Charsets.UTF_8)),
+            length = 32,
+        )
+        return rawKeyLiteral(okm)  // "x'<64 hex>'" as ASCII bytes
     }
 
     override fun store(key: String, data: ByteArray) {
@@ -507,8 +515,8 @@ dependencies {
       - Neither `push_enable` nor `push_handle_wake` exists yet. Stories PUSH-015 and PUSH-016 of `.docs/prds/push.json` add them.
 
 11. **`AndroidStorage.store(key, data)` / `retrieve(key)` / `delete(key)` / `listKeys(prefix)` / `deletePrefix(prefix)` / `exists(key)`:**
-    - All operations on SQLCipher database encrypted with a TEE-derived 32-byte AES-256 key.
-    - Storage key is generated in `AndroidKeyStore` under alias `scp.storage.key` with AES-256-GCM, TEE-backed, no user authentication required.
+    - All operations on a SQLCipher database whose 32-byte key is derived as `17-persistence-and-storage.md` §17.6 requires: HKDF-SHA-256 over the Keystore MAC of a fixed label, salt `SHA-256("SCP-SQLCIPHER-KEY-V1")`, info `"scp-sqlcipher:"` followed by the SHA-256 digest of the database directory's absolute path, passed to SQLCipher as the raw-key literal `x'<64 hex>'`. Two storage directories derive two keys; one directory derives the same key on every open.
+    - Storage key is generated in `AndroidKeyStore` under alias `scp.storage.key` as a non-exportable 256-bit HMAC-SHA-256 key (`PURPOSE_SIGN`, `DIGEST_SHA256`), TEE-backed where the device's KeyMint is, no user authentication required. (Amended 2026-10-12; these two items previously named an AES-256-GCM key.)
     - `listKeys(prefix)` returns keys in lexicographic order (required for KeyPackage buffer management and event log range queries).
     - `deletePrefix(prefix)` returns count of deleted keys.
 
