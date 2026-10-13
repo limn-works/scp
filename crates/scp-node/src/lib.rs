@@ -67,6 +67,7 @@ pub use self_host::{
 // both that path and external consumers.
 pub use config::{
     DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, Reach, TlsMode,
+    validate_reach_and_tls,
 };
 
 // ---------------------------------------------------------------------------
