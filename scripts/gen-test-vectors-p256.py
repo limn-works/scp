@@ -2570,7 +2570,12 @@ def emit_reveal_ranking_and_text_form() -> None:
 
 
 def challenge_verification_id(
-    verifier: str, subject: str, capability_uri: str, timestamp: int
+    verifier: str,
+    subject: str,
+    capability_uri: str,
+    challenge_id: bytes,
+    attempt: int,
+    timestamp: int,
 ) -> tuple[bytes, bytes]:
     """`07-trust-validation-and-capabilities.md` §7.3.4: the preimage and the
     value of `verification_id`."""
@@ -2578,6 +2583,8 @@ def challenge_verification_id(
         var_field(verifier)
         + var_field(subject)
         + var_field(capability_uri)
+        + fixed_field(challenge_id)
+        + u32(attempt)
         + u64(timestamp)
     )
     return pre, sha256(pre)
@@ -2588,65 +2595,142 @@ def challenge_verification_preimage(
     verifier: str,
     subject: str,
     capability_uri: str,
+    definition_digest: bytes,
     suite_digest: bytes,
+    challenge_id: bytes,
+    attempt: int,
+    response_digest: bytes,
+    max_retries: int,
+    cooldown_secs: int,
+    pass_threshold_bps: int,
+    min_category_cases: int,
     passed: bool,
-    score: int | None,
+    score: int,
     test_count: int,
     pass_count: int,
+    challenge_created_at: int,
+    challenge_expires_at: int,
     timestamp: int,
     expires_at: int,
-    context_id: str | None,
+    context_id: str,
 ) -> bytes:
-    """§7.3.4's `R_v`. `score` is length-prefixed in both forms."""
+    """§7.3.4's `R_v`: 22 signed fields, none optional."""
     return canonical_preimage(
         "SCP-CHALLENGE-VERIFY-V1:",
         fixed_field(verification_id),
         var_field(verifier),
         var_field(subject),
         var_field(capability_uri),
+        fixed_field(definition_digest),
         fixed_field(suite_digest),
+        fixed_field(challenge_id),
+        u32(attempt),
+        fixed_field(response_digest),
+        u32(max_retries),
+        u32(cooldown_secs),
+        u32(pass_threshold_bps),
+        u32(min_category_cases),
         u8(1 if passed else 0),
-        (u32(4) + u32(score)) if score is not None else absent_var(),
+        u32(score),
         u32(test_count),
         u32(pass_count),
+        u64(challenge_created_at),
+        u64(challenge_expires_at),
         u64(timestamp),
         u64(expires_at),
-        var_field(context_id) if context_id is not None else absent_var(),
+        var_field(context_id),
     )
 
 
+def capability_definition_preimage(
+    capability_uri: str,
+    min_cases_tag: int,
+    min_cases: int,
+    pass_threshold_bps: int,
+    max_retries: int,
+    cooldown_secs: int,
+    description: str,
+) -> bytes:
+    """§7.3.4.6's `Def`. The tag is 0 for `Total` and 1 for `PerCategory`."""
+    return canonical_preimage(
+        "SCP-CAPABILITY-DEFINITION-V1:",
+        var_field(capability_uri),
+        u8(min_cases_tag),
+        u32(min_cases),
+        u32(pass_threshold_bps),
+        u32(max_retries),
+        u32(cooldown_secs),
+        var_field(description),
+    )
+
+
+def answer_commitment(salt: bytes, expected_jcs: bytes) -> bytes:
+    """§7.3.4's salted answer commitment under `SCP-CHALLENGE-COMMIT-V1:`."""
+    return sha256(canonical_preimage(
+        "SCP-CHALLENGE-COMMIT-V1:", fixed_field(salt), var_field(expected_jcs)
+    ))
+
+
 def emit_challenge_vectors() -> None:
-    section("§25.30 Trust challenge request and verification record (§7.3.4)")
+    section("§25.30 Trust challenge request, response, record and definition (§7.3.4)")
     # An identifier-scoped URI: a protocol URI with one case is a request a
     # conforming SDK refuses, because `schema-validation/v1` sets a minimum of
     # 20 cases (§7.3.4.3).
     capability_uri = ID_DEFINER + ":capability:schema-validation/v1"
+    context_id = "test-context-01"
+    created_at, expires_at = 1700000000, 1700086400
+    max_retries, cooldown_secs, threshold = 2, 3600, 8000
+
+    # --- Vector 63: the capability definition the fixture URI follows. ---
+    pre63 = capability_definition_preimage(
+        capability_uri,
+        0,
+        1,
+        threshold,
+        max_retries,
+        cooldown_secs,
+        "Fixture definition for spec 25 vectors 59-62.",
+    )
+    definition_digest = sha256(pre63)
+    emit("vector_63.preimage_len", len(pre63))
+    emit_hex("vector_63.preimage", pre63)
+    emit_hex("vector_63.definition_digest", definition_digest)
 
     # --- Vector 59: the challenge request. ---
     challenge_id = bytes(range(1, 33))
+    salt = bytes(range(0x21, 0x41))
     test_input = {"name": "widget", "count": 3}
     expected = {
         "SchemaMatch": {"schema": {"type": "object", "required": ["name", "count"]}}
     }
     input_jcs = jcs(test_input)
     expected_jcs = jcs(expected)
+    commitment = answer_commitment(salt, expected_jcs)
     test_case = (
         var_field("schema-validation-001")
         + var_field(input_jcs)
-        + var_field(expected_jcs)
         + var_field("schema")
         + u32(10000)
+        + fixed_field(commitment)
     )
+    test_cases_field = u32(1) + test_case
+    suite_digest = sha256(test_cases_field)
     pre59 = canonical_preimage(
         "SCP-CHALLENGE-REQ-V1:",
         fixed_field(challenge_id),
         var_field(capability_uri),
-        u32(1),
-        test_case,
-        u32(300),
+        fixed_field(definition_digest),
+        test_cases_field,
+        u64(created_at),
+        u64(expires_at),
+        u32(max_retries),
+        u32(cooldown_secs),
+        u32(threshold),
+        var_field(context_id),
         var_field(ID_VERIFIER),
         var_field(ID_SUBJECT),
     )
+    request_digest = sha256(pre59)
     emit_hex("vector_59.challenge_id", challenge_id)
     emit("vector_59.verifier", ID_VERIFIER)
     emit("vector_59.definer", ID_DEFINER)
@@ -2654,49 +2738,83 @@ def emit_challenge_vectors() -> None:
     emit("vector_59.subject", ID_SUBJECT)
     emit("vector_59.input_jcs", input_jcs.decode())
     emit("vector_59.expected_jcs", expected_jcs.decode())
-    test_cases_field = u32(1) + test_case
-    suite_digest = sha256(test_cases_field)
+    emit_hex("vector_59.salt", salt)
+    emit_hex("vector_59.answer_commitment", commitment)
+    emit("vector_59.test_case_field_len", len(test_cases_field))
     emit_hex("vector_59.test_case_field", test_cases_field)
     emit_hex("vector_59.suite_digest", suite_digest)
     emit("vector_59.preimage_len", len(pre59))
     emit_hex("vector_59.preimage", pre59)
-    emit_hex("vector_59.digest", sha256(pre59))
+    emit_hex("vector_59.digest", request_digest)
+    assert expected_jcs not in pre59
 
-    # --- Vectors 60 and 61: the verification record. ---
-    for label, ts, passed, score, pass_count, context_id in (
-        ("vector_60", 1700000000, True, 10000, 1, "test-context-01"),
-        ("vector_61", 1700000060, False, None, 0, None),
+    # --- Responses: attempt 1 (fails the schema) and Vector 62 (attempt 2). ---
+    response_digests = {}
+    for label, attempt, output in (
+        ("vector_60.response", 1, {"name": "widget"}),
+        ("vector_62", 2, {"count": 3, "name": "widget"}),
     ):
-        expires_at = ts + 7776000
+        pre = canonical_preimage(
+            "SCP-CHALLENGE-RESP-V1:",
+            fixed_field(challenge_id),
+            fixed_field(request_digest),
+            var_field(ID_SUBJECT),
+            u32(attempt),
+            u32(1),
+            var_field("schema-validation-001"),
+            var_field(jcs(output)),
+        )
+        response_digests[attempt] = sha256(pre)
+        emit("%s.output_jcs" % label, jcs(output).decode())
+        emit("%s.preimage_len" % label, len(pre))
+        emit_hex("%s.preimage" % label, pre)
+        emit_hex("%s.digest" % label, response_digests[attempt])
+
+    # --- Vectors 60 and 61: the verification records of attempts 1 and 2. ---
+    # Vector 61 is graded exactly `cooldown_secs` after Vector 60, the
+    # cooldown boundary (§7.3.4 step 3).
+    for label, attempt, ts, passed, score, pass_count in (
+        ("vector_60", 1, 1700000600, False, 0, 0),
+        ("vector_61", 2, 1700000600 + cooldown_secs, True, 10000, 1),
+    ):
+        record_expires_at = ts + 7776000
         vid_pre, vid = challenge_verification_id(
-            ID_VERIFIER, ID_SUBJECT, capability_uri, ts
+            ID_VERIFIER, ID_SUBJECT, capability_uri, challenge_id, attempt, ts
         )
         pre = challenge_verification_preimage(
             vid,
             ID_VERIFIER,
             ID_SUBJECT,
             capability_uri,
+            definition_digest,
             suite_digest,
+            challenge_id,
+            attempt,
+            response_digests[attempt],
+            max_retries,
+            cooldown_secs,
+            threshold,
+            1,
             passed,
             score,
             1,
             pass_count,
-            ts,
+            created_at,
             expires_at,
+            ts,
+            record_expires_at,
             context_id,
         )
-        score_field = (u32(4) + u32(score)) if score is not None else absent_var()
+        emit("%s.attempt" % label, attempt)
         emit("%s.timestamp" % label, ts)
-        emit("%s.expires_at" % label, expires_at)
-        emit_hex("%s.score_field" % label, score_field)
+        emit("%s.expires_at" % label, record_expires_at)
         emit("%s.verification_id_preimage_len" % label, len(vid_pre))
         emit_hex("%s.verification_id_preimage" % label, vid_pre)
         emit_hex("%s.verification_id" % label, vid)
         emit("%s.preimage_len" % label, len(pre))
         emit_hex("%s.preimage" % label, pre)
         emit_hex("%s.digest" % label, sha256(pre))
-        if score is None:
-            assert pre.count(absent_var()) == 2, label
+        assert ABSENT_SENTINEL not in pre, label
 
 
 def main() -> int:

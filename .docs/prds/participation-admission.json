@@ -16,7 +16,7 @@
       "id": "gate-participation-admission-production",
       "name": "Context-Hosted Statement Production and Discovery",
       "priority": "P1",
-      "status": "done",
+      "status": "in-progress",
       "stories": [
         "SCP-BA-005",
         "SCP-BA-006"
@@ -244,7 +244,7 @@
       "gate": "gate-participation-admission-production",
       "priority": "P1",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-core/src/trust/participation.rs",
         "crates/scp-core/src/trust/mod.rs",
@@ -294,7 +294,9 @@
           "section": "### 7.3.1 Verifiable Event Logs"
         }
       ],
-      "details": {}
+      "details": {
+        "statusReason": "Reopened 2026-10-13: the production participation-profile producer signs with the participation_signing_seed key that `07-trust-validation-and-capabilities.md` §7.3.2.1 requires, and no production code derives that key yet."
+      }
     },
     {
       "id": "SCP-BA-006",

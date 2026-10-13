@@ -2099,126 +2099,138 @@ rejected, padded:
 
 ## 25.30 Trust Challenge Vectors (§7.3.4)
 
-The request and verification preimages below are the encodings now in force under `SCP-CHALLENGE-REQ-V1:` and `SCP-CHALLENGE-VERIFY-V1:`; each encoding changed under the same separator, and no earlier encoding has a vector. `07-trust-validation-and-capabilities.md` §7.3.4 fixes both field orders, the `verification_id` derivation and the `suite_digest` derivation. None of these vectors carries a key or a signature: each pins a preimage and its SHA-256 digest, which the verifier's `#active` key signs, so none depends on the curve. `verifier` and `subject` are the §25.1 fixture identifiers of those roles, in the `scp:` text form, so each carries the length prefix `00000038`. `capability_uri` is an identifier-scoped URI whose definer is the fixture identifier `definer`. A protocol capability URI would need at least the minimum number of test cases §7.3.4.3 sets for it, 20 for `schema-validation/v1`, and a conforming SDK refuses a one-case request for one.
+`07-trust-validation-and-capabilities.md` §7.3.4 fixes five encodings: the request preimage under `SCP-CHALLENGE-REQ-V1:`, the answer commitment under `SCP-CHALLENGE-COMMIT-V1:`, the response preimage under `SCP-CHALLENGE-RESP-V1:`, the verification record preimage under `SCP-CHALLENGE-VERIFY-V1:`, and the `verification_id` and `suite_digest` derivations. §7.3.4.6 fixes the capability definition preimage under `SCP-CAPABILITY-DEFINITION-V1:`. The request and record encodings each changed under the same separator, and no earlier encoding has a vector. None of these vectors carries a key or a signature: each pins a preimage and its SHA-256 digest, which the signer's `#active` key signs, so none depends on the curve. `verifier` and `subject` are the §25.1 fixture identifiers of those roles, in the `scp:` text form, so each carries the length prefix `00000038`. `capability_uri` is an identifier-scoped URI whose definer is the fixture identifier `definer`. A protocol capability URI would need at least the minimum number of test cases §7.3.4.3 sets for it, 20 for `schema-validation/v1`, and a conforming SDK refuses a one-case request for one.
 
-### Vector 59: the challenge request
-
-Inputs:
+The five vectors share these inputs:
 
 - `challenge_id`: the 32 bytes `01` through `20`;
 - `capability_uri`: `scp:tfgiiao36zlseo2tzfoi32knfx6topped3qloxcsube5gdvfrqgq:capability:schema-validation/v1`, whose definer `scp:tfgiiao36zlseo2tzfoi32knfx6topped3qloxcsube5gdvfrqgq` ends in `q`, so the last base32 character carries four zero bits (§7.3.4.1);
-- `test_cases`: one element, with `test_id` `schema-validation-001`, `input` `{"name":"widget","count":3}`, `expected` `SchemaMatch { schema: {"type":"object","required":["name","count"]} }`, `category` `schema` and `weight` 10000;
-- `timeout_secs`: 300;
+- `created_at` 1700000000 and `expires_at` 1700086400, a one-day window;
+- `max_retries` 2, `cooldown_secs` 3600 and `pass_threshold_bps` 8000, which equal Vector 63's definition;
+- `context_id`: `test-context-01`;
 - `verifier` and `subject`: the fixture identifiers `verifier` and `subject`.
-
-`input` and `expected` each enter the preimage as RFC 8785 canonical JSON behind a 4-byte big-endian length. `expected` takes its externally tagged wire form, so RFC 8785 sorts the members of `schema` and leaves the order of the `required` array as given.
 
 ```
 challenge_id:   0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
 verifier:       scp:vsrmsobf2uzejsbdaag3txwauasjrpnt5wlkulhahbbfwtdfaapa
 subject:        scp:ktarg6aqtsju6mh2ws3hk7t5kmsvmckq7d5eqwsmaw5di3e3p4ta
-JCS(input):     {"count":3,"name":"widget"}
-JCS(expected):  {"SchemaMatch":{"schema":{"required":["name","count"],"type":"object"}}}
 ```
 
-**`test_cases` field `T` (the count, then the one element; 150 bytes):**
+### Vector 63: the capability definition
+
+The fixture URI is identifier-scoped, so its definition is a definer-signed §7.3.4.6 record. Inputs: `capability_uri` as above; `min_cases` `Total(1)`, so the tag byte is `00` and the count is 1; `pass_threshold_bps` 8000; `max_retries` 2; `cooldown_secs` 3600; `description` `Fixture definition for spec 25 vectors 59-62.`. The description is part of the preimage, so the vector keeps its text as written.
+
+**`Def` (187 bytes):**
+
+```
+  5343502d4341504142494c4954592d444546494e4954494f4e2d56313a000000
+  587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836
+  746f7070656433716c6f7863737562653567647666727167713a636170616269
+  6c6974793a736368656d612d76616c69646174696f6e2f763100000000010000
+  1f400000000200000e100000002d4669787475726520646566696e6974696f6e
+  20666f72207370656320323520766563746f72732035392d36322e
+```
+
+```
+definition_digest = SHA-256(Def):  1947de3173cb08e14fa71bd41bb256274ba2b62e0d0d9e73b83af1a971ee8f67
+```
+
+### Vector 59: the challenge request
+
+Inputs, beyond the shared ones: `definition_digest` the Vector 63 value; one test case with `test_id` `schema-validation-001`, `input` `{"name":"widget","count":3}`, `category` `schema` and `weight` 10000, whose expected output `SchemaMatch { schema: {"type":"object","required":["name","count"]} }` enters the request only through its answer commitment; the case's `salt`, the 32 bytes `21` through `40`.
+
+`input` enters the preimage as RFC 8785 canonical JSON behind a 4-byte big-endian length. The expected output takes its externally tagged wire form, so RFC 8785 sorts the members of `schema` and leaves the order of the `required` array as given. The commitment hashes the separator, the salt as 32 fixed bytes, and the length-prefixed canonical expected output.
+
+```
+JCS(input):     {"count":3,"name":"widget"}
+JCS(expected):  {"SchemaMatch":{"schema":{"required":["name","count"],"type":"object"}}}
+salt:           2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40
+answer_commitment = SHA-256("SCP-CHALLENGE-COMMIT-V1:" ‖ salt ‖ F(JCS(expected))):
+                b73317ea1cf075724a76d4454a3c777e10b4cf31a853d650f667398c6e52a2d8
+```
+
+**`test_cases` field `T` (the count, then the one element; 106 bytes):**
 
 ```
   0000000100000015736368656d612d76616c69646174696f6e2d303031000000
-  1b7b22636f756e74223a332c226e616d65223a22776964676574227d00000048
-  7b22536368656d614d61746368223a7b22736368656d61223a7b227265717569
-  726564223a5b226e616d65222c22636f756e74225d2c2274797065223a226f62
-  6a656374227d7d7d00000006736368656d6100002710
+  1b7b22636f756e74223a332c226e616d65223a22776964676574227d00000006
+  736368656d6100002710b73317ea1cf075724a76d4454a3c777e10b4cf31a853
+  d650f667398c6e52a2d8
 ```
 
-`suite_digest` is `SHA-256(T)` with no domain prefix, and Vectors 60 and 61 carry it:
+`suite_digest` is `SHA-256(T)` with no domain prefix, and Vectors 60 and 61 carry it. `T` carries no byte of the expected output:
 
 ```
-suite_digest = SHA-256(T):  728fca93ec869b96f4f784cb46ad1b2aa68a4a39d7c4b60b66707586914fdcfc
+suite_digest = SHA-256(T):  5b7643e58ef89237bb133984f100bc4d7228e51de8adf358c550a4db1813bf21
 ```
 
-**`R` (419 bytes):**
+**`R` (450 bytes):**
 
 ```
   5343502d4348414c4c454e47452d5245512d56313a0102030405060708090a0b
   0c0d0e0f101112131415161718191a1b1c1d1e1f20000000587363703a746667
   6969616f33367a6c73656f32747a666f6933326b6e667836746f707065643371
   6c6f7863737562653567647666727167713a6361706162696c6974793a736368
-  656d612d76616c69646174696f6e2f76310000000100000015736368656d612d
+  656d612d76616c69646174696f6e2f76311947de3173cb08e14fa71bd41bb256
+  274ba2b62e0d0d9e73b83af1a971ee8f670000000100000015736368656d612d
   76616c69646174696f6e2d3030310000001b7b22636f756e74223a332c226e61
-  6d65223a22776964676574227d000000487b22536368656d614d61746368223a
-  7b22736368656d61223a7b227265717569726564223a5b226e616d65222c2263
-  6f756e74225d2c2274797065223a226f626a656374227d7d7d00000006736368
-  656d61000027100000012c000000387363703a7673726d736f626632757a656a
-  73626461616733747877617561736a72706e7435776c6b756c68616862626677
-  74646661617061000000387363703a6b7461726736617174736a75366d683277
-  7333686b3774356b6d73766d636b71376435657177736d617735646933653370
-  347461
+  6d65223a22776964676574227d00000006736368656d6100002710b73317ea1c
+  f075724a76d4454a3c777e10b4cf31a853d650f667398c6e52a2d80000000065
+  53f10000000000655542800000000200000e1000001f400000000f746573742d
+  636f6e746578742d3031000000387363703a7673726d736f626632757a656a73
+  626461616733747877617561736a72706e7435776c6b756c6861686262667774
+  646661617061000000387363703a6b7461726736617174736a75366d68327773
+  33686b3774356b6d73766d636b71376435657177736d61773564693365337034
+  7461
 ```
 
 ```
-D = SHA-256(R):  9425a8bca59a96ea6f400233a247fb9aa4b0d4bbb98b7e8b1e756297e7e2a91f
+D = SHA-256(R):  dc18665f0a48315ffdaeaa7cb55525240f7bbb289e29c3172ebf45d29fe9ba28
 ```
 
-### Vector 60: the verification record, with every optional field present
+### Vector 62: the challenge response, attempt 2
 
-Inputs: `verifier`, `subject` and `capability_uri` as in Vector 59; `suite_digest` the Vector 59 value, 32 fixed bytes; `timestamp` 1700000000 (`0x6553f100`); `verification_id` derived as §7.3.4 states from those inputs; `passed` true; `score` 10000 basis points (100.00%), present, so its field is `00 00 00 04` followed by `00 00 27 10`; `test_count` 1 and `pass_count` 1; `expires_at` 1707776000, `timestamp` plus 7776000 seconds (90 days); `context_id` `test-context-01`.
+The subject answers the one case of Vector 59 with `{"count":3,"name":"widget"}`, which satisfies the schema. Inputs: `challenge_id` and `subject` as above; `request_digest` Vector 59's `D`; `attempt` 2; one output for `schema-validation-001`. Vector 62 is the first vector under `SCP-CHALLENGE-RESP-V1:`.
 
-```
-timestamp:                     1700000000
-expires_at:                    1707776000
-score field:                   0000000400002710
-```
-
-**`verification_id` preimage (220 bytes):**
+**`P` (210 bytes):**
 
 ```
-  000000387363703a7673726d736f626632757a656a7362646161673374787761
-  7561736a72706e7435776c6b756c686168626266777464666161706100000038
-  7363703a6b7461726736617174736a75366d6832777333686b3774356b6d7376
-  6d636b71376435657177736d617735646933653370347461000000587363703a
-  7466676969616f33367a6c73656f32747a666f6933326b6e667836746f707065
-  6433716c6f7863737562653567647666727167713a6361706162696c6974793a
-  736368656d612d76616c69646174696f6e2f7631000000006553f100
+  5343502d4348414c4c454e47452d524553502d56313a0102030405060708090a
+  0b0c0d0e0f101112131415161718191a1b1c1d1e1f20dc18665f0a48315ffdae
+  aa7cb55525240f7bbb289e29c3172ebf45d29fe9ba28000000387363703a6b74
+  61726736617174736a75366d6832777333686b3774356b6d73766d636b713764
+  35657177736d6177356469336533703474610000000200000001000000157363
+  68656d612d76616c69646174696f6e2d3030310000001b7b22636f756e74223a
+  332c226e616d65223a22776964676574227d
 ```
 
 ```
-verification_id:               2334382d57e941658fc2c2a2457010918c9eec0ec822a85f74e2370b0e09fcb8
+D_r = SHA-256(P):  0219d13a72f6310ae90df4cd269ce8104a111b422bacdda5c4e2ca3008e677fc
 ```
 
-**`R_v` (352 bytes):**
+### Vector 60: the verification record, failed attempt 1
+
+Attempt 1 answered with `{"name":"widget"}`, which lacks the required `count`, so the case failed. Its response preimage takes the inputs of Vector 62 except `attempt` 1 and that output; the record's `response_digest` is that response's `D_r`.
+
+**Attempt-1 response `P` (200 bytes):**
 
 ```
-  5343502d4348414c4c454e47452d5645524946592d56313a2334382d57e94165
-  8fc2c2a2457010918c9eec0ec822a85f74e2370b0e09fcb8000000387363703a
-  7673726d736f626632757a656a73626461616733747877617561736a72706e74
-  35776c6b756c6861686262667774646661617061000000387363703a6b746172
-  6736617174736a75366d6832777333686b3774356b6d73766d636b7137643565
-  7177736d617735646933653370347461000000587363703a7466676969616f33
-  367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f786373
-  7562653567647666727167713a6361706162696c6974793a736368656d612d76
-  616c69646174696f6e2f7631728fca93ec869b96f4f784cb46ad1b2aa68a4a39
-  d7c4b60b66707586914fdcfc0100000004000027100000000100000001000000
-  006553f1000000000065ca98000000000f746573742d636f6e746578742d3031
+  5343502d4348414c4c454e47452d524553502d56313a0102030405060708090a
+  0b0c0d0e0f101112131415161718191a1b1c1d1e1f20dc18665f0a48315ffdae
+  aa7cb55525240f7bbb289e29c3172ebf45d29fe9ba28000000387363703a6b74
+  61726736617174736a75366d6832777333686b3774356b6d73766d636b713764
+  35657177736d6177356469336533703474610000000100000001000000157363
+  68656d612d76616c69646174696f6e2d303031000000117b226e616d65223a22
+  776964676574227d
 ```
 
 ```
-D_v = SHA-256(R_v):            ac0cd969cbbeb08ca4021ad9f852fdef1bf80db83039fe0c9c5347d73e8027a9
+D_r = SHA-256(P):  93dfe96c3f9d4973548c944fa0836291bf95458acb69707fa3d54f712d31e7ab
 ```
 
-### Vector 61: the verification record, with `score` and `context_id` both absent
+Record inputs: `verifier`, `subject`, `capability_uri` and `challenge_id` as above; `definition_digest` the Vector 63 value; `suite_digest` the Vector 59 value; `attempt` 1; `response_digest` the attempt-1 `D_r`; `max_retries` 2, `cooldown_secs` 3600 and `pass_threshold_bps` 8000; `min_category_cases` 1; `passed` false; `score` 0; `test_count` 1 and `pass_count` 0; `challenge_created_at` 1700000000 and `challenge_expires_at` 1700086400; `timestamp` 1700000600; `expires_at` 1707776600, `timestamp` plus 7776000 seconds (90 days); `context_id` `test-context-01`.
 
-Inputs as in Vector 60 except: `timestamp` 1700000060, so `verification_id` differs; `expires_at` 1707776060; `passed` false and `pass_count` 0; `score` absent; `context_id` absent.
-
-Both absent forms are length-prefixed: each is `00 00 00 20` followed by `SHA-256(0x00)`, so `R_v` carries the sentinel twice, each copy preceded by `00000020`. A present `score` begins with the length word `00000004` and an absent one with `00000020`, so a record carrying a present score cannot re-parse as this one, whatever its length.
-
-```
-timestamp:                     1700000060
-expires_at:                    1707776060
-score field:                   000000206e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d
-```
-
-**`verification_id` preimage (220 bytes):**
+**`verification_id` preimage (256 bytes):**
 
 ```
   000000387363703a7673726d736f626632757a656a7362646161673374787761
@@ -2227,31 +2239,79 @@ score field:                   000000206e340b9cffb37a989ca544e6bb780a2c78901d3fb
   6d636b71376435657177736d617735646933653370347461000000587363703a
   7466676969616f33367a6c73656f32747a666f6933326b6e667836746f707065
   6433716c6f7863737562653567647666727167713a6361706162696c6974793a
-  736368656d612d76616c69646174696f6e2f7631000000006553f13c
+  736368656d612d76616c69646174696f6e2f76310102030405060708090a0b0c
+  0d0e0f101112131415161718191a1b1c1d1e1f2000000001000000006553f358
 ```
 
 ```
-verification_id:               ced1d4c2b8d32ac88258a172f9d48bd402fb88687d7285f800dc90c1655046e4
+verification_id:               9554fd256e3c6bb5ee6c73e1ca28e72ade44785bde24d84c17869cb1da667b77
 ```
 
-**`R_v` (397 bytes):**
+**`R_v` (480 bytes):**
 
 ```
-  5343502d4348414c4c454e47452d5645524946592d56313aced1d4c2b8d32ac8
-  8258a172f9d48bd402fb88687d7285f800dc90c1655046e4000000387363703a
+  5343502d4348414c4c454e47452d5645524946592d56313a9554fd256e3c6bb5
+  ee6c73e1ca28e72ade44785bde24d84c17869cb1da667b77000000387363703a
   7673726d736f626632757a656a73626461616733747877617561736a72706e74
   35776c6b756c6861686262667774646661617061000000387363703a6b746172
   6736617174736a75366d6832777333686b3774356b6d73766d636b7137643565
   7177736d617735646933653370347461000000587363703a7466676969616f33
   367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f786373
   7562653567647666727167713a6361706162696c6974793a736368656d612d76
-  616c69646174696f6e2f7631728fca93ec869b96f4f784cb46ad1b2aa68a4a39
-  d7c4b60b66707586914fdcfc00000000206e340b9cffb37a989ca544e6bb780a
-  2c78901d3fb33738768511a30617afa01d0000000100000000000000006553f1
-  3c0000000065ca983c000000206e340b9cffb37a989ca544e6bb780a2c78901d
-  3fb33738768511a30617afa01d
+  616c69646174696f6e2f76311947de3173cb08e14fa71bd41bb256274ba2b62e
+  0d0d9e73b83af1a971ee8f675b7643e58ef89237bb133984f100bc4d7228e51d
+  e8adf358c550a4db1813bf210102030405060708090a0b0c0d0e0f1011121314
+  15161718191a1b1c1d1e1f200000000193dfe96c3f9d4973548c944fa0836291
+  bf95458acb69707fa3d54f712d31e7ab0000000200000e1000001f4000000001
+  00000000000000000100000000000000006553f1000000000065554280000000
+  006553f3580000000065ca9a580000000f746573742d636f6e746578742d3031
 ```
 
 ```
-D_v = SHA-256(R_v):            127c1d21606c26ab60ee8bcd691f3c776c677cb600f2b9d0a94333b50bb3472d
+D_v = SHA-256(R_v):            00d8282d8b49e2485955d9164678991f105e0ca9d909e49140c2e57969bf3aed
+```
+
+### Vector 61: the verification record, passing attempt 2 at the cooldown boundary
+
+Inputs as in Vector 60 except: `attempt` 2; `response_digest` Vector 62's `D_r`; `passed` true; `score` 10000; `pass_count` 1; `timestamp` 1700004200; `expires_at` 1707780200. The challenger graded attempt 2 at Vector 60's `timestamp` plus `cooldown_secs`, the earliest time §7.3.4 step 3 admits it.
+
+**`verification_id` preimage (256 bytes):**
+
+```
+  000000387363703a7673726d736f626632757a656a7362646161673374787761
+  7561736a72706e7435776c6b756c686168626266777464666161706100000038
+  7363703a6b7461726736617174736a75366d6832777333686b3774356b6d7376
+  6d636b71376435657177736d617735646933653370347461000000587363703a
+  7466676969616f33367a6c73656f32747a666f6933326b6e667836746f707065
+  6433716c6f7863737562653567647666727167713a6361706162696c6974793a
+  736368656d612d76616c69646174696f6e2f76310102030405060708090a0b0c
+  0d0e0f101112131415161718191a1b1c1d1e1f20000000020000000065540168
+```
+
+```
+verification_id:               5cec3cdef9ef548b71a346c713eead24381a8cac1e0d422e1a788cf524d99d63
+```
+
+**`R_v` (480 bytes):**
+
+```
+  5343502d4348414c4c454e47452d5645524946592d56313a5cec3cdef9ef548b
+  71a346c713eead24381a8cac1e0d422e1a788cf524d99d63000000387363703a
+  7673726d736f626632757a656a73626461616733747877617561736a72706e74
+  35776c6b756c6861686262667774646661617061000000387363703a6b746172
+  6736617174736a75366d6832777333686b3774356b6d73766d636b7137643565
+  7177736d617735646933653370347461000000587363703a7466676969616f33
+  367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f786373
+  7562653567647666727167713a6361706162696c6974793a736368656d612d76
+  616c69646174696f6e2f76311947de3173cb08e14fa71bd41bb256274ba2b62e
+  0d0d9e73b83af1a971ee8f675b7643e58ef89237bb133984f100bc4d7228e51d
+  e8adf358c550a4db1813bf210102030405060708090a0b0c0d0e0f1011121314
+  15161718191a1b1c1d1e1f20000000020219d13a72f6310ae90df4cd269ce810
+  4a111b422bacdda5c4e2ca3008e677fc0000000200000e1000001f4000000001
+  01000027100000000100000001000000006553f1000000000065554280000000
+  00655401680000000065caa8680000000f746573742d636f6e746578742d3031
+```
+
+```
+D_v = SHA-256(R_v):            3cb193fbe8242b331704a2d5fd25b66801b6f45eda72fba05bffe4c31df6379d
 ```
