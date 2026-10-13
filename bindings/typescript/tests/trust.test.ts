@@ -127,10 +127,7 @@ function mountWithContext() {
 }
 
 // These tests call `scp.evaluateTrust(context, subjectDid, tokens?)` directly.
-// A local `evaluateTrust(scp, did, ctx, tokens?)` wrapper stood here until the
-// ADR-059 rebuild, mirroring a free function `src/trust.ts` exported. §7 of
-// ADR-048 requires a stateful operation to be a method on `SCP`, so both the
-// free function and this wrapper are gone and the method is the single entry.
+// §7 of ADR-048 requires a stateful operation to be a method on `SCP`.
 
 describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
   let cleanup: (() => Promise<void>) | undefined;
@@ -226,10 +223,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
   });
 
   // ADR-059 Decision 3 forbids an SDK from reconstructing which validation
-  // stage failed by matching error-message text. `src/trust.ts` broke that rule
-  // until the C3c rebuild: six tables of Rust `Display` prefixes fed a
-  // `__classifyUcanError` helper that ran `startsWith` over the thrown message
-  // and turned the winner into a partially-true `CapabilityValidation`.
+  // stage failed by matching error-message text.
   //
   // This assertion is closed by construction rather than sampled: it pins the
   // THROWN INSTANCE, not its wording. Any classifier must either swallow the

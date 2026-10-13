@@ -40,13 +40,3 @@ lesson records the failure modes behind them.
   verdict.
 - **Evaluate every declared capability, not `att[0]` alone**, and never infer which stages
   passed from a hardcoded pipeline order.
-
-## Where these rules are still broken
-
-`SCP.evaluateTrust` in `bindings/typescript/src/scp.ts`, `evaluate_trust` in
-`bindings/python/scp_sdk/trust.py`, and `evaluateTrust` in `bindings/swift/Sources/SCP/Trust.swift`
-call `ucanEvaluate` and read the six booleans. The module-level `evaluateTrust` that
-`bindings/typescript/src/index.ts` re-exports from `bindings/typescript/src/trust.ts` still runs
-the superseded path: `validateOneCapUri` classifies bridge errors by prefix-matching the
-`Display` message (with `REVOCATION_PREFIXES`), `__PASSED_BEFORE` hardcodes the stage order,
-and `evaluateLayer1` sends only the `att[0].with` that `__extractFirstCapabilityUri` returns.

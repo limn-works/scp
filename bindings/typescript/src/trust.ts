@@ -10,10 +10,6 @@
  * helpers only. Trust evaluation dispatches against a context handle, the
  * instance's trust store, and the instance's event log, so it is stateful.
  *
- * A free `evaluateTrust` lived here and delegated to the method until the
- * ADR-059 rebuild. It predated ADR-048, had no caller, and put a second
- * argument order on one operation.
- *
  * See ADR-059 ("Structured Capability/Trust Validation Across the FFI; SDKs
  * Consume Typed Results, Not Prose") and §7 of ADR-048, both in `.docs/adrs/`,
  * plus §7.2.4 and §7.3 of
