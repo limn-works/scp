@@ -292,6 +292,10 @@ name = "fullstack"
 path = "tests/integration/fullstack.rs"
 
 [[test]]
+name = "pseudonym_membership_rotation"
+path = "tests/integration/pseudonym_membership_rotation.rs"
+
+[[test]]
 name = "conformance"
 path = "tests/integration/conformance.rs"
 
