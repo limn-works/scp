@@ -721,7 +721,6 @@
       "canonical": "trust_create_challenge",
       "category": "trust",
       "pyo3": [
-        "py_trust_create_challenge",
         "trust_create_challenge"
       ],
       "uniffi": [
@@ -735,7 +734,6 @@
       "canonical": "trust_verify_response",
       "category": "trust",
       "pyo3": [
-        "py_trust_verify_response",
         "trust_verify_response"
       ],
       "uniffi": [
@@ -763,7 +761,6 @@
       "canonical": "check_capability_requirements",
       "category": "trust",
       "pyo3": [
-        "py_check_capability_requirements",
         "check_capability_requirements"
       ],
       "uniffi": [

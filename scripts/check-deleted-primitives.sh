@@ -58,7 +58,9 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# SCP_DELETED_PRIMITIVES_ROOT overrides the scanned root, for the fixture
+# tests in scripts/tests/deleted-primitives/.
+REPO_ROOT="${SCP_DELETED_PRIMITIVES_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$REPO_ROOT"
 
 # ---------------------------------------------------------------------------
@@ -161,6 +163,11 @@ BAN_ENTRIES=(
     "exportSigningKeyBytes|bindings|*.ts|Custody providers sign and never export a seed; the host export callback is deleted"
     "exportSigningKeyBytes|bindings|*.kt|Custody providers sign and never export a seed; the host export callback is deleted"
     "exportSigningKeyBytes|bindings|*.swift|Custody providers sign and never export a seed; the host export callback is deleted"
+    # Either spelling in any binding file: a generated header, a Kotlin
+    # build script or a JavaScript shim reintroduces the callback as surely as
+    # a source file.
+    "export_signing_key_bytes|bindings|*|Custody providers sign and never export a seed; the host export callback is deleted"
+    "exportSigningKeyBytes|bindings|*|Custody providers sign and never export a seed; the host export callback is deleted"
     "SigningKeyBytes|crates|*.rs|Carry a CommandSigner in the command; no command carries raw key bytes"
     "dispatch_broadcast_command_with_custody|crates|*.rs|Broadcast publish signs in the actor turn through CommandSigner; the reserve/sign-outside/apply pattern is deleted"
     # #2148 (birth-into-actor): the six provider-dissolution symbols

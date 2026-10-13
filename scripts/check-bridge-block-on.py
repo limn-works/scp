@@ -32,8 +32,9 @@ against its call.
   production actor wait as `async`.
 
 Test code is skipped: files under a `tests/` directory, `mod` items gated on
-`cfg(test)` or named `tests`, and functions carrying `#[test]`,
-`#[tokio::test]` or a `cfg(test)` gate.
+`cfg(test)`, and functions carrying `#[test]`, `#[tokio::test]` or a
+`cfg(test)` gate. A module's name never makes it test code: a `mod tests`
+without `cfg(test)` compiles into production and is scanned.
 
 The tree-sitter scanner and its `cfg(test)` parsing are those of
 `scripts/check-block-in-place.py`, which excludes `crates/scp-ffi/**`, so
@@ -58,6 +59,7 @@ import importlib.util
 import json
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -161,9 +163,7 @@ def scan(path: Path, rel: str) -> tuple[list[Site], list[str]]:
     def walk(node, in_test: bool) -> None:
         test = in_test
         if node.type == "mod_item":
-            name_node = node.child_by_field_name("name")
-            name = SCANNER.node_text(name_node, source) if name_node is not None else ""
-            if SCANNER.has_test_cfg_attribute(node, source) or name == "tests":
+            if SCANNER.has_test_cfg_attribute(node, source):
                 test = True
         elif node.type == "function_item" and _fn_is_test(node, source):
             test = True
@@ -182,29 +182,29 @@ def scan(path: Path, rel: str) -> tuple[list[Site], list[str]]:
     return sites, errors
 
 
-def production_files(root: str) -> list[str]:
-    base = REPO_ROOT / root
+def production_files(repo: Path, root: str) -> list[str]:
+    base = repo / root
     out = []
     for path in sorted(base.rglob("*.rs")):
-        rel = path.relative_to(REPO_ROOT).as_posix()
+        rel = path.relative_to(repo).as_posix()
         if "/tests/" in rel:
             continue
         out.append(rel)
     return out
 
 
-def load_ratchet() -> dict[str, int]:
+def load_ratchet(ratchet_file: Path) -> dict[str, int]:
     try:
-        data = json.loads(RATCHET_FILE.read_text())
+        data = json.loads(ratchet_file.read_text())
     except FileNotFoundError:
-        sys.stderr.write(f"error: ratchet file {RATCHET_FILE} missing\n")
+        sys.stderr.write(f"error: ratchet file {ratchet_file} missing\n")
         sys.exit(2)
     except json.JSONDecodeError as e:
-        sys.stderr.write(f"error: ratchet file {RATCHET_FILE} is not JSON: {e}\n")
+        sys.stderr.write(f"error: ratchet file {ratchet_file} is not JSON: {e}\n")
         sys.exit(2)
     files = data.get("files")
     if not isinstance(files, dict):
-        sys.stderr.write(f"error: {RATCHET_FILE} has no `files` map\n")
+        sys.stderr.write(f"error: {ratchet_file} has no `files` map\n")
         sys.exit(2)
     return {str(k): int(v) for k, v in files.items()}
 
@@ -218,24 +218,27 @@ def check_pyo3_sites(sites: list[Site]) -> list[str]:
     ]
 
 
-def real_scan(list_all: bool) -> int:
+def real_scan(list_all: bool, repo: Path = REPO_ROOT, quiet: bool = False) -> int:
+    """Scan the bridges under `repo`. `quiet` suppresses all output, for the
+    self-test's fixture trees."""
+    out = (lambda *_a, **_k: None) if quiet else print
     failures: list[str] = []
     pyo3_count = 0
-    for rel in production_files(PYO3_ROOT):
+    for rel in production_files(repo, PYO3_ROOT):
         if rel == PYO3_HELPER:
             continue
-        sites, errors = scan(REPO_ROOT / rel, rel)
+        sites, errors = scan(repo / rel, rel)
         failures.extend(errors)
         failures.extend(check_pyo3_sites(sites))
         pyo3_count += len(sites)
         if list_all:
             for s in sites:
-                print(f"pyo3 {s.file}:{s.line}: {s.reason or '<no directive>'}")
+                out(f"pyo3 {s.file}:{s.line}: {s.reason or '<no directive>'}")
 
-    ratchet = load_ratchet()
+    ratchet = load_ratchet(repo / RATCHET_FILE.relative_to(REPO_ROOT))
     napi_counts: dict[str, int] = {}
-    for rel in production_files(NAPI_ROOT):
-        sites, errors = scan(REPO_ROOT / rel, rel)
+    for rel in production_files(repo, NAPI_ROOT):
+        sites, errors = scan(repo / rel, rel)
         failures.extend(errors)
         if sites:
             napi_counts[rel] = len(sites)
@@ -246,7 +249,7 @@ def real_scan(list_all: bool) -> int:
                     f"`// ci-allow: bridge-block-on: <reason>`: {s.snippet}"
                 )
             if list_all:
-                print(f"napi {s.file}:{s.line}: {s.reason or '<no directive>'}")
+                out(f"napi {s.file}:{s.line}: {s.reason or '<no directive>'}")
     for rel, count in sorted(napi_counts.items()):
         budget = ratchet.get(rel, 0)
         if count > budget:
@@ -254,17 +257,17 @@ def real_scan(list_all: bool) -> int:
                 f"{rel}: {count} production `.block_on` sites, ratchet allows {budget}"
             )
         elif count < budget:
-            print(f"note: {rel}: {count} sites, ratchet {budget} can drop")
+            out(f"note: {rel}: {count} sites, ratchet {budget} can drop")
     for rel, budget in sorted(ratchet.items()):
         if rel not in napi_counts and budget > 0:
-            print(f"note: {rel}: 0 sites, ratchet {budget} can drop")
+            out(f"note: {rel}: 0 sites, ratchet {budget} can drop")
 
     if failures:
         for f in failures:
-            print(f"FAIL {f}")
-        print(f"check-bridge-block-on: {len(failures)} violation(s)")
+            out(f"FAIL {f}")
+        out(f"check-bridge-block-on: {len(failures)} violation(s)")
         return 1
-    print(
+    out(
         f"check-bridge-block-on: OK ({pyo3_count} PyO3 and "
         f"{sum(napi_counts.values())} napi production sites, each with a reason)"
     )
@@ -322,12 +325,47 @@ def self_test() -> int:
         problems.append(f"fixture has no `{prefix}*` case")
     if check_file(FIXTURE_FILE, quiet=True) == 0:
         problems.append("--check-file passed a fixture that holds violations")
+    problems.extend(_real_scan_fixture_trees())
     if problems:
         for p in problems:
             print(f"SELF-TEST FAIL {p}")
         return 1
     print(f"check-bridge-block-on self-test: OK ({len(ranges)} fixture functions)")
     return 0
+
+
+_UNCFGD_TESTS_MODULE = """mod tests {
+    pub fn production(rt: &tokio::runtime::Runtime) {
+        rt.block_on(async {});
+    }
+}
+"""
+
+
+def _real_scan_fixture_trees() -> list[str]:
+    """Run `real_scan` over two fixture trees: one whose PyO3 bridge holds a
+    bare `.block_on` in a `mod tests` without `cfg(test)`, which must fail,
+    and the same module gated on `cfg(test)`, which must pass."""
+    problems: list[str] = []
+    cases = [
+        ("an uncfg'd `mod tests`", _UNCFGD_TESTS_MODULE, 1),
+        ("a `cfg(test)` module", "#[cfg(test)]\n" + _UNCFGD_TESTS_MODULE, 0),
+    ]
+    for label, body, expected in cases:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            (repo / PYO3_ROOT).mkdir(parents=True)
+            (repo / NAPI_ROOT).mkdir(parents=True)
+            ratchet = repo / RATCHET_FILE.relative_to(REPO_ROOT)
+            ratchet.parent.mkdir(parents=True)
+            ratchet.write_text('{"files": {}}')
+            (repo / PYO3_ROOT / "lib.rs").write_text(body)
+            got = real_scan(False, repo, quiet=True)
+        if got != expected:
+            problems.append(
+                f"real_scan over a tree with {label} returned {got}, expected {expected}"
+            )
+    return problems
 
 
 def main() -> int:

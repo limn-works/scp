@@ -69,8 +69,10 @@ mod helpers {
     }
 }
 
+// A module's name does not make it test code: without `cfg(test)` it
+// compiles into production.
 mod tests {
-    fn test_in_tests_module(rt: &tokio::runtime::Runtime) {
+    fn flag_in_tests_module_without_cfg_test(rt: &tokio::runtime::Runtime) {
         rt.block_on(async {});
     }
 }

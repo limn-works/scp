@@ -455,6 +455,9 @@ jobs:
               - '.docs/standards/sdk-capability-matrix.json'
               - '.docs/adrs/**'
               - '.docs/prds/**'
+              # `crates/scp-testing/tests/integration/trust.rs` compiles in spec 07 to
+              # check its protocol capability minimums against the compiled-in constants.
+              - '.docs/specs/07-trust-validation-and-capabilities.md'
               - 'tests/conformance/**'
               - 'bindings/typescript-wasm/tests/fixtures/outlet-stream-invoker-kat.json'
               - 'scripts/pure-helpers-allowlist.txt'
@@ -1382,6 +1385,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-deleted-primitives.sh
+      - name: Run deleted-primitives fixture tests
+        run: bash scripts/tests/deleted-primitives/run-tests.sh
 
   handler-no-panic:
     needs: check-draft

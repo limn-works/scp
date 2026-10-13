@@ -222,6 +222,11 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // every bridge's `trust_verify_attestation` reaches, lives here.
 const FFI_TRUST_STORE_SRC: &str =
     include_str!("../../../../crates/scp-ffi/common/src/trust_store.rs");
+// The shared challenge operations (spec 07 §7.3.4) every bridge's
+// `trust_create_challenge` and `trust_verify_response` reach, and the NAPI
+// class whose exported methods delegate to the `_on` bodies.
+const FFI_CHALLENGE_SRC: &str = include_str!("../../../../crates/scp-ffi/common/src/challenge.rs");
+const NAPI_SCP_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp.rs");
 
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
@@ -264,7 +269,12 @@ const FFI_TRUST_STORE_SRC: &str =
 // `verify_attestation_in_context` to the list read and its checker, and one per
 // native bridge pins each `trust_verify_attestation` export to that helper over
 // the instance's own repository.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 59;
+// Raised 59 -> 67 when the challenge operations (spec 07 §7.3.4) gained their
+// routing assertions: two pin the shared `create_challenge` and
+// `verify_response_and_sign` to their checks and to `sign_bounded`, and one per
+// native bridge pins each of `trust_create_challenge` and
+// `trust_verify_response` to the shared operation.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 67;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -5197,6 +5207,158 @@ fn uniffi_trust_verify_attestation_reads_the_instance_revocation_list() {
         ),
         "UniFFI trust_verify_attestation must verify through \
          verify_attestation_in_context over the instance's repository"
+    );
+}
+
+// ===========================================================================
+// Challenge operations (spec 07 §7.3.4) — shared bodies and bridge routing
+// ===========================================================================
+//
+// The shared `create_challenge` builds the request through the registry's
+// minimum-suite check and signs it with the verifier's `#active` key through
+// custody; `verify_response_and_sign` checks the response before it signs the
+// record. Each bridge export reaches those bodies, and the verify export
+// decodes its JSON arguments through `VerifyInputs::decode`, the only way to
+// build the shared operation's input.
+
+#[test]
+fn shared_create_challenge_checks_the_suite_and_signs_through_custody() {
+    assert!(
+        fn_body_contains(
+            FFI_CHALLENGE_SRC,
+            "create_challenge",
+            "challenge_request_unsigned("
+        ) && fn_body_contains(FFI_CHALLENGE_SRC, "create_challenge", "sign_bounded("),
+        "create_challenge must build the request with challenge_request_unsigned \
+         and sign it through sign_bounded"
+    );
+}
+
+#[test]
+fn shared_verify_response_checks_the_response_and_signs_through_custody() {
+    assert!(
+        fn_body_contains(
+            FFI_CHALLENGE_SRC,
+            "verify_response_and_sign",
+            "check_challenge_response("
+        ) && fn_body_contains(
+            FFI_CHALLENGE_SRC,
+            "verify_response_and_sign",
+            "sign_bounded("
+        ),
+        "verify_response_and_sign must check the response with \
+         check_challenge_response and sign the record through sign_bounded"
+    );
+}
+
+#[test]
+fn pyo3_trust_create_challenge_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_create_challenge",
+            "trust_create_challenge_impl("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_create_challenge_impl",
+            "scp_ffi_common::challenge::create_challenge("
+        ),
+        "PyO3 trust_create_challenge must reach scp_ffi_common::challenge::create_challenge"
+    );
+}
+
+#[test]
+fn napi_trust_create_challenge_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            NAPI_SCP_SRC,
+            "trust_create_challenge",
+            "trust_create_challenge_on("
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "trust_create_challenge_on",
+            "scp_ffi_common::challenge::create_challenge("
+        ),
+        "NAPI trustCreateChallenge must reach scp_ffi_common::challenge::create_challenge"
+    );
+}
+
+#[test]
+fn uniffi_trust_create_challenge_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_create_challenge",
+            "trust_create_challenge_impl("
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_create_challenge_impl",
+            "scp_ffi_common::challenge::create_challenge("
+        ),
+        "UniFFI trust_create_challenge must reach scp_ffi_common::challenge::create_challenge"
+    );
+}
+
+#[test]
+fn pyo3_trust_verify_response_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_verify_response",
+            "trust_verify_response_impl("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_verify_response_impl",
+            "scp_ffi_common::challenge::VerifyInputs::decode("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_verify_response_impl",
+            "scp_ffi_common::challenge::verify_response_and_sign("
+        ),
+        "PyO3 trust_verify_response must decode through VerifyInputs::decode and \
+         reach scp_ffi_common::challenge::verify_response_and_sign"
+    );
+}
+
+#[test]
+fn napi_trust_verify_response_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            NAPI_SCP_SRC,
+            "trust_verify_response",
+            "trust_verify_response_on("
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "trust_verify_response_on",
+            "scp_ffi_common::challenge::VerifyInputs::decode("
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "trust_verify_response_on",
+            "scp_ffi_common::challenge::verify_response_and_sign("
+        ),
+        "NAPI trustVerifyResponse must decode through VerifyInputs::decode and \
+         reach scp_ffi_common::challenge::verify_response_and_sign"
+    );
+}
+
+#[test]
+fn uniffi_trust_verify_response_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_verify_response",
+            "trust_verify_response_impl("
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_verify_response_impl",
+            "scp_ffi_common::challenge::VerifyInputs::decode("
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_verify_response_impl",
+            "scp_ffi_common::challenge::verify_response_and_sign("
+        ),
+        "UniFFI trust_verify_response must decode through VerifyInputs::decode and \
+         reach scp_ffi_common::challenge::verify_response_and_sign"
     );
 }
 
