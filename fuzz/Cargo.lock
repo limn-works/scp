@@ -2522,16 +2522,19 @@ dependencies = [
 name = "scp-identity"
 version = "0.1.0-beta.2"
 dependencies = [
+ "async-trait",
  "base64",
  "bs58",
  "ed25519-dalek",
  "hex",
  "rand 0.8.8",
  "scp-clock",
+ "scp-crypto",
  "scp-dht",
  "scp-did",
  "scp-platform",
  "scp-protocol",
+ "scp-relay-client",
  "serde",
  "serde_bytes",
  "serde_json",
