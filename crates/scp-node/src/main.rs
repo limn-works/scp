@@ -263,6 +263,11 @@ ENVIRONMENT VARIABLES:
                                 Required in --relay-only mode: no default, and an unset or
                                 empty value exits 1. This build serves only 'none'; any
                                 platform exits 1. Full node mode does not read it
+    SCP_RELAY_URL               The relay's public WebSocket URL, which determines its
+                                reserved push routing ID (spec section 10.7.1, push
+                                registration protocol). Required in --relay-only mode:
+                                no default, and an unset or empty value exits 1. Full
+                                node mode does not read it
     SCP_RELAY_MAX_BLOB_SIZE     Max blob size in bytes (default: 262144)
     SCP_RELAY_MAX_BLOB_TTL      Max blob TTL in seconds (default: 604800)
     SCP_RELAY_MAX_CONNECTIONS   Max total connections (default: 1000)
