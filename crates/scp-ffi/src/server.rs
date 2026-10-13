@@ -492,8 +492,6 @@ impl PyNodeHandle {
     /// **Note:** The background server does not support TLS. For production
     /// deployments requiring encryption, use the node binary's ``serve()``
     /// with TLS configuration.
-    ///
-    /// Raises ``RuntimeError`` if the server is already running or binding fails.
     #[pyo3(signature = (bind_addr=None))]
     fn serve(&self, py: Python<'_>, bind_addr: Option<String>) -> PyResult<String> {
         let addr = bind_addr

@@ -152,7 +152,8 @@ class Node:
             The actual bound address as a string (e.g. ``"127.0.0.1:8080"``).
 
         Raises:
-            RuntimeError: If the server is already running or binding fails.
+            TransportError: If the server is already running or binding fails
+                (``SCP-TRANS-5054``).
             ValueError: If ``bind_addr`` is not a valid socket address.
         """
         return await asyncio.to_thread(self._raw_handle.serve, bind_addr)  # type: ignore[no-any-return]
