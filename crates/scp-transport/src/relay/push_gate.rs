@@ -7,7 +7,7 @@
 //! whatever the result (§10.7.1 "No blob storage"):
 //!
 //! - [`PushRole::Disabled`] answers `4063` `PUSH_NOT_SUPPORTED`.
-//! - [`PushRole::Enabled`] decodes the blob as a `PushRegistration` or a
+//! - `PushRole::Enabled` (built with the `push-store` feature) decodes the blob as a `PushRegistration` or a
 //!   `PushDeregistration` (§22.11.4), refuses a platform with no configured
 //!   sender (`4061`), applies the §10.7.1 freshness checks (`4062`), verifies
 //!   the signature through the injected
@@ -185,7 +185,7 @@ impl PushPublishGate {
 #[error("push is enabled but the relay URL is not configured")]
 pub struct PushWithoutRelayUrl;
 
-/// Refuses `push` = [`PushRole::Enabled`] with no `relay_url`.
+/// Refuses `push` = `PushRole::Enabled` with no `relay_url`.
 ///
 /// # Errors
 ///
