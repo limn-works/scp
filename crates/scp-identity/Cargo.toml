@@ -33,6 +33,16 @@ scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", features = ["software_platform"] }
 tokio = { workspace = true }
 serde = { workspace = true }
+# The push signature verifier seam (`push_verify.rs`, PUSH-005): an async trait
+# object the relay holds as `Arc<dyn PushSignatureVerifier>` (ADR-062), so it
+# uses `async_trait` rather than RPITIT, which is not dyn-safe.
+async-trait = { workspace = true }
+# `PushVerifyError::wire_code` returns the ADR-004 push codes this wasm-safe leaf
+# declares. Acyclic: scp-relay-client depends only on scp-protocol.
+scp-relay-client = { path = "../scp-relay-client", version = "=0.1.0-beta.2" }
+# The `testing`-gated push test verifier checks a real P-256 signature through
+# `scp_crypto::p256::verify_prehash_strict` (§9.5.1 low-s rule included).
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 ed25519-dalek = { workspace = true }
