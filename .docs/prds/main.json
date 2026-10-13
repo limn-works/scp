@@ -222,7 +222,7 @@
       "id": "gate-addr",
       "name": "Addressability and Deployment",
       "priority": "P0",
-      "status": "done",
+      "status": "in-progress",
       "stories": [
         "SCP-140",
         "SCP-141",
@@ -232,7 +232,16 @@
         "SCP-145",
         "SCP-146",
         "SCP-147",
-        "SCP-148"
+        "SCP-148",
+        "SCP-319",
+        "SCP-320",
+        "SCP-321",
+        "SCP-322",
+        "SCP-323",
+        "SCP-324",
+        "SCP-325",
+        "SCP-326",
+        "SCP-327"
       ]
     },
     {
@@ -11381,6 +11390,458 @@
         }
       ],
       "details": {}
+    },
+    {
+      "id": "SCP-319",
+      "title": "Expose the node reach and TLS validator as validate_reach_and_tls",
+      "gate": "gate-addr",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/config.rs",
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "`node_start` in `scp-ffi-common` must run the core node's reach and TLS validation before it creates any directory or file (construction.md, node start target shape). The validator is today the private `validate_config` in `crates/scp-node/src/config.rs`. This story renames it to `pub fn validate_reach_and_tls`, re-exports it from `crates/scp-node/src/lib.rs`, and updates its call sites. The `dns_provider` handling stays unchanged, because the keri workstream has not ruled on node-side DID publication. SCP-321, the common `node_start` story, calls the renamed validator.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C2.",
+      "acceptanceCriteria": [
+        "`crates/scp-node/src/config.rs` defines `pub fn validate_reach_and_tls`, and `git grep -n 'fn validate_config' crates/scp-node/src/config.rs` returns no line",
+        "`crates/scp-node/src/lib.rs` re-exports `validate_reach_and_tls`, so a crate that depends on `scp-node` calls it as `scp_node::validate_reach_and_tls`",
+        "Every former call site of `validate_config` calls `validate_reach_and_tls`, and `cargo build -p scp-node` succeeds",
+        "`git diff` of this story shows no change to a line in `crates/scp-node/src/config.rs` that reads or writes `dns_provider`",
+        "The existing validator tests in `crates/scp-node` pass without edits to their assertions"
+      ],
+      "actionItems": [
+        "Rename `validate_config` to `pub fn validate_reach_and_tls` in `crates/scp-node/src/config.rs`",
+        "Add `validate_reach_and_tls` to the `pub use` re-exports in `crates/scp-node/src/lib.rs`",
+        "Update every call site and run the existing validator tests"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Node start — `NodeStartConfig`"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.17 Capability Selection Is Mandatory, Fails Closed, and Never Defaults"
+        }
+      ],
+      "details": {
+        "plan": "Track C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C2.",
+        "capabilityRow": "§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`.",
+        "integrationChecklistItem1": "Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation.",
+        "kotlin": "Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\"."
+      }
+    },
+    {
+      "id": "SCP-320",
+      "title": "Make NodeState.http_bind_addr optional and bind serve_background to it",
+      "gate": "gate-addr",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/http.rs"
+      ],
+      "description": "`NodeConfig::http_bind_addr` defaults to `0.0.0.0:8443` (`crates/scp-node/src/lib.rs`), and `Node::start` only stores it on `NodeState` for NAT tier selection. `serve_background*` ignores it and binds `127.0.0.1:8443` from its own parameter, so the config field has no effect on that path. This story makes `NodeState.http_bind_addr` an `Option<SocketAddr>`. The advertised port and the NAT tier use the configured port, or the default port when none is configured. `serve_background*(None)` binds the configured address, or loopback `127.0.0.1:8443` when none is configured, and never `0.0.0.0`. `NodeStartConfig.http_bind_addr` (construction.md, node start target shape) depends on this behavior.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C3.",
+      "acceptanceCriteria": [
+        "`NodeState.http_bind_addr` in `crates/scp-node` has type `Option<SocketAddr>`",
+        "The advertised HTTP port and the NAT tier selection read the configured `http_bind_addr` port when one is set, and the default port when it is `None`",
+        "Test `serve_background_none_binds_configured_http_bind_addr`: with `http_bind_addr` configured, `serve_background*(None)` binds that address",
+        "Test `serve_background_none_without_config_binds_loopback`: with no `http_bind_addr` configured, `serve_background*(None)` binds `127.0.0.1:8443` and not `0.0.0.0`"
+      ],
+      "actionItems": [
+        "Change `NodeState.http_bind_addr` to `Option<SocketAddr>` and update its readers",
+        "Make `serve_background*` fall back to the configured address, then to `127.0.0.1:8443`",
+        "Add the two named tests"
+      ],
+      "blockedBy": [
+        "SCP-319"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Node start — `NodeStartConfig`"
+        }
+      ],
+      "details": {
+        "plan": "Track C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C3.",
+        "capabilityRow": "§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`.",
+        "integrationChecklistItem1": "Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation.",
+        "kotlin": "Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\"."
+      }
+    },
+    {
+      "id": "SCP-321",
+      "title": "Add NodeStartConfig and server::node_start to scp-ffi-common",
+      "gate": "gate-addr",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/common/src/node_start_config.rs",
+        "crates/scp-ffi/common/src/lib.rs",
+        "crates/scp-ffi/common/src/server.rs",
+        "crates/scp-ffi/common/src/error_codes.rs",
+        "crates/scp-ffi/common/tests/storage_code_allocation.rs",
+        "scripts/check-construction-pattern.py",
+        ".github/workflows/ci.yml"
+      ],
+      "description": "This story adds the common half of node start. `NodeStartConfig` in the new file `crates/scp-ffi/common/src/node_start_config.rs` carries exactly the fields, types and arms that construction.md §\"Node start — `NodeStartConfig`\" lists, with a `from_json` constructor. `server::node_start(cfg, NodeIdentity, InstanceStorage)` validates first, through `scp_node::validate_reach_and_tls` (SCP-319) and the field checks, then calls `Node::start` with `IdentitySource::Explicit`. It takes the `SCP` instance's own storage handle (§17.6 of the persistence spec, first-party storage adapters), and logs a warning when that store is in-memory. `internal_relay_url` uses the bound relay address. `ServerError` gains `InvalidConfig` and `OperatorIdentityUnavailable`. `error_codes.rs` gains one shared `server_error_code` and `server_error_class` pair, following the `custody_failure_code` precedent, that maps every variant to the code in sdk-common.md §\"Node start error codes\". The bridge exports are SCP-322.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C4.",
+      "acceptanceCriteria": [
+        "`NodeStartConfig` in `crates/scp-ffi/common/src/node_start_config.rs` has the fields, types, required and optional split, and enum arms of construction.md §\"Node start — `NodeStartConfig`\"; serde reads it with `deny_unknown_fields` and tags its data enums `kind`, and a unit test shows `from_json` rejects an unknown key",
+        "`server::node_start` calls `Node::start` with `IdentitySource::Explicit` and the instance storage handle, and a unit test shows that a config failing validation leaves no new file or directory on disk",
+        "`ServerError` has `InvalidConfig` and `OperatorIdentityUnavailable`, `error_codes.rs` defines `server_error_code`, `server_error_class` and the constants `STORAGE_8007`, `STORAGE_8008`, `STORAGE_8009` and `IDENT_1063`, and a unit test asserts the code of every row of sdk-common.md §\"Node start error codes\" that exists after this story",
+        "`crates/scp-ffi/common/tests/storage_code_allocation.rs` lists `SCP-STORAGE-8007`, `SCP-STORAGE-8008` and `SCP-STORAGE-8009`, and passes",
+        "The test `node_start_rejects_invalid_reach_tls_with_storage_8007_in_shipped_build` compiles under `cfg(not(feature = \"testing\"))`, and `.github/workflows/ci.yml` runs it by name with `--no-tests=fail --features server` under `cargo nextest` in a lane where `scp-ffi-common/testing` is not unified on; `python3.12 scripts/tests/ci-gate/ci_gate_selftest.py` passes",
+        "`scripts/check-construction-pattern.py` scans `node_start_config.rs` through an additive edit, and passes"
+      ],
+      "actionItems": [
+        "Create `node_start_config.rs` with `NodeStartConfig`, its enum mirrors and `from_json`",
+        "Add `server::node_start`, the two `ServerError` variants and the shared code functions",
+        "Add the allocation-test entries, the shipped test and its CI command, and the construction-pattern scan entry"
+      ],
+      "blockedBy": [
+        "SCP-319"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Node start — `NodeStartConfig`"
+        },
+        {
+          "file": ".docs/standards/sdk-common.md",
+          "section": "### Node start error codes"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.6 First-Party Storage Adapters (Client SDK)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.17 Capability Selection Is Mandatory, Fails Closed, and Never Defaults"
+        }
+      ],
+      "details": {
+        "plan": "Track C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C4.",
+        "capabilityRow": "§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`.",
+        "integrationChecklistItem1": "Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation.",
+        "kotlin": "Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\"."
+      }
+    },
+    {
+      "id": "SCP-322",
+      "title": "Export node_start from the PyO3, napi-rs and UniFFI bridges",
+      "gate": "gate-addr",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/server.rs",
+        "crates/scp-ffi/napi/src/server.rs",
+        "crates/scp-ffi/uniffi/src/server.rs",
+        "scripts/bridge-aliases.json",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs",
+        ".github/workflows/ci.yml"
+      ],
+      "description": "Each bridge exports `node_start`, which delegates to `server::node_start` (SCP-321). Today `NodeError::InvalidConfig` maps on UniFFI to `SCP-TRANS-5050`, the same code `ServerError::Relay` uses, while PyO3 and napi-rs map every non-passphrase server error to an uncoded runtime error. This story makes all three bridges map through the shared `server_error_code` and `server_error_class` pair of sdk-common.md §\"Node start error codes\". UniFFI's `build_node_identity_from_uniffi` errors on every build without `testing` today, which would leave the operator identity unusable on Swift, so this story removes that gate and deletes the UniFFI `IDENT_1013` stub.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C5.",
+      "acceptanceCriteria": [
+        "Each bridge's `node_start` runs these steps in this order: the handle check (`check_handle` on UniFFI), config parse or conversion, operator identity resolution, taking the instance storage, `server::node_start`, `server::register_node`, `auto_wire_context_manager`, and wrapping the handle",
+        "An operator identity that does not resolve returns `SCP-IDENT-1063` on every bridge: PyO3 `build_node_identity` keeps the code, the napi-rs registry miss returns it, and UniFFI `build_node_identity_from_uniffi` compiles and runs without `testing`, with the `IDENT_1013` stub deleted",
+        "Every `server_err` and `node_err` on the three bridges maps through `server_error_code` and `server_error_class`, so no bridge returns an uncoded runtime error for a `ServerError`",
+        "Shipped tests in the existing bridge production filters pass: PyO3 and napi-rs `node_start_with_unregistered_operator_did_returns_ident_1063`, UniFFI `node_start_with_externally_loaded_identity_returns_ident_1063`",
+        "Tests built with `testing` cover a successful `node_start` and every row of sdk-common.md §\"Node start error codes\" that a bridge can reach",
+        "`scripts/bridge-aliases.json` has a `node_start` entry, and `pipeline_wiring.rs` asserts that each bridge delegates to `server::node_start(`"
+      ],
+      "actionItems": [
+        "Add `node_start` to each bridge's `server.rs`",
+        "Route every bridge's server and node error mapping through the shared code functions",
+        "Remove the `testing` gate from `build_node_identity_from_uniffi` and delete the `IDENT_1013` stub",
+        "Add the bridge-alias entry, the `pipeline_wiring.rs` assertion and the shipped tests"
+      ],
+      "blockedBy": [
+        "SCP-320",
+        "SCP-321"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Node start — `NodeStartConfig`"
+        },
+        {
+          "file": ".docs/standards/sdk-common.md",
+          "section": "### Node start error codes"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.17 Capability Selection Is Mandatory, Fails Closed, and Never Defaults"
+        }
+      ],
+      "details": {
+        "plan": "Track C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C5.",
+        "capabilityRow": "§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`.",
+        "integrationChecklistItem1": "Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation.",
+        "kotlin": "Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\"."
+      }
+    },
+    {
+      "id": "SCP-323",
+      "title": "Wrap node_start in the Python SDK",
+      "gate": "gate-addr",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/python/scp_sdk/server.py",
+        "bindings/python/scp_sdk/_scp_core.pyi",
+        "bindings/python/tests/test_server.py"
+      ],
+      "description": "The Python SDK mirrors `NodeStartConfig` (construction.md §\"Node start — `NodeStartConfig`\") as dataclasses and sum types, under the five-language equivalence table of construction.md, and calls the PyO3 `node_start` export from SCP-322. Each code of sdk-common.md §\"Node start error codes\" reaches the caller as the typed error of its category.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C6.",
+      "acceptanceCriteria": [
+        "The Python config dataclass and its sum types carry the same field names, enum arms and required and optional split as `NodeStartConfig`, and a test asserts the dict each config produces matches the wire shape `NodeStartConfig::from_json` reads",
+        "The Python SDK's node start entry calls the PyO3 `node_start` export and returns a `Node`",
+        "A test shows each node start code of sdk-common.md §\"Node start error codes\" raises the typed SDK error of its category with the code preserved",
+        "`python3.12 -m ruff check .` and `python3.12 -m pytest tests/test_server.py` pass in `bindings/python`"
+      ],
+      "actionItems": [
+        "Add the config dataclasses and the node start entry to `bindings/python/scp_sdk/server.py`",
+        "Add the `node_start` stub to `_scp_core.pyi`",
+        "Add wire-shape and error-mapping tests"
+      ],
+      "blockedBy": [
+        "SCP-322"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Node start — `NodeStartConfig`"
+        },
+        {
+          "file": ".docs/standards/sdk-common.md",
+          "section": "### Node start error codes"
+        }
+      ],
+      "details": {
+        "plan": "Track C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C6.",
+        "capabilityRow": "§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`.",
+        "integrationChecklistItem1": "Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation.",
+        "kotlin": "Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\"."
+      }
+    },
+    {
+      "id": "SCP-324",
+      "title": "Wrap node_start in the TypeScript SDK",
+      "gate": "gate-addr",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/typescript/src/server.ts",
+        "bindings/typescript/src/internal/native.ts",
+        "bindings/typescript/tests/server.test.ts"
+      ],
+      "description": "The TypeScript SDK mirrors `NodeStartConfig` (construction.md §\"Node start — `NodeStartConfig`\") as an options interface with discriminated unions tagged `kind`, under the five-language equivalence table of construction.md, and calls the napi-rs `node_start` export from SCP-322. Each code of sdk-common.md §\"Node start error codes\" reaches the caller as the typed error of its category.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C7.",
+      "acceptanceCriteria": [
+        "The TypeScript options interface and its discriminated unions carry the same field names, enum arms and required and optional split as `NodeStartConfig`, and a test asserts the JSON each config produces matches the wire shape `NodeStartConfig::from_json` reads",
+        "The TypeScript SDK's node start entry calls the napi-rs `node_start` export and returns a `Node`",
+        "A test shows each node start code of sdk-common.md §\"Node start error codes\" throws the typed SDK error of its category with the code preserved",
+        "`bun run lint` and `bun test tests/server.test.ts` pass in `bindings/typescript`"
+      ],
+      "actionItems": [
+        "Add the options interface and the node start entry to `bindings/typescript/src/server.ts`",
+        "Declare `node_start` in `src/internal/native.ts`",
+        "Add wire-shape and error-mapping tests"
+      ],
+      "blockedBy": [
+        "SCP-323",
+        "SCP-325"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Node start — `NodeStartConfig`"
+        },
+        {
+          "file": ".docs/standards/sdk-common.md",
+          "section": "### Node start error codes"
+        }
+      ],
+      "details": {
+        "plan": "Track C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C7.",
+        "capabilityRow": "§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`.",
+        "integrationChecklistItem1": "Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation.",
+        "kotlin": "Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\"."
+      }
+    },
+    {
+      "id": "SCP-325",
+      "title": "Wrap node_start in the Swift SDK on macOS",
+      "gate": "gate-addr",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/swift/Sources/SCP/Server.swift",
+        "bindings/swift/Tests/SCPTests/NodeStartTests.swift"
+      ],
+      "description": "The Swift SDK mirrors `NodeStartConfig` (construction.md §\"Node start — `NodeStartConfig`\") as a struct with enums carrying associated values, under the five-language equivalence table of construction.md, and calls the UniFFI `node_start` export from SCP-322 with an `Identity` handle as the operator. The `#if os(macOS)` guard goes on the hand-written wrapper in `bindings/swift/Sources/SCP/Server.swift`, so the capability is absent on iOS. The UniFFI-generated layer needs no guard. Each code of sdk-common.md §\"Node start error codes\" reaches the caller as the typed error of its category.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C8.",
+      "acceptanceCriteria": [
+        "The Swift config struct and its enums carry the same field names, enum arms and required and optional split as `NodeStartConfig`, and a test asserts the record each config produces matches the UniFFI `node_start` argument",
+        "The Swift node start entry sits inside `#if os(macOS)` in `bindings/swift/Sources/SCP/Server.swift`, and an iOS build of the SDK has no node start symbol",
+        "The Swift node start entry calls the UniFFI `node_start` export with an `Identity` handle as the operator and returns a `Node`",
+        "A test shows each node start code of sdk-common.md §\"Node start error codes\" throws the typed `ScpError` of its category with the code preserved"
+      ],
+      "actionItems": [
+        "Add the config struct and the macOS-only node start entry to `Server.swift`",
+        "Add wire-shape and error-mapping tests"
+      ],
+      "blockedBy": [
+        "SCP-322"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Node start — `NodeStartConfig`"
+        },
+        {
+          "file": ".docs/standards/sdk-common.md",
+          "section": "### Node start error codes"
+        }
+      ],
+      "details": {
+        "plan": "Track C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C8.",
+        "capabilityRow": "§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`.",
+        "integrationChecklistItem1": "Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation.",
+        "kotlin": "Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\"."
+      }
+    },
+    {
+      "id": "SCP-326",
+      "title": "Record node_start in the SDK capability matrix",
+      "gate": "gate-addr",
+      "priority": "P1",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "After the Python (SCP-323), TypeScript (SCP-324) and Swift (SCP-325) wrappers land, `sdk-capability-matrix.json` gains a `node_start` row. Python, TypeScript and Swift are true. Kotlin is false, with an exemption that quotes Alec's 2026-08-17 ruling verbatim: \"let's keep kotlin false but not forever. we can add impls later\". The row's `notes` record that the Swift wrapper exists on macOS only.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C9.",
+      "acceptanceCriteria": [
+        "`.docs/standards/sdk-capability-matrix.json` has a `node_start` row with Python, TypeScript and Swift true",
+        "The row's Kotlin cell is false, with an exemption that contains the text \"let's keep kotlin false but not forever. we can add impls later\"",
+        "The row's `notes` state that the Swift wrapper exists on macOS only",
+        "`python3.12 scripts/check-sdk-coverage.py` passes"
+      ],
+      "actionItems": [
+        "Add the `node_start` row to the matrix",
+        "Run `scripts/check-sdk-coverage.py`"
+      ],
+      "blockedBy": [
+        "SCP-327"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Node start — `NodeStartConfig`"
+        }
+      ],
+      "details": {
+        "plan": "Track C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C9.",
+        "capabilityRow": "§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`.",
+        "integrationChecklistItem1": "Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation.",
+        "kotlin": "Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\"."
+      }
+    },
+    {
+      "id": "SCP-327",
+      "title": "Cut the dev node start pair from shipped bridge builds",
+      "gate": "gate-addr",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/common/src/server.rs",
+        "crates/scp-ffi/common/src/error_codes.rs",
+        "crates/scp-ffi/src/server.rs",
+        "crates/scp-ffi/napi/src/server.rs",
+        "crates/scp-ffi/uniffi/src/server.rs",
+        "bindings/typescript/tests/server.test.ts",
+        ".github/workflows/ci.yml"
+      ],
+      "description": "Alec ruled on 2026-08-10: \"start local/start in mem are for dev. all sdks still expose. we cut them from prod.\" This story gates the common dev-pair bodies with `#[cfg(any(test, feature = \"testing\"))]`, which removes the `start_node_local` no-identity arm that builds `FileKeyCustody` at `<data_dir>/identity.key`. Each bridge keeps its exported dev symbols, so every SDK still exposes them. The bridge's own `testing` feature splits each body: under `testing` it calls the common body, and otherwise it returns `ServerError::DevStartUnavailable` (`SCP-TRANS-5055`, sdk-common.md §\"Node start error codes\"), which replaces `AutoGenerateUnavailable`. The split reads the bridge's feature, because bridge dev-dependencies turn on `scp-ffi-common/testing`.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C10.",
+      "acceptanceCriteria": [
+        "The common `start_node_in_memory` and `start_node_local` bodies compile only under `#[cfg(any(test, feature = \"testing\"))]`, and no `FileKeyCustody` construction at `<data_dir>/identity.key` remains on a build without `testing`",
+        "Each bridge still exports its dev start symbols; built without its own `testing` feature, each symbol returns `ServerError::DevStartUnavailable`, and `AutoGenerateUnavailable` no longer exists",
+        "`error_codes.rs` defines `TRANS_5055`, and `server_error_code` maps `DevStartUnavailable` to `SCP-TRANS-5055`",
+        "Shipped tests in each bridge's production filter pass: `node_start_in_memory_on_a_shipped_build_returns_trans_5055` and `node_start_local_on_a_shipped_build_returns_trans_5055`",
+        "Dev-pair bridge tests that ran without a feature gate carry `cfg(feature = \"testing\")`, and the TypeScript dev-start tests run against a testing build",
+        "`python3.12 scripts/tests/ci-gate/ci_gate_selftest.py` passes"
+      ],
+      "actionItems": [
+        "Gate the common dev-pair bodies and add `DevStartUnavailable` with its code",
+        "Split each bridge's dev-pair exports on the bridge's own `testing` feature",
+        "Gate the dev-pair bridge tests, move the TypeScript dev-start tests to a testing build, and add the shipped tests to the production filters"
+      ],
+      "blockedBy": [
+        "SCP-324"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-052: Unified Construction Pattern"
+        },
+        {
+          "file": ".docs/standards/construction.md",
+          "section": "### Node start — `NodeStartConfig`"
+        },
+        {
+          "file": ".docs/standards/sdk-common.md",
+          "section": "### Node start error codes"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.17 Capability Selection Is Mandatory, Fails Closed, and Never Defaults"
+        }
+      ],
+      "details": {
+        "plan": "Track C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C10.",
+        "capabilityRow": "§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`.",
+        "integrationChecklistItem1": "Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation.",
+        "kotlin": "Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\"."
+      }
     }
   ]
 }
