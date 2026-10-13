@@ -108,13 +108,22 @@ use crate::context::ttl::{self, CloseResult, TtlTimer};
 // §9.10.4 routing construction helpers
 // ---------------------------------------------------------------------------
 
-/// Deduplicates a context's relay set (§5.12.3.1 `relay_urls`), keeping each
-/// URL's first position, so the stored set lists each relay once whichever
-/// source supplied it (the creator, an invitation bundle, or a snapshot).
+/// Returns the stored form of a context's relay set (§5.12.3.1 `relay_urls`).
+/// Each URL that has a §9.18.2 canonical relay URL becomes that canonical URL,
+/// and every other URL stays exactly as written. The function then keeps each
+/// stored URL once, at its first position, so two spellings of one relay
+/// collapse to one entry whichever source supplied the set (the creator, an
+/// invitation bundle, or a snapshot). A URL with no canonical form never fails
+/// the caller.
+///
+/// Every write of `PerContextState::relay_urls` goes through this function.
+/// A Welcome joiner calls it after it verifies the bundle signature, which
+/// covers the URLs as the creator sent them.
 pub fn normalize_relay_urls(relay_urls: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::with_capacity(relay_urls.len());
     relay_urls
         .into_iter()
+        .map(|url| scp_protocol::discovery::push::canonical_relay_url(&url).unwrap_or(url))
         .filter(|url| seen.insert(url.clone()))
         .collect()
 }
@@ -6076,5 +6085,41 @@ mod restore_reconcile_tests {
                 "{ctx_id}: the commit deletes bob's pseudonym record"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod relay_url_storage_tests {
+    //! §5.12.3.1 `relay_urls` storage rule: canonical when possible.
+
+    use super::normalize_relay_urls;
+
+    fn urls(list: &[&str]) -> Vec<String> {
+        list.iter().map(|u| (*u).to_owned()).collect()
+    }
+
+    #[test]
+    fn normalize_relay_urls_collapses_spellings_of_one_relay_to_its_canonical_url() {
+        assert_eq!(
+            normalize_relay_urls(urls(&[
+                "WSS://Relay.Example:443/",
+                "wss://relay-b.example/scp/v1",
+                "wss://relay.example",
+                "wss://relay-b.example:443/scp/v1/",
+            ])),
+            urls(&["wss://relay.example", "wss://relay-b.example/scp/v1"])
+        );
+    }
+
+    #[test]
+    fn normalize_relay_urls_keeps_a_url_without_canonical_form_as_written() {
+        assert_eq!(
+            normalize_relay_urls(urls(&[
+                "https://Relay.Example/scp/",
+                "wss://relay.example//",
+                "https://Relay.Example/scp/",
+            ])),
+            urls(&["https://Relay.Example/scp/", "wss://relay.example//"])
+        );
     }
 }

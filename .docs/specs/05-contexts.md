@@ -1232,7 +1232,16 @@ The invitation bundle is the single-delivery package that enables zero-roundtrip
 InvitationBundle {
   context_id:         String              // The context being invited to.
   creator_did:        Identifier          // The context creator / inviter.
-  relay_urls:         Vec<String>         // Relay endpoints where the context is hosted.
+  relay_urls:         Vec<String>         // Relay endpoints where the context is hosted,
+                                          // as the creator sent them. The signature covers
+                                          // these URLs byte for byte. A member stores each URL
+                                          // that has a canonical relay URL (§9.18.2) in that
+                                          // canonical form, stores every other URL exactly as
+                                          // written, and keeps each stored URL once, at its
+                                          // first position. A joiner applies this rule after it
+                                          // verifies the signature. A member never rejects a
+                                          // context because one of its relay URLs has no
+                                          // canonical relay URL.
   welcome_message:    Vec<u8>             // MLS Welcome message (RFC 9420 §12.4.3.1).
                                           // Contains the GroupInfo, encrypted group secrets,
                                           // and the invitee's KeyPackage reference.

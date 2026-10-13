@@ -1431,7 +1431,10 @@ pub struct PerContextState {
     /// `InvitationBundle.relay_urls`, "Relay endpoints where the context is
     /// hosted"). Set once per instance: the creator's relays at create, the
     /// invitation bundle's `relay_urls` at Welcome join, and the persisted set
-    /// at import and restore (PUSH-025). Deduplicated in first-seen order. An
+    /// at import and restore (PUSH-025). Every write passes the set through
+    /// `lifecycle_helpers::normalize_relay_urls`, which stores each URL's
+    /// §9.18.2 canonical relay URL when it has one, keeps every other URL as
+    /// written, and deduplicates in first-seen order. An
     /// empty set states that no relay hosts the context, as for a context
     /// created with no relay connected.
     pub relay_urls: Vec<String>,
