@@ -179,7 +179,7 @@ Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `No
 
 `node_start` starts a production node from an existing `SCP` instance. The PyO3, napi-rs and UniFFI bridges export it, and the Python, TypeScript and macOS Swift SDKs wrap it. `server::node_start` in `scp-ffi-common` converts a `NodeStartConfig` into the core `NodeConfig` above, and calls `Node::start`. The config takes the name `NodeStartConfig` because the converting function has both `NodeStartConfig` and `NodeConfig` in scope.
 
-`NodeStartConfig` lives in `crates/scp-ffi/common/src/node_start_config.rs`. It is a flat config under this standard. Serde deserializes it with `deny_unknown_fields`, and each of its data enums carries the tag `kind`.
+`NodeStartConfig` lives in `crates/scp-ffi/common/src/node_start_config.rs`. It is a flat config under this standard. Serde deserializes it with `deny_unknown_fields`, and each of its data enums carries the tag `kind`. A `kind` value is the arm's name in `snake_case`, as the bridges' `StorageConfig` spells `in_memory`: `{"kind": "nat_traversal"}`, `{"kind": "any_origin"}`.
 
 | Field | Type | Status |
 |---|---|---|
@@ -187,7 +187,7 @@ Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `No
 | `identity` | operator handle: a DID string on PyO3 and napi-rs, `Arc<Identity>` on UniFFI | required |
 | `blob_storage` | `FfiBlobBackend{InMemory, Redb{path}, Sqlite{path}}` | required; S3 and Postgres omitted |
 | `tls` | `FfiTlsMode{SelfSigned, Acme{email?}, Plaintext, Terminated}` | required |
-| `dht` | `FfiDhtMode{Disabled}` | required; **pending a ruling from the keri workstream** |
+| `dht` | `FfiDhtMode{Disabled}` | required; `Disabled` only, by keri's scope ruling of 2026-10-13 |
 | `cors_origins` | `FfiCorsOrigins{AnyOrigin, List{origins}}` | required |
 | `bind_addr`, `http_bind_addr` | `Option<SocketAddr>` | optional |
 | `nat` | `{Auto}` | optional |
@@ -212,12 +212,7 @@ Arms and fields that `NodeStartConfig` omits:
 | `NatSlot::Custom`, `NatSlot::Tuned` | Both carry `NatStrategy` trait objects. |
 | `local_api`, `http3`, `dns_provider`, `network_detector`, `dht_gateways` | `local_api` is a development control plane whose token the node mints. The `http3` field compiles only under `feature = "http3"`, which no bridge enables. `dns_provider` overrides the selected `tls` and `domain` without saying so in the signature. `network_detector` is a core capability slot. `dht_gateways` has no DHT client to reach, because the operator identity owns its DID method and its DHT client. |
 
-**Pending a ruling from the keri workstream.** The keri workstream owns DID publication. Until it rules, these two items stand:
-
-- `dht` exposes `FfiDhtMode::Disabled` only.
-- `FfiTlsMode` omits a `DnsSubdomain` arm, and `dns_provider` stays a setting of the `scp-node` binary alone.
-
-If the keri workstream allows node-side publication, the change adds `FfiDhtMode::Production` with `dht_gateways`, adds `FfiTlsMode::DnsSubdomain`, and lowers `dns_provider` into the core `TlsMode`. This standard does not decide either item.
+keri's scope ruling of 2026-10-13: `dht` exposes `Disabled` only, because ADR-063 removes Mainline publication; under `Disabled` the node runs its relay and publishes nothing. `DnsSubdomain` stays out of the SDK mirror and `dns_provider` stays binary-only, because the DID-derived label collides across one operator's nodes and changes at the `Identifier` cut-over; the keri workstream owns defining that label and a future relay-advertisement variant.
 
 Entry: each bridge's `node_start` resolves the operator identity, takes the instance storage, and calls `server::node_start(cfg, NodeIdentity, InstanceStorage)` in `scp-ffi-common`, which validates and then calls `Node::start`. `sdk-common.md` §"Node start error codes" lists the error code each failure returns.
 

@@ -67,6 +67,18 @@ impl From<ServerError> for ScpError {
                 msg: user_msg,
                 code: codes::IDENT_1001.to_owned(),
             },
+            // Only `server::node_start` returns these two, and this bridge does
+            // not export it until SCP-322, which moves every arm here onto
+            // `server_error_code` and `server_error_class`. They read the shared
+            // code now so this match stays exhaustive.
+            ServerError::InvalidConfig(_) => Self::Validation {
+                msg: user_msg,
+                code: codes::server_error_code(&e).to_owned(),
+            },
+            ServerError::OperatorIdentityUnavailable => Self::Identity {
+                msg: user_msg,
+                code: codes::server_error_code(&e).to_owned(),
+            },
         }
     }
 }

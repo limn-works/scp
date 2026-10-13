@@ -11486,7 +11486,7 @@
       "gate": "gate-addr",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/common/src/node_start_config.rs",
         "crates/scp-ffi/common/src/lib.rs",

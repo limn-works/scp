@@ -16,7 +16,7 @@
 //!
 //! Gated behind the `server` feature.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path};
 use std::sync::Arc;
 
@@ -25,7 +25,9 @@ use scp_core::context::supervisor::Supervisor;
 use scp_did::DidDocument;
 use scp_identity::ScpIdentity;
 use scp_identity::dht::DidDht;
-use scp_node::{DhtMode, ExplicitIdentity, IdentitySource, Node, NodeConfig, NodeError, Reach};
+use scp_node::{
+    DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, NodeError, Reach, TlsMode,
+};
 use scp_platform::EncryptedStorage;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::file::FileKeyCustody;
@@ -34,6 +36,9 @@ use scp_platform::sqlite::SqliteStorage;
 
 use crate::bridge_instance::{CoreFields, InstanceBorrower};
 use crate::dht::{DhtInitError, FfiDhtClient};
+use crate::node_start_config::{
+    FfiBlobBackend, FfiCorsOrigins, FfiDhtMode, FfiNat, FfiReach, FfiTlsMode, NodeStartConfig,
+};
 // `ClientDhtConfig` is only referenced by the production (non-test) fail-closed
 // node DHT client in `start_node_local`; the test-harness build uses the
 // in-memory double instead, so the import would otherwise be unused.
@@ -118,6 +123,17 @@ pub enum ServerError {
     /// the in-memory test-harness node is not compiled (fail-closed; ADR-062).
     #[error("auto-generated in-memory node identity is unavailable in this build")]
     AutoGenerateUnavailable,
+
+    /// A [`NodeStartConfig`](crate::node_start_config::NodeStartConfig) failed
+    /// to parse or failed a field check in [`node_start`]. The message names the
+    /// field and the rule it broke; a field check never echoes a path.
+    #[error("invalid node start config: {0}")]
+    InvalidConfig(String),
+
+    /// The operator identity a node start config names is not the identity
+    /// the bridge resolved from this `SCP` instance.
+    #[error("operator identity is not available to the node")]
+    OperatorIdentityUnavailable,
 }
 
 impl ServerError {
@@ -140,6 +156,11 @@ impl ServerError {
             Self::DhtInit(_) => "DHT client initialization failed".to_owned(),
             Self::AutoGenerateUnavailable => {
                 "auto-generated in-memory node identity is unavailable in this build".to_owned()
+            }
+            // The message names a field and a rule, never a path or an OS error.
+            Self::InvalidConfig(msg) => format!("invalid node start config: {msg}"),
+            Self::OperatorIdentityUnavailable => {
+                "operator identity is not available to the node".to_owned()
             }
         }
     }
@@ -255,6 +276,23 @@ fn test_relay_config() -> RelayConfig {
     }
 }
 
+/// Builds the in-process WebSocket URL of a relay bound at `addr`.
+///
+/// The URL carries the bound address itself, so a relay bound to `::1` or to a
+/// LAN address is reached where it listens. An unspecified bind (`0.0.0.0` or
+/// `::`) listens on every interface but is not a connectable destination, so it
+/// maps to the loopback address of the same family. `SocketAddr`'s `Display`
+/// brackets an IPv6 host.
+fn bound_relay_ws_url(mut addr: SocketAddr) -> String {
+    if addr.ip().is_unspecified() {
+        addr.set_ip(match addr.ip() {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        });
+    }
+    format!("ws://{addr}/scp/v1")
+}
+
 /// Starts a relay and returns a [`RunningRelay`] from the given config and storage.
 async fn start_relay_with(
     config: RelayConfig,
@@ -262,7 +300,7 @@ async fn start_relay_with(
 ) -> Result<RunningRelay, ServerError> {
     let server = RelayServer::new(config, Arc::new(storage));
     let (handle, addr) = server.start().await?;
-    let relay_url = format!("ws://127.0.0.1:{}/scp/v1", addr.port());
+    let relay_url = bound_relay_ws_url(addr);
     Ok(RunningRelay {
         relay_url,
         bound_addr: addr,
@@ -729,6 +767,325 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// node_start — production node start from an SCP instance (SCP-321)
+// ---------------------------------------------------------------------------
+
+/// The `SCP` instance's own protocol storage handle, which [`node_start`] gives
+/// to the node (spec §17.6, first-party storage adapters).
+///
+/// Each arm mirrors one arm of a bridge's `StorageConfig` selector and one
+/// [`RunningNode`] variant. A second store on the instance's directory would
+/// fail, because `SqliteStorage::new` takes an exclusive lock on `scp.db.lock`.
+pub enum InstanceStorage {
+    /// A `StorageConfig::InMemory` instance's encrypted in-memory store. The
+    /// node loses all state on drop, and [`node_start`] logs a warning.
+    InMemoryEncrypted(Arc<EncryptedInMemoryStorage>),
+    /// A `StorageConfig::Sqlite` instance's `SQLCipher` store.
+    Sqlite(Arc<SqliteStorage>),
+}
+
+/// The longest DNS name `node_start` accepts (RFC 1035 §2.3.4).
+const MAX_DOMAIN_LEN: usize = 253;
+
+/// The longest DNS label `node_start` accepts (RFC 1035 §2.3.4).
+const MAX_LABEL_LEN: usize = 63;
+
+/// The longest blob storage path `node_start` accepts, matching
+/// [`validate_data_dir`].
+const MAX_BLOB_PATH_LEN: usize = 4096;
+
+fn invalid(msg: impl Into<String>) -> ServerError {
+    ServerError::InvalidConfig(msg.into())
+}
+
+/// Checks that `domain` is a DNS name: dot-separated labels of ASCII letters,
+/// digits and inner hyphens, with no scheme, port, path or whitespace.
+fn check_domain(domain: &str) -> Result<(), ServerError> {
+    if domain.is_empty() || domain.len() > MAX_DOMAIN_LEN {
+        return Err(invalid("reach.domain must be 1 to 253 bytes"));
+    }
+    let label_ok = |label: &str| {
+        !label.is_empty()
+            && label.len() <= MAX_LABEL_LEN
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if !domain.split('.').all(label_ok) {
+        return Err(invalid(
+            "reach.domain must be a DNS name of letters, digits, hyphens and dots, \
+             with no scheme, port or path",
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a blob database path without touching the filesystem.
+fn check_blob_path(path: &Path) -> Result<(), ServerError> {
+    let os_str = path.as_os_str();
+    if os_str.is_empty() || os_str.len() > MAX_BLOB_PATH_LEN {
+        return Err(invalid("blob_storage.path must be 1 to 4096 bytes"));
+    }
+    if path.to_string_lossy().contains('\0') {
+        return Err(invalid("blob_storage.path must not contain a NUL byte"));
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(invalid(
+            "blob_storage.path must not contain '..' components",
+        ));
+    }
+    if path.file_name().is_none() {
+        return Err(invalid("blob_storage.path must name a file"));
+    }
+    Ok(())
+}
+
+/// Lowers a [`FfiTlsMode`] after checking its fields.
+fn lower_tls(tls: FfiTlsMode) -> Result<TlsMode, ServerError> {
+    Ok(match tls {
+        FfiTlsMode::SelfSigned {} => TlsMode::SelfSigned,
+        FfiTlsMode::Acme { email } => {
+            if let Some(email) = &email {
+                let well_formed = email
+                    .split_once('@')
+                    .is_some_and(|(local, host)| !local.is_empty() && !host.is_empty())
+                    && !email.chars().any(char::is_whitespace);
+                if !well_formed {
+                    return Err(invalid(
+                        "tls.email must be an address of the form local@host, without whitespace",
+                    ));
+                }
+            }
+            TlsMode::Acme { email }
+        }
+        FfiTlsMode::Plaintext {} => TlsMode::Plaintext,
+        FfiTlsMode::Terminated {} => TlsMode::Terminated,
+    })
+}
+
+/// Lowers a [`FfiCorsOrigins`] after checking each origin. `AnyOrigin` lowers
+/// to the core's `None`, which the core reads as `*`.
+fn lower_cors(cors: FfiCorsOrigins) -> Result<Option<Vec<String>>, ServerError> {
+    match cors {
+        FfiCorsOrigins::AnyOrigin {} => Ok(None),
+        FfiCorsOrigins::List { origins } => {
+            for origin in &origins {
+                if origin == "*" {
+                    return Err(invalid(
+                        "cors_origins.origins must not contain '*'; select any_origin instead",
+                    ));
+                }
+                let shaped = origin
+                    .split_once("://")
+                    .is_some_and(|(scheme, host)| !scheme.is_empty() && !host.is_empty())
+                    && !origin.chars().any(char::is_whitespace);
+                if !shaped {
+                    return Err(invalid(
+                        "cors_origins.origins entries must be scheme://host origins without whitespace",
+                    ));
+                }
+            }
+            Ok(Some(origins))
+        }
+    }
+}
+
+/// Every [`NodeStartConfig`] field lowered to its core type, produced only by
+/// [`validate_node_start`] and before any directory or file exists.
+struct ValidatedNodeStart {
+    reach: Reach,
+    tls: TlsMode,
+    cors_origins: Option<Vec<String>>,
+    blob_storage: FfiBlobBackend,
+    bind_addr: Option<SocketAddr>,
+    http_bind_addr: Option<SocketAddr>,
+    projection_rate_limit: Option<u32>,
+}
+
+/// Runs every check `node_start` makes before it touches the filesystem:
+/// the field checks, `scp_node::validate_reach_and_tls`, and the operator
+/// identity match.
+fn validate_node_start(
+    cfg: NodeStartConfig,
+    operator_did: &str,
+) -> Result<ValidatedNodeStart, ServerError> {
+    let NodeStartConfig {
+        reach,
+        identity,
+        blob_storage,
+        tls,
+        dht,
+        cors_origins,
+        bind_addr,
+        http_bind_addr,
+        nat,
+        projection_rate_limit,
+    } = cfg;
+
+    let reach = match reach {
+        FfiReach::Domain { domain } => {
+            check_domain(&domain)?;
+            Reach::Domain { domain }
+        }
+        FfiReach::NatTraversal {} => Reach::NatTraversal,
+        FfiReach::Local {} => Reach::Local,
+    };
+    let tls = lower_tls(tls)?;
+    scp_node::validate_reach_and_tls(&reach, &tls)?;
+    let cors_origins = lower_cors(cors_origins)?;
+    match &blob_storage {
+        FfiBlobBackend::InMemory {} => {}
+        FfiBlobBackend::Redb { path } | FfiBlobBackend::Sqlite { path } => {
+            check_blob_path(path)?;
+        }
+    }
+    if projection_rate_limit == Some(0) {
+        return Err(invalid("projection_rate_limit must be greater than 0"));
+    }
+    // keri's scope ruling of 2026-10-13: the node publishes nothing.
+    let FfiDhtMode::Disabled {} = dht;
+    // `Auto` is the one arm, and the core's default.
+    let (None | Some(FfiNat::Auto {})) = nat;
+    if !identity.starts_with("did:") || identity.len() <= "did:".len() {
+        return Err(invalid("identity must be a DID"));
+    }
+    if identity != operator_did {
+        return Err(ServerError::OperatorIdentityUnavailable);
+    }
+
+    Ok(ValidatedNodeStart {
+        reach,
+        tls,
+        cors_origins,
+        blob_storage,
+        bind_addr,
+        http_bind_addr,
+        projection_rate_limit,
+    })
+}
+
+/// Creates a blob database's parent directory (mode `0o700` on Unix).
+fn create_blob_parent(path: &Path) -> Result<(), ServerError> {
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+/// Opens the selected blob backend, creating its parent directory first.
+fn open_blob_backend(backend: &FfiBlobBackend) -> Result<BlobStorageBackend, ServerError> {
+    Ok(match backend {
+        FfiBlobBackend::InMemory {} => BlobStorageBackend::in_memory(),
+        FfiBlobBackend::Redb { path } => {
+            create_blob_parent(path)?;
+            BlobStorageBackend::redb(path)?
+        }
+        FfiBlobBackend::Sqlite { path } => {
+            create_blob_parent(path)?;
+            BlobStorageBackend::sqlite(path)?
+        }
+    })
+}
+
+/// Builds the core [`NodeConfig`] from validated fields, the operator identity
+/// and one storage handle. Generic over the handle, so each [`InstanceStorage`]
+/// arm builds its config through one body.
+fn node_config<S: EncryptedStorage>(
+    v: ValidatedNodeStart,
+    identity: NodeIdentity,
+    blob_storage: BlobStorageBackend,
+    storage: S,
+) -> NodeConfig<FileKeyCustody, ConcreteDidMethod, S> {
+    NodeConfig {
+        tls: v.tls,
+        dht: DhtMode::Disabled,
+        bind_addr: v.bind_addr,
+        http_bind_addr: v.http_bind_addr,
+        cors_origins: v.cors_origins,
+        projection_rate_limit: v.projection_rate_limit,
+        nat: NatSlot::Auto,
+        ..NodeConfig::defaults(
+            v.reach,
+            // `Explicit` carries no custody, so `K` is annotated to the
+            // production `FileKeyCustody`, and no test-only nullifier type
+            // appears on this shipped path (ADR-062 §Decision 6).
+            IdentitySource::<FileKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
+                ExplicitIdentity {
+                    identity: identity.identity,
+                    document: identity.document,
+                    did_method: identity.did_method,
+                },
+            )),
+            storage,
+            blob_storage,
+        )
+    }
+}
+
+/// Starts a production node from an `SCP` instance (construction.md §"Node
+/// start — `NodeStartConfig`").
+///
+/// `identity` is the operator identity the bridge resolved from its registry
+/// for `cfg.identity`, and `storage` is the instance's own store. Every field
+/// check, `scp_node::validate_reach_and_tls`, and the identity match run
+/// before any directory or file exists. Only then does `node_start` create the
+/// blob directory, open the blob backend, and call [`Node::start`] with
+/// `IdentitySource::Explicit` and `DhtMode::Disabled`.
+///
+/// # Errors
+///
+/// `error_codes::server_error_code` maps each error to its code
+/// (sdk-common.md §"Node start error codes"):
+/// - [`ServerError::InvalidConfig`] or [`ServerError::Node`] carrying
+///   `NodeError::InvalidConfig`: a field check or the reach and TLS check failed
+/// - [`ServerError::OperatorIdentityUnavailable`]: `cfg.identity` is not the
+///   DID of `identity`
+/// - [`ServerError::Io`] or [`ServerError::Storage`]: the blob directory or
+///   backend could not be created or opened
+/// - [`ServerError::Node`]: the core node failed to start
+pub async fn node_start(
+    cfg: NodeStartConfig,
+    identity: NodeIdentity,
+    storage: InstanceStorage,
+) -> Result<RunningNode, ServerError> {
+    let validated = validate_node_start(cfg, &identity.identity.did)?;
+    let blob_storage = open_blob_backend(&validated.blob_storage)?;
+    let node = match storage {
+        InstanceStorage::InMemoryEncrypted(storage) => {
+            tracing::warn!(
+                "node_start on an in-memory SCP instance store: the node loses all state on drop"
+            );
+            RunningNode::InMemoryEncrypted(
+                Node::start(node_config(validated, identity, blob_storage, storage)).await?,
+            )
+        }
+        InstanceStorage::Sqlite(storage) => RunningNode::Sqlite(
+            Node::start(node_config(validated, identity, blob_storage, storage)).await?,
+        ),
+    };
+    tracing::info!(
+        relay_url = %node.relay_url(),
+        did = %node.did(),
+        "node started on its SCP instance's storage handle"
+    );
+    Ok(node)
+}
+
+// ---------------------------------------------------------------------------
 // RunningNode — type-erased ApplicationNode wrapper (shared across bridges)
 // ---------------------------------------------------------------------------
 
@@ -824,12 +1181,12 @@ impl RunningNode {
     ///
     /// Unlike [`relay_url`](Self::relay_url) (which returns the advertised URL
     /// for external clients, e.g. `wss://localhost/scp/v1`), this returns
-    /// `ws://127.0.0.1:{port}/scp/v1` — suitable for in-process relay
-    /// connections that bypass TLS. The port is the actual OS-assigned port
-    /// the relay is bound to.
+    /// `ws://{bound_addr}/scp/v1` from the relay's bound address — suitable
+    /// for in-process relay connections that bypass TLS. An unspecified bind
+    /// maps to loopback (construction.md §"Node start — `NodeStartConfig`").
     #[must_use]
     pub fn internal_relay_url(&self) -> String {
-        format!("ws://127.0.0.1:{}/scp/v1", self.relay_port())
+        bound_relay_ws_url(dispatch_running_node!(self, |n| n.relay().bound_addr()))
     }
 
     /// Returns the hex-encoded bridge token for relay authentication.
@@ -1968,5 +2325,197 @@ mod tests {
             "a sibling task stalled {longest:?}, against {derivation:?} for one derivation; \
              FileKeyCustody::new ran on the worker thread"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // node_start (SCP-321)
+    // -----------------------------------------------------------------------
+
+    /// A config that starts a node on `Reach::Local` with a redb blob file at
+    /// `blob_path`, for the operator `did`.
+    fn local_start_config(did: &str, blob_path: &Path) -> NodeStartConfig {
+        NodeStartConfig {
+            reach: FfiReach::Local {},
+            identity: did.to_owned(),
+            blob_storage: FfiBlobBackend::Redb {
+                path: blob_path.to_path_buf(),
+            },
+            tls: FfiTlsMode::Plaintext {},
+            dht: FfiDhtMode::Disabled {},
+            cors_origins: FfiCorsOrigins::List {
+                origins: vec!["https://app.example.org".to_owned()],
+            },
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            nat: Some(FfiNat::Auto {}),
+            projection_rate_limit: Some(10),
+        }
+    }
+
+    /// Every config that fails validation returns its sdk-common code and
+    /// leaves no directory or file at its blob path's parent.
+    #[tokio::test]
+    async fn node_start_rejects_an_invalid_config_before_creating_any_file() {
+        use crate::error_codes::{IDENT_1063, STORAGE_8007, server_error_code};
+
+        type Mutate = fn(&mut NodeStartConfig);
+        let cases: [(&str, Mutate, &str); 9] = [
+            (
+                "acme on local reach",
+                |c| c.tls = FfiTlsMode::Acme { email: None },
+                STORAGE_8007,
+            ),
+            (
+                "plaintext on domain reach",
+                |c| {
+                    c.reach = FfiReach::Domain {
+                        domain: "node.example.org".to_owned(),
+                    };
+                },
+                STORAGE_8007,
+            ),
+            (
+                "domain with a scheme",
+                |c| {
+                    c.reach = FfiReach::Domain {
+                        domain: "https://node.example.org".to_owned(),
+                    };
+                    c.tls = FfiTlsMode::SelfSigned {};
+                },
+                STORAGE_8007,
+            ),
+            (
+                "malformed acme email",
+                |c| {
+                    c.reach = FfiReach::Domain {
+                        domain: "node.example.org".to_owned(),
+                    };
+                    c.tls = FfiTlsMode::Acme {
+                        email: Some("no-at-sign".to_owned()),
+                    };
+                },
+                STORAGE_8007,
+            ),
+            (
+                "wildcard cors entry",
+                |c| {
+                    c.cors_origins = FfiCorsOrigins::List {
+                        origins: vec!["*".to_owned()],
+                    };
+                },
+                STORAGE_8007,
+            ),
+            (
+                "zero rate limit",
+                |c| c.projection_rate_limit = Some(0),
+                STORAGE_8007,
+            ),
+            (
+                "blob path with a parent component",
+                |c| {
+                    let FfiBlobBackend::Redb { path } = &mut c.blob_storage else {
+                        unreachable!("fixture selects redb");
+                    };
+                    *path = path.join("..").join("blobs.redb");
+                },
+                STORAGE_8007,
+            ),
+            (
+                "identity that is not a DID",
+                |c| c.identity = "operator".to_owned(),
+                STORAGE_8007,
+            ),
+            (
+                "another operator's DID",
+                |c| c.identity = "did:dht:someone-else".to_owned(),
+                IDENT_1063,
+            ),
+        ];
+
+        for (label, mutate, code) in cases {
+            let identity = create_test_identity().await;
+            let tmp = temp_dir_for("node-start-invalid");
+            let mut cfg = local_start_config(&identity.identity.did, &tmp.join("blobs.redb"));
+            mutate(&mut cfg);
+
+            let result = node_start(
+                cfg,
+                identity,
+                InstanceStorage::InMemoryEncrypted(instance_in_memory_storage()),
+            )
+            .await;
+            let created = tmp.exists();
+            let _ = std::fs::remove_dir_all(&tmp);
+
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("{label}: start must fail"));
+            assert_eq!(server_error_code(&err), code, "{label}: {err:?}");
+            assert!(
+                !created,
+                "{label}: a refused start created {}",
+                tmp.display()
+            );
+        }
+    }
+
+    /// A valid config starts a node on each instance storage arm, under the
+    /// operator's DID, with the blob file at the configured path and an
+    /// internal relay URL built from the bound address.
+    #[tokio::test]
+    async fn node_start_runs_a_node_on_each_instance_storage_arm() {
+        for sqlite in [false, true] {
+            let identity = create_test_identity().await;
+            let did = identity.identity.did.clone();
+            let tmp = temp_dir_for("node-start-ok");
+            let blob_path = tmp.join("blobs").join("blobs.redb");
+            let storage = if sqlite {
+                std::fs::create_dir_all(&tmp).expect("instance dir");
+                InstanceStorage::Sqlite(instance_sqlite_storage(&tmp))
+            } else {
+                InstanceStorage::InMemoryEncrypted(instance_in_memory_storage())
+            };
+
+            let node = node_start(local_start_config(&did, &blob_path), identity, storage)
+                .await
+                .expect("a valid config starts");
+
+            assert_eq!(node.did(), did);
+            assert_eq!(matches!(node, RunningNode::Sqlite(_)), sqlite);
+            assert!(blob_path.exists(), "the redb blob file is created");
+            assert_eq!(
+                node.internal_relay_url(),
+                format!("ws://127.0.0.1:{}/scp/v1", node.relay_port())
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(tmp.join("blobs"))
+                    .expect("blob dir")
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o700, "blob dir mode {mode:o}");
+            }
+            node.shutdown();
+            drop(node);
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
+
+    /// The internal relay URL carries the bound host, brackets IPv6, and maps
+    /// an unspecified bind to loopback of the same family.
+    #[test]
+    fn bound_relay_ws_url_uses_the_bound_address() {
+        let cases = [
+            ("127.0.0.1:4000", "ws://127.0.0.1:4000/scp/v1"),
+            ("192.168.1.20:4000", "ws://192.168.1.20:4000/scp/v1"),
+            ("0.0.0.0:4000", "ws://127.0.0.1:4000/scp/v1"),
+            ("[::1]:4000", "ws://[::1]:4000/scp/v1"),
+            ("[::]:4000", "ws://[::1]:4000/scp/v1"),
+        ];
+        for (addr, url) in cases {
+            let addr: SocketAddr = addr.parse().expect("fixture address");
+            assert_eq!(bound_relay_ws_url(addr), url);
+        }
     }
 }

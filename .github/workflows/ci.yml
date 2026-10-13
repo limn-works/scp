@@ -2286,6 +2286,16 @@ jobs:
           # one for every package that has them.
           cargo nextest run --no-tests=fail -p scp-ffi-common \
             -E 'test(ffi_dht_client_is_pkarr_only_in_shipped_build) + test(disabled_node_resolution_returns_ok_none_for_unknown_did)'
+          # SCP-321: `server::node_start` refuses an invalid reach and TLS pair
+          # with SCP-STORAGE-8007 before it creates any file, in the build a
+          # shipped bridge links. The test is `#[cfg(not(feature = "testing"))]`
+          # and needs `server`, which the default-feature commands above do not
+          # enable. `-p scp-ffi-common --features server` resolves no
+          # `scp-ffi-common/testing` (no dev-dependency of this package turns it
+          # on), and a build that did would select zero tests, so
+          # `--no-tests=fail` exits 4.
+          cargo nextest run --no-tests=fail -p scp-ffi-common --features server --test node_start_shipped \
+            -E 'test(node_start_rejects_invalid_reach_tls_with_storage_8007_in_shipped_build)'
           # The same tripwire for scp-ffi-napi. `cargo test -p scp-ffi-napi`
           # above carries no name filter, so it exits 0 when the bridge's
           # `#[cfg(not(feature = "testing"))]` tests compiled out. This filter
