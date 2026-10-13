@@ -89,6 +89,15 @@ use tokio_util::sync::CancellationToken;
 /// peer. See red-hat RED-1003.
 const RECONNECT_PER_URL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The installed transport manager and the relays it holds an adapter for.
+/// [`CoreFields::context_relay_urls`] reads `relays`; every install, and
+/// every relay added to or removed from the installed manager, writes it
+/// under the transport lock.
+struct InstalledTransport {
+    manager: Arc<scp_transport::TransportManager>,
+    relays: HashSet<String>,
+}
+
 use crate::IdentityBackedDidResolver;
 
 /// Monotonic counter for [`CoreFields::instance_id`].
@@ -445,8 +454,10 @@ pub struct CoreFields {
     /// concurrent reads (probe/query). Wrapped in `Arc` so that NAPI bridge
     /// subscription tasks (which run in spawned async tasks) can hold a
     /// `Send`-compatible reference without keeping the `RwLock` guard alive
-    /// across `.await` points.
-    transport: RwLock<Option<Arc<scp_transport::TransportManager>>>,
+    /// across `.await` points. The installed manager carries the relays it
+    /// holds an adapter for, under the same lock, so the relay set a create
+    /// records cannot name a relay the installed manager is not connected to.
+    transport: RwLock<Option<InstalledTransport>>,
 
     /// Instance-scoped transport selector (transparent QUIC↔WebSocket
     /// selection, spec §10.14.3 item 4; ADR-037).
@@ -1598,11 +1609,14 @@ impl CoreFields {
     ///
     /// Returns `Err` if the `RwLock` is poisoned, or if the instance is
     /// suspended (lifecycle violation — call `resume()` first).
+    ///
+    /// The installed manager names no relay, so [`Self::context_relay_urls`]
+    /// returns no relay for it until [`Self::add_relay_url`] names one.
     pub fn set_transport(
         &self,
         manager: Arc<scp_transport::TransportManager>,
     ) -> Result<(), TransportLockError> {
-        self.install_transport_inner(manager, None)
+        self.install_transport_inner(manager, HashSet::new(), false)
     }
 
     /// Installs `manager`, connected to the one relay `relay_url`, replacing
@@ -1620,14 +1634,21 @@ impl CoreFields {
         manager: Arc<scp_transport::TransportManager>,
         relay_url: String,
     ) -> Result<(), TransportLockError> {
-        self.install_transport_inner(manager, Some(relay_url))
+        self.install_transport_inner(manager, HashSet::from([relay_url]), true)
     }
 
+    /// Installs `manager`, which holds an adapter for each relay in
+    /// `connected`, as the installed transport. When `replace_pending` is
+    /// set, `connected` also becomes the reconnect set
+    /// ([`Self::pending_relay_urls`]); otherwise the reconnect set is left as
+    /// it is, so a relay that failed to reconnect stays there for retry while
+    /// [`Self::context_relay_urls`] leaves it out.
     #[allow(clippy::significant_drop_tightening)]
     fn install_transport_inner(
         &self,
         manager: Arc<scp_transport::TransportManager>,
-        relay_url: Option<String>,
+        connected: HashSet<String>,
+        replace_pending: bool,
     ) -> Result<(), TransportLockError> {
         // Shutdown: warn only — matches bridge_instance()/context_manager()
         // behavior where shutdown is a terminal state and operations fail
@@ -1646,18 +1667,23 @@ impl CoreFields {
             .transport
             .write()
             .map_err(|_| TransportLockError::Poisoned)?;
-        if let Some(url) = relay_url {
+        // After shutdown both sets stay empty, as `add_relay_url` keeps them.
+        let connected = if self.is_shutdown() {
+            HashSet::new()
+        } else {
+            connected
+        };
+        if replace_pending {
             let mut relays = self
                 .relay_urls
                 .lock()
                 .map_err(|_| TransportLockError::Poisoned)?;
-            relays.clear();
-            // After shutdown the set stays empty, as `add_relay_url` keeps it.
-            if !self.is_shutdown() {
-                relays.insert(url);
-            }
+            relays.clone_from(&connected);
         }
-        *guard = Some(manager);
+        *guard = Some(InstalledTransport {
+            manager,
+            relays: connected,
+        });
         Ok(())
     }
 
@@ -1707,10 +1733,11 @@ impl CoreFields {
     /// Registers `url` as a relay that this bridge intends to stay
     /// connected to.
     ///
-    /// Callers (bridge `transport_connect` functions) call this immediately
-    /// after [`Self::set_transport`] so that [`Self::pending_relay_urls`] returns the
-    /// URL in subsequent reconnect attempts after [`Self::resume`]. Duplicate
-    /// calls are idempotent because the underlying set deduplicates.
+    /// Callers (bridge `transport_add_relay` functions) call this right
+    /// after adding an adapter for `url` to the installed manager, so that
+    /// [`Self::pending_relay_urls`] returns the URL in subsequent reconnect
+    /// attempts after [`Self::resume`]. Duplicate calls are idempotent
+    /// because the underlying set deduplicates.
     ///
     /// No-op after [`Self::shutdown`] — [`Self::pending_relay_urls`] is cleared on
     /// shutdown and we must not resurrect it by admitting a late writer.
@@ -1725,10 +1752,18 @@ impl CoreFields {
     /// If the `relay_urls` mutex is poisoned (a previous caller panicked
     /// while holding it), the URL is silently dropped and a warning is
     /// logged — a lost relay URL on resume is recoverable by the caller.
+    ///
+    /// When a transport manager is installed, `url` also joins the relays
+    /// [`Self::context_relay_urls`] reports for it.
     pub fn add_relay_url(&self, url: String) {
         if self.is_shutdown() {
             return;
         }
+        // Lock order: transport, then relay_urls (as install_transport_inner).
+        let Ok(mut transport) = self.transport.write() else {
+            tracing::warn!("transport lock poisoned — relay URL not stored");
+            return;
+        };
         match self.relay_urls.lock() {
             Ok(mut guard) => {
                 // Re-check `is_shutdown` after acquiring the lock to close
@@ -1744,12 +1779,16 @@ impl CoreFields {
                     drop(guard);
                     return;
                 }
+                if let Some(installed) = transport.as_mut() {
+                    installed.relays.insert(url.clone());
+                }
                 guard.insert(url);
             }
             Err(_) => {
                 tracing::warn!("relay_urls mutex poisoned — relay URL not stored");
             }
         }
+        drop(transport);
     }
 
     /// Removes a single relay URL from the pending-reconnect set.
@@ -1760,7 +1799,15 @@ impl CoreFields {
     ///
     /// Silently no-ops if the URL is not registered or if the mutex is
     /// poisoned.
+    ///
+    /// `url` also leaves the relays [`Self::context_relay_urls`] reports for
+    /// the installed manager.
     pub fn remove_relay_url(&self, url: &str) {
+        if let Ok(mut transport) = self.transport.write()
+            && let Some(installed) = transport.as_mut()
+        {
+            installed.relays.remove(url);
+        }
         match self.relay_urls.lock() {
             Ok(mut guard) => {
                 guard.remove(url);
@@ -1791,33 +1838,24 @@ impl CoreFields {
 
     /// Returns the bridge's relay set, sorted, as the relay set of a context
     /// the bridge creates: the creator's relays host the context (§5.12.3.1
-    /// `relay_urls`, PUSH-025). The set is empty when no transport manager is
-    /// installed; otherwise it holds the relay of the last
-    /// [`Self::install_transport`] plus each relay added to that manager since.
+    /// `relay_urls`, PUSH-025). The set holds the relays the installed
+    /// transport manager holds an adapter for, and is empty when no manager
+    /// is installed. A relay left in [`Self::pending_relay_urls`] after a
+    /// failed reconnect is not in it.
     ///
     /// # Errors
     ///
-    /// [`TransportLockError::Poisoned`] when the transport lock or the
-    /// relay-set mutex is poisoned, so a create fails instead of recording a
-    /// relay set it cannot vouch for.
+    /// [`TransportLockError::Poisoned`] when the transport lock is poisoned,
+    /// so a create fails instead of recording a relay set it cannot vouch
+    /// for.
     pub fn context_relay_urls(&self) -> Result<Vec<String>, TransportLockError> {
-        // The transport read guard lives through the match, so the relay set
-        // is read against the installed manager it describes.
-        let mut urls: Vec<String> = match self
+        let mut urls: Vec<String> = self
             .transport
             .read()
             .map_err(|_| TransportLockError::Poisoned)?
             .as_ref()
-        {
-            None => return Ok(Vec::new()),
-            Some(_) => self
-                .relay_urls
-                .lock()
-                .map_err(|_| TransportLockError::Poisoned)?
-                .iter()
-                .cloned()
-                .collect(),
-        };
+            .map(|installed| installed.relays.iter().cloned().collect())
+            .unwrap_or_default();
         urls.sort_unstable();
         Ok(urls)
     }
@@ -1833,7 +1871,8 @@ impl CoreFields {
     /// Iterates the deduplicated snapshot from [`Self::pending_relay_urls`], calls
     /// `NativeRelayAdapter::connect_sourced` (source = `Explicit`) for each
     /// URL, wraps the adapter in a [`scp_transport::TransportManager`], and
-    /// stores it via [`Self::set_transport`]. Called from the
+    /// installs it with the relays that reconnected as its relay set
+    /// ([`Self::context_relay_urls`]). Called from the
     /// `BridgeInstanceCore::resume` default body after the core flag flip.
     ///
     /// Collects every failure and returns the first as
@@ -1999,7 +2038,7 @@ impl CoreFields {
         // a silent-success path can't swallow the case where every
         // spawned task panicked (empty `results`, no per-URL failure).
         let mut first_failure: Option<LifecycleError> = first_panic_failure;
-        let mut connected_count = 0_usize;
+        let mut connected: HashSet<String> = HashSet::new();
         for (url, outcome) in results {
             match outcome {
                 Ok(adapter) => {
@@ -2007,7 +2046,7 @@ impl CoreFields {
                     // connection budget; we don't surface it here because the
                     // caller's reconnect intent is best-effort multi-relay.
                     let _eviction = manager.add_adapter(Box::new(adapter));
-                    connected_count += 1;
+                    connected.insert(url);
                 }
                 Err(reason) => {
                     tracing::warn!(
@@ -2024,8 +2063,9 @@ impl CoreFields {
                 }
             }
         }
+        let connected_count = connected.len();
         // #1696: one more cancellation check between the dial loop and
-        // `set_transport`. If suspend fired *after* the last successful
+        // the install. If suspend fired *after* the last successful
         // dial but *before* we install the manager, installing it now
         // would immediately fail the suspended-state guard — but more
         // importantly, the adapters we just connected belong to a
@@ -2033,7 +2073,7 @@ impl CoreFields {
         // installed.
         if cancel.is_cancelled() {
             tracing::debug!(
-                "reconnect_transport_if_pending: cancelled before set_transport — dropping {connected_count} connected adapter(s)"
+                "reconnect_transport_if_pending: cancelled before install — dropping {connected_count} connected adapter(s)"
             );
             // `manager` (and its adapters) are dropped at the end of
             // this block. Each adapter's Drop fires `cover_traffic_cancel`
@@ -2053,10 +2093,12 @@ impl CoreFields {
         // with a confusing "no adapters" error instead of the clearer
         // "reconnect failed" we surface below.
         let install_failed = if connected_count > 0 {
-            if let Err(e) = self.set_transport(Arc::new(manager)) {
+            // The installed manager names only the relays that reconnected;
+            // a failed relay stays in the reconnect set for retry.
+            if let Err(e) = self.install_transport_inner(Arc::new(manager), connected, false) {
                 tracing::warn!(
                     error = %e,
-                    "reconnect_transport_if_pending: set_transport failed after successful reconnects"
+                    "reconnect_transport_if_pending: transport install failed after successful reconnects"
                 );
                 if first_failure.is_none() {
                     first_failure = Some(LifecycleError::ReconnectFailed {
@@ -2081,7 +2123,7 @@ impl CoreFields {
         // `tracing::error!` with a structured `panicked` field so log-based
         // alerting can page on it. Plain per-URL dial failures (network
         // refused, timeout) stay at `tracing::warn!` — those are routine
-        // and recoverable on the next reconnect cycle. If `set_transport`
+        // and recoverable on the next reconnect cycle. If the install
         // itself failed, we keep the error so the caller can distinguish
         // "nothing landed" from "transport live with some losses".
         if connected_count > 0 && !install_failed {
@@ -2194,7 +2236,9 @@ impl CoreFields {
             .transport
             .read()
             .map_err(|_| TransportLockError::Poisoned)?;
-        Ok(guard.clone())
+        Ok(guard
+            .as_ref()
+            .map(|installed| Arc::clone(&installed.manager)))
     }
 
     /// Executes a closure with a read reference to the `TransportManager`.
@@ -2213,10 +2257,13 @@ impl CoreFields {
             tracing::debug!("transport RwLock poisoned (a writer panicked)");
             TransportLockError::Poisoned
         })?;
-        let manager = guard.as_deref().ok_or_else(|| {
-            tracing::debug!("transport slot is empty — no transport_connect call");
-            TransportLockError::NotInitialized
-        })?;
+        let manager = guard
+            .as_ref()
+            .map(|installed| &*installed.manager)
+            .ok_or_else(|| {
+                tracing::debug!("transport slot is empty — no transport_connect call");
+                TransportLockError::NotInitialized
+            })?;
         Ok(f(manager))
     }
 
@@ -2240,10 +2287,13 @@ impl CoreFields {
             tracing::debug!("transport RwLock poisoned (a writer panicked)");
             TransportLockError::Poisoned
         })?;
-        let arc = guard.as_mut().ok_or_else(|| {
-            tracing::debug!("transport slot is empty — no transport_connect call");
-            TransportLockError::NotInitialized
-        })?;
+        let arc = guard
+            .as_mut()
+            .map(|installed| &mut installed.manager)
+            .ok_or_else(|| {
+                tracing::debug!("transport slot is empty — no transport_connect call");
+                TransportLockError::NotInitialized
+            })?;
         // Capture strong count before the mutable borrow attempt (can't borrow
         // arc immutably inside the ok_or_else closure while get_mut borrows it).
         let strong_count = Arc::strong_count(arc);
@@ -4821,6 +4871,50 @@ mod tests {
             "the replaced manager's relay is no longer connected"
         );
         assert_eq!(instance.pending_relay_urls().len(), 1);
+    }
+
+    #[test]
+    fn an_install_that_keeps_the_pending_set_records_only_its_own_relays() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        instance.add_relay_url("wss://a.example".to_owned());
+        instance.add_relay_url("wss://b.example".to_owned());
+        instance
+            .install_transport_inner(
+                Arc::new(test_transport_manager()),
+                HashSet::from(["wss://a.example".to_owned()]),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(vec!["wss://a.example".to_owned()]),
+            "a pending relay the manager has no adapter for hosts nothing"
+        );
+        assert_eq!(instance.pending_relay_urls().len(), 2);
+    }
+
+    #[test]
+    fn set_transport_names_no_relay_until_one_is_added() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        instance
+            .install_transport(
+                Arc::new(test_transport_manager()),
+                "wss://a.example".to_owned(),
+            )
+            .unwrap();
+        instance
+            .set_transport(Arc::new(test_transport_manager()))
+            .unwrap();
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(Vec::new()),
+            "the replaced manager's relay is not the new manager's"
+        );
+        instance.add_relay_url("wss://b.example".to_owned());
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(vec!["wss://b.example".to_owned()])
+        );
     }
 
     #[test]
