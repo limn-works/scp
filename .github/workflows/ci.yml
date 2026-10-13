@@ -1977,12 +1977,15 @@ jobs:
           cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --test postgres_blob_fail_closed --test s3_blob_fail_closed
           # The relay push registration store (spec §10.7.1, PUSH-006) compiles
           # only under `push-store`, and its in-memory arm only under `testing`,
-          # which --workspace leaves off. Each feature set runs every unit test
-          # in the module, selected by module path so a test added there runs
-          # with no edit here; the `testing` set also runs the shared suite over
-          # both arms and the SQLite reopen test.
-          cargo nextest run --no-tests=fail -p scp-transport --features push-store,testing --lib --test push_store_conformance -E 'test(/^relay::push_store::/) | binary(push_store_conformance)'
-          cargo nextest run --no-tests=fail -p scp-transport --features push-store --lib -E 'test(/^relay::push_store::/)'
+          # which --workspace leaves off. Each feature set runs the whole lib
+          # and every integration target with no test filter, so a unit test
+          # in any module, or a target whose required features a set meets,
+          # runs with no edit here.
+          cargo nextest run --no-tests=fail -p scp-transport --features push-store,testing --lib --tests
+          cargo nextest run --no-tests=fail -p scp-transport --features push-store --lib --tests
+          # Selects only the assertion that compiles out under `testing`, so a
+          # build that turned `testing` on selects zero tests and fails.
+          cargo nextest run --no-tests=fail -p scp-transport --features push-store --lib store_without_testing_has_only_the_sqlite_arm
       - name: Run node and relay tests
         if: matrix.group == 'node-relay'
         run: |
