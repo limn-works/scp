@@ -90,16 +90,19 @@ export {
 // Trust — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
-export type {
-  AggregatedTrustInput,
-  AggregationInput,
-  Attestation,
-  BehavioralRecord,
-  ChallengeResult,
-  Endorsement,
-  TrustEvaluation,
-} from "./trust";
-export { evaluateTrust } from "./trust";
+// `BehavioralRecord` and `TrustEvaluation` moved to the `./types` export block
+// below. They are the shapes `SCP.participationRecord` and `SCP.evaluateTrust`
+// return; `./trust` declared a second, incompatible pair under the same two
+// names, and this block exported that pair. `BehavioralRecord` mirrors the
+// participation facts §7.3.2 of the trust spec defines, so its field set is
+// specified. The `TrustEvaluation` composite is NOT defined by any spec section
+// or ADR — the only artifact describing it is the `SCP.Trust.evaluate` section
+// of `.docs/sketch.md`, which self-describes as a working sketch and still
+// carries the pre-§7.3.2 field set. Read that gap as open, not as settled.
+//
+// `evaluateTrust` is no longer exported here. §7 of ADR-048 requires a stateful
+// operation to be a method on `SCP` in every SDK; call `scp.evaluateTrust(...)`.
+export type { AggregatedTrustInput, AggregationInput } from "./trust";
 
 // ---------------------------------------------------------------------------
 // Event Log — types only (entry points moved to SCP)
@@ -276,6 +279,7 @@ export type {
   AttestationType,
   AttestorInfo,
   BatchPublishResult,
+  BehavioralRecord,
   BroadcastAdmissionPolicy,
   BuiltInRole,
   CachedAttestation,
@@ -330,6 +334,7 @@ export type {
   ThresholdRequirement,
   TransportConfig,
   TransportStatus,
+  TrustEvaluation,
   TrustLevel,
   UcanToken,
   VerificationLevel,

@@ -917,6 +917,62 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(result.behavioralRecord).toBeDefined();
     });
 
+    // `evaluateTrust` must not consume the tokens it assesses. It routes through
+    // the read-only `ucanEvaluate` probe, which checks the nonce without
+    // recording it. The implementation this replaced called the enforcing
+    // `ucanValidate` gate, which DOES record the nonce, so the second evaluation
+    // of one token reported `nonceValid: false` with no adversary present — and
+    // a third party could burn a victim's token nonce by asking for a trust
+    // evaluation before the victim's genuine invocation ran.
+    test("evaluateTrust does not consume the token nonce (real addon)", async () => {
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+      const context = Context._fromHandle(scpInstance, ctx, admin.did);
+      const good = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+
+      const first = await scpInstance.evaluateTrust(context, member.did, [good.encoded]);
+      const second = await scpInstance.evaluateTrust(context, member.did, [good.encoded]);
+
+      expect(allValid(first.capabilityValidation)).toBe(true);
+      expect(second.capabilityValidation.nonceValid).toBe(true);
+      expect(allValid(second.capabilityValidation)).toBe(true);
+    });
+
+    // Degenerate token inputs stay fail-closed. The Layer-1 guard reads
+    // `capabilityTokens !== undefined && capabilityTokens.length > 0`; an edit to
+    // `length >= 0` would start the all-true accumulator with no token to narrow
+    // it, and no test pinned that until this one.
+    test("evaluateTrust reports every field false for an empty token array (real addon)", async () => {
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+      const context = Context._fromHandle(scpInstance, ctx, admin.did);
+
+      const result = await scpInstance.evaluateTrust(context, member.did, []);
+
+      expect(result.capabilityValidation).toEqual({
+        tokensValid: false,
+        signaturesValid: false,
+        withinCeiling: false,
+        nonceValid: false,
+        notRevoked: false,
+        timeBoundsValid: false,
+      });
+    });
+
+    // An empty string is not a token. The bridge rejects it at the input
+    // boundary and the rejection propagates, rather than folding into a verdict
+    // that would report five of six stages as passed.
+    test("evaluateTrust rejects an empty-string token instead of scoring it (real addon)", async () => {
+      const admin = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const member = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+      const context = Context._fromHandle(scpInstance, ctx, admin.did);
+
+      await expect(scpInstance.evaluateTrust(context, member.did, [""])).rejects.toThrow();
+    });
+
     // C3c (Phase 2C-2): the Layer-2 behavioral record is now the TYPED
     // participation record (§7.3.2) RECEIVED from the shared Rust core via
     // `participationRecord` — the SDK no longer classifies raw events
