@@ -36,7 +36,7 @@ use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::{NatTierChange, NetworkChangeDetector};
 use scp_transport::native::server::{RelayConfig, RelayError, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorage as _, BlobStorageBackend};
-use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
+use scp_transport::relay::push_gate::LiveRelayUrl;
 use sha2::Digest;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
@@ -3632,11 +3632,9 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     let relay_url = no_domain_relay_url(tier.as_ref(), http_port);
     // The relay reserves the push routing ID of the URL the node is about to
     // publish before the publish, so no client reads a URL whose routing ID the
-    // relay does not yet intercept (§10.7.1 step 2).
-    relay_config.relay_url.set(
-        RelayUrl::new(&relay_url)
-            .map_err(|e| NodeError::InvalidConfig(format!("relay URL {relay_url}: {e}")))?,
-    );
+    // relay does not yet intercept (§10.7.1 step 2). A tier 3 bridge URL has no
+    // routing ID and the node still publishes it.
+    published_state::reserve_push_routing_id(&relay_config.relay_url, &relay_url);
 
     push_relay_service(&mut document, &relay_url);
 
@@ -4009,6 +4007,8 @@ impl Storage for NoOpStorage {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    use scp_transport::relay::push_gate::RelayUrl;
 
     use scp_clock::SystemClock;
     use scp_dht::InMemoryDhtClient;
@@ -7606,6 +7606,47 @@ mod tests {
             live_state.get().document.relay_service_urls(),
             vec![TIER_CHANGE_NEW_URL.to_owned(), OTHER_RELAY.to_owned()],
         );
+    }
+
+    /// A tier change to a bridge URL publishes it, although a bridge URL's
+    /// `bridge_target` query (§10.12.4 step 4) leaves it with no §9.18.2
+    /// canonical form and so no push routing ID. The relay keeps reserving the
+    /// previous URL's routing ID.
+    #[tokio::test]
+    async fn tier_change_to_a_bridge_url_publishes_it_and_keeps_the_reserved_id() {
+        const BRIDGE_URL: &str = "wss://bridge.example.com/scp/v1?bridge_target=deadbeef";
+        let live_state = LiveSlot::new(NodePublishedState {
+            document: slot_test_document(&[TIER_CHANGE_OLD_URL]),
+            relay_url: TIER_CHANGE_OLD_URL.to_owned(),
+            record: None,
+        });
+        let old = RelayUrl::new(TIER_CHANGE_OLD_URL).expect("canonical test URL");
+        let relay = LiveRelayUrl::new(old.clone());
+        let publisher = Arc::new(ScriptedPublisher::new(false));
+
+        apply_tier_change(
+            &live_state,
+            &relay,
+            BRIDGE_URL,
+            "test",
+            &NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
+            &slot_test_identity(),
+            None,
+        )
+        .await;
+
+        let state = live_state.get();
+        assert_eq!(state.relay_url, BRIDGE_URL);
+        assert_eq!(
+            state.document.relay_service_urls(),
+            vec![BRIDGE_URL.to_owned()]
+        );
+        assert_eq!(
+            publisher.seen.lock().expect("lock")[0].relay_service_urls(),
+            vec![BRIDGE_URL.to_owned()],
+            "the bridge URL is published"
+        );
+        assert_eq!(relay.current(), old, "the relay keeps its reserved URL");
     }
 
     /// A FAILED re-publish still advances the address the node reports — the

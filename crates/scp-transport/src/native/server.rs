@@ -14,10 +14,13 @@
 //! ```rust,no_run
 //! use scp_transport::native::server::{Relay, RelayConfig};
 //! use scp_transport::native::storage::BlobStorageBackend;
+//! use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! // The relay's public URL fixes its reserved push routing ID (§10.7.1).
+//! let relay_url = LiveRelayUrl::new(RelayUrl::new("wss://relay.example/scp/v1")?);
 //! let (shutdown, addr) =
-//!     Relay::start(RelayConfig::defaults(crate::relay::push_gate::test_relay_url()), BlobStorageBackend::in_memory()).await?;
+//!     Relay::start(RelayConfig::defaults(relay_url), BlobStorageBackend::in_memory()).await?;
 //! // ... serve; later:
 //! shutdown.shutdown();
 //! # let _ = addr;
@@ -127,7 +130,7 @@ pub enum DidRecordValidation {
 /// No whole-struct `Default` exists:
 ///
 /// ```compile_fail,E0599
-/// let _ = scp_transport::native::server::RelayConfig::defaults(crate::relay::push_gate::test_relay_url());
+/// let _ = scp_transport::native::server::RelayConfig::default();
 /// ```
 ///
 /// ```

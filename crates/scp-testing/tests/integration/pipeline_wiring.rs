@@ -1089,7 +1089,7 @@ fn nat_tier_task_writes_the_relay_push_url_handle() {
         fn_body_contains(
             NODE_BUILDER_SRC,
             "build_no_domain_inner",
-            "relay_config.relay_url.set("
+            "reserve_push_routing_id(&relay_config.relay_url, &relay_url)"
         ),
         "build_no_domain_inner must set the probed tier's URL on the relay handle"
     );
@@ -1100,8 +1100,16 @@ fn nat_tier_task_writes_the_relay_push_url_handle() {
     let body = extract_fn_body(NODE_PUBLISHED_STATE_SRC, "apply_tier_change")
         .expect("apply_tier_change body");
     let set = body
-        .find("relay.set(")
+        .find("reserve_push_routing_id(relay, new_relay_url)")
         .expect("apply_tier_change must set the relay's live URL handle");
+    assert!(
+        fn_body_contains(
+            NODE_PUBLISHED_STATE_SRC,
+            "reserve_push_routing_id",
+            "relay.set(url)"
+        ),
+        "reserve_push_routing_id must set the relay's live URL handle"
+    );
     let publish = body
         .find(".publish(")
         .expect("apply_tier_change must publish the document");
