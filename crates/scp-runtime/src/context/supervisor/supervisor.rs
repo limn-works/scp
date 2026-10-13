@@ -17103,6 +17103,8 @@ impl Supervisor {
             }
         }
         Ok(by_relay)
+    }
+
     /// Returns the local member's routing IDs and rotation state (spec 09
     /// §9.10.4.1) for `context_id`: the current routing ID, the previous one
     /// while its grace runs, the epoch, the epoch the next rotation must

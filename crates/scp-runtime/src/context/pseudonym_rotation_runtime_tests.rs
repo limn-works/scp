@@ -303,7 +303,7 @@ fn params(policy: Option<PseudonymRotationPolicy>) -> ContextParams {
 impl Node {
     async fn create(&self, ctx_id: &str, params: ContextParams) -> ContextHandle {
         self.supervisor
-            .create_context(ctx_id.to_owned(), params, local(), Some(V1_RID))
+            .create_context(ctx_id.to_owned(), params, local(), Some(V1_RID), Vec::new())
             .await
             .expect("create_context")
     }
@@ -482,6 +482,47 @@ async fn a_rotation_persists_emits_once_announces_on_the_shared_channel_and_clea
         vec![1],
         "LocalPseudonymRotated is emitted once"
     );
+}
+
+/// The push routing IDs (`10-infrastructure-and-self-hosting.md` §10.7.1)
+/// read the same local pseudonym a rotation writes: after the rotation,
+/// `Supervisor::push_routing_ids` lists the new routing ID in place of the
+/// old one, beside the shared `context_routing_id`, under the context's relay.
+#[tokio::test]
+async fn push_routing_ids_follow_a_rotation() {
+    const RELAY: &str = "wss://relay.example/scp/v1";
+    let n = node();
+    let ctx = &cid("rotation-push-routes");
+    n.supervisor
+        .create_context(
+            ctx.clone(),
+            params(Some(interval_policy())),
+            local(),
+            Some(V1_RID),
+            vec![RELAY.to_owned()],
+        )
+        .await
+        .expect("create_context");
+    let relay = scp_protocol::discovery::push::canonical_relay_url(RELAY).expect("canonical");
+    let routes = |ids: [u8; 32]| {
+        std::collections::BTreeMap::from([(
+            relay.clone(),
+            std::collections::BTreeSet::from([context_routing_id(ctx), ids]),
+        )])
+    };
+
+    let before = n.supervisor.push_routing_ids().await.expect("push routes");
+    assert_eq!(
+        before,
+        routes(V1_RID),
+        "the v1 routing ID before a rotation"
+    );
+
+    n.clock.set(T0 + INTERVAL);
+    n.rotate(ctx, 1, RID_1).await.expect("the rotation commits");
+
+    let after = n.supervisor.push_routing_ids().await.expect("push routes");
+    assert_eq!(after, routes(RID_1), "the rotated routing ID after it");
 }
 
 /// §25.19 Vector 58: the announcement plaintext a v2 member sends is
@@ -668,6 +709,7 @@ async fn no_policy_admits_no_rotation_and_a_broadcast_context_has_no_routing_ids
             },
             local(),
             None,
+            Vec::new(),
         )
         .await
         .expect("create a broadcast context");
