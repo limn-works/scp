@@ -4207,3 +4207,49 @@ async fn spawn_from_welcome_application_data_round_trips_joiner_to_creator() {
         "the response carries bob's sender key (not an empty/echoed answer)"
     );
 }
+
+/// spec 09 §9.10.4.1 puts the interval boundaries at `T0 + j × interval_secs`,
+/// where `T0` is the creator's stamp. The invitation bundle carries no `T0`, so
+/// a Welcome joiner under an interval policy admits no rotation rather than one
+/// on boundaries counted from its own join time; under a membership-only policy,
+/// whose schedule index is 0, its next epoch is 0.
+#[tokio::test]
+async fn a_welcome_joiner_admits_no_interval_rotation_without_the_creators_t0() {
+    use scp_protocol::context::params::PseudonymRotationPolicy;
+
+    let with_policy = |interval_secs: Option<u64>, on_membership_change: bool| ContextParams {
+        pseudonym_rotation: Some(PseudonymRotationPolicy {
+            interval_secs,
+            on_membership_change,
+        }),
+        ..joiner_params()
+    };
+
+    let interval = with_policy(Some(3_600), true);
+    let (result, j) = run_join_with(0x5A, None, Some(interval.clone()), interval, None).await;
+    result.expect("the join under an interval policy succeeds");
+    let ids = j
+        .sup
+        .local_routing_ids(&j.ctx_id)
+        .await
+        .expect("routing ids");
+    assert_eq!(ids.pseudonym_epoch, None);
+    assert_eq!(
+        ids.next_pseudonym_epoch, None,
+        "a joiner without T0 admits no interval-schedule rotation"
+    );
+
+    let membership = with_policy(None, true);
+    let (result, j) = run_join_with(0x5B, None, Some(membership.clone()), membership, None).await;
+    result.expect("the join under a membership-only policy succeeds");
+    let ids = j
+        .sup
+        .local_routing_ids(&j.ctx_id)
+        .await
+        .expect("routing ids");
+    assert_eq!(
+        ids.next_pseudonym_epoch,
+        Some(0),
+        "a membership-only policy needs no T0: the next epoch is 0"
+    );
+}

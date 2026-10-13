@@ -873,22 +873,18 @@ impl ContextActor {
                 self.rotation_armed_key = Some(key);
                 self.rotation_signals = 0;
                 let now_secs = self.deps.clock.now_secs();
-                self.rotation_timer =
-                    match key
-                        .0
-                        .wake(key.1.as_ref(), self.state.creation_timestamp_secs, now_secs)
-                    {
-                        pseudonym_rotation::RotationWake::AnnouncementPending { .. }
-                        | pseudonym_rotation::RotationWake::RotationDue { .. } => {
-                            Some(Box::pin(tokio::time::sleep(Duration::ZERO)))
-                        }
-                        pseudonym_rotation::RotationWake::SleepUntil { boundary_secs } => {
-                            Some(Box::pin(tokio::time::sleep(Duration::from_secs(
-                                boundary_secs.saturating_sub(now_secs),
-                            ))))
-                        }
-                        pseudonym_rotation::RotationWake::Idle => None,
-                    };
+                self.rotation_timer = match key.0.wake(key.1.as_ref(), now_secs) {
+                    pseudonym_rotation::RotationWake::AnnouncementPending { .. }
+                    | pseudonym_rotation::RotationWake::RotationDue { .. } => {
+                        Some(Box::pin(tokio::time::sleep(Duration::ZERO)))
+                    }
+                    pseudonym_rotation::RotationWake::SleepUntil { boundary_secs } => {
+                        Some(Box::pin(tokio::time::sleep(Duration::from_secs(
+                            boundary_secs.saturating_sub(now_secs),
+                        ))))
+                    }
+                    pseudonym_rotation::RotationWake::Idle => None,
+                };
             }
         } else {
             self.rotation_timer = None;
@@ -933,11 +929,11 @@ impl ContextActor {
         self.rotation_timer = None;
         let now_secs = self.deps.clock.now_secs();
         let policy = self.state.handle.params().pseudonym_rotation;
-        let wake = self.state.class_s.pseudonym_rotation.wake(
-            policy.as_ref(),
-            self.state.creation_timestamp_secs,
-            now_secs,
-        );
+        let wake = self
+            .state
+            .class_s
+            .pseudonym_rotation
+            .wake(policy.as_ref(), now_secs);
         let event = match wake {
             pseudonym_rotation::RotationWake::AnnouncementPending { pseudonym_epoch } => {
                 scp_protocol::context::membership::ContextEvent::PseudonymAnnouncementPending {

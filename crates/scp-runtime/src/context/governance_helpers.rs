@@ -3894,13 +3894,12 @@ pub async fn execute_modify_pseudonym_rotation_policy(
     // pending membership trigger survives only under `on_membership_change`.
     let now_secs = deps.clock.now_secs();
     cell.commit_class_s_keep(deps, context_id, |mut view| {
-        let t0_secs = view.creation_timestamp_secs;
         let state = view.rest_mut();
         state.handle.set_pseudonym_rotation(new_policy);
         state
             .class_s
             .pseudonym_rotation
-            .anchor_schedule(new_policy.as_ref(), t0_secs, now_secs);
+            .anchor_schedule(new_policy.as_ref(), now_secs);
         Ok(())
     })
     .await?;

@@ -1859,10 +1859,13 @@ pub async fn create_context(
             caveat_counters: HashMap::new(),
             // Fix-D streaming reservation recovery records: fresh on create.
             stream_reservations: HashMap::new(),
-            // §9.10.4.1: the creator follows the schedule from T0, so no boundary
-            // has passed and the default state (boundary index 0) is exact.
+            // §9.10.4.1: the creator stamps T0 and follows the schedule from it.
             pseudonym_rotation:
-                crate::context::actor::pseudonym_rotation::PseudonymRotationState::default(),
+                crate::context::actor::pseudonym_rotation::PseudonymRotationState::anchored(
+                    params.pseudonym_rotation.as_ref(),
+                    Some(creation_timestamp_secs),
+                    creation_timestamp_secs,
+                ),
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -2856,7 +2859,7 @@ pub async fn import_context(
             pseudonym_rotation:
                 crate::context::actor::pseudonym_rotation::PseudonymRotationState::anchored(
                     handle.params().pseudonym_rotation.as_ref(),
-                    export.snapshot.creation_timestamp_secs,
+                    Some(export.snapshot.creation_timestamp_secs),
                     deps.clock.now_secs(),
                 ),
         },

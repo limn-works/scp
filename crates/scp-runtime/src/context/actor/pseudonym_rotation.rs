@@ -80,6 +80,15 @@ pub struct PseudonymRotationState {
     /// that rotation, and by a policy change that disables rotation.
     #[serde(default)]
     pub(crate) join_derivation_pending: bool,
+    /// `T0`, the creation timestamp the interval boundaries `T0 + j ×
+    /// interval_secs` count from: the creator's own stamp at creation, the
+    /// creator-signed snapshot's value at import. `None` for a member that
+    /// holds no copy of the creator's `T0`: a Welcome joiner, because the
+    /// invitation bundle carries none. Without `T0` the shared schedule
+    /// cannot be computed, so under a policy that sets `interval_secs` no
+    /// rotation is admissible ([`Self::next_epoch`] is `None`).
+    #[serde(default)]
+    pub(crate) schedule_t0_secs: Option<u64>,
 }
 
 /// The schedule index `k = floor((now − T0) / interval_secs)` of spec 09
@@ -95,15 +104,18 @@ pub const fn schedule_index(t0_secs: u64, interval_secs: u64, now_secs: u64) -> 
 }
 
 /// The schedule index under `policy` at `now_secs`: the interval index when
-/// the policy sets `interval_secs`, else 0 (spec 09 §9.10.4.1).
+/// the policy sets `interval_secs`, else 0 (spec 09 §9.10.4.1). `None` when
+/// the policy sets `interval_secs` and `t0_secs` is unknown.
 fn policy_schedule_index(
     policy: Option<&PseudonymRotationPolicy>,
-    t0_secs: u64,
+    t0_secs: Option<u64>,
     now_secs: u64,
-) -> u64 {
+) -> Option<u64> {
     policy
         .and_then(|p| p.interval_secs)
-        .map_or(0, |interval| schedule_index(t0_secs, interval, now_secs))
+        .map_or(Some(0), |interval| {
+            t0_secs.map(|t0| schedule_index(t0, interval, now_secs))
+        })
 }
 
 impl PseudonymRotationState {
@@ -111,9 +123,16 @@ impl PseudonymRotationState {
     /// with a v1 routing ID it keeps until its next trigger: at import. See
     /// [`Self::anchor_schedule`].
     #[must_use]
-    pub fn anchored(policy: Option<&PseudonymRotationPolicy>, t0_secs: u64, now_secs: u64) -> Self {
-        let mut state = Self::default();
-        state.anchor_schedule(policy, t0_secs, now_secs);
+    pub fn anchored(
+        policy: Option<&PseudonymRotationPolicy>,
+        t0_secs: Option<u64>,
+        now_secs: u64,
+    ) -> Self {
+        let mut state = Self {
+            schedule_t0_secs: t0_secs,
+            ..Self::default()
+        };
+        state.anchor_schedule(policy, now_secs);
         state
     }
 
@@ -123,7 +142,11 @@ impl PseudonymRotationState {
     /// derivation": a member that joins a context whose policy is set derives
     /// its first pseudonym with v2 at epoch `k`).
     #[must_use]
-    pub fn joined(policy: Option<&PseudonymRotationPolicy>, t0_secs: u64, now_secs: u64) -> Self {
+    pub fn joined(
+        policy: Option<&PseudonymRotationPolicy>,
+        t0_secs: Option<u64>,
+        now_secs: u64,
+    ) -> Self {
         let mut state = Self::anchored(policy, t0_secs, now_secs);
         state.join_derivation_pending = policy.is_some();
         state
@@ -153,17 +176,17 @@ impl PseudonymRotationState {
     /// for a member with no v2 epoch, the schedule index under `policy`.
     ///
     /// Returns `None` when no rotation is admissible: a v1 member of a context
-    /// without a policy (rotation is opt-in), or a persisted epoch of
+    /// without a policy (rotation is opt-in), a v1 member without `T0` under
+    /// a policy that sets `interval_secs`, or a persisted epoch of
     /// `u64::MAX`, which has no successor.
     #[must_use]
     pub fn next_epoch(
         &self,
         policy: Option<&PseudonymRotationPolicy>,
-        t0_secs: u64,
         now_secs: u64,
     ) -> Option<u64> {
         self.epoch.map_or_else(
-            || policy.map(|p| policy_schedule_index(Some(p), t0_secs, now_secs)),
+            || policy.and_then(|p| policy_schedule_index(Some(p), self.schedule_t0_secs, now_secs)),
             |epoch| epoch.checked_add(1),
         )
     }
@@ -173,23 +196,19 @@ impl PseudonymRotationState {
     /// not handled has passed, `on_membership_change` holds and a membership
     /// change is pending, or the member's join-time v2 derivation is pending. A
     /// disabled policy (`None`) makes nothing due, which freezes the current
-    /// routing ID.
+    /// routing ID. Nothing is due while the previous rotation's announcement
+    /// is pending, because a rotation drops the previous routing ID.
     #[must_use]
-    pub fn rotation_due(
-        &self,
-        policy: Option<&PseudonymRotationPolicy>,
-        t0_secs: u64,
-        now_secs: u64,
-    ) -> bool {
+    pub fn rotation_due(&self, policy: Option<&PseudonymRotationPolicy>, now_secs: u64) -> bool {
         let Some(p) = policy else {
             return false;
         };
-        if self.next_epoch(policy, t0_secs, now_secs).is_none() {
+        if self.announce_pending || self.next_epoch(policy, now_secs).is_none() {
             return false;
         }
-        let boundary_passed = p.interval_secs.is_some_and(|interval| {
-            schedule_index(t0_secs, interval, now_secs) > self.boundary_index
-        });
+        let boundary_passed = p.interval_secs.is_some()
+            && policy_schedule_index(policy, self.schedule_t0_secs, now_secs)
+                .is_some_and(|index| index > self.boundary_index);
         boundary_passed
             || (p.on_membership_change && self.membership_change_pending)
             || self.join_derivation_pending
@@ -204,11 +223,10 @@ impl PseudonymRotationState {
     pub fn due_epoch(
         &self,
         policy: Option<&PseudonymRotationPolicy>,
-        t0_secs: u64,
         now_secs: u64,
     ) -> Option<u64> {
-        if self.rotation_due(policy, t0_secs, now_secs) {
-            self.next_epoch(policy, t0_secs, now_secs)
+        if self.rotation_due(policy, now_secs) {
+            self.next_epoch(policy, now_secs)
         } else {
             None
         }
@@ -216,18 +234,14 @@ impl PseudonymRotationState {
 
     /// The wall-clock second of the next interval boundary the member has not
     /// handled, `T0 + (boundary_index + 1) × interval_secs`, or `None` when the
-    /// policy sets no interval or the value overflows `u64`.
+    /// policy sets no interval, `T0` is unknown, or the value overflows `u64`.
     #[must_use]
-    pub fn next_boundary_secs(
-        &self,
-        policy: Option<&PseudonymRotationPolicy>,
-        t0_secs: u64,
-    ) -> Option<u64> {
+    pub fn next_boundary_secs(&self, policy: Option<&PseudonymRotationPolicy>) -> Option<u64> {
         let interval = policy.and_then(|p| p.interval_secs)?;
         self.boundary_index
             .checked_add(1)?
             .checked_mul(interval)?
-            .checked_add(t0_secs)
+            .checked_add(self.schedule_t0_secs?)
     }
 
     /// Anchors the schedule at `now_secs` for a member that starts following
@@ -236,13 +250,9 @@ impl PseudonymRotationState {
     /// "First v2 derivation": a v1 member keeps its routing ID until its next
     /// trigger). A pending membership change survives only while the policy
     /// still sets `on_membership_change`.
-    pub fn anchor_schedule(
-        &mut self,
-        policy: Option<&PseudonymRotationPolicy>,
-        t0_secs: u64,
-        now_secs: u64,
-    ) {
-        self.boundary_index = policy_schedule_index(policy, t0_secs, now_secs);
+    pub fn anchor_schedule(&mut self, policy: Option<&PseudonymRotationPolicy>, now_secs: u64) {
+        self.boundary_index =
+            policy_schedule_index(policy, self.schedule_t0_secs, now_secs).unwrap_or(0);
         if !policy.is_some_and(|p| p.on_membership_change) {
             self.membership_change_pending = false;
         }
@@ -274,7 +284,6 @@ impl PseudonymRotationState {
         new_epoch: u64,
         previous_routing_id: [u8; 32],
         policy: Option<&PseudonymRotationPolicy>,
-        t0_secs: u64,
         now_secs: u64,
     ) -> Option<()> {
         let grace_until_secs = now_secs.checked_add(PSEUDONYM_ROTATION_GRACE_SECS)?;
@@ -286,7 +295,7 @@ impl PseudonymRotationState {
         self.announce_pending = true;
         self.boundary_index = self
             .boundary_index
-            .max(policy_schedule_index(policy, t0_secs, now_secs));
+            .max(policy_schedule_index(policy, self.schedule_t0_secs, now_secs).unwrap_or(0));
         self.membership_change_pending = false;
         self.join_derivation_pending = false;
         Some(())
@@ -297,19 +306,14 @@ impl PseudonymRotationState {
     /// announcement outranks a due rotation: the member re-publishes the
     /// rotation it persisted before it derives the next one.
     #[must_use]
-    pub fn wake(
-        &self,
-        policy: Option<&PseudonymRotationPolicy>,
-        t0_secs: u64,
-        now_secs: u64,
-    ) -> RotationWake {
+    pub fn wake(&self, policy: Option<&PseudonymRotationPolicy>, now_secs: u64) -> RotationWake {
         if let (true, Some(pseudonym_epoch)) = (self.announce_pending, self.epoch) {
             return RotationWake::AnnouncementPending { pseudonym_epoch };
         }
-        if let Some(pseudonym_epoch) = self.due_epoch(policy, t0_secs, now_secs) {
+        if let Some(pseudonym_epoch) = self.due_epoch(policy, now_secs) {
             return RotationWake::RotationDue { pseudonym_epoch };
         }
-        self.next_boundary_secs(policy, t0_secs)
+        self.next_boundary_secs(policy)
             .map_or(RotationWake::Idle, |boundary_secs| {
                 RotationWake::SleepUntil { boundary_secs }
             })
@@ -413,6 +417,11 @@ mod tests {
     const T0: u64 = 1_700_000_000;
     const I: u64 = 3_600;
 
+    /// A member that holds the creator's `T0`, before any policy applies.
+    fn at_t0() -> PseudonymRotationState {
+        PseudonymRotationState::anchored(None, Some(T0), T0)
+    }
+
     fn interval_policy() -> PseudonymRotationPolicy {
         PseudonymRotationPolicy {
             interval_secs: Some(I),
@@ -439,76 +448,71 @@ mod tests {
 
     #[test]
     fn nothing_is_due_without_a_policy_over_a_thousand_periods() {
-        let state = PseudonymRotationState::default();
+        let state = at_t0();
         for j in 0..=1_000 {
-            assert!(!state.rotation_due(None, T0, T0 + j * I));
+            assert!(!state.rotation_due(None, T0 + j * I));
         }
-        assert_eq!(state.next_epoch(None, T0, T0 + 1_000 * I), None);
+        assert_eq!(state.next_epoch(None, T0 + 1_000 * I), None);
     }
 
     #[test]
     fn due_at_each_boundary_and_once_for_missed_boundaries() {
         let policy = interval_policy();
-        let mut state = PseudonymRotationState::default();
-        assert!(!state.rotation_due(Some(&policy), T0, T0 + I - 1));
-        assert_eq!(state.next_boundary_secs(Some(&policy), T0), Some(T0 + I));
-        assert!(state.rotation_due(Some(&policy), T0, T0 + I));
+        let mut state = at_t0();
+        assert!(!state.rotation_due(Some(&policy), T0 + I - 1));
+        assert_eq!(state.next_boundary_secs(Some(&policy)), Some(T0 + I));
+        assert!(state.rotation_due(Some(&policy), T0 + I));
         // First v2 derivation at the schedule index of that moment.
-        assert_eq!(state.next_epoch(Some(&policy), T0, T0 + I), Some(1));
+        assert_eq!(state.next_epoch(Some(&policy), T0 + I), Some(1));
         state
-            .record_rotation(1, [1; 32], Some(&policy), T0, T0 + I)
+            .record_rotation(1, [1; 32], Some(&policy), T0 + I)
             .unwrap();
-        assert!(!state.rotation_due(Some(&policy), T0, T0 + I));
-        assert_eq!(
-            state.next_boundary_secs(Some(&policy), T0),
-            Some(T0 + 2 * I)
-        );
+        state.announce_pending = false;
+        assert!(!state.rotation_due(Some(&policy), T0 + I));
+        assert_eq!(state.next_boundary_secs(Some(&policy)), Some(T0 + 2 * I));
 
         // Three boundaries pass while stopped: one rotation covers them.
         let late = T0 + 5 * I;
-        assert!(state.rotation_due(Some(&policy), T0, late));
-        assert_eq!(state.next_epoch(Some(&policy), T0, late), Some(2));
+        assert!(state.rotation_due(Some(&policy), late));
+        assert_eq!(state.next_epoch(Some(&policy), late), Some(2));
         state
-            .record_rotation(2, [2; 32], Some(&policy), T0, late)
+            .record_rotation(2, [2; 32], Some(&policy), late)
             .unwrap();
-        assert!(!state.rotation_due(Some(&policy), T0, late));
-        assert_eq!(
-            state.next_boundary_secs(Some(&policy), T0),
-            Some(T0 + 6 * I)
-        );
+        assert!(!state.rotation_due(Some(&policy), late));
+        assert_eq!(state.next_boundary_secs(Some(&policy)), Some(T0 + 6 * I));
     }
 
     #[test]
     fn anchoring_skips_boundaries_before_the_policy_applies() {
         let policy = interval_policy();
-        let mut state = PseudonymRotationState::default();
+        let mut state = at_t0();
         let enabled_at = T0 + 4 * I + 10;
-        state.anchor_schedule(Some(&policy), T0, enabled_at);
-        assert!(!state.rotation_due(Some(&policy), T0, enabled_at));
-        assert!(state.rotation_due(Some(&policy), T0, T0 + 5 * I));
-        assert_eq!(state.next_epoch(Some(&policy), T0, T0 + 5 * I), Some(5));
+        state.anchor_schedule(Some(&policy), enabled_at);
+        assert!(!state.rotation_due(Some(&policy), enabled_at));
+        assert!(state.rotation_due(Some(&policy), T0 + 5 * I));
+        assert_eq!(state.next_epoch(Some(&policy), T0 + 5 * I), Some(5));
     }
 
     #[test]
     fn membership_change_is_due_only_under_on_membership_change() {
-        let mut state = PseudonymRotationState::default();
+        let mut state = at_t0();
         state.note_membership_change(Some(&interval_policy()));
         assert!(!state.membership_change_pending);
 
         let policy = membership_policy();
         state.note_membership_change(Some(&policy));
-        assert!(state.rotation_due(Some(&policy), T0, T0));
-        assert_eq!(state.next_epoch(Some(&policy), T0, T0), Some(0));
+        assert!(state.rotation_due(Some(&policy), T0));
+        assert_eq!(state.next_epoch(Some(&policy), T0), Some(0));
         state
-            .record_rotation(0, [9; 32], Some(&policy), T0, T0)
+            .record_rotation(0, [9; 32], Some(&policy), T0)
             .unwrap();
-        assert!(!state.rotation_due(Some(&policy), T0, T0 + 10 * I));
+        assert!(!state.rotation_due(Some(&policy), T0 + 10 * I));
 
         // Disabling the policy freezes the routing ID: nothing is due.
         state.note_membership_change(Some(&policy));
-        assert!(!state.rotation_due(None, T0, T0));
+        assert!(!state.rotation_due(None, T0));
         // A policy change that drops the membership trigger clears the flag.
-        state.anchor_schedule(Some(&interval_policy()), T0, T0);
+        state.anchor_schedule(Some(&interval_policy()), T0);
         assert!(!state.membership_change_pending);
     }
 
@@ -516,30 +520,76 @@ mod tests {
     fn a_joiner_under_a_policy_rotates_to_v2_at_the_schedule_index_at_once() {
         let policy = interval_policy();
         let joined_at = T0 + 3 * I + 7;
-        let mut state = PseudonymRotationState::joined(Some(&policy), T0, joined_at);
-        assert!(state.rotation_due(Some(&policy), T0, joined_at));
-        assert_eq!(state.next_epoch(Some(&policy), T0, joined_at), Some(3));
+        let mut state = PseudonymRotationState::joined(Some(&policy), Some(T0), joined_at);
+        assert!(state.rotation_due(Some(&policy), joined_at));
+        assert_eq!(state.next_epoch(Some(&policy), joined_at), Some(3));
         state
-            .record_rotation(3, [3; 32], Some(&policy), T0, joined_at)
+            .record_rotation(3, [3; 32], Some(&policy), joined_at)
             .unwrap();
-        assert!(!state.rotation_due(Some(&policy), T0, T0 + 4 * I - 1));
-        assert!(state.rotation_due(Some(&policy), T0, T0 + 4 * I));
+        state.announce_pending = false;
+        assert!(!state.rotation_due(Some(&policy), T0 + 4 * I - 1));
+        assert!(state.rotation_due(Some(&policy), T0 + 4 * I));
 
         // Without a policy a joiner keeps v1: nothing is due.
-        let v1 = PseudonymRotationState::joined(None, T0, joined_at);
-        assert!(!v1.rotation_due(None, T0, joined_at + 1_000 * I));
+        let v1 = PseudonymRotationState::joined(None, Some(T0), joined_at);
+        assert!(!v1.rotation_due(None, joined_at + 1_000 * I));
         // Disabling the policy before the first rotation cancels it.
-        let mut cancelled = PseudonymRotationState::joined(Some(&policy), T0, joined_at);
-        cancelled.anchor_schedule(None, T0, joined_at);
+        let mut cancelled = PseudonymRotationState::joined(Some(&policy), Some(T0), joined_at);
+        cancelled.anchor_schedule(None, joined_at);
         assert!(!cancelled.join_derivation_pending);
+    }
+
+    /// A Welcome joiner holds no copy of the creator's `T0`: under an interval
+    /// policy it computes no boundary and no epoch, so nothing is due, while a
+    /// membership-only policy, whose schedule index is 0, still rotates it.
+    #[test]
+    fn a_member_without_t0_follows_no_interval_schedule() {
+        let joined_at = T0 + 3 * I + 7;
+        let policy = interval_policy();
+        let state = PseudonymRotationState::joined(Some(&policy), None, joined_at);
+        assert!(state.join_derivation_pending);
+        assert_eq!(state.next_epoch(Some(&policy), joined_at), None);
+        assert_eq!(state.next_boundary_secs(Some(&policy)), None);
+        for j in 0..=10 {
+            assert!(!state.rotation_due(Some(&policy), joined_at + j * I));
+        }
+        assert_eq!(state.wake(Some(&policy), joined_at), RotationWake::Idle);
+
+        let membership = membership_policy();
+        let state = PseudonymRotationState::joined(Some(&membership), None, joined_at);
+        assert_eq!(state.due_epoch(Some(&membership), joined_at), Some(0));
+    }
+
+    /// While a persisted rotation waits for its announcement, no further
+    /// rotation is due, whatever trigger fired; once the announcement
+    /// succeeds, the trigger makes the next epoch due.
+    #[test]
+    fn no_rotation_is_due_while_an_announcement_is_pending() {
+        let policy = PseudonymRotationPolicy {
+            interval_secs: Some(I),
+            on_membership_change: true,
+        };
+        let mut state = at_t0();
+        state
+            .record_rotation(1, [1; 32], Some(&policy), T0 + I)
+            .unwrap();
+        state.note_membership_change(Some(&policy));
+        assert_eq!(state.due_epoch(Some(&policy), T0 + 3 * I), None);
+        assert_eq!(
+            state.wake(Some(&policy), T0 + 3 * I),
+            RotationWake::AnnouncementPending { pseudonym_epoch: 1 }
+        );
+
+        state.announce_pending = false;
+        assert_eq!(state.due_epoch(Some(&policy), T0 + I + 1), Some(2));
     }
 
     #[test]
     fn rotation_keeps_at_most_one_previous_and_sets_the_grace() {
         let policy = interval_policy();
-        let mut state = PseudonymRotationState::default();
+        let mut state = at_t0();
         state
-            .record_rotation(1, [1; 32], Some(&policy), T0, T0 + I)
+            .record_rotation(1, [1; 32], Some(&policy), T0 + I)
             .unwrap();
         let previous = state.previous().unwrap();
         assert_eq!(previous.routing_id, [1; 32]);
@@ -552,7 +602,7 @@ mod tests {
         assert!(state.announce_pending());
 
         state
-            .record_rotation(2, [2; 32], Some(&policy), T0, T0 + I + 1)
+            .record_rotation(2, [2; 32], Some(&policy), T0 + I + 1)
             .unwrap();
         assert_eq!(state.previous().unwrap().routing_id, [2; 32]);
         assert_eq!(state.epoch(), Some(2));
@@ -563,26 +613,26 @@ mod tests {
         let policy = interval_policy();
         let state = PseudonymRotationState {
             epoch: Some(u64::MAX),
-            ..PseudonymRotationState::default()
+            ..at_t0()
         };
-        assert_eq!(state.next_epoch(Some(&policy), T0, T0 + 9 * I), None);
-        assert!(!state.rotation_due(Some(&policy), T0, T0 + 9 * I));
+        assert_eq!(state.next_epoch(Some(&policy), T0 + 9 * I), None);
+        assert!(!state.rotation_due(Some(&policy), T0 + 9 * I));
 
-        let mut fresh = PseudonymRotationState::default();
+        let mut fresh = at_t0();
         assert!(
             fresh
-                .record_rotation(1, [1; 32], Some(&policy), T0, u64::MAX)
+                .record_rotation(1, [1; 32], Some(&policy), u64::MAX)
                 .is_none()
         );
-        assert_eq!(fresh, PseudonymRotationState::default());
+        assert_eq!(fresh, at_t0());
     }
 
     #[test]
     fn discard_grace_drops_previous_and_pending_work() {
         let policy = membership_policy();
-        let mut state = PseudonymRotationState::default();
+        let mut state = at_t0();
         state
-            .record_rotation(0, [1; 32], Some(&policy), T0, T0)
+            .record_rotation(0, [1; 32], Some(&policy), T0)
             .unwrap();
         state.note_membership_change(Some(&policy));
         state.discard_grace();
@@ -623,10 +673,7 @@ mod tests {
     fn the_added_member_does_not_trigger_its_own_rotation() {
         let mut state = context_state(Some(membership_policy()));
         note_member_added(&mut state, LOCAL, LOCAL);
-        assert_eq!(
-            state.class_s.pseudonym_rotation,
-            PseudonymRotationState::default()
-        );
+        assert_eq!(state.class_s.pseudonym_rotation, at_t0());
 
         note_member_added(&mut state, LOCAL, PEER);
         assert!(state.class_s.pseudonym_rotation.membership_change_pending);
@@ -644,7 +691,7 @@ mod tests {
         state
             .class_s
             .pseudonym_rotation
-            .record_rotation(0, [1; 32], Some(&policy), T0, T0)
+            .record_rotation(0, [1; 32], Some(&policy), T0)
             .unwrap();
         note_member_removed(&mut state, LOCAL, LOCAL);
         let rotation = &state.class_s.pseudonym_rotation;
@@ -662,7 +709,7 @@ mod tests {
         state
             .class_s
             .pseudonym_rotation
-            .record_rotation(1, [9; 32], Some(&policy), T0, T0 + I)
+            .record_rotation(1, [9; 32], Some(&policy), T0 + I)
             .unwrap();
         let grace_end = T0 + I + PSEUDONYM_ROTATION_GRACE_SECS;
         let during =
@@ -681,31 +728,28 @@ mod tests {
     #[test]
     fn wake_orders_pending_announcement_then_due_rotation_then_the_boundary() {
         let policy = interval_policy();
-        let mut state = PseudonymRotationState::default();
+        let mut state = at_t0();
         assert_eq!(
-            state.wake(Some(&policy), T0, T0 + 1),
+            state.wake(Some(&policy), T0 + 1),
             RotationWake::SleepUntil {
                 boundary_secs: T0 + I
             }
         );
         assert_eq!(
-            state.wake(Some(&policy), T0, T0 + I),
+            state.wake(Some(&policy), T0 + I),
             RotationWake::RotationDue { pseudonym_epoch: 1 }
         );
         state
-            .record_rotation(1, [1; 32], Some(&policy), T0, T0 + I)
+            .record_rotation(1, [1; 32], Some(&policy), T0 + I)
             .unwrap();
         assert_eq!(
-            state.wake(Some(&policy), T0, T0 + 3 * I),
+            state.wake(Some(&policy), T0 + 3 * I),
             RotationWake::AnnouncementPending { pseudonym_epoch: 1 }
         );
         assert_eq!(
-            PseudonymRotationState::default().wake(Some(&membership_policy()), T0, T0 + 9 * I),
+            at_t0().wake(Some(&membership_policy()), T0 + 9 * I),
             RotationWake::Idle
         );
-        assert_eq!(
-            PseudonymRotationState::default().wake(None, T0, T0 + 9 * I),
-            RotationWake::Idle
-        );
+        assert_eq!(at_t0().wake(None, T0 + 9 * I), RotationWake::Idle);
     }
 }

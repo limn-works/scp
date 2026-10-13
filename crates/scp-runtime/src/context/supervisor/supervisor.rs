@@ -16095,13 +16095,16 @@ impl Supervisor {
                 caveat_counters: HashMap::new(),
                 // Fix-D streaming reservation recovery: a fresh joiner carries none.
                 stream_reservations: HashMap::new(),
-                // §9.10.4.1 "First v2 derivation": a joiner follows the schedule
-                // from its join time, and under a policy its first rotation, to
-                // v2 at the schedule index, is due at once.
+                // §9.10.4.1 "First v2 derivation": under a policy a joiner's
+                // first rotation, to v2 at the schedule index, is due at once.
+                // The invitation bundle carries no copy of the creator's T0, and
+                // `creation_timestamp_secs` above is this joiner's clock, so the
+                // joiner holds no T0: under an interval policy no rotation is
+                // admissible rather than one off the members' shared boundaries.
                 pseudonym_rotation:
                     crate::context::actor::pseudonym_rotation::PseudonymRotationState::joined(
                         params.pseudonym_rotation.as_ref(),
-                        creation_timestamp_secs,
+                        None,
                         deps.clock.now_secs(),
                     ),
             },

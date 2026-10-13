@@ -1714,7 +1714,11 @@ impl PerContextState {
                 caveat_counters: HashMap::new(),
                 stream_reservations: HashMap::new(),
                 pseudonym_rotation:
-                    crate::context::actor::pseudonym_rotation::PseudonymRotationState::default(),
+                    crate::context::actor::pseudonym_rotation::PseudonymRotationState::anchored(
+                        None,
+                        Some(created_at),
+                        created_at,
+                    ),
             },
             pending_broadcast_publishes: HashMap::new(),
             welcome_scratchpad: None,
@@ -3261,6 +3265,12 @@ mod tests {
         DID("did:example:admin".to_owned())
     }
 
+    /// The rotation state a context created at `t0` starts with: no policy,
+    /// the schedule anchored at the creator's T0.
+    fn rotation_anchored_at(t0: u64) -> PseudonymRotationState {
+        PseudonymRotationState::anchored(None, Some(t0), t0)
+    }
+
     /// §9.10.4: `ContextRouting::for_mode` makes "encrypted context with no
     /// pseudonym" unrepresentable — the encrypted branch always carries a
     /// concrete `[u8; 32]`, never an `Option`, and exposes peer-registry
@@ -3700,7 +3710,7 @@ mod tests {
         assert!(caveat_counters.is_empty());
         // No in-flight streaming reservation recovery records on a fresh context.
         assert!(stream_reservations.is_empty());
-        assert_eq!(pseudonym_rotation, PseudonymRotationState::default());
+        assert_eq!(pseudonym_rotation, rotation_anchored_at(12));
         assert!(pending_broadcast_publishes.is_empty());
         assert!(welcome_scratchpad.is_none());
         assert_eq!(lifecycle_state, ContextLifecycleState::Open);

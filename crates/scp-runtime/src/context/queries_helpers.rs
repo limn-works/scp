@@ -140,7 +140,7 @@ pub fn local_pseudonym(state: &PerContextState) -> Result<[u8; 32], ContextError
 /// # Errors
 ///
 /// [`ContextError::NotPseudonymousContext`] for a broadcast context.
-pub fn local_routing_ids(
+pub(super) fn local_routing_ids(
     state: &PerContextState,
     now_secs: u64,
 ) -> Result<crate::context::actor::pseudonym_rotation::LocalRoutingIds, ContextError> {
@@ -151,11 +151,7 @@ pub fn local_routing_ids(
         current,
         previous: rotation.previous().filter(|p| p.in_grace(now_secs)),
         pseudonym_epoch: rotation.epoch(),
-        next_pseudonym_epoch: rotation.next_epoch(
-            policy.as_ref(),
-            state.creation_timestamp_secs,
-            now_secs,
-        ),
+        next_pseudonym_epoch: rotation.next_epoch(policy.as_ref(), now_secs),
         announce_pending: rotation.announce_pending(),
     })
 }

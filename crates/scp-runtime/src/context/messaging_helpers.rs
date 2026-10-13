@@ -3913,7 +3913,7 @@ pub async fn send_pseudonym_announcement(
 /// # Errors
 ///
 /// [`ContextError::InvalidState`] when the announcement fails to serialize.
-pub fn encode_local_announcement(
+pub(super) fn encode_local_announcement(
     member_did: &str,
     routing_id: [u8; 32],
     pseudonym_epoch: Option<u64>,
@@ -3964,7 +3964,9 @@ pub fn encode_local_announcement(
 ///   member's DID.
 /// - [`ContextError::InvalidState`] when no rotation is due (no rotation
 ///   policy, no boundary, membership change or join derivation pending since
-///   the last rotation, or an exhausted epoch), when `new_epoch` is not the
+///   the last rotation, the previous rotation's announcement still pending, no
+///   creation timestamp under an interval policy, or an exhausted epoch), when
+///   `new_epoch` is not the
 ///   due epoch, when `new_routing_id` is a
 ///   reserved value, the current or previous routing ID, or a peer's routing
 ///   ID, or when the grace end overflows. Nothing changes on any of these.
@@ -3974,7 +3976,7 @@ pub fn encode_local_announcement(
 ///   with `announce_pending` set, and the rotation arm keeps signalling
 ///   [`ContextEvent::PseudonymAnnouncementPending`] until an announcement
 ///   succeeds.
-pub async fn rotate_pseudonym(
+pub(super) async fn rotate_pseudonym(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     sender_did: &DID,
@@ -3995,13 +3997,14 @@ pub async fn rotate_pseudonym(
     }
 
     let now_secs = deps.clock.now_secs();
-    let t0_secs = cell.creation_timestamp_secs;
     let policy = handle.params().pseudonym_rotation;
     let mut rotation = cell.class_s.pseudonym_rotation;
-    let Some(expected_epoch) = rotation.due_epoch(policy.as_ref(), t0_secs, now_secs) else {
+    let Some(expected_epoch) = rotation.due_epoch(policy.as_ref(), now_secs) else {
         return Err(ContextError::InvalidState(
             "no pseudonym rotation is due: the context has no rotation policy, no trigger has \
-             fired since the last rotation, or the epoch has no successor (spec 09 §9.10.4.1)"
+             fired since the last rotation, the previous rotation's announcement is pending, \
+             the member holds no creation timestamp for an interval schedule, or the epoch has \
+             no successor (spec 09 §9.10.4.1)"
                 .into(),
         ));
     };
@@ -4029,13 +4032,7 @@ pub async fn rotate_pseudonym(
         ));
     }
     rotation
-        .record_rotation(
-            new_epoch,
-            old_routing_id,
-            policy.as_ref(),
-            t0_secs,
-            now_secs,
-        )
+        .record_rotation(new_epoch, old_routing_id, policy.as_ref(), now_secs)
         .ok_or_else(|| {
             ContextError::InvalidState("pseudonym rotation grace end overflows u64".into())
         })?;
