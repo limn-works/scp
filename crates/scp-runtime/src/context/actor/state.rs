@@ -1899,15 +1899,19 @@ impl ContextCryptoState {
                 })))
             }
             scp_mls::encrypt::DecryptedContent::Commit {
-                sender_did: _,
+                sender_did,
                 members,
+                leaf_dids,
             } => {
                 // `scp-mls` admitted the Commit on its post-commit tree and
                 // merged it. The cache follows that tree: a removed member
                 // leaves it, a rotated key replaces the cached one, and an
                 // uncached DID stays uncached.
                 self.follow_tree(&members, &[]);
-                Ok(OpenResult::Control)
+                Ok(OpenResult::Commit {
+                    committer_did: sender_did,
+                    leaf_dids,
+                })
             }
             scp_mls::encrypt::DecryptedContent::Proposal { sender_did: _ } => {
                 Ok(OpenResult::Control)
@@ -4339,13 +4343,13 @@ mod crypto_ops_golden {
                 .to_bytes()
                 .unwrap();
         match bob_a.open(CTX_STR, &outer).unwrap() {
-            OpenResult::Control => {}
-            other => panic!("expected Control, got {other:?}"),
+            OpenResult::Commit { committer_did, .. } => assert_eq!(committer_did, ALICE),
+            other => panic!("expected a Commit, got {other:?}"),
         }
         assert_eq!(cached_key(&bob_a, ALICE), Some(new_key));
     }
 
-    /// `open` of `commit` by `state`, which must yield a control message.
+    /// `open` of `commit` by `state`, which must yield a Commit.
     fn open_commit(state: &mut PerContextState, ctx: &[u8; 32], commit: Vec<u8>) {
         let outer =
             scp_protocol::envelope::outer::create_outer_envelope(&routing(ctx), None, 300, commit)
@@ -4353,8 +4357,8 @@ mod crypto_ops_golden {
                 .to_bytes()
                 .unwrap();
         match state.open(CTX_STR, &outer).unwrap() {
-            OpenResult::Control => {}
-            other => panic!("expected Control, got {other:?}"),
+            OpenResult::Commit { .. } => {}
+            other => panic!("expected a Commit, got {other:?}"),
         }
     }
 

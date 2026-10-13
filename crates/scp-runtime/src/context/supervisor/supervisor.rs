@@ -27323,6 +27323,10 @@ mod tests {
                 &ctx_bytes,
                 msg,
             ))
+            .map(|dispatched| match dispatched {
+                crate::context::messaging_helpers::Dispatched::Envelope(env) => Some(*env),
+                _ => None,
+            })
         };
 
         // The gate `deliver_incoming` runs once the inner envelope verifies.
@@ -27489,7 +27493,13 @@ mod tests {
                 &blob,
             ))
             .expect("Bob merges the add-Carol Commit");
-        assert!(opened.is_none(), "a Commit surfaces no envelope");
+        assert!(
+            matches!(
+                opened,
+                crate::context::messaging_helpers::Dispatched::Commit { .. }
+            ),
+            "a Commit surfaces as a processed Commit, got {opened:?}"
+        );
         let group = bob_cs.mls_group.as_ref().expect("Bob's group");
         assert_eq!(
             group.epoch().expect("Bob's epoch"),
@@ -27616,8 +27626,10 @@ mod tests {
                 &ctx_bytes,
                 &sealed,
             ))
-            .expect("a recv at the just-advanced epoch must open")
-            .expect("an Application envelope must surface");
+            .expect("a recv at the just-advanced epoch must open");
+        let crate::context::messaging_helpers::Dispatched::Envelope(opened) = opened else {
+            panic!("an Application envelope must surface, got {opened:?}");
+        };
         assert_eq!(
             opened.receive_floor.epoch, 2,
             "the surfaced recv floor must be at the rotated epoch 2"
@@ -27702,7 +27714,10 @@ mod tests {
         )
         .await
         .expect("bob opens the KeyResponse through custody");
-        assert!(opened.is_none(), "a KeyResponse surfaces no envelope");
+        assert!(
+            matches!(opened, crate::context::messaging_helpers::Dispatched::Handled),
+            "a KeyResponse surfaces no envelope, got {opened:?}"
+        );
         assert_eq!(
             custody.dh_calls(),
             1,
@@ -27724,8 +27739,10 @@ mod tests {
             &app,
         )
         .await
-        .expect("the installed sender key opens alice's message")
-        .expect("an Application envelope surfaces");
+        .expect("the installed sender key opens alice's message");
+        let crate::context::messaging_helpers::Dispatched::Envelope(opened) = opened else {
+            panic!("an Application envelope must surface, got {opened:?}");
+        };
         assert_eq!(opened.receive_floor.epoch, rotated_epoch);
         assert_eq!(
             custody.dh_calls(),
@@ -28011,7 +28028,7 @@ mod tests {
         )
         .await;
         assert!(
-            !matches!(opened, Ok(Some(_))),
+            !matches!(opened, Ok(crate::context::messaging_helpers::Dispatched::Envelope(_))),
             "no rotated sender key was installed: {opened:?}"
         );
     }
@@ -28064,8 +28081,10 @@ mod tests {
             &app,
         )
         .await
-        .expect("the installed sender key opens alice's message")
-        .expect("an Application envelope surfaces");
+        .expect("the installed sender key opens alice's message");
+        let crate::context::messaging_helpers::Dispatched::Envelope(opened) = opened else {
+            panic!("an Application envelope must surface, got {opened:?}");
+        };
         assert_eq!(opened.receive_floor.epoch, rotated_epoch);
 
         let (second, _) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
@@ -29479,7 +29498,7 @@ mod tests {
             ))
             .expect("a well-formed request is accepted on the receive path");
         assert!(
-            ok.is_none(),
+            matches!(ok, crate::context::messaging_helpers::Dispatched::Handled),
             "a KeyRequest is consumed on the receive side (no application envelope surfaces)"
         );
         assert_eq!(
