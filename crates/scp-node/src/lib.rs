@@ -115,6 +115,24 @@ pub const DEFAULT_BACKGROUND_HTTP_BIND_ADDR: SocketAddr = SocketAddr::new(
     DEFAULT_HTTP_PORT,
 );
 
+/// Builds the in-process WebSocket URL of a relay bound at `addr`.
+///
+/// The URL carries the bound address itself, so a relay bound to `::1` or to a
+/// LAN address is reached where it listens. An unspecified bind (`0.0.0.0` or
+/// `::`) listens on every interface but is not a connectable destination, so it
+/// maps to the loopback address of the same family. `SocketAddr`'s `Display`
+/// brackets an IPv6 host.
+#[must_use]
+pub fn bound_relay_ws_url(mut addr: SocketAddr) -> String {
+    if addr.ip().is_unspecified() {
+        addr.set_ip(match addr.ip() {
+            std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        });
+    }
+    format!("ws://{addr}/scp/v1")
+}
+
 /// The public HTTP port a node advertises and hands to NAT tier selection:
 /// the configured [`NodeConfig::http_bind_addr`] port, or
 /// [`DEFAULT_HTTP_PORT`] when none is configured.

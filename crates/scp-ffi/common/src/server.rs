@@ -16,7 +16,7 @@
 //!
 //! Gated behind the `server` feature.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
@@ -26,7 +26,8 @@ use scp_did::DidDocument;
 use scp_identity::ScpIdentity;
 use scp_identity::dht::DidDht;
 use scp_node::{
-    DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, NodeError, Reach, TlsMode,
+    DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, NodeError, Reach,
+    TlsMode, bound_relay_ws_url,
 };
 use scp_platform::EncryptedStorage;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
@@ -319,23 +320,6 @@ impl RunningRelay {
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.is_shutdown()
     }
-}
-
-/// Builds the in-process WebSocket URL of a relay bound at `addr`.
-///
-/// The URL carries the bound address itself, so a relay bound to `::1` or to a
-/// LAN address is reached where it listens. An unspecified bind (`0.0.0.0` or
-/// `::`) listens on every interface but is not a connectable destination, so it
-/// maps to the loopback address of the same family. `SocketAddr`'s `Display`
-/// brackets an IPv6 host.
-fn bound_relay_ws_url(mut addr: SocketAddr) -> String {
-    if addr.ip().is_unspecified() {
-        addr.set_ip(match addr.ip() {
-            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        });
-    }
-    format!("ws://{addr}/scp/v1")
 }
 
 /// Starts a test relay on an OS-assigned loopback port, with zero delivery
