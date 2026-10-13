@@ -5,7 +5,8 @@
 //! arrives on one relay. [`push_routes`] reads one context's share of that list
 //! from the actor-owned state, and
 //! [`Supervisor::push_routing_ids`](crate::context::supervisor::Supervisor::push_routing_ids)
-//! fans the read across every context actor and groups the answers by relay URL.
+//! fans the read across every known context and groups the answers by canonical
+//! relay URL (`09-security-model.md` §9.18.2).
 
 use scp_protocol::context::{ContextState, broadcast_routing_id, context_routing_id};
 

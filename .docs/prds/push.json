@@ -826,7 +826,7 @@
         "crates/scp-runtime/src/context/mod.rs",
         "crates/scp-testing/tests/integration/pipeline_wiring.rs"
       ],
-      "description": "`Supervisor::push_routing_ids()` fans a query out to each standing context actor. Each actor returns its `context_routing_id` and this device's current `pseudonym_routing_id` (\u00a79.10.4). The Supervisor groups the results by relay URL. FFI, SDK and matrix rows are covered by PUSH-015.",
+      "description": "`Supervisor::push_routing_ids()` fans a query out to each standing context actor. Each actor returns its `context_routing_id` and this device's current `pseudonym_routing_id` (\u00a79.10.4). The Supervisor groups the results by canonical relay URL (\u00a79.18.2). FFI, SDK and matrix rows are covered by PUSH-015.",
       "acceptanceCriteria": [
         "With two contexts on two relays, the result maps each relay to exactly the routing IDs of the contexts on it.",
         "the result contains this device's current local pseudonym routing ID for each context; after the local pseudonym changes, the next query returns the new one and not the old one",
@@ -838,7 +838,6 @@
         "Add the `pipeline_wiring.rs` assertion."
       ],
       "blockedBy": [
-        "PUSH-004",
         "PUSH-025"
       ],
       "sources": [

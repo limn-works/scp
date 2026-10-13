@@ -1027,6 +1027,18 @@ fn push_routing_ids_reach_push_helpers_through_the_actor_mailbox() {
     assert!(
         fn_body_contains(
             SUPERVISOR_SRC,
+            "push_routing_ids",
+            "self.known_context_ids()"
+        ),
+        "Supervisor::push_routing_ids must enumerate known_context_ids, so a context whose actor is down fails the query"
+    );
+    assert!(
+        fn_body_contains(SUPERVISOR_SRC, "push_routing_ids", "canonical_relay_url("),
+        "Supervisor::push_routing_ids must group by the canonical relay URL"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
             "dispatch_push_command",
             "dispatch_via_mailbox(&actor, ContextCommand::Push(cmd))"
         ),
