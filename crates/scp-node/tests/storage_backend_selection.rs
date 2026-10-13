@@ -16,12 +16,15 @@ fn node_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_scp-node"))
 }
 
-/// A command that runs `scp-node` with `SCP_RELAY_PUSH_PLATFORMS=none`, the
-/// push selection a `--relay-only` node needs to reach its blob store. A full
-/// node does not read the variable.
+/// A command that runs `scp-node` with `SCP_RELAY_URL` set and
+/// `SCP_RELAY_PUSH_PLATFORMS=none`. A `--relay-only` node refuses to start
+/// without either, so each test reaches the configuration it tests. A full
+/// node reads neither variable.
 fn node_command() -> Command {
     let mut command = Command::new(node_bin());
-    command.env("SCP_RELAY_PUSH_PLATFORMS", "none");
+    command
+        .env("SCP_RELAY_URL", "wss://relay.example/scp/v1")
+        .env("SCP_RELAY_PUSH_PLATFORMS", "none");
     command
 }
 

@@ -29,6 +29,9 @@
 //! - `push_store` -- the relay's push registration store (spec section
 //!   10.7.1 step 4), indexed by registration key and by routing ID. Behind
 //!   the `push-store` feature.
+//! - [`push_gate`] -- the relay's interception of every PUBLISH to its
+//!   reserved push routing ID (spec section 10.7.1, PUSH-007): the
+//!   [`push_gate::PushRole`] selection and the verify-then-store gate.
 //!
 //! See spec section 19.8 (relay monetization), section 18.3.3 (relay
 //! operator configuration), section 10.12.3 (STUN service on relays),
@@ -44,6 +47,7 @@ pub(crate) mod log_capture;
 pub mod push;
 pub mod push_apns;
 pub mod push_fcm;
+pub mod push_gate;
 #[cfg(feature = "push-store")]
 pub mod push_store;
 #[cfg(test)]

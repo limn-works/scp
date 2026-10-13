@@ -1,5 +1,7 @@
 # Each service names its blob storage backend and an absolute database path,
-# and the relay names its push platforms (`none` here). None of these variables
+# and the relay names its push platforms (`none` here) and its public URL, from
+# which it derives its reserved push routing ID (spec §10.7.1, push
+# registration protocol). None of these variables
 # has a default: a binary started with one unset exits 1 (persistence spec
 # §17.7 and §17.17.1, SCP-CAPSEL-8000). The path sits on a named volume, so
 # stored blobs survive a container restart.
@@ -10,6 +12,7 @@ services:
     ports:
       - "9000:9000"
     environment:
+      SCP_RELAY_URL: "ws://localhost:9000/scp/v1"
       SCP_RELAY_PUSH_PLATFORMS: "none"
       SCP_RELAY_STORAGE_BACKEND: "sqlite"
       SCP_RELAY_STORAGE_PATH: "/data/scp-relay.db"

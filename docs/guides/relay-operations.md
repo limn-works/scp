@@ -76,11 +76,11 @@ cargo build --release -p scp-node --features cloud-blobs
 Runs a bare `RelayServer`. No identity, no HTTP, no TLS. Suitable for infrastructure operators who want a minimal relay that accepts WebSocket connections.
 
 ```bash
-SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
 ```
 
-`scp-relay` has no default push selection, storage backend or database path; section 3
-lists the push values and section 4 the storage values, and what an unset value does.
+`scp-relay` has no default public URL, push selection, storage backend or database path; section 3
+lists the URL and push values and section 4 the storage values, and what an unset value does.
 
 ### scp-node modes
 
@@ -96,8 +96,8 @@ lists the push values and section 4 the storage values, and what an unset value 
 # Full node (a shipped binary logs "no production pre-rotation custody backend available" and exits 1; see section 6)
 SCP_NODE_DOMAIN=relay.example.com SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/blobs.db scp-node
 
-# Relay-only mode (names its push selection, storage backend and path, none of which has a default; see sections 3 and 4)
-SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-node --relay-only
+# Relay-only mode (names its public URL, push selection, storage backend and path, none of which has a default; see sections 3 and 4)
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-node --relay-only
 
 # Ephemeral mode (everything in memory); a shipped binary exits 1 on --ephemeral, alone or beside another mode flag
 SCP_NODE_DOMAIN=localhost cargo run -p scp-node --features testing -- --ephemeral
@@ -113,6 +113,7 @@ All relay configuration is via `SCP_RELAY_*` environment variables. These map to
 
 | Environment Variable | `RelayConfig` Field | Default | Description |
 |---------------------|---------------------|---------|-------------|
+| `SCP_RELAY_URL` | `relay_url` | none (required) | The relay's public WebSocket URL, which determines its reserved push routing ID (spec §10.7.1, push registration protocol). Set it to the URL clients connect to. `scp-relay` and `scp-node --relay-only` exit 1 when it is unset or empty; a full node does not read it |
 | `SCP_RELAY_BIND_ADDR` | `bind_addr` | `0.0.0.0:9000` | WebSocket listener bind address |
 | `SCP_RELAY_MAX_BLOB_SIZE` | `max_blob_size` | `262144` (256 KB) | Maximum blob size in bytes |
 | `SCP_RELAY_MAX_BLOB_TTL` | `max_blob_ttl` | `604800` (7 days) | Maximum blob TTL in seconds |
@@ -215,15 +216,17 @@ OPTIONS:
 
 ```bash
 # SQLite
-SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
 
 # PostgreSQL (binary built with: cargo build --release -p scp-relay --features cloud-blobs)
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 \
 SCP_RELAY_PUSH_PLATFORMS=none \
 SCP_RELAY_STORAGE_BACKEND=postgres \
 SCP_RELAY_DATABASE_URL="postgres://user:pass@localhost/scp_relay" \
 scp-relay
 
 # S3-compatible, e.g. MinIO (binary built with --features cloud-blobs)
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 \
 SCP_RELAY_PUSH_PLATFORMS=none \
 SCP_RELAY_STORAGE_BACKEND=s3 \
 SCP_RELAY_S3_BUCKET=scp-blobs \
@@ -233,7 +236,7 @@ AWS_SECRET_ACCESS_KEY=... \
 scp-relay
 
 # In-memory (development only)
-SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=memory scp-relay
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=memory scp-relay
 ```
 
 All backends implement the `BlobStorage` trait and pass the `blob_store_conformance!` test suite. See [Storage Backends](storage-backends.md) for details on the trait and conformance testing.
@@ -246,9 +249,10 @@ All backends implement the `BlobStorage` trait and pass the `blob_store_conforma
 
 ```bash
 # Minimal: SQLite storage, bind 0.0.0.0:9000
-SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
 
 # Custom bind address and limits
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 \
 SCP_RELAY_PUSH_PLATFORMS=none \
 SCP_RELAY_STORAGE_BACKEND=sqlite \
 SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db \
@@ -261,7 +265,7 @@ scp-relay
 
 Each limit and bind variable takes its default only when it is unset: a value that does not parse, including an empty one, makes the relay exit 1 with an error naming the variable.
 
-The relay logs to stderr. Control verbosity with `SCP_RELAY_LOG_LEVEL` or `RUST_LOG`; a filter that does not parse, or a `SCP_RELAY_LOG_FORMAT` other than `json` or `pretty`, exits 1. The commands below assume `SCP_RELAY_PUSH_PLATFORMS`, `SCP_RELAY_STORAGE_BACKEND` and `SCP_RELAY_STORAGE_PATH` are already exported, as in the examples above:
+The relay logs to stderr. Control verbosity with `SCP_RELAY_LOG_LEVEL` or `RUST_LOG`; a filter that does not parse, or a `SCP_RELAY_LOG_FORMAT` other than `json` or `pretty`, exits 1. The commands below assume `SCP_RELAY_URL`, `SCP_RELAY_PUSH_PLATFORMS`, `SCP_RELAY_STORAGE_BACKEND` and `SCP_RELAY_STORAGE_PATH` are already exported, as in the examples above:
 
 ```bash
 # Structured JSON logs for production
