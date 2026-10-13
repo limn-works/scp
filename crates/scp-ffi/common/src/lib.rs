@@ -277,6 +277,11 @@ pub mod test_helpers;
 #[cfg(feature = "server")]
 pub mod server;
 
+// `NodeStartConfig`, the flat config `server::node_start` reads
+// (construction.md §"Node start — `NodeStartConfig`").
+#[cfg(feature = "server")]
+pub mod node_start_config;
+
 // Shared DHT client for all FFI bridges (ADR-062 §Decision 1). `scp-dht` is a
 // non-optional dependency compiled with `production-dht`, so the real
 // `PkarrDhtClient` — and therefore `FfiDhtClient` — is always available; the

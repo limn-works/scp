@@ -69,7 +69,11 @@ custody = ["dep:scp-platform", "scp-platform?/file", "dep:ed25519-dalek"]
 # makes `--no-default-features --features server` compile rather than fail on a
 # missing `scp-core` dep. It resolves no new feature anywhere, because every
 # crate enabling `server` already enables `resolvers`.
-server = ["resolvers", "dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/file", "scp-platform/encrypting", "dep:scp-identity", "dep:rand", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
+# `dep:serde` reads `NodeStartConfig` (construction.md §"Node start"), and
+# `scp-transport?/sqlite-blob` backs its `Sqlite` blob arm (the `?` form mints
+# no implicit `scp-transport` feature). `scp-node` already
+# enables `sqlite-blob`, so that edge resolves no new feature in a shipped graph.
+server = ["resolvers", "dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/file", "scp-platform/encrypting", "dep:scp-identity", "dep:rand", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror", "dep:serde", "scp-transport?/sqlite-blob"]
 
 [dependencies]
 scp-core = { path = "../../scp-core", optional = true }
@@ -98,6 +102,7 @@ scp-crypto = { path = "../../scp-crypto" }
 async-trait = { workspace = true, optional = true }
 dashmap = { workspace = true }
 zeroize = { workspace = true }
+serde = { workspace = true, optional = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
