@@ -83,6 +83,31 @@ pub mod code {
     /// `routing_id`. The client should fix its signature and retry.
     pub const BRIDGE_AUTH_FAILED: u16 = 4034;
 
+    /// A push registration or deregistration was rejected (ADR-004, §10.7.1).
+    ///
+    /// The registrant's identifier does not resolve, the signature does not
+    /// verify (including a signature over another relay's canonical URL), the
+    /// verifying key is not `Current` in the `#active` role, the message does
+    /// not decode, or a registration's `routing_ids` list is empty.
+    pub const PUSH_REGISTRATION_REJECTED: u16 = 4060;
+
+    /// The relay has no push sender configured for the message's platform.
+    pub const PUSH_PLATFORM_UNAVAILABLE: u16 = 4061;
+
+    /// The push message's `timestamp` falls outside the relay's skew window
+    /// (`09-security-model.md` §9.18.13) or is not newer than the last one the
+    /// relay accepted for the registration key.
+    pub const PUSH_REGISTRATION_STALE: u16 = 4062;
+
+    /// The relay's push role is `Disabled`; it rejects every PUBLISH to its
+    /// reserved push routing ID.
+    pub const PUSH_NOT_SUPPORTED: u16 = 4063;
+
+    /// The identity identifier already holds the per-relay cap of push
+    /// registrations (§9.18.13) and the message names a registration key the
+    /// relay does not hold.
+    pub const PUSH_REGISTRATION_LIMIT: u16 = 4064;
+
     // -----------------------------------------------------------------------
     // Server errors (5xxx) -- retry with backoff or switch relay
     // -----------------------------------------------------------------------
@@ -95,6 +120,14 @@ pub mod code {
 
     /// The relay is shutting down. Clients should reconnect to another relay.
     pub const SHUTTING_DOWN: u16 = 5002;
+
+    /// The relay has no verifier that can check a push signature against a
+    /// key state, so it accepts no push message and changes no registration.
+    pub const PUSH_VERIFIER_UNAVAILABLE: u16 = 5003;
+
+    /// The push registrant's key-state resolution was inconclusive or did not
+    /// finish in time; the relay changed no registration.
+    pub const PUSH_KEY_STATE_UNAVAILABLE: u16 = 5004;
 
     /// Returns `true` if the error code indicates a client error (4xxx).
     ///
@@ -163,6 +196,11 @@ mod tests {
             code::BRIDGE_LIMIT_EXCEEDED,
             code::BRIDGE_TARGET_NOT_FOUND,
             code::BRIDGE_AUTH_FAILED,
+            code::PUSH_REGISTRATION_REJECTED,
+            code::PUSH_PLATFORM_UNAVAILABLE,
+            code::PUSH_REGISTRATION_STALE,
+            code::PUSH_NOT_SUPPORTED,
+            code::PUSH_REGISTRATION_LIMIT,
         ];
 
         for c in client_codes {
@@ -183,6 +221,8 @@ mod tests {
             code::INTERNAL_ERROR,
             code::STORAGE_FULL,
             code::SHUTTING_DOWN,
+            code::PUSH_VERIFIER_UNAVAILABLE,
+            code::PUSH_KEY_STATE_UNAVAILABLE,
         ];
 
         for c in server_codes {
@@ -231,6 +271,13 @@ mod tests {
         assert_eq!(code::INTERNAL_ERROR, 5000);
         assert_eq!(code::STORAGE_FULL, 5001);
         assert_eq!(code::SHUTTING_DOWN, 5002);
+        assert_eq!(code::PUSH_REGISTRATION_REJECTED, 4060);
+        assert_eq!(code::PUSH_PLATFORM_UNAVAILABLE, 4061);
+        assert_eq!(code::PUSH_REGISTRATION_STALE, 4062);
+        assert_eq!(code::PUSH_NOT_SUPPORTED, 4063);
+        assert_eq!(code::PUSH_REGISTRATION_LIMIT, 4064);
+        assert_eq!(code::PUSH_VERIFIER_UNAVAILABLE, 5003);
+        assert_eq!(code::PUSH_KEY_STATE_UNAVAILABLE, 5004);
     }
 
     #[test]
