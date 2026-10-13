@@ -82,8 +82,6 @@ pub const IDENT_1010: &str = "SCP-IDENT-1010";
 pub const IDENT_1011: &str = "SCP-IDENT-1011";
 /// `UniFFI` identity resolve error.
 pub const IDENT_1012: &str = "SCP-IDENT-1012";
-/// `UniFFI` identity passphrase error.
-pub const IDENT_1013: &str = "SCP-IDENT-1013";
 /// DID method or format invalid.
 ///
 /// Distinct from `IDENT_1004` (key generation failure) which is a
@@ -824,8 +822,6 @@ pub const TRANS_5050: &str = "SCP-TRANS-5050";
 pub const TRANS_5051: &str = "SCP-TRANS-5051";
 /// `UniFFI` transport TLS error.
 pub const TRANS_5052: &str = "SCP-TRANS-5052";
-/// `UniFFI` transport storage error.
-pub const TRANS_5053: &str = "SCP-TRANS-5053";
 /// `UniFFI` transport node error.
 pub const TRANS_5054: &str = "SCP-TRANS-5054";
 /// `UniFFI` transport relay connect error.

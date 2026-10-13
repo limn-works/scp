@@ -2892,13 +2892,16 @@ pub struct Identity {
     /// `remove_agent_key`, migrate) can reach the per-instance shared DHT
     /// client and resolver cache. Mirrors the NAPI bridge's `bi` field.
     ///
-    /// Only READ by the mutable identity methods, which all fail closed on a
+    /// READ by the mutable identity methods, which all fail closed on a
     /// shipped (no-`testing`) build before consulting it (ADR-062 §Decision 6),
-    /// so it is written-but-unread there — hence the conditional `dead_code`
-    /// allowance. It remains a production field (written by `identity_load`).
+    /// and by `node_start`'s operator identity resolution (`server` feature),
+    /// which reaches the instance's shared DHT client through it. A build with
+    /// neither feature writes it without reading it — hence the conditional
+    /// `dead_code` allowance. It remains a production field (written by
+    /// `identity_load`).
     ///
     /// Rust-internal field — NOT exposed through `#[uniffi::export]`.
-    #[cfg_attr(not(feature = "testing"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "testing", feature = "server")), allow(dead_code))]
     pub(crate) bi: Arc<crate::runtime::UniffiBridgeInstance>,
     /// JSON-serialized `scp_did::DidRotationEvent` produced when this
     /// handle was minted by [`Scp::identity_migrate`]. SDK callers MUST
@@ -16852,6 +16855,24 @@ impl Scp {
         data_dir: String,
     ) -> Result<Arc<crate::server::RelayHandle>, ScpError> {
         crate::server::relay_start_local_on(&self.inner, data_dir).await
+    }
+
+    /// Starts a production node from this `Scp` (construction.md §"Node start
+    /// — `NodeStartConfig`"): the node runs under the operator identity
+    /// `config.identity`, which this `Scp` must have minted, and on this
+    /// instance's own storage.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-PERM-3030` when another `Scp` minted `config.identity`; otherwise
+    /// the code sdk-common.md §"Node start error codes" gives the failure,
+    /// such as `SCP-IDENT-1063` for an identity loaded with no custody.
+    #[cfg(feature = "server")]
+    pub async fn node_start(
+        &self,
+        config: crate::server::NodeStartConfig,
+    ) -> Result<Arc<crate::server::NodeHandle>, ScpError> {
+        crate::server::node_start_on(&self.inner, config).await
     }
 
     /// Per-instance equivalent of the free-function `node_start_in_memory`.

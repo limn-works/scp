@@ -2306,6 +2306,13 @@ jobs:
           # on selects zero tests and `--no-tests=fail` exits 4.
           cargo nextest run --no-tests=fail -p scp-ffi-napi --features server --lib \
             -E 'test(in_memory_on_a_shipped_build_rejects_with_ident_1008) + test(encrypted_file_on_a_shipped_build_refuses_with_ident_1059_before_opening)'
+          # SCP-322: `Scp.nodeStart` refuses an operator DID no identity on the
+          # instance holds with SCP-IDENT-1063 in the build a shipped bridge
+          # links. The test carries no cfg gate, so it runs in its own command:
+          # in the union above it would keep that command's selection non-empty
+          # and `--no-tests=fail` could never fire.
+          cargo nextest run --no-tests=fail -p scp-ffi-napi --features server --lib \
+            -E 'test(node_start_with_unregistered_operator_did_returns_ident_1063)'
 
   # Builds the pyo3 bridge (`scp-ffi`) in its PRODUCTION configuration: default
   # features (`server` on) but WITHOUT `testing`. `build-matrix.yml` builds the
@@ -2394,6 +2401,12 @@ jobs:
           # than 0 if a feature flip selects zero tests.
           cargo nextest run --no-tests=fail -p scp-ffi --features server --lib \
             -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed) + test(resolve_custody_rejects_in_memory_on_a_shipped_build_with_ident_1008)'
+          # SCP-322: `SCP.node_start` refuses an operator DID no identity on the
+          # instance holds with SCP-IDENT-1063 in the build a shipped bridge
+          # links. The test carries no cfg gate, so it runs in its own command
+          # for the reason the scp-ffi-napi step gives.
+          cargo nextest run --no-tests=fail -p scp-ffi --features server --lib \
+            -E 'test(node_start_with_unregistered_operator_did_returns_ident_1063)'
       - name: Check the PyPI wheel's features vendor OpenSSL on non-Apple targets only
         run: |
           # `crates/scp-platform/Cargo.toml` declares the libsqlite3-sys edge that
@@ -2569,6 +2582,12 @@ jobs:
             -E 'test(identity_create_in_memory_rejected_without_feature) + test(identity_create_entry_points_reject_in_memory_on_a_shipped_build) + test(identity_create_with_custody_fails_closed_without_pre_rotation_backend) + test(shipped_build_reaches_every_callback_custody_identity_op)'
           cargo nextest run --no-tests=fail -p scp-ffi-uniffi --features server --lib \
             -E 'test(ucan_mint_works_over_callback_custody) + test(ucan_delegate_works_over_callback_custody) + test(ucan_delegate_signs_with_delegator_key_not_context_creator_key) + test(ucan_mint_without_retained_custody_returns_ident_1017)'
+          # SCP-322: `Scp::node_start` refuses an operator identity that
+          # `identity_load` returned, which holds no key material, with
+          # SCP-IDENT-1063 in the build a shipped bridge links. Un-gated, so it
+          # runs under its own `--no-tests=fail`, as the `ucan_*` tests do.
+          cargo nextest run --no-tests=fail -p scp-ffi-uniffi --features server --lib \
+            -E 'test(node_start_with_externally_loaded_identity_returns_ident_1063)'
 
   # ── Why the doc tests and rustdoc run in two jobs ───────────────────────────
   #

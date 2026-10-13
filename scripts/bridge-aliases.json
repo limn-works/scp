@@ -2556,6 +2556,19 @@
       ]
     },
     {
+      "canonical": "node_start",
+      "category": "transport",
+      "pyo3": [
+        "node_start"
+      ],
+      "uniffi": [
+        "node_start"
+      ],
+      "napi": [
+        "node_start"
+      ]
+    },
+    {
       "canonical": "relay_start_in_memory",
       "category": "transport",
       "pyo3": [

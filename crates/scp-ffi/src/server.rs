@@ -9,6 +9,8 @@
 //!   encrypted-in-memory and `SQLCipher` variants via an internal enum).
 //! - `PyScp::relay_start_in_memory` / `PyScp::relay_start_local` -- relay
 //!   startup.
+//! - `PyScp::node_start` -- production node start from this instance's
+//!   storage under an operator identity (SCP-322).
 //! - `PyScp::node_start_in_memory` / `PyScp::node_start_local` -- node
 //!   startup.
 //!
@@ -22,37 +24,51 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use zeroize::Zeroizing;
 
+use scp_ffi_common::error_codes as codes;
+use scp_ffi_common::node_start_config::NodeStartConfig;
 use scp_ffi_common::server::{
-    self, ConcreteDidMethod, NodeIdentity, RunningNode, RunningRelay, ServerError,
+    self, ConcreteDidMethod, InstanceStorage, NodeIdentity, RunningNode, RunningRelay, ServerError,
 };
 use scp_identity::DidCache;
 use scp_node::NodeError;
 use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
+use crate::error::ScpPyError;
+
 // ---------------------------------------------------------------------------
 // Error conversion
 // ---------------------------------------------------------------------------
 
-fn server_err(e: ServerError) -> PyErr {
-    tracing::debug!(error = %e, "server operation failed");
-    match &e {
-        ServerError::MissingPassphrase => {
-            // Map to ValidationError (code SCP-VALID-7004) to match the
-            // UniFFI bridge and allow Python callers to distinguish this
-            // actionable error from generic RuntimeError failures.
-            crate::error::ScpPyError::ValidationError {
-                message: e.user_message(),
-                code: scp_ffi_common::error_codes::VALID_7004.to_owned(),
-            }
-            .into()
-        }
-        _ => pyo3::exceptions::PyRuntimeError::new_err(e.user_message()),
+/// Builds the [`ScpPyError`] for `e` with `message`: the variant from
+/// `server_error_class` and the code from `server_error_code`, the one mapping
+/// the `PyO3`, napi-rs and `UniFFI` bridges share (sdk-common.md §"Node start
+/// error codes").
+fn coded(e: &ServerError, message: String) -> ScpPyError {
+    let code = codes::server_error_code(e).to_owned();
+    match codes::server_error_class(e) {
+        codes::ServerErrorClass::Validation => ScpPyError::ValidationError { message, code },
+        codes::ServerErrorClass::Identity => ScpPyError::IdentityError { message, code },
+        codes::ServerErrorClass::Transport => ScpPyError::TransportError { message, code },
+        codes::ServerErrorClass::Context => ScpPyError::ContextError { message, code },
     }
 }
 
+/// Maps a [`ServerError`] to its coded [`ScpPyError`] with the sanitized
+/// [`ServerError::user_message`]; the full error goes to the debug log only.
+fn server_error(e: ServerError) -> ScpPyError {
+    tracing::debug!(error = %e, "server operation failed");
+    coded(&e, e.user_message())
+}
+
+fn server_err(e: ServerError) -> PyErr {
+    server_error(e).into()
+}
+
+/// A `NodeError` from a running node's operation (projection, deploy, serve)
+/// maps as `ServerError::Node` does, with a message that names no path.
 fn node_err(e: NodeError) -> PyErr {
     tracing::debug!(error = %e, "node operation failed");
-    pyo3::exceptions::PyRuntimeError::new_err("node operation failed")
+    coded(&ServerError::Node(e), "node operation failed".to_owned()).into()
 }
 
 /// Auto-wires the global `ContextManager` with relay transport after
@@ -540,33 +556,107 @@ impl Drop for PyNodeHandle {
 ///
 /// # Errors
 ///
-/// Returns `PyErr` if the DID is not found in the identity registry.
-fn build_node_identity(bi: &crate::runtime::PyBridgeInstance, did: &str) -> PyResult<NodeIdentity> {
-    crate::runtime::with_identity(bi, did, |entry| {
-        let custody = Arc::clone(&entry.custody);
-        let sign_fn = ConcreteDidMethod::make_sign_fn(custody);
-        // Publish through the instance's shared DHT client (the one the
-        // resolver reads from) so a node serving this identity re-publishes
-        // into the same DHT the rest of the bridge resolves against. Fall back
-        // to a fail-closed production client if the resolver was never
-        // initialized — never an in-memory nullifier on a shipped path
-        // (ADR-062 §Decision 1).
-        let dht_client = match crate::runtime::resolver_dht_client(bi) {
-            Some(client) => client,
-            None => Arc::new(crate::identity::build_ffi_dht_client()?),
-        };
-        let cache = Arc::new(DidCache::new());
-        let did_method = Arc::new(ConcreteDidMethod::with_client_and_signer(
-            dht_client, cache, sign_fn,
-        ));
-
-        Ok(NodeIdentity {
-            identity: entry.identity.clone(),
-            document: entry.document.clone(),
-            did_method,
-        })
+/// - `IdentityError` with `SCP-IDENT-1063` (`OperatorIdentityUnavailable`,
+///   sdk-common.md §"Node start error codes") when the DID is not registered
+///   on this instance.
+/// - `IdentityError` with `SCP-IDENT-1058` when the instance has no DHT client
+///   and the production client cannot be built.
+fn build_node_identity(
+    bi: &crate::runtime::PyBridgeInstance,
+    did: &str,
+) -> Result<NodeIdentity, ScpPyError> {
+    let entry = crate::runtime::identity_registry(bi)
+        .get(did)
+        .ok_or_else(|| server_error(ServerError::OperatorIdentityUnavailable))?;
+    let custody = Arc::clone(&entry.custody);
+    let sign_fn = ConcreteDidMethod::make_sign_fn(custody);
+    // Publish through the instance's shared DHT client (the one the resolver
+    // reads from) so a node serving this identity re-publishes into the same
+    // DHT the rest of the bridge resolves against. Fall back to a fail-closed
+    // production client if the resolver was never initialized — never an
+    // in-memory nullifier on a shipped path (ADR-062 §Decision 1).
+    let dht_client = match crate::runtime::resolver_dht_client(bi) {
+        Some(client) => client,
+        None => Arc::new(crate::identity::build_ffi_dht_client()?),
+    };
+    let cache = Arc::new(DidCache::new());
+    let did_method = Arc::new(ConcreteDidMethod::with_client_and_signer(
+        dht_client, cache, sign_fn,
+    ));
+    Ok(NodeIdentity {
+        identity: entry.identity.clone(),
+        document: entry.document.clone(),
+        did_method,
     })
-    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+}
+
+/// Resolves the operator identity a node start config names: a malformed DID
+/// is `InvalidConfig` (`SCP-STORAGE-8007`), and a DID not registered on this
+/// instance is `OperatorIdentityUnavailable` (`SCP-IDENT-1063`).
+fn resolve_operator_identity(
+    bi: &crate::runtime::PyBridgeInstance,
+    did: &str,
+) -> Result<NodeIdentity, ScpPyError> {
+    if scp_ffi_common::validate::validate_did(did).is_err() {
+        return Err(server_error(ServerError::InvalidConfig(
+            "identity must be a DID".to_owned(),
+        )));
+    }
+    build_node_identity(bi, did)
+}
+
+/// The instance's own storage handle, which `server::node_start` gives to the
+/// node (spec §17.6). Fails closed when the instance was built without a
+/// storage selection.
+fn instance_storage(bi: &crate::runtime::PyBridgeInstance) -> Result<InstanceStorage, ScpPyError> {
+    Ok(match crate::runtime::get_storage(bi)? {
+        crate::runtime::StorageProvider::InMemoryEncrypted(s) => {
+            InstanceStorage::InMemoryEncrypted(Arc::clone(s))
+        }
+        crate::runtime::StorageProvider::Sqlite(s) => InstanceStorage::Sqlite(Arc::clone(s)),
+    })
+}
+
+/// Starts a production node on `bi`'s storage under the operator identity the
+/// config names (construction.md §"Node start — `NodeStartConfig`").
+///
+/// Runs, in order: the config parse, the operator identity resolution, taking
+/// the instance storage, `server::node_start`, `server::register_node`,
+/// `auto_wire_context_manager`, and wrapping the handle.
+///
+/// # Errors
+///
+/// The code sdk-common.md §"Node start error codes" gives each failure.
+fn node_start_on(
+    bi_arc: &Arc<crate::runtime::PyBridgeInstance>,
+    py: Python<'_>,
+    rt: &tokio::runtime::Runtime,
+    config_json: &str,
+) -> Result<PyNodeHandle, ScpPyError> {
+    let bi = &**bi_arc;
+    let cfg = NodeStartConfig::from_json(config_json).map_err(server_error)?;
+    let identity = resolve_operator_identity(bi, &cfg.identity)?;
+    let storage = instance_storage(bi)?;
+    let node = py
+        .allow_threads(|| rt.block_on(server::node_start(cfg, identity, storage)))
+        .map_err(server_error)?;
+    // Registered before anything else can fail, so `SCP.shutdown()` stops
+    // this node before it releases the storage the node holds
+    // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
+    let inner = server::register_node(&bi.core, node);
+    auto_wire_context_manager(
+        bi,
+        py,
+        rt,
+        inner.did(),
+        &inner.internal_relay_url(),
+        inner.bridge_token_hex(),
+    );
+    Ok(PyNodeHandle {
+        instance_id: bi.core.instance_id(),
+        inner,
+        bi: Arc::clone(bi_arc),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +665,20 @@ fn build_node_identity(bi: &crate::runtime::PyBridgeInstance, did: &str) -> PyRe
 
 #[pymethods]
 impl crate::scp::PyScp {
+    /// Starts a production node from this ``SCP`` instance.
+    ///
+    /// ``config_json`` is a ``NodeStartConfig`` (construction.md §"Node start
+    /// — ``NodeStartConfig``"): its ``identity`` names an operator identity
+    /// registered on this instance, and the node runs on this instance's own
+    /// storage. Each failure raises with the code sdk-common.md §"Node start
+    /// error codes" gives it, such as ``SCP-IDENT-1063`` for an unregistered
+    /// operator DID.
+    #[pyo3(name = "node_start")]
+    pub fn node_start(&self, py: Python<'_>, config_json: &str) -> PyResult<PyNodeHandle> {
+        let rt = crate::runtime()?;
+        node_start_on(&self.inner, py, rt, config_json).map_err(PyErr::from)
+    }
+
     /// Starts a relay with in-memory blob storage on an OS-assigned port.
     ///
     /// Returns a :class:`RelayHandle` whose ``relay_url`` property contains the
@@ -1081,5 +1185,248 @@ mod tests {
         // Clean up.
         crate::runtime::clear_transport_manager(&bi).ok();
         relay.shutdown();
+    }
+
+    /// A `NodeStartConfig` JSON naming `identity`, on loopback with plaintext,
+    /// in-memory blobs and an OS-assigned relay port, with `edit` applied.
+    fn start_json(identity: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut cfg = serde_json::json!({
+            "reach": {"kind": "local"},
+            "identity": identity,
+            "blob_storage": {"kind": "in_memory"},
+            "tls": {"kind": "plaintext"},
+            "dht": {"kind": "disabled"},
+            "cors_origins": {"kind": "any_origin"},
+            "bind_addr": "127.0.0.1:0",
+        });
+        edit(&mut cfg);
+        cfg.to_string()
+    }
+
+    /// The error's class name and code.
+    fn class_and_code(e: &ScpPyError) -> (&'static str, &str) {
+        match e {
+            ScpPyError::IdentityError { code, .. } => ("identity", code),
+            ScpPyError::ContextError { code, .. } => ("context", code),
+            ScpPyError::TransportError { code, .. } => ("transport", code),
+            ScpPyError::ValidationError { code, .. } => ("validation", code),
+            other => panic!("unexpected error class: {other:?}"),
+        }
+    }
+
+    /// The error a refused `node_start_on` returned.
+    fn start_error(result: Result<PyNodeHandle, ScpPyError>, label: &str) -> ScpPyError {
+        match result {
+            Ok(node) => {
+                node.shutdown();
+                panic!("{label}: node_start must fail");
+            }
+            Err(e) => e,
+        }
+    }
+
+    /// A well-formed operator DID that no identity on this instance holds
+    /// returns `SCP-IDENT-1063` on a shipped build as on a `testing` build,
+    /// and the Python exception carries the code.
+    #[test]
+    fn node_start_with_unregistered_operator_did_returns_ident_1063() {
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let json = start_json("did:dht:z6MkNodeStartOperatorProbe", |_| {});
+            let err = start_error(
+                node_start_on(&scp.inner, py, rt(), &json),
+                "unregistered operator",
+            );
+            assert_eq!(
+                class_and_code(&err),
+                ("identity", codes::IDENT_1063),
+                "{err:?}"
+            );
+
+            let raised = match scp.node_start(py, &json) {
+                Ok(node) => {
+                    node.shutdown();
+                    panic!("the pymethod must refuse an unregistered operator");
+                }
+                Err(e) => e.to_string(),
+            };
+            assert!(raised.contains(codes::IDENT_1063), "{raised}");
+        });
+    }
+
+    /// One `ServerError` per class: each bridge error takes its variant from
+    /// `server_error_class` and its code from `server_error_code`, and a
+    /// running node's `NodeError` names no path in its message.
+    #[test]
+    fn server_and_node_errors_map_through_the_shared_table() {
+        let cases: Vec<(ServerError, &str, &str)> = vec![
+            (
+                ServerError::InvalidConfig("x".into()),
+                "validation",
+                codes::STORAGE_8007,
+            ),
+            (
+                ServerError::Io(std::io::Error::other("/secret/path")),
+                "validation",
+                codes::STORAGE_8008,
+            ),
+            (
+                ServerError::Node(NodeError::Storage("x".into())),
+                "validation",
+                codes::STORAGE_8009,
+            ),
+            (
+                ServerError::OperatorIdentityUnavailable,
+                "identity",
+                codes::IDENT_1063,
+            ),
+            (
+                ServerError::Node(NodeError::Serve("x".into())),
+                "transport",
+                codes::TRANS_5054,
+            ),
+            (
+                ServerError::MissingPassphrase,
+                "validation",
+                codes::VALID_7004,
+            ),
+            (
+                ServerError::Platform(scp_platform::error::PlatformError::StorageError("x".into())),
+                "context",
+                codes::CTX_2053,
+            ),
+        ];
+        for (e, class, code) in cases {
+            let label = format!("{e:?}");
+            let err = server_error(e);
+            assert_eq!(class_and_code(&err), (class, code), "{label}");
+        }
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let err = node_err(NodeError::InvalidConfig("/secret/path/data.db".into()));
+            let raised = err.value(py).to_string();
+            assert!(raised.contains(codes::STORAGE_8007), "{raised}");
+            assert!(raised.contains("node operation failed"), "{raised}");
+            assert!(!raised.contains("/secret/path"), "{raised}");
+        });
+    }
+
+    /// A valid config starts a node under the operator identity, registers it
+    /// with the instance, and wires the instance's `Supervisor` to its relay.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_runs_a_node_under_the_operator_identity() {
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let identity = scp.identity_create(py, "in_memory", None).unwrap();
+            let did = identity.did().to_owned();
+            let node = scp.node_start(py, &start_json(&did, |_| {})).unwrap();
+
+            assert_eq!(node.did(), did);
+            assert!(node.relay_port() > 0);
+            assert!(
+                crate::runtime::supervisor(&scp.inner).is_ok(),
+                "node_start must wire the instance's Supervisor"
+            );
+            node.shutdown();
+            assert!(node.is_shutdown());
+        });
+    }
+
+    /// Every sdk-common.md §"Node start error codes" row a `PyO3` caller can
+    /// reach through `node_start` returns its code and class.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_maps_each_reachable_failure_to_its_sdk_common_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("regular-file");
+        std::fs::write(&file, b"x").unwrap();
+        let under_file = file.join("sub").join("blobs.redb").display().to_string();
+        let dir = tmp.path().join("a-directory");
+        std::fs::create_dir(&dir).unwrap();
+        let dir = dir.display().to_string();
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken_addr = taken.local_addr().unwrap().to_string();
+
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let identity = scp.identity_create(py, "in_memory", None).unwrap();
+            let did = identity.did().to_owned();
+
+            let cases: Vec<(&str, String, &str, &str)> = vec![
+                (
+                    "malformed JSON (InvalidConfig)",
+                    "{not json".to_owned(),
+                    "validation",
+                    codes::STORAGE_8007,
+                ),
+                (
+                    "unknown field (InvalidConfig)",
+                    start_json(&did, |c| c["port"] = 1.into()),
+                    "validation",
+                    codes::STORAGE_8007,
+                ),
+                (
+                    "malformed operator DID (InvalidConfig)",
+                    start_json("not-a-did", |_| {}),
+                    "validation",
+                    codes::STORAGE_8007,
+                ),
+                (
+                    "domain with a scheme (InvalidConfig)",
+                    start_json(&did, |c| {
+                        c["reach"] = serde_json::json!({
+                            "kind": "domain", "domain": "https://node.example.org"
+                        });
+                        c["tls"] = serde_json::json!({"kind": "self_signed"});
+                    }),
+                    "validation",
+                    codes::STORAGE_8007,
+                ),
+                (
+                    "domain with plaintext (Node(InvalidConfig))",
+                    start_json(&did, |c| {
+                        c["reach"] =
+                            serde_json::json!({"kind": "domain", "domain": "node.example.org"});
+                    }),
+                    "validation",
+                    codes::STORAGE_8007,
+                ),
+                (
+                    "blob parent under a regular file (Io)",
+                    start_json(&did, |c| {
+                        c["blob_storage"] = serde_json::json!({"kind": "redb", "path": under_file});
+                    }),
+                    "validation",
+                    codes::STORAGE_8008,
+                ),
+                (
+                    "redb path that is a directory (Storage)",
+                    start_json(&did, |c| {
+                        c["blob_storage"] = serde_json::json!({"kind": "redb", "path": dir});
+                    }),
+                    "validation",
+                    codes::STORAGE_8008,
+                ),
+                (
+                    "relay bind on a taken port (Node(Relay))",
+                    start_json(&did, |c| c["bind_addr"] = taken_addr.clone().into()),
+                    "transport",
+                    codes::TRANS_5051,
+                ),
+            ];
+            for (label, json, class, code) in cases {
+                let err = start_error(node_start_on(&scp.inner, py, rt(), &json), label);
+                assert_eq!(class_and_code(&err), (class, code), "{label}: {err:?}");
+            }
+        });
+        drop(taken);
     }
 }

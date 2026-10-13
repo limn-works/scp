@@ -1306,7 +1306,7 @@ impl InstanceBorrower for RunningNode {
 /// Wraps a started node in an [`Arc`] and registers it with `core` as a
 /// borrower of that instance's storage.
 ///
-/// Every bridge node-start path (`node_start_in_memory_*`,
+/// Every bridge node-start path (`node_start_on`, `node_start_in_memory_*`,
 /// `node_start_local_*`, across `PyO3`, NAPI, and `UniFFI`) routes its node
 /// through this one call, so registration is not a step a bridge author can
 /// forget while still obtaining an `Arc<RunningNode>` for its handle type.

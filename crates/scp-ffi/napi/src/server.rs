@@ -7,6 +7,8 @@
 //! - [`NapiNodeHandle`] — opaque handle to a running application node (wraps
 //!   encrypted-in-memory and `SQLCipher` variants via an internal enum).
 //! - `relay_start_in_memory` / `relay_start_local` — relay startup.
+//! - `node_start` — production node start from this instance's storage under
+//!   an operator identity (SCP-322).
 //! - `node_start_in_memory` / `node_start_local` — node startup.
 //!
 //! Gated behind the `server` feature on `scp-ffi-common`.
@@ -17,6 +19,8 @@ use napi::Error as NapiError;
 use napi_derive::napi;
 use zeroize::Zeroizing;
 
+use scp_ffi_common::error_codes as codes;
+use scp_ffi_common::node_start_config::NodeStartConfig;
 use scp_ffi_common::server::{self, NodeIdentity, RunningNode, RunningRelay, ServerError};
 use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate_did};
 use scp_node::NodeError;
@@ -29,25 +33,32 @@ use crate::{decrement_handle_count, increment_handle_count};
 // Error conversion
 // ---------------------------------------------------------------------------
 
-fn server_err(e: ServerError) -> NapiError {
-    tracing::debug!(error = %e, "server operation failed");
-    match &e {
-        ServerError::MissingPassphrase => {
-            // Map to Validation error (code SCP-VALID-7004) to match the
-            // UniFFI bridge and allow TypeScript callers to distinguish this
-            // actionable error from generic failures.
-            NapiError::from(ScpNapiError::Validation {
-                message: e.user_message(),
-                code: scp_ffi_common::error_codes::VALID_7004.to_owned(),
-            })
-        }
-        _ => NapiError::from_reason(e.user_message()),
+/// Builds the [`ScpNapiError`] for `e` with `message`: the variant from
+/// `server_error_class` and the code from `server_error_code`, the one mapping
+/// the `PyO3`, napi-rs and `UniFFI` bridges share (sdk-common.md §"Node start
+/// error codes").
+fn coded(e: &ServerError, message: String) -> ScpNapiError {
+    let code = codes::server_error_code(e).to_owned();
+    match codes::server_error_class(e) {
+        codes::ServerErrorClass::Validation => ScpNapiError::Validation { message, code },
+        codes::ServerErrorClass::Identity => ScpNapiError::Identity { message, code },
+        codes::ServerErrorClass::Transport => ScpNapiError::Transport { message, code },
+        codes::ServerErrorClass::Context => ScpNapiError::Context { message, code },
     }
 }
 
+/// Maps a [`ServerError`] to its coded error with the sanitized
+/// [`ServerError::user_message`]; the full error goes to the debug log only.
+fn server_err(e: ServerError) -> NapiError {
+    tracing::debug!(error = %e, "server operation failed");
+    coded(&e, e.user_message()).into()
+}
+
+/// A `NodeError` from a running node's operation (projection, deploy, serve)
+/// maps as `ServerError::Node` does, with a message that names no path.
 fn node_err(e: NodeError) -> NapiError {
     tracing::debug!(error = %e, "node operation failed");
-    NapiError::from_reason("node operation failed")
+    coded(&ServerError::Node(e), "node operation failed".to_owned()).into()
 }
 
 /// Auto-wires the global `ContextManager` with relay transport after
@@ -476,7 +487,10 @@ impl Drop for NapiNodeHandle {
 ///
 /// # Errors
 ///
-/// Returns `napi::Error` if the DID is not found in the identity registry.
+/// - `SCP-IDENT-1063` (`OperatorIdentityUnavailable`, sdk-common.md §"Node
+///   start error codes") when the DID is not registered on this instance.
+/// - `SCP-IDENT-1058` when no shared DHT client exists and the production
+///   client cannot be built.
 ///
 /// Works for any locally registered identity — in-memory OR a production
 /// callback custody (`identityCreateWithCustody`) — since signing dispatches
@@ -488,60 +502,111 @@ fn build_node_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result<NodeI
     use scp_identity::DidCache;
     use scp_platform::traits::KeyCustody;
 
-    crate::runtime::with_identity(bi, did, |entry| {
-        let custody_clone = Arc::clone(&entry.custody);
+    let entry = crate::runtime::identity_registry(bi)
+        .get(did)
+        .ok_or_else(|| server_err(ServerError::OperatorIdentityUnavailable))?;
+    let custody_clone = Arc::clone(&entry.custody);
 
-        // Hand-rolled sign_fn: `ConcreteDidMethod::make_sign_fn` requires
-        // `Arc<K: KeyCustody>`, and `NapiKeyCustody` does implement `KeyCustody`
-        // via enum dispatch, so we sign through it directly. Same pattern as
-        // `make_dht_with_signer` in identity.rs.
-        let sign_fn: Arc<
-            dyn Fn(
-                    u64,
-                    Vec<u8>,
-                ) -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<
-                                Output = Result<Vec<u8>, scp_identity::IdentityError>,
-                            > + Send,
-                    >,
-                > + Send
-                + Sync,
-        > = Arc::new(move |key_id: u64, data: Vec<u8>| {
-            let kc = Arc::clone(&custody_clone);
-            Box::pin(async move {
-                let handle = scp_platform::traits::KeyHandle::new(key_id);
-                let sig = kc
-                    .sign(&handle, &data)
-                    .await
-                    .map_err(scp_identity::IdentityError::Platform)?;
-                Ok(sig.into_bytes())
-            })
-        });
-
-        // Publish through the process-shared DHT client (the one the resolver
-        // reads from) so a node serving this identity re-publishes into the same
-        // DHT the rest of the bridge resolves against. Fall back to a fail-closed
-        // production client if the resolver was never initialized — never an
-        // in-memory nullifier on a shipped path (ADR-062 §Decision 1).
-        let dht_client = match crate::runtime::shared_dht_client() {
-            Some(client) => Arc::clone(client),
-            None => Arc::new(crate::identity::build_ffi_dht_client()?),
-        };
-        let cache = Arc::new(DidCache::new());
-        let did_method = Arc::new(
-            scp_ffi_common::server::ConcreteDidMethod::with_client_and_signer(
-                dht_client, cache, sign_fn,
-            ),
-        );
-
-        Ok(NodeIdentity {
-            identity: entry.identity.clone(),
-            document: entry.document.clone(),
-            did_method,
+    // Hand-rolled sign_fn: `ConcreteDidMethod::make_sign_fn` requires
+    // `Arc<K: KeyCustody>`, and `NapiKeyCustody` does implement `KeyCustody`
+    // via enum dispatch, so we sign through it directly. Same pattern as
+    // `make_dht_with_signer` in identity.rs.
+    let sign_fn: Arc<
+        dyn Fn(
+                u64,
+                Vec<u8>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<Vec<u8>, scp_identity::IdentityError>>
+                        + Send,
+                >,
+            > + Send
+            + Sync,
+    > = Arc::new(move |key_id: u64, data: Vec<u8>| {
+        let kc = Arc::clone(&custody_clone);
+        Box::pin(async move {
+            let handle = scp_platform::traits::KeyHandle::new(key_id);
+            let sig = kc
+                .sign(&handle, &data)
+                .await
+                .map_err(scp_identity::IdentityError::Platform)?;
+            Ok(sig.into_bytes())
         })
+    });
+
+    // Publish through the process-shared DHT client (the one the resolver
+    // reads from) so a node serving this identity re-publishes into the same
+    // DHT the rest of the bridge resolves against. Fall back to a fail-closed
+    // production client if the resolver was never initialized — never an
+    // in-memory nullifier on a shipped path (ADR-062 §Decision 1).
+    let dht_client = match crate::runtime::shared_dht_client() {
+        Some(client) => Arc::clone(client),
+        None => Arc::new(crate::identity::build_ffi_dht_client().map_err(napi::Error::from)?),
+    };
+    let cache = Arc::new(DidCache::new());
+    let did_method = Arc::new(
+        scp_ffi_common::server::ConcreteDidMethod::with_client_and_signer(
+            dht_client, cache, sign_fn,
+        ),
+    );
+
+    Ok(NodeIdentity {
+        identity: entry.identity.clone(),
+        document: entry.document.clone(),
+        did_method,
     })
-    .map_err(napi::Error::from)
+}
+
+/// Resolves the operator identity a node start config names: a malformed DID
+/// is `InvalidConfig` (`SCP-STORAGE-8007`), and a DID not registered on this
+/// instance is `OperatorIdentityUnavailable` (`SCP-IDENT-1063`).
+fn resolve_operator_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result<NodeIdentity> {
+    if validate_did(did).is_err() {
+        return Err(server_err(ServerError::InvalidConfig(
+            "identity must be a DID".to_owned(),
+        )));
+    }
+    build_node_identity(bi, did)
+}
+
+/// Per-bridge-instance implementation of `node_start`: starts a production
+/// node on `bi`'s storage under the operator identity the config names
+/// (construction.md §"Node start — `NodeStartConfig`").
+///
+/// Runs, in order: the config parse, the operator identity resolution, taking
+/// the instance storage, `server::node_start`, `server::register_node`,
+/// `auto_wire_context_manager`, and wrapping the handle.
+///
+/// # Errors
+///
+/// The code sdk-common.md §"Node start error codes" gives each failure.
+pub(crate) async fn node_start_on(
+    bi: &Arc<NapiBridgeInstance>,
+    config_json: String,
+) -> napi::Result<NapiNodeHandle> {
+    let cfg = NodeStartConfig::from_json(&config_json).map_err(server_err)?;
+    let identity = resolve_operator_identity(bi, &cfg.identity)?;
+    let storage = crate::runtime::protocol_repository(bi).instance_storage();
+    let node = server::node_start(cfg, identity, storage)
+        .await
+        .map_err(server_err)?;
+    // Registered before anything else can fail, so `SCP.shutdown()` stops
+    // this node before it releases the storage the node holds
+    // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
+    let inner = server::register_node(&bi.core, node);
+    auto_wire_context_manager(
+        bi,
+        inner.did(),
+        &inner.internal_relay_url(),
+        inner.bridge_token_hex(),
+    )
+    .await;
+    increment_handle_count();
+    Ok(NapiNodeHandle {
+        inner,
+        bi: Arc::clone(bi),
+        instance_id: bi.instance_id(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -864,5 +929,230 @@ mod tests {
         rt().block_on(inner.disable_broadcast_projection("no-such-ctx"));
         // Should not panic.
         inner.shutdown();
+    }
+
+    /// A `NodeStartConfig` JSON naming `identity`, on loopback with plaintext,
+    /// in-memory blobs and an OS-assigned relay port, with `edit` applied.
+    fn start_json(identity: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut cfg = serde_json::json!({
+            "reach": {"kind": "local"},
+            "identity": identity,
+            "blob_storage": {"kind": "in_memory"},
+            "tls": {"kind": "plaintext"},
+            "dht": {"kind": "disabled"},
+            "cors_origins": {"kind": "any_origin"},
+            "bind_addr": "127.0.0.1:0",
+        });
+        edit(&mut cfg);
+        cfg.to_string()
+    }
+
+    /// The reason a refused `node_start` returned.
+    fn start_error(result: napi::Result<NapiNodeHandle>, label: &str) -> String {
+        match result {
+            Ok(node) => {
+                node.shutdown();
+                panic!("{label}: node_start must fail");
+            }
+            Err(e) => e.reason.clone(),
+        }
+    }
+
+    /// Asserts `reason` is the `ScpNapiError` rendering with `code` and
+    /// `class`, the form the TypeScript SDK parses.
+    fn assert_coded(reason: &str, class: &str, code: &str, label: &str) {
+        let prefix = format!("[{code}] {class} error: ");
+        assert!(
+            reason.starts_with(&prefix),
+            "{label}: expected {prefix:?}, got {reason:?}"
+        );
+    }
+
+    /// A well-formed operator DID that no identity on this instance holds
+    /// returns `SCP-IDENT-1063` on a shipped build as on a `testing` build.
+    #[test]
+    fn node_start_with_unregistered_operator_did_returns_ident_1063() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let json = start_json("did:dht:z6MkNodeStartOperatorProbe", |_| {});
+        let reason = start_error(rt().block_on(scp.node_start(json)), "unregistered operator");
+        assert_coded(
+            &reason,
+            "identity",
+            codes::IDENT_1063,
+            "unregistered operator",
+        );
+    }
+
+    /// One `ServerError` per class: each bridge error takes its variant from
+    /// `server_error_class` and its code from `server_error_code`, and a
+    /// running node's `NodeError` names no path in its message.
+    #[test]
+    fn server_and_node_errors_map_through_the_shared_table() {
+        let cases: Vec<(ServerError, &str, &str)> = vec![
+            (
+                ServerError::InvalidConfig("x".into()),
+                "validation",
+                codes::STORAGE_8007,
+            ),
+            (
+                ServerError::Io(std::io::Error::other("/secret/path")),
+                "validation",
+                codes::STORAGE_8008,
+            ),
+            (
+                ServerError::Node(NodeError::Storage("x".into())),
+                "validation",
+                codes::STORAGE_8009,
+            ),
+            (
+                ServerError::OperatorIdentityUnavailable,
+                "identity",
+                codes::IDENT_1063,
+            ),
+            (
+                ServerError::Node(NodeError::Serve("x".into())),
+                "transport",
+                codes::TRANS_5054,
+            ),
+            (
+                ServerError::MissingPassphrase,
+                "validation",
+                codes::VALID_7004,
+            ),
+            (
+                ServerError::Platform(scp_platform::error::PlatformError::StorageError("x".into())),
+                "context",
+                codes::CTX_2053,
+            ),
+        ];
+        for (e, class, code) in cases {
+            let label = format!("{e:?}");
+            assert_coded(&server_err(e).reason, class, code, &label);
+        }
+
+        let reason = node_err(NodeError::InvalidConfig("/secret/path/data.db".into()))
+            .reason
+            .clone();
+        assert_eq!(
+            reason,
+            format!(
+                "[{}] validation error: node operation failed",
+                codes::STORAGE_8007
+            )
+        );
+    }
+
+    /// A valid config starts a node under the operator identity, registers it
+    /// with the instance, and wires the instance's `Supervisor` to its relay.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_runs_a_node_under_the_operator_identity() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let identity = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let did = identity.did();
+        let node = rt()
+            .block_on(scp.node_start(start_json(&did, |_| {})))
+            .unwrap();
+
+        assert_eq!(node.did(), did);
+        assert!(node.relay_port() > 0);
+        assert!(
+            crate::runtime::supervisor(&scp.inner).is_ok(),
+            "node_start must wire the instance's Supervisor"
+        );
+        node.shutdown();
+        assert!(node.is_shutdown());
+    }
+
+    /// Every sdk-common.md §"Node start error codes" row a napi-rs caller can
+    /// reach through `node_start` returns its code and class.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_maps_each_reachable_failure_to_its_sdk_common_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("regular-file");
+        std::fs::write(&file, b"x").unwrap();
+        let under_file = file.join("sub").join("blobs.redb").display().to_string();
+        let dir = tmp.path().join("a-directory");
+        std::fs::create_dir(&dir).unwrap();
+        let dir = dir.display().to_string();
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken_addr = taken.local_addr().unwrap().to_string();
+
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let identity = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let did = identity.did();
+
+        let cases: Vec<(&str, String, &str, &str)> = vec![
+            (
+                "malformed JSON (InvalidConfig)",
+                "{not json".to_owned(),
+                "validation",
+                codes::STORAGE_8007,
+            ),
+            (
+                "unknown field (InvalidConfig)",
+                start_json(&did, |c| c["port"] = 1.into()),
+                "validation",
+                codes::STORAGE_8007,
+            ),
+            (
+                "malformed operator DID (InvalidConfig)",
+                start_json("not-a-did", |_| {}),
+                "validation",
+                codes::STORAGE_8007,
+            ),
+            (
+                "domain with a scheme (InvalidConfig)",
+                start_json(&did, |c| {
+                    c["reach"] = serde_json::json!({
+                        "kind": "domain", "domain": "https://node.example.org"
+                    });
+                    c["tls"] = serde_json::json!({"kind": "self_signed"});
+                }),
+                "validation",
+                codes::STORAGE_8007,
+            ),
+            (
+                "domain with plaintext (Node(InvalidConfig))",
+                start_json(&did, |c| {
+                    c["reach"] =
+                        serde_json::json!({"kind": "domain", "domain": "node.example.org"});
+                }),
+                "validation",
+                codes::STORAGE_8007,
+            ),
+            (
+                "blob parent under a regular file (Io)",
+                start_json(&did, |c| {
+                    c["blob_storage"] = serde_json::json!({"kind": "redb", "path": under_file});
+                }),
+                "validation",
+                codes::STORAGE_8008,
+            ),
+            (
+                "redb path that is a directory (Storage)",
+                start_json(&did, |c| {
+                    c["blob_storage"] = serde_json::json!({"kind": "redb", "path": dir});
+                }),
+                "validation",
+                codes::STORAGE_8008,
+            ),
+            (
+                "relay bind on a taken port (Node(Relay))",
+                start_json(&did, |c| c["bind_addr"] = taken_addr.clone().into()),
+                "transport",
+                codes::TRANS_5051,
+            ),
+        ];
+        for (label, json, class, code) in cases {
+            let reason = start_error(rt().block_on(scp.node_start(json)), label);
+            assert_coded(&reason, class, code, label);
+        }
+        drop(taken);
     }
 }
