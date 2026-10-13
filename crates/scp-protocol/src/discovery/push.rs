@@ -84,7 +84,7 @@ pub enum RelayUrlError {
 /// not decode, or a registration's `routing_ids` list is empty").
 /// [`PushMessageError::InvalidRelayUrl`] names a relay URL the caller
 /// supplied, never a field of the message.
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PushMessageError {
     /// The bytes are not a `MessagePack` encoding of the message.
     #[error("push message does not decode: {0}")]

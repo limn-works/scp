@@ -28,6 +28,7 @@ use scp_identity::DidMethod;
 use scp_identity::ScpIdentity;
 use scp_identity::republish::RepublishEntry;
 use scp_transport::nat::NatTierChange;
+use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
 
 use crate::DhtMode;
 use crate::NodeError;
@@ -326,12 +327,28 @@ pub async fn seed_from_startup_publish(
 /// honest `None`.
 pub async fn apply_tier_change(
     live_state: &LiveSlot<NodePublishedState>,
+    relay: &LiveRelayUrl,
     new_relay_url: &str,
     trigger_reason: &str,
     publisher: &NodePublisher,
     identity: &ScpIdentity,
     event_tx: Option<&tokio::sync::mpsc::Sender<NatTierChange>>,
 ) {
+    // The relay moves first: every listener reserves the new URL's push
+    // routing ID before any client can read that URL from the document or the
+    // slot, so a registration signed for it is intercepted, never stored as a
+    // blob (§10.7.1 step 2). A URL with no canonical form leaves everything on
+    // the current URL, and the next re-evaluation tries again.
+    match RelayUrl::new(new_relay_url) {
+        Ok(url) => relay.set(url),
+        Err(e) => {
+            tracing::warn!(
+                error = %e, new_url = %new_relay_url,
+                "tier change names a relay URL with no canonical form; keeping the current URL"
+            );
+            return;
+        }
+    }
     let current = live_state.get();
     let previous_relay_url = current.relay_url;
     let mut next_document = current.document;

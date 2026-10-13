@@ -1328,7 +1328,12 @@ mod tests {
             dev_bind_addr: None,
             projected_contexts: RwLock::new(HashMap::new()),
             blob_storage: Arc::new(BlobStorageBackend::in_memory()),
-            relay_config: scp_transport::native::server::RelayConfig::default(),
+            relay_config: scp_transport::native::server::RelayConfig::defaults(
+                scp_transport::relay::push_gate::LiveRelayUrl::new(
+                    scp_transport::relay::push_gate::RelayUrl::new("ws://127.0.0.1:9000/scp/v1")
+                        .unwrap(),
+                ),
+            ),
             start_time: Instant::now(),
             http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
             shutdown_token: CancellationToken::new(),
@@ -1525,7 +1530,12 @@ mod vhost_tests {
             dev_bind_addr: None,
             projected_contexts: RwLock::new(projected),
             blob_storage: Arc::new(BlobStorageBackend::from(storage)),
-            relay_config: scp_transport::native::server::RelayConfig::default(),
+            relay_config: scp_transport::native::server::RelayConfig::defaults(
+                scp_transport::relay::push_gate::LiveRelayUrl::new(
+                    scp_transport::relay::push_gate::RelayUrl::new("ws://127.0.0.1:9000/scp/v1")
+                        .unwrap(),
+                ),
+            ),
             start_time: Instant::now(),
             http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
@@ -1980,8 +1990,9 @@ fn spawn_quic_listener(
         // store (§3.10.2). The listener also shares the relay's slot registry
         // below — the two together honor one set of claimed slots.
         did_record_validation: rc.did_record_validation,
-        // The same reserved push routing ID and push role as the WebSocket
-        // relay, so a push message is intercepted on QUIC too (§10.7.1).
+        // A clone of the WebSocket relay's live URL handle and the same push
+        // role, so a push message is intercepted on QUIC too and a tier change
+        // moves both transports' reserved push routing ID at once (§10.7.1).
         relay_url: rc.relay_url.clone(),
         push: rc.push.clone(),
     };

@@ -46,6 +46,7 @@ use crate::node_start_config::{
 use crate::dht::ClientDhtConfig;
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorageBackend, StorageError};
+use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
 use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
@@ -320,16 +321,6 @@ impl RunningRelay {
     }
 }
 
-/// Builds a [`RelayConfig`] bound to `127.0.0.1:0` with zero delivery jitter
-/// (suitable for testing — deterministic timing).
-fn test_relay_config() -> RelayConfig {
-    RelayConfig {
-        bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        delivery_jitter_ms: 0,
-        ..RelayConfig::default()
-    }
-}
-
 /// Builds the in-process WebSocket URL of a relay bound at `addr`.
 ///
 /// The URL carries the bound address itself, so a relay bound to `::1` or to a
@@ -347,14 +338,30 @@ fn bound_relay_ws_url(mut addr: SocketAddr) -> String {
     format!("ws://{addr}/scp/v1")
 }
 
-/// Starts a relay and returns a [`RunningRelay`] from the given config and storage.
-async fn start_relay_with(
-    config: RelayConfig,
-    storage: BlobStorageBackend,
-) -> Result<RunningRelay, ServerError> {
+/// Starts a test relay on an OS-assigned loopback port, with zero delivery
+/// jitter (deterministic timing), and returns a [`RunningRelay`].
+///
+/// The listener is bound first so the relay's URL names the real port from the
+/// relay's first connection: the relay reserves the push routing ID of exactly
+/// the URL [`RunningRelay::relay_url`] returns (§10.7.1 step 2), and answers a
+/// PUBLISH there with `4063` instead of storing it.
+async fn start_relay_with(storage: BlobStorageBackend) -> Result<RunningRelay, ServerError> {
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .map_err(|e| RelayError::BindFailed(e.to_string()))?;
+    let relay_url = bound_relay_ws_url(
+        listener
+            .local_addr()
+            .map_err(|e| RelayError::BindFailed(e.to_string()))?,
+    );
+    let config = RelayConfig {
+        delivery_jitter_ms: 0,
+        ..RelayConfig::defaults(LiveRelayUrl::new(
+            RelayUrl::new(&relay_url).map_err(RelayError::from)?,
+        ))
+    };
     let server = RelayServer::new(config, Arc::new(storage));
-    let (handle, addr) = server.start().await?;
-    let relay_url = bound_relay_ws_url(addr);
+    let (handle, addr) = server.start_with_listener(listener).await?;
     Ok(RunningRelay {
         relay_url,
         bound_addr: addr,
@@ -372,7 +379,7 @@ async fn start_relay_with(
 ///
 /// Returns [`ServerError::Relay`] if the relay cannot bind.
 pub async fn start_relay_in_memory() -> Result<RunningRelay, ServerError> {
-    start_relay_with(test_relay_config(), BlobStorageBackend::in_memory()).await
+    start_relay_with(BlobStorageBackend::in_memory()).await
 }
 
 /// Starts a relay with redb-backed blob storage on an OS-assigned port.
@@ -401,7 +408,7 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
     }
     let db_path = data_dir.join("blobs.redb");
     let storage = BlobStorageBackend::redb(&db_path)?;
-    start_relay_with(test_relay_config(), storage).await
+    start_relay_with(storage).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1741,6 +1748,53 @@ mod tests {
             relay.relay_url()
         );
         assert_ne!(relay.bound_addr().port(), 0, "port should be assigned");
+        relay.shutdown();
+    }
+
+    /// The test relay reserves the push routing ID of the URL it hands to
+    /// clients (§10.7.1 step 2), so a PUBLISH there is answered `4063` and never
+    /// stored as a blob.
+    #[tokio::test]
+    async fn test_relay_reserves_the_push_routing_id_of_its_url() {
+        use futures::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let relay = start_relay_in_memory().await.unwrap();
+        let routing_id = scp_transport::relay::push_gate::RelayUrl::new(relay.relay_url())
+            .unwrap()
+            .push_routing_id();
+        let (mut ws, _) = tokio_tungstenite::connect_async(relay.relay_url())
+            .await
+            .unwrap();
+        let publish = scp_relay_client::ClientMessage::Publish {
+            ref_id: None,
+            routing_id,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            blob: vec![1],
+        };
+        ws.send(Message::Binary(publish.to_bytes().unwrap()))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Message::Binary(bytes) = frame else {
+            panic!("expected a binary relay frame, got {frame:?}");
+        };
+        let reply = scp_relay_client::RelayMessage::from_bytes(&bytes).unwrap();
+        assert!(
+            matches!(
+                reply,
+                scp_relay_client::RelayMessage::Err {
+                    code: scp_relay_client::code::PUSH_NOT_SUPPORTED,
+                    ..
+                }
+            ),
+            "expected ERR 4063 PUSH_NOT_SUPPORTED, got {reply:?}"
+        );
         relay.shutdown();
     }
 

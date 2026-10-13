@@ -36,6 +36,7 @@ use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::{NatTierChange, NetworkChangeDetector};
 use scp_transport::native::server::{RelayConfig, RelayError, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorage as _, BlobStorageBackend};
+use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
 use sha2::Digest;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
@@ -2600,7 +2601,9 @@ pub fn spawn_self_host_mapping_renewal(
 /// `live_state` is the node's shared state slot, not a copy: this task is its
 /// only writer, and it keeps no document and no URL of its own — not even the
 /// "current" address it compares against, which it reads back out of the slot.
-/// See [`LiveSlot`].
+/// See [`LiveSlot`]. `relay_url` is the handle every relay listener reads its
+/// reserved push routing ID from; [`apply_tier_change`] moves it with the
+/// advertised address (§10.7.1 step 2).
 #[allow(clippy::too_many_arguments)]
 fn spawn_tier_reevaluation(
     nat_strategy: Arc<dyn NatStrategy>,
@@ -2608,6 +2611,7 @@ fn spawn_tier_reevaluation(
     publisher: NodePublisher,
     identity: ScpIdentity,
     live_state: LiveSlot<NodePublishedState>,
+    relay_url: LiveRelayUrl,
     relay_port: u16,
     event_tx: Option<tokio::sync::mpsc::Sender<NatTierChange>>,
     reevaluation_interval: Duration,
@@ -2674,6 +2678,7 @@ fn spawn_tier_reevaluation(
             );
             apply_tier_change(
                 &live_state,
+                &relay_url,
                 &new_relay_url,
                 trigger_reason,
                 &publisher,
@@ -3625,6 +3630,13 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     };
 
     let relay_url = no_domain_relay_url(tier.as_ref(), http_port);
+    // The relay reserves the push routing ID of the URL the node is about to
+    // publish before the publish, so no client reads a URL whose routing ID the
+    // relay does not yet intercept (§10.7.1 step 2).
+    relay_config.relay_url.set(
+        RelayUrl::new(&relay_url)
+            .map_err(|e| NodeError::InvalidConfig(format!("relay URL {relay_url}: {e}")))?,
+    );
 
     push_relay_service(&mut document, &relay_url);
 
@@ -3679,6 +3691,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
             publisher,
             bg_identity,
             live_state.clone(),
+            relay_config.relay_url.clone(),
             http_port,
             Some(tier_event_tx),
             TIER_REEVALUATION_INTERVAL,
@@ -6235,6 +6248,7 @@ mod tests {
                 relay_url: "ws://198.51.100.7:32891/scp/v1".to_owned(),
                 record: None,
             }),
+            LiveRelayUrl::new(RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
             32891,
             Some(event_tx),
             TEST_REEVALUATION_INTERVAL,
@@ -6326,6 +6340,7 @@ mod tests {
                 relay_url: "ws://198.51.100.7:32891/scp/v1".to_owned(),
                 record: None,
             }),
+            LiveRelayUrl::new(RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
             32891,
             Some(event_tx),
             // Use a long interval so the periodic timer does NOT fire first.
@@ -6417,6 +6432,7 @@ mod tests {
                 relay_url: "ws://198.51.100.7:32891/scp/v1".to_owned(),
                 record: None,
             }),
+            LiveRelayUrl::new(RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
             32891,
             Some(event_tx),
             TEST_REEVALUATION_INTERVAL,
@@ -6518,6 +6534,7 @@ mod tests {
                 relay_url: format!("ws://{addr}/scp/v1"),
                 record: None,
             }),
+            LiveRelayUrl::new(RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
             addr.port(),
             Some(event_tx),
             TEST_REEVALUATION_INTERVAL,
@@ -6649,6 +6666,7 @@ mod tests {
                 relay_url: "ws://198.51.100.7:32891/scp/v1".to_owned(),
                 record: None,
             }),
+            LiveRelayUrl::new(RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap()),
             32891,
             None,
             interval,
@@ -7243,6 +7261,108 @@ mod tests {
         node.shutdown();
     }
 
+    /// Publishes a one-byte blob over the node's internal WebSocket relay to the
+    /// reserved push routing ID that a client derives from `url`,
+    /// `SHA-256("scp-push-registration" || canonical url)` (§10.7.1 step 2), and
+    /// returns the relay's reply.
+    async fn publish_to_reserved_push_id<S: scp_platform::traits::Storage>(
+        node: &ApplicationNode<S>,
+        url: &str,
+    ) -> scp_relay_client::RelayMessage {
+        use futures::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
+
+        let routing_id = scp_transport::relay::push_gate::RelayUrl::new(url)
+            .expect("the advertised relay URL has a canonical form")
+            .push_routing_id();
+        let mut request = format!("ws://{}/scp/v1", node.relay().bound_addr())
+            .into_client_request()
+            .expect("the relay address forms a request");
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", node.bridge_token_hex().as_str())
+                .parse()
+                .expect("the bridge token is a valid header value"),
+        );
+        let (mut ws, _) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("the internal relay accepts the bridge token");
+        let publish = scp_relay_client::ClientMessage::Publish {
+            ref_id: None,
+            routing_id,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            blob: vec![1],
+        };
+        ws.send(Message::Binary(
+            publish.to_bytes().expect("PUBLISH encodes"),
+        ))
+        .await
+        .expect("the PUBLISH is sent");
+        let frame = tokio::time::timeout(TEST_EVENT_TIMEOUT, ws.next())
+            .await
+            .expect("the relay answers the PUBLISH in time")
+            .expect("the relay keeps the connection open")
+            .expect("the relay frame is readable");
+        match frame {
+            Message::Binary(bytes) => {
+                scp_relay_client::RelayMessage::from_bytes(&bytes).expect("the reply decodes")
+            }
+            other => panic!("expected a binary relay frame, got {other:?}"),
+        }
+    }
+
+    /// Asserts the relay answered a PUBLISH to its reserved push routing ID as
+    /// a relay with no push service must: `4063` and no blob stored (§10.7.1
+    /// "No blob storage"). An `OK` carrying a `blob_id` means the relay did not
+    /// recognize the routing ID as reserved and stored the message as a blob.
+    fn assert_push_not_supported(reply: &scp_relay_client::RelayMessage, when: &str) {
+        assert!(
+            matches!(
+                reply,
+                scp_relay_client::RelayMessage::Err {
+                    code: scp_relay_client::code::PUSH_NOT_SUPPORTED,
+                    ..
+                }
+            ),
+            "{when}: expected ERR 4063 PUSH_NOT_SUPPORTED, got {reply:?}"
+        );
+    }
+
+    /// A no-domain node's relay reserves the push routing ID of the URL the node
+    /// advertises at startup, so a PUBLISH there never becomes a stored blob.
+    #[tokio::test]
+    async fn no_domain_relay_reserves_the_push_routing_id_of_its_advertised_url() {
+        let (config, _net_change_tx) = tier_change_config(DhtMode::Disabled);
+        let node = Node::start_for_testing(config)
+            .await
+            .expect("the no-domain node starts");
+        assert_eq!(node.relay_url(), TIER_CHANGE_OLD_URL);
+        let reply = publish_to_reserved_push_id(&node, TIER_CHANGE_OLD_URL).await;
+        assert_push_not_supported(&reply, "at startup");
+        node.shutdown();
+    }
+
+    /// After a NAT tier change the relay's reserved push routing ID follows the
+    /// new advertised URL, which is the URL a client now dials and derives the
+    /// routing ID from. A PUBLISH to the previous URL's reserved routing ID is
+    /// still refused and never stored.
+    #[tokio::test]
+    async fn tier_change_moves_the_relay_push_gate_to_the_new_url() {
+        let (config, net_change_tx) = tier_change_config(DhtMode::Disabled);
+        let mut node = Node::start_for_testing(config)
+            .await
+            .expect("the no-domain node starts");
+        drive_tier_change(&mut node, &net_change_tx).await;
+        assert_eq!(node.relay_url(), TIER_CHANGE_NEW_URL);
+
+        let reply = publish_to_reserved_push_id(&node, TIER_CHANGE_NEW_URL).await;
+        assert_push_not_supported(&reply, "the new URL after the tier change");
+        let reply = publish_to_reserved_push_id(&node, TIER_CHANGE_OLD_URL).await;
+        assert_push_not_supported(&reply, "the previous URL after the tier change");
+        node.shutdown();
+    }
+
     /// The `DhtMode::Disabled` case: the node publishes NOTHING — its record is
     /// `None` before and after — and every surface must STILL advance, because
     /// its reachability genuinely changed.
@@ -7432,6 +7552,7 @@ mod tests {
 
         apply_tier_change(
             &live_state,
+            &LiveRelayUrl::new(RelayUrl::new(TIER_CHANGE_OLD_URL).unwrap()),
             TIER_CHANGE_NEW_URL,
             "test",
             &NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
@@ -7470,6 +7591,7 @@ mod tests {
 
         apply_tier_change(
             &live_state,
+            &LiveRelayUrl::new(RelayUrl::new(TIER_CHANGE_OLD_URL).unwrap()),
             TIER_CHANGE_NEW_URL,
             "test",
             &NodePublisher::from_dyn(
@@ -7503,6 +7625,7 @@ mod tests {
 
         apply_tier_change(
             &live_state,
+            &LiveRelayUrl::new(RelayUrl::new(TIER_CHANGE_OLD_URL).unwrap()),
             TIER_CHANGE_NEW_URL,
             "test",
             &NodePublisher::from_dyn(
@@ -7539,6 +7662,7 @@ mod tests {
         // address that did not move.
         apply_tier_change(
             &live_state,
+            &LiveRelayUrl::new(RelayUrl::new(TIER_CHANGE_OLD_URL).unwrap()),
             TIER_CHANGE_NEW_URL,
             "retry",
             &NodePublisher::from_dyn(

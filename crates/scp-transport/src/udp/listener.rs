@@ -142,9 +142,11 @@ struct DtlsSession {
 /// use scp_transport::native::storage::InMemoryBlobStorage;
 /// use scp_transport::relay::rate_limit::{self, PublishRateLimiter};
 /// use scp_transport::native::did_slot::DidSlotRegistry;
+/// use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
 ///
 /// let config = UdpDtlsListenerConfig::default();
-/// let relay_config = RelayConfig::default();
+/// let relay_url = LiveRelayUrl::new(RelayUrl::new("wss://relay.example")?);
+/// let relay_config = RelayConfig::defaults(relay_url);
 /// let storage = Arc::new(InMemoryBlobStorage::new());
 /// let rate_limiter = PublishRateLimiter::new(100);
 /// let conn_tracker = rate_limit::new_connection_tracker();
@@ -217,8 +219,7 @@ impl<S: BlobStorage + 'static> UdpDtlsListener<S> {
     ///
     /// # Errors
     ///
-    /// Returns an error string if `relay_config` enables push without a relay
-    /// URL (§10.7.1 step 2), or if the OpenSSL DTLS server context cannot be
+    /// Returns an error string if the OpenSSL DTLS server context cannot be
     /// initialized.
     pub fn new(
         config: UdpDtlsListenerConfig,
@@ -228,7 +229,6 @@ impl<S: BlobStorage + 'static> UdpDtlsListener<S> {
         connection_tracker: ConnectionTracker,
         did_slots: DidSlotRegistry,
     ) -> Result<Self, String> {
-        relay_config.check_push().map_err(|e| e.to_string())?;
         let ssl_ctx = build_dtls_server_context()
             .map_err(|e| format!("failed to build DTLS server context: {e}"))?;
 
@@ -953,7 +953,7 @@ async fn handle_udp_publish<S: BlobStorage>(
     // the same gate every relay transport runs: a PUBLISH to the reserved push
     // routing ID is answered here and never reaches storage or a subscriber.
     if let Some(reply) = push_gate::gate_publish(
-        config.relay_url.as_ref(),
+        &config.relay_url,
         &config.push,
         &routing_id,
         blob,
@@ -1325,7 +1325,10 @@ mod tests {
     /// Helper: create a test listener and return the bound address and shutdown handle.
     async fn start_test_listener() -> (UdpDtlsShutdownHandle, SocketAddr, Arc<InMemoryBlobStorage>)
     {
-        start_test_listener_with_relay_config(RelayConfig::default()).await
+        start_test_listener_with_relay_config(RelayConfig::defaults(
+            crate::relay::push_gate::test_relay_url(),
+        ))
+        .await
     }
 
     /// Helper: create a test listener with a custom `RelayConfig`.
@@ -1491,7 +1494,7 @@ mod tests {
     fn listener_creation_succeeds() {
         let storage = Arc::new(InMemoryBlobStorage::new());
         let config = UdpDtlsListenerConfig::default();
-        let relay_config = RelayConfig::default();
+        let relay_config = RelayConfig::defaults(crate::relay::push_gate::test_relay_url());
         let listener = UdpDtlsListener::new(
             config,
             relay_config,
@@ -1920,7 +1923,7 @@ mod tests {
     async fn publish_oversized_blob_returns_error() {
         let small_relay_config = RelayConfig {
             max_blob_size: 1024,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let (handle, addr, _storage) =
             start_test_listener_with_relay_config(small_relay_config).await;
@@ -2142,60 +2145,43 @@ mod tests {
     }
 
     /// The UDP/DTLS listener runs the same push gate as the WebSocket relay
-    /// (§10.7.1): with push disabled it answers a PUBLISH to the reserved push
-    /// routing ID with 4063 and stores nothing there.
+    /// (§10.7.1) and reads the shared [`LiveRelayUrl`] on every PUBLISH: after
+    /// a `set` on a clone of the handle, the new reserved routing ID and the
+    /// previous one are both answered with 4063 and nothing is stored at
+    /// either.
     #[tokio::test]
-    async fn udp_rejects_the_reserved_push_routing_id_with_4063_and_stores_nothing() {
-        let url = crate::relay::push_gate::RelayUrl::new("wss://relay.push.test").unwrap();
-        let (handle, addr, storage) = start_test_listener_with_relay_config(RelayConfig {
-            relay_url: Some(url.clone()),
-            ..RelayConfig::default()
-        })
-        .await;
+    async fn udp_listener_reads_the_shared_relay_url() {
+        use crate::relay::push_gate::{LiveRelayUrl, RelayUrl};
+        let old = RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap();
+        let new = RelayUrl::new("ws://203.0.113.42:8443/scp/v1").unwrap();
+        let live = LiveRelayUrl::new(old.clone());
+        let (handle, addr, storage) =
+            start_test_listener_with_relay_config(RelayConfig::defaults(live.clone())).await;
+        live.set(new.clone());
         let client = create_dtls_client(addr).await;
 
-        let rid = url.push_routing_id();
-        let response = send_and_recv(
-            &client,
-            &ClientMessage::Publish {
-                ref_id: Some("push".to_string()),
-                routing_id: rid,
-                recipient_hint: None,
-                blob_ttl: 3600,
-                blob: vec![0x42; 64],
-            },
-        )
-        .await;
-        assert!(
-            matches!(
-                &response,
-                RelayMessage::Err { code: 4063, ref_id: Some(r), .. } if r == "push"
-            ),
-            "{response:?}"
-        );
-        assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+        for rid in [new.push_routing_id(), old.push_routing_id()] {
+            let response = send_and_recv(
+                &client,
+                &ClientMessage::Publish {
+                    ref_id: Some("push".to_string()),
+                    routing_id: rid,
+                    recipient_hint: None,
+                    blob_ttl: 3600,
+                    blob: vec![0x42; 64],
+                },
+            )
+            .await;
+            assert!(
+                matches!(
+                    &response,
+                    RelayMessage::Err { code: 4063, ref_id: Some(r), .. } if r == "push"
+                ),
+                "{response:?}"
+            );
+            assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+        }
 
         handle.shutdown();
-    }
-
-    #[cfg(feature = "push-store")]
-    #[test]
-    fn udp_new_refuses_push_enabled_without_a_relay_url() {
-        let dir = tempfile::tempdir().unwrap();
-        let relay_config = RelayConfig {
-            push: crate::relay::push_gate::PushRole::Enabled(
-                crate::relay::push_gate::kel_service_for_tests(dir.path()),
-            ),
-            ..RelayConfig::default()
-        };
-        let result = UdpDtlsListener::new(
-            UdpDtlsListenerConfig::default(),
-            relay_config,
-            Arc::new(InMemoryBlobStorage::new()),
-            PublishRateLimiter::new(100),
-            rate_limit::new_connection_tracker(),
-            DidSlotRegistry::new(),
-        );
-        assert!(matches!(result, Err(e) if e.contains("relay URL")));
     }
 }

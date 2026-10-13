@@ -500,7 +500,7 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "critical",
-      "status": "in-progress",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/server.rs",
         "crates/scp-transport/src/relay/push_gate.rs",
@@ -514,9 +514,11 @@
         "crates/scp-node/src/http.rs",
         "crates/scp-node/src/config.rs",
         "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/published_state.rs",
+        "crates/scp-ffi/common/src/server.rs",
         "crates/scp-relay-client/src/error.rs"
       ],
-      "description": "Adds `RelayConfig.push: PushRole` with the variants `Disabled` and `Enabled(PushServiceConfig)`. `Disabled` is the default, because it fails safe in the same way as `BridgeRole::Disabled` (ADR-052, the unified construction pattern, M2 and M4). `PushServiceConfig` holds the store, the `Arc<dyn PushSignatureVerifier>` and the configured senders; all three are required, with no defaults. `RelayConfig.relay_url` holds the relay's \u00a79.18.2 canonical URL, from which the relay derives its reserved push routing ID and rebuilds every preimage (\u00a710.7.1 steps 2 and 3). The push gate runs in the PUBLISH handler of every relay transport that stores blobs (WebSocket, QUIC, UDP/DTLS and WebTransport) beside `did_slots.gate_publish`, after the rate-limit, size and TTL checks and before `storage.store`; the QUIC and WebTransport configurations carry the same `relay_url` and `push` fields, and every listener refuses to start with `Enabled` and no URL. On any verifier rejection the relay stores nothing and changes nothing. File location `push_gate.rs` is an indicator. The operation is relay-internal and has no client dispatch, so the `pw` row is n/a.",
+      "description": "Adds `RelayConfig.push: PushRole` with the variants `Disabled` and `Enabled(PushServiceConfig)`. `Disabled` is the default, because it fails safe in the same way as `BridgeRole::Disabled` (ADR-052, the unified construction pattern, M2 and M4). `PushServiceConfig` holds the store, the `Arc<dyn PushSignatureVerifier>` and the configured senders; all three are required, with no defaults. `RelayConfig.relay_url` is a required `LiveRelayUrl` handle holding the relay's \u00a79.18.2 canonical URL, from which the relay derives its reserved push routing ID and rebuilds every preimage (\u00a710.7.1 steps 2 and 3). `RelayConfig` has no `Default` (M4 fires on `relay_url`), so no relay is built without a URL. A full node seeds the handle from its domain or its NAT tier address, and the NAT-tier task sets it before republishing on a tier change; the handle keeps a bounded list of retired routing IDs, and a PUBLISH to one is refused and never stored. The push gate runs in the PUBLISH handler of every relay transport that stores blobs (WebSocket, QUIC, UDP/DTLS and WebTransport) beside `did_slots.gate_publish`, after the rate-limit, size and TTL checks and before `storage.store`; the QUIC and WebTransport configurations carry clones of the same `relay_url` handle and the same `push` field, so every listener reads one URL and a change moves all of them at once. On any verifier rejection the relay stores nothing and changes nothing. File location `push_gate.rs` is an indicator. The operation is relay-internal and has no client dispatch, so the `pw` row is n/a.",
       "acceptanceCriteria": [
         "A PUBLISH to the reserved routing ID never reaches `storage.store` or `deliver_to_subscribers`, whatever the result; tests prove this by querying and subscribing to the reserved routing ID afterwards.",
         "A relay with `Disabled` returns 4063.",
@@ -526,7 +528,8 @@
         "A relay returns 4062 for a timestamp outside the skew window (indicator: \u00b1300 s) or not newer than the stored one.",
         "A relay returns 4061 for a platform with no configured sender.",
         "A valid deregistration removes exactly its own key.",
-        "The new codes are constants in `crates/scp-relay-client/src/error.rs`."
+        "The new codes are constants in `crates/scp-relay-client/src/error.rs`.",
+        "Every listener (WebSocket, QUIC, UDP/DTLS, WebTransport) reads the shared relay URL handle: after a URL change it intercepts the new reserved routing ID and refuses the previous one, storing nothing at either; a full node's NAT tier change moves the handle."
       ],
       "actionItems": [
         "Add `PushRole` and `PushServiceConfig` to `RelayConfig`.",

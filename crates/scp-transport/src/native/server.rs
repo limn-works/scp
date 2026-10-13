@@ -17,7 +17,7 @@
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let (shutdown, addr) =
-//!     Relay::start(RelayConfig::default(), BlobStorageBackend::in_memory()).await?;
+//!     Relay::start(RelayConfig::defaults(crate::relay::push_gate::test_relay_url()), BlobStorageBackend::in_memory()).await?;
 //! // ... serve; later:
 //! shutdown.shutdown();
 //! # let _ = addr;
@@ -51,7 +51,7 @@ use super::relay_persistence::RelayPersistence;
 use super::storage::{BlobStorage, BlobStorageBackend};
 use crate::error::TransportError;
 use crate::relay::bridge::{BRIDGE_AUTH_FAILED_MSG, BridgeRegistration, BridgeRegistry};
-use crate::relay::push_gate::{self, PushRole, RelayUrl};
+use crate::relay::push_gate::{self, LiveRelayUrl, PushRole};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 use scp_relay_client::code;
@@ -120,8 +120,26 @@ pub enum DidRecordValidation {
 
 /// Configuration for the relay server.
 ///
-/// All fields have sensible defaults matching the ADR-004 specification.
-/// Use [`RelayConfig::default()`] for standard configuration.
+/// Every field but `relay_url` has a default matching ADR-004. The relay's URL
+/// has none (construction.md M4), so build the standard configuration with
+/// [`RelayConfig::defaults`] and override fields with struct-update syntax.
+///
+/// No whole-struct `Default` exists:
+///
+/// ```compile_fail,E0599
+/// let _ = scp_transport::native::server::RelayConfig::defaults(crate::relay::push_gate::test_relay_url());
+/// ```
+///
+/// ```
+/// use scp_transport::native::server::RelayConfig;
+/// use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let url = LiveRelayUrl::new(RelayUrl::new("wss://relay.example")?);
+/// let config = RelayConfig { delivery_jitter_ms: 0, ..RelayConfig::defaults(url) };
+/// assert_eq!(config.relay_url.current().canonical(), "wss://relay.example");
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
     /// Address to bind the WebSocket listener to.
@@ -182,19 +200,23 @@ pub struct RelayConfig {
     /// always re-verifies); set [`DidRecordValidation::Disabled`] to store DID
     /// frames opaquely like a foreign transport.
     pub did_record_validation: DidRecordValidation,
-    /// The relay's own URL in its §9.18.2 canonical form, from which it
-    /// derives its reserved push routing ID (§10.7.1 step 2). With `None` the
-    /// relay knows no reserved push routing ID and intercepts no PUBLISH, so
-    /// [`RelayServer::start`] and [`RelayServer::run`] refuse to start a relay
-    /// whose `push` is enabled without it. Defaults to `None`.
-    pub relay_url: Option<RelayUrl>,
+    /// The relay's own URL, from which every listener sharing this handle
+    /// derives the reserved push routing ID (§10.7.1 step 2). Required: a
+    /// relay always knows its URL, so push interception always runs. The
+    /// QUIC, UDP and WebTransport listeners of the same relay take clones of
+    /// this handle, and [`LiveRelayUrl::set`] moves all of them at once when
+    /// the URL changes.
+    pub relay_url: LiveRelayUrl,
     /// Whether the relay offers push (§10.7.1, ADR-004 "Push registration
     /// interception"). Defaults to [`PushRole::Disabled`].
     pub push: PushRole,
 }
 
-impl Default for RelayConfig {
-    fn default() -> Self {
+impl RelayConfig {
+    /// The ADR-004 defaults for every field, with `relay_url` as the relay's
+    /// URL.
+    #[must_use]
+    pub fn defaults(relay_url: LiveRelayUrl) -> Self {
         Self {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 9000)),
             max_blob_size: MAX_BLOB_SIZE,
@@ -208,10 +230,7 @@ impl Default for RelayConfig {
             rate_limit_subscribes_per_minute: 20,
             delivery_jitter_ms: 50,
             bridge_secret: None,
-            // Fail-safe broker default. `RelayConfig` may keep a whole-struct
-            // `Default` (construction.md M4) precisely because its only
-            // security-consequential field, `bridge`, defaults to the fail-safe
-            // `BridgeRole::Disabled` — a relay that brokers nothing until
+            // Fail-safe broker default: a relay brokers nothing until
             // explicitly enabled.
             bridge: BridgeRole::Disabled,
             // Validating SCP-native relay by default: delivers the relay-layer
@@ -219,29 +238,11 @@ impl Default for RelayConfig {
             // dependency (client always re-verifies), and inert for encrypted
             // context blobs (they never decode as DID-record frames).
             did_record_validation: DidRecordValidation::Enabled,
-            relay_url: None,
+            relay_url,
             // Fail-safe push default, like `bridge`: a relay stores no push
             // token until push is explicitly enabled (construction.md M2).
             push: PushRole::Disabled,
         }
-    }
-}
-
-impl RelayConfig {
-    /// Refuses a configuration that enables push without the relay URL its
-    /// reserved push routing ID derives from (§10.7.1 step 2), because such a
-    /// relay would intercept nothing and store push tokens as blobs.
-    ///
-    /// [`RelayServer::run`] and [`RelayServer::start`] call it first. A
-    /// deployment that also starts the QUIC, UDP or WebTransport listener from
-    /// this configuration calls it before starting them.
-    ///
-    /// # Errors
-    ///
-    /// [`RelayError::PushWithoutRelayUrl`] when `push` is `Enabled` and
-    /// `relay_url` is `None`.
-    pub fn check_push(&self) -> Result<(), RelayError> {
-        push_gate::check_config(self.relay_url.as_ref(), &self.push).map_err(RelayError::from)
     }
 }
 
@@ -472,7 +473,6 @@ impl RelayServer {
     /// Returns [`RelayError::BindFailed`] if the server cannot bind to
     /// the configured address.
     pub async fn run(&self) -> Result<(), RelayError> {
-        self.config.check_push()?;
         // Restore persisted subscriptions on startup (SCP-PERSIST-066).
         self.restore_persisted_subscriptions().await;
 
@@ -581,18 +581,37 @@ impl RelayServer {
         });
     }
 
+    /// Binds `config.bind_addr` and starts the relay on it, as
+    /// [`start_with_listener`](Self::start_with_listener) does.
+    ///
     /// # Errors
     ///
     /// Returns [`RelayError::BindFailed`] if the server cannot bind to
     /// the configured address.
     pub async fn start(&self) -> Result<(ShutdownHandle, SocketAddr), RelayError> {
-        self.config.check_push()?;
-        // Restore persisted subscriptions on startup (SCP-PERSIST-066).
-        self.restore_persisted_subscriptions().await;
-
         let listener = TcpListener::bind(self.config.bind_addr)
             .await
             .map_err(|e| RelayError::BindFailed(e.to_string()))?;
+        self.start_with_listener(listener).await
+    }
+
+    /// Starts the relay on an already-bound `listener` and returns a shutdown
+    /// handle and the bound address; `config.bind_addr` is not read.
+    ///
+    /// A caller that binds port 0 first learns the real port before it builds
+    /// the relay's URL, so `config.relay_url` names the address the relay
+    /// actually serves from its first connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelayError::BindFailed`] if the listener has no local
+    /// address.
+    pub async fn start_with_listener(
+        &self,
+        listener: TcpListener,
+    ) -> Result<(ShutdownHandle, SocketAddr), RelayError> {
+        // Restore persisted subscriptions on startup (SCP-PERSIST-066).
+        self.restore_persisted_subscriptions().await;
 
         let local_addr = listener
             .local_addr()
@@ -723,10 +742,11 @@ pub enum RelayError {
     #[error("accept failed: {0}")]
     AcceptFailed(String),
 
-    /// The configuration enables push but names no relay URL, so the relay
-    /// could not derive its reserved push routing ID (§10.7.1 step 2).
-    #[error(transparent)]
-    PushWithoutRelayUrl(#[from] push_gate::PushWithoutRelayUrl),
+    /// The URL a caller built for the relay has no §9.18.2 canonical form, so
+    /// the relay could not derive its reserved push routing ID (§10.7.1
+    /// step 2).
+    #[error("invalid relay URL: {0}")]
+    InvalidRelayUrl(#[from] scp_protocol::discovery::push::PushMessageError),
 }
 
 /// Background task that periodically purges expired blobs and reclaims stale
@@ -1302,7 +1322,7 @@ async fn handle_publish(
     // the same gate every relay transport runs: a PUBLISH to the reserved push
     // routing ID is answered here and never reaches storage or a subscriber.
     if let Some(reply) = push_gate::gate_publish(
-        config.relay_url.as_ref(),
+        &config.relay_url,
         &config.push,
         &routing_id,
         blob,
@@ -1916,6 +1936,7 @@ mod tests {
 
     use super::*;
     use crate::native::storage::BlobStorageBackend;
+    use crate::relay::push_gate::RelayUrl;
     use futures::{SinkExt, StreamExt};
     use sha2::{Digest, Sha256};
     use tokio_tungstenite::connect_async;
@@ -1935,7 +1956,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
@@ -2782,7 +2803,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(50),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -2833,7 +2854,7 @@ mod tests {
             max_total_connections: 100,
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -2864,7 +2885,7 @@ mod tests {
             max_total_connections: 2,
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -2893,7 +2914,7 @@ mod tests {
             rate_limit_publishes_per_second: 2,
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -2943,7 +2964,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             rate_limit_subscribes_per_minute: 3,
             ttl_check_interval: Duration::from_millis(100),
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -2990,7 +3011,7 @@ mod tests {
             // 60/min = 1/sec for easy testing
             rate_limit_subscribes_per_minute: 60,
             ttl_check_interval: Duration::from_millis(100),
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -3054,7 +3075,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             rate_limit_subscribes_per_minute: 2,
             ttl_check_interval: Duration::from_millis(100),
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -3107,7 +3128,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         // Storage with capacity of 2.
         let storage = Arc::new(BlobStorageBackend::in_memory_with_capacity(2));
@@ -3160,7 +3181,7 @@ mod tests {
             max_total_connections: 100,
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -3195,7 +3216,7 @@ mod tests {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -3210,7 +3231,7 @@ mod tests {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -3245,7 +3266,7 @@ mod tests {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -3274,7 +3295,7 @@ mod tests {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 1,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -3373,7 +3394,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::with_persistence(config, storage, Arc::clone(&persistence));
@@ -3410,7 +3431,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::with_persistence(config, storage, Arc::clone(&persistence));
@@ -3509,7 +3530,7 @@ mod tests {
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
             bridge: BridgeRole::Enabled,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -3591,7 +3612,10 @@ mod tests {
         // sound precisely because its only security-consequential field defaults
         // to the fail-safe `Disabled`.
         assert_eq!(BridgeRole::default(), BridgeRole::Disabled);
-        assert_eq!(RelayConfig::default().bridge, BridgeRole::Disabled);
+        assert_eq!(
+            RelayConfig::defaults(crate::relay::push_gate::test_relay_url()).bridge,
+            BridgeRole::Disabled
+        );
     }
 
     #[tokio::test]
@@ -3603,7 +3627,7 @@ mod tests {
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
             bridge: BridgeRole::Enabled,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let (_handle, addr) = Relay::start(config, BlobStorageBackend::in_memory())
             .await
@@ -3630,7 +3654,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         assert_eq!(config.bridge, BridgeRole::Disabled);
         let (_handle, addr) = Relay::start(config, BlobStorageBackend::in_memory())
@@ -3844,7 +3868,7 @@ mod tests {
                 ttl_check_interval: Duration::from_millis(100),
                 delivery_jitter_ms: 0,
                 did_record_validation: DidRecordValidation::Disabled,
-                ..RelayConfig::default()
+                ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
             };
             let storage = Arc::new(BlobStorageBackend::in_memory());
             let (_handle, addr) = RelayServer::new(config, storage).start().await.unwrap();
@@ -4145,9 +4169,8 @@ mod tests {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
-            relay_url: Some(RelayUrl::new(PUSH_RELAY_URL).unwrap()),
             push,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(LiveRelayUrl::new(RelayUrl::new(PUSH_RELAY_URL).unwrap()))
         };
         let server = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()));
         let (_handle, addr) = server.start().await.unwrap();
@@ -4156,12 +4179,16 @@ mod tests {
 
     /// Publishes `blob` to the reserved push routing ID and returns the reply.
     async fn publish_push(addr: SocketAddr, blob: Vec<u8>) -> RelayMessage {
+        publish_to(addr, push_rid(), blob).await
+    }
+
+    async fn publish_to(addr: SocketAddr, routing_id: [u8; 32], blob: Vec<u8>) -> RelayMessage {
         let (mut sink, mut stream) = connect_client(addr).await;
         send_msg(
             &mut sink,
             &ClientMessage::Publish {
                 ref_id: Some("push".to_string()),
-                routing_id: push_rid(),
+                routing_id,
                 recipient_hint: None,
                 blob_ttl: 3600,
                 blob,
@@ -4249,8 +4276,33 @@ mod tests {
 
     #[tokio::test]
     async fn push_role_defaults_to_disabled() {
-        assert!(matches!(RelayConfig::default().push, PushRole::Disabled));
-        assert!(RelayConfig::default().relay_url.is_none());
+        let config = RelayConfig::defaults(push_gate::test_relay_url());
+        assert!(matches!(config.push, PushRole::Disabled));
+    }
+
+    /// The WebSocket listener reads the shared [`LiveRelayUrl`] on every
+    /// PUBLISH: a `set` on a clone of the handle after start moves its
+    /// reserved routing ID, and the previous one stays intercepted.
+    #[tokio::test]
+    async fn websocket_listener_reads_the_shared_relay_url() {
+        let old = RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap();
+        let new = RelayUrl::new("ws://203.0.113.42:8443/scp/v1").unwrap();
+        let live = LiveRelayUrl::new(old.clone());
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::defaults(live.clone())
+        };
+        let server = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()));
+        let (_handle, addr) = server.start().await.unwrap();
+        live.set(new.clone());
+        for (label, rid) in [
+            ("new", new.push_routing_id()),
+            ("old", old.push_routing_id()),
+        ] {
+            let reply = publish_to(addr, rid, vec![1]).await;
+            assert_eq!(err_code(&reply), code::PUSH_NOT_SUPPORTED, "{label} URL");
+        }
     }
 
     #[cfg(feature = "push-store")]
@@ -4581,29 +4633,6 @@ mod tests {
                     .is_none(),
                 "a subscriber to the reserved push routing ID received a message"
             );
-        }
-
-        #[tokio::test]
-        async fn start_refuses_push_enabled_without_a_relay_url() {
-            let dir = tempfile::tempdir().unwrap();
-            let config = RelayConfig {
-                bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-                push: PushRole::Enabled(PushServiceConfig {
-                    store: PushRegistrationStore::open_sqlite(&dir.path().join("p.db")).unwrap(),
-                    verifier: Arc::new(KelPushVerifier),
-                    senders: Arc::from(vec![apns_sender()]),
-                }),
-                ..RelayConfig::default()
-            };
-            let server = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()));
-            assert!(matches!(
-                server.start().await,
-                Err(RelayError::PushWithoutRelayUrl(_))
-            ));
-            assert!(matches!(
-                server.run().await,
-                Err(RelayError::PushWithoutRelayUrl(_))
-            ));
         }
     }
 }

@@ -159,6 +159,10 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 # DID→key extraction is delegated to `scp_did::extract_public_key_from_did`,
 # so no production code path in this crate touches z-base-32 directly.
 z-base-32 = { workspace = true }
+# `server.rs` tests speak the relay wire protocol to the test relay.
+tokio-tungstenite = { version = "0.24", features = ["connect"] }
+futures = "0.3"
+scp-relay-client = { path = "../../scp-relay-client" }
 
 [lints]
 workspace = true

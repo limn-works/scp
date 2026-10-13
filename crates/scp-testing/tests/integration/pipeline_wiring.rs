@@ -146,6 +146,11 @@ const NODE_BUILDER_SRC: &str = include_str!("../../../../crates/scp-node/src/lib
 // BEP44 record would give its monotonic sequence two independent writers.
 const NODE_SELF_HOST_SRC: &str = include_str!("../../../../crates/scp-node/src/self_host.rs");
 
+// Node published-state source — owns `apply_tier_change`, the NAT-tier task's
+// one writer, which moves the relay's live URL handle (PUSH-007, §10.7.1).
+const NODE_PUBLISHED_STATE_SRC: &str =
+    include_str!("../../../../crates/scp-node/src/published_state.rs");
+
 // Transport layer sources for Batch 3 assertions
 const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
 
@@ -1062,6 +1067,47 @@ fn relay_set_writes_store_canonical_relay_urls() {
         ),
         "Supervisor::build_welcome_joiner_state must store the bundle's relay set through \
          normalize_relay_urls"
+    );
+}
+
+// PUSH-007 (§10.7.1 step 2): the NAT-tier task writes the relay's live URL
+// handle, so every relay listener reserves the push routing ID of the URL the
+// node advertises after a tier change. `build_no_domain_inner` hands the task a
+// clone of the relay config's handle, the task calls `apply_tier_change` with
+// it, and `apply_tier_change` sets the handle before it publishes the document.
+#[test]
+fn nat_tier_task_writes_the_relay_push_url_handle() {
+    assert!(
+        fn_body_contains(
+            NODE_BUILDER_SRC,
+            "build_no_domain_inner",
+            "relay_config.relay_url.clone()"
+        ),
+        "build_no_domain_inner must give the tier task the relay config's live URL handle"
+    );
+    assert!(
+        fn_body_contains(
+            NODE_BUILDER_SRC,
+            "build_no_domain_inner",
+            "relay_config.relay_url.set("
+        ),
+        "build_no_domain_inner must set the probed tier's URL on the relay handle"
+    );
+    assert!(
+        fn_body_contains(NODE_BUILDER_SRC, "spawn_tier_reevaluation", "&relay_url,"),
+        "the tier task must pass the relay handle to apply_tier_change"
+    );
+    let body = extract_fn_body(NODE_PUBLISHED_STATE_SRC, "apply_tier_change")
+        .expect("apply_tier_change body");
+    let set = body
+        .find("relay.set(")
+        .expect("apply_tier_change must set the relay's live URL handle");
+    let publish = body
+        .find(".publish(")
+        .expect("apply_tier_change must publish the document");
+    assert!(
+        set < publish,
+        "apply_tier_change must move the relay handle before it publishes the new URL"
     );
 }
 

@@ -31,7 +31,7 @@ use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::NetworkChangeDetector;
 use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
-use scp_transport::relay::push_gate::RelayUrl;
+use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
 
 use crate::{
     ApplicationNode, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy, NoOpCustody, NoOpDidMethod,
@@ -965,8 +965,7 @@ where
     let relay_config = RelayConfig {
         bind_addr,
         bridge_secret: Some(*bridge_secret),
-        relay_url: Some(relay_url),
-        ..RelayConfig::default()
+        ..RelayConfig::defaults(LiveRelayUrl::new(relay_url))
     };
 
     // The caller's explicit blob-backend selection, threaded verbatim — never
@@ -1107,10 +1106,18 @@ where
     // 3. Start relay server.
     let bind_addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
     let bridge_secret = generate_bridge_secret();
+    // The relay starts on the URL a node publishes when it skips the NAT probe.
+    // `build_no_domain_inner` sets the probed tier's URL on this shared handle
+    // before the node publishes any URL, and the tier task moves it on every
+    // tier change, so the relay always reserves the push routing ID of the URL
+    // clients read (§10.7.1 step 2).
+    let seed_url = crate::no_domain_relay_url(None, crate::advertised_http_port(http_bind_addr));
+    let relay_url = RelayUrl::new(&seed_url)
+        .map_err(|e| NodeError::InvalidConfig(format!("relay URL {seed_url}: {e}")))?;
     let relay_config = RelayConfig {
         bind_addr,
         bridge_secret: Some(*bridge_secret),
-        ..RelayConfig::default()
+        ..RelayConfig::defaults(LiveRelayUrl::new(relay_url))
     };
 
     // The caller's explicit blob-backend selection, threaded verbatim — never
@@ -1480,9 +1487,9 @@ mod tests {
             node.state
                 .relay_config
                 .relay_url
-                .as_ref()
-                .map(RelayUrl::push_routing_id),
-            Some(RelayUrl::new(&node.relay_url()).unwrap().push_routing_id()),
+                .current()
+                .push_routing_id(),
+            RelayUrl::new(&node.relay_url()).unwrap().push_routing_id(),
             "the domain node's relay must reserve the push routing ID of its published URL"
         );
         node.shutdown();

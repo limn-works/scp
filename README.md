@@ -202,7 +202,7 @@ scp-node --health
 | `SCP_RELAY_STORAGE_BACKEND` | none (required) | Blob storage backend: `sqlite`, `redb`, `postgres`, `s3` (the last two need `--features cloud-blobs`), or `memory`. Unset or empty exits 1 |
 | `SCP_RELAY_STORAGE_PATH` | none (required for `sqlite` and `redb`) | Absolute path of the database file. Unset, empty, or relative exits 1 |
 | `SCP_RELAY_PUSH_PLATFORMS` | none (required by `scp-relay` and `--relay-only`) | Push platforms the relay serves: `none`, `apns`, `fcm`, `apns,fcm`. Unset or empty exits 1. A platform also needs the push store and credential variables in [Relay Operations](docs/guides/relay-operations.md) §3; this build serves only `none` |
-| `SCP_RELAY_URL` | none (required) | The relay's public WebSocket URL, which determines its reserved push routing ID (spec §10.7.1, push registration protocol). Read by `scp-relay` and `--relay-only`, which exit 1 when it is unset or empty; a full node does not read it |
+| `SCP_RELAY_URL` | none (required) | The relay's public WebSocket URL, which determines its reserved push routing ID (spec §10.7.1, push registration protocol). Read by `scp-relay` and `--relay-only`, which exit 1 when it is unset or empty. A full node does not read it: the node derives the URL from its domain or from the address its NAT tier advertises, and moves the reserved routing ID with every tier change. Every listener (WebSocket, QUIC, UDP/DTLS) reads the same URL, and the relay refuses a PUBLISH to the routing ID of an earlier URL without storing it |
 | `SCP_RELAY_BIND_ADDR` | `0.0.0.0:9000` | Listen address |
 | `SCP_RELAY_MAX_BLOB_SIZE` | `262144` | Max blob size (bytes) |
 | `SCP_RELAY_MAX_BLOB_TTL` | `604800` | Max blob TTL (seconds) |
