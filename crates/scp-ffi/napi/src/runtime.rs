@@ -1806,15 +1806,18 @@ pub(crate) fn persist_ucan_revocation_blocking(
     })
 }
 
-/// Writes the context's UCAN nonce tracker to this instance's durable store.
+/// Writes the nonce a validation run recorded to this instance's durable
+/// store, through
+/// [`scp_ffi_common::ucan_durable_state::persist_recorded_nonce`].
 ///
 /// Called after every UCAN-validation pipeline run that can record a nonce,
 /// because that pipeline is the only writer of nonce state. A nonce accepted
 /// now is therefore still refused after the bridge instance is rebuilt.
 /// `recorded` is what the run's nonce adapter reported; when it is `None` the
-/// run recorded nothing and this writes nothing. The write runs while this
-/// call holds the context's registry entry, so two concurrent writers land in
-/// the order they read the tracker.
+/// run recorded nothing and this writes nothing. Otherwise it writes that one
+/// nonce's key, and deletes expired nonce keys when the record pruned the
+/// tracker. The write runs while this call holds the context's registry entry,
+/// so it reads the tracker entry the run just recorded.
 ///
 /// # Errors
 ///
@@ -1826,15 +1829,18 @@ pub(crate) fn persist_ucan_nonces_blocking(
     context_id: &str,
     recorded: Option<scp_ffi_common::NonceRecorded>,
 ) -> Result<(), ScpNapiError> {
-    if recorded.is_none() {
+    let Some(recorded) = recorded else {
         return Ok(());
-    }
+    };
     let to_error = durable_state_error("persist UCAN nonce state", context_id);
     with_context(bi, context_id, |rt| {
         scp_ffi_common::ucan_durable_state::block_on_storage(
             Some(crate::runtime().handle()),
-            protocol_repository(bi)
-                .persist_ucan_nonce_entries(context_id, &rt.core.nonce_tracker.snapshot_entries()),
+            protocol_repository(bi).persist_ucan_recorded_nonce(
+                context_id,
+                &rt.core.nonce_tracker,
+                recorded,
+            ),
         )
         .map_err(to_error)?
         .map_err(to_error)

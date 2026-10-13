@@ -381,39 +381,45 @@ impl ProtocolRepoVariant {
         }
     }
 
-    /// Writes the context's UCAN nonce entries to whichever `Storage` backend
-    /// this repository wraps, so a nonce seen now is still refused after the
-    /// bridge instance is rebuilt.
+    /// Writes the nonce a UCAN-validation run recorded to whichever `Storage`
+    /// backend this repository wraps, through
+    /// [`persist_recorded_nonce`](crate::ucan_durable_state::persist_recorded_nonce),
+    /// so a nonce seen now is still refused after the bridge instance is
+    /// rebuilt. The write is the one nonce's own key; when the record pruned
+    /// the tracker, expired nonce keys are deleted too.
     ///
     /// The napi-rs and `UniFFI` bridges call this after a UCAN-validation
-    /// pipeline run that recorded a nonce, because that pipeline is the only
-    /// writer of nonce state.
-    /// Callers pass `NonceTracker::snapshot_entries`.
+    /// pipeline run whose nonce adapter reported `recorded`; the `PyO3` bridge
+    /// calls the same function directly against its `StorageProvider`.
     ///
     /// # Errors
     ///
     /// Returns [`UcanDurableStateError`](crate::ucan_durable_state::UcanDurableStateError)
-    /// if the context id is not a safe key component, the entries cannot be
-    /// encoded, or the storage write fails.
-    pub async fn persist_ucan_nonce_entries<H: std::hash::BuildHasher + Sync>(
+    /// if the context id is not a safe key component, the tracker does not
+    /// hold the nonce, a value cannot be encoded or decoded, or a storage call
+    /// fails.
+    pub async fn persist_ucan_recorded_nonce<C: scp_clock::Clock>(
         &self,
         context_id: &str,
-        entries: &std::collections::HashMap<String, (u64, u64), H>,
+        tracker: &scp_core::crypto::ucan::nonce::NonceTracker<C>,
+        recorded: crate::resolvers::NonceRecorded,
     ) -> Result<(), crate::ucan_durable_state::UcanDurableStateError> {
         match self {
             Self::InMemory(repo) => {
-                crate::ucan_durable_state::persist_nonce_entries(
+                crate::ucan_durable_state::persist_recorded_nonce(
                     repo.storage(),
                     context_id,
-                    entries,
+                    tracker,
+                    recorded,
                 )
                 .await
             }
             Self::Sqlite(repo) => {
-                crate::ucan_durable_state::persist_nonce_entries(
+                crate::ucan_durable_state::persist_recorded_nonce(
                     repo.storage(),
                     context_id,
-                    entries,
+                    tracker,
+                    recorded,
                 )
                 .await
             }

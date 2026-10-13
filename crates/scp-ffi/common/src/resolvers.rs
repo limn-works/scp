@@ -758,8 +758,39 @@ impl ProofResolver for BridgeProofResolver {
 /// nonce-persist function takes an `Option<NonceRecorded>` and writes nothing
 /// when it is `None`, so a run that recorded nothing (a forged or malformed
 /// token refused before Step 9, or a probe) cannot trigger a storage write.
+///
+/// It names the one nonce the run recorded, so the persist step writes that
+/// nonce's own durable key and nothing else, and it reports whether the
+/// tracker pruned entries during the record, which is the signal for the
+/// persist step to delete the durable keys of expired nonces
+/// ([`crate::ucan_durable_state::persist_recorded_nonce`]).
 #[derive(Debug)]
-pub struct NonceRecorded(());
+pub struct NonceRecorded {
+    /// The nonce the wrapped tracker accepted.
+    pub(crate) nonce: String,
+    /// Whether the tracker dropped entries while recording: the record ran a
+    /// prune pass (on its interval, or at capacity) that removed at least one
+    /// entry.
+    pub(crate) pruned: bool,
+}
+
+impl NonceRecorded {
+    /// Records `nonce` in `inner` and reports the record, with `pruned` set
+    /// when the tracker's entry count did not grow by one (the record's prune
+    /// pass removed an entry).
+    pub(crate) fn record<C: Clock>(
+        inner: &mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
+        nonce: &str,
+        token_expiry: u64,
+    ) -> Result<Self, CoreUcanError> {
+        let before = inner.len();
+        inner.record(nonce, token_expiry)?;
+        Ok(Self {
+            nonce: nonce.to_owned(),
+            pruned: inner.len() <= before,
+        })
+    }
+}
 
 /// Adapter that implements the `validate::NonceTracker` trait for
 /// `nonce::NonceTracker<C>`.
@@ -789,8 +820,7 @@ impl<C: Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
     }
 
     fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
-        self.inner.record(nonce, token_expiry)?;
-        *self.recorded = Some(NonceRecorded(()));
+        *self.recorded = Some(NonceRecorded::record(self.inner, nonce, token_expiry)?);
         Ok(())
     }
 }
@@ -842,8 +872,7 @@ impl<C: Clock> NonceTrackerTrait for OutletGrantNonceTracker<'_, C> {
 
     fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
         if self.record {
-            self.inner.record(nonce, token_expiry)?;
-            *self.recorded = Some(NonceRecorded(()));
+            *self.recorded = Some(NonceRecorded::record(self.inner, nonce, token_expiry)?);
             Ok(())
         } else {
             self.inner.check_replay(nonce, token_expiry)

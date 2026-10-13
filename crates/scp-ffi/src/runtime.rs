@@ -1802,15 +1802,18 @@ pub(crate) fn persist_ucan_revocation_blocking(
     })
 }
 
-/// Writes a context's UCAN nonce entries to this instance's durable store.
+/// Writes the nonce a validation run recorded to this instance's durable store,
+/// through [`scp_ffi_common::ucan_durable_state::persist_recorded_nonce`].
 ///
 /// Every `PyO3` entry point that runs the ADR-016 validation pipeline and can
 /// record a nonce calls this afterwards, because step 9 of that pipeline is the
 /// only writer of nonce state. A nonce accepted now is therefore still refused
 /// after the bridge instance is rebuilt. `recorded` is what the run's nonce
 /// adapter reported; when it is `None` the run recorded nothing and this
-/// writes nothing. The write runs while this call holds the context's registry
-/// entry, so two concurrent writers land in the order they read the tracker.
+/// writes nothing. Otherwise it writes that one nonce's key, and deletes
+/// expired nonce keys when the record pruned the tracker. The write runs while
+/// this call holds the context's registry entry, so it reads the tracker entry
+/// the run just recorded.
 ///
 /// # Errors
 ///
@@ -1821,16 +1824,17 @@ pub(crate) fn persist_ucan_nonces_blocking(
     context_id: &str,
     recorded: Option<scp_ffi_common::NonceRecorded>,
 ) -> Result<(), ScpPyError> {
-    if recorded.is_none() {
+    let Some(recorded) = recorded else {
         return Ok(());
-    }
+    };
     let storage = durable_storage(bi, "persist UCAN nonce state", context_id)?;
     let to_error = durable_state_error("persist UCAN nonce state", context_id);
     with_ffi_state(bi, context_id, |rt| {
-        run_storage_io(scp_ffi_common::ucan_durable_state::persist_nonce_entries(
+        run_storage_io(scp_ffi_common::ucan_durable_state::persist_recorded_nonce(
             storage,
             context_id,
-            &rt.nonce_tracker.snapshot_entries(),
+            &rt.nonce_tracker,
+            recorded,
         ))
         .map_err(to_error)?
         .map_err(to_error)

@@ -23,22 +23,36 @@
 //!
 //! # Mechanism
 //!
-//! Two durable values per context, both written through whichever [`Storage`]
+//! Durable values per context, all written through whichever [`Storage`]
 //! backend the bridge instance selected (`SCP.with_storage(...)`):
 //!
 //! | Key | Value | Written by | Read by |
 //! |---|---|---|---|
 //! | `context/{ctx}/ucan/revocation_list` | serialized [`RevocationList`] | every bridge's `ucan_revoke`, after `revoke_ucan` succeeds | [`hydrate_core`], at per-context UCAN-state construction |
-//! | `context/{ctx}/ucan/nonce_tracker` | serialized [`NonceTracker`] | every bridge's UCAN-validation entry points, after a validation pipeline run that recorded a nonce | [`hydrate_core`], at per-context UCAN-state construction |
+//! | `context/{ctx}/ucan/nonce/{hex(nonce)}`, one key per recorded nonce | serialized `(first_seen_secs, token_expiry_secs)` | [`persist_recorded_nonce`], called by every bridge's UCAN-validation entry points after a validation pipeline run that recorded a nonce | [`hydrate_core`], at per-context UCAN-state construction, which lists the `context/{ctx}/ucan/nonce/` prefix |
+//!
+//! Recording a nonce writes that nonce's key and nothing else, so the bytes
+//! written per accepted token do not grow with the number of nonces the
+//! context holds. The key suffix is the lowercase hex encoding of the nonce's
+//! bytes, so no nonce can contain a path separator, escape the prefix, or
+//! collide with another nonce's key.
+//!
+//! Expired nonce keys are deleted at the two points the tracker itself prunes:
+//! at restore, where [`NonceTracker::from_snapshot`] drops expired entries and
+//! [`hydrate_nonce_tracker`] deletes their keys, and after a record whose prune
+//! pass removed entries, where [`persist_recorded_nonce`] sweeps the prefix and
+//! deletes every key whose entry is expired by the tracker's rule
+//! ([`NonceTracker::is_expired_entry`]). The durable set therefore stays bounded
+//! by the tracker's retention window.
 //!
 //! Hydration is monotonic in both directions, so calling it twice cannot
-//! un-revoke a token or forget a nonce: the revocation list merges as a set
+//! un-revoke a token or forget a live nonce: the revocation list merges as a set
 //! union ([`RevocationList::merge`] is append-only), and the nonce entries merge
 //! with the in-memory entry winning on a key collision.
 //!
 //! # Key namespace and cleanup
 //!
-//! Both keys sit under the `context/{context_id}/…` namespace the runtime store
+//! Every key sits under the `context/{context_id}/…` namespace the runtime store
 //! layer uses, so `ProtocolRepository::delete_context`'s
 //! `delete_prefix("context/{ctx}/")` sweep reclaims them when the context is
 //! torn down. [`NonceTracker::storage_key`] returns `nonce_tracker/{ctx}`, which
@@ -57,7 +71,7 @@
 
 use std::collections::HashMap;
 
-use scp_clock::SystemClock;
+use scp_clock::{Clock, SystemClock};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_platform::store_value::{
@@ -66,6 +80,7 @@ use scp_platform::store_value::{
 use scp_platform::traits::Storage;
 
 use crate::bridge_runtime::UcanContextStateCore;
+use crate::resolvers::NonceRecorded;
 
 /// Failure reading or writing the durable UCAN state. Each bridge maps this
 /// onto its own error surface (an `SCP-UCAN-`/`SCP-CTX-` code) at the call site.
@@ -81,6 +96,11 @@ pub enum UcanDurableStateError {
     /// The persisted bytes could not be encoded or decoded.
     #[error("UCAN durable-state value codec failed: {0}")]
     Codec(String),
+    /// A run reported a recorded nonce the context's tracker does not hold.
+    /// The tracker is the source of the entry's timestamps, so there is
+    /// nothing correct to write; reported rather than writing a guessed value.
+    #[error("recorded UCAN nonce is absent from the context's tracker: {0}")]
+    NonceNotTracked(String),
     /// The caller asked to run the storage future to completion from a
     /// synchronous FFI entry point with nothing to drive it on: either inside a
     /// current-thread tokio runtime, where neither `block_in_place` nor
@@ -108,18 +128,75 @@ pub fn revocation_list_key(context_id: &str) -> Result<String, UcanDurableStateE
     Ok(format!("context/{ctx}/ucan/revocation_list"))
 }
 
-/// Builds the durable key for a context's UCAN nonce tracker.
+/// Builds the key prefix under which a context's recorded UCAN nonces live,
+/// one key per nonce.
 ///
-/// Format: `context/{context_id}/ucan/nonce_tracker`.
+/// Format: `context/{context_id}/ucan/nonce/`.
 ///
 /// # Errors
 ///
 /// Returns [`UcanDurableStateError::Key`] if `context_id` is not a safe key
 /// component.
-pub fn nonce_tracker_key(context_id: &str) -> Result<String, UcanDurableStateError> {
+pub fn nonce_key_prefix(context_id: &str) -> Result<String, UcanDurableStateError> {
     let ctx = sanitize_key_component(context_id)
         .map_err(|e| UcanDurableStateError::Key(e.to_string()))?;
-    Ok(format!("context/{ctx}/ucan/nonce_tracker"))
+    Ok(format!("context/{ctx}/ucan/nonce/"))
+}
+
+/// Builds the durable key for one recorded nonce:
+/// `context/{context_id}/ucan/nonce/{hex(nonce)}`.
+///
+/// The suffix is the lowercase hex of the nonce's bytes. Hex has no separator
+/// characters, so no nonce can escape the prefix, and the encoding is
+/// injective, so two nonces never share a key.
+///
+/// # Errors
+///
+/// Returns [`UcanDurableStateError::Key`] if `context_id` is not a safe key
+/// component.
+pub fn nonce_key(context_id: &str, nonce: &str) -> Result<String, UcanDurableStateError> {
+    Ok(format!(
+        "{}{}",
+        nonce_key_prefix(context_id)?,
+        hex::encode(nonce.as_bytes())
+    ))
+}
+
+/// Recovers the nonce a key under `prefix` names. A key whose suffix is not
+/// the hex of a UTF-8 string was not written by [`nonce_key`], and the load
+/// refuses it rather than skip a record it cannot read.
+fn nonce_from_key(prefix: &str, key: &str) -> Result<String, UcanDurableStateError> {
+    let suffix = key.strip_prefix(prefix).ok_or_else(|| {
+        UcanDurableStateError::Codec(format!("key {key} is outside prefix {prefix}"))
+    })?;
+    let bytes = hex::decode(suffix)
+        .map_err(|e| UcanDurableStateError::Codec(format!("nonce key {key}: {e}")))?;
+    String::from_utf8(bytes)
+        .map_err(|e| UcanDurableStateError::Codec(format!("nonce key {key}: {e}")))
+}
+
+/// Reads and decodes one nonce key's `(first_seen_secs, token_expiry_secs)`.
+async fn read_nonce_entry<S: Storage>(
+    storage: &S,
+    key: &str,
+) -> Result<Option<(u64, u64)>, UcanDurableStateError> {
+    let Some(bytes) = storage
+        .retrieve(key)
+        .await
+        .map_err(|e| UcanDurableStateError::Storage(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    from_stored_value_bytes(&bytes)
+        .map(Some)
+        .map_err(|e| UcanDurableStateError::Codec(e.to_string()))
+}
+
+async fn delete_key<S: Storage>(storage: &S, key: &str) -> Result<(), UcanDurableStateError> {
+    storage
+        .delete(key)
+        .await
+        .map_err(|e| UcanDurableStateError::Storage(e.to_string()))
 }
 
 /// Writes the context's revocation list to durable storage.
@@ -174,59 +251,103 @@ pub async fn load_revocation_list<S: Storage>(
     Ok(Some(list))
 }
 
-/// Writes the context's UCAN nonce entries to durable storage.
+/// Writes the one nonce a validation run recorded to its own durable key, and
+/// deletes the keys of expired nonces when the record pruned the tracker.
 ///
-/// Every bridge calls this after a UCAN-validation pipeline run that recorded
-/// a nonce, because that pipeline is the only thing that records nonces
-/// (through `BridgeNonceTracker`, which reports each record as a
-/// `NonceRecorded`). Callers pass
-/// [`NonceTracker::snapshot_entries`], which is also what the runtime embeds in
-/// a `ContextStateSnapshot` for its own `spending_nonce_tracker`. Writing the
-/// whole entry set rather than the single new nonce keeps a pruned tracker from
-/// resurrecting entries it dropped.
+/// This is the single nonce-persist function every bridge calls (`PyO3`
+/// directly against its `StorageProvider`; napi-rs and `UniFFI` through
+/// [`ProtocolRepository::persist_ucan_recorded_nonce`](crate::bridge_runtime::ProtocolRepository::persist_ucan_recorded_nonce)),
+/// after a UCAN-validation pipeline run whose nonce adapter reported
+/// [`NonceRecorded`]. The value written is the tracker's own entry for the
+/// nonce, so the durable `first_seen` matches the in-memory one.
+///
+/// When `recorded` reports that the record's prune pass removed entries, this
+/// lists the context's nonce prefix and deletes every key whose nonce the
+/// tracker no longer holds and whose stored entry is expired by the tracker's
+/// rule. A key the tracker does not hold but that is still live (written by
+/// another bridge instance on the same backend) is kept. The sweep runs only
+/// when the tracker pruned, which the tracker does at most every 1000 records
+/// or 10 minutes, so its listing cost is amortized over those records.
 ///
 /// # Errors
 ///
-/// Returns [`UcanDurableStateError`] if the key is invalid, the entries cannot
-/// be encoded, or the storage write fails.
-pub async fn persist_nonce_entries<S: Storage, H: std::hash::BuildHasher + Sync>(
+/// Returns [`UcanDurableStateError::NonceNotTracked`] if the tracker holds no
+/// entry for the recorded nonce, and another [`UcanDurableStateError`] if the
+/// key is invalid, a value cannot be encoded or decoded, or a storage call
+/// fails.
+pub async fn persist_recorded_nonce<S: Storage, C: Clock>(
     storage: &S,
     context_id: &str,
-    entries: &HashMap<String, (u64, u64), H>,
+    tracker: &NonceTracker<C>,
+    recorded: NonceRecorded,
 ) -> Result<(), UcanDurableStateError> {
-    let key = nonce_tracker_key(context_id)?;
+    let entry = tracker
+        .entry(&recorded.nonce)
+        .ok_or_else(|| UcanDurableStateError::NonceNotTracked(recorded.nonce.clone()))?;
+    let key = nonce_key(context_id, &recorded.nonce)?;
     let bytes =
-        to_stored_value_bytes(entries).map_err(|e| UcanDurableStateError::Codec(e.to_string()))?;
+        to_stored_value_bytes(&entry).map_err(|e| UcanDurableStateError::Codec(e.to_string()))?;
     storage
         .store(&key, &bytes)
         .await
-        .map_err(|e| UcanDurableStateError::Storage(e.to_string()))
+        .map_err(|e| UcanDurableStateError::Storage(e.to_string()))?;
+    if recorded.pruned {
+        prune_nonce_keys(storage, context_id, tracker).await?;
+    }
+    Ok(())
 }
 
-/// Reads the context's persisted nonce entries from durable storage.
-///
-/// Each entry maps a nonce string to `(first_seen_secs, token_expiry_secs)`.
-/// Returns `None` when no nonce has ever been persisted for the context.
+/// Deletes the durable key of every nonce the tracker does not hold whose
+/// stored entry is expired by the tracker's retention rule.
+async fn prune_nonce_keys<S: Storage, C: Clock>(
+    storage: &S,
+    context_id: &str,
+    tracker: &NonceTracker<C>,
+) -> Result<(), UcanDurableStateError> {
+    let prefix = nonce_key_prefix(context_id)?;
+    let keys = storage
+        .list_keys(&prefix)
+        .await
+        .map_err(|e| UcanDurableStateError::Storage(e.to_string()))?;
+    for key in keys {
+        let nonce = nonce_from_key(&prefix, &key)?;
+        if tracker.entry(&nonce).is_some() {
+            continue;
+        }
+        if let Some((first_seen, token_expiry)) = read_nonce_entry(storage, &key).await?
+            && tracker.is_expired_entry(first_seen, token_expiry)
+        {
+            delete_key(storage, &key).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Reads every persisted nonce entry for the context by listing its nonce
+/// prefix. Each entry maps a nonce to `(first_seen_secs, token_expiry_secs)`;
+/// the map is empty when no nonce has been persisted.
 ///
 /// # Errors
 ///
-/// Returns [`UcanDurableStateError`] if the key is invalid, the storage read
-/// fails, or the persisted bytes cannot be decoded.
+/// Returns [`UcanDurableStateError`] if the key is invalid, a storage call
+/// fails, or a key or value under the prefix cannot be decoded.
 pub async fn load_nonce_entries<S: Storage>(
     storage: &S,
     context_id: &str,
-) -> Result<Option<HashMap<String, (u64, u64)>>, UcanDurableStateError> {
-    let key = nonce_tracker_key(context_id)?;
-    let Some(bytes) = storage
-        .retrieve(&key)
+) -> Result<HashMap<String, (u64, u64)>, UcanDurableStateError> {
+    let prefix = nonce_key_prefix(context_id)?;
+    let keys = storage
+        .list_keys(&prefix)
         .await
-        .map_err(|e| UcanDurableStateError::Storage(e.to_string()))?
-    else {
-        return Ok(None);
-    };
-    let entries: HashMap<String, (u64, u64)> =
-        from_stored_value_bytes(&bytes).map_err(|e| UcanDurableStateError::Codec(e.to_string()))?;
-    Ok(Some(entries))
+        .map_err(|e| UcanDurableStateError::Storage(e.to_string()))?;
+    let mut entries = HashMap::with_capacity(keys.len());
+    for key in keys {
+        let nonce = nonce_from_key(&prefix, &key)?;
+        if let Some(entry) = read_nonce_entry(storage, &key).await? {
+            entries.insert(nonce, entry);
+        }
+    }
+    Ok(entries)
 }
 
 /// Merges the durable revocation record into a freshly built revocation list.
@@ -250,30 +371,42 @@ pub async fn hydrate_revocation_list<S: Storage>(
     Ok(())
 }
 
-/// Merges the durable nonce record into a freshly built nonce tracker.
+/// Merges the durable nonce records into a freshly built nonce tracker, and
+/// deletes the keys of the persisted nonces that expired while no tracker held
+/// them.
 ///
 /// An entry already present in `tracker` wins over the persisted entry, so a
 /// nonce recorded in this process is never overwritten by an older durable copy.
-/// [`NonceTracker::from_snapshot`] prunes entries that expired while the tracker
-/// was not running, so a restored tracker starts normalized.
+/// The merged tracker is rebuilt through [`NonceTracker::from_snapshot`], which
+/// drops expired entries, and every persisted entry the tracker's rule
+/// ([`NonceTracker::is_expired_entry`]) calls expired has its key deleted, so
+/// restore prunes the durable set by the same rule it prunes the tracker.
+/// `clock` becomes the rebuilt tracker's time source.
 ///
 /// # Errors
 ///
-/// Returns [`UcanDurableStateError`] if the storage read fails or the persisted
-/// bytes cannot be decoded.
-pub async fn hydrate_nonce_tracker<S: Storage>(
+/// Returns [`UcanDurableStateError`] if a storage call fails or a persisted key
+/// or value cannot be decoded.
+pub async fn hydrate_nonce_tracker<S: Storage, C: Clock>(
     storage: &S,
     context_id: &str,
-    tracker: &mut NonceTracker<SystemClock>,
+    tracker: &mut NonceTracker<C>,
+    clock: C,
 ) -> Result<(), UcanDurableStateError> {
-    let Some(persisted) = load_nonce_entries(storage, context_id).await? else {
+    let persisted = load_nonce_entries(storage, context_id).await?;
+    if persisted.is_empty() {
         return Ok(());
-    };
-    let mut entries = tracker.snapshot_entries();
-    for (nonce, seen) in persisted {
-        entries.entry(nonce).or_insert(seen);
     }
-    *tracker = NonceTracker::from_snapshot(context_id.to_owned(), SystemClock, entries);
+    let mut entries = tracker.snapshot_entries();
+    for (nonce, seen) in &persisted {
+        entries.entry(nonce.clone()).or_insert(*seen);
+    }
+    *tracker = NonceTracker::from_snapshot(context_id.to_owned(), clock, entries);
+    for (nonce, (first_seen, token_expiry)) in &persisted {
+        if tracker.is_expired_entry(*first_seen, *token_expiry) {
+            delete_key(storage, &nonce_key(context_id, nonce)?).await?;
+        }
+    }
     Ok(())
 }
 
@@ -298,7 +431,7 @@ pub async fn hydrate_core<S: Storage>(
     core: &mut UcanContextStateCore,
 ) -> Result<(), UcanDurableStateError> {
     hydrate_revocation_list(storage, context_id, &mut core.revocation_list).await?;
-    hydrate_nonce_tracker(storage, context_id, &mut core.nonce_tracker).await
+    hydrate_nonce_tracker(storage, context_id, &mut core.nonce_tracker, SystemClock).await
 }
 
 /// Builds a context's UCAN validation state from the durable record.
@@ -380,10 +513,77 @@ where
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use scp_clock::TestClock;
+    use scp_core::crypto::ucan::validate::NonceTracker as _;
+    use scp_platform::PlatformError;
     use scp_platform::in_memory::InMemoryStorage;
+
+    use crate::resolvers::BridgeNonceTracker;
 
     fn tracker(context_id: &str) -> NonceTracker<SystemClock> {
         NonceTracker::new(context_id.to_owned(), SystemClock)
+    }
+
+    /// A nonce in the tracker's `{unix_millis}-{32_hex}` format, fresh at
+    /// `now_secs`.
+    fn fresh_nonce(now_secs: u64, fill: char) -> String {
+        format!(
+            "{}-{}",
+            now_secs.saturating_mul(1000),
+            fill.to_string().repeat(32)
+        )
+    }
+
+    /// Records `nonce` through the bridge adapter, the path every bridge's
+    /// validation pipeline takes, and returns the adapter's report.
+    fn record<C: Clock>(tracker: &mut NonceTracker<C>, nonce: &str, expiry: u64) -> NonceRecorded {
+        let mut recorded = None;
+        BridgeNonceTracker::new(tracker, &mut recorded)
+            .record(nonce, expiry)
+            .expect("record must succeed");
+        recorded.expect("a successful record must report NonceRecorded")
+    }
+
+    /// A [`Storage`] that counts writes and remembers the keys written, over an
+    /// [`InMemoryStorage`].
+    #[derive(Default)]
+    struct CountingStorage {
+        inner: InMemoryStorage,
+        stores: AtomicUsize,
+        written: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CountingStorage {
+        fn reset(&self) {
+            self.stores.store(0, Ordering::SeqCst);
+            self.written.lock().unwrap().clear();
+        }
+    }
+
+    impl Storage for CountingStorage {
+        async fn store(&self, key: &str, data: &[u8]) -> Result<(), PlatformError> {
+            self.stores.fetch_add(1, Ordering::SeqCst);
+            self.written.lock().unwrap().push(key.to_owned());
+            self.inner.store(key, data).await
+        }
+        async fn retrieve(&self, key: &str) -> Result<Option<Vec<u8>>, PlatformError> {
+            self.inner.retrieve(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), PlatformError> {
+            self.inner.delete(key).await
+        }
+        async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PlatformError> {
+            self.inner.list_keys(prefix).await
+        }
+        async fn delete_prefix(&self, prefix: &str) -> Result<u64, PlatformError> {
+            self.inner.delete_prefix(prefix).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool, PlatformError> {
+            self.inner.exists(key).await
+        }
     }
 
     /// A revocation written by one instance must be readable by the next, and
@@ -449,7 +649,7 @@ mod tests {
         assert!(list.is_empty(), "absent record must leave the list empty");
 
         let mut nonces = tracker("ctx-absent");
-        hydrate_nonce_tracker(&storage, "ctx-absent", &mut nonces)
+        hydrate_nonce_tracker(&storage, "ctx-absent", &mut nonces, SystemClock)
             .await
             .expect("absent record is not an error");
         assert!(
@@ -458,32 +658,206 @@ mod tests {
         );
     }
 
-    /// A nonce recorded before a restart must still be refused after one.
+    /// A nonce recorded and persisted by one tracker is refused as a replay by
+    /// the tracker a restarted instance rebuilds from storage.
     #[tokio::test]
-    async fn nonce_round_trips_through_storage() {
+    async fn replayed_nonce_recorded_before_restart_is_refused_after_it() {
         let storage = InMemoryStorage::new();
         let now = scp_clock::Clock::now_secs(&SystemClock);
-        let nonce = format!("{}-{}", now.saturating_mul(1000), "a".repeat(32));
+        let nonce = fresh_nonce(now, 'a');
         let expiry = now + 600;
 
         let mut live = tracker("ctx-nonce");
-        live.record(&nonce, expiry).expect("record must succeed");
-        persist_nonce_entries(&storage, "ctx-nonce", &live.snapshot_entries())
+        let recorded = record(&mut live, &nonce, expiry);
+        persist_recorded_nonce(&storage, "ctx-nonce", &live, recorded)
+            .await
+            .expect("persist must succeed");
+        drop(live);
+
+        let mut rebuilt = load_core(&storage, "ctx-nonce")
+            .await
+            .expect("load must succeed")
+            .nonce_tracker;
+        let mut recorded = None;
+        let replay = BridgeNonceTracker::new(&mut rebuilt, &mut recorded).record(&nonce, expiry);
+        assert!(
+            matches!(
+                replay,
+                Err(scp_core::crypto::ucan::UcanError::NonceReused(_))
+            ),
+            "the rebuilt tracker must refuse the replayed nonce, got {replay:?}"
+        );
+        assert!(recorded.is_none(), "a refused replay must report no record");
+    }
+
+    /// Recording one nonce writes exactly one key, that nonce's own, however
+    /// many nonces the context already holds.
+    #[tokio::test]
+    async fn recording_a_nonce_writes_exactly_one_key() {
+        let storage = CountingStorage::default();
+        let now = scp_clock::Clock::now_secs(&SystemClock);
+        let mut live = tracker("ctx-count");
+        for i in 0..50_u64 {
+            let nonce = format!("{}-{:032x}", now.saturating_mul(1000), i);
+            let recorded = record(&mut live, &nonce, now + 600);
+            persist_recorded_nonce(&storage, "ctx-count", &live, recorded)
+                .await
+                .expect("persist must succeed");
+        }
+        storage.reset();
+
+        let nonce = fresh_nonce(now, 'f');
+        let recorded = record(&mut live, &nonce, now + 600);
+        persist_recorded_nonce(&storage, "ctx-count", &live, recorded)
             .await
             .expect("persist must succeed");
 
-        let mut rebuilt = tracker("ctx-nonce");
-        assert!(
-            rebuilt.check_replay(&nonce, expiry).is_ok(),
-            "a freshly built tracker must not know the nonce"
+        assert_eq!(storage.stores.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *storage.written.lock().unwrap(),
+            vec![nonce_key("ctx-count", &nonce).unwrap()],
+            "the one write must be the recorded nonce's own key"
         );
-        hydrate_nonce_tracker(&storage, "ctx-nonce", &mut rebuilt)
+        assert_eq!(
+            storage
+                .list_keys(&nonce_key_prefix("ctx-count").unwrap())
+                .await
+                .unwrap()
+                .len(),
+            51,
+            "each recorded nonce must hold its own key"
+        );
+    }
+
+    /// When a record's prune pass drops an expired nonce, the persist step
+    /// deletes that nonce's durable key and keeps the live one's.
+    #[tokio::test]
+    async fn pruning_deletes_an_expired_nonce_key() {
+        let storage = InMemoryStorage::new();
+        let start = 1_800_000_000;
+        let clock = Arc::new(TestClock::new(start));
+        let mut live = NonceTracker::new("ctx-prune".to_owned(), Arc::clone(&clock));
+
+        let old = fresh_nonce(start, 'a');
+        let recorded = record(&mut live, &old, start + 60);
+        assert!(!recorded.pruned, "a first record prunes nothing");
+        persist_recorded_nonce(&storage, "ctx-prune", &live, recorded)
             .await
-            .expect("hydrate must succeed");
+            .unwrap();
+        let old_key = nonce_key("ctx-prune", &old).unwrap();
+        assert!(storage.exists(&old_key).await.unwrap());
+
+        // Past both the token's expiry grace and the 24 h retention floor, and
+        // past the tracker's 10-minute prune interval.
+        let later = start + 86_400 + 1_000;
+        clock.set(later);
+        let new = fresh_nonce(later, 'b');
+        let recorded = record(&mut live, &new, later + 60);
         assert!(
-            rebuilt.check_replay(&nonce, expiry).is_err(),
-            "the rebuilt tracker must refuse the replayed nonce"
+            recorded.pruned,
+            "the record's prune pass dropped the expired nonce"
         );
+        persist_recorded_nonce(&storage, "ctx-prune", &live, recorded)
+            .await
+            .unwrap();
+
+        assert!(
+            !storage.exists(&old_key).await.unwrap(),
+            "the expired nonce's key must be deleted"
+        );
+        assert!(
+            storage
+                .exists(&nonce_key("ctx-prune", &new).unwrap())
+                .await
+                .unwrap(),
+            "the live nonce's key must remain"
+        );
+    }
+
+    /// The prune sweep keeps a live key the tracker does not hold (another
+    /// bridge instance on the same backend wrote it).
+    #[tokio::test]
+    async fn pruning_keeps_a_live_key_the_tracker_does_not_hold() {
+        let storage = InMemoryStorage::new();
+        let start = 1_800_000_000;
+        let clock = Arc::new(TestClock::new(start));
+        let mut live = NonceTracker::new("ctx-shared".to_owned(), Arc::clone(&clock));
+        let old = fresh_nonce(start, 'a');
+        let recorded = record(&mut live, &old, start + 60);
+        persist_recorded_nonce(&storage, "ctx-shared", &live, recorded)
+            .await
+            .unwrap();
+
+        let later = start + 86_400 + 1_000;
+        clock.set(later);
+        let foreign = fresh_nonce(later, 'c');
+        let foreign_key = nonce_key("ctx-shared", &foreign).unwrap();
+        storage
+            .store(
+                &foreign_key,
+                &to_stored_value_bytes(&(later, later + 60)).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let recorded = record(&mut live, &fresh_nonce(later, 'b'), later + 60);
+        assert!(recorded.pruned);
+        persist_recorded_nonce(&storage, "ctx-shared", &live, recorded)
+            .await
+            .unwrap();
+        assert!(storage.exists(&foreign_key).await.unwrap());
+        assert!(
+            !storage
+                .exists(&nonce_key("ctx-shared", &old).unwrap())
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Restore applies the tracker's expiry rule: a nonce that expired while
+    /// no tracker ran is neither loaded nor left in storage.
+    #[tokio::test]
+    async fn restore_drops_and_deletes_an_expired_nonce() {
+        let storage = InMemoryStorage::new();
+        let start = 1_800_000_000;
+        let clock = Arc::new(TestClock::new(start));
+        let mut live = NonceTracker::new("ctx-restore".to_owned(), Arc::clone(&clock));
+        let old = fresh_nonce(start, 'a');
+        let recorded = record(&mut live, &old, start + 60);
+        persist_recorded_nonce(&storage, "ctx-restore", &live, recorded)
+            .await
+            .unwrap();
+        drop(live);
+
+        clock.set(start + 86_400 + 1_000);
+        let mut rebuilt = NonceTracker::new("ctx-restore".to_owned(), Arc::clone(&clock));
+        hydrate_nonce_tracker(&storage, "ctx-restore", &mut rebuilt, Arc::clone(&clock))
+            .await
+            .unwrap();
+        assert!(rebuilt.is_empty(), "the expired nonce must not be loaded");
+        assert!(
+            !storage
+                .exists(&nonce_key("ctx-restore", &old).unwrap())
+                .await
+                .unwrap(),
+            "restore must delete the expired nonce's key"
+        );
+    }
+
+    /// A key under the nonce prefix that is not the hex of a nonce fails the
+    /// load with a typed error instead of being skipped.
+    #[tokio::test]
+    async fn load_refuses_an_undecodable_nonce_key() {
+        let storage = InMemoryStorage::new();
+        let key = format!("{}not-hex", nonce_key_prefix("ctx-badkey").unwrap());
+        storage
+            .store(&key, &to_stored_value_bytes(&(1_u64, 2_u64)).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            load_core(&storage, "ctx-badkey").await,
+            Err(UcanDurableStateError::Codec(_))
+        ));
     }
 
     /// The keys sit under `context/{ctx}/` so the context-teardown prefix sweep
@@ -495,8 +869,8 @@ mod tests {
             "context/ctx-a/ucan/revocation_list"
         );
         assert_eq!(
-            nonce_tracker_key("ctx-a").unwrap(),
-            "context/ctx-a/ucan/nonce_tracker"
+            nonce_key("ctx-a", "1-ab/../x").unwrap(),
+            format!("context/ctx-a/ucan/nonce/{}", hex::encode("1-ab/../x"))
         );
     }
 
@@ -509,7 +883,7 @@ mod tests {
             Err(UcanDurableStateError::Key(_))
         ));
         assert!(matches!(
-            nonce_tracker_key("a/b"),
+            nonce_key("a/b", "n"),
             Err(UcanDurableStateError::Key(_))
         ));
     }
@@ -525,11 +899,11 @@ mod tests {
             .await
             .expect("persist must succeed");
         let now = scp_clock::Clock::now_secs(&SystemClock);
-        let nonce = format!("{}-{}", now.saturating_mul(1000), "b".repeat(32));
+        let nonce = fresh_nonce(now, 'b');
         let expiry = now + 600;
         let mut live = tracker("ctx-load");
-        live.record(&nonce, expiry).expect("record must succeed");
-        persist_nonce_entries(&storage, "ctx-load", &live.snapshot_entries())
+        let recorded = record(&mut live, &nonce, expiry);
+        persist_recorded_nonce(&storage, "ctx-load", &live, recorded)
             .await
             .expect("persist must succeed");
 

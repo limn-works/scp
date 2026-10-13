@@ -54,6 +54,19 @@ const PRUNE_TIME_INTERVAL_SECS: u64 = 600;
 /// single-digit microseconds on modern hardware, so it is acceptable here.
 const DEFAULT_MAX_CAPACITY: usize = 100_000;
 
+/// The retention rule: an entry is expired when
+/// `now > max(token_expiry + 300, first_seen + 86400)`.
+const fn entry_expired(now: u64, first_seen: u64, token_expiry: u64) -> bool {
+    let expiry_deadline = token_expiry.saturating_add(PRUNE_EXPIRY_GRACE_SECS);
+    let retention_deadline = first_seen.saturating_add(PRUNE_MIN_RETENTION_SECS);
+    let deadline = if expiry_deadline > retention_deadline {
+        expiry_deadline
+    } else {
+        retention_deadline
+    };
+    now > deadline
+}
+
 // ---------------------------------------------------------------------------
 // Nonce generation
 // ---------------------------------------------------------------------------
@@ -303,13 +316,26 @@ impl<C: Clock> NonceTracker<C> {
     pub fn prune(&mut self) {
         let now = self.clock.now_secs();
         self.seen.retain(|_, (first_seen, token_expiry)| {
-            let expiry_deadline = token_expiry.saturating_add(PRUNE_EXPIRY_GRACE_SECS);
-            let retention_deadline = first_seen.saturating_add(PRUNE_MIN_RETENTION_SECS);
-            let deadline = expiry_deadline.max(retention_deadline);
-            now <= deadline
+            !entry_expired(now, *first_seen, *token_expiry)
         });
         self.checks_since_prune = 0;
         self.last_prune_time = now;
+    }
+
+    /// Returns the recorded `(first_seen_secs, token_expiry_secs)` for
+    /// `nonce`, or `None` when the tracker holds no entry for it.
+    #[must_use]
+    pub fn entry(&self, nonce: &str) -> Option<(u64, u64)> {
+        self.seen.get(nonce).copied()
+    }
+
+    /// Whether an entry recorded at `first_seen` for a token expiring at
+    /// `token_expiry` is past retention now, by the same rule
+    /// [`prune`](NonceTracker::prune) applies. A durable copy of the tracker
+    /// uses this to drop the entries the tracker drops.
+    #[must_use]
+    pub fn is_expired_entry(&self, first_seen: u64, token_expiry: u64) -> bool {
+        entry_expired(self.clock.now_secs(), first_seen, token_expiry)
     }
 
     /// Serializes the tracker state to bytes for persistence.
@@ -711,6 +737,29 @@ mod tests {
         clock.advance(PRUNE_MIN_RETENTION_SECS + 1);
         tracker.prune();
         assert_eq!(tracker.len(), 0);
+    }
+
+    /// `entry` reports the recorded timestamps, and `is_expired_entry` calls
+    /// an entry expired exactly when `prune` drops it.
+    #[test]
+    fn entry_and_is_expired_entry_agree_with_prune() {
+        let (mut tracker, clock) = setup();
+        let nonce = make_nonce_now(&clock);
+        let first_seen = clock.now_secs();
+        let expiry = first_seen + 3600;
+        tracker.check_and_record(&nonce, expiry).unwrap();
+        assert_eq!(tracker.entry(&nonce), Some((first_seen, expiry)));
+        assert_eq!(tracker.entry("absent"), None);
+
+        clock.advance(PRUNE_MIN_RETENTION_SECS);
+        assert!(!tracker.is_expired_entry(first_seen, expiry));
+        tracker.prune();
+        assert_eq!(tracker.len(), 1, "the boundary second is retained");
+
+        clock.advance(1);
+        assert!(tracker.is_expired_entry(first_seen, expiry));
+        tracker.prune();
+        assert_eq!(tracker.entry(&nonce), None);
     }
 
     #[test]

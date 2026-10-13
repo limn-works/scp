@@ -1741,14 +1741,17 @@ impl UniffiBridgeInstance {
         })
     }
 
-    /// Writes this context's UCAN nonce entries to this instance's durable
-    /// store.
+    /// Writes the nonce a validation run recorded to this instance's durable
+    /// store, through
+    /// [`scp_ffi_common::ucan_durable_state::persist_recorded_nonce`].
     ///
     /// Called after every UCAN-validation pipeline run that can record a
     /// nonce, because that pipeline is the only writer of nonce state. A nonce
     /// accepted now is therefore still refused after the bridge instance is
     /// rebuilt. `recorded` is what the run's nonce adapter reported; when it
-    /// is `None` the run recorded nothing and this writes nothing.
+    /// is `None` the run recorded nothing and this writes nothing. Otherwise
+    /// it writes that one nonce's key, and deletes expired nonce keys when the
+    /// record pruned the tracker.
     ///
     /// # Errors
     ///
@@ -1760,22 +1763,22 @@ impl UniffiBridgeInstance {
         context_id: &str,
         recorded: Option<scp_ffi_common::NonceRecorded>,
     ) -> Result<(), crate::ScpError> {
-        if recorded.is_none() {
+        let Some(recorded) = recorded else {
             return Ok(());
-        }
+        };
         let to_error = |msg: String| crate::ScpError::Context {
             msg,
             code: codes::CTX_2023.to_owned(),
         };
         // The write runs while this call holds the context's registry entry, so
-        // two concurrent writers land in the order they read the tracker and
-        // the last write carries every nonce recorded before it.
+        // it reads the tracker entry the run just recorded.
         self.with_ucan_state(context_id, |state| {
             scp_ffi_common::ucan_durable_state::block_on_storage(
                 Some(crate::runtime().handle()),
-                self.protocol_repository.persist_ucan_nonce_entries(
+                self.protocol_repository.persist_ucan_recorded_nonce(
                     context_id,
-                    &state.nonce_tracker.snapshot_entries(),
+                    &state.nonce_tracker,
+                    recorded,
                 ),
             )
         })
