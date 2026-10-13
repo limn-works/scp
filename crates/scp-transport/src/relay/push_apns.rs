@@ -396,10 +396,9 @@ mod tests {
     use scp_clock::TestClock;
     use scp_crypto::p256::jose::es256_verify_strict;
 
+    use super::super::log_capture::LogCapture;
     use super::super::push::PushSender;
-    use super::super::push_test_server::{
-        CapturedRequest, LogCapture, Reply, TestServer, json_reply,
-    };
+    use super::super::push_test_server::{CapturedRequest, Reply, TestServer, json_reply};
     use super::*;
 
     const DEVICE_TOKEN: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";

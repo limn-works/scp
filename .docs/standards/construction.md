@@ -175,6 +175,52 @@ NodeConfig {
 
 Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `Node::start_for_testing(NodeConfig)` (feature-gated). The `Dom`/`Id` typestate markers are deleted; the `<K, D, S>` generics survive, carried by the config and its selectors. (The `IdentitySource` name-reconciliation against the existing private `scp-node` enum is an implementation-sequencing detail — see the ADR-052 Dependencies bullet, not restated here.)
 
+### Node start — `NodeStartConfig`
+
+`node_start` starts a production node from an existing `SCP` instance. The PyO3, napi-rs and UniFFI bridges export it, and the Python, TypeScript and macOS Swift SDKs wrap it. `server::node_start` in `scp-ffi-common` converts a `NodeStartConfig` into the core `NodeConfig` above, and calls `Node::start`. The config takes the name `NodeStartConfig` because the converting function has both `NodeStartConfig` and `NodeConfig` in scope.
+
+`NodeStartConfig` lives in `crates/scp-ffi/common/src/node_start_config.rs`. It is a flat config under this standard. Serde deserializes it with `deny_unknown_fields`, and each of its data enums carries the tag `kind`.
+
+| Field | Type | Status |
+|---|---|---|
+| `reach` | `FfiReach{Domain{domain}, NatTraversal, Local}` | required; `Tunnel` omitted |
+| `identity` | operator handle: a DID string on PyO3 and napi-rs, `Arc<Identity>` on UniFFI | required |
+| `blob_storage` | `FfiBlobBackend{InMemory, Redb{path}, Sqlite{path}}` | required; S3 and Postgres omitted |
+| `tls` | `FfiTlsMode{SelfSigned, Acme{email?}, Plaintext, Terminated}` | required |
+| `dht` | `FfiDhtMode{Disabled}` | required; **pending a ruling from the keri workstream** |
+| `cors_origins` | `FfiCorsOrigins{AnyOrigin, List{origins}}` | required |
+| `bind_addr`, `http_bind_addr` | `Option<SocketAddr>` | optional |
+| `nat` | `{Auto}` | optional |
+| `projection_rate_limit` | `Option<u32>`, greater than 0 | optional |
+
+Field rules:
+
+- **`identity` names the operator.** Alec ruled on 2026-08-17: "nodes don't get identities and don't act. they are not participants". The handle names an operator identity that is already registered on the same `SCP` instance, and the bridge lowers it to `IdentitySource::Explicit`. `NodeStartConfig` has no `Persisted` arm, no passphrase field and no key path.
+- **No storage field.** `node_start` takes the `SCP` instance's own storage handle (`17-persistence-and-storage.md` §17.6, first-party storage adapters). A second store on the same directory fails, because `SqliteStorage::new` takes a non-blocking exclusive lock on `scp.db.lock` in that directory. When the instance store is in-memory, `node_start` logs a warning that the node loses all state on drop.
+- **`tls` and `dht` are required at the FFI layer, although the core `NodeConfig` defaults both.** The PyO3 and napi-rs bridges read untyped input, so an optional field with a default would let a misspelled key select that default.
+- **`cors_origins` is required, because the core `NodeConfig` reads `None` as the permissive `*` origin.** `AnyOrigin` selects `*` only when the caller names it.
+- **Validation finishes before any directory or file exists.** `node_start` runs `scp_node::validate_reach_and_tls` and the field checks first, and creates the blob directory and files only after both pass.
+- **`internal_relay_url` uses the relay's bound address,** not a hardcoded `ws://127.0.0.1:{port}`.
+
+Arms and fields that `NodeStartConfig` omits:
+
+| Omitted | Reason |
+|---|---|
+| `Reach::Tunnel` | The core does not thread `public_url` into the published relay URL. |
+| `TlsMode::Custom` | It carries an `Arc<dyn TlsProvider>` trait object, which cannot cross the FFI boundary. |
+| `DhtMode::Memory` | Its in-memory client is a nullifier compiled only under `feature = "testing"` (ADR-062, capability injection, Decision 1). |
+| `NatSlot::Custom`, `NatSlot::Tuned` | Both carry `NatStrategy` trait objects. |
+| `local_api`, `http3`, `dns_provider`, `network_detector`, `dht_gateways` | `local_api` is a development control plane whose token the node mints. The `http3` field compiles only under `feature = "http3"`, which no bridge enables. `dns_provider` overrides the selected `tls` and `domain` without saying so in the signature. `network_detector` is a core capability slot. `dht_gateways` has no DHT client to reach, because the operator identity owns its DID method and its DHT client. |
+
+**Pending a ruling from the keri workstream.** The keri workstream owns DID publication. Until it rules, these two items stand:
+
+- `dht` exposes `FfiDhtMode::Disabled` only.
+- `FfiTlsMode` omits a `DnsSubdomain` arm, and `dns_provider` stays a setting of the `scp-node` binary alone.
+
+If the keri workstream allows node-side publication, the change adds `FfiDhtMode::Production` with `dht_gateways`, adds `FfiTlsMode::DnsSubdomain`, and lowers `dns_provider` into the core `TlsMode`. This standard does not decide either item.
+
+Entry: each bridge's `node_start` resolves the operator identity, takes the instance storage, and calls `server::node_start(cfg, NodeIdentity, InstanceStorage)` in `scp-ffi-common`, which validates and then calls `Node::start`. `sdk-common.md` §"Node start error codes" lists the error code each failure returns.
+
 ### Relay — `RelayConfig`
 
 Already a flat config object. Bring fully in line: `supports_bridge: bool` → `bridge: BridgeRole { Disabled, Enabled }` (M1). `BridgeRole::Enabled` is payload-free and needs no config secret, which the M2 Relay bullet states. The relay's `bridge_secret: Option<[u8;32]>` stays a **separate, orthogonal** field — the internal-relay WebSocket connection-admission secret, set independently of the broker role — and is therefore out of the construction-pattern surface (not folded into `BridgeRole`). Entry: `Relay::start(RelayConfig, storage)` — the SDK-facing entry, which wraps the internal `RelayServer::new(config, storage)` (see the entry-verb rule). `RelayConfig` may keep `Default` (every field is fail-safe — M4 does not fire), an exception that holds **precisely because** `BridgeRole::default() == Disabled` (its sole security-consequential field has a fail-safe default).

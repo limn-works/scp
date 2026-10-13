@@ -1,21 +1,16 @@
-//! A local HTTP/2 (h2c) server and a tracing capture for the push sender tests
-//! (PUSH-010, PUSH-011). Compiled only under `cfg(test)`; the tests never reach
+//! A local HTTP/2 (h2c) server for the push sender tests (PUSH-010,
+//! PUSH-011). Compiled only under `cfg(test)`; the tests never reach
 //! Apple or Google.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::Write;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::layer::SubscriberExt as _;
-use tracing_subscriber::{Layer as _, filter};
 
 /// One request the server received.
 #[derive(Debug, Clone)]
@@ -201,92 +196,5 @@ async fn serve(
     };
     if !reply.body.is_empty() {
         let _ = stream.send_data(Bytes::from(reply.body), true);
-    }
-}
-
-/// A shared buffer the capture subscriber writes formatted events into.
-#[derive(Clone, Default)]
-struct SharedBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl Write for SharedBuffer {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Runs `f` on this thread's active capture buffer slot.
-fn with_active<R>(f: impl FnOnce(&RefCell<Option<SharedBuffer>>) -> R) -> R {
-    thread_local! {
-        static ACTIVE: RefCell<Option<SharedBuffer>> = const { RefCell::new(None) };
-    }
-    ACTIVE.with(f)
-}
-
-/// Writes to the calling thread's active capture buffer, or discards.
-struct ThreadRouted;
-
-impl<'a> MakeWriter<'a> for ThreadRouted {
-    type Writer = Box<dyn Write>;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        with_active(|active| match active.borrow().clone() {
-            Some(buffer) => Box::new(buffer) as Box<dyn Write>,
-            None => Box::new(std::io::sink()),
-        })
-    }
-}
-
-/// Installs, once per test process, a global subscriber that formats every
-/// event of every level and target, enabled only on a thread with an active
-/// capture.
-///
-/// The global subscriber is the fix for a lost-event race: with a
-/// thread-scoped `set_default` subscriber, a callsite another test thread
-/// registers concurrently can cache `Interest::never` and drop the capturing
-/// test's events. The per-event filter here makes every callsite's interest
-/// `sometimes`, so each event is checked against the current thread.
-fn install_global() {
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        let layer = tracing_subscriber::fmt::layer()
-            .with_ansi(false)
-            .with_writer(ThreadRouted)
-            .with_filter(filter::filter_fn(|_| {
-                with_active(|active| active.borrow().is_some())
-            }));
-        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
-            .expect("no other global subscriber in the scp-transport lib tests");
-    });
-}
-
-/// Captures every tracing event, at every level and from every target, on the
-/// current thread while it lives. The tests run on tokio's current-thread
-/// runtime, so the senders' events, and hyper's and h2's, land here.
-pub(super) struct LogCapture {
-    buffer: SharedBuffer,
-}
-
-impl LogCapture {
-    pub(super) fn install() -> Self {
-        install_global();
-        let buffer = SharedBuffer::default();
-        with_active(|active| *active.borrow_mut() = Some(buffer.clone()));
-        Self { buffer }
-    }
-
-    /// Everything captured so far.
-    pub(super) fn contents(&self) -> String {
-        String::from_utf8_lossy(&self.buffer.0.lock().unwrap()).into_owned()
-    }
-}
-
-impl Drop for LogCapture {
-    fn drop(&mut self) {
-        with_active(|active| *active.borrow_mut() = None);
     }
 }
