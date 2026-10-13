@@ -57,6 +57,7 @@ use scp_mcp::sse_client::{SseClientTransport, SseCloser};
 use scp_mcp::stdio::read_response;
 use scp_platform::traits::Storage;
 
+use crate::bridge_adapters::OutletGrantNonceTracker;
 use crate::error::ScpPyError;
 use crate::types::{json_to_py_dict, py_dict_to_json};
 use crate::validate;
@@ -604,6 +605,7 @@ impl FfiBridgeProvider {
 
         // The closure's `Ok` carries the UCAN decision, so an `Err` from
         // `with_context` is a failed read of the bridge's context copy.
+        let mut recorded = None;
         let decision = crate::runtime::with_context(bi, context_id, |rt| {
             // SCP-OUT-014: select the split capability stem from the
             // outlet's registered kind — `outlet_query:{id}` for Query
@@ -625,7 +627,7 @@ impl FfiBridgeProvider {
             // Only the Invoke check made just before a `tools/call` runs
             // its outlet records the nonce; a probe records nothing.
             let mut nonce_adapter =
-                crate::bridge_adapters::OutletGrantNonceTracker::new(&mut rt.nonce_tracker, check);
+                OutletGrantNonceTracker::new(&mut rt.nonce_tracker, check, &mut recorded);
 
             let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
                 did_resolver: &did_resolver,
@@ -664,8 +666,12 @@ impl FfiBridgeProvider {
             }))
         })
         .map_err(|e| AccessRefusal::Unreadable(format!("{e}")))?;
+        // Only a run that recorded the nonce (step 9) writes; a rejected token
+        // keeps its own refusal, so a durability failure there grants nothing.
+        let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, context_id, recorded)
+            .map_err(|e| AccessRefusal::Unreadable(format!("{e}")));
         decision.map_err(AccessRefusal::Denied)?;
-        Ok(())
+        persisted
     }
 }
 
@@ -2824,6 +2830,7 @@ mod tests {
     ) -> String {
         // Use a unique context ID to avoid collisions across parallel tests.
         let ctx_id = crate::types::generate_random_id("test-mcp");
+        crate::runtime::select_in_memory_storage_for_test(bi);
         crate::runtime::register_ffi_state(bi, &ctx_id, &[]).unwrap();
 
         if with_outlet {

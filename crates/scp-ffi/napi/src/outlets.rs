@@ -34,6 +34,18 @@ fn outlet_refusal(code: &'static str) -> impl Fn(String) -> ScpNapiError + Copy 
 /// ADR-016 step 8 compares the token's grants against the context's capability
 /// ceiling, and step 4 anchors the chain on the context creator. Both come from
 /// `role_state`.
+///
+/// Step 9 of that pipeline records the token's nonce, so this writes the
+/// context's nonce entries to durable storage before returning — a nonce
+/// accepted here is still refused after the bridge instance is rebuilt.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Permission` when the pipeline rejects the token, and
+/// `ScpNapiError::Context` when the pipeline accepted the token but the nonce
+/// record did not reach durable storage. A rejected token keeps its own error:
+/// the caller is already denied, so a durability failure on that path grants
+/// nothing.
 pub(crate) fn validate_ucan_for_outlet(
     bi: &crate::runtime::NapiBridgeInstance,
     context_id: &str,
@@ -43,9 +55,40 @@ pub(crate) fn validate_ucan_for_outlet(
     proof_resolver: &scp_ffi_common::BridgeProofResolver,
     role_state: &scp_core::context::roles::ContextRoleState,
 ) -> Result<(), ScpNapiError> {
+    let (validated, recorded) = validate_ucan_for_outlet_in_memory(
+        bi,
+        context_id,
+        outlet_id,
+        identity_did,
+        ucan_token,
+        proof_resolver,
+        role_state,
+    );
+    let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, context_id, recorded);
+    validated?;
+    persisted
+}
+
+/// Runs the outlet-invocation UCAN pipeline against the in-memory per-context
+/// state, leaving durability to [`validate_ucan_for_outlet`]. Returns the
+/// pipeline's result with the [`scp_ffi_common::NonceRecorded`] its nonce
+/// adapter reported, which is `None` when the run recorded no nonce.
+fn validate_ucan_for_outlet_in_memory(
+    bi: &crate::runtime::NapiBridgeInstance,
+    context_id: &str,
+    outlet_id: &str,
+    identity_did: &str,
+    ucan_token: &str,
+    proof_resolver: &scp_ffi_common::BridgeProofResolver,
+    role_state: &scp_core::context::roles::ContextRoleState,
+) -> (
+    Result<(), ScpNapiError>,
+    Option<scp_ffi_common::NonceRecorded>,
+) {
     let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
-    crate::runtime::with_context(bi, context_id, |rt| {
+    let mut recorded = None;
+    let validated = crate::runtime::with_context(bi, context_id, |rt| {
         // SCP-OUT-014: select the split capability stem from the outlet's
         // registered kind — `outlet_query:{id}` for Query outlets,
         // `outlet_call:{id}` for Action outlets.
@@ -65,9 +108,8 @@ pub(crate) fn validate_ucan_for_outlet(
         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
             revocation_list: &rt.core.revocation_list,
         };
-        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-            inner: &mut rt.core.nonce_tracker,
-        };
+        let mut nonce_adapter =
+            scp_ffi_common::BridgeNonceTracker::new(&mut rt.core.nonce_tracker, &mut recorded);
 
         let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
             did_resolver: &did_resolver,
@@ -98,7 +140,8 @@ pub(crate) fn validate_ucan_for_outlet(
             message: format!("UCAN authorization failed for outlet '{outlet_id}': {e}"),
             code: codes::PERM_3001.to_owned(),
         })
-    })
+    });
+    (validated, recorded)
 }
 
 // ---------------------------------------------------------------------------
