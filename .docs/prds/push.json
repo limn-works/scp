@@ -1507,12 +1507,13 @@
         "crates/scp-ffi/napi/src/runtime.rs",
         "crates/scp-ffi/uniffi/src/bridge.rs"
       ],
-      "description": "Each context's actor state holds the relay endpoints that host the context, the set the \u00a75.12.3.1 `InvitationBundle` carries as `relay_urls`. The creator sets it at create, a joiner takes the bundle's `relay_urls` at join, and import and restore install the set the snapshot stored. PUSH-013 groups routing IDs by this set.",
+      "description": "Each context's actor state holds the relay endpoints that host the context, the set the \u00a75.12.3.1 `InvitationBundle` carries as `relay_urls`. The creator sets it at create, a joiner takes the bundle's `relay_urls` at join, and import and restore install the set the snapshot stored. Each path stores a URL in its \u00a79.18.2 canonical form when it has one. PUSH-013 groups routing IDs by this set.",
       "acceptanceCriteria": [
         "`PerContextState` holds `relay_urls`, and `ContextSnapshot` persists it with no serde default.",
         "`Supervisor::create_context` takes the creator's relay set, and the created context holds it.",
         "A Welcome joiner's context holds the `relay_urls` of the `InvitationBundle` it joined through.",
         "A snapshot of a context round-trips its relay set, and import and restore install the stored set.",
+        "Create, Welcome join, import and restore store each relay URL as its \u00a79.18.2 canonical relay URL when the URL has one, and store every other URL exactly as written (\u00a75.12.3.1 `relay_urls`). Two spellings of one relay become one stored entry, and no relay URL fails any of the four operations.",
         "Every FFI bridge's create passes the bridge's connected relay set; no production caller passes an empty set when a relay set exists."
       ],
       "actionItems": [
