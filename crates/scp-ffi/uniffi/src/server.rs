@@ -695,7 +695,7 @@ pub enum FfiCorsOrigins {
     /// Any origin (`*`), selected only by naming it.
     AnyOrigin,
     /// These `scheme://host` origins.
-    List {
+    Allowlist {
         /// The allowed origins; `*` is rejected.
         origins: Vec<String>,
     },
@@ -799,7 +799,7 @@ fn lower_node_start_config(
         },
         cors_origins: match cors_origins {
             FfiCorsOrigins::AnyOrigin => common::FfiCorsOrigins::AnyOrigin {},
-            FfiCorsOrigins::List { origins } => common::FfiCorsOrigins::List { origins },
+            FfiCorsOrigins::Allowlist { origins } => common::FfiCorsOrigins::Allowlist { origins },
         },
         bind_addr: parse_addr("bind_addr", bind_addr)?,
         http_bind_addr: parse_addr("http_bind_addr", http_bind_addr)?,
@@ -1360,6 +1360,16 @@ mod tests {
                         domain: "https://node.example.org".to_owned(),
                     };
                     c.tls = FfiTlsMode::SelfSigned;
+                }),
+                "validation",
+                codes::STORAGE_8007,
+            ),
+            (
+                "'*' in the CORS allowlist (InvalidConfig)",
+                Box::new(|c| {
+                    c.cors_origins = FfiCorsOrigins::Allowlist {
+                        origins: vec!["*".to_owned()],
+                    };
                 }),
                 "validation",
                 codes::STORAGE_8007,

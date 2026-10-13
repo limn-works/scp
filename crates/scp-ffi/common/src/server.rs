@@ -870,7 +870,7 @@ fn lower_tls(tls: FfiTlsMode) -> Result<TlsMode, ServerError> {
 fn lower_cors(cors: FfiCorsOrigins) -> Result<Option<Vec<String>>, ServerError> {
     match cors {
         FfiCorsOrigins::AnyOrigin {} => Ok(None),
-        FfiCorsOrigins::List { origins } => {
+        FfiCorsOrigins::Allowlist { origins } => {
             for origin in &origins {
                 if origin == "*" {
                     return Err(invalid(
@@ -2342,7 +2342,7 @@ mod tests {
             },
             tls: FfiTlsMode::Plaintext {},
             dht: FfiDhtMode::Disabled {},
-            cors_origins: FfiCorsOrigins::List {
+            cors_origins: FfiCorsOrigins::Allowlist {
                 origins: vec!["https://app.example.org".to_owned()],
             },
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
@@ -2399,7 +2399,7 @@ mod tests {
             (
                 "wildcard cors entry",
                 |c| {
-                    c.cors_origins = FfiCorsOrigins::List {
+                    c.cors_origins = FfiCorsOrigins::Allowlist {
                         origins: vec!["*".to_owned()],
                     };
                 },
