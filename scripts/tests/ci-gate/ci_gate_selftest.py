@@ -6866,6 +6866,10 @@ LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ..
                 "cargo clippy -p scp-transport --features push-store,testing --all-targets "
                 "-- -D warnings"
             ),
+            (
+                "cargo clippy -p scp-transport --features "
+                "combined,local-cache,push-store,testing --all-targets -- -D warnings"
+            ),
             "cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings",
             "cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings",
         ),

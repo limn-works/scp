@@ -1554,8 +1554,9 @@ jobs:
   # transports of scp-transport and scp-node, about 85 s of cargo time),
   # `packages-platform` (scp-platform's Apple and sync modules and scp-testing's
   # sync and combined tests, about 72 s), and `packages-blob` (the PostgreSQL and
-  # S3 backends, about 113 s). A push to `main` runs one leg, `packages`, which
-  # runs all seven, so the `clippy-packages` entry it alone writes holds every
+  # S3 backends, about 113 s, since joined by the local-cache and combined
+  # stores). A push to `main` runs one leg, `packages`, which runs every command
+  # of the three, so the `clippy-packages` entry it alone writes holds every
   # feature resolution the three legs restore it for.
   #
   # Each command stays literal in one step, and that step's `if:` names the legs
@@ -1683,7 +1684,7 @@ jobs:
           # of their own.
           cargo clippy -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --all-targets -- -D warnings
           cargo clippy -p scp-testing --features sync,combined --all-targets -- -D warnings
-      - name: Run clippy over the PostgreSQL and S3 blob backends
+      - name: Run clippy over the optional storage backends
         if: matrix.leg == 'packages' || matrix.leg == 'packages-blob'
         run: |
           PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
@@ -1704,6 +1705,10 @@ jobs:
           # with and without its `testing`-only in-memory arm.
           cargo clippy -p scp-transport --features push-store --all-targets -- -D warnings
           cargo clippy -p scp-transport --features push-store,testing --all-targets -- -D warnings
+          # The `local-cache` blob cache and the `combined` SQLCipher store compile
+          # only under their own features, which no other clippy command enables;
+          # this command lints them together with the push store.
+          cargo clippy -p scp-transport --features combined,local-cache,push-store,testing --all-targets -- -D warnings
           cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
           cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
       # Runs scripts/check-examples-compile.sh against throwaway one- and two-crate

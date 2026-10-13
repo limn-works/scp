@@ -68,6 +68,7 @@ impl<S: BlobStorage + std::fmt::Debug> std::fmt::Debug for LocalBlobCache<S> {
         f.debug_struct("LocalBlobCache")
             .field("inner", &self.inner)
             .field("max_cache_size", &self.max_cache_size)
+            .field("entries", &self.entries)
             .field("clock", &"<fn>")
             .finish()
     }
@@ -679,5 +680,29 @@ mod tests {
 
         // Blob should be gone.
         assert!(cache.get(&blob_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn debug_renders_every_field() {
+        let (clock, _time) = controllable_clock(1_000);
+        let inner = InMemoryBlobStorage::with_clock(Arc::clone(&clock));
+        let cache = LocalBlobCache::with_clock(inner, 10, clock);
+        let data = vec![7, 7, 7];
+        let blob_id = make_blob_id(&data);
+        cache
+            .store([0xAB; 32], blob_id, None, 3600, data)
+            .await
+            .unwrap();
+
+        let rendered = format!("{cache:?}");
+        for field in [
+            "inner",
+            "max_cache_size: 10",
+            "entries",
+            "stored_at: 1000",
+            "clock",
+        ] {
+            assert!(rendered.contains(field), "{field} missing from {rendered}");
+        }
     }
 }
