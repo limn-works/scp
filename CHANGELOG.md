@@ -92,7 +92,7 @@ Kotlin; Python continues to expose module-level functions per
   per-bridge exemption in `scripts/bridge-aliases.json` to justify itself
   with an ADR (`ADR-NNN`), spec section (`§N…`), or PRD story (`SCP-NNN`).
   Cited ADRs and SCP stories are existence-verified against `.docs/adrs/`
-  and `.docs/prds/` (a fabricated `ADR-999`/`SCP-9999` is rejected, not just
+  and `.docs/prds/` (a fabricated `ADR-999` or story ID is rejected, not just
   hand-waves); `§` sections remain shape-only. Issue/PR numbers are rejected
   (ephemeral; policy forbids issue refs in tracked data). The gate
   immediately caught a factually wrong exemption: `identity_migrate` was
