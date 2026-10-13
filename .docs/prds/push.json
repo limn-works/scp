@@ -1235,7 +1235,7 @@
       "gate": "gate-push-webpush",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/specs/10-infrastructure-and-self-hosting.md",
         ".docs/specs/22-human-readable-addressing.md",

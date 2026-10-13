@@ -6,8 +6,9 @@ SHA-256 for every SCP signature, from 2026-09-10. This script is the authority f
 every byte §25 prints that depends on a key or a signature. It implements
 P-256 field and point arithmetic, RFC 6979 deterministic ECDSA with SHA-256,
 low-`s` normalization, SEC1 point encoding, HKDF-SHA256, HMAC-SHA256, the
-§9.5.1 canonical hash construction, the RFC 6962 Merkle construction, and the
-MessagePack subset the SCP structures serializes into.
+§9.5.1 canonical hash construction, the RFC 6962 Merkle construction, the
+MessagePack subset the SCP structures serializes into, and AES-128-GCM with
+the RFC 8291 WebPush message encryption built on it.
 
 The script depends on nothing outside the Python standard library. Every
 public key it derives is computed twice, by two independent scalar
@@ -670,6 +671,9 @@ def self_test() -> None:
     assert hexs(sha256(data_provenance_bytes())) == (
         "fa9cbfad74121473e2df010ac3b39f74bc30912d9168bc2efc77a25077ad1c01"
     ), "DataProvenance MessagePack mismatch"
+
+    # AES-128, GCM and RFC 8291 message encryption (§25.30).
+    webpush_self_test()
 
 
 # ---------------------------------------------------------------------------
@@ -2567,6 +2571,319 @@ def emit_reveal_ranking_and_text_form() -> None:
     emit("vector_57.rejected_padded", text + "====")
 
 
+# ---------------------------------------------------------------------------
+# §25.30 WebPush vectors 59-60 (`10-infrastructure-and-self-hosting.md`
+# §10.7.1, `22-human-readable-addressing.md` §22.11.4)
+#
+# AES-128 (FIPS 197) and GCM (NIST SP 800-38D) in pure Python, so the RFC 8291
+# message encryption below needs nothing outside the standard library. The
+# self-test reproduces FIPS 197 Appendix C.1, the GCM test case with a zero
+# key and one zero block, and RFC 8291 Appendix A end to end, and checks
+# against the `cryptography` package's AESGCM where that package imports.
+# ---------------------------------------------------------------------------
+
+
+def _aes_sbox() -> list[int]:
+    sbox = [0] * 256
+    p = q = 1
+    while True:
+        # p walks GF(2^8)* by multiplying by 3; q tracks the inverse of p.
+        p = p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)
+        q ^= q << 1
+        q ^= q << 2
+        q ^= q << 4
+        q &= 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        x = q
+        for shift in (1, 2, 3, 4):
+            x ^= ((q << shift) | (q >> (8 - shift))) & 0xFF
+        sbox[p] = x ^ 0x63
+        if p == 1:
+            break
+    sbox[0] = 0x63
+    return sbox
+
+
+_AES_SBOX = _aes_sbox()
+
+
+def _xtime(b: int) -> int:
+    return ((b << 1) ^ 0x1B) & 0xFF if b & 0x80 else b << 1
+
+
+def _aes128_expand(key: bytes) -> list[list[int]]:
+    assert len(key) == 16
+    words = [list(key[i : i + 4]) for i in range(0, 16, 4)]
+    rcon = 1
+    for i in range(4, 44):
+        t = list(words[i - 1])
+        if i % 4 == 0:
+            t = [_AES_SBOX[b] for b in t[1:] + t[:1]]
+            t[0] ^= rcon
+            rcon = _xtime(rcon)
+        words.append([a ^ b for a, b in zip(words[i - 4], t)])
+    return [[b for w in words[r * 4 : r * 4 + 4] for b in w] for r in range(11)]
+
+
+def aes128_encrypt_block(round_keys: list[list[int]], block: bytes) -> bytes:
+    s = [b ^ k for b, k in zip(block, round_keys[0])]
+    for rnd in range(1, 11):
+        s = [_AES_SBOX[b] for b in s]
+        # ShiftRows on the column-major state.
+        s = [s[(i + 4 * (i % 4)) % 16] for i in range(16)]
+        if rnd != 10:
+            mixed = []
+            for c in range(4):
+                a = s[4 * c : 4 * c + 4]
+                total = a[0] ^ a[1] ^ a[2] ^ a[3]
+                mixed += [
+                    a[j] ^ total ^ _xtime(a[j] ^ a[(j + 1) % 4]) for j in range(4)
+                ]
+            s = mixed
+        s = [b ^ k for b, k in zip(s, round_keys[rnd])]
+    return bytes(s)
+
+
+def _gf128_mul(x: int, y: int) -> int:
+    r = 0xE1 << 120
+    z = 0
+    for i in range(127, -1, -1):
+        if (y >> i) & 1:
+            z ^= x
+        x = (x >> 1) ^ r if x & 1 else x >> 1
+    return z
+
+
+def aes128_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
+    """AES-128-GCM, 96-bit nonce, no associated data; returns C || tag."""
+    assert len(nonce) == 12
+    rk = _aes128_expand(key)
+    h = int.from_bytes(aes128_encrypt_block(rk, bytes(16)), "big")
+    j0 = nonce + b"\x00\x00\x00\x01"
+    out = bytearray()
+    for i in range(0, len(plaintext), 16):
+        counter = nonce + (2 + i // 16).to_bytes(4, "big")
+        stream = aes128_encrypt_block(rk, counter)
+        out += bytes(a ^ b for a, b in zip(plaintext[i : i + 16], stream))
+    ghash = 0
+    padded = bytes(out) + bytes(-len(out) % 16)
+    for i in range(0, len(padded), 16):
+        ghash = _gf128_mul(ghash ^ int.from_bytes(padded[i : i + 16], "big"), h)
+    lengths = (0).to_bytes(8, "big") + (8 * len(out)).to_bytes(8, "big")
+    ghash = _gf128_mul(ghash ^ int.from_bytes(lengths, "big"), h)
+    tag = bytes(
+        a ^ b for a, b in zip(aes128_encrypt_block(rk, j0), ghash.to_bytes(16, "big"))
+    )
+    if _HAVE_CRYPTOGRAPHY:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        assert AESGCM(key).encrypt(nonce, plaintext, None) == bytes(out) + tag, (
+            "the cryptography package computed a different AES-128-GCM output"
+        )
+    return bytes(out) + tag
+
+
+def b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def b64url_decode(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def ecdh_p256(private: int, public: Point) -> bytes:
+    assert on_curve(public), "RFC 8291 §7: the peer key must lie on P-256"
+    shared = scalar_mult_jacobian(private, public)
+    assert shared == scalar_mult_affine(private, public)
+    return shared[0].to_bytes(32, "big")
+
+
+WEBPUSH_RECORD_SIZE = 4096
+
+
+def webpush_encrypt(
+    plaintext: bytes,
+    ua_public: bytes,
+    auth: bytes,
+    as_private: int,
+    salt: bytes,
+    rs: int = WEBPUSH_RECORD_SIZE,
+) -> dict[str, bytes]:
+    """RFC 8291 §3.4 and RFC 8188 §2: one aes128gcm record, no padding."""
+    assert len(ua_public) == 65 and ua_public[0] == 0x04
+    assert len(auth) == 16 and len(salt) == 16
+    as_public = encode_uncompressed(scalar_mult_jacobian(as_private, G))
+    ecdh_secret = ecdh_p256(as_private, decode_point(ua_public))
+    prk_key = hmac_sha256(auth, ecdh_secret)
+    key_info = b"WebPush: info\x00" + ua_public + as_public
+    ikm = hmac_sha256(prk_key, key_info + b"\x01")
+    prk = hmac_sha256(salt, ikm)
+    cek = hmac_sha256(prk, b"Content-Encoding: aes128gcm\x00\x01")[:16]
+    nonce = hmac_sha256(prk, b"Content-Encoding: nonce\x00\x01")[:12]
+    record = plaintext + b"\x02"  # last-record delimiter, zero padding octets
+    assert rs >= len(record) + 16 + 1, "RFC 8188 §2: the record must fit rs"
+    ciphertext = aes128_gcm_encrypt(cek, nonce, record)
+    header = salt + u32(rs) + bytes([len(as_public)]) + as_public
+    return {
+        "as_public": as_public,
+        "ecdh_secret": ecdh_secret,
+        "prk_key": prk_key,
+        "ikm": ikm,
+        "prk": prk,
+        "cek": cek,
+        "nonce": nonce,
+        "header": header,
+        "ciphertext": ciphertext,
+        "body": header + ciphertext,
+    }
+
+
+# RFC 8291 Appendix A, verbatim.
+RFC8291_PLAINTEXT = b"When I grow up, I want to be a watermelon"
+RFC8291_AS_PRIVATE = b64url_decode("yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw")
+RFC8291_AS_PUBLIC = b64url_decode(
+    "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8"
+)
+RFC8291_UA_PUBLIC = b64url_decode(
+    "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"
+)
+RFC8291_SALT = b64url_decode("DGv6ra1nlYgDCS1FRnbzlw")
+RFC8291_AUTH = b64url_decode("BTBZMqHH6r4Tts7J_aSIgg")
+
+
+def webpush_self_test() -> None:
+    # FIPS 197 Appendix C.1.
+    rk = _aes128_expand(bytes(range(16)))
+    block = bytes.fromhex("00112233445566778899aabbccddeeff")
+    assert hexs(aes128_encrypt_block(rk, block)) == (
+        "69c4e0d86a7b0430d8cdb78070b4c55a"
+    ), "FIPS 197 C.1 mismatch"
+    # GCM test case 2 of the GCM specification (zero key, zero IV, one zero
+    # block).
+    assert hexs(aes128_gcm_encrypt(bytes(16), bytes(12), bytes(16))) == (
+        "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf"
+    ), "GCM test case 2 mismatch"
+    # RFC 8291 Appendix A end to end.
+    out = webpush_encrypt(
+        RFC8291_PLAINTEXT,
+        RFC8291_UA_PUBLIC,
+        RFC8291_AUTH,
+        int.from_bytes(RFC8291_AS_PRIVATE, "big"),
+        RFC8291_SALT,
+    )
+    assert out["as_public"] == RFC8291_AS_PUBLIC, "RFC 8291 A as_public mismatch"
+    assert b64url(out["cek"]) == "oIhVW04MRdy2XN9CiKLxTg", "RFC 8291 A CEK mismatch"
+    assert b64url(out["nonce"]) == "4h_95klXJ5E_qnoN", "RFC 8291 A NONCE mismatch"
+    assert b64url(out["body"]) == (
+        "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIg"
+        "Dll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVB"
+        "St2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN"
+    ), "RFC 8291 A body mismatch"
+
+
+WEBPUSH_ENDPOINT_MAX = 2048
+
+
+def webpush_token(endpoint: str, p256dh: bytes, auth: bytes) -> bytes:
+    """§22.11.4: BE32(len(endpoint)) || endpoint || p256dh (65) || auth (16)."""
+    raw = endpoint.encode("ascii")
+    assert 1 <= len(raw) <= WEBPUSH_ENDPOINT_MAX
+    assert all(0x21 <= b <= 0x7E for b in raw)
+    assert len(p256dh) == 65 and p256dh[0] == 0x04
+    assert on_curve(decode_point(p256dh))
+    assert len(auth) == 16
+    return u32(len(raw)) + raw + p256dh + auth
+
+
+def vapid_audience(endpoint: str) -> str:
+    """RFC 8292 §2 and RFC 6454 §6.1: the push resource's origin."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(endpoint)
+    assert parts.scheme == "https" and parts.hostname
+    host = parts.hostname
+    if parts.port in (None, 443):
+        return f"https://{host}"
+    return f"https://{host}:{parts.port}"
+
+
+WEBPUSH_ENDPOINT = "https://push.example.net/p/LBhhw0OohO-Wl4Oi971UGsB7sdQGUibx"
+WEBPUSH_PORT_ENDPOINT = (
+    "https://push.example.net:8443/p/LBhhw0OohO-Wl4Oi971UGsB7sdQGUibx"
+)
+WEBPUSH_PLAINTEXT = b'{"scp":"1"}'
+WEBPUSH_JWT_EXP = 1_700_043_200
+WEBPUSH_SUBJECT = "mailto:operator@relay.example"
+
+
+def emit_webpush() -> None:
+    section("§25.30 WebPush token, request body and VAPID JWT (vectors 59-60)")
+
+    # --- Vector 59: the WebPush PushRegistration.token encoding. ---
+    token = webpush_token(WEBPUSH_ENDPOINT, RFC8291_UA_PUBLIC, RFC8291_AUTH)
+    assert len(token) == 4 + len(WEBPUSH_ENDPOINT) + 65 + 16
+    emit("vector_59.endpoint", WEBPUSH_ENDPOINT)
+    emit("vector_59.endpoint_len", len(WEBPUSH_ENDPOINT))
+    emit_hex("vector_59.p256dh", RFC8291_UA_PUBLIC)
+    emit_hex("vector_59.auth", RFC8291_AUTH)
+    emit("vector_59.token_len", len(token))
+    emit_hex("vector_59.token", token)
+    emit("vector_59.max_token_len", 4 + WEBPUSH_ENDPOINT_MAX + 65 + 16)
+
+    # --- Vector 60: the wake body and the VAPID Authorization header. ---
+    out = webpush_encrypt(
+        WEBPUSH_PLAINTEXT,
+        RFC8291_UA_PUBLIC,
+        RFC8291_AUTH,
+        int.from_bytes(RFC8291_AS_PRIVATE, "big"),
+        RFC8291_SALT,
+    )
+    assert len(out["body"]) == 86 + len(WEBPUSH_PLAINTEXT) + 1 + 16 == 114
+    emit("vector_60.plaintext", WEBPUSH_PLAINTEXT.decode())
+    emit_hex("vector_60.plaintext_hex", WEBPUSH_PLAINTEXT)
+    emit_hex("vector_60.as_private", RFC8291_AS_PRIVATE)
+    emit_hex("vector_60.as_public", out["as_public"])
+    emit_hex("vector_60.salt", RFC8291_SALT)
+    emit("vector_60.rs", WEBPUSH_RECORD_SIZE)
+    emit_hex("vector_60.ecdh_secret", out["ecdh_secret"])
+    emit_hex("vector_60.prk_key", out["prk_key"])
+    emit_hex("vector_60.ikm", out["ikm"])
+    emit_hex("vector_60.prk", out["prk"])
+    emit_hex("vector_60.cek", out["cek"])
+    emit_hex("vector_60.nonce", out["nonce"])
+    emit_hex("vector_60.header", out["header"])
+    emit_hex("vector_60.ciphertext", out["ciphertext"])
+    emit("vector_60.body_len", len(out["body"]))
+    emit_hex("vector_60.body", out["body"])
+
+    aud = vapid_audience(WEBPUSH_ENDPOINT)
+    assert aud == "https://push.example.net"
+    assert vapid_audience(WEBPUSH_PORT_ENDPOINT) == "https://push.example.net:8443"
+    jwt_header = b64url(b'{"typ":"JWT","alg":"ES256"}')
+    claims = json.dumps(
+        {"aud": aud, "exp": WEBPUSH_JWT_EXP, "sub": WEBPUSH_SUBJECT},
+        separators=(",", ":"),
+    ).encode()
+    signing_input = (jwt_header + "." + b64url(claims)).encode("ascii")
+    digest = sha256(signing_input)
+    signature = ecdsa_sign(REF_KEY_1.d, digest)
+    assert ecdsa_verify(REF_KEY_1.point, digest, signature)
+    if _HAVE_CRYPTOGRAPHY:
+        _verify_with_cryptography(REF_KEY_1, digest, signature, "vector_60.jwt")
+    jwt = signing_input.decode("ascii") + "." + b64url(signature)
+    k = b64url(REF_KEY_1.uncompressed)
+    emit("vector_60.aud", aud)
+    emit("vector_60.aud_non_default_port", vapid_audience(WEBPUSH_PORT_ENDPOINT))
+    emit("vector_60.jwt_claims", claims.decode())
+    emit("vector_60.jwt_signing_input", signing_input.decode("ascii"))
+    emit_hex("vector_60.jwt_digest", digest)
+    emit_hex("vector_60.jwt_signature", signature)
+    emit("vector_60.jwt", jwt)
+    emit("vector_60.vapid_k", k)
+    emit("vector_60.authorization", f"vapid t={jwt}, k={k}")
+
+
 def main() -> int:
     self_test()
     _LINES.append("SCP §25 test vectors — ECDSA on NIST P-256, RFC 6979, SHA-256")
@@ -2597,6 +2914,7 @@ def main() -> int:
     emit_witness_and_relay_objects()
     emit_commitment_and_service_record()
     emit_reveal_ranking_and_text_form()
+    emit_webpush()
     print("\n".join(_LINES))
     return 0
 

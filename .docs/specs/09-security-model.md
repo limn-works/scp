@@ -3072,6 +3072,9 @@ Both seeds go through the `"SCP-PSEUDONYM-P256-V1"` seed-to-scalar step above. T
 | Push platform tag: WebPush | `0x03` | Platform tag byte for Web Push API | §10.7.1 |
 | Push timestamp skew window | 300s | A relay rejects a push registration or deregistration whose `timestamp` differs from the relay's clock by more than this many seconds, in either direction | §10.7.1 |
 | Push registrations per identity identifier per relay | 16 | A relay rejects a registration under a new registration key once the identity identifier already holds this many registrations on that relay | §10.7.1 |
+| WebPush endpoint max length | 2,048 bytes | The longest endpoint a WebPush token carries. A relay rejects a WebPush registration whose endpoint is longer with `4060`, so a WebPush token is at most 4 + 2,048 + 65 + 16 = 2,133 bytes | §22.11.4, §10.7.1 |
+| WebPush wake TTL | 3,600s (1h) | The `TTL` header value of every WebPush wake. It equals the default blob TTL of §9.18.11, so a push service drops an undelivered wake no earlier than the relay drops a default-TTL blob that caused it | §10.7.1 |
+| WebPush record size | 4,096 | The `rs` value in the header of every WebPush wake body (RFC 8188 §2) | §10.7.1 |
 
 #### 9.18.14 Version Constants
 
