@@ -317,6 +317,7 @@ export type {
   Proof,
   ProposalStatus,
   Provenance,
+  PseudonymRotationPolicy,
   PublishResult,
   RejectionReason,
   RequireParticipation,

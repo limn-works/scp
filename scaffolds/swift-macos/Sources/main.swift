@@ -45,7 +45,8 @@ let params = ContextParams(
     sessionCap: nil,
     economicPolicy: nil,
     consequenceRulesJson: nil,
-    consequenceConfigJson: nil
+    consequenceConfigJson: nil,
+    pseudonymRotation: nil
 )
 let handle = try await scp.contextCreate(identity: identity, params: params)
 print("Created context: \(handle.contextId())")

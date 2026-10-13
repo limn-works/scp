@@ -17,6 +17,7 @@ use scp_did::DID;
 use scp_event_log::tree::{GENESIS_PREV_HASH, append_unsigned_event, event_count, root};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::pseudonym::PseudonymRecord;
 
 use crate::crypto_state::ContextCryptoState;
 use crate::error::ClientError;
@@ -44,14 +45,16 @@ pub struct PerContextState {
     pub member_sequence_numbers: HashMap<String, u64>,
     /// Pull-based receive buffer. Drained by `ScpClient::drain_events`.
     pub event_buffer: VecDeque<ContextEvent>,
-    /// The §9.10.4 peer-pseudonym registry: `peer_did → 32-byte routing ID`.
-    /// Populated when a peer's `PseudonymAnnouncement` is ingested (§9.10.4). This
-    /// is the address book the app-data fan-out publishes to — each entry is one
-    /// peer's per-context relay routing ID. Excludes this member's own pseudonym
+    /// The §9.10.4 peer-pseudonym registry: `peer_did →` a [`PseudonymRecord`]
+    /// (the 32-byte routing ID, plus the announced epoch for a v2 announcement).
+    /// Populated when a peer's announcement is ingested (§9.10.4, §9.10.4.1); the
+    /// epoch drives the §9.10.4.1 receipt ordering. This is the address book the
+    /// app-data fan-out publishes to — each entry holds one peer's per-context
+    /// relay routing ID. Excludes this member's own pseudonym
     /// (that is [`Self::local_pseudonym`]); it is the exact registry
     /// [`classify_pseudonym_announcement`](scp_protocol::context::pseudonym::classify_pseudonym_announcement)
     /// consults for the cross-DID collision check.
-    pub peer_pseudonyms: HashMap<DID, [u8; 32]>,
+    pub peer_pseudonyms: HashMap<DID, PseudonymRecord>,
     /// This member's own per-context pseudonym (its 32-byte relay routing ID),
     /// derived over the wasm-held MLS signing key (ADR-057 Option A). `None` until
     /// derived on context entry (create/join). NOT persisted — re-derived on
@@ -113,19 +116,23 @@ impl PerContextState {
         }
     }
 
-    /// Records a peer's announced per-context pseudonym in the §9.10.4 registry
-    /// (keyed by the peer's DID). Overwrites a prior value for the same DID (a
-    /// key-rotation re-announce). Never records this member's own DID — the local
+    /// Records a peer's accepted announcement in the §9.10.4 registry (keyed by
+    /// the peer's DID), replacing the prior record for the same DID. The caller
+    /// passes only a record the shared classifier accepted, so the §9.10.4.1
+    /// ordering already holds. Never records this member's own DID — the local
     /// pseudonym is tracked separately in [`Self::local_pseudonym`].
-    pub fn record_peer_pseudonym(&mut self, peer_did: DID, pseudonym: [u8; 32]) {
-        self.peer_pseudonyms.insert(peer_did, pseudonym);
+    pub fn record_peer_pseudonym(&mut self, peer_did: DID, record: PseudonymRecord) {
+        self.peer_pseudonyms.insert(peer_did, record);
     }
 
     /// The app-data fan-out address set: every announced peer pseudonym (the
     /// registry values), in arbitrary order. Empty until peers announce.
     #[must_use]
     pub fn peer_pseudonym_values(&self) -> Vec<[u8; 32]> {
-        self.peer_pseudonyms.values().copied().collect()
+        self.peer_pseudonyms
+            .values()
+            .map(|r| r.routing_id)
+            .collect()
     }
 
     /// Sets this member's own per-context pseudonym (derived on context entry).

@@ -2028,15 +2028,15 @@ fn ingest_application_plaintext(
         &sender_did,
         context_id,
         Some(&state.peer_pseudonyms),
-        state.local_pseudonym(),
+        // A browser member does not rotate (§9.10.4.A browser interim), so it
+        // holds no previous routing ID: its current one is the whole own set.
+        &state.local_pseudonym().into_iter().collect::<Vec<_>>(),
     ) {
-        PseudonymAnnouncementDecision::Accept {
-            member_did,
-            pseudonym,
-        } => {
-            let previous = state.peer_pseudonyms.get(&member_did).copied();
+        PseudonymAnnouncementDecision::Accept { member_did, record } => {
+            let previous = state.peer_pseudonyms.get(&member_did).map(|r| r.routing_id);
             let learned_new_peer = previous.is_none();
-            state.record_peer_pseudonym(member_did.clone(), pseudonym);
+            state.record_peer_pseudonym(member_did.clone(), record);
+            let pseudonym = record.routing_id;
             // Emit the `PseudonymAnnounced` observability event when the recorded
             // pseudonym is NEW **or CHANGED** — i.e. a first-contact peer, or a
             // KNOWN peer that rotated its pseudonym and re-announced a different
@@ -2077,7 +2077,11 @@ fn ingest_application_plaintext(
                 false,
             )
         }
-        PseudonymAnnouncementDecision::Rejected { .. } => (
+        // §9.10.4.1: a v2 re-announcement of the recorded epoch and routing ID
+        // (`Unchanged`) is consumed and changes nothing, like a rejected
+        // announcement; neither is application data nor teaches a new peer.
+        PseudonymAnnouncementDecision::Unchanged
+        | PseudonymAnnouncementDecision::Rejected { .. } => (
             ReceiveOutput {
                 application: false,
                 sender_key_distributions: Vec::new(),
@@ -2136,7 +2140,11 @@ mod ingest_emit_tests {
     use scp_did::{DID, SigningKeyId};
     use scp_mls::group::create_group;
     use scp_protocol::context::membership::ContextEvent;
-    use scp_protocol::context::pseudonym::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
+    use scp_protocol::context::pseudonym::{
+        PSEUDONYM_ANNOUNCEMENT_TAG, PSEUDONYM_ANNOUNCEMENT_V2_TAG, PseudonymAnnouncement,
+        PseudonymAnnouncementV2, PseudonymRecord, REJECT_COLLISION, REJECT_EPOCH,
+        REJECT_V1_AFTER_V2,
+    };
 
     const CTX: &str = "ctx-client-ingest-emit-unit";
     const ALICE: &str = "did:key:z6MkAliceClientIngestEmitFixtureAAAAAAAAA";
@@ -2207,8 +2215,11 @@ mod ingest_emit_tests {
             "a first-contact announcement must emit a PseudonymAnnounced event"
         );
         assert_eq!(
-            state.peer_pseudonyms.get(&DID(BOB.to_owned())),
-            Some(&first),
+            state
+                .peer_pseudonyms
+                .get(&DID(BOB.to_owned()))
+                .map(|r| r.routing_id),
+            Some(first),
             "the peer registry records BOB's first pseudonym"
         );
 
@@ -2243,10 +2254,115 @@ mod ingest_emit_tests {
             "a rotated (changed) pseudonym re-announce must emit a fresh PseudonymAnnounced event"
         );
         assert_eq!(
-            state.peer_pseudonyms.get(&DID(BOB.to_owned())),
-            Some(&rotated),
+            state
+                .peer_pseudonyms
+                .get(&DID(BOB.to_owned()))
+                .map(|r| r.routing_id),
+            Some(rotated),
             "the peer registry now holds BOB's rotated pseudonym"
         );
+    }
+
+    /// BOB's authenticated v2 announcement wire bytes (§9.10.4.1).
+    fn bob_announcement_v2(pseudonym_epoch: u64, routing_id: [u8; 32]) -> Vec<u8> {
+        rmp_serde::to_vec_named(&PseudonymAnnouncementV2 {
+            tag: PSEUDONYM_ANNOUNCEMENT_V2_TAG.to_owned(),
+            member_did: BOB.to_owned(),
+            pseudonym_epoch,
+            routing_id,
+        })
+        .unwrap()
+    }
+
+    fn bob_record(state: &PerContextState) -> Option<PseudonymRecord> {
+        state.peer_pseudonyms.get(&DID(BOB.to_owned())).copied()
+    }
+
+    /// Spec 09 §9.10.4.1 receipt ordering in the browser client: the record
+    /// holds the announced epoch, a same-epoch re-announcement is consumed and
+    /// changes nothing, and a lower epoch, an equal epoch with another routing
+    /// ID, a v1 announcement after v2, and a routing ID equal to the receiver's
+    /// own are each rejected with the registry left as it was.
+    #[test]
+    fn ingest_applies_v2_epoch_ordering() {
+        let mut state = alice_state();
+        let v1_id = [0x42u8; 32];
+        let e1 = [0x51u8; 32];
+        let e2 = [0x52u8; 32];
+
+        // v1, then v2 over the v1 record: accepted, epoch recorded.
+        ingest_application_plaintext(&mut state, CTX, BOB.to_owned(), bob_announcement(v1_id));
+        let (out, learned) = ingest_application_plaintext(
+            &mut state,
+            CTX,
+            BOB.to_owned(),
+            bob_announcement_v2(1, e1),
+        );
+        assert!(!out.application && !learned);
+        assert_eq!(
+            bob_record(&state),
+            Some(PseudonymRecord {
+                routing_id: e1,
+                epoch: Some(1),
+            })
+        );
+        assert_eq!(
+            announced_events(&state),
+            2,
+            "v1 then a changed v2 routing ID"
+        );
+
+        // Same epoch, same routing ID: consumed, nothing changes, no event.
+        let (out, learned) = ingest_application_plaintext(
+            &mut state,
+            CTX,
+            BOB.to_owned(),
+            bob_announcement_v2(1, e1),
+        );
+        assert!(!out.application && !learned);
+        assert_eq!(announced_events(&state), 2);
+
+        // Each rejected announcement leaves BOB's record unchanged and is not
+        // delivered as application data. The own routing ID is ALICE's
+        // `[0x01; 32]` from `alice_state`.
+        let before = bob_record(&state);
+        for (bytes, reason) in [
+            (bob_announcement_v2(0, e2), REJECT_EPOCH),
+            (bob_announcement_v2(1, e2), REJECT_EPOCH),
+            (bob_announcement(e2), REJECT_V1_AFTER_V2),
+            (bob_announcement_v2(2, [0x01u8; 32]), REJECT_COLLISION),
+        ] {
+            assert_eq!(
+                classify_pseudonym_announcement(
+                    &bytes,
+                    BOB,
+                    CTX,
+                    Some(&state.peer_pseudonyms),
+                    &[[0x01u8; 32]],
+                ),
+                PseudonymAnnouncementDecision::Rejected {
+                    reason,
+                    claimed_did: None,
+                }
+            );
+            let (out, learned) =
+                ingest_application_plaintext(&mut state, CTX, BOB.to_owned(), bytes);
+            assert!(!out.application && !learned, "{reason}");
+            assert_eq!(bob_record(&state), before, "{reason}");
+        }
+        assert_eq!(announced_events(&state), 2);
+
+        // A higher epoch replaces the record and emits.
+        ingest_application_plaintext(&mut state, CTX, BOB.to_owned(), bob_announcement_v2(2, e2));
+        assert_eq!(
+            bob_record(&state),
+            Some(PseudonymRecord {
+                routing_id: e2,
+                epoch: Some(2),
+            })
+        );
+        assert_eq!(announced_events(&state), 3);
+        assert_eq!(state.peer_pseudonym_values(), vec![e2]);
     }
 }
 

@@ -270,12 +270,14 @@ pub struct ContextSnapshot {
     member_wrapping_keys: Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>,
     /// Per-member next-outgoing message sequence numbers: `(did, sequence)`.
     member_sequence_numbers: Vec<(String, u64)>,
-    /// The §9.10.4 peer-pseudonym registry: `(peer_did, routing_id)` pairs — every
-    /// peer's announced per-context relay routing id (ADR-057 transport slice).
+    /// The §9.10.4 peer-pseudonym registry: `(peer_did, record)` pairs — every
+    /// peer's announced per-context relay routing id and, for a v2 announcement,
+    /// its epoch (§9.10.4.1 receipt ordering; `epoch` is `#[serde(default)]`, so a
+    /// record without it decodes as v1). ADR-057 transport slice.
     /// Persisted so a reopened tab can immediately fan app data out to known peers
     /// without waiting for them to re-announce. Excludes this member's own
     /// pseudonym (re-derived from the MLS key on restore, not persisted).
-    peer_pseudonyms: Vec<(String, [u8; 32])>,
+    peer_pseudonyms: Vec<(String, scp_protocol::context::pseudonym::PseudonymRecord)>,
     /// The §9.9.3 checkpoint: the event-log Merkle root at snapshot time. On
     /// restore, the root recomputed from `events` MUST equal this, or the blob is
     /// rejected as a torn/corrupt/truncated event stream. This binds the event
@@ -393,11 +395,12 @@ impl ContextSnapshot {
 
         // §9.10.4 peer-pseudonym registry (ADR-057 transport slice). The own
         // pseudonym is not captured — it is re-derived from the MLS key on restore.
-        let peer_pseudonyms: Vec<(String, [u8; 32])> = state
-            .peer_pseudonyms
-            .iter()
-            .map(|(did, pseudonym)| (did.0.clone(), *pseudonym))
-            .collect();
+        let peer_pseudonyms: Vec<(String, scp_protocol::context::pseudonym::PseudonymRecord)> =
+            state
+                .peer_pseudonyms
+                .iter()
+                .map(|(did, record)| (did.0.clone(), *record))
+                .collect();
 
         // Convert the receive buffer (decrypted-but-undrained local history) into
         // the persisted variant-aware form. The driver buffers `MessageSent` (a
@@ -592,11 +595,13 @@ impl ContextSnapshot {
         // §9.10.4 peer-pseudonym registry (ADR-057 transport slice). The own
         // pseudonym is re-derived from the MLS key by the driver after restore
         // (`ScpClient::install_local_routing`), so `local_pseudonym` starts `None`.
-        let peer_pseudonyms: HashMap<scp_did::DID, [u8; 32]> =
-            std::mem::take(&mut self.peer_pseudonyms)
-                .into_iter()
-                .map(|(did, pseudonym)| (scp_did::DID::from(did), pseudonym))
-                .collect();
+        let peer_pseudonyms: HashMap<
+            scp_did::DID,
+            scp_protocol::context::pseudonym::PseudonymRecord,
+        > = std::mem::take(&mut self.peer_pseudonyms)
+            .into_iter()
+            .map(|(did, record)| (scp_did::DID::from(did), record))
+            .collect();
 
         // Rebuild the receive buffer (decrypted-but-undrained local history) in
         // FIFO order, so a message sent or decrypted before the tab closed is
@@ -734,6 +739,36 @@ mod tests {
         assert_eq!(restored.member_dids(), vec![CREATOR.to_owned()]);
     }
 
+    /// Spec 09 §9.10.4.1: the peer registry's per-DID `(epoch, routing_id)`
+    /// survives a snapshot, so a reopened tab still rejects a replayed
+    /// lower-epoch announcement; a v1 record keeps `epoch: None`.
+    #[test]
+    fn peer_pseudonym_epochs_round_trip() {
+        use scp_protocol::context::pseudonym::PseudonymRecord;
+        let mut state = fresh_state();
+        let v2 = PseudonymRecord {
+            routing_id: [0x61u8; 32],
+            epoch: Some(7),
+        };
+        let v1 = PseudonymRecord {
+            routing_id: [0x62u8; 32],
+            epoch: None,
+        };
+        state.record_peer_pseudonym(scp_did::DID::from("did:key:z6MkV2Peer".to_owned()), v2);
+        state.record_peer_pseudonym(scp_did::DID::from("did:key:z6MkV1Peer".to_owned()), v1);
+
+        let blob = ContextSnapshot::capture(CTX, CREATOR, &state)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let restored = ContextSnapshot::from_bytes(&blob)
+            .unwrap()
+            .restore(CREATOR)
+            .unwrap();
+        assert_eq!(restored.peer_pseudonyms, state.peer_pseudonyms);
+        assert_eq!(restored.peer_pseudonyms.len(), 2);
+    }
+
     #[test]
     fn buffered_messages_round_trip() {
         // Both buffered variants — a sender's own MessageSent and a receiver's
@@ -843,7 +878,7 @@ mod tests {
             wrapping_secret: [u8; 32],
             member_wrapping_keys: Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>,
             member_sequence_numbers: Vec<(String, u64)>,
-            peer_pseudonyms: Vec<(String, [u8; 32])>,
+            peer_pseudonyms: Vec<(String, scp_protocol::context::pseudonym::PseudonymRecord)>,
             event_log_root: [u8; 32],
         }
         let mut state = fresh_state();

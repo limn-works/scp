@@ -83,7 +83,8 @@ enum MessagingExample {
             sessionCap: nil,
             economicPolicy: nil,
             consequenceRulesJson: nil,
-            consequenceConfigJson: nil
+            consequenceConfigJson: nil,
+            pseudonymRotation: nil
         )
         let aliceHandle = try await aliceNode.contextCreate(identity: alice, params: params)
 

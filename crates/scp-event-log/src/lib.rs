@@ -20,7 +20,7 @@
 //!
 //! - [`EventLog`] -- The append-only Merkle tree per context.
 //! - [`Event`] -- A protocol event with actor, type, payload, and signature.
-//! - [`EventType`] -- The 77 event type variants.
+//! - [`EventType`] -- The 78 event type variants.
 //! - [`EventPayload`] -- Type-specific event data.
 //! - [`EventLogError`] -- Error type for event log operations.
 //! - [`EventLogSigner`] -- Trait abstracting signing for checkpoint generation.
@@ -88,7 +88,7 @@ pub trait EventLogSigner: Send + Sync {
 // EventType
 // ---------------------------------------------------------------------------
 
-/// The 77 event type variants for SCP context event logs.
+/// The 78 event type variants for SCP context event logs.
 ///
 /// Every protocol action that mutates context state is represented as one of
 /// these variants. See ADR-011 for the base enumeration and ADR-031 for
@@ -98,7 +98,9 @@ pub trait EventLogSigner: Send + Sync {
 /// consequence-enforcement, commit-broadcast-reconciliation, compromise-recovery,
 /// and app-sandbox-binding variants; the cross-context-saga event model
 /// (ADR-011 Amendment §6 for `CrossContextOutletInvoked`; spec §6.2.4 for
-/// `CrossContextDivergenceMarker`) added the 2 `CrossContext*` variants. This is a CLOSED set with no catch-all
+/// `CrossContextDivergenceMarker`) added the 2 `CrossContext*` variants; the
+/// ADR-031 amendment of 2026-10-12 added `PseudonymRotationPolicyModified`
+/// (spec 09 §9.10.4.1). This is a CLOSED set with no catch-all
 /// variant: every protocol action that produces a verifiable Merkle-log entry
 /// is one of these variants.
 ///
@@ -442,6 +444,9 @@ pub enum EventType {
     /// [`EventType::OutletInvoked`] leaf carries), so the marker leaf is
     /// byte-identical across honest members.
     CrossContextDivergenceMarker,
+    /// The pseudonym rotation policy was set, changed or removed
+    /// (`ModifyPseudonymRotationPolicy`, ADR-031 §3; spec 09 §9.10.4.1).
+    PseudonymRotationPolicyModified,
 }
 
 // ---------------------------------------------------------------------------
@@ -728,7 +733,7 @@ mod tests {
     #[test]
     fn event_type_serialization_roundtrip_all_variants() {
         // Round-trips every variant of the closed taxonomy through serde JSON.
-        // The 77-variant count and wire-distinctness are pinned separately in
+        // The 78-variant count and wire-distinctness are pinned separately in
         // `event_type_taxonomy_is_closed_at_77_distinct_variants`.
         for event_type in all_event_types() {
             let json = serde_json::to_string(&event_type).expect("serialize");
@@ -820,19 +825,20 @@ mod tests {
             EventType::AppUnbound,
             EventType::CrossContextOutletInvoked,
             EventType::CrossContextDivergenceMarker,
+            EventType::PseudonymRotationPolicyModified,
         ]
     }
 
     #[test]
-    fn event_type_taxonomy_is_closed_at_77_distinct_variants() {
+    fn event_type_taxonomy_is_closed_at_78_distinct_variants() {
         // Pins the closed-set count and asserts wire-distinctness, independent
         // of the round-trip test (which would otherwise exceed the function
         // line limit).
         let event_types = all_event_types();
         assert_eq!(
             event_types.len(),
-            77,
-            "closed EventType taxonomy must enumerate exactly 77 variants"
+            78,
+            "closed EventType taxonomy must enumerate exactly 78 variants"
         );
 
         let mut serialized: Vec<String> = event_types
@@ -843,8 +849,8 @@ mod tests {
         serialized.dedup();
         assert_eq!(
             serialized.len(),
-            77,
-            "all 77 EventType variants must serialize to distinct values"
+            78,
+            "all 78 EventType variants must serialize to distinct values"
         );
     }
 

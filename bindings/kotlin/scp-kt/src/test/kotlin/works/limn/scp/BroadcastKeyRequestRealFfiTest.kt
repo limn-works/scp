@@ -82,6 +82,7 @@ class BroadcastKeyRequestRealFfiTest {
             economicPolicy = null,
             consequenceRulesJson = null,
             consequenceConfigJson = null,
+            pseudonymRotation = null,
         )
 
     private fun shutdownBridge(): CoroutineBridge =

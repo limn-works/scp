@@ -15392,6 +15392,14 @@ impl Supervisor {
         // the checks hold on both sides of the invitation (GitHub #2250).
         crate::context::state::validate_genesis_outlets(&params.outlets)
             .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+        // §9.10.4.1 validity criterion. Creation and the governance action both
+        // reject an invalid rotation policy; a joiner's `params` arrive from a
+        // peer, so apply the same criterion before the consume.
+        if let Some(policy) = &params.pseudonym_rotation {
+            policy
+                .validate()
+                .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+        }
 
         // Build the joiner's actor deps (crypto, transport, event log, KP store,
         // mls_storage, persistence, capability token) for the owning identity.

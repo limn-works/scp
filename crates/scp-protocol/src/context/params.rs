@@ -520,6 +520,74 @@ pub struct ConsequenceConfig {
     pub allow_automatic_access_revocation: bool,
 }
 
+/// Pseudonym rotation grace, in seconds (spec §9.18.11, §9.10.4.1).
+///
+/// A member that rotated stays subscribed to its previous routing ID for
+/// this long, and a [`PseudonymRotationPolicy::interval_secs`] may not be
+/// shorter.
+pub const PSEUDONYM_ROTATION_GRACE_SECS: u64 = 600;
+
+/// When each member of an encrypted context rotates its pseudonymous routing
+/// ID (spec §9.10.4.1 "Rotation policy, and where it lives").
+///
+/// Held in [`ContextParams::pseudonym_rotation`]. The creator sets it at
+/// creation, and governance changes it through
+/// `GovernanceAction::ModifyPseudonymRotationPolicy` (ADR-031). Both paths
+/// call [`PseudonymRotationPolicy::validate`] and reject an invalid policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PseudonymRotationPolicy {
+    /// Interval trigger: members rotate at each boundary
+    /// `T0 + j × interval_secs` (`j ≥ 1`). When set, at least
+    /// [`PSEUDONYM_ROTATION_GRACE_SECS`].
+    pub interval_secs: Option<u64>,
+    /// Membership trigger: every member except the added or removed one
+    /// rotates once after each committed `AddMember` or `RemoveMember`.
+    pub on_membership_change: bool,
+}
+
+/// Why a [`PseudonymRotationPolicy`] fails the §9.10.4.1 validity criterion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PseudonymRotationPolicyError {
+    /// The policy sets neither trigger: `interval_secs` is `None` and
+    /// `on_membership_change` is `false`.
+    #[error(
+        "pseudonym rotation policy sets no trigger: set interval_secs, or set on_membership_change to true"
+    )]
+    NoTrigger,
+    /// `interval_secs` is shorter than the rotation grace.
+    #[error(
+        "pseudonym rotation interval_secs {interval_secs} is shorter than the rotation grace of {minimum_secs} s"
+    )]
+    IntervalBelowGrace {
+        /// The interval the policy carried.
+        interval_secs: u64,
+        /// [`PSEUDONYM_ROTATION_GRACE_SECS`].
+        minimum_secs: u64,
+    },
+}
+
+impl PseudonymRotationPolicy {
+    /// Applies the §9.10.4.1 validity criterion: at least one trigger, and a
+    /// set `interval_secs` of at least [`PSEUDONYM_ROTATION_GRACE_SECS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PseudonymRotationPolicyError`] naming the clause the policy
+    /// fails.
+    pub const fn validate(&self) -> Result<(), PseudonymRotationPolicyError> {
+        match self.interval_secs {
+            Some(interval_secs) if interval_secs < PSEUDONYM_ROTATION_GRACE_SECS => {
+                Err(PseudonymRotationPolicyError::IntervalBelowGrace {
+                    interval_secs,
+                    minimum_secs: PSEUDONYM_ROTATION_GRACE_SECS,
+                })
+            }
+            None if !self.on_membership_change => Err(PseudonymRotationPolicyError::NoTrigger),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Full configuration for an SCP context, declared at creation time.
 ///
 /// `ContextParams` captures every parameter that defines a context's behavior:
@@ -792,6 +860,14 @@ pub struct ContextParams {
     /// Bounds total fan-in to a single outlet. Default `128`.
     #[serde(default = "default_max_concurrent_inbound_streams_per_outlet")]
     pub max_concurrent_inbound_streams_per_outlet: u32,
+
+    /// When members rotate their pseudonymous routing IDs (spec §9.10.4.1).
+    /// `None` means no rotation: each member keeps the routing ID it holds.
+    /// Creation rejects a policy that fails
+    /// [`PseudonymRotationPolicy::validate`], and governance changes the
+    /// field only through `ModifyPseudonymRotationPolicy` (ADR-031).
+    #[serde(default)]
+    pub pseudonym_rotation: Option<PseudonymRotationPolicy>,
 }
 
 /// §9.18.B default for [`ContextParams::stream_window_default`] (chunks).
@@ -871,6 +947,7 @@ impl Default for ContextParams {
                 default_max_concurrent_inbound_streams_per_origin_invoker(),
             max_concurrent_inbound_streams_per_outlet:
                 default_max_concurrent_inbound_streams_per_outlet(),
+            pseudonym_rotation: None,
         }
     }
 }
@@ -1109,6 +1186,10 @@ mod tests {
             max_concurrent_inbound_streams_per_invoker: 8,
             max_concurrent_inbound_streams_per_origin_invoker: 16,
             max_concurrent_inbound_streams_per_outlet: 128,
+            pseudonym_rotation: Some(PseudonymRotationPolicy {
+                interval_secs: Some(86_400),
+                on_membership_change: true,
+            }),
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -1122,6 +1203,83 @@ mod tests {
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.template_id, Some(TemplateId::PublicBroadcast));
         assert!(params.economic_policy.is_none());
+    }
+
+    #[test]
+    fn pseudonym_rotation_policy_accepts_each_trigger_at_and_above_grace() {
+        for policy in [
+            PseudonymRotationPolicy {
+                interval_secs: None,
+                on_membership_change: true,
+            },
+            PseudonymRotationPolicy {
+                interval_secs: Some(PSEUDONYM_ROTATION_GRACE_SECS),
+                on_membership_change: false,
+            },
+            PseudonymRotationPolicy {
+                interval_secs: Some(86_400),
+                on_membership_change: true,
+            },
+        ] {
+            assert_eq!(policy.validate(), Ok(()), "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn pseudonym_rotation_policy_rejects_no_trigger() {
+        let policy = PseudonymRotationPolicy {
+            interval_secs: None,
+            on_membership_change: false,
+        };
+        assert_eq!(
+            policy.validate(),
+            Err(PseudonymRotationPolicyError::NoTrigger)
+        );
+    }
+
+    #[test]
+    fn pseudonym_rotation_policy_rejects_interval_below_grace() {
+        for interval_secs in [0, 1, PSEUDONYM_ROTATION_GRACE_SECS - 1] {
+            for on_membership_change in [false, true] {
+                let policy = PseudonymRotationPolicy {
+                    interval_secs: Some(interval_secs),
+                    on_membership_change,
+                };
+                assert_eq!(
+                    policy.validate(),
+                    Err(PseudonymRotationPolicyError::IntervalBelowGrace {
+                        interval_secs,
+                        minimum_secs: 600,
+                    }),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn context_params_without_pseudonym_rotation_key_deserializes_to_none() {
+        let mut value = serde_json::to_value(ContextParams::default()).expect("serialize");
+        let removed = value
+            .as_object_mut()
+            .expect("params serialize as an object")
+            .remove("pseudonym_rotation");
+        assert_eq!(removed, Some(serde_json::Value::Null));
+        let params: ContextParams = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(params.pseudonym_rotation, None);
+    }
+
+    #[test]
+    fn context_params_pseudonym_rotation_round_trips_through_msgpack() {
+        let params = ContextParams {
+            pseudonym_rotation: Some(PseudonymRotationPolicy {
+                interval_secs: Some(3_600),
+                on_membership_change: false,
+            }),
+            ..ContextParams::default()
+        };
+        let bytes = rmp_serde::to_vec_named(&params).expect("encode");
+        let back: ContextParams = rmp_serde::from_slice(&bytes).expect("decode");
+        assert_eq!(back.pseudonym_rotation, params.pseudonym_rotation);
     }
 
     #[test]

@@ -321,6 +321,20 @@ class TestScpContextCreate:
         )
         assert native.context_create.call_args[0][1]["consequence_rules"] is None
 
+    async def test_pseudonym_rotation_reaches_the_bridge(self) -> None:
+        """Spec 09 §9.10.4.1: the ``pseudonym_rotation`` dict reaches the bridge as written."""
+        from scp_sdk.scp import SCP
+
+        native = MagicMock()
+        native.context_create.return_value = native_context_handle()
+        scp = _make_scp(native)
+        policy = {"interval_secs": 3600, "on_membership_change": True}
+
+        await SCP.context_create(
+            scp, "did:dht:z6MkAlice", {"ceiling": [], "pseudonym_rotation": policy}
+        )
+        assert native.context_create.call_args[0][1]["pseudonym_rotation"] == policy
+
     async def test_accepts_empty_roles(self) -> None:
         """H14: an explicit empty roles dict must round-trip as an empty dict."""
         from scp_sdk.scp import SCP

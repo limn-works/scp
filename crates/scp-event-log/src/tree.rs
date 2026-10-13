@@ -492,6 +492,9 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         // stays retired. These are convergent commit-ordered durable leaves.
         EventType::CrossContextOutletInvoked => 76,
         EventType::CrossContextDivergenceMarker => 77,
+        // ADR-031 amendment of 2026-10-12 (spec 09 §9.10.4.1): the next free
+        // tag after 77.
+        EventType::PseudonymRotationPolicyModified => 78,
     }
 }
 
@@ -1310,12 +1313,13 @@ mod tests {
     //   - the 39 unification variants occupy tags 36..=75 with tag 59 retired
     //     (PseudonymAnnounced removed — a routing-bootstrap ContextEvent signal);
     //   - the 2 ADR-011 Amendment §6 cross-context-saga variants occupy 76..=77;
-    //   - all 77 tags are distinct.
+    //   - `PseudonymRotationPolicyModified` (ADR-031 amendment) occupies 78;
+    //   - all 78 tags are distinct.
     // -----------------------------------------------------------------------
 
     /// The complete `EventType` taxonomy in ADR declaration order, used to
     /// cross-check against `event_type_tag`.
-    const ALL_EVENT_TYPES: [EventType; 77] = [
+    const ALL_EVENT_TYPES: [EventType; 78] = [
         EventType::ContextCreated,
         EventType::ContextClosing,
         EventType::ContextClosed,
@@ -1393,21 +1397,22 @@ mod tests {
         EventType::AppUnbound,
         EventType::CrossContextOutletInvoked,
         EventType::CrossContextDivergenceMarker,
+        EventType::PseudonymRotationPolicyModified,
     ];
 
     #[test]
     fn all_event_type_tags_are_distinct() {
         let mut tags: Vec<u16> = ALL_EVENT_TYPES.iter().map(event_type_tag).collect();
-        assert_eq!(tags.len(), 77, "taxonomy must enumerate all 77 variants");
+        assert_eq!(tags.len(), 78, "taxonomy must enumerate all 78 variants");
         tags.sort_unstable();
         tags.dedup();
         assert_eq!(
             tags.len(),
-            77,
-            "all 77 EventType tags must be distinct (no two variants share a tag)"
+            78,
+            "all 78 EventType tags must be distinct (no two variants share a tag)"
         );
         // Tag 59 is intentionally retired (PseudonymAnnounced removed); the tag
-        // space is therefore 0..=75 minus {59}. This is the only gap.
+        // space is therefore 0..=78 minus {59}. This is the only gap.
         assert!(
             !tags.contains(&59),
             "tag 59 is retired and must not be reused (PseudonymAnnounced removal)"
@@ -1511,6 +1516,10 @@ mod tests {
         // tags after 75 (tag 59 stays retired).
         assert_eq!(event_type_tag(&EventType::CrossContextOutletInvoked), 76);
         assert_eq!(event_type_tag(&EventType::CrossContextDivergenceMarker), 77);
+        assert_eq!(
+            event_type_tag(&EventType::PseudonymRotationPolicyModified),
+            78
+        );
     }
 
     #[test]

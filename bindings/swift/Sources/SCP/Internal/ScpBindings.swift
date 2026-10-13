@@ -9046,6 +9046,14 @@ public struct ContextParams {
      * governance only).
      */
     public var consequenceConfigJson: String?
+    /**
+     * Pseudonym rotation policy (spec 09 §9.10.4.1). `None` disables
+     * rotation: members keep one routing ID for the context's lifetime. A
+     * set policy must name at least one trigger, and a set
+     * `interval_secs` must be at least 600; otherwise the create fails with
+     * `SCP-VALID-7000`.
+     */
+    public var pseudonymRotation: PseudonymRotationPolicy?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -9110,7 +9118,14 @@ public struct ContextParams {
          * Optional consequence config as a JSON-encoded object (ADR-017, #1531).
          * `None` means the default config (severe enforcement tiers gated to
          * governance only).
-         */consequenceConfigJson: String?) {
+         */consequenceConfigJson: String?, 
+        /**
+         * Pseudonym rotation policy (spec 09 §9.10.4.1). `None` disables
+         * rotation: members keep one routing ID for the context's lifetime. A
+         * set policy must name at least one trigger, and a set
+         * `interval_secs` must be at least 600; otherwise the create fails with
+         * `SCP-VALID-7000`.
+         */pseudonymRotation: PseudonymRotationPolicy?) {
         self.mode = mode
         self.ceiling = ceiling
         self.ceilingPolicy = ceilingPolicy
@@ -9125,6 +9140,7 @@ public struct ContextParams {
         self.economicPolicy = economicPolicy
         self.consequenceRulesJson = consequenceRulesJson
         self.consequenceConfigJson = consequenceConfigJson
+        self.pseudonymRotation = pseudonymRotation
     }
 }
 
@@ -9177,6 +9193,9 @@ extension ContextParams: Equatable, Hashable {
         if lhs.consequenceConfigJson != rhs.consequenceConfigJson {
             return false
         }
+        if lhs.pseudonymRotation != rhs.pseudonymRotation {
+            return false
+        }
         return true
     }
 
@@ -9195,6 +9214,7 @@ extension ContextParams: Equatable, Hashable {
         hasher.combine(economicPolicy)
         hasher.combine(consequenceRulesJson)
         hasher.combine(consequenceConfigJson)
+        hasher.combine(pseudonymRotation)
     }
 }
 
@@ -9220,7 +9240,8 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
                 sessionCap: FfiConverterOptionUInt32.read(from: &buf), 
                 economicPolicy: FfiConverterOptionString.read(from: &buf), 
                 consequenceRulesJson: FfiConverterOptionString.read(from: &buf), 
-                consequenceConfigJson: FfiConverterOptionString.read(from: &buf)
+                consequenceConfigJson: FfiConverterOptionString.read(from: &buf), 
+                pseudonymRotation: FfiConverterOptionTypePseudonymRotationPolicy.read(from: &buf)
         )
     }
 
@@ -9239,6 +9260,7 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.economicPolicy, into: &buf)
         FfiConverterOptionString.write(value.consequenceRulesJson, into: &buf)
         FfiConverterOptionString.write(value.consequenceConfigJson, into: &buf)
+        FfiConverterOptionTypePseudonymRotationPolicy.write(value.pseudonymRotation, into: &buf)
     }
 }
 
@@ -11369,6 +11391,96 @@ public func FfiConverterTypeProof_lift(_ buf: RustBuffer) throws -> Proof {
 #endif
 public func FfiConverterTypeProof_lower(_ value: Proof) -> RustBuffer {
     return FfiConverterTypeProof.lower(value)
+}
+
+
+/**
+ * When members of a context rotate their relay routing ID (spec 09
+ * §9.10.4.1). Mirrors `scp_core::context::PseudonymRotationPolicy`.
+ */
+public struct PseudonymRotationPolicy {
+    /**
+     * Interval trigger in seconds: members rotate at each multiple of the
+     * interval after context creation. When set, at least 600.
+     */
+    public var intervalSecs: UInt64?
+    /**
+     * Membership trigger: every member except the added or removed one
+     * rotates once after each committed `AddMember` or `RemoveMember`.
+     */
+    public var onMembershipChange: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Interval trigger in seconds: members rotate at each multiple of the
+         * interval after context creation. When set, at least 600.
+         */intervalSecs: UInt64?, 
+        /**
+         * Membership trigger: every member except the added or removed one
+         * rotates once after each committed `AddMember` or `RemoveMember`.
+         */onMembershipChange: Bool) {
+        self.intervalSecs = intervalSecs
+        self.onMembershipChange = onMembershipChange
+    }
+}
+
+#if compiler(>=6)
+extension PseudonymRotationPolicy: Sendable {}
+#endif
+
+
+extension PseudonymRotationPolicy: Equatable, Hashable {
+    public static func ==(lhs: PseudonymRotationPolicy, rhs: PseudonymRotationPolicy) -> Bool {
+        if lhs.intervalSecs != rhs.intervalSecs {
+            return false
+        }
+        if lhs.onMembershipChange != rhs.onMembershipChange {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(intervalSecs)
+        hasher.combine(onMembershipChange)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePseudonymRotationPolicy: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PseudonymRotationPolicy {
+        return
+            try PseudonymRotationPolicy(
+                intervalSecs: FfiConverterOptionUInt64.read(from: &buf), 
+                onMembershipChange: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PseudonymRotationPolicy, into buf: inout [UInt8]) {
+        FfiConverterOptionUInt64.write(value.intervalSecs, into: &buf)
+        FfiConverterBool.write(value.onMembershipChange, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePseudonymRotationPolicy_lift(_ buf: RustBuffer) throws -> PseudonymRotationPolicy {
+    return try FfiConverterTypePseudonymRotationPolicy.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePseudonymRotationPolicy_lower(_ value: PseudonymRotationPolicy) -> RustBuffer {
+    return FfiConverterTypePseudonymRotationPolicy.lower(value)
 }
 
 
@@ -16360,6 +16472,30 @@ fileprivate struct FfiConverterOptionTypeOutletCostDefinition: FfiConverterRustB
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeOutletCostDefinition.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypePseudonymRotationPolicy: FfiConverterRustBuffer {
+    typealias SwiftType = PseudonymRotationPolicy?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePseudonymRotationPolicy.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePseudonymRotationPolicy.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }

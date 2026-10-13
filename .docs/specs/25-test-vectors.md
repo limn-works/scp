@@ -1108,7 +1108,7 @@ Expected bytes (hex, 171 bytes, single continuous string):
 
 where `member`, `other` and `ctx` are the values Vector 36 defines. Every `Rejected` and `Unchanged` row leaves the registry exactly as the row's input states it.
 
-No test asserts this vector yet. A conforming implementation reproduces both byte strings and every decision in the table on native and on `wasm32`, as Vector 36 requires of v1.
+A conforming implementation reproduces both byte strings and every decision in the table on native and on `wasm32`, as Vector 36 requires of v1. `vector_58_v2_wire_and_decision_table_match_on_every_target` in `crates/scp-client-wasm/tests/pseudonym_cross_target_kat.rs` asserts both on native and on `wasm32` (native `#[test]` plus `#[wasm_bindgen_test]`), and `vector_58_v2_wire_bytes_match_golden` and `vector_58_decision_table` in `crates/scp-protocol/src/context/pseudonym.rs` assert them beside the classifier.
 
 ## 25.20 Trust Attestation Signing Vectors (§7.4.1, §9.5.2)
 

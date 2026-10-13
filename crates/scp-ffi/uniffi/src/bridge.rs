@@ -2160,6 +2160,33 @@ pub struct ContextParams {
     /// `None` means the default config (severe enforcement tiers gated to
     /// governance only).
     pub consequence_config_json: Option<String>,
+    /// Pseudonym rotation policy (spec 09 §9.10.4.1). `None` disables
+    /// rotation: members keep one routing ID for the context's lifetime. A
+    /// set policy must name at least one trigger, and a set
+    /// `interval_secs` must be at least 600; otherwise the create fails with
+    /// `SCP-VALID-7000`.
+    pub pseudonym_rotation: Option<PseudonymRotationPolicy>,
+}
+
+/// When members of a context rotate their relay routing ID (spec 09
+/// §9.10.4.1). Mirrors `scp_core::context::PseudonymRotationPolicy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct PseudonymRotationPolicy {
+    /// Interval trigger in seconds: members rotate at each multiple of the
+    /// interval after context creation. When set, at least 600.
+    pub interval_secs: Option<u64>,
+    /// Membership trigger: every member except the added or removed one
+    /// rotates once after each committed `AddMember` or `RemoveMember`.
+    pub on_membership_change: bool,
+}
+
+impl From<PseudonymRotationPolicy> for scp_core::context::PseudonymRotationPolicy {
+    fn from(policy: PseudonymRotationPolicy) -> Self {
+        Self {
+            interval_secs: policy.interval_secs,
+            on_membership_change: policy.on_membership_change,
+        }
+    }
 }
 
 /// A message received from an SCP context.
@@ -7295,6 +7322,7 @@ fn bridge_params_to_core(
         economic_policy_json: params.economic_policy.clone(),
         consequence_rules_json: params.consequence_rules_json.clone(),
         consequence_config_json: params.consequence_config_json.clone(),
+        pseudonym_rotation: params.pseudonym_rotation.map(Into::into),
         ..Default::default()
     };
 
@@ -19595,6 +19623,49 @@ mod tests {
             economic_policy: None,
             consequence_rules_json: None,
             consequence_config_json: None,
+            pseudonym_rotation: None,
+        }
+    }
+
+    /// Spec 09 §9.10.4.1: the record's pseudonym rotation policy reaches the
+    /// core `ContextParams` unchanged, `None` stays `None`, and a policy that
+    /// fails the validity criterion fails the conversion with `SCP-VALID-7000`.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn bridge_params_carry_pseudonym_rotation_policy() {
+        let mut params = encrypted_join_test_params();
+        assert_eq!(
+            bridge_params_to_core(&params).unwrap().pseudonym_rotation,
+            None
+        );
+
+        params.pseudonym_rotation = Some(PseudonymRotationPolicy {
+            interval_secs: Some(3600),
+            on_membership_change: true,
+        });
+        assert_eq!(
+            bridge_params_to_core(&params).unwrap().pseudonym_rotation,
+            Some(scp_core::context::PseudonymRotationPolicy {
+                interval_secs: Some(3600),
+                on_membership_change: true,
+            })
+        );
+
+        for invalid in [
+            PseudonymRotationPolicy {
+                interval_secs: None,
+                on_membership_change: false,
+            },
+            PseudonymRotationPolicy {
+                interval_secs: Some(599),
+                on_membership_change: true,
+            },
+        ] {
+            params.pseudonym_rotation = Some(invalid);
+            match bridge_params_to_core(&params) {
+                Err(ScpError::Validation { code, .. }) => assert_eq!(code, codes::VALID_7000),
+                other => panic!("expected SCP-VALID-7000 for {invalid:?}, got {other:?}"),
+            }
         }
     }
 
@@ -31992,6 +32063,7 @@ mod tests {
                 economic_policy: None,
                 consequence_rules_json: None,
                 consequence_config_json: None,
+                pseudonym_rotation: None,
             }
         }
 

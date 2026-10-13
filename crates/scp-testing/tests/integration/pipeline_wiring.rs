@@ -1917,6 +1917,45 @@ fn execute_remove_member_calls_remove_member_sender_key() {
     );
 }
 
+/// Spec 09 §9.10.4.1, ADR-031: an approved `ModifyPseudonymRotationPolicy`
+/// reaches its executor. `execute_governance_action` (the approved-proposal
+/// path of propose and vote) calls `dispatch_governance_action`, whose arm for
+/// the variant calls `execute_modify_pseudonym_rotation_policy`, which writes
+/// the policy through the fail-closed Class-S commit and appends the ADR-011
+/// event.
+#[test]
+fn modify_pseudonym_rotation_policy_reaches_its_executor() {
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "execute_governance_action",
+            "dispatch_governance_action("
+        ),
+        "execute_governance_action must call dispatch_governance_action"
+    );
+    let dispatch = extract_fn_body(MANAGER_SRC, "dispatch_governance_action")
+        .expect("dispatch_governance_action exists");
+    assert!(
+        dispatch.contains("GovernanceAction::ModifyPseudonymRotationPolicy")
+            && dispatch.contains("execute_modify_pseudonym_rotation_policy("),
+        "dispatch_governance_action must route ModifyPseudonymRotationPolicy to \
+         execute_modify_pseudonym_rotation_policy"
+    );
+    let executor = extract_fn_body(MANAGER_SRC, "execute_modify_pseudonym_rotation_policy")
+        .expect("execute_modify_pseudonym_rotation_policy exists");
+    for step in [
+        ".validate()",
+        "commit_class_s_keep",
+        "set_pseudonym_rotation(",
+        "EventType::PseudonymRotationPolicyModified",
+    ] {
+        assert!(
+            executor.contains(step),
+            "execute_modify_pseudonym_rotation_policy must contain `{step}`"
+        );
+    }
+}
+
 #[test]
 fn execute_remove_member_calls_rotate_sender_key() {
     assert!(

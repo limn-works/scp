@@ -134,6 +134,32 @@ export interface ContextParams {
    * permit `RevokeAccess` rules.
    */
   readonly consequenceConfig?: ConsequenceConfig;
+  /**
+   * Pseudonym rotation policy (spec 09 §9.10.4.1). Omit or pass `null` to
+   * disable rotation: members keep one relay routing ID for the context's
+   * lifetime. A policy with no trigger, an `intervalSecs` under 600, an
+   * unknown key, or a missing `onMembershipChange` fails `contextCreate`
+   * with `SCP-VALID-7000`.
+   */
+  readonly pseudonymRotation?: PseudonymRotationPolicy | null;
+}
+
+/**
+ * When members of a context rotate their relay routing ID (spec 09 §9.10.4.1).
+ * At least one trigger must be set.
+ */
+export interface PseudonymRotationPolicy {
+  /**
+   * Interval trigger in seconds: members rotate at each multiple of the
+   * interval after context creation. When set, at least 600. Omit or pass
+   * `null` for no interval trigger.
+   */
+  readonly intervalSecs?: number | null;
+  /**
+   * Membership trigger: every member except the added or removed one rotates
+   * once after each committed `AddMember` or `RemoveMember`.
+   */
+  readonly onMembershipChange: boolean;
 }
 
 // ---------------------------------------------------------------------------
