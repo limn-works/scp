@@ -486,8 +486,10 @@ pub(crate) fn event_log_checkpoint_on(
         let epoch_u64 = validate_non_negative_epoch(epoch)?;
 
         let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {
-            // ci-allow: bridge-block-on: waits on no context actor; signs through custody on the JS thread, so a JS callback custody cannot complete here (known defect, reported separately)
-            crate::runtime().block_on(async {
+            // Waits on no context actor; signs through custody on the JS
+            // thread, so a JS callback custody cannot complete here (known
+            // defect, reported separately).
+            crate::block_on_shared(async {
                 // The bounded, key-type-checked sign of ADR-049 Decision 7a:
                 // a custody that never answers fails with SCP-CRYPTO-4062.
                 let signer = scp_ffi_common::signer::identity_command_signer(
@@ -504,7 +506,7 @@ pub(crate) fn event_log_checkpoint_on(
                 )
                 .await
                 .map_err(|e| ScpNapiError::checkpoint_error(&e))
-            })
+            })?
         })
         .map_err(napi::Error::from)?;
 
@@ -546,8 +548,10 @@ pub(crate) fn event_log_checkpoint_by_did_on(
         let epoch_u64 = validate_non_negative_epoch(epoch)?;
 
         let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {
-            // ci-allow: bridge-block-on: waits on no context actor; signs through custody on the JS thread, so a JS callback custody cannot complete here (known defect, reported separately)
-            crate::runtime().block_on(async {
+            // Waits on no context actor; signs through custody on the JS
+            // thread, so a JS callback custody cannot complete here (known
+            // defect, reported separately).
+            crate::block_on_shared(async {
                 // The bounded, key-type-checked sign of ADR-049 Decision 7a:
                 // a custody that never answers fails with SCP-CRYPTO-4062.
                 let signer = scp_ffi_common::signer::identity_command_signer(
@@ -564,7 +568,7 @@ pub(crate) fn event_log_checkpoint_by_did_on(
                 )
                 .await
                 .map_err(|e| ScpNapiError::checkpoint_error(&e))
-            })
+            })?
         })
         .map_err(napi::Error::from)?;
 

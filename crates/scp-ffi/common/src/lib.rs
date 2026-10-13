@@ -18,6 +18,10 @@
 //!
 //! See §3.10.10, §9.5, §7.4.1, §22.3.1, §22.4, §22.8 in `.docs/specs/`.
 
+// The one `block_on` / `block_in_place` caller under `crates/scp-ffi/`
+// (ADR-049 Decision 7a; `scripts/check-bridge-block-on.py`).
+#[cfg(feature = "resolvers")]
+pub mod bridge_wait;
 pub mod custody_request;
 pub mod error_codes;
 pub mod outlet_id;

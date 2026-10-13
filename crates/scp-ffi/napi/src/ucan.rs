@@ -685,17 +685,12 @@ pub(crate) async fn ucan_delegate_on(
         };
 
         // napi-rs async functions run on the tokio runtime, but
-        // `with_identity` holds a DashMap ref guard (sync). Use
-        // `tokio::task::block_in_place` to avoid nesting block_on calls.
-        let rt_handle = tokio::runtime::Handle::current();
-        let result = tokio::task::block_in_place(|| {
-            // ci-allow: bridge-block-on: runs in an async napi function on a tokio worker under block_in_place; waits on no context actor
-            rt_handle.block_on(async {
-                delegate_ucan(&params, entry.custody.as_ref(), &scp_clock::SystemClock).await
-            })
-        });
-
-        result.map_err(ScpNapiError::from)
+        // `with_identity` holds a DashMap ref guard (sync), so the delegation
+        // is driven synchronously; waits on no context actor.
+        crate::block_on_shared(async {
+            delegate_ucan(&params, entry.custody.as_ref(), &scp_clock::SystemClock).await
+        })?
+        .map_err(ScpNapiError::from)
     })
     .map_err(napi::Error::from)?;
 

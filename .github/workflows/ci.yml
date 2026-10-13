@@ -1303,11 +1303,11 @@ jobs:
         run: python3.12 scripts/check-block-in-place.py --self-test
       - name: Real scan
         run: python3.12 scripts/check-block-in-place.py
-      # ADR-049 Decision 7a: a bridge never blocks a host thread (the GIL,
-      # the JS thread) on an actor reply. Self-test first, as above.
+      # ADR-049 Decision 7a: `bridge_block_on` is the only bridge wait, and
+      # only listed callers reach it. Self-test first, as above.
       - name: Bridge block_on self-test
         run: python3.12 scripts/check-bridge-block-on.py --self-test
-      - name: Bridge block_on scan + napi ratchet
+      - name: Bridge block_on whitelist + caller list
         run: python3.12 scripts/check-bridge-block-on.py
 
   # Every `§N.M` citation in the artifacts that tell an agent how to write and how to

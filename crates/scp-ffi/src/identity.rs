@@ -2815,10 +2815,14 @@ impl crate::scp::PyScp {
                 CustodyMigrationOrchestrator::new(did_val, migration_target, context_ids);
             let backend = NotConfiguredMigrationBackend;
 
-            // ci-allow: bridge-block-on: drives custody migration against the NotConfigured backend with the GIL released; waits on no context actor and no host callback
-            let result = rt
-                .block_on(orchestrator.execute(&backend, &scp_clock::SystemClock))
-                .map_err(|e| ScpPyError::identity(format!("custody migration failed: {e}")))?;
+            // Runs with the GIL released; waits on no context actor and no
+            // host callback.
+            let result = scp_ffi_common::bridge_wait::bridge_block_on(
+                || Ok(rt),
+                orchestrator.execute(&backend, &scp_clock::SystemClock),
+            )
+            .map_err(|e| ScpPyError::context(e.to_string()))?
+            .map_err(|e| ScpPyError::identity(format!("custody migration failed: {e}")))?;
 
             // Serialize to JSON and return — the Python layer converts to dict.
             let json = serde_json::to_string(&result).map_err(|e| {

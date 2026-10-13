@@ -1,9 +1,8 @@
 // Fixture for `scripts/check-bridge-block-on.py --self-test`. Never compiled.
 //
-// Function names carry the expected verdict: `flag_*` holds a bare
-// `.block_on` the gate must flag, `allow_*` a site whose directive has a
-// reason, `test_*` test code the gate must not see, and `bad_directive_*` a
-// directive with no reason, which is an error.
+// Function names carry the expected verdict: `flag_*` holds a blocking wait
+// the gate must flag, and `test_*` test code the gate must not see. The gate
+// is a whitelist, so a `ci-allow` directive exempts nothing.
 
 fn flag_bare_block_on(rt: &tokio::runtime::Runtime) {
     rt.block_on(async {});
@@ -37,17 +36,42 @@ fn flag_cfg_not_test_is_production(rt: &tokio::runtime::Runtime) {
     rt.block_on(async {});
 }
 
-fn allow_trailing_directive(rt: &tokio::runtime::Runtime) {
+fn flag_old_trailing_directive(rt: &tokio::runtime::Runtime) {
     rt.block_on(async {}); // ci-allow: bridge-block-on: waits on no context actor
 }
 
-fn allow_directive_above(rt: &tokio::runtime::Runtime) {
+fn flag_old_directive_above(rt: &tokio::runtime::Runtime) {
     // ci-allow: bridge-block-on: the caller released the GIL
     rt.block_on(async {});
 }
 
-fn bad_directive_without_reason(rt: &tokio::runtime::Runtime) {
-    rt.block_on(async {}); // ci-allow: bridge-block-on:
+fn flag_block_in_place() {
+    tokio::task::block_in_place(|| ());
+}
+
+fn flag_ufcs_handle_block_on(h: &tokio::runtime::Handle) {
+    tokio::runtime::Handle::block_on(h, async {});
+}
+
+fn flag_futures_executor_block_on() {
+    futures::executor::block_on(async {});
+}
+
+fn flag_renaming_use() {
+    use tokio::task::block_in_place as bip;
+    bip(|| ());
+}
+
+fn flag_method_value(rt: &tokio::runtime::Runtime) {
+    let wait = tokio::runtime::Runtime::block_on::<std::future::Ready<()>>;
+    wait(rt, std::future::ready(()));
+}
+
+fn flag_second_helper_outside_the_helper_file(rt: &tokio::runtime::Runtime) {
+    fn bridge_block_on(rt: &tokio::runtime::Runtime) {
+        rt.block_on(async {});
+    }
+    bridge_block_on(rt);
 }
 
 #[test]

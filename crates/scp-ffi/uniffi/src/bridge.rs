@@ -1293,6 +1293,17 @@ impl ScpError {
 // From<scp-core error types> for ScpError
 // ---------------------------------------------------------------------------
 
+/// A bridge wait that could not drive its future (`scp_ffi_common::block_on`)
+/// reports `SCP-CTX-2001`, as the `PyO3` bridge does.
+impl From<scp_ffi_common::bridge_wait::BridgeBlockOnError> for ScpError {
+    fn from(e: scp_ffi_common::bridge_wait::BridgeBlockOnError) -> Self {
+        Self::Context {
+            msg: e.to_string(),
+            code: codes::CTX_2001.to_owned(),
+        }
+    }
+}
+
 impl From<scp_ffi_common::validate::ValidationError> for ScpError {
     fn from(e: scp_ffi_common::validate::ValidationError) -> Self {
         Self::Validation {
@@ -3810,7 +3821,6 @@ impl TransportManager {
 
         // Phase D (#1695): the handle's `bi` field is the owning
         // `UniffiBridgeInstance` — mutate its transport slot directly.
-        let rt = runtime();
         let sourced = SourcedRelayUrl {
             url: relay_url.clone(),
             source: RelayUrlSource::Explicit,
@@ -3826,13 +3836,12 @@ impl TransportManager {
         // bridge's `transport_add_relay`.
         let profile = scp_transport::profile::TransportProfile::platform_default();
         let selector = self.bi.core.transport_selector();
-        let (adapter, suppression_rx) = rt
-            .block_on(async {
-                selector
-                    .select_and_connect_discovering_with_suppression(&sourced, Some(&profile))
-                    .await
-            })
-            .map_err(ScpError::from)?;
+        let (adapter, suppression_rx) = crate::block_on_shared(async {
+            selector
+                .select_and_connect_discovering_with_suppression(&sourced, Some(&profile))
+                .await
+        })?
+        .map_err(ScpError::from)?;
 
         let count = self
             .bi
@@ -5276,11 +5285,10 @@ impl McpUniFfiBridgeProvider {
         };
         let sup = Arc::clone(sup);
         let id = context_id.to_owned();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { sup.get_role_state_checked(&id).await })
-        })
-        .map_err(|e| format!("role state of context '{context_id}' could not be read: {e}"))
+        crate::block_on_shared(async move { sup.get_role_state_checked(&id).await })
+            .map_err(|e| e.to_string())
+            .and_then(|read| read.map_err(|e| e.to_string()))
+            .map_err(|e| format!("role state of context '{context_id}' could not be read: {e}"))
     }
 
     /// Reads `context_id`'s role state through [`Self::role_state_of`], for
@@ -5344,10 +5352,10 @@ impl McpUniFfiBridgeProvider {
         };
         let sup = Arc::clone(sup);
         let id = context_id.to_owned();
-        match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { sup.read_context_state_checked(&id).await })
-        }) {
+        match crate::block_on_shared(async move { sup.read_context_state_checked(&id).await })
+            .map_err(|e| e.to_string())
+            .and_then(|read| read.map_err(|e| e.to_string()))
+        {
             Ok(Some(scp_core::context::ContextState::Active)) => Ok(()),
             Ok(_) => Err(denied()),
             Err(e) => Err(AccessRefusal::Unreadable(format!(
@@ -5478,15 +5486,14 @@ impl McpUniFfiBridgeProvider {
                 ))
             })?
         };
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(bi.ensure_ucan_registered_while_active(context_id))
-        })
-        .map_err(|e| {
-            AccessRefusal::Unreadable(format!(
-                "UCAN state of context '{context_id}' could not be registered: {e}"
-            ))
-        })?;
+        crate::block_on_shared(bi.ensure_ucan_registered_while_active(context_id))
+            .map_err(|e| e.to_string())
+            .and_then(|registered| registered.map_err(|e| e.to_string()))
+            .map_err(|e| {
+                AccessRefusal::Unreadable(format!(
+                    "UCAN state of context '{context_id}' could not be registered: {e}"
+                ))
+            })?;
 
         // ADR-016 step 8 compares the token's grants against the ceiling in
         // `role_state`, and the chain check anchors on its `creator_did`. The
@@ -5888,10 +5895,10 @@ impl McpUniFfiBridgeProvider {
         // Ensure UCAN state is registered before appending the event, while
         // the supervisor reports the context `Active`. A failure leaves the
         // append to the `None` arm below, which logs it.
-        if let Err(e) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(bi.ensure_ucan_registered_while_active(context_id))
-        }) {
+        if let Err(e) = crate::block_on_shared(bi.ensure_ucan_registered_while_active(context_id))
+            .map_err(|e| e.to_string())
+            .and_then(|registered| registered.map_err(|e| e.to_string()))
+        {
             tracing::warn!(
                 outlet = %outlet_name,
                 context = %context_id,
@@ -6462,22 +6469,18 @@ async fn event_log_checkpoint_impl(
             .map_err(ScpError::from)?;
             let checkpoint = bi
                 .with_ucan_state(&context_id, |ucan_state| {
-                    // generate_checkpoint is async — use block_in_place to allow
-                    // blocking inside this spawned async task. block_in_place moves
-                    // the worker thread to blocking mode (requires multi-thread runtime).
-                    let handle = tokio::runtime::Handle::current();
-                    tokio::task::block_in_place(|| {
-                        handle.block_on(async {
-                            scp_event_log::checkpoint::generate_checkpoint(
-                                &ucan_state.event_log,
-                                &sender_did,
-                                epoch,
-                                &signer,
-                            )
-                            .await
-                            .map_err(|e| ScpError::checkpoint_error(&e))
-                        })
-                    })
+                    // generate_checkpoint is async; this closure is sync, so
+                    // the wait blocks this spawned task's worker.
+                    crate::block_on_shared(async {
+                        scp_event_log::checkpoint::generate_checkpoint(
+                            &ucan_state.event_log,
+                            &sender_did,
+                            epoch,
+                            &signer,
+                        )
+                        .await
+                        .map_err(|e| ScpError::checkpoint_error(&e))
+                    })?
                 })
                 .ok_or_else(|| ScpError::Context {
                     msg: format!("context '{context_id}' not found in UCAN registry"),
@@ -6586,22 +6589,18 @@ async fn event_log_checkpoint_by_did_impl(
             .map_err(ScpError::from)?;
             let checkpoint = bi
                 .with_ucan_state(&context_id, |ucan_state| {
-                    // generate_checkpoint is async — use block_in_place to allow
-                    // blocking inside this spawned async task. block_in_place moves
-                    // the worker thread to blocking mode (requires multi-thread runtime).
-                    let handle = tokio::runtime::Handle::current();
-                    tokio::task::block_in_place(|| {
-                        handle.block_on(async {
-                            scp_event_log::checkpoint::generate_checkpoint(
-                                &ucan_state.event_log,
-                                &sender_did,
-                                epoch,
-                                &signer,
-                            )
-                            .await
-                            .map_err(|e| ScpError::checkpoint_error(&e))
-                        })
-                    })
+                    // generate_checkpoint is async; this closure is sync, so
+                    // the wait blocks this spawned task's worker.
+                    crate::block_on_shared(async {
+                        scp_event_log::checkpoint::generate_checkpoint(
+                            &ucan_state.event_log,
+                            &sender_did,
+                            epoch,
+                            &signer,
+                        )
+                        .await
+                        .map_err(|e| ScpError::checkpoint_error(&e))
+                    })?
                 })
                 .ok_or_else(|| ScpError::Context {
                     msg: format!("context '{context_id}' not found in UCAN registry"),
@@ -8933,15 +8932,14 @@ pub(crate) fn scpid_sign_impl(
         code: codes::IDENT_1008.to_owned(),
     })?;
 
-    let rt = crate::runtime();
-    let response = rt.block_on(core_sign(
+    let response = crate::block_on_shared(core_sign(
         &*custody,
         &key_handle,
         &identity.did,
         key_id,
         &challenge,
         signed_at_override,
-    ));
+    ))?;
 
     let response = response.map_err(|e| ScpError::Identity {
         msg: e.to_string(),
@@ -9004,9 +9002,7 @@ fn scpid_verify_on(
         code: codes::IDENT_1033.to_owned(),
     })?;
 
-    let rt = crate::runtime();
-    let auth = rt
-        .block_on(core_verify(resolver.as_ref(), &response, &challenge))
+    let auth = crate::block_on_shared(core_verify(resolver.as_ref(), &response, &challenge))?
         .map_err(|e| ScpError::Identity {
             msg: e.to_string(),
             code: scpid_error_code(&e).to_owned(),
@@ -17408,14 +17404,12 @@ impl Scp {
             CustodyMigrationOrchestrator::new(did_val, migration_target, context_ids);
         let backend = NotConfiguredMigrationBackend;
 
-        let rt = crate::runtime();
-
-        let result = rt
-            .block_on(orchestrator.execute(&backend, &scp_clock::SystemClock))
-            .map_err(|e| ScpError::Identity {
-                msg: format!("custody migration failed: {e}"),
-                code: codes::IDENT_1025.to_owned(),
-            })?;
+        let result =
+            crate::block_on_shared(orchestrator.execute(&backend, &scp_clock::SystemClock))?
+                .map_err(|e| ScpError::Identity {
+                    msg: format!("custody migration failed: {e}"),
+                    code: codes::IDENT_1025.to_owned(),
+                })?;
 
         serde_json::to_string(&result).map_err(|e| ScpError::Identity {
             msg: format!("failed to serialize custody migration result: {e}"),
@@ -18303,27 +18297,24 @@ impl Scp {
             guard.get(&owner_did).cloned().unwrap_or_default()
         };
 
-        let handle = tokio::runtime::Handle::current();
-        let outcome = tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                let mut resolver = scp_core::discovery::AddressResolver::new();
-                let querier = petname_helpers::LocalHandleQuerier::new(&bi.core);
-                resolver
-                    .resolve(
-                        &address,
-                        &petname_map,
-                        &querier,
-                        &known_contexts,
-                        &known_domains,
-                        &scp_clock::SystemClock,
-                    )
-                    .await
-                    .map_err(|e| ScpError::Validation {
-                        msg: format!("address resolution failed: {e}"),
-                        code: petname_helpers::address_resolution_error_code(&e).to_owned(),
-                    })
-            })
-        })?;
+        let outcome = crate::block_on_shared(async {
+            let mut resolver = scp_core::discovery::AddressResolver::new();
+            let querier = petname_helpers::LocalHandleQuerier::new(&bi.core);
+            resolver
+                .resolve(
+                    &address,
+                    &petname_map,
+                    &querier,
+                    &known_contexts,
+                    &known_domains,
+                    &scp_clock::SystemClock,
+                )
+                .await
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("address resolution failed: {e}"),
+                    code: petname_helpers::address_resolution_error_code(&e).to_owned(),
+                })
+        })??;
 
         // §22.8.2 ranks results by trust level, so a caller reads
         // `unavailable_layers` to learn which higher-trust layers this build

@@ -345,21 +345,18 @@ struct FfiBridgeProvider {
 /// Fails from a current-thread runtime, which would have to run the awaited
 /// work on the thread this call blocks, and when the bridge runtime cannot
 /// start.
-fn block_on_provider_task<F: std::future::Future>(fut: F) -> Result<F::Output, String> {
-    match tokio::runtime::Handle::try_current() {
-        // Inside the MCP transport task: the awaited work runs on this
-        // runtime's other workers while this one blocks.
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            // ci-allow: bridge-block-on: the multi-thread arm runs on the MCP transport task, never on a Python thread
-            Ok(tokio::task::block_in_place(|| handle.block_on(fut)))
-        }
-        Ok(_) => Err("a current-thread runtime cannot drive the wait".to_owned()),
-        Err(_) => {
-            let rt = crate::runtime().map_err(|e| format!("{e}"))?;
-            // ci-allow: bridge-block-on: the provider runs only on the MCP transport task, so this arm serves direct calls from Rust tests and never a Python thread
-            Ok(rt.block_on(fut))
-        }
-    }
+fn block_on_provider_task<F>(fut: F) -> Result<F::Output, String>
+where
+    F: std::future::Future,
+{
+    // Inside the MCP transport task the awaited work runs on the runtime's
+    // other workers while this one blocks. Outside every runtime (direct
+    // calls from Rust tests) the shared runtime drives it.
+    scp_ffi_common::bridge_wait::bridge_block_on(
+        || crate::runtime().map_err(|e| e.to_string()),
+        fut,
+    )
+    .map_err(|e| e.to_string())
 }
 
 impl FfiBridgeProvider {

@@ -20,8 +20,10 @@
 //! A single tokio `Runtime` is created at module import time and stored in a
 //! [`OnceLock`]. Every synchronous bridge function waits on a tokio future
 //! through `actor_wait::block_on_released`, which releases the Python GIL for
-//! the whole wait (ADR-049 Decision 7a); `scripts/check-bridge-block-on.py`
-//! fails any other production `.block_on(`.
+//! the whole wait (ADR-049 Decision 7a). `scripts/check-bridge-block-on.py`
+//! fails every `block_on` and `block_in_place` under `crates/scp-ffi/` outside
+//! `scp_ffi_common::bridge_wait::bridge_block_on`, and every caller of that
+//! helper missing from the gate's `CALLERS` list.
 //!
 //! The exception is `PyMessageReceiver::__anext__`, which returns an
 //! `asyncio.Future` and spawns the recv on the tokio runtime, resolving the
@@ -220,8 +222,13 @@ fn shutdown_runtime(py: Python<'_>, _timeout_millis: u64) {
 /// `tokio::time::sleep` built on the calling thread needs a current runtime
 /// and panics on the atexit thread, which has none.
 fn drain_runtime(rt: &tokio::runtime::Runtime) {
-    // ci-allow: bridge-block-on: the atexit drain sleeps with the GIL released and waits on no context actor
-    rt.block_on(async { tokio::time::sleep(SHUTDOWN_DRAIN).await });
+    // The atexit drain sleeps with the GIL released and waits on no context
+    // actor. A refusal (a current-thread ambient runtime) skips the drain.
+    if let Err(e) = scp_ffi_common::bridge_wait::bridge_block_on(|| Ok(rt), async {
+        tokio::time::sleep(SHUTDOWN_DRAIN).await;
+    }) {
+        tracing::warn!("SCP runtime shutdown drain skipped: {e}");
+    }
 }
 
 /// The `_scp_core` Python extension module.

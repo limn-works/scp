@@ -581,22 +581,12 @@ fn held_role_state(
             .await
             .map_err(|e| format!("role state of context '{id}' could not be read: {e}"))
     };
-    match tokio::runtime::Handle::try_current() {
-        // Inside the MCP transport task: the actor runs on this runtime's
-        // other workers while this one blocks.
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            // ci-allow: bridge-block-on: the multi-thread arm runs on the MCP transport task, never on the JS thread
-            tokio::task::block_in_place(|| handle.block_on(query))
-        }
-        // A current-thread runtime would have to run the actor on the thread
-        // this call blocks.
-        Ok(_) => Err(format!(
-            "cannot read the role state of context '{context_id}' from a \
-             current-thread runtime"
-        )),
-        // ci-allow: bridge-block-on: the provider runs only on the MCP transport task, so this arm serves direct calls from Rust tests and never the JS thread
-        Err(_) => crate::runtime().block_on(query),
-    }
+    // Inside the MCP transport task the actor runs on the runtime's other
+    // workers while this one blocks; outside every runtime (direct calls from
+    // Rust tests) the shared runtime drives it. A current-thread runtime is
+    // refused, since it would have to run the actor on the blocked thread.
+    crate::block_on_shared(query)
+        .map_err(|e| format!("cannot read the role state of context '{context_id}': {e}"))?
 }
 
 /// Why the NAPI MCP server lists no tools and refuses every `tools/call`: this

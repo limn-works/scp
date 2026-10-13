@@ -9,9 +9,10 @@
 //!
 //! [`block_on_released`] releases the GIL for the whole wait, so a host
 //! callback, or another Python thread, can always run.
-//! `scripts/check-bridge-block-on.py` fails any other production `.block_on(`
-//! under `crates/scp-ffi/src/` that does not carry a
-//! `// ci-allow: bridge-block-on: <reason>` directive.
+//! `scripts/check-bridge-block-on.py` fails every `block_on` and
+//! `block_in_place` under `crates/scp-ffi/` outside
+//! `scp_ffi_common::bridge_wait::bridge_block_on`, which this wait reaches
+//! through `bridge_block_on_off_thread`.
 //!
 //! The future must not touch Python objects: `Python<'_>` and `Bound<'_, _>`
 //! are `!Send`, so the compiler rejects them, but `Py<T>` is `Send` and is not
@@ -21,21 +22,17 @@
 use std::future::Future;
 
 use pyo3::Python;
+use scp_ffi_common::bridge_wait::bridge_block_on_off_thread;
 
 use crate::error::ScpPyError;
 
 /// Drives `fut` to completion with the GIL released.
 ///
-/// The wait picks the bridge that the ambient tokio regime permits:
-///
-/// 1. no ambient runtime (the normal Python call): the shared runtime's
-///    `block_on`;
-/// 2. a multi-thread ambient runtime, where `Runtime::block_on` panics:
-///    `block_in_place` around the ambient handle, under the bridge exemption
-///    that ADR-049 Decision 7a restates;
-/// 3. a current-thread ambient runtime, where `Runtime::block_on` and
-///    `block_in_place` both panic: a private current-thread runtime on a
-///    scoped thread. The scope lets `fut` borrow the caller's locals.
+/// The wait runs through
+/// [`scp_ffi_common::bridge_wait::bridge_block_on_off_thread`], which picks
+/// the regime the ambient tokio state permits; inside a current-thread
+/// ambient runtime it drives `fut` on a private runtime on a scoped thread, so
+/// `fut` may borrow the caller's locals.
 ///
 /// # Errors
 ///
@@ -46,46 +43,10 @@ where
     F: Future + Send,
     F::Output: Send,
 {
-    py.allow_threads(|| block_on_any_regime(fut))
-}
-
-fn block_on_any_regime<F>(fut: F) -> Result<F::Output, ScpPyError>
-where
-    F: Future + Send,
-    F::Output: Send,
-{
-    match tokio::runtime::Handle::try_current() {
-        Err(_) => {
-            let rt = crate::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
-            Ok(rt.block_on(fut))
-        }
-        Ok(handle)
-            if matches!(
-                handle.runtime_flavor(),
-                tokio::runtime::RuntimeFlavor::MultiThread
-            ) =>
-        {
-            Ok(tokio::task::block_in_place(|| handle.block_on(fut)))
-        }
-        Ok(_) => std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map(|rt| rt.block_on(fut))
-                        .map_err(|e| {
-                            ScpPyError::context(format!(
-                                "a bridge wait could not build a private runtime: {e}"
-                            ))
-                        })
-                })
-                .join()
-                .map_err(|_| {
-                    ScpPyError::context("a bridge wait's private runtime thread panicked")
-                })?
-        }),
-    }
+    py.allow_threads(|| {
+        bridge_block_on_off_thread(|| crate::runtime().map_err(|e| e.to_string()), fut)
+            .map_err(|e| ScpPyError::context(e.to_string()))
+    })
 }
 
 #[cfg(test)]

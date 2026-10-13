@@ -210,9 +210,9 @@ pub struct DidRotatedEvent {
 /// # Async-sync bridging
 ///
 /// The underlying resolver is async (network I/O). The `validate::DidResolver`
-/// trait is sync. This struct bridges via `tokio::task::block_in_place` (when
-/// called from within a tokio multi-thread runtime) or `Handle::block_on`
-/// (when called from a non-tokio thread, e.g., `PyO3`).
+/// trait is sync. This struct bridges through
+/// [`crate::bridge_wait::bridge_block_on`] on a scoped thread outside every
+/// runtime (see `resolve_sync`).
 ///
 /// See §3.10.10, §9.5 (UCAN validation), §7.4.1 (attestation verification).
 /// Closes #311.
@@ -346,7 +346,7 @@ impl IdentityBackedDidResolver {
         }
     }
 
-    /// Returns a handle to the long-lived, dedicated DID-resolution runtime,
+    /// Returns the long-lived, dedicated DID-resolution runtime,
     /// building it ONCE on first use and reusing it forever after.
     ///
     /// A small fixed-size multi-thread runtime: it owns its own worker threads,
@@ -358,11 +358,11 @@ impl IdentityBackedDidResolver {
     /// Returns `Err(NetworkUnavailable)` only if the OS refuses to create the
     /// runtime's threads on the very first call; subsequent calls reuse the
     /// already-built runtime and never allocate.
-    fn resolution_handle(&self) -> Result<&tokio::runtime::Handle, ResolutionError> {
+    fn resolution_runtime(&self) -> Result<&tokio::runtime::Runtime, ResolutionError> {
         // Fast path: already built. This is the common case on a hot path — no
         // allocation, no thread spawn, just a relaxed atomic load.
         if let Some(rt) = self.resolution_rt.get() {
-            return Ok(rt.handle());
+            return Ok(rt);
         }
         // Slow path (first use only): build fallibly, then publish into the
         // `OnceLock`. `OnceLock::get_or_init` cannot carry a `Result`, so we
@@ -386,21 +386,18 @@ impl IdentityBackedDidResolver {
             lost.shutdown_background();
         }
         // The slot is guaranteed populated now (by us or the race winner).
-        self.resolution_rt
-            .get()
-            .map(tokio::runtime::Runtime::handle)
-            .ok_or_else(|| {
-                ResolutionError::NetworkUnavailable(
-                    "DID-resolution runtime unexpectedly absent after init".to_owned(),
-                )
-            })
+        self.resolution_rt.get().ok_or_else(|| {
+            ResolutionError::NetworkUnavailable(
+                "DID-resolution runtime unexpectedly absent after init".to_owned(),
+            )
+        })
     }
 
     /// Calls the async resolve function from a sync context.
     ///
     /// The async resolution is driven to completion on the long-lived,
-    /// shared resolution runtime (see [`Self::resolution_handle`]) via
-    /// `handle().block_on(...)`. Critically, that `block_on` is invoked from a
+    /// shared resolution runtime (see [`Self::resolution_runtime`]) via
+    /// [`crate::bridge_wait::bridge_block_on`]. Critically, that `block_on` is invoked from a
     /// freshly-spawned scoped OS thread — a thread that is NOT itself inside any
     /// tokio runtime — and the result is handed back through `join()`. There is
     /// NO per-call runtime construction: the reactor + worker threads are built
@@ -430,11 +427,19 @@ impl IdentityBackedDidResolver {
     fn resolve_sync(&self, did: &str) -> Result<ResolvedDidDocument, ResolutionError> {
         let resolve_fn = Arc::clone(&self.resolve_fn);
         let did_owned = did.to_owned();
-        let handle = self.resolution_handle()?.clone();
+        let rt = self.resolution_runtime()?;
 
+        // The scoped thread is outside every runtime, so the helper takes its
+        // first regime: `Runtime::block_on` on the resolution runtime.
         std::thread::scope(|scope| {
             scope
-                .spawn(move || handle.block_on(Self::resolve_document(&*resolve_fn, &did_owned)))
+                .spawn(move || {
+                    crate::bridge_wait::bridge_block_on(
+                        || Ok(rt),
+                        Self::resolve_document(&*resolve_fn, &did_owned),
+                    )
+                    .map_err(|e| ResolutionError::NetworkUnavailable(e.to_string()))?
+                })
                 .join()
                 .unwrap_or_else(|_| {
                     Err(ResolutionError::NetworkUnavailable(
@@ -1608,7 +1613,7 @@ mod tests {
             tokio::runtime::Handle::current(),
         );
         resolver
-            .resolution_handle()
+            .resolution_runtime()
             .expect("the resolution runtime builds");
         assert!(
             resolver.resolution_rt.get().is_some(),

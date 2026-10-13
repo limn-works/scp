@@ -1180,15 +1180,15 @@ impl Scp {
         // Drive the async orchestrator on the module-local tokio runtime
         // (crate::runtime()). Same rationale as identity_execute_recovery:
         // the napi-rs worker thread has no tokio context.
-        // ci-allow: bridge-block-on: drives custody migration against the NotConfigured backend; waits on no context actor and no host callback
-        let result = crate::runtime()
-            .block_on(orchestrator.execute(&backend, &scp_clock::SystemClock))
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Identity {
-                    message: format!("custody migration failed: {e}"),
-                    code: codes::IDENT_1025.to_owned(),
-                })
-            })?;
+        // Waits on no context actor and no host callback.
+        let result =
+            crate::block_on_shared(orchestrator.execute(&backend, &scp_clock::SystemClock))?
+                .map_err(|e| {
+                    NapiError::from(ScpNapiError::Identity {
+                        message: format!("custody migration failed: {e}"),
+                        code: codes::IDENT_1025.to_owned(),
+                    })
+                })?;
 
         serde_json::to_string(&result).map_err(|e| {
             NapiError::from(ScpNapiError::Identity {
