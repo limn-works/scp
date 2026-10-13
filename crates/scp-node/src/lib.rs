@@ -2401,6 +2401,15 @@ fn tier_to_relay_url(tier: &ReachabilityTier) -> String {
     }
 }
 
+/// The relay URL a domain-mode node publishes in its DID document.
+///
+/// The node also gives it to its relay server as `RelayConfig.relay_url`, so
+/// the relay's reserved push routing ID (§10.7.1 step 2) derives from the URL
+/// clients read from the document.
+pub(crate) fn domain_relay_url(domain: &str) -> String {
+    format!("wss://{domain}/scp/v1")
+}
+
 /// Resolves the published relay URL for no-domain mode.
 ///
 /// `Some(tier)` is the probed reachability tier; `None` means the NAT probe was
@@ -3251,7 +3260,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     acme_challenges: Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>>,
     #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
 ) -> Result<ApplicationNode<S>, NodeError> {
-    let relay_url = format!("wss://{domain}/scp/v1");
+    let relay_url = domain_relay_url(&domain);
     // `add_relay_service` now returns the wasm-safe `DidError`
     // (ADR-057); route it through `IdentityError` so it lands in the
     // existing `NodeError::Identity` variant, preserving prior behavior.

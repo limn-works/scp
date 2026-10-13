@@ -189,9 +189,7 @@ pub struct RelayConfig {
     /// whose `push` is enabled without it. Defaults to `None`.
     pub relay_url: Option<RelayUrl>,
     /// Whether the relay offers push (§10.7.1, ADR-004 "Push registration
-    /// interception"). Defaults to [`PushRole::Disabled`] (the fail-safe —
-    /// stores no push token and answers `4063` at the reserved push routing
-    /// ID).
+    /// interception"). Defaults to [`PushRole::Disabled`].
     pub push: PushRole,
 }
 

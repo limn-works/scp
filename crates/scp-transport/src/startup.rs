@@ -24,6 +24,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::native::server::{RelayConfig, RelayError};
 use crate::native::storage::{BlobStorageBackend, StorageError};
+use crate::relay::push_gate::RelayUrl;
 
 /// The variable that names the relay's blob storage backend.
 const BACKEND_VAR: &str = "SCP_RELAY_STORAGE_BACKEND";
@@ -194,6 +195,10 @@ fn is_blank(raw: &std::ffi::OsStr) -> bool {
 /// | `SCP_RELAY_MAX_CONNECTIONS` | 1,000 |
 /// | `SCP_RELAY_MAX_CONNECTIONS_PER_IP` | 10 |
 /// | `SCP_RELAY_RATE_LIMIT` | 100 |
+/// | `SCP_RELAY_URL` | unset: the relay reserves no push routing ID |
+///
+/// `SCP_RELAY_URL` is the relay's public URL, from which it derives its
+/// reserved push routing ID (§10.7.1 step 2).
 ///
 /// # Errors
 ///
@@ -201,6 +206,7 @@ fn is_blank(raw: &std::ffi::OsStr) -> bool {
 /// value that does not parse.
 pub fn relay_config_from_env() -> Result<RelayConfig, StartupError> {
     Ok(RelayConfig {
+        relay_url: parse_relay_url(RELAY_URL_VAR, env::var_os(RELAY_URL_VAR))?,
         bind_addr: env_or(
             "SCP_RELAY_BIND_ADDR",
             SocketAddr::from(([0, 0, 0, 0], 9000)),
@@ -212,6 +218,24 @@ pub fn relay_config_from_env() -> Result<RelayConfig, StartupError> {
         rate_limit_publishes_per_second: env_or("SCP_RELAY_RATE_LIMIT", 100)?,
         ..RelayConfig::default()
     })
+}
+
+/// The variable that holds the relay's public URL.
+const RELAY_URL_VAR: &str = "SCP_RELAY_URL";
+
+/// Parses `raw`, the value of variable `name`, as a [`RelayUrl`], or returns
+/// `None` when the variable is unset.
+fn parse_relay_url(
+    name: &'static str,
+    raw: Option<OsString>,
+) -> Result<Option<RelayUrl>, StartupError> {
+    raw.map(|raw| {
+        RelayUrl::new(&utf8(name, raw)?).map_err(|e| StartupError::InvalidValue {
+            var: name,
+            reason: e.to_string(),
+        })
+    })
+    .transpose()
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,8 +1430,39 @@ mod tests {
 
     use super::{
         BackendChoice, BackendSelectionError, StartupError, backend_choice_from_value, log_filter,
-        log_format_is_json, parse_or, rejection_message, valid_backends,
+        log_format_is_json, parse_or, parse_relay_url, rejection_message, valid_backends,
     };
+    use crate::relay::push_gate::RelayUrl;
+
+    /// `SCP_RELAY_URL` set to a relay URL yields that URL's reserved push
+    /// routing ID; unset yields `None`; a value with no canonical form is
+    /// refused, never read as unset.
+    #[test]
+    fn relay_url_parses_set_unset_and_refuses_invalid() {
+        let url = "wss://relay.example/scp/v1";
+        assert_eq!(
+            parse_relay_url("V", Some(OsString::from(url)))
+                .ok()
+                .flatten()
+                .as_ref()
+                .map(RelayUrl::push_routing_id),
+            RelayUrl::new(url)
+                .ok()
+                .as_ref()
+                .map(RelayUrl::push_routing_id),
+        );
+        assert!(RelayUrl::new(url).is_ok());
+        assert!(matches!(parse_relay_url("V", None), Ok(None)));
+        for bad in ["", "not a url", "https://relay.example"] {
+            assert!(
+                matches!(
+                    parse_relay_url("V", Some(OsString::from(bad))),
+                    Err(StartupError::InvalidValue { var: "V", .. })
+                ),
+                "{bad:?} must be refused"
+            );
+        }
+    }
 
     /// `parse` accepts a name in either case exactly when this build compiled
     /// its backend, returns `NotCompiled` naming the backend's own
