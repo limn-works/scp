@@ -1480,19 +1480,18 @@ fn trust_verify_attestation_rejects_invalid_json() {
 }
 
 #[test]
-fn trust_verify_response_rejects_invalid_challenge_json_with_valid_7002() {
+fn trust_grade_response_without_resolver_is_ident_1033() {
     setup();
     Python::with_gil(|py| {
         let err = _scp_core::scp::PyScp::new_in_memory_for_test()
-            .trust_verify_response(
+            .trust_grade_response(
                 py,
                 "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
-                "bad",
-                "bad",
-                "ctx",
+                "{}",
+                "{}",
             )
             .unwrap_err();
-        assert!(err.to_string().contains("SCP-VALID-7002"), "{err}");
+        assert!(err.to_string().contains("SCP-IDENT-1033"), "{err}");
     });
 }
 

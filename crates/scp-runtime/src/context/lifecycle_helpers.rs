@@ -2754,6 +2754,7 @@ pub async fn import_context(
                 },
                 threshold_signers: export.snapshot.threshold_signers,
                 threshold_value: export.snapshot.threshold_value,
+                capability_requirements: export.snapshot.capability_requirements,
                 // IMPORT path (not restore): start with a FRESH spending-
                 // nonce tracker.
                 spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
@@ -3411,6 +3412,7 @@ pub async fn restore_context(
                 },
                 threshold_signers: ctx_snapshot.threshold_signers,
                 threshold_value: ctx_snapshot.threshold_value,
+                capability_requirements: ctx_snapshot.capability_requirements,
                 spending_nonce_tracker:
                     scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
                         context_id.to_owned(),
@@ -3886,6 +3888,7 @@ async fn shutdown_sweep(supervisor: &crate::context::supervisor::Supervisor) -> 
     }
 
     supervisor.stop_key_package_actors().await;
+    supervisor.stop_challenger_ledger_actors().await;
 
     // Supervisor-level state clear. Acquired under the write_lock once
     // for the standing_contexts + local_dids stores so a concurrent

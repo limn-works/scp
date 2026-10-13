@@ -1189,6 +1189,7 @@ mod tests {
             economic_policy: None,
             consequence_rules_json: None,
             consequence_config_json: None,
+            capability_requirements_json: None,
         };
 
         let handle = rt
@@ -1252,6 +1253,7 @@ mod tests {
             economic_policy: None,
             consequence_rules_json: None,
             consequence_config_json: None,
+            capability_requirements_json: None,
         };
 
         let handle = rt

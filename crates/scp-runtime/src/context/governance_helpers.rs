@@ -3827,6 +3827,55 @@ pub async fn execute_modify_hard_rate_limit(
 }
 
 // ---------------------------------------------------------------------------
+// execute_modify_capability_requirements (per-action leaf helper)
+// ---------------------------------------------------------------------------
+
+/// Replace the context's live capability requirements (spec 07 §7.3.4.4).
+///
+/// The list is a Class-S governance field (ADR-049 §9), and the direction a
+/// failed persist leaves it in depends on the change:
+///
+/// - A replacement that only restricts admission
+///   ([`CapabilityRequirements::is_tightening_of`](scp_protocol::trust::CapabilityRequirements::is_tightening_of))
+///   commits keep-direction: on a persist failure the stricter list stays in
+///   force, because restoring the looser one is the unsafe direction.
+/// - Any other replacement, a mixed one included, commits restore-direction:
+///   on a persist failure the old list comes back, so a loosening never takes
+///   effect without being durable.
+///
+/// The replay marker is persisted fail-closed by the proposal executor around
+/// this leaf; the `GovernanceActionExecuted` leaf it appends records the
+/// change, so this leaf appends no event of its own.
+///
+/// # Errors
+///
+/// [`ContextError::ContextNotActive`] for a context that is not `Active`, or
+/// [`ContextError::PersistenceFailed`] when the persist fails.
+pub async fn execute_modify_capability_requirements(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    requirements: &scp_protocol::trust::CapabilityRequirements,
+    meta: CommitMeta<'_>,
+) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did: _,
+        timestamp_secs: _,
+    } = meta;
+    require_active(&cell.handle)?;
+    let replace = |mut view: crate::context::actor::class_s::ClassSMut| {
+        view.governance_class_s_mut().capability_requirements = requirements.clone();
+        Ok::<(), ContextError>(())
+    };
+    if requirements.is_tightening_of(&cell.governance.class_s.capability_requirements) {
+        cell.commit_class_s_keep(deps, context_id, replace).await
+    } else {
+        cell.commit_class_s_restore(deps, context_id, replace).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // execute_propose_context_migration (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
@@ -4960,7 +5009,8 @@ pub async fn dispatch_content_governance_action(
         | GovernanceAction::ModifyPruningPolicy { .. }
         | GovernanceAction::ProposeContextMigration { .. }
         | GovernanceAction::CancelContextMigration
-        | GovernanceAction::ModifyHardRateLimit { .. } => {
+        | GovernanceAction::ModifyHardRateLimit { .. }
+        | GovernanceAction::ModifyCapabilityRequirements { .. } => {
             // ADR-049 §10 (round-9): these variants are routed by
             // `dispatch_governance_action` / `dispatch_context_governance_action`
             // and never reach this content-level leaf. A future routing change
@@ -5235,7 +5285,8 @@ pub async fn dispatch_context_governance_action(
         | GovernanceAction::SetEconomicPolicy { .. }
         | GovernanceAction::ApproveSpend { .. }
         | GovernanceAction::LockEconomicPolicy
-        | GovernanceAction::ModifyHardRateLimit { .. } => {
+        | GovernanceAction::ModifyHardRateLimit { .. }
+        | GovernanceAction::ModifyCapabilityRequirements { .. } => {
             // ADR-049 §10 (round-9): these variants are handled by the top-level
             // `dispatch_governance_action` and never reach this context-level
             // dispatcher. A future routing change that delivers one here must
@@ -5481,6 +5532,21 @@ pub async fn dispatch_governance_action(
                 deps,
                 context_id,
                 new_config,
+                CommitMeta {
+                    pid,
+                    actor_did: actor,
+                    timestamp_secs: ts,
+                },
+            )
+            .await?;
+            Ok(GovernanceActionResult::Executed)
+        }
+        GovernanceAction::ModifyCapabilityRequirements { requirements } => {
+            execute_modify_capability_requirements(
+                cell,
+                deps,
+                context_id,
+                requirements,
                 CommitMeta {
                     pid,
                     actor_did: actor,

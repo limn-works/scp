@@ -908,6 +908,19 @@ pub enum GovernanceAction {
         /// The new hard rate limit configuration.
         new_config: HardRateLimitConfig,
     },
+    /// Replace the context's capability requirements (spec 07 §7.3.4.4): the
+    /// capabilities an agent must hold, the verification level each needs,
+    /// and the challengers whose records count.
+    ///
+    /// The list is a Class-S governance field (ADR-049 §9). A replacement
+    /// that only restricts admission
+    /// ([`CapabilityRequirements::is_tightening_of`](crate::trust::CapabilityRequirements::is_tightening_of))
+    /// stays in force if its persist fails; any other replacement takes
+    /// effect only once it is durable.
+    ModifyCapabilityRequirements {
+        /// The complete new list. It replaces the current one.
+        requirements: crate::trust::CapabilityRequirements,
+    },
 }
 
 impl GovernanceAction {
@@ -945,6 +958,7 @@ impl GovernanceAction {
             Self::ProposeContextMigration { .. } => "ProposeContextMigration",
             Self::CancelContextMigration => "CancelContextMigration",
             Self::ModifyHardRateLimit { .. } => "ModifyHardRateLimit",
+            Self::ModifyCapabilityRequirements { .. } => "ModifyCapabilityRequirements",
         }
     }
 
@@ -1002,7 +1016,8 @@ impl GovernanceAction {
             | Self::LockEconomicPolicy
             | Self::ProposeContextMigration { .. }
             | Self::CancelContextMigration
-            | Self::ModifyHardRateLimit { .. } => false,
+            | Self::ModifyHardRateLimit { .. }
+            | Self::ModifyCapabilityRequirements { .. } => false,
         }
     }
 
@@ -1092,7 +1107,8 @@ impl GovernanceAction {
             | Self::LockEconomicPolicy
             | Self::ProposeContextMigration { .. }
             | Self::CancelContextMigration
-            | Self::ModifyHardRateLimit { .. } => None,
+            | Self::ModifyHardRateLimit { .. }
+            | Self::ModifyCapabilityRequirements { .. } => None,
         }
     }
 }
@@ -2290,9 +2306,9 @@ pub fn actions_conflict(
     proposer_b: &DID,
 ) -> bool {
     use GovernanceAction::{
-        AddSigner, ChangeRole, ModifyCeiling, ModifyPruningPolicy, ModifyThreshold,
-        ReconfigureGovernance, RemoveMember, RemoveSigner, ResetMember, RestoreAccess,
-        RevokeAccess, RotateContentKeys, SuspendAccess, SuspendCapability,
+        AddSigner, ChangeRole, ModifyCapabilityRequirements, ModifyCeiling, ModifyPruningPolicy,
+        ModifyThreshold, ReconfigureGovernance, RemoveMember, RemoveSigner, ResetMember,
+        RestoreAccess, RevokeAccess, RotateContentKeys, SuspendAccess, SuspendCapability,
     };
 
     // Canonical conflict matrix. The sync module's `actions_conflict`
@@ -2317,6 +2333,7 @@ pub fn actions_conflict(
         (ModifyCeiling { .. }, ModifyCeiling { .. })
         | (ModifyThreshold { .. }, ModifyThreshold { .. })
         | (ModifyPruningPolicy { .. }, ModifyPruningPolicy { .. })
+        | (ModifyCapabilityRequirements { .. }, ModifyCapabilityRequirements { .. })
         | (ReconfigureGovernance { .. }, ReconfigureGovernance { .. })
         // Concurrent context-wide key rotations conflict (global property mutation).
         | (RotateContentKeys { .. }, RotateContentKeys { .. }) => true,

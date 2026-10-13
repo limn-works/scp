@@ -41,3 +41,26 @@ if [ -n "$matches" ]; then
 fi
 
 echo "scp-protocol dependency check passed: no async runtime deps."
+
+# jsonschema_has_no_resolve_features: a challenge schema compiles with a
+# retriever that fetches nothing (spec 07 §7.3.4 step 1), and jsonschema's
+# `resolve-http` and `resolve-file` features add retrievers that fetch over
+# the network and read the file system. Its `default` feature turns both on.
+# The inverse feature tree across the whole workspace, dev edges included,
+# names every jsonschema feature any crate enables; none of the three may
+# appear.
+jsonschema_has_no_resolve_features() {
+    local tree enabled
+    tree=$(cargo tree --workspace --target all -e features -i jsonschema 2>&1) || {
+        echo "ERROR: cargo tree failed: $tree"
+        exit 1
+    }
+    enabled=$(echo "$tree" | grep -E 'jsonschema feature "(resolve-http|resolve-file|default)"' | sort -u || true)
+    if [ -n "$enabled" ]; then
+        echo "ERROR: jsonschema builds with a resolving feature:"
+        echo "$enabled"
+        exit 1
+    fi
+    echo "jsonschema feature check passed: no resolve-http, resolve-file or default."
+}
+jsonschema_has_no_resolve_features

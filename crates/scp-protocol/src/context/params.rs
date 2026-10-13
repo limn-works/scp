@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::economy::EconomicPolicy;
 use crate::provenance::CounterpartyPolicy;
-use crate::trust::{CapabilityRequirement, RequireParticipation};
+use crate::trust::{CapabilityRequirements, RequireParticipation};
 
 pub use super::close::IncompleteVerificationPolicy;
 
@@ -669,17 +669,13 @@ pub struct ContextParams {
     /// challenge-verification records. Empty (the default) means no capability
     /// requirements.
     ///
-    /// SECURITY (verifier legitimacy): a `ChallengeVerified` requirement is
-    /// satisfied only by a `ChallengeVerification` whose verifier signature is
-    /// authentic and whose signed `subject`/`context_id` match the agent and
-    /// context being admitted — but a `verifier` DID is self-certifying, so
-    /// signature authenticity does NOT establish that the verifier is
-    /// *authorized/trusted*. A context that needs verifier legitimacy must
-    /// establish it separately (a trusted-verifier set, a context-membership
-    /// proof, or the §7.3.5 threshold/independence path), not rely on a passing
-    /// challenge-verification check alone.
+    /// A `ChallengeVerified` requirement counts only records from the
+    /// challengers its `trusted_verifiers` names, compared by key, and never a
+    /// record whose verifier is its subject. The list is validated on
+    /// deserialize and seeds the context's governance-held requirements at
+    /// creation; it is never read after (spec 07 §7.3.4.4).
     #[serde(default)]
-    pub capability_requirements: Vec<CapabilityRequirement>,
+    pub capability_requirements: CapabilityRequirements,
 
     /// Policy for handling incomplete summary verification at window expiry.
     ///
@@ -854,7 +850,7 @@ impl Default for ContextParams {
             session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
-            capability_requirements: Vec::new(),
+            capability_requirements: CapabilityRequirements::default(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
@@ -1095,7 +1091,7 @@ mod tests {
             session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
-            capability_requirements: Vec::new(),
+            capability_requirements: CapabilityRequirements::default(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
@@ -1249,7 +1245,7 @@ mod tests {
             session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
-            capability_requirements: Vec::new(),
+            capability_requirements: CapabilityRequirements::default(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
@@ -1314,7 +1310,7 @@ mod tests {
             session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
-            capability_requirements: Vec::new(),
+            capability_requirements: CapabilityRequirements::default(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
@@ -1823,21 +1819,33 @@ mod tests {
 
     #[test]
     fn capability_requirements_serde_roundtrip() {
-        use crate::trust::{CapabilityRequirement, VerificationLevel};
+        use crate::trust::{CapabilityRequirement, RawCapabilityRequirement, VerificationLevel};
 
+        let verifier = scp_did::did_dht_from_public_key(&[1u8; 32]);
+        let requirement = |uri: &str, verification_level, trusted_verifiers| {
+            CapabilityRequirement::try_from(RawCapabilityRequirement {
+                capability: uri.parse().unwrap(),
+                verification_level,
+                trusted_verifiers,
+                retry_cap: None,
+            })
+            .unwrap()
+        };
         let params = ContextParams {
             capability_requirements: vec![
-                CapabilityRequirement {
-                    capability: "scp:capability:schema-validation/v1".parse().unwrap(),
-                    verification_level: VerificationLevel::SelfAttested,
-                },
-                CapabilityRequirement {
-                    capability: "scp:capability:prompt-injection-resistance/v1"
-                        .parse()
-                        .unwrap(),
-                    verification_level: VerificationLevel::ChallengeVerified,
-                },
-            ],
+                requirement(
+                    "scp:capability:schema-validation/v1",
+                    VerificationLevel::SelfAttested,
+                    Vec::new(),
+                ),
+                requirement(
+                    "scp:capability:prompt-injection-resistance/v1",
+                    VerificationLevel::ChallengeVerified,
+                    vec![verifier],
+                ),
+            ]
+            .try_into()
+            .unwrap(),
             ..ContextParams::default()
         };
 

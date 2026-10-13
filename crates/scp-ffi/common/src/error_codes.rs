@@ -1132,6 +1132,38 @@ pub const VALID_7097: &str = "SCP-VALID-7097";
 /// Challenge verify-input byte-length validation error (Swift-SDK-emitted:
 /// `ChallengeRequest`/`ChallengeResponse` `signature` must be 64 bytes).
 pub const VALID_7098: &str = "SCP-VALID-7098";
+/// A challenger's ledger already holds its bound of open challenges
+/// ([`TrustError::ChallengeNotOpen`](scp_protocol::trust::TrustError::ChallengeNotOpen)).
+pub const VALID_7099: &str = "SCP-VALID-7099";
+// 7100 and 7101 are emitted by the TypeScript discovery module.
+/// A challenge was answered or graded outside its signed window
+/// ([`TrustError::ChallengeExpired`](scp_protocol::trust::TrustError::ChallengeExpired)).
+pub const VALID_7102: &str = "SCP-VALID-7102";
+/// A response's attempt number is not the next one
+/// ([`TrustError::AttemptOutOfOrder`](scp_protocol::trust::TrustError::AttemptOutOfOrder)).
+pub const VALID_7103: &str = "SCP-VALID-7103";
+/// A response's attempt number exceeds `1 + max_retries`
+/// ([`TrustError::RetriesExhausted`](scp_protocol::trust::TrustError::RetriesExhausted)).
+pub const VALID_7104: &str = "SCP-VALID-7104";
+/// A response arrived inside the cooldown after the previous attempt
+/// ([`TrustError::CooldownActive`](scp_protocol::trust::TrustError::CooldownActive)).
+pub const VALID_7105: &str = "SCP-VALID-7105";
+/// The challenge is closed: passed or out of attempts
+/// ([`TrustError::ChallengeClosed`](scp_protocol::trust::TrustError::ChallengeClosed)).
+pub const VALID_7106: &str = "SCP-VALID-7106";
+/// The challenger holds no open challenge with this id, digest and subject
+/// ([`TrustError::UnknownChallenge`](scp_protocol::trust::TrustError::UnknownChallenge)).
+pub const VALID_7107: &str = "SCP-VALID-7107";
+/// A response does not answer its request: another challenge or digest, or
+/// not one output per case in order
+/// ([`TrustError::OutputsMismatch`](scp_protocol::trust::TrustError::OutputsMismatch)).
+pub const VALID_7108: &str = "SCP-VALID-7108";
+/// A custom evaluator outlet could not be run.
+///
+/// It is unregistered, has no handler, the challenger lacks call permission,
+/// or the invocation failed before the handler ran
+/// ([`TrustError::EvaluatorUnavailable`](scp_protocol::trust::TrustError::EvaluatorUnavailable)).
+pub const VALID_7109: &str = "SCP-VALID-7109";
 /// Handle/petname DID validation error.
 pub const VALID_7110: &str = "SCP-VALID-7110";
 /// Handle/petname alias validation error.
@@ -1146,8 +1178,19 @@ pub const VALID_7114: &str = "SCP-VALID-7114";
 pub const VALID_7115: &str = "SCP-VALID-7115";
 /// Petname count exceeds `u32::MAX` and cannot be represented at the FFI boundary.
 pub const VALID_7116: &str = "SCP-VALID-7116";
+// 7117 (`evaluator_failed`) and 7118 (`budget_exceeded`) are reserved for the
+// challenge case-fail reasons of those names; no error carries them, because
+// at grade time each is a per-case result, not a failure of the call.
+/// A challenge's grading faulted `MAX_GRADING_FAULTS` times and closed
+/// ([`TrustError::ChallengeFaulted`](scp_protocol::trust::TrustError::ChallengeFaulted)).
+pub const VALID_7119: &str = "SCP-VALID-7119";
 /// Handle registry lock error.
 pub const VALID_7120: &str = "SCP-VALID-7120";
+/// A required capability has no passing record from a trusted challenger.
+///
+/// The only passing record comes from a challenger the requirement does not
+/// trust ([`AdmissionError::UntrustedVerifier`](scp_protocol::trust::AdmissionError::UntrustedVerifier)).
+pub const VALID_7121: &str = "SCP-VALID-7121";
 /// Handle registry operation error.
 pub const VALID_7122: &str = "SCP-VALID-7122";
 /// Handle registry query error.
@@ -1158,6 +1201,14 @@ pub const VALID_7124: &str = "SCP-VALID-7124";
 pub const VALID_7125: &str = "SCP-VALID-7125";
 /// Handle registry batch error.
 pub const VALID_7126: &str = "SCP-VALID-7126";
+/// A challenge or record names one key as both challenger and subject.
+pub const VALID_7127: &str = "SCP-VALID-7127";
+/// The capability's standard is not gradable by challenge
+/// ([`TrustError::StandardNotGradable`](scp_protocol::trust::TrustError::StandardNotGradable)).
+pub const VALID_7128: &str = "SCP-VALID-7128";
+/// The capability definition a challenge cites could not be obtained
+/// ([`TrustError::CapabilityDefinitionUnavailable`](scp_protocol::trust::TrustError::CapabilityDefinitionUnavailable)).
+pub const VALID_7129: &str = "SCP-VALID-7129";
 /// Address resolution validation error.
 pub const VALID_7130: &str = "SCP-VALID-7130";
 /// Address resolution parse error.
@@ -1189,12 +1240,48 @@ pub const VALID_7135: &str = "SCP-VALID-7135";
 /// fetch and no bridge configures a domain; and a context handle registry this
 /// bridge instance does not hold.
 pub const VALID_7136: &str = "SCP-VALID-7136";
+/// A signed challenge policy value lies outside a limit: outside its
+/// capability definition, or looser than a requirement's retry cap.
+pub const VALID_7137: &str = "SCP-VALID-7137";
+/// A schema-match case's expected output was refused at challenge creation
+/// ([`TrustError::SchemaRejected`](scp_protocol::trust::TrustError::SchemaRejected)).
+pub const VALID_7138: &str = "SCP-VALID-7138";
+/// Another grading of the same challenge holds a live lease
+/// ([`TrustError::GradingInProgress`](scp_protocol::trust::TrustError::GradingInProgress)).
+pub const VALID_7139: &str = "SCP-VALID-7139";
 /// Recovery or custody-migration concurrency cap reached.
 ///
 /// The NAPI bridge bounds concurrent `block_on` invocations to prevent libuv
 /// worker-pool exhaustion (RED-PR5-002 / BLACK-PR5-002). Caller should back
 /// off and retry.
 pub const VALID_7140: &str = "SCP-VALID-7140";
+/// A capability requirement breaks a shape rule of spec 07 §7.3.4.4
+/// ([`AdmissionError::InvalidRequirement`](scp_protocol::trust::AdmissionError::InvalidRequirement)).
+pub const VALID_7141: &str = "SCP-VALID-7141";
+/// A challenge request or response exceeds its size bound
+/// ([`TrustError::ResponseTooLarge`](scp_protocol::trust::TrustError::ResponseTooLarge)).
+pub const VALID_7143: &str = "SCP-VALID-7143";
+/// Two capability definitions with one URI disagree
+/// ([`TrustError::DefinitionEquivocation`](scp_protocol::trust::TrustError::DefinitionEquivocation)).
+pub const VALID_7144: &str = "SCP-VALID-7144";
+/// A case opening does not match the commitment the challenger signed: a
+/// grading fault, never a graded attempt
+/// ([`TrustError::AnswerKeyMismatch`](scp_protocol::trust::TrustError::AnswerKeyMismatch)).
+pub const VALID_7145: &str = "SCP-VALID-7145";
+/// Every grading permit for this challenger is held
+/// ([`TrustError::GradingCapacityExhausted`](scp_protocol::trust::TrustError::GradingCapacityExhausted)).
+pub const VALID_7146: &str = "SCP-VALID-7146";
+/// An identifier is not the canonical spelling of its key.
+pub const VALID_7147: &str = "SCP-VALID-7147";
+/// A context names too many capability requirements.
+///
+/// The limit is `MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT`
+/// ([`AdmissionError::TooManyCapabilityRequirements`](scp_protocol::trust::AdmissionError::TooManyCapabilityRequirements)).
+pub const VALID_7148: &str = "SCP-VALID-7148";
+/// A grading's lease expired or was replaced before its commit; nothing was
+/// written
+/// ([`TrustError::GradingLeaseLost`](scp_protocol::trust::TrustError::GradingLeaseLost)).
+pub const VALID_7149: &str = "SCP-VALID-7149";
 /// Governance vote validation error.
 pub const VALID_7216: &str = "SCP-VALID-7216";
 /// Media validation error.
@@ -1547,4 +1634,109 @@ pub const fn is_key_custody_failure(kind: scp_crypto::CustodyFailureKind) -> boo
         | Kind::PushPlatformUnavailable
         | Kind::PushProviderFailed => false,
     }
+}
+
+/// The bridge error class a trust or admission failure reaches the caller as;
+/// each bridge maps it to its own error variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustFailureClass {
+    /// A validation error: the input or a record is refused.
+    Validation,
+    /// An identity error: a key or definition needed for the check could not
+    /// be obtained, so the decision is unknown.
+    Identity,
+}
+
+/// The bridge error code for a [`TrustError`](scp_protocol::trust::TrustError),
+/// one mapping for the `PyO3`, napi-rs and `UniFFI` bridges.
+///
+/// The match is exhaustive, so a new variant does not compile until it has a
+/// code. Every challenge-flow error has its own code; the remaining trust
+/// errors keep [`VALID_7003`], and a suite below its standard's minimum keeps
+/// [`VALID_7039`].
+#[must_use]
+pub const fn trust_error_code(e: &scp_protocol::trust::TrustError) -> &'static str {
+    use scp_protocol::trust::TrustError as E;
+    match e {
+        E::ChallengeSuiteBelowMinimum { .. } => VALID_7039,
+        E::ChallengeNotOpen { .. } => VALID_7099,
+        E::ChallengeExpired { .. } => VALID_7102,
+        E::AttemptOutOfOrder { .. } => VALID_7103,
+        E::RetriesExhausted { .. } => VALID_7104,
+        E::CooldownActive { .. } => VALID_7105,
+        E::ChallengeClosed { .. } => VALID_7106,
+        E::UnknownChallenge { .. } => VALID_7107,
+        E::OutputsMismatch { .. } => VALID_7108,
+        E::EvaluatorUnavailable { .. } => VALID_7109,
+        E::ChallengeFaulted { .. } => VALID_7119,
+        E::SelfChallenge { .. } => VALID_7127,
+        E::StandardNotGradable { .. } => VALID_7128,
+        E::CapabilityDefinitionUnavailable { .. } => VALID_7129,
+        E::PolicyOutsideDefinition { .. } => VALID_7137,
+        E::SchemaRejected { .. } => VALID_7138,
+        E::GradingInProgress { .. } => VALID_7139,
+        E::ResponseTooLarge { .. } => VALID_7143,
+        E::DefinitionEquivocation { .. } => VALID_7144,
+        E::AnswerKeyMismatch { .. } => VALID_7145,
+        E::GradingCapacityExhausted { .. } => VALID_7146,
+        E::NonCanonicalIdentifier { .. } => VALID_7147,
+        E::GradingLeaseLost { .. } => VALID_7149,
+        E::NoEventsForSubject { .. }
+        | E::EmptyEventLog
+        | E::InvalidEventData { .. }
+        | E::AttestationSignatureInvalid { .. }
+        | E::AttestationExpired { .. }
+        | E::AttestationRevoked { .. }
+        | E::AttestationRevocationInvalid { .. }
+        | E::AttestationEvidenceInvalid { .. }
+        | E::ChallengeResponderMismatch { .. }
+        | E::ChallengeSignatureInvalid { .. }
+        | E::ChallengeSigningFailed { .. }
+        | E::CanonicalizationFailed { .. }
+        | E::UnknownChallengeCapability { .. }
+        | E::InvalidChallengeSuite { .. }
+        | E::ChallengeVerifierMismatch { .. }
+        | E::ChallengeVerificationIdMismatch { .. }
+        | E::ChallengeVerificationValidityTooLong { .. }
+        | E::ChallengeVerificationFromFuture { .. }
+        | E::KeyResolutionUnavailable { .. }
+        | E::ChallengeRequestSignatureInvalid { .. }
+        | E::ChallengeVerificationSignatureInvalid { .. }
+        | E::ChallengeVerificationExpired { .. }
+        | E::ChallengeContextMismatch { .. }
+        | E::ChallengeSubjectMismatch { .. }
+        | E::ChallengeWindowInvalid { .. }
+        | E::ChallengeVerificationOutsideWindow { .. }
+        | E::ChallengeVerificationInconsistent { .. }
+        | E::NotAMember { .. }
+        | E::NotOptedIn { .. }
+        | E::StoreError { .. } => VALID_7003,
+    }
+}
+
+/// The bridge error code and class for an
+/// [`AdmissionError`](scp_protocol::trust::AdmissionError), one mapping for
+/// the `PyO3`, napi-rs and `UniFFI` bridges.
+///
+/// A record check that could not run ([`IDENT_1033`]) is an identity error;
+/// every other admission failure is a validation error.
+#[must_use]
+pub const fn admission_error_code(
+    e: &scp_protocol::trust::AdmissionError,
+) -> (&'static str, TrustFailureClass) {
+    use scp_protocol::trust::AdmissionError as E;
+    let code = match e {
+        E::MissingCapability { .. } | E::VerificationRequired { .. } => VALID_7076,
+        E::EmptySubjectDid => VALID_7077,
+        E::UntrustedVerifier { .. } => VALID_7121,
+        E::SelfChallenge { .. } => VALID_7127,
+        E::RetryCapExceeded { .. } => VALID_7137,
+        E::InvalidRequirement { .. } => VALID_7141,
+        E::NonCanonicalIdentifier { .. } => VALID_7147,
+        E::TooManyCapabilityRequirements { .. } => VALID_7148,
+        E::VerificationUnavailable { .. } => {
+            return (IDENT_1033, TrustFailureClass::Identity);
+        }
+    };
+    (code, TrustFailureClass::Validation)
 }

@@ -373,4 +373,36 @@ mod tests {
         // re-sorts by key name.
         assert_eq!(canonical, r#"{"a_field":"hello","z_field":1}"#);
     }
+
+    /// Every finite double parses back to the same bits and survives a JCS
+    /// round trip. `serde_json`'s default parser is off by an ULP on some
+    /// 17-digit inputs; the workspace pins `float_roundtrip`, and a grader
+    /// comparing outputs by JCS equality depends on it.
+    #[test]
+    fn float_round_trip_is_exact() {
+        // A fixed xorshift sequence of bit patterns, so a failure reproduces.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut checked = 0;
+        while checked < 20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let x = f64::from_bits(state);
+            // JCS writes -0 as 0, and I-JSON refuses integral values above
+            // 2^53, so neither is a round-trip case.
+            if !x.is_finite()
+                || x == 0.0
+                || (x.fract() == 0.0 && x.abs() >= 9_007_199_254_740_992.0)
+            {
+                continue;
+            }
+            checked += 1;
+            let text = format!("{x:e}");
+            let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(parsed.as_f64().unwrap().to_bits(), x.to_bits(), "{text}");
+            let canonical = to_string(&parsed).unwrap();
+            let back: serde_json::Value = serde_json::from_str(&canonical).unwrap();
+            assert_eq!(back.as_f64().unwrap().to_bits(), x.to_bits(), "{canonical}");
+        }
+    }
 }

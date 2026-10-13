@@ -242,6 +242,15 @@ pub fn context_params(state: &PerContextState) -> ContextParams {
     state.handle.params().clone()
 }
 
+/// Returns a clone of the context's live capability requirements, the
+/// Class-S governance field (spec §8.10).
+#[must_use]
+pub fn capability_requirements(
+    state: &PerContextState,
+) -> scp_protocol::trust::CapabilityRequirements {
+    state.governance.class_s.capability_requirements.clone()
+}
+
 /// Returns a clone of the role state for a context.
 #[must_use]
 pub fn get_role_state(state: &PerContextState) -> ContextRoleState {

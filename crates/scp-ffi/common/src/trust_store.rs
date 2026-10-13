@@ -22,6 +22,7 @@ use scp_core::trust::aggregate::{
     revocation_list_key,
 };
 use scp_core::trust::attestation::{ActiveKeyResolver, Attestation, RevocationStatus};
+use scp_core::trust::capability_definition::CapabilityDefinitionSource;
 use scp_core::trust::{
     ChallengeVerification, TrustError, verify_attestation, verify_challenge_verification,
 };
@@ -445,6 +446,10 @@ where
 /// fails, or if `resolver` cannot reach its backend
 /// ([`TrustError::KeyResolutionUnavailable`]).
 ///
+/// `definitions` supplies the capability definition each challenge record
+/// cites (spec 07 §7.3.4.6); a record whose definition cannot be obtained is
+/// an error, never a silent drop.
+///
 /// `resolver` resolves the `#active` key of each attestation issuer, threshold
 /// attestor and challenge verifier (spec 09 §9.7.1), for verify-on-ingest and
 /// for the aggregation read path. The bridges pass their
@@ -454,6 +459,7 @@ where
 pub fn populate_and_aggregate<S: TrustProtocolRepository>(
     store: S,
     resolver: &dyn ActiveKeyResolver,
+    definitions: &dyn CapabilityDefinitionSource,
     context_id: &str,
     subject_did: &str,
     cached_attestations: Vec<CachedAttestation>,
@@ -488,7 +494,14 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
     // that fail verification, and propagate infra faults so a backend error does
     // not silently discard a legitimate verifier's signal.
     for cr in challenge_results {
-        match verify_challenge_verification(cr, resolver, context_id, subject_did, &clock) {
+        match verify_challenge_verification(
+            cr,
+            resolver,
+            definitions,
+            context_id,
+            subject_did,
+            &clock,
+        ) {
             Ok(()) => cache.store().store_challenge_result(context_id, cr)?,
             Err(reason) if reason.is_record_rejection() => {
                 tracing::debug!(
@@ -511,6 +524,7 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
         attestor_sets,
         cache: &cache,
         resolver,
+        definitions,
         clock: &clock,
     };
 
@@ -568,7 +582,9 @@ pub fn verified_attestations<S: TrustProtocolRepository>(
 mod tests {
     use super::*;
     use scp_core::trust::AttestationType;
-    use scp_core::trust::challenge::{ChallengeType, VerificationMethod};
+    use scp_core::trust::MinCases;
+    use scp_core::trust::capability_definition::{CapabilityDefinition, ProtocolOnlyDefinitions};
+    use scp_core::trust::challenge::TOTAL_WEIGHT_BPS;
     use scp_event_log::{Event, EventPayload, EventType};
 
     /// A revocation entry that never expires.
@@ -716,40 +732,57 @@ mod tests {
     /// `timestamp` 30 days before `expires_at`, and an empty signature. A
     /// record expiring 30 days after the verifying clock's now is therefore
     /// stamped at that now, never in its future, which a verifier rejects.
+    /// Its policy fields copy the [`CHALLENGE_URI`] protocol row, so
+    /// [`ProtocolOnlyDefinitions`] admits it: the full-credit pass of a
+    /// suite holding exactly the row's minimum case count.
     fn unsigned_challenge(
         verifier_key: &ed25519_dalek::SigningKey,
         subject: &str,
-        record_context: Option<&str>,
+        record_context: &str,
         expires_at: u64,
     ) -> ChallengeVerification {
         let verifier = scp_did::did_dht_from_public_key(&verifier_key.verifying_key().to_bytes());
         let subject = scp_did::DID::from(subject);
         let timestamp = expires_at.saturating_sub(30 * 86_400);
+        let (definition, _) = CapabilityDefinition::protocol_row(CHALLENGE_URI).unwrap();
+        let (test_count, min_category_cases) = match definition.min_cases {
+            MinCases::Total(k) => (k, 0),
+            MinCases::PerCategory(k) => (k, k),
+        };
+        let challenge_id = [0x3c; 32];
+        let attempt = 1;
         ChallengeVerification {
             verification_id: scp_core::trust::challenge_verification_id(
                 &verifier,
                 &subject,
                 CHALLENGE_URI,
+                &challenge_id,
+                attempt,
                 timestamp,
             )
             .unwrap(),
             verifier,
             subject,
             capability_uri: CHALLENGE_URI.to_owned(),
+            definition_digest: definition.digest().unwrap(),
             suite_digest: [0x5d; 32],
+            challenge_id,
+            attempt,
+            response_digest: [0x7e; 32],
+            max_retries: definition.max_retries,
+            cooldown_secs: definition.cooldown_secs,
+            pass_threshold_bps: definition.pass_threshold_bps,
+            min_category_cases,
             passed: true,
-            score: Some(95),
-            test_count: 1,
-            pass_count: 1,
+            score: TOTAL_WEIGHT_BPS,
+            test_count,
+            pass_count: test_count,
+            challenge_created_at: timestamp.saturating_sub(60),
+            challenge_expires_at: timestamp.saturating_add(60),
             timestamp,
             expires_at,
-            context_id: record_context.map(ToOwned::to_owned),
+            context_id: record_context.to_owned(),
             verifier_signature: Vec::new(),
-            verification_method: VerificationMethod::ChallengeVerified {
-                challenge_type: ChallengeType::schema_validation(),
-            },
-            result: serde_json::json!({"passed": true}),
-            completed_at: timestamp,
         }
     }
 
@@ -774,7 +807,7 @@ mod tests {
         let mut cv = unsigned_challenge(
             &ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]),
             subject,
-            Some(context_id),
+            context_id,
             live_expiry(),
         );
         cv.verifier_signature = vec![0u8; 64];
@@ -790,7 +823,7 @@ mod tests {
     /// and expiry gates with an otherwise-valid record.
     fn make_genuinely_signed_challenge_with(
         subject: &str,
-        record_context: Option<&str>,
+        record_context: &str,
         expires_at: u64,
     ) -> ChallengeVerification {
         sign_challenge(unsigned_challenge(
@@ -803,7 +836,7 @@ mod tests {
 
     /// Convenience: a genuinely-signed, in-context, live challenge.
     fn make_genuinely_signed_challenge(subject: &str, context_id: &str) -> ChallengeVerification {
-        make_genuinely_signed_challenge_with(subject, Some(context_id), live_expiry())
+        make_genuinely_signed_challenge_with(subject, context_id, live_expiry())
     }
 
     fn make_event(event_type: EventType, actor: &str, ts: u64, seq: u64, data: Vec<u8>) -> Event {
@@ -860,7 +893,8 @@ mod tests {
         };
 
         let context_id = "ctx-integration";
-        let subject_did = "did:key:alice";
+        // A canonical subject: the read path rejects a non-canonical one.
+        let subject_did = POPULATE_SUBJECT;
         let clock = TestClock::new(2000);
         // Resolves the genuine challenge verifier key so the read-path
         // re-validation (Fix 1) keeps the genuinely-signed challenge result.
@@ -881,8 +915,7 @@ mod tests {
         // A genuinely verifier-signed, in-context challenge result so it survives
         // the aggregation read-path re-validation.
         // Stamped at the test clock's now, 2000, and live for 30 days.
-        let cr =
-            make_genuinely_signed_challenge_with(subject_did, Some(context_id), 2000 + 30 * 86_400);
+        let cr = make_genuinely_signed_challenge_with(subject_did, context_id, 2000 + 30 * 86_400);
         store.store_challenge_result(context_id, &cr).unwrap();
 
         // --- Build events ---
@@ -923,6 +956,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            definitions: &ProtocolOnlyDefinitions,
             clock: &clock,
         };
 
@@ -954,7 +988,7 @@ mod tests {
         );
         assert_eq!(input.challenge_results[0].capability_uri, CHALLENGE_URI);
         assert!(input.challenge_results[0].passed);
-        assert_eq!(input.challenge_results[0].score, Some(95));
+        assert_eq!(input.challenge_results[0].score, TOTAL_WEIGHT_BPS);
 
         assert_eq!(input.consequence_structure.len(), 1);
         assert!(input.threshold_counts.is_empty());
@@ -1048,6 +1082,7 @@ mod tests {
         let json = populate_and_aggregate(
             store,
             &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             context_id,
             subject_did,
             vec![make_forged_fresh_cached(subject_did)],
@@ -1156,6 +1191,7 @@ mod tests {
         let json = populate_and_aggregate(
             store,
             &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             context_id,
             subject_did,
             vec![CachedAttestation {
@@ -1210,6 +1246,7 @@ mod tests {
         let json = populate_and_aggregate(
             store,
             &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             context_id,
             subject_did,
             vec![],
@@ -1256,6 +1293,7 @@ mod tests {
         let json = populate_and_aggregate(
             store,
             &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             context_id,
             subject_did,
             vec![],
@@ -1294,7 +1332,7 @@ mod tests {
             "did:key:77777777777777777777777777777777777777777777777777777777777777ff";
 
         // expires_at = 1000 is far below the real system clock used at ingest.
-        let expired = make_genuinely_signed_challenge_with(subject_did, Some(context_id), 1000);
+        let expired = make_genuinely_signed_challenge_with(subject_did, context_id, 1000);
 
         let events = vec![make_event(
             EventType::MessageSent,
@@ -1308,6 +1346,7 @@ mod tests {
         let json = populate_and_aggregate(
             store,
             &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             context_id,
             subject_did,
             vec![],
@@ -1342,7 +1381,7 @@ mod tests {
 
         // Genuinely signed, unexpired — but bound to `other_context`.
         let foreign =
-            make_genuinely_signed_challenge_with(subject_did, Some(other_context), live_expiry());
+            make_genuinely_signed_challenge_with(subject_did, other_context, live_expiry());
 
         let events = vec![make_event(
             EventType::MessageSent,
@@ -1356,6 +1395,7 @@ mod tests {
         let json = populate_and_aggregate(
             store,
             &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             ingest_context,
             subject_did,
             vec![],
@@ -2077,6 +2117,7 @@ mod tests {
         let json = populate_and_aggregate(
             InMemoryFfiTrustStore::new(),
             &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             context_id,
             &subject_did,
             vec![],
@@ -2103,7 +2144,7 @@ mod tests {
         let mut cv = unsigned_challenge(
             &ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
             POPULATE_SUBJECT,
-            Some(ctx),
+            ctx,
             live_expiry(),
         );
         cv.verification_id = [0x11; 32];
@@ -2111,7 +2152,7 @@ mod tests {
         // Control: the same record with its derived id survives.
         assert_eq!(
             populate_challenge_count(
-                make_genuinely_signed_challenge_with(POPULATE_SUBJECT, Some(ctx), live_expiry()),
+                make_genuinely_signed_challenge_with(POPULATE_SUBJECT, ctx, live_expiry()),
                 ctx
             ),
             1
@@ -2124,7 +2165,7 @@ mod tests {
         let mut cv = unsigned_challenge(
             &ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
             POPULATE_SUBJECT,
-            Some(ctx),
+            ctx,
             live_expiry(),
         );
         cv.expires_at = cv.timestamp + 90 * 86_400 + 1;
@@ -2133,7 +2174,7 @@ mod tests {
         let mut cv = unsigned_challenge(
             &ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
             POPULATE_SUBJECT,
-            Some(ctx),
+            ctx,
             live_expiry(),
         );
         cv.expires_at = cv.timestamp + 90 * 86_400;
@@ -2159,6 +2200,7 @@ mod tests {
         let err = populate_and_aggregate(
             InMemoryFfiTrustStore::new(),
             &UnavailableResolver,
+            &ProtocolOnlyDefinitions,
             ctx,
             POPULATE_SUBJECT,
             vec![],
@@ -2186,6 +2228,7 @@ mod tests {
                 &crate::resolvers::BlockingResolutionScope::for_tests(),
                 None,
             ),
+            &ProtocolOnlyDefinitions,
             ctx,
             POPULATE_SUBJECT,
             vec![],
@@ -2246,6 +2289,7 @@ mod tests {
         let json = populate_and_aggregate(
             store,
             &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             context_id,
             subject_did,
             vec![

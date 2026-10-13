@@ -1928,11 +1928,6 @@ impl Scp {
         timeout_ms: Option<u32>,
         estimated_chunk_count: Option<u32>,
     ) -> Result<String, ScpError> {
-        let OutletStreamAuthority {
-            ucan_token,
-            proof_tokens,
-            ucan_proof_id,
-        } = authority;
         // Per-instance handle affinity: both participant handles MUST have been
         // minted by THIS bridge instance (mirrors the unary saga export).
         self.inner
@@ -1943,6 +1938,11 @@ impl Scp {
             .core
             .check_handle(target_handle.instance_id())
             .map_err(ScpError::from)?;
+        let OutletStreamAuthority {
+            ucan_token,
+            proof_tokens,
+            ucan_proof_id,
+        } = authority;
         let bi = Arc::clone(&self.inner);
         crate::runtime()
             .spawn(async move {

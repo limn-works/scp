@@ -518,6 +518,10 @@ pub struct PyContextParams {
     /// When `None`, defaults to `ConsequenceConfig::default()` (all severe
     /// enforcement tiers gated to governance only).
     consequence_config: Option<String>,
+    /// The admission capability requirements as a JSON array of
+    /// `CapabilityRequirement` (spec §7.3.5). When `None`, the context has
+    /// none.
+    capability_requirements: Option<String>,
 }
 
 #[pymethods]
@@ -529,7 +533,7 @@ impl PyContextParams {
     /// * `params` -- A Python dict with a required non-empty `ceiling` list
     ///   and optional keys `roles`, `outlets`, `ttl`, `memory_scope`,
     ///   `governance`, `mode`, `ceiling_policy`, `promotion_policy`,
-    ///   `template_id`, `economic_policy`.
+    ///   `template_id`, `economic_policy`, `capability_requirements`.
     ///
     /// # Errors
     ///
@@ -651,6 +655,13 @@ impl PyContextParams {
         self.consequence_config.as_deref()
     }
 
+    /// Returns the admission capability requirements as a JSON string, or
+    /// `None` if the context has none (spec §7.3.5).
+    #[getter]
+    fn capability_requirements(&self) -> Option<&str> {
+        self.capability_requirements.as_deref()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "PyContextParams(ceiling={:?}, roles={:?}, outlets={:?}, ttl={:?}, \
@@ -658,7 +669,8 @@ impl PyContextParams {
              promotion_policy='{}', template_id={:?}, economic_policy={:?}, \
              min_protocol_version={:?}, max_chain_depth={:?}, \
              max_nesting_depth={:?}, session_cap={:?}, \
-             consequence_rules={:?}, consequence_config={:?})",
+             consequence_rules={:?}, consequence_config={:?}, \
+             capability_requirements={:?})",
             self.ceiling,
             self.roles,
             self.outlets,
@@ -676,6 +688,7 @@ impl PyContextParams {
             self.session_cap,
             self.consequence_rules,
             self.consequence_config,
+            self.capability_requirements,
         )
     }
 }
@@ -961,6 +974,14 @@ impl PyContextParams {
             None => None,
         };
 
+        // capability_requirements: Optional[str] (JSON array, default: None) -- spec §7.3.5
+        let capability_requirements: Option<String> =
+            match dict.get_item("capability_requirements")? {
+                Some(val) if val.is_none() => None,
+                Some(val) => Some(val.extract()?),
+                None => None,
+            };
+
         Ok(Self {
             ceiling,
             roles,
@@ -979,6 +1000,7 @@ impl PyContextParams {
             session_cap,
             consequence_rules,
             consequence_config,
+            capability_requirements,
         })
     }
 
@@ -1075,6 +1097,11 @@ impl PyContextParams {
         } else {
             serde_json::to_string(&params.consequence_config).ok()
         };
+        let capability_requirements = if params.capability_requirements.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&params.capability_requirements).ok()
+        };
 
         Self {
             ceiling,
@@ -1094,6 +1121,7 @@ impl PyContextParams {
             session_cap: params.session_cap,
             consequence_rules,
             consequence_config,
+            capability_requirements,
         }
     }
 }
@@ -1687,6 +1715,7 @@ fn build_core_context_params(
         economic_policy_json: py_params.economic_policy.clone(),
         consequence_rules_json: py_params.consequence_rules.clone(),
         consequence_config_json: py_params.consequence_config.clone(),
+        capability_requirements_json: py_params.capability_requirements.clone(),
         roles: py_params
             .roles
             .iter()
@@ -7644,6 +7673,7 @@ mod tests {
             session_cap: None,
             consequence_rules: None,
             consequence_config: None,
+            capability_requirements: None,
         }
     }
 

@@ -1303,6 +1303,7 @@ mod tests {
             outlet_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
+            capability_requirements: scp_protocol::trust::CapabilityRequirements::default(),
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,

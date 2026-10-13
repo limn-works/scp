@@ -152,6 +152,15 @@ pub(crate) async fn dispatch(
             Outcome::ok(())
         }
 
+        QueriesCommand::GetCapabilityRequirements {
+            context_id: _,
+            reply,
+        } => {
+            let answer = queries_helpers::capability_requirements(state);
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
         QueriesCommand::GetRoleState {
             context_id: _,
             reply,

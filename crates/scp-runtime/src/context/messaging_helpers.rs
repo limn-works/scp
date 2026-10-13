@@ -2829,13 +2829,15 @@ pub fn build_snapshot_from_state(
         // Class-S governance subset (ADR-049 §9): exhaustively destructured so a
         // NEW Class-S governance field forces a conscious persist decision here
         // too. `executed_proposals` / `threshold_signers` / `threshold_value` /
-        // `spending_nonce_tracker` are all persisted into the snapshot below.
+        // `spending_nonce_tracker` / `capability_requirements` are all persisted
+        // into the snapshot below.
         class_s:
             crate::context::state::GovernanceClassS {
                 executed_proposals: _executed_proposals,
                 threshold_signers: _threshold_signers,
                 threshold_value: _threshold_value,
                 spending_nonce_tracker: _spending_nonce_tracker,
+                capability_requirements: _capability_requirements,
             },
         // --- Transient: deliberately NOT persisted (rebuilt at restore). ---
         // `deadlock`: per-context deadlock-detection scratch state, recomputed
@@ -2877,6 +2879,7 @@ pub fn build_snapshot_from_state(
         outlet_interfaces: state.governance.outlet_interfaces.clone(),
         threshold_signers: state.governance.class_s.threshold_signers.clone(),
         threshold_value: state.governance.class_s.threshold_value,
+        capability_requirements: state.governance.class_s.capability_requirements.clone(),
         pruning_policy: state.governance.pruning_policy.clone(),
         governance_model_config: Some(state.governance.engine.model_config()),
         economic_policy: state.governance.economic_policy.clone(),

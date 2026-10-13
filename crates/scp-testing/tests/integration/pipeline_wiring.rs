@@ -223,9 +223,17 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 const FFI_TRUST_STORE_SRC: &str =
     include_str!("../../../../crates/scp-ffi/common/src/trust_store.rs");
 // The shared challenge operations (spec 07 §7.3.4) every bridge's
-// `trust_create_challenge` and `trust_verify_response` reach, and the NAPI
-// class whose exported methods delegate to the `_on` bodies.
+// `trust_create_challenge`, `trust_respond_to_challenge`,
+// `trust_grade_response` and `check_capability_requirements` reach, the
+// challenger ledger actor the supervisor dispatches them to, the common context
+// params builder, and the NAPI class whose exported methods delegate to the
+// `_on` bodies.
 const FFI_CHALLENGE_SRC: &str = include_str!("../../../../crates/scp-ffi/common/src/challenge.rs");
+const LEDGER_SRC: &str = include_str!(
+    "../../../../crates/scp-runtime/src/context/supervisor/challenger_ledger_actor.rs"
+);
+const FFI_CONTEXT_PARAMS_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/common/src/context_params.rs");
 const NAPI_SCP_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp.rs");
 
 // =========================================================================
@@ -274,7 +282,14 @@ const NAPI_SCP_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp
 // `verify_response_and_sign` to their checks and to `CommandSigner::sign_bounded_ed25519`, and one per
 // native bridge pins each of `trust_create_challenge` and
 // `trust_verify_response` to the shared operation.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 67;
+// Raised 67 -> 88 when challenge grading moved to the challenger ledger
+// (spec 07 §7.3.4): the verify assertions became grade assertions, and 21 new
+// ones pin the shared respond, grade, evaluator, and check bodies, each
+// supervisor challenge dispatch to the ledger mailbox, the ledger's attempt
+// checks and its ban on the synchronous trust store, each bridge's respond
+// export, grade repository, and evaluator invoker, the context params reading
+// `capability_requirements`, and the governance leaf's direction choice.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 88;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -5039,86 +5054,134 @@ fn uniffi_participation_record_routes_to_supervisor() {
 // Capability-admission op `check_capability_requirements` (§7.3.4.4, SCP-ACR-008)
 // ===========================================================================
 //
-// Each native bridge's capability-admission export MUST delegate to the shared
-// core `scp_protocol::trust::check_capability_requirements` (re-exported as
-// `scp_core::trust::check_capability_requirements`) rather than re-implementing
-// the admission decision locally, AND MUST wire the instance's DID resolver
-// (`instance_active_key_resolver` over the instance `IdentityBackedDidResolver`),
-// which reads the verifier's `#active` key, so each `ChallengeVerification` is
-// signature/subject/context/expiry verified. Pinning the fully-qualified
-// `scp_core::trust::check_capability_requirements(` call (not the bare leaf,
-// which the bridge fn shares its name with) plus the resolver makes a
-// self-satisfying substring impossible.
+// The shared `scp_ffi_common::challenge::check_capability_requirements` reads
+// the requirements from the context's governance at call time
+// (`Supervisor::capability_requirements_checked`), then runs the core
+// `scp_protocol::trust::check_capability_requirements` on the blocking pool
+// with the instance's DID resolver (`instance_active_key_resolver`), which
+// reads each verifier's `#active` key. Each native bridge's export reaches that
+// shared body with its own instance's resolver, so no bridge takes the
+// requirements from its caller or decides admission itself.
 
-/// The PyO3 `SCP.check_capability_requirements` method must route to core.
+#[test]
+fn shared_check_capability_requirements_reads_governance_then_resolves() {
+    let body = extract_fn_body(FFI_CHALLENGE_SRC, "check_capability_requirements")
+        .expect("scp_ffi_common::challenge::check_capability_requirements must exist");
+    let read = body.find("sup.capability_requirements_checked(&context_id)");
+    let pool = body.find("run_blocking_resolution(");
+    assert!(
+        read.is_some()
+            && pool.is_some()
+            && read < pool
+            && body.contains("scp_protocol::trust::check_capability_requirements(")
+            && body.contains("instance_active_key_resolver(scope, resolver.as_ref())"),
+        "check_capability_requirements must read the context's governed requirements \
+         before it runs core check_capability_requirements on the blocking pool with \
+         the instance DID resolver"
+    );
+}
+
+/// The PyO3 `SCP.check_capability_requirements` method reaches the shared
+/// operation with the instance's supervisor and DID resolver, without the GIL.
 #[test]
 fn pyo3_check_capability_requirements_routes_to_core() {
+    let reaches =
+        |callee| fn_body_contains(PYO3_TRUST_SRC, "check_capability_requirements", callee);
     assert!(
-        fn_body_contains(
-            PYO3_TRUST_SRC,
-            "check_capability_requirements",
-            "scp_core::trust::check_capability_requirements("
-        ) && fn_body_contains(
-            PYO3_TRUST_SRC,
-            "check_capability_requirements",
-            "on_resolution_pool(py, move |scope|"
-        ) && fn_body_contains(
-            PYO3_TRUST_SRC,
-            "check_capability_requirements",
-            "instance_active_key_resolver("
-        ) && fn_body_contains(
-            PYO3_TRUST_SRC,
-            "check_capability_requirements",
-            "crate::runtime::did_resolver(&bi)"
-        ),
-        "PyO3 check_capability_requirements must call core \
-         check_capability_requirements with the instance DID resolver, \
-         on the blocking pool without the GIL"
+        reaches("scp_ffi_common::challenge::check_capability_requirements(")
+            && reaches("crate::runtime::supervisor(bi)")
+            && reaches("crate::runtime::did_resolver(bi).cloned()")
+            && reaches("crate::actor_wait::block_on_released("),
+        "PyO3 check_capability_requirements must reach the shared operation with the \
+         instance supervisor and DID resolver, with the GIL released"
     );
 }
 
 /// The NAPI `check_capability_requirements` bridge op (body in
-/// `check_capability_requirements_on`) must route to core.
+/// `check_capability_requirements_on`) reaches the shared operation.
 #[test]
 fn napi_check_capability_requirements_routes_to_core() {
     assert!(
         fn_body_contains(
-            NAPI_TRUST_SRC,
-            "check_capability_requirements_on",
-            "scp_core::trust::check_capability_requirements("
+            NAPI_SCP_SRC,
+            "check_capability_requirements",
+            "check_capability_requirements_on("
         ) && fn_body_contains(
             NAPI_TRUST_SRC,
             "check_capability_requirements_on",
-            "instance_active_key_resolver(scope, crate::runtime::did_resolver(bi))"
+            "scp_ffi_common::challenge::check_capability_requirements("
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "check_capability_requirements_on",
+            "crate::runtime::supervisor(bi)"
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "check_capability_requirements_on",
+            "crate::runtime::did_resolver(bi).cloned()"
         ),
-        "NAPI check_capability_requirements_on must call core \
-         check_capability_requirements with the instance DID resolver"
+        "NAPI check_capability_requirements_on must reach the shared operation with \
+         the instance supervisor and DID resolver"
     );
 }
 
-/// The UniFFI `Scp::check_capability_requirements` method must route to core.
+/// The UniFFI `Scp::check_capability_requirements` method reaches the shared
+/// operation.
 #[test]
 fn uniffi_check_capability_requirements_routes_to_core() {
+    let reaches =
+        |callee| fn_body_contains(UNIFFI_BRIDGE_SRC, "check_capability_requirements", callee);
+    assert!(
+        reaches("scp_ffi_common::challenge::check_capability_requirements(")
+            && reaches("self.inner.context_manager_expect()")
+            && reaches("self.inner.did_resolver()"),
+        "UniFFI check_capability_requirements must reach the shared operation with the \
+         instance supervisor and DID resolver"
+    );
+}
+
+/// Every bridge passes its `capability_requirements` parameter into the
+/// common context params, and the common builder parses it through the
+/// validating type, so a context created through any bridge holds the
+/// requirements its creator set.
+#[test]
+fn ffi_context_create_reads_capability_requirements() {
     assert!(
         fn_body_contains(
-            UNIFFI_BRIDGE_SRC,
-            "check_capability_requirements",
-            "scp_core::trust::check_capability_requirements("
+            FFI_CONTEXT_PARAMS_SRC,
+            "build_context_params",
+            "parse_capability_requirements(params.capability_requirements_json.as_ref())"
+        ) && fn_body_contains(
+            PYO3_CONTEXT_SRC,
+            "build_core_context_params",
+            "capability_requirements_json: py_params.capability_requirements.clone()"
+        ) && fn_body_contains(
+            NAPI_CONTEXT_SRC,
+            "parse_context_params",
+            "capability_requirements_json,"
         ) && fn_body_contains(
             UNIFFI_BRIDGE_SRC,
-            "check_capability_requirements",
-            "on_resolution_pool(move |scope|"
-        ) && fn_body_contains(
-            UNIFFI_BRIDGE_SRC,
-            "check_capability_requirements",
-            "let did_resolver = inner.did_resolver();"
-        ) && fn_body_contains(
-            UNIFFI_BRIDGE_SRC,
-            "check_capability_requirements",
-            "instance_active_key_resolver(scope, did_resolver.as_ref())"
+            "bridge_params_to_core",
+            "capability_requirements_json: params.capability_requirements_json.clone()"
         ),
-        "UniFFI check_capability_requirements must call core \
-         check_capability_requirements with the instance DID resolver"
+        "each bridge must pass its capability requirements to the common builder, \
+         which must parse them"
+    );
+}
+
+/// `ModifyCapabilityRequirements` keeps a tightening in force on a persist
+/// failure and restores the old list for any other change, so a loosening
+/// never takes effect without being durable.
+#[test]
+fn governance_modify_capability_requirements_chooses_direction_by_delta() {
+    let body = extract_fn_body(MANAGER_SRC, "execute_modify_capability_requirements")
+        .expect("execute_modify_capability_requirements must exist");
+    let tightening = body.find(".is_tightening_of(");
+    let keep = body.find(".commit_class_s_keep(");
+    let restore = body.find(".commit_class_s_restore(");
+    assert!(
+        tightening.is_some() && keep.is_some() && restore.is_some() && tightening < keep,
+        "execute_modify_capability_requirements must choose commit_class_s_keep for a \
+         tightening and commit_class_s_restore otherwise"
     );
 }
 
@@ -5236,48 +5299,173 @@ fn uniffi_trust_verify_attestation_reads_the_instance_revocation_list() {
 }
 
 // ===========================================================================
-// Challenge operations (spec 07 §7.3.4) — shared bodies and bridge routing
+// Challenge operations (spec 07 §7.3.4) — shared bodies, ledger, and bridge routing
 // ===========================================================================
 //
-// The shared `create_challenge` builds the request through the registry's
-// minimum-suite check and signs it with the verifier's `#active` key through
-// custody; `verify_response_and_sign` checks the response before it signs the
-// record. Each bridge export reaches those bodies, and the verify export
-// decodes its JSON arguments through `VerifyInputs::decode`, the only way to
-// build the shared operation's input.
+// The shared `create_challenge` builds the request, checks every `CustomEval`
+// evaluator, and records the challenge in the challenger's ledger, which signs
+// it. `respond_to_challenge` signs the subject's response through custody.
+// `grade_response` looks the challenge up in the ledger before any DID
+// resolution, authenticates the response on the blocking pool, takes a grading
+// permit and the ledger lease, grades, commits, and writes the record to the
+// bridge's repository. Each supervisor dispatch reaches the challenger ledger's
+// mailbox, whose Begin and Commit handlers check the attempt. Each bridge's
+// export reaches the shared body, and each bridge's evaluator invoker runs the
+// handler through the shared `invoke_evaluator_outlet`.
 
 #[test]
-fn shared_create_challenge_checks_the_suite_and_signs_through_custody() {
+fn shared_create_challenge_checks_the_definition_and_signs_in_the_ledger() {
+    let reaches = |callee| fn_body_contains(FFI_CHALLENGE_SRC, "create_challenge", callee);
     assert!(
-        fn_body_contains(
-            FFI_CHALLENGE_SRC,
-            "create_challenge",
-            "challenge_request_unsigned("
-        ) && fn_body_contains(
-            FFI_CHALLENGE_SRC,
-            "create_challenge",
-            "sign_bounded_ed25519("
-        ),
-        "create_challenge must build the request with challenge_request_unsigned \
-         and sign it through sign_bounded_ed25519"
+        reaches("challenge_request_unsigned(")
+            && reaches(".check_registered(")
+            && reaches(".dispatch_challenge_create(")
+            && fn_body_contains(LEDGER_SRC, "handle_create", "sign_bounded_ed25519("),
+        "create_challenge must build the request, check each evaluator, and record it \
+         in the ledger, whose Create handler signs it through sign_bounded_ed25519"
     );
 }
 
 #[test]
-fn shared_verify_response_checks_the_response_and_signs_through_custody() {
+fn shared_respond_to_challenge_signs_through_custody() {
+    let reaches = |callee| fn_body_contains(FFI_CHALLENGE_SRC, "respond_to_challenge", callee);
+    assert!(
+        reaches("challenge_response_unsigned(")
+            && reaches("run_blocking_resolution(")
+            && reaches(".sign_bounded_ed25519(&unsigned.signing_digest())"),
+        "respond_to_challenge must build the response on the blocking pool and sign \
+         its digest through sign_bounded_ed25519"
+    );
+}
+
+#[test]
+fn shared_grade_response_authenticates_then_grades_and_commits() {
     assert!(
         fn_body_contains(
             FFI_CHALLENGE_SRC,
-            "verify_response_and_sign",
-            "check_challenge_response("
-        ) && fn_body_contains(
-            FFI_CHALLENGE_SRC,
-            "verify_response_and_sign",
-            "sign_bounded_ed25519("
+            "grade_response",
+            "grade_response_within("
         ),
-        "verify_response_and_sign must check the response with \
-         check_challenge_response and sign the record through sign_bounded_ed25519"
+        "grade_response must run grade_response_within"
     );
+    let body = extract_fn_body(FFI_CHALLENGE_SRC, "grade_response_within")
+        .expect("grade_response_within must exist");
+    let at = |needle: &str| body.find(needle);
+    let lookup = at(".dispatch_challenge_lookup(");
+    let resolve = at("run_blocking_resolution(");
+    let permit = at(".challenge_grading_permit(");
+    let begin = at(".dispatch_challenge_begin_grade(");
+    let commit = at(".dispatch_challenge_commit(");
+    assert!(
+        lookup.is_some()
+            && resolve.is_some()
+            && permit.is_some()
+            && begin.is_some()
+            && commit.is_some()
+            && lookup < resolve
+            && resolve < permit
+            && permit < begin
+            && begin < commit,
+        "grade_response_within must look the challenge up, then resolve, then take a \
+         permit, then Begin, then Commit, in that order"
+    );
+    assert!(
+        body.contains("authenticate_challenge_response(")
+            && body.contains(" grade(")
+            && body.contains("store_graded(repo, committed)")
+            && fn_body_contains(
+                FFI_CHALLENGE_SRC,
+                "store_graded",
+                ".store_trust_challenge_result("
+            )
+            && body.contains("evaluate_cases(")
+            && fn_body_contains(FFI_CHALLENGE_SRC, "evaluate_cases", "schema_case(")
+            && fn_body_contains(
+                FFI_CHALLENGE_SRC,
+                "evaluate_cases",
+                ".invoke(EvaluatorCall {"
+            )
+            && fn_body_contains(FFI_CHALLENGE_SRC, "schema_case", "SchemaGate::admit("),
+        "grade_response_within must authenticate, run each evaluated case (schemas \
+         through SchemaGate, evaluators through the invoker), grade, and store the record"
+    );
+}
+
+/// Begin and Commit both check the attempt in the ledger turn, and Commit signs
+/// the record it persisted.
+#[test]
+fn ledger_begin_and_commit_check_the_attempt() {
+    assert!(
+        fn_body_contains(LEDGER_SRC, "handle_begin", "check_attempt(")
+            && fn_body_contains(LEDGER_SRC, "handle_commit", "check_attempt(")
+            && fn_body_contains(LEDGER_SRC, "handle_commit", ".signed_attempt(")
+            && fn_body_contains(LEDGER_SRC, "signed_attempt", ".sign_bounded_ed25519("),
+        "the ledger's Begin and Commit handlers must check the attempt, and Commit must \
+         sign the record through sign_bounded_ed25519"
+    );
+}
+
+/// The ledger actor never reaches the synchronous trust store or blocks its
+/// turn on a runtime; the graded record is written by the async caller.
+#[test]
+fn ledger_handler_never_calls_the_sync_trust_store() {
+    let code = strip_non_code(LEDGER_SRC);
+    for banned in [
+        "TrustStore",
+        "trust_store",
+        "block_on(",
+        "store_trust_challenge_result(",
+    ] {
+        assert!(
+            !code.contains(banned),
+            "challenger_ledger_actor.rs must not reach `{banned}`"
+        );
+    }
+}
+
+/// Asserts that `Supervisor::{dispatch}` resolves the challenger's ledger and
+/// sends `ChallengerLedgerCommand::{command}` to its mailbox.
+fn assert_dispatch_reaches_ledger(dispatch: &str, command: &str) {
+    let body = extract_fn_body(SUPERVISOR_SRC, dispatch)
+        .unwrap_or_else(|| panic!("Supervisor::{dispatch} must exist"));
+    assert!(
+        body.contains("self.challenger_ledger_for(challenger)")
+            && body.contains(".send(|reply| ChallengerLedgerCommand::")
+            && body.contains(&format!("ChallengerLedgerCommand::{command} {{")),
+        "Supervisor::{dispatch} must send ChallengerLedgerCommand::{command} to the \
+         challenger's ledger mailbox"
+    );
+    let arm = format!("ChallengerLedgerCommand::{command} {{");
+    let dispatch_body = extract_fn_body(LEDGER_SRC, "dispatch").expect("ledger dispatch");
+    assert!(
+        dispatch_body.contains(&arm),
+        "the ledger actor's dispatch must handle ChallengerLedgerCommand::{command}"
+    );
+}
+
+#[test]
+fn supervisor_challenge_create_reaches_the_ledger_mailbox() {
+    assert_dispatch_reaches_ledger("dispatch_challenge_create", "Create");
+}
+
+#[test]
+fn supervisor_challenge_lookup_reaches_the_ledger_mailbox() {
+    assert_dispatch_reaches_ledger("dispatch_challenge_lookup", "Lookup");
+}
+
+#[test]
+fn supervisor_challenge_begin_grade_reaches_the_ledger_mailbox() {
+    assert_dispatch_reaches_ledger("dispatch_challenge_begin_grade", "BeginGrade");
+}
+
+#[test]
+fn supervisor_challenge_commit_reaches_the_ledger_mailbox() {
+    assert_dispatch_reaches_ledger("dispatch_challenge_commit", "Commit");
+}
+
+#[test]
+fn supervisor_challenge_fault_reaches_the_ledger_mailbox() {
+    assert_dispatch_reaches_ledger("dispatch_challenge_fault", "RecordFault");
 }
 
 #[test]
@@ -5329,66 +5517,207 @@ fn uniffi_trust_create_challenge_reaches_the_shared_operation() {
 }
 
 #[test]
-fn pyo3_trust_verify_response_reaches_the_shared_operation() {
+fn pyo3_trust_respond_to_challenge_reaches_the_shared_operation() {
     assert!(
         fn_body_contains(
             PYO3_TRUST_SRC,
-            "trust_verify_response",
-            "trust_verify_response_impl("
+            "trust_respond_to_challenge",
+            "trust_respond_to_challenge_impl("
         ) && fn_body_contains(
             PYO3_TRUST_SRC,
-            "trust_verify_response_impl",
-            "scp_ffi_common::challenge::VerifyInputs::decode("
-        ) && fn_body_contains(
-            PYO3_TRUST_SRC,
-            "trust_verify_response_impl",
-            "scp_ffi_common::challenge::verify_response_and_sign("
+            "trust_respond_to_challenge_impl",
+            "scp_ffi_common::challenge::respond_to_challenge("
         ),
-        "PyO3 trust_verify_response must decode through VerifyInputs::decode and \
-         reach scp_ffi_common::challenge::verify_response_and_sign"
+        "PyO3 trust_respond_to_challenge must reach \
+         scp_ffi_common::challenge::respond_to_challenge"
     );
 }
 
 #[test]
-fn napi_trust_verify_response_reaches_the_shared_operation() {
+fn napi_trust_respond_to_challenge_reaches_the_shared_operation() {
     assert!(
         fn_body_contains(
             NAPI_SCP_SRC,
-            "trust_verify_response",
-            "trust_verify_response_on("
+            "trust_respond_to_challenge",
+            "trust_respond_to_challenge_on("
         ) && fn_body_contains(
             NAPI_TRUST_SRC,
-            "trust_verify_response_on",
-            "scp_ffi_common::challenge::VerifyInputs::decode("
-        ) && fn_body_contains(
-            NAPI_TRUST_SRC,
-            "trust_verify_response_on",
-            "scp_ffi_common::challenge::verify_response_and_sign("
+            "trust_respond_to_challenge_on",
+            "scp_ffi_common::challenge::respond_to_challenge("
         ),
-        "NAPI trustVerifyResponse must decode through VerifyInputs::decode and \
-         reach scp_ffi_common::challenge::verify_response_and_sign"
+        "NAPI trustRespondToChallenge must reach \
+         scp_ffi_common::challenge::respond_to_challenge"
     );
 }
 
 #[test]
-fn uniffi_trust_verify_response_reaches_the_shared_operation() {
+fn uniffi_trust_respond_to_challenge_reaches_the_shared_operation() {
     assert!(
         fn_body_contains(
             UNIFFI_BRIDGE_SRC,
-            "trust_verify_response",
-            "trust_verify_response_impl("
+            "trust_respond_to_challenge",
+            "trust_respond_to_challenge_impl("
         ) && fn_body_contains(
             UNIFFI_BRIDGE_SRC,
-            "trust_verify_response_impl",
-            "scp_ffi_common::challenge::VerifyInputs::decode("
-        ) && fn_body_contains(
-            UNIFFI_BRIDGE_SRC,
-            "trust_verify_response_impl",
-            "scp_ffi_common::challenge::verify_response_and_sign("
+            "trust_respond_to_challenge_impl",
+            "scp_ffi_common::challenge::respond_to_challenge("
         ),
-        "UniFFI trust_verify_response must decode through VerifyInputs::decode and \
-         reach scp_ffi_common::challenge::verify_response_and_sign"
+        "UniFFI trust_respond_to_challenge must reach \
+         scp_ffi_common::challenge::respond_to_challenge"
     );
+}
+
+#[test]
+fn pyo3_trust_grade_response_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_grade_response",
+            "trust_grade_response_impl("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_grade_response_impl",
+            "grade_with_storage("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "grade_with_storage",
+            "scp_ffi_common::challenge::grade_response("
+        ),
+        "PyO3 trust_grade_response must reach scp_ffi_common::challenge::grade_response"
+    );
+}
+
+#[test]
+fn napi_trust_grade_response_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            NAPI_SCP_SRC,
+            "trust_grade_response",
+            "trust_grade_response_on("
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "trust_grade_response_on",
+            "scp_ffi_common::challenge::grade_response("
+        ),
+        "NAPI trustGradeResponse must reach scp_ffi_common::challenge::grade_response"
+    );
+}
+
+#[test]
+fn uniffi_trust_grade_response_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_grade_response",
+            "trust_grade_response_impl("
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_grade_response_impl",
+            "scp_ffi_common::challenge::grade_response("
+        ),
+        "UniFFI trust_grade_response must reach scp_ffi_common::challenge::grade_response"
+    );
+}
+
+/// The PyO3 grade writes the record through a `ProtocolRepository` over the
+/// instance's own storage provider.
+#[test]
+fn pyo3_grade_response_uses_the_bridge_repository() {
+    assert!(
+        fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_grade_response_impl",
+            "crate::runtime::get_storage(bi)"
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "grade_with_storage",
+            "ProtocolRepository::new(storage)"
+        ),
+        "PyO3 trust_grade_response must store through a ProtocolRepository over the \
+         instance storage"
+    );
+}
+
+/// The NAPI grade writes the record through the instance's repository.
+#[test]
+fn napi_grade_response_uses_the_bridge_repository() {
+    assert!(
+        fn_body_contains(
+            NAPI_TRUST_SRC,
+            "trust_grade_response_on",
+            "crate::runtime::protocol_repository(bi)"
+        ),
+        "NAPI trustGradeResponse must store through the instance's protocol repository"
+    );
+}
+
+/// The UniFFI grade writes the record through the instance's repository.
+#[test]
+fn uniffi_grade_response_uses_the_bridge_repository() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_grade_response_impl",
+            "bi.protocol_repository()"
+        ),
+        "UniFFI trust_grade_response must store through the instance's protocol repository"
+    );
+}
+
+/// The shared evaluator call runs the host handler on the blocking pool under
+/// the grading permit, inside the outlet economy pipeline, on its own task.
+#[test]
+fn shared_evaluator_outlet_spawns_blocking_inside_the_economy_pipeline() {
+    let reaches = |callee| fn_body_contains(FFI_CHALLENGE_SRC, "invoke_evaluator_outlet", callee);
+    assert!(
+        reaches("tokio::task::spawn_blocking(")
+            && reaches("let _permit = permit;")
+            && reaches("tokio::spawn(")
+            && reaches(".invoke_outlet_with_economy(")
+            && reaches("let Some(handler) = handler else")
+            && reaches("EvaluatorOutcome::Unavailable("),
+        "invoke_evaluator_outlet must refuse without a handler and run it on the \
+         blocking pool under the permit inside invoke_outlet_with_economy"
+    );
+}
+
+/// Asserts that `src` holds `impl scp_ffi_common::challenge::EvaluatorInvoker
+/// for {ty}` whose `check_registered` reaches `check_evaluator_registered` and
+/// whose `invoke` reaches `invoke_evaluator_outlet`.
+fn assert_bridge_evaluator_invoker(src: &str, ty: &str) {
+    let header = format!("impl scp_ffi_common::challenge::EvaluatorInvoker for {ty}");
+    let at = src
+        .find(&header)
+        .unwrap_or_else(|| panic!("`{header}` must exist"));
+    let block = &src[at..];
+    assert!(
+        fn_body_contains(
+            block,
+            "check_registered",
+            "scp_ffi_common::challenge::check_evaluator_registered("
+        ) && fn_body_contains(
+            block,
+            "invoke",
+            "scp_ffi_common::challenge::invoke_evaluator_outlet("
+        ),
+        "{ty} must check through check_evaluator_registered and invoke through \
+         invoke_evaluator_outlet"
+    );
+}
+
+#[test]
+fn pyo3_evaluator_invoker_spawns_blocking_and_refuses_without_handler() {
+    assert_bridge_evaluator_invoker(PYO3_TRUST_SRC, "PyEvaluatorInvoker<'_>");
+}
+
+#[test]
+fn napi_evaluator_invoker_spawns_blocking_and_refuses_without_handler() {
+    assert_bridge_evaluator_invoker(NAPI_TRUST_SRC, "NapiEvaluatorInvoker<'_>");
+}
+
+#[test]
+fn uniffi_evaluator_invoker_spawns_blocking_and_refuses_without_handler() {
+    assert_bridge_evaluator_invoker(UNIFFI_BRIDGE_SRC, "UniffiEvaluatorInvoker<'_>");
 }
 
 // ===========================================================================

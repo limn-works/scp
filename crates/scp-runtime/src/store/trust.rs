@@ -465,7 +465,6 @@ impl<S: Storage + 'static> TrustProtocolRepository for ProtocolRepositoryTrustBr
 mod tests {
     use super::*;
     use scp_protocol::trust::attestation::RevocationStatus;
-    use scp_protocol::trust::challenge::{ChallengeType, VerificationMethod};
 
     /// The verification id `make_challenge_result(n, ..)` stores, as the
     /// lowercase hex its storage key uses.
@@ -505,20 +504,25 @@ mod tests {
             verifier: "did:key:verifier".into(),
             subject: subject.into(),
             capability_uri: "scp:capability:schema-validation/v1".to_owned(),
+            definition_digest: [0xcd; 32],
             suite_digest: [0xab; 32],
+            challenge_id: [0xef; 32],
+            attempt: 1,
+            response_digest: [0x12; 32],
+            max_retries: 2,
+            cooldown_secs: 300,
+            pass_threshold_bps: 9000,
+            min_category_cases: 10,
             passed: true,
-            score: Some(9500),
+            score: 9500,
             test_count: 10,
             pass_count: 9,
+            challenge_created_at: 1000,
+            challenge_expires_at: 2000,
             timestamp: 1801,
             expires_at: 88_200,
-            context_id: Some("ctx-test".to_owned()),
+            context_id: "ctx-test".to_owned(),
             verifier_signature: vec![0u8; 64],
-            verification_method: VerificationMethod::ChallengeVerified {
-                challenge_type: ChallengeType::schema_validation(),
-            },
-            result: serde_json::json!({"passed": true}),
-            completed_at: 1800,
         }
     }
 
@@ -869,7 +873,7 @@ mod tests {
         let r2 = {
             let mut r = make_challenge_result(2, "did:key:alice");
             r.passed = false;
-            r.score = Some(40);
+            r.score = 40;
             r
         };
 

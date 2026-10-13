@@ -31,6 +31,7 @@ use super::attestation::{
     ThresholdCheckInput, ThresholdRequirement, check_attestation_freshness,
     check_threshold_attestation, verify_attestation,
 };
+use super::capability_definition::CapabilityDefinitionSource;
 use super::challenge::{ChallengeVerification, verify_challenge_verification};
 use super::consequence::ConsequenceRule;
 use super::participation::compute_participation_record;
@@ -576,6 +577,11 @@ pub struct AggregationContext<'a, S, C> {
     /// for every attestation-class signature this aggregation re-verifies.
     pub resolver: &'a dyn ActiveKeyResolver,
 
+    /// Supplies the capability definition each stored challenge record is
+    /// checked against (spec 07 §7.3.4.6). An unobtainable definition fails
+    /// the aggregation; it does not drop the record.
+    pub definitions: &'a dyn CapabilityDefinitionSource,
+
     /// Clock for timestamp operations.
     pub clock: &'a C,
 }
@@ -654,6 +660,7 @@ where
         match verify_challenge_verification(
             &cv,
             ctx.resolver,
+            ctx.definitions,
             ctx.context_id,
             ctx.subject_did,
             ctx.clock,
@@ -781,6 +788,9 @@ mod tests {
 
     use super::*;
     use crate::trust::attestation::RevocationStatus;
+    use crate::trust::challenge_fixtures::{
+        FIXTURE_URI, Fixture, FixtureDefinitions, cases, fixture,
+    };
     use scp_clock::TestClock;
     use scp_event_log::{EventPayload, EventType};
 
@@ -1098,80 +1108,28 @@ mod tests {
             attestor_sets,
             cache: &cache,
             resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &clock,
         };
 
         aggregate_trust_input(&ctx).map(|input| input.threshold_counts)
     }
 
-    /// Deterministic verifier signing key used by `make_challenge_verification`,
-    /// so a test resolver can be seeded with the matching public key.
-    fn challenge_verifier_key() -> ed25519_dalek::SigningKey {
-        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    /// A genuine record for the fixture subject in `"ctx-1"`, graded at
+    /// `at` through the production challenge steps, with its fixture.
+    fn make_challenge_verification(at: u64) -> (Fixture, ChallengeVerification) {
+        let fx = fixture();
+        fx.clock.set(at);
+        let cv = fx.genuine_record(FIXTURE_URI, cases(2)).unwrap();
+        (fx, cv)
     }
 
-    /// Builds a GENUINELY verifier-signed [`ChallengeVerification`] bound to
-    /// `context_id`. The `verifier_signature` is a real Ed25519 signature over
-    /// the canonical bytes, so it passes `verify_challenge_verification` when the
-    /// resolver is seeded via [`seed_challenge_verifier`].
-    fn make_challenge_verification(
-        capability_uri: &str,
-        responder: &str,
-        completed_at: u64,
-        context_id: Option<&str>,
-    ) -> ChallengeVerification {
-        use crate::trust::challenge::{
-            ChallengeType, VerificationMethod, challenge_verification_id,
-            challenge_verification_signing_digest,
-        };
-        use ed25519_dalek::Signer;
-
-        let verifier_pub = challenge_verifier_key().verifying_key().to_bytes();
-        let verifier = scp_did::did_dht_from_public_key(&verifier_pub);
-        let subject = DID::from(responder);
-        let timestamp = completed_at + 1;
-        let mut cv = ChallengeVerification {
-            verification_id: challenge_verification_id(
-                &verifier,
-                &subject,
-                capability_uri,
-                timestamp,
-            )
-            .unwrap(),
-            verifier,
-            subject,
-            capability_uri: capability_uri.to_owned(),
-            suite_digest: [3u8; 32],
-            passed: true,
-            score: None,
-            test_count: 1,
-            pass_count: 1,
-            timestamp,
-            expires_at: completed_at + 86400,
-            context_id: context_id.map(ToOwned::to_owned),
-            verifier_signature: vec![],
-            verification_method: VerificationMethod::ChallengeVerified {
-                challenge_type: ChallengeType::schema_validation(),
-            },
-            result: serde_json::json!({"passed": true}),
-            completed_at,
-        };
-        let digest = challenge_verification_signing_digest(&cv).unwrap();
-        cv.verifier_signature = challenge_verifier_key().sign(&digest).to_bytes().to_vec();
-        cv
-    }
-
-    /// Capability URIs the challenge-result tests record.
-    const SCHEMA_URI: &str = "scp:capability:schema-validation/v1";
-    const RATE_URI: &str = "scp:capability:rate-limit-compliance/v1";
-
-    /// Seeds `resolver` with the public key for the verifier DID used by
-    /// [`make_challenge_verification`], so the genuine signature resolves and
-    /// verifies on the challenge read path.
-    fn seed_challenge_verifier(resolver: &mut TestResolver) {
-        let verifier_pub = challenge_verifier_key().verifying_key().to_bytes();
-        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub).to_string();
-        resolver.keys.insert(verifier_did, verifier_pub.to_vec());
+    /// Seeds `resolver` with the fixture verifier's key, so the record's
+    /// signature resolves and verifies on the challenge read path.
+    fn seed_challenge_verifier(resolver: &mut TestResolver, fx: &Fixture) {
+        resolver
+            .keys
+            .insert(fx.verifier.did.to_string(), fx.verifier.public().to_vec());
     }
 
     // -----------------------------------------------------------------------
@@ -1425,30 +1383,24 @@ mod tests {
     fn store_persists_and_retrieves_challenge_results() {
         let store = InMemoryTrustStore::new();
 
-        let cv = make_challenge_verification(SCHEMA_URI, "did:key:alice", 1000, Some("ctx-1"));
+        let (_, cv) = make_challenge_verification(1000);
         store.store_challenge_result("ctx-1", &cv).unwrap();
 
-        let results = store
-            .get_challenge_results("ctx-1", "did:key:alice")
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].capability_uri, SCHEMA_URI);
-        assert_eq!(results[0].completed_at, 1000);
+        let results = store.get_challenge_results("ctx-1", &cv.subject).unwrap();
+        assert_eq!(results, vec![cv]);
     }
 
     #[test]
     fn store_accumulates_multiple_challenge_results() {
         let store = InMemoryTrustStore::new();
 
-        let cv1 = make_challenge_verification(SCHEMA_URI, "did:key:alice", 1000, Some("ctx-1"));
-        let cv2 = make_challenge_verification(RATE_URI, "did:key:alice", 2000, Some("ctx-1"));
+        let (_, cv1) = make_challenge_verification(1000);
+        let (_, cv2) = make_challenge_verification(2000);
 
         store.store_challenge_result("ctx-1", &cv1).unwrap();
         store.store_challenge_result("ctx-1", &cv2).unwrap();
 
-        let results = store
-            .get_challenge_results("ctx-1", "did:key:alice")
-            .unwrap();
+        let results = store.get_challenge_results("ctx-1", &cv1.subject).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -1599,13 +1551,16 @@ mod tests {
     fn aggregate_returns_complete_trust_input() {
         let store = InMemoryTrustStore::new();
         let clock = TestClock::new(2000);
-        // Seed the resolver with the verifier key so the genuinely-signed
-        // challenge result re-validates on the read path (Fix 1).
+        // A genuinely signed, in-context challenge result for the fixture
+        // subject, whose verifier key the resolver knows, so it re-validates
+        // on the read path.
+        let (fx, cv) = make_challenge_verification(1500);
+        let alice = fx.subject.did.to_string();
         let mut resolver = TestResolver::new();
-        seed_challenge_verifier(&mut resolver);
+        seed_challenge_verifier(&mut resolver, &fx);
 
         // Seed the store with cached attestations.
-        let att = make_attestation("att-1", "did:key:alice", AttestationType::Endorsement);
+        let att = make_attestation("att-1", &alice, AttestationType::Endorsement);
         let entry = CachedAttestation {
             attestation: att,
             verified_at: 1900,
@@ -1613,19 +1568,17 @@ mod tests {
         };
         store.store_cached_attestation("ctx-1", entry).unwrap();
 
-        // Seed the store with a genuinely-signed, in-context challenge result.
-        let cv = make_challenge_verification(SCHEMA_URI, "did:key:alice", 1500, Some("ctx-1"));
         store.store_challenge_result("ctx-1", &cv).unwrap();
 
         let cache = AttestationCache::new(store);
 
         // Create events for participation record computation.
         let events = vec![
-            make_event(EventType::MessageSent, "did:key:alice", 1000, 0, vec![]),
-            make_event(EventType::MessageSent, "did:key:alice", 1500, 1, vec![]),
+            make_event(EventType::MessageSent, &alice, 1000, 0, vec![]),
+            make_event(EventType::MessageSent, &alice, 1500, 1, vec![]),
             make_event(
                 EventType::OutletInvoked,
-                "did:key:alice",
+                &alice,
                 1600,
                 2,
                 b"my-outlet".to_vec(),
@@ -1649,7 +1602,7 @@ mod tests {
 
         let ctx = AggregationContext {
             context_id: "ctx-1",
-            subject_did: "did:key:alice",
+            subject_did: &alice,
             events: &events,
             merkle_root: [0u8; 32],
             consequence_rules: &consequence_rules,
@@ -1657,13 +1610,14 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &clock,
         };
 
         let input = aggregate_trust_input(&ctx).unwrap();
 
         // Participation profile.
-        assert_eq!(input.participation_record.subject_did, "did:key:alice");
+        assert_eq!(input.participation_record.subject_did, alice);
         assert_eq!(input.participation_record.context_id, "ctx-1");
         assert_eq!(input.participation_record.participation_count, 3);
         assert_eq!(
@@ -1680,7 +1634,7 @@ mod tests {
 
         // Challenge results.
         assert_eq!(input.challenge_results.len(), 1);
-        assert_eq!(input.challenge_results[0].capability_uri, SCHEMA_URI);
+        assert_eq!(input.challenge_results[0].capability_uri, FIXTURE_URI);
 
         // Consequence structure.
         assert_eq!(input.consequence_structure.len(), 1);
@@ -1696,20 +1650,13 @@ mod tests {
         // `expires_at`, re-running aggregation must EXCLUDE it (the persistent
         // store would otherwise serve it as a current trust signal forever).
         let store = InMemoryTrustStore::new();
+        let (fx, cv) = make_challenge_verification(1500);
+        let alice = fx.subject.did.to_string();
         let mut resolver = TestResolver::new();
-        seed_challenge_verifier(&mut resolver);
-
-        // completed_at = 1500 → expires_at = 1500 + 86400 = 87_900.
-        let cv = make_challenge_verification(SCHEMA_URI, "did:key:alice", 1500, Some("ctx-1"));
+        seed_challenge_verifier(&mut resolver, &fx);
         store.store_challenge_result("ctx-1", &cv).unwrap();
 
-        let events = vec![make_event(
-            EventType::MessageSent,
-            "did:key:alice",
-            1000,
-            0,
-            vec![],
-        )];
+        let events = vec![make_event(EventType::MessageSent, &alice, 1000, 0, vec![])];
         let consequence_rules = vec![];
         let threshold_requirements = HashMap::new();
         let attestor_sets = HashMap::new();
@@ -1719,7 +1666,7 @@ mod tests {
         let before_clock = TestClock::new(2000);
         let ctx_before = AggregationContext {
             context_id: "ctx-1",
-            subject_did: "did:key:alice",
+            subject_did: &alice,
             events: &events,
             merkle_root: [0u8; 32],
             consequence_rules: &consequence_rules,
@@ -1727,6 +1674,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &before_clock,
         };
         let input_before = aggregate_trust_input(&ctx_before).unwrap();
@@ -1737,10 +1685,10 @@ mod tests {
         );
 
         // After expiry the result is EXCLUDED on read.
-        let after_clock = TestClock::new(90_000);
+        let after_clock = TestClock::new(cv.expires_at);
         let ctx_after = AggregationContext {
             context_id: "ctx-1",
-            subject_did: "did:key:alice",
+            subject_did: &alice,
             events: &events,
             merkle_root: [0u8; 32],
             consequence_rules: &consequence_rules,
@@ -1748,6 +1696,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &after_clock,
         };
         let input_after = aggregate_trust_input(&ctx_after).unwrap();
@@ -1759,24 +1708,22 @@ mod tests {
 
     /// Runs `aggregate_trust_input` over one stored, genuinely signed,
     /// in-context challenge result for `did:key:alice`.
-    fn aggregate_one_challenge(resolver: &dyn ActiveKeyResolver) -> Result<TrustInput, TrustError> {
+    fn aggregate_one_challenge(
+        fx: &Fixture,
+        cv: &ChallengeVerification,
+        resolver: &dyn ActiveKeyResolver,
+    ) -> Result<TrustInput, TrustError> {
+        let alice = fx.subject.did.to_string();
         let store = InMemoryTrustStore::new();
-        let cv = make_challenge_verification(SCHEMA_URI, "did:key:alice", 1500, Some("ctx-1"));
-        store.store_challenge_result("ctx-1", &cv).unwrap();
-        let events = vec![make_event(
-            EventType::MessageSent,
-            "did:key:alice",
-            1000,
-            0,
-            vec![],
-        )];
+        store.store_challenge_result("ctx-1", cv).unwrap();
+        let events = vec![make_event(EventType::MessageSent, &alice, 1000, 0, vec![])];
         let threshold_requirements = HashMap::new();
         let attestor_sets = HashMap::new();
         let cache = AttestationCache::new(store);
         let clock = TestClock::new(2000);
         let ctx = AggregationContext {
             context_id: "ctx-1",
-            subject_did: "did:key:alice",
+            subject_did: &alice,
             events: &events,
             merkle_root: [0u8; 32],
             consequence_rules: &[],
@@ -1784,6 +1731,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &clock,
         };
         aggregate_trust_input(&ctx)
@@ -1793,15 +1741,16 @@ mod tests {
     fn aggregate_reverifies_challenges_with_the_active_key_resolver() {
         // The resolver knows the verifier's `#active` key, so the stored
         // challenge result is re-verified and kept.
+        let (fx, cv) = make_challenge_verification(1500);
         let mut resolver = TestResolver::new();
-        seed_challenge_verifier(&mut resolver);
-        let input = aggregate_one_challenge(&resolver).unwrap();
+        seed_challenge_verifier(&mut resolver, &fx);
+        let input = aggregate_one_challenge(&fx, &cv, &resolver).unwrap();
         assert_eq!(input.challenge_results.len(), 1);
-        assert_eq!(input.challenge_results[0].capability_uri, SCHEMA_URI);
+        assert_eq!(input.challenge_results[0].capability_uri, FIXTURE_URI);
 
         // Control: a resolver that knows no key cannot authenticate the
         // record's signature, so the record is dropped.
-        let input = aggregate_one_challenge(&TestResolver::new()).unwrap();
+        let input = aggregate_one_challenge(&fx, &cv, &TestResolver::new()).unwrap();
         assert!(input.challenge_results.is_empty());
     }
 
@@ -1821,7 +1770,8 @@ mod tests {
     fn aggregate_propagates_key_resolution_outage_on_a_challenge() {
         // A resolver outage is not a judgment on the record: aggregation fails
         // instead of silently dropping a possibly valid challenge result.
-        let result = aggregate_one_challenge(&UnavailableResolver);
+        let (fx, cv) = make_challenge_verification(1500);
+        let result = aggregate_one_challenge(&fx, &cv, &UnavailableResolver);
         assert!(
             matches!(&result, Err(TrustError::KeyResolutionUnavailable { did, .. }) if did.starts_with("did:dht:")),
             "got {result:?}"
@@ -1932,6 +1882,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &clock,
         };
 
@@ -1973,6 +1924,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &clock,
         };
 
@@ -2033,6 +1985,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &clock,
         };
 

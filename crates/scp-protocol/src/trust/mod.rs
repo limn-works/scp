@@ -6,21 +6,27 @@
 pub mod admission;
 pub mod aggregate;
 pub mod attestation;
+pub mod capability_definition;
 pub mod capability_registry;
 pub mod capability_uri;
 pub mod caveats;
 pub mod challenge;
+#[cfg(test)]
+mod challenge_fixtures;
 pub mod consequence;
 pub mod custody_violation;
+pub mod identifier;
 mod language_tag;
 pub mod participation;
 pub mod renewal;
+pub mod schema_gate;
 pub mod sybil;
 pub mod ucan;
 
 // Re-exports for backward compatibility.
 pub use admission::{
-    AdmissionError, CapabilityRequirement, VerificationLevel, check_capability_requirements,
+    AdmissionCheck, AdmissionError, CapabilityRequirement, CapabilityRequirements,
+    RawCapabilityRequirement, RetryCap, VerificationLevel, check_capability_requirements,
 };
 pub use attestation::{
     ActiveKeyResolver, Attestation, AttestationEvidence, RevocationStatus,
@@ -30,6 +36,10 @@ pub use attestation::{
 // carries the same `testing` gate as its definition.
 #[cfg(any(test, feature = "testing"))]
 pub use attestation::IdentityDidPublicKeyResolver;
+pub use capability_definition::{
+    CapabilityDefinition, CapabilityDefinitionSource, DefinitionError, ProtocolOnlyDefinitions,
+    SignedCapabilityDefinition,
+};
 pub use capability_registry::{ChallengeStandard, MinCases};
 pub use capability_uri::{CapabilityUri, CapabilityUriError};
 pub use caveats::{
@@ -39,20 +49,32 @@ pub use caveats::{
     MAX_RATE_WINDOW_SECS, MaskWidthError, RateWindow, assert_mask_widths,
 };
 pub use challenge::{
-    ChallengeRequest, ChallengeResponse, ChallengeType, ChallengeVerification, ExpectedOutput,
-    TestCase, UnsignedChallengeRequest, UnsignedChallengeVerification,
+    AnswerKey, AttemptLedgerView, AuthenticatedResponse, CHALLENGE_CLOCK_SKEW_SECS,
+    CHALLENGE_GRADING_BUDGET_SECS, CHALLENGE_LEASE_MARGIN_SECS, CaseOpening, CaseResult,
+    ChallengeCase, ChallengeClosure, ChallengePolicy, ChallengeRequest, ChallengeResponse,
+    ChallengeType, ChallengeVerification, ExpectedOutput, GradeError, GradeOutcome,
+    MAX_CAPABILITY_DESCRIPTION_BYTES, MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT,
+    MAX_CHALLENGE_COOLDOWN_SECS, MAX_CHALLENGE_JSON_DEPTH, MAX_CHALLENGE_RESPONSE_BYTES,
+    MAX_CHALLENGE_RETRIES, MAX_CHALLENGE_SCHEMA_BYTES, MAX_CHALLENGE_WINDOW_SECS,
+    MAX_GRADING_FAULTS, MAX_TRUSTED_VERIFIERS_PER_REQUIREMENT, MAX_VERIFICATION_VALIDITY_SECS,
+    NewChallenge, OwnedAuthenticatedResponse, PolicyPick, TOTAL_WEIGHT_BPS, TestCase, TestOutput,
+    UnsignedChallengeRequest, UnsignedChallengeResponse, UnsignedChallengeVerification,
+    answer_commitment, authenticate_challenge_response, canonical_challenge_request_bytes,
     canonical_challenge_response_bytes, canonical_challenge_verification_bytes,
-    challenge_request_signing_digest, challenge_request_unsigned, challenge_suite_digest,
-    challenge_verification_id, challenge_verification_signing_digest, check_challenge_response,
-    verify_challenge_verification,
+    challenge_request_signing_digest, challenge_request_unsigned,
+    challenge_response_signing_digest, challenge_response_unsigned, challenge_suite_digest,
+    challenge_verification_id, challenge_verification_signing_digest,
+    challenge_verification_unsigned, check_attempt, check_response_bounds, grade,
+    min_category_cases, verify_challenge_verification,
 };
 #[cfg(any(test, feature = "testing"))]
-pub use challenge::{ChallengeSigner, issue_challenge, verify_challenge_response};
+pub use challenge::{ChallengeSigner, issue_challenge};
 pub use custody_violation::{
     ActionCategory, COUNTER_ATTESTATION_DOMAIN, CUSTODY_VIOLATION_DOMAIN, CounterAttestation,
     CustodyViolationError, CustodyViolationResult, CustodyViolationType,
     ScpCustodyViolationAttestation, classify_action, enforce_category_a,
 };
+pub use identifier::CanonicalIdentifier;
 #[cfg(any(test, feature = "testing"))]
 pub use participation::produce_participation_profile;
 pub use participation::{
@@ -60,6 +82,7 @@ pub use participation::{
     ParticipationRecord, ParticipationThreshold, RequireParticipation,
     UnsignedParticipationProfile, compute_participation_record, participation_profile_unsigned,
 };
+pub use schema_gate::{SchemaGate, SchemaVerdict};
 pub use sybil::{
     EarnedCapacityLevel, FreshnessWeight, IdentityDepthAssessment, TrustSignal,
     TrustSignalCategory, evaluate_earned_capacity,
@@ -209,15 +232,6 @@ pub enum TrustError {
         reason: String,
     },
 
-    /// The challenge response's ID does not match the challenge request.
-    #[error("challenge ID mismatch: expected {expected}, got {got}")]
-    ChallengeIdMismatch {
-        /// The expected challenge ID (from the request).
-        expected: String,
-        /// The actual challenge ID (from the response).
-        got: String,
-    },
-
     /// The challenge responder is not the challenged subject.
     #[error("challenge responder mismatch: expected {expected}, got {got}")]
     ChallengeResponderMismatch {
@@ -225,22 +239,6 @@ pub enum TrustError {
         expected: String,
         /// The actual responder DID (from the response).
         got: String,
-    },
-
-    /// The challenge response's `completed_at` falls outside the acceptable
-    /// freshness window: either older than the timeout, or implausibly far in
-    /// the future relative to the verifier's clock (clock-skew bound).
-    #[error(
-        "challenge {challenge_id}: outside freshness window (timeout {timeout_secs}s, completed at \
-         {completed_at})"
-    )]
-    ChallengeTimeout {
-        /// The challenge ID.
-        challenge_id: String,
-        /// The timeout in seconds.
-        timeout_secs: u64,
-        /// The timestamp when the response was completed.
-        completed_at: u64,
     },
 
     /// The challenge response's Ed25519 signature is invalid.
@@ -324,18 +322,9 @@ pub enum TrustError {
         got: String,
     },
 
-    /// The challenge response's self-reported counts or score are malformed or
-    /// out of range for its request.
-    #[error("challenge {challenge_id}: invalid response: {reason}")]
-    InvalidChallengeResponse {
-        /// The challenge ID (lowercase hex).
-        challenge_id: String,
-        /// Which field is malformed or out of range.
-        reason: String,
-    },
-
     /// The record's `verification_id` is not the spec 07 §7.3.4 derivation
-    /// from its signed `verifier`, `subject`, `capability_uri` and `timestamp`.
+    /// from its signed `verifier`, `subject`, `capability_uri`, `challenge_id`,
+    /// `attempt` and `timestamp`.
     #[error("challenge verification {verification_id}: not the derived id {expected}")]
     ChallengeVerificationIdMismatch {
         /// The record's `verification_id` (lowercase hex).
@@ -389,13 +378,13 @@ pub enum TrustError {
         reason: String,
     },
 
-    /// The capability URI refers to a system capability (`scp:system:*`),
-    /// which is a protocol feature flag and not challenge-testable.
-    #[error(
-        "system capability '{uri}' is not challengeable — system capabilities are feature flags, not testable capabilities"
-    )]
-    NotChallengeable {
-        /// The system capability URI that was rejected.
+    /// The capability URI names a standard whose pass condition cannot be
+    /// computed from the subject's outputs (spec 07 §7.3.4.7), or a system
+    /// capability (`scp:system:*`), which is a feature flag and not a tested
+    /// capability (ADR-041). Refused at creation and at consumption.
+    #[error("capability '{uri}' is not gradable from outputs")]
+    StandardNotGradable {
+        /// The refused capability URI.
         uri: String,
     },
 
@@ -435,18 +424,17 @@ pub enum TrustError {
     },
 
     /// The challenge verification record is not bound to the context it is being
-    /// ingested/consumed under. A verifier-signed result for context A (or a
-    /// context-agnostic `None` result) MUST NOT be replayed into context B's
+    /// ingested/consumed under. A verifier-signed result for context A MUST NOT be replayed into context B's
     /// aggregation — `context_id` is a signed field, so the binding is
     /// cryptographically authentic but must still match the target context.
     #[error(
-        "challenge verification {verification_id}: context mismatch (record {record_context:?}, expected {expected_context})"
+        "challenge verification {verification_id}: context mismatch (record {record_context}, expected {expected_context})"
     )]
     ChallengeContextMismatch {
         /// The verification record ID.
         verification_id: String,
-        /// The `context_id` carried by the record (`None` if context-agnostic).
-        record_context: Option<String>,
+        /// The `context_id` the record signs.
+        record_context: String,
         /// The target context the record is being consumed under.
         expected_context: String,
     },
@@ -468,6 +456,242 @@ pub enum TrustError {
         record_subject: String,
         /// The subject the record is being consumed for.
         expected_subject: String,
+    },
+
+    /// An identifier is not the canonical encoding of its key (spec 07
+    /// §7.3.4 "Identifiers"): a padding alias of a did:dht key, or a form the
+    /// protocol does not accept.
+    #[error("non-canonical identifier {identifier:?}: {reason}")]
+    NonCanonicalIdentifier {
+        /// The identifier as received.
+        identifier: String,
+        /// Why it is not canonical.
+        reason: String,
+    },
+
+    /// The verifier and the subject decode to the same key (spec 07 §7.3.4
+    /// steps 1 and 5(i)).
+    #[error("challenge verifier and subject are the same identity: {identifier}")]
+    SelfChallenge {
+        /// The identifier both fields name.
+        identifier: String,
+    },
+
+    /// No capability definition can be obtained for the URI (spec 07
+    /// §7.3.4.6). This reports an outage, not a judgment on the subject.
+    #[error("capability definition unavailable for {uri}")]
+    CapabilityDefinitionUnavailable {
+        /// The capability URI.
+        uri: String,
+    },
+
+    /// Two validly signed definitions for one URI differ (spec 07 §7.3.4.6).
+    #[error("capability definition equivocation for {uri}")]
+    DefinitionEquivocation {
+        /// The capability URI.
+        uri: String,
+    },
+
+    /// A signed policy value lies outside the capability definition's limits
+    /// or the protocol bounds (spec 07 §7.3.4 steps 1, 5(f) and 5(g)).
+    #[error("challenge policy outside the definition of {uri}: {reason}")]
+    PolicyOutsideDefinition {
+        /// The capability URI.
+        uri: String,
+        /// Which limit the value breaks.
+        reason: String,
+    },
+
+    /// A `SchemaMatch` schema is not admissible (spec 07 §7.3.4 step 1).
+    #[error("test case {test_id:?}: schema rejected: {reason}")]
+    SchemaRejected {
+        /// The test case carrying the schema.
+        test_id: String,
+        /// Which admission rule the schema breaks.
+        reason: String,
+    },
+
+    /// The challenge window `expires_at - created_at` is zero, above
+    /// `MAX_CHALLENGE_WINDOW_SECS`, or overflows (spec 07 §7.3.4 step 1).
+    #[error("challenge window of {window_secs}s is outside 1..={max_secs}s")]
+    ChallengeWindowInvalid {
+        /// The requested window, in seconds.
+        window_secs: u64,
+        /// `MAX_CHALLENGE_WINDOW_SECS`.
+        max_secs: u64,
+    },
+
+    /// The time is outside the challenge window (spec 07 §7.3.4 steps 2 and
+    /// 3).
+    #[error(
+        "challenge {challenge_id}: now {now} is outside the window {created_at}..={expires_at}"
+    )]
+    ChallengeExpired {
+        /// The challenge id (lowercase hex).
+        challenge_id: String,
+        /// The clock reading, in Unix seconds.
+        now: u64,
+        /// The request's `created_at`.
+        created_at: u64,
+        /// The request's `expires_at`.
+        expires_at: u64,
+    },
+
+    /// The challenge is closed after a pass or its last allowed attempt.
+    #[error("challenge {challenge_id}: closed")]
+    ChallengeClosed {
+        /// The challenge id (lowercase hex).
+        challenge_id: String,
+    },
+
+    /// The attempt is not the last graded attempt plus one.
+    #[error("challenge {challenge_id}: attempt {attempt} is out of order (expected {expected})")]
+    AttemptOutOfOrder {
+        /// The challenge id (lowercase hex).
+        challenge_id: String,
+        /// The attempt submitted.
+        attempt: u32,
+        /// The only attempt the challenger accepts next.
+        expected: u32,
+    },
+
+    /// The attempt exceeds `1 + max_retries`.
+    #[error("challenge {challenge_id}: attempt {attempt} exceeds {allowed} allowed attempts")]
+    RetriesExhausted {
+        /// The challenge id (lowercase hex).
+        challenge_id: String,
+        /// The attempt submitted.
+        attempt: u32,
+        /// `1 + max_retries`.
+        allowed: u64,
+    },
+
+    /// The cooldown since the last graded attempt has not passed.
+    #[error("challenge {challenge_id}: cooldown active, retry at {retry_after}")]
+    CooldownActive {
+        /// The challenge id (lowercase hex).
+        challenge_id: String,
+        /// The first Unix second at which the next attempt is accepted.
+        retry_after: u64,
+    },
+
+    /// The challenge recorded `MAX_GRADING_FAULTS` faults and closed.
+    #[error("challenge {challenge_id}: closed after {faults} grading faults")]
+    ChallengeFaulted {
+        /// The challenge id (lowercase hex).
+        challenge_id: String,
+        /// The fault count.
+        faults: u32,
+    },
+
+    /// The response does not answer the request: another `challenge_id` or
+    /// `request_digest`, or outputs that do not match the cases one for one
+    /// and in order (spec 07 §7.3.4 step 3).
+    #[error("challenge {challenge_id}: response does not match the request: {reason}")]
+    OutputsMismatch {
+        /// The request's challenge id (lowercase hex).
+        challenge_id: String,
+        /// What does not match.
+        reason: String,
+    },
+
+    /// A response exceeds `MAX_CHALLENGE_RESPONSE_BYTES` or
+    /// `MAX_CHALLENGE_JSON_DEPTH` (spec 07 §7.3.4 steps 2 and 3).
+    #[error("challenge response too large: {reason}")]
+    ResponseTooLarge {
+        /// Which bound the response breaks.
+        reason: String,
+    },
+
+    /// The challenger refused to open a challenge: its ledger already holds
+    /// `MAX_OPEN_CHALLENGES_PER_CHALLENGER` open challenges (spec 09
+    /// §9.18.C).
+    #[error("challenger {challenger} cannot open a challenge: {open} challenges are open")]
+    ChallengeNotOpen {
+        /// The challenger.
+        challenger: String,
+        /// How many challenges its ledger holds open.
+        open: usize,
+    },
+
+    /// The challenger's ledger holds no live challenge with this id, request
+    /// digest and subject (spec 07 §7.3.4 step 3).
+    #[error("challenge {challenge_id}: unknown to this challenger")]
+    UnknownChallenge {
+        /// The challenge id (lowercase hex).
+        challenge_id: String,
+    },
+
+    /// Another grading of this challenge holds a live lease (spec 07 §7.3.4
+    /// step 3).
+    #[error("challenge {challenge_id}: another grading is in progress")]
+    GradingInProgress {
+        /// The challenge id (lowercase hex).
+        challenge_id: String,
+    },
+
+    /// The grading lease this commit or fault names was replaced or released
+    /// (spec 07 §7.3.4 step 4); nothing was written.
+    #[error("challenge {challenge_id}: the grading lease was lost")]
+    GradingLeaseLost {
+        /// The challenge id (lowercase hex).
+        challenge_id: String,
+    },
+
+    /// Every one of the challenger's `MAX_CONCURRENT_GRADINGS_PER_CHALLENGER`
+    /// grading permits is held (spec 09 §9.18.C).
+    #[error("challenger {challenger}: every grading permit is in use")]
+    GradingCapacityExhausted {
+        /// The challenger.
+        challenger: String,
+    },
+
+    /// A `CustomEval` evaluator cannot run: its outlet is unregistered, it
+    /// has no handler, or the challenger may not call it (spec 07 §7.3.4
+    /// steps 1 and 3). A challenger fault, never an attempt.
+    #[error("evaluator outlet {outlet_id} in context {context_id} is unavailable: {reason}")]
+    EvaluatorUnavailable {
+        /// The evaluator context.
+        context_id: String,
+        /// The evaluator outlet.
+        outlet_id: String,
+        /// Why it cannot run.
+        reason: String,
+    },
+
+    /// A case's opening does not match its answer commitment: a challenger
+    /// fault, never an attempt (spec 07 §7.3.4 step 3).
+    #[error("answer key does not open the commitment of test case {test_id:?}")]
+    AnswerKeyMismatch {
+        /// The test case whose opening fails.
+        test_id: String,
+    },
+
+    /// The record's `timestamp` lies outside its signed challenge window
+    /// (spec 07 §7.3.4 step 5(c)).
+    #[error(
+        "challenge verification {verification_id}: timestamp {timestamp} outside the challenge window {created_at}..={expires_at}"
+    )]
+    ChallengeVerificationOutsideWindow {
+        /// The record's `verification_id` (lowercase hex).
+        verification_id: String,
+        /// The record's `timestamp`.
+        timestamp: u64,
+        /// The record's `challenge_created_at`.
+        created_at: u64,
+        /// The record's `challenge_expires_at`.
+        expires_at: u64,
+    },
+
+    /// The record's result fields contradict each other (spec 07 §7.3.4
+    /// step 5(h)): `passed` is not `score >= pass_threshold_bps`, `score`
+    /// exceeds 10000, or `pass_count` exceeds `test_count`.
+    #[error("challenge verification {verification_id}: inconsistent result: {reason}")]
+    ChallengeVerificationInconsistent {
+        /// The record's `verification_id` (lowercase hex).
+        verification_id: String,
+        /// Which relation fails.
+        reason: String,
     },
 
     /// The requested DID is not a member of the context.
@@ -523,6 +747,16 @@ impl TrustError {
             | Self::ChallengeVerificationIdMismatch { .. }
             | Self::ChallengeVerificationValidityTooLong { .. }
             | Self::ChallengeVerificationFromFuture { .. }
+            | Self::ChallengeVerificationOutsideWindow { .. }
+            | Self::ChallengeVerificationInconsistent { .. }
+            | Self::NonCanonicalIdentifier { .. }
+            | Self::SelfChallenge { .. }
+            // A record naming a URI no standard or identifier defines is
+            // itself invalid; an unreachable definition is not (below).
+            | Self::UnknownChallengeCapability { .. }
+            | Self::StandardNotGradable { .. }
+            | Self::PolicyOutsideDefinition { .. }
+            | Self::DefinitionEquivocation { .. }
             | Self::CanonicalizationFailed { .. } => true,
             // `InvalidEventData` and `ChallengeSigningFailed` are excluded on
             // purpose: no record-verification path raises them, so treating
@@ -530,18 +764,33 @@ impl TrustError {
             Self::NoEventsForSubject { .. }
             | Self::EmptyEventLog
             | Self::InvalidEventData { .. }
-            | Self::ChallengeIdMismatch { .. }
             | Self::ChallengeResponderMismatch { .. }
-            | Self::ChallengeTimeout { .. }
             | Self::ChallengeSignatureInvalid { .. }
             | Self::ChallengeSigningFailed { .. }
-            | Self::UnknownChallengeCapability { .. }
             | Self::InvalidChallengeSuite { .. }
             | Self::ChallengeSuiteBelowMinimum { .. }
-            | Self::NotChallengeable { .. }
             | Self::ChallengeRequestSignatureInvalid { .. }
             | Self::ChallengeVerifierMismatch { .. }
-            | Self::InvalidChallengeResponse { .. }
+            // An unobtainable definition is an outage, not a judgment on the
+            // record (spec 07 §7.3.4.6), so the loop propagates it.
+            | Self::CapabilityDefinitionUnavailable { .. }
+            | Self::SchemaRejected { .. }
+            | Self::ChallengeWindowInvalid { .. }
+            | Self::ChallengeExpired { .. }
+            | Self::ChallengeClosed { .. }
+            | Self::AttemptOutOfOrder { .. }
+            | Self::RetriesExhausted { .. }
+            | Self::CooldownActive { .. }
+            | Self::ChallengeFaulted { .. }
+            | Self::OutputsMismatch { .. }
+            | Self::ResponseTooLarge { .. }
+            | Self::AnswerKeyMismatch { .. }
+            | Self::ChallengeNotOpen { .. }
+            | Self::UnknownChallenge { .. }
+            | Self::GradingInProgress { .. }
+            | Self::GradingLeaseLost { .. }
+            | Self::GradingCapacityExhausted { .. }
+            | Self::EvaluatorUnavailable { .. }
             | Self::KeyResolutionUnavailable { .. }
             | Self::NotAMember { .. }
             | Self::NotOptedIn { .. }

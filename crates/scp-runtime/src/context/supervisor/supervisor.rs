@@ -1843,6 +1843,12 @@ pub struct Supervisor {
     pub(in crate::context::supervisor) saga_journal: Arc<dyn SagaJournal>,
     /// Per-identity `KeyPackageStoreActor` handles.
     pub(in crate::context::supervisor) key_package_stores: DashMap<DID, KeyPackageStoreHandle>,
+    /// Per-challenger `ChallengerLedgerActor` handles, keyed by the
+    /// challenger's canonical identifier (spec 07 §7.3.4).
+    pub(in crate::context::supervisor) challenger_ledgers: DashMap<
+        String,
+        crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerHandle,
+    >,
     /// The one task tracker every supervisor-held task spawns through
     /// (ADR-049 Decision 16, supervisor task drain); Decision 16 item 1 states
     /// which tasks are members. Spawn only through [`Self::spawn_permit`],
@@ -2364,6 +2370,7 @@ impl Supervisor {
             pending_discards: dashmap::DashSet::new(),
             saga_journal,
             key_package_stores: DashMap::new(),
+            challenger_ledgers: DashMap::new(),
             task_tracker: tokio_util::task::TaskTracker::new(),
             spawn_gate: std::sync::RwLock::new(false),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
@@ -2854,6 +2861,21 @@ impl Supervisor {
     #[must_use]
     pub(crate) fn clock_ref(&self) -> Option<&Arc<dyn Clock>> {
         self.clock.get()
+    }
+
+    /// The supervisor clock's current Unix seconds: the time a challenger
+    /// signs as `created_at`, from the same clock its ledger checks windows
+    /// against.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::NotInitialized`] when the supervisor has no clock
+    /// ([`Self::with_providers_and_journal`] was not used).
+    pub fn now_secs(&self) -> Result<u64, ContextError> {
+        use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
+        self.clock_ref()
+            .map(scp_clock::Clock::now_secs)
+            .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))
     }
 
     /// Cheap reference to the supervisor's
@@ -4812,7 +4834,8 @@ impl Supervisor {
             // through `lookup_miss_error` so a poisoned / silently-dead
             // context surfaces the dedicated poison error (ADR-049 §10).
             QueriesCommand::LocalPseudonym { ref context_id, .. }
-            | QueriesCommand::GetBroadcastKeyForLocalAuthor { ref context_id, .. } => {
+            | QueriesCommand::GetBroadcastKeyForLocalAuthor { ref context_id, .. }
+            | QueriesCommand::GetCapabilityRequirements { ref context_id, .. } => {
                 let err = self
                     .lookup_miss_error(context_id, format!("context not registered: {context_id}"));
                 reply_with_error(cmd, err);
@@ -11466,6 +11489,36 @@ impl Supervisor {
         self.shutdown_token.cancel();
     }
 
+    /// Stops every challenger-ledger actor and clears `challenger_ledgers`
+    /// (ADR-049 Decision 16, step 3), as [`Self::stop_key_package_actors`]
+    /// does for the key-package actors. The ledger is durable, so a stopped
+    /// actor loses only its in-memory grading leases.
+    pub(in crate::context) async fn stop_challenger_ledger_actors(&self) {
+        let handles: Vec<(
+            String,
+            crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerHandle,
+        )> = {
+            let _guard = self.write_lock.lock().await;
+            let drained = self
+                .challenger_ledgers
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().clone()))
+                .collect();
+            self.challenger_ledgers.clear();
+            drained
+        };
+        for (identity, handle) in handles {
+            if let Err(e) = handle.send_shutdown().await {
+                tracing::warn!(
+                    identity = %identity,
+                    error = %e,
+                    "shutdown: challenger-ledger actor did not accept Shutdown; its inbox \
+                     closes when the last handle drops"
+                );
+            }
+        }
+    }
+
     /// Stops every key-package actor and clears `key_package_stores`
     /// (ADR-049 Decision 16, step 3). The map is drained under the write lock
     /// so no resolver observes a half-cleared map; the shutdown commands are
@@ -12601,6 +12654,285 @@ impl Supervisor {
             Err(reply_error) => Err(ContextError::ActorBusy(format!(
                 "context '{context_id}' has a live actor that did not answer a role-state \
                  read: {reply_error:?}"
+            ))),
+        }
+    }
+
+    /// Get-or-spawn the attempt-ledger actor of `challenger` (spec 07
+    /// §7.3.4), keyed by its canonical identifier so two spellings of one key
+    /// can never hold two ledgers. A handle whose actor stopped is replaced;
+    /// the replacement keeps the old grading semaphore, so permits held by
+    /// unfinished gradings still count.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError::NonCanonicalIdentifier`](scp_protocol::trust::TrustError::NonCanonicalIdentifier)
+    /// for a non-canonical `challenger`; [`ContextError::NotInitialized`]
+    /// without storage or a clock; the spawn gate's error during shutdown.
+    async fn challenger_ledger_for(
+        &self,
+        challenger: &str,
+    ) -> Result<
+        crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerHandle,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        use crate::context::supervisor::challenger_ledger_actor::{
+            ChallengerLedgerActor, MAX_CONCURRENT_GRADINGS_PER_CHALLENGER,
+        };
+        let identity = scp_protocol::trust::CanonicalIdentifier::parse(challenger)?;
+        let key = identity.as_str().to_owned();
+        if let Some(handle) = self.challenger_ledgers.get(&key)
+            && !handle.is_closed()
+        {
+            return Ok(handle.value().clone());
+        }
+        let _guard = self.write_lock.lock().await;
+        let semaphore = match self.challenger_ledgers.get(&key) {
+            Some(handle) if !handle.is_closed() => return Ok(handle.value().clone()),
+            Some(handle) => handle.grading_semaphore(),
+            None => Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_GRADINGS_PER_CHALLENGER,
+            )),
+        };
+        let deps = self.build_challenger_ledger_deps()?;
+        let permit = self.spawn_permit("spawn challenger-ledger actor")?;
+        let (handle, _join) =
+            ChallengerLedgerActor::spawn_through(&permit, identity, deps, semaphore);
+        self.challenger_ledgers.insert(key, handle.clone());
+        drop(permit);
+        Ok(handle)
+    }
+
+    /// Assembles the ledger actor's collaborators from the supervisor's
+    /// provider slots.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::NotInitialized`] if storage or the clock is not wired.
+    fn build_challenger_ledger_deps(
+        &self,
+    ) -> Result<
+        crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerDeps,
+        ContextError,
+    > {
+        use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
+        let not_init = || ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned());
+        Ok(
+            crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerDeps {
+                mls_storage: Arc::clone(self.mls_storage_ref().ok_or_else(not_init)?),
+                clock: Arc::clone(self.clock_ref().ok_or_else(not_init)?),
+            },
+        )
+    }
+
+    /// Takes one of `challenger`'s `MAX_CONCURRENT_GRADINGS_PER_CHALLENGER`
+    /// grading permits without waiting (spec 09 §9.18.C). The grading holds
+    /// it until its future and every blocking closure it started finish.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError::GradingCapacityExhausted`](scp_protocol::trust::TrustError::GradingCapacityExhausted)
+    /// when every permit is held; the errors of the ledger lookup.
+    pub async fn challenge_grading_permit(
+        &self,
+        challenger: &str,
+    ) -> Result<
+        tokio::sync::OwnedSemaphorePermit,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle.grading_semaphore().try_acquire_owned().map_err(|_| {
+            scp_protocol::trust::TrustError::GradingCapacityExhausted {
+                challenger: challenger.to_owned(),
+            }
+            .into()
+        })
+    }
+
+    /// Persists a new challenge in `challenger`'s ledger and signs its
+    /// request in the same ledger turn (spec 07 §7.3.4 step 1).
+    ///
+    /// # Errors
+    ///
+    /// The ledger's refusal ([`TrustError::ChallengeNotOpen`](scp_protocol::trust::TrustError::ChallengeNotOpen),
+    /// a verifier mismatch), a persistence or custody failure, or
+    /// [`ContextError::ActorBusy`].
+    pub async fn dispatch_challenge_create(
+        &self,
+        challenger: &str,
+        unsigned: scp_protocol::trust::UnsignedChallengeRequest,
+        answer_key: scp_protocol::trust::AnswerKey,
+        definition: scp_protocol::trust::capability_definition::CapabilityDefinition,
+        evaluator_context_id: Option<String>,
+        signer: crate::context::actor::signer::CommandSigner,
+    ) -> Result<
+        scp_protocol::trust::ChallengeRequest,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::Create {
+                unsigned: Box::new(unsigned),
+                answer_key,
+                definition: Box::new(definition),
+                evaluator_context_id,
+                signer,
+                reply,
+            })
+            .await
+    }
+
+    /// Read-only: whether `challenger`'s ledger holds a live challenge with
+    /// this id, request digest and subject (spec 07 §7.3.4 step 3, before
+    /// any resolution). Takes no lease and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError::UnknownChallenge`](scp_protocol::trust::TrustError::UnknownChallenge)
+    /// when it does not; a non-canonical subject; a load failure or
+    /// [`ContextError::ActorBusy`].
+    pub async fn dispatch_challenge_lookup(
+        &self,
+        challenger: &str,
+        request: &scp_protocol::trust::ChallengeRequest,
+    ) -> Result<(), crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError> {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let request_digest = scp_protocol::trust::challenge_request_signing_digest(request)?;
+        let subject = scp_protocol::trust::CanonicalIdentifier::parse(&request.subject)?;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::Lookup {
+                challenge_id: request.challenge_id,
+                request_digest,
+                subject,
+                reply,
+            })
+            .await
+    }
+
+    /// Begins grading an authenticated response (spec 07 §7.3.4 step 3
+    /// Begin): a stored record for a resubmit, else the grading lease.
+    ///
+    /// # Errors
+    ///
+    /// The ledger's refusal (`UnknownChallenge`, the `check_attempt` errors,
+    /// `GradingInProgress`), a persistence or custody failure, or
+    /// [`ContextError::ActorBusy`].
+    pub async fn dispatch_challenge_begin_grade(
+        &self,
+        challenger: &str,
+        auth: Arc<scp_protocol::trust::OwnedAuthenticatedResponse>,
+        signer: crate::context::actor::signer::CommandSigner,
+    ) -> Result<
+        crate::context::supervisor::challenger_ledger_actor::BeginOutcome,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::BeginGrade {
+                auth,
+                signer,
+                reply,
+            })
+            .await
+    }
+
+    /// Records a graded attempt and signs its record (spec 07 §7.3.4 step 4).
+    ///
+    /// # Errors
+    ///
+    /// `GradingLeaseLost` with nothing written, the `check_attempt` errors at
+    /// the commit time, a persistence or custody failure, or
+    /// [`ContextError::ActorBusy`].
+    pub async fn dispatch_challenge_commit(
+        &self,
+        challenger: &str,
+        auth: Arc<scp_protocol::trust::OwnedAuthenticatedResponse>,
+        lease_id: u64,
+        outcome: scp_protocol::trust::GradeOutcome,
+        signer: crate::context::actor::signer::CommandSigner,
+    ) -> Result<
+        crate::context::supervisor::challenger_ledger_actor::GradedAttempt,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::Commit {
+                auth,
+                lease_id,
+                outcome,
+                signer,
+                reply,
+            })
+            .await
+    }
+
+    /// Records a challenger fault, which uses no attempt (spec 07 §7.3.4
+    /// step 3).
+    ///
+    /// # Errors
+    ///
+    /// `GradingLeaseLost` with nothing written, a persistence failure, or
+    /// [`ContextError::ActorBusy`].
+    pub async fn dispatch_challenge_fault(
+        &self,
+        challenger: &str,
+        challenge_id: [u8; 32],
+        lease_id: u64,
+        fault: crate::context::supervisor::challenger_ledger_actor::GradingFault,
+    ) -> Result<
+        crate::context::supervisor::challenger_ledger_actor::FaultRecorded,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::RecordFault {
+                challenge_id,
+                lease_id,
+                fault,
+                reply,
+            })
+            .await
+    }
+
+    /// Reads the context's live capability requirements (spec §8.10), the
+    /// list a member must satisfy, as set by `ModifyCapabilityRequirements`.
+    ///
+    /// Fails closed: an unknown, crashed, poisoned or busy context is an
+    /// error, never an empty list, because an empty list admits everyone.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] when the supervisor serves no
+    ///   context for `context_id`.
+    /// - [`ContextError::ContextPoisoned`] / [`ContextError::ActorCrashed`]
+    ///   for a poisoned or respawning context (ADR-049 §10).
+    /// - [`ContextError::ActorBusy`] when the actor's mailbox send or reply
+    ///   timed out.
+    pub async fn capability_requirements_checked(
+        &self,
+        context_id: &str,
+    ) -> Result<scp_protocol::trust::CapabilityRequirements, ContextError> {
+        let Some(actor) = self.lookup(context_id) else {
+            return Err(
+                self.lookup_miss_error(context_id, format!("context not registered: {context_id}"))
+            );
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = ContextCommand::Queries(QueriesCommand::GetCapabilityRequirements {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        });
+        Self::dispatch_via_mailbox(&actor, cmd).await?;
+        match bounded_reply_await(rx).await {
+            Ok(answer) => answer,
+            Err(reply_error) => Err(ContextError::ActorBusy(format!(
+                "context '{context_id}' has a live actor that did not answer a \
+                 capability-requirements read: {reply_error:?}"
             ))),
         }
     }
@@ -16856,6 +17188,7 @@ impl Supervisor {
         match cmd {
             QueriesCommand::ReadContextState { context_id, .. }
             | QueriesCommand::LocalPseudonym { context_id, .. }
+            | QueriesCommand::GetCapabilityRequirements { context_id, .. }
             | QueriesCommand::GetBroadcastKeyForLocalAuthor { context_id, .. }
             | QueriesCommand::MemberCount { context_id, .. }
             | QueriesCommand::IsMember { context_id, .. }
@@ -17219,6 +17552,14 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
         | QueriesCommand::GetBroadcastKeyForLocalAuthor { .. } => {
             debug_assert!(false, "hard-error variant routed through soft-default path");
         }
+        // No soft default exists: an empty requirements list would admit
+        // every member, so a misrouted read fails closed.
+        QueriesCommand::GetCapabilityRequirements { reply, context_id } => {
+            debug_assert!(false, "hard-error variant routed through soft-default path");
+            let _ = reply.send(Err(ContextError::ContextNotRegistered(format!(
+                "context not registered: {context_id}"
+            ))));
+        }
         // Legacy `member_count` returns `None` on unknown context.
         QueriesCommand::MemberCount { reply, .. } => {
             let _ = reply.send(Ok(None));
@@ -17310,6 +17651,9 @@ fn reply_with_error(cmd: QueriesCommand, err: ContextError) {
             let _ = reply.send(Err(err));
         }
         QueriesCommand::GetBroadcastKeyForLocalAuthor { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
+        QueriesCommand::GetCapabilityRequirements { reply, .. } => {
             let _ = reply.send(Err(err));
         }
         #[cfg(feature = "testing")]
@@ -21393,6 +21737,7 @@ mod tests {
             outlet_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
+            capability_requirements: scp_protocol::trust::CapabilityRequirements::default(),
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,

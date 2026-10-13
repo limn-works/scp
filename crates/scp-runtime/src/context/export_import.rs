@@ -740,6 +740,9 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         outlet_interfaces: Vec::new(),
         threshold_signers: Vec::new(),
         threshold_value: 0,
+        // Admission requirements are public context parameters (legibility
+        // before opt-in), so the public scope carries the live list.
+        capability_requirements: snapshot.capability_requirements.clone(),
         pruning_policy: None,
         governance_model_config: None,
         economic_policy: snapshot.economic_policy.clone(),
@@ -1085,6 +1088,7 @@ mod tests {
             outlet_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
+            capability_requirements: scp_protocol::trust::CapabilityRequirements::default(),
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,

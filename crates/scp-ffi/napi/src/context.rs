@@ -681,6 +681,20 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
         })?),
     };
 
+    // The admission capability requirements (spec §7.3.5): a JSON array, or
+    // a JSON-encoded string, normalized to a JSON string for the common
+    // builder, which parses it through the validating type.
+    let capability_requirements_json: Option<String> = match &params["capabilityRequirements"] {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        other => Some(serde_json::to_string(other).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid capabilityRequirements: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })?),
+    };
+
     // Parse minProtocolVersion: [major, minor] array or null (spec §13.4).
     let min_protocol_version = params["minProtocolVersion"].as_array().and_then(|arr| {
         let major = u8::try_from(arr.first()?.as_u64()?).ok()?;
@@ -719,9 +733,17 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
         max_nesting_depth,
         session_cap,
         economic_policy_json: economic_policy.clone(),
+        capability_requirements_json,
         consequence_rules_json,
         consequence_config_json,
-        ..Default::default()
+        // Named so a new common field does not compile until this bridge
+        // reads it.
+        governance_threshold: None,
+        governance_signers: None,
+        governance_voters: None,
+        roles: Vec::new(),
+        outlets: Vec::new(),
+        template_id: None,
     };
 
     let core = scp_ffi_common::context_params::build_context_params(&common).map_err(|e| {

@@ -744,6 +744,32 @@
       ]
     },
     {
+      "canonical": "trust_respond_to_challenge",
+      "category": "trust",
+      "pyo3": [
+        "trust_respond_to_challenge"
+      ],
+      "uniffi": [
+        "trust_respond_to_challenge"
+      ],
+      "napi": [
+        "trust_respond_to_challenge"
+      ]
+    },
+    {
+      "canonical": "trust_grade_response",
+      "category": "trust",
+      "pyo3": [
+        "trust_grade_response"
+      ],
+      "uniffi": [
+        "trust_grade_response"
+      ],
+      "napi": [
+        "trust_grade_response"
+      ]
+    },
+    {
       "canonical": "verify_participation_requirements",
       "category": "trust",
       "pyo3": [

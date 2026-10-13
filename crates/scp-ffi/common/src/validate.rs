@@ -774,6 +774,9 @@ pub fn validate_governance_action_strings(
         | GovernanceAction::ReconfigureGovernance { .. }
         | GovernanceAction::LockEconomicPolicy
         | GovernanceAction::ModifyHardRateLimit { .. }
+        // Every requirement's identifiers were validated when the list
+        // deserialized (`CapabilityRequirement::try_from`).
+        | GovernanceAction::ModifyCapabilityRequirements { .. }
         | GovernanceAction::CancelContextMigration => {}
     }
     Ok(())

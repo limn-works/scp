@@ -38,10 +38,14 @@ use scp_protocol::envelope::inner::compute_canonical_hash;
 use scp_protocol::envelope::padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
 use scp_protocol::envelope::{InnerEnvelopeParams, MessageType};
 use scp_protocol::identity::attestation::IdentityLinkAttestation;
+use scp_protocol::trust::capability_definition::CapabilityDefinition;
+use scp_protocol::trust::capability_registry::MinCases;
 use scp_protocol::trust::challenge::{
-    ChallengeRequest, ChallengeType, ChallengeVerification, ExpectedOutput, TestCase,
-    VerificationMethod, canonical_challenge_verification_bytes, challenge_request_signing_digest,
-    challenge_suite_digest, challenge_verification_id, challenge_verification_signing_digest,
+    ChallengeCase, ChallengeRequest, ChallengeResponse, ChallengeVerification, ExpectedOutput,
+    TestOutput, answer_commitment, canonical_challenge_request_bytes,
+    canonical_challenge_response_bytes, canonical_challenge_verification_bytes,
+    challenge_request_signing_digest, challenge_response_signing_digest, challenge_suite_digest,
+    challenge_verification_id, challenge_verification_signing_digest,
 };
 use scp_runtime::sync::weeks_offline::{ResetReason, ResetRequest};
 
@@ -965,305 +969,295 @@ fn vector37_keypackage_attestation() {
 }
 
 // ---------------------------------------------------------------------------
-// §25.30 Trust challenge request and verification record (§7.3.4)
+// §25.30 Trust challenge vectors (§7.3.4, §7.3.4.6)
 // ---------------------------------------------------------------------------
 
 /// An identifier-scoped URI: `ID_DEFINER` followed by
 /// `:capability:schema-validation/v1`.
 const CHALLENGE_CAPABILITY_URI: &str =
     "scp:tfgiiao36zlseo2tzfoi32knfx6topped3qloxcsube5gdvfrqgq:capability:schema-validation/v1";
-/// §7.3.4 `suite_digest`: SHA-256 of Vector 59's `test_cases` field, no prefix.
+/// Vector 63 `definition_digest`.
+const CHALLENGE_DEFINITION_DIGEST_HEX: &str =
+    "1947de3173cb08e14fa71bd41bb256274ba2b62e0d0d9e73b83af1a971ee8f67";
+/// Vector 59 `suite_digest`: SHA-256 of `T`, no prefix.
 const CHALLENGE_SUITE_DIGEST_HEX: &str =
-    "728fca93ec869b96f4f784cb46ad1b2aa68a4a39d7c4b60b66707586914fdcfc";
+    "5b7643e58ef89237bb133984f100bc4d7228e51de8adf358c550a4db1813bf21";
+/// Vector 59 `D`.
+const CHALLENGE_REQUEST_DIGEST_HEX: &str =
+    "dc18665f0a48315ffdaeaa7cb55525240f7bbb289e29c3172ebf45d29fe9ba28";
+/// Vector 63 `Def`.
+const VDEF_HEX: &str = "5343502d4341504142494c4954592d444546494e4954494f4e2d56313a000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f7631000000000100001f400000000200000e100000002d4669787475726520646566696e6974696f6e20666f72207370656320323520766563746f72732035392d36322e";
+/// Vector 59 `T`.
+const VT_HEX: &str = "0000000100000015736368656d612d76616c69646174696f6e2d3030310000001b7b22636f756e74223a332c226e616d65223a22776964676574227d00000006736368656d6100002710b73317ea1cf075724a76d4454a3c777e10b4cf31a853d650f667398c6e52a2d8";
+/// Vector 59 `R`.
+const VR_HEX: &str = "5343502d4348414c4c454e47452d5245512d56313a0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f76311947de3173cb08e14fa71bd41bb256274ba2b62e0d0d9e73b83af1a971ee8f670000000100000015736368656d612d76616c69646174696f6e2d3030310000001b7b22636f756e74223a332c226e616d65223a22776964676574227d00000006736368656d6100002710b73317ea1cf075724a76d4454a3c777e10b4cf31a853d650f667398c6e52a2d8000000006553f10000000000655542800000000200000e1000001f400000000f746573742d636f6e746578742d3031000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461";
+/// Vector 62 `P`, attempt 2.
+const VP2_HEX: &str = "5343502d4348414c4c454e47452d524553502d56313a0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20dc18665f0a48315ffdaeaa7cb55525240f7bbb289e29c3172ebf45d29fe9ba28000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000020000000100000015736368656d612d76616c69646174696f6e2d3030310000001b7b22636f756e74223a332c226e616d65223a22776964676574227d";
+/// Vector 60 attempt-1 response `P`.
+const VP1_HEX: &str = "5343502d4348414c4c454e47452d524553502d56313a0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20dc18665f0a48315ffdaeaa7cb55525240f7bbb289e29c3172ebf45d29fe9ba28000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000010000000100000015736368656d612d76616c69646174696f6e2d303031000000117b226e616d65223a22776964676574227d";
+/// Vector 60 `verification_id` preimage.
+const VID60_HEX: &str = "000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f76310102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2000000001000000006553f358";
+/// Vector 60 `R_v`.
+const VRV60_HEX: &str = "5343502d4348414c4c454e47452d5645524946592d56313a9554fd256e3c6bb5ee6c73e1ca28e72ade44785bde24d84c17869cb1da667b77000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f76311947de3173cb08e14fa71bd41bb256274ba2b62e0d0d9e73b83af1a971ee8f675b7643e58ef89237bb133984f100bc4d7228e51de8adf358c550a4db1813bf210102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f200000000193dfe96c3f9d4973548c944fa0836291bf95458acb69707fa3d54f712d31e7ab0000000200000e1000001f400000000100000000000000000100000000000000006553f1000000000065554280000000006553f3580000000065ca9a580000000f746573742d636f6e746578742d3031";
+/// Vector 61 `verification_id` preimage.
+const VID61_HEX: &str = "000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f76310102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20000000020000000065540168";
+/// Vector 61 `R_v`.
+const VRV61_HEX: &str = "5343502d4348414c4c454e47452d5645524946592d56313a5cec3cdef9ef548b71a346c713eead24381a8cac1e0d422e1a788cf524d99d63000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f76311947de3173cb08e14fa71bd41bb256274ba2b62e0d0d9e73b83af1a971ee8f675b7643e58ef89237bb133984f100bc4d7228e51de8adf358c550a4db1813bf210102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20000000020219d13a72f6310ae90df4cd269ce8104a111b422bacdda5c4e2ca3008e677fc0000000200000e1000001f400000000101000027100000000100000001000000006553f100000000006555428000000000655401680000000065caa8680000000f746573742d636f6e746578742d3031";
 
-/// §7.3.4 `verification_id`: SHA-256 over the length-prefixed verifier,
-/// subject and capability URI, then the 8-byte timestamp. Returns the preimage.
-fn challenge_verification_id_preimage(timestamp: u64) -> Vec<u8> {
-    canonical_hash_bytes(
-        b"",
-        &[
-            CanonicalField::VarBytes(ID_VERIFIER.as_bytes()),
-            CanonicalField::VarBytes(ID_SUBJECT.as_bytes()),
-            CanonicalField::VarBytes(CHALLENGE_CAPABILITY_URI.as_bytes()),
-            CanonicalField::U64(timestamp),
-        ],
-    )
-    .unwrap()
+fn challenge_vector_id() -> [u8; 32] {
+    core::array::from_fn(|i| u8::try_from(i + 1).unwrap())
 }
 
-/// The inputs of §7.3.4's `R_v` that Vectors 60 and 61 vary.
-struct VerificationVectorInput<'a> {
-    timestamp: u64,
-    passed: bool,
-    score: Option<u32>,
-    pass_count: u32,
-    context_id: Option<&'a str>,
-}
-
-/// Rebuilds §7.3.4's `R_v`. Both optional fields are length-prefixed in both
-/// forms: a present `score` is `U32(4) ‖ U32(score)`, and an absent optional is
-/// `VarBytes(SHA-256(0x00))`, which writes `00 00 00 20 ‖ sentinel`.
-fn challenge_verification_preimage(
-    input: &VerificationVectorInput<'_>,
-    verification_id: &[u8; 32],
-) -> Vec<u8> {
-    let absent = unhex32(ABSENT_SENTINEL_HEX);
-    let suite_digest = unhex32(CHALLENGE_SUITE_DIGEST_HEX);
-    let mut fields = vec![
-        CanonicalField::Fixed32(verification_id),
-        CanonicalField::VarBytes(ID_VERIFIER.as_bytes()),
-        CanonicalField::VarBytes(ID_SUBJECT.as_bytes()),
-        CanonicalField::VarBytes(CHALLENGE_CAPABILITY_URI.as_bytes()),
-        CanonicalField::Fixed32(&suite_digest),
-        CanonicalField::U8(u8::from(input.passed)),
-    ];
-    match input.score {
-        Some(score) => {
-            fields.push(CanonicalField::U32(4));
-            fields.push(CanonicalField::U32(score));
-        }
-        None => fields.push(CanonicalField::VarBytes(&absent)),
+fn challenge_vector_request() -> ChallengeRequest {
+    let salt: [u8; 32] = core::array::from_fn(|i| u8::try_from(i + 0x21).unwrap());
+    let expected = ExpectedOutput::SchemaMatch {
+        schema: serde_json::json!({"type": "object", "required": ["name", "count"]}),
+    };
+    ChallengeRequest {
+        challenge_id: challenge_vector_id(),
+        capability_uri: CHALLENGE_CAPABILITY_URI.to_owned(),
+        definition_digest: unhex32(CHALLENGE_DEFINITION_DIGEST_HEX),
+        test_cases: vec![ChallengeCase {
+            test_id: "schema-validation-001".to_owned(),
+            input: serde_json::json!({"name": "widget", "count": 3}),
+            category: "schema".to_owned(),
+            weight: 10_000,
+            answer_commitment: answer_commitment(&salt, &expected).unwrap(),
+        }],
+        created_at: 1_700_000_000,
+        expires_at: 1_700_086_400,
+        max_retries: 2,
+        cooldown_secs: 3600,
+        pass_threshold_bps: 8000,
+        context_id: "test-context-01".to_owned(),
+        verifier: DID(ID_VERIFIER.to_owned()),
+        subject: DID(ID_SUBJECT.to_owned()),
+        verifier_signature: Vec::new(),
     }
-    fields.extend([
-        CanonicalField::U32(1),
-        CanonicalField::U32(input.pass_count),
-        CanonicalField::U64(input.timestamp),
-        CanonicalField::U64(input.timestamp + 7_776_000),
-    ]);
-    fields.push(CanonicalField::VarBytes(
-        input.context_id.map_or(&absent[..], str::as_bytes),
-    ));
-    canonical_hash_bytes(b"SCP-CHALLENGE-VERIFY-V1:", &fields).unwrap()
 }
 
-/// Asserts the `verification_id` preimage and value, `R_v` and `D_v` of one
-/// verification vector, and returns `R_v`.
-fn assert_challenge_verification_vector(
-    label: &str,
-    input: &VerificationVectorInput<'_>,
-    id_preimage_hex: &str,
-    id_hex: &str,
-    preimage_hex: &str,
-    digest_hex: &str,
-) -> Vec<u8> {
-    let id_preimage = challenge_verification_id_preimage(input.timestamp);
-    assert_eq!(
-        hex::encode(&id_preimage),
+fn challenge_vector_response(attempt: u32, output: serde_json::Value) -> ChallengeResponse {
+    ChallengeResponse {
+        challenge_id: challenge_vector_id(),
+        request_digest: unhex32(CHALLENGE_REQUEST_DIGEST_HEX),
+        subject: DID(ID_SUBJECT.to_owned()),
+        attempt,
+        outputs: vec![TestOutput {
+            test_id: "schema-validation-001".to_owned(),
+            output,
+        }],
+        subject_signature: Vec::new(),
+    }
+}
+
+/// The inputs and expected bytes of one verification-record vector.
+struct VerificationVector<'a> {
+    label: &'a str,
+    attempt: u32,
+    response_preimage_hex: &'a str,
+    passed: bool,
+    timestamp: u64,
+    id_preimage_hex: &'a str,
+    rv_hex: &'a str,
+    dv_hex: &'a str,
+}
+
+/// Asserts one verification-record vector through the production encoders:
+/// the `verification_id` preimage and value, `R_v` and `D_v`. Returns `R_v`.
+fn assert_challenge_verification_vector(v: &VerificationVector<'_>) -> Vec<u8> {
+    let VerificationVector {
+        label,
+        attempt,
+        response_preimage_hex,
+        passed,
+        timestamp,
         id_preimage_hex,
-        "{label}: verification_id preimage"
-    );
-    let verification_id = sha256(&id_preimage);
+        rv_hex,
+        dv_hex,
+    } = *v;
+    let challenge_id = challenge_vector_id();
+    let id_preimage = hex::decode(id_preimage_hex).unwrap();
+    let verification_id = challenge_verification_id(
+        ID_VERIFIER,
+        ID_SUBJECT,
+        CHALLENGE_CAPABILITY_URI,
+        &challenge_id,
+        attempt,
+        timestamp,
+    )
+    .unwrap();
     assert_eq!(
-        hex::encode(verification_id),
-        id_hex,
+        verification_id,
+        sha256(&id_preimage),
         "{label}: verification_id"
     );
-
-    let preimage = challenge_verification_preimage(input, &verification_id);
-    assert_eq!(hex::encode(&preimage), preimage_hex, "{label}: R_v");
-    assert_eq!(hex::encode(sha256(&preimage)), digest_hex, "{label}: D_v");
-
-    // The production encoders reproduce the bytes rebuilt above.
-    let verifier = DID(ID_VERIFIER.to_owned());
-    let subject = DID(ID_SUBJECT.to_owned());
-    assert_eq!(
-        challenge_verification_id(
-            &verifier,
-            &subject,
-            CHALLENGE_CAPABILITY_URI,
-            input.timestamp
-        )
-        .unwrap(),
-        verification_id,
-        "{label}: challenge_verification_id"
-    );
-    let challenge_type: ChallengeType =
-        serde_json::from_value(serde_json::json!(CHALLENGE_CAPABILITY_URI)).unwrap();
     let record = ChallengeVerification {
         verification_id,
-        verifier,
-        subject,
+        verifier: DID(ID_VERIFIER.to_owned()),
+        subject: DID(ID_SUBJECT.to_owned()),
         capability_uri: CHALLENGE_CAPABILITY_URI.to_owned(),
+        definition_digest: unhex32(CHALLENGE_DEFINITION_DIGEST_HEX),
         suite_digest: unhex32(CHALLENGE_SUITE_DIGEST_HEX),
-        passed: input.passed,
-        score: input.score,
+        challenge_id,
+        attempt,
+        response_digest: sha256(&hex::decode(response_preimage_hex).unwrap()),
+        max_retries: 2,
+        cooldown_secs: 3600,
+        pass_threshold_bps: 8000,
+        min_category_cases: 1,
+        passed,
+        score: if passed { 10_000 } else { 0 },
         test_count: 1,
-        pass_count: input.pass_count,
-        timestamp: input.timestamp,
-        expires_at: input.timestamp + 7_776_000,
-        context_id: input.context_id.map(str::to_owned),
+        pass_count: u32::from(passed),
+        challenge_created_at: 1_700_000_000,
+        challenge_expires_at: 1_700_086_400,
+        timestamp,
+        expires_at: timestamp + 7_776_000,
+        context_id: "test-context-01".to_owned(),
         verifier_signature: Vec::new(),
-        verification_method: VerificationMethod::ChallengeVerified { challenge_type },
-        result: serde_json::json!({}),
-        completed_at: input.timestamp,
     };
-    assert_eq!(
-        canonical_challenge_verification_bytes(&record).unwrap(),
-        preimage,
-        "{label}: canonical_challenge_verification_bytes"
-    );
+    let rv = canonical_challenge_verification_bytes(&record).unwrap();
+    assert_eq!(rv.len(), 480, "{label}: R_v length");
+    assert_eq!(hex::encode(&rv), rv_hex, "{label}: R_v");
     assert_eq!(
         hex::encode(challenge_verification_signing_digest(&record).unwrap()),
-        digest_hex,
-        "{label}: challenge_verification_signing_digest"
+        dv_hex,
+        "{label}: D_v"
     );
-    preimage
+    assert_eq!(
+        hex::encode(sha256(&rv)),
+        dv_hex,
+        "{label}: D_v = SHA-256(R_v)"
+    );
+    rv
+}
+
+#[test]
+fn vector_63_capability_definition() {
+    let definition = CapabilityDefinition {
+        capability_uri: CHALLENGE_CAPABILITY_URI.to_owned(),
+        min_cases: MinCases::Total(1),
+        pass_threshold_bps: 8000,
+        max_retries: 2,
+        cooldown_secs: 3600,
+        description: "Fixture definition for spec 25 vectors 59-62.".to_owned(),
+    };
+    let def = definition.canonical_bytes().unwrap();
+    assert_eq!(def.len(), 187);
+    assert_eq!(hex::encode(&def), VDEF_HEX);
+    assert_eq!(
+        hex::encode(definition.digest().unwrap()),
+        CHALLENGE_DEFINITION_DIGEST_HEX
+    );
+    assert_eq!(hex::encode(sha256(&def)), CHALLENGE_DEFINITION_DIGEST_HEX);
 }
 
 #[test]
 fn vector_59_challenge_request() {
-    let challenge_id: [u8; 32] = core::array::from_fn(|i| (i + 1) as u8);
-    // Keys inserted out of order on purpose: RFC 8785 sorts members, and keeps
-    // the `required` array in its given order.
-    let input =
-        scp_protocol::jcs::to_vec(&serde_json::json!({"name": "widget", "count": 3})).unwrap();
-    let expected = scp_protocol::jcs::to_vec(&serde_json::json!({
-        "SchemaMatch": {"schema": {"type": "object", "required": ["name", "count"]}}
-    }))
-    .unwrap();
-    assert_eq!(input, br#"{"count":3,"name":"widget"}"#);
-    assert_eq!(
-        expected,
-        br#"{"SchemaMatch":{"schema":{"required":["name","count"],"type":"object"}}}"#
-    );
-
     assert_eq!(
         CHALLENGE_CAPABILITY_URI,
         format!("{ID_DEFINER}:capability:schema-validation/v1")
     );
-    // `T`, the `test_cases` field: the count, then the one element.
-    let test_cases_field = canonical_hash_bytes(
-        b"",
-        &[
-            CanonicalField::U32(1),
-            CanonicalField::VarBytes(b"schema-validation-001"),
-            CanonicalField::VarBytes(&input),
-            CanonicalField::VarBytes(&expected),
-            CanonicalField::VarBytes(b"schema"),
-            CanonicalField::U32(10_000),
-        ],
-    )
-    .unwrap();
+    let request = challenge_vector_request();
     assert_eq!(
-        hex::encode(&test_cases_field),
-        "0000000100000015736368656d612d76616c69646174696f6e2d3030310000001b7b22636f756e74223a332c226e616d65223a22776964676574227d000000487b22536368656d614d61746368223a7b22736368656d61223a7b227265717569726564223a5b226e616d65222c22636f756e74225d2c2274797065223a226f626a656374227d7d7d00000006736368656d6100002710"
+        hex::encode(request.test_cases[0].answer_commitment),
+        "b73317ea1cf075724a76d4454a3c777e10b4cf31a853d650f667398c6e52a2d8",
+        "answer_commitment"
     );
-    assert_eq!(
-        hex::encode(sha256(&test_cases_field)),
-        CHALLENGE_SUITE_DIGEST_HEX,
-        "suite_digest = SHA-256(T)"
-    );
-
-    let preimage = canonical_hash_bytes(
-        b"SCP-CHALLENGE-REQ-V1:",
-        &[
-            CanonicalField::Fixed32(&challenge_id),
-            CanonicalField::VarBytes(CHALLENGE_CAPABILITY_URI.as_bytes()),
-            CanonicalField::RawBytes(&test_cases_field),
-            CanonicalField::U32(300),
-            CanonicalField::VarBytes(ID_VERIFIER.as_bytes()),
-            CanonicalField::VarBytes(ID_SUBJECT.as_bytes()),
-        ],
-    )
-    .unwrap();
-
-    assert_eq!(
-        hex::encode(challenge_id),
-        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
-    );
-    assert_eq!(preimage.len(), 419);
-    assert_eq!(
-        hex::encode(&preimage),
-        "5343502d4348414c4c454e47452d5245512d56313a0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f76310000000100000015736368656d612d76616c69646174696f6e2d3030310000001b7b22636f756e74223a332c226e616d65223a22776964676574227d000000487b22536368656d614d61746368223a7b22736368656d61223a7b227265717569726564223a5b226e616d65222c22636f756e74225d2c2274797065223a226f626a656374227d7d7d00000006736368656d61000027100000012c000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461"
-    );
-    assert_eq!(
-        hex::encode(sha256(&preimage)),
-        "9425a8bca59a96ea6f400233a247fb9aa4b0d4bbb98b7e8b1e756297e7e2a91f"
-    );
-
-    // The production encoders reproduce `suite_digest` and `D`.
-    let request = ChallengeRequest {
-        challenge_id,
-        capability_uri: CHALLENGE_CAPABILITY_URI.to_owned(),
-        test_cases: vec![TestCase {
-            test_id: "schema-validation-001".to_owned(),
-            input: serde_json::json!({"name": "widget", "count": 3}),
-            expected: ExpectedOutput::SchemaMatch {
-                schema: serde_json::json!({"type": "object", "required": ["name", "count"]}),
-            },
-            category: "schema".to_owned(),
-            weight: 10_000,
-        }],
-        timeout_secs: 300,
-        verifier: DID(ID_VERIFIER.to_owned()),
-        subject: DID(ID_SUBJECT.to_owned()),
-        verifier_signature: Vec::new(),
-    };
+    let t = hex::decode(VT_HEX).unwrap();
+    assert_eq!(t.len(), 106);
+    assert_eq!(hex::encode(sha256(&t)), CHALLENGE_SUITE_DIGEST_HEX);
     assert_eq!(
         hex::encode(challenge_suite_digest(&request.test_cases).unwrap()),
         CHALLENGE_SUITE_DIGEST_HEX,
         "challenge_suite_digest"
     );
+    let r = canonical_challenge_request_bytes(&request).unwrap();
+    assert_eq!(r.len(), 450);
+    assert_eq!(hex::encode(&r), VR_HEX, "R");
+    // `R` embeds `T` verbatim and no byte of the expected output.
+    assert!(VR_HEX.contains(VT_HEX));
     assert_eq!(
-        challenge_request_signing_digest(&request).unwrap(),
-        sha256(&preimage),
+        hex::encode(challenge_request_signing_digest(&request).unwrap()),
+        CHALLENGE_REQUEST_DIGEST_HEX,
         "challenge_request_signing_digest"
     );
+    assert_eq!(hex::encode(sha256(&r)), CHALLENGE_REQUEST_DIGEST_HEX);
+}
+
+#[test]
+fn vector_62_challenge_response() {
+    let request = challenge_vector_request();
+    assert_eq!(
+        challenge_request_signing_digest(&request).unwrap(),
+        unhex32(CHALLENGE_REQUEST_DIGEST_HEX)
+    );
+    for (attempt, output, p_hex, d_r) in [
+        (
+            2,
+            serde_json::json!({"count": 3, "name": "widget"}),
+            VP2_HEX,
+            "0219d13a72f6310ae90df4cd269ce8104a111b422bacdda5c4e2ca3008e677fc",
+        ),
+        (
+            1,
+            serde_json::json!({"name": "widget"}),
+            VP1_HEX,
+            "93dfe96c3f9d4973548c944fa0836291bf95458acb69707fa3d54f712d31e7ab",
+        ),
+    ] {
+        let response = challenge_vector_response(attempt, output);
+        let p = canonical_challenge_response_bytes(&response).unwrap();
+        assert_eq!(hex::encode(&p), p_hex, "attempt {attempt}: P");
+        assert_eq!(
+            hex::encode(challenge_response_signing_digest(&response).unwrap()),
+            d_r,
+            "attempt {attempt}: D_r"
+        );
+        assert_eq!(hex::encode(sha256(&p)), d_r);
+    }
+    assert_eq!(hex::decode(VP2_HEX).unwrap().len(), 210);
+    assert_eq!(hex::decode(VP1_HEX).unwrap().len(), 200);
 }
 
 #[test]
 fn vector_60_challenge_verification() {
-    let preimage = assert_challenge_verification_vector(
-        "vector 60",
-        &VerificationVectorInput {
-            timestamp: 1_700_000_000,
-            passed: true,
-            score: Some(10_000),
-            pass_count: 1,
-            context_id: Some("test-context-01"),
-        },
-        "000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f7631000000006553f100",
-        "2334382d57e941658fc2c2a2457010918c9eec0ec822a85f74e2370b0e09fcb8",
-        "5343502d4348414c4c454e47452d5645524946592d56313a2334382d57e941658fc2c2a2457010918c9eec0ec822a85f74e2370b0e09fcb8000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f7631728fca93ec869b96f4f784cb46ad1b2aa68a4a39d7c4b60b66707586914fdcfc0100000004000027100000000100000001000000006553f1000000000065ca98000000000f746573742d636f6e746578742d3031",
-        "ac0cd969cbbeb08ca4021ad9f852fdef1bf80db83039fe0c9c5347d73e8027a9",
+    let rv = assert_challenge_verification_vector(&VerificationVector {
+        label: "vector 60",
+        attempt: 1,
+        response_preimage_hex: VP1_HEX,
+        passed: false,
+        timestamp: 1_700_000_600,
+        id_preimage_hex: VID60_HEX,
+        rv_hex: VRV60_HEX,
+        dv_hex: "00d8282d8b49e2485955d9164678991f105e0ca9d909e49140c2e57969bf3aed",
+    });
+    assert_eq!(
+        hex::encode(sha256(&hex::decode(VID60_HEX).unwrap())),
+        "9554fd256e3c6bb5ee6c73e1ca28e72ade44785bde24d84c17869cb1da667b77"
     );
-    assert_eq!(preimage.len(), 352);
-    // 10000 basis points, length-prefixed: `00 00 00 04 00 00 27 10`.
-    assert!(hex::encode(&preimage).contains("0000000400002710"));
+    assert_eq!(hex::decode(VID60_HEX).unwrap().len(), 256);
+    assert!(!hex::encode(rv).contains(ABSENT_SENTINEL_HEX));
 }
 
 #[test]
-fn vector_61_challenge_verification_absent_optionals() {
-    let preimage = assert_challenge_verification_vector(
-        "vector 61",
-        &VerificationVectorInput {
-            timestamp: 1_700_000_060,
-            passed: false,
-            score: None,
-            pass_count: 0,
-            context_id: None,
-        },
-        "000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f7631000000006553f13c",
-        "ced1d4c2b8d32ac88258a172f9d48bd402fb88687d7285f800dc90c1655046e4",
-        "5343502d4348414c4c454e47452d5645524946592d56313aced1d4c2b8d32ac88258a172f9d48bd402fb88687d7285f800dc90c1655046e4000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f7631728fca93ec869b96f4f784cb46ad1b2aa68a4a39d7c4b60b66707586914fdcfc00000000206e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d0000000100000000000000006553f13c0000000065ca983c000000206e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
-        "127c1d21606c26ab60ee8bcd691f3c776c677cb600f2b9d0a94333b50bb3472d",
+fn vector_61_challenge_verification_passing_attempt() {
+    let rv = assert_challenge_verification_vector(&VerificationVector {
+        label: "vector 61",
+        attempt: 2,
+        response_preimage_hex: VP2_HEX,
+        passed: true,
+        timestamp: 1_700_004_200,
+        id_preimage_hex: VID61_HEX,
+        rv_hex: VRV61_HEX,
+        dv_hex: "3cb193fbe8242b331704a2d5fd25b66801b6f45eda72fba05bffe4c31df6379d",
+    });
+    assert_eq!(
+        hex::encode(sha256(&hex::decode(VID61_HEX).unwrap())),
+        "5cec3cdef9ef548b71a346c713eead24381a8cac1e0d422e1a788cf524d99d63"
     );
-    assert_eq!(preimage.len(), 397);
-    // Both absent optionals are length-prefixed: the sentinel appears twice,
-    // and every copy is preceded by the length word `00000020`.
-    let preimage_hex = hex::encode(&preimage);
-    let copies: Vec<usize> = preimage_hex
-        .match_indices(ABSENT_SENTINEL_HEX)
-        .map(|(i, _)| i)
-        .collect();
-    assert_eq!(copies.len(), 2, "vector 61: sentinel copies");
-    for at in copies {
-        assert_eq!(
-            &preimage_hex[at - 8..at],
-            "00000020",
-            "vector 61: sentinel at {at} lacks its length word"
-        );
-    }
+    // The record has no optional field, so no absent-field sentinel appears.
+    assert!(!hex::encode(rv).contains(ABSENT_SENTINEL_HEX));
 }
 
 // ---------------------------------------------------------------------------
@@ -1302,7 +1296,9 @@ fn domain_separators_are_all_unique() {
         "SCP-CONTEXT-EXPORT-V1:",
         "SCP-CHALLENGE-REQ-V1:",
         "SCP-CHALLENGE-RESP-V1:",
+        "SCP-CHALLENGE-COMMIT-V1:",
         "SCP-CHALLENGE-VERIFY-V1:",
+        "SCP-CAPABILITY-DEFINITION-V1:",
         "SCP-BRIDGE-REGISTER-V1:",
         "SCP-BLOCK-NOTIFICATION-V1:",
         "SCP-EPOCH-ADVANCE-V1:",

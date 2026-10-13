@@ -53,7 +53,7 @@ use crate::sync::NapiSyncPolicy;
 #[cfg(feature = "testing")]
 use crate::testing::NapiFullStackNode;
 use crate::transport::{NapiReliabilityScore, NapiTransportManager, NapiTransportStatus};
-use crate::trust::{NapiAttestationVerificationResult, NapiChallengeResult, NapiTrustScoreResult};
+use crate::trust::{NapiAttestationVerificationResult, NapiChallengeRequest, NapiTrustScoreResult};
 use crate::ucan::NapiUcanToken;
 
 /// The SCP instance — a caller-owned handle that wraps a
@@ -3672,46 +3672,73 @@ impl Scp {
     }
 
     /// Creates a challenge for `subject` from the challenger-written test cases
-    /// (`testCasesJson`, a JSON array of `TestCase`) and signs it with
-    /// `verifier`'s `#active` key (spec 07 §7.3.4).
+    /// (`testCasesJson`, a JSON array of `TestCase` with their answers),
+    /// records it in `verifier`'s ledger, and returns the request signed with
+    /// `verifier`'s `#active` key (spec 07 §7.3.4 step 1). `policy` picks
+    /// fewer retries or a longer cooldown than the capability definition's;
+    /// `evaluatorContextId` names the context of the `CustomEval` evaluator
+    /// outlets.
     #[napi(js_name = "trustCreateChallenge")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn trust_create_challenge(
         &self,
         verifier: String,
         subject: String,
         capability_uri: String,
         test_cases_json: String,
-        timeout_secs: u32,
-    ) -> napi::Result<NapiChallengeResult> {
+        window_secs: u32,
+        context_id: String,
+        evaluator_context_id: Option<String>,
+        policy: Option<crate::trust::NapiPolicyPick>,
+    ) -> napi::Result<NapiChallengeRequest> {
         crate::trust::trust_create_challenge_on(
             &self.inner,
             verifier,
             subject,
             capability_uri,
             test_cases_json,
-            timeout_secs,
+            window_secs,
+            context_id,
+            evaluator_context_id,
+            policy,
         )
         .await
     }
 
-    /// Checks a challenge response and returns the `ChallengeVerification`
-    /// JSON signed with `verifier`'s `#active` key (spec 07 §7.3.4).
-    #[napi(js_name = "trustVerifyResponse")]
-    pub async fn trust_verify_response(
+    /// Answers a challenge: checks the challenger's signature on
+    /// `requestJson`, and returns the `ChallengeResponse` JSON of
+    /// `outputsJson` for `attempt`, signed with `subject`'s `#active` key
+    /// (spec 07 §7.3.4 step 2).
+    #[napi(js_name = "trustRespondToChallenge")]
+    pub async fn trust_respond_to_challenge(
         &self,
-        verifier: String,
-        challenge_json: String,
-        response_json: String,
-        context_id: String,
+        subject: String,
+        request_json: String,
+        outputs_json: String,
+        attempt: u32,
     ) -> napi::Result<String> {
-        crate::trust::trust_verify_response_on(
+        crate::trust::trust_respond_to_challenge_on(
             &self.inner,
-            verifier,
-            challenge_json,
-            response_json,
-            context_id,
+            subject,
+            request_json,
+            outputs_json,
+            attempt,
         )
         .await
+    }
+
+    /// Grades a subject's response in `verifier`'s ledger and returns the
+    /// record signed with `verifier`'s `#active` key, with the per-case
+    /// results (spec 07 §7.3.4 steps 3 and 4).
+    #[napi(js_name = "trustGradeResponse")]
+    pub async fn trust_grade_response(
+        &self,
+        verifier: String,
+        request_json: String,
+        response_json: String,
+    ) -> napi::Result<crate::trust::NapiGradeResult> {
+        crate::trust::trust_grade_response_on(&self.inner, verifier, request_json, response_json)
+            .await
     }
 
     /// Per-instance equivalent of the free-function `verify_participation_requirements`.
@@ -3730,11 +3757,11 @@ impl Scp {
         )
     }
 
-    /// Verifies that an agent meets a context's capability requirements for
-    /// admission (spec §7.3.4.4). `subjectDid`/`contextId` bind challenge
-    /// verifications to the agent and context being admitted, and each
-    /// record's signature is checked against the verifier's `#active` key
-    /// through this instance's DID resolver. Returns normally
+    /// Verifies that an agent meets the capability requirements in the
+    /// context's governance state (spec §7.3.4.4). `subjectDid`/`contextId`
+    /// bind challenge verifications to the agent and context being admitted,
+    /// and each record's signature is checked against the verifier's
+    /// `#active` key through this instance's DID resolver. Returns normally
     /// when all requirements are satisfied; throws on any unmet requirement or
     /// malformed JSON.
     #[napi(js_name = "checkCapabilityRequirements")]
@@ -3742,22 +3769,16 @@ impl Scp {
         &self,
         context_id: String,
         subject_did: String,
-        requirements_json: String,
         agent_capabilities_json: String,
         challenge_verifications_json: String,
     ) -> napi::Result<()> {
-        let bi = Arc::clone(&self.inner);
-        crate::trust::on_resolution_pool(move |scope| {
-            crate::trust::check_capability_requirements_on(
-                scope,
-                &bi,
-                context_id,
-                subject_did,
-                requirements_json,
-                agent_capabilities_json,
-                challenge_verifications_json,
-            )
-        })
+        crate::trust::check_capability_requirements_on(
+            &self.inner,
+            context_id,
+            subject_did,
+            agent_capabilities_json,
+            challenge_verifications_json,
+        )
         .await
     }
 

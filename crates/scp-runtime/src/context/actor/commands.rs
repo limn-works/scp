@@ -2663,6 +2663,16 @@ pub enum QueriesCommand {
             Result<Option<scp_protocol::context::params::ContextParams>, ContextError>,
         >,
     },
+    /// The context's live capability requirements (spec §8.10, the
+    /// Class-S governance field `ModifyCapabilityRequirements` sets).
+    /// Hard-error on an unknown context: an admission check that read an
+    /// empty list for a context it could not reach would admit everyone.
+    GetCapabilityRequirements {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<scp_protocol::trust::CapabilityRequirements, ContextError>>,
+    },
     /// Role state snapshot (cloned).
     GetRoleState {
         /// Context identifier string.

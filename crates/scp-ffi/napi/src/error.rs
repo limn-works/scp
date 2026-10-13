@@ -610,21 +610,18 @@ impl From<scp_core::provenance::ProvenanceError> for ScpNapiError {
 }
 
 impl From<scp_core::trust::TrustError> for ScpNapiError {
+    /// The code comes from the shared table, so a challenge refusal carries
+    /// its own code on every bridge.
     fn from(e: scp_core::trust::TrustError) -> Self {
-        if matches!(
-            e,
-            scp_core::trust::TrustError::ChallengeSuiteBelowMinimum { .. }
-        ) {
-            return Self::Validation {
-                message: format!("{e} — supply at least the standard's minimum test cases"),
-                code: codes::VALID_7039.to_owned(),
-            };
-        }
+        let code = scp_ffi_common::error_codes::trust_error_code(&e);
+        let message = if code == codes::VALID_7039 {
+            format!("{e} — supply at least the standard's minimum test cases")
+        } else {
+            format!("trust evaluation failed: {e}")
+        };
         Self::Validation {
-            message: format!(
-                "trust evaluation failed: {e} — check event log data and attestation validity"
-            ),
-            code: codes::VALID_7003.to_owned(),
+            message,
+            code: code.to_owned(),
         }
     }
 }

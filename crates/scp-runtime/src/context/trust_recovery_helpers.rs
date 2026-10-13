@@ -29,10 +29,13 @@
 //! # Not migrated as commands
 //!
 //! The trust operations read and mutate no per-context state, so none goes
-//! through the actor mailbox. `verify_attestation` (`scp-protocol`) is a
-//! pure-CPU check over a DID resolver and a clock. The challenge operations,
-//! `create_challenge` and `verify_response_and_sign` (`scp-ffi-common`),
-//! sign the request or record digest through the verifier's custody.
+//! through a per-context actor mailbox. `verify_attestation` (`scp-protocol`)
+//! is a pure-CPU check over a DID resolver and a clock. The challenge
+//! operations keep per-challenger state, the attempt ledger, which the
+//! per-identity `ChallengerLedgerActor`
+//! (`supervisor/challenger_ledger_actor.rs`) owns: `Supervisor::dispatch_challenge_*`
+//! reaches it, and it signs the request and record digests inside its turn
+//! through the verifier's custody.
 
 // Module-level allow:
 //

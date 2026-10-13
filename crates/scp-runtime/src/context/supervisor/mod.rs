@@ -118,6 +118,7 @@
 // are reachable only through the `Supervisor` gate primitives + `SupervisorHandle`
 // accessors, keeping the registry internal (nothing outside the supervisor
 // module names it directly).
+pub mod challenger_ledger_actor;
 mod floors;
 pub mod handle;
 pub(in crate::context) mod identity_capability;
@@ -144,6 +145,11 @@ impl supervisor::Supervisor {
     }
 }
 
+pub use challenger_ledger_actor::{
+    BeginOutcome, ChallengeLedgerError, ChallengerLedgerCommand, ChallengerLedgerHandle,
+    FaultRecorded, GradedAttempt, GradingFault, GradingLease,
+    MAX_CONCURRENT_GRADINGS_PER_CHALLENGER, MAX_OPEN_CHALLENGES_PER_CHALLENGER,
+};
 pub use handle::SupervisorHandle;
 pub use key_package_actor::{
     KP_MAILBOX_CAPACITY, KP_SEND_TIMEOUT, KeyPackageCommand, KeyPackageStoreActor,

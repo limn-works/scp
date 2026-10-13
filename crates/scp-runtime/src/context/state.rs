@@ -733,6 +733,11 @@ pub struct ContextSnapshot {
     /// Governance threshold value (quorum requirement).
     #[serde(default)]
     pub threshold_value: u32,
+    /// The live capability requirements (spec 07 §7.3.4.4), seeded from
+    /// `context_params` at creation and replaced only by
+    /// `ModifyCapabilityRequirements`.
+    #[serde(default)]
+    pub capability_requirements: scp_protocol::trust::CapabilityRequirements,
     /// Pruning policy override (ADR-030 §6).
     #[serde(default)]
     pub pruning_policy: Option<PruningPolicy>,
@@ -1483,6 +1488,10 @@ pub(crate) struct GovernanceClassS {
     /// replay attacks where a valid spending UCAN is resubmitted.
     pub(crate) spending_nonce_tracker:
         scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn Clock>>,
+    /// The live capability requirements (spec 07 §7.3.4.4). Admission reads
+    /// this list, never `ContextParams`; only `ModifyCapabilityRequirements`
+    /// replaces it, so the snapshot a Class-S combinator takes restores it.
+    pub(crate) capability_requirements: scp_protocol::trust::CapabilityRequirements,
 }
 
 /// Lossless, `Clone`-able mirror of [`GovernanceClassS`] (ADR-049 §9).
@@ -1512,6 +1521,8 @@ pub(crate) struct GovernanceClassSSnapshot {
     /// `(nonce → (first_seen_secs, token_expiry_secs))` entries of the
     /// `spending_nonce_tracker`, projected via `snapshot_entries`.
     pub(crate) spending_nonce_tracker_entries: HashMap<String, (u64, u64)>,
+    /// Mirror of [`GovernanceClassS::capability_requirements`].
+    pub(crate) capability_requirements: scp_protocol::trust::CapabilityRequirements,
 }
 
 #[allow(
@@ -1529,6 +1540,7 @@ impl GovernanceClassS {
             threshold_value: self.threshold_value,
             spending_nonce_tracker_context_id: self.spending_nonce_tracker.context_id().to_owned(),
             spending_nonce_tracker_entries: self.spending_nonce_tracker.snapshot_entries(),
+            capability_requirements: self.capability_requirements.clone(),
         }
     }
 
@@ -1548,6 +1560,7 @@ impl GovernanceClassS {
             threshold_value,
             spending_nonce_tracker_context_id,
             spending_nonce_tracker_entries,
+            capability_requirements,
         } = snap;
         *self = Self {
             executed_proposals,
@@ -1558,6 +1571,7 @@ impl GovernanceClassS {
                 Arc::clone(clock),
                 spending_nonce_tracker_entries,
             ),
+            capability_requirements,
         };
     }
 }
@@ -1739,6 +1753,7 @@ impl GovernanceState {
                     context_id.to_owned(),
                     clock,
                 ),
+                capability_requirements: scp_protocol::trust::CapabilityRequirements::default(),
             },
         }
     }
@@ -2177,6 +2192,9 @@ pub(crate) fn fresh_governance_state(
                 context_id.to_owned(),
                 clock,
             ),
+            // Spec 07 §7.3.4.4: the genesis list seeds the governance-held
+            // one, which admission reads from here on.
+            capability_requirements: params.capability_requirements.clone(),
         },
     }
 }
