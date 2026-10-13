@@ -17002,9 +17002,11 @@ impl Supervisor {
     ///   when a context's actor is down;
     /// - [`ContextError::ActorBusy`] from a mailbox send;
     /// - [`ContextError::TransportFailed`] when an actor drops its reply or
-    ///   does not answer within the reply bound;
-    /// - [`ContextError::InvalidState`] when a context's relay set holds a URL
-    ///   with no §9.18.2 canonical form.
+    ///   does not answer within the reply bound.
+    ///
+    /// A relay URL with no §9.18.2 canonical form gets no entry, because
+    /// §9.18.2 derives no reserved push routing ID for it. The query still
+    /// returns the routing IDs of every other relay and context.
     pub async fn push_routing_ids(
         &self,
     ) -> Result<
@@ -17035,12 +17037,12 @@ impl Supervisor {
         for routes in replies {
             let Some(routes) = routes? else { continue };
             for relay_url in routes.relay_urls {
-                let canonical = scp_protocol::discovery::push::canonical_relay_url(&relay_url)
-                    .map_err(|err| {
-                        ContextError::InvalidState(format!(
-                            "Supervisor::push_routing_ids — relay URL `{relay_url}` has no canonical form: {err}"
-                        ))
-                    })?;
+                // §9.18.2: a URL that a step rejects has no canonical URL, so
+                // the client derives no reserved push routing ID for it.
+                let Ok(canonical) = scp_protocol::discovery::push::canonical_relay_url(&relay_url)
+                else {
+                    continue;
+                };
                 by_relay
                     .entry(canonical)
                     .or_default()
@@ -18744,16 +18746,44 @@ mod tests {
         assert!(ids.contains(&scp_protocol::context::context_routing_id(&ctx_b)));
     }
 
-    /// A relay URL with no §9.18.2 canonical form fails the whole query.
+    /// A relay URL with no §9.18.2 canonical form gets no entry. The query
+    /// still returns the routing IDs for the context's other relay and for a
+    /// second context on the same device.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn push_routing_ids_reject_a_relay_url_with_no_canonical_form() {
+    async fn push_routing_ids_skip_a_relay_url_with_no_canonical_form() {
+        use std::collections::{BTreeMap, BTreeSet};
+
         let sup = supervisor_with_providers();
-        create_push_context(&sup, &hex::encode([0xC2u8; 32]), &["https://relay.example"]).await;
-        assert!(matches!(
-            sup.push_routing_ids().await,
-            Err(ContextError::InvalidState(_))
-        ));
+        let mixed = hex::encode([0xC2u8; 32]);
+        let other = hex::encode([0xC3u8; 32]);
+        create_push_context(
+            &sup,
+            &mixed,
+            &["wss://relay-a.example", "https://relay-b.example"],
+        )
+        .await;
+        create_push_context(&sup, &other, &["wss://relay-c.example"]).await;
+        assert_eq!(
+            sup.push_routing_ids().await.unwrap(),
+            BTreeMap::from([
+                (
+                    "wss://relay-a.example".to_owned(),
+                    BTreeSet::from([
+                        scp_protocol::context::context_routing_id(&mixed),
+                        [0x5A; 32]
+                    ]),
+                ),
+                (
+                    "wss://relay-c.example".to_owned(),
+                    BTreeSet::from([
+                        scp_protocol::context::context_routing_id(&other),
+                        [0x5A; 32]
+                    ]),
+                ),
+            ]),
+            "the https URL gets no entry, and both contexts keep their routing IDs"
+        );
     }
 
     /// A context whose actor is down — poisoned, its last respawn failed, or
