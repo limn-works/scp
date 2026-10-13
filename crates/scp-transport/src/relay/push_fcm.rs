@@ -612,10 +612,9 @@ mod tests {
     use ring::signature::{KeyPair as _, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
     use scp_clock::TestClock;
 
+    use super::super::log_capture::LogCapture;
     use super::super::push::PushSender;
-    use super::super::push_test_server::{
-        CapturedRequest, LogCapture, Reply, TestServer, json_reply,
-    };
+    use super::super::push_test_server::{CapturedRequest, Reply, TestServer, json_reply};
     use super::*;
 
     /// A fresh RSA-2048 service-account key as PKCS#8 PEM, generated once per
