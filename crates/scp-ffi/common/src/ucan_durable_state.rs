@@ -256,7 +256,7 @@ pub async fn load_revocation_list<S: Storage>(
 ///
 /// This is the single nonce-persist function every bridge calls (`PyO3`
 /// directly against its `StorageProvider`; napi-rs and `UniFFI` through
-/// [`ProtocolRepository::persist_ucan_recorded_nonce`](crate::bridge_runtime::ProtocolRepository::persist_ucan_recorded_nonce)),
+/// [`ProtocolRepoVariant::persist_ucan_recorded_nonce`](crate::bridge_runtime::ProtocolRepoVariant::persist_ucan_recorded_nonce)),
 /// after a UCAN-validation pipeline run whose nonce adapter reported
 /// [`NonceRecorded`]. The value written is the tracker's own entry for the
 /// nonce, so the durable `first_seen` matches the in-memory one.
