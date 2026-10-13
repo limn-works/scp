@@ -2822,7 +2822,7 @@ All domain separators are UTF-8 strings used as prefixes (or, where a row says s
 | `"SCP-PRIVATE-LOG-V1:"` | Private state event hash chain | §3.7 |
 | `"SCP-PUSH-REGISTER-V1:"` | Push notification registration signing | §9.5.2, §22.11.4 |
 | `"SCP-PUSH-DEREGISTER-V1:"` | Push notification deregistration signing | §9.5.2, §22.11.4 |
-| `"scp-push-registration"` | Reserved push routing ID of one relay — `SHA-256("scp-push-registration" \|\| relay_url)`, where `relay_url` is the UTF-8 bytes of the relay's canonical URL, carrying no length prefix and no separator byte. The canonical URL is the WebSocket URL the client dialed, with the scheme and the host lowercased, the port removed when it is the scheme's default (443 for `wss`, 80 for `ws`), the path kept byte for byte except that a trailing `/` is removed, and no query or fragment; so `WSS://Relay.Example:443/` and `wss://relay.example` yield one routing ID, while `wss://relay.example/scp/v1` yields another. A client publishes its `PushRegistration` and `PushDeregistration` to this routing ID, and a relay intercepts a PUBLISH to the routing ID derived from each URL it serves under; a routing-derivation prefix, NOT a §9.5.1 signature-preimage separator | `10-infrastructure-and-self-hosting.md` §10.7.1 |
+| `"scp-push-registration"` | Reserved push routing ID of one relay — `SHA-256("scp-push-registration" \|\| relay_url)`, where `relay_url` is the UTF-8 bytes of the relay's canonical URL, carrying no length prefix and no separator byte. The paragraph **Canonical relay URL** below this table defines the canonical URL; so `WSS://Relay.Example:443/` and `wss://relay.example` yield one routing ID, while `wss://relay.example/scp/v1` yields another. A client publishes its `PushRegistration` and `PushDeregistration` to this routing ID, and a relay intercepts a PUBLISH to the routing ID derived from each URL it serves under; a routing-derivation prefix, NOT a §9.5.1 signature-preimage separator | `10-infrastructure-and-self-hosting.md` §10.7.1 |
 | `"SCP-CHUNK-MSG-ID-V1:"` | Chunked message ID derivation | §9.10.3 |
 | `"SCP-COMMIT-RANGE-REQ-V1:"` | Commit range request signing | §23.16.2 |
 | `"SCP-COMMIT-RANGE-RESP-V1:"` | Commit range response signing | §23.16.3 |
@@ -2839,6 +2839,36 @@ All domain separators are UTF-8 strings used as prefixes (or, where a row says s
 | `"SCP-INVITATION-BUNDLE-V1:"` | InvitationBundle signing — over the full genesis `ContextParams` (per-field JCS hashes) | §5.12.3.1 |
 | `"SCP-JOIN-RESPONSE-V1:"` | JoinResponse signing | §5.12.3.2 |
 | `"standing:"` / `"standing-"` | Standing-pair context-id derivation prefix — internal id construction over a §9.5.1 length-prefixed body, NOT a §9.5.1 signature-preimage separator (`"standing-"` is an output id-prefix) | §5.15.8 |
+
+**Canonical relay URL.** A client or a relay computes the canonical URL of a relay from the WebSocket URL the client dialed by the steps below, in order. A URL that a step rejects has no canonical URL, so the client derives no reserved push routing ID and signs no push preimage for it.
+
+1. Split the URL at the first `://`. The text before it is the scheme, compared without regard to ASCII case; it MUST be `wss` or `ws`, and the canonical URL writes it in lowercase. The default port is 443 for `wss` and 80 for `ws`.
+2. Every byte after `://` MUST be printable ASCII, `0x21` to `0x7E`. A space, a control byte and any non-ASCII byte reject the URL.
+3. The text after `://` MUST hold no `?` and no `#`, so a URL carrying a query or a fragment is rejected rather than truncated.
+4. The authority is the text after `://` up to the first `/`, or all of that text when it holds no `/`; the path is the rest, starting with that `/`. The authority MUST hold no `@`, so a URL carrying user information is rejected.
+5. The host is either a bracketed IPv6 literal, `[` then one or more hexadecimal digits, `:` and `.`, then `]`, or a name made of one or more ASCII letters, digits, `-`, `.` and `_`. The host MUST NOT be empty. The canonical URL writes the host with its ASCII letters lowercased and every other byte as written; it does not rewrite an IPv6 literal into another form.
+6. The authority MUST be the host alone, or the host, `:` and a port. The port MUST be one to five ASCII decimal digits whose value is between 1 and 65535. The canonical URL omits the port when its value is the default port, and otherwise writes its value in decimal without leading zeros, so `:08443` becomes `:8443` and `:00443` under `wss` is omitted.
+7. When the path ends with `/`, remove that one `/`. The remaining path MUST NOT end with `/`, which rejects a path such as `//`, because the result would otherwise change when it is canonicalized again. The canonical URL keeps the remaining path byte for byte.
+8. The canonical URL is the lowercase scheme, `://`, the host, `:` and the port when step 6 keeps one, and the path.
+
+Implementations reproduce these vectors:
+
+| Dialed URL | Canonical URL, or the step that rejects it |
+|------------|-------------------------------------------|
+| `WSS://Relay.Example:443/` | `wss://relay.example` |
+| `ws://Relay.Example:80` | `ws://relay.example` |
+| `ws://relay.example:443` | `ws://relay.example:443` |
+| `wss://relay.example:00443` | `wss://relay.example` |
+| `wss://relay.example:08443` | `wss://relay.example:8443` |
+| `wss://relay.example/Scp/V1/` | `wss://relay.example/Scp/V1` |
+| `wss://[2001:DB8::1]:8443/` | `wss://[2001:db8::1]:8443` |
+| `https://relay.example` | rejected by step 1 |
+| `wss://relay.exämple` | rejected by step 2 |
+| `wss://relay.example/?k=v` | rejected by step 3 |
+| `wss://u@relay.example` | rejected by step 4 |
+| `wss://re*lay` | rejected by step 5 |
+| `wss://relay.example:0` | rejected by step 6 |
+| `wss://relay.example//` | rejected by step 7 |
 
 #### 9.18.3 Key Derivation and HPKE Labels
 

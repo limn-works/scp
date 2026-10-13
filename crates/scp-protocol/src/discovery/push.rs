@@ -417,17 +417,8 @@ pub fn push_registration_routing_id(relay_url: &str) -> Result<[u8; 32], PushMes
     Ok(hasher.finalize().into())
 }
 
-/// Returns the §9.18.2 canonical form of a relay's WebSocket URL.
-///
-/// The scheme and the host are lowercased, the port is removed when it is the
-/// scheme's default (443 for `wss`, 80 for `ws`), and the path is kept byte
-/// for byte except that one trailing `/` is removed. So
-/// `WSS://Relay.Example:443/` and `wss://relay.example` yield
-/// `wss://relay.example`, while `wss://relay.example/scp/v1` stays distinct.
-///
-/// The function fails closed rather than guess: it rejects a query or a
-/// fragment, user information, a byte outside printable ASCII, and a path
-/// that would still end with `/`, which keeps the result a fixed point.
+/// Returns the canonical form of a relay's WebSocket URL, computed by the
+/// eight steps of the **Canonical relay URL** paragraph of §9.18.2.
 ///
 /// # Errors
 ///
@@ -884,6 +875,47 @@ mod tests {
             let got = canonical_relay_url(input).unwrap();
             assert_eq!(got, want, "{input}");
             assert_eq!(canonical_relay_url(&got).unwrap(), got, "fixed point");
+        }
+    }
+
+    /// The rows of the §9.18.2 **Canonical relay URL** vector table, in order;
+    /// each rejected row maps to the error of the step that rejects it.
+    #[test]
+    fn canonical_relay_url_reproduces_section_9_18_2_vectors() {
+        let cases: [(&str, Result<&str, RelayUrlError>); 14] = [
+            ("WSS://Relay.Example:443/", Ok("wss://relay.example")),
+            ("ws://Relay.Example:80", Ok("ws://relay.example")),
+            ("ws://relay.example:443", Ok("ws://relay.example:443")),
+            ("wss://relay.example:00443", Ok("wss://relay.example")),
+            ("wss://relay.example:08443", Ok("wss://relay.example:8443")),
+            (
+                "wss://relay.example/Scp/V1/",
+                Ok("wss://relay.example/Scp/V1"),
+            ),
+            ("wss://[2001:DB8::1]:8443/", Ok("wss://[2001:db8::1]:8443")),
+            (
+                "https://relay.example",
+                Err(RelayUrlError::UnsupportedScheme),
+            ),
+            ("wss://relay.exämple", Err(RelayUrlError::InvalidCharacter)),
+            (
+                "wss://relay.example/?k=v",
+                Err(RelayUrlError::QueryOrFragment),
+            ),
+            ("wss://u@relay.example", Err(RelayUrlError::UserInfo)),
+            ("wss://re*lay", Err(RelayUrlError::InvalidHost)),
+            ("wss://relay.example:0", Err(RelayUrlError::InvalidPort)),
+            (
+                "wss://relay.example//",
+                Err(RelayUrlError::TrailingEmptySegment),
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                canonical_relay_url(input).as_deref(),
+                want.map(str::to_owned).as_deref(),
+                "{input}"
+            );
         }
     }
 
