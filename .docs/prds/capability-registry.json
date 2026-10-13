@@ -65,9 +65,9 @@
       ],
       "description": "Implement the CapabilityUri validated type that parses and validates agent capability URIs per ADR-041 and §7.3.4.1. Three URI authorities: (1) scp:capability:{kebab-case}/v{N} for protocol-defined challenge capabilities, (2) {identifier}:capability:{kebab-case}/v{N} for identity-scoped custom capabilities, (3) scp:system:{kebab-case} for protocol feature flags. The parser enforces: kebab-case naming (lowercase ASCII + hyphens), positive integer version numbers, no deeper nesting. CapabilityUri implements Display (round-trips to the canonical URI string), FromStr, Serialize/Deserialize, PartialEq, Eq, Hash, Clone, Debug. Error variants: MalformedUri, InvalidKebabCase, InvalidVersion, UnknownAuthority.",
       "acceptanceCriteria": [
-        "CapabilityUri enum has three variants: Protocol { name: String, version: u32 }, DidScoped { did: String, name: String, version: u32 }, System { name: String }",
+        "CapabilityUri enum has three variants: Protocol { name: String, version: u32 }, IdentifierScoped { definer: String, name: String, version: u32 }, System { name: String }",
         "FromStr parses 'scp:capability:prompt-injection-resistance/v1' into Protocol { name: \"prompt-injection-resistance\", version: 1 }",
-        "FromStr parses '{identifier}:capability:domain-expertise/v2' into DidScoped { did: the identifier, name: \"domain-expertise\", version: 2 }",
+        "FromStr parses '{identifier}:capability:domain-expertise/v2' into IdentifierScoped { definer: the identifier, name: \"domain-expertise\", version: 2 }",
         "FromStr parses 'scp:system:relay-operation' into System { name: \"relay-operation\" }",
         "FromStr rejects 'scp:capability:UPPERCASE/v1' with InvalidKebabCase error",
         "FromStr rejects 'scp:capability:name/v0' with InvalidVersion error (version must be >= 1)",
@@ -76,11 +76,11 @@
         "FromStr rejects 'scp:capability:name/v1/extra' with MalformedUri error (no deeper nesting)",
         "Display round-trips: parse then display produces the original string for all valid URIs",
         "CapabilityUri derives Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Debug",
-        "Tests verify parsing for all three authority types: Protocol (scp:capability:prompt-injection-resistance/v1), DidScoped ({identifier}:capability:domain-expertise/v2), System (scp:system:relay-operation)",
+        "Tests verify parsing for all three authority types: Protocol (scp:capability:prompt-injection-resistance/v1), IdentifierScoped ({identifier}:capability:domain-expertise/v2), System (scp:system:relay-operation)",
         "Tests verify all error variants are reachable"
       ],
       "actionItems": [
-        "Define CapabilityUri enum with Protocol, DidScoped, and System variants",
+        "Define CapabilityUri enum with Protocol, IdentifierScoped, and System variants",
         "Implement FromStr with kebab-case validation regex",
         "Implement Display for canonical round-trip",
         "Implement Serialize/Deserialize via the string representation",
@@ -114,7 +114,7 @@
       ],
       "description": "Implement the protocol capability registry per ADR-041 and §7.3.4.3. The registry is a compile-time constant map from CapabilityUri to RegistryEntry containing category, description, and optional parameter schema (serde_json::Value). The registry contains 28 challenge capabilities across 10 categories and 4 system capabilities. Provides lookup_protocol_capability(uri) -> Option<&RegistryEntry> and is_known_protocol_capability(uri) -> bool. The validate_capability_uri(uri) function rejects unknown scp:capability:* URIs while accepting all valid identity-scoped URIs. This is the SDK enforcement point described in §7.3.4.2.",
       "acceptanceCriteria": [
-        "RegistryEntry struct has fields: category (String), description (String), parameter_schema (Option<serde_json::Value>)",
+        "RegistryEntry struct has fields: category (String), description (String), challenge (Option<ChallengeStandard>), where ChallengeStandard carries min_cases, either MinCases::Total(n) or MinCases::PerCategory(n) (`07-trust-validation-and-capabilities.md` §7.3.4.3)",
         "PROTOCOL_REGISTRY contains exactly 27 entries with CapabilityUri::Protocol variants",
         "SYSTEM_REGISTRY contains exactly 4 entries with CapabilityUri::System variants",
         "lookup_protocol_capability returns Some for 'scp:capability:prompt-injection-resistance/v1'",
@@ -125,7 +125,7 @@
         "validate_capability_uri accepts arbitrary identity-scoped capabilities without registry lookup",
         "validate_capability_uri rejects unknown scp:capability:* URIs with UnknownProtocolCapability error",
         "validate_capability_uri accepts all 4 system capabilities",
-        "Parameterized capabilities (latency-compliance, multilingual, mathematical-reasoning, code-generation, code-review) have non-None parameter_schema",
+        "Each of the 28 protocol capabilities has challenge Some(ChallengeStandard) carrying the minimum test-case rule §7.3.4.3 sets for it, multilingual/v1 carrying MinCases::PerCategory(5); each of the 4 system capabilities has challenge None",
         "Registry entries are grouped by category: safety-security (4), schema-compliance (3), behavioral-compliance (4), operational (3), spending-commerce (2), reasoning-logic (3), code (2), recall-fidelity (2), bias-fairness (2), factual-hallucination (3)",
         "Tests verify round-trip: every registry entry's URI parses back to the same CapabilityUri"
       ],
@@ -135,7 +135,7 @@
         "Build SYSTEM_REGISTRY with all 4 entries",
         "Implement lookup_protocol_capability and is_known_protocol_capability",
         "Implement validate_capability_uri that enforces scp:capability:* reservation",
-        "Add parameter schemas for parameterized capabilities",
+        "Add the §7.3.4.3 challenge standard to each protocol capability",
         "Add unit tests verifying all 32 registry entries",
         "Re-export from trust/mod.rs"
       ],
@@ -214,20 +214,20 @@
         "crates/scp-core/src/trust/challenge.rs",
         "crates/scp-core/src/trust/capability_registry.rs"
       ],
-      "description": "After SCP-ACR-003 unifies ChallengeType with CapabilityUri, ensure the challenge-response protocol supports all 28 protocol-defined capabilities. The issue_challenge function must accept any valid CapabilityUri (protocol or identity-scoped). The verify_challenge_response function validates against the registry to confirm the challenge type is a known protocol capability or a valid identity-scoped URI. Parameterized capabilities (latency-compliance, multilingual, mathematical-reasoning, code-generation, code-review) must have their parameter schemas available for challenge parameter validation. This story does NOT implement concrete test vectors for each capability; it ensures the infrastructure supports all 28.",
+      "description": "After SCP-ACR-003 unifies ChallengeType with CapabilityUri, ensure the challenge-response protocol supports all 28 protocol-defined capabilities. The challenge_request_unsigned function must accept any valid CapabilityUri (protocol or identifier-scoped) and returns the request with its signing digest, which the verifier signs through its custody signer. The check_challenge_response function validates the response against the request before the verifier signs the ChallengeVerification record. Each protocol capability's challenge standard sets the minimum number of test cases a challenge for it carries (`07-trust-validation-and-capabilities.md` §7.3.4.3). This story does NOT implement concrete test vectors for each capability; it ensures the infrastructure supports all 28.",
       "acceptanceCriteria": [
-        "issue_challenge accepts any of the 28 protocol capability URIs as the challenge_type",
-        "issue_challenge accepts identity-scoped capability URIs as the challenge_type",
-        "issue_challenge rejects unknown scp:capability:* URIs (not in registry)",
-        "verify_challenge_response succeeds for challenges using any of the 28 protocol capabilities",
-        "For parameterized capabilities, issue_challenge validates that parameters match the registry's parameter_schema when present",
-        "Tests exercise issue_challenge with one capability from each of the 10 categories: prompt-injection-resistance (safety-security), schema-validation (schema-compliance), rate-limit-compliance (behavioral-compliance), latency-compliance (operational), spending-limit-enforcement (spending-commerce), mathematical-reasoning (reasoning-logic), code-generation (code), instruction-recall (recall-fidelity), demographic-bias-resistance (bias-fairness), source-attribution (factual-hallucination)",
-        "Tests exercise issue_challenge with an identity-scoped custom capability",
-        "Tests verify that issue_challenge rejects an unknown scp:capability:fake/v1"
+        "challenge_request_unsigned accepts each of the 28 protocol capability URIs when the test cases meet that URI's §7.3.4.3 minimum",
+        "challenge_request_unsigned accepts identifier-scoped capability URIs, to which no protocol minimum applies",
+        "challenge_request_unsigned rejects unknown scp:capability:* URIs (not in registry) with TrustError::UnknownChallengeCapability",
+        "check_challenge_response succeeds for challenges using any of the 28 protocol capabilities",
+        "For a protocol capability URI, challenge_request_unsigned rejects test cases below the URI's ChallengeStandard.min_cases with TrustError::ChallengeSuiteBelowMinimum",
+        "A test runs every one of the 28 protocol capability URIs, which span all 10 categories, through challenge_request_unsigned at that URI's §7.3.4.3 minimum and through check_challenge_response",
+        "Tests exercise challenge_request_unsigned with an identifier-scoped custom capability",
+        "Tests verify that challenge_request_unsigned rejects an unknown scp:capability:nonexistent/v1"
       ],
       "actionItems": [
-        "Update issue_challenge to validate challenge_type against registry",
-        "Add parameter schema validation for parameterized capabilities",
+        "Make challenge_request_unsigned validate capability_uri against the registry",
+        "Enforce each protocol capability's minimum test-case rule",
         "Update verify_challenge_response to accept URI-based challenge types",
         "Add integration tests covering all 10 categories",
         "Add test for identity-scoped custom capability challenge",
@@ -262,7 +262,7 @@
       "acceptanceCriteria": [
         "CapabilityEntry.capabilities field type is Vec<CapabilityUri> (not Vec<String>)",
         "parse_capability_endpoint('scp:capabilities:scp:capability:schema-validation/v1,scp:capability:rate-limit-compliance/v1') returns two valid CapabilityUri::Protocol entries",
-        "parse_capability_endpoint('scp:capabilities:{identifier}:capability:custom/v1') returns one valid CapabilityUri::DidScoped entry",
+        "parse_capability_endpoint('scp:capabilities:{identifier}:capability:custom/v1') returns one valid CapabilityUri::IdentifierScoped entry",
         "parse_capability_endpoint('scp:capabilities:invalid!!') returns DiscoveryError::InvalidCapabilities",
         "extract_capabilities deduplicates by CapabilityUri equality (not string equality)",
         "resolve_capabilities returns CapabilityEntry with validated CapabilityUri instances",
@@ -305,10 +305,10 @@
       "description": "Extend the service record's capability advertising to support system capabilities (scp:system:*). System capabilities use the same SCPCapabilities service endpoint format as challenge capabilities but with the scp:system: prefix. The parse_capability_endpoint function already handles this via the CapabilityUri parser (SCP-ACR-005), but this story ensures system capabilities are properly represented, documented, and tested. System capabilities describe node roles (relay-operation, etc.) and are not subject to challenge-response verification. Contexts and peers discover system capabilities by resolving the service record.",
       "acceptanceCriteria": [
         "parse_capability_endpoint('scp:capabilities:scp:system:relay-operation') returns one valid CapabilityUri::System entry",
-        "CapabilityEntry can contain a mix of Protocol, DidScoped, and System capabilities",
+        "CapabilityEntry can contain a mix of Protocol, IdentifierScoped, and System capabilities",
         "Tests verify a service record with system capabilities resolves correctly via resolve_capabilities",
-        "Tests verify deduplication works across Protocol, DidScoped, and System variants",
-        "issue_challenge rejects CapabilityUri::System variants with ChallengeError::NotChallengeable (system capabilities are node role declarations, not challengeable)"
+        "Tests verify deduplication works across Protocol, IdentifierScoped, and System variants",
+        "challenge_request_unsigned rejects CapabilityUri::System variants with TrustError::NotChallengeable (system capabilities are node role declarations, not challengeable)"
       ],
       "actionItems": [
         "Add tests for system capability parsing and resolution",

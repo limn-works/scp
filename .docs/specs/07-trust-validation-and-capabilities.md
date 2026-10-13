@@ -478,7 +478,7 @@ ChallengeVerification {
 11. `expires_at`: 8-byte BE u64;
 12. `context_id`: present, 4-byte BE length + UTF-8; absent, `00 00 00 20` followed by `SHA-256(0x00)`.
 
-This encoding replaces the earlier `SCP-CHALLENGE-VERIFY-V1:` encoding under the same separator; no signature made under the earlier encoding verifies. A verifier of the record rejects it when `verification_id` does not equal the derivation above, or when `expires_at` exceeds `timestamp` by more than 90 days.
+This encoding replaces the earlier `SCP-CHALLENGE-VERIFY-V1:` encoding under the same separator; no signature made under the earlier encoding verifies. A verifier of the record rejects it when `verification_id` does not equal the derivation above, when `expires_at` exceeds `timestamp` by more than 90 days, or when `timestamp` is later than the verifier's clock plus the `09-security-model.md` §9.14 clock-skew tolerance (5 minutes). The last check bounds the 90-day cap in real time: without it, a record stamped years ahead would pass the cap and stay unexpired for years.
 
 **Challenge suite protocol.** The protocol for administering a challenge:
 
