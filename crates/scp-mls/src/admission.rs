@@ -117,6 +117,11 @@ pub(crate) struct CommitAdmission {
     /// wrapping-key directory rebuilds it without a fallible step after the
     /// merge.
     pub(crate) members: MemberLeaves,
+    /// The DID of every occupied leaf before and after the Commit, keyless
+    /// leaves included, from which a receiver classifies the Commit's
+    /// membership changes by DID (spec 09 §9.10.4.1 "Membership-change
+    /// criterion").
+    pub(crate) leaf_dids: scp_protocol::context::pseudonym::CommitLeafDids,
 }
 
 /// The occupied leaves of a group's tree, each with its DID and `0xFF01`
@@ -441,6 +446,14 @@ pub(crate) fn admit_staged_commit(
         }
     }
 
+    admission.leaf_dids = scp_protocol::context::pseudonym::CommitLeafDids {
+        before: tree.iter().map(|l| l.did.clone()).collect(),
+        after: after
+            .iter()
+            .map(|l| l.did.clone())
+            .chain(admission.added.iter().map(|l| l.did.clone()))
+            .collect(),
+    };
     admission.members = MemberLeaves {
         leaves: after
             .into_iter()
@@ -756,6 +769,7 @@ mod tests {
             DecryptedContent::Commit {
                 sender_did,
                 members,
+                ..
             } => {
                 assert_eq!(sender_did, did("bob"));
                 assert_eq!(members.rotated(), rotated.as_slice());
@@ -912,6 +926,80 @@ mod tests {
             .expect("the bystander counts the post-commit tree");
         assert_eq!(f.dave.epoch().unwrap(), 4);
         assert_eq!(f.dave.members().unwrap().len(), 3 + MAX_LEAVES_PER_DID);
+    }
+
+    /// The leaf DIDs a bystander's `DecryptedContent::Commit` carries classify
+    /// membership changes by DID, not by leaf (spec 09 §9.10.4.1
+    /// "Membership-change criterion", CONF-005): a second device leaf for Bob
+    /// and the removal of one of his two leaves change nothing, the removal of
+    /// his last leaf is one `RemoveMember`, and a new DID is one `AddMember`.
+    #[test]
+    fn received_commit_leaf_dids_classify_membership_by_did() {
+        use scp_protocol::context::pseudonym::{CommitLeafDids, classify_commit_membership};
+
+        fn received(dave: &mut ScpMlsGroup, bytes: &[u8]) -> CommitLeafDids {
+            match decrypt_with_sender_did(dave, bytes).unwrap() {
+                DecryptedContent::Commit { leaf_dids, .. } => leaf_dids,
+                other => panic!("expected a Commit, got {other:?}"),
+            }
+        }
+        fn count(list: &[String], name: &str) -> usize {
+            list.iter().filter(|d| **d == did(name)).count()
+        }
+
+        let mut f = fixture();
+        let bob_key = uncompressed_point_for(&did("bob"));
+
+        // A second device leaf for Bob, who already holds one.
+        let add = add_member_with_convergent_timestamp(
+            &mut f.alice,
+            kp("bob", &bob_key).into(),
+            &SystemClock,
+            SystemClock.now_secs(),
+        )
+        .unwrap();
+        let leaf_dids = received(&mut f.dave, &add.commit.tls_serialize_detached().unwrap());
+        assert_eq!(count(&leaf_dids.before, "bob"), 1);
+        assert_eq!(count(&leaf_dids.after, "bob"), 2);
+        let change = classify_commit_membership(&leaf_dids);
+        assert!(
+            change.is_empty(),
+            "a device leaf is no AddMember: {change:?}"
+        );
+
+        // Removing one of Bob's two leaves leaves him a member.
+        let first = leaf_of(&f.alice, "bob");
+        let remove = crate::group::remove_member(&mut f.alice, first, &SystemClock).unwrap();
+        let leaf_dids = received(&mut f.dave, &remove.commit_bytes);
+        assert_eq!(count(&leaf_dids.before, "bob"), 2);
+        assert_eq!(count(&leaf_dids.after, "bob"), 1);
+        let change = classify_commit_membership(&leaf_dids);
+        assert!(
+            change.is_empty(),
+            "a device leaf is no RemoveMember: {change:?}"
+        );
+
+        // Removing Bob's last leaf is one RemoveMember.
+        let last = leaf_of(&f.alice, "bob");
+        let remove = crate::group::remove_member(&mut f.alice, last, &SystemClock).unwrap();
+        let change = classify_commit_membership(&received(&mut f.dave, &remove.commit_bytes));
+        assert_eq!(change.removed_dids, vec![did("bob")]);
+        assert!(change.added_dids.is_empty());
+
+        // A DID with no leaf before the Commit is one AddMember.
+        let add = add_member(
+            &mut f.alice,
+            kp("erin", &uncompressed_point_for(&did("erin"))).into(),
+            &SystemClock,
+        )
+        .unwrap();
+        let change = classify_commit_membership(&received(
+            &mut f.dave,
+            &add.commit.tls_serialize_detached().unwrap(),
+        ));
+        assert_eq!(change.added_dids, vec![did("erin")]);
+        assert!(change.removed_dids.is_empty());
+        assert_eq!(f.dave.epoch().unwrap(), 6);
     }
 
     /// Bob's `UpdatePath` rotates his key to K2 while the same Commit adds a

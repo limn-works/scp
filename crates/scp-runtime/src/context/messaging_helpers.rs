@@ -1497,6 +1497,15 @@ pub enum DeliverOutcome {
 /// coalesced. The token carrier (vs. the prior `bool`) makes a populated-but-
 /// undischarged obligation a Drop-guard PANIC in debug/CI rather than a silently
 /// dropped flag.
+///
+/// `commit_sink` (spec 09 §9.10.4.1): when the envelope is a Commit another
+/// member committed, this function classifies its membership changes by DID
+/// with [`classify_commit_membership`](scp_protocol::context::pseudonym::classify_commit_membership)
+/// and stores the result here. The receive view cannot reach Class-S state, so
+/// the cell-holding handler applies it with
+/// [`note_processed_commit`](crate::context::actor::pseudonym_rotation::note_processed_commit)
+/// inside a fail-closed, keep-direction Class-S commit: it deletes each removed
+/// DID's registry record and records the rotation trigger.
 #[allow(clippy::too_many_lines)]
 pub async fn deliver_incoming(
     view: &mut ClassCMut<'_>,
@@ -1504,6 +1513,7 @@ pub async fn deliver_incoming(
     context_id: &str,
     encrypted_blob: &[u8],
     downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
+    commit_sink: &mut Option<crate::context::actor::pseudonym_rotation::ProcessedCommit>,
 ) -> Result<DeliverOutcome, ContextError> {
     // ADR-056: canonical digest (matches the MLS group / sender keys), not a
     // re-hash of the hex id.
@@ -1534,17 +1544,29 @@ pub async fn deliver_incoming(
     // contexts carry no crypto sub-state (`None`), matching the retained provider
     // fallback; the `&mut` view is released as soon as the sync call returns, so
     // `view` is free for the dispatch cascade below.
-    let Some(opened_envelope) = decrypt_and_dispatch(
+    let opened_envelope = match decrypt_and_dispatch(
         deps,
         view.mode_mut().crypto_mut(),
         context_id,
         &context_id_bytes,
         encrypted_blob,
-    )?
-    else {
-        // MLS Commit / Proposal — processed internally by the crypto layer,
-        // no inner envelope to classify.
-        return Ok(DeliverOutcome::Handled);
+    )? {
+        Dispatched::Envelope(env) => *env,
+        Dispatched::Commit {
+            committer_did,
+            leaf_dids,
+        } => {
+            // §9.10.4.1 "Membership-change criterion": count the merged
+            // Commit's changes by DID. The handler applies them fail-closed.
+            *commit_sink = Some(crate::context::actor::pseudonym_rotation::ProcessedCommit {
+                committer_did,
+                change: scp_protocol::context::pseudonym::classify_commit_membership(&leaf_dids),
+            });
+            return Ok(DeliverOutcome::Handled);
+        }
+        // An MLS Proposal or a management message, processed by the crypto
+        // layer; no inner envelope to classify.
+        Dispatched::Handled => return Ok(DeliverOutcome::Handled),
     };
 
     let inner = opened_envelope.inner;
@@ -3117,6 +3139,23 @@ pub(in crate::context) fn stream_reservations_snapshot(
 // 13. decrypt_and_dispatch
 // ---------------------------------------------------------------------------
 
+/// What [`decrypt_and_dispatch`] made of one inbound envelope.
+#[derive(Debug)]
+pub(super) enum Dispatched {
+    /// An application envelope for the caller to verify and classify.
+    Envelope(Box<scp_protocol::context::builder::OpenedEnvelope>),
+    /// A Commit another member committed, already admitted and merged. The
+    /// caller classifies its membership changes (spec 09 §9.10.4.1).
+    Commit {
+        /// The committer's DID from its MLS credential.
+        committer_did: String,
+        /// The DID of every occupied leaf before and after the Commit.
+        leaf_dids: scp_protocol::context::pseudonym::CommitLeafDids,
+    },
+    /// An MLS Proposal or a management message, processed here.
+    Handled,
+}
+
 /// Decrypts an incoming envelope and dispatches management/control
 /// messages.
 ///
@@ -3128,7 +3167,7 @@ pub(super) fn decrypt_and_dispatch(
     context_id: &str,
     context_id_bytes: &[u8; 32],
     encrypted_blob: &[u8],
-) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
+) -> Result<Dispatched, ContextError> {
     let decrypt_start = std::time::Instant::now();
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's OWNED
     // field-granular Class-C `&mut ContextCryptoState` (driven from
@@ -3167,9 +3206,16 @@ pub(super) fn decrypt_and_dispatch(
                     "application message from own DID".to_owned(),
                 ));
             }
-            Ok(Some(*env))
+            Ok(Dispatched::Envelope(env))
         }
-        scp_protocol::context::builder::OpenResult::Control => Ok(None),
+        scp_protocol::context::builder::OpenResult::Commit {
+            committer_did,
+            leaf_dids,
+        } => Ok(Dispatched::Commit {
+            committer_did,
+            leaf_dids,
+        }),
+        scp_protocol::context::builder::OpenResult::Control => Ok(Dispatched::Handled),
         scp_protocol::context::builder::OpenResult::Management {
             sender_did,
             payload,
@@ -3246,7 +3292,7 @@ pub(super) fn decrypt_and_dispatch(
                         // returns `None` (§9.16.2 silent drop) — nothing queued.
                         cs.pending_distributions.push((sender_did.clone(), sealed));
                     }
-                    Ok(None)
+                    Ok(Dispatched::Handled)
                 }
                 scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(_) => {
                     // ADR-049 PR-6 GATE-BEFORE-INSTALL + PR-7 install-onto-ACTOR
@@ -3277,7 +3323,7 @@ pub(super) fn decrypt_and_dispatch(
                     let ctx_id_hex = hex::encode(context_id_bytes);
                     cs.sender_key_store
                         .set_unchecked(&ctx_id_hex, &sender_did, sender_key);
-                    Ok(None)
+                    Ok(Dispatched::Handled)
                 }
                 other => Err(ContextError::CryptoFailed(format!(
                     "unexpected sender-key distribution variant on the receive path: {other:?}"

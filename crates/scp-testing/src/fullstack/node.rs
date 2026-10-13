@@ -34,6 +34,7 @@
 //! only substitutes for the absent transport.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use scp_core::context::builder::{
@@ -41,8 +42,9 @@ use scp_core::context::builder::{
 };
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::membership::ContextEvent;
+use scp_core::context::persistence::ContextPersistence;
 use scp_core::context::providers::event_log::MerkleEventLogProvider;
-use scp_core::context::state::context_id_to_bytes;
+use scp_core::context::state::{ContextSnapshot, context_id_to_bytes};
 use scp_core::context::supervisor::{
     InviteMemberOutcome, MessageSigner, Supervisor, WelcomeJoinRequest,
 };
@@ -163,6 +165,83 @@ impl ContextTransportProvider for CapturingTransport {
 }
 
 // ---------------------------------------------------------------------------
+// Observation — event channel and snapshot store of an observed node
+// ---------------------------------------------------------------------------
+
+/// Error a [`SnapshotStore`] write returns while writes are set to fail.
+type PersistError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The snapshots an observed node's supervisor persisted, keyed by context
+/// ID. [`FullStackNode::set_persistence_failing`] makes every write fail, so a
+/// test can drive the fail-closed persist paths.
+#[derive(Default)]
+struct SnapshotStore {
+    /// The last snapshot written per context.
+    snapshots: Mutex<HashMap<String, ContextSnapshot>>,
+    /// When set, every `persist_context` returns an error and stores nothing.
+    fail_writes: AtomicBool,
+}
+
+impl SnapshotStore {
+    /// Locks the snapshot map, recovering from poisoning.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ContextSnapshot>> {
+        self.snapshots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// [`ContextPersistence`] over a shared [`SnapshotStore`].
+struct StorePersistence(Arc<SnapshotStore>);
+
+#[async_trait::async_trait]
+impl ContextPersistence for StorePersistence {
+    async fn persist_context(
+        &self,
+        context_id: &str,
+        snapshot: &ContextSnapshot,
+    ) -> Result<(), PersistError> {
+        if self.0.fail_writes.load(Ordering::SeqCst) {
+            return Err("fullstack observed node: persistence writes are set to fail".into());
+        }
+        self.0
+            .lock()
+            .insert(context_id.to_owned(), snapshot.clone());
+        Ok(())
+    }
+
+    async fn load_context(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<ContextSnapshot>, PersistError> {
+        Ok(self.0.lock().get(context_id).cloned())
+    }
+
+    async fn delete_context(&self, context_id: &str) -> Result<(), PersistError> {
+        self.0.lock().remove(context_id);
+        Ok(())
+    }
+
+    async fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistError> {
+        Ok(self.0.lock().keys().cloned().collect())
+    }
+}
+
+/// Capacity of an observed node's supervisor event channel. Large enough that
+/// a test draining it after each step never lags.
+const OBSERVED_EVENT_CAPACITY: usize = 4_096;
+
+/// What an observed node exposes beyond a plain one: the supervisor event
+/// channel (the channel the actor's timer arms signal on, such as
+/// `PseudonymRotationDue`) and the snapshots its supervisor persisted.
+struct NodeObservation {
+    /// The supervisor's event channel; tests subscribe to it.
+    events: tokio::sync::broadcast::Sender<(String, ContextEvent)>,
+    /// The supervisor's persistence.
+    store: Arc<SnapshotStore>,
+}
+
+// ---------------------------------------------------------------------------
 // ArcEventLogProvider — share one MerkleEventLogProvider between node + actor
 // ---------------------------------------------------------------------------
 
@@ -257,16 +336,24 @@ pub struct FullStackNode {
     /// consumed for Welcome extraction without losing the events the tests
     /// assert on later).
     pending_events: Mutex<Vec<ContextEvent>>,
+    /// The event channel and snapshot store of a node built with
+    /// [`FullStackNetwork::create_observed_node`](super::network::FullStackNetwork::create_observed_node);
+    /// `None` for a plain node, whose supervisor has neither.
+    observation: Option<NodeObservation>,
 }
 
 impl FullStackNode {
-    /// Creates a new full-stack node.
+    /// Creates a new full-stack node. With `observed` set, the supervisor gets
+    /// an event channel and a snapshot store the test can read (see
+    /// [`Self::subscribe_events`] and [`Self::persisted_snapshot`]); otherwise
+    /// it has neither.
     #[must_use]
     pub(super) fn new(
         did: DID,
         crypto: Arc<E2eCryptoProvider>,
         key_resolver: KeyResolver,
         registry: NodeRegistry,
+        observed: bool,
     ) -> Self {
         let event_log = Arc::new(MerkleEventLogProvider::new());
         let sent: SentBuffer = Arc::new(Mutex::new(Vec::new()));
@@ -277,12 +364,37 @@ impl FullStackNode {
         let event_log_box: Box<dyn ContextEventLogProvider> =
             Box::new(ArcEventLogProvider(Arc::clone(&event_log)));
 
-        let manager = scp_core::context::test_supervisor(
-            Arc::clone(&crypto.provider),
-            transport_box,
-            event_log_box,
-            Arc::clone(&key_resolver),
-        );
+        let (manager, observation) = if observed {
+            let (events, _) = tokio::sync::broadcast::channel(OBSERVED_EVENT_CAPACITY);
+            let store = Arc::new(SnapshotStore::default());
+            let mls_storage: Arc<
+                dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter,
+            > = Arc::new(
+                scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    scp_platform::in_memory::InMemoryStorage::new(),
+                )),
+            );
+            let manager = Supervisor::with_providers(
+                Arc::clone(&crypto.provider),
+                transport_box,
+                event_log_box,
+                Arc::clone(&key_resolver),
+                Some(Box::new(StorePersistence(Arc::clone(&store)))),
+                None,
+                Some(events.clone()),
+                None,
+                mls_storage,
+            );
+            (manager, Some(NodeObservation { events, store }))
+        } else {
+            let manager = scp_core::context::test_supervisor(
+                Arc::clone(&crypto.provider),
+                transport_box,
+                event_log_box,
+                Arc::clone(&key_resolver),
+            );
+            (manager, None)
+        };
 
         Self {
             did,
@@ -294,7 +406,61 @@ impl FullStackNode {
             sent,
             registry,
             pending_events: Mutex::new(Vec::new()),
+            observation,
         }
+    }
+
+    /// Subscribes to this node's supervisor event channel: every event sent
+    /// after this call, tagged with its context ID. `None` for a plain node.
+    #[must_use]
+    pub fn subscribe_events(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<(String, ContextEvent)>> {
+        self.observation.as_ref().map(|o| o.events.subscribe())
+    }
+
+    /// The last snapshot this node's supervisor persisted for `context_id`.
+    /// `None` for a plain node or a context never persisted.
+    #[must_use]
+    pub fn persisted_snapshot(&self, context_id: &str) -> Option<ContextSnapshot> {
+        self.observation
+            .as_ref()
+            .and_then(|o| o.store.lock().get(context_id).cloned())
+    }
+
+    /// Makes every later persistence write of this node fail (`true`) or
+    /// succeed (`false`). Returns `false` for a plain node, which has no
+    /// persistence to fail.
+    pub fn set_persistence_failing(&self, failing: bool) -> bool {
+        self.observation.as_ref().is_some_and(|o| {
+            o.store.fail_writes.store(failing, Ordering::SeqCst);
+            true
+        })
+    }
+
+    /// Rotates this node's pseudonym in `context_id` to `new_routing_id` at
+    /// `new_epoch` through the real `Supervisor::rotate_pseudonym`, signing
+    /// the announcement with this node's `#active` key (spec 09 §9.10.4.1).
+    /// The announcement lands in the captured-send buffer.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the supervisor.
+    pub async fn rotate_pseudonym(
+        &self,
+        context_id: &str,
+        new_epoch: u64,
+        new_routing_id: [u8; 32],
+    ) -> Result<(), ContextError> {
+        self.manager
+            .rotate_pseudonym(
+                context_id,
+                &self.did,
+                &self.signing_key,
+                new_epoch,
+                new_routing_id,
+            )
+            .await
     }
 
     /// Locks the captured-send buffer, recovering from poisoning.
@@ -486,6 +652,50 @@ impl FullStackNode {
         Ok(())
     }
 
+    /// Removes `member_did` from the context (committer-side operation)
+    /// through the real `Supervisor::leave_context` path, and deposits the
+    /// removal Commit for every remaining member on another node to merge
+    /// with [`Self::feed_pending_incoming`].
+    ///
+    /// `execute_remove_member` broadcasts the raw epoch-advance Commit first
+    /// and then pushes this node's rotated sender key, sealed to each
+    /// recipient separately, so the first captured send is the Commit. The
+    /// sender-key pushes carry no recipient the harness can read, so they are
+    /// discarded: a test that needs this node's post-removal messages to reach
+    /// a member must route those pushes itself.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the supervisor, and returns
+    /// [`ContextError::CryptoFailed`] if the removal sent no Commit.
+    pub async fn remove_member(
+        &self,
+        handle: &ContextHandle,
+        member_did: &str,
+    ) -> Result<(), ContextError> {
+        let context_id = handle.context_id();
+        let ctx_bytes = context_id_to_bytes(context_id);
+        let _ = self.take_sent_ciphertexts();
+        self.manager
+            .leave_context(handle, &self.did, &DID::from(member_did))
+            .await?;
+        let (_, commit) = self
+            .take_sent_ciphertexts()
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                ContextError::CryptoFailed(format!("removing {member_did} sent no Commit"))
+            })?;
+        for remaining in self.manager.member_dids(context_id).await {
+            if remaining == member_did || remaining == self.did.as_ref() {
+                continue;
+            }
+            self.crypto
+                .deposit_commit(&ctx_bytes, &remaining, commit.clone());
+        }
+        Ok(())
+    }
+
     /// Joins a context from the sealed invitation the creator deposited in the
     /// `KeyExchange` (joiner-side operation), standing up a live, send-capable
     /// per-context ACTOR via `Supervisor::spawn_actor_from_welcome` (ADR-049 §9
@@ -570,6 +780,13 @@ impl FullStackNode {
         self.feed_pending_incoming(context_id_str, context_id)
             .await?;
 
+        // The current member set, read from the creator. A joiner's own
+        // membership view lists only the creator and itself (nothing replays
+        // the earlier adds to it), so the exchanges below read the creator's.
+        let members = self
+            .creator_member_dids(&creator_did, handle.context_id())
+            .await?;
+
         // 6. Joiner→incumbent sender-key exchange via the spec's PULL protocol
         //    (§9.16.2), the canonical new-member mechanism. Neither `invite_member`
         //    nor the Welcome carries the joiner's sender key to the incumbents, so
@@ -580,7 +797,7 @@ impl FullStackNode {
         //    [`scp_mls::extract_member_wrapping_key`] returns only the local
         //    member's key; its rustdoc says why.
         //    Instead each incumbent PULLS the joiner's key (see the helper).
-        self.incumbents_pull_joiner_sender_key(context_id, &handle)
+        self.incumbents_pull_joiner_sender_key(context_id, &handle, &members)
             .await?;
 
         // 7. §9.17 content-access-key acquisition via the REAL pull protocol.
@@ -592,9 +809,36 @@ impl FullStackNode {
         //    opened keys into its actor store. (The production actor-loop
         //    distribution this simulates over the harness transport is deferred
         //    and tracked in #2050.)
-        self.pull_access_keys_from_creator(context_id_str, &creator_did, &handle)
+        self.pull_access_keys_from_creator(context_id_str, &creator_did, &members)
             .await?;
         Ok(handle)
+    }
+
+    /// The creator's member DIDs for `context_id`: the authoritative member
+    /// set of a `SingleAdmin` context, whose creator commits every add and
+    /// remove.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] if the creator node is not registered.
+    async fn creator_member_dids(
+        &self,
+        creator_did: &str,
+        context_id: &str,
+    ) -> Result<Vec<String>, ContextError> {
+        let creator = {
+            let registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.get(creator_did).cloned()
+        };
+        let creator = creator.ok_or_else(|| {
+            ContextError::CryptoFailed(format!(
+                "creator node {creator_did} is not registered in the network"
+            ))
+        })?;
+        Ok(creator.manager.member_dids(context_id).await)
     }
 
     /// Drives the §9.17 access-key PULL for a Welcome-joiner (`self`).
@@ -611,10 +855,12 @@ impl FullStackNode {
     /// testing seam. This is the real request/response round trip over the
     /// harness's simulated transport — no deposit/pickup shortcut.
     ///
-    /// The joiner pulls the FULL current member set at join time. Incremental
-    /// re-distribution to already-joined members when a LATER member joins is the
-    /// production actor-loop concern tracked in #2050 (no current test drives a
-    /// joiner→later-joiner send, so it is not simulated here).
+    /// The joiner pulls the FULL current member set at join time (`members`,
+    /// read from the creator), so a later joiner holds an earlier joiner's key
+    /// and its sends reach that member. Re-distribution to already-joined
+    /// members when a LATER member joins is the production actor-loop concern
+    /// tracked in #2050; an earlier joiner never needs the later joiner's
+    /// access key to open what the later joiner sends.
     ///
     /// # Expiry
     ///
@@ -632,7 +878,7 @@ impl FullStackNode {
         &self,
         context_id_str: &str,
         creator_did: &str,
-        joiner_handle: &ContextHandle,
+        members: &[String],
     ) -> Result<(), ContextError> {
         use scp_clock::Clock as _;
         use scp_core::crypto::access_keys::wire::{
@@ -659,10 +905,10 @@ impl FullStackNode {
         let joiner_did = self.did.as_ref();
         let mut nonce_dedup = scp_core::crypto::sender_keys::NonceDedup::new();
 
-        for member_did in self.manager.member_dids(joiner_handle.context_id()).await {
+        for member_did in members {
             // The creator holds every member's key; a missing entry is a real
             // wiring bug (fail loud rather than silently skip a recipient).
-            let member_key = creator_keys.get(&member_did).cloned().ok_or_else(|| {
+            let member_key = creator_keys.get(member_did).cloned().ok_or_else(|| {
                 ContextError::CryptoFailed(format!(
                     "§9.17 pull: creator holds no access key for member {member_did}"
                 ))
@@ -711,7 +957,7 @@ impl FullStackNode {
                     ContextError::CryptoFailed(format!("open access-key response: {e}"))
                 })?;
             self.manager
-                .test_install_access_key(context_id_str, &member_did, key)
+                .test_install_access_key(context_id_str, member_did, key)
                 .await?;
         }
         Ok(())
@@ -719,7 +965,8 @@ impl FullStackNode {
 
     /// Drives the §9.16.2 PULL exchange for the joiner→incumbent direction.
     ///
-    /// For each existing member `incumbent`, the incumbent issues a signed
+    /// For each existing member `incumbent` in `members` (read from the
+    /// creator, so an earlier joiner is included), the incumbent issues a signed
     /// [`SenderKeyRequest`](scp_core::crypto::sender_keys::SenderKeyRequest)
     /// carrying a FRESH EPHEMERAL wrapping key, the joiner (`self`) answers via
     /// [`Supervisor::handle_sender_key_request`](scp_core::context::supervisor::Supervisor::handle_sender_key_request),
@@ -741,6 +988,7 @@ impl FullStackNode {
         &self,
         context_id: &[u8; 32],
         joiner_handle: &ContextHandle,
+        members: &[String],
     ) -> Result<(), ContextError> {
         use scp_core::crypto::sender_keys::SenderKeyDistributionMessage;
         use scp_core::crypto::sender_keys::key_protocol::{
@@ -759,8 +1007,8 @@ impl FullStackNode {
         // response), so this is only the requester's best-effort hint.
         let joiner_epoch = 1u64;
 
-        for incumbent_did in self.manager.member_dids(joiner_handle.context_id()).await {
-            if incumbent_did == joiner_did {
+        for incumbent_did in members {
+            if *incumbent_did == joiner_did {
                 continue;
             }
 
@@ -771,7 +1019,7 @@ impl FullStackNode {
                     .registry
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                registry.get(&incumbent_did).cloned()
+                registry.get(incumbent_did).cloned()
             };
             let Some(incumbent) = incumbent else {
                 continue;
@@ -788,7 +1036,7 @@ impl FullStackNode {
             let request = request_sender_key(
                 &custody,
                 &signing_handle,
-                &incumbent_did,
+                incumbent_did,
                 &joiner_did,
                 joiner_epoch,
                 &scp_clock::SystemClock,
@@ -1095,7 +1343,7 @@ impl FullStackNode {
     /// # Errors
     ///
     /// Propagates [`ContextError`] if any deliver step fails.
-    async fn feed_pending_incoming(
+    pub async fn feed_pending_incoming(
         &self,
         context_id_str: &str,
         context_id: &[u8; 32],

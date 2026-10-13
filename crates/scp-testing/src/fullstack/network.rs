@@ -66,6 +66,25 @@ impl FullStackNetwork {
     /// deterministic [`resolver`](Self::resolver) — no per-test resolver wiring.
     #[must_use]
     pub fn create_node(&self, did: &str) -> FullStackNode {
+        self.build_node(did, false)
+    }
+
+    /// Creates a node like [`Self::create_node`] whose supervisor also has an
+    /// event channel and a snapshot store, so a test can observe the signals
+    /// the actor's timer arms send ([`FullStackNode::subscribe_events`]), read
+    /// what it persisted ([`FullStackNode::persisted_snapshot`]), and make its
+    /// persistence fail ([`FullStackNode::set_persistence_failing`]).
+    ///
+    /// Creating a node with a DID already in the network replaces that DID's
+    /// registry entry, so the new node takes its place in later `add_member`
+    /// calls: a removed member rejoining on a fresh device.
+    #[must_use]
+    pub fn create_observed_node(&self, did: &str) -> FullStackNode {
+        self.build_node(did, true)
+    }
+
+    /// Builds and registers a node; see [`Self::create_node`].
+    fn build_node(&self, did: &str, observed: bool) -> FullStackNode {
         let did_value = DID(did.to_owned());
         let crypto = Arc::new(E2eCryptoProvider::new(
             did_value.clone(),
@@ -76,6 +95,7 @@ impl FullStackNetwork {
             crypto,
             Self::resolver(),
             Arc::clone(&self.registry),
+            observed,
         );
         // Register the node's supervisor AFTER it is built (its `manager` now
         // exists) so the creator side can reserve this node's own KeyPackage
