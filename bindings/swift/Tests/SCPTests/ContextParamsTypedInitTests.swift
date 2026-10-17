@@ -9,7 +9,10 @@ import XCTest
 /// default ceiling would turn that refusal into a context with capabilities
 /// nobody chose, so the empty list must reach the bridge unchanged.
 final class ContextParamsTypedInitTests: XCTestCase {
-    private func makeParams(ceiling: [String]) throws -> ContextParams {
+    private func makeParams(
+        ceiling: [String],
+        capabilityRequirements: [CapabilityRequirement]? = nil
+    ) throws -> ContextParams {
         try ContextParams(
             mode: .encrypted,
             ceiling: ceiling,
@@ -19,7 +22,8 @@ final class ContextParamsTypedInitTests: XCTestCase {
             ttlSeconds: 3600,
             promotable: false,
             consequenceRules: nil,
-            consequenceConfig: nil
+            consequenceConfig: nil,
+            capabilityRequirements: capabilityRequirements
         )
     }
 
@@ -32,5 +36,34 @@ final class ContextParamsTypedInitTests: XCTestCase {
             try makeParams(ceiling: ["messages:read"]).ceiling,
             ["messages:read"]
         )
+    }
+
+    func testAbsentCapabilityRequirementsStayAbsent() throws {
+        XCTAssertNil(try makeParams(ceiling: ["messages:read"]).capabilityRequirementsJson)
+    }
+
+    func testCapabilityRequirementsReachTheWireField() throws {
+        let params = try makeParams(
+            ceiling: ["messages:read"],
+            capabilityRequirements: [
+                CapabilityRequirement(
+                    capability: "scp:cap:translate",
+                    verificationLevel: .challengeVerified,
+                    trustedVerifiers: ["did:dht:verifier"],
+                    retryCap: RetryCap(maxRetries: 2, minCooldownSecs: 60)
+                )
+            ]
+        )
+        let json = try XCTUnwrap(params.capabilityRequirementsJson)
+        let decoded = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]]
+        )
+        XCTAssertEqual(decoded.count, 1)
+        XCTAssertEqual(decoded[0]["capability"] as? String, "scp:cap:translate")
+        XCTAssertEqual(decoded[0]["verification_level"] as? String, "ChallengeVerified")
+        XCTAssertEqual(decoded[0]["trusted_verifiers"] as? [String], ["did:dht:verifier"])
+        let cap = try XCTUnwrap(decoded[0]["retry_cap"] as? [String: Any])
+        XCTAssertEqual(cap["max_retries"] as? Int, 2)
+        XCTAssertEqual(cap["min_cooldown_secs"] as? Int, 60)
     }
 }

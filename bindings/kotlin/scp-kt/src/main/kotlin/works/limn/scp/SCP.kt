@@ -27,7 +27,7 @@ package works.limn.scp
 import uniffi.scp.AssetEntry
 import uniffi.scp.AttestationVerificationResult
 import uniffi.scp.BatchPublishResult
-import uniffi.scp.ChallengeResult
+import uniffi.scp.ChallengePolicy
 import uniffi.scp.Checkpoint
 import uniffi.scp.ContextHandle
 import uniffi.scp.ContextParams
@@ -69,9 +69,6 @@ import uniffi.scp.Scp as NativeScp
 
 /** The code an SDK `shutdown` raises when the durable store still holds its advisory lock. */
 private const val STORAGE_LOCK_HELD_CODE = "SCP-STORAGE-8005"
-
-/** The challenge response window [SCP.trustCreateChallenge] uses by default. */
-private const val DEFAULT_CHALLENGE_TIMEOUT_SECS = 300u
 
 /**
  * Caller-owned SCP instance — the SDK entry point.
@@ -2074,30 +2071,88 @@ class SCP internal constructor(
     suspend fun transportStatus(manager: TransportManager): TransportStatus = inner.transportStatus(manager = manager)
 
     /**
-     * Builds a challenge request for [capabilityUri] from the challenger-written
-     * [testCases] and signs it with [verifier]'s `#active` key through custody
-     * (spec 07 §7.3.4, ADR-017). Returns the challenge id and the signed
-     * request JSON; read it with [decodeChallengeRequestJson].
+     * Issues a challenge request for [capabilityUri] signed by [verifier]'s
+     * `#active` key through custody (spec 07 §7.3.4 step 1, ADR-017).
      *
+     * The challenger writes [testCases] with their answers. The returned
+     * request carries a salted commitment to each answer and never the answer;
+     * the challenger's ledger keeps the answers to grade with. The capability
+     * definition for [capabilityUri] sets the pass threshold, the retries and
+     * the cooldown; [policy] may only tighten them.
+     *
+     * @param verifier The challenger's identity.
+     * @param subject DID of the challenged identity.
+     * @param capabilityUri The capability URI under test.
+     * @param testCases The challenger-written cases; their weights sum to 10000.
+     * @param contextId The context where the challenge is administered.
+     * @param windowSecs Seconds from creation during which attempts are graded.
+     * @param evaluatorContextId The context of the evaluator outlet that
+     *   `CustomEval` cases name; `null` when there are none.
+     * @param policy A stricter retry and cooldown policy; `null` keeps the
+     *   definition's.
+     * @throws IllegalArgumentException when the returned request is malformed.
      * @throws uniffi.scp.ScpException.Validation with code
-     *   [CHALLENGE_SUITE_BELOW_MINIMUM_CODE] when a protocol capability URI's
-     *   suite has fewer cases than its standard's minimum, `SCP-VALID-7002` for
-     *   malformed test cases, `SCP-VALID-7013` for an invalid subject DID, and
-     *   `SCP-VALID-7003` for any other refusal.
+     *   [CHALLENGE_SUITE_BELOW_MINIMUM_CODE] when the suite has fewer cases
+     *   than the definition's minimum, `SCP-VALID-7002` for malformed test
+     *   cases, `SCP-VALID-7137` for a policy looser than the definition, and
+     *   [NON_CANONICAL_IDENTIFIER_CODE] for a DID that is not canonical.
      */
+    @Suppress("LongParameterList")
     suspend fun trustCreateChallenge(
         verifier: Identity,
         subject: String,
         capabilityUri: String,
         testCases: List<TestCase>,
-        timeoutSecs: UInt = DEFAULT_CHALLENGE_TIMEOUT_SECS,
-    ): ChallengeResult =
-        inner.trustCreateChallenge(
-            verifier = verifier,
-            subject = subject,
-            capabilityUri = capabilityUri,
-            testCasesJson = encodeTestCasesJson(testCases),
-            timeoutSecs = timeoutSecs,
+        contextId: String,
+        windowSecs: UInt,
+        evaluatorContextId: String? = null,
+        policy: ChallengePolicy? = null,
+    ): ChallengeRequest =
+        decodeChallengeRequestJson(
+            inner
+                .trustCreateChallenge(
+                    verifier = verifier,
+                    subject = subject,
+                    capabilityUri = capabilityUri,
+                    testCasesJson = encodeTestCasesJson(testCases),
+                    windowSecs = windowSecs,
+                    contextId = contextId,
+                    evaluatorContextId = evaluatorContextId,
+                    policy = policy,
+                ).requestJson,
+        )
+
+    /**
+     * Answers [request] for [attempt], signed by [subject]'s `#active` key
+     * (spec 07 §7.3.4 step 2, ADR-017).
+     *
+     * The challenger's signature on [request] is checked against the key this
+     * instance's DID resolver returns before anything is signed.
+     *
+     * @param subject The challenged identity.
+     * @param request The signed request, as the challenger sent it.
+     * @param outputs One output per case.
+     * @param attempt The attempt number, starting at 1.
+     * @throws IllegalArgumentException on a malformed [request] before any
+     *   bridge call, or when the returned response is malformed.
+     * @throws uniffi.scp.ScpException.Validation when the request's signature,
+     *   subject or window does not hold.
+     * @throws uniffi.scp.ScpException.Identity with code `SCP-IDENT-1033` when
+     *   this instance has no DID resolver.
+     */
+    suspend fun trustRespondToChallenge(
+        subject: Identity,
+        request: ChallengeRequest,
+        outputs: List<TestOutput>,
+        attempt: UInt,
+    ): ChallengeResponse =
+        decodeChallengeResponseJson(
+            inner.trustRespondToChallenge(
+                subject = subject,
+                requestJson = encodeChallengeRequestJson(request),
+                outputsJson = encodeTestOutputsJson(outputs),
+                attempt = attempt,
+            ),
         )
 
     /**
@@ -2132,31 +2187,42 @@ class SCP internal constructor(
         )
 
     /**
-     * Checks the subject's [response] against [challenge] and returns the
-     * [ChallengeVerification] record signed with [verifier]'s `#active` key
-     * (spec 07 §7.3.4, ADR-017). The bridge resolves the verifier and responder
-     * keys through this instance's DID resolver.
+     * Grades [response] to [request] and returns the record, signed by
+     * [verifier]'s `#active` key (spec 07 §7.3.4 steps 3 and 4, ADR-017).
      *
-     * @throws IllegalArgumentException on a wrong-length signature or a non-hex
-     *   challenge id, before any bridge call, or when the returned record is
-     *   malformed.
-     * @throws uniffi.scp.ScpException.Validation with code `SCP-VALID-7003` when
-     *   the response is refused and `SCP-VALID-7011` for an empty [contextId].
+     * Both signatures are checked first. The challenger's ledger then checks
+     * the attempt number, the cooldown and the window, grades each case against
+     * its stored answer, and signs a record for the attempt, pass or fail. The
+     * record is also written to this instance's trust store;
+     * [GradedChallenge.trustStoreError] says why when that write failed.
+     *
+     * @param verifier The identity that issued [request].
+     * @param request The signed request.
+     * @param response The subject's signed response.
+     * @throws IllegalArgumentException on a malformed [request] or [response]
+     *   before any bridge call, or when the returned record is malformed.
+     * @throws uniffi.scp.ScpException.Validation when a signature or the
+     *   attempt does not hold, and with code [GRADING_CAPACITY_EXHAUSTED_CODE],
+     *   [GRADING_LEASE_LOST_CODE] or [ANSWER_KEY_MISMATCH_CODE] for a grading
+     *   that used no attempt.
      */
-    suspend fun trustVerifyResponse(
+    suspend fun trustGradeResponse(
         verifier: Identity,
-        challenge: ChallengeRequest,
+        request: ChallengeRequest,
         response: ChallengeResponse,
-        contextId: String,
-    ): ChallengeVerification =
-        decodeChallengeVerificationJson(
-            inner.trustVerifyResponse(
+    ): GradedChallenge {
+        val graded =
+            inner.trustGradeResponse(
                 verifier = verifier,
-                challengeJson = encodeChallengeRequestJson(challenge),
+                requestJson = encodeChallengeRequestJson(request),
                 responseJson = encodeChallengeResponseJson(response),
-                contextId = contextId,
-            ),
+            )
+        return GradedChallenge(
+            record = decodeChallengeVerificationJson(graded.recordJson),
+            caseResults = decodeCaseResultsJson(graded.reasonsJson),
+            trustStoreError = graded.trustStoreError,
         )
+    }
 
     /**
      * Read-only, structured counterpart to [ucanValidate].
@@ -2435,45 +2501,38 @@ class SCP internal constructor(
 
     /**
      * Verifies that an agent meets a context's capability requirements for
-     * admission (spec §7.3.4.4, SCP-ACR-008). Serializes the typed
-     * [CapabilityRequirement] / [ChallengeVerification] values (and the agent
-     * capability URIs) to the serde wire shape (ADR-058) and forwards to
-     * [NativeScp.checkCapabilityRequirements] on [inner]. ADR-048 §1 + §7
-     * Kotlin bullet.
+     * admission (spec 07 §7.3.4.4). Serializes the agent capability URIs and
+     * the typed [ChallengeVerification] records to the serde wire shape
+     * (ADR-058) and forwards to [NativeScp.checkCapabilityRequirements] on
+     * [inner].
      *
-     * [subjectDid]/[contextId] bind challenge verifications to the agent and
-     * context being admitted: a [ChallengeVerification] only satisfies a
-     * requirement when its signed `subject`/`context_id` equal these values,
-     * closing cross-subject and cross-context attribution. Each record's
-     * signature is checked against the verifier's `#active` key, resolved
-     * through this instance's DID resolver. The lookup blocks, so call this
-     * off the main thread.
+     * The requirements are the ones the context's governance holds at the time
+     * of the call, set through `ContextParams.capabilityRequirementsJson`; the
+     * caller cannot supply them. A `ChallengeVerified` requirement is met only
+     * by a passing record signed by one of its trusted verifiers, for
+     * [subjectDid] and [contextId], within the requirement's retry cap. Each
+     * record's signature is checked against the verifier's `#active` key,
+     * resolved through this instance's DID resolver.
      *
      * Returns normally when all requirements are satisfied.
      *
+     * @throws IllegalArgumentException on a malformed record before any bridge
+     *   call.
      * @throws uniffi.scp.ScpException.Validation with code `SCP-VALID-7076`
-     *   for an unmet requirement, `SCP-VALID-7077` for an empty subject.
+     *   for an unmet requirement, `SCP-VALID-7000` for a malformed DID, and
+     *   [NON_CANONICAL_IDENTIFIER_CODE] for a DID that is not canonical.
      * @throws uniffi.scp.ScpException.Identity with code `SCP-IDENT-1033` when
      *   a record must be verified and this instance has no DID resolver.
-     *
-     * Security caveat — authenticity is not authorization: a passing
-     * `ChallengeVerified` check proves the verifier's signature is authentic
-     * and bound to this subject/context, NOT that the verifier is *trusted*.
-     * Because `verifier_did` is self-certifying, a subject can present a
-     * genuinely-signed result from a verifier it controls. Establish verifier
-     * legitimacy separately and MUST NOT treat success as authorization.
      */
     suspend fun checkCapabilityRequirements(
         contextId: String,
         subjectDid: String,
-        requirements: List<CapabilityRequirement>,
         agentCapabilities: List<String>,
         challengeVerifications: List<ChallengeVerification>,
     ) {
         inner.checkCapabilityRequirements(
             contextId = contextId,
             subjectDid = subjectDid,
-            requirementsJson = encodeCapabilityRequirementsJson(requirements),
             agentCapabilitiesJson = encodeAgentCapabilitiesJson(agentCapabilities),
             challengeVerificationsJson = encodeChallengeVerificationsJson(challengeVerifications),
         )

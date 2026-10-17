@@ -2,8 +2,8 @@
 // (ADR-058, the input-side analog of ADR-059).
 //
 // Mirrors `scp_protocol::trust::{admission, challenge, participation}`:
-// VerificationLevel / CapabilityRequirement (§7.3.4.4, SCP-ACR-008),
-// VerificationMethod / ChallengeVerification (§7.3.4.2, ADR-017), and
+// VerificationLevel / RetryCap / CapabilityRequirement (§7.3.4.4),
+// ChallengeVerification (§7.3.4, ADR-017), and
 // ParticipationFact / ParticipationThreshold / RequireParticipation /
 // ParticipationProfile (§7.3.2.1, SCP-BA-004). The SDK exposes typed shapes
 // (no stringly-typed JSON) and serializes to the Rust serde wire format at the
@@ -32,28 +32,25 @@ import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonEncoder
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 
 /**
- * The one [Json] configuration for trust-admission wire encoding.
+ * The one [Json] configuration for trust-admission and challenge wire
+ * encoding.
  *
- * `encodeDefaults = true` so the optional [ChallengeVerification.score] /
- * [ChallengeVerification.contextId] fields serialize as explicit JSON `null`
- * when absent (matching `serde_json::to_string` of the Rust `Option<T>` fields
- * and the Swift/TypeScript SDK encoders), rather than being omitted as
- * kotlinx.serialization would do for defaulted fields. The Rust deserializer
- * accepts either shape, but explicit `null` keeps the wire form identical
- * across bindings.
+ * `encodeDefaults = true` so defaulted fields ([CapabilityRequirement.trustedVerifiers],
+ * an absent [CapabilityRequirement.retryCap]) serialize explicitly, as
+ * `serde_json::to_string` of the Rust struct and the Swift/TypeScript SDK
+ * encoders write them, rather than being omitted as kotlinx.serialization
+ * would do for defaulted fields. Decoding refuses an unknown key and a missing
+ * field, so a shape the bridge did not write fails at the boundary.
  */
-private val trustAdmissionJson = Json { encodeDefaults = true }
+internal val trustAdmissionJson = Json { encodeDefaults = true }
 
 // ---------------------------------------------------------------------------
-// Capability admission types (§7.3.4.4, SCP-ACR-008, ADR-058)
+// Capability admission types (§7.3.4.4, ADR-058)
 // ---------------------------------------------------------------------------
 
 /**
@@ -80,144 +77,87 @@ enum class VerificationLevel {
 }
 
 /**
- * A single admission requirement: a capability URI and the minimum
- * verification level needed.
+ * The most retries and the least cooldown a context accepts from a
+ * challenger's standard (spec 07 §7.3.4.4). A record graded under more
+ * retries or a shorter cooldown does not meet the requirement.
  *
- * The serial names are the serde-canonical snake_case the Rust core
- * deserializes (`Vec<CapabilityRequirement>`). Mirrors the Swift SDK
- * `CapabilityRequirement`, the TypeScript SDK `CapabilityRequirement`, and the
- * Rust struct 1:1. See §7.3.4.4.
+ * @property maxRetries The most retries the challenger's standard may allow.
+ * @property minCooldownSecs The shortest cooldown, in seconds, the
+ *   challenger's standard may set.
+ */
+@Serializable
+data class RetryCap(
+    @SerialName("max_retries") val maxRetries: UInt,
+    @SerialName("min_cooldown_secs") val minCooldownSecs: UInt,
+)
+
+/**
+ * A single admission requirement: a capability URI, the minimum verification
+ * level, and for `ChallengeVerified` the challengers whose records count
+ * (spec 07 §7.3.4.4).
+ *
+ * A context's governance holds its requirements: set
+ * `ContextParams.capabilityRequirementsJson` to
+ * [encodeCapabilityRequirementsJson] of them when creating the context. The
+ * serial names are the snake_case the Rust `RawCapabilityRequirement`
+ * deserializes. Mirrors the Swift SDK `CapabilityRequirement`, the TypeScript
+ * SDK `CapabilityRequirement`, and the Python SDK `CapabilityRequirement`.
  *
  * @property capability The capability URI that must be present.
  * @property verificationLevel The minimum verification level required.
+ * @property trustedVerifiers DIDs of the challengers whose records meet a
+ *   `ChallengeVerified` requirement. Required and non-empty for
+ *   `ChallengeVerified`; empty for `SelfAttested`. The bridge enforces both.
+ * @property retryCap The retry and cooldown bounds a record's standard must
+ *   meet, if any. Only `ChallengeVerified` takes one.
  */
 @Serializable
 data class CapabilityRequirement(
     val capability: String,
     @SerialName("verification_level") val verificationLevel: VerificationLevel,
+    @SerialName("trusted_verifiers") val trustedVerifiers: List<String> = emptyList(),
+    @SerialName("retry_cap") val retryCap: RetryCap? = null,
 )
 
 /**
- * How a capability was verified, as recorded in a [ChallengeVerification].
+ * A signed record that a challenger graded a subject's response (spec 07
+ * §7.3.4, ADR-017).
  *
- * Serializes as the bare string `"SelfAttested"` or the externally-tagged
- * `{"ChallengeVerified": {"challenge_type": "<uri>"}}`, matching the Rust
- * `VerificationMethod` enum. The inner `challenge_type` is a bare capability
- * URI string (the Rust `ChallengeType` serializes as its URI string). Mirrors
- * the Swift SDK `ChallengeVerificationMethod` and the TypeScript SDK
- * `ChallengeVerificationMethod` 1:1.
+ * [SCP.trustGradeResponse] returns one; pass a list of them to
+ * [SCP.checkCapabilityRequirements] to meet `ChallengeVerified`
+ * requirements. The serial names are the snake_case the Rust core
+ * deserializes; [verifierSignature] is a 64-byte JSON number array. The
+ * verifier's signature covers every field, so a record with any field altered
+ * fails verification. Mirrors the Swift SDK `ChallengeVerification`, the
+ * TypeScript SDK `ChallengeVerification`, and the Rust struct 1:1.
  *
- * SECURITY: `verification_method` is NOT covered by the verifier signature
- * (ADR-017 caveat) — consumers MUST NOT key trust decisions on it.
- */
-@Serializable(with = ChallengeVerificationMethodSerializer::class)
-sealed class ChallengeVerificationMethod {
-    /** Self-attested — no challenge proof. */
-    data object SelfAttested : ChallengeVerificationMethod()
-
-    /** Challenge-verified, carrying the challenge type (a capability URI). */
-    data class ChallengeVerified(val challengeType: String) : ChallengeVerificationMethod()
-}
-
-/**
- * Custom serializer producing the Rust `VerificationMethod` externally-tagged
- * serde shape: `"SelfAttested"` for the unit variant, and
- * `{"ChallengeVerified": {"challenge_type": "<uri>"}}` for the struct variant.
- * JSON-only by construction (the wire format is JSON at the FFI boundary).
- */
-object ChallengeVerificationMethodSerializer : KSerializer<ChallengeVerificationMethod> {
-    override val descriptor: SerialDescriptor = JsonElement.serializer().descriptor
-
-    override fun serialize(
-        encoder: Encoder,
-        value: ChallengeVerificationMethod,
-    ) {
-        val jsonEncoder =
-            encoder as? JsonEncoder
-                ?: throw SerializationException("ChallengeVerificationMethod is JSON-only")
-        val element: JsonElement =
-            when (value) {
-                ChallengeVerificationMethod.SelfAttested -> JsonPrimitive("SelfAttested")
-                is ChallengeVerificationMethod.ChallengeVerified ->
-                    buildJsonObject {
-                        put(
-                            "ChallengeVerified",
-                            buildJsonObject { put("challenge_type", value.challengeType) },
-                        )
-                    }
-            }
-        jsonEncoder.encodeJsonElement(element)
-    }
-
-    override fun deserialize(decoder: Decoder): ChallengeVerificationMethod {
-        val jsonDecoder =
-            decoder as? JsonDecoder
-                ?: throw SerializationException("ChallengeVerificationMethod is JSON-only")
-        val element = jsonDecoder.decodeJsonElement()
-        return parseMethod(element)
-            ?: throw SerializationException("unsupported VerificationMethod shape: $element")
-    }
-
-    /**
-     * Parses the two serde shapes, or returns `null` for anything else: the
-     * bare `"SelfAttested"` string, or the
-     * `{"ChallengeVerified": {"challenge_type": "<uri>"}}` tagged object.
-     */
-    private fun parseMethod(element: JsonElement): ChallengeVerificationMethod? =
-        when {
-            element is JsonPrimitive && element.isString && element.content == "SelfAttested" ->
-                ChallengeVerificationMethod.SelfAttested
-            element is JsonObject ->
-                (element["ChallengeVerified"] as? JsonObject)
-                    ?.get("challenge_type")
-                    ?.jsonPrimitive
-                    ?.contentOrNull
-                    ?.let { ChallengeVerificationMethod.ChallengeVerified(it) }
-            else -> null
-        }
-}
-
-/**
- * A signed record that a specific verifier tested a capability (spec 07
- * §7.3.4.2, ADR-017).
- *
- * Pass a list of these to [SCP.checkCapabilityRequirements] to satisfy
- * `ChallengeVerified` requirements; [SCP.trustVerifyResponse] returns one. The
- * serial names are the serde-canonical snake_case the Rust core deserializes;
- * [verifierSignature] is a 64-byte JSON number array. Mirrors the Swift SDK
- * `ChallengeVerification`, the TypeScript SDK `ChallengeVerification`, and the
- * Rust struct 1:1.
- *
- * SECURITY (ADR-017): the verifier signs the SHA-256 of the canonical record
- * over `verification_id`, `verifier`, `subject`, `capability_uri`,
- * `suite_digest`, `passed`, `score`, `test_count`, `pass_count`, `timestamp`,
- * `expires_at` and `context_id`. [verificationMethod], [result] and
- * [completedAt] are NOT signed and can be altered without invalidating the
- * signature; never key a trust decision on them.
- *
- * @property verificationId 64 lowercase hex characters, derived from the
- *   challenge ID.
- * @property verifier DID of the verifier who issued and checked the challenge.
- * @property subject DID of the subject who answered the challenge.
- * @property capabilityUri The capability URI that was verified.
- * @property suiteDigest 64 lowercase hex characters: the SHA-256 of the
- *   canonical test-case list the challenge request signed.
- * @property passed Whether the subject passed the challenge overall.
- * @property score Optional score in basis points, 0 to 10000. Serializes as
- *   explicit `null` when absent.
- * @property testCount Total number of test cases in the challenge.
+ * @property verificationId The record's id, 64 lowercase hex characters.
+ * @property verifier DID of the challenger that graded the response.
+ * @property subject DID of the subject that answered.
+ * @property capabilityUri The capability URI that was tested.
+ * @property definitionDigest Digest of the capability definition, 64
+ *   lowercase hex characters.
+ * @property suiteDigest Digest of the graded test cases, 64 lowercase hex
+ *   characters.
+ * @property challengeId The graded request's id, 64 lowercase hex characters.
+ * @property attempt The attempt this record grades, starting at 1.
+ * @property responseDigest Digest of the graded response, 64 lowercase hex
+ *   characters.
+ * @property maxRetries Retries the challenger's standard allowed.
+ * @property cooldownSecs Cooldown in seconds between attempts.
+ * @property passThresholdBps Score in basis points needed to pass.
+ * @property minCategoryCases Least cases per category the standard required.
+ * @property passed Whether the subject passed.
+ * @property score Score in basis points, 0 to 10000.
+ * @property testCount Number of test cases graded.
  * @property passCount Number of test cases the subject passed.
- * @property timestamp Unix seconds when the verifier checked the response.
- * @property expiresAt Unix seconds when this record expires; at most 90 days
- *   after [timestamp].
- * @property contextId Context in which the challenge was issued, if any.
- *   Serializes as explicit `null` when absent.
- * @property verifierSignature Ed25519 signature by the verifier's `#active` key
- *   over the record digest (64 bytes).
- * @property verificationMethod How the capability was verified (unsigned).
- * @property result The challenge-specific result from the response (unsigned).
- * @property completedAt Unix seconds when the response was completed
- *   (unsigned).
+ * @property challengeCreatedAt Unix seconds when the request was created.
+ * @property challengeExpiresAt Unix seconds when the request expired.
+ * @property timestamp Unix seconds of the grading.
+ * @property expiresAt Unix seconds when this record expires.
+ * @property contextId The context the challenge was administered for.
+ * @property verifierSignature Ed25519 signature by the verifier's `#active`
+ *   key over the record digest (64 bytes).
  */
 @Serializable
 data class ChallengeVerification(
@@ -225,18 +165,25 @@ data class ChallengeVerification(
     val verifier: String,
     val subject: String,
     @SerialName("capability_uri") val capabilityUri: String,
+    @SerialName("definition_digest") val definitionDigest: String,
     @SerialName("suite_digest") val suiteDigest: String,
+    @SerialName("challenge_id") val challengeId: String,
+    val attempt: UInt,
+    @SerialName("response_digest") val responseDigest: String,
+    @SerialName("max_retries") val maxRetries: UInt,
+    @SerialName("cooldown_secs") val cooldownSecs: UInt,
+    @SerialName("pass_threshold_bps") val passThresholdBps: UInt,
+    @SerialName("min_category_cases") val minCategoryCases: UInt,
     val passed: Boolean,
-    val score: UInt? = null,
+    val score: UInt,
     @SerialName("test_count") val testCount: UInt,
     @SerialName("pass_count") val passCount: UInt,
+    @SerialName("challenge_created_at") val challengeCreatedAt: ULong,
+    @SerialName("challenge_expires_at") val challengeExpiresAt: ULong,
     val timestamp: ULong,
     @SerialName("expires_at") val expiresAt: ULong,
-    @SerialName("context_id") val contextId: String? = null,
+    @SerialName("context_id") val contextId: String,
     @SerialName("verifier_signature") val verifierSignature: List<UByte>,
-    @SerialName("verification_method") val verificationMethod: ChallengeVerificationMethod,
-    val result: JsonElement,
-    @SerialName("completed_at") val completedAt: ULong,
 )
 
 // ---------------------------------------------------------------------------
@@ -454,9 +401,11 @@ data class ParticipationProfile(
 // ---------------------------------------------------------------------------
 
 /**
- * Encodes a typed [CapabilityRequirement] list to the JSON wire shape the
- * bridge deserializes (`Vec<CapabilityRequirement>`). [CapabilityRequirement.verificationLevel]
- * serializes as the bare variant string.
+ * Encodes a typed [CapabilityRequirement] list to the JSON
+ * `ContextParams.capabilityRequirementsJson` carries
+ * (`Vec<RawCapabilityRequirement>`). [CapabilityRequirement.verificationLevel]
+ * serializes as the bare variant string; the bridge validates the list when
+ * the context is created.
  */
 fun encodeCapabilityRequirementsJson(requirements: List<CapabilityRequirement>): String =
     trustAdmissionJson.encodeToString(
@@ -490,14 +439,11 @@ private fun requireByteLength(
 
 /**
  * Encodes a typed [ChallengeVerification] list to the JSON wire shape the
- * bridge deserializes (`Vec<ChallengeVerification>`). The
- * [ChallengeVerification.verificationMethod] discriminated union is encoded to
- * its serde-tagged shape; [ChallengeVerification.verifierSignature] passes
- * through as a number array; absent `score` / `context_id` serialize as
- * explicit `null`.
+ * bridge deserializes (`Vec<ChallengeVerification>`).
  *
- * @throws IllegalArgumentException if [ChallengeVerification.verifierSignature]
- *   is not exactly 64 elements (before any bridge call).
+ * @throws IllegalArgumentException if an id or digest is not 64 lowercase hex
+ *   characters, [ChallengeVerification.score] exceeds 10000, or the signature
+ *   is not 64 bytes (before any bridge call).
  */
 fun encodeChallengeVerificationsJson(verifications: List<ChallengeVerification>): String {
     for (verification in verifications) {
@@ -510,11 +456,12 @@ fun encodeChallengeVerificationsJson(verifications: List<ChallengeVerification>)
 }
 
 /**
- * Decodes the record JSON [SCP.trustVerifyResponse]'s bridge returns.
+ * Decodes the record JSON [SCP.trustGradeResponse]'s bridge returns.
  *
- * @throws IllegalArgumentException if the JSON is not a record, an id or
- *   digest is not 64 lowercase hex characters, [ChallengeVerification.score]
- *   exceeds 10000, or the signature is not 64 bytes.
+ * @throws IllegalArgumentException if the JSON is not a record (a field is
+ *   missing or unknown), an id or digest is not 64 lowercase hex characters,
+ *   [ChallengeVerification.score] exceeds 10000, or the signature is not 64
+ *   bytes.
  */
 fun decodeChallengeVerificationJson(json: String): ChallengeVerification {
     val verification =
@@ -530,19 +477,16 @@ fun decodeChallengeVerificationJson(json: String): ChallengeVerification {
 private const val MAX_SCORE_BASIS_POINTS = 10_000u
 
 private fun requireChallengeVerification(verification: ChallengeVerification) {
-    requireLowerHex32("ChallengeVerification", "verificationId", verification.verificationId)
-    requireLowerHex32("ChallengeVerification", "suiteDigest", verification.suiteDigest)
-    verification.score?.let {
-        require(it <= MAX_SCORE_BASIS_POINTS) {
-            "ChallengeVerification.score must be in [0, 10000], got $it"
-        }
+    val type = "ChallengeVerification"
+    requireLowerHex32(type, "verificationId", verification.verificationId)
+    requireLowerHex32(type, "definitionDigest", verification.definitionDigest)
+    requireLowerHex32(type, "suiteDigest", verification.suiteDigest)
+    requireLowerHex32(type, "challengeId", verification.challengeId)
+    requireLowerHex32(type, "responseDigest", verification.responseDigest)
+    require(verification.score <= MAX_SCORE_BASIS_POINTS) {
+        "ChallengeVerification.score must be in [0, 10000], got ${verification.score}"
     }
-    requireByteLength(
-        "ChallengeVerification",
-        "verifierSignature",
-        BYTES_64,
-        verification.verifierSignature,
-    )
+    requireByteLength(type, "verifierSignature", BYTES_64, verification.verifierSignature)
 }
 
 /**

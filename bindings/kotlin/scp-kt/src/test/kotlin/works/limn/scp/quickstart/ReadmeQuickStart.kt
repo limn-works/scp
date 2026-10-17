@@ -43,6 +43,7 @@ suspend fun main() {
                     economicPolicy = null,
                     consequenceRulesJson = null,
                     consequenceConfigJson = null,
+                    capabilityRequirementsJson = null,
                 ),
         )
 

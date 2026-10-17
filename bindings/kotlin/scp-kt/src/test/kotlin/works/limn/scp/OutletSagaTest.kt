@@ -373,6 +373,7 @@ class OutletSagaTest {
             economicPolicy = null,
             consequenceRulesJson = null,
             consequenceConfigJson = null,
+            capabilityRequirementsJson = null,
         )
 
     private fun weatherOutlet(operatorDid: String): OutletDefinition =

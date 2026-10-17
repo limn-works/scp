@@ -134,6 +134,13 @@ export interface ContextParams {
    * permit `RevokeAccess` rules.
    */
   readonly consequenceConfig?: ConsequenceConfig;
+  /**
+   * The context's admission capability requirements (spec 07 §7.3.4.4), as
+   * the JSON {@link encodeCapabilityRequirements} returns. The bridge
+   * validates them at creation; {@link SCP.checkCapabilityRequirements} reads
+   * them from the context's governance at each check. Omit for none.
+   */
+  readonly capabilityRequirements?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -1645,118 +1652,143 @@ export function encodeParticipationProfile(profiles: readonly ParticipationProfi
  *
  * - `"SelfAttested"` — the agent claims the capability (present in their
  *   capability list); no challenge proof required.
- * - `"ChallengeVerified"` — the capability was verified through the
- *   challenge-response protocol. Also satisfies `SelfAttested`.
+ * - `"ChallengeVerified"` — a challenger the requirement trusts graded the
+ *   capability (spec 07 §7.3.4). Also satisfies `SelfAttested`.
  */
 export type VerificationLevel = "SelfAttested" | "ChallengeVerified";
 
 /**
- * A single admission requirement: a capability URI and the minimum
- * verification level needed.
+ * The loosest retry policy a requirement accepts in a record (spec 07
+ * §7.3.4.4): a record whose `maxRetries` is above `maxRetries`, or whose
+ * `cooldownSecs` is below `minCooldownSecs`, does not satisfy it.
  *
- * Mirrors the Rust `CapabilityRequirement` struct (`scp-core`). See §7.3.4.4.
+ * Mirrors the Rust `RetryCap` struct (`scp-core`).
+ */
+export interface RetryCap {
+  /** The most retries after the first attempt a record may allow. */
+  readonly maxRetries: number;
+  /** The shortest cooldown, in seconds, a record may allow. */
+  readonly minCooldownSecs: number;
+}
+
+/**
+ * A single admission requirement of a context (spec 07 §7.3.4.4).
+ *
+ * Mirrors the Rust `CapabilityRequirement` struct (`scp-core`). A
+ * `SelfAttested` requirement names no verifiers and no retry cap. A
+ * `ChallengeVerified` requirement names at least one trusted verifier DID;
+ * only a record signed by one of them satisfies it. The bridge validates the
+ * shape when a context is created, and refuses a malformed requirement with
+ * `SCP-VALID-7141` (or {@link NON_CANONICAL_IDENTIFIER_CODE} for a verifier
+ * DID that is not the canonical spelling of its key).
  */
 export interface CapabilityRequirement {
   /** The capability URI that must be present. */
   readonly capability: string;
   /** The minimum verification level required. */
   readonly verificationLevel: VerificationLevel;
+  /** DIDs of the challengers whose records satisfy a `ChallengeVerified` requirement. */
+  readonly trustedVerifiers?: readonly string[];
+  /** The loosest retry policy a record may carry; absent accepts any. */
+  readonly retryCap?: RetryCap | null;
 }
 
 /**
- * How a capability was verified, as recorded in a {@link ChallengeVerification}.
- *
- * Mirrors the Rust `VerificationMethod` enum (`scp-core`). Serializes as the
- * bare string `"SelfAttested"` or the tagged
- * `{ "ChallengeVerified": { "challenge_type": <uri> } }`.
- *
- * SECURITY: `verificationMethod` is NOT covered by the verifier signature
- * (ADR-017 caveat) — consumers MUST NOT key trust decisions on it.
- */
-export type ChallengeVerificationMethod =
-  | { readonly kind: "SelfAttested" }
-  | { readonly kind: "ChallengeVerified"; readonly challengeType: string };
-
-/**
- * A signed record that a verifier tested a subject's capability (spec 07
- * §7.3.4, ADR-017).
+ * A signed record of one graded challenge attempt (spec 07 §7.3.4, ADR-017).
  *
  * Mirrors the Rust `ChallengeVerification` struct (`scp-core`).
- * {@link SCP.trustVerifyResponse} returns one; pass a list of them to
- * {@link SCP.checkCapabilityRequirements} to satisfy `ChallengeVerified`
- * requirements.
+ * {@link SCP.trustGradeResponse} returns one for every attempt, pass or
+ * fail; pass a list of them to {@link SCP.checkCapabilityRequirements} to
+ * satisfy `ChallengeVerified` requirements.
  *
- * SECURITY: the verifier's signature covers the SHA-256 digest of twelve
- * fields, in this order: `verificationId`, `verifier`, `subject`,
- * `capabilityUri`, `suiteDigest`, `passed`, `score`, `testCount`,
- * `passCount`, `timestamp`, `expiresAt` and `contextId`. `verificationMethod`,
- * `result` and `completedAt` are NOT signed and can be altered without
- * invalidating the signature, so no trust decision may read them.
+ * The verifier's signature covers every field except `verifierSignature`, so
+ * altering any field invalidates the record.
  */
 export interface ChallengeVerification {
-  /** SHA-256 of the verifier, subject, capability URI and timestamp, as 64 lowercase hex characters. */
+  /** The record id, as 64 lowercase hex characters. */
   readonly verificationId: string;
-  /** DID of the verifier who issued and verified the challenge. */
+  /** DID of the challenger who graded the attempt. */
   readonly verifier: string;
-  /** DID of the subject who answered the challenge. */
+  /** DID of the subject who answered. */
   readonly subject: string;
   /** The capability URI that was tested. */
   readonly capabilityUri: string;
-  /** SHA-256 of the scored request's test cases, as 64 lowercase hex characters. */
+  /** Digest of the capability definition the challenge followed, as 64 lowercase hex characters. */
+  readonly definitionDigest: string;
+  /** Digest of the request's cases and answer commitments, as 64 lowercase hex characters. */
   readonly suiteDigest: string;
-  /** How the capability was verified (unsigned). */
-  readonly verificationMethod: ChallengeVerificationMethod;
-  /** Whether the subject passed the challenge overall. */
+  /** The graded request's id, as 64 lowercase hex characters. */
+  readonly challengeId: string;
+  /** The attempt number, starting at 1. */
+  readonly attempt: number;
+  /** Digest of the graded response, as 64 lowercase hex characters. */
+  readonly responseDigest: string;
+  /** Retries after the first attempt the challenge allowed. */
+  readonly maxRetries: number;
+  /** Seconds the subject had to wait between attempts. */
+  readonly cooldownSecs: number;
+  /** Score in basis points at or above which an attempt passes. */
+  readonly passThresholdBps: number;
+  /** Fewest cases per category the definition requires (0 when it sets none). */
+  readonly minCategoryCases: number;
+  /** Whether the attempt passed. */
   readonly passed: boolean;
-  /** Number of test cases administered. */
+  /** Score in basis points, 0-10000 (10000 is perfect). */
+  readonly score: number;
+  /** Number of cases graded. */
   readonly testCount: number;
-  /** Number of test cases the subject passed. */
+  /** Number of cases the subject passed. */
   readonly passCount: number;
-  /** The subject's raw result (arbitrary JSON, unsigned). */
-  readonly result: unknown;
-  /** Unix timestamp (seconds) when the subject completed the response (unsigned). */
-  readonly completedAt: number;
-  /** Unix timestamp (seconds) of the verification. */
+  /** Unix seconds when the challenge was created. */
+  readonly challengeCreatedAt: number;
+  /** Unix seconds when the challenge stopped accepting attempts. */
+  readonly challengeExpiresAt: number;
+  /** Unix seconds when the attempt was graded. */
   readonly timestamp: number;
-  /** Unix timestamp (seconds) when the record expires, at most 90 days after `timestamp`. */
+  /** Unix seconds when the record expires, at most 90 days after `timestamp`. */
   readonly expiresAt: number;
+  /** The context where the challenge was administered. */
+  readonly contextId: string;
   /** The verifier's 64-byte signature. */
   readonly verifierSignature: readonly number[];
-  /** Score in basis points, 0-10000 (10000 is perfect), if graded. */
-  readonly score?: number | null;
-  /** Context where the challenge was administered, if any. */
-  readonly contextId?: string | null;
 }
 
 /**
- * Encodes a typed {@link CapabilityRequirement} array to the JSON wire shape
- * expected by the Rust bridge (`Vec<CapabilityRequirement>`).
+ * Encodes typed {@link CapabilityRequirement}s to the JSON wire shape the
+ * Rust bridge deserializes (`Vec<CapabilityRequirement>`), the value of
+ * {@link ContextParams.capabilityRequirements}.
  *
- * `verificationLevel` serializes as the bare variant string.
+ * @throws Error if a `retryCap` value is not an integer in the u32 range
+ *   (before any bridge call).
  */
 export function encodeCapabilityRequirements(
   requirements: readonly CapabilityRequirement[],
 ): string {
   return JSON.stringify(
-    requirements.map((r) => ({
-      capability: r.capability,
-      verification_level: r.verificationLevel,
-    })),
+    requirements.map((r) => {
+      const cap = r.retryCap ?? null;
+      return {
+        capability: r.capability,
+        verification_level: r.verificationLevel,
+        trusted_verifiers: r.trustedVerifiers ?? [],
+        retry_cap:
+          cap === null
+            ? null
+            : {
+                max_retries: requireUint("RetryCap", "maxRetries", cap.maxRetries, U32_MAX),
+                min_cooldown_secs: requireUint(
+                  "RetryCap",
+                  "minCooldownSecs",
+                  cap.minCooldownSecs,
+                  U32_MAX,
+                ),
+              },
+      };
+    }),
   );
 }
 
-function encodeChallengeVerificationMethod(method: ChallengeVerificationMethod): unknown {
-  switch (method.kind) {
-    case "SelfAttested":
-      return "SelfAttested";
-    case "ChallengeVerified":
-      return { ChallengeVerified: { challenge_type: method.challengeType } };
-    default: {
-      const exhaustive: never = method;
-      throw new Error(`unknown ChallengeVerificationMethod kind: ${JSON.stringify(exhaustive)}`);
-    }
-  }
-}
+const U32_MAX = 0xffff_ffff;
 
 const LOWER_HEX_32 = /^[0-9a-f]{64}$/;
 
@@ -1803,96 +1835,117 @@ function requireRecord(typeName: string, value: unknown): Record<string, unknown
   return value as Record<string, unknown>;
 }
 
+function requireArray(typeName: string, fieldName: string, value: unknown): unknown[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`${typeName}.${fieldName} must be an array, got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+function challengeVerificationWire(v: ChallengeVerification): unknown {
+  const t = "ChallengeVerification";
+  requireByteLength(t, "verifierSignature", 64, v.verifierSignature);
+  return {
+    verification_id: requireLowerHex32(t, "verificationId", v.verificationId),
+    verifier: v.verifier,
+    subject: v.subject,
+    capability_uri: v.capabilityUri,
+    definition_digest: requireLowerHex32(t, "definitionDigest", v.definitionDigest),
+    suite_digest: requireLowerHex32(t, "suiteDigest", v.suiteDigest),
+    challenge_id: requireLowerHex32(t, "challengeId", v.challengeId),
+    attempt: requireUint(t, "attempt", v.attempt, U32_MAX),
+    response_digest: requireLowerHex32(t, "responseDigest", v.responseDigest),
+    max_retries: requireUint(t, "maxRetries", v.maxRetries, U32_MAX),
+    cooldown_secs: requireUint(t, "cooldownSecs", v.cooldownSecs, U32_MAX),
+    pass_threshold_bps: requireUint(t, "passThresholdBps", v.passThresholdBps, U32_MAX),
+    min_category_cases: requireUint(t, "minCategoryCases", v.minCategoryCases, U32_MAX),
+    passed: v.passed,
+    score: requireUint(t, "score", v.score, U32_MAX),
+    test_count: requireUint(t, "testCount", v.testCount, U32_MAX),
+    pass_count: requireUint(t, "passCount", v.passCount, U32_MAX),
+    challenge_created_at: requireUint(
+      t,
+      "challengeCreatedAt",
+      v.challengeCreatedAt,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    challenge_expires_at: requireUint(
+      t,
+      "challengeExpiresAt",
+      v.challengeExpiresAt,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    timestamp: requireUint(t, "timestamp", v.timestamp, Number.MAX_SAFE_INTEGER),
+    expires_at: requireUint(t, "expiresAt", v.expiresAt, Number.MAX_SAFE_INTEGER),
+    context_id: v.contextId,
+    verifier_signature: v.verifierSignature,
+  };
+}
+
 /**
- * Encodes a typed {@link ChallengeVerification} array to the JSON wire shape
- * expected by the Rust bridge (`Vec<ChallengeVerification>`).
+ * Encodes typed {@link ChallengeVerification}s to the JSON wire shape the
+ * Rust bridge deserializes (`Vec<ChallengeVerification>`).
  *
- * Field names are snake_cased to match `serde_json::to_string`. `score` and
- * `contextId` default to `null` when absent.
- *
- * @throws Error if `verifierSignature` is not exactly 64 elements, or
- *   `verificationId` or `suiteDigest` is not 64 lowercase hex characters
- *   (before any bridge call).
+ * @throws Error if `verifierSignature` is not exactly 64 elements, an id or
+ *   digest is not 64 lowercase hex characters, or a number is out of its
+ *   range (before any bridge call).
  */
 export function encodeChallengeVerifications(
   verifications: readonly ChallengeVerification[],
 ): string {
-  for (const v of verifications) {
-    requireByteLength("ChallengeVerification", "verifierSignature", 64, v.verifierSignature);
-    requireLowerHex32("ChallengeVerification", "verificationId", v.verificationId);
-    requireLowerHex32("ChallengeVerification", "suiteDigest", v.suiteDigest);
-  }
-  return JSON.stringify(
-    verifications.map((v) => ({
-      verification_id: v.verificationId,
-      verifier: v.verifier,
-      subject: v.subject,
-      capability_uri: v.capabilityUri,
-      suite_digest: v.suiteDigest,
-      passed: v.passed,
-      score: v.score ?? null,
-      test_count: v.testCount,
-      pass_count: v.passCount,
-      timestamp: v.timestamp,
-      expires_at: v.expiresAt,
-      context_id: v.contextId ?? null,
-      verifier_signature: v.verifierSignature,
-      verification_method: encodeChallengeVerificationMethod(v.verificationMethod),
-      result: v.result,
-      completed_at: v.completedAt,
-    })),
-  );
+  return JSON.stringify(verifications.map(challengeVerificationWire));
 }
 
-function decodeChallengeVerificationMethod(value: unknown): ChallengeVerificationMethod {
-  if (value === "SelfAttested") {
-    return { kind: "SelfAttested" };
-  }
-  const tagged = requireRecord("ChallengeVerification.verificationMethod", value);
-  const keys = Object.keys(tagged);
-  if (keys.length === 1 && keys[0] === "ChallengeVerified") {
-    const body = requireRecord("ChallengeVerified", tagged.ChallengeVerified);
-    return {
-      kind: "ChallengeVerified",
-      challengeType: requireString("ChallengeVerified", "challenge_type", body.challenge_type),
-    };
-  }
-  throw new Error(
-    `ChallengeVerification.verificationMethod is malformed: ${JSON.stringify(value)}`,
-  );
+function challengeVerificationFromWire(value: unknown): ChallengeVerification {
+  const t = "ChallengeVerification";
+  const raw = requireRecord(t, value);
+  return {
+    verificationId: requireLowerHex32(t, "verification_id", raw.verification_id),
+    verifier: requireString(t, "verifier", raw.verifier),
+    subject: requireString(t, "subject", raw.subject),
+    capabilityUri: requireString(t, "capability_uri", raw.capability_uri),
+    definitionDigest: requireLowerHex32(t, "definition_digest", raw.definition_digest),
+    suiteDigest: requireLowerHex32(t, "suite_digest", raw.suite_digest),
+    challengeId: requireLowerHex32(t, "challenge_id", raw.challenge_id),
+    attempt: requireUint(t, "attempt", raw.attempt, U32_MAX),
+    responseDigest: requireLowerHex32(t, "response_digest", raw.response_digest),
+    maxRetries: requireUint(t, "max_retries", raw.max_retries, U32_MAX),
+    cooldownSecs: requireUint(t, "cooldown_secs", raw.cooldown_secs, U32_MAX),
+    passThresholdBps: requireUint(t, "pass_threshold_bps", raw.pass_threshold_bps, U32_MAX),
+    minCategoryCases: requireUint(t, "min_category_cases", raw.min_category_cases, U32_MAX),
+    passed: requireBoolean(t, "passed", raw.passed),
+    score: requireUint(t, "score", raw.score, 10_000),
+    testCount: requireUint(t, "test_count", raw.test_count, U32_MAX),
+    passCount: requireUint(t, "pass_count", raw.pass_count, U32_MAX),
+    challengeCreatedAt: requireUint(
+      t,
+      "challenge_created_at",
+      raw.challenge_created_at,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    challengeExpiresAt: requireUint(
+      t,
+      "challenge_expires_at",
+      raw.challenge_expires_at,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    timestamp: requireUint(t, "timestamp", raw.timestamp, Number.MAX_SAFE_INTEGER),
+    expiresAt: requireUint(t, "expires_at", raw.expires_at, Number.MAX_SAFE_INTEGER),
+    contextId: requireString(t, "context_id", raw.context_id),
+    verifierSignature: requireSignature(t, "verifier_signature", raw.verifier_signature),
+  };
 }
 
 /**
- * Decodes the Rust `ChallengeVerification` JSON (what the bridge's
- * `trustVerifyResponse` returns) into a typed {@link ChallengeVerification}.
+ * Decodes the Rust `ChallengeVerification` JSON into a typed
+ * {@link ChallengeVerification}.
  *
  * @throws Error if a field is missing or out of range: a non-hex id or
  *   digest, a count outside u32, a score above 10000, or a signature that is
  *   not 64 bytes.
  */
 export function decodeChallengeVerification(json: string): ChallengeVerification {
-  const t = "ChallengeVerification";
-  const raw = requireRecord(t, JSON.parse(json));
-  const score = raw.score;
-  const contextId = raw.context_id;
-  return {
-    verificationId: requireLowerHex32(t, "verification_id", raw.verification_id),
-    verifier: requireString(t, "verifier", raw.verifier),
-    subject: requireString(t, "subject", raw.subject),
-    capabilityUri: requireString(t, "capability_uri", raw.capability_uri),
-    suiteDigest: requireLowerHex32(t, "suite_digest", raw.suite_digest),
-    verificationMethod: decodeChallengeVerificationMethod(raw.verification_method),
-    passed: requireBoolean(t, "passed", raw.passed),
-    testCount: requireUint(t, "test_count", raw.test_count, 0xffff_ffff),
-    passCount: requireUint(t, "pass_count", raw.pass_count, 0xffff_ffff),
-    result: raw.result,
-    completedAt: requireUint(t, "completed_at", raw.completed_at, Number.MAX_SAFE_INTEGER),
-    timestamp: requireUint(t, "timestamp", raw.timestamp, Number.MAX_SAFE_INTEGER),
-    expiresAt: requireUint(t, "expires_at", raw.expires_at, Number.MAX_SAFE_INTEGER),
-    verifierSignature: requireSignature(t, "verifier_signature", raw.verifier_signature),
-    score: score === null ? null : requireUint(t, "score", score, 10_000),
-    contextId: contextId === null ? null : requireString(t, "context_id", contextId),
-  };
+  return challengeVerificationFromWire(JSON.parse(json));
 }
 
 function requireBoolean(typeName: string, fieldName: string, value: unknown): boolean {
@@ -2137,6 +2190,40 @@ export function encodeAttestorSets(
 export const CHALLENGE_SUITE_BELOW_MINIMUM_CODE = "SCP-VALID-7039";
 
 /**
+ * Code the bridge raises when a case opening does not match the commitment
+ * the challenger signed. It is a grading fault: no attempt is used and no
+ * record is signed. Maps from `TrustError::AnswerKeyMismatch`.
+ */
+export const ANSWER_KEY_MISMATCH_CODE = "SCP-VALID-7145";
+
+/**
+ * Code the bridge raises when every grading permit of the challenger is
+ * held; retry the grading later. Maps from
+ * `TrustError::GradingCapacityExhausted`.
+ */
+export const GRADING_CAPACITY_EXHAUSTED_CODE = "SCP-VALID-7146";
+
+/**
+ * Code the bridge raises when a DID is not the canonical spelling of its key
+ * (a challenger, a subject, or a requirement's trusted verifier).
+ */
+export const NON_CANONICAL_IDENTIFIER_CODE = "SCP-VALID-7147";
+
+/**
+ * Code the bridge raises when a context names more capability requirements
+ * than the protocol allows. Maps from
+ * `AdmissionError::TooManyCapabilityRequirements`.
+ */
+export const TOO_MANY_CAPABILITY_REQUIREMENTS_CODE = "SCP-VALID-7148";
+
+/**
+ * Code the bridge raises when a grading's lease expired or was replaced
+ * before its commit; nothing was written, and the grading may be retried.
+ * Maps from `TrustError::GradingLeaseLost`.
+ */
+export const GRADING_LEASE_LOST_CODE = "SCP-VALID-7149";
+
+/**
  * What a test case's output must satisfy (spec 07 §7.3.4). Encoded
  * externally tagged, `{"<Variant>": {<fields>}}`, the Rust `ExpectedOutput`
  * wire form. `CustomEval` names an evaluator outlet the challenger chooses;
@@ -2150,7 +2237,9 @@ export type ExpectedOutput =
   | { readonly kind: "CustomEval"; readonly evaluatorOutletId: string };
 
 /**
- * One test case of a challenge, written by the verifier (spec 07 §7.3.4).
+ * One test case of a challenge with its answer, written by the challenger
+ * (spec 07 §7.3.4). The answer never leaves the challenger: the request
+ * carries a {@link ChallengeCase} with a commitment to it instead.
  *
  * A request's weights sum to 10000. Numbers in `input` and in the expected
  * output must lie within ±(2^53 - 1) (I-JSON); the bridge refuses others.
@@ -2170,58 +2259,134 @@ export interface TestCase {
   readonly weight: number;
 }
 
-/** What {@link SCP.trustCreateChallenge} returns. */
-export interface CreatedChallenge {
-  /** The request's 32-byte random id as 64 lowercase hex characters. */
-  readonly challengeId: string;
+/**
+ * One test case as the signed request carries it: the input and a
+ * commitment to the answer, never the answer (spec 07 §7.3.4).
+ *
+ * Mirrors the Rust `ChallengeCase` struct (`scp-core`).
+ */
+export interface ChallengeCase {
+  /** Identifier, unique within the request. */
+  readonly testId: string;
+  /** JSON input given to the subject. */
+  readonly input: unknown;
+  /** Test category. */
+  readonly category: string;
+  /** Importance weight in basis points. */
+  readonly weight: number;
+  /** The salted commitment to the case's answer, as 64 lowercase hex characters. */
+  readonly answerCommitment: string;
+}
+
+/**
+ * A challenger's retry policy for one challenge (spec 07 §7.3.4.6): at most
+ * the capability definition's retries, and at least its cooldown. Omit it
+ * to take the definition's values.
+ */
+export interface ChallengePolicy {
+  /** Retries after the first attempt; at most the definition's. */
+  readonly maxRetries: number;
+  /** Seconds between graded attempts; at least the definition's. */
+  readonly cooldownSecs: number;
+}
+
+/** Options of {@link SCP.trustCreateChallenge}. */
+export interface CreateChallengeOptions {
+  /** A stricter retry policy than the capability definition's. */
+  readonly policy?: ChallengePolicy;
   /**
-   * The signed request as JSON, to send to the subject; {@link
-   * decodeChallengeRequest} reads it back for {@link SCP.trustVerifyResponse}.
+   * The context whose evaluator outlets grade `CustomEval` cases. Required
+   * when any case is `CustomEval`; the verifier must be able to call each
+   * named outlet there.
    */
-  readonly challengeJson: string;
+  readonly evaluatorContextId?: string;
 }
 
 /**
  * A signed challenge request (spec 07 §7.3.4, ADR-017).
  *
- * Mirrors the Rust `ChallengeRequest` struct (`scp-core`). The verifier's
- * signature covers every other field.
+ * Mirrors the Rust `ChallengeRequest` struct (`scp-core`). The challenger's
+ * signature covers every other field, so pass the request back to the
+ * bridge unchanged.
  */
 export interface ChallengeRequest {
   /** The 32-byte random id as 64 lowercase hex characters. */
   readonly challengeId: string;
   /** The capability URI under test (spec 07 §7.3.4.1). */
   readonly capabilityUri: string;
-  /** The verifier-written test cases. */
-  readonly testCases: readonly TestCase[];
-  /** Maximum seconds the subject has to complete every case. */
-  readonly timeoutSecs: number;
-  /** DID of the verifier. */
+  /** Digest of the capability definition the challenge follows, as 64 lowercase hex characters. */
+  readonly definitionDigest: string;
+  /** The cases, with answer commitments and no answers. */
+  readonly testCases: readonly ChallengeCase[];
+  /** Unix seconds when the challenge was created. */
+  readonly createdAt: number;
+  /** Unix seconds after which no attempt is graded. */
+  readonly expiresAt: number;
+  /** Retries after the first attempt. */
+  readonly maxRetries: number;
+  /** Seconds the subject waits between attempts. */
+  readonly cooldownSecs: number;
+  /** Score in basis points at or above which an attempt passes. */
+  readonly passThresholdBps: number;
+  /** The context where the challenge is administered. */
+  readonly contextId: string;
+  /** DID of the challenger. */
   readonly verifier: string;
   /** DID of the subject. */
   readonly subject: string;
-  /** The verifier's 64-byte signature. */
+  /** The challenger's 64-byte signature. */
   readonly verifierSignature: readonly number[];
 }
 
+/** The subject's output for one case. Mirrors the Rust `TestOutput` struct. */
+export interface TestOutput {
+  /** The case's `testId`. */
+  readonly testId: string;
+  /** The subject's JSON output for the case. */
+  readonly output: unknown;
+}
+
 /**
- * A response to a challenge request (ADR-017, spec 07 §7.3.4).
+ * The subject's signed answers to one attempt of a challenge (spec 07
+ * §7.3.4 step 2, ADR-017).
  *
- * Mirrors the Rust `ChallengeResponse` struct (`scp-core`). The subject signs
- * it; the bridge reads `passed`, `score` (basis points), `test_count` and
- * `pass_count` from `result`.
+ * Mirrors the Rust `ChallengeResponse` struct (`scp-core`).
+ * {@link SCP.trustRespondToChallenge} builds and signs it.
  */
 export interface ChallengeResponse {
-  /** The request's `challengeId`, exactly as written there (64 lowercase hex characters). */
+  /** The request's `challengeId`. */
   readonly challengeId: string;
-  /** DID of the entity responding to the challenge. */
-  readonly responderDid: string;
-  /** Challenge-specific result data (pass/fail, metrics, evidence, etc.). */
-  readonly result: unknown;
-  /** Unix timestamp (seconds) when the response was completed. */
-  readonly completedAt: number;
-  /** Ed25519 signature over the canonical response bytes (64 bytes). */
-  readonly signature: readonly number[];
+  /** Digest of the signed request, as 64 lowercase hex characters. */
+  readonly requestDigest: string;
+  /** DID of the subject. */
+  readonly subject: string;
+  /** The attempt number, starting at 1. */
+  readonly attempt: number;
+  /** One output per case. */
+  readonly outputs: readonly TestOutput[];
+  /** The subject's 64-byte signature. */
+  readonly subjectSignature: readonly number[];
+}
+
+/** The grade of one case. Mirrors the Rust `CaseResult` struct; never signed. */
+export interface CaseResult {
+  /** Whether the case passed. */
+  readonly passed: boolean;
+  /** Why it failed, or the evaluator's reason, when there is one. */
+  readonly reason: string | null;
+}
+
+/** What {@link SCP.trustGradeResponse} returns. */
+export interface GradedChallenge {
+  /** The signed record of the attempt, pass or fail. */
+  readonly record: ChallengeVerification;
+  /** The per-case grades, in request order; not signed. */
+  readonly caseResults: readonly CaseResult[];
+  /**
+   * Why the record could not be written to this instance's trust store, when
+   * it could not. The record is signed and the attempt used either way.
+   */
+  readonly trustStoreError: string | null;
 }
 
 /**
@@ -2253,45 +2418,6 @@ function encodeExpectedOutput(expected: ExpectedOutput): unknown {
   }
 }
 
-function decodeExpectedOutput(value: unknown): ExpectedOutput {
-  const tagged = requireRecord("ExpectedOutput", value);
-  const keys = Object.keys(tagged);
-  if (keys.length !== 1) {
-    throw new Error(
-      `ExpectedOutput must be a single-key tagged object, got ${JSON.stringify(value)}`,
-    );
-  }
-  const tag = keys[0] as string;
-  const body = requireRecord(tag, tagged[tag]);
-  switch (tag) {
-    case "ExactMatch":
-      return { kind: "ExactMatch", value: body.value };
-    case "SchemaMatch":
-      return { kind: "SchemaMatch", schema: body.schema };
-    case "ContainsAll":
-      return { kind: "ContainsAll", required: requireStringArray(tag, "required", body.required) };
-    case "ContainsNone":
-      return {
-        kind: "ContainsNone",
-        forbidden: requireStringArray(tag, "forbidden", body.forbidden),
-      };
-    case "CustomEval":
-      return {
-        kind: "CustomEval",
-        evaluatorOutletId: requireString(tag, "evaluator_outlet_id", body.evaluator_outlet_id),
-      };
-    default:
-      throw new Error(`unknown ExpectedOutput variant ${JSON.stringify(tag)}`);
-  }
-}
-
-function requireStringArray(typeName: string, fieldName: string, value: unknown): string[] {
-  if (!Array.isArray(value) || !value.every((s) => typeof s === "string")) {
-    throw new Error(`${typeName}.${fieldName} must be an array of strings`);
-  }
-  return value as string[];
-}
-
 /**
  * Encodes typed {@link TestCase}s to the JSON wire shape the Rust bridge
  * deserializes (`Vec<TestCase>`).
@@ -2299,67 +2425,89 @@ function requireStringArray(typeName: string, fieldName: string, value: unknown)
  * @throws Error if a `weight` is not an integer in the u32 range.
  */
 export function encodeTestCases(testCases: readonly TestCase[]): string {
-  return JSON.stringify(testCases.map(testCaseWire));
+  return JSON.stringify(
+    testCases.map((c) => ({
+      test_id: c.testId,
+      input: c.input,
+      expected: encodeExpectedOutput(c.expected),
+      category: c.category,
+      weight: requireUint("TestCase", "weight", c.weight, U32_MAX),
+    })),
+  );
 }
 
-function testCaseWire(c: TestCase): unknown {
-  requireUint("TestCase", "weight", c.weight, 0xffff_ffff);
-  return {
-    test_id: c.testId,
-    input: c.input,
-    expected: encodeExpectedOutput(c.expected),
-    category: c.category,
-    weight: c.weight,
-  };
+/** Encodes typed {@link TestOutput}s to the Rust `Vec<TestOutput>` wire shape. */
+export function encodeTestOutputs(outputs: readonly TestOutput[]): string {
+  return JSON.stringify(outputs.map((o) => ({ test_id: o.testId, output: o.output })));
 }
 
 /**
  * Encodes a typed {@link ChallengeRequest} to the JSON wire shape the Rust
  * bridge deserializes (`ChallengeRequest`).
  *
- * @throws Error if `verifierSignature` is not exactly 64 elements or
- *   `challengeId` is not 64 lowercase hex characters (before any bridge call).
+ * @throws Error if `verifierSignature` is not exactly 64 elements, an id,
+ *   digest or commitment is not 64 lowercase hex characters, or a number is
+ *   out of its range (before any bridge call).
  */
-export function encodeChallengeRequest(challenge: ChallengeRequest): string {
-  requireByteLength("ChallengeRequest", "verifierSignature", 64, challenge.verifierSignature);
-  requireLowerHex32("ChallengeRequest", "challengeId", challenge.challengeId);
+export function encodeChallengeRequest(request: ChallengeRequest): string {
+  const t = "ChallengeRequest";
+  requireByteLength(t, "verifierSignature", 64, request.verifierSignature);
   return JSON.stringify({
-    challenge_id: challenge.challengeId,
-    capability_uri: challenge.capabilityUri,
-    test_cases: challenge.testCases.map(testCaseWire),
-    timeout_secs: challenge.timeoutSecs,
-    verifier: challenge.verifier,
-    subject: challenge.subject,
-    verifier_signature: challenge.verifierSignature,
+    challenge_id: requireLowerHex32(t, "challengeId", request.challengeId),
+    capability_uri: request.capabilityUri,
+    definition_digest: requireLowerHex32(t, "definitionDigest", request.definitionDigest),
+    test_cases: request.testCases.map((c) => ({
+      test_id: c.testId,
+      input: c.input,
+      category: c.category,
+      weight: requireUint("ChallengeCase", "weight", c.weight, U32_MAX),
+      answer_commitment: requireLowerHex32("ChallengeCase", "answerCommitment", c.answerCommitment),
+    })),
+    created_at: requireUint(t, "createdAt", request.createdAt, Number.MAX_SAFE_INTEGER),
+    expires_at: requireUint(t, "expiresAt", request.expiresAt, Number.MAX_SAFE_INTEGER),
+    max_retries: requireUint(t, "maxRetries", request.maxRetries, U32_MAX),
+    cooldown_secs: requireUint(t, "cooldownSecs", request.cooldownSecs, U32_MAX),
+    pass_threshold_bps: requireUint(t, "passThresholdBps", request.passThresholdBps, U32_MAX),
+    context_id: request.contextId,
+    verifier: request.verifier,
+    subject: request.subject,
+    verifier_signature: request.verifierSignature,
   });
 }
 
 /**
- * Decodes the signed request JSON that {@link SCP.trustCreateChallenge}
- * returns into a typed {@link ChallengeRequest}.
+ * Decodes the signed request JSON the bridge returns into a typed
+ * {@link ChallengeRequest}.
  *
  * @throws Error if a field is missing or malformed.
  */
 export function decodeChallengeRequest(json: string): ChallengeRequest {
   const t = "ChallengeRequest";
   const raw = requireRecord(t, JSON.parse(json));
-  if (!Array.isArray(raw.test_cases)) {
-    throw new Error(`${t}.test_cases must be an array`);
-  }
   return {
     challengeId: requireLowerHex32(t, "challenge_id", raw.challenge_id),
     capabilityUri: requireString(t, "capability_uri", raw.capability_uri),
-    testCases: raw.test_cases.map((value: unknown) => {
-      const c = requireRecord("TestCase", value);
+    definitionDigest: requireLowerHex32(t, "definition_digest", raw.definition_digest),
+    testCases: requireArray(t, "test_cases", raw.test_cases).map((value) => {
+      const c = requireRecord("ChallengeCase", value);
       return {
-        testId: requireString("TestCase", "test_id", c.test_id),
+        testId: requireString("ChallengeCase", "test_id", c.test_id),
         input: c.input,
-        expected: decodeExpectedOutput(c.expected),
-        category: requireString("TestCase", "category", c.category),
-        weight: requireUint("TestCase", "weight", c.weight, 0xffff_ffff),
+        category: requireString("ChallengeCase", "category", c.category),
+        weight: requireUint("ChallengeCase", "weight", c.weight, U32_MAX),
+        answerCommitment: requireLowerHex32(
+          "ChallengeCase",
+          "answer_commitment",
+          c.answer_commitment,
+        ),
       };
     }),
-    timeoutSecs: requireUint(t, "timeout_secs", raw.timeout_secs, 0xffff_ffff),
+    createdAt: requireUint(t, "created_at", raw.created_at, Number.MAX_SAFE_INTEGER),
+    expiresAt: requireUint(t, "expires_at", raw.expires_at, Number.MAX_SAFE_INTEGER),
+    maxRetries: requireUint(t, "max_retries", raw.max_retries, U32_MAX),
+    cooldownSecs: requireUint(t, "cooldown_secs", raw.cooldown_secs, U32_MAX),
+    passThresholdBps: requireUint(t, "pass_threshold_bps", raw.pass_threshold_bps, U32_MAX),
+    contextId: requireString(t, "context_id", raw.context_id),
     verifier: requireString(t, "verifier", raw.verifier),
     subject: requireString(t, "subject", raw.subject),
     verifierSignature: requireSignature(t, "verifier_signature", raw.verifier_signature),
@@ -2370,17 +2518,58 @@ export function decodeChallengeRequest(json: string): ChallengeRequest {
  * Encodes a typed {@link ChallengeResponse} to the JSON wire shape the Rust
  * bridge deserializes (`ChallengeResponse`).
  *
- * @throws Error if `signature` is not exactly 64 elements (before any bridge
- *   call).
+ * @throws Error if `subjectSignature` is not exactly 64 elements, an id or
+ *   digest is not 64 lowercase hex characters, or `attempt` is out of the
+ *   u32 range (before any bridge call).
  */
 export function encodeChallengeResponse(response: ChallengeResponse): string {
-  requireByteLength("ChallengeResponse", "signature", 64, response.signature);
+  const t = "ChallengeResponse";
+  requireByteLength(t, "subjectSignature", 64, response.subjectSignature);
   return JSON.stringify({
-    challenge_id: response.challengeId,
-    responder_did: response.responderDid,
-    result: response.result,
-    completed_at: response.completedAt,
-    signature: response.signature,
+    challenge_id: requireLowerHex32(t, "challengeId", response.challengeId),
+    request_digest: requireLowerHex32(t, "requestDigest", response.requestDigest),
+    subject: response.subject,
+    attempt: requireUint(t, "attempt", response.attempt, U32_MAX),
+    outputs: response.outputs.map((o) => ({ test_id: o.testId, output: o.output })),
+    subject_signature: response.subjectSignature,
+  });
+}
+
+/**
+ * Decodes the signed response JSON the bridge returns into a typed
+ * {@link ChallengeResponse}.
+ *
+ * @throws Error if a field is missing or malformed.
+ */
+export function decodeChallengeResponse(json: string): ChallengeResponse {
+  const t = "ChallengeResponse";
+  const raw = requireRecord(t, JSON.parse(json));
+  return {
+    challengeId: requireLowerHex32(t, "challenge_id", raw.challenge_id),
+    requestDigest: requireLowerHex32(t, "request_digest", raw.request_digest),
+    subject: requireString(t, "subject", raw.subject),
+    attempt: requireUint(t, "attempt", raw.attempt, U32_MAX),
+    outputs: requireArray(t, "outputs", raw.outputs).map((value) => {
+      const o = requireRecord("TestOutput", value);
+      return { testId: requireString("TestOutput", "test_id", o.test_id), output: o.output };
+    }),
+    subjectSignature: requireSignature(t, "subject_signature", raw.subject_signature),
+  };
+}
+
+/**
+ * Decodes the bridge's per-case grades (JSON array of the Rust `CaseResult`).
+ *
+ * @throws Error if an entry is malformed.
+ */
+export function decodeCaseResults(json: string): CaseResult[] {
+  return requireArray("CaseResults", "", JSON.parse(json)).map((value) => {
+    const c = requireRecord("CaseResult", value);
+    const reason = c.reason ?? null;
+    return {
+      passed: requireBoolean("CaseResult", "passed", c.passed),
+      reason: reason === null ? null : requireString("CaseResult", "reason", reason),
+    };
   });
 }
 

@@ -59,6 +59,7 @@ fun toolsExample(
             economicPolicy = null,
             consequenceRulesJson = null,
             consequenceConfigJson = null,
+            capabilityRequirementsJson = null,
         )
     val handle = scp.contextCreate(operator, params)
     println("Context: ${handle.contextId()}")

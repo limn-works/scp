@@ -62,7 +62,8 @@ enum ContextExample {
             sessionCap: nil,
             economicPolicy: nil,
             consequenceRulesJson: nil,
-            consequenceConfigJson: nil
+            consequenceConfigJson: nil,
+            capabilityRequirementsJson: nil
         )
 
         // 3. Alice creates the context. The returned ContextHandle is the

@@ -1085,33 +1085,63 @@ class TestTrust:
 
         The reference pattern for cross-bridge structured codes (spec section
         7.3.4.4): asserts the anchor op's codes stay recoverable the same way
-        the participation sibling's now are.
+        the participation sibling's now are. The context's governance holds
+        the requirement the check reads.
         """
         from scp_sdk.errors import ValidationError
-        from scp_sdk.trust import CapabilityRequirement, VerificationLevel
+        from scp_sdk.trust import (
+            NON_CANONICAL_IDENTIFIER_CODE,
+            CapabilityRequirement,
+            VerificationLevel,
+            encode_capability_requirements,
+        )
+        from tests.harness_custody import create_in_memory_identity
+
+        creator = await create_in_memory_identity(scp)
+        subject = await create_in_memory_identity(scp)
+        ctx = await scp.context_create(
+            creator.did,
+            {
+                "ceiling": ["messages:read", "messages:write"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+                "capability_requirements": encode_capability_requirements(
+                    [
+                        CapabilityRequirement(
+                            capability="scp:capability:schema-validation/v1",
+                            verification_level=VerificationLevel("SelfAttested"),
+                        )
+                    ]
+                ),
+            },
+        )
+        context_id = ctx.context_id
 
         # SDK wrapper: a malformed subject DID fails boundary validation with
         # the generic validation code shared by all three bridges.
         with pytest.raises(ValidationError, match="SCP-VALID-7000"):
-            await scp.check_capability_requirements("ctx-real-ffi", "not-a-did", [], [], [])
+            await scp.check_capability_requirements(context_id, "not-a-did", [], [])
+
+        # SDK wrapper: a well-formed DID that is not canonical is refused.
+        with pytest.raises(ValidationError) as non_canonical:
+            await scp.check_capability_requirements(context_id, "did:dht:zSubject", [], [])
+        assert non_canonical.value.code == NON_CANONICAL_IDENTIFIER_CODE
 
         # SDK wrapper: a self-attested requirement the agent lacks fails the
-        # admission check itself, which carries its own per-case code.
-        requirement = CapabilityRequirement(
-            capability="scp:capability:schema-validation/v1",
-            verification_level=VerificationLevel("SelfAttested"),
-        )
+        # admission check itself, which carries its own per-case code; the
+        # declared capability meets it.
         with pytest.raises(ValidationError, match="SCP-VALID-7076"):
-            await scp.check_capability_requirements(
-                "ctx-real-ffi", "did:key:alice", [requirement], [], []
-            )
+            await scp.check_capability_requirements(context_id, subject.did, [], [])
+        await scp.check_capability_requirements(
+            context_id, subject.did, ["scp:capability:schema-validation/v1"], []
+        )
 
-        # Raw bridge: the per-position JSON parse code (unreachable through
+        # Raw bridge: the per-position JSON parse codes (unreachable through
         # the typed SDK wrapper, which always serializes valid JSON).
-        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7073"):
-            scp._native.check_capability_requirements(
-                "ctx-real-ffi", "did:key:alice", "not json", "[]", "[]"
-            )
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7074"):
+            scp._native.check_capability_requirements(context_id, subject.did, "not json", "[]")
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7075"):
+            scp._native.check_capability_requirements(context_id, subject.did, "[]", "not json")
 
         # The free function is gone; the check reads the instance resolver.
         assert not hasattr(_scp_core, "check_capability_requirements")

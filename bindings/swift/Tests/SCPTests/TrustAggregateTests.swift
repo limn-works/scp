@@ -264,15 +264,24 @@ private func makeTestCases(_ count: Int) -> [TestCase] {
 private func makeChallengeRequest(
     signature: [UInt8] = Array(repeating: 8, count: 64),
     challengeId: String = String(repeating: "ab", count: 32),
-    expected: ExpectedOutput = .exactMatch(value: ["ok": true])
+    answerCommitment: String = String(repeating: "cc", count: 32)
 ) -> ChallengeRequest {
     ChallengeRequest(
         challengeId: challengeId,
         capabilityUri: schemaUri,
+        definitionDigest: String(repeating: "dd", count: 32),
         testCases: [
-            TestCase(testId: "t0", input: ["i": 0], expected: expected, category: "basic", weight: 10000)
+            ChallengeCase(
+                testId: "t0", input: ["i": 0], category: "basic", weight: 10000,
+                answerCommitment: answerCommitment
+            )
         ],
-        timeoutSecs: 300,
+        createdAt: 1_700_000_000,
+        expiresAt: 1_700_003_600,
+        maxRetries: 2,
+        cooldownSecs: 60,
+        passThresholdBps: 8000,
+        contextId: "ctx-1",
         verifier: "did:dht:zVerifier",
         subject: "did:dht:zSubject",
         verifierSignature: signature
@@ -281,15 +290,34 @@ private func makeChallengeRequest(
 
 /// A structurally-valid `ChallengeResponse` with a real 64-byte signature.
 private func makeChallengeResponse(
-    signature: [UInt8] = Array(repeating: 4, count: 64)
+    signature: [UInt8] = Array(repeating: 4, count: 64),
+    requestDigest: String = String(repeating: "ee", count: 32)
 ) -> ChallengeResponse {
     ChallengeResponse(
         challengeId: String(repeating: "ab", count: 32),
-        responderDid: "did:dht:zSubject",
-        result: ["passed": true],
-        completedAt: 1_700_000_100,
-        signature: signature
+        requestDigest: requestDigest,
+        subject: "did:dht:zSubject",
+        attempt: 1,
+        outputs: [TestOutput(testId: "t0", output: ["ok": true])],
+        subjectSignature: signature
     )
+}
+
+/// Asserts `body` throws ``ScpError/Validation(msg:code:)`` with `message`
+/// and `SCP-VALID-7098`.
+private func assertChallengeInputError(
+    _ message: String,
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    _ body: () throws -> Void
+) {
+    XCTAssertThrowsError(try body(), file: file, line: line) { error in
+        guard case let ScpError.Validation(msg, code) = error else {
+            return XCTFail("expected ScpError.Validation, got \(error)", file: file, line: line)
+        }
+        XCTAssertEqual(msg, message, file: file, line: line)
+        XCTAssertEqual(code, "SCP-VALID-7098", file: file, line: line)
+    }
 }
 
 final class ChallengeTrustInputEncoderTests: XCTestCase {
@@ -312,27 +340,46 @@ final class ChallengeTrustInputEncoderTests: XCTestCase {
         )
     }
 
-    func testChallengeRequestEncodesSevenSnakeCaseFields() throws {
-        let json = try encodeChallengeRequestJson(makeChallengeRequest())
+    func testChallengeRequestEncodesThirteenSnakeCaseFieldsAndDecodesBack() throws {
+        let request = makeChallengeRequest()
+        let json = try encodeChallengeRequestJson(request)
         assertJSONEqual(
             json,
             """
             {
               "challenge_id": "\(String(repeating: "ab", count: 32))",
               "capability_uri": "scp:capability:schema-validation/v1",
-              "test_cases": [{"test_id": "t0", "input": {"i": 0},
-                "expected": {"ExactMatch": {"value": {"ok": true}}},
-                "category": "basic", "weight": 10000}],
-              "timeout_secs": 300,
+              "definition_digest": "\(String(repeating: "dd", count: 32))",
+              "test_cases": [{"test_id": "t0", "input": {"i": 0}, "category": "basic", "weight": 10000,
+                "answer_commitment": "\(String(repeating: "cc", count: 32))"}],
+              "created_at": 1700000000,
+              "expires_at": 1700003600,
+              "max_retries": 2,
+              "cooldown_secs": 60,
+              "pass_threshold_bps": 8000,
+              "context_id": "ctx-1",
               "verifier": "did:dht:zVerifier",
               "subject": "did:dht:zSubject",
               "verifier_signature": \(Array(repeating: 8, count: 64))
             }
             """
         )
+        XCTAssertEqual(try decodeChallengeRequestJson(json), request)
     }
 
-    func testEveryExpectedOutputVariantEncodesTaggedAndDecodesBack() throws {
+    func testChallengeRequestDecodeRefusesAMissingField() throws {
+        let json = try encodeChallengeRequestJson(makeChallengeRequest())
+            .replacingOccurrences(of: "\"pass_threshold_bps\":8000,", with: "")
+        XCTAssertFalse(json.contains("pass_threshold_bps"))
+        XCTAssertThrowsError(try decodeChallengeRequestJson(json)) { error in
+            guard case let ScpError.Validation(_, code) = error else {
+                return XCTFail("expected ScpError.Validation, got \(error)")
+            }
+            XCTAssertEqual(code, "SCP-VALID-7098")
+        }
+    }
+
+    func testEveryExpectedOutputVariantEncodesTagged() throws {
         let variants: [(ExpectedOutput, String)] = [
             (.exactMatch(value: [1, "a"]), #"{"ExactMatch":{"value":[1,"a"]}}"#),
             (.schemaMatch(schema: ["type": "object"]), #"{"SchemaMatch":{"schema":{"type":"object"}}}"#),
@@ -341,8 +388,8 @@ final class ChallengeTrustInputEncoderTests: XCTestCase {
             (.customEval(evaluatorOutletId: "o-1"), #"{"CustomEval":{"evaluator_outlet_id":"o-1"}}"#)
         ]
         for (expected, wire) in variants {
-            let request = makeChallengeRequest(expected: expected)
-            let casesJson = try encodeTestCasesJson(request.testCases)
+            let testCase = TestCase(testId: "t0", input: ["i": 0], expected: expected, category: "basic", weight: 10000)
+            let casesJson = try encodeTestCasesJson([testCase])
             let cases = try XCTUnwrap(
                 JSONSerialization.jsonObject(with: Data(casesJson.utf8)) as? [[String: Any]]
             )
@@ -353,14 +400,38 @@ final class ChallengeTrustInputEncoderTests: XCTestCase {
                 withJSONObject: JSONSerialization.jsonObject(with: Data(wire.utf8)), options: [.sortedKeys]
             )
             XCTAssertEqual(encodedExpected, wireExpected)
-            XCTAssertEqual(try decodeChallengeRequestJson(encodeChallengeRequestJson(request)), request)
         }
     }
 
-    func testChallengeRequestDecodeRefusesAnUnknownVariant() throws {
-        let json = try encodeChallengeRequestJson(makeChallengeRequest())
-            .replacingOccurrences(of: "\"ExactMatch\"", with: "\"Nope\"")
-        XCTAssertThrowsError(try decodeChallengeRequestJson(json)) { error in
+    func testChallengeResponseEncodesSixSnakeCaseFieldsAndDecodesBack() throws {
+        let response = makeChallengeResponse()
+        let json = try encodeChallengeResponseJson(response)
+        assertJSONEqual(
+            json,
+            """
+            {
+              "challenge_id": "\(String(repeating: "ab", count: 32))",
+              "request_digest": "\(String(repeating: "ee", count: 32))",
+              "subject": "did:dht:zSubject",
+              "attempt": 1,
+              "outputs": [{"test_id": "t0", "output": {"ok": true}}],
+              "subject_signature": \(Array(repeating: 4, count: 64))
+            }
+            """
+        )
+        XCTAssertEqual(try decodeChallengeResponseJson(json), response)
+        try assertJSONEqual(
+            encodeTestOutputsJson(response.outputs),
+            #"[{"test_id": "t0", "output": {"ok": true}}]"#
+        )
+    }
+
+    func testCaseResultsDecodeWithAndWithoutReason() throws {
+        XCTAssertEqual(
+            try decodeCaseResultsJson(#"[{"passed":true,"reason":null},{"passed":false,"reason":"mismatch"}]"#),
+            [CaseResult(passed: true, reason: nil), CaseResult(passed: false, reason: "mismatch")]
+        )
+        XCTAssertThrowsError(try decodeCaseResultsJson(#"{"passed":true}"#)) { error in
             guard case let ScpError.Validation(_, code) = error else {
                 return XCTFail("expected ScpError.Validation, got \(error)")
             }
@@ -368,63 +439,70 @@ final class ChallengeTrustInputEncoderTests: XCTestCase {
         }
     }
 
-    func testChallengeResponseEncodesFiveSnakeCaseFields() throws {
-        let json = try encodeChallengeResponseJson(makeChallengeResponse())
-        assertJSONEqual(
-            json,
-            """
-            {
-              "challenge_id": "\(String(repeating: "ab", count: 32))",
-              "responder_did": "did:dht:zSubject",
-              "result": {"passed": true},
-              "completed_at": 1700000100,
-              "signature": \(Array(repeating: 4, count: 64))
-            }
-            """
-        )
-    }
-
-    func testWrongLengthChallengeSignaturesThrowBeforeBridgeCall() throws {
-        XCTAssertThrowsError(
-            try encodeChallengeRequestJson(makeChallengeRequest(signature: [1, 2, 3]))
-        ) { error in
-            guard case let ScpError.Validation(msg, _) = error else {
-                return XCTFail("expected ScpError.Validation, got \(error)")
-            }
-            XCTAssertEqual(msg, "ChallengeRequest.verifierSignature must be exactly 64 elements, got 3")
+    func testMalformedChallengeInputsThrowBeforeBridgeCall() {
+        assertChallengeInputError("ChallengeRequest.verifierSignature must be exactly 64 elements, got 3") {
+            _ = try encodeChallengeRequestJson(makeChallengeRequest(signature: [1, 2, 3]))
         }
-        XCTAssertThrowsError(
-            try encodeChallengeRequestJson(makeChallengeRequest(challengeId: "chal-1"))
-        ) { error in
-            guard case let ScpError.Validation(msg, _) = error else {
-                return XCTFail("expected ScpError.Validation, got \(error)")
-            }
-            XCTAssertEqual(msg, "ChallengeRequest.challengeId must be 64 lowercase hex characters")
+        assertChallengeInputError("ChallengeRequest.challengeId must be 64 lowercase hex characters") {
+            _ = try encodeChallengeRequestJson(makeChallengeRequest(challengeId: "chal-1"))
         }
-        XCTAssertThrowsError(
-            try encodeChallengeResponseJson(
+        assertChallengeInputError("ChallengeCase.answerCommitment must be 64 lowercase hex characters") {
+            _ = try encodeChallengeRequestJson(
+                makeChallengeRequest(answerCommitment: String(repeating: "CC", count: 32))
+            )
+        }
+        assertChallengeInputError("ChallengeResponse.subjectSignature must be exactly 64 elements, got 63") {
+            _ = try encodeChallengeResponseJson(
                 makeChallengeResponse(signature: Array(repeating: 4, count: 63))
             )
-        ) { error in
-            guard case let ScpError.Validation(msg, _) = error else {
-                return XCTFail("expected ScpError.Validation, got \(error)")
-            }
-            XCTAssertEqual(msg, "ChallengeResponse.signature must be exactly 64 elements, got 63")
+        }
+        assertChallengeInputError("ChallengeResponse.requestDigest must be 64 lowercase hex characters") {
+            _ = try encodeChallengeResponseJson(makeChallengeResponse(requestDigest: "ee"))
         }
     }
 }
 
-/// Call-through against the real Rust deserializers: these invoke the bridge
-/// verification ops through the typed wrappers, proving the serialized JSON
-/// parses and evaluates on the Rust side (dummy signatures yield structured
-/// negative verdicts, never parse errors).
+/// Call-through against the real Rust bridge: these invoke the challenge
+/// operations through the typed wrappers.
 final class ChallengeTrustInputCallThroughTests: XCTestCase {
+    // Implicitly unwrapped because XCTest `setUp` initializes it before any
+    // test method runs — the XCTest lifecycle guarantees non-nil.
+    // swiftlint:disable:next implicitly_unwrapped_optional
+    var scp: SCP!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        scp = try SCP(storage: .inMemory)
+    }
+
+    override func tearDown() async throws {
+        try await scp.shutdown(timeoutMillis: 1000)
+        scp = nil
+        try await super.tearDown()
+    }
+
+    /// A context on `scp` whose governance requires `schemaUri` graded by
+    /// `verifierDid`.
+    private func requiringContext(verifierDid: String) async throws -> String {
+        try await contextRequiring(scp, [
+            CapabilityRequirement(
+                capability: schemaUri,
+                verificationLevel: .challengeVerified,
+                trustedVerifiers: [verifierDid]
+            )
+        ])
+    }
+
+    /// An output that passes every case `makeTestCases` writes.
+    private func passingOutputs(_ cases: [TestCase]) -> [TestOutput] {
+        cases.map { TestOutput(testId: $0.testId, output: ["ok": true]) }
+    }
+
     func testTrustVerifyAttestationWithoutAResolverFailsClosedWith7052() async throws {
         // An instance with no identity has no DID resolver, so the issuer's
         // `#active` key cannot be resolved: a coded SCP-VALID-7052 error,
         // never a verdict. The issuer DID in the message proves the envelope
         // parsed on the real Rust deserializer (a parse failure is 7012).
-        let scp = try SCP(storage: .inMemory)
         do {
             _ = try await scp.trustVerifyAttestation(
                 contextId: "ctx-ffi-1",
@@ -440,7 +518,6 @@ final class ChallengeTrustInputCallThroughTests: XCTestCase {
     func testTrustVerifyAttestationResolvableIssuerBadSignatureIsInvalid() async throws {
         // An issuer that resolves on this instance reaches the real verifier:
         // a dummy signature yields a structured `valid: false` verdict.
-        let scp = try SCP(storage: .inMemory)
         let issuer = try await createInMemoryIdentity(scp)
         let result = try await scp.trustVerifyAttestation(
             contextId: "ctx-ffi-1",
@@ -450,49 +527,126 @@ final class ChallengeTrustInputCallThroughTests: XCTestCase {
         XCTAssertTrue(result.errorMessage.contains("signature"), result.errorMessage)
     }
 
+    /// A protocol suite one case short of its standard's minimum is refused.
     func testTrustCreateChallengeBelowMinimumIsValid7039() async throws {
-        let scp = try SCP(storage: .inMemory)
         let verifier = try await createInMemoryIdentity(scp)
         let subject = try await createInMemoryIdentity(scp)
-        do {
-            _ = try await scp.trustCreateChallenge(
+        let contextId = try await requiringContext(verifierDid: verifier.did())
+        await assertValidationCode(challengeSuiteBelowMinimumCode) {
+            _ = try await self.scp.trustCreateChallenge(
                 verifier: verifier, subject: subject.did(), capabilityUri: schemaUri,
-                testCases: makeTestCases(19)
+                testCases: makeTestCases(19), contextId: contextId, windowSecs: 3600
             )
-            XCTFail("a 19-case schema-validation suite must be refused")
-        } catch let ScpError.Validation(_, code) {
-            XCTAssertEqual(code, challengeSuiteBelowMinimumCode)
         }
     }
 
-    func testCreatedChallengeDecodesAndAForgedResponseIsRefused() async throws {
-        let scp = try SCP(storage: .inMemory)
+    /// Test 38: one challenge from creation to admission through the real
+    /// bridge. The context's governance requires the capability, so the
+    /// subject is refused before it holds a record and admitted after.
+    func test_challenge_round_trip() async throws {
         let verifier = try await createInMemoryIdentity(scp)
         let subject = try await createInMemoryIdentity(scp)
+        let contextId = try await requiringContext(verifierDid: verifier.did())
         let cases = makeTestCases(20)
-        let created = try await scp.trustCreateChallenge(
-            verifier: verifier, subject: subject.did(), capabilityUri: schemaUri, testCases: cases
-        )
-        let challenge = try decodeChallengeRequestJson(created.challengeJson)
-        XCTAssertEqual(challenge.challengeId, created.challengeId)
-        XCTAssertEqual(challenge.verifier, verifier.did())
-        XCTAssertEqual(challenge.subject, subject.did())
-        XCTAssertEqual(challenge.testCases, cases)
 
-        let response = ChallengeResponse(
-            challengeId: challenge.challengeId,
-            responderDid: subject.did(),
-            result: ["passed": true, "score": 10000, "test_count": 20, "pass_count": 20],
-            completedAt: UInt64(Date().timeIntervalSince1970),
-            signature: Array(repeating: 0, count: 64)
+        let request = try await scp.trustCreateChallenge(
+            verifier: verifier, subject: subject.did(), capabilityUri: schemaUri,
+            testCases: cases, contextId: contextId, windowSecs: 3600
+        )
+        XCTAssertEqual(request.verifier, verifier.did())
+        XCTAssertEqual(request.subject, subject.did())
+        XCTAssertEqual(request.contextId, contextId)
+        XCTAssertEqual(request.capabilityUri, schemaUri)
+        XCTAssertEqual(request.testCases.map(\.testId), cases.map(\.testId))
+        XCTAssertEqual(request.expiresAt - request.createdAt, 3600)
+        // The request commits to each answer and never carries it.
+        XCTAssertFalse(try encodeChallengeRequestJson(request).contains("ExactMatch"))
+
+        await assertValidationCode("SCP-VALID-7076") {
+            try await self.scp.checkCapabilityRequirements(
+                contextId: contextId, subjectDid: subject.did(),
+                agentCapabilities: [], challengeVerifications: []
+            )
+        }
+
+        let response = try await scp.trustRespondToChallenge(
+            subject: subject, request: request, outputs: passingOutputs(cases), attempt: 1
+        )
+        XCTAssertEqual(response.challengeId, request.challengeId)
+        XCTAssertEqual(response.subject, subject.did())
+        XCTAssertEqual(response.attempt, 1)
+
+        let graded = try await scp.trustGradeResponse(verifier: verifier, request: request, response: response)
+        XCTAssertNil(graded.trustStoreError)
+        XCTAssertEqual(graded.caseResults.count, 20)
+        XCTAssertTrue(graded.caseResults.allSatisfy(\.passed))
+        let record = graded.record
+        XCTAssertTrue(record.passed)
+        XCTAssertEqual(record.attempt, 1)
+        XCTAssertEqual(record.passCount, 20)
+        XCTAssertEqual(record.testCount, 20)
+        XCTAssertEqual(record.challengeId, request.challengeId)
+        XCTAssertEqual(record.verifier, verifier.did())
+        XCTAssertEqual(record.subject, subject.did())
+        XCTAssertEqual(record.contextId, contextId)
+
+        try await scp.checkCapabilityRequirements(
+            contextId: contextId, subjectDid: subject.did(),
+            agentCapabilities: [], challengeVerifications: [record]
+        )
+        // Every field is signed: a record whose attempt was altered is dropped.
+        await assertValidationCode("SCP-VALID-7076") {
+            try await self.scp.checkCapabilityRequirements(
+                contextId: contextId, subjectDid: subject.did(),
+                agentCapabilities: [], challengeVerifications: [record.withAttempt(2)]
+            )
+        }
+    }
+
+    /// A response with a forged signature is refused and uses no attempt.
+    func testForgedResponseIsRefusedAndGradesNothing() async throws {
+        let verifier = try await createInMemoryIdentity(scp)
+        let subject = try await createInMemoryIdentity(scp)
+        let contextId = try await requiringContext(verifierDid: verifier.did())
+        let cases = makeTestCases(20)
+        let request = try await scp.trustCreateChallenge(
+            verifier: verifier, subject: subject.did(), capabilityUri: schemaUri,
+            testCases: cases, contextId: contextId, windowSecs: 3600
+        )
+        let response = try await scp.trustRespondToChallenge(
+            subject: subject, request: request, outputs: passingOutputs(cases), attempt: 1
+        )
+        let forged = ChallengeResponse(
+            challengeId: response.challengeId, requestDigest: response.requestDigest,
+            subject: response.subject, attempt: response.attempt, outputs: response.outputs,
+            subjectSignature: Array(repeating: 0, count: 64)
         )
         do {
-            _ = try await scp.trustVerifyResponse(
-                verifier: verifier, challenge: challenge, response: response, contextId: "ctx-ffi"
-            )
+            _ = try await scp.trustGradeResponse(verifier: verifier, request: request, response: forged)
             XCTFail("a response with a forged signature must be refused")
-        } catch let ScpError.Validation(_, code) {
-            XCTAssertEqual(code, "SCP-VALID-7003")
-        }
+        } catch is ScpError {}
+        // The forgery took no attempt: the real response still grades as attempt 1.
+        let graded = try await scp.trustGradeResponse(verifier: verifier, request: request, response: response)
+        XCTAssertEqual(graded.record.attempt, 1)
+        XCTAssertTrue(graded.record.passed)
+    }
+}
+
+private extension ChallengeVerification {
+    /// This record with `attempt` replaced and every other field, the
+    /// signature included, kept.
+    func withAttempt(_ attempt: UInt32) -> ChallengeVerification {
+        ChallengeVerification(
+            verificationId: verificationId, verifier: verifier, subject: subject,
+            capabilityUri: capabilityUri, definitionDigest: definitionDigest,
+            suiteDigest: suiteDigest, challengeId: challengeId, attempt: attempt,
+            responseDigest: responseDigest, maxRetries: maxRetries,
+            cooldownSecs: cooldownSecs, passThresholdBps: passThresholdBps,
+            minCategoryCases: minCategoryCases, passed: passed, score: score,
+            testCount: testCount, passCount: passCount,
+            challengeCreatedAt: challengeCreatedAt, challengeExpiresAt: challengeExpiresAt,
+            timestamp: timestamp, expiresAt: expiresAt, contextId: contextId,
+            verifierSignature: verifierSignature
+        )
     }
 }

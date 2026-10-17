@@ -75,15 +75,16 @@ import type {
   BehavioralRecord,
   CachedAttestation,
   CachedAttestationEnvelope,
-  CapabilityRequirement,
   CapabilityValidation,
+  ChallengePolicy,
   ChallengeRequest,
   ChallengeResponse,
   ChallengeVerification,
   ConsequenceRule,
-  CreatedChallenge,
+  CreateChallengeOptions,
   EventLogEntry,
   GovernanceActionResult,
+  GradedChallenge,
   InviteMemberOutcome,
   MemberRole,
   OutletDefinition,
@@ -92,16 +93,19 @@ import type {
   SagaResult,
   SealedInvitation,
   TestCase,
+  TestOutput,
   ThresholdRequirement,
   TrustEvaluation,
 } from "./types";
 import {
   checkProposalResponse,
+  decodeCaseResults,
+  decodeChallengeRequest,
+  decodeChallengeResponse,
   decodeChallengeVerification,
   encodeAttestation,
   encodeAttestorSets,
   encodeCachedAttestations,
-  encodeCapabilityRequirements,
   encodeChallengeRequest,
   encodeChallengeResponse,
   encodeChallengeVerifications,
@@ -111,6 +115,7 @@ import {
   encodeParticipationProfile,
   encodeRequireParticipation,
   encodeTestCases,
+  encodeTestOutputs,
   encodeThresholdRequirements,
   governanceActionResultFromBridge,
   memberRoleFromBridge,
@@ -3891,21 +3896,27 @@ export class SCP {
   }
 
   /**
-   * Issue a challenge request signed with `verifier`'s `#active` key (spec 07
-   * §7.3.4, ADR-017).
+   * Issue a challenge request signed by `verifier`'s `#active` key (spec 07
+   * §7.3.4 step 1, ADR-017).
    *
-   * The verifier writes the test cases. A protocol capability URI
-   * (`scp:capability:*`) must be in the protocol capability list, and the
-   * request must meet its standard's minimum case count.
+   * The challenger writes the cases with their answers. The returned request
+   * carries a salted commitment to each answer and never the answer; the
+   * challenger's ledger keeps the answers to grade with. The capability
+   * definition for `capabilityUri` sets the pass threshold, the retries and
+   * the cooldown; `options.policy` may only tighten them.
    *
    * @param verifier DID of an identity of this instance; its custody signs.
    * @param subject DID of the identity being challenged.
    * @param capabilityUri The capability URI under test, in canonical form.
-   * @param testCases The verifier-written cases; their weights sum to 10000.
-   * @param timeoutSecs Seconds the subject has to complete every case.
+   * @param testCases The challenger-written cases; their weights sum to 10000.
+   * @param contextId The context where the challenge is administered.
+   * @param windowSecs Seconds from creation during which attempts are graded.
+   * @param options A stricter policy, and the evaluator context for
+   *   `CustomEval` cases.
    * @throws ValidationError `SCP-VALID-7013` for a malformed DID;
    *   {@link CHALLENGE_SUITE_BELOW_MINIMUM_CODE} (`SCP-VALID-7039`) for too few
-   *   cases; `SCP-VALID-7003` for any other refusal.
+   *   cases; `SCP-VALID-7137` for a policy looser than the definition;
+   *   {@link NON_CANONICAL_IDENTIFIER_CODE} for a DID that is not canonical.
    * @throws ScpError `SCP-CRYPTO-4006` when the verifier's key is destroyed,
    *   or another custody failure.
    */
@@ -3914,65 +3925,125 @@ export class SCP {
     subject: string,
     capabilityUri: string,
     testCases: readonly TestCase[],
-    timeoutSecs: number = 300,
-  ): Promise<CreatedChallenge> {
+    contextId: string,
+    windowSecs: number,
+    options: CreateChallengeOptions = {},
+  ): Promise<ChallengeRequest> {
     const testCasesJson = encodeTestCases(testCases);
+    let created: { challengeId: string; requestJson: string };
     try {
-      return await (
+      created = await (
         this.#native.trustCreateChallenge as (
           v: string,
           s: string,
           u: string,
           t: string,
           secs: number,
-        ) => Promise<CreatedChallenge>
-      )(verifier, subject, capabilityUri, testCasesJson, timeoutSecs);
+          c: string,
+          e: string | undefined,
+          p: ChallengePolicy | undefined,
+        ) => Promise<{ challengeId: string; requestJson: string }>
+      )(
+        verifier,
+        subject,
+        capabilityUri,
+        testCasesJson,
+        windowSecs,
+        contextId,
+        options.evaluatorContextId,
+        options.policy,
+      );
     } catch (err) {
       throw mapBridgeError(err);
     }
+    return decodeChallengeRequest(created.requestJson);
   }
 
   /**
-   * Check `response` against `challenge` and return the record, signed with
-   * `verifier`'s `#active` key (spec 07 §7.3.4, ADR-017).
+   * Answer `request` for attempt `attempt`, signed by `subject`'s `#active`
+   * key (spec 07 §7.3.4 step 2, ADR-017).
    *
-   * The request's and the response's signatures are checked against keys
-   * this instance's DID resolver returns.
+   * The challenger's signature on `request` is checked against the key this
+   * instance's DID resolver returns before anything is signed.
    *
-   * @param verifier DID of the identity that issued `challenge`; it must be an
-   *   identity of this instance.
-   * @param challenge The signed request ({@link decodeChallengeRequest} of
-   *   {@link CreatedChallenge.challengeJson}).
-   * @param response The subject's signed response.
-   * @param contextId The context where the challenge was administered.
-   * @throws ValidationError `SCP-VALID-7013` for a malformed DID,
-   *   `SCP-VALID-7011` for an empty `contextId`, `SCP-VALID-7003` when a check
-   *   fails.
+   * @param subject DID of the challenged identity; it must be an identity of
+   *   this instance.
+   * @param request The signed request, as the challenger sent it.
+   * @param outputs One output per case.
+   * @param attempt The attempt number, starting at 1.
+   * @throws ValidationError `SCP-VALID-7013` for a malformed DID, or a
+   *   refusal when the request's signature, subject or window does not hold.
    * @throws IdentityError `SCP-IDENT-1033` when this instance has no DID
    *   resolver.
    */
-  async trustVerifyResponse(
-    verifier: string,
-    challenge: ChallengeRequest,
-    response: ChallengeResponse,
-    contextId: string,
-  ): Promise<ChallengeVerification> {
-    const challengeJson = encodeChallengeRequest(challenge);
-    const responseJson = encodeChallengeResponse(response);
-    let recordJson: string;
+  async trustRespondToChallenge(
+    subject: string,
+    request: ChallengeRequest,
+    outputs: readonly TestOutput[],
+    attempt: number,
+  ): Promise<ChallengeResponse> {
+    const requestJson = encodeChallengeRequest(request);
+    const outputsJson = encodeTestOutputs(outputs);
+    let responseJson: string;
     try {
-      recordJson = await (
-        this.#native.trustVerifyResponse as (
-          v: string,
-          c: string,
+      responseJson = await (
+        this.#native.trustRespondToChallenge as (
+          s: string,
           r: string,
-          ctx: string,
+          o: string,
+          a: number,
         ) => Promise<string>
-      )(verifier, challengeJson, responseJson, contextId);
+      )(subject, requestJson, outputsJson, attempt);
     } catch (err) {
       throw mapBridgeError(err);
     }
-    return decodeChallengeVerification(recordJson);
+    return decodeChallengeResponse(responseJson);
+  }
+
+  /**
+   * Grade `response` to `request` and return the record, signed by
+   * `verifier`'s `#active` key (spec 07 §7.3.4 steps 3 and 4, ADR-017).
+   *
+   * Both signatures are checked first. The challenger's ledger then checks
+   * the attempt number, the cooldown and the window, grades each case
+   * against its stored answer, and signs a record for the attempt, pass or
+   * fail. The record is also written to this instance's trust store.
+   *
+   * @param verifier DID of the identity that issued `request`; it must be an
+   *   identity of this instance.
+   * @param request The signed request.
+   * @param response The subject's signed response.
+   * @throws ValidationError `SCP-VALID-7013` for a malformed DID, a refusal
+   *   when a signature or the attempt does not hold,
+   *   {@link GRADING_CAPACITY_EXHAUSTED_CODE}, {@link GRADING_LEASE_LOST_CODE}
+   *   or {@link ANSWER_KEY_MISMATCH_CODE} for a grading that used no attempt.
+   * @throws IdentityError `SCP-IDENT-1033` when this instance has no DID
+   *   resolver.
+   */
+  async trustGradeResponse(
+    verifier: string,
+    request: ChallengeRequest,
+    response: ChallengeResponse,
+  ): Promise<GradedChallenge> {
+    const requestJson = encodeChallengeRequest(request);
+    const responseJson = encodeChallengeResponse(response);
+    let graded: { recordJson: string; reasonsJson: string; trustStoreError?: string | null };
+    try {
+      graded = await (
+        this.#native.trustGradeResponse as (
+          v: string,
+          r: string,
+          s: string,
+        ) => Promise<{ recordJson: string; reasonsJson: string; trustStoreError?: string | null }>
+      )(verifier, requestJson, responseJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+    return {
+      record: decodeChallengeVerification(graded.recordJson),
+      caseResults: decodeCaseResults(graded.reasonsJson),
+      trustStoreError: graded.trustStoreError ?? null,
+    };
   }
 
   /**
@@ -4010,54 +4081,39 @@ export class SCP {
 
   /**
    * Verify that an agent meets a context's capability requirements for
-   * admission (spec §7.3.4.4).
+   * admission (spec 07 §7.3.4.4).
    *
-   * `subjectDid`/`contextId` bind challenge verifications to the agent and
-   * context being admitted: a `ChallengeVerification` only satisfies a
-   * requirement when its signed `subject_did`/`context_id` equal these values,
-   * closing cross-subject and cross-context attribution.
+   * The requirements are the ones the context's governance holds at the time
+   * of the call, set through {@link ContextParams.capabilityRequirements}; the
+   * caller cannot supply them. A `ChallengeVerified` requirement is met only
+   * by a passing record signed by one of its trusted verifiers, for this
+   * subject and context, within the requirement's retry cap.
    *
    * Returns normally when all requirements are satisfied; throws on any unmet
    * requirement or malformed JSON.
    *
-   * Security caveat — authenticity is not authorization: a passing
-   * `ChallengeVerified` check proves the verifier's signature is authentic and
-   * bound to this subject/context, not that the verifier is *trusted*. Because
-   * `verifierDid` is self-certifying, a subject can present a genuinely-signed
-   * result from a verifier it controls. Establish verifier legitimacy
-   * separately and do NOT treat success as authorization.
-   *
    * @param contextId The context the agent is being admitted to.
    * @param subjectDid DID of the agent being admitted.
-   * @param requirements Typed {@link CapabilityRequirement} values. Serialized
-   *   internally to the serde wire shape (ADR-058).
    * @param agentCapabilities The agent's self-attested capability URIs.
    * @param challengeVerifications Typed {@link ChallengeVerification} records.
-   *   Serialized internally to the serde wire shape (ADR-058).
+   * @throws ValidationError `SCP-VALID-7076` for an unmet requirement.
    */
   async checkCapabilityRequirements(
     contextId: string,
     subjectDid: string,
-    requirements: readonly CapabilityRequirement[],
     agentCapabilities: readonly string[],
     challengeVerifications: readonly ChallengeVerification[],
   ): Promise<void> {
+    const recordsJson = encodeChallengeVerifications(challengeVerifications);
     try {
       await (
         this.#native.checkCapabilityRequirements as (
           c: string,
           s: string,
-          r: string,
           a: string,
           v: string,
         ) => Promise<void>
-      )(
-        contextId,
-        subjectDid,
-        encodeCapabilityRequirements(requirements),
-        JSON.stringify(agentCapabilities),
-        encodeChallengeVerifications(challengeVerifications),
-      );
+      )(contextId, subjectDid, JSON.stringify(agentCapabilities), recordsJson);
     } catch (err) {
       throw mapBridgeError(err);
     }

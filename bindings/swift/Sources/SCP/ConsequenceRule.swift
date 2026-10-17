@@ -435,7 +435,8 @@ public func encodeConsequenceConfigJson(_ config: ConsequenceConfig) throws -> S
 
 public extension ContextParams {
     /// Convenience initializer that accepts typed ``ConsequenceRule`` /
-    /// ``ConsequenceConfig`` values and serializes them to the JSON wire shape
+    /// ``ConsequenceConfig`` / ``CapabilityRequirement`` values and serializes
+    /// them to the JSON wire shape
     /// that the underlying UniFFI ``ContextParams`` expects.
     ///
     /// Use this in preference to constructing `ContextParams` with raw JSON
@@ -446,7 +447,8 @@ public extension ContextParams {
     /// with `ScpError.Validation` code `SCP-VALID-7005` (construction.md M2);
     /// no default ceiling replaces it.
     ///
-    /// - Throws: `EncodingError` if a typed value cannot be serialized.
+    /// - Throws: `EncodingError` or ``ScpError`` if a typed value cannot be
+    ///   serialized.
     init(
         mode: ContextMode,
         ceiling: [String],
@@ -461,10 +463,12 @@ public extension ContextParams {
         sessionCap: UInt32? = nil,
         economicPolicy: String? = nil,
         consequenceRules: [ConsequenceRule]?,
-        consequenceConfig: ConsequenceConfig?
+        consequenceConfig: ConsequenceConfig?,
+        capabilityRequirements: [CapabilityRequirement]?
     ) throws {
         let rulesJson = try consequenceRules.map { try encodeConsequenceRulesJson($0) }
         let configJson = try consequenceConfig.map { try encodeConsequenceConfigJson($0) }
+        let requirementsJson = try capabilityRequirements.map { try encodeCapabilityRequirementsJson($0) }
         self.init(
             mode: mode,
             ceiling: ceiling,
@@ -479,7 +483,8 @@ public extension ContextParams {
             sessionCap: sessionCap,
             economicPolicy: economicPolicy,
             consequenceRulesJson: rulesJson,
-            consequenceConfigJson: configJson
+            consequenceConfigJson: configJson,
+            capabilityRequirementsJson: requirementsJson
         )
     }
 }

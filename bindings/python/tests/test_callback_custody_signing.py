@@ -165,19 +165,25 @@ async def test_trust_create_challenge_signs_through_a_python_provider(scp) -> No
         )
         for i in range(20)
     ]
+    ctx = await scp.context_create(subject.did, _GOVERNANCE_PARAMS)
     provider.armed = True
     before = provider.sign_calls
 
-    result = await asyncio.wait_for(
+    request = await asyncio.wait_for(
         scp.trust_create_challenge(
-            verifier.did, subject.did, "scp:capability:schema-validation/v1", cases
+            verifier.did,
+            subject.did,
+            "scp:capability:schema-validation/v1",
+            cases,
+            ctx.context_id,
+            3_600,
         ),
         timeout=_DEADLINE_S,
     )
 
     assert provider.sign_calls > before, "the request never reached the provider's sign"
     assert provider.signing.is_set()
-    assert json.loads(result["challenge_json"])["verifier"] == verifier.did
+    assert request.verifier == verifier.did
 
 
 @pytest.mark.asyncio

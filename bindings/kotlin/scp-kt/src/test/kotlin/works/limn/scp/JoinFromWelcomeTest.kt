@@ -115,6 +115,7 @@ class JoinFromWelcomeTest {
             economicPolicy = null,
             consequenceRulesJson = null,
             consequenceConfigJson = null,
+            capabilityRequirementsJson = null,
         )
 
     // ── reserveKeyPackage — real UniFFI bridge ────────────────────────────

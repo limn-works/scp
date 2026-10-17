@@ -71,7 +71,8 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
             sessionCap: nil,
             economicPolicy: nil,
             consequenceRulesJson: nil,
-            consequenceConfigJson: nil
+            consequenceConfigJson: nil,
+            capabilityRequirementsJson: nil
         )
     }
 

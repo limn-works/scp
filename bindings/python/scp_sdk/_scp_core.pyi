@@ -823,20 +823,25 @@ class SCP:
     def trust_query_score(self, did: Any, context_id: Any) -> Any: ...
     def trust_create_challenge(
         self,
-        verifier: Any,
-        subject: Any,
-        capability_uri: Any,
-        test_cases_json: Any,
-        timeout_secs: Any = ...,
-    ) -> Any: ...
-    def trust_verify_response(
-        self, verifier: Any, challenge_json: Any, response_json: Any, context_id: Any
-    ) -> Any: ...
+        verifier: str,
+        subject: str,
+        capability_uri: str,
+        test_cases_json: str,
+        window_secs: int,
+        context_id: str,
+        evaluator_context_id: str | None = ...,
+        policy: dict[str, int] | None = ...,
+    ) -> dict[str, str]: ...
+    def trust_respond_to_challenge(
+        self, subject: str, request_json: str, outputs_json: str, attempt: int
+    ) -> str: ...
+    def trust_grade_response(
+        self, verifier: str, request_json: str, response_json: str
+    ) -> dict[str, Any]: ...
     def check_capability_requirements(
         self,
         context_id: str,
         subject_did: str,
-        requirements_json: str,
         agent_capabilities_json: str,
         challenge_verifications_json: str,
     ) -> None: ...

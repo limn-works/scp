@@ -3,7 +3,9 @@
  * spec §7.3 / §7.3.4).
  *
  * These drive `scp.aggregateTrustInput`, `scp.trustVerifyAttestation`, and
- * `scp.trustCreateChallenge` and `scp.trustVerifyResponse` against the real NAPI addon, proving the
+ * the challenge operations (`scp.trustCreateChallenge`,
+ * `scp.trustRespondToChallenge`, `scp.trustGradeResponse`,
+ * `scp.checkCapabilityRequirements`) against the real NAPI addon, proving the
  * types.ts-serialized JSON parses and evaluates on the real Rust
  * deserializers — not just that the encoders emit the pinned shapes
  * (`trust.test.ts` covers that with the mock bridge). Mirrors the Kotlin
@@ -16,14 +18,8 @@
 import { describe, expect, test } from "bun:test";
 import { ScpError } from "../src/errors";
 import { SCP } from "../src/scp";
-import type {
-  CachedAttestationEnvelope,
-  ChallengeRequest,
-  ChallengeResponse,
-  EventLogEntry,
-  TestCase,
-} from "../src/types";
-import { CHALLENGE_SUITE_BELOW_MINIMUM_CODE, decodeChallengeRequest } from "../src/types";
+import type { CachedAttestationEnvelope, EventLogEntry, TestCase } from "../src/types";
+import { CHALLENGE_SUITE_BELOW_MINIMUM_CODE, encodeCapabilityRequirements } from "../src/types";
 
 const SCHEMA_URI = "scp:capability:schema-validation/v1";
 
@@ -109,7 +105,7 @@ if (scp === null) {
     });
   });
 
-  describe("scp.trustVerifyAttestation / scp.trustVerifyResponse — real-FFI call-through", () => {
+  describe("scp.trustVerifyAttestation and the challenge operations — real-FFI call-through", () => {
     /** A typed envelope whose 64-byte signature is all zeros. */
     const zeroSignedAttestation = (issuer: string): CachedAttestationEnvelope => ({
       id: "att-ffi-1",
@@ -152,12 +148,41 @@ if (scp === null) {
       expect(result.errorMessage).toContain("signature");
     });
 
+    /** A context on `live` whose governance requires `SCHEMA_URI` graded by `verifier`. */
+    async function requiringContext(verifierDid: string): Promise<string> {
+      const creator = await createInMemoryIdentity(live);
+      const ctx = await live.contextCreate(
+        creator,
+        JSON.stringify({
+          ceiling: ["messages:read", "messages:write"],
+          memoryScope: "ephemeral",
+          governance: "single_admin",
+          capabilityRequirements: encodeCapabilityRequirements([
+            {
+              capability: SCHEMA_URI,
+              verificationLevel: "ChallengeVerified",
+              trustedVerifiers: [verifierDid],
+            },
+          ]),
+        }),
+      );
+      return ctx.contextId;
+    }
+
     test("trustCreateChallenge refuses a protocol suite below its minimum with SCP-VALID-7039", async () => {
       const verifier = await createInMemoryIdentity(live);
       const subject = await createInMemoryIdentity(live);
+      const contextId = await requiringContext(verifier.did);
       let caught: unknown;
       try {
-        await live.trustCreateChallenge(verifier.did, subject.did, SCHEMA_URI, testCases(19));
+        await live.trustCreateChallenge(
+          verifier.did,
+          subject.did,
+          SCHEMA_URI,
+          testCases(19),
+          contextId,
+          3_600,
+        );
       } catch (e) {
         caught = e;
       }
@@ -165,33 +190,102 @@ if (scp === null) {
       expect((caught as ScpError).code).toBe(CHALLENGE_SUITE_BELOW_MINIMUM_CODE);
     });
 
-    test("a created request decodes into the SDK types; a forged response is refused", async () => {
+    // Test 38: one challenge from creation to admission through the real
+    // bridge. The context's governance requires the capability, so the
+    // subject is refused before it holds a record and admitted after.
+    test("challenge_round_trip", async () => {
       const verifier = await createInMemoryIdentity(live);
       const subject = await createInMemoryIdentity(live);
+      const contextId = await requiringContext(verifier.did);
       const cases = testCases(20);
-      const created = await live.trustCreateChallenge(verifier.did, subject.did, SCHEMA_URI, cases);
-      const challenge: ChallengeRequest = decodeChallengeRequest(created.challengeJson);
-      expect(challenge.challengeId).toBe(created.challengeId);
-      expect(challenge.verifier).toBe(verifier.did);
-      expect(challenge.subject).toBe(subject.did);
-      expect(challenge.testCases).toEqual(cases);
-      expect(challenge.verifierSignature).toHaveLength(64);
 
-      const response: ChallengeResponse = {
-        challengeId: challenge.challengeId,
-        responderDid: subject.did,
-        result: { passed: true, score: 10_000, test_count: 20, pass_count: 20 },
-        completedAt: Math.floor(Date.now() / 1000),
-        signature: Array.from({ length: 64 }, () => 0),
-      };
+      const request = await live.trustCreateChallenge(
+        verifier.did,
+        subject.did,
+        SCHEMA_URI,
+        cases,
+        contextId,
+        3_600,
+      );
+      expect(request.verifier).toBe(verifier.did);
+      expect(request.subject).toBe(subject.did);
+      expect(request.contextId).toBe(contextId);
+      expect(request.capabilityUri).toBe(SCHEMA_URI);
+      expect(request.testCases.map((c) => c.testId)).toEqual(cases.map((c) => c.testId));
+      expect(request.expiresAt - request.createdAt).toBe(3_600);
+      // The request commits to each answer and never carries it.
+      expect(JSON.stringify(request)).not.toContain("ExactMatch");
+
+      await expect(
+        live.checkCapabilityRequirements(contextId, subject.did, [], []),
+      ).rejects.toMatchObject({ code: "SCP-VALID-7076" });
+
+      const response = await live.trustRespondToChallenge(
+        subject.did,
+        request,
+        cases.map((c) => ({ testId: c.testId, output: { ok: true } })),
+        1,
+      );
+      expect(response.challengeId).toBe(request.challengeId);
+      expect(response.subject).toBe(subject.did);
+      expect(response.attempt).toBe(1);
+
+      const graded = await live.trustGradeResponse(verifier.did, request, response);
+      expect(graded.trustStoreError).toBeNull();
+      expect(graded.caseResults).toHaveLength(20);
+      expect(graded.caseResults.every((c) => c.passed)).toBe(true);
+      const record = graded.record;
+      expect(record.passed).toBe(true);
+      expect(record.attempt).toBe(1);
+      expect(record.passCount).toBe(20);
+      expect(record.testCount).toBe(20);
+      expect(record.challengeId).toBe(request.challengeId);
+      expect(record.verifier).toBe(verifier.did);
+      expect(record.subject).toBe(subject.did);
+      expect(record.contextId).toBe(contextId);
+
+      await expect(
+        live.checkCapabilityRequirements(contextId, subject.did, [], [record]),
+      ).resolves.toBeUndefined();
+      // Every field is signed: a record whose attempt was altered is dropped.
+      await expect(
+        live.checkCapabilityRequirements(contextId, subject.did, [], [{ ...record, attempt: 2 }]),
+      ).rejects.toMatchObject({ code: "SCP-VALID-7076" });
+    });
+
+    test("a forged response is refused and grades nothing", async () => {
+      const verifier = await createInMemoryIdentity(live);
+      const subject = await createInMemoryIdentity(live);
+      const contextId = await requiringContext(verifier.did);
+      const cases = testCases(20);
+      const request = await live.trustCreateChallenge(
+        verifier.did,
+        subject.did,
+        SCHEMA_URI,
+        cases,
+        contextId,
+        3_600,
+      );
+      const response = await live.trustRespondToChallenge(
+        subject.did,
+        request,
+        cases.map((c) => ({ testId: c.testId, output: { ok: true } })),
+        1,
+      );
       let caught: unknown;
       try {
-        await live.trustVerifyResponse(verifier.did, challenge, response, "ctx-ffi");
+        await live.trustGradeResponse(verifier.did, request, {
+          ...response,
+          subjectSignature: Array.from({ length: 64 }, () => 0),
+        });
       } catch (e) {
         caught = e;
       }
       expect(caught).toBeInstanceOf(ScpError);
-      expect((caught as ScpError).code).toBe("SCP-VALID-7003");
+      // The forgery took no attempt: the real response still grades as attempt 1.
+      const graded = await live.trustGradeResponse(verifier.did, request, response);
+      expect(graded.record.attempt).toBe(1);
+      expect(graded.record.passed).toBe(true);
     });
   });
 }

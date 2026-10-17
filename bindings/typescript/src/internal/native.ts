@@ -2071,7 +2071,6 @@ export function createNativeBridge(scp: SCP): Bridge {
     async checkCapabilityRequirements(
       contextId: string,
       subjectDid: string,
-      requirementsJson: string,
       agentCapabilitiesJson: string,
       challengeVerificationsJson: string,
     ): Promise<void> {
@@ -2079,11 +2078,10 @@ export function createNativeBridge(scp: SCP): Bridge {
         native.checkCapabilityRequirements as (
           c: string,
           s: string,
-          r: string,
           a: string,
           v: string,
         ) => Promise<void>
-      )(contextId, subjectDid, requirementsJson, agentCapabilitiesJson, challengeVerificationsJson);
+      )(contextId, subjectDid, agentCapabilitiesJson, challengeVerificationsJson);
     },
 
     // Lifecycle

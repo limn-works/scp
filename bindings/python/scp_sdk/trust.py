@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from scp_sdk._extension import native_module
@@ -605,13 +605,35 @@ class VerificationLevel:
             raise ValueError(msg)
 
 
+@dataclass(frozen=True)
+class RetryCap:
+    """The most retries and the least cooldown a context accepts from a
+    challenger's standard (spec 07 §7.3.4.4).
+
+    A record graded under more retries or a shorter cooldown does not meet the
+    requirement.
+    """
+
+    #: The most retries the challenger's standard may allow.
+    max_retries: int
+    #: The shortest cooldown, in seconds, the challenger's standard may set.
+    min_cooldown_secs: int
+
+    def __post_init__(self) -> None:
+        _require_uint("RetryCap.max_retries", self.max_retries, 32)
+        _require_uint("RetryCap.min_cooldown_secs", self.min_cooldown_secs, 32)
+
+
 @dataclass
 class CapabilityRequirement:
-    """A single admission requirement: a capability URI and the minimum
-    verification level needed.
+    """A single admission requirement: a capability URI, the minimum
+    verification level, and for ``ChallengeVerified`` the challengers whose
+    records count (spec 07 §7.3.4.4).
 
-    Mirrors the Rust ``CapabilityRequirement`` struct (``scp-core``). See
-    §7.3.4.4.
+    Mirrors the Rust ``RawCapabilityRequirement`` wire form. A context's
+    governance holds its requirements: pass them to ``context_create`` under
+    the ``capability_requirements`` key, encoded by
+    :func:`encode_capability_requirements`.
     """
 
     #: The capability URI that must be present.
@@ -620,174 +642,151 @@ class CapabilityRequirement:
     #: The minimum verification level required.
     verification_level: VerificationLevel
 
+    #: DIDs of the challengers whose records meet a ``ChallengeVerified``
+    #: requirement. Required and non-empty for ``ChallengeVerified``; empty
+    #: for ``SelfAttested``. The bridge enforces both.
+    trusted_verifiers: list[str] = field(default_factory=list)
+
+    #: The retry and cooldown bounds a record's standard must meet, if any.
+    #: Only ``ChallengeVerified`` takes one.
+    retry_cap: RetryCap | None = None
+
     def _to_bridge_dict(self) -> dict[str, Any]:
-        """Convert to a dict matching the Rust ``CapabilityRequirement``
+        """Convert to a dict matching the Rust ``RawCapabilityRequirement``
         serde JSON representation."""
         return {
             "capability": self.capability,
             "verification_level": self.verification_level.name,
+            "trusted_verifiers": list(self.trusted_verifiers),
+            "retry_cap": None
+            if self.retry_cap is None
+            else {
+                "max_retries": self.retry_cap.max_retries,
+                "min_cooldown_secs": self.retry_cap.min_cooldown_secs,
+            },
         }
 
 
-@dataclass
-class ChallengeVerificationMethod:
-    """How a capability was verified, as recorded in a
-    :class:`ChallengeVerification`.
+def encode_capability_requirements(requirements: list[CapabilityRequirement]) -> str:
+    """Encode ``requirements`` as the JSON string ``context_create`` reads from
+    its ``capability_requirements`` key.
 
-    Mirrors the Rust ``VerificationMethod`` enum (``scp-core``). Named
-    ``ChallengeVerificationMethod`` in the SDK to avoid colliding with the
-    DID-document ``VerificationMethod`` type in the other bindings; the wire
-    shape is unchanged.
-
-    - ``name == "SelfAttested"`` serializes as the bare string
-      ``"SelfAttested"``.
-    - ``name == "ChallengeVerified"`` serializes as
-      ``{"ChallengeVerified": {"challenge_type": <uri>}}`` and requires
-      ``challenge_type``.
-
-    SECURITY: ``verification_method`` is NOT covered by the verifier signature
-    (ADR-017 caveat) — consumers MUST NOT key trust decisions on it.
+    The bridge validates the requirements when the context is created and
+    refuses a ``ChallengeVerified`` requirement without a trusted verifier,
+    and a ``SelfAttested`` one with verifiers or a retry cap.
     """
+    return json.dumps([r._to_bridge_dict() for r in requirements])
 
-    #: The verification-method variant name.
-    name: str
 
-    #: The challenge-type capability URI. Required iff ``name`` is
-    #: ``"ChallengeVerified"``; must be ``None`` otherwise.
-    challenge_type: str | None = None
-
-    def __post_init__(self) -> None:
-        if self.name not in VERIFICATION_LEVELS:
-            msg = (
-                f"Invalid ChallengeVerificationMethod name {self.name!r}. "
-                f"Valid: {sorted(VERIFICATION_LEVELS)}"
-            )
-            raise ValueError(msg)
-        if self.name == "ChallengeVerified" and self.challenge_type is None:
-            msg = "ChallengeVerificationMethod 'ChallengeVerified' requires challenge_type"
-            raise ValueError(msg)
-        if self.name == "SelfAttested" and self.challenge_type is not None:
-            msg = "ChallengeVerificationMethod 'SelfAttested' must not carry challenge_type"
-            raise ValueError(msg)
-
-    def _to_bridge_value(self) -> Any:
-        """Convert to the serde-tagged value the Rust ``VerificationMethod``
-        deserializes."""
-        if self.name == "SelfAttested":
-            return "SelfAttested"
-        return {"ChallengeVerified": {"challenge_type": self.challenge_type}}
+#: Signed fields of a :class:`ChallengeVerification` that hold a 32-byte digest
+#: or id as 64 lowercase hex characters.
+_RECORD_HEX_FIELDS = (
+    "verification_id",
+    "definition_digest",
+    "suite_digest",
+    "challenge_id",
+    "response_digest",
+)
+_RECORD_U32_FIELDS = (
+    "attempt",
+    "max_retries",
+    "cooldown_secs",
+    "pass_threshold_bps",
+    "min_category_cases",
+    "test_count",
+    "pass_count",
+)
+_RECORD_U64_FIELDS = ("challenge_created_at", "challenge_expires_at", "timestamp", "expires_at")
 
 
 @dataclass
 class ChallengeVerification:
-    """A signed record that a verifier tested a subject's capability (spec 07
+    """A signed record that a challenger graded a subject's response (spec 07
     §7.3.4, ADR-017).
 
-    Mirrors the Rust ``ChallengeVerification`` struct (``scp-core``).
-    :meth:`scp_sdk.SCP.trust_verify_response` returns one; pass a list of them
-    to :meth:`scp_sdk.SCP.check_capability_requirements` to satisfy ``ChallengeVerified``
-    requirements.
+    Mirrors the Rust ``ChallengeVerification`` struct.
+    :meth:`scp_sdk.SCP.trust_grade_response` returns one; pass a list of them
+    to :meth:`scp_sdk.SCP.check_capability_requirements` to meet
+    ``ChallengeVerified`` requirements.
 
-    SECURITY: the verifier's signature covers the SHA-256 digest of twelve
-    fields, in this order: ``verification_id``, ``verifier``, ``subject``,
-    ``capability_uri``, ``suite_digest``, ``passed``, ``score``,
-    ``test_count``, ``pass_count``, ``timestamp``, ``expires_at`` and
-    ``context_id``. ``verification_method``, ``result`` and ``completed_at``
-    are NOT signed and can be altered without invalidating the signature, so
-    no trust decision may read them.
+    The verifier's signature covers every field, so a record with any field
+    altered fails verification.
     """
 
-    #: SHA-256 of the verifier, subject, capability URI and timestamp, as 64
-    #: lowercase hex characters.
+    #: The record's id, as 64 lowercase hex characters.
     verification_id: str
-
-    #: DID of the verifier who issued and verified the challenge.
+    #: DID of the challenger that graded the response.
     verifier: str
-
-    #: DID of the subject who answered the challenge.
+    #: DID of the subject that answered.
     subject: str
-
     #: The capability URI that was tested.
     capability_uri: str
-
-    #: SHA-256 of the scored request's test cases, as 64 lowercase hex
-    #: characters.
+    #: Digest of the capability definition, as 64 lowercase hex characters.
+    definition_digest: str
+    #: Digest of the graded test cases, as 64 lowercase hex characters.
     suite_digest: str
-
-    #: Whether the subject passed the challenge overall.
+    #: The graded request's id, as 64 lowercase hex characters.
+    challenge_id: str
+    #: The attempt this record grades, starting at 1.
+    attempt: int
+    #: Digest of the graded response, as 64 lowercase hex characters.
+    response_digest: str
+    #: Retries the challenger's standard allowed.
+    max_retries: int
+    #: Cooldown in seconds the challenger's standard set between attempts.
+    cooldown_secs: int
+    #: Score in basis points needed to pass.
+    pass_threshold_bps: int
+    #: Least cases per category the standard required.
+    min_category_cases: int
+    #: Whether the subject passed.
     passed: bool
-
-    #: Number of test cases administered.
+    #: Score in basis points, 0-10000.
+    score: int
+    #: Number of test cases graded.
     test_count: int
-
     #: Number of test cases the subject passed.
     pass_count: int
-
-    #: Unix timestamp (seconds) of the verification.
+    #: Unix timestamp (seconds) when the request was created.
+    challenge_created_at: int
+    #: Unix timestamp (seconds) when the request expired.
+    challenge_expires_at: int
+    #: Unix timestamp (seconds) of the grading.
     timestamp: int
-
-    #: Unix timestamp (seconds) when the record expires, at most 90 days after
-    #: ``timestamp``.
+    #: Unix timestamp (seconds) when the record expires.
     expires_at: int
-
+    #: The context the challenge was administered for.
+    context_id: str
     #: The verifier's 64-byte signature as a list of integers.
     verifier_signature: list[int]
 
-    #: How the capability was verified (unsigned).
-    verification_method: ChallengeVerificationMethod
-
-    #: The subject's raw result (arbitrary JSON, unsigned).
-    result: Any
-
-    #: Unix timestamp (seconds) when the subject completed the response
-    #: (unsigned).
-    completed_at: int
-
-    #: Score in basis points, 0-10000 (10000 is perfect), if graded.
-    score: int | None = None
-
-    #: Context where the challenge was administered, if any.
-    context_id: str | None = None
-
     def __post_init__(self) -> None:
-        for name in ("verification_id", "suite_digest"):
+        for name in _RECORD_HEX_FIELDS:
             _require_lower_hex_32(f"ChallengeVerification.{name}", getattr(self, name))
-        for name in ("timestamp", "expires_at", "completed_at"):
-            _require_uint(f"ChallengeVerification.{name}", getattr(self, name), 64)
-        for name in ("test_count", "pass_count"):
+        for name in _RECORD_U32_FIELDS:
             _require_uint(f"ChallengeVerification.{name}", getattr(self, name), 32)
-        if self.score is not None and (
+        for name in _RECORD_U64_FIELDS:
+            _require_uint(f"ChallengeVerification.{name}", getattr(self, name), 64)
+        for name in ("verifier", "subject", "capability_uri", "context_id"):
+            _require_str(f"ChallengeVerification.{name}", getattr(self, name))
+        if not isinstance(self.passed, bool):
+            msg = f"ChallengeVerification.passed must be a bool, got {self.passed!r}"
+            raise ValueError(msg)
+        if (
             isinstance(self.score, bool)
             or not isinstance(self.score, int)
             or not 0 <= self.score <= 10_000
         ):
             msg = (
-                f"ChallengeVerification.score must be basis points in [0, 10000] "
-                f"or None, got {self.score!r}"
+                "ChallengeVerification.score must be basis points in [0, 10000], "
+                f"got {self.score!r}"
             )
             raise ValueError(msg)
         _require_signature("ChallengeVerification.verifier_signature", self.verifier_signature)
 
     def _to_bridge_dict(self) -> dict[str, Any]:
         """Convert to the Rust ``ChallengeVerification`` serde JSON shape."""
-        return {
-            "verification_id": self.verification_id,
-            "verifier": self.verifier,
-            "subject": self.subject,
-            "capability_uri": self.capability_uri,
-            "suite_digest": self.suite_digest,
-            "passed": self.passed,
-            "score": self.score,
-            "test_count": self.test_count,
-            "pass_count": self.pass_count,
-            "timestamp": self.timestamp,
-            "expires_at": self.expires_at,
-            "context_id": self.context_id,
-            "verifier_signature": self.verifier_signature,
-            "verification_method": self.verification_method._to_bridge_value(),
-            "result": self.result,
-            "completed_at": self.completed_at,
-        }
+        return {f.name: getattr(self, f.name) for f in fields(self)}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ChallengeVerification:
@@ -795,40 +794,32 @@ class ChallengeVerification:
         shape, the inverse of the bridge projection.
 
         Raises:
-            ValueError: If ``verification_method`` is neither
-                ``"SelfAttested"`` nor ``{"ChallengeVerified": {...}}``, or a
-                field fails the checks of the constructor.
-            KeyError: If a required field is absent.
+            ValueError: If a field is absent, unknown, or fails the checks of
+                the constructor.
         """
-        method = data["verification_method"]
-        if method == "SelfAttested":
-            verification_method = ChallengeVerificationMethod(name="SelfAttested")
-        elif isinstance(method, dict) and set(method) == {"ChallengeVerified"}:
-            verification_method = ChallengeVerificationMethod(
-                name="ChallengeVerified",
-                challenge_type=method["ChallengeVerified"]["challenge_type"],
-            )
-        else:
-            msg = f"ChallengeVerification.verification_method is malformed: {method!r}"
-            raise ValueError(msg)
-        return cls(
-            verification_id=data["verification_id"],
-            verifier=data["verifier"],
-            subject=data["subject"],
-            capability_uri=data["capability_uri"],
-            suite_digest=data["suite_digest"],
-            passed=data["passed"],
-            score=data["score"],
-            test_count=data["test_count"],
-            pass_count=data["pass_count"],
-            timestamp=data["timestamp"],
-            expires_at=data["expires_at"],
-            context_id=data["context_id"],
-            verifier_signature=data["verifier_signature"],
-            verification_method=verification_method,
-            result=data["result"],
-            completed_at=data["completed_at"],
-        )
+        return cls(**_exact_fields(cls, data))
+
+
+def _exact_fields(cls: Any, data: Any) -> dict[str, Any]:
+    """Return ``data`` when its keys are exactly ``cls``'s field names."""
+    name = cls.__name__
+    if not isinstance(data, dict):
+        msg = f"{name} must be a JSON object, got {data!r}"
+        raise ValueError(msg)
+    expected = {f.name for f in fields(cls)}
+    missing = sorted(expected - set(data))
+    unknown = sorted(set(data) - expected)
+    if missing or unknown:
+        msg = f"{name} fields do not match: missing {missing}, unknown {unknown}"
+        raise ValueError(msg)
+    return data
+
+
+def _require_str(name: str, value: Any) -> None:
+    """Raise ``ValueError`` unless ``value`` is a string."""
+    if not isinstance(value, str):
+        msg = f"{name} must be a string, got {value!r}"
+        raise ValueError(msg)
 
 
 def _require_lower_hex_32(name: str, value: Any) -> None:
@@ -1572,6 +1563,26 @@ def verify_participation_requirements(
 #: ``category``). Maps from ``TrustError::ChallengeSuiteBelowMinimum``.
 CHALLENGE_SUITE_BELOW_MINIMUM_CODE = "SCP-VALID-7039"
 
+#: Code the bridge raises when a test case's expected output does not match
+#: the answer commitment the request carries.
+ANSWER_KEY_MISMATCH_CODE = "SCP-VALID-7145"
+
+#: Code the bridge raises when the challenger has no grading capacity left;
+#: the subject is charged no attempt.
+GRADING_CAPACITY_EXHAUSTED_CODE = "SCP-VALID-7146"
+
+#: Code the bridge raises when a DID, capability URI or context id is not in
+#: canonical form.
+NON_CANONICAL_IDENTIFIER_CODE = "SCP-VALID-7147"
+
+#: Code the bridge raises when a context declares more capability
+#: requirements than the protocol allows.
+TOO_MANY_CAPABILITY_REQUIREMENTS_CODE = "SCP-VALID-7148"
+
+#: Code the bridge raises when another grading of the same challenge took the
+#: grading lease first; the subject is charged no attempt.
+GRADING_LEASE_LOST_CODE = "SCP-VALID-7149"
+
 
 @dataclass(frozen=True)
 class ExactMatch:
@@ -1709,62 +1720,228 @@ class TestCase:
         )
 
 
-class ChallengeResult(TypedDict):
-    """What :meth:`scp_sdk.SCP.trust_create_challenge` returns."""
+@dataclass(frozen=True)
+class ChallengePolicy:
+    """The retry and cooldown standard a challenger sets for a non-protocol
+    capability URI (spec 07 §7.3.4). A protocol URI's standard fixes both."""
 
-    #: The request's 32-byte random id as 64 lowercase hex characters.
-    challenge_id: str
-    #: The signed :class:`ChallengeRequest` as JSON, to send to the subject and
-    #: later pass, parsed, to :meth:`scp_sdk.SCP.trust_verify_response`.
-    challenge_json: str
+    #: Retries allowed after the first attempt.
+    max_retries: int
+    #: Seconds a subject waits between attempts.
+    cooldown_secs: int
+
+    def __post_init__(self) -> None:
+        _require_uint("ChallengePolicy.max_retries", self.max_retries, 32)
+        _require_uint("ChallengePolicy.cooldown_secs", self.cooldown_secs, 32)
 
 
-class ChallengeRequest(TypedDict):
+@dataclass(frozen=True)
+class ChallengeCase:
+    """One test case as the request carries it: the input and a commitment to
+    the expected output, never the expected output itself."""
+
+    __test__ = False  # not a pytest class
+
+    #: Identifier, unique within the request.
+    test_id: str
+    #: JSON input given to the subject.
+    input: Any
+    #: Test category.
+    category: str
+    #: Importance weight in basis points.
+    weight: int
+    #: SHA-256 commitment to the expected output, as 64 lowercase hex
+    #: characters.
+    answer_commitment: str
+
+    def __post_init__(self) -> None:
+        _require_str("ChallengeCase.test_id", self.test_id)
+        _require_str("ChallengeCase.category", self.category)
+        _require_uint("ChallengeCase.weight", self.weight, 32)
+        _require_lower_hex_32("ChallengeCase.answer_commitment", self.answer_commitment)
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ChallengeCase:
+        """Build a case from the Rust ``ChallengeCase`` serde JSON shape."""
+        return cls(**_exact_fields(cls, data))
+
+
+@dataclass(frozen=True)
+class ChallengeRequest:
     """A signed challenge request (spec 07 §7.3.4, ADR-017).
 
-    The serde wire shape of the Rust ``ChallengeRequest`` (``scp-core``):
-    ``json.loads`` of the ``challenge_json`` that
-    :meth:`scp_sdk.SCP.trust_create_challenge` returns. The verifier's
+    :meth:`scp_sdk.SCP.trust_create_challenge` returns one. The verifier's
     signature covers every other field.
     """
 
     #: The 32-byte random id as 64 lowercase hex characters.
     challenge_id: str
-    #: The capability URI under test (§7.3.4.1).
+    #: The capability URI under test.
     capability_uri: str
-    #: The verifier-written test cases, each in the wire form of
-    #: :class:`TestCase` (``TestCase.from_dict`` reads one).
-    test_cases: list[dict[str, Any]]
-    #: Maximum seconds the subject has to complete every case.
-    timeout_secs: int
-    #: DID of the verifier.
+    #: Digest of the capability definition, as 64 lowercase hex characters.
+    definition_digest: str
+    #: The test cases, each committing to its expected output.
+    test_cases: list[ChallengeCase]
+    #: Unix timestamp (seconds) when the request was created.
+    created_at: int
+    #: Unix timestamp (seconds) after which no response is graded.
+    expires_at: int
+    #: Retries the standard allows.
+    max_retries: int
+    #: Cooldown in seconds between attempts.
+    cooldown_secs: int
+    #: Score in basis points needed to pass.
+    pass_threshold_bps: int
+    #: The context the challenge is administered for.
+    context_id: str
+    #: DID of the challenger.
     verifier: str
     #: DID of the subject.
     subject: str
     #: The verifier's 64-byte signature as a list of integers.
     verifier_signature: list[int]
 
+    def __post_init__(self) -> None:
+        _require_lower_hex_32("ChallengeRequest.challenge_id", self.challenge_id)
+        _require_lower_hex_32("ChallengeRequest.definition_digest", self.definition_digest)
+        for name in ("created_at", "expires_at"):
+            _require_uint(f"ChallengeRequest.{name}", getattr(self, name), 64)
+        for name in ("max_retries", "cooldown_secs", "pass_threshold_bps"):
+            _require_uint(f"ChallengeRequest.{name}", getattr(self, name), 32)
+        for name in ("capability_uri", "context_id", "verifier", "subject"):
+            _require_str(f"ChallengeRequest.{name}", getattr(self, name))
+        if not isinstance(self.test_cases, list) or not all(
+            isinstance(c, ChallengeCase) for c in self.test_cases
+        ):
+            msg = "ChallengeRequest.test_cases must be a list of ChallengeCase"
+            raise ValueError(msg)
+        _require_signature("ChallengeRequest.verifier_signature", self.verifier_signature)
 
-class ChallengeResponse(TypedDict):
-    """A response to a challenge request (ADR-017, §7.3.4).
+    def _to_wire(self) -> dict[str, Any]:
+        """Convert to the Rust ``ChallengeRequest`` serde JSON shape."""
+        wire = {f.name: getattr(self, f.name) for f in fields(self)}
+        wire["test_cases"] = [asdict(c) for c in self.test_cases]
+        return wire
 
-    The serde wire shape of the Rust ``ChallengeResponse`` (``scp-core``) the
-    bridge deserializes for :meth:`scp_sdk.SCP.trust_verify_response`. The
-    subject signs it; the bridge reads ``passed``, ``score`` (basis points),
-    ``test_count`` and ``pass_count`` from ``result``.
+    @classmethod
+    def from_dict(cls, data: Any) -> ChallengeRequest:
+        """Build a request from the Rust ``ChallengeRequest`` serde JSON shape.
+
+        Raises:
+            ValueError: If a field is absent, unknown, or malformed.
+        """
+        wire = dict(_exact_fields(cls, data))
+        cases = wire["test_cases"]
+        if not isinstance(cases, list):
+            msg = f"ChallengeRequest.test_cases must be a list, got {cases!r}"
+            raise ValueError(msg)
+        wire["test_cases"] = [ChallengeCase.from_dict(c) for c in cases]
+        return cls(**wire)
+
+
+@dataclass(frozen=True)
+class TestOutput:
+    """The subject's output for one test case."""
+
+    __test__ = False  # not a pytest class
+
+    #: The answered case's ``test_id``.
+    test_id: str
+    #: The subject's JSON output.
+    output: Any
+
+    def __post_init__(self) -> None:
+        _require_str("TestOutput.test_id", self.test_id)
+
+
+@dataclass(frozen=True)
+class ChallengeResponse:
+    """A subject's signed response to a challenge request (spec 07 §7.3.4).
+
+    :meth:`scp_sdk.SCP.trust_respond_to_challenge` returns one. The subject's
+    signature covers every other field.
     """
 
-    #: The request's ``challenge_id``, exactly as written there (64 lowercase
-    #: hex characters).
+    #: The answered request's ``challenge_id``.
     challenge_id: str
-    #: DID of the entity responding to the challenge.
-    responder_did: str
-    #: Challenge-specific result data (pass/fail, metrics, evidence, etc.).
-    result: Any
-    #: Unix timestamp (seconds) when the response was completed.
-    completed_at: int
-    #: Ed25519 signature over the canonical response bytes (64 bytes as ints).
-    signature: list[int]
+    #: Digest of the answered request, as 64 lowercase hex characters.
+    request_digest: str
+    #: DID of the subject.
+    subject: str
+    #: The attempt this response makes, starting at 1.
+    attempt: int
+    #: One output per test case.
+    outputs: list[TestOutput]
+    #: The subject's 64-byte signature as a list of integers.
+    subject_signature: list[int]
+
+    def __post_init__(self) -> None:
+        _require_lower_hex_32("ChallengeResponse.challenge_id", self.challenge_id)
+        _require_lower_hex_32("ChallengeResponse.request_digest", self.request_digest)
+        _require_str("ChallengeResponse.subject", self.subject)
+        _require_uint("ChallengeResponse.attempt", self.attempt, 32)
+        if not isinstance(self.outputs, list) or not all(
+            isinstance(o, TestOutput) for o in self.outputs
+        ):
+            msg = "ChallengeResponse.outputs must be a list of TestOutput"
+            raise ValueError(msg)
+        _require_signature("ChallengeResponse.subject_signature", self.subject_signature)
+
+    def _to_wire(self) -> dict[str, Any]:
+        """Convert to the Rust ``ChallengeResponse`` serde JSON shape."""
+        wire = {f.name: getattr(self, f.name) for f in fields(self)}
+        wire["outputs"] = [asdict(o) for o in self.outputs]
+        return wire
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ChallengeResponse:
+        """Build a response from the Rust ``ChallengeResponse`` serde JSON shape.
+
+        Raises:
+            ValueError: If a field is absent, unknown, or malformed.
+        """
+        wire = dict(_exact_fields(cls, data))
+        outputs = wire["outputs"]
+        if not isinstance(outputs, list):
+            msg = f"ChallengeResponse.outputs must be a list, got {outputs!r}"
+            raise ValueError(msg)
+        wire["outputs"] = [TestOutput(**_exact_fields(TestOutput, o)) for o in outputs]
+        return cls(**wire)
+
+
+@dataclass(frozen=True)
+class CaseResult:
+    """How one test case graded."""
+
+    #: Whether the output met the case's expected output.
+    passed: bool
+    #: Why the case failed, or the evaluator's reason; ``None`` when there is
+    #: none.
+    reason: str | None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CaseResult:
+        """Build a result from the bridge's case-result JSON shape."""
+        wire = _exact_fields(cls, data)
+        if not isinstance(wire["passed"], bool):
+            msg = f"CaseResult.passed must be a bool, got {wire['passed']!r}"
+            raise ValueError(msg)
+        if wire["reason"] is not None:
+            _require_str("CaseResult.reason", wire["reason"])
+        return cls(passed=wire["passed"], reason=wire["reason"])
+
+
+@dataclass(frozen=True)
+class GradedChallenge:
+    """What :meth:`scp_sdk.SCP.trust_grade_response` returns."""
+
+    #: The signed record of the grading.
+    record: ChallengeVerification
+    #: One result per test case, in request order.
+    case_results: list[CaseResult]
+    #: Why the record could not be stored in this instance's trust store, or
+    #: ``None`` when it was stored. The record is signed and valid either way.
+    trust_store_error: str | None
 
 
 async def trust_verify_attestation(
@@ -1808,10 +1985,15 @@ async def trust_verify_attestation(
 
 
 __all__ = [
+    "ANSWER_KEY_MISMATCH_CODE",
     "ATTESTATION_TYPES",
     "CHALLENGE_SUITE_BELOW_MINIMUM_CODE",
+    "GRADING_CAPACITY_EXHAUSTED_CODE",
+    "GRADING_LEASE_LOST_CODE",
+    "NON_CANONICAL_IDENTIFIER_CODE",
     "PARTICIPATION_FACT_VARIANTS",
     "PARTICIPATION_THRESHOLD_OPERATORS",
+    "TOO_MANY_CAPABILITY_REQUIREMENTS_CODE",
     "VERIFICATION_LEVELS",
     "AttestationSummary",
     "AttestorInfo",
@@ -1820,11 +2002,12 @@ __all__ = [
     "CachedAttestationEnvelope",
     "CapabilityRequirement",
     "CapabilityValidation",
+    "CaseResult",
+    "ChallengeCase",
+    "ChallengePolicy",
     "ChallengeRequest",
     "ChallengeResponse",
-    "ChallengeResult",
     "ChallengeVerification",
-    "ChallengeVerificationMethod",
     "ContainsAll",
     "ContainsNone",
     "CustomEval",
@@ -1832,16 +2015,20 @@ __all__ = [
     "EventLogEntryPayload",
     "ExactMatch",
     "ExpectedOutput",
+    "GradedChallenge",
     "ParticipationFact",
     "ParticipationProfile",
     "ParticipationThreshold",
     "RequireParticipation",
+    "RetryCap",
     "SchemaMatch",
     "TestCase",
+    "TestOutput",
     "ThresholdRequirement",
     "TrustEvaluation",
     "VerificationLevel",
     "aggregate_trust_input",
+    "encode_capability_requirements",
     "evaluate_trust",
     "participation_record",
     "trust_verify_attestation",

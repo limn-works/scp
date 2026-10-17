@@ -1302,20 +1302,27 @@ public extension SCP {
         try await inner.transportStatus(manager: manager)
     }
 
-    /// Forwards to ``Scp/trustCreateChallenge`` on ``inner``.
+    /// Forwards to ``Scp/trustCreateChallenge`` on ``inner``. Prefer the typed
+    /// overload in `Trust.swift` (ADR-058), which returns a ``ChallengeRequest``.
     func trustCreateChallenge(
         verifier: Identity,
         subject: String,
         capabilityUri: String,
         testCasesJson: String,
-        timeoutSecs: UInt32
+        windowSecs: UInt32,
+        contextId: String,
+        evaluatorContextId: String?,
+        policy: ChallengePolicy?
     ) async throws -> ChallengeResult {
         try await inner.trustCreateChallenge(
             verifier: verifier,
             subject: subject,
             capabilityUri: capabilityUri,
             testCasesJson: testCasesJson,
-            timeoutSecs: timeoutSecs
+            windowSecs: windowSecs,
+            contextId: contextId,
+            evaluatorContextId: evaluatorContextId,
+            policy: policy
         )
     }
 
@@ -1324,18 +1331,33 @@ public extension SCP {
     //   `try trustQueryScore(did:contextId:)`
     // `trustVerifyAttestation(contextId:attestation:)` lives in Trust.swift.
 
-    /// Forwards to ``Scp/trustVerifyResponse`` on ``inner``.
-    func trustVerifyResponse(
-        verifier: Identity,
-        challengeJson: String,
-        responseJson: String,
-        contextId: String
+    /// Forwards to ``Scp/trustRespondToChallenge`` on ``inner``. Prefer the
+    /// typed overload in `Trust.swift` (ADR-058).
+    func trustRespondToChallenge(
+        subject: Identity,
+        requestJson: String,
+        outputsJson: String,
+        attempt: UInt32
     ) async throws -> String {
-        try await inner.trustVerifyResponse(
+        try await inner.trustRespondToChallenge(
+            subject: subject,
+            requestJson: requestJson,
+            outputsJson: outputsJson,
+            attempt: attempt
+        )
+    }
+
+    /// Forwards to ``Scp/trustGradeResponse`` on ``inner``. Prefer the typed
+    /// overload in `Trust.swift` (ADR-058), which returns a ``GradedChallenge``.
+    func trustGradeResponse(
+        verifier: Identity,
+        requestJson: String,
+        responseJson: String
+    ) async throws -> ChallengeGradeResult {
+        try await inner.trustGradeResponse(
             verifier: verifier,
-            challengeJson: challengeJson,
-            responseJson: responseJson,
-            contextId: contextId
+            requestJson: requestJson,
+            responseJson: responseJson
         )
     }
 
@@ -1365,18 +1387,16 @@ public extension SCP {
 
     /// Forwards to ``Scp/checkCapabilityRequirements`` on ``inner``. Prefer the
     /// typed overload in `Trust.swift` (ADR-058), which serializes typed
-    /// ``CapabilityRequirement`` / ``ChallengeVerification`` values.
+    /// ``ChallengeVerification`` values.
     func checkCapabilityRequirements(
         contextId: String,
         subjectDid: String,
-        requirementsJson: String,
         agentCapabilitiesJson: String,
         challengeVerificationsJson: String
     ) async throws {
         try await inner.checkCapabilityRequirements(
             contextId: contextId,
             subjectDid: subjectDid,
-            requirementsJson: requirementsJson,
             agentCapabilitiesJson: agentCapabilitiesJson,
             challengeVerificationsJson: challengeVerificationsJson
         )

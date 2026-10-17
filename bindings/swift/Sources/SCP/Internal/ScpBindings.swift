@@ -2106,41 +2106,35 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rotateKeys: Bool) async throws 
     
     /**
-     * Verifies that an agent meets a context's capability requirements for
-     * admission, bound to the agent and context being admitted (spec 07
-     * §7.3.4.4).
+     * Checks an agent against the capability requirements in `context_id`'s
+     * governance state, read at call time (spec 07 §7.3.4.4).
      *
      * Inputs:
-     * - `context_id`: the context the agent is being admitted to. A challenge
-     * verification only satisfies a requirement when its signed
-     * `context_id` equals this value.
-     * - `subject_did`: the DID of the agent being admitted. Only challenge
-     * verifications whose signed `subject` equals this value can satisfy a
-     * requirement (cross-subject attribution is rejected).
-     * - `requirements_json`: JSON array of `CapabilityRequirement` objects.
+     * - `context_id`: the context the agent is being admitted to. A record
+     * only counts when its signed `context_id` equals this value.
+     * - `subject_did`: the DID of the agent being admitted. Only records whose
+     * signed `subject` equals this value count.
      * - `agent_capabilities_json`: JSON array of capability-URI strings.
      * - `challenge_verifications_json`: JSON array of `ChallengeVerification`
-     * records; each counts only if its signature verifies against the
+     * records. Each counts only if its signature verifies against the
      * verifier's `#active` key, resolved through this instance's DID
-     * resolver, and it is in-context, in-subject, passed and unexpired.
-     *
-     * Authenticity is not authorization: a passing `ChallengeVerified` check
-     * proves the verifier's signature, NOT that the verifier is trusted.
-     * Establish verifier legitimacy separately (spec §7.3.4.4 / §7.4).
-     *
-     * The resolver lookup runs on the blocking pool.
+     * resolver on the blocking pool, and it comes from a verifier the
+     * requirement trusts, within the requirement's retry cap.
      *
      * # Errors
      *
-     * - `SCP-VALID-7000` for an invalid `subject_did`.
-     * - `SCP-VALID-7073` / `7074` / `7075` for malformed requirements,
-     * agent-capabilities or challenge-verifications JSON.
-     * - `SCP-VALID-7076` when a requirement is unmet, `SCP-VALID-7077` for an
-     * empty subject.
+     * - `SCP-VALID-7000` for an invalid `subject_did`, `SCP-VALID-7011` for
+     * an invalid `context_id`.
+     * - `SCP-VALID-7074` / `7075` for malformed agent-capabilities or
+     * challenge-verifications JSON.
+     * - The admission code of the refusal: `SCP-VALID-7076` for an unmet
+     * requirement, `SCP-VALID-7121` for an untrusted verifier,
+     * `SCP-VALID-7137` past the retry cap.
      * - `SCP-IDENT-1033` when a record must be verified and this instance has
      * no DID resolver, or its backend is unreachable.
+     * - The `ContextError` code when the context's governance cannot be read.
      */
-    func checkCapabilityRequirements(contextId: String, subjectDid: String, requirementsJson: String, agentCapabilitiesJson: String, challengeVerificationsJson: String) async throws 
+    func checkCapabilityRequirements(contextId: String, subjectDid: String, agentCapabilitiesJson: String, challengeVerificationsJson: String) async throws 
     
     /**
      * Per-instance equivalent of the free-function `configure_local_transport`.
@@ -3699,24 +3693,77 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func transportStatus(manager: TransportManager) async throws  -> TransportStatus
     
     /**
-     * Creates a challenge request for capability verification (spec 07
-     * §7.3.4).
+     * Creates a challenge in `verifier`'s ledger and returns the request the
+     * ledger signed with `verifier`'s `#active` key (spec 07 §7.3.4 step 1,
+     * ADR-017).
      *
-     * The request is signed with `verifier`'s `#active` key through its
-     * custody. `test_cases_json` is the challenger-written JSON array of test
-     * cases.
+     * `test_cases_json` is the challenger-written JSON array of `TestCase`,
+     * with their answers; the request carries only their commitments. The
+     * subject answers within `window_secs`. `context_id` is the context the
+     * record will be bound to. `evaluator_context_id` names the context whose
+     * outlets grade `CustomEval` cases. `policy` picks fewer retries or a
+     * longer cooldown than the capability definition's.
      *
      * # Errors
      *
      * - The handle check's error when `verifier` belongs to another `Scp`.
-     * - `SCP-VALID-7013` for an invalid subject DID.
+     * - `SCP-VALID-7013` for an invalid verifier or subject DID,
+     * `SCP-VALID-7011` for an invalid context id.
      * - `SCP-VALID-7002` for malformed `test_cases_json`.
-     * - `SCP-VALID-7039` when a protocol capability URI carries fewer cases
-     * than its standard's minimum; `SCP-VALID-7003` for any other refusal.
+     * - The `TrustError` code of the refusal: a suite below the definition's
+     * minimum, a policy looser than the definition's, a self-challenge, or
+     * a `CustomEval` evaluator that is not registered.
+     * - `SCP-CTX-2000` when this instance has no supervisor.
      * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
      * error when signing fails (`SCP-CRYPTO-4006` for a destroyed key).
      */
-    func trustCreateChallenge(verifier: Identity, subject: String, capabilityUri: String, testCasesJson: String, timeoutSecs: UInt32) async throws  -> ChallengeResult
+    func trustCreateChallenge(verifier: Identity, subject: String, capabilityUri: String, testCasesJson: String, windowSecs: UInt32, contextId: String, evaluatorContextId: String?, policy: ChallengePolicy?) async throws  -> ChallengeResult
+    
+    /**
+     * Grades the subject's `response_json` to `request_json` in `verifier`'s
+     * ledger and returns the record it signed with `verifier`'s `#active`
+     * key (spec 07 §7.3.4 steps 3 and 4, ADR-017).
+     *
+     * `CustomEval` cases run on the outlets of the evaluator context's handle
+     * in this `Scp`. The record is written to this instance's protocol
+     * repository; a write failure is reported in `trust_store_error`, since
+     * the attempt is used either way.
+     *
+     * # Errors
+     *
+     * - The handle check's error when `verifier` belongs to another `Scp`.
+     * - `SCP-VALID-7013` for an invalid verifier DID.
+     * - `SCP-VALID-7002` for a malformed request or response JSON.
+     * - `SCP-IDENT-1033` when this instance has no DID resolver.
+     * - The `TrustError` code when the response is refused: an unknown
+     * challenge, a bad subject signature, an attempt out of turn, a
+     * cooldown not yet over, an expired window, or the grading capacity
+     * exhausted.
+     * - `SCP-CTX-2000` when this instance has no supervisor.
+     * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
+     * error when signing fails.
+     */
+    func trustGradeResponse(verifier: Identity, requestJson: String, responseJson: String) async throws  -> ChallengeGradeResult
+    
+    /**
+     * Answers a challenge: checks the challenger's signature on
+     * `request_json` through this instance's DID resolver, and returns the
+     * `ChallengeResponse` JSON of `outputs_json` for `attempt`, signed with
+     * `subject`'s `#active` key (spec 07 §7.3.4 step 2, ADR-017).
+     *
+     * # Errors
+     *
+     * - The handle check's error when `subject` belongs to another `Scp`.
+     * - `SCP-VALID-7013` for an invalid subject DID.
+     * - `SCP-VALID-7002` for a malformed request or outputs JSON.
+     * - `SCP-IDENT-1033` when this instance has no DID resolver.
+     * - The `TrustError` code when the request is refused: a bad signature,
+     * another subject, an expired window, or outputs that do not match its
+     * cases.
+     * - `SCP-IDENT-1054` when `subject` has no custodied key, and the custody
+     * error when signing fails.
+     */
+    func trustRespondToChallenge(subject: Identity, requestJson: String, outputsJson: String, attempt: UInt32) async throws  -> String
     
     /**
      * Verifies an attestation's Ed25519 signature, evidence, expiry, and its
@@ -3726,27 +3773,6 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * (`VALID_7052`), never a verdict. See ADR-017 Layer 3 (Attestation).
      */
     func trustVerifyAttestation(contextId: String, attestationJson: String) async throws  -> AttestationVerificationResult
-    
-    /**
-     * Verifies a challenge response and returns the signed
-     * `ChallengeVerification` JSON (spec 07 §7.3.4).
-     *
-     * The request and response signatures are checked through this
-     * instance's DID resolver; the record is bound to `context_id` and signed
-     * with `verifier`'s `#active` key through its custody.
-     *
-     * # Errors
-     *
-     * - The handle check's error when `verifier` belongs to another `Scp`.
-     * - `SCP-VALID-7011` for an empty `context_id`.
-     * - `SCP-VALID-7002` for a malformed challenge or response
-     * JSON.
-     * - `SCP-IDENT-1033` when this instance has no DID resolver.
-     * - `SCP-VALID-7003` when the response is refused.
-     * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
-     * error when signing fails.
-     */
-    func trustVerifyResponse(verifier: Identity, challengeJson: String, responseJson: String, contextId: String) async throws  -> String
     
     /**
      * Per-instance equivalent of the free-function `ucan_delegate`.
@@ -4360,47 +4386,41 @@ open func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rot
 }
     
     /**
-     * Verifies that an agent meets a context's capability requirements for
-     * admission, bound to the agent and context being admitted (spec 07
-     * §7.3.4.4).
+     * Checks an agent against the capability requirements in `context_id`'s
+     * governance state, read at call time (spec 07 §7.3.4.4).
      *
      * Inputs:
-     * - `context_id`: the context the agent is being admitted to. A challenge
-     * verification only satisfies a requirement when its signed
-     * `context_id` equals this value.
-     * - `subject_did`: the DID of the agent being admitted. Only challenge
-     * verifications whose signed `subject` equals this value can satisfy a
-     * requirement (cross-subject attribution is rejected).
-     * - `requirements_json`: JSON array of `CapabilityRequirement` objects.
+     * - `context_id`: the context the agent is being admitted to. A record
+     * only counts when its signed `context_id` equals this value.
+     * - `subject_did`: the DID of the agent being admitted. Only records whose
+     * signed `subject` equals this value count.
      * - `agent_capabilities_json`: JSON array of capability-URI strings.
      * - `challenge_verifications_json`: JSON array of `ChallengeVerification`
-     * records; each counts only if its signature verifies against the
+     * records. Each counts only if its signature verifies against the
      * verifier's `#active` key, resolved through this instance's DID
-     * resolver, and it is in-context, in-subject, passed and unexpired.
-     *
-     * Authenticity is not authorization: a passing `ChallengeVerified` check
-     * proves the verifier's signature, NOT that the verifier is trusted.
-     * Establish verifier legitimacy separately (spec §7.3.4.4 / §7.4).
-     *
-     * The resolver lookup runs on the blocking pool.
+     * resolver on the blocking pool, and it comes from a verifier the
+     * requirement trusts, within the requirement's retry cap.
      *
      * # Errors
      *
-     * - `SCP-VALID-7000` for an invalid `subject_did`.
-     * - `SCP-VALID-7073` / `7074` / `7075` for malformed requirements,
-     * agent-capabilities or challenge-verifications JSON.
-     * - `SCP-VALID-7076` when a requirement is unmet, `SCP-VALID-7077` for an
-     * empty subject.
+     * - `SCP-VALID-7000` for an invalid `subject_did`, `SCP-VALID-7011` for
+     * an invalid `context_id`.
+     * - `SCP-VALID-7074` / `7075` for malformed agent-capabilities or
+     * challenge-verifications JSON.
+     * - The admission code of the refusal: `SCP-VALID-7076` for an unmet
+     * requirement, `SCP-VALID-7121` for an untrusted verifier,
+     * `SCP-VALID-7137` past the retry cap.
      * - `SCP-IDENT-1033` when a record must be verified and this instance has
      * no DID resolver, or its backend is unreachable.
+     * - The `ContextError` code when the context's governance cannot be read.
      */
-open func checkCapabilityRequirements(contextId: String, subjectDid: String, requirementsJson: String, agentCapabilitiesJson: String, challengeVerificationsJson: String)async throws   {
+open func checkCapabilityRequirements(contextId: String, subjectDid: String, agentCapabilitiesJson: String, challengeVerificationsJson: String)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_check_capability_requirements(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(contextId),FfiConverterString.lower(subjectDid),FfiConverterString.lower(requirementsJson),FfiConverterString.lower(agentCapabilitiesJson),FfiConverterString.lower(challengeVerificationsJson)
+                    FfiConverterString.lower(contextId),FfiConverterString.lower(subjectDid),FfiConverterString.lower(agentCapabilitiesJson),FfiConverterString.lower(challengeVerificationsJson)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
@@ -7604,36 +7624,119 @@ open func transportStatus(manager: TransportManager)async throws  -> TransportSt
 }
     
     /**
-     * Creates a challenge request for capability verification (spec 07
-     * §7.3.4).
+     * Creates a challenge in `verifier`'s ledger and returns the request the
+     * ledger signed with `verifier`'s `#active` key (spec 07 §7.3.4 step 1,
+     * ADR-017).
      *
-     * The request is signed with `verifier`'s `#active` key through its
-     * custody. `test_cases_json` is the challenger-written JSON array of test
-     * cases.
+     * `test_cases_json` is the challenger-written JSON array of `TestCase`,
+     * with their answers; the request carries only their commitments. The
+     * subject answers within `window_secs`. `context_id` is the context the
+     * record will be bound to. `evaluator_context_id` names the context whose
+     * outlets grade `CustomEval` cases. `policy` picks fewer retries or a
+     * longer cooldown than the capability definition's.
      *
      * # Errors
      *
      * - The handle check's error when `verifier` belongs to another `Scp`.
-     * - `SCP-VALID-7013` for an invalid subject DID.
+     * - `SCP-VALID-7013` for an invalid verifier or subject DID,
+     * `SCP-VALID-7011` for an invalid context id.
      * - `SCP-VALID-7002` for malformed `test_cases_json`.
-     * - `SCP-VALID-7039` when a protocol capability URI carries fewer cases
-     * than its standard's minimum; `SCP-VALID-7003` for any other refusal.
+     * - The `TrustError` code of the refusal: a suite below the definition's
+     * minimum, a policy looser than the definition's, a self-challenge, or
+     * a `CustomEval` evaluator that is not registered.
+     * - `SCP-CTX-2000` when this instance has no supervisor.
      * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
      * error when signing fails (`SCP-CRYPTO-4006` for a destroyed key).
      */
-open func trustCreateChallenge(verifier: Identity, subject: String, capabilityUri: String, testCasesJson: String, timeoutSecs: UInt32)async throws  -> ChallengeResult  {
+open func trustCreateChallenge(verifier: Identity, subject: String, capabilityUri: String, testCasesJson: String, windowSecs: UInt32, contextId: String, evaluatorContextId: String?, policy: ChallengePolicy?)async throws  -> ChallengeResult  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_trust_create_challenge(
                     self.uniffiClonePointer(),
-                    FfiConverterTypeIdentity_lower(verifier),FfiConverterString.lower(subject),FfiConverterString.lower(capabilityUri),FfiConverterString.lower(testCasesJson),FfiConverterUInt32.lower(timeoutSecs)
+                    FfiConverterTypeIdentity_lower(verifier),FfiConverterString.lower(subject),FfiConverterString.lower(capabilityUri),FfiConverterString.lower(testCasesJson),FfiConverterUInt32.lower(windowSecs),FfiConverterString.lower(contextId),FfiConverterOptionString.lower(evaluatorContextId),FfiConverterOptionTypeChallengePolicy.lower(policy)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeChallengeResult_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Grades the subject's `response_json` to `request_json` in `verifier`'s
+     * ledger and returns the record it signed with `verifier`'s `#active`
+     * key (spec 07 §7.3.4 steps 3 and 4, ADR-017).
+     *
+     * `CustomEval` cases run on the outlets of the evaluator context's handle
+     * in this `Scp`. The record is written to this instance's protocol
+     * repository; a write failure is reported in `trust_store_error`, since
+     * the attempt is used either way.
+     *
+     * # Errors
+     *
+     * - The handle check's error when `verifier` belongs to another `Scp`.
+     * - `SCP-VALID-7013` for an invalid verifier DID.
+     * - `SCP-VALID-7002` for a malformed request or response JSON.
+     * - `SCP-IDENT-1033` when this instance has no DID resolver.
+     * - The `TrustError` code when the response is refused: an unknown
+     * challenge, a bad subject signature, an attempt out of turn, a
+     * cooldown not yet over, an expired window, or the grading capacity
+     * exhausted.
+     * - `SCP-CTX-2000` when this instance has no supervisor.
+     * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
+     * error when signing fails.
+     */
+open func trustGradeResponse(verifier: Identity, requestJson: String, responseJson: String)async throws  -> ChallengeGradeResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_trust_grade_response(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(verifier),FfiConverterString.lower(requestJson),FfiConverterString.lower(responseJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeChallengeGradeResult_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Answers a challenge: checks the challenger's signature on
+     * `request_json` through this instance's DID resolver, and returns the
+     * `ChallengeResponse` JSON of `outputs_json` for `attempt`, signed with
+     * `subject`'s `#active` key (spec 07 §7.3.4 step 2, ADR-017).
+     *
+     * # Errors
+     *
+     * - The handle check's error when `subject` belongs to another `Scp`.
+     * - `SCP-VALID-7013` for an invalid subject DID.
+     * - `SCP-VALID-7002` for a malformed request or outputs JSON.
+     * - `SCP-IDENT-1033` when this instance has no DID resolver.
+     * - The `TrustError` code when the request is refused: a bad signature,
+     * another subject, an expired window, or outputs that do not match its
+     * cases.
+     * - `SCP-IDENT-1054` when `subject` has no custodied key, and the custody
+     * error when signing fails.
+     */
+open func trustRespondToChallenge(subject: Identity, requestJson: String, outputsJson: String, attempt: UInt32)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_trust_respond_to_challenge(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(subject),FfiConverterString.lower(requestJson),FfiConverterString.lower(outputsJson),FfiConverterUInt32.lower(attempt)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -7658,42 +7761,6 @@ open func trustVerifyAttestation(contextId: String, attestationJson: String)asyn
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeAttestationVerificationResult_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
-     * Verifies a challenge response and returns the signed
-     * `ChallengeVerification` JSON (spec 07 §7.3.4).
-     *
-     * The request and response signatures are checked through this
-     * instance's DID resolver; the record is bound to `context_id` and signed
-     * with `verifier`'s `#active` key through its custody.
-     *
-     * # Errors
-     *
-     * - The handle check's error when `verifier` belongs to another `Scp`.
-     * - `SCP-VALID-7011` for an empty `context_id`.
-     * - `SCP-VALID-7002` for a malformed challenge or response
-     * JSON.
-     * - `SCP-IDENT-1033` when this instance has no DID resolver.
-     * - `SCP-VALID-7003` when the response is refused.
-     * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
-     * error when signing fails.
-     */
-open func trustVerifyResponse(verifier: Identity, challengeJson: String, responseJson: String, contextId: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_trust_verify_response(
-                    self.uniffiClonePointer(),
-                    FfiConverterTypeIdentity_lower(verifier),FfiConverterString.lower(challengeJson),FfiConverterString.lower(responseJson),FfiConverterString.lower(contextId)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -8895,6 +8962,195 @@ public func FfiConverterTypeCapabilityValidationRecord_lower(_ value: Capability
 
 
 /**
+ * A graded attempt, as `trust_grade_response` returns it.
+ */
+public struct ChallengeGradeResult {
+    /**
+     * The signed `ChallengeVerification` (JSON).
+     */
+    public var recordJson: String
+    /**
+     * The per-case results (JSON array of `CaseResult`), never signed.
+     */
+    public var reasonsJson: String
+    /**
+     * Why the record could not be written to this instance's trust store,
+     * when it could not; the record is signed and the attempt used either
+     * way.
+     */
+    public var trustStoreError: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The signed `ChallengeVerification` (JSON).
+         */recordJson: String, 
+        /**
+         * The per-case results (JSON array of `CaseResult`), never signed.
+         */reasonsJson: String, 
+        /**
+         * Why the record could not be written to this instance's trust store,
+         * when it could not; the record is signed and the attempt used either
+         * way.
+         */trustStoreError: String?) {
+        self.recordJson = recordJson
+        self.reasonsJson = reasonsJson
+        self.trustStoreError = trustStoreError
+    }
+}
+
+#if compiler(>=6)
+extension ChallengeGradeResult: Sendable {}
+#endif
+
+
+extension ChallengeGradeResult: Equatable, Hashable {
+    public static func ==(lhs: ChallengeGradeResult, rhs: ChallengeGradeResult) -> Bool {
+        if lhs.recordJson != rhs.recordJson {
+            return false
+        }
+        if lhs.reasonsJson != rhs.reasonsJson {
+            return false
+        }
+        if lhs.trustStoreError != rhs.trustStoreError {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(recordJson)
+        hasher.combine(reasonsJson)
+        hasher.combine(trustStoreError)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeChallengeGradeResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ChallengeGradeResult {
+        return
+            try ChallengeGradeResult(
+                recordJson: FfiConverterString.read(from: &buf), 
+                reasonsJson: FfiConverterString.read(from: &buf), 
+                trustStoreError: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ChallengeGradeResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.recordJson, into: &buf)
+        FfiConverterString.write(value.reasonsJson, into: &buf)
+        FfiConverterOptionString.write(value.trustStoreError, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChallengeGradeResult_lift(_ buf: RustBuffer) throws -> ChallengeGradeResult {
+    return try FfiConverterTypeChallengeGradeResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChallengeGradeResult_lower(_ value: ChallengeGradeResult) -> RustBuffer {
+    return FfiConverterTypeChallengeGradeResult.lower(value)
+}
+
+
+/**
+ * A challenger's choice of fewer retries or a longer cooldown than the
+ * capability definition's.
+ */
+public struct ChallengePolicy {
+    /**
+     * Retries after the first attempt; at most the definition's.
+     */
+    public var maxRetries: UInt32
+    /**
+     * Seconds between graded attempts; at least the definition's.
+     */
+    public var cooldownSecs: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Retries after the first attempt; at most the definition's.
+         */maxRetries: UInt32, 
+        /**
+         * Seconds between graded attempts; at least the definition's.
+         */cooldownSecs: UInt32) {
+        self.maxRetries = maxRetries
+        self.cooldownSecs = cooldownSecs
+    }
+}
+
+#if compiler(>=6)
+extension ChallengePolicy: Sendable {}
+#endif
+
+
+extension ChallengePolicy: Equatable, Hashable {
+    public static func ==(lhs: ChallengePolicy, rhs: ChallengePolicy) -> Bool {
+        if lhs.maxRetries != rhs.maxRetries {
+            return false
+        }
+        if lhs.cooldownSecs != rhs.cooldownSecs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(maxRetries)
+        hasher.combine(cooldownSecs)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeChallengePolicy: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ChallengePolicy {
+        return
+            try ChallengePolicy(
+                maxRetries: FfiConverterUInt32.read(from: &buf), 
+                cooldownSecs: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ChallengePolicy, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.maxRetries, into: &buf)
+        FfiConverterUInt32.write(value.cooldownSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChallengePolicy_lift(_ buf: RustBuffer) throws -> ChallengePolicy {
+    return try FfiConverterTypeChallengePolicy.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChallengePolicy_lower(_ value: ChallengePolicy) -> RustBuffer {
+    return FfiConverterTypeChallengePolicy.lower(value)
+}
+
+
+/**
  * Result of creating a challenge request.
  */
 public struct ChallengeResult {
@@ -8903,9 +9159,9 @@ public struct ChallengeResult {
      */
     public var challengeId: String
     /**
-     * The signed `ChallengeRequest` (JSON).
+     * The signed `ChallengeRequest` (JSON), which carries no answers.
      */
-    public var challengeJson: String
+    public var requestJson: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -8914,10 +9170,10 @@ public struct ChallengeResult {
          * The challenge ID: lowercase hex of its 32 random bytes.
          */challengeId: String, 
         /**
-         * The signed `ChallengeRequest` (JSON).
-         */challengeJson: String) {
+         * The signed `ChallengeRequest` (JSON), which carries no answers.
+         */requestJson: String) {
         self.challengeId = challengeId
-        self.challengeJson = challengeJson
+        self.requestJson = requestJson
     }
 }
 
@@ -8931,7 +9187,7 @@ extension ChallengeResult: Equatable, Hashable {
         if lhs.challengeId != rhs.challengeId {
             return false
         }
-        if lhs.challengeJson != rhs.challengeJson {
+        if lhs.requestJson != rhs.requestJson {
             return false
         }
         return true
@@ -8939,7 +9195,7 @@ extension ChallengeResult: Equatable, Hashable {
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(challengeId)
-        hasher.combine(challengeJson)
+        hasher.combine(requestJson)
     }
 }
 
@@ -8953,13 +9209,13 @@ public struct FfiConverterTypeChallengeResult: FfiConverterRustBuffer {
         return
             try ChallengeResult(
                 challengeId: FfiConverterString.read(from: &buf), 
-                challengeJson: FfiConverterString.read(from: &buf)
+                requestJson: FfiConverterString.read(from: &buf)
         )
     }
 
     public static func write(_ value: ChallengeResult, into buf: inout [UInt8]) {
         FfiConverterString.write(value.challengeId, into: &buf)
-        FfiConverterString.write(value.challengeJson, into: &buf)
+        FfiConverterString.write(value.requestJson, into: &buf)
     }
 }
 
@@ -9222,6 +9478,11 @@ public struct ContextParams {
      * governance only).
      */
     public var consequenceConfigJson: String?
+    /**
+     * The admission capability requirements as a JSON array of
+     * `CapabilityRequirement` (spec §7.3.5). `None` means none.
+     */
+    public var capabilityRequirementsJson: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -9286,7 +9547,11 @@ public struct ContextParams {
          * Optional consequence config as a JSON-encoded object (ADR-017, #1531).
          * `None` means the default config (severe enforcement tiers gated to
          * governance only).
-         */consequenceConfigJson: String?) {
+         */consequenceConfigJson: String?, 
+        /**
+         * The admission capability requirements as a JSON array of
+         * `CapabilityRequirement` (spec §7.3.5). `None` means none.
+         */capabilityRequirementsJson: String?) {
         self.mode = mode
         self.ceiling = ceiling
         self.ceilingPolicy = ceilingPolicy
@@ -9301,6 +9566,7 @@ public struct ContextParams {
         self.economicPolicy = economicPolicy
         self.consequenceRulesJson = consequenceRulesJson
         self.consequenceConfigJson = consequenceConfigJson
+        self.capabilityRequirementsJson = capabilityRequirementsJson
     }
 }
 
@@ -9353,6 +9619,9 @@ extension ContextParams: Equatable, Hashable {
         if lhs.consequenceConfigJson != rhs.consequenceConfigJson {
             return false
         }
+        if lhs.capabilityRequirementsJson != rhs.capabilityRequirementsJson {
+            return false
+        }
         return true
     }
 
@@ -9371,6 +9640,7 @@ extension ContextParams: Equatable, Hashable {
         hasher.combine(economicPolicy)
         hasher.combine(consequenceRulesJson)
         hasher.combine(consequenceConfigJson)
+        hasher.combine(capabilityRequirementsJson)
     }
 }
 
@@ -9396,7 +9666,8 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
                 sessionCap: FfiConverterOptionUInt32.read(from: &buf), 
                 economicPolicy: FfiConverterOptionString.read(from: &buf), 
                 consequenceRulesJson: FfiConverterOptionString.read(from: &buf), 
-                consequenceConfigJson: FfiConverterOptionString.read(from: &buf)
+                consequenceConfigJson: FfiConverterOptionString.read(from: &buf), 
+                capabilityRequirementsJson: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -9415,6 +9686,7 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.economicPolicy, into: &buf)
         FfiConverterOptionString.write(value.consequenceRulesJson, into: &buf)
         FfiConverterOptionString.write(value.consequenceConfigJson, into: &buf)
+        FfiConverterOptionString.write(value.capabilityRequirementsJson, into: &buf)
     }
 }
 
@@ -16833,6 +17105,30 @@ fileprivate struct FfiConverterOptionTypeIdentity: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeChallengePolicy: FfiConverterRustBuffer {
+    typealias SwiftType = ChallengePolicy?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeChallengePolicy.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeChallengePolicy.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeDataProvenance: FfiConverterRustBuffer {
     typealias SwiftType = DataProvenance?
 
@@ -18271,7 +18567,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_unsubscribe() != 16701) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_check_capability_requirements() != 64202) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_check_capability_requirements() != 25379) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_local_transport() != 46239) {
@@ -18670,13 +18966,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_status() != 20055) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_create_challenge() != 10459) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_create_challenge() != 1761) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_grade_response() != 14844) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_respond_to_challenge() != 25925) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_attestation() != 54259) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 52836) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 59265) {

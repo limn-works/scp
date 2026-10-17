@@ -3,9 +3,8 @@
 //
 // These pin the TrustAdmission.kt encoders against the exact
 // `serde_json::to_string` shapes the Rust bridge deserializes: bare variant
-// strings, `{"<Op>": u64}` thresholds, snake_case struct fields, externally
-// tagged `verification_method`, byte arrays as JSON number arrays, and
-// explicit `null` for absent `score` / `context_id`. The fixtures mirror the
+// strings, `{"<Op>": u64}` thresholds, snake_case struct fields, byte arrays
+// as JSON number arrays, and explicit `null` for an absent `retry_cap`. The fixtures mirror the
 // TypeScript SDK `trust.test.ts` and Swift SDK `TrustAdmissionTests.swift`
 // encoder tests 1:1. Pure serialization logic — no native library required.
 // The real call-through against the Rust deserializers lives in
@@ -14,13 +13,13 @@
 package works.limn.scp
 
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import org.junit.jupiter.api.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
-import kotlin.test.assertTrue
 
 class TrustAdmissionTest {
     /** A structurally-valid profile with real 32/32/64 byte arrays. */
@@ -53,14 +52,26 @@ class TrustAdmissionTest {
     fun `capability requirement encodes snake_case fields and a bare level string`() {
         assertJsonEquals(
             """
-            [{"capability":"scp:capability:schema-validation/v1",
-              "verification_level":"ChallengeVerified"}]
+            [{"capability":"scp:capability:messages-write/v1",
+              "verification_level":"SelfAttested",
+              "trusted_verifiers":[],
+              "retry_cap":null},
+             {"capability":"scp:capability:schema-validation/v1",
+              "verification_level":"ChallengeVerified",
+              "trusted_verifiers":["did:dht:zVerifier"],
+              "retry_cap":{"max_retries":2,"min_cooldown_secs":60}}]
             """.trimIndent(),
             encodeCapabilityRequirementsJson(
                 listOf(
                     CapabilityRequirement(
+                        capability = "scp:capability:messages-write/v1",
+                        verificationLevel = VerificationLevel.SELF_ATTESTED,
+                    ),
+                    CapabilityRequirement(
                         capability = "scp:capability:schema-validation/v1",
                         verificationLevel = VerificationLevel.CHALLENGE_VERIFIED,
+                        trustedVerifiers = listOf("did:dht:zVerifier"),
+                        retryCap = RetryCap(maxRetries = 2u, minCooldownSecs = 60u),
                     ),
                 ),
             ),
@@ -145,25 +156,33 @@ class TrustAdmissionTest {
         assertEquals(64, profile["signature"]?.jsonArray?.size)
     }
 
-    private val pirUri = "scp:capability:prompt-injection-resistance/v1"
+    private val schemaUri = "scp:capability:schema-validation/v1"
 
     private fun makeVerification(): ChallengeVerification =
         ChallengeVerification(
             verificationId = "ab".repeat(32),
             verifier = "did:dht:zVerifier",
             subject = "did:dht:zResponder",
-            capabilityUri = pirUri,
+            capabilityUri = schemaUri,
+            definitionDigest = "ef".repeat(32),
             suiteDigest = "cd".repeat(32),
+            challengeId = "01".repeat(32),
+            attempt = 1u,
+            responseDigest = "02".repeat(32),
+            maxRetries = 2u,
+            cooldownSecs = 60u,
+            passThresholdBps = 8_000u,
+            minCategoryCases = 1u,
             passed = true,
+            score = 10_000u,
             testCount = 20u,
             passCount = 20u,
-            timestamp = 1_700_000_000uL,
+            challengeCreatedAt = 1_700_000_000uL,
+            challengeExpiresAt = 1_700_003_600uL,
+            timestamp = 1_700_000_100uL,
             expiresAt = 1_700_086_400uL,
             contextId = "ctx-admission",
             verifierSignature = List(64) { 9.toUByte() },
-            verificationMethod = ChallengeVerificationMethod.ChallengeVerified(challengeType = pirUri),
-            result = Json.parseToJsonElement("true"),
-            completedAt = 1_700_000_000uL,
         )
 
     private val verificationWire =
@@ -171,25 +190,32 @@ class TrustAdmissionTest {
         {"verification_id":"${"ab".repeat(32)}",
          "verifier":"did:dht:zVerifier",
          "subject":"did:dht:zResponder",
-         "capability_uri":"scp:capability:prompt-injection-resistance/v1",
+         "capability_uri":"scp:capability:schema-validation/v1",
+         "definition_digest":"${"ef".repeat(32)}",
          "suite_digest":"${"cd".repeat(32)}",
+         "challenge_id":"${"01".repeat(32)}",
+         "attempt":1,
+         "response_digest":"${"02".repeat(32)}",
+         "max_retries":2,
+         "cooldown_secs":60,
+         "pass_threshold_bps":8000,
+         "min_category_cases":1,
          "passed":true,
-         "score":null,
+         "score":10000,
          "test_count":20,
          "pass_count":20,
-         "timestamp":1700000000,
+         "challenge_created_at":1700000000,
+         "challenge_expires_at":1700003600,
+         "timestamp":1700000100,
          "expires_at":1700086400,
          "context_id":"ctx-admission",
-         "verifier_signature":${List(64) { 9 }.joinToString(",", "[", "]")},
-         "verification_method":{"ChallengeVerified":
-           {"challenge_type":"scp:capability:prompt-injection-resistance/v1"}},
-         "result":true,
-         "completed_at":1700000000}
+         "verifier_signature":${List(64) { 9 }.joinToString(",", "[", "]")}}
         """.trimIndent()
 
     @Test
-    fun `challenge verification encodes the full 16-field snake_case record`() {
+    fun `challenge verification encodes the full 23-field snake_case record`() {
         assertJsonEquals("[$verificationWire]", encodeChallengeVerificationsJson(listOf(makeVerification())))
+        assertEquals(23, Json.parseToJsonElement(verificationWire).jsonObject.size)
     }
 
     @Test
@@ -201,18 +227,23 @@ class TrustAdmissionTest {
     fun `challenge verification decode refuses a malformed record`() {
         val record = Json.parseToJsonElement(verificationWire).jsonObject
 
+        fun encode(fields: Map<String, JsonElement>): String =
+            Json.encodeToString(JsonObject.serializer(), JsonObject(fields))
+
         fun with(
             key: String,
             value: String,
-        ): String =
-            Json.encodeToString(
-                kotlinx.serialization.json.JsonObject.serializer(),
-                kotlinx.serialization.json.JsonObject(record + (key to Json.parseToJsonElement(value))),
-            )
+        ): String = encode(record + (key to Json.parseToJsonElement(value)))
         assertEquals(
             "ChallengeVerification.verificationId must be 64 lowercase hex characters",
             assertFailsWith<IllegalArgumentException> {
                 decodeChallengeVerificationJson(with("verification_id", "\"${"AB".repeat(32)}\""))
+            }.message,
+        )
+        assertEquals(
+            "ChallengeVerification.responseDigest must be 64 lowercase hex characters",
+            assertFailsWith<IllegalArgumentException> {
+                decodeChallengeVerificationJson(with("response_digest", "\"02\""))
             }.message,
         )
         assertEquals(
@@ -222,32 +253,14 @@ class TrustAdmissionTest {
             }.message,
         )
         assertEquals(10_000u, decodeChallengeVerificationJson(with("score", "10000")).score)
+        // A field the bridge did not write, or one it did write and is gone,
+        // fails at the boundary.
         assertFailsWith<IllegalArgumentException> {
-            decodeChallengeVerificationJson(with("verification_method", "{\"Nope\":{}}"))
+            decodeChallengeVerificationJson(with("verification_method", "\"SelfAttested\""))
         }
-    }
-
-    @Test
-    fun `absent score and context_id serialize as explicit JSON null`() {
-        val encoded =
-            encodeChallengeVerificationsJson(
-                listOf(
-                    makeVerification().copy(
-                        verificationMethod = ChallengeVerificationMethod.SelfAttested,
-                        contextId = null,
-                    ),
-                ),
-            )
-        val record = Json.parseToJsonElement(encoded).jsonArray[0].jsonObject
-        // The keys are PRESENT with JsonNull values — not omitted. The Rust
-        // deserializer accepts either shape, but explicit null keeps the wire
-        // form identical to the Swift/TypeScript SDK encoders.
-        assertTrue(record.containsKey("score"), "score must be present as explicit null")
-        assertEquals(JsonNull, record["score"])
-        assertTrue(record.containsKey("context_id"), "context_id must be present as explicit null")
-        assertEquals(JsonNull, record["context_id"])
-        // The SelfAttested method variant is the bare string, not an object.
-        assertEquals(Json.parseToJsonElement("\"SelfAttested\""), record["verification_method"])
+        assertFailsWith<IllegalArgumentException> {
+            decodeChallengeVerificationJson(encode(record - "attempt"))
+        }
     }
 
     @Test
@@ -305,21 +318,5 @@ class TrustAdmissionTest {
         val encoded = encodeRequireParticipationJson(listOf(original))
         val decoded = Json.decodeFromString<List<RequireParticipation>>(encoded)
         assertEquals(listOf(original), decoded)
-    }
-
-    @Test
-    fun `verification method round-trips through decode`() {
-        val methods =
-            listOf(
-                ChallengeVerificationMethod.SelfAttested,
-                ChallengeVerificationMethod.ChallengeVerified(
-                    challengeType = "scp:capability:outlet-integrity/v1",
-                ),
-            )
-        for (method in methods) {
-            val encoded = Json.encodeToString(ChallengeVerificationMethodSerializer, method)
-            val decoded = Json.decodeFromString(ChallengeVerificationMethodSerializer, encoded)
-            assertEquals(method, decoded)
-        }
     }
 }

@@ -2,10 +2,12 @@
 // trust-aggregation wrapper (ADR-058, spec §7.3).
 //
 // These invoke the bridge `aggregate_trust_input` op through the typed
-// [SCP.aggregateTrustInput] wrapper, proving the TrustAggregate.kt-serialized
-// JSON parses and evaluates on the real Rust deserializers — not just that
-// the encoders emit the pinned shapes (TrustAggregateTest.kt covers that
-// without the native lib).
+// [SCP.aggregateTrustInput] wrapper, and the challenge operations
+// ([SCP.trustCreateChallenge], [SCP.trustRespondToChallenge],
+// [SCP.trustGradeResponse], [SCP.checkCapabilityRequirements]), proving
+// the TrustAggregate.kt-serialized JSON parses and evaluates on the real Rust
+// deserializers — not just that the encoders emit the pinned shapes
+// (TrustAggregateTest.kt covers that without the native lib).
 //
 // All tests require the compiled UniFFI cdylib. A cdylib that is absent or fails
 // to load throws `UnsatisfiedLinkError` from the first native call and fails the
@@ -22,6 +24,11 @@ import kotlinx.serialization.json.put
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import uniffi.scp.CeilingPolicy
+import uniffi.scp.ContextMode
+import uniffi.scp.ContextParams
+import uniffi.scp.GovernanceModel
+import uniffi.scp.MemoryScope
 import uniffi.scp.ScpException
 import uniffi.scp.StorageConfig
 import works.limn.scp.bridge.CoroutineBridge
@@ -29,6 +36,7 @@ import works.limn.scp.conformance.ConformanceStubBindings
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
 
@@ -196,56 +204,145 @@ class TrustAggregateFfiTest {
         }
     }
 
+    /** A context on [scp] whose governance requires [schemaUri] graded by [verifierDid]. */
+    private suspend fun requiringContext(verifierDid: String): String {
+        val creator = scp.identityCreateInMemory()
+        val handle =
+            scp.contextCreate(
+                creator,
+                ContextParams(
+                    mode = ContextMode.ENCRYPTED,
+                    ceiling = listOf("messages:read", "messages:write"),
+                    ceilingPolicy = CeilingPolicy.IMMUTABLE,
+                    governance = GovernanceModel.SINGLE_ADMIN,
+                    memoryScope = MemoryScope.EPHEMERAL,
+                    ttlSeconds = 3600uL,
+                    promotable = false,
+                    minProtocolVersion = 0.toUShort(),
+                    maxChainDepth = null,
+                    maxNestingDepth = null,
+                    sessionCap = null,
+                    economicPolicy = null,
+                    consequenceRulesJson = null,
+                    consequenceConfigJson = null,
+                    capabilityRequirementsJson =
+                        encodeCapabilityRequirementsJson(
+                            listOf(
+                                CapabilityRequirement(
+                                    capability = schemaUri,
+                                    verificationLevel = VerificationLevel.CHALLENGE_VERIFIED,
+                                    trustedVerifiers = listOf(verifierDid),
+                                ),
+                            ),
+                        ),
+                ),
+            )
+        return handle.contextId()
+    }
+
+    /** An output that passes every case [testCases] writes. */
+    private fun passingOutputs(cases: List<TestCase>): List<TestOutput> =
+        cases.map { TestOutput(testId = it.testId, output = buildJsonObject { put("ok", true) }) }
+
     /** A protocol suite one case short of its standard's minimum is refused. */
     @Test
     fun `trustCreateChallenge - suite below minimum is SCP-VALID-7039`() {
         runBlocking {
             val verifier = scp.identityCreateInMemory()
             val subject = scp.identityCreateInMemory()
+            val contextId = requiringContext(verifier.did())
             val error =
                 assertFailsWith<ScpException.Validation> {
-                    scp.trustCreateChallenge(verifier, subject.did(), schemaUri, testCases(19))
+                    scp.trustCreateChallenge(verifier, subject.did(), schemaUri, testCases(19), contextId, 3_600u)
                 }
             assertEquals(CHALLENGE_SUITE_BELOW_MINIMUM_CODE, error.code)
         }
     }
 
     /**
-     * A created request decodes into the SDK types, and a response with a
-     * forged signature is refused by the real verifier.
+     * Test 38: one challenge from creation to admission through the real
+     * bridge. The context's governance requires the capability, so the
+     * subject is refused before it holds a record and admitted after.
      */
     @Test
-    fun `trustCreateChallenge then trustVerifyResponse - forged response is refused`() {
+    fun `challenge_round_trip`() {
         runBlocking {
             val verifier = scp.identityCreateInMemory()
             val subject = scp.identityCreateInMemory()
+            val contextId = requiringContext(verifier.did())
             val cases = testCases(20)
-            val created = scp.trustCreateChallenge(verifier, subject.did(), schemaUri, cases)
-            val challenge = decodeChallengeRequestJson(created.challengeJson)
-            assertEquals(created.challengeId, challenge.challengeId)
-            assertEquals(verifier.did(), challenge.verifier)
-            assertEquals(subject.did(), challenge.subject)
-            assertEquals(cases, challenge.testCases)
 
-            val response =
-                ChallengeResponse(
-                    challengeId = challenge.challengeId,
-                    responderDid = subject.did(),
-                    result =
-                        buildJsonObject {
-                            put("passed", true)
-                            put("score", 10_000)
-                            put("test_count", 20)
-                            put("pass_count", 20)
-                        },
-                    completedAt = (System.currentTimeMillis() / 1000).toULong(),
-                    signature = List(64) { 0.toUByte() },
-                )
-            val error =
+            val request = scp.trustCreateChallenge(verifier, subject.did(), schemaUri, cases, contextId, 3_600u)
+            assertEquals(verifier.did(), request.verifier)
+            assertEquals(subject.did(), request.subject)
+            assertEquals(contextId, request.contextId)
+            assertEquals(schemaUri, request.capabilityUri)
+            assertEquals(cases.map { it.testId }, request.testCases.map { it.testId })
+            assertEquals(3_600uL, request.expiresAt - request.createdAt)
+            // The request commits to each answer and never carries it.
+            assertFalse(encodeChallengeRequestJson(request).contains("ExactMatch"))
+
+            val refused =
                 assertFailsWith<ScpException.Validation> {
-                    scp.trustVerifyResponse(verifier, challenge, response, "ctx-ffi")
+                    scp.checkCapabilityRequirements(contextId, subject.did(), emptyList(), emptyList())
                 }
-            assertEquals("SCP-VALID-7003", error.code)
+            assertEquals("SCP-VALID-7076", refused.code)
+
+            val response = scp.trustRespondToChallenge(subject, request, passingOutputs(cases), 1u)
+            assertEquals(request.challengeId, response.challengeId)
+            assertEquals(subject.did(), response.subject)
+            assertEquals(1u, response.attempt)
+
+            val graded = scp.trustGradeResponse(verifier, request, response)
+            assertNull(graded.trustStoreError)
+            assertEquals(20, graded.caseResults.size)
+            assertTrue(graded.caseResults.all { it.passed })
+            val record = graded.record
+            assertTrue(record.passed)
+            assertEquals(1u, record.attempt)
+            assertEquals(20u, record.passCount)
+            assertEquals(20u, record.testCount)
+            assertEquals(request.challengeId, record.challengeId)
+            assertEquals(verifier.did(), record.verifier)
+            assertEquals(subject.did(), record.subject)
+            assertEquals(contextId, record.contextId)
+
+            scp.checkCapabilityRequirements(contextId, subject.did(), emptyList(), listOf(record))
+            // Every field is signed: a record whose attempt was altered is dropped.
+            val altered =
+                assertFailsWith<ScpException.Validation> {
+                    scp.checkCapabilityRequirements(
+                        contextId,
+                        subject.did(),
+                        emptyList(),
+                        listOf(record.copy(attempt = 2u)),
+                    )
+                }
+            assertEquals("SCP-VALID-7076", altered.code)
+        }
+    }
+
+    /** A response with a forged signature is refused and uses no attempt. */
+    @Test
+    fun `trustGradeResponse - forged response is refused and grades nothing`() {
+        runBlocking {
+            val verifier = scp.identityCreateInMemory()
+            val subject = scp.identityCreateInMemory()
+            val contextId = requiringContext(verifier.did())
+            val cases = testCases(20)
+            val request = scp.trustCreateChallenge(verifier, subject.did(), schemaUri, cases, contextId, 3_600u)
+            val response = scp.trustRespondToChallenge(subject, request, passingOutputs(cases), 1u)
+            assertFailsWith<ScpException> {
+                scp.trustGradeResponse(
+                    verifier,
+                    request,
+                    response.copy(subjectSignature = List(64) { 0.toUByte() }),
+                )
+            }
+            // The forgery took no attempt: the real response still grades as attempt 1.
+            val graded = scp.trustGradeResponse(verifier, request, response)
+            assertEquals(1u, graded.record.attempt)
+            assertTrue(graded.record.passed)
         }
     }
 }

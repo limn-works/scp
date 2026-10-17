@@ -664,7 +664,6 @@ export interface Bridge {
   checkCapabilityRequirements(
     contextId: string,
     subjectDid: string,
-    requirementsJson: string,
     agentCapabilitiesJson: string,
     challengeVerificationsJson: string,
   ): Promise<void>;
