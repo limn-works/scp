@@ -1672,6 +1672,27 @@ async fn check_capability_requirements_reads_governance() {
     let request = h.create(0, &invoker).await;
     let response = h.respond(&request, 1).await;
     let graded = h.grade(&request, &response, &invoker).await.unwrap();
+    // More than MAX_ADMISSION_RECORDS records are refused at decode.
+    let flood = serde_json::to_string(&vec![
+        graded.record.clone();
+        scp_protocol::trust::MAX_ADMISSION_RECORDS + 1
+    ])
+    .unwrap();
+    let err =
+        check_capability_requirements(&h.sup, None, EVAL_CTX.to_owned(), did(2).0, &caps, &flood)
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ChallengeOpError::MalformedJson {
+                input: JsonInput::ChallengeVerifications,
+                reason,
+            } if reason.contains("invalid length")
+        ),
+        "{err:?}"
+    );
+
     let records = serde_json::to_string(&[graded.record]).unwrap();
     let err =
         check_capability_requirements(&h.sup, None, EVAL_CTX.to_owned(), did(2).0, &caps, &records)

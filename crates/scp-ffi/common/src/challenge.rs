@@ -39,10 +39,11 @@ use scp_protocol::trust::schema_gate::schema_verdict;
 use scp_protocol::trust::{
     AdmissionCheck, AdmissionError, AuthenticatedResponse, CHALLENGE_GRADING_BUDGET_SECS,
     CapabilityDefinitionSource, CapabilityUri, CaseResult, ChallengePolicy, ChallengeRequest,
-    ChallengeResponse, ChallengeVerification, ExpectedOutput, GradingCapacityCause,
-    MAX_CHALLENGE_RESPONSE_BYTES, NewChallenge, PolicyPick, ProtocolOnlyDefinitions, SchemaGate,
-    SchemaVerdict, TestCase, TestOutput, TrustError, authenticate_challenge_response,
-    challenge_request_unsigned, challenge_response_unsigned, check_challenge_json_bounds, grade,
+    ChallengeResponse, ChallengeVerification, ChallengeVerifications, ExpectedOutput,
+    GradingCapacityCause, MAX_CHALLENGE_RESPONSE_BYTES, NewChallenge, PolicyPick,
+    ProtocolOnlyDefinitions, SchemaGate, SchemaVerdict, TestCase, TestOutput, TrustError,
+    authenticate_challenge_response, challenge_request_unsigned, challenge_response_unsigned,
+    check_challenge_json_bounds, grade,
 };
 use serde_json::Value;
 use tokio::sync::OwnedSemaphorePermit;
@@ -1146,7 +1147,7 @@ pub async fn check_capability_requirements(
 ) -> Result<(), ChallengeOpError> {
     let capabilities: Vec<CapabilityUri> =
         decode!(JsonInput::AgentCapabilities, agent_capabilities_json)?;
-    let records: Vec<ChallengeVerification> = decode!(
+    let records: ChallengeVerifications = decode!(
         JsonInput::ChallengeVerifications,
         challenge_verifications_json
     )?;
@@ -1160,6 +1161,12 @@ pub async fn check_capability_requirements(
                 context_id: &context_id,
                 subject_did: &subject_did,
                 resolver: instance_active_key_resolver(scope, resolver.as_ref()),
+                // The instance holds no other definition source: the
+                // protocol rows of spec 07 §7.3.4.3 are the only definitions
+                // any party can obtain until a definer fetch path ships, and
+                // an identifier-scoped URI fails closed with
+                // `CapabilityDefinitionUnavailable` rather than reading as a
+                // default. Create grades against the same source.
                 definitions: &ProtocolOnlyDefinitions,
                 clock: &SystemClock,
             },

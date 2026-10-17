@@ -11,16 +11,19 @@
 //! capabilities and challenge records against a list, returning the first
 //! unmet requirement as an [`AdmissionError`].
 
+use std::fmt;
+
 use scp_clock::Clock;
 use scp_did::DID;
-use serde::{Deserialize, Serialize};
+use serde::de::{IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::TrustError;
 use super::attestation::ActiveKeyResolver;
 use super::capability_definition::CapabilityDefinitionSource;
 use super::capability_uri::CapabilityUri;
 use super::challenge::{
-    ChallengeVerification, MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT,
+    ChallengeVerification, MAX_ADMISSION_RECORDS, MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT,
     MAX_TRUSTED_VERIFIERS_PER_REQUIREMENT, verify_challenge_verification,
 };
 use super::identifier::CanonicalIdentifier;
@@ -370,6 +373,86 @@ pub enum AdmissionError {
 }
 
 // ---------------------------------------------------------------------------
+// ChallengeVerifications
+// ---------------------------------------------------------------------------
+
+/// The `ChallengeVerification` records one admission check reads: at most
+/// [`MAX_ADMISSION_RECORDS`] (spec 09 §9.18.18).
+///
+/// Deserialize refuses a longer list before it decodes the record past the
+/// bound, so no oversize set reaches resolution or verification.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ChallengeVerifications(Vec<ChallengeVerification>);
+
+/// More than [`MAX_ADMISSION_RECORDS`] records were supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{count} challenge verification records exceed the maximum {MAX_ADMISSION_RECORDS}")]
+pub struct TooManyAdmissionRecords {
+    /// The number supplied.
+    pub count: usize,
+}
+
+impl TryFrom<Vec<ChallengeVerification>> for ChallengeVerifications {
+    type Error = TooManyAdmissionRecords;
+
+    fn try_from(records: Vec<ChallengeVerification>) -> Result<Self, Self::Error> {
+        if records.len() > MAX_ADMISSION_RECORDS {
+            return Err(TooManyAdmissionRecords {
+                count: records.len(),
+            });
+        }
+        Ok(Self(records))
+    }
+}
+
+impl ChallengeVerifications {
+    /// The records.
+    #[must_use]
+    pub fn as_slice(&self) -> &[ChallengeVerification] {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ChallengeVerifications {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Bounded;
+
+        impl<'de> Visitor<'de> for Bounded {
+            type Value = Vec<ChallengeVerification>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    f,
+                    "at most {MAX_ADMISSION_RECORDS} challenge verification records"
+                )
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut records =
+                    Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_ADMISSION_RECORDS));
+                while let Some(record) = seq.next_element()? {
+                    records.push(record);
+                    if records.len() == MAX_ADMISSION_RECORDS {
+                        // One more element of any shape is refused undecoded.
+                        if seq.next_element::<IgnoredAny>()?.is_some() {
+                            return Err(serde::de::Error::invalid_length(
+                                MAX_ADMISSION_RECORDS + 1,
+                                &self,
+                            ));
+                        }
+                        break;
+                    }
+                }
+                Ok(records)
+            }
+        }
+
+        deserializer.deserialize_seq(Bounded).map(Self)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // check_capability_requirements
 // ---------------------------------------------------------------------------
 
@@ -396,11 +479,54 @@ enum RecordStanding {
     Irrelevant,
 }
 
-/// One record after the requirement-independent checks.
+/// One candidate record after the requirement-independent checks.
 struct CheckedRecord<'a> {
     record: &'a ChallengeVerification,
-    /// `Ok(verifier)` when the record passed every step-5 check.
-    verdict: Result<CanonicalIdentifier, TrustError>,
+    verdict: Verdict,
+}
+
+/// What the requirement-independent checks found for one candidate.
+enum Verdict {
+    /// The record passed every step-5 check.
+    Verified(CanonicalIdentifier),
+    /// The record failed a step-5 check.
+    Rejected(TrustError),
+    /// No requirement for the record's URI trusts its verifier, so it was
+    /// not verified.
+    Untrusted,
+}
+
+/// Whether `record` can count toward some requirement (spec 07 §7.3.4.4
+/// step 4a): it passed, names `context_id` and the subject by key, names a
+/// required capability, and either a `SelfAttested` requirement names that
+/// capability or a requirement for it trusts the verifier. `None` discards
+/// the record unverified; `Some(false)` keeps it as untrusted, unverified.
+fn candidate(
+    requirements: &CapabilityRequirements,
+    record: &ChallengeVerification,
+    subject: &CanonicalIdentifier,
+    context_id: &str,
+) -> Option<bool> {
+    if !record.passed
+        || record.context_id != context_id
+        || CanonicalIdentifier::parse(&record.subject).ok().as_ref() != Some(subject)
+    {
+        return None;
+    }
+    let verifier = CanonicalIdentifier::parse(&record.verifier).ok()?;
+    let mut named = false;
+    for requirement in requirements.as_slice() {
+        if requirement.capability().to_string() != record.capability_uri {
+            continue;
+        }
+        named = true;
+        if requirement.verification_level() == VerificationLevel::SelfAttested
+            || requirement.trusts(&verifier)
+        {
+            return Some(true);
+        }
+    }
+    named.then_some(false)
 }
 
 fn standing(requirement: &CapabilityRequirement, checked: &CheckedRecord<'_>) -> RecordStanding {
@@ -409,11 +535,21 @@ fn standing(requirement: &CapabilityRequirement, checked: &CheckedRecord<'_>) ->
         return RecordStanding::Irrelevant;
     }
     let verifier = match &checked.verdict {
-        Ok(verifier) => verifier,
-        Err(TrustError::SelfChallenge { .. }) => {
+        Verdict::Verified(verifier) => verifier,
+        Verdict::Untrusted => {
+            return if requirement.verification_level() == VerificationLevel::ChallengeVerified {
+                RecordStanding::Refused(AdmissionError::UntrustedVerifier {
+                    uri,
+                    verifier: checked.record.verifier.to_string(),
+                })
+            } else {
+                RecordStanding::Irrelevant
+            };
+        }
+        Verdict::Rejected(TrustError::SelfChallenge { .. }) => {
             return RecordStanding::Refused(AdmissionError::SelfChallenge { uri });
         }
-        Err(_) => return RecordStanding::Irrelevant,
+        Verdict::Rejected(_) => return RecordStanding::Irrelevant,
     };
     if !checked.record.passed {
         return RecordStanding::Irrelevant;
@@ -439,10 +575,15 @@ fn standing(requirement: &CapabilityRequirement, checked: &CheckedRecord<'_>) ->
 
 /// Checks that an agent meets every capability requirement for admission.
 ///
-/// Every record first runs through [`verify_challenge_verification`] (spec 07
-/// §7.3.4 step 5: signature, context, subject, expiry, window, definition,
-/// consistency, verifier ≠ subject). A record that check rejects does not
-/// count; a check that could not run fails the admission closed. Then, per
+/// A record is first filtered with no resolution (spec 07 §7.3.4.4 step
+/// 4a): one that did not pass, names another subject or context, or names
+/// no required capability is discarded; one whose verifier no requirement
+/// for its capability trusts is kept unverified and refuses a
+/// `ChallengeVerified` requirement with [`AdmissionError::UntrustedVerifier`].
+/// Every other record runs through [`verify_challenge_verification`]
+/// (spec 07 §7.3.4 step 5, which resolves the verifier last). A record that
+/// check rejects does not count; a check that could not run fails the
+/// admission closed. Then, per
 /// requirement, a record counts only when it names the requirement's
 /// capability, passed, and (under `ChallengeVerified`) its verifier is in
 /// `trusted_verifiers` by key and its policy respects `retry_cap`.
@@ -466,21 +607,32 @@ fn standing(requirement: &CapabilityRequirement, checked: &CheckedRecord<'_>) ->
 pub fn check_capability_requirements(
     requirements: &CapabilityRequirements,
     agent_capabilities: &[CapabilityUri],
-    challenge_verifications: &[ChallengeVerification],
+    challenge_verifications: &ChallengeVerifications,
     check: &AdmissionCheck<'_>,
 ) -> Result<(), AdmissionError> {
     if check.subject_did.is_empty() {
         return Err(AdmissionError::EmptySubjectDid);
     }
-    if let Err(e) = CanonicalIdentifier::parse(check.subject_did) {
-        return Err(AdmissionError::NonCanonicalIdentifier {
+    let subject = CanonicalIdentifier::parse(check.subject_did).map_err(|e| {
+        AdmissionError::NonCanonicalIdentifier {
             identifier: check.subject_did.to_owned(),
             reason: e.to_string(),
-        });
-    }
+        }
+    })?;
 
-    let mut checked = Vec::with_capacity(challenge_verifications.len());
-    for record in challenge_verifications {
+    let mut checked = Vec::new();
+    for record in challenge_verifications.as_slice() {
+        match candidate(requirements, record, &subject, check.context_id) {
+            None => continue,
+            Some(false) => {
+                checked.push(CheckedRecord {
+                    record,
+                    verdict: Verdict::Untrusted,
+                });
+                continue;
+            }
+            Some(true) => {}
+        }
         let verdict = verify_challenge_verification(
             record,
             check.resolver,
@@ -490,13 +642,15 @@ pub fn check_capability_requirements(
             check.clock,
         )
         .and_then(|()| CanonicalIdentifier::parse(&record.verifier));
-        if let Err(e) = &verdict
-            && !e.is_record_rejection()
-        {
-            return Err(AdmissionError::VerificationUnavailable {
-                reason: e.to_string(),
-            });
-        }
+        let verdict = match verdict {
+            Ok(verifier) => Verdict::Verified(verifier),
+            Err(e) if e.is_record_rejection() => Verdict::Rejected(e),
+            Err(e) => {
+                return Err(AdmissionError::VerificationUnavailable {
+                    reason: e.to_string(),
+                });
+            }
+        };
         checked.push(CheckedRecord { record, verdict });
     }
 
@@ -590,7 +744,7 @@ mod tests {
         check_capability_requirements(
             requirements,
             capabilities,
-            records,
+            &records.to_vec().try_into().unwrap(),
             &AdmissionCheck {
                 context_id: CONTEXT,
                 subject_did: &fx.subject.did,
@@ -617,6 +771,108 @@ mod tests {
         fx.genuine_record(FIXTURE_URI, cases(2)).unwrap()
     }
 
+    /// Counts the resolutions it forwards to the fixture resolver.
+    struct Counting<'a> {
+        inner: &'a dyn ActiveKeyResolver,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ActiveKeyResolver for Counting<'_> {
+        fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+            self.calls.set(self.calls.get() + 1);
+            self.inner.resolve_active_key(did)
+        }
+    }
+
+    /// Runs the check with a counting resolver; returns the verdict and the
+    /// number of resolutions.
+    fn admit_counted(
+        fx: &Fixture,
+        requirements: &CapabilityRequirements,
+        records: Vec<ChallengeVerification>,
+    ) -> (Result<(), AdmissionError>, usize) {
+        let counting = Counting {
+            inner: &fx.resolver,
+            calls: std::cell::Cell::new(0),
+        };
+        let verdict = check_capability_requirements(
+            requirements,
+            &[],
+            &records.try_into().unwrap(),
+            &AdmissionCheck {
+                context_id: CONTEXT,
+                subject_did: &fx.subject.did,
+                resolver: &counting,
+                definitions: &fx.definitions,
+                clock: &fx.clock,
+            },
+        );
+        (verdict, counting.calls.get())
+    }
+
+    /// T19: an oversize set is refused at decode; records that cannot count
+    /// cost no resolution; a record failing a cheap check costs none.
+    #[test]
+    fn admission_records_are_bounded_and_filtered_before_resolution() {
+        let fx = fixture();
+        let genuine = record(&fx);
+
+        // Decode refuses past the cap, and admits exactly the cap.
+        let many = serde_json::to_string(&vec![genuine.clone(); 10_000]).unwrap();
+        let err = serde_json::from_str::<ChallengeVerifications>(&many).unwrap_err();
+        assert!(err.to_string().contains("invalid length"), "{err}");
+        let over =
+            serde_json::to_string(&vec![genuine.clone(); MAX_ADMISSION_RECORDS + 1]).unwrap();
+        assert!(serde_json::from_str::<ChallengeVerifications>(&over).is_err());
+        let at = serde_json::to_string(&vec![genuine.clone(); MAX_ADMISSION_RECORDS]).unwrap();
+        let decoded: ChallengeVerifications = serde_json::from_str(&at).unwrap();
+        assert_eq!(decoded.as_slice().len(), MAX_ADMISSION_RECORDS);
+        assert_eq!(
+            ChallengeVerifications::try_from(vec![genuine.clone(); MAX_ADMISSION_RECORDS + 1]),
+            Err(TooManyAdmissionRecords {
+                count: MAX_ADMISSION_RECORDS + 1
+            })
+        );
+
+        let uri = fixture_cap();
+        let reqs = list(vec![verified_by(&uri, &[&fx.verifier.did], None)]);
+
+        // Records for a capability the context does not require.
+        let mut unrequired = genuine.clone();
+        unrequired.capability_uri = "scp:capability:schema-validation/v1".to_owned();
+        let (verdict, calls) = admit_counted(&fx, &reqs, vec![unrequired; MAX_ADMISSION_RECORDS]);
+        assert_eq!(
+            verdict,
+            Err(AdmissionError::VerificationRequired {
+                uri: uri.to_string()
+            })
+        );
+        assert_eq!(calls, 0, "unrequired records were resolved");
+
+        // A record from a verifier no requirement trusts.
+        let mut untrusted = genuine.clone();
+        untrusted.verifier = fx.other.did.clone();
+        let (verdict, calls) = admit_counted(&fx, &reqs, vec![untrusted]);
+        assert!(
+            matches!(verdict, Err(AdmissionError::UntrustedVerifier { .. })),
+            "{verdict:?}"
+        );
+        assert_eq!(calls, 0, "an untrusted verifier was resolved");
+
+        // A genuinely signed record whose timestamp is outside its window.
+        let mut late = genuine.clone();
+        late.timestamp = late.challenge_expires_at;
+        fx.resign(&mut late).unwrap();
+        let (verdict, calls) = admit_counted(&fx, &reqs, vec![late]);
+        assert!(verdict.is_err(), "{verdict:?}");
+        assert_eq!(calls, 0, "a record failing the window check was resolved");
+
+        // The genuine record costs exactly one resolution and admits.
+        let (verdict, calls) = admit_counted(&fx, &reqs, vec![genuine]);
+        verdict.unwrap();
+        assert_eq!(calls, 1);
+    }
+
     #[test]
     fn empty_requirements_always_pass() {
         let fx = fixture();
@@ -630,7 +886,7 @@ mod tests {
             check_capability_requirements(
                 &CapabilityRequirements::default(),
                 &[],
-                &[],
+                &ChallengeVerifications::default(),
                 &AdmissionCheck {
                     context_id: CONTEXT,
                     subject_did,
@@ -879,7 +1135,7 @@ mod tests {
         let result = check_capability_requirements(
             &reqs,
             &[],
-            &[genuine],
+            &vec![genuine].try_into().unwrap(),
             &AdmissionCheck {
                 context_id: CONTEXT,
                 subject_did: &fx.subject.did,

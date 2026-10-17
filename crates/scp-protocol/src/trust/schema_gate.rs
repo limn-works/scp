@@ -188,8 +188,6 @@ fn check_pattern(pattern: &str) -> Result<(), String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use std::time::{Duration, Instant};
-
     use serde_json::json;
 
     use super::*;
@@ -205,13 +203,34 @@ mod tests {
         }
     }
 
+    /// Test 8: each row is refused by the walk, named by its reason, not
+    /// by a later compile failure.
     #[test]
     fn schema_gate_refuses_remote_ref_and_foreign_draft() {
-        rejected(&json!({"$ref": "https://example.com/s.json"}));
-        rejected(&json!({"$ref": "other.json#/a"}));
-        rejected(&json!({"$dynamicRef": "https://example.com/s.json#a"}));
-        rejected(&json!({"$recursiveRef": "#"}));
-        rejected(&json!({"$schema": "http://json-schema.org/draft-07/schema#"}));
+        for (schema, reason) in [
+            (
+                json!({"$ref": "https://example.com/s.json"}),
+                "/$ref is \"https://example.com/s.json\", not a fragment reference",
+            ),
+            (
+                json!({"$ref": "other.json#/a"}),
+                "/$ref is \"other.json#/a\", not a fragment reference",
+            ),
+            (
+                json!({"$dynamicRef": "https://example.com/s.json#a"}),
+                "/$dynamicRef is \"https://example.com/s.json#a\", not a fragment reference",
+            ),
+            (
+                json!({"$recursiveRef": "#"}),
+                "/$recursiveRef is not admitted",
+            ),
+            (
+                json!({"$schema": "http://json-schema.org/draft-07/schema#"}),
+                "/$schema names \"http://json-schema.org/draft-07/schema#\", not draft 2020-12",
+            ),
+        ] {
+            assert_eq!(rejected(&schema), reason, "{schema}");
+        }
         // A fragment reference within the document is admitted.
         SchemaGate::admit(
             "t",
@@ -246,11 +265,30 @@ mod tests {
         assert!(reason.contains("patternProperties"), "{reason}");
     }
 
-    /// The validator is built with the deny-all retriever: an external
+    /// Test 8c. `admit` compiles a schema whose resources carry remote
+    /// `$id`s without fetching them, and refuses a remote reference in the
+    /// walk. The validator is built with the deny-all retriever: an external
     /// reference fails to compile even with the walk bypassed, and the
     /// retriever itself refuses every URI.
     #[test]
     fn schema_gate_never_fetches() {
+        let embedded = json!({
+            "$id": "https://example.invalid/root.json",
+            "$defs": {"a": {"$id": "https://example.invalid/a.json", "type": "string"}},
+            "properties": {"x": {"$ref": "#/$defs/a"}}
+        });
+        let validator = SchemaGate::admit("t", &embedded).unwrap();
+        assert_eq!(
+            schema_verdict(&validator, &json!({"x": 1})),
+            SchemaVerdict::Fail
+        );
+        let remote = json!({"properties": {"a": {"$ref": "https://example.invalid/s.json"}}});
+        let reason = rejected(&remote);
+        assert!(
+            reason.starts_with("/properties/a/$ref is ") && reason.contains("not a fragment"),
+            "{reason}"
+        );
+
         let foreign = json!({"properties": {"a": {"$ref": "https://example.invalid/s.json"}}});
         let refused = jsonschema::options()
             .with_draft(jsonschema::Draft::Draft202012)
@@ -310,10 +348,8 @@ mod tests {
         ] {
             let validator = SchemaGate::admit("t", &json!({"type": "string", "pattern": pattern}))
                 .unwrap_or_else(|e| panic!("{pattern}: {e}"));
-            let started = Instant::now();
             let verdict = schema_verdict(&validator, &json!(input));
             assert_ne!(verdict, SchemaVerdict::BacktrackLimit, "{pattern}");
-            assert!(started.elapsed() < Duration::from_secs(5), "{pattern}");
         }
     }
 

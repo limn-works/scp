@@ -26,7 +26,8 @@ pub mod ucan;
 // Re-exports for backward compatibility.
 pub use admission::{
     AdmissionCheck, AdmissionError, CapabilityRequirement, CapabilityRequirements,
-    RawCapabilityRequirement, RetryCap, VerificationLevel, check_capability_requirements,
+    ChallengeVerifications, RawCapabilityRequirement, RetryCap, TooManyAdmissionRecords,
+    VerificationLevel, check_capability_requirements,
 };
 pub use attestation::{
     ActiveKeyResolver, Attestation, AttestationEvidence, RevocationStatus,
@@ -52,11 +53,12 @@ pub use challenge::{
     AnswerKey, AttemptLedgerView, AuthenticatedResponse, CHALLENGE_CLOCK_SKEW_SECS,
     CHALLENGE_GRADING_BUDGET_SECS, CHALLENGE_LEASE_MARGIN_SECS, CaseResult, ChallengeCase,
     ChallengeClosure, ChallengePolicy, ChallengeRequest, ChallengeResponse, ChallengeType,
-    ChallengeVerification, ExpectedOutput, GradeOutcome, MAX_CAPABILITY_DESCRIPTION_BYTES,
-    MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT, MAX_CHALLENGE_JSON_DEPTH,
-    MAX_CHALLENGE_RESPONSE_BYTES, MAX_CHALLENGE_SCHEMA_BYTES, MAX_CHALLENGE_WINDOW_SECS,
-    MAX_TRUSTED_VERIFIERS_PER_REQUIREMENT, MAX_VERIFICATION_VALIDITY_SECS, NewChallenge,
-    PolicyPick, TOTAL_WEIGHT_BPS, TestCase, TestOutput, UnsignedChallengeRequest,
+    ChallengeVerification, ExpectedOutput, GradeOutcome, MAX_ADMISSION_RECORDS,
+    MAX_CAPABILITY_DESCRIPTION_BYTES, MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT,
+    MAX_CHALLENGE_JSON_DEPTH, MAX_CHALLENGE_RESPONSE_BYTES, MAX_CHALLENGE_SCHEMA_BYTES,
+    MAX_CHALLENGE_WINDOW_SECS, MAX_CONTAINS_HAYSTACK_BYTES, MAX_CONTAINS_NEEDLE_BYTES,
+    MAX_CONTAINS_NEEDLES, MAX_TRUSTED_VERIFIERS_PER_REQUIREMENT, MAX_VERIFICATION_VALIDITY_SECS,
+    NewChallenge, PolicyPick, TOTAL_WEIGHT_BPS, TestCase, TestOutput, UnsignedChallengeRequest,
     UnsignedChallengeResponse, UnsignedChallengeVerification, authenticate_challenge_response,
     canonical_challenge_request_bytes, canonical_challenge_response_bytes,
     canonical_challenge_verification_bytes, challenge_request_signing_digest,

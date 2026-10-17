@@ -5391,11 +5391,8 @@ fn shared_grade_response_authenticates_then_grades_and_commits() {
             )
             && body.contains("evaluate_cases(")
             && fn_body_contains(FFI_CHALLENGE_SRC, "evaluate_cases", "schema_case(")
-            && fn_body_contains(
-                FFI_CHALLENGE_SRC,
-                "evaluate_cases",
-                ".invoke(EvaluatorCall {"
-            )
+            && fn_body_contains(FFI_CHALLENGE_SRC, "evaluate_cases", "eval_case(")
+            && fn_body_contains(FFI_CHALLENGE_SRC, "eval_case", ".invoke(EvaluatorCall {")
             && fn_body_contains(FFI_CHALLENGE_SRC, "schema_case", "SchemaGate::admit("),
         "grade_response_within must authenticate, run each evaluated case (schemas \
          through SchemaGate, evaluators through the invoker), grade, and store the record"

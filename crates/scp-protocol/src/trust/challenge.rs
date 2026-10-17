@@ -418,6 +418,15 @@ pub const MAX_CHALLENGE_JSON_DEPTH: usize = 64;
 pub const MAX_CAPABILITY_DESCRIPTION_BYTES: usize = 1024;
 /// The most capability requirements one context holds.
 pub const MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT: usize = 64;
+/// The most decoded string bytes one `ContainsAll` or `ContainsNone` case
+/// scans.
+pub const MAX_CONTAINS_HAYSTACK_BYTES: usize = 65_536;
+/// The most strings one `ContainsAll` or `ContainsNone` case lists.
+pub const MAX_CONTAINS_NEEDLES: usize = 64;
+/// The longest string a `ContainsAll` or `ContainsNone` case lists.
+pub const MAX_CONTAINS_NEEDLE_BYTES: usize = 1024;
+/// The most `ChallengeVerification` records one admission check reads.
+pub const MAX_ADMISSION_RECORDS: usize = 256;
 
 /// Domain separator of the request preimage `R`.
 const DOMAIN_CHALLENGE_REQ_V1: &[u8] = b"SCP-CHALLENGE-REQ-V1:";
@@ -913,7 +922,8 @@ impl ChallengePolicy {
 
 /// Checks the suite rules of spec 07 §7.3.4 that hold for every URI: a
 /// non-empty list, unique `test_id`s, weights summing to `TOTAL_WEIGHT_BPS`,
-/// and I-JSON in every `input` and `expected`. Returns the case count.
+/// I-JSON in every `input` and `expected`, and the needle bounds of
+/// `ContainsAll` and `ContainsNone`. Returns the case count.
 fn check_suite_rules(test_cases: &[TestCase]) -> Result<u32, TrustError> {
     let invalid = |reason: String| TrustError::InvalidChallengeSuite { reason };
     if test_cases.is_empty() {
@@ -928,6 +938,11 @@ fn check_suite_rules(test_cases: &[TestCase]) -> Result<u32, TrustError> {
             return Err(invalid(format!("test_id {:?} repeats", case.test_id)));
         }
         weight_sum += u64::from(case.weight);
+        if let ExpectedOutput::ContainsAll { required: needles }
+        | ExpectedOutput::ContainsNone { forbidden: needles } = &case.expected
+        {
+            check_needles(&case.test_id, needles).map_err(invalid)?;
+        }
         let expected = serde_json::to_value(&case.expected).map_err(|e| {
             invalid(format!(
                 "test case {:?} expected does not serialize: {e}",
@@ -945,6 +960,26 @@ fn check_suite_rules(test_cases: &[TestCase]) -> Result<u32, TrustError> {
         )));
     }
     Ok(count)
+}
+
+/// At most `MAX_CONTAINS_NEEDLES` needles, each at most
+/// `MAX_CONTAINS_NEEDLE_BYTES` bytes.
+fn check_needles(test_id: &str, needles: &[String]) -> Result<(), String> {
+    if needles.len() > MAX_CONTAINS_NEEDLES {
+        return Err(format!(
+            "test case {test_id:?} lists {} strings, more than {MAX_CONTAINS_NEEDLES}",
+            needles.len()
+        ));
+    }
+    needles
+        .iter()
+        .find(|n| n.len() > MAX_CONTAINS_NEEDLE_BYTES)
+        .map_or(Ok(()), |n| {
+            Err(format!(
+                "test case {test_id:?} lists a {}-byte string, more than {MAX_CONTAINS_NEEDLE_BYTES}",
+                n.len()
+            ))
+        })
 }
 
 /// Checks the definition's minimum (spec 07 §7.3.4.3). Under
@@ -1484,24 +1519,38 @@ pub struct GradeOutcome {
 
 /// The haystacks of `ContainsAll` and `ContainsNone`: the output itself
 /// when it is a string, else every decoded string leaf and object key.
-fn string_haystacks(output: &serde_json::Value) -> Vec<&str> {
+/// `None` when they total more than `MAX_CONTAINS_HAYSTACK_BYTES`; the walk
+/// stops there, before any scan.
+fn string_haystacks(output: &serde_json::Value) -> Option<Vec<&str>> {
     let mut found = Vec::new();
+    let mut total: usize = 0;
     let mut stack = vec![output];
     while let Some(value) = stack.pop() {
         match value {
-            serde_json::Value::String(s) => found.push(s.as_str()),
+            serde_json::Value::String(s) => {
+                total = total.saturating_add(s.len());
+                found.push(s.as_str());
+            }
             serde_json::Value::Array(items) => stack.extend(items),
             serde_json::Value::Object(map) => {
                 for (key, child) in map {
+                    total = total.saturating_add(key.len());
                     found.push(key.as_str());
                     stack.push(child);
                 }
             }
             _ => {}
         }
+        if total > MAX_CONTAINS_HAYSTACK_BYTES {
+            return None;
+        }
     }
-    found
+    Some(found)
 }
+
+/// The reason of a `ContainsAll` or `ContainsNone` case whose haystacks
+/// exceed `MAX_CONTAINS_HAYSTACK_BYTES`.
+const HAYSTACK_TOO_LARGE: &str = "haystack_too_large";
 
 /// Grades one authenticated attempt (spec 07 §7.3.4 step 3).
 ///
@@ -1514,7 +1563,9 @@ fn string_haystacks(output: &serde_json::Value) -> Vec<&str> {
 /// - `SchemaMatch`: `Fail` gives `schema_mismatch`, `BacktrackLimit` gives
 ///   `backtrack_limit`.
 /// - `ContainsAll` / `ContainsNone`: byte-exact, case-sensitive substring
-///   search over [`string_haystacks`].
+///   search over [`string_haystacks`]; haystacks over
+///   `MAX_CONTAINS_HAYSTACK_BYTES` fail the case with `haystack_too_large`
+///   and no scan.
 ///
 /// Grading cannot fail. A key that does not hold one expected output per
 /// case yields one result per expected output, and
@@ -1551,28 +1602,28 @@ pub fn grade(
                     CaseResult::fail("budget_exceeded")
                 }
             },
-            ExpectedOutput::ContainsAll { required } => {
-                let hay = string_haystacks(output);
-                if required
-                    .iter()
-                    .all(|r| hay.iter().any(|h| h.contains(r.as_str())))
+            ExpectedOutput::ContainsAll { required } => match string_haystacks(output) {
+                None => CaseResult::fail(HAYSTACK_TOO_LARGE),
+                Some(hay)
+                    if required
+                        .iter()
+                        .all(|r| hay.iter().any(|h| h.contains(r.as_str()))) =>
                 {
                     CaseResult::pass()
-                } else {
-                    CaseResult::fail("missing_required")
                 }
-            }
-            ExpectedOutput::ContainsNone { forbidden } => {
-                let hay = string_haystacks(output);
-                if forbidden
-                    .iter()
-                    .any(|f| hay.iter().any(|h| h.contains(f.as_str())))
+                Some(_) => CaseResult::fail("missing_required"),
+            },
+            ExpectedOutput::ContainsNone { forbidden } => match string_haystacks(output) {
+                None => CaseResult::fail(HAYSTACK_TOO_LARGE),
+                Some(hay)
+                    if forbidden
+                        .iter()
+                        .any(|f| hay.iter().any(|h| h.contains(f.as_str()))) =>
                 {
                     CaseResult::fail("forbidden_present")
-                } else {
-                    CaseResult::pass()
                 }
-            }
+                Some(_) => CaseResult::pass(),
+            },
             ExpectedOutput::CustomEval { .. } => evals.get(&i).cloned().unwrap_or_else(|| {
                 cut_off = true;
                 CaseResult::fail("budget_exceeded")
@@ -1851,9 +1902,9 @@ fn check_record_policy(
 /// from anyone.
 ///
 /// `verifier`, `subject` and `expected_subject` are parsed canonically
-/// first ([`TrustError::NonCanonicalIdentifier`]). Then, in order:
-/// - (a) the signature over `D_v` against the verifier's `#active` key
-///   ([`TrustError::ChallengeVerificationSignatureInvalid`]);
+/// first ([`TrustError::NonCanonicalIdentifier`]). Then, in order, (b)
+/// through (l) and then (a), so a record that fails a check needing no
+/// resolution costs none:
 /// - (b) `verification_id` re-derives
 ///   ([`TrustError::ChallengeVerificationIdMismatch`]);
 /// - (c) `challenge_created_at < timestamp < challenge_expires_at`
@@ -1874,7 +1925,9 @@ fn check_record_policy(
 ///   ([`TrustError::ChallengeSubjectMismatch`]);
 /// - (k) `context_id` is the target context
 ///   ([`TrustError::ChallengeContextMismatch`]);
-/// - (l) `now < expires_at` ([`TrustError::ChallengeVerificationExpired`]).
+/// - (l) `now < expires_at` ([`TrustError::ChallengeVerificationExpired`]);
+/// - (a) the signature over `D_v` against the verifier's `#active` key
+///   ([`TrustError::ChallengeVerificationSignatureInvalid`]).
 ///
 /// # Errors
 ///
@@ -1891,15 +1944,6 @@ pub fn verify_challenge_verification(
     let subject = CanonicalIdentifier::parse(&v.subject)?;
     let expected_canonical = CanonicalIdentifier::parse(expected_subject)?;
     let id_hex = hex::encode(v.verification_id);
-
-    let digest = challenge_verification_signing_digest(v)?;
-    let key = resolver.resolve_active_key(&v.verifier)?;
-    verify_ed25519_signature(&key, &digest, &v.verifier_signature).map_err(|reason| {
-        TrustError::ChallengeVerificationSignatureInvalid {
-            verification_id: id_hex.clone(),
-            reason,
-        }
-    })?;
 
     let expected_id = challenge_verification_id(
         &v.verifier,
@@ -1989,7 +2033,15 @@ pub fn verify_challenge_verification(
         });
     }
 
-    Ok(())
+    // (a) last: the only step that resolves an identifier.
+    let digest = challenge_verification_signing_digest(v)?;
+    let key = resolver.resolve_active_key(&v.verifier)?;
+    verify_ed25519_signature(&key, &digest, &v.verifier_signature).map_err(|reason| {
+        TrustError::ChallengeVerificationSignatureInvalid {
+            verification_id: id_hex,
+            reason,
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2353,22 +2405,39 @@ mod tests {
         assert_eq!(wrong.reason.as_deref(), Some("mismatch"));
     }
 
-    /// Test 8d.
+    /// Test 8d. The gate admits no pattern that backtracks, so a
+    /// backtracking validator is built past the gate (which refuses its
+    /// schema) to drive `schema_verdict` into its limit; its verdict then
+    /// fails the case with `backtrack_limit`.
     #[test]
     fn grade_backtrack_limit_fails_the_case() {
         let fx = fixture();
+        let hostile = json!({"type": "string", "pattern": "^(a*)*\\1b$"});
+        assert!(matches!(
+            SchemaGate::admit("t", &hostile),
+            Err(TrustError::SchemaRejected { .. })
+        ));
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .build(&hostile)
+            .unwrap();
+        let output = json!("a".repeat(64));
+        let verdict = crate::trust::schema_gate::schema_verdict(&validator, &output);
+        assert_eq!(verdict, SchemaVerdict::BacktrackLimit);
+
+        // The case's schema is irrelevant to `grade`, which reads the
+        // verdict; an admissible one lets the fixture issue the suite.
         let schema = ExpectedOutput::SchemaMatch {
             schema: json!({"type": "string"}),
         };
         let mut suite = cases(2);
         suite[0].expected = schema.clone();
         suite[1].expected = schema;
-        let schemas =
-            BTreeMap::from([(0, SchemaVerdict::BacktrackLimit), (1, SchemaVerdict::Pass)]);
+        let schemas = BTreeMap::from([(0, verdict), (1, SchemaVerdict::Pass)]);
         let outcome = graded(
             &fx,
             suite,
-            vec![json!("x"), json!("y")],
+            vec![output, json!("y")],
             &BTreeMap::new(),
             &schemas,
         );
@@ -2468,6 +2537,121 @@ mod tests {
         let result = grade_one(forbidden, json!({"k": ["a Secret"]}));
         assert!(!result.passed);
         assert_eq!(result.reason.as_deref(), Some("forbidden_present"));
+    }
+
+    /// T20. A case whose string haystacks exceed
+    /// `MAX_CONTAINS_HAYSTACK_BYTES` fails with `haystack_too_large`, even
+    /// when the needle is present; keys count toward the total.
+    #[test]
+    fn grade_contains_haystack_is_bounded() {
+        let all = ExpectedOutput::ContainsAll {
+            required: vec!["needle".to_owned()],
+        };
+        let none = ExpectedOutput::ContainsNone {
+            forbidden: vec!["absent".to_owned()],
+        };
+        let at = format!("needle{}", "x".repeat(MAX_CONTAINS_HAYSTACK_BYTES - 6));
+        assert!(grade_one(all.clone(), json!(at)).passed);
+        assert!(grade_one(none.clone(), json!(at)).passed);
+
+        let over = json!([at, "y"]);
+        for expected in [all.clone(), none] {
+            let result = grade_one(expected, over.clone());
+            assert!(!result.passed);
+            assert_eq!(result.reason.as_deref(), Some("haystack_too_large"));
+        }
+        let key = "k".repeat(MAX_CONTAINS_HAYSTACK_BYTES);
+        let result = grade_one(all, json!({ key: "needle" }));
+        assert_eq!(result.reason.as_deref(), Some("haystack_too_large"));
+    }
+
+    /// A suite whose `ContainsAll` or `ContainsNone` case lists more than
+    /// `MAX_CONTAINS_NEEDLES` strings, or a string longer than
+    /// `MAX_CONTAINS_NEEDLE_BYTES`, is refused at issue.
+    #[test]
+    fn contains_needles_are_bounded_at_issue() {
+        let fx = fixture();
+        let with = |expected: ExpectedOutput| {
+            let mut suite = cases(2);
+            suite[0].expected = expected;
+            fx.issue(FIXTURE_URI, suite)
+        };
+        let needles = |n: usize, len: usize| -> Vec<String> {
+            (0..n).map(|i| format!("{i:0>len$}")).collect()
+        };
+        with(ExpectedOutput::ContainsAll {
+            required: needles(MAX_CONTAINS_NEEDLES, MAX_CONTAINS_NEEDLE_BYTES),
+        })
+        .unwrap();
+        for expected in [
+            ExpectedOutput::ContainsAll {
+                required: needles(MAX_CONTAINS_NEEDLES + 1, 4),
+            },
+            ExpectedOutput::ContainsNone {
+                forbidden: needles(MAX_CONTAINS_NEEDLES + 1, 4),
+            },
+            ExpectedOutput::ContainsAll {
+                required: needles(1, MAX_CONTAINS_NEEDLE_BYTES + 1),
+            },
+            ExpectedOutput::ContainsNone {
+                forbidden: needles(1, MAX_CONTAINS_NEEDLE_BYTES + 1),
+            },
+        ] {
+            assert!(
+                matches!(
+                    with(expected),
+                    Err(TrustError::InvalidChallengeSuite { .. })
+                ),
+                "admitted"
+            );
+        }
+    }
+
+    /// TQ3. A definition source that returns an out-of-bound definition, or
+    /// a definition of another URI, is refused when a policy is resolved and
+    /// when a record is verified.
+    #[test]
+    fn definition_source_output_is_checked_at_every_consumer() {
+        let mut fx = fixture();
+        let genuine = record(&fx);
+        let mismatched = CapabilityDefinition {
+            capability_uri: PROTOCOL_URI.to_owned(),
+            ..fixture_definition()
+        };
+        for (what, bad) in [
+            (
+                "threshold 0",
+                CapabilityDefinition {
+                    pass_threshold_bps: 0,
+                    ..fixture_definition()
+                },
+            ),
+            (
+                "min_cases 0",
+                CapabilityDefinition {
+                    min_cases: MinCases::Total(0),
+                    ..fixture_definition()
+                },
+            ),
+            ("another URI", mismatched),
+        ] {
+            fx.definitions.fixture_override = Some(bad);
+            assert!(
+                matches!(
+                    ChallengePolicy::resolve(&fx.definitions, FIXTURE_URI, None),
+                    Err(TrustError::CapabilityDefinitionUnavailable { .. })
+                ),
+                "{what}: resolve"
+            );
+            assert!(
+                matches!(
+                    verify(&fx, &genuine),
+                    Err(TrustError::CapabilityDefinitionUnavailable { .. })
+                ),
+                "{what}: verify {:?}",
+                verify(&fx, &genuine)
+            );
+        }
     }
 
     /// The score, not the pass count, decides.
@@ -2976,6 +3160,19 @@ mod tests {
             .unwrap();
         fx.resign(&mut per_category).unwrap();
         assert_outside(&fx, &per_category, "PerCategory short");
+
+        // Total(k) counts every case: two categories of one case each reach
+        // Total(2) though neither category reaches 2.
+        fx.definitions.fixture_override = Some(CapabilityDefinition {
+            min_cases: MinCases::Total(2),
+            ..fixture_definition()
+        });
+        let two_categories = fx
+            .genuine_record(FIXTURE_URI, cases_in(&[("a", 1), ("b", 1)]))
+            .unwrap();
+        assert_eq!(two_categories.test_count, 2);
+        assert_eq!(two_categories.min_category_cases, 1);
+        verify(&fx, &two_categories).unwrap();
     }
 
     /// Test 20.
@@ -3116,15 +3313,20 @@ mod tests {
                 base,
                 "{field} is not in R_v"
             );
-            let err = verify(&fx, &v).unwrap_err();
+            // The genuine signature does not cover the altered record, and
+            // the record is refused: by the signature, or by a check that
+            // runs before it.
             assert!(
-                matches!(
-                    err,
-                    TrustError::ChallengeVerificationSignatureInvalid { .. }
-                        | TrustError::NonCanonicalIdentifier { .. }
-                ),
-                "{field}: {err:?}"
+                verify_ed25519_signature(
+                    &fx.verifier.public(),
+                    &challenge_verification_signing_digest(&v).unwrap(),
+                    &v.verifier_signature,
+                )
+                .is_err(),
+                "{field}: the signature still verifies"
             );
+            let err = verify(&fx, &v).unwrap_err();
+            assert!(err.is_record_rejection(), "{field}: {err:?}");
         }
     }
 

@@ -3111,6 +3111,8 @@ The challenge protocol of `07-trust-validation-and-capabilities.md` §7.3.4 read
 | `MAX_CHALLENGE_SCHEMA_BYTES` | 65536 (64 KiB) | Bounds the canonical JSON of one `SchemaMatch` schema, and so its compilation cost | §7.3.4 step 1 |
 | `MAX_CHALLENGE_JSON_DEPTH` | 64 | Bounds recursion over a schema and over a response's outputs | §7.3.4 steps 1 and 3 |
 | `MAX_CONTAINS_HAYSTACK_BYTES` | 65536 (64 KiB) | Bounds the decoded string values and object keys one `ContainsAll` or `ContainsNone` case scans, so the scan cost of one case is bounded by its needles times this bound and not by the whole response | §7.3.4 step 3 |
+| `MAX_CONTAINS_NEEDLES` | 64 | Bounds the strings one `ContainsAll` or `ContainsNone` case lists | §7.3.4 step 1 |
+| `MAX_CONTAINS_NEEDLE_BYTES` | 1024 | Bounds one string a `ContainsAll` or `ContainsNone` case lists; with `MAX_CONTAINS_NEEDLES` and `MAX_CONTAINS_HAYSTACK_BYTES` it bounds the scan of one case | §7.3.4 step 1 |
 | `MAX_CAPABILITY_DESCRIPTION_BYTES` | 1024 | Bounds the definition record | §7.3.4.6 |
 | `MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT` | 64 | Bounds the governance payload and the admission work for one context; the 28 protocol capabilities and identifier-scoped capabilities fit | §7.3.4.4 |
 | `MAX_ADMISSION_RECORDS` | 256 | Bounds the `ChallengeVerification` records one admission check decodes, four per requirement at `MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT`; a larger set is refused before any record is resolved or verified | §7.3.4.4 |
