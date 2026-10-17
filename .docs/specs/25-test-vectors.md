@@ -709,7 +709,7 @@ An implementation that concatenates the caller's own block first computes two di
 
 ## 25.11 Proposal ID Vectors (§9.5.2)
 
-Domain: `"SCP-PROPOSAL-V1:"`
+Domain: `"SCP-PROPOSAL-V2:"`
 
 ### Vector 23: Governance Proposal ID
 
@@ -722,31 +722,31 @@ Input:
                 (96 bytes — the compact JSON of GovernanceAction::AddMember, whose
                  "did" is the fixture identifier new member, §25.1)
                 hex: 0x7b224164644d656d626572223a7b22646964223a227363703a796b637a3378336479636e7463366c6b787a6265336e697876643777356333377269616f776c6832366c637a646e6335766d6a61222c22726f6c65223a226d656d626572227d7d
-  timestamp:    1700000000
+  anchor_seq:   42
 
 Canonical hash input (per §9.5.2 GovernanceProposal ID):
-  "SCP-PROPOSAL-V1:"                           (16 bytes)
+  "SCP-PROPOSAL-V2:"                           (16 bytes)
   || BE32(20) || "gov-proposal-context"         (4 + 20 = 24 bytes)
   || BE32(56) || proposer_did                  (4 + 56 = 60 bytes)
   || BE32(96) || action_bytes                   (4 + 96 = 100 bytes, length-prefixed)
-  || BE64(1700000000)                           (8 bytes)
+  || BE64(42)                                   (8 bytes)
 
 Total: 16 + 24 + 60 + 100 + 8 = 208 bytes
 
 Preimage (hex, 208 bytes):
-  5343502d50524f504f53414c2d56313a00000014676f762d70726f706f73616c2d636f6e74657874000000387363703a666c726b66677936656872776a3335617935377033366c64666661726c636d68326d6a37736d7237726175797670726579716661000000607b224164644d656d626572223a7b22646964223a227363703a796b637a3378336479636e7463366c6b787a6265336e697876643777356333377269616f776c6832366c637a646e6335766d6a61222c22726f6c65223a226d656d626572227d7d000000006553f100
+  5343502d50524f504f53414c2d56323a00000014676f762d70726f706f73616c2d636f6e74657874000000387363703a666c726b66677936656872776a3335617935377033366c64666661726c636d68326d6a37736d7237726175797670726579716661000000607b224164644d656d626572223a7b22646964223a227363703a796b637a3378336479636e7463366c6b787a6265336e697876643777356333377269616f776c6832366c637a646e6335766d6a61222c22726f6c65223a226d656d626572227d7d000000000000002a
 
 Proposal ID:
-  0x15ff55609885bc70e5c7828697ce978af7c09b8d12d058fee276822d1d34e7f6
+  0xdb29972554562daa98f8f267f2bba151c8dfec980a5de5b1a6c35ea1604b0e38
 
 Note: action_bytes is the canonical JSON serialization of the GovernanceAction
 enum (compact, no whitespace — equivalent to serde_json::to_vec in Rust or
 json.dumps(separators=(',', ':')) in Python). JSON is used rather than
-MessagePack for cross-implementation determinism (see §9.5.2). Field order
-matches code: context_id, proposer_did, action_bytes, timestamp.
+MessagePack for cross-implementation determinism (see §9.5.2). Field order:
+context_id, proposer_did, action_bytes, anchor_seq.
 ```
 
-Before 2026-09-10 this vector carried `0xdeadbeef01020304` labelled a placeholder, together with a note telling a later author to substitute real JSON. Those eight bytes are not a JSON serialization of any `GovernanceAction`, so the vector pinned no proposal ID and its stated 85-byte total measured a preimage no conforming producer builds. The `AddMember` action above is a real variant of the enum §9.5.2 names, stated literally, so this vector now derives from its own printed inputs. The domain separator is 16 ASCII bytes, not the 17 the vector previously stated.
+Before 2026-09-10 this vector carried `0xdeadbeef01020304` labelled a placeholder, together with a note telling a later author to substitute real JSON. Those eight bytes are not a JSON serialization of any `GovernanceAction`, so the vector pinned no proposal ID and its stated 85-byte total measured a preimage no conforming producer builds. The `AddMember` action above is a real variant of the enum §9.5.2 names, stated literally, so this vector now derives from its own printed inputs. The domain separator is 16 ASCII bytes, not the 17 the vector previously stated. On 2026-10-17 ADR-066 retired `"SCP-PROPOSAL-V1:"` and its proposer-chosen `timestamp` field; this vector now uses `"SCP-PROPOSAL-V2:"` with `anchor_seq` 42 in field 4.
 
 ## 25.12 HPKE Key Distribution Vectors
 

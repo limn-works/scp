@@ -11874,22 +11874,21 @@
         "crates/scp-mls/src/group.rs",
         "crates/scp-mls/src/error.rs"
       ],
-      "description": "ADR-066 and §7.3.1.1 of the trust spec put one fixed-size governance leaf block in every Commit's authenticated data. This story builds the `scp-mls` half, treating the transfer body as bytes (its codec is SCP-331): the 16,421-byte `GovernanceLeafBlock` (magic `SCPG`, version 1, 12-byte nonce, `ciphertext_len` 16,400); the 16,384-byte padded plaintext (32-byte `transfer_id`, `part_index`, `part_count`, `chunk_len`, chunk, zero padding); the empty block; splitting a body into at most 64 parts of 16,344 bytes and reassembling them with the SHA-256 `transfer_id` check; AES-128-GCM under `MLS-Exporter(\"SCP-GOVERNANCE-LEAF-V1\", UTF-8 context_id, 16)` taken from `MlsGroup::export_secret` before merge (never `StagedCommit::export_secret`, which gives the new epoch), held in `Zeroizing` and dropped before the merge returns; additional data `magic ‖ version ‖ BE32(len(group_id)) ‖ group_id ‖ epoch ‖ sender_leaf_index`; the canonical-encoding checks; committer entry points that set the block on add, remove, and proposal-free UpdatePath Commits and on every key-update and periodic Update Commit; and a two-phase receive that returns the staged Commit with the decrypted part before merge. The runtime committer side is SCP-329 and the receiver side is SCP-330.",
+      "description": "ADR-066 and §7.3.1.1 of the trust spec put one fixed-size governance leaf block in every Commit's authenticated data. This story builds the `scp-mls` half, treating each part body as bytes (the record codec and the record-aligned split are SCP-331): the 16,421-byte `GovernanceLeafBlock` (magic `SCPG`, version 1, 12-byte nonce, `ciphertext_len` 16,400); the 16,384-byte padded plaintext (32-byte `proposal_id`, `part_index`, `part_count`, `body_len`, body, zero padding); the empty block; AES-128-GCM under `MLS-Exporter(\"SCP-GOVERNANCE-LEAF-V1\", UTF-8 context_id, 16)` taken from `MlsGroup::export_secret` before merge (never `StagedCommit::export_secret`, which gives the new epoch), held in `Zeroizing` and dropped before the merge returns; additional data `magic ‖ version ‖ BE32(len(group_id)) ‖ group_id ‖ epoch ‖ sender_leaf_index`; the header-level canonical-encoding checks; committer entry points that set the block on add, remove, and proposal-free UpdatePath Commits and on every key-update and periodic Update Commit; and a two-phase receive that returns the staged Commit, its sending epoch, its pre-Commit ratchet tree view, and the decrypted part before merge. The runtime committer side is SCP-329 and the receiver side is SCP-330.",
       "acceptanceCriteria": [
-        "Every block the encoder emits is 16,421 bytes with `ciphertext_len` 16,400, for an empty block, a one-part body of 1 byte, and a one-part body of 16,344 bytes",
-        "A body of 16,345 bytes splits into 2 parts and one of 1,046,016 bytes into 64; a body of 1,046,017 bytes returns a typed error and builds no Commit; reassembly returns the original bytes, and reassembly with one part altered fails the `transfer_id` check",
-        "Decoding fails closed with a typed error, one test each: wrong magic; unknown version; `ciphertext_len` other than 16,400; `len(authenticated_data)` other than 21 + `ciphertext_len`; an AEAD tag that does not verify; a non-zero padding byte; `chunk_len` above 16,344; a non-final part whose `chunk_len` is below 16,344; `part_index` not below `part_count`; an empty block with a non-zero header field",
+        "Every block the encoder emits is 16,421 bytes with `ciphertext_len` 16,400, for an empty block, a part body of 1 byte, and a part body of 16,344 bytes; a part body of 16,345 bytes returns a typed error and builds no Commit",
+        "Decoding fails closed with a typed error, one test each: wrong magic; unknown version; `ciphertext_len` other than 16,400; `len(authenticated_data)` other than 21 + `ciphertext_len`; an AEAD tag that does not verify; a non-zero padding byte; `body_len` above 16,344; `part_count` above 64; `part_index` not below `part_count`; an empty block (`part_count` 0) with a non-zero `proposal_id`, `part_index`, or `body_len`",
         "A block encrypted for group G, epoch N, sender leaf L fails to decrypt when any one of G, N, or L differs, one test each",
         "A test exports the key from two members at one epoch and each decrypts the other's block; a block sent at epoch N fails under the key of epoch N+1; `StagedCommit::export_secret` has no call site in `scp-mls`",
         "The exported key is held in a `Zeroizing` value whose scope ends before the merge function returns",
-        "The committer entry points set the block on an add Commit, a remove Commit, a proposal-free UpdatePath Commit, and a self-Update Commit, and a receiving member's two-phase receive returns the same part bytes before merge",
+        "The committer entry points set the block on an add Commit, a remove Commit, a proposal-free UpdatePath Commit, and a self-Update Commit, and a receiving member's two-phase receive returns the same header and body bytes, the sending epoch, and a tree view in which the committer's leaf is its leaf before the Commit, all before merge",
         "A test flips one byte of the block inside a sent Commit, and the two-phase receive rejects the frame and returns no part bytes; after a discard, the group stays at the old epoch and processes the next valid Commit of that epoch",
         "`cargo clippy -p scp-mls --all-targets -- -D warnings` and `cargo test -p scp-mls` pass"
       ],
       "actionItems": [
-        "Add the `governance_leaf_block` module with the fixed-size layout, parts, padding, additional data, exporter key, and constants",
+        "Add the `governance_leaf_block` module with the fixed-size layout, header, padding, additional data, exporter key, and constants",
         "Set the block on every Commit kind the group builds",
-        "Add the two-phase receive with merge and discard",
+        "Add the two-phase receive with merge and discard, returning the sending epoch and the pre-Commit tree view",
         "Add the tests the criteria name"
       ],
       "blockedBy": [],
@@ -11913,7 +11912,7 @@
       ],
       "details": {
         "authentication": "The Commit authenticates the block: `authenticated_data` lies in `FramedContent`, which the committer's leaf signature over `FramedContentTBS` covers (RFC 9420 §6.1), and the `PrivateMessage` AEAD covers it again under `PURE_CIPHERTEXT` (ADR-057 T3). The exporter-key AEAD adds confidentiality, because MLS sends `authenticated_data` in the clear (RFC 9420 §6.3).",
-        "size": "16,384 is the smallest §9.10.3 bucket that holds the 64-signer Threshold maximum of 64 × 169 = 10,816 vote bytes, with 5,521 bytes left for the proposal and leaves (§7.3.1.1, 'Why 16,384 bytes')."
+        "size": "16,384 is the smallest §9.10.3 bucket that holds the 64-signer Threshold maximum of 64 × 169 = 10,816 vote bytes. §9.10.3 pads no Commit, so the block adds 16,425 bytes to every Commit (§7.3.1.1, 'What the block costs')."
       }
     },
     {
@@ -11929,29 +11928,34 @@
         "crates/scp-runtime/src/crypto/mls/backend.rs",
         "crates/scp-client/src/client.rs"
       ],
-      "description": "Per §7.3.1.1 of the trust spec, §5.9 invariant 3 of the contexts spec, and ADR-066 (which amends ADR-031 §7 and §8), the member that executes a governance action in an encrypted context sends one MLS Commit whose block carries the proposal record, exactly the approvals SCP-332 selects, and every commit-ordered leaf it appends for the action, each leaf signed under the committer's identity key through SCP-336 with a `signing_key_id` equal to the one in the committer's own `0xFF03` attestation. Today `execute_add_member` appends `MemberJoined` after `try_broadcast_commit` and sends no leaf, `execute_change_role` sends no Commit at all, and leaves carry empty signatures. This story builds the leaves before the Commit, assigns sequence and `prev_hash` from the committer's log, encodes the body (SCP-331), sends it through the SCP-328 entry points (in parts when it exceeds 16,344 bytes), and appends exactly those leaf bytes to its own log. An action that changes no MLS membership, such as `ChangeRole`, is a proposal-free UpdatePath Commit. Every other Commit the runtime or `scp-client` sends carries the empty block, and the ADR-057 T3 `SCPT` blob is removed. When the executor's Commit loses its epoch, it re-checks the action against the new state and sends it again or marks the proposal `Invalidated`. The receiver side is SCP-330.",
+      "description": "Per §7.3.1.1 of the trust spec, §5.9 invariant 3 of the contexts spec, and ADR-066 (which amends ADR-031 §7 and §8), the member that executes a governance action in an encrypted context sends its transfer in the Commit that executes it, or across up to 64 Commits when it does not fit one part. The transfer carries the proposal record, the approvals SCP-332 selects, and every commit-ordered leaf the executor appends for the action, each leaf signed under the committer's identity key through SCP-336 with a `signing_key_id` equal to the one in the committer's own `0xFF03` attestation. Today `execute_add_member` appends `MemberJoined` after `try_broadcast_commit` and sends no leaf, `execute_change_role` sends no Commit at all, and leaves carry empty signatures. This story splits the records with SCP-331 and sends each part through the SCP-328 entry points, building each part against the state of the epoch it is sent in: the proposal in part 0, the executor's own vote signed under its current leaf key and the leaves (with sequence and `prev_hash` from the executor's log at that epoch) only in the final part. Parts before the final one are proposal-free UpdatePath Commits, and every Commit the executor sends between part 0 and the final part carries the next part. The executor appends exactly the final part's leaf bytes to its own log. An action that changes no MLS membership, such as `ChangeRole`, executes in a proposal-free UpdatePath Commit. Every other Commit the runtime or `scp-client` sends carries the empty block, and the ADR-057 T3 `SCPT` blob is removed. When the executor's Commit loses its epoch, it re-runs the SCP-335 check against the new state and sends again or marks the proposal `Invalidated`; when a Commit that adds a member ends its staged transfer, it restarts from part 0. The receiver side is SCP-330.",
       "acceptanceCriteria": [
         "For `AddMember`, `RemoveMember`, `RevokeAccess`, `ResetMember`, `ChangeRole`, `TransferAdmin`, `SuspendCapability`, `SuspendAccess`, `RestoreAccess`, and `ModifyCeiling`, a test executes the action in an encrypted context and decodes the sent Commit's block; the decoded leaves are byte-identical to the leaves the committer appended, in the same order, and each leaf's signature verifies under the committer's identity key with the `signing_key_id` of its `0xFF03` attestation",
         "In a `Threshold` context with threshold 2 of 3, the executing Commit carries the proposal record and exactly 2 approvals although the executor holds 3",
         "A test executes `ChangeRole` and asserts that the committer's epoch advanced by one and that the sent Commit carries no proposals",
         "A key-update Commit, a periodic Update Commit, and the `scp-client` add Commit each carry a 16,421-byte block; the first two carry the empty block; no Commit carries an `SCPT` blob, and `SCPT` has zero occurrences in `crates/`",
-        "An action whose body needs 3 parts is sent as 2 proposal-free UpdatePath Commits and then the executing Commit, and a second node reassembles it",
+        "An action whose transfer needs 3 parts is sent as 2 proposal-free UpdatePath Commits and then the executing Commit; only the final part carries leaves; the executor's own vote is in the final part and verifies under its leaf key of that epoch; a second node authorizes it",
+        "A 3-part transfer still executes at a second node when a third node commits an Update of its own leaf, whose approval part 0 carried, between parts 0 and 1, and when another member's governance Commit appends leaves between parts 1 and 2",
+        "A test adds a member between parts 0 and 1 of a transfer; the executor restarts from part 0 at the new state and the action executes",
+        "An action whose leaves and the executor's own vote do not fit one part body returns `GovernanceError::LimitExceeded` naming the limit, and sends no Commit",
         "Two nodes each send a Commit for epoch N; the losing executor, after processing the winner, re-sends its non-conflicting action at epoch N+1, and marks a conflicting one `Invalidated`",
-        "A test asserts that the committer's log head after the action equals the hash of the last leaf in the block",
+        "A test asserts that the committer's log head after the action equals the hash of the last leaf in the final part",
         "`pipeline_wiring.rs` asserts that `execute_add_member` and `execute_change_role` reach the block-binding commit entry point",
         "CI-feature `cargo clippy` over the touched crates and their tests pass"
       ],
       "actionItems": [
-        "Build and sign each action's leaves before its Commit and encode the body with the selected approvals",
-        "Send non-membership actions as proposal-free UpdatePath Commits, in parts when needed",
+        "Split each transfer into record-aligned parts and build each part at the epoch it is sent in",
+        "Build and sign the leaves and the executor's vote only for the final part",
+        "Send non-membership actions as proposal-free UpdatePath Commits",
         "Put the empty block on every other Commit and remove `SCPT`",
-        "Re-check and resend after a lost Commit",
+        "Re-check and resend after a lost Commit, and restart a transfer an Add ended",
         "Add the tests and the `pipeline_wiring.rs` assertion"
       ],
       "blockedBy": [
         "SCP-328",
         "SCP-331",
         "SCP-332",
+        "SCP-335",
         "SCP-336"
       ],
       "sources": [
@@ -11991,24 +11995,25 @@
         "crates/scp-runtime/src/context/governance_helpers.rs",
         "crates/scp-runtime/src/context/providers/event_log.rs"
       ],
-      "description": "Per §7.3.1.1 of the trust spec and ADR-066, a member that processes a Commit it did not send runs the three receiver steps against its own pre-Commit state. Verify: the block decrypts and is canonical (SCP-328), parts reassemble, the committer's identifier is the one the verified §9.7.1 `0xFF03` attestation on its current leaf binds (never the MLS credential identity; this needs the attestation verification SCP-CRYPTO22-004 builds), each leaf's own signature verifies per §23.13 ¶1 under the identity key that attestation names (SCP-336), and sequence, `prev_hash`, timestamp, and proposal agreement hold. Authorize: the SCP-335 check over the proposal, votes, quorum, and conflicts, or the `SingleAdmin` capability check. Append: merge, append, record the executed proposal and staged parts, and apply in one durable step. A Commit that fails is rejected before merge. Until a receiver has verified the leaf that grants a member a role, it grants that member nothing and never assumes a default role. A leaf that arrives later by replication or reconciliation and hashes the same as the held leaf is discarded; one that hashes differently is handled as §9.9.3 equivocation. Its two-node criteria need SCP-329's committer side merged before the story is done; SCP-329 is not in blockedBy because this story can start without it. The rejoin criteria of PUSH-030 and PUSH-026 depend on this story.",
+      "description": "Per §7.3.1.1 of the trust spec and ADR-066, a member that processes a Commit it did not send runs the three receiver steps against its own pre-Commit state, and no step reads its clock or a leaf timestamp. Verify: the block decrypts and is canonical (SCP-328); the committer's identifier is the one the verified §9.7.1 `0xFF03` attestation binds on the committer's leaf before the Commit, the leaf whose key signed `FramedContentTBS` (never the MLS credential identity; this needs the attestation verification SCP-CRYPTO22-004 builds), and a Commit whose UpdatePath leaf's attestation binds a different identifier is rejected; the SCP-335 check passes on the part with the receiver's governance state and the sender's staged transfer; and in the final part each leaf's own signature verifies per §23.13 ¶1 under the identity key that attestation names (SCP-336), with sequence and `prev_hash` continuing the receiver's log. Authorize: the SCP-335 count and conflict check, or the `SingleAdmin` capability check. Append: merge, append the final part's leaves, update the governance state, and stage, advance, or end staged transfers, in one durable step that persists the staged transfers with the MLS state. A Commit that fails is rejected before merge. Until a receiver has verified the leaf that grants a member a role, it grants that member nothing and never assumes a default role. A leaf that arrives later by replication or reconciliation and hashes the same as the held leaf is discarded; one that hashes differently is handled as §9.9.3 equivocation. Its two-node criteria need SCP-329's committer side merged before the story is done; SCP-329 is not in blockedBy because this story can start without it. The rejoin criteria of PUSH-030 and PUSH-026 depend on this story.",
       "acceptanceCriteria": [
         "Two-node test: A adds C as `observer`; B processes A's Commit and then holds C with role `observer`, C's `messages:read` is authorized at B and C's `messages:write` is not, and B's log head equals A's",
         "Two-node test: A changes C's role from `observer` to `member` by `ChangeRole`; after B processes the Commit, C's `messages:write` is authorized at B",
-        "B rejects before merge, with its epoch, log head, staged parts, and role state unchanged, one test each: a Commit with no block; a `MemberJoined` subject other than the added identifier; a leaf whose `actor_did` is not the identifier the committer's `0xFF03` binds; a committer whose MLS credential names an identity other than its `0xFF03` identifier, with leaves naming the credential identity; a leaf whose signature does not verify under the key the committer's `0xFF03` names; a leaf whose `sequence` is not B's next; a leaf whose `prev_hash` is not B's log head; a leaf whose timestamp is earlier than B's log head's",
-        "In a `Threshold` context, B rejects before merge a Commit that carries one approval fewer than the threshold, and accepts the same action when it carries exactly the threshold, although B itself received no vote message",
+        "B rejects before merge, with its epoch, log head, governance state, staged transfers, and role state unchanged, one test each: a Commit with no block; a `MemberJoined` subject other than the added identifier; a leaf whose `actor_did` is not the identifier the committer's `0xFF03` binds; a committer whose MLS credential names an identity other than its `0xFF03` identifier, with leaves naming the credential identity; a Commit whose UpdatePath leaf carries an attestation for another identifier; a leaf whose signature does not verify under the key the committer's `0xFF03` names; a leaf whose `sequence` is not B's next; a leaf whose `prev_hash` is not B's log head",
+        "B accepts a leaf whose timestamp is a year earlier than its log head's, and a following Commit whose leaf timestamp is a year later than B's clock, and both verdicts are unchanged when B's clock moves",
+        "In a `Threshold` context, B rejects before merge a Commit that carries one approval fewer than the threshold, and accepts the same action when it carries the threshold, although B itself received no vote message",
         "B rejects before merge a `SingleAdmin` Commit whose committer lacks `member:invite`, and a Commit that assigns a role absent from B's role registry",
         "A test delivers to B an add Commit whose block fails verification and asserts that B's role state holds no entry for C and that C's next message fails with `MemberNotFound`",
         "Delivering to B a leaf it already holds, through the replication or reconciliation entry point, leaves B's log unchanged; delivering a different leaf at a held sequence produces the §9.9.3 equivocation outcome",
-        "A crash injected between merge and append leaves B, after restart, either at the old epoch with the old log, staged parts, and role state, or at the new epoch with the new leaves appended and applied",
+        "A crash injected between merge and append leaves B, after restart, either at the old epoch with the old log, governance state, staged transfers, and role state, or at the new epoch with the new leaves appended and applied and the part staged; a test restarts B between parts 0 and 1 of a 3-part transfer and B then authorizes the final part",
         "CI-feature `cargo clippy` over the touched crates and their tests pass"
       ],
       "actionItems": [
         "Route incoming Commits through the SCP-328 two-phase receive",
-        "Take the committer identity from the verified `0xFF03` attestation and verify each leaf signature",
-        "Run the SCP-335 check against the pre-Commit state",
-        "Merge, append, record, and apply in one durable step, and discard on failure",
-        "Delete any receiver-side default-role assignment",
+        "Take the committer identity from the verified `0xFF03` attestation on its pre-Commit leaf, reject an UpdatePath leaf attested to another identifier, and verify each leaf signature",
+        "Run the SCP-335 check against the pre-Commit state and the sender's staged transfer",
+        "Merge, append, update the governance state, and persist staged transfers in one durable step, and discard on failure",
+        "Delete any receiver-side default-role assignment and the leaf timestamp check",
         "Deduplicate replicated or reconciled leaves by sequence and hash",
         "Add the tests the criteria name"
       ],
@@ -12049,23 +12054,29 @@
         "crates/scp-protocol/src/envelope/inner/mod.rs",
         "crates/scp-protocol/src/context/governance/wire.rs",
         "crates/scp-protocol/src/context/governance/mod.rs",
-        "crates/scp-protocol/src/jcs.rs"
+        "crates/scp-protocol/src/jcs.rs",
+        "crates/scp-runtime/tests/test_vectors.rs",
+        "scripts/gen-test-vectors-p256.py"
       ],
-      "description": "Per §5.9.1 of the contexts spec, §7.3.1.1 of the trust spec, and the §9.5.2 preimages of the security spec, this story builds the pure, synchronous wire layer of ADR-066 in `scp-protocol`: the `MessageType` variants `GovernanceProposal` (0x06) and `GovernanceVote` (0x07); the proposal record and vote record as MessagePack arrays with minimal headers; the governance transfer body (a MessagePack array of the proposal record or nil, the vote records, and the leaf byte strings); the `\"SCP-GOVERNANCE-PROPOSAL-V1:\"` and `\"SCP-VOTE-V2:\"` preimages, which replace `\"SCP-VOTE-V1:\"` and `compute_vote_hash`; `signing_key_id` as the SHA-256 of a 65-byte SEC1 leaf `signature_key`; and the I-JSON integer bound (±(2^53 − 1)) on every integer of a `GovernanceAction`, which `jcs::to_vec` does not enforce today. The block encryption and parts are SCP-328; the engine intake is SCP-332. Every type stays wasm32-compatible (`scripts/check-protocol-deps.sh`).",
+      "description": "Per §5.9.1 of the contexts spec, §7.3.1.1 of the trust spec, and the §9.5.2 preimages of the security spec, this story builds the pure, synchronous wire layer of ADR-066 in `scp-protocol`: the `MessageType` variants `GovernanceProposal` (0x06) and `GovernanceVote` (0x07); the proposal record (`proposer_did`, `action_bytes`, `anchor_seq`, `leaf_key_hash`, `signature`) and the vote record (`voter_did`, `vote`, `leaf_key_hash`, `expires_epoch`, `signature`) as MessagePack arrays with minimal headers; the part body (a three-item array of the proposal record or nil, the vote records, and the leaf byte strings); the record-aligned split of a transfer into parts, with the proposal in part 0, the leaves and the executor's own vote in the final part, and no record split across two parts; the `\"SCP-PROPOSAL-V2:\"` proposal ID over `anchor_seq`, which replaces `\"SCP-PROPOSAL-V1:\"` and its `timestamp` field; the `\"SCP-GOVERNANCE-PROPOSAL-V1:\"` and `\"SCP-VOTE-V2:\"` preimages, which replace `\"SCP-VOTE-V1:\"` and `compute_vote_hash`; `leaf_key_hash` as the SHA-256 of a 65-byte SEC1 leaf `signature_key`, named so it is never confused with the `signing_key_id` that names an identity-key role; `MAX_GOVERNANCE_ACTION_BYTES` of 8,192; and the I-JSON integer bound (±(2^53 − 1)) on every integer of a `GovernanceAction`, which `jcs::to_vec` does not enforce today. The block encryption is SCP-328; the engine intake is SCP-332. Every type stays wasm32-compatible (`scripts/check-protocol-deps.sh`).",
       "acceptanceCriteria": [
         "`MessageType::GovernanceProposal` is 0x06 and `MessageType::GovernanceVote` is 0x07, and a round-trip test decodes each from its byte",
-        "The proposal record, vote record, and transfer body encode exactly as §5.9.1 and §7.3.1.1 lay them out; round-trip tests cover a nil proposal, zero votes, 64 votes, and 16 leaves, and a vote record whose `expires_at` needs a uint64 encodes in 169 bytes",
-        "Decoding rejects with a typed error, one test each: a non-minimal MessagePack header for a string, a binary string, an array, and an integer; trailing bytes after the body array; a `signing_key_id` or `signature` of the wrong length; a vote choice above 2; more than 16 leaves; `action_bytes` longer than 65,535 bytes",
-        "A test vector fixes the `\"SCP-GOVERNANCE-PROPOSAL-V1:\"` preimage hash and one fixes the `\"SCP-VOTE-V2:\"` preimage hash for fixed inputs, and each hash changes when any one field changes, including `context_id`, the choice, `signing_key_id`, and `expires_at`",
-        "`compute_vote_hash`, the `\"SCP-VOTE-V1:\"` separator constant, and every caller of them are gone from the workspace",
+        "The proposal record, vote record, and part body encode exactly as §5.9.1 and §7.3.1.1 lay them out; round-trip tests cover a nil proposal, zero votes, 96 votes, and 16 leaves; a vote record whose `expires_epoch` needs a uint64 encodes in 169 bytes, and a proposal record whose `anchor_seq` needs a uint64 encodes in 171 bytes plus `action_bytes`",
+        "Decoding rejects with a typed error, one test each: a non-minimal MessagePack header for a string, a binary string, an array, and an integer; trailing bytes after the body array; a `leaf_key_hash` or `signature` of the wrong length; a vote choice above 2; more than 16 leaves; `action_bytes` longer than 8,192 bytes; a proposal in a part other than part 0; leaves in a part other than the final part",
+        "The split puts a transfer whose records fit 16,344 bytes in one part; with an 8,192-byte action, part 0 holds the proposal and at least 47 votes and every middle part holds 96; a test splits a transfer of 6,000 approvals and an 8,192-byte action into exactly 64 parts and one of 6,001 approvals returns a typed error; every part body is at most 16,344 bytes and decodes alone",
+        "When the leaves and the executor's own vote do not fit one part body, the split returns a typed error naming the limit",
+        "A test vector fixes the `\"SCP-PROPOSAL-V2:\"` proposal ID, one fixes the `\"SCP-GOVERNANCE-PROPOSAL-V1:\"` preimage hash, and one fixes the `\"SCP-VOTE-V2:\"` preimage hash for fixed inputs, and each changes when any one field changes, including `context_id`, `anchor_seq`, the choice, `leaf_key_hash`, and `expires_epoch`",
+        "`crates/scp-runtime/tests/test_vectors.rs` and `scripts/gen-test-vectors-p256.py` compute Vector 23 of `25-test-vectors.md` §25.11 with `\"SCP-PROPOSAL-V2:\"` and `anchor_seq` 42, and both produce the proposal ID that section prints",
+        "`compute_vote_hash`, the `\"SCP-VOTE-V1:\"` and `\"SCP-PROPOSAL-V1:\"` separator constants, the proposal ID's `timestamp` input, and every caller of them are gone from the workspace",
         "Canonicalizing a `GovernanceAction` that holds the integer 2^53 or −2^53 returns a typed error, and one holding 2^53 − 1 succeeds",
         "`scripts/check-protocol-deps.sh` passes and `cargo test -p scp-protocol --features testing` passes",
         "CI-feature `cargo clippy` over the touched crates and their tests pass"
       ],
       "actionItems": [
         "Add the two `MessageType` variants",
-        "Add the record and body codecs with minimal-header checks",
-        "Add the two preimages and delete the V1 vote hash",
+        "Add the record and part body codecs with minimal-header checks",
+        "Add the record-aligned split",
+        "Add the V2 proposal ID and the two preimages, and delete the V1 vote hash and V1 proposal ID",
         "Enforce the I-JSON bound in action canonicalization",
         "Add the tests and vectors the criteria name"
       ],
@@ -12086,6 +12097,10 @@
         {
           "file": ".docs/adrs/phase-6.md",
           "section": "## ADR-066: Governance Leaves Ride the MLS Commit"
+        },
+        {
+          "file": ".docs/specs/25-test-vectors.md",
+          "section": "## 25.11 Proposal ID Vectors (§9.5.2)"
         }
       ],
       "details": {}
@@ -12102,21 +12117,23 @@
         "crates/scp-protocol/src/context/governance/intake.rs",
         "crates/scp-protocol/src/context/governance/executability.rs"
       ],
-      "description": "Per §5.9.1 of the contexts spec (receive path) and the executability rule of §7.3.1.1 of the trust spec, the `GovernanceEngine` gains pure intake of a proposal or vote that another member sent, and the rule that says when an action is executable. Intake takes the decoded record from SCP-331 plus the verified sender identity and leaf key the caller supplies, and applies the checks §5.9.1 lists: identifiers agree, `signing_key_id` matches the sender leaf key, the signature verifies, the action bound, the I-JSON bound, `GovernancePropose` or `GovernanceVote`, eligibility, and `expires_at` at most the `voting_deadline`. A later vote from the same voter replaces the earlier one, `Withdraw` removes it, and orphan votes are capped at 256 per context. Executability counts approvals per model (Threshold `threshold`; Majority `floor(eligible/2)+1`; Unanimity, and `ExtendTtl` or `PromoteContext`, all eligible voters; the deadlock fallback `floor(active/2)+1` and at least 2), where eligible voters hold `GovernanceVote` and joined at or before the proposal's `created_at`, and returns exactly that many approvals for the Commit. ADR-031 §4c's deadline arm does not execute until `00-open-questions.md` settles it. Proposal lifecycle records become local `ContextEvent`s, never leaves. The Commit-side verification is SCP-335; runtime routing is SCP-333.",
+      "description": "Per §5.9.1 of the contexts spec (receive path) and the executability rule of §7.3.1.1 of the trust spec, the `GovernanceEngine` gains pure intake of a proposal or vote that another member sent, and the rule that says when an action is executable. Intake takes the decoded record from SCP-331, the verified sender identity and leaf key the caller supplies, the message's MLS epoch, and the member's commit-ordered leaf count, and applies the checks §5.9.1 lists: identifiers agree, `leaf_key_hash` matches the sender leaf key, the signature verifies, the action bound, the I-JSON bound, `anchor_seq` at most the member's count, `GovernancePropose` or `GovernanceVote`, and `expires_epoch` at or after the message's epoch. No intake check reads a clock. The engine starts a local voting window when it accepts a proposal and uses it only to mark the proposal `Expired` locally. A later vote from the same voter replaces the earlier one, `Withdraw` removes it, orphan votes are capped at 256 per context, and an orphan is dropped once the group's epoch passes its `expires_epoch`. Executability counts approvals per model (Threshold `threshold`; Majority `floor(eligible/2)+1`; Unanimity, and `ExtendTtl` or `PromoteContext`, all eligible voters; the deadlock fallback `floor(active/2)+1` and at least 2), where the eligible voters are the members that hold `GovernanceVote` now, and returns that many approvals whose `expires_epoch` is at or after the current epoch. ADR-031 §4c's deadline arm does not execute until `00-open-questions.md` settles it. Proposal lifecycle records become local `ContextEvent`s, never leaves. The Commit-side verification is SCP-335; runtime routing is SCP-333.",
       "acceptanceCriteria": [
-        "Intake rejects, with a typed error and no state change, one test each: a sender identifier that differs from `proposer_did` or `voter_did`; a `signing_key_id` that is not the hash of the supplied leaf key; a bad signature; a proposer without `GovernancePropose`; a voter without `GovernanceVote`; a voter who joined after the proposal's `created_at`; an `expires_at` after the `voting_deadline`; an executed `proposal_id`",
+        "Intake rejects, with a typed error and no state change, one test each: a sender identifier that differs from `proposer_did` or `voter_did`; a `leaf_key_hash` that is not the hash of the supplied leaf key; a bad signature; a proposer without `GovernancePropose`; a voter without `GovernanceVote`; an `anchor_seq` above the member's commit-ordered leaf count; an `expires_epoch` below the message's epoch; an executed `proposal_id`",
+        "A member that joined after a proposal's `anchor_seq` and holds `GovernanceVote` has its vote accepted and counted",
         "A second vote from one voter replaces the first, a `Withdraw` removes it, and a test asserts the tally after each",
-        "A vote that arrives before its proposal is counted once the proposal arrives; the 257th orphan vote in a context drops the oldest; an orphan vote past its `expires_at` is dropped",
-        "For each model, a table test asserts the approval count at which the action becomes executable and that the returned approval set has exactly that size, including the `ExtendTtl` and `PromoteContext` unanimity override and the deadlock fallback's minimum of 2",
-        "A `Majority` proposal whose approvals do not exceed half of the eligible voters is not executable at or after its deadline, whatever the rejections",
+        "A vote that arrives before its proposal is counted once the proposal arrives; the 257th orphan vote in a context drops the oldest; an orphan vote is dropped once the group's epoch passes its `expires_epoch`",
+        "For each model, a table test asserts the approval count at which the action becomes executable and that the returned approval set has exactly that size and holds no vote whose `expires_epoch` is below the current epoch, including the `ExtendTtl` and `PromoteContext` unanimity override and the deadlock fallback's minimum of 2",
+        "A `Majority` proposal whose approvals do not exceed half of the eligible voters is not executable after its local voting window ends, whatever the rejections",
+        "No intake or executability function takes a clock or a timestamp argument, asserted by a test that runs intake with the engine's clock set a year ahead and a year behind and gets the same result",
         "Accepting a proposal or vote appends no leaf to the event log and records a local `ContextEvent`",
         "`cargo test -p scp-protocol --features testing` passes",
         "CI-feature `cargo clippy` over the touched crates and their tests pass"
       ],
       "actionItems": [
-        "Add remote proposal and vote intake to the engine",
+        "Add remote proposal and vote intake to the engine, with the anchor and epoch checks",
         "Add vote replacement, withdrawal, and the orphan cap",
-        "Add the per-model executability rule and approval selection",
+        "Add the per-model executability rule and approval selection over current `GovernanceVote` holders",
         "Record lifecycle records as local ContextEvents",
         "Add the tests the criteria name"
       ],
@@ -12155,19 +12172,23 @@
         "crates/scp-protocol/src/context/governance/mod.rs",
         "crates/scp-event-log/src/lib.rs"
       ],
-      "description": "Per receiver steps 1.3 to 2 of §7.3.1.1 of the trust spec, this story builds the pure check every receiver runs on a decoded transfer body before it merges a Commit: recompute `proposal_id` from the receiver's `context_id`; check the executed-proposal set (§5.9 invariant 2), `created_at` at or before T (the `GovernanceActionExecuted` leaf's timestamp), and the proposer's `GovernancePropose` and signature; check that each vote is `Approve`, from a distinct eligible voter, with `expires_at` between T and the `voting_deadline`, signed under that voter's leaf key in the caller-supplied pre-Commit tree view whose `0xFF03` binds the voter; check that the vote count equals the SCP-332 requirement; check that the leaves match the proposal and the Commit's Add and Remove proposals; and apply the ADR-031 §7 conflict list against executed actions whose leaf timestamp is at or after `created_at`. Under epoch order the governance freeze for mutual removal and simultaneous commit cannot arise (ADR-031 §7 amendment), so this story deletes `ResolveConflict`, `ConflictResolution`, and the `GovernanceConflictDetected` and `GovernanceConflictResolved` event types with every caller. Leaf signature checks are SCP-330's; this check reads key state only from its inputs.",
+      "description": "Per the governance-state, conflict, staging, and receiver-step rules of §7.3.1.1 of the trust spec, this story builds in `scp-protocol` the pure check every receiver runs on one decoded part before it merges a Commit, and the governance state the check reads. The governance state holds the membership and roles, `member_since` (each member's join point: the `sequence` of its latest `MemberJoined` or `MemberReset` leaf), `change_seq` per `GovernanceConflictKey` (`role:X`, `read:X`, `write:X`, `ceiling`), and the executed-proposal set, with a function that applies a leaf to it from the leaf's own `sequence`. The per-sender staged transfer holds the `proposal_id`, `part_count`, the merged part count, the verified proposal, and the counted voter identifiers. The check takes the part, the sender's identifier, the sending epoch E, a pre-Commit tree view, the receiver's commit-ordered leaf count N, the governance state, and the sender's staged transfer, and reads nothing else: no clock and no leaf timestamp. It applies the staging rule (part 0 replaces; part i needs the same `proposal_id` and `part_count` and exactly i merged parts); in part 0, recomputes the `\"SCP-PROPOSAL-V2:\"` `proposal_id`, checks it against the header, the executed set, `anchor_seq ≤ N`, `GovernancePropose`, and the signature in the tree view; in every part, checks each vote is `Approve`, from a voter not yet counted, who holds `GovernanceVote` (and is a `Threshold` signer), with `E ≤ expires_epoch` and a signature under that voter's leaf in the tree view whose `0xFF03` binds the voter; in the final part, counts staged and new approvals whose voters still hold `GovernanceVote` against the requirement computed from the current state, checks the leaves match the proposal and the Commit's Add and Remove proposals, and applies the conflict rule (a key with `change_seq ≥ anchor_seq`, or a subject X with `member_since[X] ≥ anchor_seq`). It also implements when a staged transfer ends. Under epoch order the governance freeze for mutual removal and simultaneous commit cannot arise (ADR-031 §7 amendment), so this story deletes `ResolveConflict`, `ConflictResolution`, and the `GovernanceConflictDetected` and `GovernanceConflictResolved` event types with every caller. Leaf signature checks are SCP-330's.",
       "acceptanceCriteria": [
-        "Given a valid body for each model, the check returns `Authorized`; one test per rejection returns a typed reason: a recomputed `proposal_id` in the executed set; `created_at` after T; a `Reject` record; a repeated voter; an ineligible voter; `expires_at` before T; `expires_at` after the deadline; a signature under a leaf key absent from the tree view; a leaf key whose `0xFF03` binds another identifier; one vote too few; one vote too many",
+        "Given a valid one-part transfer for each model, the check returns `Authorized`; one test per rejection returns a typed reason: a recomputed `proposal_id` that differs from the header's; a `proposal_id` in the executed set; `anchor_seq` above N; a `Reject` record; a voter counted twice, within a part or across a staged part; a voter without `GovernanceVote`; `expires_epoch` below E; a vote whose `leaf_key_hash` matches no leaf of the voter in the tree view; a leaf key whose `0xFF03` binds another identifier; one approval too few",
+        "Staging: part 1 with no staged part 0, part 2 after only part 0, a part whose `proposal_id` or `part_count` differs from the staged transfer's, and a proposal outside part 0 are each rejected; part 0 from a sender with a staged transfer replaces it; an empty block from the sender, the sender's removal, and a Commit that adds a member each end the staged transfer, and the last ends every sender's",
+        "A three-part transfer is authorized when, between parts 0 and 1, another member's Commit replaces the leaf key of a voter whose approval part 0 carried; the same transfer is rejected at the final part when, between parts, a Commit removes enough carried voters that the count falls below the requirement",
         "A body whose `GovernanceActionExecuted` leaf names another `proposal_id`, another action, or an executor other than the committer is rejected, as is a body with a proposal and no such leaf",
-        "A `ChangeRole` proposal conflicting with a `ChangeRole` for the same member executed after the proposal's `created_at` is rejected, and the same proposal is authorized when that action executed before `created_at`",
-        "Two receivers given the same pre-Commit state and body return the same verdict, asserted by a test that first feeds each receiver's engine a different set of vote messages",
+        "Conflicts: a `ChangeRole` for X anchored at sequence s is rejected when a `ChangeRole` for X executed at a sequence at or after s, and authorized when it executed before s; an action naming X is rejected when X rejoined at a sequence at or after its anchor; a `ModifyCeiling`, a read-access revocation, and a write-access revocation each conflict through their own key, one test each",
+        "Applying a log's leaves in order to an empty governance state yields the same `member_since`, `change_seq`, and executed set as the state the check updated while authorizing those leaves, and a member's keys are dropped when it leaves",
+        "Two receivers given the same pre-Commit state and parts return the same verdict, asserted by a test that first feeds each receiver's engine a different set of vote messages and sets their clocks a day apart",
         "`ResolveConflict`, `ConflictResolution`, `GovernanceConflictDetected`, and `GovernanceConflictResolved` have zero occurrences in `crates/` and `bindings/`",
         "`cargo test -p scp-protocol --features testing` and `cargo test -p scp-event-log --features testing` pass",
         "CI-feature `cargo clippy` over the touched crates and their tests pass"
       ],
       "actionItems": [
-        "Add the pure Commit governance check",
-        "Add the conflict-list check over executed actions",
+        "Add the governance state with `member_since`, `change_seq`, and the executed set, and the leaf-apply function",
+        "Add the staged-transfer type and the staging and ending rules",
+        "Add the per-part check and the final-part count and conflict check",
         "Delete the conflict freeze types, events, and callers",
         "Add the tests the criteria name"
       ],
@@ -12203,7 +12224,7 @@
         "crates/scp-event-log/src/tree.rs",
         "crates/scp-runtime/src/context/providers/event_log.rs"
       ],
-      "description": "§7.3.1 of the trust spec says events are signed by the acting agent, and §23.13 ¶1 of the sync spec verifies each event under the `actor_did` and `signing_key_id` fields of `Event`. Today the runtime provider appends every leaf with `signature: Vec::new()` through `append_unsigned_event`, and `Event` has no `signing_key_id` field, so step 1.5 of §7.3.1.1 (each leaf's own signature) cannot pass. This story adds `signing_key_id` to `Event`, signs each commit-ordered leaf the runtime appends under the actor's identity key through the existing `EventLogSigner` seam, and adds the verify function that §23.13 ¶1 and §7.3.1.1 step 1.5 call, which takes the public key from its caller. The `.docs/lessons/unsigned-event-mcp-bridge.md` lesson is updated to match. The committer's use of it is SCP-329; the receiver's is SCP-330.",
+      "description": "§7.3.1 of the trust spec says events are signed by the acting agent, and §23.13 ¶1 of the sync spec verifies each event under the `actor_did` and `signing_key_id` fields of `Event`. Today the runtime provider appends every leaf with `signature: Vec::new()` through `append_unsigned_event`, and `Event` has no `signing_key_id` field, so step 1.5 of §7.3.1.1 (each leaf's own signature) cannot pass. This story adds `signing_key_id` to `Event`, naming the actor's identity-key role such as `#active` (the record field that hashes an MLS leaf key is `leaf_key_hash`, a different value), signs each commit-ordered leaf the runtime appends under the actor's identity key through the existing `EventLogSigner` seam, and adds the verify function that §23.13 ¶1 and §7.3.1.1 step 1.5 call, which takes the public key from its caller. The `.docs/lessons/unsigned-event-mcp-bridge.md` lesson is updated to match. The committer's use of it is SCP-329; the receiver's is SCP-330.",
       "acceptanceCriteria": [
         "`Event` has a `signing_key_id` field, and the signature covers every field but `signature`; a test changes each field in turn and the verify function rejects the event",
         "Every leaf the runtime provider appends carries a 64-byte signature that verifies under the actor's identity key, asserted by a test that appends one leaf of each commit-ordered event type the runtime emits",
@@ -12248,23 +12269,26 @@
         "crates/scp-runtime/src/context/messaging_helpers.rs",
         "crates/scp-runtime/src/context/actor/handlers/governance.rs"
       ],
-      "description": "Per §5.9.1 of the contexts spec, a member's `propose` and `vote` operations send a `GovernanceProposal` (0x06) or `GovernanceVote` (0x07) MLS application message signed under the member's current leaf key, and an incoming one is routed from the receive path in `messaging_helpers.rs` into the SCP-332 engine intake. The sender identity handed to intake is the identifier the verified §9.7.1 `0xFF03` attestation on the MLS sender leaf binds, never the credential identity, which needs the attestation verification wiring SCP-CRYPTO22-004 builds. A member whose leaf `signature_key` changes re-sends its pending proposals and unexpired votes signed under the new key. The proposal and vote events the runtime appends to the event log today, and the per-node `next_proposal_seq` used for them, are replaced by local `ContextEvent`s. Executing an executable proposal is SCP-329.",
+      "description": "Per §5.9.1 of the contexts spec, a member's `propose` and `vote` operations send a `GovernanceProposal` (0x06) or `GovernanceVote` (0x07) MLS application message signed under the member's current leaf key, and an incoming one is routed from the receive path in `messaging_helpers.rs` into the SCP-332 engine intake with the message's MLS epoch and the member's commit-ordered leaf count. A new proposal's `anchor_seq` is the proposer's commit-ordered leaf count, and a vote's `expires_epoch` is the current epoch plus the member's configured validity. The sender identity handed to intake is the identifier the verified §9.7.1 `0xFF03` attestation on the MLS sender leaf binds, never the credential identity, which needs the attestation verification wiring SCP-CRYPTO22-004 builds. Withdrawing an approval sends a `Withdraw` vote message and commits an UpdatePath for the member's own leaf through the SCP-328 self-Update entry point. A member whose leaf `signature_key` changes re-sends its pending proposals, each with its original `anchor_seq`, and each vote it has not withdrawn whose `expires_epoch` has not passed, signed under the new key. The proposal and vote events the runtime appends to the event log today, and the per-node `next_proposal_seq` used for them, are replaced by local `ContextEvent`s. Executing an executable proposal is SCP-329.",
       "acceptanceCriteria": [
-        "Two-node test: A proposes in a `Threshold` context and B's engine holds the proposal; B votes and A's engine holds B's approval; neither node's event log grew",
+        "Two-node test: A proposes in a `Threshold` context and B's engine holds the proposal with A's `anchor_seq`; B votes and A's engine holds B's approval; neither node's event log grew",
         "A message whose `InnerEnvelope` sender differs from the identifier the sender leaf's `0xFF03` binds is dropped with a typed reason, and a test sets a credential identity that differs from the attested one and asserts the attested one is used",
-        "After A's own Update Commit, A re-sends its pending proposal and votes, and B counts A's re-signed vote and not the old one",
+        "After A's own Update Commit, A re-sends its pending proposal with the same `proposal_id` and its votes, and B counts A's re-signed vote and not the old one",
+        "Withdraw: B approves, then withdraws; B's epoch advances by one through its own UpdatePath Commit, and a Commit from A that carries B's earlier approval is rejected at a third node",
         "A vote message signed under a leaf key B's tree no longer holds is dropped",
         "`pipeline_wiring.rs` asserts that the dispatch path for an incoming `GovernanceVote` reaches the engine intake",
         "CI-feature `cargo clippy` over the touched crates and their tests pass"
       ],
       "actionItems": [
-        "Send proposal and vote messages from the propose and vote operations",
-        "Route incoming 0x06 and 0x07 messages to the engine intake with the attested sender",
+        "Send proposal and vote messages from the propose and vote operations, with `anchor_seq` and `expires_epoch`",
+        "Route incoming 0x06 and 0x07 messages to the engine intake with the attested sender, the message epoch, and the leaf count",
+        "Withdraw by a `Withdraw` message plus a self-UpdatePath Commit",
         "Re-send pending proposals and votes after a leaf key change",
         "Replace the appended lifecycle events with local ContextEvents",
         "Add the tests and the `pipeline_wiring.rs` assertion"
       ],
       "blockedBy": [
+        "SCP-328",
         "SCP-331",
         "SCP-332",
         "SCP-CRYPTO22-004"
@@ -12297,20 +12321,24 @@
         "crates/scp-runtime/src/context/lifecycle_helpers.rs",
         "crates/scp-event-log/src/checkpoint.rs"
       ],
-      "description": "A member a Commit adds receives the Welcome, not the Commit (§7.3.1.1 of the trust spec, 'The members a Commit adds'). It rebuilds the event log and the governance state from a checkpoint and the leaves after it, as ADR-030 §5 'State Reconstruction from Checkpoints' specifies, fetching them through the §23.7 reconciliation of the sync spec and verifying each leaf per §23.13. No code builds this reconstruction today. This story builds it and returns the rebuilt log's count, Merkle root, and last leaf hash, so SCP-334 can compare them with the Welcome's `scp_event_log_head` extension.",
+      "description": "A member a Commit adds receives the Welcome, not the Commit (§7.3.1.1 of the trust spec, 'The members a Commit adds'). It rebuilds the event log and the governance state from a checkpoint and the leaves after it, as ADR-030 §5 'State Reconstruction from Checkpoints' specifies, fetching them through the §23.7 reconciliation of the sync spec and verifying each leaf per §23.13. ADR-066 amends ADR-030's `ContextStateSnapshot` with `member_since`, `governance_change_seqs`, and `executed_proposals`, because a receiver's authorization reads them and their source leaves may lie before the checkpoint. No code builds this reconstruction today. This story adds the three snapshot fields, fills them when a checkpoint is created, and builds the reconstruction, which loads the snapshot's governance state and applies each later leaf with the SCP-335 leaf-apply function. It returns the rebuilt log's count, Merkle root, and last leaf hash, so SCP-334 can compare them with the Welcome's `scp_event_log_head` extension.",
       "acceptanceCriteria": [
-        "From a checkpoint and the leaves after it, the rebuild produces role, membership, and executed-proposal state equal to the state of a member that processed every Commit, asserted over a log with an add, a role change, and a removal",
+        "`ContextStateSnapshot` carries `member_since`, `governance_change_seqs`, and `executed_proposals`, a checkpoint fills them from the live governance state, and its deterministic serialization covers them",
+        "From a checkpoint and the leaves after it, the rebuild produces role, membership, `member_since`, `change_seq`, and executed-proposal state equal to the state of a member that processed every Commit, asserted over a log with an add, a role change, a removal, and a rejoin of the removed member, with the checkpoint taken before the rejoin and again after it",
+        "A rebuilt member and a live member return the same SCP-335 verdict on a later Commit whose action conflicts with an action executed before the checkpoint",
         "A leaf that fails §23.13 verification, or breaks the `prev_hash` chain, stops the rebuild with a typed error and leaves no partial state",
         "The rebuild returns the count, Merkle root, and last leaf hash of the rebuilt log",
         "`cargo test -p scp-event-log --features testing` passes",
         "CI-feature `cargo clippy` over the touched crates and their tests pass"
       ],
       "actionItems": [
+        "Add the three governance fields to `ContextStateSnapshot` and fill them at checkpoint creation",
         "Build the reconstruction from checkpoint plus leaves",
         "Return the log head summary",
         "Add the tests the criteria name"
       ],
       "blockedBy": [
+        "SCP-335",
         "SCP-336"
       ],
       "sources": [
@@ -12341,19 +12369,21 @@
         "crates/scp-runtime/src/context/governance_helpers.rs",
         "crates/scp-runtime/src/context/invitation_helpers.rs"
       ],
-      "description": "Per §7.3.1.1 of the trust spec ('The members a Commit adds') and the `0xFF04` row of §9.18.7 of the security spec, the committer of a Commit with an Add proposal places the `scp_event_log_head` extension, 72 bytes holding the log's count (u64 BE), Merkle root, and last leaf hash after the Commit's own leaves, in the Welcome's GroupInfo. The joiner grants no member any rights, its own role included, and sends no message a role authorizes, until the SCP-337 rebuild returns a count, root, and last leaf hash equal to the extension's; a mismatch is handled as §9.9.3 equivocation. The Commit's own leaves and receiver steps are SCP-329 and SCP-330.",
+      "description": "Per §7.3.1.1 of the trust spec ('The members a Commit adds') and the `0xFF04` row of §9.18.7 of the security spec, the committer of a Commit with an Add proposal places the `scp_event_log_head` extension, 72 bytes holding the log's count (u64 BE), Merkle root, and last leaf hash after the Commit's own leaves, in the Welcome's GroupInfo. The joiner grants no member any rights, its own role included, and sends no message a role authorizes, until the SCP-337 rebuild returns a count, root, and last leaf hash equal to the extension's; a mismatch is handled as §9.9.3 equivocation. The joiner trusts the extension only from the GroupInfo whose signature its Welcome processing verified, and the GroupInfo that carries it never leaves the Welcome in the clear. The Commit's own leaves and receiver steps are SCP-329 and SCP-330.",
       "acceptanceCriteria": [
         "The extension encodes and decodes as 72 bytes, and decoding rejects any other length",
         "Two-node test: A adds C; C's Welcome GroupInfo carries the extension whose count and root equal A's log after the add; after the rebuild C holds A's role state and its own role",
         "Before the rebuild matches, C authorizes no message from any member and its own write fails with a typed error",
         "A Welcome whose extension root differs from the rebuilt root leaves C with no rights and raises the §9.9.3 equivocation outcome",
         "A Welcome without the extension is rejected",
+        "openmls 0.9.0 discards the verified GroupInfo extensions when it builds the group (`creation.rs`), and `ProcessedWelcome::unverified_group_info()` is the only path that reads them. The joiner reads `0xFF04` from that unverified GroupInfo and trusts it only after the `StagedWelcome` built from the same `ProcessedWelcome` has verified the GroupInfo signature, and a test asserts that a GroupInfo whose extension bytes were altered after signing fails `StagedWelcome` construction and grants no rights",
+        "The plaintext GroupInfo that `create_group_info_with_extensions` places in the commit bundle is never published or sent outside the Welcome: a test captures every blob the committer publishes for an add and finds no GroupInfo and no `0xFF04` bytes outside the Welcome ciphertext",
         "CI-feature `cargo clippy` over the touched crates and their tests pass"
       ],
       "actionItems": [
         "Add the `0xFF04` extension codec",
-        "Set it in the Welcome GroupInfo at the committer",
-        "Gate the joiner's rights on the rebuild matching it",
+        "Set it in the Welcome GroupInfo at the committer, and never publish the commit bundle's plaintext GroupInfo",
+        "Read the extension only after `StagedWelcome` verification, and gate the joiner's rights on the rebuild matching it",
         "Add the tests the criteria name"
       ],
       "blockedBy": [

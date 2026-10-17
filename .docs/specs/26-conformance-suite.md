@@ -123,10 +123,10 @@ Each test specifies:
 |-------|-------|
 | **Layer** | Context |
 | **Tier** | Core |
-| **Spec Sections** | §5.9, §9.5.2 |
-| **Preconditions** | Context with 3 members. Governance model: majority vote. |
-| **Steps** | 1. Member A proposes role change for Member C. 2. Proposal ID is computed per §9.5.2 (domain: `"SCP-PROPOSAL-V1:"`). 3. Member A votes approve (signed per `"SCP-VOTE-V1:"`). 4. Member B votes approve. 5. Quorum reached (2/3). 6. Role change is applied. |
-| **Expected Outcome** | Proposal passes with 2/3 votes. Member C's role is updated. Governance event recorded in event log. All vote signatures are verifiable. |
+| **Spec Sections** | §5.9, §5.9.1, §7.3.1.1, §9.5.2 |
+| **Preconditions** | Encrypted context with 3 members. Governance model: majority vote. |
+| **Steps** | 1. Member A sends a `GovernanceProposal` message proposing a role change for Member C; its proposal ID is computed per §9.5.2 (domain: `"SCP-PROPOSAL-V2:"`) over A's `anchor_seq`. 2. Member B sends a `GovernanceVote` approving (signed per `"SCP-VOTE-V2:"`). 3. Member A, now holding 2 approvals of 3 eligible voters, sends one Commit whose governance leaf block carries the proposal, both approvals, and the signed leaves. 4. Members B and C process the Commit. |
+| **Expected Outcome** | B and C each authorize the Commit from its contents alone and apply C's new role. Every member's event log ends with the same leaves. The proposal and vote signatures verify under the senders' leaf keys. |
 
 ### CONF-010: Governance — Threshold Voting (k-of-n)
 
