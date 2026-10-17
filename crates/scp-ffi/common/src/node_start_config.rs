@@ -494,6 +494,35 @@ mod tests {
                 other => panic!("no Rust type checks the fixture's `{other}` arms"),
             }
         }
+
+        // Every `optional_arm_fields` entry names a field, an arm and an arm
+        // field the fixture lists; the `arms` check above ties those to Rust.
+        // Without this, a stale entry is never read and passes silently.
+        let optional_arm_fields = fx["optional_arm_fields"]
+            .as_object()
+            .expect("optional_arm_fields object");
+        for (field, by_kind) in optional_arm_fields {
+            let arms = fx["arms"][field.as_str()].as_array().unwrap_or_else(|| {
+                panic!("optional_arm_fields names `{field}`, which has no arms")
+            });
+            for (kind, names) in by_kind
+                .as_object()
+                .expect("optional_arm_fields entry object")
+            {
+                let arm = arms
+                    .iter()
+                    .find(|arm| arm["kind"] == kind.as_str())
+                    .unwrap_or_else(|| {
+                        panic!("optional_arm_fields names `{field}.{kind}`, which is not an arm")
+                    });
+                for name in strings(names) {
+                    assert!(
+                        name != "kind" && arm.get(&name).is_some(),
+                        "optional_arm_fields names `{field}.{kind}.{name}`, which is not a field of that arm"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

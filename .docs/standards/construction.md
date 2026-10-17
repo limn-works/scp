@@ -184,7 +184,7 @@ Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `No
 | Field | Type | Status |
 |---|---|---|
 | `reach` | `FfiReach{Domain{domain}, NatTraversal, Local}` | required; `Tunnel` omitted |
-| `identity` | operator handle: a DID string on PyO3 and napi-rs, `Arc<Identity>` on UniFFI | required |
+| `identity` | operator handle: each SDK (Python, TypeScript, Swift) takes its own `Identity` handle object; the wrapper lowers it to its DID string at the PyO3 and napi-rs bridges and passes `Arc<Identity>` at UniFFI | required |
 | `blob_storage` | `FfiBlobBackend{InMemory, Redb{path}, Sqlite{path}}` | required; S3 and Postgres omitted |
 | `tls` | `FfiTlsMode{SelfSigned, Acme{email?}, Plaintext, Terminated}` | required |
 | `dht` | `FfiDhtMode{Disabled}` | required; `Disabled` only, by keri's scope ruling of 2026-10-13 |

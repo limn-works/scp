@@ -32,7 +32,7 @@ from types import NoneType, TracebackType
 from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias, get_args, get_type_hints
 
 from scp_sdk.context import validate_admission, validate_broadcast_key_hex
-from scp_sdk.errors import StorageError, ValidationError
+from scp_sdk.errors import StorageError, _require_type
 from scp_sdk.identity import Identity
 
 if TYPE_CHECKING:
@@ -214,6 +214,14 @@ class NodeStartConfig:
     field: the node runs on the ``SCP`` instance's own storage (spec §17.6), and
     an in-memory instance store loses all node state when the node drops.
 
+    Two error rules apply before the bridge runs. An ``identity`` that is not an
+    :class:`~scp_sdk.Identity`, or a value passed to
+    :meth:`scp_sdk.SCP.node_start` that is not a ``NodeStartConfig``, raises
+    :class:`~scp_sdk.errors.ValidationError` ``SCP-VALID-7005``. A sum-typed
+    field holding a value outside its arms raises
+    :class:`~scp_sdk.errors.StorageError` ``SCP-STORAGE-8007``, the code the
+    bridge returns for a malformed config.
+
     Attributes:
         reach: How the node is reached.
         identity: The operator :class:`~scp_sdk.Identity`, already created on
@@ -261,13 +269,7 @@ class NodeStartConfig:
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)
             if field.name == "identity":
-                if not isinstance(value, Identity):
-                    raise ValidationError(
-                        "NodeStartConfig.identity must be a scp_sdk.Identity returned by "
-                        f"the SDK, got {type(value).__module__}.{type(value).__qualname__}",
-                        "SCP-VALID-7005",
-                    )
-                wire[field.name] = value.did
+                wire[field.name] = _require_type(value, Identity, "NodeStartConfig.identity").did
                 continue
             arms = _ARMS.get(field.name)
             if arms is None:

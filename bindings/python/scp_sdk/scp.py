@@ -61,7 +61,13 @@ from typing import (
 
 from scp_sdk._extension import EXTENSION_LOAD_FAILED_CODE, native_module
 from scp_sdk.context import Context
-from scp_sdk.errors import IdentityError, ScpError, ValidationError, _coded_bridge_error
+from scp_sdk.errors import (
+    IdentityError,
+    ScpError,
+    ValidationError,
+    _coded_bridge_error,
+    _require_type,
+)
 from scp_sdk.fullstack import FullStackNode
 from scp_sdk.governance import GovernanceActionResult, check_proposal_response
 from scp_sdk.identity import Identity
@@ -536,13 +542,7 @@ def _unwrap_handle(
     :class:`~scp_sdk.errors.ValidationError` with ``SCP-VALID-7005``, so a
     caller never meets an ``AttributeError`` or a bridge ``TypeError``.
     """
-    if isinstance(value, expected):
-        return value._raw_handle
-    raise ValidationError(
-        f"SCP.{method}(): {param} must be a scp_sdk.{expected.__name__} returned "
-        f"by the SDK, got {type(value).__module__}.{type(value).__qualname__}",
-        "SCP-VALID-7005",
-    )
+    return _require_type(value, expected, f"SCP.{method}(): {param}")._raw_handle
 
 
 def _to_native_sealed(sealed: SealedInvitation) -> Any:
@@ -3704,13 +3704,7 @@ class SCP:
                 instance holds the binding; the bridge has shut the node down
                 before it raises ``SCP-TRANS-5056``.
         """
-        if not isinstance(config, NodeStartConfig):
-            raise ValidationError(
-                "SCP.node_start(): config must be a scp_sdk.NodeStartConfig, got "
-                f"{type(config).__module__}.{type(config).__qualname__}",
-                "SCP-VALID-7005",
-            )
-        config_json = config._to_json()
+        config_json = _require_type(config, NodeStartConfig, "SCP.node_start(): config")._to_json()
         try:
             raw = await asyncio.to_thread(self._native.node_start, config_json)
         except Exception as exc:
